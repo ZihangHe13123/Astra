@@ -13,6 +13,51 @@ from tests.test_context_index_lexical import NOW, _read_source
 from tests.test_context_index_native import candidate
 
 
+@pytest.mark.parametrize("text", [
+    "早上好", "早上好呀～", "早安", "早安呀！", "上午好", "中午好", "午安",
+    "下午好", "晚上好", "晚安", "你好呀！", "您好啊", "Good morning!",
+    "Good afternoon.", "Good evening", "Good night!", "  GOOD MORNING!  ", "hello!",
+])
+def test_greeting_only_turn_does_not_recall_prior_context(text):
+    plan = plan_query(text, NOW, recent_text="Astra 检索问题", task_text="Astra 优化计划")
+    assert not plan.should_recall
+    assert not plan.include_recent
+
+
+@pytest.mark.parametrize("text", [
+    "早上好，帮我查Astra检索问题", "早上好是什么语言", "早安的英文是什么",
+    "晚安之后继续Astra优化", "你好呀，刚才的方案还有哪些风险",
+    "Good morning, recall the Astra plan", "What does good morning mean?",
+    "Good evening — check the retrieval tests", "早上好呀呀呀", "Good morning Astra",
+])
+def test_greeting_words_do_not_suppress_substantive_or_unrecognized_turns(text):
+    assert plan_query(text, NOW).should_recall
+
+
+@pytest.mark.parametrize("text", ["刚才你说的Astra优化", "早上好，刚才你说的Astra优化"])
+def test_recent_anaphora_survives_greeting_filter(text):
+    plan = plan_query(text, NOW)
+    assert plan.should_recall and plan.include_recent
+
+
+def test_distinct_evidence_from_same_session_keeps_both_locators():
+    schema = candidate("schema", "Astra optimization: optional paging fields must stay optional", rank=0)
+    receipt = candidate("receipt", "Astra optimization: uncertain browser writes require observation", rank=1)
+    schema = replace(schema, topic_key="same-session",
+                     locator=replace(schema.locator, primary="same-session", secondary=1))
+    receipt = replace(receipt, topic_key="same-session",
+                      locator=replace(receipt.locator, primary="same-session", secondary=2))
+
+    rows = select_rows(
+        SourceResult("available", relevance=(schema, receipt)),
+        SourceResult("absent"), plan_query("Astra optimization", NOW),
+    )
+
+    assert {row.identity for row in rows} == {"schema", "receipt"}
+    assert {row.locator.primary for row in rows} == {"same-session"}
+    assert {row.locator.secondary for row in rows} == {1, 2}
+
+
 def _limit_sql_work(connection, *, instructions=25000):
     """Bound query work without depending on runner clock speed."""
     steps = 0

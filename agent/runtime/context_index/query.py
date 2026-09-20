@@ -26,6 +26,13 @@ _TRIVIAL = frozenset(
         "hello",
     }
 )
+# Match whole greetings only; particles are bounded to one explicit character.
+# A greeting followed by a request must remain eligible for recall.
+_GREETING = re.compile(
+    r"(?:你好|您好|早上好|上午好|中午好|下午好|晚上好|早安|午安|晚安)[呀啊]?"
+    r"|(?:hi|hello|good\s+(?:morning|afternoon|evening|night))",
+    re.I,
+)
 # Whole, unambiguous arithmetic only. Bare dates, versions and substantive
 # questions containing an expression must still be eligible for recall.
 _ARITHMETIC = re.compile(r"\d+(?:\.\d+)?(?:\s*[+*×÷]\s*\d+(?:\.\d+)?)+")
@@ -119,8 +126,9 @@ def plan_query(
     original = str(text).strip()
     normalized = re.sub(r"[\s!?。！？,.，]+", " ", original.casefold()).strip()
     arithmetic = unicodedata.normalize("NFKC", original).rstrip("!?。！？= ").strip()
+    greeting = _GREETING.fullmatch(original.strip(" \t\r\n!?。！？,.，~～"))
     enabled = (bool(normalized) and normalized not in _TRIVIAL and not original.startswith("/")
-               and not _ARITHMETIC.fullmatch(arithmetic))
+               and not greeting and not _ARITHMETIC.fullmatch(arithmetic))
     resume = bool(_RESUME.search(original))
     recent = bool(_RECENT.search(original))
     intent = (
