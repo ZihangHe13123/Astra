@@ -24,6 +24,11 @@ one-time code and approve the login. Then start Astra and choose
 **ChatGPT / Codex** in `/model`. The model list comes from your account's catalog.
 Signing in saves the connection; selecting a model saves your startup default.
 
+Sign in separately on each computer. `astra update` preserves the current
+installation's credentials but does not sign in or copy a login from another
+device. The ChatGPT / Codex models are listed in `/model` only after the connection
+has been saved.
+
 Alternatively, use `/connect` inside Astra and select **ChatGPT / Codex →
 Subscription**. The panel shows the URL and code while waiting. Esc cancels the
 connection attempt. If you change the device-code authorization setting during
@@ -37,6 +42,15 @@ astra auth logout
 `status` reports whether Astra has saved credentials, without printing tokens.
 `logout` removes Astra's local credentials. A saved model selection remains in
 place and prompts for sign-in on its next request.
+
+## No GPT models after an update
+
+Check this installation's saved credentials from a terminal with
+`astra auth status`. If it reports `sign-in required`, run `astra auth login`.
+If it reports `signed in` but the models are still missing, restart Astra and
+choose **ChatGPT / Codex** in `/connect` to refresh and save the provider
+connection, then open `/model` again. A saved credential alone does not confirm
+that model discovery succeeded; check any connection error shown during login.
 
 ## Reasoning and tools
 

@@ -8,7 +8,7 @@ Astra connects to model APIs to help you research, work with files and operate
 applications. It keeps conversations and state on your machine, and also supports
 optional local model endpoints.
 
-[Quick start](#quick-start) · [Everyday commands](#everyday-commands) · [Updates](#updates-and-data) · [Documentation](#documentation)
+[Quick start](#quick-start) · [ChatGPT login](#chatgpt--codex) · [Everyday commands](#everyday-commands) · [Updates](#updates-and-data) · [Documentation](#documentation)
 
 ## What you can do
 
@@ -54,6 +54,45 @@ user PATH, and creates `.env` if needed. Existing configuration is preserved.
 
 ### 2. Connect a model
 
+Choose a ChatGPT account connection, an API provider, or a local model endpoint.
+
+#### ChatGPT / Codex
+
+Use your ChatGPT account to access its available Codex models. This connection
+does not require an API key or changes to `.env`.
+
+1. Open a **new terminal** (Windows CMD / PowerShell, macOS or Linux) and run:
+
+   ```text
+   astra auth login
+   ```
+
+   If Windows cannot find `astra` yet, run `.\astra.bat auth login` from the installation directory.
+2. Open the URL shown in the terminal, enter the one-time code, and approve the login.
+3. Wait until the terminal reports `Signed in.` and the number of available Codex models, then run `astra`.
+4. **Inside Astra**, enter `/model`, choose **ChatGPT / Codex**, and select an available GPT model. This saves your startup model.
+
+Already inside Astra? Enter `/connect`, select **ChatGPT / Codex → Subscription**,
+and follow the displayed login instructions. Then choose a model in `/model`.
+
+If OpenAI says device-code authorization is disabled, enable it in your ChatGPT
+security settings, cancel the old attempt, and start login again.
+See [OpenAI's device-code requirements](https://learn.chatgpt.com/docs/auth#preferred-device-code-authentication-beta).
+
+**Connect each computer separately.** `astra update` preserves the current
+installation's login, but does not sign you in or sync another computer's login.
+The ChatGPT / Codex models appear in `/model` after you connect the account.
+
+**No GPT models after updating?** Run `astra auth status` in your terminal.
+If it reports `sign-in required`, run `astra auth login`. If it reports
+`signed in`, restart Astra and use `/connect → ChatGPT / Codex` to refresh and
+save the connection, then open `/model` again.
+
+Astra displays reasoning summaries when the model returns them.
+See [login details, reasoning summaries and troubleshooting](docs/codex-oauth.md).
+
+#### API providers and local models
+
 Edit `.env` in the installation directory. For example, to use the bundled
 DeepSeek profile, set these existing entries with your own API key:
 
@@ -65,10 +104,6 @@ LLM_BASE_URL=https://api.deepseek.com
 
 Other providers and local endpoints are supported through
 [model profiles and `/connect`](docs/usage.md#model-connections).
-
-To try a ChatGPT subscription, run `astra auth login` or choose
-**ChatGPT / Codex** in `/connect`, then select its model in `/model`.
-See [Codex login and reasoning summaries](docs/codex-oauth.md).
 
 ### 3. Start
 
@@ -92,6 +127,7 @@ Enter these **inside Astra**:
 | Command | Purpose |
 | --- | --- |
 | `/help` · `/doctor` | Find commands and check runtime connections. |
+| `/connect` | Connect a ChatGPT account, API provider or local endpoint. |
 | `/model` · `/mode high` | Select a model and adjust supported reasoning effort. |
 | `/memory` · `/skills` | Inspect memory and the skill library. |
 | `/learn review` | Discuss improvements to automatic skills, then choose edits and verification. |
@@ -129,6 +165,7 @@ is not yet provided by its Appshot helper; see [platform limits](docs/appshot.md
 | --- | --- |
 | Install, update or recover | [Launcher guide](docs/launcher-update.md) |
 | Configure models and use the terminal | [Everyday use](docs/usage.md) |
+| Sign in with ChatGPT and select a GPT model | [Quick start](#chatgpt--codex) · [Codex login guide](docs/codex-oauth.md) |
 | Use a browser or desktop application | [Browser interaction](docs/browser-interaction.md) · [macOS Computer Use](docs/macos-computer-use.md) · [Appshot](docs/appshot.md) |
 | Understand memory and learning | [Memory overview](docs/memory.md) · [Skill review](docs/skill-learning.md) |
 | Add search, MCP, messaging or image generation | [Integrations](docs/integrations.md) |

@@ -6,7 +6,7 @@
 
 Astra 主要通过模型 API 帮你查资料、处理文件和操作应用。对话和运行状态保存在你的机器上，也支持连接可选的本地模型服务。
 
-[快速开始](#快速开始) · [常用命令](#常用命令) · [更新与数据](#更新与数据) · [文档导航](#文档导航)
+[快速开始](#快速开始) · [ChatGPT 登录](#chatgpt--codex) · [常用命令](#常用命令) · [更新与数据](#更新与数据) · [文档导航](#文档导航)
 
 ## 可以做什么
 
@@ -49,6 +49,40 @@ cd Astra
 
 ### 2. 连接模型
 
+可以选择 ChatGPT 账号登录、API 服务或本地模型中的任一种方式。
+
+#### ChatGPT / Codex
+
+使用 ChatGPT 账号连接账号可用的 Codex 模型，无需填写 API Key 或修改 `.env`。
+
+1. 打开一个**新终端**（Windows CMD / PowerShell、macOS 或 Linux），运行：
+
+   ```text
+   astra auth login
+   ```
+
+   如果 Windows 暂时找不到 `astra` 命令，可在安装目录运行 `.\astra.bat auth login`。
+2. 打开终端显示的网址，输入本次生成的一次性代码，在浏览器中批准登录。
+3. 等终端显示 `Signed in.` 和可用 Codex 模型数量，再运行 `astra`。
+4. 在 **Astra 内部**输入 `/model`，选择 **ChatGPT / Codex**，再选择账号可用的 GPT 模型。这会保存为下次启动的默认模型。
+
+如果已经进入 Astra，也可以输入 `/connect`，选择 **ChatGPT / Codex → Subscription**，
+按界面提示登录，再通过 `/model` 选模型。
+
+如果 OpenAI 提示设备代码授权未启用，请在 ChatGPT 的安全设置中开启相应选项，取消旧的登录尝试后重新发起。
+参见 [OpenAI 设备代码授权说明](https://learn.chatgpt.com/docs/auth#preferred-device-code-authentication-beta)。
+
+**每台电脑都需要单独连接账号。** `astra update` 会保留当前安装的登录状态，但不会自动登录，也不会同步另一台电脑的登录状态。
+完成账号连接后，`/model` 才会列出 ChatGPT / Codex 的模型。
+
+**更新后没有 GPT 模型？** 在终端运行 `astra auth status`：
+若显示 `sign-in required`，运行 `astra auth login`；
+若显示 `signed in`，重新启动 Astra，通过 `/connect → ChatGPT / Codex` 刷新并保存连接，再打开 `/model`。
+
+模型返回推理摘要时，Astra 会显示摘要。更多说明见[登录、推理摘要与故障排查](docs/codex-oauth.md)。
+
+#### API 服务与本地模型
+
 编辑安装目录中的 `.env`。例如，使用内置 DeepSeek 配置时，将已有的对应条目设为以下值，并填入你自己的 API Key：
 
 ```dotenv
@@ -58,10 +92,6 @@ LLM_BASE_URL=https://api.deepseek.com
 ```
 
 其他 API 服务和本地模型的配置方式见[模型配置与 `/connect`](docs/zh-CN/usage.md#model-connections)。
-
-也可以运行 `astra auth login`，或在 `/connect` 选择 **ChatGPT / Codex**，
-使用 ChatGPT 订阅登录，再通过 `/model` 选模型。需先在 ChatGPT「设置 → 安全」
-启用 Codex 设备代码授权；可显示服务端返回的推理摘要。详见[登录说明](docs/codex-oauth.md)。
 
 ### 3. 启动
 
@@ -83,6 +113,7 @@ astra
 | 命令 | 用途 |
 | --- | --- |
 | `/help` · `/doctor` | 查看命令和运行时连接状态。 |
+| `/connect` | 连接 ChatGPT 账号、API 服务或本地模型。 |
 | `/model` · `/mode high` | 选择模型，调整受支持的推理强度。 |
 | `/memory` · `/skills` | 查看记忆和技能库。 |
 | `/learn review` | 讨论自动技能的改进建议，再选择修改和验证范围。 |
@@ -114,6 +145,7 @@ astra update
 | --- | --- |
 | 安装、更新或恢复 | [启动与更新](docs/zh-CN/launcher-update.md) |
 | 配置模型、使用终端界面 | [日常使用](docs/zh-CN/usage.md) |
+| 登录 ChatGPT、选择 GPT 模型 | [快速教程](#chatgpt--codex) · [Codex 登录说明](docs/codex-oauth.md) |
 | 操作浏览器或桌面应用 | [浏览器操作](docs/zh-CN/browser-interaction.md) · [macOS 电脑操作](docs/zh-CN/macos-computer-use.md) · [Appshot](docs/zh-CN/appshot.md) |
 | 了解记忆和学习机制 | [记忆概览](docs/zh-CN/memory.md) · [技能检查](docs/zh-CN/skill-learning.md) |
 | 配置搜索、MCP、消息或绘图服务 | [可选集成](docs/zh-CN/integrations.md) |
