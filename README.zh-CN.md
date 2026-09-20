@@ -59,6 +59,10 @@ LLM_BASE_URL=https://api.deepseek.com
 
 其他 API 服务和本地模型的配置方式见[模型配置与 `/connect`](docs/zh-CN/usage.md#model-connections)。
 
+也可以运行 `astra auth login`，或在 `/connect` 选择 **ChatGPT / Codex**，
+使用 ChatGPT 订阅登录，再通过 `/model` 选模型。需先在 ChatGPT「设置 → 安全」
+启用 Codex 设备代码授权；可显示服务端返回的推理摘要。详见[登录说明](docs/codex-oauth.md)。
+
 ### 3. 启动
 
 打开一个**新终端**，进入准备工作的文件夹，再运行：

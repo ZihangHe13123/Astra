@@ -48,6 +48,32 @@ class SlowLLM:
         return {"content": "too late", "tool_calls": []}
 
 
+def test_delegate_retains_codex_continuation_without_logging_ciphertext(process_manager):
+    from agent.runtime.codex_wire import completed_response
+    raw = completed_response({"status": "completed", "output": [
+        {"type": "reasoning", "encrypted_content": "PRIVATE-CIPHER", "summary": []},
+        {"type": "function_call", "call_id": "c", "name": "read_file", "arguments": '{"path":"a.txt"}'},
+    ]}, account="account", model="model")
+    seen, transcript = [], []
+    class CapturingLLM(SequenceLLM):
+        async def chat(self, **kwargs):
+            import copy
+            seen.append(copy.deepcopy(kwargs["messages"]))
+            return await super().chat(**kwargs)
+    llm = CapturingLLM([raw, {"content": "done", "tool_calls": []}])
+    async def work():
+        registry = ToolRegistry()
+        _register_read_tool(registry)
+        register_delegate_tools(registry, llm_getter=lambda: llm, session_id_getter=lambda: "session",
+            on_session_event=lambda sid, event: transcript.append(event))
+        result = await registry.execute("delegate_task", {"goal": "read", "timeout": 5})
+        assert json.loads(result["output"])["worker_status"] == "completed"
+    asyncio.run(work())
+    assistant = next(m for m in seen[1] if m.get("role") == "assistant")
+    assert assistant["_provider_state"] == raw["_provider_state"]
+    assert "PRIVATE-CIPHER" not in json.dumps(transcript)
+
+
 @pytest.mark.parametrize("kind", ["subagent", "workspace", "worktree"])
 def test_running_delegate_observes_parent_yolo_changes(tmp_path, kind):
     parent = ToolRegistry()

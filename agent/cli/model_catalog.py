@@ -414,6 +414,7 @@ def entries_from_items(endpoint: ProviderEndpoint, items: list[dict], *, source:
                           api_key_env=endpoint.profile.api_key_env,
                           api_key_resolver=endpoint.profile.api_key_resolver,
                           model_id=model_id, context_limit=context, max_tokens=min(output, max(1, context // 2)),
+                          reasoning_levels=tuple(item.get("reasoning_levels") or template.reasoning_levels),
                           capabilities=frozenset(capabilities), catalog_provider=endpoint.id,
                           provider_label=endpoint.label)
         entries[model_id] = CatalogEntry(f"{endpoint.id}::{model_id}", model_id, endpoint.id,
@@ -459,6 +460,7 @@ def normalize_model_items(payload: Any) -> list[dict]:
 
 async def discover_endpoint(endpoint: ProviderEndpoint, *, force: bool = False,
                             timeout: float = 4.0) -> ModelCatalog:
+    from agent.runtime.codex_auth import CodexAuthError
     cached = model_cache.read_cache(endpoint)
     fresh = model_cache.read_cache(endpoint, fresh=True)
     if fresh is not None and not force:
@@ -468,16 +470,22 @@ async def discover_endpoint(endpoint: ProviderEndpoint, *, force: bool = False,
     headers = {"Authorization": f"Bearer {key}"} if key else {}
     try:
         async with asyncio.timeout(timeout):
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.get(endpoint.profile.base_url.rstrip("/") + "/models", headers=headers)
-                response.raise_for_status()
-                items = normalize_model_items(response.json())
+            if endpoint.profile.provider == "openai-codex":
+                from agent.runtime.codex_auth import fetch_models
+                items = await fetch_models()
+            else:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await client.get(endpoint.profile.base_url.rstrip("/") + "/models", headers=headers)
+                    response.raise_for_status()
+                    items = normalize_model_items(response.json())
         try:
             stamp = model_cache.write_cache(endpoint, items)
         except OSError:
             stamp = None  # Read-only cache storage must not hide a successful live list.
         return ModelCatalog(tuple(entries_from_items(endpoint, items, source="live", fetched_at=stamp)),
                             {}, {endpoint.id: "live"})
+    except CodexAuthError as exc:
+        error_code, reason = "auth_failed", str(exc)
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
         error_code = "listing_unsupported" if code in {404, 405} else "auth_failed" if code in {401, 403} else "http_error"
@@ -518,15 +526,17 @@ async def discover_model_catalog(timeout: float = 4.0, *, provider_id: str | Non
 
 
 def provider_menu_items(catalog: ModelCatalog) -> list[dict]:
+    def connected(profile: ModelProfile) -> bool:
+        if profile.provider == "openai-codex":
+            return bool(profile.api_key())
+        return bool(profile.api_key()) or not profile.api_key_env or urlsplit(profile.base_url).hostname in {"localhost", "127.0.0.1", "::1"}
     endpoints = {e.id: e for e in provider_endpoints()}
     groups = {e.provider_id: {"id": e.provider_id, "label": e.provider_label,
-                              "endpoint": e.base_url, "connected": bool(e.profile.api_key()) or not e.profile.api_key_env or
-                              urlsplit(e.base_url).hostname in {"localhost", "127.0.0.1", "::1"}} for e in catalog.entries}
+                              "endpoint": e.base_url, "connected": connected(e.profile)} for e in catalog.entries}
     for endpoint in endpoints.values():
         groups[endpoint.id] = {"id": endpoint.id, "label": endpoint.label,
                                "endpoint": endpoint.profile.base_url,
-                               "connected": bool(endpoint.profile.api_key()) or not endpoint.profile.api_key_env or
-                               urlsplit(endpoint.profile.base_url).hostname in {"localhost", "127.0.0.1", "::1"}}
+                               "connected": connected(endpoint.profile)}
     for provider_id, group in groups.items():
         group["source"] = catalog.statuses.get(provider_id, "preset")
         group["error"] = catalog.errors.get(provider_id, "")

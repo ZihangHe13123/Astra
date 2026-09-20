@@ -48,6 +48,7 @@ class ModelProfile:
     catalog_provider: str = "configured"
     provider_label: str = "Configured"
     vision_detail: str = "auto"
+    reasoning_levels: tuple[str, ...] = ()
     vision_preprocess: VisionPreprocessPolicy | None = None
     api_key_resolver: Callable[[], str] | None = field(
         default=None,
@@ -69,6 +70,8 @@ class ModelProfile:
             settings["repetition_penalty_parameter"] = self.repetition_penalty_parameter
         settings["vision_detail"] = self.vision_detail
         settings["vision_preprocess"] = self.vision_preprocess
+        if self.provider == "openai-codex":
+            settings["reasoning_levels"] = self.reasoning_levels
         return settings
 
     def api_key(self) -> str:

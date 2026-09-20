@@ -22,10 +22,13 @@ class ConnectionRoute:
     label: str
     base_url: str
     api_key_env: str
+    auth_mode: str = "api-key"
 
 
 # Routes are separate connections: a plan key is never retried on a billable API.
 ROUTES = (
+    ConnectionRoute("codex", "ChatGPT / Codex", "Subscription · sign in with ChatGPT",
+                    "https://chatgpt.com/backend-api/codex", "", "oauth"),
     ConnectionRoute("deepseek", "DeepSeek", "API", "https://api.deepseek.com", "DEEPSEEK_API_KEY"),
     ConnectionRoute("qwen38", "Qwen / Model Studio", "Token Plan · Beijing", "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1", "QWEN38_API_KEY"),
     ConnectionRoute("qwen-token-sg", "Qwen / Model Studio", "Token Plan · Singapore", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", "QWEN_TOKEN_SG_API_KEY"),
@@ -90,6 +93,11 @@ def connection_record(route_id: str, *, base_url: str = "", api_key: str = "", a
     url = validate_base_url(base_url or route.base_url)
     if route.base_url and url != route.base_url:
         raise ValueError("Use Custom OpenAI-compatible for a different endpoint.")
+    if route.auth_mode == "oauth":
+        if api_key or api_key_env:
+            raise ValueError("ChatGPT uses device login, not an API key.")
+        return route.id, {"label": f"{route.provider} · {route.label}", "base_url": url,
+                         "route_id": route.id, "auth_mode": "oauth"}
     if api_key_env and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api_key_env):
         raise ValueError("Enter an environment variable name, not its value.")
     if any(ord(c) < 32 or ord(c) == 127 for c in api_key) or len(api_key) > 8192:
@@ -106,6 +114,12 @@ def connection_record(route_id: str, *, base_url: str = "", api_key: str = "", a
 
 
 def record_profile(provider_id: str, record: dict) -> ModelProfile:
+    if record.get("route_id") == "codex":
+        from agent.runtime.codex_auth import BASE_URL, credential_hint
+        return ModelProfile(base_url=BASE_URL, context_limit=32_768, provider="openai-codex",
+            api_key_env="", api_key_resolver=credential_hint,
+            catalog_provider=provider_id, provider_label=str(record["label"]),
+            capabilities=frozenset({"streaming", "tools", "reasoning"}))
     return ModelProfile(
         base_url=validate_base_url(record["base_url"]), context_limit=32_768,
         api_key_env=record.get("api_key_env", ""),

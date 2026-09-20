@@ -1619,6 +1619,7 @@ class ReActAgent(AgentBase):
         content: str,
         tool_calls: list | None,
         reasoning_content: str = "",
+        provider_state: dict | None = None,
     ) -> dict:
         msg: dict[str, Any] = {"role": "assistant", "content": content}
         capabilities = getattr(getattr(self.llm, "config", None), "capabilities", frozenset())
@@ -1643,6 +1644,10 @@ class ReActAgent(AgentBase):
                     "function": {"name": tc["name"], "arguments": arguments},
                 })
             msg["tool_calls"] = persistent_calls
+        if provider_state:
+            from .codex_wire import signature
+            if provider_state.get("signature") == signature(msg):
+                msg["_provider_state"] = provider_state
         return msg
 
     def _persistent_tool_call_arguments(self, tool_call: dict[str, Any]) -> str:
@@ -3390,6 +3395,7 @@ class ReActAgent(AgentBase):
             prefill_recovery = None
             full_content = ""
             full_reasoning = ""
+            provider_state = None
             tool_calls = None
             usage = None
             finish_reason = ""
@@ -3641,6 +3647,7 @@ class ReActAgent(AgentBase):
                                 yield with_request({"type": "chunk", "content": event["content"]})
                         elif event["type"] == "tool_calls":
                             tool_calls = event["calls"]
+                            provider_state = event.get("_provider_state")
                             full_content = event.get("content", full_content)
                             full_reasoning = event.get("reasoning_content", full_reasoning)
                             finish_reason = str(
@@ -3648,6 +3655,7 @@ class ReActAgent(AgentBase):
                             )
                             usage = event.get("usage")
                         elif event["type"] == "done":
+                            provider_state = event.get("_provider_state")
                             full_content = event.get("content", full_content)
                             full_reasoning = event.get("reasoning_content", full_reasoning)
                             finish_reason = str(
@@ -3920,7 +3928,7 @@ class ReActAgent(AgentBase):
                     })
                     break
             self.context.add_assistant_raw(
-                self._assistant_message("" if forced_tool else full_content, tool_calls, full_reasoning)
+                self._assistant_message("" if forced_tool else full_content, tool_calls, full_reasoning, provider_state)
             )
             if task_id and self.task_store is not None:
                 # An assistant tool_call is intentionally incomplete until its
@@ -4282,6 +4290,7 @@ class ReActAgent(AgentBase):
         if stop_reason:
             final_text = ""
             final_reasoning = ""
+            final_provider_state = None
             final_tool_calls = None
             if not hard_prompt_stop:
                 try:
@@ -4322,6 +4331,7 @@ class ReActAgent(AgentBase):
                                 final_text = event.get("content", final_text)
                                 final_reasoning = event.get("reasoning_content", final_reasoning)
                             elif event["type"] == "done":
+                                final_provider_state = event.get("_provider_state")
                                 final_text = event.get("content", final_text)
                                 final_reasoning = event.get("reasoning_content", final_reasoning)
                             elif event["type"] in {"generation_stats", "generation_progress"} and emit_events:
@@ -4332,10 +4342,11 @@ class ReActAgent(AgentBase):
                     logger.exception("graceful stop synthesis failed reason=%s", stop_reason)
 
             if not final_text.strip() or final_tool_calls:
+                final_provider_state = None
                 final_text = self._fallback_stop_answer(stop_reason)
                 if emit_events:
                     yield with_request({"type": "chunk", "content": final_text})
-            self.context.add_assistant_raw(self._assistant_message(final_text, None, final_reasoning))
+            self.context.add_assistant_raw(self._assistant_message(final_text, None, final_reasoning, final_provider_state))
             last_text = final_text
 
         if user_index is not None and storage_content is not None:

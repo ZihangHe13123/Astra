@@ -30,6 +30,13 @@ async def probe_profile(
     api_key: str | None = None,
     base_url: str | None = None,
 ) -> ConnectionProbe:
+    if profile.provider == "openai-codex":
+        from agent.runtime.codex_auth import fetch_models
+        try:
+            models = await fetch_models()
+            return ConnectionProbe(True, "Connected to ChatGPT / Codex", tuple(m["id"] for m in models))
+        except (ValueError, httpx.HTTPError) as exc:
+            return ConnectionProbe(False, str(exc))
     resolved_key = profile.api_key() if api_key is None else api_key
     resolved_url = base_url or profile.base_url
     if not resolved_key and not is_local_url(resolved_url):
@@ -112,13 +119,20 @@ async def create_probe_and_switch(
     return probe, settings_path
 
 
-async def connect_provider(route_id: str, *, base_url: str = "", api_key: str = "", api_key_env: str = ""):
+async def connect_provider(route_id: str, *, base_url: str = "", api_key: str = "", api_key_env: str = "", on_progress=None):
     """Validate/discover/save a connection without changing the current model."""
     from .provider_connections import connection_record, record_profile, save_connection
     from .model_catalog import ProviderEndpoint, discover_endpoint
     provider_id, record = connection_record(route_id, base_url=base_url, api_key=api_key, api_key_env=api_key_env)
+    if route_id == "codex":
+        from agent.runtime.codex_auth import credential_hint, device_login
+        if not credential_hint():
+            if on_progress is None:
+                raise ValueError("Sign in first with astra auth login.")
+            await device_login(on_progress)
     profile = record_profile(provider_id, record)
-    catalog = await discover_endpoint(ProviderEndpoint(provider_id, profile.provider_label, profile, inferred=True), force=True)
+    catalog = await discover_endpoint(ProviderEndpoint(provider_id, profile.provider_label, profile, inferred=True),
+                                      force=True, timeout=30 if route_id == "codex" else 4)
     if provider_id in catalog.errors and catalog.error_codes.get(provider_id) != "listing_unsupported":
         raise ValueError(catalog.errors[provider_id])
     save_connection(provider_id, record)
@@ -149,10 +163,16 @@ async def prompt_provider_connection(agent) -> None:
         routes = [route for route in ROUTES if route.provider == provider]
         route = routes[await choose([route.label for route in routes], "API route")]
         base_url = route.base_url or await asyncio.to_thread(input, "API base URL: ")
-        key = await asyncio.to_thread(getpass.getpass, "API key (hidden; empty uses an environment variable): ")
-        env = "" if key else await asyncio.to_thread(input, f"Environment variable [{route.api_key_env}]: ")
-        env = env or (route.api_key_env if not key else "")
-        provider_id, catalog = await connect_provider(route.id, base_url=base_url, api_key=key, api_key_env=env)
+        key = env = ""
+        if route.auth_mode != "oauth":
+            key = await asyncio.to_thread(getpass.getpass, "API key (hidden; empty uses an environment variable): ")
+            env = "" if key else await asyncio.to_thread(input, f"Environment variable [{route.api_key_env}]: ")
+            env = env or (route.api_key_env if not key else "")
+        async def progress(challenge):
+            print("Enable Codex device-code login in ChatGPT Settings → Security if authorization is disabled.")
+            print(f"Open {challenge['verification_uri']} and enter {challenge['user_code']}", flush=True)
+        provider_id, catalog = await connect_provider(route.id, base_url=base_url, api_key=key, api_key_env=env,
+                                                      on_progress=progress)
         key = ""
         for error in catalog.errors.values():
             print(f"  {error}")

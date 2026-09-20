@@ -619,6 +619,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   const connectionOpenRef = useRef(false);
   const [connectionPending, setConnectionPending] = useState(false);
   const [connectionError, setConnectionError] = useState("");
+  const [connectionAuth, setConnectionAuth] = useState<{ verification_uri: string; user_code: string } | null>(null);
   const connectionRequestRef = useRef("");
   const [modelList, setModelList] = useState<ModelMenuItem[]>(DEFAULT_MODEL_LIST);
   const [activeTask, setActiveTask] = useState<TaskInfo | null>(null);
@@ -965,6 +966,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         break;
       case "connection_result":
         if (event.request_id !== connectionRequestRef.current) break;
+        setConnectionAuth(null);
         setConnectionPending(false);
         setConnectionError(event.error);
         if (!event.error) {
@@ -973,6 +975,9 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           if (event.provider_id && connectionOpenRef.current) appshotInputRef.current?.openModelMenu(event.provider_id);
           connectionOpenRef.current = false;
         }
+        break;
+      case "connection_auth":
+        if (event.request_id === connectionRequestRef.current) setConnectionAuth(event);
         break;
       case "cache_status":
         setInfo((prev) => ({
@@ -2156,11 +2161,17 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           contextPct={info.ctxPct}
         />}
         auxiliary={<>
-          {connectionOpen && <Box flexDirection="column" display={approvalRequests.length || questionRequest ? "none" : "flex"}><ConnectionPanel routes={connectionRoutes} pending={connectionPending} error={connectionError}
-            onCancel={() => { setConnectionOpen(false); connectionOpenRef.current = false; }}
+          {connectionOpen && <Box flexDirection="column" display={approvalRequests.length || questionRequest ? "none" : "flex"}><ConnectionPanel routes={connectionRoutes} pending={connectionPending} error={connectionError} authorization={connectionAuth}
+            onCancel={() => {
+              if (connectionPending && connectionRequestRef.current) send({ type: "cancel_connection", request_id: connectionRequestRef.current });
+              connectionRequestRef.current = "";
+              setConnectionPending(false); setConnectionAuth(null);
+              setConnectionOpen(false); connectionOpenRef.current = false;
+            }}
             onSave={(request) => {
               connectionRequestRef.current = request.request_id;
               setConnectionError("");
+              setConnectionAuth(null);
               if (send(request)) setConnectionPending(true);
               else setConnectionError("Backend disconnected. Reconnect before saving.");
             }} /></Box>}

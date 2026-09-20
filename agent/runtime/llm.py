@@ -524,6 +524,7 @@ class LLMConfig:
     # to stable Flash and legacy V4 models; other OpenAI-compatible models
     # ignore it since the kwarg is not sent.
     reasoning_effort: str | None = "max"
+    reasoning_levels: tuple[str, ...] = ()
     # DeepSeek accepts thinking={"type":"disabled"} to drop the (default-on,
     # token-hungry) reasoning phase. None = never sent, so existing callers are
     # unaffected; only honored for DeepSeek models.
@@ -822,7 +823,7 @@ class OpenAICompatibleProvider:
         kwargs = {
             "model": self.config.model,
             "messages": _messages_for_capabilities(
-                messages,
+                [{k: v for k, v in m.items() if k != "_provider_state"} for m in messages],
                 self.config.capabilities,
                 frozenset(
                     str(tool.get("function", {}).get("name") or "")
@@ -1312,7 +1313,7 @@ class OpenAICompatibleProvider:
 
     def estimate_tokens(self, messages: list[dict]) -> int:
         prepared = _messages_for_capabilities(
-            messages,
+            [{k: v for k, v in m.items() if k != "_provider_state"} for m in messages],
             self.config.capabilities,
             vision_detail=self.config.vision_detail,
         )
@@ -1365,6 +1366,8 @@ class LLMClient:
         # A direct model switch must not inherit the previous model capacity.
         generation_settings.setdefault("context_limit", None)
         generation_settings.setdefault("connection_required", False)
+        if provider_name and provider_name != self.config.provider:
+            generation_settings.setdefault("reasoning_levels", ())
         next_config = replace(
             self.config,
             model=model,

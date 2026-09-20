@@ -9,11 +9,12 @@ export interface ConnectionPanelProps {
   routes: ConnectionRoute[];
   pending: boolean;
   error: string;
+  authorization?: { verification_uri: string; user_code: string } | null;
   onSave: (request: Extract<TuiCommand, { type: "connect_provider" }>) => void;
   onCancel: () => void;
 }
 
-export function ConnectionPanel({ routes, pending, error, onSave, onCancel }: ConnectionPanelProps) {
+export function ConnectionPanel({ routes, pending, error, authorization, onSave, onCancel }: ConnectionPanelProps) {
   const theme = useTheme();
   const [stage, setStage] = useState<"provider" | "route" | "url" | "auth" | "key" | "env">("provider");
   const [provider, setProvider] = useState("");
@@ -43,6 +44,11 @@ export function ConnectionPanel({ routes, pending, error, onSave, onCancel }: Co
     if (stage === "provider") { setProvider(chosen); moveTo("route"); }
     else if (stage === "route") {
       const next = routes.find(r => r.provider === provider && r.label === chosen)!;
+      if (next.auth_mode === "oauth") {
+        onSave({ type: "connect_provider", request_id: randomUUID(), route_id: next.id,
+          base_url: next.base_url, api_key: "", api_key_env: "" });
+        return;
+      }
       setRoute(next); setBaseUrl(next.base_url); moveTo(next.base_url ? "auth" : "url");
     } else if (stage === "auth") {
       if (chosen.startsWith("Paste")) moveTo("key");
@@ -71,7 +77,12 @@ export function ConnectionPanel({ routes, pending, error, onSave, onCancel }: Co
     <Text bold>{pending ? "Connecting…" : title}</Text>
     {baseUrl && stage !== "provider" && stage !== "route" && <Text dimColor>{baseUrl}</Text>}
     {error && <Text color="red">{error}</Text>}
-    {pending ? <Text>Checking model list. The current model stays selected.</Text>
+    {pending ? authorization ? <Box flexDirection="column">
+        <Text>Open {authorization.verification_uri}</Text>
+        <Text bold>Enter code: {authorization.user_code}</Text>
+        <Text>Waiting for ChatGPT authorization…</Text>
+        <Text dimColor>If disabled, enable Codex device-code login in ChatGPT Settings → Security, then reconnect.</Text>
+      </Box> : <Text>Connecting and checking model list…</Text>
       : textEntry ? <TextInput value={value} onChange={setValue} onSubmit={submitText}
         mask={stage === "key" ? "*" : undefined} placeholder={stage === "url" ? "https://…/v1" : undefined} />
       : <>
@@ -79,6 +90,6 @@ export function ConnectionPanel({ routes, pending, error, onSave, onCancel }: Co
         {filtered.slice(Math.max(0, selection - 4), Math.max(0, selection - 4) + 7).map(label =>
           <Text key={label} inverse={label === filtered[selection]}>{label === filtered[selection] ? "› " : "  "}{label}</Text>)}
       </>}
-    <Text dimColor>↑/↓ choose · Enter continue · Esc close{pending ? " (request may still finish)" : ""}</Text>
+    <Text dimColor>↑/↓ choose · Enter continue · Esc {pending ? "cancel connection" : "close"}</Text>
   </Box>;
 }

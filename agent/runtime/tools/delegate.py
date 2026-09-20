@@ -1970,6 +1970,8 @@ def register_delegate_tools(
                         }
                         for i, tc in enumerate(tool_calls_raw)
                     ]
+                if raw.get("_provider_state"):
+                    assistant_msg["_provider_state"] = raw["_provider_state"]
                 messages.append(assistant_msg)
                 turns += 1
                 await budget_tracker.progress(turns)

@@ -66,6 +66,10 @@ LLM_BASE_URL=https://api.deepseek.com
 Other providers and local endpoints are supported through
 [model profiles and `/connect`](docs/usage.md#model-connections).
 
+To try a ChatGPT subscription, run `astra auth login` or choose
+**ChatGPT / Codex** in `/connect`, then select its model in `/model`.
+See [Codex login and reasoning summaries](docs/codex-oauth.md).
+
 ### 3. Start
 
 Open a **new terminal**, change to the folder you want to work in, then run:

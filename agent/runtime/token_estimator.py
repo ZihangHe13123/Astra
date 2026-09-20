@@ -55,6 +55,13 @@ def estimate_value_tokens(value) -> int:
     if isinstance(value, (int, float, bool)):
         return 1
     if isinstance(value, dict):
+        if "_provider_state" in value and value.get("role") == "assistant":
+            state = value["_provider_state"]
+            hidden = state.get("reasoning_tokens", 0) if isinstance(state, dict) else 0
+            # Ciphertext bytes are not text tokens. Use the server's reasoning
+            # token count when available, so session budgets remain meaningful.
+            return estimate_value_tokens({k: v for k, v in value.items() if k != "_provider_state"}) + (
+                max(0, hidden) if isinstance(hidden, int) else 0)
         image_tokens = _image_part_tokens(value)
         if image_tokens is not None:
             return image_tokens

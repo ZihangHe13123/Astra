@@ -54,6 +54,8 @@ def parser() -> argparse.ArgumentParser:
     local.add_argument("--overwrite-local", action="store_true", help="back up local files, then use the incoming versions")
     activity = commands.add_parser("activity", help="Manage activity recording (legacy command compatibility)")
     activity.add_argument("args", nargs=argparse.REMAINDER)
+    auth = commands.add_parser("auth", help="Manage Astra's ChatGPT / Codex subscription login")
+    auth.add_argument("action", choices=("login", "status", "logout"), nargs="?", default="status")
     return result
 
 
@@ -169,6 +171,9 @@ def main(argv: list[str] | None = None, *, root: Path | None = None) -> int:
         install = discover(root or options.root)
         command = "version" if options.version else "setup" if options.setup_only else options.command
         as_json = getattr(options, "json", False)
+        if command == "auth":
+            return subprocess.run([str(install.python), "-m", "agent.cli.codex_auth_cli", options.action],
+                cwd=install.root, env=runtime_environment(install, Path.cwd()), check=False).returncode
         if command in {"setup", "update"}:
             if options.setup_only:
                 # Normalize the old alias before the snapshot handoff/parser.

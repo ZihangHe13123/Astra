@@ -1748,18 +1748,25 @@ async def _main(startup_started: float):
         nonlocal catalog
         request_id = str(request.get("request_id", ""))
         try:
+            async def auth_progress(challenge):
+                _send({"type": "connection_auth", "request_id": request_id, **challenge})
             provider_id, discovered = await connect_provider(
                 str(request.get("route_id", "")), base_url=str(request.get("base_url", "")),
-                api_key=str(request.pop("api_key", "")), api_key_env=str(request.get("api_key_env", "")))
+                api_key=str(request.pop("api_key", "")), api_key_env=str(request.get("api_key_env", "")),
+                on_progress=auth_progress)
             error = discovered.errors.get(provider_id, "")
             catalog = ModelCatalog(tuple(e for e in catalog.entries if e.provider_id != provider_id) + discovered.entries,
                                    {**{k: v for k, v in catalog.errors.items() if k != provider_id}, **discovered.errors}, {**catalog.statuses, **discovered.statuses})
             await _send_model_info()
             _send({"type": "connection_result", "request_id": request_id, "provider_id": provider_id,
                    "error": "", "notice": error or "Connection saved. Select a model; chat access is checked on use."})
-        except (ValueError, OSError) as exc:
+        except asyncio.CancelledError:
+            _send({"type": "connection_result", "request_id": request_id, "error": "Connection cancelled."})
+            raise
+        except Exception as exc:
             # Only validation errors are suitable for display; never include filesystem/HTTP payloads.
-            message = str(exc) if isinstance(exc, ValueError) else "Could not save connection; current model unchanged."
+            message = (str(exc) if isinstance(exc, ValueError) else "Device login timed out; try again."
+                       if isinstance(exc, TimeoutError) else "Could not connect or save connection; current model unchanged.")
             _send({"type": "connection_result", "request_id": request_id, "error": message})
         finally:
             request.pop("api_key", None)
@@ -1778,7 +1785,7 @@ async def _main(startup_started: float):
         _send({"type": "model_info", "model": agent.llm.config.model,
                "model_key": current_model_key,
                "reasoning_effort": (agent.llm.config.reasoning_effort
-                                    if is_deepseek_model(agent.llm.config.model) else None),
+                                    if is_deepseek_model(agent.llm.config.model) or agent.llm.config.provider == "openai-codex" else None),
                "code_mode": agent.code_mode,
                "personas": personas,
                "models": [entry.to_event(current=entry.key == current_model_key)
@@ -2347,11 +2354,17 @@ async def _main(startup_started: float):
                            "error": "Restart is pending. Cancel it before changing connections."})
                     continue
                 if "connect" not in catalog_tasks or catalog_tasks["connect"].done():
-                    catalog_tasks["connect"] = asyncio.create_task(_connect_provider(dict(cmd)))
+                    catalog_tasks["connect"] = asyncio.create_task(_connect_provider(dict(cmd)),
+                        name="connection:" + str(cmd.get("request_id", "")))
                 else:
                     _send({"type": "connection_result", "request_id": str(cmd.get("request_id", "")),
                            "error": "A connection request is still running."})
                 cmd.pop("api_key", None)
+
+            elif cmd.get("type") == "cancel_connection":
+                connection_task = catalog_tasks.get("connect")
+                if connection_task and connection_task.get_name() == "connection:" + str(cmd.get("request_id", "")):
+                    connection_task.cancel()
 
             elif cmd.get("type") == "command":
                 raw_command = cmd.get("cmd")

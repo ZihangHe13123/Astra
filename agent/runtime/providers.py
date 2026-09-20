@@ -48,3 +48,11 @@ def _openai_compatible_factory(config):
 
 
 DEFAULT_PROVIDER_REGISTRY.register("openai-compatible", _openai_compatible_factory)
+
+
+def _codex_factory(config):
+    from .codex_provider import CodexProvider
+    return CodexProvider(config)
+
+
+DEFAULT_PROVIDER_REGISTRY.register("openai-codex", _codex_factory)

@@ -260,6 +260,7 @@ export type PyEvent =
       has_more: boolean;
     }
   | { type: "connection_result"; request_id: string; provider_id?: string; error: string; notice?: string }
+  | { type: "connection_auth"; request_id: string; verification_uri: string; user_code: string; expires_in: number }
   | ({ type: "turn_changes" } & TurnChangesEventData)
   | { type: "done" }
   | { type: "backend_hello"; protocol_version: number }
@@ -386,6 +387,7 @@ export interface ProviderInfo {
 export interface ConnectionRoute {
   id: string; provider: string; label: string; base_url: string;
   api_key_env: string; key_available: boolean;
+  auth_mode?: "api-key" | "oauth";
 }
 export interface ModelInfo {
   source?: string;
@@ -429,6 +431,7 @@ export type TuiCommand =
   | { type: "command"; cmd: string }
   | { type: "refresh_models"; provider_id?: string; force?: boolean }
   | { type: "connect_provider"; request_id: string; route_id: string; base_url: string; api_key: string; api_key_env: string }
+  | { type: "cancel_connection"; request_id: string }
   | { type: "event_replay"; after_cursor: number; limit?: number }
   | { type: "tool_approval_response"; request_id: string; decision: "once" | "session" | "deny" }
   | { type: "user_question_response"; request_id: string; answers: UserQuestionAnswer[] }
