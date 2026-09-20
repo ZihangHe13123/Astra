@@ -147,6 +147,58 @@ def completed_response(response: dict, *, account: str, model: str) -> dict:
                       "prompt_cache_hit_tokens": cached, "prompt_cache_miss_tokens": max(0, prompt - cached)}}
 
 
+class OutputStream:
+    """Collect complete items when the terminal event omits its output list."""
+
+    def __init__(self):
+        self.indices: set[int] = set()
+        self.identities: dict[int, dict] = {}
+        self.items: dict[int, dict] = {}
+
+    def observe(self, event: dict) -> None:
+        kind = event.get("type", "")
+        if "output_index" not in event:
+            return
+        index = event["output_index"]
+        if not isinstance(index, int) or index < 0:
+            raise LLMResponseError("incomplete_response", "Invalid Codex output index.")
+        self.indices.add(index)
+        if kind not in {"response.output_item.added", "response.output_item.done"}:
+            return
+        item = event.get("item")
+        if not isinstance(item, dict) or not item.get("type"):
+            raise LLMResponseError("incomplete_response", "Missing Codex output item.")
+        identity = self.identities.setdefault(index, {})
+        for key in ("type", "id"):
+            if key in item:
+                if key in identity and identity[key] != item[key]:
+                    raise LLMResponseError("incomplete_response", "Codex output identity changed while streaming.")
+                identity[key] = item[key]
+        if kind == "response.output_item.done":
+            if index in self.items and self.items[index] != item:
+                raise LLMResponseError("incomplete_response", "Codex completed output item changed.")
+            self.items[index] = item
+
+    def complete(self, response: dict) -> dict:
+        output = response.get("output")
+        if output is None or output == []:
+            # Never reconstruct executable calls from deltas or unfinished items.
+            if self.indices != set(self.items) or set(self.items) != set(range(len(self.items))):
+                raise LLMResponseError("incomplete_response", "Codex did not complete every output item.")
+            output = [self.items[index] for index in range(len(self.items))]
+        if not isinstance(output, list) or any(not isinstance(item, dict) for item in output):
+            raise LLMResponseError("incomplete_response", "Invalid Codex completed output.")
+        if self.indices - set(range(len(output))):
+            raise LLMResponseError("incomplete_response", "Codex dropped a streamed output item.")
+        for index, identity in self.identities.items():
+            if any(output[index].get(key) != value for key, value in identity.items()):
+                raise LLMResponseError("incomplete_response", "Codex final output identity conflicts with streamed identity.")
+        for index, item in self.items.items():
+            if any(output[index].get(key) != value for key, value in item.items()):
+                raise LLMResponseError("incomplete_response", "Codex final output conflicts with a completed item.")
+        return {**response, "output": output}
+
+
 class ToolStream:
     """Reject contradictory streamed identities/arguments before tool dispatch."""
 

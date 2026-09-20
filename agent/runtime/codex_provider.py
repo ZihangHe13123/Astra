@@ -8,7 +8,7 @@ from dataclasses import replace
 import httpx
 
 from . import codex_auth
-from .codex_wire import ToolStream, completed_response, input_items
+from .codex_wire import OutputStream, ToolStream, completed_response, input_items
 from .llm import (LLMIdleTimeout, LLMResponseError, _RequestBudget, _RequestCapTimeout,
                   _StreamReadTiming, _messages_for_capabilities)
 from .network import active_proxy_for_url
@@ -49,9 +49,9 @@ class CodexProvider:
         effort = self.config.reasoning_effort or "high"
         levels = getattr(self.config, "reasoning_levels", ())
         if effort == "max":
-            # "max" means the model's advertised maximum, not a fixed effort
-            # that might be unsupported by a particular account/model.
-            effort = next((v for v in ("xhigh", "high", "medium", "low", "minimal", "none") if v in levels), "xhigh")
+            # Intersect the model catalog with this endpoint's wire enum: the
+            # catalog can advertise "ultra" while /responses rejects that value.
+            effort = next((v for v in ("max", "xhigh", "high", "medium", "low", "minimal", "none") if v in levels), "xhigh")
         elif levels and effort not in levels:
             raise codex_auth.CodexAuthError(f"This Codex model supports reasoning efforts: {', '.join(levels)}; use /mode high or /mode max.")
         body = {"model": self.config.model, "instructions": instructions, "input": items,
@@ -119,6 +119,7 @@ class CodexProvider:
                     summary_part = None
                     summaries = {}
                     tool_stream = ToolStream()
+                    output_stream = OutputStream()
                     while True:
                         try:
                             line = await timing.read(lines, budget, self.config.idle_timeout)
@@ -138,6 +139,7 @@ class CodexProvider:
                             raise LLMResponseError("incomplete_response", "Invalid Codex stream event.") from exc
                         kind = event.get("type", "")
                         tool_stream.observe(event)
+                        output_stream.observe(event)
                         if kind in {"response.output_text.delta", "response.refusal.delta"}:
                             delta = str(event.get("delta") or "")
                             if delta:
@@ -163,7 +165,7 @@ class CodexProvider:
                         elif kind in {"error", "response.failed", "response.incomplete"}:
                             raise LLMResponseError("incomplete_response", "Codex reported a failed or incomplete response.")
                         elif kind == "response.completed":
-                            completed = event.get("response") or {}
+                            completed = output_stream.complete(event.get("response") or {})
                             result = completed_response(completed, account=data["account_id"], model=self.config.model)
                             tool_stream.validate(completed.get("output") or [])
                             if not result["content"].startswith(content):

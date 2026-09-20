@@ -7,9 +7,11 @@ separate Codex agent process is involved.
 
 ## Sign in
 
-In **ChatGPT → Settings → Security**, enable **Codex device-code authorization**
-if it is disabled. A disabled Continue button on the OpenAI consent page means
-this account setting needs attention.
+In **ChatGPT → Settings → Account security & login** (formerly **Security**),
+scroll to the bottom and enable **Codex device-code authorization** if it is
+disabled. In Chinese, the section is **账户安全与登录** and the switch is
+**为 Codex 启用设备代码授权**. A disabled Continue button on the OpenAI consent
+page means this account setting needs attention.
 
 From a terminal:
 
@@ -44,8 +46,9 @@ hide them. A model may provide no summary; Astra does not fabricate one or claim
 to display private reasoning.
 
 `/mode low`, `/mode high` and `/mode max` set supported reasoning effort.
-`max` uses the highest effort advertised for the selected model. An unsupported
-explicit effort reports an error rather than silently substituting another.
+`max` uses the highest effort advertised for the selected model that the Codex
+endpoint accepts. An unsupported explicit effort reports an error rather than
+silently substituting another.
 Ordinary Chat Completions sampling/output-limit parameters are not forwarded:
 the subscription endpoint does not support those parameters.
 

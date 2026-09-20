@@ -55,6 +55,64 @@ def terminal(output=None):
     return {"type": "response.completed", "response": response(output)}
 
 
+def completed_items(output):
+    return [*({"type": "response.output_item.done", "output_index": index, "item": item}
+              for index, item in enumerate(output)), terminal([])]
+
+
+@pytest.mark.parametrize("omit_output", [False, True])
+def test_completed_items_survive_empty_terminal_output(omit_output):
+    signed_in()
+    thought = {"type": "reasoning", "encrypted_content": "opaque", "summary": [
+        {"type": "summary_text", "text": "Check the greeting"}]}
+    events = completed_items([thought, message("早上好")])
+    if omit_output:
+        events[-1]["response"].pop("output")
+    provider = CodexProvider(config(), transport=httpx.MockTransport(lambda r: httpx.Response(200, content=sse(
+        {"type": "response.output_text.delta", "output_index": 1, "delta": "早上"}, *events))))
+    async def work():
+        return [e async for e in provider.chat_stream([])]
+    emitted = asyncio.run(work())
+    assert "".join(e["content"] for e in emitted if e["type"] == "chunk") == "早上好"
+    assert emitted[-1]["type"] == "done"
+    assert emitted[-1]["content"] == "早上好"
+    assert emitted[-1]["usage"]["prompt_tokens"] == 25
+    assert emitted[-1]["reasoning_content"] == "推理摘要\nCheck the greeting"
+    assert emitted[-1][STATE_KEY]["items"][0]["encrypted_content"] == "opaque"
+
+
+@pytest.mark.parametrize("failure", ["missing_item", "unfinished_item", "changed_item", "no_completion", "delta_only"])
+def test_completed_items_do_not_accept_partial_or_conflicting_streams(failure):
+    signed_in()
+    call = {"type": "function_call", "call_id": "call_1", "name": "read_file", "arguments": "{}"}
+    events = completed_items([call])
+    if failure == "missing_item":
+        events[0]["output_index"] = 1
+    elif failure == "unfinished_item":
+        events.insert(0, {"type": "response.output_item.added", "output_index": 1,
+                          "item": {**call, "call_id": "call_2", "status": "in_progress"}})
+    elif failure == "changed_item":
+        events[-1] = terminal([{**call, "arguments": '{"path":"unexpected"}'}])
+    elif failure == "no_completion":
+        events.pop()
+    elif failure == "delta_only":
+        events = [{"type": "response.output_text.delta", "output_index": 0, "delta": "partial"}, terminal([])]
+    provider = CodexProvider(config(max_retries=0), transport=httpx.MockTransport(
+        lambda r: httpx.Response(200, content=sse(*events))))
+    emitted = []
+    async def work():
+        with pytest.raises(LLMResponseError):
+            async for event in provider.chat_stream([]):
+                emitted.append(event)
+    asyncio.run(work())
+    assert not any(e["type"] in {"done", "tool_calls"} for e in emitted)
+
+
+def test_max_uses_highest_advertised_effort_supported_by_endpoint():
+    provider = CodexProvider(config(reasoning_effort="max", reasoning_levels=("low", "high", "xhigh", "max", "ultra")))
+    assert provider._body([], None, None, "account")["reasoning"]["effort"] == "max"
+
+
 def test_device_login_uses_independent_private_store(monkeypatch):
     requests, progress = [], []
     original_sleep = asyncio.sleep
@@ -261,7 +319,8 @@ def test_heartbeat_only_stream_times_out_and_closes():
     assert closed
 
 
-def test_real_agent_loop_and_saved_history_preserve_continuation(tmp_path):
+@pytest.mark.parametrize("empty_terminal_output", [False, True])
+def test_real_agent_loop_and_saved_history_preserve_continuation(tmp_path, empty_terminal_output):
     from agent.core.msg import ContentBlock, Msg
     from agent.runtime.context import AgentContext
     from agent.runtime.llm import LLMClient
@@ -272,16 +331,18 @@ def test_real_agent_loop_and_saved_history_preserve_continuation(tmp_path):
     requests, ran = [], []
     thought = {"type": "reasoning", "encrypted_content": "opaque", "summary": [{"type": "summary_text", "text": "Check"}]}
     call = {"type": "function_call", "call_id": "call_1", "name": "fixture_read", "arguments": "{}"}
+    def stream(output):
+        return sse(*(completed_items(output) if empty_terminal_output else [terminal(output)]))
     def handler(request):
         body = json.loads(request.content)
         requests.append(body)
         if len(requests) == 1:
             assert body["tools"][0]["type"] == "function"
-            return httpx.Response(200, content=sse(terminal([thought, message("Checking", "commentary"), call])))
+            return httpx.Response(200, content=stream([thought, message("Checking", "commentary"), call]))
         assert [i["type"] for i in body["input"]][-4:] == ["reasoning", "message", "function_call", "function_call_output"]
         assert body["input"][-1]["call_id"] == "call_1"
         assert "apple" in body["input"][-1]["output"]
-        return httpx.Response(200, content=sse(terminal([thought, message("Done")])))
+        return httpx.Response(200, content=stream([thought, message("Done")]))
     def read():
         ran.append(True)
         return "apple"
