@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import time
+from copy import deepcopy
 from dataclasses import replace
 
 import httpx
@@ -35,6 +36,48 @@ def signed_in(**overrides):
 def config(**kw):
     return LLMConfig(model="test-codex", base_url=codex_auth.BASE_URL, provider="openai-codex",
                      capabilities=frozenset({"reasoning", "tools", "streaming", "vision"}), **kw)
+
+
+def test_body_defaults_function_strict_false_without_changing_optional_schemas():
+    tools = [
+        {"type": "function", "function": {
+            "name": "read_file", "description": "Read a page",
+            "parameters": {"type": "object", "properties": {
+                "path": {"type": "string"},
+                "offset": {"type": "integer", "default": 0},
+                "byte_offset": {"type": "integer", "minimum": 0},
+            }, "required": ["path"]},
+        }},
+        {"type": "function", "function": {
+            "name": "delegate_task", "description": "Delegate with optional effort",
+            "parameters": {"type": "object", "properties": {
+                "goal": {"type": "string"},
+                "reasoning_effort": {"type": "string", "enum": ["low", "high"]},
+            }, "required": ["goal"], "additionalProperties": False},
+        }},
+    ]
+    original = deepcopy(tools)
+
+    body = CodexProvider(config())._body([], tools, None, "account")
+
+    assert tools == original
+    assert body["tools"] == [
+        {"type": "function", "strict": False, **tool["function"]} for tool in original
+    ]
+
+
+@pytest.mark.parametrize("strict", [False, True])
+def test_body_preserves_explicit_function_strict_intent(strict):
+    tools = [{"type": "function", "function": {
+        "name": "probe", "strict": strict,
+        "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+    }}]
+    original = deepcopy(tools)
+
+    body = CodexProvider(config())._body([], tools, None, "account")
+
+    assert body["tools"][0]["strict"] is strict
+    assert tools == original
 
 
 def message(text="Done", phase="final_answer"):

@@ -60,7 +60,9 @@ class CodexProvider:
         # The subscription backend does not accept max_output_tokens or normal
         # sampling parameters. Do not forward Chat Completions-only options.
         if tools:
-            body["tools"] = [{"type": "function", **t["function"]} for t in tools]
+            # Responses may otherwise normalize optional arguments into required
+            # strict-mode fields. Preserve an explicitly supplied strict flag.
+            body["tools"] = [{"type": "function", "strict": False, **t["function"]} for t in tools]
             body["parallel_tool_calls"] = True
             if not omit_tool_choice:
                 body["tool_choice"] = ({"type": "function", "name": tool_choice["function"]["name"]}

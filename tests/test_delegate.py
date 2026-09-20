@@ -663,6 +663,79 @@ def test_worker_reasoning_effort_requires_supported_remote_model():
     assert worker.config.reasoning_effort == "high"
 
 
+@pytest.mark.parametrize("model", [
+    "flash", "FAST", "deepseek-flash", "deepseek-pro", "deepseek-chat",
+    "deepseek-reasoner", "deepseek-v4-pro", "deepseek-v4-flash",
+])
+@pytest.mark.parametrize("reasoning_effort", ["", "high"])
+def test_codex_worker_rejects_deepseek_before_provider_construction(model, reasoning_effort):
+    constructed, dispatched = [], []
+
+    class Provider:
+        async def chat(self, messages, tools):
+            dispatched.append((messages, tools))
+            return {"content": "unexpected"}
+
+    def factory(config):
+        constructed.append(config)
+        return Provider()
+
+    active = LLMClient(
+        LLMConfig(provider="openai-codex", model="test-codex",
+                  base_url="https://chatgpt.com/backend-api/codex"),
+        provider=Provider(), provider_factory=factory,
+    )
+    cache = {"key": "existing-key", "client": object()}
+    original_cache = dict(cache)
+    original_config = active.config
+
+    with pytest.raises(ValueError, match="openai-codex.*DeepSeek"):
+        _worker_llm(active, cache, model=model, reasoning_effort=reasoning_effort)
+
+    assert constructed == []
+    assert dispatched == []
+    assert cache == original_cache
+    assert active.config is original_config
+
+
+def test_codex_worker_inheritance_overrides_and_cache_stay_provider_bound():
+    constructed = []
+
+    def factory(config):
+        constructed.append(config)
+        return object()
+
+    active = LLMClient(
+        LLMConfig(provider="openai-codex", model="test-codex",
+                  base_url="https://chatgpt.com/backend-api/codex", api_key="parent-key"),
+        provider=object(), provider_factory=factory,
+    )
+    original = active.config
+    cache = {}
+
+    inherited = _worker_llm(active, cache)
+    assert inherited is not active
+    assert inherited.config.model == original.model
+    assert _worker_llm(active, cache) is inherited
+
+    # Compatible model names are not limited to a hard-coded Codex allowlist.
+    override = _worker_llm(active, cache, model="future-codex-model")
+    assert override is not inherited
+    assert override.config.model == "future-codex-model"
+    assert _worker_llm(active, cache, model="future-codex-model") is override
+
+    restored = _worker_llm(active, cache)
+    assert restored is not override
+    assert restored.config.model == original.model
+    assert active.config is original
+    assert len(constructed) == 3
+    for worker in (inherited, override, restored):
+        assert worker.config.provider == original.provider
+        assert worker.config.base_url == original.base_url
+        assert worker.config.api_key == original.api_key
+        assert worker.provider_registry is active.provider_registry
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [

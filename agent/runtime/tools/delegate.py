@@ -1031,6 +1031,17 @@ def _worker_llm(
 ) -> Any:
     """Use an independent remote client so workers do not block the root slot."""
     resolved = _resolve_model(model)
+    if (
+        isinstance(active, LLMClient)
+        and active.config.provider == "openai-codex"
+        and not _is_local_endpoint(active.config.base_url)
+        and resolved.lower().startswith("deepseek-")
+    ):
+        raise ValueError(
+            f"openai-codex is incompatible with the DeepSeek model override '{resolved}'. "
+            "Omit the override to inherit the parent model or select a compatible Codex model; "
+            "worker overrides do not switch providers or credentials."
+        )
     if reasoning_effort:
         effective_model = resolved or str(
             getattr(getattr(active, "config", None), "model", "") or ""
