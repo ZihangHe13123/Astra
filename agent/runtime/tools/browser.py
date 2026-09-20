@@ -644,8 +644,8 @@ def register_browser_tools(
             try:
                 await _assert_write_origin(tab)
                 dispatched = True
-                result = await hook(selector, tab_id=tab.tab_id, url=tab.url)
-                return await _finish_action(tab.tab_id, result)
+                result = await _await_backend_result(hook(selector, tab_id=tab.tab_id, url=tab.url))
+                return await _finish_action(tab.tab_id, str(result))
             except Exception as e:
                 return _interaction_failure("click", f"Click failed: {e}", dispatched=dispatched)
         return _interaction_failure("click", "[Browser Error] Interactive backend not available.")
@@ -663,10 +663,10 @@ def register_browser_tools(
             try:
                 await _assert_write_origin(tab)
                 dispatched = True
-                result = await hook(
+                result = await _await_backend_result(hook(
                     selector, text, tab_id=tab.tab_id, url=tab.url
-                )
-                return await _finish_action(tab.tab_id, result)
+                ))
+                return await _finish_action(tab.tab_id, str(result))
             except Exception as e:
                 return _interaction_failure("type", f"Type failed: {e}", dispatched=dispatched)
         return _interaction_failure("type", "[Browser Error] Interactive backend not available.")

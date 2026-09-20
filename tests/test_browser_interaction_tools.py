@@ -139,6 +139,30 @@ def test_read_exception_is_not_a_partial_mutation(tmp_path, stage):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("operation", ["click", "type"])
+def test_nonawaitable_mutation_hook_has_clear_failure_without_replay(tmp_path, operation):
+    async def scenario():
+        reg, backend, _ = setup(tmp_path)
+        await reg.execute("browser_open", {"url": "https://example.com/form", "extract": False})
+
+        def synchronous_hook(*args, **kwargs):
+            backend.writes += 1
+            return "untrusted synchronous receipt"
+
+        setattr(backend, "interactive_" + operation, synchronous_hook)
+        args = {"selector": "#target"}
+        if operation == "type":
+            args["text"] = "replacement"
+        result = await reg.execute("browser_" + operation, args)
+
+        assert "browser backend operation must be awaitable" in result["error"]
+        assert result["details"] == {"operation": operation, "dispatch_state": "unknown"}
+        assert result["partial"] is True and result["retryable"] is False
+        assert "Do not replay" in result["recovery_hint"]
+        assert backend.writes == 1 and backend.reads == 0
+    asyncio.run(scenario())
+
+
 def test_browser_type_legacy_execution_and_permission_policy_survive(tmp_path):
     async def scenario():
         reg, backend, _ = setup(tmp_path)

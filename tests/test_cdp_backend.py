@@ -329,9 +329,15 @@ class TestRegisterWithBackend:
         names = {item["name"] for item in reg.describe()}
         assert {
             "browser_open", "browser_snapshot", "browser_extract", "browser_click",
-            "browser_type", "browser_select", "browser_wait", "browser_screenshot",
+            "browser_fill", "browser_select", "browser_wait", "browser_screenshot",
             "browser_handoff", "browser_resume", "browser_close", "browser_status",
         } <= names
+        assert "browser_type" not in names
+        assert reg.get("browser_type") is not None
+        schemas = {item["function"]["name"] for item in reg.to_openai_tools()}
+        assert "browser_fill" in schemas and "browser_type" not in schemas
+        explicit = reg.to_openai_tools(names={"browser_type"})
+        assert [item["function"]["name"] for item in explicit] == ["browser_type"]
 
     def test_backend_priority_over_extract_fn(self, tmp_path):
         """Explicit backend takes priority over extract_fn/status_fn."""
