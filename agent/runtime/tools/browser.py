@@ -27,6 +27,7 @@ import inspect
 import logging
 import re
 from contextlib import suppress
+from functools import wraps
 from pathlib import Path
 from typing import Any, Awaitable, Callable, cast
 from ..browser_control_transport import BROWSER_ENDPOINT_RECOVERY, BrowserEndpointOwnedError
@@ -41,7 +42,7 @@ from ..browser_session import (
 from ..tool_failure import ToolFailure
 from ..browser_lifecycle import BrowserLifecycle
 from .approval import ScopedApprovalStore, normalized_origin
-from .registry import ToolDef, ToolRegistry
+from .registry import ToolDef, ToolRegistry, _set_tool_timeout_failure
 
 logger = logging.getLogger(__name__)
 
@@ -90,7 +91,18 @@ def register_browser_tools(
     registry.hooks.on_before_tool(lifecycle.before_tool)
 
     def register(tool: ToolDef) -> None:
-        tool.fn = lifecycle.wrap(tool.fn)
+        wrapped = lifecycle.wrap(tool.fn)
+        operation = tool.name.removeprefix("browser_")
+        if operation in {"click", "type", "fill", "check"}:
+            @wraps(wrapped)
+            async def invoke(*args, **kwargs):
+                # The lifecycle lock/release may suspend before the handler
+                # runs, so seed the non-dispatched state outside that wrapper.
+                _record_mutation_timeout(operation, dispatched=False)
+                return await wrapped(*args, **kwargs)
+            tool.fn = invoke
+        else:
+            tool.fn = wrapped
         # Cached results cannot establish ownership or fresh remote references.
         tool.cache_results = False
         registry.register(tool)
@@ -267,6 +279,16 @@ def register_browser_tools(
             "dispatch_state": "unknown" if dispatched else "not_dispatched",
             "operation": operation,
         } if mutating else None)
+
+    def _record_mutation_timeout(operation: str, *, dispatched: bool) -> None:
+        if operation not in {"click", "type", "fill", "check"}:
+            return
+        state = "unknown" if dispatched else "not_dispatched"
+        _set_tool_timeout_failure(_interaction_failure(
+            operation,
+            f"Browser {operation} timed out; dispatch_state={state}. This is not confirmation of success.",
+            dispatched=dispatched,
+        ))
 
     def _connection_failure(operation: str, exc: Exception) -> ToolFailure:
         if isinstance(exc, BrowserEndpointOwnedError):
@@ -644,6 +666,7 @@ def register_browser_tools(
             try:
                 await _assert_write_origin(tab)
                 dispatched = True
+                _record_mutation_timeout("click", dispatched=True)
                 result = await _await_backend_result(hook(selector, tab_id=tab.tab_id, url=tab.url))
                 return await _finish_action(tab.tab_id, str(result))
             except Exception as e:
@@ -663,6 +686,7 @@ def register_browser_tools(
             try:
                 await _assert_write_origin(tab)
                 dispatched = True
+                _record_mutation_timeout("type", dispatched=True)
                 result = await _await_backend_result(hook(
                     selector, text, tab_id=tab.tab_id, url=tab.url
                 ))
@@ -685,6 +709,7 @@ def register_browser_tools(
         try:
             await _assert_write_origin(tab)
             dispatched = True
+            _record_mutation_timeout(operation, dispatched=True)
             result = await _await_backend_result(hook(selector, tab_id=tab.tab_id, url=tab.url, **args))
             return await _finish_action(tab.tab_id, str(result), expected_text=args.get("text") if operation == "fill" else None)
         except Exception as exc:

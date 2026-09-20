@@ -229,6 +229,25 @@ _PRIVATE_RESULT_SLOT: contextvars.ContextVar[_PrivateResultSlot | None] = (
 
 
 @dataclass
+class _TimeoutFailureSlot:
+    """Mutable attempt-local state shared with the task cancelled by wait_for."""
+
+    failure: ToolFailure | None = None
+
+
+_TIMEOUT_FAILURE_SLOT: contextvars.ContextVar[_TimeoutFailureSlot | None] = (
+    contextvars.ContextVar("tool_timeout_failure_slot", default=None)
+)
+
+
+def _set_tool_timeout_failure(failure: ToolFailure) -> None:
+    """Record handler-owned uncertainty without changing tool arguments/results."""
+    slot = _TIMEOUT_FAILURE_SLOT.get()
+    if slot is not None:
+        slot.failure = copy.deepcopy(failure)
+
+
+@dataclass
 class _YoloState:
     enabled: bool = False
 
@@ -962,6 +981,9 @@ class ToolRegistry:
         permission_cleanup: PermissionCleanup | None = None
         permission_args: dict[str, Any] | None = None
         permission_call_id = call_id or uuid.uuid4().hex
+        # Preflight/permission checks can themselves raise TimeoutError before
+        # any timed attempt has started; they have no handler-owned metadata.
+        timeout_slot: _TimeoutFailureSlot | None = None
         # ── before_tool hooks ──
         try:
             args = self.hooks.dispatch_before_tool(name, args, tool)
@@ -1257,6 +1279,8 @@ class ToolRegistry:
 
                         private_slot = _PrivateResultSlot()
                         private_token = _PRIVATE_RESULT_SLOT.set(private_slot)
+                        timeout_slot = _TimeoutFailureSlot()
+                        timeout_token = _TIMEOUT_FAILURE_SLOT.set(timeout_slot)
                         try:
                             task = self.hooks.dispatch_around_tool(name, args, tool, invoke_tool)
                             if tool.timeout is None:
@@ -1265,6 +1289,7 @@ class ToolRegistry:
                                 result = await asyncio.wait_for(task, timeout=tool.timeout)
                             private_result = private_slot.retrieve()
                         finally:
+                            _TIMEOUT_FAILURE_SLOT.reset(timeout_token)
                             _PRIVATE_RESULT_SLOT.reset(private_token)
                         report("finalizing")
                         duration_ms = int((time.perf_counter() - start) * 1000)
@@ -1381,10 +1406,15 @@ class ToolRegistry:
             logger.warning("tool timeout name=%s timeout=%s", name, tool.timeout)
             report("timed_out", status="failed", message=f"exceeded {tool.timeout}s")
             error_msg = f"[ToolTimeout] {name}: exceeded {tool.timeout}s"
+            timeout_failure = timeout_slot.failure if timeout_slot is not None else None
+            if timeout_failure is not None:
+                # String-only consumers (including Code Mode RPC) must retain
+                # the same observation/no-replay guidance as structured events.
+                error_msg += f". {timeout_failure.message} {timeout_failure.recovery_hint}".rstrip()
             self.hooks.dispatch_tool_error(
                 name, self.persistence_safe_args(tool, args), error_msg, tool
             )
-            return await finalize({
+            timeout_result: dict[str, Any] = {
                 "output": "",
                 "error": error_msg,
                 "code": "overall_timeout",
@@ -1396,7 +1426,14 @@ class ToolRegistry:
                     "unchanged in the same turn; inspect the service or inputs, change approach, "
                     "or ask the user before retrying."
                 ),
-            })
+            }
+            if timeout_failure is not None:
+                timeout_result.update({
+                    "partial": timeout_failure.partial,
+                    "details": copy.deepcopy(timeout_failure.details),
+                    "recovery_hint": timeout_failure.recovery_hint or timeout_result["recovery_hint"],
+                })
+            return await finalize(timeout_result)
         except Exception as e:
             from ..turn_budget import TurnBudgetExceeded
             if isinstance(e, TurnBudgetExceeded):
