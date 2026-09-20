@@ -273,18 +273,20 @@ def resolve_profile_key(value: str, profiles: dict[str, ModelProfile]) -> str:
     return matches[0] if len(matches) == 1 else value
 
 
-def prompt_token_budget(context_limit: int, max_tokens: int) -> int:
+def prompt_token_budget(context_limit: int, max_tokens: int, *, model: str = "", provider: str = "") -> int:
     """Return the token threshold at which proactive compression begins.
 
-    Proactive compression starts at 50% of the model context window (aligned
-    with Hermes' compression.threshold=0.5), so long contexts never ride into
-    the degraded-attention zone before compacting. Small windows may need an
-    earlier threshold to preserve the configured completion allowance (with an
-    8K minimum), so the stricter of the two limits wins.
+    GPT models and the Codex provider use the model window minus the output
+    reserve, without the additional 50% proactive threshold used by other
+    models. Preserve the configured completion allowance (with an 8K minimum),
+    scaling the reserve down only when it would consume the entire window.
     """
     limit = max(2, int(context_limit))
     desired_reserve = max(8_192, int(max_tokens))
     reserve = desired_reserve if desired_reserve < limit else max(1, limit // 2)
     completion_safe_limit = max(1, limit - reserve)
+    model_id = model.strip().lower().rsplit("::", 1)[-1].rsplit("/", 1)[-1]
+    if provider == "openai-codex" or model_id.startswith(("gpt-", "chatgpt-")):
+        return completion_safe_limit
     compression_threshold = max(1, limit // 2)
     return min(completion_safe_limit, compression_threshold)

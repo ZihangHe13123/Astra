@@ -572,7 +572,9 @@ def create_agent(llm_config: LLMConfig, sandbox_timeout: int,
     agent._computer_runtime = computer_runtime
     agent._sandbox = sandbox
     limit = _resolve_context_limit_simple(llm_config.model)
-    agent.context.max_prompt_tokens = prompt_token_budget(limit, llm_config.max_tokens)
+    agent.context.max_prompt_tokens = prompt_token_budget(
+        limit, llm_config.max_tokens, model=llm_config.model, provider=llm_config.provider,
+    )
     agent.llm.config.context_limit = limit
     agent.context.set_session(str(SESSION_DEFAULT))
     bus.register(agent)

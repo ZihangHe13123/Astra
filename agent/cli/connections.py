@@ -62,7 +62,10 @@ async def probe_profile(
 
 def sync_context_budget(agent, profile: ModelProfile) -> int:
     """Apply a model profile's current context metadata to a live agent."""
-    budget = prompt_token_budget(profile.context_limit, agent.llm.config.max_tokens)
+    budget = prompt_token_budget(
+        profile.context_limit, agent.llm.config.max_tokens,
+        model=profile.model_id or getattr(agent.llm.config, "model", ""), provider=profile.provider,
+    )
     agent.context.max_prompt_tokens = budget
     agent.llm.config.context_limit = profile.context_limit
     return budget

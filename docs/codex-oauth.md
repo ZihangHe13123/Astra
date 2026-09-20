@@ -52,6 +52,13 @@ silently substituting another.
 Ordinary Chat Completions sampling/output-limit parameters are not forwarded:
 the subscription endpoint does not support those parameters.
 
+GPT models and ChatGPT / Codex connections use the model's context window minus
+the configured output reserve (at least 8,192 tokens) as the automatic compaction
+threshold. Astra does not apply its additional 50% proactive threshold to these
+models. For a 272,000-token window and 4,096-token configured output allowance,
+compaction starts at 263,808 tokens. Startup, model switching and catalog refresh
+all use this rule.
+
 Encrypted reasoning continuation and assistant message phases are saved with
 the session. They are sent back only to the same account and model. They are
 kept out of visible messages and other providers' requests. Editing or

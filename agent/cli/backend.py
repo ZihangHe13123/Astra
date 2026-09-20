@@ -1115,7 +1115,9 @@ async def _main(startup_started: float):
     # Avoid a second synchronous /models request during startup; an explicit
     # model-menu refresh will replace it with current live metadata.
     limit = startup_profile.context_limit or _get_context_limit(startup_model)
-    agent.context.max_prompt_tokens = prompt_token_budget(limit, llm_config.max_tokens)
+    agent.context.max_prompt_tokens = prompt_token_budget(
+        limit, llm_config.max_tokens, model=llm_config.model, provider=llm_config.provider,
+    )
     agent.llm.config.context_limit = limit
     agent.context.set_session(str(startup_session_path()))
     bus.register(agent)

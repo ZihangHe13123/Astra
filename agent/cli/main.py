@@ -990,7 +990,9 @@ async def _async_init(llm_config: LLMConfig, sandbox_timeout: int, workdir: str)
     register_conclave_tools(tools, llm_getter=lambda: agent.llm)
     setattr(agent, "_search_provider_state", search_provider_state)
     limit = _resolve_context_limit_simple(llm_config.model, llm_config.context_limit)
-    agent.context.max_prompt_tokens = prompt_token_budget(limit, llm_config.max_tokens)
+    agent.context.max_prompt_tokens = prompt_token_budget(
+        limit, llm_config.max_tokens, model=llm_config.model, provider=llm_config.provider,
+    )
     agent.llm.config.context_limit = limit
     agent.context.set_session(str(startup_session_path()))
     bus.register(agent)
