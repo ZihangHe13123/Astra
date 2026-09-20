@@ -261,6 +261,13 @@ def register_browser_tools(
             details=details or {}, recovery_hint=recovery_hint or
             "Observe the target with browser_snapshot/browser_read before deciding the next action. Do not replay uncertain writes or fall back to global keyboard/paste.")
 
+    def _interaction_failure(operation: str, message: str, *, dispatched: bool = False) -> ToolFailure:
+        mutating = operation in {"click", "type", "fill", "check"}
+        return _failure(message, partial=mutating and dispatched, details={
+            "dispatch_state": "unknown" if dispatched else "not_dispatched",
+            "operation": operation,
+        } if mutating else None)
+
     def _connection_failure(operation: str, exc: Exception) -> ToolFailure:
         if isinstance(exc, BrowserEndpointOwnedError):
             return ToolFailure(code=exc.code, message=str(exc), retryable=False,
@@ -626,50 +633,54 @@ def register_browser_tools(
     async def _browser_click(selector: str, tab_id: str = "") -> str | ToolFailure:
         tab, err = _resolve_tab(tab_id)
         if err:
-            return err
+            return _interaction_failure("click", err)
         guard = _interactive_guard(tab)
         if guard:
-            return guard
+            return _interaction_failure("click", guard)
         # Dispatch to the backend's interactive click if available
-        backend = manager.backend
-        if backend is not None:
+        hook = getattr(manager.backend, "interactive_click", None)
+        if callable(hook):
+            dispatched = False
             try:
                 await _assert_write_origin(tab)
-                result = await backend.interactive_click(selector, tab_id=tab.tab_id, url=tab.url)
+                dispatched = True
+                result = await hook(selector, tab_id=tab.tab_id, url=tab.url)
                 return await _finish_action(tab.tab_id, result)
             except Exception as e:
-                return _failure(f"Click failed: {e}")
-        return "[Browser Error] Interactive backend not available."
+                return _interaction_failure("click", f"Click failed: {e}", dispatched=dispatched)
+        return _interaction_failure("click", "[Browser Error] Interactive backend not available.")
 
     async def _browser_type(selector: str, text: str, tab_id: str = "") -> str | ToolFailure:
         tab, err = _resolve_tab(tab_id)
         if err:
-            return err
+            return _interaction_failure("type", err)
         guard = _interactive_guard(tab)
         if guard:
-            return guard
-        backend = manager.backend
-        if backend is not None:
+            return _interaction_failure("type", guard)
+        hook = getattr(manager.backend, "interactive_type", None)
+        if callable(hook):
+            dispatched = False
             try:
                 await _assert_write_origin(tab)
-                result = await backend.interactive_type(
+                dispatched = True
+                result = await hook(
                     selector, text, tab_id=tab.tab_id, url=tab.url
                 )
                 return await _finish_action(tab.tab_id, result)
             except Exception as e:
-                return _failure(f"Type failed: {e}")
-        return "[Browser Error] Interactive backend not available."
+                return _interaction_failure("type", f"Type failed: {e}", dispatched=dispatched)
+        return _interaction_failure("type", "[Browser Error] Interactive backend not available.")
 
     async def _target_tool(operation: str, selector: str, tab_id: str, **args) -> str | ToolFailure:
         tab, err = _resolve_tab(tab_id)
         if err:
-            return _failure(err)
+            return _interaction_failure(operation, err)
         guard = _interactive_guard(tab)
         if guard:
-            return _failure(guard)
+            return _interaction_failure(operation, guard)
         hook = getattr(manager.backend, "interactive_" + operation, None)
         if not callable(hook):
-            return _failure(f"Backend does not support browser_{operation}")
+            return _interaction_failure(operation, f"Backend does not support browser_{operation}")
         dispatched = False
         try:
             await _assert_write_origin(tab)
@@ -677,7 +688,7 @@ def register_browser_tools(
             result = await _await_backend_result(hook(selector, tab_id=tab.tab_id, url=tab.url, **args))
             return await _finish_action(tab.tab_id, str(result), expected_text=args.get("text") if operation == "fill" else None)
         except Exception as exc:
-            return _failure(f"{operation} failed: {exc}", partial=dispatched and operation in {"fill", "check"})
+            return _interaction_failure(operation, f"{operation} failed: {exc}", dispatched=dispatched)
 
     async def _browser_fill(selector: str, text: str, tab_id: str = "") -> str | ToolFailure:
         return await _target_tool("fill", selector, tab_id, text=text)
@@ -921,7 +932,7 @@ def register_browser_tools(
             "已配置自动连接时会主动连接扩展并打开可见标签，无需先调用 browser_status/browser_tabs/browser_connect；等待最多45秒。"
             "新标签当前可能被选中，不保证保留用户的活动标签；按已有通道能力优先减少前台打扰。"
             "若配置了只读后端，会立即抓取页面正文并存储脱敏快照。"
-            "需要交互时再用 browser_click/browser_type，遇到验证码/登录/支付用 browser_handoff。"
+            "需要交互时再用 browser_click/browser_fill，遇到验证码/登录/支付用 browser_handoff。"
         ),
         parameters={
             "type": "object",
@@ -1030,7 +1041,7 @@ def register_browser_tools(
         },
         fn=_browser_type, risk="write", approval="on_risk", idempotent=False,
         trace_context=_browser_trace_context,
-        group="browser",
+        group="browser", expose_by_default=False,
         permission_check=_browser_write_permission_check("Type into page", "text"),
         permission_grant=browser_approvals.grant,
     ))

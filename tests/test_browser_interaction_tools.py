@@ -1,6 +1,8 @@
 import asyncio
 import json
 
+import pytest
+
 from agent.runtime.browser_session import BackendCapabilities, BrowserSessionManager
 from agent.runtime.tools.browser import register_browser_tools
 from agent.runtime.tools.registry import ToolRegistry
@@ -65,6 +67,92 @@ def test_write_checks_live_origin_before_dispatch(tmp_path):
         result = await reg.execute('browser_click', {'selector':'#save'})
         assert b.writes == 0
         assert 'live_origin_changed' in result['error']
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("operation", ["click", "type", "fill", "check"])
+@pytest.mark.parametrize("stage", ["origin", "guard", "backend", "observation"])
+def test_mutation_exception_receipt_tracks_dispatch_without_replay(tmp_path, operation, stage):
+    async def scenario():
+        reg, backend, _ = setup(tmp_path)
+        await reg.execute("browser_open", {"url": "https://example.com/form", "extract": False})
+
+        async def action(*args, **kwargs):
+            backend.writes += 1
+            if stage == "backend":
+                raise RuntimeError("backend outcome unavailable")
+            return "legacy action result"
+
+        async def observe(**kwargs):
+            backend.reads += 1
+            raise RuntimeError("observation unavailable")
+
+        setattr(backend, "interactive_" + operation, action)
+        backend.interactive_state = observe
+        if stage == "origin":
+            backend.origin_changed = True
+        elif stage == "guard":
+            backend.capabilities = BackendCapabilities(True, False, True)
+        args = {"selector": "#target"}
+        if operation in {"type", "fill"}:
+            args["text"] = "replacement"
+        result = await reg.execute("browser_" + operation, args)
+
+        dispatched = stage in {"backend", "observation"}
+        assert result["error"]
+        assert result["details"]["dispatch_state"] == ("unknown" if dispatched else "not_dispatched")
+        assert result["details"]["operation"] == operation
+        assert result["partial"] is dispatched
+        assert result["retryable"] is False
+        assert "browser_snapshot/browser_read" in result["recovery_hint"]
+        assert "Do not replay" in result["recovery_hint"]
+        assert backend.writes == int(dispatched)
+        assert backend.reads == int(stage == "observation")
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stage", ["backend", "observation"])
+def test_read_exception_is_not_a_partial_mutation(tmp_path, stage):
+    async def scenario():
+        reg, backend, _ = setup(tmp_path)
+        await reg.execute("browser_open", {"url": "https://example.com/form", "extract": False})
+        calls = []
+
+        async def read(*args, **kwargs):
+            calls.append("read")
+            if stage == "backend":
+                raise RuntimeError("read unavailable")
+            return "legacy read result"
+
+        async def observe(**kwargs):
+            backend.reads += 1
+            raise RuntimeError("observation unavailable")
+
+        backend.interactive_read = read
+        backend.interactive_state = observe
+        result = await reg.execute("browser_read", {"selector": "#target"})
+        assert result["error"]
+        assert result["partial"] is False
+        assert backend.writes == 0
+        assert calls == ["read"]
+        assert backend.reads == int(stage == "observation")
+    asyncio.run(scenario())
+
+
+def test_browser_type_legacy_execution_and_permission_policy_survive(tmp_path):
+    async def scenario():
+        reg, backend, _ = setup(tmp_path)
+        backend.interactive_type = backend.interactive_click
+        await reg.execute("browser_open", {"url": "https://example.com/form", "extract": False})
+        args = {"selector": "#target", "text": "replacement"}
+        result = await reg.execute("browser_type", args)
+        assert not result["error"] and "after:e1" in result["output"]
+        assert backend.writes == 1
+
+        reg.policy.add_rule_shortcut("browser_type", "deny")
+        denied = await reg.execute("browser_type", args)
+        assert denied["error"]
+        assert backend.writes == 1
     asyncio.run(scenario())
 
 

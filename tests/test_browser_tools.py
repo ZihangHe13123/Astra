@@ -228,7 +228,29 @@ class TestRegistration:
     def test_openai_tools_include_browser(self, registry):
         schemas = registry.to_openai_tools(groups={"browser"})
         schema_names = {s["function"]["name"] for s in schemas}
-        assert EXPECTED_TOOLS <= schema_names
+        assert EXPECTED_TOOLS - {"browser_type"} <= schema_names
+
+    def test_browser_type_is_explicit_compatibility_only(self, registry):
+        schemas = registry.to_openai_tools(groups={"browser"})
+        names = [schema["function"]["name"] for schema in schemas]
+        assert "browser_type" not in names
+        assert "browser_fill" in names
+        assert names == sorted(names)
+        assert "browser_type" not in {
+            schema["function"]["name"] for schema in registry.to_openai_tools()
+        }
+        explicit = registry.to_openai_tools(names={"browser_type"})
+        assert [schema["function"]["name"] for schema in explicit] == ["browser_type"]
+        legacy = registry.get("browser_type")
+        assert legacy is not None
+        assert legacy.risk == "write" and legacy.approval == "on_risk"
+        assert legacy.idempotent is False
+        assert callable(legacy.permission_check) and callable(legacy.permission_grant)
+
+    def test_browser_open_guides_new_input_to_fill(self, registry):
+        description = registry.get("browser_open").description
+        assert "browser_fill" in description
+        assert "browser_type" not in description
 
 
 # ---------------------------------------------------------------------------
