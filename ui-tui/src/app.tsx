@@ -574,7 +574,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   const [displayBatcher] = useState(() => createStreamingDisplayBatcher(rawDispatchDisplay));
   const dispatchDisplay = displayBatcher.dispatch;
   const historyLines = displayState.historyLines;
-  const [historyGeneration, setHistoryGeneration] = useState(0);
+  const historyGeneration = displayState.historyGeneration;
   const [busy, setBusy] = useState(false);
   const [backendStatus, setBackendStatus] = useState<"connecting" | "ready" | "disconnected">("connecting");
   const [showReasoning, setShowReasoning] = useState(true);
@@ -1092,7 +1092,6 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           ),
         );
         dispatchDisplay({ type: "replaceHistory", lines: restored });
-        setHistoryGeneration((current) => current + 1);
         msgIdRef.current = event.messages.length + 1;
         break;
       }
@@ -1880,7 +1879,6 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         } else if (text === "/reset") {
           timeRailCursorRef.current.reset();
           dispatchDisplay({ type: "clearHistory" });
-          setHistoryGeneration((current) => current + 1);
           toolResultsRef.current = [];
           detailOpenRef.current = false;
           setToolResults([]);

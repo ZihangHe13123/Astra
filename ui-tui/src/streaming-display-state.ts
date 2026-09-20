@@ -4,6 +4,7 @@ import { appendLiveHistory, createLiveHistoryBatchAppender } from "./static-hist
 
 export type StreamingDisplayState = {
   historyLines: RenderLine[];
+  historyGeneration: number;
   previewLines: Partial<Record<StreamingRole, RenderLine[]>>;
   pendingActivityTail: RenderLine[];
   toolDetailQueue: RenderLine[];
@@ -30,6 +31,7 @@ export function createStreamingDisplayState(
 ): StreamingDisplayState {
   return {
     historyLines,
+    historyGeneration: 0,
     previewLines: {},
     pendingActivityTail: [],
     toolDetailQueue: [],
@@ -165,6 +167,9 @@ function reduceDisplay(
     return {
       ...state,
       historyLines: action.lines,
+      // Reset Ink's Static cursor in the same render as its replacement items.
+      // Separate updates first print a suffix with the old cursor, then replay it.
+      historyGeneration: state.historyGeneration + 1,
       previewLines: {},
       pendingActivityTail: [],
       toolDetailQueue: [],
@@ -174,6 +179,7 @@ function reduceDisplay(
   return {
     ...state,
     historyLines: [],
+    historyGeneration: state.historyGeneration + 1,
     previewLines: {},
     pendingActivityTail: [],
     toolDetailQueue: [],
