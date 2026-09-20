@@ -1041,7 +1041,7 @@ def register_browser_tools(
         },
         fn=_browser_type, risk="write", approval="on_risk", idempotent=False,
         trace_context=_browser_trace_context,
-        group="browser", expose_by_default=False,
+        group="browser", expose_by_default=False, allow_hidden_execution=True,
         permission_check=_browser_write_permission_check("Type into page", "text"),
         permission_grant=browser_approvals.grant,
     ))

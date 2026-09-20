@@ -2939,6 +2939,7 @@ class ReActAgent(AgentBase):
                 self.tool_allowlist is None
                 and tool_def is not None
                 and not tool_def.expose_by_default
+                and not tool_def.allow_hidden_execution
             )
             if hidden_from_work or (self.tool_allowlist is not None and name not in self.tool_allowlist):
                 error = f"[ToolDisabled] Tool '{name}' is not available in the current mode."

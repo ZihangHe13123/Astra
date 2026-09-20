@@ -198,7 +198,7 @@ _main()
 
 
 def _tool_allowed(agent: Any, name: str) -> bool:
-    """Mirror the top-level availability gate: allowlist + expose_by_default."""
+    """Mirror mode allowlists and the default exposure/compatibility gate."""
     tool_def = agent.tools.get(name)
     if tool_def is None:
         return False
@@ -207,7 +207,7 @@ def _tool_allowed(agent: Any, name: str) -> bool:
     allowlist = getattr(agent, "tool_allowlist", None)
     if allowlist is not None:
         return name in allowlist
-    return bool(tool_def.expose_by_default)
+    return bool(tool_def.expose_by_default or tool_def.allow_hidden_execution)
 
 
 def _tool_risk(agent: Any, name: str) -> str:

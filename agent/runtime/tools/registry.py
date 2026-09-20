@@ -127,6 +127,9 @@ class ToolDef:
     group: str = "core"
     max_inline_chars: int | None = None
     expose_by_default: bool = True
+    # Compatibility aliases may execute while absent from default schemas.
+    # This never overrides explicit mode allowlists or authorization policy.
+    allow_hidden_execution: bool = False
     # A successful direct tool result is also the assistant's final response.
     # This is used by atomic interaction modes where visible prose and local
     # state changes must commit together instead of requiring a second LLM pass.
