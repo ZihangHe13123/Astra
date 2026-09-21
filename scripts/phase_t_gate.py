@@ -92,6 +92,10 @@ def _run_gate(args: argparse.Namespace, gate_temp: Path) -> None:
     check("Pyright", [str(PYRIGHT), "agent", "scripts/phase_t_provider_smoke.py",
                     "scripts/phase_t_gate.py", "scripts/wheel_smoke.py"])
 
+    core_root = PROJECT_ROOT / "ui-core"
+    check("Shared UI build", [str(NPM), "run", "build"], cwd=core_root)
+    check("Shared UI tests", [str(NPM), "test"], cwd=core_root)
+
     tui_root = PROJECT_ROOT / "ui-tui"
     test_files = [str(path) for path in discover_tui_tests(tui_root / "src")]
     check("TUI tests", ["node", "--import", "tsx", "--test", *test_files], cwd=tui_root)

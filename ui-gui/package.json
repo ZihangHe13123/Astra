@@ -1,0 +1,36 @@
+{
+  "name": "astra-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "dist/main.cjs",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "build": "npm --prefix ../ui-core run build && tsc --noEmit && node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "start": "electron .",
+    "test": "tsx --test tests/*.test.ts",
+    "test:e2e": "node tests/smoke.mjs"
+  },
+  "dependencies": {
+    "@astra/ui-core": "file:../ui-core",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1",
+    "lucide-react": "0.468.0"
+  },
+  "devDependencies": {
+    "electron": "44.4.3",
+    "vite": "8.3.0",
+    "esbuild": "0.28.2",
+    "typescript": "5.9.3",
+    "tsx": "4.19.0",
+    "@types/node": "25.8.0",
+    "@types/react": "18.3.0",
+    "@types/react-dom": "18.3.0",
+    "@playwright/test": "1.59.1"
+  }
+}

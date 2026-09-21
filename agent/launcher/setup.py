@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 
 from . import dependencies
-from .common import LauncherError, git
+from .common import LauncherError, git, write_json
 from .installation import Installation, user_home
 from .locking import exclusive
 from .services import ServiceMaintenance
@@ -113,7 +113,7 @@ def install_command(install: Installation, *, bin_dir: Path | None = None, modif
     return target
 
 
-def setup_source(install: Installation, extras: list[str], *, repair: bool = False) -> dict:
+def setup_source(install: Installation, extras: list[str], *, repair: bool = False, gui: bool = False) -> dict:
     if install.kind != "source":
         raise LauncherError("Use the original installer to repair an installed distribution. Source setup cannot modify it.")
     with exclusive(install):
@@ -123,6 +123,8 @@ def setup_source(install: Installation, extras: list[str], *, repair: bool = Fal
         dependencies.ensure_uv(install)
         selected = dependencies.enabled_extras(install, extras)
         ready = not repair and dependencies.is_ready(install) and selected == install.metadata.get("extras")
+        if gui or dependencies.gui_enabled(install):
+            ready = ready and dependencies.gui_ready(install)
         if ready:
             try:
                 dependencies.python_health(install)
@@ -136,7 +138,7 @@ def setup_source(install: Installation, extras: list[str], *, repair: bool = Fal
             transaction = Transaction(install, before, before)
             with services.suspended():
                 preflight(install)
-                _prepare_environment(install, selected, transaction)
+                _prepare_environment(install, selected, transaction, gui=gui)
         template, config = install.root / ".env.example", install.root / ".env"
         if template.is_file() and not config.exists():
             # Exclusive creation avoids replacing a concurrently-created configuration.
@@ -147,9 +149,13 @@ def setup_source(install: Installation, extras: list[str], *, repair: bool = Fal
         return result if ready else services.finish(result)
 
 
-def _prepare_environment(install: Installation, selected: list[str], transaction: Transaction) -> None:
+def _prepare_environment(install: Installation, selected: list[str], transaction: Transaction, *, gui: bool = False) -> None:
     try:
         transaction.prepare()
+        if gui:
+            write_json(install.control / "installation.json", {
+                **install.metadata, "schema": 1, "root": str(install.root), "gui": True,
+            })
         dependencies.synchronize(install, selected)
         dependencies.validate(install)
         dependencies.record_environment(install, selected)

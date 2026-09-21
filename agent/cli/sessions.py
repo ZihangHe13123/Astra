@@ -231,6 +231,15 @@ def export_session_markdown(name: str) -> Path:
 
 
 def rename_session(old_name: str, new_name: str) -> None:
+    from agent.ui.session_ownership import claim_session
+    leases = [claim_session(path) for path in sorted((session_path(old_name), session_path(new_name)))]
+    try:
+        _rename_session(old_name, new_name)
+    finally:
+        leases.clear()
+
+
+def _rename_session(old_name: str, new_name: str) -> None:
     old_store = SessionStore(session_path(old_name))
     new_store = SessionStore(session_path(new_name))
     if not old_store.exists:
@@ -245,6 +254,15 @@ def rename_session(old_name: str, new_name: str) -> None:
 
 
 def delete_session(name: str) -> None:
+    from agent.ui.session_ownership import claim_session
+    lease = claim_session(session_path(name))
+    try:
+        _delete_session(name)
+    finally:
+        del lease
+
+
+def _delete_session(name: str) -> None:
     store = SessionStore(session_path(name))
     if not store.exists:
         raise FileNotFoundError(f"Session '{name}' not found")

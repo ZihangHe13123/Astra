@@ -295,6 +295,8 @@ class AgentContext:
     # compaction (active tool chains must never be collapsed mid-flight).
     compact_keep_recent: int = 4
     _session_path: str = ""
+    enforce_session_ownership: bool = False
+    _session_lease: Any = field(default=None, init=False, repr=False)
 
     # Token 统计（跨会话持久化）
     total_prompt_tokens: int = 0
@@ -332,10 +334,16 @@ class AgentContext:
         return self.total_prompt_tokens + self.total_completion_tokens
 
     def set_session(self, path: str):
+        if self.enforce_session_ownership:
+            from agent.ui.session_ownership import claim_session
+            lease = claim_session(path)
+        else:
+            lease = None
         self._system_prompt_migration = {}
         self.system_projection.reset()
         self.runtime_projection.reset()
         self._session_path = path
+        self._session_lease = lease
         self._session_store = SessionStore(path)
         self._saved_message_count = 0
         if self.compressor is not None:

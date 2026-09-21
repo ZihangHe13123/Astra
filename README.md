@@ -8,7 +8,7 @@ Astra connects to model APIs to help you research, work with files and operate
 applications. It keeps conversations and state on your machine, and also supports
 optional local model endpoints.
 
-[Quick start](#quick-start) · [ChatGPT login](#chatgpt--codex) · [Everyday commands](#everyday-commands) · [Updates](#updates-and-data) · [Documentation](#documentation)
+[Quick start](#quick-start) · [ChatGPT login](#chatgpt--codex) · [Desktop preview](docs/gui.md) · [Everyday commands](#everyday-commands) · [Updates](#updates-and-data) · [Documentation](#documentation)
 
 ## What you can do
 
@@ -51,6 +51,25 @@ cd Astra
 
 Setup prepares the Python environment and terminal UI, registers `astra` in your
 user PATH, and creates `.env` if needed. Existing configuration is preserved.
+
+### Optional desktop preview
+
+The source checkout also includes an Electron desktop preview. It needs **Node.js 22.12+**:
+
+```text
+astra setup --gui
+astra --gui
+```
+
+To install the desktop and register the global command together, run
+`./astra.sh setup --gui --install-command` from the checkout on macOS/Linux,
+or `.\astra.bat setup --gui --install-command` on Windows. Then open a new terminal
+and run `astra --gui` from your project directory. Plain `astra` opens the terminal UI.
+Exit running Astra sessions before setup so their dependency environment can be updated.
+GUI dependencies are downloaded only after enabling the component. The preview
+provides conversations, model login, background sessions, approvals and file diffs;
+full TUI parity and cross-platform native acceptance are still in progress.
+See the [desktop guide and current limits](docs/gui.md).
 
 ### 2. Connect a model
 

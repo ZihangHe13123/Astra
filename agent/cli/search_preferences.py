@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 
+from agent.runtime.json_preferences import update_preferences
+
 from .model_preferences import model_settings_path
 
 
@@ -36,11 +38,4 @@ def save_selected_search_provider(provider: str) -> Path:
     if provider not in SEARCH_PROVIDERS:
         raise ValueError(f"Unknown search provider: {provider}")
 
-    path = model_settings_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = _read_settings(path)
-    data["search_provider"] = provider
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
-    return path
+    return update_preferences(model_settings_path(), lambda data: data.update(search_provider=provider))

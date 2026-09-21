@@ -8,6 +8,8 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+
+from agent.runtime.json_preferences import update_preferences
 from typing import Any
 
 
@@ -35,15 +37,6 @@ def _read_settings() -> dict[str, Any]:
     return dict(loaded) if isinstance(loaded, dict) else {}
 
 
-def _atomic_write_settings(data: dict[str, Any]) -> Path:
-    path = context_index_settings_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(data, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
-    return path
-
-
 def load_context_index_preferences() -> ContextIndexPreferences:
     """Load Context Index preferences, fail-closing an invalid mode."""
     data = _read_settings()
@@ -60,8 +53,8 @@ def save_context_index_preferences(mode: str, char_budget: int | None = None) ->
     """Atomically save Context Index preferences without replacing other settings."""
     if mode not in MODES:
         raise ValueError("mode must be off, session, all, or shadow")
-    data = _read_settings()
-    data["context_index_mode"] = mode
-    if char_budget is not None:
-        data["context_index_char_budget"] = max(400, min(int(char_budget), 2000))
-    return _atomic_write_settings(data)
+    def change(data):
+        data["context_index_mode"] = mode
+        if char_budget is not None:
+            data["context_index_char_budget"] = max(400, min(int(char_budget), 2000))
+    return update_preferences(context_index_settings_path(), change)

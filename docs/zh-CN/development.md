@@ -13,10 +13,12 @@ Pytest 会隔离继承的 Astra 安装、工作区和模型设置，使代理内
 
 ## 可复现的开发环境
 
-仓库提交了 `uv.lock` 和 `ui-tui/package-lock.json`。安装 Python 3.11+、Node.js 18+ 和 [uv（英文文档）](https://docs.astral.sh/uv/) 后，在仓库根目录运行：
+仓库提交了 `uv.lock` 以及 `ui-core`、`ui-tui`、`ui-gui` 的 npm 锁文件。安装 Python 3.11+、Node.js 18+ 和 [uv（英文文档）](https://docs.astral.sh/uv/) 后，在仓库根目录运行：
 
 ```text
 uv sync --locked --python 3.11 --extra dev --extra mcp --extra tracing --extra server --extra notebook
+npm --prefix ui-core ci
+npm --prefix ui-core run build
 npm --prefix ui-tui ci
 ```
 
@@ -24,7 +26,10 @@ npm --prefix ui-tui ci
 
 统一入口 `astra setup` 使用 `uv sync --locked --inexact`，记录启用的 extras 和依赖是否需要更新，执行锁定依赖安装及界面构建；仍会检查依赖冲突。上述手动命令适合开发与发布检查，之后可运行 `astra setup` 记录验证过的环境。
 
-Python wheel 包含 Agent、内置模型配置和 Session Recall。Ink 界面、仓库内技能和 macOS 原生辅助程序仍需要源码安装及各自的准备步骤。
+桌面开发使用 Node.js 22.12+，运行 `astra setup --gui --extra dev`。
+GUI 验证命令见[桌面开发检查](gui.md#development-checks)。普通发布检查会先构建和测试 `ui-core` 再检查 TUI；GUI 验证单独启用。
+
+Python wheel 包含 Agent、内置模型配置和 Session Recall。Ink 和 Electron 界面、仓库内技能和 macOS 原生辅助程序仍需要源码安装及各自的准备步骤。
 
 <a id="maintenance-entry-points"></a>
 

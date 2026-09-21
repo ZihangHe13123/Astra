@@ -17,16 +17,69 @@ PYTHON_PROBE = "import openai, yaml, httpx, mcp, opentelemetry, websockets, PIL"
 LOCK_FILES = ("pyproject.toml", "uv.lock", "ui-tui/package.json", "ui-tui/package-lock.json")
 
 
+def gui_enabled(install: Installation) -> bool:
+    return bool(install.metadata.get("gui"))
+
+
+def source_ui_packages(install: Installation, *, gui: bool | None = None) -> list[Path]:
+    packages = []
+    if (install.root / "ui-core/package.json").is_file():
+        packages.append(install.root / "ui-core")
+    packages.append(install.ui)
+    include_gui = gui if gui is not None else gui_enabled(install)
+    if include_gui:
+        packages.append(install.root / "ui-gui")
+    return packages
+
+
 def fingerprint(install: Installation) -> str:
     digest = hashlib.sha256()
     digest.update(f"{sys.platform}/{platform.machine()}".encode())
-    for name in LOCK_FILES:
+    names: list[str] = list(LOCK_FILES)
+    if (install.root / "ui-core/package.json").is_file():
+        names.extend(("ui-core/package.json", "ui-core/package-lock.json"))
+    for name in names:
         path = install.root / name
         if not path.is_file():
             raise LauncherError(f"Missing {path}. Reinstall the complete source checkout.")
         digest.update(name.encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()
+
+
+def gui_fingerprint(install: Installation) -> str:
+    digest = hashlib.sha256(fingerprint(install).encode())
+    for name in ("package.json", "package-lock.json"):
+        path = install.root / "ui-gui" / name
+        if not path.is_file():
+            raise LauncherError("Desktop source is missing. Update this checkout before running astra setup --gui.")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def gui_ready(install: Installation) -> bool:
+    state = read_json(install.control / "gui-environment.json")
+    return (gui_enabled(install) and state.get("root") == str(install.root)
+            and state.get("fingerprint") == gui_fingerprint(install)
+            and all((install.root / "ui-gui" / name).is_file() for name in
+                    ("node_modules/electron/cli.js", "dist/main.cjs", "dist/preload.cjs", "dist/renderer/index.html")))
+
+
+def gui_health(install: Installation) -> None:
+    run([node_command(), "-e", "const [a,b]=process.versions.node.split('.').map(Number);"
+         "if(a<22 || (a===22 && b<12)) { console.error('GUI requires Node.js 22.12 or newer'); process.exit(1); }"], cwd=install.root)
+    gui_executable(install)
+
+
+def gui_executable(install: Installation) -> str:
+    # Requiring Electron 44 can download binaries. Health checks and launches
+    # must remain read-only; only explicit setup/update installs components.
+    package = install.root / "ui-gui/node_modules/electron"
+    marker = package / "path.txt"
+    path = (package / "dist" / marker.read_text(encoding="utf-8").strip()).resolve() if marker.is_file() else package
+    if not path.is_relative_to((package / "dist").resolve()) or not path.is_file():
+        raise LauncherError("Electron binary missing. Run astra setup --gui --repair.")
+    return str(path)
 
 
 def node_command() -> str:
@@ -108,7 +161,9 @@ def check_environment_ownership(install: Installation) -> None:
     if install.metadata.get("relocated") and any((install.root / name).exists() for name in (".venv", "ui-tui/node_modules")):
         raise LauncherError("This installation moved or was copied. Move .venv and ui-tui/node_modules aside, "
                             "keep .astra and .sessions, then run astra setup to recreate environments at this path.")
-    for path in (install.root / ".venv", install.ui / "node_modules", install.ui / "dist"):
+    generated = [install.root / ".venv", *(install.root / ui / directory
+                 for ui in ("ui-tui", "ui-core", "ui-gui") for directory in ("node_modules", "dist"))]
+    for path in generated:
         if path.is_symlink() or (path.exists() and path.resolve() != path.absolute()):
             raise LauncherError(f"Shared/symlinked generated directory: {path}. Update its owning checkout instead.")
         if path.exists() and not path.is_dir():
@@ -139,14 +194,21 @@ def synchronize(install: Installation, extras: list[str], *, python: bool = True
         run([uv, "pip", "check", "--python", str(install.python)], cwd=install.root, env=env)
     if node:
         print("Synchronizing interface dependencies from package-lock.json…", flush=True)
-        run([npm, "ci", "--no-audit", "--no-fund"], cwd=install.ui, capture=False, timeout=900)
+        for package in source_ui_packages(install):
+            run([npm, "ci", "--no-audit", "--no-fund"], cwd=package, capture=False, timeout=900)
+        if gui_enabled(install):
+            run([node_command(), "node_modules/electron/install.js"], cwd=install.root / "ui-gui",
+                capture=False, timeout=900)
     if build:
-        run([npm, "run", "build"], cwd=install.ui, capture=False, timeout=600)
+        for package in source_ui_packages(install):
+            run([npm, "run", "build"], cwd=package, capture=False, timeout=600)
 
 
 def validate(install: Installation) -> None:
     python_health(install)
     node_health(install)
+    if gui_enabled(install):
+        gui_health(install)
     if not (install.ui / "node_modules/tsx/dist/cli.mjs").is_file():
         raise LauncherError("The Ink interface is incomplete. Run astra setup.")
     # Syntax check all application modules without starting model clients or services.
@@ -178,6 +240,10 @@ def record_environment(install: Installation, extras: list[str]) -> None:
         "python": run([str(install.python), "-c", "import sys;print(sys.version.split()[0])"], cwd=install.root),
         "node": check_node(install.root),
     })
+    if gui_enabled(install):
+        write_json(install.control / "gui-environment.json", {
+            "schema": 1, "root": str(install.root), "fingerprint": gui_fingerprint(install),
+        })
 
 
 def diagnostics(install: Installation) -> dict:
@@ -199,6 +265,15 @@ def diagnostics(install: Installation) -> dict:
                 problems.append({"component": "environment", "message": "Dependencies are unverified or changed. Run astra setup."})
         except LauncherError as exc:
             problems.append({"component": "environment", "message": str(exc)})
+        if gui_enabled(install):
+            try:
+                if not gui_ready(install):
+                    raise LauncherError("Desktop dependencies are unverified or changed. Run astra setup --gui.")
+                gui_health(install)
+            except LauncherError as exc:
+                problems.append({"component": "gui", "message": str(exc)})
+        report["gui"] = {"enabled": gui_enabled(install),
+                         "healthy": gui_enabled(install) and not any(p["component"] == "gui" for p in problems)}
     if report["pending_update"]:
         problems.append({"component": "update", "message": "Interrupted update: run astra update --recover."})
     if report["pending_services"]:

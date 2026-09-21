@@ -6,7 +6,7 @@
 
 Astra 主要通过模型 API 帮你查资料、处理文件和操作应用。对话和运行状态保存在你的机器上，也支持连接可选的本地模型服务。
 
-[快速开始](#快速开始) · [ChatGPT 登录](#chatgpt--codex) · [常用命令](#常用命令) · [更新与数据](#更新与数据) · [文档导航](#文档导航)
+[快速开始](#快速开始) · [ChatGPT 登录](#chatgpt--codex) · [桌面预览版](docs/zh-CN/gui.md) · [常用命令](#常用命令) · [更新与数据](#更新与数据) · [文档导航](#文档导航)
 
 ## 可以做什么
 
@@ -46,6 +46,22 @@ cd Astra
 ```
 
 安装会准备 Python 环境和终端界面，将 `astra` 注册到用户 PATH，并在缺少 `.env` 时创建它。已有配置会保留。
+
+### 可选：桌面预览版
+
+源码中提供了 Electron 桌面预览版，需要 **Node.js 22.12+**：
+
+```text
+astra setup --gui
+astra --gui
+```
+
+要一次安装桌面组件并注册全局命令，在源码目录运行 macOS/Linux 的
+`./astra.sh setup --gui --install-command`，或 Windows 的
+`.\astra.bat setup --gui --install-command`。随后打开新终端，即可在项目目录运行
+`astra --gui`；直接运行 `astra` 仍进入终端界面。安装前请先退出正在运行的 Astra 会话，以便更新依赖环境。
+启用 GUI 后才下载对应组件。目前可使用对话、模型登录、后台会话、审批与文件差异；
+完整 TUI 功能对等和跨平台原生验收仍在进行。详见[桌面指南及当前边界](docs/zh-CN/gui.md)。
 
 ### 2. 连接模型
 

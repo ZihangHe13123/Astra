@@ -164,8 +164,9 @@ class SessionStore:
         os.replace(tmp, self.hindsight_sync_path)
         return self.hindsight_sync_path
 
-    def load(self) -> dict[str, Any]:
-        self.recover_interrupted()
+    def load(self, *, readonly: bool = False) -> dict[str, Any]:
+        if not readonly:
+            self.recover_interrupted()
         data = dict(DEFAULT_SESSION_DATA)
         data["messages"] = []
 
@@ -320,9 +321,9 @@ class SessionStore:
         )
         self._run_id = ""
 
-    def export_markdown(self, name: str, out: Path) -> Path:
-        data = self.load()
-        out.parent.mkdir(parents=True, exist_ok=True)
+    def markdown(self, name: str) -> str:
+        """Render the complete existing export without mutating session storage."""
+        data = self.load(readonly=True)
         lines = [f"# Session: {name}", ""]
         for msg in data.get("messages", []):
             role = msg.get("role", "unknown")
@@ -344,8 +345,12 @@ class SessionStore:
                     value = event.get(key)
                     if value not in (None, "", [], {}):
                         lines.extend([f"**{key}:**", "", str(value), ""])
-        with open(out, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines).rstrip() + "\n")
+        return "\n".join(lines).rstrip() + "\n"
+
+    def export_markdown(self, name: str, out: Path) -> Path:
+        markdown = self.markdown(name)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(markdown, encoding="utf-8")
         return out
 
     def _read_json(self, path: Path) -> dict[str, Any] | None:

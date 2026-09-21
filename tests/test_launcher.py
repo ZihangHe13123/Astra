@@ -951,3 +951,71 @@ def test_native_windows_argument_cwd_and_exit_forwarding(tmp_path, wrapper, shel
                             capture_output=True, text=True, encoding="utf-8", check=False)
     assert result.returncode == 23, result.stdout + result.stderr
     assert json.loads(result.stdout) == [["version", "two words", "中文", "literal!bang", "a & b", "100%literal"], str(tmp_path)]
+
+
+def test_gui_is_opt_in_and_shared_core_precedes_clients(source):
+    install, _ = source
+    (install.root / "ui-core").mkdir()
+    (install.root / "ui-core/package.json").write_text("{}")
+    (install.root / "ui-core/package-lock.json").write_text("{}")
+    assert [p.name for p in dependencies.source_ui_packages(install)] == ["ui-core", "ui-tui"]
+    assert [p.name for p in dependencies.source_ui_packages(install, gui=True)] == ["ui-core", "ui-tui", "ui-gui"]
+    before = dependencies.fingerprint(install)
+    (install.root / "ui-gui").mkdir()
+    (install.root / "ui-gui/package.json").write_text('{"changed":true}')
+    assert dependencies.fingerprint(install) == before
+    (install.root / "ui-core/package-lock.json").write_text('{"changed":true}')
+    assert dependencies.fingerprint(install) != before
+
+
+def test_failed_gui_setup_restores_component_choice_and_files(source, monkeypatch):
+    install, _ = source
+    generated = install.root / "ui-gui/dist"
+    generated.mkdir(parents=True)
+    (generated / "old.txt").write_text("old")
+    def fail(inst, _extras):
+        assert dependencies.gui_enabled(inst)
+        (generated / "old.txt").write_text("broken")
+        raise LauncherError("GUI build failed")
+    monkeypatch.setattr(dependencies, "synchronize", fail)
+    with pytest.raises(LauncherError, match="restored"):
+        setup.setup_source(install, [], gui=True)
+    assert not dependencies.gui_enabled(install)
+    assert (generated / "old.txt").read_text() == "old"
+    assert not (install.control / "gui-environment.json").exists()
+    assert_private_data(install)
+
+
+def test_gui_health_does_not_download_electron(source, monkeypatch):
+    install, _ = source
+    monkeypatch.setattr(dependencies, "run", lambda *args, **kwargs: "")
+    with pytest.raises(LauncherError, match="Electron binary missing"):
+        dependencies.gui_health(install)
+    assert not (install.root / "ui-gui").exists()
+
+
+def test_gui_entry_is_separate_from_default_tui(source, monkeypatch):
+    from agent.launcher import gui
+    install, _ = source
+    calls = []
+    monkeypatch.setattr(gui, "launch_gui", lambda inst: calls.append("gui") or 0)
+    monkeypatch.setattr(cli, "launch", lambda inst, **kwargs: calls.append("tui") or 0)
+    assert cli.main(["--gui"], root=install.root) == 0
+    assert cli.main([], root=install.root) == 0
+    assert calls == ["gui", "tui"]
+    assert cli.parser().parse_args(["setup", "--gui"]).setup_gui
+    with pytest.raises(SystemExit):
+        cli.main(["--gui", "--tui"], root=install.root)
+
+
+def test_gui_code_updates_rebuild_only_when_enabled(source, monkeypatch):
+    install, seed = source
+    (seed / "ui-gui").mkdir()
+    after = advance(seed, "ui-gui/change.ts")
+    git_command(install.root, "fetch", "origin")
+    before = git_command(install.root, "rev-parse", "HEAD")
+    monkeypatch.setattr(dependencies, "is_ready", lambda inst: True)
+    monkeypatch.setattr(dependencies, "gui_ready", lambda inst: True)
+    assert update.environment_plan(install, before, after, False) == {"python":False,"node":False,"build":False}
+    write_json(install.control / "installation.json", {"schema":1,"root":str(install.root),"gui":True})
+    assert update.environment_plan(install, before, after, False) == {"python":False,"node":False,"build":True}

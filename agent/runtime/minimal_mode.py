@@ -122,6 +122,7 @@ class MinimalModeController:
         # No compressor: dsh minimal has no context compaction, and long
         # tool-heavy sessions must not silently fold tool results.
         minimal.set_system_prompt(MINIMAL_SYSTEM_PROMPT)
+        minimal.enforce_session_ownership = work.enforce_session_ownership
         minimal.set_session(str(path))
         if not minimal.load():
             SessionStore(path).save({

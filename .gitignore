@@ -154,3 +154,9 @@ persona.local.json
 
 # Installation-local executable mode extensions
 /local_mode.py
+# Desktop and shared client build outputs
+/ui-core/dist/
+/ui-gui/dist/
+/ui-gui/test-results/
+/ui-gui/playwright-report/
+/output/playwright/

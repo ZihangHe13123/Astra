@@ -15,6 +15,7 @@ from .session_store import SessionStore
 
 if TYPE_CHECKING:
     from .react import ReActAgent
+    from agent.ui.session_ownership import SessionLease
 
 API_VERSION = 1
 _COMMAND = re.compile(r"/[a-z][a-z0-9_-]{0,31}\Z")
@@ -57,6 +58,10 @@ class LocalMode:
                 if not callable(getattr(controller, method, None)):
                     raise ValueError("Incomplete local mode controller")
         self.controller = controller
+        # Extensions predate context-level ownership and may create their own
+        # AgentContext. Keep the shared writer lease in the host so they cannot
+        # accidentally bypass multi-window/TUI/GUI session exclusion.
+        self._session_lease: SessionLease | None = None
         self.command = command
         self.label = label
         self.description = description
@@ -97,13 +102,34 @@ class LocalMode:
         return self.controller
 
     def enter(self, path: Path) -> bool:
-        return self._controller().enter(path)
+        from agent.ui.session_ownership import claim_session
+
+        controller = self._controller()
+        lease = claim_session(path)
+        try:
+            entered = controller.enter(path)
+            if entered:
+                self._session_lease = lease
+            return entered
+        finally:
+            del lease
 
     def switch(self, path: Path) -> None:
-        self._controller().switch(path)
+        from agent.ui.session_ownership import claim_session
+
+        controller = self._controller()
+        lease = claim_session(path)
+        try:
+            controller.switch(path)
+            self._session_lease = lease
+        finally:
+            del lease
 
     def leave(self) -> bool:
-        return self._controller().leave()
+        left = self._controller().leave()
+        if left:
+            self._session_lease = None
+        return left
 
     def undo_last_reply(self) -> tuple[bool, str]:
         return self._controller().undo_last_reply()
@@ -156,7 +182,7 @@ class LocalMode:
         if not store.exists:
             return 0
         try:
-            return len(store.load().get("messages", []))
+            return len(store.load(readonly=True).get("messages", []))
         except KeyError:
             return 0
 

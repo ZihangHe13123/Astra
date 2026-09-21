@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 
+from agent.runtime.json_preferences import update_preferences
+
 from .models import model_profiles, resolve_profile_key
 
 
@@ -49,25 +51,11 @@ def save_selected_model(model: str, valid_models: set[str] | None = None) -> Pat
         raise ValueError(f"Unknown model: {model}")
 
     path = model_settings_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = {}
-    try:
-        existing = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(existing, dict):
-            data.update(existing)
-    except (OSError, json.JSONDecodeError):
-        pass
-
-    data["selected_model"] = model
-    previous = data.get("recent_models", [])
-    data["recent_models"] = [model, *[m for m in previous if isinstance(m, str) and m != model]][:8] if isinstance(previous, list) else [model]
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
-    return path
+    def change(data):
+        data["selected_model"] = model
+        previous = data.get("recent_models", [])
+        data["recent_models"] = [model, *[m for m in previous if isinstance(m, str) and m != model]][:8] if isinstance(previous, list) else [model]
+    return update_preferences(path, change)
 
 
 def resolve_startup_model(env_model: str, env_base_url: str) -> tuple[str, str]:

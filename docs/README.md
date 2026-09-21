@@ -5,14 +5,15 @@
 Start with the [English homepage](../README.md) for a short introduction and quick
 start. Common guides are available in both languages; use the
 [Chinese documentation index](zh-CN/README.md) to keep reading in Chinese.
-Low-level designs and historical acceptance references remain in English and are
-labelled in the Chinese navigation.
+Low-level designs and historical acceptance references retain their original
+language; the indexes label language-specific references.
 
 ## Installation and daily use
 
 | Task | Guide |
 | --- | --- |
 | Install, update, keep local changes or recover an interrupted update | [Launcher and updates](launcher-update.md) |
+| Use the source desktop preview, model login and file diffs | [Desktop GUI](gui.md) |
 | Select a model, adjust reasoning and use terminal commands | [Everyday use](usage.md) |
 | Restart safely or check back within the current session | [Session lifecycle](session-lifecycle.md) |
 | Configure sandboxing, host file access and tool permissions | [Tool execution](execution.md) |
@@ -31,6 +32,9 @@ labelled in the Chinese navigation.
 | Diagnose slow responses and tools | [Runtime profiling](runtime-responsiveness.md) |
 
 ## How Astra works
+
+Desktop GUI: [architecture, current implementation and TUI parity targets (Chinese)](design/gui.md).
+The source preview is available; full feature and native platform acceptance remains in progress.
 
 | Area | Reference |
 | --- | --- |

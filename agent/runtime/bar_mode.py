@@ -269,6 +269,7 @@ class BarModeController:
         ))
         bar.compressor = ContextCompressor(self.agent.llm)
         bar.compaction_observer = work.compaction_observer
+        bar.enforce_session_ownership = work.enforce_session_ownership
         bar.set_session(str(path))
         if not bar.load():
             SessionStore(path).save({

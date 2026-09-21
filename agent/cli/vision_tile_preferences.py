@@ -5,6 +5,8 @@ from agent.runtime.paths import state_path
 import json
 import os
 from pathlib import Path
+
+from agent.runtime.json_preferences import update_preferences
 from typing import Protocol
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -36,18 +38,7 @@ def load_vision_tiles_enabled() -> bool:
 
 def save_vision_tiles_enabled(enabled: bool) -> Path:
     """Atomically persist the tiling preference without discarding other settings."""
-    path = vision_tile_settings_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        loaded = json.loads(path.read_text(encoding="utf-8"))
-        data = dict(loaded) if isinstance(loaded, dict) else {}
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        data = {}
-    data["vision_tiles_enabled"] = bool(enabled)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(data, ensure_ascii=True, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
-    return path
+    return update_preferences(vision_tile_settings_path(), lambda data: data.update(vision_tiles_enabled=bool(enabled)))
 
 
 def execute_vision_tiles_command(agent: VisionTileAgent, args: list[str]) -> tuple[str, str]:

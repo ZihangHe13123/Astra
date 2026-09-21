@@ -129,3 +129,41 @@ def test_provider_flow_over_real_ipc(tmp_path, monkeypatch, unconfigured):
         server.server_close()
     for path in (tmp_path / "sessions").glob("*.json*"):
         assert "PRIVATE-CONNECT-KEY" not in path.read_text()
+
+
+def test_desktop_model_selection_receipts_are_correlated_without_changing_tui(tmp_path, monkeypatch):
+    monkeypatch.setenv("ASTRA_HOME", str(tmp_path / "state"))
+    proc, _, _, wait = _start_question_protocol_backend(tmp_path, 0, "desktop-model-selection")
+
+    def send(payload):
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps(payload) + "\n")
+        proc.stdin.flush()
+
+    try:
+        initial = wait(lambda e: e.get("type") == "model_info")
+        original = initial["model_key"]
+        send({"type": "command", "cmd": "/model definitely-missing", "request_id": "select-missing"})
+        missing = wait(lambda e: e.get("type") == "model_selection_result")
+        assert missing["request_id"] == "select-missing"
+        assert missing["model_key"] == original
+        assert missing["code"] == "unknown_model"
+        assert "Unknown model: definitely-missing" in missing["error"]
+        assert "Current model unchanged" in missing["error"]
+
+        selector = "test::another-model"
+        send({"type": "command", "cmd": f"/model {selector}", "request_id": "select-valid"})
+        selected = wait(lambda e: e.get("type") == "model_selection_result")
+        assert selected["request_id"] == "select-valid"
+        assert selected["model_key"] == selector
+        assert not selected["error"]
+        assert json.loads((tmp_path / "settings.json").read_text())["selected_model"] == selector
+
+        # The ordinary TUI command retains the existing output/error contract.
+        send({"type": "command", "cmd": "/model definitely-missing"})
+        tui = wait(lambda e: e.get("type") == "tool_result" and e.get("name") == "model")
+        assert "request_id" not in tui
+        assert tui["error"] == ""
+        assert tui["output"].startswith("Unknown model: definitely-missing")
+    finally:
+        _stop_protocol_backend(proc)

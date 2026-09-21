@@ -7,6 +7,8 @@ import os
 from dataclasses import replace
 from pathlib import Path
 
+from agent.runtime.json_preferences import update_preferences
+
 from agent.runtime.deepseek import is_deepseek_model
 from agent.runtime.llm import LLMConfig
 
@@ -48,16 +50,11 @@ def _validate(effort: str) -> None:
 def save_reasoning_effort(effort: str) -> Path:
     """Save the intensity and retire both old mode keys without touching other settings."""
     _validate(effort)
-    path = _settings_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = _read_settings()
-    data["reasoning_effort"] = effort
-    data.pop("agent_mode", None)
-    data.pop("code_mode", None)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
-    return path
+    def change(data):
+        data["reasoning_effort"] = effort
+        data.pop("agent_mode", None)
+        data.pop("code_mode", None)
+    return update_preferences(_settings_path(), change)
 
 
 def apply_reasoning_effort(config: LLMConfig, effort: str | None = None) -> LLMConfig:

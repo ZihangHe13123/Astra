@@ -331,20 +331,22 @@ class ApprovalInbox:
     def cancel(self, request_id: str) -> ApprovalRecord | None:
         return self._transition_pending(request_id, "cancelled")
 
-    def recover_orphaned(self) -> list[ApprovalRecord]:
+    def recover_orphaned(self, *, session_id: str | None = None) -> list[ApprovalRecord]:
         """Mark approvals whose waiting coroutine belonged to an old process."""
         now = _now()
         with self._lock, self._connection() as db:
             rows = db.execute(
                 "SELECT request_id FROM approval_requests WHERE state='pending'"
+                + (" AND session_id=?" if session_id is not None else ""),
+                (session_id,) if session_id is not None else (),
             ).fetchall()
             request_ids = [str(row["request_id"]) for row in rows]
             if request_ids:
                 db.execute(
                     """UPDATE approval_requests
                        SET state='orphaned', updated_at=?, resolved_at=?
-                       WHERE state='pending'""",
-                    (now, now),
+                       WHERE state='pending'""" + (" AND session_id=?" if session_id is not None else ""),
+                    (now, now, session_id) if session_id is not None else (now, now),
                 )
         return [
             record

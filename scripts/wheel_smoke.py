@@ -25,6 +25,7 @@ def check_source_distribution(path: Path) -> None:
     blocked_parts = {
         ".git", ".hg", ".venv", ".venv-wsl", ".logs", ".tmp", ".worktrees",
         ".build", ".swiftpm", "node_modules", "__pycache__", ".pytest_cache",
+        ".ruff_cache", ".mypy_cache", ".cache", ".vite", "output", "test-results", "playwright-report",
     }
     names = set()
     with tarfile.open(path) as archive:
@@ -39,17 +40,27 @@ def check_source_distribution(path: Path) -> None:
             )
             private = (
                 bool(blocked_parts.intersection(parts))
-                or name == "persona.local.json"
+                or name in {"persona.local.json", ".DS_Store"}
                 or (name.startswith(".env") and name != ".env.example")
-                or PurePosixPath(relative).suffix in {".pem", ".p12", ".pfx", ".key"}
-                or relative.startswith(("docs/superpowers/", "docs/validation/", "ui-tui/dist/", "evals/coding/results/"))
+                or PurePosixPath(relative).suffix in {".pem", ".p12", ".pfx", ".key", ".pyc", ".pyo", ".tsbuildinfo"}
+                or relative.startswith((
+                    "docs/superpowers/", "docs/validation/", "evals/coding/results/",
+                    "ui-core/dist/", "ui-gui/dist/", "ui-tui/dist/",
+                ))
             )
             if not member.isfile() or ".." in parts or member.name.startswith("/") or not allowed or private:
                 raise SystemExit(f"Source distribution contains a non-public path: {relative}")
             names.add(relative)
     required = {
         "agent/cli/main.py", "agent/runtime/prompts.py", "config/models.yaml",
-        "ui-tui/src/index.tsx", "astra.py", "README.md", "pyproject.toml",
+        "astra.py", "README.md", "pyproject.toml",
+        "ui-core/package.json", "ui-core/package-lock.json", "ui-core/tsconfig.json",
+        "ui-core/src/backend-protocol.ts", "ui-core/src/backend-handshake.ts", "ui-core/src/types.ts",
+        "ui-core/src/session-state.ts", "ui-core/src/agent-team-state.ts", "ui-core/src/turn-changes.ts",
+        "ui-gui/package.json", "ui-gui/package-lock.json", "ui-gui/tsconfig.json",
+        "ui-gui/build.mjs", "ui-gui/index.html", "ui-gui/src/main/index.ts",
+        "ui-gui/src/preload/index.ts", "ui-gui/src/renderer/index.tsx", "ui-gui/src/bridge.ts",
+        "ui-tui/package.json", "ui-tui/package-lock.json", "ui-tui/tsconfig.json", "ui-tui/src/index.tsx",
     }
     if missing := required - names:
         raise SystemExit(f"Source distribution is missing public inputs: {sorted(missing)}")

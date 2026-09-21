@@ -180,12 +180,14 @@ class TaskStore:
             db.execute("DROP INDEX IF EXISTS idx_task_runs_case_updated")
             db.execute("CREATE INDEX IF NOT EXISTS idx_task_runs_status_scheduled ON task_runs(status, scheduled_at)")
 
-    def recover_interrupted(self) -> int:
+    def recover_interrupted(self, *, session_id: str | None = None) -> int:
         """Mark work left in-flight by a previous process as interrupted/unknown."""
         now = _now()
         with self._lock, self._connection() as db:
             runs = db.execute(
                 "SELECT id FROM task_runs WHERE status IN ('pending','running','cancelling')"
+                + (" AND session_id=?" if session_id is not None else ""),
+                (session_id,) if session_id is not None else (),
             ).fetchall()
             run_ids = [row["id"] for row in runs]
             if not run_ids:

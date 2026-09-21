@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 
+from agent.runtime.json_preferences import update_preferences
+
 from agent.sandbox.router import SandboxRouter
 
 
@@ -39,20 +41,7 @@ def resolve_startup_sandbox_mode(env_mode: str) -> str:
 def save_selected_sandbox_mode(mode: str) -> Path:
     if mode not in VALID_SANDBOX_MODES:
         raise ValueError(f"Unknown sandbox mode: {mode}")
-    path = sandbox_settings_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = {}
-    try:
-        existing = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(existing, dict):
-            data.update(existing)
-    except (OSError, json.JSONDecodeError):
-        pass
-    data["sandbox_mode"] = mode
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
-    return path
+    return update_preferences(sandbox_settings_path(), lambda data: data.update(sandbox_mode=mode))
 
 
 def execute_sandbox_command(router: SandboxRouter, args: list[str]) -> tuple[str, str]:

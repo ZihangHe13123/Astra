@@ -111,7 +111,7 @@ def legacy_processes(install: Installation) -> list[str]:
         if pid in {str(os.getpid()), str(os.getppid())}:
             continue
         normalized = os.path.normcase(command)
-        runtime_path = any(os.sep + name + os.sep in normalized for name in (".venv", "ui-tui"))
+        runtime_path = any(os.sep + name + os.sep in normalized for name in (".venv", "ui-tui", "ui-gui"))
         if needle in normalized and runtime_path:
             # Report identities only; process command lines can contain credentials.
             module = re.search(r"(?:^|\s)-m\s+([a-zA-Z0-9_.]+)", command)
@@ -134,13 +134,14 @@ def preflight(install: Installation, *, allowed_pids: set[int] | None = None) ->
 
 def environment_plan(install: Installation, before: str, target: str, repair: bool,
                      local_files: list[str] | None = None) -> dict[str, bool]:
-    if repair or not dependencies.is_ready(install):
+    if repair or not dependencies.is_ready(install) or (dependencies.gui_enabled(install) and not dependencies.gui_ready(install)):
         return {"python": True, "node": True, "build": True}
     changed = set(git(install.root, "diff", "--name-only", before, target).splitlines())
     changed.update(local_files or [])
     python = bool(changed & {"pyproject.toml", "uv.lock"})
-    node = bool(changed & {"ui-tui/package.json", "ui-tui/package-lock.json"})
-    build = node or any(name.startswith("ui-tui/") for name in changed)
+    interfaces = ["ui-tui", "ui-core"] + (["ui-gui"] if dependencies.gui_enabled(install) else [])
+    node = bool(changed & {f"{ui}/{name}" for ui in interfaces for name in ("package.json", "package-lock.json")})
+    build = node or any(name.startswith(tuple(f"{ui}/" for ui in interfaces)) for name in changed)
     return {"python": python, "node": node, "build": build}
 
 
@@ -178,10 +179,13 @@ def update_source(install: Installation, *, check: bool = False, recover: bool =
                     "channel": channel, "local_changes": bool(local.paths), "local_details": local.summary(),
                     "process_holders": legacy_processes(install), "installation": str(install.root),
                     "managed_services": services.summary()}
-        if before == target and not repair and dependencies.is_ready(install):
+        if before == target and not repair and dependencies.is_ready(install) and (
+                not dependencies.gui_enabled(install) or dependencies.gui_ready(install)):
             try:
                 dependencies.python_health(install)
                 dependencies.node_health(install)
+                if dependencies.gui_enabled(install):
+                    dependencies.gui_health(install)
             except LauncherError:
                 repair = True
             else:
@@ -214,10 +218,13 @@ def update_source(install: Installation, *, check: bool = False, recover: bool =
             else:
                 policy = "keep"
         local.unchanged()
-        if not repair and dependencies.is_ready(install):
+        if not repair and dependencies.is_ready(install) and (
+                not dependencies.gui_enabled(install) or dependencies.gui_ready(install)):
             try:
                 dependencies.python_health(install)
                 dependencies.node_health(install)
+                if dependencies.gui_enabled(install):
+                    dependencies.gui_health(install)
             except LauncherError:
                 repair = True
             else:
@@ -228,8 +235,11 @@ def update_source(install: Installation, *, check: bool = False, recover: bool =
         dependencies.check_node(install.root)
         extras = dependencies.enabled_extras(install)
         plan = environment_plan(install, before, target, repair, local.paths)
-        generated = tuple(name for name, selected in ((".venv", plan["python"]), ("ui-tui/node_modules", plan["node"]),
-                                                       ("ui-tui/dist", plan["build"])) if selected)
+        # Include the shared package on upgrades that introduce it, before it
+        # exists in the old checkout. Disabled GUI stays optional.
+        interfaces = ["ui-tui", "ui-core"] + (["ui-gui"] if dependencies.gui_enabled(install) else [])
+        generated = tuple(([".venv"] if plan["python"] else []) + [f"{ui}/{folder}"
+                          for ui in interfaces for folder, selected in (("node_modules", plan["node"]), ("dist", plan["build"])) if selected])
         transaction = Transaction(install, before, target, generated=generated)
         if local.paths:
             transaction.attach_local(local, policy)

@@ -14,12 +14,14 @@ live acceptance may opt into inherited settings with the
 
 ## Reproducible development and maintenance setup
 
-`uv.lock` and `ui-tui/package-lock.json` are committed. With Python 3.11+, Node
+`uv.lock` and the lockfiles in `ui-core`, `ui-tui` and `ui-gui` are committed. With Python 3.11+, Node
 18+ and [uv](https://docs.astral.sh/uv/) installed, run from the repository root
 on any supported platform:
 
 ```text
 uv sync --locked --python 3.11 --extra dev --extra mcp --extra tracing --extra server --extra notebook
+npm --prefix ui-core ci
+npm --prefix ui-core run build
 npm --prefix ui-tui ci
 ```
 
@@ -33,8 +35,12 @@ conflict checks still apply. The manual commands above remain useful for
 development and release checks; use `astra setup` afterward to record the
 verified environment.
 
+For desktop development use Node.js 22.12+ and `astra setup --gui --extra dev`.
+See [desktop checks](gui.md#development-checks) for the separate GUI acceptance suite.
+The normal release gate builds and tests `ui-core` before the TUI; GUI checks remain optional.
+
 The Python wheel contains the Agent, bundled model profiles and Session Recall.
-The Ink UI, repository-local skills and macOS native helper require the source
+The Ink and Electron UIs, repository-local skills and macOS native helper require the source
 checkout and their respective setup steps.
 
 ## Maintenance entry points

@@ -11,8 +11,9 @@ from .common import LauncherError, git, read_json, write_json
 from .installation import Installation
 from .local_changes import LocalChanges
 
-GENERATED = (".venv", "ui-tui/node_modules", "ui-tui/dist")
-RECORDS = ("installation.json", "environment.json")
+GENERATED = (".venv", "ui-tui/node_modules", "ui-tui/dist", "ui-core/node_modules", "ui-core/dist",
+             "ui-gui/node_modules", "ui-gui/dist")
+RECORDS = ("installation.json", "environment.json", "gui-environment.json")
 
 
 def receipt(install: Installation, **fields) -> dict:

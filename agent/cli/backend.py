@@ -699,7 +699,8 @@ def _save_handoff(agent: ReActAgent, task_store: TaskStore | None, *, notes: str
 async def main():
     global _event_writer
     # Establish IPC before environment/model initialization, including failures.
-    _write_event({"type": "backend_hello", "protocol_version": 1})
+    _write_event({"type": "backend_hello", "protocol_version": 1,
+                  "capabilities": ["ui_queries", "session_ownership", "gui_ready"]})
     startup_started = time.perf_counter()
     load_project_env(PROJECT_ROOT)
     profile = RuntimeProfiler.from_env(PROJECT_ROOT)
@@ -720,6 +721,8 @@ async def _main(startup_started: float):
     global _runtime_event_stream, _event_writer
     restart = ControlledRestart(supported=os.getenv("ASTRA_TUI_RESTART") == "1")
     wakeups = SessionWakeups()
+    from agent.ui.submissions import Submissions
+    gui_submissions = Submissions()
     wakeup_context: contextvars.ContextVar[dict | None] = contextvars.ContextVar("session_wakeup", default=None)
     latest_user_request = ""
     exit_code = 0
@@ -740,15 +743,18 @@ async def _main(startup_started: float):
 
     _event_writer = OrderedEventWriter(_runtime_event_stream, _write_event)
 
+    from agent.ui.session_ownership import claim_session
+    initial_session_path = startup_session_path()
+    try:
+        startup_session_lease = claim_session(initial_session_path)
+    except OSError as exc:
+        _send({"type": "error", "message": str(exc), "code": "session_unavailable"})
+        return 1
+    startup_session_id = initial_session_path.stem
     task_store: TaskStore | None = None
     try:
         task_store = TaskStore()
-        recovered = await durable_io(task_store.recover_interrupted)
-        if recovered:
-            logger.warning(
-                "[backend] marked %s unfinished task(s) as interrupted",
-                recovered,
-            )
+        await durable_io(task_store.recover_interrupted, session_id=startup_session_id)
     except Exception as exc:
         print(f"[backend] task persistence disabled: {exc}", file=sys.stderr, flush=True)
 
@@ -756,7 +762,7 @@ async def _main(startup_started: float):
     orphaned_approvals = []
     try:
         approval_inbox = ApprovalInbox()
-        orphaned_approvals = approval_inbox.recover_orphaned()
+        orphaned_approvals = await durable_io(approval_inbox.recover_orphaned, session_id=startup_session_id)
     except Exception as exc:
         print(f"[backend] approval inbox persistence disabled: {exc}", file=sys.stderr, flush=True)
     startup_profiler.mark("durable_state")
@@ -1013,7 +1019,7 @@ async def _main(startup_started: float):
             return "deny"
         request_id = str(request.get("request_id") or uuid.uuid4().hex)
         future = asyncio.get_running_loop().create_future()
-        surface = "channel" if channel_name else "tui"
+        surface = "channel" if channel_name else ("gui" if os.getenv("ASTRA_UI_SURFACE") == "gui" else "tui")
         session_id = (
             Path(agent_holder["agent"].context.session_path).stem
             if agent_holder and agent_holder["agent"].context.session_path
@@ -1119,7 +1125,11 @@ async def _main(startup_started: float):
         limit, llm_config.max_tokens, model=llm_config.model, provider=llm_config.provider,
     )
     agent.llm.config.context_limit = limit
-    agent.context.set_session(str(startup_session_path()))
+    agent.context.enforce_session_ownership = True
+    agent.context.set_session(str(initial_session_path))
+    # A desktop host can own several live backends. Only recover records from
+    # the session for which this process has already acquired the writer lease.
+    del startup_session_lease  # the active context now owns this lease
     bus.register(agent)
     bar_mode = BarModeController(agent, load_bar_output_mode())
     register_bar_tools(tools, bar_mode)
@@ -1773,6 +1783,13 @@ async def _main(startup_started: float):
         finally:
             request.pop("api_key", None)
 
+    def _send_model_result(result: dict, request_id: str) -> None:
+        if request_id:
+            _send({**result, "type": "model_selection_result",
+                   "request_id": request_id, "model_key": current_model_key})
+        else:
+            _send(result)
+
     async def _send_model_info(*, refresh: bool = False):
         if refresh:
             await _refresh_model_catalog()
@@ -1987,6 +2004,11 @@ async def _main(startup_started: float):
 
     if restored:
         await _send_history()
+
+    if os.getenv("ASTRA_UI_SURFACE") == "gui":
+        _send({"type": "yolo_status", "yolo": agent.tools.yolo})
+        _send({"type": "gui_ready", "workspace": str(Path(sandbox_workdir).resolve()),
+               "session_id": Path(agent.context.session_path).stem})
 
     channel_router = AgentChannelRouter(agent, agent_turn_lock, sessions_dir(PROJECT_ROOT),
                                         admission=lambda: not restart.draining)
@@ -2219,6 +2241,15 @@ async def _main(startup_started: float):
                 terminal_output_failed = cmd.get("reason") == "terminal_output_failure"
                 break
 
+            elif cmd.get("type") == "ui_query":
+                from agent.ui.queries import query
+                request_id = str(cmd.get("request_id", ""))[:128]
+                try:
+                    result = await asyncio.to_thread(query, cmd, agent=agent)
+                    _send({"type": "ui_query_result", "request_id": request_id, "result": result, "error": ""})
+                except Exception as exc:
+                    _send({"type": "ui_query_result", "request_id": request_id, "result": None, "error": str(exc)})
+
             elif cmd.get("type") == "restart_ack":
                 if restart.acknowledge(str(cmd.get("request_id") or "")):
                     try:
@@ -2306,12 +2337,13 @@ async def _main(startup_started: float):
             elif cmd.get("type") == "submission_status":
                 submission_id = cmd.get("submission_id")
                 if isinstance(submission_id, str) and len(submission_id) <= 128:
-                    _send(appshot_admission.status(submission_id))
+                    _send(gui_submissions.status(submission_id) if submission_id in gui_submissions.records
+                          else appshot_admission.status(submission_id))
 
             elif cmd.get("type") == "message":
                 if isinstance(cmd.get("text"), str):
                     latest_user_request = cmd["text"][:8000]
-                if cmd.get("appshots") or "submission_id" in cmd:
+                if cmd.get("appshots") or ("submission_id" in cmd and os.getenv("ASTRA_UI_SURFACE") != "gui"):
                     if active_wakeup and active_task is not None and not active_task.done():
                         _wakeup_event(wakeups.cancel("user_interrupted"), "Wakeup stopped for your new request.")
                         await _stop_wakeup_turn()
@@ -2325,11 +2357,29 @@ async def _main(startup_started: float):
                     })
                     _send({"type": "done"})
                     continue
-                max_bytes = int(os.getenv("MAX_IMAGE_UPLOAD_BYTES", str(10 * 1024 * 1024)))
-                msg = Msg(sender="user", role="user", content=build_user_message_content(text, max_bytes=max_bytes))
-                await _launch_message(msg, text)
+                sid = cmd.get("submission_id") if os.getenv("ASTRA_UI_SURFACE") == "gui" else None
+                if sid:
+                    receipt = gui_submissions.begin(cmd)
+                    if receipt is not None:
+                        _send(receipt)
+                        continue
+                try:
+                    max_bytes = int(os.getenv("MAX_IMAGE_UPLOAD_BYTES", str(10 * 1024 * 1024)))
+                    msg = Msg(sender="user", role="user", content=build_user_message_content(text, max_bytes=max_bytes))
+                    accepted = await _launch_message(msg, text)
+                except Exception as exc:
+                    accepted = False
+                    _send({"type": "error", "message": str(exc)})
+                if sid:
+                    _send(gui_submissions.finish(sid, accepted))
 
             elif cmd.get("type") == "image":
+                sid = cmd.get("submission_id") if os.getenv("ASTRA_UI_SURFACE") == "gui" else None
+                if sid:
+                    receipt = gui_submissions.begin(cmd)
+                    if receipt is not None:
+                        _send(receipt)
+                        continue
                 try:
                     latest_user_request = str(cmd.get("prompt", ""))[:8000]
                     max_bytes = int(os.getenv("MAX_IMAGE_UPLOAD_BYTES", str(10 * 1024 * 1024)))
@@ -2339,9 +2389,12 @@ async def _main(startup_started: float):
                         max_bytes=max_bytes,
                     )
                     msg = Msg(sender="user", role="user", content=blocks)
-                    await _launch_message(msg, f"/image {cmd.get('path', '')} {cmd.get('prompt', '')}".strip())
+                    accepted = await _launch_message(msg, f"/image {cmd.get('path', '')} {cmd.get('prompt', '')}".strip())
                 except Exception as e:
+                    accepted = False
                     _send({"type": "error", "message": str(e)})
+                if sid:
+                    _send(gui_submissions.finish(sid, accepted))
 
             elif cmd.get("type") == "refresh_models":
                 provider_id = str(cmd.get("provider_id", ""))
@@ -3349,9 +3402,14 @@ async def _main(startup_started: float):
                     await _send_model_info()
                 elif c.startswith("/model"):
                     arg = parse_model_command_argument(c)
+                    # Desktop selections have their own correlated receipt. A
+                    # late receipt must never settle another model selection.
+                    selection_id = cmd.get("request_id")
+                    if not isinstance(selection_id, str):
+                        selection_id = ""
                     if active_task is not None and not active_task.done():
-                        _send({"type": "tool_result", "name": "model", "output": "",
-                               "error": "Wait for the current reply or cancel it before switching models.", "code": "busy"})
+                        _send_model_result({"type": "tool_result", "name": "model", "output": "",
+                               "error": "Wait for the current reply or cancel it before switching models.", "code": "busy"}, selection_id)
                         continue
                     if arg:
                         # An explicit provider::model also supports unlisted/custom IDs.
@@ -3366,23 +3424,23 @@ async def _main(startup_started: float):
                                     valid_models=set(catalog.profiles) | {entry.key},
                                 )
                             except (ValueError, OSError) as exc:
-                                _send({
+                                _send_model_result({
                                     "type": "tool_result",
                                     "name": "model",
                                     "output": "",
                                     "error": f"Model switch rejected; current model unchanged: {exc}",
                                     "code": "provider_not_configured",
-                                })
+                                }, selection_id)
                             else:
                                 current_model_key = entry.key
                                 if not catalog.resolve(entry.key):
                                     catalog = ModelCatalog((*catalog.entries, entry), catalog.errors, catalog.statuses)
-                                _send({"type": "tool_result", "name": "model",
+                                _send_model_result({"type": "tool_result", "name": "model",
                                        "output": f"Model connection switched to: {entry.model_id}\n"
                                                  f"Provider: {entry.provider_label} @ {entry.base_url}\n"
                                                  f"Saved as startup default in {settings_path}.\n"
                                                  "Model access and tool support are checked when used.",
-                                       "error": "", "code": ""})
+                                       "error": "", "code": ""}, selection_id)
                         else:
                             lines = [f"Unknown model: {arg}. Available:"]
                             for provider in dict.fromkeys(item.provider_label for item in catalog.entries):
@@ -3391,8 +3449,10 @@ async def _main(startup_started: float):
                                     if item.provider_label == provider:
                                         marker = "*" if item.key == current_model_key else " "
                                         lines.append(f"    {marker} {item.model_id} ({item.key})")
-                            _send({"type": "tool_result", "name": "model",
-                                   "output": "\n".join(lines), "error": "", "code": ""})
+                            _send_model_result({"type": "tool_result", "name": "model",
+                                   "output": "\n".join(lines),
+                                   "error": f"Unknown model: {arg}. Current model unchanged." if selection_id else "",
+                                   "code": "unknown_model" if selection_id else ""}, selection_id)
                     else:
                         lines = [f"Current model: {agent.llm.config.model} @ {agent.llm.config.base_url}", "Available:"]
                         for provider in dict.fromkeys(item.provider_label for item in catalog.entries):
@@ -3403,8 +3463,8 @@ async def _main(startup_started: float):
                                     lines.append(f"    {marker} {item.model_id} ({item.key})")
                         for provider_id, error in catalog.errors.items():
                             lines.append(f"  [{provider_id}] unavailable: {error}")
-                        _send({"type": "tool_result", "name": "model",
-                               "output": "\n".join(lines), "error": "", "code": ""})
+                        _send_model_result({"type": "tool_result", "name": "model",
+                               "output": "\n".join(lines), "error": "", "code": ""}, selection_id)
                     _send({"type": "done"})
                     # update status bar with new model name
                     await _send_model_info()
@@ -3572,11 +3632,15 @@ async def _main(startup_started: float):
                             elif len(parts) >= 4 and parts[1] == "rename":
                                 old_name, new_name = parts[2], parts[3]
                                 old_path = session_path(old_name)
-                                rename_session(old_name, new_name)
-                                memory_store.rename_working(old_name, new_name)
                                 new_path = session_path(new_name)
-                                if Path(agent.context.session_path).resolve() == old_path.resolve():
-                                    agent.context.set_session(str(new_path))
+                                rename_lease = claim_session(new_path)
+                                try:
+                                    rename_session(old_name, new_name)
+                                    memory_store.rename_working(old_name, new_name)
+                                    if Path(agent.context.session_path).resolve() == old_path.resolve():
+                                        agent.context.set_session(str(new_path))
+                                finally:
+                                    del rename_lease
                                 _send_session_info()
                                 _send_session_list()
                                 _send_working_memory()

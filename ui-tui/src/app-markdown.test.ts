@@ -216,7 +216,7 @@ assert.match(hostileSummary, /\\u\{E0020\}/);
 assert.deepEqual(hostileAnswers, unchangedHostileAnswers);
 
 const appSource = readFileSync(new URL("./app.tsx", import.meta.url), "utf8");
-const typesSource = readFileSync(new URL("./types.ts", import.meta.url), "utf8");
+const typesSource = readFileSync(new URL("../../ui-core/src/types.ts", import.meta.url), "utf8");
 const appModule = await import("./app.js");
 const submitStreamLifecyclePolicy = (appModule as unknown as Record<string, unknown>)
   .submitStreamLifecyclePolicy;

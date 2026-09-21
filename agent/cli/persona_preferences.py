@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+from agent.runtime.json_preferences import update_preferences
+
 from agent.runtime.persona import PersonaState
 from agent.runtime.prompts import DEFAULT_PROMPT_PROFILE, get_prompt_profile, resolve_prompt_profile_name
 
@@ -31,20 +33,9 @@ def save_selected_persona(name: str) -> Path:
         raise ValueError(f"Unknown persona: {name}")
     name = resolved
 
-    path = model_settings_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    data = _read_settings(path)
     profile = get_prompt_profile(name)
-    data["selected_persona"] = name
-    data["persona_definition_version"] = profile.version
-    data["persona_state_revision"] = 0
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(path)
-    return path
+    return update_preferences(model_settings_path(), lambda data: data.update(
+        selected_persona=name, persona_definition_version=profile.version, persona_state_revision=0))
 
 
 def resolve_startup_persona(env_persona: str | None = None) -> str:

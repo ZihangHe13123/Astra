@@ -27,6 +27,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--cli", action="store_true", help="use the legacy text CLI explicitly")
     result.add_argument("--tui", action="store_true", help="use the legacy Textual UI explicitly")
     result.add_argument("--ink", action="store_true", help=argparse.SUPPRESS)
+    result.add_argument("--gui", action="store_true", help="open the desktop interface (requires astra setup --gui)")
     result.add_argument("--setup-only", action="store_true", help="compatibility alias for setup")
     result.add_argument("--root", type=Path, help=argparse.SUPPRESS)
     result.add_argument("--updater-child", action="store_true", help=argparse.SUPPRESS)
@@ -37,6 +38,7 @@ def parser() -> argparse.ArgumentParser:
         item.add_argument("--json", action="store_true")
     setup = commands.add_parser("setup", help="Prepare the locked source environment")
     setup.add_argument("--extra", action="append", default=[], help="enable an optional Python dependency group")
+    setup.add_argument("--gui", dest="setup_gui", action="store_true", help="also prepare the optional desktop interface")
     setup.add_argument("--repair", action="store_true", help="resynchronize even if the environment is recorded as current")
     setup.add_argument("--install-command", action="store_true", help="install a dedicated per-user astra command")
     setup.add_argument("--command-only", action="store_true", help="install the command without changing dependencies")
@@ -164,6 +166,10 @@ def choose_local_files(preview: dict) -> str:
 def main(argv: list[str] | None = None, *, root: Path | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     options = parser().parse_args(arguments)
+    if sum((options.gui, options.cli, options.tui, options.ink)) > 1:
+        parser().error("Choose only one interface: --gui, --cli, --tui or --ink.")
+    if options.gui and options.command:
+        parser().error("Use astra --gui to launch, or astra setup --gui to install desktop dependencies.")
     if options.command == "update" and (options.keep_local or options.overwrite_local) and (
             options.check or options.recover or options.repair):
         parser().error("Local-file choices apply to an update, not --check, --repair or --recover.")
@@ -183,7 +189,7 @@ def main(argv: list[str] | None = None, *, root: Path | None = None) -> int:
                 return isolated_maintenance(install, arguments)
             with contextlib.redirect_stdout(sys.stderr):
                 if command == "setup":
-                    value = {"outcome": "command installed"} if options.command_only else setup_source(install, options.extra, repair=options.repair)
+                    value = {"outcome": "command installed"} if options.command_only else setup_source(install, options.extra, repair=options.repair, gui=options.setup_gui)
                     if options.install_command or options.command_only:
                         value["command"] = str(install_command(install, bin_dir=options.bin_dir, modify_path=not options.no_path))
                 else:
@@ -202,6 +208,9 @@ def main(argv: list[str] | None = None, *, root: Path | None = None) -> int:
             value["running"] = active_instances(install)
             _display(value, as_json)
             return 0 if value["healthy"] else 1
+        if options.gui:
+            from .gui import launch_gui
+            return launch_gui(install)
         return launch(install, cli=options.cli, textual=options.tui,
                       activity=options.args if command == "activity" else None)
     except (LauncherError, OSError) as exc:

@@ -52,11 +52,16 @@ jobs:
         with:
           node-version: "22.23.1"
           cache: npm
-          cache-dependency-path: ui-tui/package-lock.json
+          cache-dependency-path: |
+            ui-tui/package-lock.json
+            ui-core/package-lock.json
       - name: Install locked Python dependencies
         run: uv sync --locked --extra dev --extra mcp --extra tracing --extra server --extra notebook
       - name: Check installed Python dependencies
         run: uv pip check
+      - name: Install and build shared UI protocol
+        working-directory: ui-core
+        run: npm ci && npm run build
       - name: Install locked TUI dependencies
         working-directory: ui-tui
         run: npm ci

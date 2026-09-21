@@ -4,7 +4,7 @@ import { formatVisionPreprocessMessage } from "./app.js";
 import type { VisionPreprocessEvent } from "./types.js";
 
 const appSource = readFileSync(new URL("./app.tsx", import.meta.url), "utf8");
-const typesSource = readFileSync(new URL("./types.ts", import.meta.url), "utf8");
+const typesSource = readFileSync(new URL("../../ui-core/src/types.ts", import.meta.url), "utf8");
 
 assert.match(typesSource, /type: "vision_preprocess"/);
 assert.match(appSource, /case "vision_preprocess"/);

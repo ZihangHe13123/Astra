@@ -1,0 +1,957 @@
+[
+  {
+    "command": "/image",
+    "description": "attach image path with optional prompt",
+    "group": "CHAT",
+    "id": "F01",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/bar",
+    "description": "open an isolated private night shift",
+    "group": "CHAT",
+    "id": "F02",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "enter",
+        "description": "open the latest isolated night shift",
+        "completion": "/bar enter",
+        "submitValue": "/bar enter"
+      },
+      {
+        "command": "new",
+        "description": "forget this shift and start another",
+        "completion": "/bar new",
+        "submitValue": "/bar new"
+      },
+      {
+        "command": "sip",
+        "description": "take one sip from the current drink",
+        "completion": "/bar sip",
+        "submitValue": "/bar sip"
+      },
+      {
+        "command": "leave",
+        "description": "close the bar and restore work context",
+        "completion": "/bar leave",
+        "submitValue": "/bar leave"
+      },
+      {
+        "command": "status",
+        "description": "show isolation state",
+        "completion": "/bar status",
+        "submitValue": "/bar status"
+      },
+      {
+        "command": "output",
+        "description": "choose atomic or streaming replies  ›",
+        "completion": "/bar output "
+      },
+      {
+        "command": "sessions",
+        "description": "browse saved private night shifts  ›",
+        "completion": "/bar sessions "
+      },
+      {
+        "command": "atomic",
+        "description": "validated turn · text and scene state commit together",
+        "completion": "/bar output atomic",
+        "submitValue": "/bar output atomic"
+      },
+      {
+        "command": "stream",
+        "description": "show prose immediately · scene tools update afterward",
+        "completion": "/bar output stream",
+        "submitValue": "/bar output stream"
+      },
+      {
+        "command": "status",
+        "description": "show the saved output mode",
+        "completion": "/bar output status",
+        "submitValue": "/bar output status"
+      },
+      {
+        "command": "back",
+        "description": "return to bar actions",
+        "completion": "/bar "
+      }
+    ]
+  },
+  {
+    "command": "/minimal",
+    "description": "open an isolated zero-injection coding session",
+    "group": "CHAT",
+    "id": "F03",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "enter",
+        "description": "open the latest isolated minimal session",
+        "completion": "/minimal enter",
+        "submitValue": "/minimal enter"
+      },
+      {
+        "command": "new",
+        "description": "start another saved minimal session",
+        "completion": "/minimal new",
+        "submitValue": "/minimal new"
+      },
+      {
+        "command": "leave",
+        "description": "close minimal and restore work context",
+        "completion": "/minimal leave",
+        "submitValue": "/minimal leave"
+      },
+      {
+        "command": "status",
+        "description": "show minimal isolation state",
+        "completion": "/minimal status",
+        "submitValue": "/minimal status"
+      },
+      {
+        "command": "sessions",
+        "description": "browse saved minimal sessions  ›",
+        "completion": "/minimal sessions "
+      },
+      {
+        "command": "back",
+        "description": "return to minimal actions",
+        "completion": "/minimal "
+      }
+    ]
+  },
+  {
+    "command": "/sip",
+    "description": "take one manual sip from the current bar drink",
+    "group": "CHAT",
+    "id": "F05",
+    "takes_args": false,
+    "options": []
+  },
+  {
+    "command": "/reset",
+    "description": "clear current conversation",
+    "group": "CHAT",
+    "id": "F06",
+    "takes_args": false,
+    "options": []
+  },
+  {
+    "command": "/compress",
+    "description": "compress context via LLM summary",
+    "group": "CHAT",
+    "id": "F07",
+    "takes_args": false,
+    "options": []
+  },
+  {
+    "command": "/undo",
+    "description": "remove the last model reply or the last N exchanges",
+    "group": "CHAT",
+    "id": "F08",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/retry",
+    "description": "remove the last reply and resend the last request",
+    "group": "CHAT",
+    "id": "F09",
+    "takes_args": false,
+    "options": []
+  },
+  {
+    "command": "/changes",
+    "description": "review the change ledger of recent turns",
+    "group": "CHAT",
+    "id": "F10",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/think",
+    "description": "toggle reasoning display",
+    "group": "CHAT",
+    "id": "F11",
+    "takes_args": false,
+    "options": []
+  },
+  {
+    "command": "/model",
+    "description": "show or switch model",
+    "group": "MODEL",
+    "id": "F12",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "Back to providers",
+        "description": "Choose another provider",
+        "completion": "/model "
+      }
+    ]
+  },
+  {
+    "command": "/mode",
+    "description": "set reasoning effort (low/high/max)",
+    "group": "MODEL",
+    "id": "F13",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "low",
+        "description": "light reasoning",
+        "completion": "/mode low",
+        "submitValue": "/mode low"
+      },
+      {
+        "command": "high",
+        "description": "standard reasoning (default)",
+        "completion": "/mode high",
+        "submitValue": "/mode high"
+      },
+      {
+        "command": "max",
+        "description": "deepest reasoning",
+        "completion": "/mode max",
+        "submitValue": "/mode max"
+      }
+    ]
+  },
+  {
+    "command": "/connect",
+    "description": "connect a provider and choose its model",
+    "group": "MODEL",
+    "id": "F14",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/persona",
+    "description": "show or switch prompt persona",
+    "group": "MODEL",
+    "id": "F15",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/search",
+    "description": "show or switch web search provider",
+    "group": "TOOLS",
+    "id": "F16",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "auto",
+        "description": "smart routing with provider fallback",
+        "completion": "/search auto",
+        "submitValue": "/search auto"
+      },
+      {
+        "command": "exa",
+        "description": "force Exa semantic search",
+        "completion": "/search exa",
+        "submitValue": "/search exa"
+      },
+      {
+        "command": "searxng",
+        "description": "force local SearXNG metasearch",
+        "completion": "/search searxng",
+        "submitValue": "/search searxng"
+      }
+    ]
+  },
+  {
+    "command": "/tool",
+    "description": "open latest or numbered tool result details",
+    "group": "TOOLS",
+    "id": "F17",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/gallery",
+    "description": "open latest or numbered image search gallery",
+    "group": "TOOLS",
+    "id": "F18",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/memory",
+    "description": "inspect or update working/core memory",
+    "group": "TOOLS",
+    "id": "F19",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "review",
+        "description": "discuss memory evidence and proposed corrections",
+        "completion": "/memory review ",
+        "submitValue": "/memory review"
+      },
+      {
+        "command": "status",
+        "description": "show current working and core memory",
+        "completion": "/memory status",
+        "submitValue": "/memory status"
+      },
+      {
+        "command": "remember",
+        "description": "store a stable agent or environment fact in MEMORY.md",
+        "completion": "/memory remember "
+      },
+      {
+        "command": "remember-user",
+        "description": "store a user profile or preference in USER.md",
+        "completion": "/memory remember-user "
+      },
+      {
+        "command": "working",
+        "description": "update a working-memory field",
+        "completion": "/memory working "
+      },
+      {
+        "command": "inspect",
+        "description": "inspect structured memory by query or id",
+        "completion": "/memory inspect "
+      },
+      {
+        "command": "timeline",
+        "description": "show lifecycle and supersession history",
+        "completion": "/memory timeline "
+      },
+      {
+        "command": "why",
+        "description": "show the last recall and retention decisions",
+        "completion": "/memory why",
+        "submitValue": "/memory why"
+      },
+      {
+        "command": "correct",
+        "description": "supersede one active memory with a correction",
+        "completion": "/memory correct "
+      },
+      {
+        "command": "forget",
+        "description": "forget an active core or structured memory",
+        "completion": "/memory forget "
+      },
+      {
+        "command": "import-core",
+        "description": "merge external Core Markdown edits",
+        "completion": "/memory import-core",
+        "submitValue": "/memory import-core"
+      },
+      {
+        "command": "clear-working",
+        "description": "clear this session's working memory",
+        "completion": "/memory clear-working",
+        "submitValue": "/memory clear-working"
+      }
+    ]
+  },
+  {
+    "command": "/skills",
+    "description": "list, inspect, or create local skills",
+    "group": "TOOLS",
+    "id": "F20",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "list",
+        "description": "list local skills",
+        "completion": "/skills list",
+        "submitValue": "/skills list"
+      },
+      {
+        "command": "show",
+        "description": "show a skill or supporting file",
+        "completion": "/skills show "
+      },
+      {
+        "command": "create",
+        "description": "draft a skill together before saving",
+        "completion": "/skills create ",
+        "submitValue": "/skills create"
+      }
+    ]
+  },
+  {
+    "command": "/learn",
+    "description": "discuss skill improvements, save, and undo changes",
+    "group": "TOOLS",
+    "id": "F21",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "status",
+        "description": "show direct skill learning status",
+        "completion": "/learn status",
+        "submitValue": "/learn status"
+      },
+      {
+        "command": "review",
+        "description": "discuss skill improvements and choose changes",
+        "completion": "/learn review",
+        "submitValue": "/learn review"
+      },
+      {
+        "command": "migrate",
+        "description": "import historical automatic summaries; preserve user skills",
+        "completion": "/learn migrate",
+        "submitValue": "/learn migrate"
+      },
+      {
+        "command": "history",
+        "description": "show changes and reasons",
+        "completion": "/learn history",
+        "submitValue": "/learn history"
+      },
+      {
+        "command": "undo",
+        "description": "restore a learning change by run ID",
+        "completion": "/learn undo "
+      },
+      {
+        "command": "legacy pending",
+        "description": "inspect historical candidates",
+        "completion": "/learn legacy pending",
+        "submitValue": "/learn legacy pending"
+      },
+      {
+        "command": "legacy show",
+        "description": "read one historical candidate",
+        "completion": "/learn legacy show "
+      },
+      {
+        "command": "mode",
+        "description": "set off or review mode",
+        "completion": "/learn mode "
+      }
+    ]
+  },
+  {
+    "command": "/tools",
+    "description": "list available tools",
+    "group": "TOOLS",
+    "id": "F22",
+    "takes_args": false,
+    "options": []
+  },
+  {
+    "command": "/browser",
+    "description": "show or release this session’s browser control",
+    "group": "TOOLS",
+    "id": "F23",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "status",
+        "description": "inspect browser control without acquiring it",
+        "completion": "/browser status",
+        "submitValue": "/browser status"
+      },
+      {
+        "command": "stop",
+        "description": "release browser control; keep the user browser open",
+        "completion": "/browser stop",
+        "submitValue": "/browser stop"
+      }
+    ]
+  },
+  {
+    "command": "/computer",
+    "description": "show, set up, or stop local macOS Computer Use",
+    "group": "TOOLS",
+    "id": "F24",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "status",
+        "description": "show bounded Computer Use readiness without opening settings",
+        "completion": "/computer status",
+        "submitValue": "/computer status"
+      },
+      {
+        "command": "setup",
+        "description": "open only missing macOS privacy settings",
+        "completion": "/computer setup",
+        "submitValue": "/computer setup"
+      },
+      {
+        "command": "stop",
+        "description": "close the local Computer Use session",
+        "completion": "/computer stop",
+        "submitValue": "/computer stop"
+      }
+    ]
+  },
+  {
+    "command": "/conclave",
+    "description": "research with experts and discuss the findings",
+    "group": "TOOLS",
+    "id": "F25",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "config",
+        "description": "show current Conclave configuration",
+        "completion": "/conclave config",
+        "submitValue": "/conclave config"
+      },
+      {
+        "command": "config chairperson",
+        "description": "set chairperson LLM model",
+        "completion": "/conclave config chairperson "
+      },
+      {
+        "command": "config expert_list",
+        "description": "override which experts to use (comma-separated names)",
+        "completion": "/conclave config expert_list "
+      },
+      {
+        "command": "config sources",
+        "description": "set max sources per expert (1-20)",
+        "completion": "/conclave config sources "
+      },
+      {
+        "command": "config max_tokens",
+        "description": "set chairperson max tokens (256-8192)",
+        "completion": "/conclave config max_tokens "
+      },
+      {
+        "command": "config discussion",
+        "description": "toggle cross-discussion phase on/off",
+        "completion": "/conclave config discussion "
+      },
+      {
+        "command": "config reset",
+        "description": "restore default Conclave configuration",
+        "completion": "/conclave config reset",
+        "submitValue": "/conclave config reset"
+      },
+      {
+        "command": "学术专家",
+        "description": "Google Scholar · 学术论文与顶会",
+        "completion": "/conclave config expert_list 学术专家, "
+      },
+      {
+        "command": "arXiv 专家",
+        "description": "arXiv · 最新预印本研究",
+        "completion": "/conclave config expert_list arXiv 专家, "
+      },
+      {
+        "command": "GitHub 专家",
+        "description": "GitHub · 代码与开源生态",
+        "completion": "/conclave config expert_list GitHub 专家, "
+      },
+      {
+        "command": "Google 专家",
+        "description": "Google · 综合英文搜索",
+        "completion": "/conclave config expert_list Google 专家, "
+      },
+      {
+        "command": "Bing 专家",
+        "description": "Bing · 补充英文搜索",
+        "completion": "/conclave config expert_list Bing 专家, "
+      },
+      {
+        "command": "StackOverflow 专家",
+        "description": "StackOverflow · 实战技术问答",
+        "completion": "/conclave config expert_list StackOverflow 专家, "
+      },
+      {
+        "command": "知乎专家",
+        "description": "知乎 · 中文深度讨论",
+        "completion": "/conclave config expert_list 知乎专家, "
+      },
+      {
+        "command": "百度专家",
+        "description": "百度 · 中文综合搜索",
+        "completion": "/conclave config expert_list 百度专家, "
+      },
+      {
+        "command": "Wikipedia 专家",
+        "description": "Wikipedia · 百科知识",
+        "completion": "/conclave config expert_list Wikipedia 专家, "
+      },
+      {
+        "command": "新闻专家",
+        "description": "Google News · 时效资讯",
+        "completion": "/conclave config expert_list 新闻专家, "
+      },
+      {
+        "command": "Reddit 专家",
+        "description": "Reddit · 社区讨论",
+        "completion": "/conclave config expert_list Reddit 专家, "
+      },
+      {
+        "command": "B站专家",
+        "description": "B站 · 中文视频教程",
+        "completion": "/conclave config expert_list B站专家, "
+      }
+    ]
+  },
+  {
+    "command": "/appshot",
+    "description": "status · shortcut · enable · disable",
+    "group": "CAPTURE",
+    "id": "F26",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/tasks",
+    "description": "list or inspect per-request task runs",
+    "group": "SESSION",
+    "id": "F27",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/budget",
+    "description": "set turn time limit in seconds, or off",
+    "group": "SESSION",
+    "id": "F28",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/resume",
+    "description": "resume an interrupted task",
+    "group": "SESSION",
+    "id": "F29",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/cancel",
+    "description": "cancel the active or selected task",
+    "group": "SESSION",
+    "id": "F30",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/goal",
+    "description": "set/show/pause/resume the session goal (long-horizon verification mode)",
+    "group": "SESSION",
+    "id": "F31",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/today",
+    "description": "list today's task runs",
+    "group": "SESSION",
+    "id": "F32",
+    "takes_args": false,
+    "options": []
+  },
+  {
+    "command": "/session",
+    "description": "list or switch sessions",
+    "group": "SESSION",
+    "id": "F33",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "delete",
+        "description": "delete a saved session",
+        "completion": "/session delete "
+      },
+      {
+        "command": "rename",
+        "description": "rename a saved session",
+        "completion": "/session rename "
+      },
+      {
+        "command": "export",
+        "description": "export a session to Markdown",
+        "completion": "/session export "
+      }
+    ]
+  },
+  {
+    "command": "/handoff",
+    "description": "compose, save, and revise a continuation brief",
+    "group": "SESSION",
+    "id": "F34",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/theme",
+    "description": "show or switch terminal color theme",
+    "group": "DISPLAY",
+    "id": "F35",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/timeline",
+    "description": "toggle conversation timeline display",
+    "group": "DISPLAY",
+    "id": "F36",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "on",
+        "description": "show timestamps and the shared time rail",
+        "completion": "/timeline on",
+        "submitValue": "/timeline on"
+      },
+      {
+        "command": "off",
+        "description": "hide timestamps while preserving model time awareness",
+        "completion": "/timeline off",
+        "submitValue": "/timeline off"
+      }
+    ]
+  },
+  {
+    "command": "/health",
+    "description": "show harness diagnostics",
+    "group": "SYSTEM",
+    "id": "F37",
+    "takes_args": false,
+    "options": []
+  },
+  {
+    "command": "/doctor",
+    "description": "discuss diagnosis and repairs; --raw for report",
+    "group": "SYSTEM",
+    "id": "F38",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/diagnostics",
+    "description": "explain runtime state; --raw for snapshot",
+    "group": "SYSTEM",
+    "id": "F39",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "context",
+        "description": "token composition and prompt cache",
+        "completion": "/diagnostics context",
+        "submitValue": "/diagnostics context"
+      },
+      {
+        "command": "startup",
+        "description": "startup phase timings",
+        "completion": "/diagnostics startup",
+        "submitValue": "/diagnostics startup"
+      },
+      {
+        "command": "mcp",
+        "description": "live MCP readiness snapshot",
+        "completion": "/diagnostics mcp",
+        "submitValue": "/diagnostics mcp"
+      },
+      {
+        "command": "tasks",
+        "description": "durable tasks and retained processes",
+        "completion": "/diagnostics tasks",
+        "submitValue": "/diagnostics tasks"
+      },
+      {
+        "command": "json",
+        "description": "machine-readable full snapshot",
+        "completion": "/diagnostics json",
+        "submitValue": "/diagnostics json"
+      }
+    ]
+  },
+  {
+    "command": "/maintenance",
+    "description": "preview or apply bounded runtime cleanup",
+    "group": "SYSTEM",
+    "id": "F40",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "preview",
+        "description": "show candidates without changing files",
+        "completion": "/maintenance preview "
+      },
+      {
+        "command": "apply",
+        "description": "delete expired generated artifacts",
+        "completion": "/maintenance apply "
+      },
+      {
+        "command": "checkpoint",
+        "description": "checkpoint project SQLite WAL files only",
+        "completion": "/maintenance checkpoint",
+        "submitValue": "/maintenance checkpoint"
+      }
+    ]
+  },
+  {
+    "command": "/sandbox",
+    "description": "show or toggle Docker isolation",
+    "group": "SYSTEM",
+    "id": "F41",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "on",
+        "description": "run Shell/Python in isolated Docker",
+        "completion": "/sandbox on",
+        "submitValue": "/sandbox on"
+      },
+      {
+        "command": "off",
+        "description": "run on host with timeout and dangerous-command checks",
+        "completion": "/sandbox off",
+        "submitValue": "/sandbox off"
+      },
+      {
+        "command": "status",
+        "description": "show the active execution backend",
+        "completion": "/sandbox status",
+        "submitValue": "/sandbox status"
+      }
+    ]
+  },
+  {
+    "command": "/vision-tiles",
+    "description": "show or toggle DeepSeek original-pixel image tiling",
+    "group": "SYSTEM",
+    "id": "F42",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "on",
+        "description": "preserve large-image detail with automatic tiles",
+        "completion": "/vision-tiles on",
+        "submitValue": "/vision-tiles on"
+      },
+      {
+        "command": "off",
+        "description": "send originals directly; DeepSeek may downscale them",
+        "completion": "/vision-tiles off",
+        "submitValue": "/vision-tiles off"
+      },
+      {
+        "command": "status",
+        "description": "show saved and active tiling state",
+        "completion": "/vision-tiles status",
+        "submitValue": "/vision-tiles status"
+      }
+    ]
+  },
+  {
+    "command": "/context-index",
+    "description": "show or set proactive historical context suggestions",
+    "group": "SYSTEM",
+    "id": "F43",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "on",
+        "description": "enable Session and cached Activity suggestions",
+        "completion": "/context-index on",
+        "submitValue": "/context-index on"
+      },
+      {
+        "command": "off",
+        "description": "disable proactive historical suggestions",
+        "completion": "/context-index off",
+        "submitValue": "/context-index off"
+      },
+      {
+        "command": "session",
+        "description": "recommend Session history only",
+        "completion": "/context-index session",
+        "submitValue": "/context-index session"
+      },
+      {
+        "command": "all",
+        "description": "recommend Session and cached Activity history",
+        "completion": "/context-index all",
+        "submitValue": "/context-index all"
+      },
+      {
+        "command": "status",
+        "description": "show the saved and active mode",
+        "completion": "/context-index status",
+        "submitValue": "/context-index status"
+      },
+      {
+        "command": "why",
+        "description": "audit the last recommendation decision",
+        "completion": "/context-index why",
+        "submitValue": "/context-index why"
+      }
+    ]
+  },
+  {
+    "command": "/mcp",
+    "description": "show MCP server and tool status",
+    "group": "SYSTEM",
+    "id": "F44",
+    "takes_args": false,
+    "options": []
+  },
+  {
+    "command": "/yolo",
+    "description": "toggle live approvals bypass · Ctrl+Y · [on|off|status]",
+    "group": "SYSTEM",
+    "id": "F45",
+    "takes_args": false,
+    "options": []
+  },
+  {
+    "command": "/permissions",
+    "description": "inspect or change tool policy",
+    "group": "SYSTEM",
+    "id": "F46",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/reload",
+    "description": "hot-reload agent runtime (code/persona/skills/model)",
+    "group": "SYSTEM",
+    "id": "F47",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/reconnect",
+    "description": "restart backend connection",
+    "group": "SYSTEM",
+    "id": "F48",
+    "takes_args": false,
+    "options": []
+  },
+  {
+    "command": "/restart",
+    "description": "restart backend after current work is delivered; cancel stops waiting",
+    "group": "SYSTEM",
+    "id": "F49",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/wakeup",
+    "description": "session wakeups: status, cancel, after/every SECONDS PROMPT",
+    "group": "SYSTEM",
+    "id": "F50",
+    "takes_args": true,
+    "options": []
+  },
+  {
+    "command": "/help",
+    "description": "show command help",
+    "group": "SYSTEM",
+    "id": "F51",
+    "takes_args": false,
+    "options": []
+  }
+]

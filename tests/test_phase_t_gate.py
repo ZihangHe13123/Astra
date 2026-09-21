@@ -22,6 +22,13 @@ def _source_archive(tmp_path, names):
     ".git", ".env", ".astra/approvals.db", ".logs/backend.log",
     ".astra/skills/personal/private-note/SKILL.md", "personal-notes.md",
     "ui-tui/node_modules/example/index.js", "ui-tui/dist/app.mjs",
+    "ui-core/node_modules/typescript/index.js", "ui-core/dist/backend-protocol.js",
+    "ui-gui/node_modules/electron/index.js", "ui-gui/dist/main.cjs",
+    "ui-gui/test-results/result.json", "ui-gui/playwright-report/index.html",
+    "ui-gui/output/screenshot.png", "output/playwright/gui/result.json",
+    "ui-core/.cache/compiler.json", "ui-gui/.vite/deps/react.js", "ui-gui/tsconfig.tsbuildinfo",
+    "ui-core/.DS_Store", "ui-gui/.ruff_cache/cache", "ui-gui/.mypy_cache/cache",
+    "agent/example.pyc",
     "agent/.env.local", "agent/persona.local.json", "agent/private.key",
     "native/appshot-core/.build/private.txt", "docs/superpowers/private.md",
     "docs/validation/private.md", "evals/coding/results/private.json",
@@ -32,13 +39,35 @@ def test_source_distribution_refuses_private_or_generated_files(tmp_path, relati
         wheel_smoke.check_source_distribution(path)
 
 
-def test_source_distribution_keeps_public_cli_tui_and_configuration(tmp_path):
-    path = _source_archive(tmp_path, [
+def _public_source_inputs():
+    return [
         "agent/cli/main.py", "agent/runtime/prompts.py", "config/models.yaml",
         "ui-tui/src/index.tsx", "astra.py", "README.md", "pyproject.toml", "PKG-INFO",
+        "ui-tui/package.json", "ui-tui/package-lock.json", "ui-tui/tsconfig.json",
+        "ui-core/package.json", "ui-core/package-lock.json", "ui-core/tsconfig.json",
+        "ui-core/src/backend-protocol.ts", "ui-core/src/backend-handshake.ts", "ui-core/src/types.ts",
+        "ui-core/src/session-state.ts", "ui-core/src/agent-team-state.ts", "ui-core/src/turn-changes.ts",
+        "ui-gui/package.json", "ui-gui/package-lock.json", "ui-gui/tsconfig.json",
+        "ui-gui/build.mjs", "ui-gui/index.html", "ui-gui/src/main/index.ts",
+        "ui-gui/src/preload/index.ts", "ui-gui/src/renderer/index.tsx", "ui-gui/src/bridge.ts",
         ".env.example", ".astra/skills/operations/using-computer-use/SKILL.md",
-    ])
+    ]
+
+
+def test_source_distribution_keeps_public_cli_shared_ui_desktop_and_configuration(tmp_path):
+    path = _source_archive(tmp_path, _public_source_inputs())
     wheel_smoke.check_source_distribution(path)
+
+
+@pytest.mark.parametrize("missing", [
+    "ui-core/package-lock.json", "ui-core/src/backend-protocol.ts", "ui-gui/package-lock.json",
+    "ui-gui/build.mjs", "ui-gui/src/preload/index.ts", "ui-tui/package-lock.json",
+])
+def test_source_distribution_requires_shared_ui_and_desktop_build_inputs(tmp_path, missing):
+    path = _source_archive(tmp_path, [name for name in _public_source_inputs() if name != missing])
+    with pytest.raises(SystemExit, match="missing public inputs") as raised:
+        wheel_smoke.check_source_distribution(path)
+    assert missing in str(raised.value)
 
 
 def test_source_distribution_rejects_incomplete_public_inputs(tmp_path):
@@ -89,7 +118,7 @@ def test_normal_gate_uses_external_temporary_storage_and_excludes_performance(mo
 
     assert phase_t_gate.main([]) == 0
     assert [label for label, _, _ in calls] == [
-        "Ruff", "Pyright", "TUI tests", "TUI typecheck/build", "Python tests",
+        "Ruff", "Pyright", "Shared UI build", "Shared UI tests", "TUI tests", "TUI typecheck/build", "Python tests",
     ]
     command = calls[-1][1]
     assert command[command.index("-m", 3) + 1] == "not context_index_performance"
@@ -191,13 +220,13 @@ def test_failed_stage_only_continues_when_requested_and_gate_still_fails(monkeyp
     assert raised.value.code not in (None, 0)
     if keep_going:
         assert calls == [
-            "Ruff", "Pyright", "TUI tests", "TUI typecheck/build", "Python tests",
+            "Ruff", "Pyright", "Shared UI build", "Shared UI tests", "TUI tests", "TUI typecheck/build", "Python tests",
             "isolated wheel smoke", "Context Index performance", "shared Appshot Swift tests", "macOS Swift tests",
         ]
         assert "TUI tests" in str(raised.value) and "Python tests" in str(raised.value)
         assert not temporary_paths[0].exists()
     else:
-        assert calls == ["Ruff", "Pyright", "TUI tests"]
+        assert calls == ["Ruff", "Pyright", "Shared UI build", "Shared UI tests", "TUI tests"]
     assert "real provider 4K smoke" not in calls
     assert "automated gate passed" not in capsys.readouterr().out
 

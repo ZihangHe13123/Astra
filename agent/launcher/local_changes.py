@@ -100,7 +100,8 @@ class LocalChanges:
         self.remote_paths = sorted(name for name in self.base.keys() | self.incoming.keys()
                                    if self.base.get(name) != self.incoming.get(name))
         for name in self.remote_paths:
-            private = (name == ".env" or name.startswith((".sessions/", ".venv/", "ui-tui/node_modules/", "ui-tui/dist/"))
+            generated = tuple(f"{ui}/{part}/" for ui in ("ui-tui", "ui-core", "ui-gui") for part in ("node_modules", "dist"))
+            private = (name == ".env" or name.startswith((".sessions/", ".venv/", *generated))
                        or (name.startswith(".astra/") and not name.startswith(".astra/skills/")))
             if private:
                 raise LauncherError(f"Incoming source changes target private/generated state at {name!r}. "
