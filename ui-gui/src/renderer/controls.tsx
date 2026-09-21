@@ -1,20 +1,11 @@
 import { connectionFlow, filterCommands, moveSelection, opensCommandInterface } from "./control-state.js";
 import { modelConnection } from "./model-connection.js";
+import { names } from "./command-help.js";
 import React, { useState } from "react";
 import { X, Check, ChevronRight, ExternalLink, LoaderCircle } from "lucide-react";
 import type { CommandDescription } from "../bridge.js";
 import type { SessionState, UIEvent } from "@astra/ui-core/session-state";
 
-export const names: Record<string, string> = {
-  image:"添加图片", bar:"酒吧", minimal:"极简模式", sip:"小酌", reset:"清空对话", compress:"压缩上下文",
-  undo:"撤销回复", retry:"重试回复", changes:"查看改动", think:"推理显示", model:"选择模型", mode:"推理强度", connect:"连接模型",
-  persona:"选择人格", search:"搜索来源", tool:"工具结果", gallery:"图片画廊", memory:"记忆", skills:"技能", learn:"技能学习",
-  tools:"可用工具", browser:"浏览器控制", computer:"电脑控制", conclave:"专家研究", appshot:"窗口捕获", tasks:"任务", budget:"时间预算",
-  resume:"恢复任务", cancel:"停止任务", goal:"目标", today:"今日任务", session:"会话管理", handoff:"交接", theme:"外观", timeline:"时间线",
-  health:"运行健康", doctor:"诊断", diagnostics:"诊断详情", maintenance:"维护", sandbox:"沙箱", "vision-tiles":"图像分块",
-  "context-index":"上下文索引", mcp:"MCP 集成", yolo:"权限模式", permissions:"工具权限", reload:"热重载", reconnect:"重新连接",
-  restart:"受控重启", wakeup:"会话提醒", help:"帮助",
-};
 export function Modal({ title, close, children, wide = false, initialFocus }: {
   title: string; close: () => void; children: React.ReactNode; wide?: boolean; initialFocus?: string;
 }) {
@@ -44,8 +35,8 @@ export function Modal({ title, close, children, wide = false, initialFocus }: {
     </div>
   </div>;
 }
-export function CommandPalette({ commands, run, close }: { commands: CommandDescription[]; run: (command: string) => void; close: () => void }) {
-  const [filter, setFilter] = useState("");
+export function CommandPalette({ commands, labels = names, initialFilter = "", run, close }: { commands: CommandDescription[]; labels?: Record<string, string>; initialFilter?: string; run: (command: string) => void; close: () => void }) {
+  const [filter, setFilter] = useState(initialFilter);
   const [selected, setSelected] = useState<CommandDescription>();
   const [sub, setSub] = useState("");
   const [args, setArgs] = useState("");
@@ -53,7 +44,7 @@ export function CommandPalette({ commands, run, close }: { commands: CommandDesc
   const search = React.useRef<HTMLInputElement>(null);
   const form = React.useRef<HTMLFormElement>(null);
   const listId = React.useId();
-  const items = filterCommands(commands, filter, names);
+  const items = filterCommands(commands, filter, labels);
   const activeIndex = Math.min(active, Math.max(0, items.length - 1));
   const execute = (command: string) => { close(); run(command); };
   const choose = (command: CommandDescription) => {
@@ -71,7 +62,7 @@ export function CommandPalette({ commands, run, close }: { commands: CommandDesc
   return <Modal title="命令与功能" close={close} initialFocus=".command-search">
     {selected ? <form ref={form} onSubmit={e => { e.preventDefault(); submit(); }} className="form">
       <button className="text-button" type="button" onClick={() => { setSelected(undefined); setSub(""); setArgs(""); }}>← 全部功能</button>
-      <h3>{names[selected.command.slice(1)]} <code>{selected.command}</code></h3><p className="muted">{selected.description}</p>
+      <h3>{labels[selected.command.slice(1)]} <code>{selected.command}</code></h3><p className="muted">{selected.description}</p>
       {!!selected.options.length && <label>操作<select value={sub} onChange={e => setSub(e.target.value)}>
         <option value="">默认操作</option>{selected.options.map((o, i) => <option key={i} value={o.completion.trim()}>{o.command} · {o.description}</option>)}
       </select></label>}
@@ -88,7 +79,7 @@ export function CommandPalette({ commands, run, close }: { commands: CommandDesc
       }}/>
       <div className="command-list" id={listId} role="listbox" aria-label="功能列表">{items.map((c, i) => <button key={c.id} id={`${listId}-${i}`} role="option" aria-selected={i === activeIndex}
         className={i === activeIndex ? "selected" : ""} tabIndex={-1} onMouseEnter={() => setActive(i)} onClick={() => choose(c)}>
-        <span><strong>{names[c.command.slice(1)] || c.command}</strong><small>{c.description}</small></span><code>{c.command}</code><ChevronRight size={15}/>
+        <span><strong>{labels[c.command.slice(1)] || c.command}</strong><small>{c.description}</small></span><code>{c.command}</code><ChevronRight size={15}/>
       </button>)}{!items.length && <p className="muted" role="status">没有匹配的功能</p>}</div></>}
   </Modal>;
 }

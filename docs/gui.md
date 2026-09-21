@@ -93,6 +93,31 @@ artifact storage. Use the file picker to explicitly open an external file. Raw H
 and executable URL schemes are not rendered. These presentation rules do not change
 the model's tool permissions.
 
+## Command help while typing
+
+The composer starts at one line, grows with its content, and scrolls internally
+after 220 px. Type `/` at the start of a message for command suggestions. Filter
+by command spelling or Chinese feature name, use the arrow keys to select, and
+Tab, Enter or click to fill the draft. **Completion does not execute anything**;
+press Send or Enter again after completion to run the command. Escape dismisses
+help without clearing the draft. Shift+Enter still inserts a newline. Suggestions
+stay hidden for multiline text or drafts with attachments.
+
+The current mode's actions appear first. Enter its prefix for subcommand help:
+
+| Mode | Continue latest | New isolated session | Browse history | Return to Work |
+| --- | --- | --- | --- | --- |
+| Bar | `/bar` | `/bar new` | `/bar sessions` | `/bar leave` |
+| Minimal | `/minimal` | `/minimal new` | `/minimal sessions` | `/minimal leave` |
+
+In the GUI, browsing mode history opens a filtered session picker. New sessions
+preserve previous ones. `/bar sip` takes a sip; `/bar output atomic` displays a
+validated reply together with its scene state, while `/bar output stream` streams
+the text. Installed local modes contribute their own commands and descriptions.
+Leave the current isolated mode before
+entering another. The permissions/mode dialog also links to command help and
+preserves any existing draft.
+
 ## Session menus
 
 Use the **…** button beside an opened or historical session, or open

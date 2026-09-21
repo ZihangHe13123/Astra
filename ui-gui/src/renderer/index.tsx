@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { ArrowUp, Square, Plus, Search, PanelLeft, PanelRight, ChevronDown, Folder, Settings, Paperclip, X, Copy, RotateCcw, ChevronRight, Command, Pin, Moon, Sun, Monitor, ArrowLeft, LoaderCircle, SlidersHorizontal, FileDiff, Terminal, Check } from "lucide-react";
 import { projectEvent, textContent, type SessionState, type UIEvent, type Message } from "@astra/ui-core/session-state";
@@ -11,10 +11,16 @@ import { modeCommand, modeChoices, localCommandEntry } from "../local-mode.js";
 import { migrateBlankDraft } from "./drafts.js";
 import { MessageList } from "./messages.js";
 import { DelegateHistory, DelegateSummary } from "./delegates.js";
+import { CommandInput } from "./command-input.js";
+import { commandNames, describeCommands, modeSessionTarget, type CommandMode } from "./command-help.js";
 import { sessionTitle, sidebarGroups } from "./sidebar.js";
 import "./style.css";
 
 const defaults: Preferences = { theme: "system", drafts: {}, attachments: {}, workspaces: {}, pinned: [], projects: [], titles: {}, timeline: true };
+const builtinCommandModes: CommandMode[] = [
+  { mode: "bar", command: "/bar", label: "酒吧", description: "进入独立酒吧场景；原工作上下文保留" },
+  { mode: "minimal", command: "/minimal", label: "极简", description: "进入轻量独立对话；保留只读网页工具" },
+];
 function App() {
   const [states, setStates] = useState<Record<string, SessionState>>({});
   const [active, setActive] = useState("");
@@ -30,6 +36,8 @@ function App() {
   const [side, setSide] = useState(true);
   const [panel, setPanel] = useState<Panel>();
   const [modal, setModal] = useState<"commands" | "models" | "model-picker" | "settings" | "permissions" | "sessions" | "persona">();
+  const [sessionMode, setSessionMode] = useState<string>();
+  const [commandQuery, setCommandQuery] = useState("");
   const [sessionDialog, setSessionDialog] = useState<{ action: "rename" | "delete"; entry: SessionEntry; title: string }>();
   const [toast, setToast] = useState("");
   const [selection, setSelection] = useState<{ index?: number; serial: number }>({ serial: 0 });
@@ -46,11 +54,15 @@ function App() {
   const [opening, setOpening] = useState(false);
   const fail = useCallback((e: unknown) => setToast(e instanceof Error ? e.message : String(e)), []);
   const state = states[active];
+  const localDefinition = state?.info.local_mode_info?.definition;
+  const commandModes = useMemo(() => [...builtinCommandModes, ...(localDefinition ? [{ mode: "local", ...localDefinition }] : [])], [localDefinition]);
   const key = preview ? `${preview.mode}:${preview.session_id}` : state && !state.isDraft ? `${state.mode}:${state.session}` : `new:${state?.workspace || workspace}`;
   const draft = prefs.drafts[key] || "";
   const files = prefs.attachments[key] || [];
   const hasAppshot = !!state?.info.gui_appshot?.attachments?.length;
   const refresh = useCallback(() => { void window.astra.query("sessions").then(setHistory).catch(fail); }, []);
+  const showSessions = (mode?: string) => { setSessionMode(mode); setSearch(""); refresh(); setModal("sessions"); };
+  const showCommands = (query = "") => { setCommandQuery(query); setModal("commands"); };
   const savePrefs = (update: Partial<Preferences>) => { setPrefs(old => ({ ...old, ...update })); };
   useEffect(() => {
     const buffered: any[] = [];
@@ -91,7 +103,7 @@ function App() {
   useEffect(() => {
     const listener = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "n") { e.preventDefault(); newChat(); }
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); setModal("commands"); }
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") { e.preventDefault(); showCommands(); }
       if ((e.metaKey || e.ctrlKey) && e.key === ".") { e.preventDefault(); void send({ type: "command", cmd: "/cancel" }); }
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "o") { e.preventDefault(); setPanel("tools"); }
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "l") { e.preventDefault(); setPanel("context"); }
@@ -100,7 +112,6 @@ function App() {
     window.addEventListener("keydown", listener); return () => window.removeEventListener("keydown", listener);
   }, [active, modal, workspace, state?.isDraft, preview]);
   useEffect(() => { setFollow(true); setOlderLoading(false); }, [active, preview?.session_id, preview?.mode]);
-  useLayoutEffect(() => { const el = input.current; if (el) { el.style.height = "auto"; el.style.height = `${Math.min(220, Math.max(67, el.scrollHeight))}px`; } }, [draft, active, preview]);
   useEffect(() => { if (follow && scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight; }, [state?.revision, active, preview, follow]);
   useEffect(() => {
     const event = state?.info.restart_ready;
@@ -158,10 +169,12 @@ function App() {
   };
   const command = async (value: string, target?: SessionState) => {
     if (value === "/model" || value === "/connect") { void openModels(); return; }
-    if (value === "/session" || value === "/session list") { refresh(); setModal("sessions"); return; }
+    if (value === "/session" || value === "/session list") { showSessions(); return; }
+    const historyMode = modeSessionTarget(value, commandModes);
+    if (historyMode) { showSessions(historyMode); return; }
     if (value === "/permissions") { await openSessionSettings("permissions"); return; }
     if (value === "/persona") { await openSessionSettings("persona"); return; }
-    if (value === "/help") { setModal("commands"); return; }
+    if (value === "/help") { showCommands(); return; }
     if (/^\/(tool|gallery)(?:\s+\d+)?$/.test(value)) {
       const [name, number] = value.split(/\s+/);
       if (number && Number(number) < 1) { fail("结果编号从 1 开始。"); return false; }
@@ -265,13 +278,13 @@ function App() {
   const appshotStatus = state?.info.gui_appshot;
   const appshotUnavailable = appshotStatus?.broker?.connection === "disconnected" && appshotStatus?.notice;
   const model = state?.info.model_info;
+  const commands = useMemo(() => describeCommands([...catalog, ...localCommandEntry(localDefinition)].map(c => c.command === "/persona" && model?.personas ? { ...c, options: model.personas.map((p: UIEvent) => ({ command: p.name, description: p.description, completion: `/persona ${p.name}` })) } : c), commandModes), [catalog, model?.personas, commandModes, localDefinition]);
   useEffect(() => {
     if (state?.status !== "ready" || !state.session || state.isDraft || preview) return;
     setPrefs(old => ({ ...old, lastSession: { session: state.session, mode: state.mode, workspace: state.workspace },
       workspaces: { ...old.workspaces, [`${state.mode}:${state.session}`]: state.workspace } }));
   }, [state?.session, state?.mode, state?.workspace, state?.status, state?.isDraft, preview?.session_id]);
   useEffect(() => { if (state?.info.task_status?.task?.finished_at) refresh(); }, [state?.info.task_status?.task?.finished_at]);
-  const localDefinition = state?.info.local_mode_info?.definition;
   const changeMode = async (mode: string) => {
     setModal(undefined);
     if (state?.mode !== "work" && mode !== "work") return;
@@ -336,7 +349,7 @@ function App() {
   return <div className={`app ${side ? "" : "sidebar-hidden"}`}>
     <aside className="sidebar"><div className="traffic-space"/><div className="brand"><span className="astra-mark">A</span><strong>Astra</strong><button className="icon" aria-label="隐藏侧栏" onClick={() => setSide(false)}><PanelLeft size={17}/></button></div>
       <button className="new-chat" onClick={() => newChat()}><Plus size={18}/>新对话<span>{navigator.platform.includes("Mac") ? "⌘" : "Ctrl"} N</span></button>
-      <button className="nav-button" onClick={() => setModal("commands")}><Command size={17}/>命令与功能<kbd>{navigator.platform.includes("Mac") ? "⌘" : "Ctrl"} K</kbd></button>
+      <button className="nav-button" onClick={() => showCommands()}><Command size={17}/>命令与功能<kbd>{navigator.platform.includes("Mac") ? "⌘" : "Ctrl"} K</kbd></button>
       <div className="sidebar-search"><Search size={15}/><input aria-label="搜索会话" value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索会话"/></div>
       <div className="session-scroll">
         {!!groups.pinned.length && <><h4 className="section-label">置顶</h4>{groups.pinned.map(entryButton)}</>}
@@ -353,7 +366,7 @@ function App() {
       <div><span className="workspace" title={state?.workspace || workspace}>{(state?.workspace || workspace).split(/[\\/]/).pop()}</span>{historyLoading || state?.status === "connecting" || state?.status === "loading" ? <LoaderCircle size={16} className="spin"/> : null}<button className="icon" aria-label="执行详情" onClick={() => setPanel(panel ? undefined : "tools")}><PanelRight size={18}/></button></div></header>
       <div className={`body ${panel && state && !preview ? "with-details" : ""}`}><div className="conversation"><div className="messages-scroll" aria-busy={historyLoading} data-history-request={preview?.request || 0} ref={scroller} onScroll={e => { const t = e.currentTarget; if (!t.clientHeight) return; setFollow(t.scrollHeight - t.scrollTop - t.clientHeight < 120); }}>
         <div className="messages">
-          {!messages.length && <section className="welcome"><div className="welcome-mark">A</div><h1>从一个想法开始。</h1><p>对话、研究、编写代码，或把手头的事情交给 Astra。</p><div className="welcome-actions"><button onClick={() => { void openModels(); }}><SlidersHorizontal size={16}/>连接或选择模型</button><button onClick={() => setModal("commands")}><Command size={16}/>浏览全部功能</button></div></section>}
+          {!messages.length && <section className="welcome"><div className="welcome-mark">A</div><h1>从一个想法开始。</h1><p>对话、研究、编写代码，或把手头的事情交给 Astra。</p><div className="welcome-actions"><button onClick={() => { void openModels(); }}><SlidersHorizontal size={16}/>连接或选择模型</button><button onClick={() => showCommands()}><Command size={16}/>浏览全部功能</button></div></section>}
           {preview?.has_more && <button className="load-more" disabled={olderLoading} onClick={() => { void loadOlder(); }}>{olderLoading ? "加载中…" : "加载更早历史"}</button>}
           <MessageList key={preview ? `preview:${preview.mode}:${preview.session_id}` : active || "blank"} messages={messages} runtime={preview ? undefined : state?.id} timeline={prefs.timeline} reasoning={model?.show_reasoning !== false} scroller={scroller} follow={follow} retry={retry} fail={fail}/>
           {preview?.delegates?.length > 0 && <DelegateHistory key={`${preview.mode}:${preview.session_id}`} delegates={preview.delegates} fail={fail}/>}
@@ -372,10 +385,10 @@ function App() {
             {!!state?.info.gui_appshot?.attachments?.length && <div className="attachment-list">{state.info.gui_appshot.attachments.map((a: UIEvent) => <span key={a.id}>{a.label}<button className="icon" aria-label="移除窗口捕获" onClick={() => { void window.astra.appshot(active, "remove", a.id).catch(fail); }}><X size={12}/></button></span>)}</div>}
             {state?.info.gui_appshot?.pending && <div className="attachment-list"><span>窗口捕获：{state.info.gui_appshot.pending.status === "unknown" ? "接收状态未知" : "等待接收确认"}</span><button onClick={() => command("/appshot pending status")}>查询状态</button><button onClick={() => command("/appshot pending discard")}>丢弃附件</button></div>}
             {!!files.length && <div className="attachment-list">{files.map(path => <span key={path}><Paperclip size={12}/>{path.split(/[\\/]/).pop()}<button className="icon" aria-label="移除附件" onClick={() => setPrefs(old => ({ ...old, attachments: { ...old.attachments, [key]: files.filter(f => f !== path) } }))}><X size={12}/></button></span>)}</div>}
-            <textarea ref={input} aria-label="消息" disabled={opening} placeholder={state?.busy ? "补充指令，或告诉 Astra 调整方向…" : "向 Astra 描述你的任务…"} value={draft} rows={3}
-              onChange={e => savePrefs({ drafts: { ...prefs.drafts, [key]: e.target.value } })}
-              onPaste={e => { if ([...e.clipboardData.items].some(i => i.type.startsWith("image/"))) { e.preventDefault(); void window.astra.clipboardImage().then(p => { if (p) attach([p]); }).catch(fail); } }}
-              onKeyDown={e => { if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && e.keyCode !== 229) { e.preventDefault(); void submit(); } }}/>
+            <CommandInput inputRef={input} disabled={opening} placeholder={state?.busy ? "补充指令，或告诉 Astra 调整方向…" : "向 Astra 描述你的任务，输入 / 查看指令…"} value={draft}
+              commands={commands} modes={commandModes} mode={state?.mode || "work"} attachments={!!files.length || hasAppshot}
+              onChange={value => savePrefs({ drafts: { ...prefs.drafts, [key]: value } })} onSubmit={() => { void submit(); }}
+              onPaste={e => { if ([...e.clipboardData.items].some(i => i.type.startsWith("image/"))) { e.preventDefault(); void window.astra.clipboardImage().then(p => { if (p) attach([p]); }).catch(fail); } }}/>
             <div className="composer-bottom"><div><button className="icon" aria-label="添加附件" onClick={() => { void window.astra.choose("files").then(attach).catch(fail); }}><Plus size={20}/></button><button className={`permission ${state?.info.yolo_status?.yolo ? "yolo" : ""}`} onClick={() => { void openSessionSettings("permissions"); }} title="工具审批设置">{state?.info.yolo_status?.yolo ? "完全访问" : "按需审批"}</button></div>
               <div><button className="model-button" onClick={() => { void openModels(); }}>{model?.model && model.model !== "none" ? model.model : "选择模型"}<ChevronDown size={13}/></button>
                 <select aria-label="推理强度" value={model?.reasoning_effort || "high"} disabled={!model?.reasoning_effort} onChange={e => command(`/mode ${e.target.value}`)}><option value="low">低</option><option value="high">高</option><option value="max">最高</option></select>
@@ -387,26 +400,27 @@ function App() {
       </div>{panel && state && !preview && <Details state={state} panel={panel} setPanel={setPanel} selection={selection} width={prefs.detailWidth || 420} onWidth={detailWidth => savePrefs({ detailWidth })} close={() => setPanel(undefined)} fail={fail}/>}</div>
     </main>
     {toast && <div className="toast" role="alert"><span>{toast}</span><button className="icon" onClick={() => setToast("")} aria-label="关闭提示"><X size={16}/></button></div>}
-    {modal === "commands" && <CommandPalette commands={[...catalog, ...localCommandEntry(localDefinition)].map(c => c.command === "/persona" && model?.personas ? { ...c, options: model.personas.map((p: UIEvent) => ({ command: p.name, description: p.description, completion: `/persona ${p.name}` })) } : c)} close={() => setModal(undefined)} run={command}/>}
+    {modal === "commands" && <CommandPalette commands={commands} labels={commandNames(commandModes)} initialFilter={commandQuery} close={() => setModal(undefined)} run={command}/>}
     {modal === "model-picker" && <ModelPicker state={state} send={value => window.astra.send(active, value)} onConfigure={configureModels} close={() => setModal(undefined)}/>}
     {modal === "models" && <ModelSettings initialModelKey={initialModelKey} state={state} send={value => window.astra.send(active, value)} close={() => setModal(undefined)}/>}
     {sessionDialog && <SessionActionDialog key={`${sessionDialog.action}:${sessionDialog.entry.mode}:${sessionDialog.entry.name}`} action={sessionDialog.action} title={sessionDialog.title} close={() => setSessionDialog(undefined)} confirm={confirmSessionAction}/>}
-    {modal === "sessions" && <Modal title="管理会话" close={() => setModal(undefined)}><div className="form"><input aria-label="筛选会话" value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索会话…"/>{historyFiltered.map(entryButton)}{!historyFiltered.length && <p className="muted">暂无匹配的会话。</p>}</div></Modal>}
+    {modal === "sessions" && <Modal title="管理会话" close={() => setModal(undefined)}><div className="form"><label>对话模式<select aria-label="筛选对话模式" value={sessionMode || ""} onChange={e => setSessionMode(e.target.value || undefined)}><option value="">全部模式</option><option value="work">通用</option>{commandModes.map(mode => <option key={mode.mode} value={mode.mode}>{mode.label}</option>)}</select></label><input aria-label="筛选会话" value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索会话…"/>{historyFiltered.filter(entry => !sessionMode || entry.mode === sessionMode).map(entryButton)}{!historyFiltered.some(entry => !sessionMode || entry.mode === sessionMode) && <p className="muted">暂无匹配的会话。</p>}</div></Modal>}
     {modal === "persona" && <Modal title="人格设置" close={() => setModal(undefined)}><div className="form"><p className="muted small">选择当前会话使用的人格。</p>{(model?.personas || []).map((p: UIEvent) => <button key={p.name} onClick={() => { setModal(undefined); void command(`/persona ${p.name}`); }}><span>{p.name}<small>{p.description}</small></span></button>)}</div></Modal>}
     {modal === "permissions" && <Modal title="权限与对话模式" close={() => setModal(undefined)}><div className="form"><h3>工具审批</h3><p className="muted small">控制工具操作是否需要你确认。</p>
       <div className="choice-grid">{[{ value: false, name: "按需审批", description: "按现有权限规则确认操作" }, { value: true, name: "完全访问", description: "直接执行工具操作，跳过审批" }].map(option => <button key={option.name} disabled={state?.status !== "ready"} aria-pressed={!!state?.info.yolo_status?.yolo === option.value} className={!!state?.info.yolo_status?.yolo === option.value ? "selected" : ""} onClick={() => { setModal(undefined); void command(`/yolo ${option.value ? "on" : "off"}`); }}><strong>{option.name}</strong><small>{option.description}</small></button>)}</div>
       <h3>对话模式</h3><div className="choice-grid">{modeChoices(localDefinition).map(option => <button key={option.mode} disabled={state?.status !== "ready" || !!state?.busy || option.mode === state?.mode || state?.mode !== "work" && option.mode !== "work"} aria-pressed={option.mode === (state?.mode || "work")} onClick={() => { void changeMode(option.mode); }}><strong>{option.label}</strong><small>{option.description}</small></button>)}</div>
       {state?.mode && state.mode !== "work" && <p className="muted small">先返回通用模式，再选择其他模式。</p>}
+      <button className="text-button" onClick={() => showCommands(commandModes.find(mode => mode.mode === state?.mode)?.command || "")}>查看{commandModes.find(mode => mode.mode === state?.mode)?.label || "全部"}模式指令 <ChevronRight size={14}/></button>
     </div></Modal>}
     {modal === "settings" && <Modal title="设置" close={() => setModal(undefined)}><div className="form"><h3>外观</h3><div className="theme-choices">{[{ name: "system", label: "跟随系统", icon: Monitor }, { name: "light", label: "浅色", icon: Sun }, { name: "dark", label: "深色", icon: Moon }].map(t => <button key={t.name} className={prefs.theme === t.name ? "selected" : ""} onClick={() => savePrefs({ theme: t.name })}><t.icon size={18}/>{t.label}</button>)}</div>
       <label className="option"><input type="checkbox" checked={prefs.timeline} onChange={e => savePrefs({ timeline: e.target.checked })}/>显示消息时间</label><hr/>
       <button onClick={() => configureModels()}>模型与账号 <ChevronRight size={15}/></button>
       <button onClick={() => { void openSessionSettings("permissions"); }}>权限与对话模式 <ChevronRight size={15}/></button>
-      <button onClick={() => { refresh(); setModal("sessions"); }}>管理会话 <ChevronRight size={15}/></button>
+      <button onClick={() => showSessions()}>管理会话 <ChevronRight size={15}/></button>
       <button onClick={() => { void command("/persona"); }}>人格设置 <ChevronRight size={15}/></button>
       <button onClick={() => { setModal(undefined); void command("/diagnostics"); }}>查看诊断 <ChevronRight size={15}/></button>
       <button onClick={() => { setModal(undefined); void command("/restart"); }}>重启当前后端 <RotateCcw size={15}/></button>
-      <button onClick={() => setModal("commands")}>全部功能与设置 <ChevronRight size={15}/></button>
+      <button onClick={() => showCommands()}>全部功能与设置 <ChevronRight size={15}/></button>
       {state && <><label>会话显示名称<input value={prefs.titles[`${state.mode}:${state.session}`] || ""} onChange={e => savePrefs({ titles: { ...prefs.titles, [`${state.mode}:${state.session}`]: e.target.value } })} placeholder={state.session}/></label><button onClick={() => { void window.astra.close(active).catch(fail); setModal(undefined); }}>关闭当前会话后端</button></>}
       <p className="muted small">界面设置保存在当前 Astra 数据目录。会话、账号和工具使用现有后端。</p></div></Modal>}
   </div>;
