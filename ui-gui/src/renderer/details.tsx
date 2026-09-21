@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState } from "react";
 import { FileDiff, Terminal, Layers, Users, X, ExternalLink, FolderOpen } from "lucide-react";
 import type { SessionState, UIEvent } from "@astra/ui-core/session-state";
+import { DelegateCards } from "./delegates.js";
+import { toolEmptyOutput, toolExpanded, toolStatus } from "./tool-status.js";
 
 export type Panel = "tools" | "changes" | "files" | "context" | "team";
 export function Details({ state, panel, setPanel, selection, width, onWidth, close, fail }: { state: SessionState; panel: Panel; setPanel: (p: Panel) => void; selection: { index?: number; serial: number }; width: number; onWidth: (width: number) => void; close: () => void; fail: (e: unknown) => void }) {
@@ -52,16 +54,17 @@ export function Details({ state, panel, setPanel, selection, width, onWidth, clo
         <div className="actions"><button onClick={() => { void window.astra.file(state.id, preview.path!, "open").catch(fail); }}><ExternalLink size={14}/> 系统打开</button><button onClick={() => { void window.astra.file(state.id, preview.path!, "reveal").catch(fail); }}><FolderOpen size={14}/> 定位</button></div>
         {preview.data ? <img className="preview-image" src={preview.data} alt="文件预览"/> : <pre className="file-preview">{preview.text}</pre>}{preview.truncated && <p className="muted">仅预览前 256 KiB，原文件保持完整。</p>}
       </> : panel === "tools" ? <>
+        <DelegateCards delegates={state.delegates} runtime={state.id} fail={fail} openFile={openFile}/>
         <h3>工具与进程 <span className="count">{state.tools.length}</span></h3>
         {!state.tools.length && <p className="muted">工具运行后，结果会显示在这里。</p>}
-        {state.tools.map((tool, i) => <details className="tool-detail" data-result-index={tool.result_index} key={tool.call_id || i} open={tool.status === "running" || !!tool.error}><summary><span className={`status-dot ${tool.status}`}/><strong>{tool.result_index ? `${tool.result_index}. ` : ""}{tool.name}</strong><span className="muted small">{tool.duration_ms != null ? tool.duration_ms >= 1000 ? `${(tool.duration_ms / 1000).toFixed(1)} 秒` : `${tool.duration_ms} ms` : statusLabel(tool.status)}</span></summary>
+        {[...state.tools].sort((a, b) => Number(toolStatus(b) === "running") - Number(toolStatus(a) === "running")).map((tool, i) => <details className="tool-detail" data-result-index={tool.result_index} key={tool.call_id || i} open={toolExpanded(tool)}><summary><span className={`status-dot ${toolStatus(tool)}`}/><strong>{tool.result_index ? `${tool.result_index}. ` : ""}{tool.name}</strong><span className="muted small">{statusLabel(toolStatus(tool))}{tool.duration_ms != null ? ` · ${tool.duration_ms >= 1000 ? `${(tool.duration_ms / 1000).toFixed(1)} 秒` : `${tool.duration_ms} ms`}` : ""}</span></summary>
           {tool.arguments && <details><summary>参数</summary><pre>{typeof tool.arguments === "string" ? tool.arguments : JSON.stringify(tool.arguments, null, 2)}</pre></details>}
-          {tool.progress && <p>{tool.progress.message || tool.progress.stage}</p>}
-          {tool.error && <p className="error-text">{tool.error}</p>}<pre>{tool.output || "等待结果…"}</pre>
+          {tool.progress && toolStatus(tool) === "running" && <p>{tool.progress.message || tool.progress.stage}</p>}
+          {tool.error && <p className="error-text">{tool.error}</p>}{(tool.output || toolEmptyOutput(tool)) && <pre>{tool.output || toolEmptyOutput(tool)}</pre>}
           {tool.artifact_path && <button onClick={() => openFile(tool.artifact_path)}>查看完整结果</button>}
           {tool.output_truncated && <p className="muted small">显示内容已截断；完整输出见产物。</p>}
         </details>)}
-        {Object.values(state.processes).map((p: UIEvent) => <details key={p.process_id} className="tool-detail"><summary>{p.label} · {statusLabel(p.status)}</summary><RawDetails value={p}/>{p.artifact_path && <button onClick={() => openFile(p.artifact_path)}>查看日志</button>}</details>)}
+        {Object.values(state.processes).filter(p => p.kind !== "subagent" || !state.delegates[p.process_id]).map((p: UIEvent) => <details key={p.process_id} className="tool-detail"><summary>{p.label} · {statusLabel(p.status)}</summary><RawDetails value={p}/>{p.artifact_path && <button onClick={() => openFile(p.artifact_path)}>查看日志</button>}</details>)}
       </> : panel === "changes" ? <>
         <h3>文件改动</h3><p className="muted small">查看已完成回合的快照差异。</p>
         {changes?.turns?.length ? <select value={turn} onChange={e => { setTurn(Number(e.target.value)); setFile(undefined); }}>{changes.turns.map((t: UIEvent, i: number) => <option key={t.turn_seq} value={i + 1}>回合 {t.turn_seq} · {t.files} 个文件{!t.available && !t.empty ? " · 快照已淘汰" : ""}</option>)}</select> : <p className="muted">还没有可查看的回合。</p>}
@@ -100,7 +103,7 @@ export function Details({ state, panel, setPanel, selection, width, onWidth, clo
 }
 
 const eventLabels: Record<string, string> = { task_status: "任务状态", generation_progress: "生成进度", working_memory: "工作计划", yolo_status: "工具权限", computer_status: "电脑控制", gui_appshot: "窗口捕获", wakeup_status: "定时提醒", turn_changes: "文件改动", usage: "用量", gui_model_result: "模型切换结果" };
-function statusLabel(status?: string) { return ({ running: "运行中", active: "进行中", scheduled: "已安排", completed: "已完成", idle: "待命", pending: "等待中", in_progress: "进行中", done: "已完成", cancelled: "已取消", failed: "失败", paused: "已暂停", ready: "就绪" } as Record<string, string>)[status || ""] || status || ""; }
+function statusLabel(status?: string) { return ({ running: "运行中", active: "进行中", scheduled: "已安排", completed: "已完成", idle: "待命", pending: "等待中", in_progress: "进行中", done: "已完成", cancelled: "已取消", failed: "失败", interrupted: "已中断", paused: "已暂停", ready: "就绪" } as Record<string, string>)[status || ""] || status || ""; }
 function RawDetails({ value, label = "诊断详情" }: { value: unknown; label?: string }) {
   const [open, setOpen] = useState(false);
   return <details className="tool-detail" onToggle={e => setOpen(e.currentTarget.open)}><summary className="muted small">{label}</summary>{open && <pre>{JSON.stringify(value, null, 2)}</pre>}</details>;

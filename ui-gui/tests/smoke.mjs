@@ -14,6 +14,21 @@ const workspace = join(folder, '工作区 with spaces'); mkdirSync(workspace);
 const target = join(workspace, 'receipt.txt');
 const output = join(root, 'output/playwright/gui'); mkdirSync(output, { recursive: true });
 const requests = [];
+const delegateGoals = ['DELEGATE_GUI_ALPHA', 'DELEGATE_GUI_BETA', 'DELEGATE_GUI_FAILURE'];
+const delegateReports = ['Alpha verified the local receipt.', 'Beta independently verified the local receipt.'];
+// Hold only loopback model responses. Real delegate scheduling, file tools,
+// Python status events and Electron rendering remain unchanged.
+const delegateGates = new Map(delegateGoals.map(goal => {
+  let release; const wait = new Promise(resolve => { release = resolve; });
+  return [goal, { wait, release, reached: false }];
+}));
+const until = async (predicate, message, timeout = 20000) => {
+  const deadline = Date.now() + timeout;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(message);
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+};
 const server = createServer(async (req, res) => {
   if (req.method === 'GET') { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ data: [{ id: 'gui-test' }] })); return; }
   if (!req.url.endsWith('/chat/completions')) { res.writeHead(404); res.end(); return; }
@@ -22,9 +37,43 @@ const server = createServer(async (req, res) => {
   const lastUser = payload.messages.findLastIndex(m => m.role === 'user');
   const text = String(payload.messages[lastUser]?.content || '');
   const answered = payload.messages.slice(lastUser + 1).some(m => m.role === 'tool');
-  const call = !answered && text.includes('测试文件') ? ['write_file', { path: target, content: 'apple\norange\ngrape\n' }]
+  // Match the worker's initial task envelope, never a substring of inherited
+  // context. Each child has fork_turns=none and cannot fan out recursively.
+  const delegateGoal = payload.messages.flatMap(message => {
+    if (message.role !== 'user' || typeof message.content !== 'string') return [];
+    const match = /^## Task\n(DELEGATE_GUI_ALPHA|DELEGATE_GUI_BETA|DELEGATE_GUI_FAILURE)\n\n## Context\n/.exec(message.content);
+    return match ? [match[1]] : [];
+  })[0];
+  const delegateRead = delegateGoal && payload.messages.some(message => message.role === 'tool');
+  const delegateParent = !delegateGoal && text.includes('DELEGATE_GUI_TEST');
+  if (delegateRead) {
+    const gate = delegateGates.get(delegateGoal); gate.reached = true;
+    await gate.wait;
+    if (delegateGoal === 'DELEGATE_GUI_FAILURE') {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'DELEGATE_GUI_EXPECTED_FAILURE', type: 'invalid_request_error', code: 'fixture_failure' } }));
+      return;
+    }
+  }
+  const call = delegateGoal && !delegateRead ? ['read_file', { path: target }]
+    : !answered && delegateParent ? ['delegate_task', { tasks: delegateGoals.map(goal => ({
+      goal, mode: 'explorer', fork_turns: 'none', tools: ['read_file'], max_turns: 4,
+    })) }]
+    : !answered && text.includes('测试文件') ? ['write_file', { path: target, content: 'apple\norange\ngrape\n' }]
     : !answered && text.includes('追问') ? ['ask_user_question', { questions: [{ id: 'choice', question: '使用哪种格式？', multi_select: false,
       options: [{ label: 'Markdown', description: '便于阅读' }, { label: 'JSON', description: '便于处理' }] }] }] : undefined;
+  // Delegate turns use ordinary completions; the main conversation streams.
+  // Respect the actual transport instead of giving the SDK SSE as a JSON body.
+  if (delegateGoal && payload.stream !== true) {
+    const message = call ? { role: 'assistant', content: null, tool_calls: [{ id: 'call-' + requests.length,
+      type: 'function', function: { name: call[0], arguments: JSON.stringify(call[1]) } }] }
+      : { role: 'assistant', content: delegateReports[delegateGoals.indexOf(delegateGoal)] };
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ id: 'smoke-' + requests.length, object: 'chat.completion', created: Math.floor(Date.now()/1000),
+      model: 'gui-test', choices: [{ index: 0, message, finish_reason: call ? 'tool_calls' : 'stop' }],
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 } }));
+    return;
+  }
   res.setHeader('Content-Type', 'text/event-stream');
   const chunk = (delta, finish_reason = null) => res.write('data: ' + JSON.stringify({ id: 'smoke-' + requests.length,
     object: 'chat.completion.chunk', created: Math.floor(Date.now()/1000), model: 'gui-test',
@@ -34,7 +83,9 @@ const server = createServer(async (req, res) => {
     chunk({}, 'tool_calls');
   } else {
     chunk({ role: 'assistant', reasoning_content: '先确认请求，再整理结果。' });
-    if (text.includes('慢速A')) { chunk({ content: '会话 A 正在运行。' }); await new Promise(r=>setTimeout(r, 2500)); chunk({ content: '\n\n会话 A 已完成。' }); }
+    if (delegateGoal) chunk({ content: delegateReports[delegateGoals.indexOf(delegateGoal)] });
+    else if (delegateParent) chunk({ content: 'DELEGATE_GUI_PARENT_DONE' });
+    else if (text.includes('慢速A')) { chunk({ content: '会话 A 正在运行。' }); await new Promise(r=>setTimeout(r, 2500)); chunk({ content: '\n\n会话 A 已完成。' }); }
     else chunk({ content: answered ? '操作完成，结果已核验。' : '你好，Astra 桌面连接成功。\n\n| 项目 | 状态 |\n| --- | --- |\n| 后端 | 已连接 |\n\n```python\nprint("hello")\n```' });
     chunk({}, 'stop');
   }
@@ -131,6 +182,7 @@ try {
  await submit('发送失败仍保留的草稿');
  await page.getByRole('alert').filter({hasText:/Backend|后端/}).waitFor();
  assert.equal(await page.getByRole('textbox',{name:'消息'}).inputValue(),'发送失败仍保留的草稿');
+ await page.getByRole('button',{name:'关闭提示',exact:true}).click();
  await page.getByRole('button',{name:'新对话',exact:false}).click();
  passed('pre-admission failure preserves visible blank-page draft');
  await submit('你好');
@@ -155,6 +207,95 @@ try {
  await page.getByRole('button',{name:'关闭详情',exact:true}).click(); passed('real change ledger and snapshots');
  await submit('请追问格式'); await page.getByRole('radio',{name:'Markdown 便于阅读'}).check();
  await page.getByRole('button',{name:'发送答复',exact:true}).click(); await idle(); passed('structured question and same-turn continuation');
+ // Three real children read the approved file and then pause at the HTTP
+ // fixture. Their progress and terminal events must retain distinct identity.
+ await page.evaluate(()=>{
+   window.__delegateEvents=[];
+   window.astra.onEvents(events=>{for(const entry of events) if(entry.event?.type==='delegate_status') window.__delegateEvents.push(entry.event);});
+ });
+ await submit('DELEGATE_GUI_TEST');
+ // The normal owner limit is two active children. Keep that contract: the
+ // third must stay queued until one report releases its execution slot.
+ // The loopback route also retains the local model's one-request limit, so
+ // never require two blocked HTTP reports to arrive at the same time.
+ await until(()=>[...delegateGates.values()].some(gate=>gate.reached),'A delegate did not reach its report gate');
+ const delegateSummary=page.getByTestId('delegate-summary');
+ await delegateSummary.waitFor(); assert.match(await delegateSummary.innerText(),/3 项进行中/);
+ for(const goal of delegateGoals) assert.match(await delegateSummary.innerText(),new RegExp(goal));
+ await delegateSummary.click();
+ const delegateCards=page.locator('section[aria-label="委派任务"] article[data-delegate-id]');
+ await page.waitForFunction(()=>document.querySelectorAll('section[aria-label="委派任务"] article[data-status="running"]').length===2
+   &&document.querySelectorAll('section[aria-label="委派任务"] article[data-status="queued"]').length===1);
+ const delegateIds=(await delegateCards.evaluateAll(cards=>cards.map(card=>card.dataset.delegateId))).sort();
+ assert.equal(new Set(delegateIds).size,3);
+ const firstFinishedGoal=delegateGoals.find(goal=>goal!==delegateGoals[2]&&delegateGates.get(goal).reached);
+ assert.ok(firstFinishedGoal,'the ordered fixture starts a successful reader before the intentional failure');
+ await page.waitForFunction(goal=>window.__delegateEvents.some(event=>event.goal===goal&&event.current_tool==='read_file'),firstFinishedGoal);
+ const delegateBounds=await app.evaluate(({BrowserWindow})=>{
+   const window=BrowserWindow.getAllWindows()[0];const bounds=window.getBounds();window.setBounds({...bounds,width:1320,height:820});return bounds;
+ });
+ await page.waitForFunction(()=>innerWidth===1320); await page.screenshot({path:join(output,'delegates-running-1320.png')});
+ await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setBounds({width:1000,height:820}));
+ await page.waitForFunction(()=>innerWidth===1000); await page.screenshot({path:join(output,'delegates-running-1000.png')});
+ await app.evaluate(({BrowserWindow},bounds)=>BrowserWindow.getAllWindows()[0].setBounds(bounds),delegateBounds);
+ passed('three independent delegate cards show two running and one queued at 1320px and 1000px');
+ const priorDelegateToolGoals=await page.evaluate(()=>window.__delegateEvents.filter(event=>event.current_tool==='read_file').map(event=>event.goal));
+ const beforeDelegateReload=requests.length;
+ await page.reload(); await page.getByRole('textbox',{name:'消息'}).waitFor();
+ await page.getByTestId('delegate-summary').click();
+ await page.waitForFunction(()=>document.querySelectorAll('section[aria-label="委派任务"] article[data-status="running"]').length===2
+   &&document.querySelectorAll('section[aria-label="委派任务"] article[data-status="queued"]').length===1);
+ assert.deepEqual((await delegateCards.evaluateAll(cards=>cards.map(card=>card.dataset.delegateId))).sort(),delegateIds);
+ assert.equal(requests.length,beforeDelegateReload);
+ passed('renderer reload preserves three live delegate identities without replaying model calls');
+ await page.evaluate(()=>{
+   window.__delegateEvents=[];
+   window.astra.onEvents(events=>{for(const entry of events) if(entry.event?.type==='delegate_status') window.__delegateEvents.push(entry.event);});
+ });
+ const firstFinishedCard=delegateCards.filter({has:page.locator('.delegate-goal',{hasText:firstFinishedGoal})});
+ delegateGates.get(firstFinishedGoal).release();
+ await page.waitForFunction(id=>document.querySelector(`article[data-delegate-id="${id}"]`)?.dataset.status==='completed',await firstFinishedCard.getAttribute('data-delegate-id'));
+ await firstFinishedCard.locator('summary').filter({hasText:'查看结果'}).click();
+ await firstFinishedCard.getByText(delegateReports[delegateGoals.indexOf(firstFinishedGoal)],{exact:true}).waitFor();
+ assert.match(await page.getByTestId('delegate-summary').innerText(),/2 项进行中/);
+ assert.equal(await delegateCards.locator('.delegate-activity').count(),2);
+ const nextFinishedGoal=delegateGoals.slice(0,2).find(goal=>goal!==firstFinishedGoal);
+ await until(()=>delegateGates.get(nextFinishedGoal).reached,'Second reader did not reach its report gate');
+ delegateGates.get(nextFinishedGoal).release();
+ await until(()=>delegateGates.get(delegateGoals[2]).reached,'Queued delegate did not read the file after execution and model slots were released');
+ await page.waitForFunction(goal=>window.__delegateEvents.some(event=>event.goal===goal&&event.current_tool==='read_file'),delegateGoals[2]);
+ const observedDelegateToolGoals=new Set([...priorDelegateToolGoals,...await page.evaluate(()=>window.__delegateEvents.filter(event=>event.current_tool==='read_file').map(event=>event.goal))]);
+ for(const goal of delegateGoals) assert.ok(observedDelegateToolGoals.has(goal),`${goal} must publish its real current_tool`);
+ const childRequests=requests.filter(request=>request.messages.some(message=>message.role==='user'&&typeof message.content==='string'&&/^## Task\nDELEGATE_GUI_(ALPHA|BETA|FAILURE)\n/.test(message.content)));
+ assert.equal(childRequests.length,6,'each of three workers makes one tool request and one report request');
+ for(const goal of delegateGoals) {
+   const request=childRequests.findLast(request=>request.messages.some(message=>message.role==='user'&&String(message.content).startsWith(`## Task\n${goal}\n`)));
+   assert.ok(request.messages.some(message=>message.role==='tool'&&String(message.content).includes('apple')),'each child must actually read the local fixture');
+ }
+ delegateGates.get(delegateGoals[2]).release();
+ await page.getByText('DELEGATE_GUI_PARENT_DONE',{exact:true}).waitFor({timeout:30000}); await idle();
+ await page.waitForFunction(()=>{
+   const cards=[...document.querySelectorAll('section[aria-label="委派任务"] article[data-delegate-id]')];
+   return cards.length===3&&cards.filter(card=>card.dataset.status==='completed').length===2&&cards.filter(card=>card.dataset.status==='failed').length===1;
+ });
+ for(let i=0;i<2;i++) {
+   const card=delegateCards.filter({has:page.locator('.delegate-goal',{hasText:delegateGoals[i]})});
+   if(await card.locator('.delegate-result').getAttribute('open')===null) await card.locator('summary').filter({hasText:'查看结果'}).click();
+   await card.getByText(delegateReports[i],{exact:true}).waitFor();
+ }
+ const failedCard=delegateCards.filter({has:page.locator('.delegate-goal',{hasText:delegateGoals[2]})});
+ assert.match(await failedCard.innerText(),/DELEGATE_GUI_EXPECTED_FAILURE/);
+ assert.doesNotMatch(await failedCard.innerText(),/等待结果|等待执行名额|正在处理任务/);
+ assert.equal(await failedCard.locator('.delegate-activity').count(),0);
+ assert.doesNotMatch(await page.getByTestId('delegate-summary').innerText(),/项进行中/);
+ const delegateSession=await page.evaluate(async id=>{
+   const snapshot=await window.astra.bootstrap();const session=snapshot.sessions.find(s=>s.id===id);
+   return {name:session.session,mode:session.mode,title:snapshot.preferences.titles[`${session.mode}:${session.session}`]||session.session};
+ },first);
+ await page.screenshot({path:join(output,'delegates-terminal.png')});
+ await page.getByRole('button',{name:'关闭详情',exact:true}).click();
+ assert.equal(readFileSync(target,'utf8'),'apple\norange\ngrape\n');
+ passed('delegate completion updates independently, final reports are expandable, and failed children stop waiting');
  await submit('慢速A'); await page.getByText('会话 A 正在运行。',{exact:true}).waitFor();
  await page.getByRole('button',{name:'新对话',exact:false}).click();
  await page.waitForFunction(id => document.querySelector('.topbar .title')?.textContent !== id,
@@ -426,6 +567,8 @@ try {
  }),closed);
  assert.ok(closedHistory.sessions.some(entry=>entry.name===closed.session&&entry.mode===closed.mode));
  assert.ok(closedHistory.history.messages.some(message=>String(message.content).includes('你好')));
+ assert.deepEqual(closedHistory.history.delegates.map(item=>item.process_id).sort(),delegateIds);
+ assert.deepEqual(closedHistory.history.delegates.map(item=>item.status).sort(),['completed','completed','failed']);
  passed('explicit close releases the runtime while preserving its saved history');
  // Full host shutdown/relaunch restores the last session and the final keystroke,
  // without invoking the model. This is separate from a renderer-only reload.
@@ -441,6 +584,24 @@ try {
  assert.equal(await restored.getByRole('textbox',{name:'消息'}).inputValue(),'退出前的草稿');
  await restored.getByText('你好，Astra 桌面连接成功。',{exact:true}).waitFor();
  assert.equal(requests.length,beforeRelaunch); passed('full desktop relaunch restores history and draft without requesting a model');
+ await restored.getByRole('button',{name:delegateSession.title,exact:true}).first().click();
+ await restored.getByText('只读浏览历史，不会启动模型。',{exact:true}).waitFor();
+ await restored.locator('.delegate-history > summary').click();
+ const recoveredCards=restored.locator('section[aria-label="委派任务"] article[data-delegate-id]');
+ await restored.waitForFunction(()=>document.querySelectorAll('section[aria-label="委派任务"] article[data-delegate-id]').length===3);
+ assert.deepEqual((await recoveredCards.evaluateAll(cards=>cards.map(card=>card.dataset.delegateId))).sort(),delegateIds);
+ assert.deepEqual((await recoveredCards.evaluateAll(cards=>cards.map(card=>card.dataset.status))).sort(),['completed','completed','failed']);
+ for(let i=0;i<2;i++) {
+   const card=recoveredCards.filter({has:restored.locator('.delegate-goal',{hasText:delegateGoals[i]})});
+   await card.locator('summary').filter({hasText:'查看结果'}).click(); await card.getByText(delegateReports[i],{exact:true}).waitFor();
+ }
+ assert.doesNotMatch(await recoveredCards.filter({has:restored.locator('.delegate-goal',{hasText:delegateGoals[2]})}).innerText(),/等待结果|等待执行名额|正在处理任务/);
+ await restored.screenshot({path:join(output,'delegates-restored.png')});
+ assert.equal(requests.length,beforeRelaunch);
+ await restored.getByTitle(last,{exact:true}).click();
+ await restored.waitForFunction(async name=>{const b=await window.astra.bootstrap();return b.sessions.find(s=>s.id===b.active)?.session===name;},last);
+ assert.equal(await restored.getByRole('textbox',{name:'消息'}).inputValue(),'退出前的草稿');
+ passed('closed delegate history survives full desktop relaunch with stable IDs, final reports and no model request');
  await restored.evaluate(()=>{window.__restarted=false;window.astra.onEvents(events=>{if(events.some(e=>e.event?.type==='backend_hello'))window.__restarted=true;});});
  await restored.getByRole('textbox',{name:'消息'}).fill('/restart');
  await restored.getByRole('button',{name:'发送',exact:true}).click();
@@ -453,9 +614,14 @@ try {
  console.log('Artifacts:',output);
 } catch (error) {
  console.error('SMOKE FAILED',error);
+ writeFileSync(join(output,'fixture-request-diagnostics.json'),JSON.stringify(requests.map(request=>({
+   users:request.messages.filter(message=>message.role==='user').map(message=>String(message.content).slice(0,800)),
+   tools:request.messages.filter(message=>message.role==='tool').map(message=>({name:message.name,tool_call_id:message.tool_call_id,content:String(message.content).slice(0,300)})),
+ })),null,2));
  if (app) { try {const p=await app.firstWindow();await p.screenshot({path:join(output,'failure.png')});console.error((await p.locator('body').innerText()).slice(-6000));console.error('State',await p.evaluate(async()=>{const b=await window.astra.bootstrap();return b.sessions.map(s=>({status:s.status,info:Object.keys(s.info),notices:s.notices}));}));} catch {} }
  console.error('Isolated diagnostic data:',folder); process.exitCode=1;
 } finally {
+ for(const gate of delegateGates.values()) gate.release();
  if(app) await app.close();
  server.closeAllConnections();await new Promise(r=>server.close(r));
 }

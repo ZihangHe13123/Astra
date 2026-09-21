@@ -26,7 +26,7 @@ function CodeBlock({ children, fail }: { children?: React.ReactNode; fail: (e: u
   const code = useRef<HTMLPreElement>(null);
   return <div className="code-block"><div className="copy-code"><CopyButton label="复制代码" text={() => code.current?.textContent || ""} fail={fail}/></div><pre ref={code}>{children}</pre></div>;
 }
-const Markdown = memo(function Markdown({ text, runtime, fail }: { text: string; runtime?: string; fail: (e: unknown) => void }) {
+export const Markdown = memo(function Markdown({ text, runtime, fail }: { text: string; runtime?: string; fail: (e: unknown) => void }) {
   const components = useMemo(() => ({
     img: ({ src, alt }: { src?: string; alt?: string }) => <InlineImage src={src} alt={alt} runtime={runtime}/>,
     a: ({ href, children }: React.ComponentProps<"a">) => <a href={href} onClick={e => { e.preventDefault(); if (!href) return;

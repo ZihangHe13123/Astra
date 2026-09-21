@@ -11,6 +11,7 @@ from pathlib import Path
 from agent.cli import sessions
 from agent.runtime.session_store import SessionStore
 from agent.ui.history_index import history_page
+from agent.ui.delegates import delegate_history
 
 
 @lru_cache(maxsize=1)
@@ -44,7 +45,7 @@ def history(name: str, mode: str = "work", *, before: int | None = None, limit: 
     result = history_page(store, before=before, limit=limit)
     for message in result["messages"]:
         message["id"] = f"{mode}:{name}:{message.pop('position')}"
-    return {"session_id": name, "mode": mode, **result}
+    return {"session_id": name, "mode": mode, **result, "delegates": delegate_history(store)}
 
 
 def changes(agent, turn: int = 1, index: int | None = None) -> dict:

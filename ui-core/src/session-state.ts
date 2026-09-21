@@ -1,5 +1,6 @@
 import { reduceAgentTeamEvent, type AgentTeamView } from "./agent-team-state.js";
 import type { PyEvent } from "./types.js";
+import { delegateActive, reduceDelegateEvent, type DelegateView } from "./delegates.js";
 
 /** Platform-independent projection. The backend remains the execution authority. */
 export type UIEvent = { type: string; [key: string]: any };
@@ -10,12 +11,12 @@ export type Message = {
 export type SessionState = {
   id: string; session: string; workspace: string; mode: string; status: string; busy: boolean; isDraft: boolean;
   messages: Message[]; tools: UIEvent[]; approvals: UIEvent[]; questions: UIEvent[];
-  processes: Record<string, UIEvent>; teams: Record<string, AgentTeamView>; info: Record<string, UIEvent>;
+  processes: Record<string, UIEvent>; delegates: Record<string, DelegateView>; teams: Record<string, AgentTeamView>; info: Record<string, UIEvent>;
   notices: UIEvent[]; stream: string; serial: number; revision: number;
 };
 export function initialSession(id: string, workspace = ""): SessionState {
   return { id, workspace, session: "", mode: "work", status: "connecting", busy: false, isDraft: false,
-    messages: [], tools: [], approvals: [], questions: [], processes: {}, teams: {},
+    messages: [], tools: [], approvals: [], questions: [], processes: {}, delegates: {}, teams: {},
     info: {}, notices: [], stream: "", serial: 0, revision: 0 };
 }
 export function textContent(value: unknown): string {
@@ -46,6 +47,8 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
     case "gui_ready": state.status = "ready"; state.workspace = event.workspace || state.workspace; break;
     case "gui_disconnected":
       state.status = "disconnected"; state.busy = false; state.stream = "";
+      state.delegates = Object.fromEntries(Object.entries(state.delegates).map(([id, d]) => [id, delegateActive(d) ? { ...d, status: "interrupted", current_tool: "" } : d]));
+      state.tools = state.tools.map(t => t.status === "running" ? { ...t, status: "interrupted" } : t);
       state.messages = state.messages.map(m => m.submissionState === "pending" ? { ...m, submissionState: "unknown" } : m);
       if (state.info.connection_pending?.status === "pending") {
         state.info = { ...state.info,
@@ -95,7 +98,8 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
       state.messages = (event.messages || []).map((m: UIEvent, i: number) => ({
         id: m.id || `history:${event.session_id}:${i}`, role: m.role, content: textContent(m.content), timestamp: m.timestamp,
       }));
-      state.tools = (event.tool_results || []).map((r: UIEvent, i: number) => ({ ...r, type: "tool_result", result_index: i + 1, call_id: r.call_id || `history-tool:${i}` }));
+      state.tools = (event.tool_results || []).map((r: UIEvent, i: number) => ({ ...r, type: "tool_result", status: r.error ? "failed" : "completed", historical: true, result_index: i + 1, call_id: r.call_id || `history-tool:${i}` }));
+      state.delegates = (event.delegates || []).reduce(reduceDelegateEvent, {});
       state.session = event.session_id || state.session; state.stream = ""; break;
     case "task_started": state.busy = true; state.stream = ""; state.info = { ...state.info, task_status: event }; break;
     case "task_status":
@@ -140,6 +144,9 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
         : state.questions.filter(a => a.request_id !== event.request_id);
       append("error", event.reason); notice(); break;
     case "process_status": state.processes = { ...state.processes, [event.process_id]: event }; break;
+    case "delegate_status":
+      if (!event.session_id || !state.session || event.session_id === state.session) state.delegates = reduceDelegateEvent(state.delegates, event as Partial<DelegateView>);
+      break;
     case "agent_team": {
       state.teams = Object.fromEntries(reduceAgentTeamEvent(Object.values(state.teams),
         event as Extract<PyEvent, { type: "agent_team" }>).map(team => [team.id, team])); break;

@@ -841,7 +841,7 @@ def test_delegate_runs_tool_loop_and_returns_final_answer(process_manager, tmp_p
         lifecycle_events = [event[1] for event in session_events if event[1]["type"] == "lifecycle"]
         assert [event["state"] for event in lifecycle_events] == ["active", "terminal"]
         assert lifecycle_events[-1]["completion_reason"] == "reported"
-        dialogue_events = [event[1] for event in session_events if event[1]["type"] != "lifecycle"]
+        dialogue_events = [event[1] for event in session_events if event[1]["type"] not in {"lifecycle", "delegate_status"}]
         assert [event["type"] for event in dialogue_events] == [
             "started", "assistant", "tool", "assistant", "terminal",
         ]
@@ -1589,7 +1589,8 @@ def test_delegate_returns_partial_report_after_repeated_unparsed_dsml(process_ma
             {"content": dsml, "tool_calls": []},
             {"content": dsml, "tool_calls": []},
         ])
-        register_delegate_tools(registry, llm_getter=lambda: llm)
+        events = []
+        register_delegate_tools(registry, llm_getter=lambda: llm, on_delegate_event=events.append)
 
         result = await registry.execute(
             "delegate_task",
@@ -1605,6 +1606,8 @@ def test_delegate_returns_partial_report_after_repeated_unparsed_dsml(process_ma
         assert "Partial report" in payload["result"]
         assert "read:README.md" in payload["result"]
         assert dsml not in payload["result"]
+        assert events[-1]["status"] == "partial" and events[-1]["partial"]
+        assert "Partial report" in events[-1]["result"]
 
     asyncio.run(scenario())
 
@@ -1969,7 +1972,8 @@ def test_delegate_queue_time_counts_toward_total_timeout(
     async def scenario():
         monkeypatch.setenv("ASTRA_DELEGATE_CONCURRENCY", "1")
         registry = ToolRegistry()
-        register_delegate_tools(registry, llm_getter=VerySlowLLM)
+        events = []
+        register_delegate_tools(registry, llm_getter=VerySlowLLM, on_delegate_event=events.append)
         loop = asyncio.get_running_loop()
         started = loop.time()
 
@@ -1987,6 +1991,9 @@ def test_delegate_queue_time_counts_toward_total_timeout(
 
         assert elapsed < 1.5
         assert all(item["worker_status"] == "timed_out" for item in payload["results"])
+        terminal = [event for event in events if event["status"] == "timed_out"]
+        assert {event["goal"] for event in terminal} == {"first", "queued"}
+        assert not any(event["goal"] == "queued" and event["status"] == "running" for event in events)
 
     asyncio.run(scenario())
 

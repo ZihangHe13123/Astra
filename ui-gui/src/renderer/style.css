@@ -83,3 +83,24 @@
 .model-picker>p { padding: 10px 20px 0; }
 .model-picker .models>p { padding: 12px; }
 .connection-progress { display: flex; margin: 10px 20px; font-size: 12px; }
+
+/* Delegated work stays distinct from the parent's tool receipts. */
+.delegate-summary { display: block; width: 100%; border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; margin: 16px 0; background: transparent; text-align: left; color: var(--text); }
+.delegate-heading { display: flex; align-items: center; gap: 8px; font-size: 12px; min-width: 0; }
+.delegate-heading > :last-child { margin-left: auto; flex-shrink: 0; }
+.delegate-heading strong { font-weight: 550; }
+.delegate-brief { display: grid; grid-template-columns: 6px minmax(0, 1fr) auto; align-items: center; gap: 8px; font-size: 12px; margin-top: 10px; }
+.delegate-brief > span:nth-child(2) { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.delegate-brief small { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; max-width: 200px; }
+.delegates { margin-bottom: 24px; }
+.delegate-card { border: 1px solid var(--line); border-radius: 10px; padding: 13px; margin: 10px 0; overflow-wrap: anywhere; }
+.delegate-goal { font-size: 12px; line-height: 1.65; margin: 10px 0 6px; white-space: pre-wrap; max-height: 8em; overflow: auto; }
+.delegate-activity,.delegate-meta { font-size: 11px; line-height: 1.6; color: var(--muted); margin: 6px 0; }
+.delegate-card .error-text { font-size: 12px; line-height: 1.6; }
+.delegate-result { margin-top: 10px; font-size: 12px; }
+.delegate-result .message { font-size: 12px; margin: 10px 0 0; }
+.status-dot.queued,.status-dot.idle,.status-dot.partial,.status-dot.timed_out { background: #bd9147; }
+.status-dot.interrupted,.status-dot.cancelled { background: var(--muted); }
+@media (max-width: 1250px) { .delegate-brief { grid-template-columns: 6px minmax(0, 1fr); } .delegate-brief small { grid-column: 2; max-width: none; } }
+.delegate-history { margin: 18px 0; color: var(--muted); font-size: 12px; }
+.delegate-history .delegate-card { color: var(--text); }

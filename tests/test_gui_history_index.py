@@ -70,6 +70,7 @@ def _same(store, **params):
     expected = _oracle(store, **params)
     actual = queries.history("demo", **params)
     assert actual.pop("revision")
+    assert actual.pop("delegates") == []
     assert actual == expected
     return actual
 
@@ -287,3 +288,17 @@ def test_query_worker_handles_multiple_requests_and_exits_at_eof(store):
     assert responses[0]["result"]["messages"][0]["content"] == "hello"
     assert responses[1]["ok"] is False
     assert len(responses[2]["result"]) == 50
+
+
+def test_history_includes_only_the_selected_sessions_public_delegate_reports(store):
+    _write(store.legacy_path, {"messages": [_message("hello")]})
+    store.append_subagent_event({"type": "started", "process_id": "child", "goal": "Inspect", "recorded_at": 10})
+    store.append_subagent_event({"type": "assistant", "process_id": "child", "content": "not a final report", "recorded_at": 11})
+    store.append_subagent_event({"type": "terminal", "process_id": "child", "status": "completed", "result": "Final report", "recorded_at": 12})
+    before = store.subagent_path.read_bytes()
+    result = queries.history("demo")
+    assert result["messages"][0]["content"] == "hello"
+    assert result["delegates"][0]["result"] == "Final report"
+    assert result["delegates"][0]["status"] == "completed"
+    assert result["delegates"][0]["session_id"] == "demo"
+    assert store.subagent_path.read_bytes() == before

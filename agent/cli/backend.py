@@ -888,6 +888,20 @@ async def _main(startup_started: float):
             else None
         ),
     )
+    delegate_statuses: dict[str, dict] = {}
+
+    def _send_delegate_status(event: dict) -> None:
+        # Live state wins over a read-only historical "interrupted" projection
+        # when /session, /compress or /undo reloads the current transcript.
+        delegate_statuses[event["process_id"]] = dict(event)
+        if len(delegate_statuses) > 200:
+            for key, value in list(delegate_statuses.items()):
+                if value.get("status") not in {"queued", "running", "idle"}:
+                    delegate_statuses.pop(key)
+                    if len(delegate_statuses) <= 200:
+                        break
+        _send(event)
+
     delegate_mailbox = register_delegate_tools(
         tools,
         llm_getter=lambda: (
@@ -910,6 +924,7 @@ async def _main(startup_started: float):
             "type": "agent_team" if event.get("kind") == "agent_team" else "process_status",
             **event,
         }),
+        on_delegate_event=_send_delegate_status,
         on_session_event=lambda session_id, event: SessionStore(
             session_path(session_id)
         ).append_subagent_event(event),
@@ -1847,7 +1862,15 @@ async def _main(startup_started: float):
         results = history_tool_results(agent.context.messages, saved_results)
         if bar_mode.active:
             results = [result for result in results if result["name"] not in BAR_SCENE_TOOL_NAMES or result["error"]]
-        _send({"type": "history", "session_id": Path(agent.context.session_path).stem if agent.context.session_path else "", "messages": hist, "tool_results": results})
+        delegates = {}
+        session_id = Path(agent.context.session_path).stem if agent.context.session_path else ""
+        if agent.context.session_path:
+            from agent.ui.delegates import delegate_history
+            restored_delegates = await durable_io(delegate_history, SessionStore(agent.context.session_path))
+            delegates = {item["process_id"]: item for item in restored_delegates}
+            delegates.update({pid: item for pid, item in delegate_statuses.items() if item.get("session_id") == session_id})
+        _send({"type": "history", "session_id": session_id, "messages": hist,
+               "tool_results": results, "delegates": list(delegates.values())})
 
     def _send_session_info():
         if bar_mode.active or minimal_mode.active or local_mode.active:

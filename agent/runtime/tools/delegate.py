@@ -1337,6 +1337,7 @@ def register_delegate_tools(
     on_session_event: Callable[[str, dict[str, Any]], Any] | None = None,
     task_store: TaskStore | None = None,
     sandbox=None,
+    on_delegate_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> DelegateMailbox:
     """Register delegate_task and companion tools for read-only subagent dispatch."""
     if on_process_event:
@@ -1774,6 +1775,7 @@ def register_delegate_tools(
                     if active_budget is not None:
                         active_budget.resume()
                     if slot_lease is not None:
+                        _progress_event("delegate_queued", status="queued", message="Waiting for an execution slot.")
                         await slot_lease.acquire(
                             _keep_alive_deadline(
                                 active_budget,
@@ -2492,18 +2494,66 @@ def register_delegate_tools(
             agent_name=_agent_name,
             keep_alive=_keep_alive,
         )
+        from agent.ui.delegates import sanitize_delegate_event
+
+        run_session_id = session_id_getter() if session_id_getter else ""
+        process_holder: dict[str, Any] = {}
+        display_started = time.monotonic()
+        display: dict[str, Any] = {
+            "type": "delegate_status", "process_id": uuid.uuid4().hex,
+            "task_id": spec.task_id, "session_id": run_session_id,
+            "goal": spec.goal, "worker_type": spec.worker_type,
+            "status": "queued", "started_at": time.time(), "updated_at": time.time(),
+            "completed_at": None, "duration_ms": 0, "current_tool": "",
+            "turns_used": 0, "max_turns": spec.max_turns,
+            "result": "", "error": "", "partial": False,
+            **({"team_id": spec.team_id, "agent_id": spec.team_agent_id} if spec.team_id else {}),
+        }
+        terminal_statuses = {"completed", "failed", "cancelled", "timed_out", "partial", "interrupted"}
+        persisted_status: str | None = None
+
+        def _delegate_event(status: str, **fields: Any) -> None:
+            """Presentation is optional and cannot affect the worker's outcome."""
+            nonlocal persisted_status
+            persist = status != persisted_status or status == "idle" and "result" in fields
+            display.update(fields, status=status, updated_at=time.time(),
+                           duration_ms=int(max(0, time.monotonic() - display_started) * 1000))
+            if status in terminal_statuses:
+                display.update(completed_at=time.time(), current_tool="")
+            payload = sanitize_delegate_event(display)
+            if persist and on_session_event is not None and run_session_id:
+                try:
+                    on_session_event(run_session_id, payload)
+                    persisted_status = status
+                except Exception:
+                    logger.exception("failed to persist delegate presentation status")
+            if on_delegate_event is not None:
+                try:
+                    on_delegate_event(payload)
+                except Exception:
+                    logger.exception("delegate display callback failed")
+
         worktree: Path | None = None
         worker_registry: ToolRegistry | None = None
-        if isolation == "worktree":
-            worktree = await asyncio.to_thread(_create_detached_worktree, sandbox)
-            worker_registry = _create_worker_worktree_registry(registry, sandbox, worktree)
-        elif spec.workspace_root:
-            worker_registry = _create_workspace_registry(
-                registry,
-                sandbox,
-                Path(spec.workspace_root),
-                mode=spec.worker_type,
-            )
+        try:
+            if isolation == "worktree":
+                worktree = await asyncio.to_thread(_create_detached_worktree, sandbox)
+                worker_registry = _create_worker_worktree_registry(registry, sandbox, worktree)
+            elif spec.workspace_root:
+                worker_registry = _create_workspace_registry(
+                    registry,
+                    sandbox,
+                    Path(spec.workspace_root),
+                    mode=spec.worker_type,
+                )
+        except BaseException as exc:
+            # No process exists yet; retain a unique display ID for this failed
+            # accepted dispatch without manufacturing a cancellable process.
+            _delegate_event("queued")
+            _delegate_event("cancelled" if isinstance(exc, asyncio.CancelledError) else "failed",
+                            error="Subagent startup cancelled" if isinstance(exc, asyncio.CancelledError)
+                            else f"{type(exc).__name__}: {exc}")
+            raise
         execution_registry = worker_registry or sub_registry
         base_sandbox = getattr(sandbox, "current", sandbox)
         effective_root = str(
@@ -2537,14 +2587,21 @@ def register_delegate_tools(
             except Exception:
                 logger.exception("could not start durable delegate step task_id=%s", _task_id)
 
-        run_session_id = session_id_getter() if session_id_getter else ""
-        process_holder: dict[str, Any] = {}
-
         def _record_progress(stage: str, **details: Any) -> None:
             process = process_holder.get("process")
             turns_used = details.get("turns_used")
             if process is not None and isinstance(turns_used, int):
                 process.metadata["turns_used"] = max(0, turns_used)
+            if isinstance(turns_used, int):
+                display["turns_used"] = max(0, turns_used)
+            # Final progress strings are not the authoritative worker result.
+            # The terminal record below publishes its precise outcome/report.
+            if stage not in {"delegate_completed", "delegate_failed"}:
+                status = str(details.get("status")) if details.get("status") in {"idle", "queued"} else "running"
+                fields = {"current_tool": str(details.get("message") or "")} if stage == "tool_call" else {"current_tool": ""}
+                if stage == "delegate_awakened":
+                    fields["result"] = ""
+                _delegate_event(status, **fields)
             if _progress is not None:
                 _progress(stage, **details)
 
@@ -2552,8 +2609,17 @@ def register_delegate_tools(
             process = process_holder.get("process")
             if process is not None:
                 mailbox.episode(process, payload)
+            if payload is not None and payload.get("worker_status") == "idle":
+                _delegate_event("idle", result=str(payload.get("result") or ""), current_tool="")
 
         def _record_session_event(event: dict[str, Any]) -> None:
+            if event.get("type") == "terminal":
+                _delegate_event(str(event.get("status") or "failed"),
+                    result=str(event.get("result") or ""), error=str(event.get("error") or ""),
+                    turns_used=int(event.get("turns_used") or display["turns_used"]),
+                    partial=bool(event.get("partial") or event.get("status") == "partial"))
+            elif event.get("type") == "tool":
+                _delegate_event("running", current_tool="")
             if on_session_event is None or not run_session_id:
                 return
             process = process_holder.get("process")
@@ -2634,6 +2700,7 @@ def register_delegate_tools(
                 else:
                     await child_slots.acquire(owner_id, deadline)
                     acquired = True
+                _delegate_event("running")
                 # The inner loop owns the authoritative deadline so it can
                 # preserve collected evidence instead of being cancelled and
                 # replaced by an empty outer-timeout payload.
@@ -2726,6 +2793,7 @@ def register_delegate_tools(
                 ),
                 "result": str(result.get("result") or ""),
                 "error": str(result.get("error") or ""),
+                "partial": bool(result.get("partial")),
                 "completion_reason": result["completion_reason"],
                 "lifecycle": result["lifecycle"],
             })
@@ -2792,6 +2860,24 @@ def register_delegate_tools(
 
         def _started(process) -> None:
             process_holder["process"] = process
+            display["process_id"] = process.process_id
+            _delegate_event("queued")
+
+            def finished(done: asyncio.Task) -> None:
+                # A task cancelled before its first instruction never reaches
+                # factory try/finally. ProcessManager has already recorded it.
+                if display["status"] in terminal_statuses:
+                    return
+                result = process.result or {}
+                status = "cancelled" if done.cancelled() else str(result.get("worker_status") or ("failed" if result.get("error") else "completed"))
+                _record_session_event({"type": "terminal", "status": status,
+                    "result": str(result.get("result") or ""),
+                    "error": str(result.get("error") or ""),
+                    "turns_used": int(result.get("turns_used") or display["turns_used"]),
+                    "partial": bool(result.get("partial"))})
+
+            if process.task is not None:
+                process.task.add_done_callback(finished)
             process.metadata["runtime"] = runtime_identity()
             process.metadata["execution_binding"] = execution_binding
             if spec.team_agent_id:
@@ -2810,14 +2896,19 @@ def register_delegate_tools(
                     logger.exception("could not bind team agent process")
             _record_session_event({"type": "started", "status": "running"})
 
+        def _start_process():
+            try:
+                return _sub_processes.start(
+                    _factory, kind="subagent", label=spec.goal[:240],
+                    task_id=spec.task_id, metadata=spec.process_metadata(),
+                )
+            except Exception as exc:
+                _delegate_event("queued")
+                _delegate_event("failed", error=f"{type(exc).__name__}: {exc}")
+                raise
+
         if background:
-            process = _sub_processes.start(
-                _factory,
-                kind="subagent",
-                label=spec.goal[:240],
-                task_id=spec.task_id,
-                metadata=spec.process_metadata(),
-            )
+            process = _start_process()
             _started(process)
             _sub_processes.expose(process)
             mailbox.track(
@@ -2839,13 +2930,7 @@ def register_delegate_tools(
             )
 
         if foreground_yield_ms > 0:
-            process = _sub_processes.start(
-                _factory,
-                kind="subagent",
-                label=spec.goal[:240],
-                task_id=spec.task_id,
-                metadata=spec.process_metadata(),
-            )
+            process = _start_process()
             _started(process)
             try:
                 completed = await _sub_processes.wait(process, foreground_yield_ms)
@@ -2881,13 +2966,7 @@ def register_delegate_tools(
             )
 
         # Synchronous: wait until done
-        process = _sub_processes.start(
-            _factory,
-            kind="subagent",
-            label=spec.goal[:240],
-            task_id=spec.task_id,
-            metadata=spec.process_metadata(),
-        )
+        process = _start_process()
         _started(process)
         try:
             await _sub_processes.wait(process, 0)

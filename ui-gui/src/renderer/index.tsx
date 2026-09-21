@@ -10,6 +10,7 @@ import { SessionMenu, SessionActionDialog, type SessionAction } from "./session-
 import { modeCommand, modeChoices, localCommandEntry } from "../local-mode.js";
 import { migrateBlankDraft } from "./drafts.js";
 import { MessageList } from "./messages.js";
+import { DelegateHistory, DelegateSummary } from "./delegates.js";
 import { sessionTitle, sidebarGroups } from "./sidebar.js";
 import "./style.css";
 
@@ -355,7 +356,9 @@ function App() {
           {!messages.length && <section className="welcome"><div className="welcome-mark">A</div><h1>从一个想法开始。</h1><p>对话、研究、编写代码，或把手头的事情交给 Astra。</p><div className="welcome-actions"><button onClick={() => { void openModels(); }}><SlidersHorizontal size={16}/>连接或选择模型</button><button onClick={() => setModal("commands")}><Command size={16}/>浏览全部功能</button></div></section>}
           {preview?.has_more && <button className="load-more" disabled={olderLoading} onClick={() => { void loadOlder(); }}>{olderLoading ? "加载中…" : "加载更早历史"}</button>}
           <MessageList key={preview ? `preview:${preview.mode}:${preview.session_id}` : active || "blank"} messages={messages} runtime={preview ? undefined : state?.id} timeline={prefs.timeline} reasoning={model?.show_reasoning !== false} scroller={scroller} follow={follow} retry={retry} fail={fail}/>
+          {preview?.delegates?.length > 0 && <DelegateHistory key={`${preview.mode}:${preview.session_id}`} delegates={preview.delegates} fail={fail}/>}
           {state && !preview && <>{state.tools.length > 0 && <button className="execution-summary" onClick={() => setPanel("tools")}><Terminal size={15}/>{state.tools.filter(t => t.status === "running").length ? "工具正在执行" : `${state.tools.length} 项工具结果`}<ChevronRight size={15}/></button>}
+            <DelegateSummary delegates={state.delegates} open={() => setPanel("tools")}/>
             {state.approvals.map(e => <Approval key={e.request_id} event={e} send={respond}/>)}{state.questions.map(e => <Question key={e.request_id} event={e} send={respond}/>)}
             {state.busy && <div className="generating"><span className="pulse"/>Astra 正在工作<span>{state.info.generation_progress?.phase === "waiting" ? "等待模型响应" : ""}</span></div>}
             {state.status === "disconnected" && <div className="disconnected"><p>后端已断开，已显示的内容仍保留。</p><button onClick={() => command("/reconnect")}>重新连接</button></div>}
