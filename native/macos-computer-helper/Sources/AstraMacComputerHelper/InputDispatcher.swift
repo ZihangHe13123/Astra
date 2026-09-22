@@ -745,6 +745,26 @@ final class InputDispatcher: InputDispatching {
             logPlanDenied(
                 "TYPE-PREFLIGHT role=\(element.roleResult) enabled=\(String(describing: element.enabled)) secure=\(element.isSecure)"
             )
+            if action.replace != nil {
+                guard action.replace == true, action.elementRef != nil,
+                      element.supportsAXSelectedTextWrite, !element.isSecure, element.enabled == true,
+                      textInputSafety == .safeASCIIKeyboardLayout
+                else { return .unsupported(backend: .axSelectedText, actionClass: .text) }
+                switch performer.preflightAXTextReplacement(element) {
+                case .unsupported: return .unsupported(backend: .axSelectedText, actionClass: .text)
+                case let .failed(error): throw error
+                case .settable: break
+                }
+                guard let axElement = element.element,
+                      let authority = inputDispatchKeyboardFocusAuthority(element, localToWindowBounds: expected.bounds)
+                else { throw ActionExecutionError.inputFocusRequired }
+                // No focus acquisition while planning; the existing foreground
+                // authorization and activity lease must guard the mutation.
+                return PlannedAction(resolved: ResolvedAction(source: action, method: .accessibilityText,
+                    screenPoint: nil, endScreenPoint: nil, element: axElement, verifiedElement: element),
+                    backend: .axSelectedText, actionClass: .text,
+                    targetKeyboardFocus: authority, requiresTakeover: true)
+            }
             guard !element.isSecure else { return .unsupported(backend: .axSelectedText, actionClass: .text) }
             // 焦点权威在计划期可能**根本读不到**：macOS 只在 app 处于前台时才报
             // kAXFocusedUIElement（只读探针实测：后台 -25212 kAXErrorNoValue，前台才有值），
@@ -1037,6 +1057,7 @@ final class InputDispatcher: InputDispatching {
                 expected: expected,
                 requiredAction: nil
             )
+            guard entry.source.replace == nil else { throw InputDispatchError.backgroundActionUnsupported }
             guard !current.isSecure else { throw ActionExecutionError.secureTarget }
             _ = try performer.focusedKeyboardElement(matching: current)
             switch performer.preflightAXTextMutation(current) {
@@ -1099,8 +1120,13 @@ final class InputDispatcher: InputDispatching {
             else { throw ActionExecutionError.invalidAction }
             let current = try preflightFreshAXElement(entry, expected: expected, requiredAction: nil)
             guard !current.isSecure else { throw ActionExecutionError.secureTarget }
-            _ = try performer.focusedKeyboardElement(matching: current)
-            switch performer.preflightAXTextMutation(current) {
+            // Replacement consume is read-only. Focus acquisition belongs to
+            // performReplacement, where this invocation's activity lease guards it.
+            if entry.source.replace != true {
+                _ = try performer.focusedKeyboardElement(matching: current)
+            }
+            switch entry.source.replace == true
+                ? performer.preflightAXTextReplacement(current) : performer.preflightAXTextMutation(current) {
             case .settable: break
             case .unsupported: throw InputDispatchError.backgroundActionUnsupported
             case let .failed(error): throw error
@@ -1284,6 +1310,7 @@ final class InputDispatcher: InputDispatching {
             action.modifiers.forEach { append($0, to: &bytes) }
             // Preserve existing action digests when no checked goal was supplied.
             if let checked = action.checked { append("checked:\(checked)", to: &bytes) }
+            if let replace = action.replace { append("replace:\(replace)", to: &bytes) }
         }
         return SHA256.hash(data: Data(bytes)).map { String(format: "%02x", $0) }.joined()
     }

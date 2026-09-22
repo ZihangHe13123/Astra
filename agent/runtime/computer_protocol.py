@@ -523,8 +523,17 @@ class ComputerAction:
     element_index: int | None = None
     modifiers: tuple[str, ...] = ()
     checked: bool | None = None
+    replace: bool | None = None
 
     def __post_init__(self) -> None:
+        if self.replace is not None and (
+            self.replace is not True or self.type != "type" or self.element_ref is None
+            or self.modifiers or any(getattr(self, key) is not None for key in (
+                "x", "y", "end_x", "end_y", "key", "delta_x", "delta_y", "duration_ms",
+                "element_index", "target_element_ref", "checked",
+            ))
+        ):
+            raise ValueError("replace:true requires only type, text and an exact element_ref")
         if self.checked is not None and (
             type(self.checked) is not bool or self.type != "click"
             or (self.element_ref is None and self.element_index is None)
@@ -652,9 +661,13 @@ class ComputerAction:
         allowed = {
             "type", "x", "y", "end_x", "end_y", "text", "key", "delta_x",
             "delta_y", "duration_ms", "element_ref", "target_element_ref",
-            "element_index", "modifiers", "checked",
+            "element_index", "modifiers", "checked", "replace",
         }
         _reject_unknown_fields(value, allowed, "action")
+        if "replace" in value:
+            if value["replace"] is not True:
+                raise ValueError("replace must be true when specified")
+            _reject_unknown_fields(value, {"type", "text", "element_ref", "replace"}, "replacement action")
         if "type" not in value:
             raise ValueError("action requires type")
         kwargs = dict(value)

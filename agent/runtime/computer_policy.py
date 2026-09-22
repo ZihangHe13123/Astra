@@ -119,6 +119,7 @@ _PROTOCOL_ACTION_KEYS = frozenset({
     "element_ref",
     "target_element_ref",
     "modifiers",
+    "replace",
 })
 
 

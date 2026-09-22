@@ -2310,7 +2310,28 @@ private final class InputDispatcherSyntheticPosterSpy: SyntheticInputPosting {
     }
 }
 
+@Test func replacementPlanningRequiresAXValueAndActivityGuardedTakeover() throws {
+    let performer = InputDispatcherPerformerSpy()
+    let dispatcher = InputDispatcher(performer: performer,
+        backgroundTextInputSafety: InputDispatcherTextSafety(.safeASCIIKeyboardLayout))
+    let action = try NativeAction.parse(.object([
+        "type": .string("type"), "text": .string(""), "element_ref": .string("text"), "replace": .bool(true),
+    ]))
+    let context = DispatchContext(guardValue: inputDispatcherBackgroundGuard())
+    let rejected = try dispatcher.plan(actions: [action], context: context)
+    #expect(rejected.cooperativeError == .backgroundActionUnsupported)
+    #expect(performer.performed.isEmpty)
+    performer.replacementPreflight = .settable
+    let plan = try dispatcher.plan(actions: [action], context: context)
+    #expect(plan.cooperativeError == nil)
+    #expect(plan.requiresTakeover && plan.backends == [.axSelectedText])
+    #expect(!plan.matches(actions: [.type(text: "", elementRef: "text")]))
+    #expect(performer.performed.isEmpty)
+}
+
 private final class InputDispatcherPerformerSpy: ActionProviding {
+    var replacementPreflight: AXTextMutationPreflight = .unsupported
+    func preflightAXTextReplacement(_ element: ActionElement) -> AXTextMutationPreflight { replacementPreflight }
     var performed: [ResolvedAction] = []
     var state = ActionTargetState(
         pid: 11,

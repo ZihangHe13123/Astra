@@ -1679,6 +1679,179 @@ private func containedOverlayTargetState() -> ActionTargetState {
     )
 }
 
+@Test func replacementAXObservationCheckpointStopsBatchSuffix() throws {
+    let f = MixedForegroundExecutionFixture(enabled: [])
+    f.performer.requiresObservation = true
+    let source = NativeAction.click(elementRef: "press")
+    let target = try #require(f.performer.element(reference: "press", snapshotID: "snapshot"))
+    let entries = [
+        PlannedDispatchEntry(sourceIndex: 0, source: source, backend: .axPress, actionClass: .press,
+            resolved: ResolvedAction(source: source, method: .accessibilityPress,
+                screenPoint: nil, endScreenPoint: nil, element: target.element, verifiedElement: target),
+            pointerSafeRegion: nil, targetKeyboardFocus: nil),
+        PlannedDispatchEntry(sourceIndex: 1, source: .wait(durationMS: 0), backend: .wait, actionClass: nil,
+            resolved: ResolvedAction(source: .wait(durationMS: 0), method: .wait,
+                screenPoint: nil, endScreenPoint: nil, element: nil), pointerSafeRegion: nil, targetKeyboardFocus: nil),
+    ]
+    let result = f.executor.run(expected: f.guardValue, application: f.application,
+        lease: f.activity.lease, entries: entries)
+    #expect(result.error == nil && result.cooperativeError == .observationRequired)
+    #expect(result.lastAcknowledgedAction == 0 && result.outcomes.count == 1)
+    #expect(result.outcomes.first?.observationRequired == true)
+    #expect(result.outcomes.first?.effectVerification == .unverified)
+    #expect(!f.log.values.contains(where: { $0.hasPrefix("wait:") }))
+}
+
+@Test func replacementConsumeIsReadOnlyEvenWhenUserPausesDuringStateRead() throws {
+    let f = try runReplacementForegroundCase("consume_pause")
+    #expect(f.writes == 0 && f.value == "old")
+    #expect(f.focusWritesWhilePaused == 0 && f.fallbacks == 0)
+    #expect(f.result.error == nil && f.result.cooperativeError == .userActivityPaused)
+    #expect(f.result.lastAcknowledgedAction == -1 && f.result.outcomes.count <= 1)
+    #expect(f.gates == 1) // The event gate is entered once and rejects before mutation.
+}
+
+@Test(arguments: ["pre_read", "last_target_validation", "before_focus"])
+func replacementPausedDuringPreparationNeverStartsWrite(scenario: String) throws {
+    let f = try runReplacementForegroundCase(scenario)
+    #expect(f.writes == 0 && f.value == "old")
+    #expect(f.result.error == nil && f.result.cooperativeError == .userActivityPaused)
+    #expect(f.result.lastAcknowledgedAction == -1 && f.result.outcomes.count <= 1)
+    #expect(f.gates == 1 && f.fallbacks == 0)
+    #expect(f.focusWritesWhilePaused == 0)
+}
+
+@Test(arguments: ["setter", "post_read"])
+func replacementPausedAfterWriteIsUnknownWithoutSecondDelivery(scenario: String) throws {
+    let f = try runReplacementForegroundCase(scenario)
+    #expect(f.writes == 1 && f.value == "new 中文")
+    #expect(f.result.error == .unknownOutcome && f.result.cooperativeError == .userActivityPaused)
+    #expect(f.result.lastAcknowledgedAction == -1 && f.result.outcomes.count == 1)
+    #expect(f.gates == 1 && f.fallbacks == 0)
+}
+
+@Test(arguments: ["secure", "disabled", "ime", "missing_target_validator"])
+func replacementExecutionRejectsUnsafeOrUnvalidatedTarget(scenario: String) throws {
+    let f = try runReplacementForegroundCase(scenario)
+    #expect(f.writes == 0 && f.value == "old")
+    #expect(f.result.error != nil && f.result.error != .unknownOutcome)
+    #expect(f.result.lastAcknowledgedAction == -1 && f.result.outcomes.count <= 1)
+    #expect(f.fallbacks == 0)
+}
+
+@Test(arguments: ["verified", "clear", "noop", "mismatch", "missing_readback"])
+func replacementRealConsumerPreservesVerificationAndStopsUnverifiedSuffix(scenario: String) throws {
+    let f = try runReplacementForegroundCase(scenario)
+    let pending = scenario == "mismatch" || scenario == "missing_readback"
+    #expect(f.writes == (scenario == "noop" ? 0 : 1))
+    #expect(f.result.error == nil)
+    #expect(f.result.cooperativeError == (pending ? .observationRequired : nil))
+    #expect(f.result.outcomes.first?.effectVerification == (pending ? .unverified : scenario == "noop" ? .noop : .verified))
+    #expect(f.result.lastAcknowledgedAction == (pending ? 0 : 1))
+    #expect(f.result.outcomes.count == (pending ? 1 : 2))
+    #expect(f.fallbacks == 0)
+    if scenario == "clear" { #expect(f.value.isEmpty) }
+}
+
+/// Uses the production performer AND AXValue replacer; only native I/O and live state are injected.
+private func runReplacementForegroundCase(_ scenario: String) throws -> (
+    result: PIDTargetedActionResult, writes: Int, value: String, gates: Int, fallbacks: Int, focusWritesWhilePaused: Int
+) {
+    let base = MixedForegroundExecutionFixture(enabled: [])
+    let activity = base.activity
+    let ax = AXUIElementCreateApplication(11)
+    let bounds = CGRect(x: 10, y: 10, width: 30, height: 20)
+    func field(_ role: String = "AXTextField", enabled: Bool = true) -> ActionElement {
+        ActionElement(element: ax, identityToken: "field", bounds: bounds,
+            roleResult: .init(value: role, status: .complete),
+            subroleResult: .init(value: nil, status: .complete), enabled: enabled,
+            actionNames: .complete([]))
+    }
+    let target = field()
+    var current = target
+    var safety = BackgroundTextInputSafety.safeASCIIKeyboardLayout
+    var reads = 0, writes = 0, validations = 0, fallbacks = 0
+    var stateReads = 0, focusWritesWhilePaused = 0
+    var consuming = false
+    var value = "old"
+    let writer = SystemAXTextValueReplacer(clock: { 0 },
+        setMessagingTimeout: { _, _ in .success }, isSettable: { _ in (.success, true) },
+        copyValue: { _ in
+            reads += 1
+            if reads == 1 {
+                if scenario == "pre_read" { activity.paused = true }
+                if scenario == "secure" { current = field("AXSecureTextField") }
+                if scenario == "disabled" { current = field(enabled: false) }
+                if scenario == "ime" { safety = .imeOrCandidate }
+            } else {
+                if scenario == "post_read" { activity.paused = true }
+                if scenario == "missing_readback" { return (.cannotComplete, nil) }
+                if scenario == "mismatch" { return (.success, "not the requested value" as CFString) }
+            }
+            return (.success, value as CFString)
+        }, setValue: { _, text in
+            writes += 1
+            value = text as String
+            if scenario == "setter" { activity.paused = true }
+            return .success
+        })
+    let validate: ((ActionElement) throws -> Void)? = scenario == "missing_target_validator" ? nil : { expected in
+        try validateReplacementField(expected: expected, current: current, belongs: { CFEqual($0, ax) })
+        validations += 1
+        if scenario == "last_target_validation", validations == 3 { activity.paused = true }
+    }
+    let performer = SystemActionPerformer(state: {
+        stateReads += 1
+        if scenario == "before_focus", stateReads == 4 { activity.paused = true }
+        if consuming { activity.paused = true }
+        return base.performer.state
+    }, lookup: { _, _ in current },
+        selectedTextWriter: SystemAXSelectedTextWriter(isSettable: { _ in (.success, true) },
+            setValue: { _, _ in fallbacks += 1; return .success }),
+        textValueReplacer: writer, replacementTargetValidation: validate,
+        focusedKeyboard: { _ in current }, focusAcquisition: { _, _ in
+            if activity.paused { focusWritesWhilePaused += 1 }
+            return current
+        }, textInputSafety: { safety })
+    let pid = PIDTargetedActionExecutor(poster: base.poster,
+        compatibility: PIDInputCompatibilityRegistry(cells: []), activity: activity,
+        validator: ExactPIDActionGuardValidator(state: {
+            PIDActionTargetState(target: base.performer.state, snapshotID: "snapshot", isFrontmost: true, isKeyWindow: true)
+        }), element: { _, _ in current }, evidence: { _, _ in false }, delay: { _ in })
+    let executor = ForegroundPlanExecutor(activity: activity, performer: performer, pidExecutor: pid)
+    let source = try NativeAction.parse(.object([
+        "type": .string("type"), "element_ref": .string("field"), "replace": .bool(true),
+        "text": .string(scenario == "clear" ? "" : scenario == "noop" ? "old" : "new 中文"),
+    ]))
+    var entries = [
+        PlannedDispatchEntry(sourceIndex: 0, source: source, backend: .axSelectedText, actionClass: .text,
+            resolved: ResolvedAction(source: source, method: .accessibilityText,
+                screenPoint: nil, endScreenPoint: nil, element: ax, verifiedElement: target),
+            pointerSafeRegion: nil, targetKeyboardFocus: nil),
+        PlannedDispatchEntry(sourceIndex: 1, source: .wait(durationMS: 0), backend: .wait, actionClass: nil,
+            resolved: ResolvedAction(source: .wait(durationMS: 0), method: .wait,
+                screenPoint: nil, endScreenPoint: nil, element: nil), pointerSafeRegion: nil, targetKeyboardFocus: nil),
+    ]
+    if scenario == "consume_pause" {
+        let dispatcher = InputDispatcher(performer: performer, application: base.application,
+            syntheticPolicy: foregroundTakeoverPlanningPolicy(application: base.application, pointerActions: []),
+            backgroundTextInputSafety: InputDispatcherTextSafetyForTakeover(.safeASCIIKeyboardLayout))
+        let actions = [source, NativeAction.wait(durationMS: 0)]
+        let plan = try dispatcher.plan(actions: actions, context: DispatchContext(guardValue: base.guardValue))
+        consuming = true
+        entries = try dispatcher.consumeForegroundPlan(plan, authority: ForegroundPlanConsumptionAuthority(
+            planRef: plan.planRef, snapshotID: "snapshot", interactionMode: .foregroundTakeover,
+            actions: actions, backends: plan.backends, guardValue: base.guardValue))
+        consuming = false
+        #expect(activity.paused)
+        #expect(entries.count == 2 && entries.first?.source.replace == true)
+    }
+    let result = executor.run(expected: base.guardValue, application: base.application,
+        lease: activity.lease, entries: entries)
+    #expect(base.poster.events.isEmpty)
+    return (result, writes, value, activity.eventGateCalls, fallbacks, focusWritesWhilePaused)
+}
+
 private final class MixedForegroundExecutionFixture {
     let guardValue: ActionGuard
     let application = PIDTargetApplication(bundleIdentifier: "com.example.Editor", version: "1")
@@ -2118,6 +2291,7 @@ private final class MixedForegroundLog {
 }
 
 private final class MixedForegroundPerformer: ActionProviding {
+    var requiresObservation = false
     let log: MixedForegroundLog
     let state: ActionTargetState
     private let pointerAXElement = AXUIElementCreateApplication(11)
@@ -2199,7 +2373,9 @@ private final class MixedForegroundPerformer: ActionProviding {
             onWait?()
         default: throw ActionPerformFailure(error: .invalidAction, inputStarted: false)
         }
-        return ActionPerformance(inputStarted: action.method != .wait)
+        return ActionPerformance(inputStarted: action.method != .wait,
+            effectVerification: requiresObservation ? .unverified : nil,
+            observationRequired: requiresObservation)
     }
 }
 

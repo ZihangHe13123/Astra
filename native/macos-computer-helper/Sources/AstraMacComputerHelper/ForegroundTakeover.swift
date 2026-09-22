@@ -1085,7 +1085,13 @@ final class ForegroundPlanExecutor {
                             guard self.now() <= deadline else { throw ActionExecutionError.actionTimeout }
                         },
                         mutation: {
-                            performance = try self.performer.perform(action)
+                            if action.source.replace == true {
+                                performance = try self.performer.performReplacement(action, validateMutation: {
+                                    try self.activity.assertNotPaused(lease: lease)
+                                })
+                            } else {
+                                performance = try self.performer.perform(action)
+                            }
                         }
                     )
                 }
@@ -1111,7 +1117,8 @@ final class ForegroundPlanExecutor {
             }
             return PIDTargetedActionResult(
                 outcomes: [ActionOutcome(index: entry.sourceIndex, ok: true, error: nil,
-                    effectVerification: performance.effectVerification ?? effectProbe.map { effects.verify($0) })],
+                    effectVerification: performance.effectVerification ?? effectProbe.map { effects.verify($0) },
+                    observationRequired: performance.observationRequired)],
                 lastAcknowledgedAction: entry.sourceIndex,
                 error: nil,
                 cooperativeError: nil
@@ -1119,6 +1126,16 @@ final class ForegroundPlanExecutor {
         } catch is UserActivityMonitoringError {
             return stopped(cooperativeError: .userActivityPaused)
         } catch let failure as ActionPerformFailure {
+            if entry.source.replace == true {
+                do { try activity.assertNotPaused(lease: lease) }
+                catch {
+                    let error: ActionExecutionError? = failure.inputStarted ? .unknownOutcome : nil
+                    return PIDTargetedActionResult(
+                        outcomes: [ActionOutcome(index: entry.sourceIndex, ok: false, error: error)],
+                        lastAcknowledgedAction: -1, error: error, cooperativeError: .userActivityPaused
+                    )
+                }
+            }
             let reported = failure.inputStarted ? ActionExecutionError.unknownOutcome : failure.error
             return PIDTargetedActionResult(
                 outcomes: [ActionOutcome(index: entry.sourceIndex, ok: false, error: reported)],

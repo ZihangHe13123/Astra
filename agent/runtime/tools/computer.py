@@ -247,6 +247,16 @@ ACTION_SCHEMA = {
             ("text",),
         ),
         _action_schema(
+            "type",
+            {
+                "text": {"type": "string", "maxLength": MAX_TEXT_CHARACTERS},
+                "element_ref": _ELEMENT_REF,
+                "replace": {"type": "boolean", "const": True,
+                            "description": "Replace the complete field value; empty text clears. Requires replace_text_v1 and exact readback."},
+            },
+            ("text", "element_ref", "replace"),
+        ),
+        _action_schema(
             "keypress",
             {
                 "key": {"type": "string", "minLength": 1, "maxLength": MAX_KEY_SCALARS},
@@ -3759,6 +3769,14 @@ def register_computer_tools(
                 recovery_hint="Call computer_snapshot(settle_ms=300) and inspect the result. Ref churn or an unchanged dialog does not authorize another click. After two inconclusive reads, report unconfirmed and hand off.",
             )
             return None
+        if any(action.replace is True for action in prepared.actions):
+            if "replace_text_v1" not in observation_capabilities(raw_tree):
+                prepared.failure = _failure(
+                    "unsupported_operation",
+                    "Field replacement requires replace_text_v1 from an updated helper. No input was dispatched; do not substitute typing or keyboard shortcuts.",
+                    retryable=False,
+                )
+                return None
         if any(action.checked is not None for action in prepared.actions):
             raw_tree = _LAST_PUBLISHED_AX_TREES.get(str(manager.session_id or ""))
             if "checked_click_v1" not in observation_capabilities(raw_tree):
@@ -4077,7 +4095,7 @@ def register_computer_tools(
         postcondition=verify_snapshot, repeat_guard=False, max_calls_per_turn=32, **common,
     ))
     registry.register(ToolDef(
-        "computer_act", "Execute a guarded batch. For short forms, put independent radio/checkbox choices in one actions array using click + checked:true and fresh form_controls refs/indexes. Already satisfied goals skip input; inspect final choice_verification. An input acknowledgement alone does not prove the desired effect. Default auto plans takeover before input; set opens_dialog:true on the FIRST click opening a native file/save/modal panel, including ordinary or custom buttons. Coordinates default to window_logical; use image_pixels only with the latest published target image. Return fresh refs for continued work. Never replay unknown outcomes or click Submit without task authorization.", ACT_SCHEMA, computer_act,
+        "computer_act", "Execute a guarded batch. For short forms, put independent radio/checkbox choices in one actions array using click + checked:true and fresh form_controls refs/indexes. With replace_text_v1, type + replace:true + exact element_ref replaces the complete field value (empty text clears); inspect effect verification, never replace it with keyboard shortcuts after failure. Already satisfied goals skip input; inspect final choice_verification. An input acknowledgement alone does not prove the desired effect or page saving. Default auto plans takeover before input; set opens_dialog:true on the FIRST click opening a native file/save/modal panel, including ordinary or custom buttons. Coordinates default to window_logical; use image_pixels only with the latest published target image. Return fresh refs for continued work. Never replay unknown outcomes or click Submit without task authorization.", ACT_SCHEMA, computer_act,
         risk="write", approval="on_risk", replay="never", max_retries=0,
         result_persistence="request_local", permission_check=act_permission_check,
         permission_grant=act_permission_grant, permission_finalizer=finalize_act_permission,

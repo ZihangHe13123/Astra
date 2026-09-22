@@ -4868,6 +4868,30 @@ def test_legacy_helper_checked_goal_fails_before_planning(registry, manager, bac
     assert not any(name in {"act", "plan_actions"} for name, _ in backend.calls)
 
 
+def test_legacy_helper_replacement_fails_before_planning(registry, manager, backend):
+    register(registry, manager)
+    focus(registry)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    result = run(registry.execute("computer_act", {"snapshot_id": snapshot["snapshot_id"],
+        "actions": [{"type": "type", "text": "", "element_ref": "snapshot-1:1", "replace": True}]}))
+    assert result["code"] == "unsupported_operation"
+    assert not any(name in {"act", "plan_actions", "takeover_begin"} for name, _ in backend.calls)
+
+
+def test_capable_helper_receives_exact_replacement_semantics(registry, manager, backend):
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["replace_text_v1"],
+        "children": [{"role": "AXTextField", "element_ref": "snapshot-1:field", "label": "Search",
+                      "value": "old", "bounds": {"x": 10, "y": 10, "width": 50, "height": 20}}]}
+    register(registry, manager)
+    registry.set_approval_handler(lambda request: asyncio.sleep(0, result="once"))
+    focus(registry)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    action = {"type": "type", "text": "", "element_ref": "snapshot-1:field", "replace": True}
+    run(registry.execute("computer_act", {"snapshot_id": snapshot["snapshot_id"], "actions": [action]}))
+    sent = [payload[1] for name, payload in backend.calls if name == "act"]
+    assert sent == [[action]]
+
+
 @pytest.mark.parametrize("approval", ["once", "deny"])
 def test_dialog_intent_activates_before_an_ordinary_ax_button_with_normal_approval(
     registry, manager, backend, monkeypatch, approval,

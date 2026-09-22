@@ -4,6 +4,97 @@ import CoreGraphics
 import Foundation
 import Testing
 
+@Test func replacementWirePreservesIntentAndBindsDigestAndReference() throws {
+    for text in ["", "A中文🙂"] {
+        let action = try NativeAction.parse(.object([
+            "type": .string("type"), "text": .string(text), "element_ref": .string("field"), "replace": .bool(true),
+        ]))
+        #expect(action != NativeAction.type(text: text, elementRef: "field"))
+        #expect(InputDispatcher.digest([action]) != InputDispatcher.digest([.type(text: text, elementRef: "field")]))
+        let rebound = try NativeAction.parse(.object([
+            "type": .string("type"), "text": .string(text), "element_ref": .string("other"), "replace": .bool(true),
+        ]))
+        #expect(action.resolvingElementReference("other") == rebound)
+    }
+}
+
+@Test func replacementExecutionUsesValueWriterAndPreservesVerification() throws {
+    let element = AXUIElementCreateApplication(11)
+    let target = ActionElement(element: element, bounds: CGRect(x: 10, y: 10, width: 30, height: 20),
+        role: kAXTextFieldRole as String, subrole: nil, actions: [])
+    let action = try NativeAction.parse(.object([
+        "type": .string("type"), "text": .string(""), "element_ref": .string("field"), "replace": .bool(true),
+    ]))
+    for verification in [ActionEffectVerification.verified, .unverified, .noop] {
+        let writer = ReplacementValueWriterSpy(verification: verification)
+        let performer = SystemActionPerformer(state: {
+            ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100), axIdentity: 33)
+        }, lookup: { _, _ in target }, textValueReplacer: writer,
+        replacementTargetValidation: { current in #expect(CFEqual(current.element!, element)) },
+        focusedKeyboard: { _ in target })
+        let result = try performer.performReplacement(ResolvedAction(source: action, method: .accessibilityText,
+            screenPoint: nil, endScreenPoint: nil, element: element, verifiedElement: target), validateMutation: {})
+        #expect(writer.writes == [""] && result.effectVerification == verification)
+        #expect(result.observationRequired == (verification == .unverified))
+        #expect(result.inputStarted == (verification != .noop))
+        #expect(performer.preflightAXTextReplacement(target) == .settable)
+        do {
+            _ = try performer.perform(ResolvedAction(source: action, method: .unicodeText,
+                screenPoint: nil, endScreenPoint: nil, element: element, verifiedElement: target))
+            Issue.record("replacement must never use legacy unicode/selected-text fallback")
+        } catch let error as ActionPerformFailure { #expect(!error.inputStarted) }
+    }
+}
+
+@Test func replacementExecutionWithoutInvocationActivityGuardIsRejected() throws {
+    let ax = AXUIElementCreateApplication(11)
+    let target = ActionElement(element: ax, bounds: CGRect(x: 10, y: 10, width: 30, height: 20),
+        role: kAXTextFieldRole as String, subrole: nil, actions: [])
+    let source = try NativeAction.parse(.object([
+        "type": .string("type"), "text": .string(""), "element_ref": .string("field"), "replace": .bool(true),
+    ]))
+    let writer = ReplacementValueWriterSpy(verification: .verified)
+    let performer = SystemActionPerformer(state: {
+        ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100), axIdentity: 33)
+    }, lookup: { _, _ in target }, textValueReplacer: writer,
+        replacementTargetValidation: { _ in }, focusedKeyboard: { _ in target })
+    do {
+        _ = try performer.perform(ResolvedAction(source: source, method: .accessibilityText,
+            screenPoint: nil, endScreenPoint: nil, element: ax, verifiedElement: target))
+        Issue.record("replacement without the invocation lease guard was accepted")
+    } catch let error as ActionPerformFailure {
+        #expect(!error.inputStarted)
+    }
+    #expect(writer.writes.isEmpty)
+}
+
+private final class ReplacementValueWriterSpy: AXTextValueReplacing {
+    let verification: ActionEffectVerification
+    var writes: [String] = []
+    init(verification: ActionEffectVerification) { self.verification = verification }
+    func preflight(to _: AXUIElement) -> AXTextMutationPreflight { .settable }
+    func replace(_ text: String, to _: AXUIElement, validateBeforeMutation: () throws -> Void) throws -> TextReplacementResult {
+        try validateBeforeMutation()
+        writes.append(text)
+        return TextReplacementResult(inputStarted: verification != .noop,
+            effectVerification: verification, observationRequired: verification == .unverified)
+    }
+}
+
+@Test func replacementWireRejectsMissingTargetFalseAndMixedFields() {
+    let base: [String: JSONValue] = ["type": .string("type"), "text": .string(""), "element_ref": .string("field"), "replace": .bool(true)]
+    let invalid: [[String: JSONValue]] = [
+        ["replace": .bool(false)], ["replace": .null], ["replace": .number(1)],
+        ["element_ref": .null], ["type": .string("keypress"), "key": .string("a")],
+        ["modifiers": .array([])], ["x": .number(1)], ["key": .null], ["element_index": .number(1)],
+    ]
+    for extra in invalid {
+        #expect(throws: ActionExecutionError.invalidAction) {
+            _ = try NativeAction.parse(.object(base.merging(extra) { _, new in new }))
+        }
+    }
+}
+
 @Test func protocolV2CoordinatePointerUsesIndependentTargetElementReference() throws {
     let action = try NativeAction.parse(.object([
         "type": .string("click"),

@@ -489,6 +489,55 @@ def test_high_impact_batch_hash_distinguishes_exact_typed_payload_without_retain
     assert "printf" not in first.operation
 
 
+@pytest.mark.parametrize("text", ["", "new 中文 value"], ids=["clear", "text"])
+@pytest.mark.parametrize("secret", [None, b"fixture-only-key"])
+def test_replacement_intent_is_bound_to_batch_hash_and_exact_approval_scope(text, secret):
+    from agent.runtime.computer_policy import classify_computer_batch
+    from agent.runtime.computer_backend import ComputerActionPlan
+    from agent.runtime.computer_protocol import ComputerInteractionMode
+
+    target = context(
+        "com.apple.Terminal",
+        elements={"field": {"label": "Shell", "role": "AXTextArea"}},
+    )
+    if secret:
+        target["_scope_secret"] = secret
+    plan = ComputerActionPlan(
+        plan_ref="same-plan",
+        interaction_mode=ComputerInteractionMode.FOREGROUND_TAKEOVER,
+        requires_takeover=True,
+        reason="foreground_takeover_required",
+        action_classes=("text",),
+        pid_action_classes=(),
+    )
+    action = {"type": "type", "text": text, "element_ref": "field"}
+    ordinary = classify_computer_batch(target, [action], interaction_plan=plan)
+    replacement = classify_computer_batch(target, [{**action, "replace": True}], interaction_plan=plan)
+
+    assert ordinary.risk.value == replacement.risk.value == "high_impact"
+    assert ordinary.batch_hash != replacement.batch_hash
+    assert ordinary.scope != replacement.scope
+
+
+def test_legacy_type_hash_is_unchanged_when_replacement_flag_is_absent():
+    import hashlib
+
+    from agent.runtime.computer_policy import classify_computer_batch
+
+    target = context("com.apple.Terminal")
+    action = {"type": "type", "text": "", "element_ref": "field"}
+    canonical = {
+        "session_id": "session-1", "bundle_id": "com.apple.Terminal",
+        "window_ref": "window-1", "snapshot_id": "snapshot-1",
+        "interaction_mode": "background", "requires_takeover": False,
+        "action_classes": ["text"], "actions": [action],
+    }
+    expected = hashlib.sha256(json.dumps(
+        canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    assert classify_computer_batch(target, [action]).batch_hash == expected
+
+
 def test_batch_hash_supports_an_ephemeral_secret_to_avoid_offline_text_guessing():
     from agent.runtime.computer_policy import classify_computer_batch
 

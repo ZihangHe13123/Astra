@@ -2765,6 +2765,27 @@ final class SystemWindowObserver: WindowObserving {
                 else { return nil }
                 return AXScrollPressTarget(owner: owner, button: button)
             },
+            replacementTargetValidation: { [weak self] expected in
+                guard let self, target.interactionMode == .foregroundTakeover,
+                      let element = expected.element else { throw ActionExecutionError.staleSnapshot }
+                let guardValue = snapshotContext.guardValue
+                let live = try self.currentActionState(for: target,
+                    expectedFocusedRootPreference: guardValue.focusedRootPreference)
+                guard live.pid == guardValue.pid, live.windowID == guardValue.windowID,
+                      live.axIdentity == guardValue.axIdentity, live.bounds == guardValue.bounds,
+                      live.focusedAXIdentity == guardValue.focusedAXIdentity,
+                      live.focusedAXBounds == guardValue.focusedAXBounds,
+                      live.focusedRootPreference == guardValue.focusedRootPreference,
+                      let root = self.catalogExactAXWindow(in: AXUIElementCreateApplication(target.pid), target: target),
+                      CFHash(root) == guardValue.axIdentity,
+                      let retained = snapshotContext.references.values.first(where: {
+                          $0.element.map { CFEqual($0, element) } ?? false
+                      }) else { throw ActionExecutionError.staleSnapshot }
+                let current = self.currentActionElement(snapshotElement: retained, target: target,
+                    windowBounds: guardValue.bounds, requiresExactBounds: true)
+                try validateReplacementField(expected: expected, current: current,
+                    belongs: { focusedElementBelongsToExactAXRoot(element: $0, root: root, pid: target.pid) })
+            },
             // 键盘焦点获取能力在此**显式装配**（默认 nil ＝ 不获取）。有了它，`type` 才可能
             // 在目标未被点击聚焦时把焦点带过去，走纯 AX 写入而不是合成键盘事件。
             focusAcquisition: acquireKeyboardFocusViaAX,
