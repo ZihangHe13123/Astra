@@ -1322,6 +1322,32 @@ private func scrollbarAXPressReferences(
     #expect(provider.fallbackWindowIDs == [73])
 }
 
+@Test func popupPrimaryContentCannotBeScaledParentPixels() throws {
+    let popup = CGRect(x: 89, y: 70, width: 1038, height: 159)
+    #expect(!primaryWindowContentHasExactSize(
+        contentRect: CGRect(x: 0, y: 0, width: 1319, height: 768), expectedBounds: popup
+    ))
+    #expect(primaryWindowContentHasExactSize(
+        contentRect: CGRect(x: 0, y: 0, width: 1038, height: 159), expectedBounds: popup
+    ))
+    #expect(!primaryWindowContentHasExactSize(contentRect: .null, expectedBounds: popup))
+    #expect(!primaryWindowContentHasExactSize(contentRect: popup, expectedBounds: .zero))
+    #expect(!primaryWindowContentHasExactSize(
+        contentRect: CGRect(x: 0, y: 0, width: 1039, height: 159), expectedBounds: popup
+    ))
+    let provider = RecordingImageProvider(primaryError: .contentMismatch, fallbackImage: testImage())
+    _ = try captureExactWindowImage(windowID: 73, provider: provider)
+    #expect(provider.fallbackWindowIDs == [73])
+}
+
+@Test func popupGeometryFallbackFailureDoesNotCaptureAnotherSurface() {
+    let provider = RecordingImageProvider(primaryError: .contentMismatch, fallbackImage: nil)
+    #expect(throws: WindowObservationError.self) {
+        try captureExactWindowImage(windowID: 73, provider: provider)
+    }
+    #expect(provider.fallbackWindowIDs == [73])
+}
+
 @Test func exactWindowFallbackFailureFailsClosed() {
     let provider = RecordingImageProvider(primaryError: .timedOut, fallbackImage: nil)
 

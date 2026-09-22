@@ -260,7 +260,19 @@ enum WindowObservationError: Error {
 
 let applicationMenuBarMaximumDepth = 4
 
-enum PrimaryWindowCaptureError: Error { case timedOut }
+enum PrimaryWindowCaptureError: Error { case timedOut, contentMismatch }
+
+/// A requested output size does not prove SCK captured the same source region:
+/// a compositor-owned popup may otherwise become a scaled parent plus padding.
+/// Identity is checked by the caller; this checks the independent filter size.
+func primaryWindowContentHasExactSize(contentRect: CGRect, expectedBounds: CGRect) -> Bool {
+    let values = [contentRect.minX, contentRect.minY, contentRect.width, contentRect.height,
+                  expectedBounds.minX, expectedBounds.minY, expectedBounds.width, expectedBounds.height]
+    guard values.allSatisfy({ $0.isFinite }), contentRect.width > 0, contentRect.height > 0,
+          expectedBounds.width > 0, expectedBounds.height > 0 else { return false }
+    return abs(contentRect.width - expectedBounds.width) < 0.01
+        && abs(contentRect.height - expectedBounds.height) < 0.01
+}
 
 protocol ExactWindowImageProviding {
     func primaryImage() throws -> CGImage
@@ -364,11 +376,14 @@ func captureExactWindowImage(
 ) throws -> CGImage {
     do {
         return try provider.primaryImage()
-    } catch PrimaryWindowCaptureError.timedOut {
-        guard let image = provider.fallbackImage(for: windowID) else {
-            throw WindowObservationError.captureFailed
+    } catch let error as PrimaryWindowCaptureError {
+        switch error {
+        case .timedOut, .contentMismatch:
+            guard let image = provider.fallbackImage(for: windowID) else {
+                throw WindowObservationError.captureFailed
+            }
+            return image
         }
-        return image
     }
 }
 
@@ -1058,6 +1073,8 @@ final class SystemWindowObserver: WindowObserving {
     private var catalogGeneration = 0
     private var targets: [String: WindowTarget] = [:]
     private var catalogWindowIdentities: [CatalogWindowIdentityKey: [CatalogWindowIdentityRecord]] = [:]
+    private var catalogAbsenceTracker = CatalogWindowAbsenceTracker()
+    private let windowServerInventory: () -> Set<CGWindowID>?
     private let catalogBuilder: (() throws -> WindowCatalogObservation)?
     private let catalogWindows: (() throws -> [CatalogSCWindow])?
     private let catalogAXWindowMatcher: ((AXUIElement, WindowTarget) -> AXUIElement?)?
@@ -1124,7 +1141,8 @@ final class SystemWindowObserver: WindowObserving {
         catalogWindows: (() throws -> [CatalogSCWindow])? = nil,
         catalogAXWindowMatcher: ((AXUIElement, WindowTarget) -> AXUIElement?)? = nil,
         catalogAXIdentityHash: @escaping (AXUIElement) -> CFHashCode = { CFHash($0) },
-        catalogAXWindows: ((pid_t) -> [CatalogAXWindowRecord])? = nil
+        catalogAXWindows: ((pid_t) -> [CatalogAXWindowRecord])? = nil,
+        windowServerInventory: (() -> Set<CGWindowID>?)? = nil
     ) {
         self.permissions = permissions
         self.activation = activation
@@ -1141,6 +1159,9 @@ final class SystemWindowObserver: WindowObserving {
         self.catalogAXWindowMatcher = catalogAXWindowMatcher
         self.catalogAXIdentityHash = catalogAXIdentityHash
         self.catalogAXWindows = catalogAXWindows
+        self.windowServerInventory = windowServerInventory ?? (
+            catalogBuilder == nil && catalogWindows == nil ? fullWindowServerInventoryForAbsence : { nil }
+        )
     }
 
     func apps() throws -> JSONValue {
@@ -1157,10 +1178,28 @@ final class SystemWindowObserver: WindowObserving {
         let nextGeneration = try nextCatalogGeneration(after: catalogGeneration)
         targets = observation.targets
         catalogGeneration = nextGeneration
-        return .object([
+        // Track only exposed identities, retaining history across refreshes.
+        for case let .object(app) in observation.apps {
+            guard case let .string(appRef)? = app["app_ref"],
+                  case let .array(windows)? = app["windows"] else { continue }
+            for case let .object(window) in windows {
+                guard case .bool(true)? = window["bindable"],
+                      case let .string(reference)? = window["window_identity_ref"],
+                      case let .string(windowRef)? = window["window_ref"],
+                      let target = observation.targets[windowRef], target.appRef == appRef
+                else { continue }
+                catalogAbsenceTracker.record(reference: reference, windowID: target.windowID)
+            }
+        }
+        var result: [String: JSONValue] = [
             "catalog_generation": .number(Double(nextGeneration)),
             "apps": .array(observation.apps),
-        ])
+        ]
+        let absent = catalogAbsenceTracker.confirmedAbsent(windowIDs: windowServerInventory())
+        if !absent.isEmpty {
+            result["confirmed_absent_window_identity_refs"] = .array(absent.map(JSONValue.string))
+        }
+        return .object(result)
     }
 
     private func buildCatalog() throws -> WindowCatalogObservation {
@@ -1781,6 +1820,7 @@ final class SystemWindowObserver: WindowObserving {
                 if let subtree, !axSubtreeBelongsToWindow(subtree, window: expectedAfter, pid: target.pid) {
                     throw WindowObservationError.staleTarget
                 }
+                let contentBudget = budget.contentProjectionBudget()
                 let windowTree = metrics.measure(.ax) { AXNodeReader.read(
                     root: subtree ?? serializationRoot,
                     windowBounds: observationBounds,
@@ -1792,19 +1832,25 @@ final class SystemWindowObserver: WindowObserving {
                         ).value,
                         rootIsExpectedWindow: CFEqual(serializationRoot, expectedAfter)
                     ),
-                    recoverFocusedBranch: subtree == nil && CFEqual(serializationRoot, expectedAfter)
+                    recoverFocusedBranch: subtree == nil && CFEqual(serializationRoot, expectedAfter),
+                    budget: contentBudget
                 ) }
                 try budget.check()
-                let menuBarTree = (subtree == nil ? self.applicationMenuBar(
-                    in: appElement,
-                    expectedPID: target.pid
-                ) : nil).map {
-                    AXNodeReader.read(
-                        root: $0,
-                        windowBounds: observationBounds,
-                        maximumDepth: applicationMenuBarMaximumDepth
-                    )
-                }
+                let menuBarTree: AXNode? = {
+                    let restoreContent = contentBudget.install()
+                    defer { restoreContent() }
+                    return (subtree == nil ? self.applicationMenuBar(
+                        in: appElement,
+                        expectedPID: target.pid
+                    ) : nil).map {
+                        AXNodeReader.read(
+                            root: $0,
+                            windowBounds: observationBounds,
+                            maximumDepth: applicationMenuBarMaximumDepth,
+                            budget: contentBudget
+                        )
+                    }
+                }()
                 let observationTree = subtree != nil ? windowTree : targetApplicationObservationTree(
                     window: windowTree,
                     menuBar: menuBarTree
@@ -1825,11 +1871,16 @@ final class SystemWindowObserver: WindowObserving {
                 case .off:
                     detail = nil
                 case .on:
-                    detail = try metrics.measure(.detail) { try AXTextDetailSerializer.serialize(
-                        root: subtree ?? serializationRoot,
-                        snapshotID: snapshotID
-                    ) }
+                    detail = try metrics.measure(.detail) {
+                        let restoreContent = contentBudget.install()
+                        defer { restoreContent() }
+                        return try AXTextDetailSerializer.serialize(
+                            root: subtree ?? serializationRoot,
+                            snapshotID: snapshotID
+                        )
+                    }
                 }
+                metrics.recordContentBudget(contentBudget)
                 try budget.check()
                 if let subtree, !axSubtreeBelongsToWindow(subtree, window: expectedAfter, pid: target.pid) {
                     throw WindowObservationError.staleTarget
@@ -3215,11 +3266,14 @@ final class SystemWindowObserver: WindowObserving {
         configuration.width = Int(geometry.pixelSize.width)
         configuration.height = Int(geometry.pixelSize.height)
         configuration.showsCursor = false
+        configuration.ignoreShadowsSingleWindow = true
         let filter = SCContentFilter(desktopIndependentWindow: window)
         let provider = SystemExactWindowImageProvider(
             primary: {
-                if focusedTransientActive {
-                    throw PrimaryWindowCaptureError.timedOut
+                if focusedTransientActive || !primaryWindowContentHasExactSize(
+                    contentRect: filter.contentRect, expectedBounds: geometry.bounds
+                ) {
+                    throw PrimaryWindowCaptureError.contentMismatch
                 }
                 do {
                     return try waitForAsync(timeout: AXObservationBudget.current?.phaseTimeout(maximum: 5) ?? 5) {

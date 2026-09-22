@@ -50,10 +50,15 @@ def test_keyboard_failure_diagnostics_are_not_allowed_on_success():
         }, expected_index=0)
 
 
-@pytest.mark.parametrize("key", ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Esc", "Enter"])
-def test_common_key_aliases_are_accepted_without_changing_authorization_payload(key):
-    action = ComputerAction.from_mapping({"type": "keypress", "key": key})
-    assert action.to_mapping() == {"type": "keypress", "key": key}
+@pytest.mark.parametrize(("key", "canonical"), [
+    ("ArrowLeft", "left"), ("ArrowRight", "right"), ("ArrowUp", "up"),
+    ("ArrowDown", "down"), ("Esc", "escape"), ("Enter", "return"),
+    ("Backspace", "delete"),
+])
+def test_common_key_aliases_use_native_names_without_changing_target_or_modifiers(key, canonical):
+    request = {"type": "keypress", "key": key, "element_ref": "ax_field", "modifiers": ["shift"]}
+    action = ComputerAction.from_mapping(request)
+    assert action.to_mapping() == {**request, "key": canonical}
 
 
 @pytest.mark.parametrize("key", ["ArrowDiagonal", "Right+Enter", "Control+K", "F100"])

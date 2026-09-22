@@ -14,6 +14,8 @@ final class ObservationPIDInventory<Value> {
 
 let maximumOrdinaryAXDuration: TimeInterval = 5
 let maximumObservationAXCallDuration: TimeInterval = 0.25
+let maximumContentAXDuration: TimeInterval = 3
+let finalObservationValidationReserve: TimeInterval = 1
 
 final class AXObservationBudget {
     static var current: AXObservationBudget? { Thread.current.threadDictionary["astra.observationBudget"] as? AXObservationBudget }
@@ -30,6 +32,7 @@ final class AXObservationBudget {
     private let clock: () -> TimeInterval
     private let deadline: TimeInterval
     private var externalRemainingBudget: (() -> TimeInterval)?
+    private weak var failureParent: AXObservationBudget?
     private var remainingDuration: TimeInterval { externalRemainingBudget?() ?? (deadline - clock()) }
     private let setTimeout: (AXUIElement, Float) -> AXError
     private(set) var calls = 0
@@ -50,17 +53,42 @@ final class AXObservationBudget {
         self.init(setTimeout: setTimeout)
         self.externalRemainingBudget = remainingBudget
     }
+    /// Optional content must leave time for final exact-window validation.
+    /// Child expiry is partial content; a timeout-setup failure still poisons
+    /// the hard transaction rather than silently weakening its safety reads.
+    func contentProjectionBudget(
+        maximumDuration: TimeInterval = maximumContentAXDuration,
+        reservingDuration: TimeInterval = finalObservationValidationReserve
+    ) -> AXObservationBudget {
+        let now = clock()
+        guard maximumDuration.isFinite, maximumDuration > 0,
+              reservingDuration.isFinite, reservingDuration >= 0,
+              now.isFinite, (now + maximumDuration).isFinite
+        else { return AXObservationBudget(duration: 0, clock: clock, setTimeout: setTimeout) }
+        let contentDeadline = now + maximumDuration
+        let child = AXObservationBudget(duration: maximumDuration, clock: clock, setTimeout: setTimeout)
+        child.failureParent = self
+        child.externalRemainingBudget = { [self] in
+            guard available else { return 0 }
+            return min(contentDeadline - clock(), remainingDuration - reservingDuration)
+        }
+        return child
+    }
+    private func fail() {
+        failed = true
+        failureParent?.fail()
+    }
     func call<Value>(element: AXUIElement, _ body: () -> Value) -> Value? {
         guard available else { return nil }
         let remaining = min(remainingDuration, maximumObservationAXCallDuration)
         guard remaining.isFinite, remaining > 0 else { return nil }
         var timeout = Float(remaining)
         if Double(timeout) > remaining { timeout = timeout.nextDown }
-        guard timeout > 0, setTimeout(element, timeout) == .success else { failed = true; return nil }
+        guard timeout > 0, setTimeout(element, timeout) == .success else { fail(); return nil }
         guard available else { _ = setTimeout(element, 0); return nil }
         calls += 1
         let value = body()
-        guard setTimeout(element, 0) == .success else { failed = true; return nil }
+        guard setTimeout(element, 0) == .success else { fail(); return nil }
         return available ? value : nil
     }
 }
@@ -125,6 +153,12 @@ final class ObservationStageMetrics {
     enum Stage: String { case inventory, image, png, ax, detail, finalValidation = "final_validation" }
     private let start = ProcessInfo.processInfo.systemUptime
     private var milliseconds: [String: Double] = [:]
+    private var contentAXCalls = 0
+    private var contentAXBudgetExpired = false
+    func recordContentBudget(_ budget: AXObservationBudget) {
+        contentAXCalls += budget.calls
+        contentAXBudgetExpired = contentAXBudgetExpired || budget.expired
+    }
     func measure<Value>(_ stage: Stage, _ body: () throws -> Value) rethrows -> Value {
         let before = ProcessInfo.processInfo.systemUptime
         defer { milliseconds[stage.rawValue, default: 0] += (ProcessInfo.processInfo.systemUptime - before) * 1_000 }
@@ -139,6 +173,7 @@ final class ObservationStageMetrics {
             "total_ms": (ProcessInfo.processInfo.systemUptime - start) * 1_000,
             "ax_calls": budget?.calls ?? 0, "ax_cache_hits": cache?.hits ?? 0,
             "ax_budget_expired": budget?.expired ?? false, "ax_timeout_setup_failed": budget?.failed ?? false,
+            "content_ax_calls": contentAXCalls, "content_ax_budget_expired": contentAXBudgetExpired,
         ]
         if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]) {
             FileHandle.standardError.write(data + Data("\n".utf8))

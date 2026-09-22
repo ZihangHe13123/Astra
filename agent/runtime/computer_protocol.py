@@ -619,12 +619,19 @@ class ComputerAction:
             canonical = {
                 "arrowleft": "left", "arrowright": "right", "arrowup": "up",
                 "arrowdown": "down", "enter": "return", "esc": "escape",
+                "backspace": "delete",
             }.get(self.key.lower(), self.key.lower())
             supported = set("abcdefghijklmnopqrstuvwxyz0123456789=-][';\\,/.") | {
                 "return", "tab", "space", "delete", "escape", "left", "right", "down", "up",
             }
             if canonical not in supported:
-                raise ValueError("unsupported key name; pass a supported key with modifiers separately")
+                raise ValueError(
+                    "unsupported key name; supported: a-z, 0-9, = - ] [ ' ; \\ , / ., "
+                    "return (enter), tab, space, delete (backspace), escape (esc), "
+                    "left/right/up/down (ArrowLeft/ArrowRight/ArrowUp/ArrowDown); "
+                    "pass modifiers separately"
+                )
+            object.__setattr__(self, "key", canonical)
         if (
             self.type == "keypress"
             and self.key is not None

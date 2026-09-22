@@ -104,6 +104,7 @@ class ComputerAppCatalog:
 
     generation: int
     apps: tuple[Mapping[str, object], ...]
+    confirmed_absent_window_identity_refs: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if isinstance(self.generation, bool) or not isinstance(self.generation, int):
@@ -112,6 +113,18 @@ class ComputerAppCatalog:
             raise ValueError("generation must be positive")
         if not isinstance(self.apps, tuple) or not all(isinstance(app, Mapping) for app in self.apps):
             raise ValueError("apps must be a tuple of objects")
+        refs = self.confirmed_absent_window_identity_refs
+        if (
+            not isinstance(refs, tuple) or len(refs) > 200
+            or any(
+                not isinstance(ref, str) or not ref
+                or len(ref) > _MAX_WINDOW_IDENTITY_REF_SCALARS
+                or any(0xD800 <= ord(character) <= 0xDFFF for character in ref)
+                for ref in refs
+            )
+            or len(set(refs)) != len(refs)
+        ):
+            raise ValueError("confirmed_absent_window_identity_refs must be a tuple of at most 200 unique valid identity refs")
 
 
 @dataclass(frozen=True)
@@ -411,6 +424,7 @@ class ComputerSessionManager:
         self._suspended_target: ComputerTarget | None = None
         self._target_window_identity_ref: str | None = None
         self._suspended_window_identity_ref: str | None = None
+
         self._resume_candidate: ComputerTarget | None = None
         self._resume_catalog_refreshed = False
         self._resume_publication_id: str | None = None
@@ -518,6 +532,7 @@ class ComputerSessionManager:
             self.grants.clear()
             self._resume_candidate = None
             self._resume_catalog_refreshed = False
+            self._resume_publication_id = None
             if not self._handed_off:
                 self._target = None
                 self._target_window_identity_ref = None
@@ -1698,7 +1713,7 @@ class ComputerSessionManager:
                 preserve_takeover_cleanup=True,
             )
 
-    async def resume(self, publication_id: str) -> ComputerTarget:
+    async def resume(self, publication_id: str) -> ComputerTarget | None:
         async with self._lock:
             self._require_open()
             if not self._valid_window_identity_ref(publication_id):
@@ -1714,7 +1729,29 @@ class ComputerSessionManager:
                 )
             candidate = self._resume_candidate
             if candidate is None:
-                raise ComputerSessionError("target_gone", "target_gone: suspended target is unavailable")
+                identities = self._catalog_window_identities(self._last_catalog)
+                if (
+                    identities is None
+                    or self._last_catalog is None
+                    or not self._valid_window_identity_ref(self._suspended_window_identity_ref)
+                    or self._suspended_window_identity_ref not in self._last_catalog.confirmed_absent_window_identity_refs
+                    or self._suspended_window_identity_ref in identities
+                ):
+                    raise ComputerSessionError("target_gone", "target_gone: suspended target absence is unproven")
+                # This fresh proof is produced only for opaque identities
+                # exposed in this helper lifetime, against full WindowServer
+                # inventory. Unrelated UI bindability is not continuity proof.
+                self._resume_catalog_refreshed = False
+                self._invalidate_cooperative_state()
+                self.grants.clear()
+                self._target = None
+                self._target_identity = None
+                self._target_window_identity_ref = None
+                self._target_generation += 1
+                self._resume_publication_id = publication_id
+                # Keep handoff and continuity until the unbound receipt passes
+                # publication. Abort/cancellation must retain user control.
+                return None
             self._resume_candidate = None
             self._resume_catalog_refreshed = False
             self._invalidate_cooperative_state()
@@ -1731,6 +1768,15 @@ class ComputerSessionManager:
             self._target_window_identity_ref = self._suspended_window_identity_ref
             self._resume_publication_id = publication_id
             return refreshed
+
+    def validate_unbound_resume_publication(self, publication_id: str) -> None:
+        self._require_open()
+        if (
+            self._resume_publication_id != publication_id
+            or not self._handed_off or self._target is not None
+            or self._suspended_target is None
+        ):
+            raise ComputerSessionError("stale_resume_publication")
 
     async def commit_resume_publication(self, publication_id: str) -> None:
         async with self._lock:
@@ -1958,6 +2004,26 @@ class ComputerSessionManager:
                 except (TypeError, ValueError):
                     return None
         return matches[0] if len(matches) == 1 else None
+
+    @classmethod
+    def _catalog_window_identities(cls, catalog: ComputerAppCatalog | None) -> frozenset[str] | None:
+        """Find conflicts with a native absence proof, never infer absence."""
+        if not isinstance(catalog, ComputerAppCatalog):
+            return None
+        identities: set[str] = set()
+        for application in catalog.apps:
+            if not isinstance(application, Mapping) or not isinstance(application.get("windows"), list):
+                return None
+            for window in application["windows"]:
+                if not isinstance(window, Mapping):
+                    return None
+                identity = window.get("window_identity_ref")
+                if identity is None:
+                    continue
+                if not cls._valid_window_identity_ref(identity):
+                    return None
+                identities.add(identity)
+        return frozenset(identities)
 
     @staticmethod
     def _valid_window_identity_ref(value: object) -> TypeGuard[str]:

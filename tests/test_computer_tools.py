@@ -599,6 +599,162 @@ def register_local(registry, manager, monkeypatch, tmp_path):
     return runtime
 
 
+def test_robustness_initial_timeout_recovers_through_exact_catalog(registry, manager, backend, monkeypatch):
+    register(registry, manager)
+    registry.yolo = True
+    assert run(registry.execute("computer_apps", {}))["error"] == ""
+
+    async def timeout(*args, **kwargs):
+        raise HelperApplicationError(ComputerError(ComputerErrorCode.OBSERVATION_TIMEOUT, "timeout"))
+
+    monkeypatch.setattr(backend, "get_app_state", timeout)
+    result = run(registry.execute("computer_get_app_state", {"app_ref": "app-1", "window_ref": "window-1"}))
+    assert result["code"] == "observation_timeout"
+    assert manager.target is None
+    hint = result["recovery_hint"]
+    assert "computer_apps" in hint and "computer_get_app_state" in hint
+    assert "snapshot" not in hint.lower()
+
+
+def test_robustness_bad_key_rejected_before_helper(registry, manager, backend):
+    register(registry, manager)
+    before = list(backend.calls)
+    result = run(registry.execute("computer_act", {
+        "snapshot_id": "unused", "actions": [{"type": "keypress", "key": "bad-key"}],
+    }))
+    assert result["error"]
+    assert "delete" in str(result) and "escape" in str(result)
+    assert backend.calls == before
+
+
+def _robustness_menu_tree():
+    return {"role": "AXWindow", "children": [
+        {"role": "AXMenuBar", "element_ref": "bar", "children": [
+            {"role": "AXMenuBarItem", "element_ref": "file", "index": 2,
+             "label": "File", "actions": ["AXPress"], "children": [
+                 {"role": "AXMenu", "children": [
+                     {"role": "AXMenuItem", "element_ref": "open", "index": 4, "label": "Open"},
+                 ]},
+             ]},
+        ]},
+        {"role": "AXTextField", "element_ref": "field", "index": 5, "value": "current"},
+        {"role": "AXTextField", "subrole": "AXSecureTextField", "value": "secret"},
+    ]}
+
+
+def test_robustness_ordinary_ax_collapses_only_static_menu_descendants():
+    from copy import deepcopy
+    from agent.runtime.tools.computer import _bounded_ax_tree, _bounded_ax_subtree
+
+    raw = _robustness_menu_tree()
+    original = deepcopy(raw)
+    public = _bounded_ax_tree(raw)
+    entry = public["children"][0]["children"][0]
+    assert entry["element_ref"] == "file" and entry["index"] == 2
+    assert entry["actions"] == ["AXPress"]
+    assert "Open" not in json.dumps(public)
+    assert "subtree_ref" in json.dumps(entry)
+    assert public["children"][1]["value"] == "current"
+    assert "secret" not in json.dumps(public)
+    assert raw == original
+    assert "Open" in json.dumps(_bounded_ax_subtree(raw, "file"))
+
+
+@pytest.mark.parametrize("explicit", ["active_menu", "subtree", "role_filter", "native_subtree"])
+def test_robustness_explicit_menu_content_is_preserved(registry, manager, backend, explicit):
+    from agent.runtime.tools.computer import _public_snapshot_payload
+
+    register(registry, manager)
+    run(registry.execute("computer_apps", {}))
+    run(registry.execute("computer_focus", {"app_ref": "app-1", "window_ref": "window-1"}))
+    raw = _robustness_menu_tree()
+    kwargs = {}
+    if explicit == "active_menu":
+        raw = {"role": "AXMenu", "children": raw["children"][0]["children"]}
+    elif explicit == "subtree":
+        kwargs["subtree_ref"] = "file"
+    elif explicit == "role_filter":
+        kwargs["role_filter"] = "AXMenuItem"
+    else:
+        raw["observation_scope"] = "native_subtree"
+    backend.snapshot_ax_tree_override = raw
+    snapshot = run(manager.snapshot())
+    payload, *_ = _public_snapshot_payload(manager, snapshot, scope="target_window", **kwargs)
+    assert "Open" in json.dumps(payload["ax_tree"])
+
+
+@pytest.mark.parametrize("action_result", [None, {"status": "action_acknowledged", "last_acknowledged_action": 0}])
+def test_robustness_public_ordinary_receipt_prioritizes_window_fields(registry, manager, backend, action_result):
+    from agent.runtime.tools.computer import _public_snapshot_payload
+
+    register(registry, manager)
+    run(registry.execute("computer_apps", {}))
+    run(registry.execute("computer_focus", {"app_ref": "app-1", "window_ref": "window-1"}))
+    backend.snapshot_ax_tree_override = _robustness_menu_tree()
+    snapshot = run(manager.snapshot())
+    payload, *_ = _public_snapshot_payload(manager, snapshot, scope="target_window", action_result=action_result)
+    projected = json.dumps(payload["ax_tree"])
+    assert "Open" not in projected and "secret" not in projected
+    assert "current" in projected and "AXPress" in projected and "subtree_ref" in projected
+    assert payload["ax_tree"]["children"][0]["children"][0]["index"] == 2
+    assert "Open" in json.dumps(snapshot.payload["ax_tree"])
+
+
+def _robustness_menu_handoff(registry, manager, backend, monkeypatch):
+    original_apps = backend.apps
+    vanished = [False]
+
+    async def catalog():
+        result = await original_apps()
+        app = dict(result.apps[0])
+        parent = {"window_ref": "parent", "title": "Parent", "bindable": True,
+                  "window_identity_ref": "identity-parent"}
+        app["windows"] = [parent] if vanished[0] else [*app["windows"][:1], parent]
+        return ComputerAppCatalog(
+            result.generation, (app,),
+            confirmed_absent_window_identity_refs=("identity-a",) if vanished[0] else (),
+        )
+
+    monkeypatch.setattr(backend, "apps", catalog)
+    register(registry, manager)
+    registry.yolo = True
+    assert run(registry.execute("computer_apps", {}))["error"] == ""
+    assert run(registry.execute("computer_get_app_state", {"app_ref": "app-1", "window_ref": "window-1"}))["error"] == ""
+    assert run(registry.execute("computer_handoff", {}))["error"] == ""
+    vanished[0] = True
+
+
+def test_robustness_vanished_resume_receipt_allows_exact_rebind(registry, manager, backend, monkeypatch):
+    _robustness_menu_handoff(registry, manager, backend, monkeypatch)
+    before = len(backend.calls)
+    result = run(registry.execute("computer_resume", {"app_ref": "app-1", "window_ref": "window-1"}))
+    assert not result["error"] and result["verified"] is True
+    payload = json.loads(result.get("fresh_output") or result["output"])
+    assert payload["status"] == "target_gone_unbound"
+    assert "computer_apps" in payload["recovery_hint"] and "computer_get_app_state" in payload["recovery_hint"]
+    assert not manager.handed_off and manager.target is None and manager.suspended_target is None
+    assert [name for name, _ in backend.calls[before:]] == ["apps"]
+    assert run(registry.execute("computer_apps", {}))["error"] == ""
+    assert run(registry.execute("computer_get_app_state", {"app_ref": "app-1", "window_ref": "parent"}))["error"] == ""
+
+
+@pytest.mark.parametrize("failure", ["postcondition", "commit", "cancelled"])
+def test_robustness_unbound_receipt_publication_failure_stays_handed_off(registry, manager, backend, monkeypatch, failure):
+    _robustness_menu_handoff(registry, manager, backend, monkeypatch)
+    if failure == "postcondition":
+        registry.get("computer_resume").postcondition = lambda args, result: (False, "publication refused")
+    else:
+        async def fail_commit(publication_id):
+            if failure == "cancelled":
+                raise asyncio.CancelledError()
+            raise RuntimeError("commit refused")
+        monkeypatch.setattr(manager, "commit_resume_publication", fail_commit)
+    result = run(registry.execute("computer_resume", {"app_ref": "app-1", "window_ref": "window-1"}))
+    assert result["code"] == "postcondition_failed"
+    assert manager.handed_off and manager.suspended_target == ComputerTarget("app-1", "window-1")
+    assert manager.target is None and not manager.grants
+
+
 def test_local_runtime_resume_is_lazy_and_does_not_start_manager(
     registry,
     manager,

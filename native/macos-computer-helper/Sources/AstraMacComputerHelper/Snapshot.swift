@@ -1516,12 +1516,14 @@ enum AXNodeReader {
         root: AXUIElement,
         windowBounds: CGRect,
         maximumDepth: Int = maximumAXDepth,
-        recoverFocusedBranch: Bool = false
+        recoverFocusedBranch: Bool = false,
+        budget: AXObservationBudget? = nil
     ) -> AXNode {
         read(
             provider: SystemAXNodeAttributeProvider(element: root, recoverFocusedBranch: recoverFocusedBranch),
             windowBounds: windowBounds,
-            maximumDepth: maximumDepth
+            maximumDepth: maximumDepth,
+            budget: budget
         )
     }
 
@@ -1622,6 +1624,13 @@ enum AXNodeReader {
         let help = state.take(provider.stringValue(for: kAXHelpAttribute)).value
         let value = secure ? "<redacted>" : state.take(provider.stringValue(for: kAXValueAttribute)).value
         let actions = state.budget?.available != false ? provider.actions().prefix(32).compactMap { state.take($0).value } : []
+        let enabled = state.budget?.available != false ? provider.boolValue(for: kAXEnabledAttribute) : nil
+        let focused = state.budget?.available != false ? provider.boolValue(for: kAXFocusedAttribute) : nil
+        let sourceElement = state.budget?.available != false ? provider.sourceElement() : nil
+        // Any accessor, including empty children or the final source lookup,
+        // can consume the soft budget. Publish partial evidence, not a complete
+        // empty tree; do not expose a reference obtained past the deadline.
+        let contentExpired = state.budget?.available == false
         return AXNode(
             role: role,
             subrole: subrole,
@@ -1629,8 +1638,8 @@ enum AXNodeReader {
             title: title,
             help: help,
             value: value,
-            enabled: state.budget?.available != false ? provider.boolValue(for: kAXEnabledAttribute) : nil,
-            focused: state.budget?.available != false ? provider.boolValue(for: kAXFocusedAttribute) : nil,
+            enabled: enabled,
+            focused: focused,
             actions: actions,
             bounds: CGRect(
                 x: elementBounds.origin.x - windowBounds.origin.x,
@@ -1639,8 +1648,8 @@ enum AXNodeReader {
                 height: elementBounds.height
             ),
             children: children,
-            sourceElement: state.budget?.available != false ? provider.sourceElement() : nil,
-            childrenTruncated: childrenTruncated
+            sourceElement: contentExpired ? nil : sourceElement,
+            childrenTruncated: childrenTruncated || contentExpired
         )
     }
 

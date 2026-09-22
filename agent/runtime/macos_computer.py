@@ -628,14 +628,22 @@ class MacComputerBackend:
         generation = result.get("catalog_generation")
         apps = result.get("apps")
         if (
-            set(result) != {"catalog_generation", "apps"}
+            set(result) not in (
+                {"catalog_generation", "apps"},
+                {"catalog_generation", "apps", "confirmed_absent_window_identity_refs"},
+            )
             or isinstance(generation, bool)
             or not isinstance(generation, int)
             or generation <= 0
         ):
             raise HelperTransportError("helper returned malformed app catalog")
         try:
-            catalog = ComputerAppCatalog(generation, _decode_catalog_apps(apps))
+            absence = result.get("confirmed_absent_window_identity_refs", [])
+            if not isinstance(absence, list):
+                raise ValueError("malformed exact-window absence evidence")
+            catalog = ComputerAppCatalog(
+                generation, _decode_catalog_apps(apps), tuple(absence),
+            )
         except (TypeError, ValueError) as exc:
             raise HelperTransportError("helper returned malformed app catalog") from exc
         self._catalog = catalog

@@ -466,7 +466,15 @@ def _session_failure(exc: ComputerSessionError) -> ToolFailure:
     return _failure(exc.code, str(exc), retryable=retryable, recovery_hint=recovery_hint)
 
 
-def _app_state_identity_failure(error: ComputerError) -> ToolFailure:
+def _app_state_identity_failure(error: ComputerError, *, target_bound: bool = True) -> ToolFailure:
+    if error.code is ComputerErrorCode.OBSERVATION_TIMEOUT and not target_bound:
+        return replace(
+            _application_failure(error),
+            recovery_hint=(
+                "Call computer_apps, then choose the exact app_ref and window_ref from "
+                "its fresh catalog before calling computer_get_app_state."
+            ),
+        )
     if error.code not in {
         ComputerErrorCode.STALE_TARGET,
         ComputerErrorCode.TARGET_GONE,
@@ -1007,6 +1015,11 @@ class LocalComputerRuntime:
     async def commit_resume_publication(self, publication_id: str) -> None:
         await (await self._ensure_manager()).commit_resume_publication(publication_id)
 
+    def validate_unbound_resume_publication(self, publication_id: str) -> None:
+        if self._manager is None:
+            raise ComputerSessionError("stale_resume_publication")
+        self._manager.validate_unbound_resume_publication(publication_id)
+
     async def abort_resume_publication(self, publication_id: str) -> None:
         manager = self._manager
         if manager is not None:
@@ -1151,6 +1164,8 @@ def _bounded_public_value(
     state: dict[str, int] | None = None,
     max_depth: int = _MAX_AX_DEPTH,
     ax_tree: bool = False,
+    collapse_static_menus: bool = False,
+    menu_entry: bool = False,
 ) -> Any:
     state = state if state is not None else {"nodes": 0}
     value_limit = state.get("value_limit", _MAX_AX_NODES)
@@ -1171,6 +1186,11 @@ def _bounded_public_value(
             key = _bound_string(raw_key)
             if secure and key.lower() in {"value", "value_summary", "text"}:
                 mapping_output[key] = "<redacted>"
+            elif is_ax_node and menu_entry and key == "children" and item:
+                mapping_output["children_omitted"] = True
+                mapping_output["expansion_hint"] = (
+                    "Use computer_snapshot subtree_ref with this element_ref to expand menu contents."
+                )
             else:
                 # AX attributes do not add element levels. Bound each attribute
                 # with the generic metadata rules; only children extend the tree.
@@ -1180,6 +1200,9 @@ def _bounded_public_value(
                     item, depth=child_depth, state=state,
                     max_depth=_MAX_AX_DEPTH if is_ax_node and key != "children" else max_depth,
                     ax_tree=child_tree,
+                    collapse_static_menus=collapse_static_menus,
+                    menu_entry=(collapse_static_menus and is_ax_node
+                                and value.get("role") == "AXMenuBar" and key == "children"),
                 )
         return mapping_output
     if isinstance(value, (list, tuple)):
@@ -1188,7 +1211,8 @@ def _bounded_public_value(
             if state["nodes"] >= value_limit:
                 break
             list_output.append(_bounded_public_value(
-                item, depth=depth + 1, state=state, max_depth=max_depth, ax_tree=ax_tree
+                item, depth=depth + 1, state=state, max_depth=max_depth, ax_tree=ax_tree,
+                collapse_static_menus=collapse_static_menus, menu_entry=menu_entry,
             ))
         return list_output
     if isinstance(value, str):
@@ -1322,11 +1346,14 @@ def _default_ax_depth(value: Any) -> int:
     return _MAX_AX_DEPTH
 
 
-def _bounded_ax_tree(value: Any, max_depth: int | None = None) -> Any:
+def _bounded_ax_tree(
+    value: Any, max_depth: int | None = None, *, collapse_static_menus: bool = True,
+) -> Any:
     if max_depth is None:
         max_depth = _default_ax_depth(value)
     bounded = _bounded_public_value(value, max_depth=max_depth, ax_tree=True,
-                                    state=_ax_projection_state(value))
+                                    state=_ax_projection_state(value),
+                                    collapse_static_menus=collapse_static_menus)
     encoded = json.dumps(bounded, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     if len(encoded) <= _MAX_AX_JSON_BYTES:
         return bounded
@@ -1813,12 +1840,22 @@ def _public_snapshot_payload(
                 f"invalid_arguments: role_filter {role_filter} matched no element "
                 "in the current snapshot",
             )
-        public_ax_tree = _bounded_ax_tree(pruned, max_depth=_FILTERED_AX_DEPTH)
+        public_ax_tree = _bounded_ax_tree(
+            pruned, max_depth=_FILTERED_AX_DEPTH, collapse_static_menus=False,
+        )
     else:
         public_ax_tree = (
             _bounded_ax_subtree(raw_ax_tree, subtree_ref, prior_tree=prior_ax_tree)
             if subtree_ref
-            else _bounded_ax_tree(raw_ax_tree)
+            else _bounded_ax_tree(
+                raw_ax_tree,
+                collapse_static_menus=not (
+                    isinstance(raw_ax_tree, Mapping) and (
+                        raw_ax_tree.get("role") in {"AXMenu", "AXMenuBar"}
+                        or raw_ax_tree.get("observation_scope") == "native_subtree"
+                    )
+                ),
+            )
         )
     payload: dict[str, Any] = {
         "success": True,
@@ -2701,7 +2738,7 @@ def register_computer_tools(
                 verified_state=state,
             )
         except HelperApplicationError as exc:
-            return _app_state_identity_failure(exc.error)
+            return _app_state_identity_failure(exc.error, target_bound=manager.target is not None)
         except HelperTransportError as exc:
             logger.warning("computer app state helper failed error_type=%s", type(exc).__name__)
             return _failure(
@@ -3316,6 +3353,15 @@ def register_computer_tools(
         except ComputerSessionError as exc:
             return _session_failure(exc)
 
+    def unbound_resume_receipt() -> dict[str, Any]:
+        return {
+            "success": True,
+            "status": "target_gone_unbound",
+            "session_id": manager.session_id,
+            "message": "The exact suspended target vanished. Old input authority is revoked; no replacement was bound and no input was sent.",
+            "recovery_hint": "Call computer_apps, then choose an exact app_ref and window_ref for computer_get_app_state. New observation and input authorization are required.",
+        }
+
     async def computer_resume(
         app_ref: str,
         window_ref: str,
@@ -3353,6 +3399,11 @@ def register_computer_tools(
                 target = await manager.resume(_permission_call_id)
                 resume_publication_owner = _permission_call_id
                 publication_started = True
+                if target is None:
+                    trusted_target.clear()
+                    trusted_snapshot.clear()
+                    clear_computer_grants()
+                    return json.dumps(unbound_resume_receipt())
                 resume_target_binding = manager.snapshot_target_binding
                 if resume_target_binding is None:
                     raise ComputerSessionError(
@@ -3495,6 +3546,18 @@ def register_computer_tools(
                 )
             return True, "verified private mode-0600 PNG through the held session directory"
         except (ComputerSessionError, OSError, ValueError, json.JSONDecodeError) as exc:
+            return False, str(exc)
+
+    def verify_resume(args: dict, result: dict) -> tuple[bool, str]:
+        if manager.target is not None:
+            return verify_snapshot(args, result)
+        try:
+            manager.validate_unbound_resume_publication(resume_publication_owner or "")
+            payload = json.loads(str(result.get("fresh_output") or result.get("output") or ""))
+            if payload != unbound_resume_receipt():
+                return False, "unbound resume receipt changed before publication"
+            return True, "verified exact-target absence and revoked authority; no replacement bound"
+        except (ComputerSessionError, ValueError, TypeError) as exc:
             return False, str(exc)
 
     def verify_app_state(args: dict, result: dict) -> tuple[bool, str]:
@@ -4038,7 +4101,7 @@ def register_computer_tools(
     registry.register(ToolDef(
         "computer_resume", "Revalidate the handed-off target and return a fresh observation.", RESUME_SCHEMA, computer_resume,
         risk="write", approval="on_risk", replay="safe", result_persistence="request_local",
-        postcondition=verify_snapshot, completion_finalizer=finalize_resume_publication, **common,
+        postcondition=verify_resume, completion_finalizer=finalize_resume_publication, **common,
     ))
     registry.register(ToolDef("computer_close", "Close Computer Use and erase session-local captures and grants.", EMPTY_SCHEMA, computer_close, risk="write", approval="never", replay="safe", **common))
     return manager

@@ -237,13 +237,16 @@ class FakeBackend:
         self.takeover_begin_calls: list[tuple[str, str]] = []
         self.takeover_end_calls: list[str] = []
         self.apps_result: list[dict[str, object]] = []
+        self.confirmed_absent_window_identity_refs: tuple[str, ...] = ()
         self.closed = 0
 
     async def status(self) -> dict[str, object]:
         return {"supported": True}
 
     async def apps(self) -> ComputerAppCatalog:
-        return ComputerAppCatalog(1, tuple(self.apps_result))
+        return ComputerAppCatalog(
+            1, tuple(self.apps_result), self.confirmed_absent_window_identity_refs,
+        )
 
     async def select(self, app_ref: str, window_ref: str) -> ComputerTarget:
         self.select_calls.append((app_ref, window_ref))
@@ -2093,6 +2096,174 @@ def test_handoff_requires_fresh_catalog_and_exact_suspended_refs_before_resume(
 
     assert resumed == ComputerTarget("app-1", "window-1")
     assert fresh.snapshot_id == "snap-2"
+
+
+def _robustness_vanished_menu(fake_backend, tmp_path, *, confirmed_absent=True, unrelated_before=False):
+    parent = {"window_ref": "parent", "bindable": True, "window_identity_ref": "identity-parent"}
+    menu = {"window_ref": "menu", "bindable": True, "window_identity_ref": "identity-menu"}
+    fake_backend.apps_result = [{"app_ref": "app", "windows": [parent, menu]}]
+    if unrelated_before:
+        fake_backend.apps_result.append({"app_ref": "unrelated", "windows": [{
+            "bindable": False, "reason": "ax_window_unmatched",
+        }]})
+    manager = ComputerSessionManager(fake_backend, cache_root=tmp_path)
+    run(manager.apps())
+    run(manager.select("app", "menu"))
+    run(manager.snapshot())
+    run(manager.handoff())
+    fake_backend.apps_result = [{"app_ref": "app", "windows": [parent]}]
+    fake_backend.confirmed_absent_window_identity_refs = ("identity-menu",) if confirmed_absent else ()
+    return manager
+
+
+@pytest.mark.parametrize("catalog_case", ["unrelated_before", "unrelated_after", "no_witness", "no_visible_apps"])
+def test_robustness_exact_absence_does_not_require_unrelated_bindability_or_witness(
+    fake_backend, tmp_path, catalog_case,
+):
+    manager = _robustness_vanished_menu(
+        fake_backend, tmp_path, unrelated_before=catalog_case == "unrelated_before",
+    )
+    if catalog_case == "unrelated_after":
+        fake_backend.apps_result.append({"app_ref": "unrelated", "windows": [{
+            "bindable": False, "reason": "ax_window_unmatched",
+        }]})
+    elif catalog_case == "no_witness":
+        fake_backend.apps_result[0]["windows"][0]["window_identity_ref"] = "new-window"
+    elif catalog_case == "no_visible_apps":
+        # The bounded UI catalog can be empty while the full WindowServer
+        # inventory is nonempty and proves the old exact identity is gone.
+        fake_backend.apps_result = []
+    run(manager.apps())
+    assert run(manager.resume("native-proof-only")) is None
+    assert manager.handed_off and manager.target is None
+    assert manager.grants == set() and fake_backend.select_calls == [("app", "menu")]
+    run(manager.commit_resume_publication("native-proof-only"))
+    assert not manager.handed_off and manager.suspended_target is None
+
+
+@pytest.mark.parametrize("omission", ["filtered_offscreen", "catalog_truncated"])
+def test_robustness_omitted_window_without_absence_proof_keeps_handoff(fake_backend, tmp_path, omission):
+    manager = _robustness_vanished_menu(fake_backend, tmp_path, confirmed_absent=False)
+    # Both eligible-window filtering and catalog limits can omit a still-live
+    # menu while retaining a same-helper parent identity. Neither proves exit.
+    run(manager.apps())
+    with pytest.raises(ComputerSessionError, match="target_gone"):
+        run(manager.resume(f"unproven-{omission}"))
+    assert manager.handed_off and manager.suspended_target == ComputerTarget("app", "menu")
+    assert manager._resume_publication_id is None
+    assert fake_backend.select_calls == [("app", "menu")]
+
+
+@pytest.mark.parametrize("proof", [None, [], ["identity"], ("",), ("x" * 257,), ("\ud800",), (1,), ([],), ("same", "same"), tuple(f"identity-{i}" for i in range(201))])
+def test_robustness_absence_proof_rejects_malformed_inventory(proof):
+    with pytest.raises(ValueError, match="confirmed_absent_window_identity_refs"):
+        ComputerAppCatalog(1, (), confirmed_absent_window_identity_refs=proof)
+
+
+def test_robustness_absence_proof_default_and_bounded_inventory():
+    assert ComputerAppCatalog(1, ()).confirmed_absent_window_identity_refs == ()
+    proof = tuple(f"identity-{i}" for i in range(200))
+    assert ComputerAppCatalog(1, (), confirmed_absent_window_identity_refs=proof).confirmed_absent_window_identity_refs == proof
+
+
+@pytest.mark.parametrize("proof", [(), ("identity-other",)])
+def test_robustness_absence_proof_must_be_latest_and_exact(fake_backend, tmp_path, proof):
+    manager = _robustness_vanished_menu(fake_backend, tmp_path)
+    run(manager.apps())
+    fake_backend.confirmed_absent_window_identity_refs = proof
+    run(manager.apps())
+    with pytest.raises(ComputerSessionError, match="target_gone"):
+        run(manager.resume("expired-or-unrelated-proof"))
+    assert manager.handed_off and manager._resume_publication_id is None
+
+
+def test_robustness_absent_resume_is_unbound_only_after_publication(fake_backend, tmp_path):
+    manager = _robustness_vanished_menu(fake_backend, tmp_path)
+    run(manager.apps())
+    assert manager.handed_off and manager.suspended_target == ComputerTarget("app", "menu")
+    assert run(manager.resume("absent-publication")) is None
+    assert manager.handed_off and manager.target is None
+    assert manager._latest_snapshot is None and manager._pending_plan is None
+    assert manager.grants == set()
+    assert fake_backend.select_calls == [("app", "menu")]
+    run(manager.commit_resume_publication("absent-publication"))
+    assert not manager.handed_off and manager.suspended_target is None
+    assert manager._suspended_window_identity_ref is None
+    with pytest.raises(ComputerSessionError, match="stale_resume_publication"):
+        run(manager.commit_resume_publication("absent-publication"))
+    run(manager.select("app", "parent"))
+    run(manager.abort_resume_publication("absent-publication"))
+    assert manager.target == ComputerTarget("app", "parent")
+
+
+def test_robustness_absent_resume_abort_retains_handoff(fake_backend, tmp_path):
+    manager = _robustness_vanished_menu(fake_backend, tmp_path)
+    run(manager.apps())
+    assert run(manager.resume("abort-absent")) is None
+    run(manager.abort_resume_publication("abort-absent"))
+    assert manager.handed_off and manager.suspended_target == ComputerTarget("app", "menu")
+    assert manager.target is None and manager.grants == set()
+    with pytest.raises(ComputerSessionError, match="fresh_apps_required"):
+        run(manager.resume("retry-absent"))
+
+
+def test_robustness_absent_publication_refresh_blocks_late_commit_and_abort(fake_backend, tmp_path):
+    manager = _robustness_vanished_menu(fake_backend, tmp_path)
+    run(manager.apps())
+    assert run(manager.resume("old-absence")) is None
+    with pytest.raises(ComputerSessionError, match="stale_resume_publication"):
+        run(manager.resume("overlapping-absence"))
+    run(manager.apps())
+    with pytest.raises(ComputerSessionError, match="stale_resume_publication"):
+        run(manager.commit_resume_publication("old-absence"))
+    assert run(manager.resume("new-absence")) is None
+    run(manager.abort_resume_publication("old-absence"))
+    manager.validate_unbound_resume_publication("new-absence")
+    assert manager.handed_off
+    run(manager.commit_resume_publication("new-absence"))
+    assert not manager.handed_off and manager.target is None
+
+
+@pytest.mark.parametrize("uncertainty", ["empty", "missing_identity", "duplicate", "invalid_refs", "duplicate_refs", "unbindable", "restart", "catalog_error", "cancelled"])
+def test_robustness_resume_uncertainty_never_releases_handoff(fake_backend, tmp_path, uncertainty):
+    # Missing or changed UI entries alone remain insufficient. The one case
+    # with a native proof below conflicts with a still-listed exact identity.
+    manager = _robustness_vanished_menu(fake_backend, tmp_path, confirmed_absent=uncertainty == "unbindable")
+    parent = fake_backend.apps_result[0]["windows"][0]
+    if uncertainty == "empty":
+        fake_backend.apps_result = []
+    elif uncertainty == "missing_identity":
+        parent.pop("window_identity_ref")
+    elif uncertainty == "duplicate":
+        fake_backend.apps_result[0]["windows"].append(dict(parent, window_ref="duplicate"))
+    elif uncertainty == "invalid_refs":
+        parent["window_ref"] = ""
+    elif uncertainty == "duplicate_refs":
+        fake_backend.apps_result[0]["windows"].append(dict(parent, window_identity_ref="different-identity"))
+    elif uncertainty == "unbindable":
+        fake_backend.apps_result[0]["windows"].append({
+            "window_ref": "menu-new", "bindable": False, "window_identity_ref": "identity-menu",
+        })
+    elif uncertainty == "restart":
+        parent["window_identity_ref"] = "new-helper-identity"
+    else:
+        # A previous successful refresh must not survive an unsuccessful one.
+        run(manager.apps())
+
+        async def failed_apps():
+            if uncertainty == "cancelled":
+                raise asyncio.CancelledError()
+            raise RuntimeError("enumeration failed")
+
+        fake_backend.apps = failed_apps
+        with pytest.raises((RuntimeError, asyncio.CancelledError)):
+            run(manager.apps())
+    if uncertainty not in {"catalog_error", "cancelled"}:
+        run(manager.apps())
+    with pytest.raises(ComputerSessionError):
+        run(manager.resume("uncertain-publication"))
+    assert manager.handed_off and manager.suspended_target == ComputerTarget("app", "menu")
+    assert fake_backend.select_calls == [("app", "menu")]
 
 
 def test_resume_rejects_catalog_without_exact_suspended_refs(fake_backend, tmp_path):

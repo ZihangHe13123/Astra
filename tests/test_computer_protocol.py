@@ -23,6 +23,21 @@ from agent.runtime.computer_protocol import (
 )
 
 
+@pytest.mark.parametrize(("key", "canonical"), [("backspace", "delete"), ("Esc", "escape"), ("ArrowLeft", "left"), ("ENTER", "return")])
+def test_robustness_key_aliases_are_canonical_on_wire(key, canonical):
+    action = ComputerAction.from_mapping({"type": "keypress", "key": key})
+    assert action.key == canonical
+    assert action.to_mapping()["key"] == canonical
+
+
+def test_robustness_bad_key_has_bounded_supported_forms():
+    with pytest.raises(ValueError) as failure:
+        ComputerAction(type="keypress", key="cmd+a")
+    message = str(failure.value)
+    assert "delete" in message and "escape" in message and "modifiers separately" in message
+    assert len(message) < 512
+
+
 def test_request_has_stable_version_and_id():
     request = ComputerRequest(
         request_id="req-1",
