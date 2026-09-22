@@ -547,6 +547,36 @@ import Testing
     #expect(response.error?.message == "request exceeds 4 MiB")
 }
 
+@Test func pointerCheckpointMessageDoesNotInferKeyboardFocusAndKeepsWireBoundary() {
+    for hasSuffix in [false, true] {
+        let windows = CooperativeProtocolWindows()
+        windows.cooperativeResultOverride = CooperativeActionResult(
+            batch: ActionBatchResult(outcomes: [ActionOutcome(index: 0, ok: true, error: nil, observationRequired: true)],
+                lastAcknowledgedAction: 0, error: nil),
+            error: hasSuffix ? .cooperative(.observationRequired) : nil)
+        let dispatcher = Dispatcher(permissions: StaticPermissions(accessibilityTrusted: true, screenRecordingAllowed: true), windows: windows)
+        let suffix = hasSuffix ? #",{"type":"wait","duration_ms":0}"# : ""
+        let response = dispatcher.handle(
+            #"{"protocol_version":4,"request_id":"checkpoint","operation":"act","payload":{"interaction_mode":"foreground_takeover","snapshot_id":"snapshot","plan_ref":"plan_test","takeover_ref":"takeover","actions":[{"type":"right_click","x":10,"y":10}\#(suffix)]}}"#
+        )
+        #expect(response.ok == !hasSuffix)
+        #expect(response.result == .object([
+            "outcomes": .array([.object(["index": .number(0), "ok": .bool(true), "observation_required": .bool(true)])]),
+            "last_acknowledged_action": .number(0),
+        ]))
+        if hasSuffix {
+            #expect(response.error?.code == "observation_required")
+            let message = response.error?.message.lowercased() ?? ""
+            #expect(!message.contains("keyboard focus"))
+            #expect(message.contains("acknowledged"))
+            #expect(message.contains("remaining actions were not sent"))
+            #expect(message.contains("do not replay"))
+        } else {
+            #expect(response.error == nil)
+        }
+    }
+}
+
 @Test func cooperativePlanAndBackgroundActRouteThroughTheWindowObserver() {
     let windows = CooperativeProtocolWindows()
     let dispatcher = Dispatcher(permissions: StaticPermissions(accessibilityTrusted: true, screenRecordingAllowed: true), windows: windows)
@@ -907,6 +937,7 @@ private func snapshotProtocolValue(
 private final class CooperativeProtocolWindows: WindowObserving {
     var planCalls = 0
     var backgroundActCalls = 0
+    var cooperativeResultOverride: CooperativeActionResult? = nil
     var fragmentPlans: [ForegroundFragmentPlanRequest?] = []
     var fragmentCommits: [FragmentStageCommit] = []
     var takeoverDeclarations: [ForegroundFragmentDeclaration] = []
@@ -984,6 +1015,7 @@ private final class CooperativeProtocolWindows: WindowObserving {
         actions _: [NativeAction]
     ) -> CooperativeActionResult {
         backgroundActCalls += 1
+        if let cooperativeResultOverride { return cooperativeResultOverride }
         return CooperativeActionResult(
             batch: ActionBatchResult(
                 outcomes: [ActionOutcome(index: 0, ok: true, error: nil)],

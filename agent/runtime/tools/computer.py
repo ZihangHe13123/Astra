@@ -150,8 +150,8 @@ _SAFE_ACTION_ERRORS = {
         "This is not evidence that the requested key or action is prohibited."
     ),
     ComputerErrorCode.OBSERVATION_REQUIRED: (
-        "The acknowledged input changed keyboard focus. Remaining actions were not sent; "
-        "inspect fresh state before choosing the next batch."
+        "Input delivery was acknowledged. Remaining actions were not sent; "
+        "inspect fresh state before choosing the next batch. Do not replay the acknowledged prefix."
     ),
     ComputerErrorCode.FOREGROUND_TAKEOVER_REQUIRED: "This action requires foreground takeover.",
     ComputerErrorCode.REQUIRES_ACTIVE_FOREGROUND_TAKEOVER: (

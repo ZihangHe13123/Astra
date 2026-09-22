@@ -1001,7 +1001,7 @@ final class Dispatcher {
             case .userActivityPaused:
                 return (code.rawValue, "native input is paused because user activity was detected")
             case .observationRequired:
-                return (code.rawValue, "keyboard focus changed; observe fresh state before sending remaining actions")
+                return (code.rawValue, "input delivery acknowledged; remaining actions were not sent. Observe fresh state; do not replay the acknowledged prefix")
             case .sidecarFailed:
                 return (code.rawValue, "native cooperative input failed")
             }

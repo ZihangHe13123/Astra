@@ -14,6 +14,16 @@ RECEIPT = {"outcomes": [CHECKPOINT], "last_acknowledged_action": 0}
 ERROR = ComputerError(ComputerErrorCode.OBSERVATION_REQUIRED, "observe")
 
 
+def test_checkpoint_error_copy_does_not_invent_a_keyboard_focus_cause():
+    from agent.runtime.tools.computer import _SAFE_ACTION_ERRORS
+
+    message = _SAFE_ACTION_ERRORS[ComputerErrorCode.OBSERVATION_REQUIRED].lower()
+    assert "keyboard focus" not in message
+    assert "acknowledged" in message
+    assert "remaining actions were not sent" in message
+    assert "do not replay" in message
+
+
 @pytest.mark.parametrize("partial", [False, True])
 def test_checkpoint_receipt_preserves_ack_without_claiming_effect_or_full_batch(partial):
     result = ComputerActResult.from_mapping(

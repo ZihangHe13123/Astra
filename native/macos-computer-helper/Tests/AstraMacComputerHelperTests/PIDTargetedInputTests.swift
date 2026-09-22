@@ -394,8 +394,10 @@ func staleFragmentLeaseCannotBorrowRearmedSessionForClickOrScroll(nextMarker: UI
         actions: pidPlanned([.click(x: 10, y: 10), .click(x: 20, y: 20)])
     )
 
-    #expect(result.error == .unknownOutcome)
-    #expect(result.lastAcknowledgedAction == -1)
+    #expect(result.error == nil)
+    #expect(result.cooperativeError == .observationRequired)
+    #expect(result.lastAcknowledgedAction == 0)
+    #expect(result.outcomes == [ActionOutcome(index: 0, ok: true, error: nil, observationRequired: true)])
     #expect(fixture.poster.events.count == 2)
     #expect(fixture.poster.events.allSatisfy { $0.pid == 11 && $0.marker == fixture.marker })
     #expect(fixture.validator.calls == 2)
@@ -511,9 +513,10 @@ func staleFragmentLeaseCannotBorrowRearmedSessionForClickOrScroll(nextMarker: UI
             ])
         )
 
-        #expect(result.error == .unknownOutcome)
-        #expect(result.lastAcknowledgedAction == -1)
-        #expect(result.outcomes == [ActionOutcome(index: 0, ok: false, error: .unknownOutcome)])
+        #expect(result.error == nil)
+        #expect(result.cooperativeError == .observationRequired)
+        #expect(result.lastAcknowledgedAction == 0)
+        #expect(result.outcomes == [ActionOutcome(index: 0, ok: true, error: nil, observationRequired: true)])
         #expect(evidenceCalls == 1)
         #expect(fixture.poster.events.count == 1)
         #expect(fixture.activity.fragmentsStarted == 1)
@@ -1050,6 +1053,63 @@ private func pidPlanned(_ actions: [NativeAction]) -> [PlannedDispatchEntry] {
                 bounds: bounds
             )
         )
+    }
+}
+
+@Test func PIDCompleteRightClickRequiresObservationWithoutDispatchingSuffix() {
+    let rightClick = NativeAction(kind: .rightClick, x: 10, y: 10,
+        endX: nil, endY: nil, text: nil, key: nil, deltaX: nil, deltaY: nil,
+        durationMS: nil, elementRef: nil, targetElementRef: nil, modifiers: [])
+    for hasSuffix in [false, true] {
+        let fixture = PIDExecutorFixture(enabled: [.click], evidence: false)
+        let actions = [rightClick] + (hasSuffix ? [.click(x: 20, y: 20)] : [])
+        let result = fixture.executor.run(expected: fixture.guardValue,
+            application: fixture.application, lease: fixture.lease, actions: pidPlanned(actions))
+
+        #expect(result.error == nil)
+        #expect(result.cooperativeError == (hasSuffix ? .observationRequired : nil))
+        #expect(result.lastAcknowledgedAction == 0)
+        #expect(result.outcomes == [ActionOutcome(index: 0, ok: true, error: nil, observationRequired: true)])
+        #expect(fixture.poster.events.map(\.event) == [
+            .mouseDown(point: CGPoint(x: 110, y: 210), clickCount: 1, button: .right),
+            .mouseUp(point: CGPoint(x: 110, y: 210), clickCount: 1, button: .right),
+        ])
+        #expect(fixture.validator.calls == 2)
+        #expect(fixture.heldInputs.heldCount == 0)
+        #expect(fixture.activity.fragmentsEnded == 1)
+    }
+}
+
+@Test func PIDCompleteBackgroundInputRetainsFailClosedReceipt() throws {
+    let fixture = PIDExecutorFixture(enabled: [.click], evidence: false)
+    let expected = ActionGuard(pid: 11, windowID: 22, bounds: fixture.guardValue.bounds,
+        axIdentity: 33, snapshotID: "snapshot", interactionMode: .background)
+    let lease = fixture.lease
+    let plan = try fixture.executor.preflight(expected: expected, application: fixture.application,
+        marker: lease.marker, entries: pidPlanned([.click(x: 10, y: 10)]), allowBackgroundDelivery: true)
+    try fixture.activity.beginFragment(lease: lease)
+    defer { fixture.activity.endFragment(lease: lease) }
+    let result = fixture.executor.executePrepared(sourceIndex: 0, from: plan, expected: expected, lease: lease)
+
+    // The background batch contract has no cooperative observation checkpoint.
+    #expect(result.error == .unknownOutcome)
+    #expect(result.lastAcknowledgedAction == -1)
+    #expect(result.outcomes.allSatisfy { !$0.observationRequired })
+    #expect(fixture.poster.events.count == 2)
+}
+
+@Test func PIDCompleteCheckpointCannotMaskPostingOrReleaseFailure() {
+    for failures: Set<Int> in [[0], [1], [1, 2]] {
+        let fixture = PIDExecutorFixture(enabled: [.click], evidence: false)
+        fixture.poster.failingCalls = failures
+        let result = fixture.executor.run(expected: fixture.guardValue,
+            application: fixture.application, lease: fixture.lease,
+            actions: pidPlanned([.click(x: 10, y: 10), .click(x: 20, y: 20)]))
+        // The fake explicitly reports zero delivery when the very first post fails.
+        #expect(result.error == (failures.contains(0) ? .helperFailed : .unknownOutcome))
+        #expect(result.lastAcknowledgedAction == -1)
+        #expect(result.outcomes.allSatisfy { !$0.observationRequired })
+        #expect(!fixture.poster.events.contains { $0.event == .mouseDown(point: CGPoint(x: 120, y: 220), clickCount: 1) })
     }
 }
 

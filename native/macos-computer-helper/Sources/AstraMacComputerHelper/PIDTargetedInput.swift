@@ -376,6 +376,12 @@ final class PIDTargetedActionExecutor {
                 )
             }
             acknowledged = entry.sourceIndex
+            if result.outcomes.last?.observationRequired == true {
+                return PIDTargetedActionResult(
+                    outcomes: outcomes, lastAcknowledgedAction: acknowledged, error: nil,
+                    cooperativeError: entry.sourceIndex == actions.last?.sourceIndex ? nil : .observationRequired
+                )
+            }
         }
         return PIDTargetedActionResult(outcomes: outcomes, lastAcknowledgedAction: acknowledged, error: nil, cooperativeError: nil)
     }
@@ -448,16 +454,22 @@ final class PIDTargetedActionExecutor {
             } catch is UserActivityMonitoringError {
                 throw PIDUserActivityPauseFailure(inputStarted: true, cleanupFailed: false)
             }
-            guard evidenceConfirmed else {
+            // Background delivery has no cooperative checkpoint contract yet.
+            // Keep its existing fail-closed receipt rather than running a suffix
+            // or emitting a checkpoint that its batch consumer cannot represent.
+            if !evidenceConfirmed, expected.interactionMode != .foregroundTakeover {
                 return PIDTargetedActionResult(
                     outcomes: [ActionOutcome(index: sourceIndex, ok: false, error: .unknownOutcome)],
-                    lastAcknowledgedAction: -1,
-                    error: .unknownOutcome,
-                    cooperativeError: nil
+                    lastAcknowledgedAction: -1, error: .unknownOutcome, cooperativeError: nil
                 )
             }
+            // perform returned only after all guarded events and the matching
+            // release completed. Losing post-action state requires observation,
+            // not replay or a claim about the application's effect. Posting,
+            // release, and user-activity failures still take the catch paths.
             return PIDTargetedActionResult(
-                outcomes: [ActionOutcome(index: sourceIndex, ok: true, error: nil)],
+                outcomes: [ActionOutcome(index: sourceIndex, ok: true, error: nil,
+                    observationRequired: !evidenceConfirmed)],
                 lastAcknowledgedAction: sourceIndex,
                 error: nil,
                 cooperativeError: nil

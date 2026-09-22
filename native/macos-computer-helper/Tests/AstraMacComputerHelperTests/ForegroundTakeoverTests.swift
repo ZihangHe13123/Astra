@@ -836,6 +836,27 @@ private func beginFailureConsumesPlanAndCleansUp(_ failure: TakeoverFixture.Fail
     }
 }
 
+@Test func foregroundPointerObservationCheckpointStopsMixedBatch() throws {
+    for hasSuffix in [false, true] {
+        let fixture = MixedForegroundExecutionFixture(enabled: [.click], pointerEvidence: false)
+        let actions: [NativeAction] = [.click(x: 10, y: 10, within: "pointer")] + (hasSuffix ? [.wait(durationMS: 0)] : [])
+        let plan = try fixture.dispatcher.plan(actions: actions, context: DispatchContext(guardValue: fixture.guardValue))
+        let entries = try fixture.dispatcher.consumeForegroundPlan(plan,
+            authority: ForegroundPlanConsumptionAuthority(planRef: plan.planRef,
+                snapshotID: fixture.guardValue.snapshotID, interactionMode: .foregroundTakeover,
+                actions: actions, backends: plan.backends, guardValue: fixture.guardValue))
+        let result = fixture.executor.run(expected: fixture.guardValue,
+            application: fixture.application, lease: fixture.activity.lease, entries: entries)
+
+        #expect(result.error == nil)
+        #expect(result.cooperativeError == (hasSuffix ? .observationRequired : nil))
+        #expect(result.lastAcknowledgedAction == 0)
+        #expect(result.outcomes == [ActionOutcome(index: 0, ok: true, error: nil, observationRequired: true)])
+        #expect(fixture.log.values == ["pid_down", "pid_up", "evidence:0"])
+        #expect(fixture.activity.fragmentsEnded == 1)
+    }
+}
+
 @Test func foregroundAXScrollRevalidatesImmediatelyAfterEarlierEntryMutatesAuthority() throws {
     enum Mutation: CaseIterable {
         case element
@@ -1462,7 +1483,7 @@ func productionPIDStateFactoryKeepsExactIdentityAfterTitleDisambiguation(mismatc
 }
 
 @Test(arguments: [false, true])
-func productionPIDStateFactoryRejectsSameProcessDifferentKeyWindowAfterOneDelivery(sameBounds: Bool) throws {
+func productionPIDStateFactoryStopsAtDifferentKeyWindowAfterCompleteDelivery(sameBounds: Bool) throws {
     let targetState = containedOverlayTargetState()
     let guardValue = ActionGuard(
         pid: targetState.pid,
@@ -1616,9 +1637,14 @@ func productionPIDStateFactoryRejectsSameProcessDifferentKeyWindowAfterOneDelive
         entries: entries
     )
 
-    #expect(result.error == .unknownOutcome)
-    #expect(result.lastAcknowledgedAction == -1)
-    #expect(result.outcomes == [ActionOutcome(index: 0, ok: false, error: .unknownOutcome)])
+    // The one scroll was delivered; the changed key window is still rejected
+    // as authority for any further action, including the queued wait.
+    #expect(!stateFactory.make(target: targetState, snapshotID: guardValue.snapshotID,
+        frontmostPID: guardValue.pid).isKeyWindow)
+    #expect(result.error == nil)
+    #expect(result.cooperativeError == .observationRequired)
+    #expect(result.lastAcknowledgedAction == 0)
+    #expect(result.outcomes == [ActionOutcome(index: 0, ok: true, error: nil, observationRequired: true)])
     #expect(poster.events.count == 1)
     #expect(evidenceCalls == 1)
     #expect(log.values == ["pid_scroll", "evidence:0"])
@@ -1667,6 +1693,7 @@ private final class MixedForegroundExecutionFixture {
         enabled: Set<DispatchActionClass>,
         guardKeyboardFocus: KeyboardFocusAuthority? = nil,
         currentKeyboardFocus: KeyboardFocusAuthority? = nil,
+        pointerEvidence: Bool = true,
         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         waitSleeper: @escaping (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
         effectReader: any AXEffectReading = TakeoverEffectReader([])
@@ -1736,6 +1763,7 @@ private final class MixedForegroundExecutionFixture {
             },
             evidence: { entry, expected in
                 executionLog.values.append("evidence:\(entry.sourceIndex)")
+                guard pointerEvidence else { return false }
                 guard let targetState = try? actionPerformer.currentTargetState() else { return false }
                 let current = PIDActionTargetState(
                     target: targetState,
