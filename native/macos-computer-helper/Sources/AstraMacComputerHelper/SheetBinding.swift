@@ -47,9 +47,14 @@ func observedAXParent(_ element: AXUIElement) -> AXUIElement? {
 }
 
 func focusBelongsToExactAXRoot(app: AXUIElement, root: AXUIElement) -> Bool {
-    guard let owner = observedAXPID(app), observedAXPID(root) == owner else { return false }
+    guard let owner = observedAXPID(app) else { return false }
     let (error, value) = observationAXAttribute(app, kAXFocusedUIElementAttribute)
-    guard error == .success, let focused = decodeAXElement(value), observedAXPID(focused) == owner else { return false }
+    guard error == .success, let focused = decodeAXElement(value) else { return false }
+    return focusedElementBelongsToExactAXRoot(element: focused, root: root, pid: owner)
+}
+
+func focusedElementBelongsToExactAXRoot(element focused: AXUIElement, root: AXUIElement, pid owner: pid_t) -> Bool {
+    guard observedAXPID(root) == owner, observedAXPID(focused) == owner else { return false }
     return CFEqual(focused, root) || focusedAncestorBranch(root: root, focused: focused,
         same: { CFEqual($0, $1) }, isOwned: { observedAXPID($0) == owner },
         parent: observedAXParent) != nil

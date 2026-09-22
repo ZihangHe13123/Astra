@@ -151,6 +151,7 @@ struct ForegroundKeyboardPreparedPlan {
 
 final class ForegroundKeyboardExecutor {
     typealias FocusLookup = () throws -> KeyboardFocusObservation
+    typealias ContinuingTextFocusLookup = (ActionGuard, KeyboardFocusAuthority) throws -> KeyboardTextContinuationObservation
 
     fileprivate enum PreparedPayload {
         case key(down: SyntheticInputEvent, up: SyntheticInputEvent)
@@ -172,6 +173,7 @@ final class ForegroundKeyboardExecutor {
     private let secureInput: any SecureInputDetecting
     private let heldInputs: HeldInputRegistry
     private let focus: FocusLookup
+    private let continuingTextFocus: ContinuingTextFocusLookup?
     private let now: () -> TimeInterval
     private let actionTimeout: TimeInterval
     private let experimentalUnicodeChunkGraphemes: Int
@@ -185,6 +187,7 @@ final class ForegroundKeyboardExecutor {
         secureInput: any SecureInputDetecting = SystemSecureInputDetector(),
         heldInputs: HeldInputRegistry = .shared,
         focus: @escaping FocusLookup,
+        continuingTextFocus: ContinuingTextFocusLookup? = nil,
         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         actionTimeout: TimeInterval = 10,
         experimentalUnicodeChunkGraphemes: Int = 8
@@ -197,6 +200,7 @@ final class ForegroundKeyboardExecutor {
         self.secureInput = secureInput
         self.heldInputs = heldInputs
         self.focus = focus
+        self.continuingTextFocus = continuingTextFocus
         self.now = now
         self.actionTimeout = actionTimeout
         self.experimentalUnicodeChunkGraphemes = min(8, max(1, experimentalUnicodeChunkGraphemes))
@@ -268,7 +272,7 @@ final class ForegroundKeyboardExecutor {
                         // Shift-Return inserts a line break without selecting
                         // the ordinary Return/default-button action.
                         let lineBreak = units == [10] || units == [13] || units == [13, 10]
-                        _ = try postBalanced(
+                        let needsObservation = try postBalanced(
                             down: lineBreak ? .virtualKeyDown(36, .maskShift) : .unicodeKeyDown(units),
                             up: lineBreak ? .virtualKeyUp(36, .maskShift) : .unicodeKeyUp(units),
                             action: action,
@@ -278,6 +282,7 @@ final class ForegroundKeyboardExecutor {
                             lease: lease,
                             textInputStarted: inputStarted
                         )
+                        observationRequired = observationRequired || needsObservation
                         inputStarted = true
                     } catch let failure as KeyboardPerformFailure {
                         throw KeyboardPerformFailure(
@@ -442,12 +447,13 @@ final class ForegroundKeyboardExecutor {
             throw KeyboardPauseFailure(inputStarted: false, cleanupFailed: false)
         }
         var inputStarted = false
+        var focusChanged = false
         var stage: KeyboardFailureStage = .beforeKeyDown
         do {
             try activity.performPIDEvent(
                 lease: lease,
                 validate: {
-                    try self.validateEvent(
+                    focusChanged = try self.validateEvent(
                         action: action,
                         application: application,
                         expected: expected,
@@ -475,16 +481,16 @@ final class ForegroundKeyboardExecutor {
                 try self.heldInputs.finish(token: token)
             }
             stage = .afterKeyUp
-            var focusChanged = false
             try activity.performPIDEvent(
                 lease: lease,
                 validate: {
                     guard self.now() <= deadline else { throw ActionExecutionError.actionTimeout }
-                    focusChanged = try self.validateEnvironment(
+                    let afterReleaseChanged = try self.validateEnvironment(
                         expected: expected, application: application, actions: [action],
                         allowOrdinaryKeyFocusTransition: true,
                         allowTextGeometryTransition: true
                     )
+                    focusChanged = focusChanged || afterReleaseChanged
                     guard self.now() <= deadline else { throw ActionExecutionError.actionTimeout }
                 },
                 mutation: {}
@@ -531,11 +537,12 @@ final class ForegroundKeyboardExecutor {
         expected: ActionGuard,
         deadline: TimeInterval,
         allowTextGeometryTransition: Bool = false
-    ) throws {
+    ) throws -> Bool {
         guard now() <= deadline else { throw ActionExecutionError.actionTimeout }
-        _ = try validateEnvironment(expected: expected, application: application, actions: [action],
-                                    allowTextGeometryTransition: allowTextGeometryTransition)
+        let changed = try validateEnvironment(expected: expected, application: application, actions: [action],
+                                              allowTextGeometryTransition: allowTextGeometryTransition)
         guard now() <= deadline else { throw ActionExecutionError.actionTimeout }
+        return changed
     }
 
     private func validateEnvironment(
@@ -546,7 +553,19 @@ final class ForegroundKeyboardExecutor {
         allowTextGeometryTransition: Bool = false
     ) throws -> Bool {
         var focusChanged = false
-        let observedFocus = try validator.revalidateAndObserveFocus(expected: expected, point: nil)
+        let observedFocus: KeyboardFocusObservation?
+        if allowTextGeometryTransition, expected.interactionMode == .foregroundTakeover,
+           actions.count == 1, case .text = actions[0].payload,
+           let wanted = actions[0].targetKeyboardFocus ?? expected.keyboardFocus,
+           let continuingTextFocus {
+            // This observer must perform the full live window/field validation;
+            // it is never used for preflight, first down, keys or blind typing.
+            let observed = try continuingTextFocus(expected, wanted)
+            observedFocus = observed.focus
+            focusChanged = observed.observationRequired
+        } else {
+            observedFocus = try validator.revalidateAndObserveFocus(expected: expected, point: nil)
+        }
         // Reuse only the live observation from this exact guard invocation.
         let currentObservation = { try observedFocus ?? self.focus() }
         // takeover 盲打委托：guard 无焦点权威 == 计划层双闸已放行的 OS 焦点委托形态
@@ -683,7 +702,7 @@ private func keyboardFiniteRect(_ rect: CGRect) -> Bool {
         rect.width > 0 && rect.height > 0
 }
 
-private func keyboardFocusIdentityAndGeometryAreTrusted(
+func keyboardFocusIdentityAndGeometryAreTrusted(
     identityToken: String,
     bounds: CGRect,
     containerBounds: CGRect

@@ -2961,6 +2961,23 @@ final class SystemWindowObserver: WindowObserving {
                     expectedPID: target.pid,
                     containerBounds: authority.guardValue.focusedAXBounds
                 )
+            },
+            continuingTextFocus: { [weak self] expected, wanted in
+                guard let self else { throw ActionExecutionError.targetGone }
+                let observation = try self.currentForegroundActionObservation(
+                    for: target, expectedFocusedRootPreference: expected.focusedRootPreference,
+                    continuingTextFocus: wanted
+                )
+                let state = observation.stateFactory.make(
+                    target: observation.target, snapshotID: snapshotID,
+                    frontmostPID: liveFrontmostPID(), observedKeyboardFocus: observation.keyboardFocus
+                )
+                // The suggestion surface is not substituted for the authorized
+                // window: key-window, PID, identities and geometry stay exact.
+                let focus = try ExactPIDActionGuardValidator(state: { state })
+                    .revalidateAndObserveFocus(expected: expected, point: nil)
+                return KeyboardTextContinuationObservation(focus: focus ?? .stale,
+                    observationRequired: observation.observationRequired)
             }
         )
         let result = ForegroundPlanExecutor(
@@ -3079,8 +3096,10 @@ final class SystemWindowObserver: WindowObserving {
 
     private func currentForegroundActionObservation(
         for target: WindowTarget,
-        expectedFocusedRootPreference: FocusedRootPreference
-    ) throws -> (target: ActionTargetState, stateFactory: ForegroundPIDActionStateFactory, keyboardFocus: KeyboardFocusObservation) {
+        expectedFocusedRootPreference: FocusedRootPreference,
+        continuingTextFocus: KeyboardFocusAuthority? = nil
+    ) throws -> (target: ActionTargetState, stateFactory: ForegroundPIDActionStateFactory,
+                 keyboardFocus: KeyboardFocusObservation, observationRequired: Bool) {
         guard liveFrontmostPID() == target.pid else {
             throw ActionExecutionError.targetNotFrontmost
         }
@@ -3090,16 +3109,14 @@ final class SystemWindowObserver: WindowObserving {
         guard let window = matchingCurrentWindow(for: target, in: content.windows) else {
             throw ActionExecutionError.targetGone
         }
-        let focusedRootPreference: FocusedRootPreference = containedAppOwnedOverlayActive(
+        var focusedRootPreference: FocusedRootPreference = containedAppOwnedOverlayActive(
             targetPID: target.pid,
             targetWindowID: target.windowID,
             targetBounds: window.frame,
             records: interactionWindowRecords(for: target)
         ) ? .containedOverlay : .selectedWindow
-        guard focusedRootPreference == expectedFocusedRootPreference else {
-            logActionRejected("FOCUSED-ROOT-PREFERENCE-FLIP pid=\(target.pid) windowID=\(target.windowID) plan=\(expectedFocusedRootPreference) act=\(focusedRootPreference) bounds=\(window.frame)")
-            throw ActionExecutionError.staleSnapshot
-        }
+        let observedPreference = focusedRootPreference
+        let observationRequired = focusedRootPreference != expectedFocusedRootPreference
         let app = AXUIElementCreateApplication(target.pid)
         // Read mutable frame/title from the same CG window. The action validator
         // separately enforces its snapshot geometry (or a bounded active drag).
@@ -3109,8 +3126,19 @@ final class SystemWindowObserver: WindowObserving {
             axIdentity: target.axIdentity, axElement: target.axElement,
             interactionMode: target.interactionMode
         )
-        guard let expected = matchingAXWindow(in: app, target: observedTarget),
-              let focused = trustedFocusedAXRoot(
+        guard let expected = matchingAXWindow(in: app, target: observedTarget) else {
+            throw ActionExecutionError.targetNotFrontmost
+        }
+        if observationRequired {
+            guard continuingTextFocus != nil,
+                  expectedFocusedRootPreference == .selectedWindow,
+                  focusedRootPreference == .containedOverlay else {
+                logActionRejected("FOCUSED-ROOT-PREFERENCE-FLIP pid=\(target.pid) windowID=\(target.windowID)")
+                throw ActionExecutionError.staleSnapshot
+            }
+            focusedRootPreference = expectedFocusedRootPreference
+        }
+        guard let focused = trustedFocusedAXRoot(
                   in: app,
                   expected: expected,
                   targetBounds: window.frame,
@@ -3121,9 +3149,23 @@ final class SystemWindowObserver: WindowObserving {
             logActionRejected("PID-GUARD root-match cgBounds=\(window.frame) retainedAXBounds=\(String(describing: target.axElement.flatMap { AXNodeReader.frameAttribute($0) }))")
             throw ActionExecutionError.targetNotFrontmost
         }
-        let keyboardFocus = currentKeyboardFocusObservation(
-            in: app, expectedPID: target.pid, containerBounds: focusedBounds
-        )
+        let keyboardFocus: KeyboardFocusObservation
+        if observationRequired {
+            guard let proof = provenContinuingTextFocus(
+                expectedPreference: expectedFocusedRootPreference, observedPreference: observedPreference,
+                wanted: continuingTextFocus, windowBounds: focusedBounds,
+                readFocused: { self.currentFocusedAXElement(in: app) },
+                observe: { self.currentKeyboardFocusObservation(of: $0, expectedPID: target.pid,
+                    containerBounds: focusedBounds) },
+                belongs: { focusedElementBelongsToExactAXRoot(element: $0, root: expected, pid: target.pid) },
+                same: { CFEqual($0, $1) }
+            ) else { throw ActionExecutionError.staleSnapshot }
+            keyboardFocus = proof
+        } else {
+            keyboardFocus = currentKeyboardFocusObservation(
+                in: app, expectedPID: target.pid, containerBounds: focusedBounds
+            )
+        }
         let state = ActionTargetState(
             pid: target.pid,
             windowID: window.windowID,
@@ -3151,7 +3193,8 @@ final class SystemWindowObserver: WindowObserving {
                 },
                 screenCaptureWindows: { screenCaptureWindows }
             ),
-            keyboardFocus
+            keyboardFocus,
+            observationRequired
         )
     }
 
@@ -3366,12 +3409,21 @@ final class SystemWindowObserver: WindowObserving {
         expectedPID: pid_t,
         containerBounds: CGRect
     ) -> KeyboardFocusObservation {
+        guard let focused = currentFocusedAXElement(in: app) else { return .secureOrIndeterminate }
+        return currentKeyboardFocusObservation(of: focused, expectedPID: expectedPID, containerBounds: containerBounds)
+    }
+
+    private func currentFocusedAXElement(in app: AXUIElement) -> AXUIElement? {
         var value: CFTypeRef?
         guard observationAXCall(element: app, fallback: AXError.cannotComplete, {
             AXUIElementCopyAttributeValue(app, kAXFocusedUIElementAttribute as CFString, &value)
-            }) == .success,
-        let focused = decodeAXElement(value)
-        else { return .secureOrIndeterminate }
+            }) == .success else { return nil }
+        return decodeAXElement(value)
+    }
+
+    private func currentKeyboardFocusObservation(
+        of focused: AXUIElement, expectedPID: pid_t, containerBounds: CGRect
+    ) -> KeyboardFocusObservation {
         var pid = pid_t()
         guard AXUIElementGetPid(focused, &pid) == .success else { return .secureOrIndeterminate }
         guard pid == expectedPID else { return .stale }

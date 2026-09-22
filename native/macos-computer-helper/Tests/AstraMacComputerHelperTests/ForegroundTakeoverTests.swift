@@ -1780,6 +1780,23 @@ private final class MixedForegroundExecutionFixture {
     }
 }
 
+@Test func foregroundTextPredownTransitionRequiresObservationBeforeSuffix() {
+    for transition in [2, 4] {
+        let fixture = MixedForegroundKeyboardFixture(keyboardEnabled: true, textTransitionAt: transition)
+        let result = fixture.executor.run(expected: fixture.guardValue,
+            application: fixture.application, lease: fixture.activity.lease, entries: fixture.entries)
+        #expect(result.error == nil)
+        #expect(result.cooperativeError == .observationRequired)
+        #expect(result.lastAcknowledgedAction == 0)
+        #expect(result.outcomes == [ActionOutcome(index: 0, ok: true, error: nil, observationRequired: true)])
+        let units: [[UInt16]] = [[65], [0x4e2d], [66]]
+        #expect(fixture.poster.events == units.flatMap { [SyntheticInputEvent.unicodeKeyDown($0), .unicodeKeyUp($0)] })
+        #expect(!fixture.log.values.contains("wait"))
+        #expect(!fixture.log.values.contains("keyboard_down"))
+        #expect(fixture.activity.fragmentsEnded == 1)
+    }
+}
+
 private final class MixedForegroundKeyboardFixture {
     let application = PIDTargetApplication(bundleIdentifier: "com.example.Editor", version: "1")
     let focusState = MixedForegroundKeyboardFocusState()
@@ -1797,7 +1814,8 @@ private final class MixedForegroundKeyboardFixture {
         pointerFocusChange: Bool = false,
         keyboardPrefixFocusChange: Bool = false,
         failKeyboardDownBeforeInput: Bool = false,
-        pauseBeforeKeyboardEvent: Bool = false
+        pauseBeforeKeyboardEvent: Bool = false,
+        textTransitionAt: Int? = nil
     ) {
         let focus = focusState.value
         guardValue = ActionGuard(
@@ -1836,7 +1854,7 @@ private final class MixedForegroundKeyboardFixture {
                 backend: .foregroundKeyboard,
                 action: .text,
                 allowedKeyChords: [ApprovedKeyChord(rawValue: "return")!],
-                allowTextEntry: false
+                allowTextEntry: textTransitionAt != nil
             ),
         ]) : PIDInputCompatibilityRegistry()
         if pointerFocusChange {
@@ -1880,6 +1898,15 @@ private final class MixedForegroundKeyboardFixture {
             },
             delay: { _ in }
         )
+        var continuationCalls = 0
+        let continuation: ForegroundKeyboardExecutor.ContinuingTextFocusLookup?
+        if let textTransitionAt {
+            continuation = { _, wanted in
+                continuationCalls += 1
+                return KeyboardTextContinuationObservation(focus: .authority(wanted),
+                    observationRequired: continuationCalls == textTransitionAt)
+            }
+        } else { continuation = nil }
         let keyboardExecutor = ForegroundKeyboardExecutor(
             poster: poster,
             compatibility: registry,
@@ -1893,7 +1920,9 @@ private final class MixedForegroundKeyboardFixture {
                     sharedActivity.paused = true
                 }
                 return .authority(sharedFocusState.value)
-            }
+            },
+            continuingTextFocus: continuation,
+            experimentalUnicodeChunkGraphemes: 1
         )
         executor = ForegroundPlanExecutor(
             activity: activity,
@@ -1901,7 +1930,10 @@ private final class MixedForegroundKeyboardFixture {
             pidExecutor: pidExecutor,
             keyboardExecutor: keyboardExecutor
         )
-        let firstEntry = keyboardPrefixFocusChange
+        let firstEntry = textTransitionAt != nil
+            ? PlannedDispatchEntry(sourceIndex: 0, source: .type(text: "A中B"),
+                backend: .foregroundKeyboard, actionClass: .text, resolved: nil)
+            : keyboardPrefixFocusChange
             ? PlannedDispatchEntry(
                 sourceIndex: 0,
                 source: .keypress(key: "return"),
@@ -2066,6 +2098,8 @@ private final class MixedForegroundKeyboardPoster: PIDTargetedInputPosting {
             log.values.append("pointer_up")
             onMouseUp?()
         case .virtualKeyDown: log.values.append("keyboard_down")
+        case .unicodeKeyDown: log.values.append("unicode_down")
+        case .unicodeKeyUp: log.values.append("unicode_up")
         case .virtualKeyUp:
             log.values.append("keyboard_up")
             onKeyboardUp?()

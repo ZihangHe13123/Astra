@@ -855,6 +855,118 @@ func foregroundNamedInputWithoutTargetAuthorityCannotBecomeWindowInput(kind: Str
     #expect(fixture.poster.events.count == 4)
 }
 
+@Test func KeyboardTextContinuityCompletesUnicodeAndRetainsObservationBoundary() throws {
+    for changedAt in 0...5 {
+        let changed = changedAt > 0
+        var continuations = 0
+        let fixture = KeyboardExecutorFixture(continuingTextFocus: { expected, wanted in
+            #expect(expected.snapshotID == "snapshot")
+            continuations += 1
+            return KeyboardTextContinuationObservation(focus: .authority(wanted),
+                observationRequired: continuations == changedAt)
+        })
+        let entry = keyboardEntry(.type(text: "A中B", elementRef: "field"), targetKeyboardFocus: fixture.expectedFocus)
+        let plan = try fixture.executor.preflight(expected: fixture.guardValue,
+            application: fixture.application, marker: fixture.lease.marker, entries: [entry])
+        fixture.validator.failureAt = 3 // Old window-only guard cannot prove the popup transition.
+        let result = fixture.executor.executePrepared(sourceIndex: 0, from: plan,
+            expected: fixture.guardValue, lease: fixture.lease)
+        #expect(result.error == nil)
+        #expect(result.lastAcknowledgedAction == 0)
+        #expect(result.outcomes.first?.observationRequired == changed)
+        #expect(continuations == 5)
+        let units: [[UInt16]] = [[65], [0x4e2d], [66]]
+        #expect(fixture.poster.events.map(\.event) == units.flatMap {
+            [SyntheticInputEvent.unicodeKeyDown($0), .unicodeKeyUp($0)]
+        })
+        #expect(fixture.poster.events.allSatisfy { $0.pid == fixture.guardValue.pid && $0.marker == fixture.lease.marker })
+        #expect(fixture.validator.calls == 2) // Preflight and first down remain strict.
+        #expect(fixture.heldInputs.heldCount == 0)
+    }
+}
+
+@Test func KeyboardTextContinuityCannotAuthorizeFirstDownOrKeypress() throws {
+    for textAction in [false, true] {
+        var continuations = 0
+        let fixture = KeyboardExecutorFixture(continuingTextFocus: { _, wanted in
+            continuations += 1
+            return KeyboardTextContinuationObservation(focus: .authority(wanted), observationRequired: true)
+        })
+        let entry = keyboardEntry(textAction ? .type(text: "abc") : .keypress(key: "return"))
+        let plan = try fixture.executor.preflight(expected: fixture.guardValue,
+            application: fixture.application, marker: fixture.lease.marker, entries: [entry])
+        fixture.validator.failureAt = textAction ? 2 : 3
+        let result = fixture.executor.executePrepared(sourceIndex: 0, from: plan,
+            expected: fixture.guardValue, lease: fixture.lease)
+        #expect(result.error == (textAction ? .staleSnapshot : .unknownOutcome))
+        #expect(continuations == 0)
+        #expect(fixture.poster.events.count == (textAction ? 0 : 2))
+    }
+}
+
+@Test func KeyboardTextContinuityRejectsLostOrSecureFieldAfterRelease() throws {
+    let other = KeyboardFocusAuthority(identityToken: "other-field",
+        bounds: CGRect(x: 20, y: 30, width: 200, height: 100), role: "AXTextArea", subrole: nil)
+    for focus: KeyboardFocusObservation in [.stale, .secure, .secureOrIndeterminate, .authority(other)] {
+        let fixture = KeyboardExecutorFixture(continuingTextFocus: { _, _ in
+            KeyboardTextContinuationObservation(focus: focus, observationRequired: true)
+        })
+        let entry = keyboardEntry(.type(text: "abc"))
+        let plan = try fixture.executor.preflight(expected: fixture.guardValue,
+            application: fixture.application, marker: fixture.lease.marker, entries: [entry])
+        let result = fixture.executor.executePrepared(sourceIndex: 0, from: plan,
+            expected: fixture.guardValue, lease: fixture.lease)
+        #expect(result.error == .unknownOutcome)
+        #expect(result.lastAcknowledgedAction == -1)
+        #expect(result.outcomes.first?.observationRequired == false)
+        #expect(fixture.poster.events.count == 2)
+        #expect(fixture.heldInputs.heldCount == 0)
+    }
+}
+
+@Test func KeyboardTextContinuityCannotBorrowAnotherFieldsAncestry() throws {
+    var samples = ["wanted", "other", "wanted"]
+    let fixture = KeyboardExecutorFixture(continuingTextFocus: { expected, wanted in
+        let proof = provenContinuingTextFocus(expectedPreference: .selectedWindow,
+            observedPreference: .containedOverlay, wanted: wanted, windowBounds: expected.bounds,
+            readFocused: { samples.isEmpty ? nil : samples.removeFirst() },
+            observe: { _ in .authority(wanted) }, belongs: { $0 == "other" }, same: { $0 == $1 })
+        return KeyboardTextContinuationObservation(focus: proof ?? .stale, observationRequired: true)
+    })
+    let entry = keyboardEntry(.type(text: "abc"))
+    let plan = try fixture.executor.preflight(expected: fixture.guardValue,
+        application: fixture.application, marker: fixture.lease.marker, entries: [entry])
+    let result = fixture.executor.executePrepared(sourceIndex: 0, from: plan,
+        expected: fixture.guardValue, lease: fixture.lease)
+    #expect(result.error == .unknownOutcome)
+    #expect(result.lastAcknowledgedAction == -1)
+    #expect(fixture.poster.events.count == 2)
+    #expect(fixture.heldInputs.heldCount == 0)
+}
+
+@Test func KeyboardTextContinuityCannotMaskSecureInputActivityOrReleaseFailure() throws {
+    for failure in ["secure", "activity", "release"] {
+        let fixture = KeyboardExecutorFixture(
+            activity: KeyboardActivity(pauseOnEventCall: failure == "activity" ? 2 : nil),
+            continuingTextFocus: { _, wanted in
+                KeyboardTextContinuationObservation(focus: .authority(wanted), observationRequired: true)
+            })
+        if failure == "release" { fixture.poster.failingCalls = [1] }
+        if failure == "secure" {
+            fixture.poster.afterPost = { if $0 == 0 { fixture.secureInput.enabled = true } }
+        }
+        let entry = keyboardEntry(.type(text: "abc"))
+        let plan = try fixture.executor.preflight(expected: fixture.guardValue,
+            application: fixture.application, marker: fixture.lease.marker, entries: [entry])
+        let result = fixture.executor.executePrepared(sourceIndex: 0, from: plan,
+            expected: fixture.guardValue, lease: fixture.lease)
+        #expect(result.error == .unknownOutcome)
+        #expect(result.lastAcknowledgedAction == -1)
+        #expect(result.outcomes.first?.observationRequired == false)
+        #expect((2...3).contains(fixture.poster.events.count))
+    }
+}
+
 private final class KeyboardExecutorFixture {
     let application = PIDTargetApplication(bundleIdentifier: "com.example.Editor", version: "1.2.3")
     let expectedFocus: KeyboardFocusAuthority
@@ -886,6 +998,7 @@ private final class KeyboardExecutorFixture {
         activity: KeyboardActivity = KeyboardActivity(),
         clockValues: [TimeInterval] = [0],
         clockStep: TimeInterval = 0,
+        continuingTextFocus: ForegroundKeyboardExecutor.ContinuingTextFocusLookup? = nil,
         experimentalUnicodeChunkGraphemes: Int = 1
     ) {
         self.activity = activity
@@ -929,6 +1042,7 @@ private final class KeyboardExecutorFixture {
             secureInput: secureInput,
             heldInputs: heldInputs,
             focus: { focusState.observation },
+            continuingTextFocus: continuingTextFocus,
             now: {
                 if !clock.isEmpty { last = clock.removeFirst() }
                 defer { last += clockStep }
