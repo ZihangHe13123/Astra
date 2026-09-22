@@ -2862,7 +2862,10 @@ final class SystemWindowObserver: WindowObserving {
                     actions: actions,
                     backends: authority.plan.backends,
                     guardValue: authority.guardValue
-                )
+                ),
+                validateFocusMutation: {
+                    try self.userActivity.assertNotPaused(lease: execution.lease)
+                }
             )
             let result = executeForegroundActions(
                 authority: authority,
@@ -2886,6 +2889,13 @@ final class SystemWindowObserver: WindowObserving {
                 )
             }
             return result
+        } catch is UserActivityMonitoringError {
+            if fragmentStage != nil { takeoverCoordinator.cancelFragment(takeoverRef) }
+            return CooperativeActionResult(
+                batch: ActionBatchResult(outcomes: [], lastAcknowledgedAction: -1, error: nil),
+                error: .cooperative(.userActivityPaused),
+                fragmentBinding: fragmentStage
+            )
         } catch InputDispatchError.backgroundActionUnsupported {
             planDiag(
                 "ACT-FAIL foreground stage=\(takeoverStage) error=backgroundActionUnsupported"

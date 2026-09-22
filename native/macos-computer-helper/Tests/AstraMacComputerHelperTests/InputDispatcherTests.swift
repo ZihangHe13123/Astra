@@ -4,6 +4,14 @@ import Carbon
 import CoreGraphics
 import Testing
 
+// Lease-free legacy fixtures use only injected I/O. This convenience overload
+// exists in the test module ONLY; production consumption requires a validator.
+extension InputDispatcher {
+    func consumeForegroundPlan(_ plan: DispatchPlan, authority: ForegroundPlanConsumptionAuthority) throws -> [PlannedDispatchEntry] {
+        try consumeForegroundPlan(plan, authority: authority, validateFocusMutation: {})
+    }
+}
+
 @Test func fragmentDraftIsNotConsumableBeforeExactSingleUseSeal() throws {
     let performer = InputDispatcherPerformerSpy()
     let dispatcher = InputDispatcher(
@@ -1409,28 +1417,29 @@ func statefulAXPressEffectVerifiesAnyBoundedValueChange(role: String) throws {
 }
 
 @Test func systemTextInputDetectorAllowsOnlyCompleteASCIIKeyboardLayoutEvidence() {
+    let gate = KeyboardInputSourceReadGate(isMainThread: { true }, refresh: {})
     let safe = SystemBackgroundTextInputSafetyDetector(snapshot: {
         BackgroundTextInputSourceSnapshot(
             category: kTISCategoryKeyboardInputSource as String,
             sourceType: kTISTypeKeyboardLayout as String,
             isASCIICapable: true
         )
-    })
+    }, readGate: gate)
     let nonASCII = SystemBackgroundTextInputSafetyDetector(snapshot: {
         BackgroundTextInputSourceSnapshot(
             category: kTISCategoryKeyboardInputSource as String,
             sourceType: kTISTypeKeyboardLayout as String,
             isASCIICapable: false
         )
-    })
+    }, readGate: gate)
     let inputMode = SystemBackgroundTextInputSafetyDetector(snapshot: {
         BackgroundTextInputSourceSnapshot(
             category: kTISCategoryKeyboardInputSource as String,
             sourceType: kTISTypeKeyboardInputMode as String,
             isASCIICapable: true
         )
-    })
-    let unknown = SystemBackgroundTextInputSafetyDetector(snapshot: { nil })
+    }, readGate: gate)
+    let unknown = SystemBackgroundTextInputSafetyDetector(snapshot: { nil }, readGate: gate)
 
     #expect(safe.detect() == .safeASCIIKeyboardLayout)
     #expect(nonASCII.detect() == .imeOrCandidate)

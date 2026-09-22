@@ -495,7 +495,8 @@ final class InputDispatcher: InputDispatching {
 
     func consumeForegroundPlan(
         _ plan: DispatchPlan,
-        authority: ForegroundPlanConsumptionAuthority
+        authority: ForegroundPlanConsumptionAuthority,
+        validateFocusMutation: () throws -> Void
     ) throws -> [PlannedDispatchEntry] {
         lock.lock()
         let record = records.removeValue(forKey: plan.planRef)
@@ -560,7 +561,8 @@ final class InputDispatcher: InputDispatching {
                 consumeDiag("consumeForegroundPlan: entry mismatch index=\(index) sourceIndex=\(entry.sourceIndex) entries=\(record.entries.count) actions=\(authority.actions.count)")
                 throw ActionExecutionError.staleSnapshot
             }
-            try preflightForegroundEntry(entry, expected: record.guardValue)
+            try preflightForegroundEntry(entry, expected: record.guardValue,
+                validateFocusMutation: validateFocusMutation)
         }
         try verify(expected: record.guardValue, current: performer.currentTargetState())
         return record.entries
@@ -1084,7 +1086,9 @@ final class InputDispatcher: InputDispatching {
         effectVerifier.verify(probe)
     }
 
-    private func preflightForegroundEntry(_ entry: PlannedDispatchEntry, expected: ActionGuard) throws {
+    private func preflightForegroundEntry(_ entry: PlannedDispatchEntry, expected: ActionGuard,
+        validateFocusMutation: () throws -> Void
+    ) throws {
         switch entry.backend {
         case .axPress:
             guard entry.resolved?.method == .accessibilityPress else {
@@ -1123,7 +1127,8 @@ final class InputDispatcher: InputDispatching {
             // Replacement consume is read-only. Focus acquisition belongs to
             // performReplacement, where this invocation's activity lease guards it.
             if entry.source.replace != true {
-                _ = try performer.focusedKeyboardElement(matching: current)
+                _ = try performer.focusedKeyboardElement(matching: current,
+                    validateFocusMutation: validateFocusMutation)
             }
             switch entry.source.replace == true
                 ? performer.preflightAXTextReplacement(current) : performer.preflightAXTextMutation(current) {
@@ -1151,7 +1156,8 @@ final class InputDispatcher: InputDispatching {
                     (entry.source.kind == .keypress && ApprovedKeyChord(action: entry.source) != nil)
             else { throw ActionExecutionError.invalidAction }
             if entry.targetKeyboardFocus != nil {
-                try preflightFreshTargetedKeyboardElement(entry, expected: expected)
+                try preflightFreshTargetedKeyboardElement(entry, expected: expected,
+                    validateFocusMutation: validateFocusMutation)
             }
         case .pidKeyboard:
             guard entry.resolved == nil,
@@ -1163,7 +1169,8 @@ final class InputDispatcher: InputDispatching {
 
     private func preflightFreshTargetedKeyboardElement(
         _ entry: PlannedDispatchEntry,
-        expected: ActionGuard
+        expected: ActionGuard,
+        validateFocusMutation: () throws -> Void
     ) throws {
         guard let reference = entry.source.elementRef,
               let retainedFocus = entry.targetKeyboardFocus,
@@ -1174,7 +1181,8 @@ final class InputDispatcher: InputDispatching {
               ),
               currentFocus == retainedFocus
         else { throw ActionExecutionError.staleSnapshot }
-        _ = try performer.focusedKeyboardElement(matching: current)
+        _ = try performer.focusedKeyboardElement(matching: current,
+            validateFocusMutation: validateFocusMutation)
     }
 
     @discardableResult

@@ -1753,6 +1753,74 @@ func replacementRealConsumerPreservesVerificationAndStopsUnverifiedSuffix(scenar
     if scenario == "clear" { #expect(f.value.isEmpty) }
 }
 
+@Test(arguments: ["refresh_ax", "refresh_keyboard", "read_ax", "read_keyboard", "safe_ax", "safe_keyboard"])
+func InputSourceRefreshPauseCannotAcquireFocusDuringConsume(scenario: String) throws {
+    let base = MixedForegroundExecutionFixture(enabled: [])
+    let activity = base.activity
+    let ax = AXUIElementCreateApplication(11)
+    let target = ActionElement(element: ax, identityToken: "field",
+        bounds: CGRect(x: 10, y: 10, width: 30, height: 20),
+        roleResult: .init(value: "AXTextField", status: .complete),
+        subroleResult: .init(value: nil, status: .complete), enabled: true,
+        actionNames: .complete([]))
+    let focusedTarget = ActionElement(element: ax, identityToken: "field",
+        bounds: target.bounds.offsetBy(dx: base.guardValue.bounds.minX, dy: base.guardValue.bounds.minY),
+        roleResult: target.roleResult, subroleResult: target.subroleResult,
+        enabled: true, actionNames: .complete([]))
+    var consuming = false
+    var consumeReads = 0
+    var focusWritesWhilePaused = 0
+    var textWrites = 0
+    let gate = KeyboardInputSourceReadGate(isMainThread: { true }, refresh: {
+        if consuming && scenario.hasPrefix("refresh_") { activity.paused = true }
+    })
+    let safety = SystemBackgroundTextInputSafetyDetector(snapshot: {
+        BackgroundTextInputSourceSnapshot(category: "TISCategoryKeyboardInputSource",
+            sourceType: "TISTypeKeyboardLayout", isASCIICapable: true)
+    }, readGate: gate)
+    let performer = SystemActionPerformer(state: {
+        if consuming {
+            consumeReads += 1
+            if scenario.hasPrefix("read_"), consumeReads >= 1 { activity.paused = true }
+        }
+        return base.performer.state
+    }, lookup: { _, _ in target },
+        selectedTextWriter: SystemAXSelectedTextWriter(isSettable: { _ in
+            (.success, scenario.hasSuffix("_ax"))
+        }, setValue: { _, _ in textWrites += 1; return .success }),
+        focusedKeyboard: { _ in focusedTarget }, focusAcquisition: { _, _ in
+            if activity.paused { focusWritesWhilePaused += 1 }
+            return focusedTarget
+        }, textInputSafety: { safety.detect() })
+    let dispatcher = InputDispatcher(performer: performer, application: base.application,
+        syntheticPolicy: foregroundTakeoverPlanningPolicy(application: base.application, pointerActions: []),
+        backgroundTextInputSafety: safety)
+    let source = try NativeAction.parse(.object([
+        "type": .string("type"), "element_ref": .string("field"), "text": .string("test"),
+    ]))
+    let plan = try dispatcher.plan(actions: [source], context: DispatchContext(guardValue: base.guardValue))
+    #expect(plan.backends == [scenario.hasSuffix("_ax") ? .axSelectedText : .foregroundKeyboard])
+    consuming = true
+    var leaseChecks = 0
+    do {
+        let entries = try dispatcher.consumeForegroundPlan(plan, authority: ForegroundPlanConsumptionAuthority(
+            planRef: plan.planRef, snapshotID: "snapshot", interactionMode: .foregroundTakeover,
+            actions: [source], backends: plan.backends, guardValue: base.guardValue), validateFocusMutation: {
+                leaseChecks += 1
+                try activity.assertNotPaused(lease: activity.lease)
+            })
+        #expect(scenario.hasPrefix("safe_"))
+        #expect(entries.count == 1)
+    } catch is UserActivityMonitoringError {
+        #expect(!scenario.hasPrefix("safe_"))
+    }
+    #expect(leaseChecks == 1)
+    #expect(activity.paused == !scenario.hasPrefix("safe_"))
+    #expect(focusWritesWhilePaused == 0)
+    #expect(textWrites == 0)
+    #expect(base.poster.events.isEmpty)
+}
+
 /// Uses the production performer AND AXValue replacer; only native I/O and live state are injected.
 private func runReplacementForegroundCase(_ scenario: String) throws -> (
     result: PIDTargetedActionResult, writes: Int, value: String, gates: Int, fallbacks: Int, focusWritesWhilePaused: Int

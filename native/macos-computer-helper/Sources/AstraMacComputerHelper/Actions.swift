@@ -804,6 +804,7 @@ protocol ActionProviding: AnyObject {
         direction: AXScrollDirection
     ) -> AXScrollPressTarget?
     func focusedKeyboardElement(matching expected: ActionElement?) throws -> ActionElement
+    func focusedKeyboardElement(matching expected: ActionElement?, validateFocusMutation: () throws -> Void) throws -> ActionElement
     func isVisibleOnScreen(_ point: CGPoint) -> Bool
     func preflightAXTextMutation(_ element: ActionElement) -> AXTextMutationPreflight
     func preflightAXTextReplacement(_ element: ActionElement) -> AXTextMutationPreflight
@@ -820,6 +821,10 @@ extension ActionProviding {
     ) -> AXScrollPressTarget? { nil }
     func isVisibleOnScreen(_: CGPoint) -> Bool { true }
     func focusedKeyboardElement(matching _: ActionElement?) throws -> ActionElement { throw ActionExecutionError.targetNotFrontmost }
+    func focusedKeyboardElement(matching expected: ActionElement?, validateFocusMutation: () throws -> Void) throws -> ActionElement {
+        try validateFocusMutation()
+        return try focusedKeyboardElement(matching: expected)
+    }
     func preflightAXTextMutation(_: ActionElement) -> AXTextMutationPreflight { .unsupported }
     func preflightAXTextReplacement(_: ActionElement) -> AXTextMutationPreflight { .unsupported }
     func performReplacement(_: ResolvedAction, validateMutation: () throws -> Void) throws -> ActionPerformance {
@@ -1027,20 +1032,29 @@ struct BackgroundTextInputSourceSnapshot: Equatable {
 }
 
 /// 诊断用：helper **自己进程内**看到的当前键盘输入源 ID。
-/// TIS 的"当前输入源"是按会话读的，外部 CLI 探针与 helper 可能取到不同值 —— 实机排查 IME
-/// 一刀切闸时，只有这个值能证明闸为什么拒绝（外部读数曾两次误导归因）。
-func currentKeyboardInputSourceIDForDiagnostics() -> String {
-    guard let unmanaged = TISCopyCurrentKeyboardInputSource() else { return "nil-source" }
-    let source = unmanaged.takeRetainedValue()
-    guard let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) else { return "nil-id" }
-    return Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
+/// TIS 的进程内缓存须先处理输入源变更通知；外部 CLI 可作对照，不能替代动作许可。
+func currentKeyboardInputSourceIDForDiagnostics(
+    readGate: KeyboardInputSourceReadGate = .shared,
+    readIdentifier: (() -> String?)? = nil
+) -> String {
+    let read = readIdentifier ?? {
+        guard let unmanaged = TISCopyCurrentKeyboardInputSource() else { return "nil-source" }
+        let source = unmanaged.takeRetainedValue()
+        guard let raw = TISGetInputSourceProperty(source, kTISPropertyInputSourceID) else { return "nil-id" }
+        return Unmanaged<CFString>.fromOpaque(raw).takeUnretainedValue() as String
+    }
+    return readGate.read(read) ?? "unavailable-source"
 }
 
 struct SystemBackgroundTextInputSafetyDetector: BackgroundTextInputSafetyDetecting {
     private let snapshot: () -> BackgroundTextInputSourceSnapshot?
 
-    init(snapshot: (() -> BackgroundTextInputSourceSnapshot?)? = nil) {
-        self.snapshot = snapshot ?? Self.currentSnapshot
+    init(
+        snapshot: (() -> BackgroundTextInputSourceSnapshot?)? = nil,
+        readGate: KeyboardInputSourceReadGate = .shared
+    ) {
+        let readSnapshot = snapshot ?? Self.currentSnapshot
+        self.snapshot = { readGate.read(readSnapshot) }
     }
 
     func detect() -> BackgroundTextInputSafety {
@@ -1281,7 +1295,7 @@ final class SystemActionPerformer: ActionProviding {
         try focusedKeyboardElement(matching: expected, validateFocusMutation: {})
     }
 
-    private func focusedKeyboardElement(matching expected: ActionElement?,
+    func focusedKeyboardElement(matching expected: ActionElement?,
         validateFocusMutation: () throws -> Void
     ) throws -> ActionElement {
         let selected = try state()
