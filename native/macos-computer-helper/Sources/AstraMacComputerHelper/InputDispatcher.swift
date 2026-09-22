@@ -750,10 +750,10 @@ final class InputDispatcher: InputDispatching {
             // kAXFocusedUIElement（只读探针实测：后台 -25212 kAXErrorNoValue，前台才有值），
             // 而前台恰恰是这份计划要去批准的接管结果 ⇒ 要求计划期读到焦点是顺序上不可能满足的
             // 条件（实机 FOCUS-ACQUIRE-EARLY unverified → AX-MAP raw=-25212 → PLAN-THROW）。
-            // 已请求接管时降级为"暂无 per-action 权威"，真复验留在投递前：deliveryKeyboardFocusGuard
-            // 取激活后一刻的 expected，validateEnvironment 再要求 currentFocus 与之一致并重查 secure。
+            // 已请求接管时保留快照里指定元素的身份和屏幕几何；不能降为 nil 而把目标
+            // 偷换成激活后的任意焦点。投递前仍须与该指定元素匹配并重查 secure。
             // 后台请求没有"激活必然先于投递"这个前提 ⇒ 照旧抛出，绝不盲投。
-            let targetKeyboardFocus: KeyboardFocusAuthority?
+            let targetKeyboardFocus: KeyboardFocusAuthority
             do {
                 let focused = try performer.focusedKeyboardElement(matching: element)
                 guard let authority = inputDispatchKeyboardFocusAuthority(focused) else {
@@ -762,8 +762,11 @@ final class InputDispatcher: InputDispatching {
                 targetKeyboardFocus = authority
             } catch {
                 guard expected.interactionMode == .foregroundTakeover else { throw error }
-                logPlanDenied("type focus authority unavailable pre-activation; deferring to delivery")
-                targetKeyboardFocus = nil
+                guard let authority = inputDispatchKeyboardFocusAuthority(element, localToWindowBounds: expected.bounds) else {
+                    throw ActionExecutionError.inputFocusRequired
+                }
+                logPlanDenied("type focus unavailable pre-activation; preserving named target for delivery")
+                targetKeyboardFocus = authority
             }
             // 输入法不安全 ⇒ 连 AX 文本写的 preflight 都不做，本发强制走键盘 unicode 通道
             // （不变量：不安全布局下绝不做文本 mutation；perform 侧另有同向守卫）。
@@ -805,6 +808,25 @@ final class InputDispatcher: InputDispatching {
             if ApprovedKeyChord(action: action) == nil {
                 logPlanDenied("keypress chordNil key=\(action.key ?? "?")")
                 return .unsupported(backend: .foregroundKeyboard, actionClass: .text)
+            }
+            if let element {
+                let targetFocus: KeyboardFocusAuthority
+                do {
+                    let focused = try performer.focusedKeyboardElement(matching: element)
+                    guard let authority = inputDispatchKeyboardFocusAuthority(focused) else {
+                        throw ActionExecutionError.inputFocusRequired
+                    }
+                    targetFocus = authority
+                } catch {
+                    guard expected.interactionMode == .foregroundTakeover else { throw error }
+                    guard let authority = inputDispatchKeyboardFocusAuthority(element, localToWindowBounds: expected.bounds) else {
+                        throw ActionExecutionError.inputFocusRequired
+                    }
+                    targetFocus = authority
+                }
+                // PID/window-command delivery must not erase an explicit field
+                // recipient. The foreground executor checks it before posting.
+                return .takeover(backend: .foregroundKeyboard, actionClass: .text, targetKeyboardFocus: targetFocus)
             }
             let backgroundDelivery = syntheticPolicy.allowsBackgroundDelivery(
                 application: application,

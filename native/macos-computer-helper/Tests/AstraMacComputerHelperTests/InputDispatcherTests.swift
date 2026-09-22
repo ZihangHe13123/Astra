@@ -1627,7 +1627,7 @@ func statefulAXPressEffectVerifiesAnyBoundedValueChange(role: String) throws {
     )
 }
 
-@Test func approvedWindowCommandChordsIgnoreElementRefForTargetFocusSemantics() throws {
+@Test func namedCommandChordsPreserveExactElementFocusSemantics() throws {
     for key in ["a", "s"] {
         let performer = InputDispatcherPerformerSpy()
         let dispatcher = InputDispatcher(
@@ -1647,9 +1647,19 @@ func statefulAXPressEffectVerifiesAnyBoundedValueChange(role: String) throws {
         )
 
         #expect(entries.count == 1)
-        #expect(entries[0].backend == .pidKeyboard)
-        #expect(entries[0].targetKeyboardFocus == nil)
+        #expect(entries[0].backend == .foregroundKeyboard)
+        #expect(entries[0].targetKeyboardFocus?.identityToken == performer.element(reference: "text", snapshotID: "snapshot")?.identityToken)
+        #expect(entries[0].targetKeyboardFocus?.role == "AXTextField")
         #expect(performer.performed.isEmpty)
+
+        // Without a ref these remain ordinary window commands.
+        let unnamedActions = [NativeAction.keypress(key: key, modifiers: ["command"])]
+        let unnamed = try dispatcher.plan(actions: unnamedActions, context: context)
+        let unnamedEntries = try dispatcher.consumeForegroundPlan(
+            unnamed, authority: foregroundConsumptionAuthority(plan: unnamed, context: context, actions: unnamedActions)
+        )
+        #expect(unnamedEntries[0].targetKeyboardFocus == nil)
+        #expect(unnamedEntries[0].backend == .pidKeyboard)
     }
 
     let rejectionPerformer = InputDispatcherPerformerSpy()
@@ -2335,7 +2345,7 @@ private final class InputDispatcherPerformerSpy: ActionProviding {
     let failures: [Int: ActionPerformFailure]
     /// 实机条件注入：app 在后台时 macOS 根本不报 kAXFocusedUIElement（实测 -25212），
     /// 于是计划期的焦点回读必然失败。用它来复现"接管还没发生 ⇒ 读不到焦点"。
-    let focusedKeyboardElementError: ActionExecutionError?
+    var focusedKeyboardElementError: ActionExecutionError?
 
     init(
         textPreflight: AXTextMutationPreflight = .settable,
@@ -2599,6 +2609,35 @@ private final class InputDispatcherElementState {
         context: DispatchContext(guardValue: inputDispatcherForegroundGuard())
     )
     #expect(unnamed.cooperativeError == nil && unnamed.requiresTakeover)
+}
+
+@Test(arguments: ["type", "keypress"])
+func namedKeyboardPlanRetainsIdentityAcrossPreActivationFailure(kind: String) throws {
+    let performer = InputDispatcherPerformerSpy(textPreflight: .unsupported, focusedKeyboardElementError: .inputFocusRequired)
+    let windowBounds = CGRect(x: -300, y: 180, width: 100, height: 100)
+    performer.state = ActionTargetState(pid: 11, windowID: 22, bounds: windowBounds, axIdentity: 33)
+    let dispatcher = InputDispatcher(
+        performer: performer, application: inputDispatcherApplication,
+        syntheticPolicy: inputDispatcherSyntheticPolicy(),
+        backgroundTextInputSafety: InputDispatcherTextSafety(.safeASCIIKeyboardLayout)
+    )
+    let context = DispatchContext(guardValue: ActionGuard(
+        pid: 11, windowID: 22, bounds: windowBounds, axIdentity: 33,
+        keyboardFocus: nil, snapshotID: "snapshot", interactionMode: .foregroundTakeover
+    ))
+    let action = kind == "type" ? NativeAction.type(text: "marker", elementRef: "text")
+        : .keypress(key: "a", modifiers: ["command"], elementRef: "text")
+    let plan = try dispatcher.plan(actions: [action], context: context)
+    #expect(plan.cooperativeError == nil && plan.requiresTakeover)
+    // Consumption happens after takeover activation; exact focus is now
+    // available. Leaving it unavailable correctly rejects before any posting.
+    performer.focusedKeyboardElementError = nil
+    let entries = try dispatcher.consumeForegroundPlan(
+        plan, authority: foregroundConsumptionAuthority(plan: plan, context: context, actions: [action])
+    )
+    #expect(entries[0].targetKeyboardFocus?.identityToken == performer.element(reference: "text", snapshotID: "snapshot")?.identityToken)
+    #expect(entries[0].targetKeyboardFocus?.bounds == CGRect(x: -290, y: 190, width: 20, height: 20))
+    #expect(performer.performed.isEmpty)
 }
 
 @Test func foregroundTakeoverTypePlanDefersFocusVerificationToDelivery() throws {

@@ -351,6 +351,9 @@ final class ForegroundKeyboardExecutor {
         else {
             throw ActionExecutionError.invalidAction
         }
+        guard entry.source.elementRef == nil || entry.targetKeyboardFocus != nil else {
+            throw ActionExecutionError.inputFocusRequired
+        }
         switch entry.source.kind {
         case .keypress:
             guard let chord = ApprovedKeyChord(action: entry.source),

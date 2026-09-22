@@ -99,10 +99,12 @@ import Testing
     #expect(fixture.poster.events.isEmpty)
 }
 
-@Test func foregroundTargetedTextFocusMismatchStopsBeforePosting() throws {
+@Test(arguments: ["type", "keypress"])
+func foregroundTargetedInputFocusMismatchStopsBeforePosting(kind: String) throws {
     let fixture = KeyboardExecutorFixture()
     let entry = keyboardEntry(
-        .type(text: "must-not-post", elementRef: "target"),
+        kind == "type" ? .type(text: "must-not-post", elementRef: "target")
+            : .keypress(key: "a", modifiers: ["command"], elementRef: "target"),
         targetKeyboardFocus: KeyboardFocusAuthority(
             identityToken: "ax:different-target",
             bounds: fixture.expectedFocus.bounds,
@@ -150,19 +152,15 @@ import Testing
     #expect(fixture.poster.events.isEmpty)
 }
 
-@Test func foregroundReferencedWindowChordRetainsSnapshotFocusContract() throws {
+@Test(arguments: ["type", "keypress"])
+func foregroundNamedInputWithoutTargetAuthorityCannotBecomeWindowInput(kind: String) throws {
     let fixture = KeyboardExecutorFixture()
-    fixture.focus = KeyboardFocusAuthority(
-        identityToken: "ax:moved-focus",
-        bounds: fixture.expectedFocus.bounds,
-        role: fixture.expectedFocus.role,
-        subrole: fixture.expectedFocus.subrole
-    )
     let entry = keyboardEntry(
-        .keypress(key: "a", modifiers: ["command"], elementRef: "target")
+        kind == "type" ? .type(text: "must-not-post", elementRef: "target")
+            : .keypress(key: "a", modifiers: ["command"], elementRef: "target")
     )
 
-    #expect(throws: ActionExecutionError.staleSnapshot) {
+    #expect(throws: ActionExecutionError.inputFocusRequired) {
         _ = try fixture.executor.preflight(
             expected: fixture.guardValue,
             application: fixture.application,
