@@ -274,6 +274,13 @@ class Runner:
         original = self.input_source()
         self.report["original_input_source"] = original
         try:
+            # The helper inherits TCC permission from the launching terminal, not its own bundle.
+            _, status = await self.call("computer_status", {})
+            permissions = (status or {}).get("permissions") or {}
+            self.report["helper"] = (status or {}).get("build_identity")
+            if not (permissions.get("accessibility") and permissions.get("screen_recording")):
+                raise RuntimeError("This terminal lacks Accessibility or Screen Recording permission. "
+                                   "Run the script in the terminal where Astra runs.")
             subprocess.run(["open", "-a", "Microsoft Edge", f"http://127.0.0.1:{self.args.port}/text?nonce={nonce}"],
                            check=True, timeout=30)
             await self.fixture_window()
