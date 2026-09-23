@@ -2809,3 +2809,69 @@ func genericForegroundPlansUnknownAppPointerWithoutAXDescendants(kind: String) t
     #expect(plan.backends == [.foregroundKeyboard])
     #expect(plan.foregroundFragmentRequirements(actions: actions)?.first?.backend == .foregroundKeyboard)
 }
+
+// If AXSelectedText becomes unavailable after planning, a retry must not repeat the same
+// refused write. This is separate from the live omnibox input-source refusal.
+private final class FlippingSelectedTextWriter: AXSelectedTextWriting {
+    var results: [AXTextMutationPreflight] = [.settable, .unsupported]
+    var writes = 0
+    func preflightSelectedText(to _: AXUIElement) -> AXTextMutationPreflight {
+        results.count > 1 ? results.removeFirst() : results.first ?? .unsupported
+    }
+    func writeSelectedText(_: String, to _: AXUIElement) -> AXSelectedTextWriteResult {
+        writes += 1
+        return .written
+    }
+}
+
+@Test func textRecheckRefusalBeforeMutationIsRememberedForKeyboardRouting() throws {
+    let writer = FlippingSelectedTextWriter()
+    let field = ActionElement(element: AXUIElementCreateApplication(11), bounds: CGRect(x: 10, y: 10, width: 50, height: 20),
+        role: kAXTextFieldRole as String, subrole: nil, actions: [])
+    let memory = AXTextWriteEffectMemory()
+    let performer = SystemActionPerformer(
+        state: { ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100),
+                                   axIdentity: 33) },
+        lookup: { reference, snapshotID in reference == "text" && snapshotID == "snapshot" ? field : nil },
+        selectedTextWriter: writer, focusedKeyboard: { _ in field }, axTextWriteMemory: memory)
+    let dispatcher = InputDispatcher(performer: performer,
+        backgroundTextInputSafety: InputDispatcherTextSafety(.safeASCIIKeyboardLayout))
+    let context = DispatchContext(guardValue: inputDispatcherBackgroundGuard())
+    let plan = try dispatcher.plan(actions: [.type(text: "abc", elementRef: "text")], context: context)
+    #expect(!plan.requiresTakeover)
+    let result = try dispatcher.execute(plan, context: context)
+    #expect(result.error == .staleSnapshot)
+    #expect(result.lastAcknowledgedAction == -1)
+    #expect(result.outcomes == [ActionOutcome(index: 0, ok: false, error: .staleSnapshot)])
+    #expect(writer.writes == 0)
+    #expect(memory.ignoresSelectedTextWrites(pid: 11))
+    let retry = try dispatcher.plan(actions: [.type(text: "abc", elementRef: "text")], context: context)
+    #expect(retry.requiresTakeover)
+}
+
+@Test func foregroundTextRecheckRefusalIsRememberedForKeyboardRouting() throws {
+    let writer = FlippingSelectedTextWriter()
+    let field = ActionElement(element: AXUIElementCreateApplication(11),
+        bounds: CGRect(x: 10, y: 10, width: 50, height: 20),
+        role: kAXTextFieldRole as String, subrole: nil, actions: [])
+    let memory = AXTextWriteEffectMemory()
+    let performer = SystemActionPerformer(
+        state: { ActionTargetState(pid: 11, windowID: 22,
+            bounds: CGRect(x: 0, y: 0, width: 100, height: 100), axIdentity: 33) },
+        lookup: { reference, snapshotID in reference == "text" && snapshotID == "snapshot" ? field : nil },
+        selectedTextWriter: writer, focusedKeyboard: { _ in field }, axTextWriteMemory: memory)
+    let dispatcher = InputDispatcher(performer: performer,
+        backgroundTextInputSafety: InputDispatcherTextSafety(.safeASCIIKeyboardLayout))
+    let context = DispatchContext(guardValue: inputDispatcherForegroundGuard())
+    let actions = [NativeAction.type(text: "abc", elementRef: "text")]
+    let plan = try dispatcher.plan(actions: actions, context: context)
+    #expect(plan.backends == [.axSelectedText])
+    #expect(throws: ActionExecutionError.staleSnapshot) {
+        _ = try dispatcher.consumeForegroundPlan(plan,
+            authority: foregroundConsumptionAuthority(plan: plan, context: context, actions: actions))
+    }
+    #expect(writer.writes == 0)
+    #expect(memory.ignoresSelectedTextWrites(pid: 11))
+    let retry = try dispatcher.plan(actions: actions, context: context)
+    #expect(retry.backends == [.foregroundKeyboard])
+}

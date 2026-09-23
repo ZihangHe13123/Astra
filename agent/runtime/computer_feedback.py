@@ -47,10 +47,16 @@ def build_action_receipt(payload, *, mode, action_count, dispatch_attempted, err
     )
     dispatch = ("acknowledged" if acknowledged == action_count and action_count else
                 "partial" if acknowledged else "unknown" if dispatch_attempted else "not_dispatched")
-    # The helper reports unknown_outcome whenever input may have started, so a structured
-    # result naming a pre-input refusal and acknowledging nothing sent nothing.
-    if (dispatch == "unknown" and error_code in _PRE_INPUT_REFUSALS and acknowledgement == -1 and outcomes
-            and all(isinstance(o, Mapping) and o.get("error_code") in (None, error_code) for o in outcomes)):
+    # A validated pre-input refusal has no acknowledged prefix and either an empty
+    # batch (before the action loop) or one matching failed outcome. Unknown outcomes
+    # never satisfy this rule, so an action that may have started remains uncertain.
+    if (dispatch == "unknown" and action_count > 0
+            and error_code in _PRE_INPUT_REFUSALS | {"background_action_unsupported"}
+            and type(acknowledgement) is int and acknowledgement == -1
+            and isinstance(native.get("outcomes"), list)
+            and (not outcomes or (len(outcomes) == 1 and isinstance(outcomes[0], Mapping)
+                                  and outcomes[0].get("index") == 0 and outcomes[0].get("ok") is False
+                                  and outcomes[0].get("error_code") == error_code))):
         dispatch = "not_dispatched"
     # No fresh observation came back and its recovery may already have revoked the
     # target, so the result's own Recovery decides how to observe next.

@@ -807,6 +807,7 @@ protocol ActionProviding: AnyObject {
     func focusedKeyboardElement(matching expected: ActionElement?, validateFocusMutation: () throws -> Void) throws -> ActionElement
     func isVisibleOnScreen(_ point: CGPoint) -> Bool
     func preflightAXTextMutation(_ element: ActionElement) -> AXTextMutationPreflight
+    func noteAXTextWriteUnavailable(_ element: ActionElement)
     func preflightAXTextReplacement(_ element: ActionElement) -> AXTextMutationPreflight
     func perform(_ action: ResolvedAction) throws -> ActionPerformance
     func performReplacement(_ action: ResolvedAction, validateMutation: () throws -> Void) throws -> ActionPerformance
@@ -826,6 +827,7 @@ extension ActionProviding {
         return try focusedKeyboardElement(matching: expected)
     }
     func preflightAXTextMutation(_: ActionElement) -> AXTextMutationPreflight { .unsupported }
+    func noteAXTextWriteUnavailable(_: ActionElement) {}
     func preflightAXTextReplacement(_: ActionElement) -> AXTextMutationPreflight { .unsupported }
     func performReplacement(_: ResolvedAction, validateMutation: () throws -> Void) throws -> ActionPerformance {
         throw ActionPerformFailure(error: .invalidAction, inputStarted: false)
@@ -1034,8 +1036,8 @@ private func completeAXString(_ element: AXUIElement, _ attribute: String) -> St
     return result.value
 }
 
-/// Processes that ignored an AXSelectedText write in this helper lifetime. Their later text is
-/// delivered by keyboard instead of repeating a write that is known not to land.
+/// Processes where an AXSelectedText write was ignored or became unavailable in this helper
+/// lifetime. Their later text is delivered by keyboard instead of repeating the unreliable path.
 final class AXTextWriteEffectMemory: @unchecked Sendable {
     static let shared = AXTextWriteEffectMemory()
     private let lock = NSLock()
@@ -1229,6 +1231,9 @@ struct SystemAXSelectedTextWriter: AXSelectedTextWriting {
         try validateBeforeMutation()
         let before = effectProbe?.readValue(element)
         let selectedBefore = effectProbe?.readSelectedText(element)
+        // AX reads may block while the input source or focus changes. Recheck after
+        // them so the final guard sits immediately before the write.
+        try validateBeforeMutation()
         let setError = setValue(element, text)
         guard setError == .success else {
             return .failed(mapAXActionError(setError), inputStarted: true)
@@ -1408,6 +1413,21 @@ final class SystemActionPerformer: ActionProviding {
         guard AXUIElementGetPid(element, &pid) == .success else { return }
         axTextWriteMemory?.recordIgnoredSelectedTextWrite(pid: pid)
         logActionRejected("AX-TEXT-INEFFECTIVE pid=\(pid) value unchanged after an accepted AXSelectedText write")
+    }
+
+    func noteAXTextWriteUnavailable(_ element: ActionElement) {
+        guard !element.isSecure, element.enabled == true,
+              element.supportsAXSelectedTextWrite, let axElement = element.element,
+              webContentProbe?(axElement) != true
+        else { return }
+        rememberUnavailableAXTextWrite(axElement)
+    }
+
+    private func rememberUnavailableAXTextWrite(_ element: AXUIElement) {
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(element, &pid) == .success else { return }
+        axTextWriteMemory?.recordIgnoredSelectedTextWrite(pid: pid)
+        logActionRejected("AX-TEXT-UNAVAILABLE pid=\(pid) selected-text write refused before mutation")
     }
 
     func preflightAXTextReplacement(_ element: ActionElement) -> AXTextMutationPreflight {
@@ -1599,12 +1619,19 @@ final class SystemActionPerformer: ActionProviding {
                 return ActionPerformance(inputStarted: result.inputStarted, effectVerification: result.effectVerification,
                     observationRequired: result.observationRequired)
             }
+            guard textInputSafety.map({ $0() == .safeASCIIKeyboardLayout }) ?? true else {
+                throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false)
+            }
             _ = try revalidateKeyboardTarget(action.verifiedElement)
+            guard axTextWriteMayLand(element) else {
+                throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false)
+            }
             switch selectedTextWriter.preflightSelectedText(to: element) {
             case .settable:
                 break
             case .unsupported:
-                throw ActionPerformFailure(error: .helperFailed, inputStarted: false)
+                rememberUnavailableAXTextWrite(element)
+                throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false)
             case let .failed(error):
                 throw ActionPerformFailure(error: error, inputStarted: false)
             }
@@ -1613,13 +1640,17 @@ final class SystemActionPerformer: ActionProviding {
                 to: element,
                 validateBeforeMutation: {
                     _ = try self.revalidateKeyboardTarget(action.verifiedElement)
+                    guard self.textInputSafety.map({ $0() == .safeASCIIKeyboardLayout }) ?? true,
+                          self.axTextWriteMayLand(element)
+                    else { throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false) }
                 }
             )
             switch selectedTextResult {
             case .written:
                 return ActionPerformance(inputStarted: true)
             case .unsupported:
-                throw ActionPerformFailure(error: .helperFailed, inputStarted: false)
+                rememberUnavailableAXTextWrite(element)
+                throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false)
             case .ineffective:
                 // A background plan cannot switch to keyboard mid-action. Report that nothing
                 // was sent; the remembered process routes the retry to keyboard delivery.

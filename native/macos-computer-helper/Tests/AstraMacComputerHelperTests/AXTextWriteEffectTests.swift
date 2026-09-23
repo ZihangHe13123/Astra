@@ -28,12 +28,14 @@ private func effectProbe(values: [String?], selected: String? = nil,
 
 private func effectPerformer(poster: RecordingEffectPoster, writer: SystemAXSelectedTextWriter,
                              memory: AXTextWriteEffectMemory? = nil,
-                             webContent: ((AXUIElement) -> Bool)? = nil) -> SystemActionPerformer {
+                             webContent: ((AXUIElement) -> Bool)? = nil,
+                             textInputSafety: (() -> BackgroundTextInputSafety)? = nil) -> SystemActionPerformer {
     SystemActionPerformer(
         state: { ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100),
                                    axIdentity: 33) },
         lookup: { _, _ in effectField }, inputPoster: poster, selectedTextWriter: writer,
-        focusedKeyboard: { _ in effectField }, webContentProbe: webContent, axTextWriteMemory: memory)
+        focusedKeyboard: { _ in effectField }, textInputSafety: textInputSafety,
+        webContentProbe: webContent, axTextWriteMemory: memory)
 }
 
 private func typeAction(_ method: ResolvedActionMethod) -> ResolvedAction {
@@ -107,6 +109,86 @@ private func typeAction(_ method: ResolvedActionMethod) -> ResolvedAction {
     #expect(poster.events.isEmpty)
     #expect(memory.ignoresSelectedTextWrites(pid: 11))
     #expect(performer.preflightAXTextMutation(effectField) == .unsupported)
+}
+
+@Test func AXTextWriteStopsWhenInputSourceChangesBeforeMutation() {
+    let poster = RecordingEffectPoster()
+    let memory = AXTextWriteEffectMemory()
+    var safety = BackgroundTextInputSafety.safeASCIIKeyboardLayout
+    var preflights = 0
+    var writes = 0
+    let writer = SystemAXSelectedTextWriter(isSettable: { _ in
+        preflights += 1
+        if preflights == 2 { safety = .imeOrCandidate }
+        return (.success, true)
+    }, setValue: { _, _ in writes += 1; return .success })
+    let performer = effectPerformer(poster: poster, writer: writer, memory: memory,
+        textInputSafety: { safety })
+    do {
+        _ = try performer.perform(typeAction(.accessibilityText))
+        Issue.record("AX text mutation must stop when the input source changes")
+    } catch let failure as ActionPerformFailure {
+        #expect(failure.error == .staleSnapshot)
+        #expect(failure.inputStarted == false)
+    } catch {
+        Issue.record("unexpected error: \(error)")
+    }
+    #expect(preflights == 2)
+    #expect(writes == 0)
+    #expect(poster.events.isEmpty)
+    #expect(!memory.ignoresSelectedTextWrites(pid: 11))
+}
+
+@Test func AXTextWriteRechecksInputSourceAfterEffectReads() {
+    let poster = RecordingEffectPoster()
+    var safety = BackgroundTextInputSafety.safeASCIIKeyboardLayout
+    var writes = 0
+    let probe = AXTextWriteEffectProbe(
+        readValue: { _ in safety = .imeOrCandidate; return "" },
+        readSelectedText: { _ in nil },
+        settleMilliseconds: 0, pollMilliseconds: 1, sleepMilliseconds: { _ in })
+    let writer = SystemAXSelectedTextWriter(isSettable: { _ in (.success, true) },
+        setValue: { _, _ in writes += 1; return .success }, effectProbe: probe)
+    let performer = effectPerformer(poster: poster, writer: writer, textInputSafety: { safety })
+    do {
+        _ = try performer.perform(typeAction(.accessibilityText))
+        Issue.record("effect reads must not leave an unsafe AX text write")
+    } catch let failure as ActionPerformFailure {
+        #expect(failure.error == .staleSnapshot)
+        #expect(failure.inputStarted == false)
+    } catch {
+        Issue.record("unexpected error: \(error)")
+    }
+    #expect(writes == 0)
+    #expect(poster.events.isEmpty)
+}
+
+@Test func AXTextWriteRechecksInputSourceAfterFocusAcquisition() {
+    var safety = BackgroundTextInputSafety.safeASCIIKeyboardLayout
+    var focusReads = 0
+    var writes = 0
+    let writer = SystemAXSelectedTextWriter(isSettable: { _ in (.success, true) },
+        setValue: { _, _ in writes += 1; return .success })
+    let performer = SystemActionPerformer(
+        state: { ActionTargetState(pid: 11, windowID: 22,
+            bounds: CGRect(x: 0, y: 0, width: 100, height: 100), axIdentity: 33) },
+        lookup: { _, _ in effectField }, selectedTextWriter: writer,
+        focusedKeyboard: { _ in
+            focusReads += 1
+            if focusReads == 2 { safety = .imeOrCandidate }
+            return effectField
+        }, textInputSafety: { safety })
+    do {
+        _ = try performer.perform(typeAction(.accessibilityText))
+        Issue.record("focus acquisition must not leave an unsafe AX text write")
+    } catch let failure as ActionPerformFailure {
+        #expect(failure.error == .staleSnapshot)
+        #expect(failure.inputStarted == false)
+    } catch {
+        Issue.record("unexpected error: \(error)")
+    }
+    #expect(focusReads == 2)
+    #expect(writes == 0)
 }
 
 @Test func WebContentTextFieldsNeverAttemptAXSelectedTextWrites() throws {

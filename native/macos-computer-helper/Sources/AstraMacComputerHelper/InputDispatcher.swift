@@ -440,9 +440,14 @@ final class InputDispatcher: InputDispatching {
             logActionRejected("EXECUTE-MODE-OR-BACKENDS planRef=\(plan.planRef)")
             throw ActionExecutionError.staleSnapshot
         }
-        if record.requiresSafeTextInput,
-           backgroundTextInputSafety.detect() != .safeASCIIKeyboardLayout {
-            throw InputDispatchError.backgroundActionUnsupported
+        if record.requiresSafeTextInput {
+            let observedSafety = backgroundTextInputSafety.detect()
+            guard observedSafety == .safeASCIIKeyboardLayout else {
+                logActionRejected(
+                    "EXECUTE-TEXT-SAFETY observed=\(observedSafety) diagnosticSource=\(currentKeyboardInputSourceIDForDiagnostics())"
+                )
+                throw InputDispatchError.backgroundActionUnsupported
+            }
         }
         guard record.cooperativeError == nil else { throw ActionExecutionError.invalidAction }
         guard !record.requiresTakeover, record.interactionMode == .background else {
@@ -1064,7 +1069,9 @@ final class InputDispatcher: InputDispatching {
             _ = try performer.focusedKeyboardElement(matching: current)
             switch performer.preflightAXTextMutation(current) {
             case .settable: return current
-            case .unsupported: throw InputDispatchError.backgroundActionUnsupported
+            case .unsupported:
+                performer.noteAXTextWriteUnavailable(current)
+                throw ActionExecutionError.staleSnapshot
             case let .failed(error): throw error
             }
         case .pidKeyboard, .pidPointer, .foregroundPointer, .foregroundKeyboard, .wait:
@@ -1133,7 +1140,12 @@ final class InputDispatcher: InputDispatching {
             switch entry.source.replace == true
                 ? performer.preflightAXTextReplacement(current) : performer.preflightAXTextMutation(current) {
             case .settable: break
-            case .unsupported: throw InputDispatchError.backgroundActionUnsupported
+            case .unsupported:
+                if entry.source.replace == true {
+                    throw InputDispatchError.backgroundActionUnsupported
+                }
+                performer.noteAXTextWriteUnavailable(current)
+                throw ActionExecutionError.staleSnapshot
             case let .failed(error): throw error
             }
         case .wait:

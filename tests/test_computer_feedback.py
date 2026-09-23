@@ -71,6 +71,36 @@ def test_structured_pre_input_refusal_is_not_reported_as_uncertain_input(code):
     assert "did not dispatch input" in receipt_instruction(value)
 
 
+@pytest.mark.parametrize("code", ["stale_snapshot", "input_focus_required"])
+def test_structured_empty_pre_input_refusal_is_not_reported_as_uncertain_input(code):
+    value = receipt({"action_result": {"last_acknowledged_action": -1, "outcomes": []}}, error_code=code)
+    assert value["dispatch_state"] == "not_dispatched"
+    assert value["next_step"] == ("refresh_snapshot" if code == "stale_snapshot" else "inspect_error")
+
+
+def test_structured_empty_background_unsupported_act_was_not_dispatched():
+    value = receipt({"action_result": {"last_acknowledged_action": -1, "outcomes": []}},
+                    error_code="background_action_unsupported")
+    assert value["dispatch_state"] == "not_dispatched"
+    assert value["next_step"] == "inspect_error"
+    assert "did not dispatch input" in receipt_instruction(value)
+
+
+@pytest.mark.parametrize("native,code", [
+    (None, "background_action_unsupported"),
+    ({"outcomes": []}, "background_action_unsupported"),
+    ({"last_acknowledged_action": -1}, "background_action_unsupported"),
+    ({"last_acknowledged_action": 0, "outcomes": []}, "background_action_unsupported"),
+    ({"last_acknowledged_action": -1, "outcomes": [{"index": 0, "ok": False,
+                                                     "error_code": "unknown_outcome"}]},
+     "background_action_unsupported"),
+    ({"last_acknowledged_action": -1, "outcomes": []}, "unknown_outcome"),
+])
+def test_background_unsupported_without_exact_empty_act_evidence_stays_unknown(native, code):
+    payload = {"action_result": native} if native is not None else {}
+    assert receipt(payload, error_code=code)["dispatch_state"] == "unknown"
+
+
 @pytest.mark.parametrize("payload,code", [
     ({}, "stale_snapshot"),
     (refused("input_focus_required", "unknown_outcome"), "input_focus_required"),

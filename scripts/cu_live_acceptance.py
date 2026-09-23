@@ -37,7 +37,8 @@ OMNIBOX_LABELS = ("Address", "地址", "搜索")
 ABC = "com.apple.keylayout.ABC"
 PINYIN = "com.apple.inputmethod.SCIM.ITABC"
 DIAGNOSTICS = Path("/tmp/astra-sipp-diagnostics.log")
-DIAGNOSTIC_MARKERS = ("AX-TEXT-INEFFECTIVE", "TEXT-CONTINUITY-REJECT", "KEY-VALIDATE", "FOCUSED-ROOT",
+DIAGNOSTIC_MARKERS = ("AX-TEXT-INEFFECTIVE", "AX-TEXT-UNAVAILABLE", "EXECUTE-TEXT-SAFETY",
+                      "EXECUTE-OTHER", "EXECUTE-PERFORM", "TEXT-CONTINUITY-REJECT", "KEY-VALIDATE", "FOCUSED-ROOT",
                       "TYPE-ROUTE", "PLAN-RESULT", "RESP-ERR", "TAKEOVER-FAIL", "OVERLAY-DETAIL",
                       "observation_validation", "FOCUS-ACQUIRE")
 
@@ -230,8 +231,12 @@ class Runner:
                 raise RuntimeError(f"{role} {labels} is not in the fixture observation")
             result, _ = await self.act(observation, [{"type": "type", "element_ref": ref, "text": text}])
             receipt = result.get("computer_receipt", {})
-            attempts.append({"code": result.get("code") or "", "dispatch": receipt.get("dispatch_state")})
-            if not result.get("error") or receipt.get("dispatch_state") != "not_dispatched":
+            code = result.get("code") or ""
+            attempts.append({"code": code, "dispatch": receipt.get("dispatch_state")})
+            # An AX write with unchanged readback can also return input_focus_required;
+            # that does not prove the write had no delayed effect, so do not replay it.
+            if (not result.get("error") or receipt.get("dispatch_state") != "not_dispatched"
+                    or code not in {"background_action_unsupported", "stale_snapshot"}):
                 break
         return {"attempts": attempts, "last_code": attempts[-1]["code"],
                 "unknown": attempts[-1]["dispatch"] in {"unknown", "partial"}}
@@ -266,14 +271,14 @@ class Runner:
         typed = await self.type_into("AXTextField", OMNIBOX_LABELS, url)
         outcome = {"name": f"omnibox ({label})", "input_source": source, **typed,
                    "typed_through_popup": False, "navigated": False}
-        if typed["unknown"]:
+        if typed["unknown"] or typed["last_code"]:
             return {**outcome, "passed": False}
         # Keyboard delivery opens suggestions over the page; read that window as its own target.
         popup = await self.suggestion_popup()
         if popup is not None:
             observation = await self.observe(*popup)
             rows = [node for node in nodes(observation.get("ax_tree"))
-                    if nonce in " ".join(str(node.get(k) or "") for k in ("label", "title", "value", "description"))]
+                    if url in " ".join(str(node.get(k) or "") for k in ("label", "title", "value", "description"))]
             outcome["typed_through_popup"] = bool(rows)
             pressable = next((node for node in rows if node.get("element_ref")
                               and "AXPress" in (node.get("actions") or [])), None)
@@ -282,6 +287,10 @@ class Runner:
                 result, _ = await self.act(observation, [{"type": "click", "element_ref": pressable["element_ref"]}])
                 outcome["press_code"] = result.get("code") or ""
                 outcome["navigated"] = await self.navigated(fixture, step, nonce)
+                if not outcome["navigated"]:
+                    receipt = result.get("computer_receipt", {})
+                    outcome["unknown"] = receipt.get("dispatch_state") in {"unknown", "partial"}
+                    return {**outcome, "passed": False}
         if not outcome["navigated"]:
             # Without an open, pressable suggestion, read the omnibox itself and submit it.
             observation = await self.observe(*await self.fixture_window())
@@ -291,7 +300,9 @@ class Runner:
                          None)
             if field is None:
                 return {**outcome, "passed": False, "error": "omnibox is not in the fixture observation"}
-            outcome["omnibox_has_url"] = nonce in str(field.get("value") or "")
+            outcome["omnibox_has_url"] = url in str(field.get("value") or "")
+            if not outcome["omnibox_has_url"]:
+                return {**outcome, "passed": False}
             result, _ = await self.act(observation, [{"type": "keypress", "key": "return",
                                                       "element_ref": field["element_ref"]}])
             outcome["return_code"] = result.get("code") or ""
