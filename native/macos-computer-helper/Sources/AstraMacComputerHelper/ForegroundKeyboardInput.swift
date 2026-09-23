@@ -152,6 +152,9 @@ struct ForegroundKeyboardPreparedPlan {
 final class ForegroundKeyboardExecutor {
     typealias FocusLookup = () throws -> KeyboardFocusObservation
     typealias ContinuingTextFocusLookup = (ActionGuard, KeyboardFocusAuthority) throws -> KeyboardTextContinuationObservation
+    /// After a delivered key: the live window/root checks, tolerating an app-owned contained
+    /// popup the key may have opened. No field proof; the key has already reached the app.
+    typealias KeyTransitionFocusLookup = (ActionGuard) throws -> KeyboardTextContinuationObservation
 
     fileprivate enum PreparedPayload {
         case key(down: SyntheticInputEvent, up: SyntheticInputEvent)
@@ -174,6 +177,7 @@ final class ForegroundKeyboardExecutor {
     private let heldInputs: HeldInputRegistry
     private let focus: FocusLookup
     private let continuingTextFocus: ContinuingTextFocusLookup?
+    private let keyTransitionFocus: KeyTransitionFocusLookup?
     private let now: () -> TimeInterval
     private let actionTimeout: TimeInterval
     private let experimentalUnicodeChunkGraphemes: Int
@@ -188,6 +192,7 @@ final class ForegroundKeyboardExecutor {
         heldInputs: HeldInputRegistry = .shared,
         focus: @escaping FocusLookup,
         continuingTextFocus: ContinuingTextFocusLookup? = nil,
+        keyTransitionFocus: KeyTransitionFocusLookup? = nil,
         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         actionTimeout: TimeInterval = 10,
         experimentalUnicodeChunkGraphemes: Int = 8
@@ -201,6 +206,7 @@ final class ForegroundKeyboardExecutor {
         self.heldInputs = heldInputs
         self.focus = focus
         self.continuingTextFocus = continuingTextFocus
+        self.keyTransitionFocus = keyTransitionFocus
         self.now = now
         self.actionTimeout = actionTimeout
         self.experimentalUnicodeChunkGraphemes = min(8, max(1, experimentalUnicodeChunkGraphemes))
@@ -242,12 +248,39 @@ final class ForegroundKeyboardExecutor {
         )
     }
 
+    /// Read-only: may this entry, bound by element_ref to one text field, start now although an
+    /// earlier entry of the same batch required observation? It runs exactly the validation of
+    /// the entry's own first event after batch input started, and posts nothing.
+    func boundTextFieldEntryMayStart(
+        sourceIndex: Int,
+        from plan: ForegroundKeyboardPreparedPlan,
+        expected: ActionGuard
+    ) -> Bool {
+        guard let action = plan.actions[sourceIndex], boundTextField(action) != nil else { return false }
+        do {
+            _ = try validateEnvironment(expected: expected, application: plan.application,
+                                        actions: [action], proveBoundField: true)
+            return true
+        } catch {
+            logActionRejected("BOUND-FIELD-CONTINUE-REJECT index=\(sourceIndex) error=\(error)")
+            return false
+        }
+    }
+
+    /// A keyboard action bound by element_ref to one non-secure text field.
+    private func boundTextField(_ action: PreparedAction) -> KeyboardFocusAuthority? {
+        guard let target = action.targetKeyboardFocus, !target.isSecure,
+              ["AXTextField", "AXTextArea"].contains(target.role) else { return nil }
+        return target
+    }
+
     func executePrepared(
         sourceIndex: Int,
         from plan: ForegroundKeyboardPreparedPlan,
         expected: ActionGuard,
         lease: UserActivitySessionLease,
-        batchDeadline: TimeInterval? = nil
+        batchDeadline: TimeInterval? = nil,
+        batchInputStarted: Bool = false
     ) -> PIDTargetedActionResult {
         let deadline = min(now() + max(0, actionTimeout), batchDeadline ?? plan.deadline)
         guard let action = plan.actions[sourceIndex] else { return stopped(error: .invalidAction) }
@@ -262,7 +295,8 @@ final class ForegroundKeyboardExecutor {
                     application: plan.application,
                     expected: expected,
                     deadline: deadline,
-                    lease: lease
+                    lease: lease,
+                    proveBoundField: batchInputStarted
                 )
             case let .text(characters):
                 var inputStarted = false
@@ -280,7 +314,8 @@ final class ForegroundKeyboardExecutor {
                             expected: expected,
                             deadline: deadline,
                             lease: lease,
-                            textInputStarted: inputStarted
+                            textInputStarted: inputStarted,
+                            proveBoundField: batchInputStarted
                         )
                         observationRequired = observationRequired || needsObservation
                         inputStarted = true
@@ -437,7 +472,8 @@ final class ForegroundKeyboardExecutor {
         expected: ActionGuard,
         deadline: TimeInterval,
         lease: UserActivitySessionLease,
-        textInputStarted: Bool = false
+        textInputStarted: Bool = false,
+        proveBoundField: Bool = false
     ) throws -> Bool {
         let token = UUID()
         let scope: HeldInputScope
@@ -458,7 +494,8 @@ final class ForegroundKeyboardExecutor {
                         application: application,
                         expected: expected,
                         deadline: deadline,
-                        allowTextGeometryTransition: textInputStarted
+                        allowTextGeometryTransition: textInputStarted,
+                        proveBoundField: proveBoundField
                     )
                 },
                 mutation: {
@@ -536,11 +573,13 @@ final class ForegroundKeyboardExecutor {
         application: PIDTargetApplication,
         expected: ActionGuard,
         deadline: TimeInterval,
-        allowTextGeometryTransition: Bool = false
+        allowTextGeometryTransition: Bool = false,
+        proveBoundField: Bool = false
     ) throws -> Bool {
         guard now() <= deadline else { throw ActionExecutionError.actionTimeout }
         let changed = try validateEnvironment(expected: expected, application: application, actions: [action],
-                                              allowTextGeometryTransition: allowTextGeometryTransition)
+                                              allowTextGeometryTransition: allowTextGeometryTransition,
+                                              proveBoundField: proveBoundField)
         guard now() <= deadline else { throw ActionExecutionError.actionTimeout }
         return changed
     }
@@ -550,17 +589,42 @@ final class ForegroundKeyboardExecutor {
         application: PIDTargetApplication,
         actions: [PreparedAction],
         allowOrdinaryKeyFocusTransition: Bool = false,
-        allowTextGeometryTransition: Bool = false
+        allowTextGeometryTransition: Bool = false,
+        proveBoundField: Bool = false
     ) throws -> Bool {
         var focusChanged = false
         let observedFocus: KeyboardFocusObservation?
-        if allowTextGeometryTransition, expected.interactionMode == .foregroundTakeover,
-           actions.count == 1, case .text = actions[0].payload,
-           let wanted = actions[0].targetKeyboardFocus ?? expected.keyboardFocus,
+        let single = actions.count == 1 ? actions[0] : nil
+        let isText: Bool
+        let isKey: Bool
+        switch single?.payload {
+        case .text?: (isText, isKey) = (true, false)
+        case .key?: (isText, isKey) = (false, true)
+        case nil: (isText, isKey) = (false, false)
+        }
+        let foreground = expected.interactionMode == .foregroundTakeover
+        // Before the first event of an action bound to one text field, once this batch's own
+        // input has started (never preflight, never the batch's first input, never blind
+        // typing). An old snapshot still never authorizes the initial keystroke. The same field
+        // proof as continuing text lets the action start through an app-owned suggestion popup
+        // that earlier input opened, and accepts that field restyled inside the window.
+        let firstEventAfterBatchInput = proveBoundField && foreground &&
+            !allowOrdinaryKeyFocusTransition && !allowTextGeometryTransition
+        let boundField = firstEventAfterBatchInput ? single.flatMap { boundTextField($0) } : nil
+        if allowTextGeometryTransition, foreground, isText,
+           let wanted = single?.targetKeyboardFocus ?? expected.keyboardFocus,
            let continuingTextFocus {
-            // This observer must perform the full live window/field validation;
-            // it is never used for preflight, first down, keys or blind typing.
+            // This observer must perform the full live window/field validation.
             let observed = try continuingTextFocus(expected, wanted)
+            observedFocus = observed.focus
+            focusChanged = observed.observationRequired
+        } else if let boundField, let continuingTextFocus {
+            let observed = try continuingTextFocus(expected, boundField)
+            observedFocus = observed.focus
+            focusChanged = observed.observationRequired
+        } else if allowOrdinaryKeyFocusTransition, foreground, isKey, let keyTransitionFocus {
+            // A popup the delivered key opened is a transition to observe, not an unknown outcome.
+            let observed = try keyTransitionFocus(expected)
             observedFocus = observed.focus
             focusChanged = observed.observationRequired
         } else {
@@ -604,11 +668,15 @@ final class ForegroundKeyboardExecutor {
             }
             for action in actions {
                 // Typing may scroll/reflow the same editor. Only after this
-                // action starts, accept geometry changes for that exact AX
-                // identity and role inside the still-validated window.
+                // action starts, or for the field a bound action names, accept
+                // geometry changes for that exact AX identity and role inside
+                // the still-validated window.
                 func matches(_ wanted: KeyboardFocusAuthority) -> Bool {
                     if wanted == currentFocus { return true }
-                    guard allowTextGeometryTransition, case .text = action.payload else { return false }
+                    let textTransition: Bool
+                    if allowTextGeometryTransition, case .text = action.payload { textTransition = true }
+                    else { textTransition = false }
+                    guard textTransition || boundField != nil else { return false }
                     return wanted.identityToken == currentFocus.identityToken &&
                         wanted.role == currentFocus.role && wanted.subrole == currentFocus.subrole &&
                         keyboardFocusIdentityAndGeometryAreTrusted(
@@ -616,22 +684,25 @@ final class ForegroundKeyboardExecutor {
                             containerBounds: expected.focusedAXBounds
                         )
                 }
+                // A delivered key may move focus: Return submits or navigates, Tab advances.
+                // That is a transition to observe, never permission for another action.
+                func acceptDeliveredKeyTransition() throws -> Bool {
+                    guard allowOrdinaryKeyFocusTransition, case .key = action.payload else { return false }
+                    guard !currentFocus.role.isEmpty,
+                          currentFocus.role.lowercased() != "axunknown",
+                          currentFocus.subrole?.lowercased() != "axunknown"
+                    else { throw ActionExecutionError.secureTarget }
+                    focusChanged = true
+                    return true
+                }
                 if let targetKeyboardFocus = action.targetKeyboardFocus {
-                    guard matches(targetKeyboardFocus) else {
+                    guard try matches(targetKeyboardFocus) || acceptDeliveredKeyTransition() else {
                         throw ActionExecutionError.inputFocusRequired
                     }
                 } else {
-                    if !matches(expectedFocus) {
-                        if allowOrdinaryKeyFocusTransition, case .key = action.payload {
-                            guard !currentFocus.role.isEmpty,
-                                  currentFocus.role.lowercased() != "axunknown",
-                                  currentFocus.subrole?.lowercased() != "axunknown"
-                            else { throw ActionExecutionError.secureTarget }
-                            focusChanged = true
-                        } else {
-                            logActionRejected("KEY-VALIDATE focus changed sameIdentity=\(currentFocus.identityToken == expectedFocus.identityToken) sameRole=\(currentFocus.role == expectedFocus.role) textGeometryAllowed=\(allowTextGeometryTransition)")
-                            throw ActionExecutionError.staleSnapshot
-                        }
+                    if !matches(expectedFocus), !(try acceptDeliveredKeyTransition()) {
+                        logActionRejected("KEY-VALIDATE focus changed sameIdentity=\(currentFocus.identityToken == expectedFocus.identityToken) sameRole=\(currentFocus.role == expectedFocus.role) textGeometryAllowed=\(allowTextGeometryTransition)")
+                        throw ActionExecutionError.staleSnapshot
                     }
                 }
             }

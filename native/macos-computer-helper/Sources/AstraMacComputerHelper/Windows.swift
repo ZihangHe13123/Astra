@@ -3293,6 +3293,21 @@ final class SystemWindowObserver: WindowObserving {
                     .revalidateAndObserveFocus(expected: expected, point: nil)
                 return KeyboardTextContinuationObservation(focus: focus ?? .stale,
                     observationRequired: observation.observationRequired)
+            },
+            keyTransitionFocus: { [weak self] expected in
+                guard let self else { throw ActionExecutionError.targetGone }
+                let observation = try self.currentForegroundActionObservation(
+                    for: target, expectedFocusedRootPreference: expected.focusedRootPreference,
+                    toleratesContainedOverlay: true
+                )
+                let state = observation.stateFactory.make(
+                    target: observation.target, snapshotID: snapshotID,
+                    frontmostPID: liveFrontmostPID(), observedKeyboardFocus: observation.keyboardFocus
+                )
+                let focus = try ExactPIDActionGuardValidator(state: { state })
+                    .revalidateAndObserveFocus(expected: expected, point: nil)
+                return KeyboardTextContinuationObservation(focus: focus ?? .stale,
+                    observationRequired: observation.observationRequired)
             }
         )
         let result = ForegroundPlanExecutor(
@@ -3417,10 +3432,13 @@ final class SystemWindowObserver: WindowObserving {
         )
     }
 
+    /// `toleratesContainedOverlay` is only for the check after a delivered key: an app-owned
+    /// contained popup that key opened is reported for observation instead of failing.
     private func currentForegroundActionObservation(
         for target: WindowTarget,
         expectedFocusedRootPreference: FocusedRootPreference,
-        continuingTextFocus: KeyboardFocusAuthority? = nil
+        continuingTextFocus: KeyboardFocusAuthority? = nil,
+        toleratesContainedOverlay: Bool = false
     ) throws -> (target: ActionTargetState, stateFactory: ForegroundPIDActionStateFactory,
                  keyboardFocus: KeyboardFocusObservation, observationRequired: Bool) {
         guard liveFrontmostPID() == target.pid else {
@@ -3453,7 +3471,7 @@ final class SystemWindowObserver: WindowObserving {
             throw ActionExecutionError.targetNotFrontmost
         }
         if observationRequired {
-            guard continuingTextFocus != nil,
+            guard continuingTextFocus != nil || toleratesContainedOverlay,
                   expectedFocusedRootPreference == .selectedWindow,
                   focusedRootPreference == .containedOverlay else {
                 logActionRejected("FOCUSED-ROOT-PREFERENCE-FLIP pid=\(target.pid) windowID=\(target.windowID)")
@@ -3473,7 +3491,7 @@ final class SystemWindowObserver: WindowObserving {
             throw ActionExecutionError.targetNotFrontmost
         }
         let keyboardFocus: KeyboardFocusObservation
-        if observationRequired {
+        if observationRequired, continuingTextFocus != nil {
             guard let proof = provenContinuingTextFocus(
                 expectedPreference: expectedFocusedRootPreference, observedPreference: observedPreference,
                 wanted: continuingTextFocus, windowBounds: focusedBounds,

@@ -935,7 +935,8 @@ final class ForegroundPlanExecutor {
                         from: preparedKeyboard,
                         expected: expected,
                         lease: lease,
-                        batchDeadline: deadline
+                        batchDeadline: deadline,
+                        batchInputStarted: priorNonWaitInputMayHaveStarted
                     )
                 } else {
                     result = stopped(cooperativeError: .backgroundActionUnsupported)
@@ -947,7 +948,8 @@ final class ForegroundPlanExecutor {
                         from: preparedKeyboard,
                         expected: expected,
                         lease: lease,
-                        batchDeadline: deadline
+                        batchDeadline: deadline,
+                        batchInputStarted: priorNonWaitInputMayHaveStarted
                     )
                 } else {
                     result = stopped(cooperativeError: .backgroundActionUnsupported)
@@ -982,10 +984,23 @@ final class ForegroundPlanExecutor {
             }
             acknowledged = entry.sourceIndex
             if result.outcomes.last?.observationRequired == true {
-                return PIDTargetedActionResult(
-                    outcomes: outcomes, lastAcknowledgedAction: acknowledged, error: nil,
-                    cooperativeError: entry.sourceIndex == entries.last?.sourceIndex ? nil : .observationRequired
-                )
+                // A following keyboard entry bound to one text field may still start when the
+                // exact validation of its own first event already passes: Cmd+L restyles the
+                // address bar it then types into. Anything else waits for a fresh observation.
+                let nextIndex = entry.sourceIndex + 1
+                guard nextIndex < entries.count,
+                      entries[nextIndex].backend == .foregroundKeyboard || entries[nextIndex].backend == .pidKeyboard,
+                      let keyboardExecutor, let preparedKeyboard,
+                      keyboardExecutor.boundTextFieldEntryMayStart(
+                          sourceIndex: entries[nextIndex].sourceIndex, from: preparedKeyboard, expected: expected
+                      )
+                else {
+                    return PIDTargetedActionResult(
+                        outcomes: outcomes, lastAcknowledgedAction: acknowledged, error: nil,
+                        cooperativeError: entry.sourceIndex == entries.last?.sourceIndex ? nil : .observationRequired
+                    )
+                }
+                logActionRejected("BOUND-FIELD-CONTINUE index=\(entries[nextIndex].sourceIndex)")
             }
             if entry.backend != .wait { priorNonWaitInputMayHaveStarted = true }
         }

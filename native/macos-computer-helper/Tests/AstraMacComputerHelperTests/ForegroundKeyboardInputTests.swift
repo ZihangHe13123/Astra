@@ -967,6 +967,87 @@ func foregroundNamedInputWithoutTargetAuthorityCannotBecomeWindowInput(kind: Str
     }
 }
 
+// Live Edge 152 (2026-09-23): Cmd+L opened the address bar's suggestions before the typed URL
+// began. Once this batch's own input has started, the first key of a type or keypress bound to
+// that exact field runs the same field proof as continuing text, instead of failing on the
+// popup's root flip. The batch's first input stays strict (see the reflow test).
+@Test func BoundTextFieldActionsStartThroughAProvenContainedOverlay() throws {
+    for keypress in [false, true] {
+        var proofs = 0
+        var transitions = 0
+        let field = KeyboardFocusAuthority(identityToken: "ax:focus",
+            bounds: CGRect(x: 20, y: 30, width: 200, height: 100), role: "AXTextField", subrole: nil)
+        let fixture = KeyboardExecutorFixture(role: "AXTextField", continuingTextFocus: { _, wanted in
+            proofs += 1
+            return KeyboardTextContinuationObservation(focus: .authority(wanted), observationRequired: true)
+        }, keyTransitionFocus: { _ in
+            transitions += 1
+            return KeyboardTextContinuationObservation(focus: .authority(field), observationRequired: true)
+        })
+        let action: NativeAction = keypress
+            ? .keypress(key: "return", elementRef: "field") : .type(text: "ab", elementRef: "field")
+        let entry = keyboardEntry(action, targetKeyboardFocus: fixture.expectedFocus)
+        let plan = try fixture.executor.preflight(expected: fixture.guardValue,
+            application: fixture.application, marker: fixture.lease.marker, entries: [entry])
+        fixture.validator.failureAt = 2 // The window-only guard cannot prove the popup state.
+        let result = fixture.executor.executePrepared(sourceIndex: 0, from: plan,
+            expected: fixture.guardValue, lease: fixture.lease, batchInputStarted: true)
+        #expect(result.error == nil)
+        #expect(result.lastAcknowledgedAction == 0)
+        #expect(result.outcomes.first?.observationRequired == true)
+        #expect(fixture.validator.calls == 1)
+        #expect(proofs == (keypress ? 1 : 4))
+        #expect(transitions == (keypress ? 1 : 0))
+        #expect(fixture.poster.events.count == (keypress ? 2 : 4))
+    }
+}
+
+// Return in an address bar navigates and moves focus into the page. The key reached the proven
+// field; the moved focus is a transition to observe, not an unknown outcome.
+@Test func BoundKeypressThatMovesFocusIsAcknowledgedForObservation() throws {
+    let fixture = KeyboardExecutorFixture(role: "AXTextField")
+    let entry = keyboardEntry(.keypress(key: "return", elementRef: "field"),
+        targetKeyboardFocus: fixture.expectedFocus)
+    let plan = try fixture.executor.preflight(expected: fixture.guardValue,
+        application: fixture.application, marker: fixture.lease.marker, entries: [entry])
+    fixture.poster.afterPost = { call in
+        if call == 1 {
+            fixture.focus = KeyboardFocusAuthority(identityToken: "ax:page",
+                bounds: CGRect(x: 10, y: 60, width: 400, height: 300), role: "AXWebArea", subrole: nil)
+        }
+    }
+    let result = fixture.executor.executePrepared(sourceIndex: 0, from: plan,
+        expected: fixture.guardValue, lease: fixture.lease)
+    #expect(result.error == nil)
+    #expect(result.lastAcknowledgedAction == 0)
+    #expect(result.outcomes.first?.observationRequired == true)
+    #expect(fixture.poster.events.count == 2)
+}
+
+// Cmd+L opens address suggestions right after the key. When the popup wins the race with the
+// post-release check, the delivered key must stay acknowledged rather than become unknown.
+@Test func KeyReleaseThatOpensAContainedOverlayIsAnObservedTransition() throws {
+    var transitions = 0
+    let focus = KeyboardFocusAuthority(identityToken: "ax:focus",
+        bounds: CGRect(x: 20, y: 30, width: 200, height: 100), role: "AXTextArea", subrole: nil)
+    let fixture = KeyboardExecutorFixture(keyTransitionFocus: { _ in
+        transitions += 1
+        return KeyboardTextContinuationObservation(focus: .authority(focus), observationRequired: true)
+    })
+    let entry = keyboardEntry(.keypress(key: "return"))
+    let plan = try fixture.executor.preflight(expected: fixture.guardValue,
+        application: fixture.application, marker: fixture.lease.marker, entries: [entry])
+    fixture.validator.failureAt = 3 // The strict post-release guard would fail on the popup.
+    let result = fixture.executor.executePrepared(sourceIndex: 0, from: plan,
+        expected: fixture.guardValue, lease: fixture.lease)
+    #expect(result.error == nil)
+    #expect(result.lastAcknowledgedAction == 0)
+    #expect(result.outcomes.first?.observationRequired == true)
+    #expect(transitions == 1)
+    #expect(fixture.validator.calls == 2) // Preflight and the unbound first down stay strict.
+    #expect(fixture.poster.events.count == 2)
+}
+
 private final class KeyboardExecutorFixture {
     let application = PIDTargetApplication(bundleIdentifier: "com.example.Editor", version: "1.2.3")
     let expectedFocus: KeyboardFocusAuthority
@@ -999,6 +1080,7 @@ private final class KeyboardExecutorFixture {
         clockValues: [TimeInterval] = [0],
         clockStep: TimeInterval = 0,
         continuingTextFocus: ForegroundKeyboardExecutor.ContinuingTextFocusLookup? = nil,
+        keyTransitionFocus: ForegroundKeyboardExecutor.KeyTransitionFocusLookup? = nil,
         experimentalUnicodeChunkGraphemes: Int = 1
     ) {
         self.activity = activity
@@ -1043,6 +1125,7 @@ private final class KeyboardExecutorFixture {
             heldInputs: heldInputs,
             focus: { focusState.observation },
             continuingTextFocus: continuingTextFocus,
+            keyTransitionFocus: keyTransitionFocus,
             now: {
                 if !clock.isEmpty { last = clock.removeFirst() }
                 defer { last += clockStep }

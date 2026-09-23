@@ -1349,6 +1349,44 @@ private func beginFailureConsumesPlanAndCleansUp(_ failure: TakeoverFixture.Fail
     #expect(fixture.poster.events.count == 2)
 }
 
+// Live Edge 152 (2026-09-23): Cmd+L kept focus in the address bar but restyled it, so the URL
+// typed behind it in the same batch was never sent. An entry bound to the field that still holds
+// focus may start after a read-only run of the exact validation its own first event performs.
+@Test func boundTextFieldEntryContinuesAfterAKeyboardRestyle() {
+    let fixture = MixedForegroundKeyboardFixture(keyboardEnabled: true, keyboardPrefixFocusChange: true)
+    let field = fixture.focusState.value
+    let focusState = fixture.focusState
+    // Replace the fixture's identity change: the prefix key keeps focus but moves the field.
+    fixture.poster.onKeyboardUp = {
+        focusState.value = KeyboardFocusAuthority(identityToken: field.identityToken,
+            bounds: field.bounds.offsetBy(dx: 0, dy: 4), role: field.role, subrole: field.subrole)
+    }
+    let bound = PlannedDispatchEntry(sourceIndex: 1, source: .keypress(key: "return", elementRef: "field"),
+        backend: .foregroundKeyboard, actionClass: .text, resolved: nil, targetKeyboardFocus: field)
+    let result = fixture.executor.run(expected: fixture.guardValue, application: fixture.application,
+        lease: fixture.activity.lease, entries: [fixture.entries[0], bound])
+    #expect(result.error == nil)
+    #expect(result.cooperativeError == nil)
+    #expect(result.lastAcknowledgedAction == 1)
+    #expect(result.outcomes.map(\.index) == [0, 1])
+    #expect(result.outcomes.first?.observationRequired == true)
+    #expect(fixture.log.values == ["keyboard_down", "keyboard_up", "keyboard_down", "keyboard_up"])
+}
+
+@Test func boundTextFieldEntryStopsWhenFocusMovedToAnotherField() {
+    let fixture = MixedForegroundKeyboardFixture(keyboardEnabled: true, keyboardPrefixFocusChange: true)
+    let bound = PlannedDispatchEntry(sourceIndex: 1, source: .keypress(key: "return", elementRef: "field"),
+        backend: .foregroundKeyboard, actionClass: .text, resolved: nil,
+        targetKeyboardFocus: fixture.focusState.value)
+    let result = fixture.executor.run(expected: fixture.guardValue, application: fixture.application,
+        lease: fixture.activity.lease, entries: [fixture.entries[0], bound])
+    #expect(result.error == nil)
+    #expect(result.cooperativeError == .observationRequired)
+    #expect(result.lastAcknowledgedAction == 0)
+    #expect(result.outcomes == [ActionOutcome(index: 0, ok: true, error: nil, observationRequired: true)])
+    #expect(fixture.log.values == ["keyboard_down", "keyboard_up"])
+}
+
 @Test func keyboardFocusCheckpointAtEndSucceedsWithoutInventingRemainingActions() {
     let fixture = MixedForegroundKeyboardFixture(keyboardEnabled: true, keyboardPrefixFocusChange: true)
     let result = fixture.executor.run(expected: fixture.guardValue, application: fixture.application,
