@@ -231,7 +231,7 @@ def test_account_catalog_normalizes_capabilities_and_scopes_cache(monkeypatch):
     async def fetch():
         def handler(request):
             assert request.headers["ChatGPT-Account-ID"] == "test-account"
-            assert request.url.params["client_version"] == "0.0.0"
+            assert request.url.params["client_version"] == "0.155.0"
             return httpx.Response(200, json={"models": [
                 {"slug": "test-codex", "context_window": 128000, "input_modalities": ["text", "image"],
                  "supported_reasoning_levels": [{"effort": "high"}, {"effort": "xhigh"}], "supported_in_api": False},

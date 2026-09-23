@@ -22,6 +22,9 @@ BASE_URL = "https://chatgpt.com/backend-api/codex"
 CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"  # Public device-flow client identifier.
 DEVICE_URL = ISSUER + "/codex/device"
 TOKEN_URL = ISSUER + "/oauth/token"
+# The account catalog omits models that need a newer client than the one reported
+# (0.0.0 hid gpt-6-sol and gpt-6-luna). Bump when a new release is missing.
+CATALOG_CLIENT_VERSION = "0.155.0"
 
 
 class CodexAuthError(ValueError):
@@ -201,7 +204,7 @@ async def fetch_models(*, client: httpx.AsyncClient | None = None) -> list[dict]
                                      proxy=active_proxy_for_url(BASE_URL)) as owned:
             return await fetch_models(client=owned)
     data = await credentials(client=client)
-    url = BASE_URL + "/models?client_version=0.0.0"
+    url = BASE_URL + "/models?client_version=" + CATALOG_CLIENT_VERSION
     response = await client.get(url, headers=headers(data))
     if response.status_code == 401:
         data = await credentials(client=client, rejected_token=data["access_token"])
