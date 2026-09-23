@@ -2428,7 +2428,13 @@ final class SystemWindowObserver: WindowObserving {
             candidate.isSharingIndicator && sharingIndicatorWithinTitlebar(candidate.bounds, targetBounds: current.frame)
                 ? candidate.windowID : nil
         })
-        let withoutIndicators = visibleWindows.filter { !indicatorIDs.contains($0.windowID) }
+        let helpTagIDs = Set(axWindows.compactMap { candidate in
+            axHelpTagRole(candidate.role) ? candidate.windowID : nil
+        })
+        let helpTags = visibleWindows.filter { $0.pid == target.pid && helpTagIDs.contains($0.windowID) }
+        let withoutIndicators = visibleWindows.filter {
+            !indicatorIDs.contains($0.windowID) && !($0.pid == target.pid && helpTagIDs.contains($0.windowID))
+        }
         let focusedField = selectedAXWindows.count == 1 &&
             mayHaveSuggestionPopup(withoutIndicators, targetPID: target.pid, targetWindowID: current.windowID)
             ? selectedAXWindows[0].element.flatMap {
@@ -2449,6 +2455,7 @@ final class SystemWindowObserver: WindowObserving {
         let strips = appStatusStripRecords(withoutIndicators, targetPID: target.pid,
             targetWindowID: current.windowID, targetBounds: current.frame)
         if !strips.isEmpty { logActionRejected("OVERLAY-PASSIVE status_strip \(placement(strips))") }
+        if !helpTags.isEmpty { logActionRejected("OVERLAY-PASSIVE help_tag \(placement(helpTags))") }
         if !suggestionPopups.isEmpty {
             logActionRejected("OVERLAY-PASSIVE suggestion_popup \(placement(suggestionPopups))")
         }
@@ -2514,9 +2521,10 @@ final class SystemWindowObserver: WindowObserving {
                   windowSharingIndicator(element, bounds: bounds) else { return nil }
             return bounds
         }
+        let helpTagBounds = axHelpTagFrames(windows)
         let withoutIndicators = records.filter { record in
             record.pid != target.pid || record.windowID == target.windowID ||
-                !indicatorBounds.contains(record.bounds)
+                (!indicatorBounds.contains(record.bounds) && !matchesAnyFrame(record.bounds, helpTagBounds))
         }
         let focusedField = mayHaveSuggestionPopup(withoutIndicators, targetPID: target.pid,
                                                   targetWindowID: target.windowID) ? target.axElement.flatMap {
@@ -4566,16 +4574,36 @@ func focusedTextFieldFrame(app: AXUIElement, root: AXUIElement, pid: pid_t, targ
 }
 
 /// Live rectangles over one window that bind but must not receive pointer input: this app's status
-/// strips and, while `root` holds the focused text field, that field's suggestion lists.
+/// strips and tooltips and, while `root` holds the focused text field, that field's suggestion lists.
 func livePassiveOverlayRegions(pid: pid_t, windowID: CGWindowID, root: AXUIElement?) -> [CGRect] {
     let records = systemVisibleWindowRecords()
     guard let target = records.first(where: { $0.pid == pid && $0.windowID == windowID }) else { return [] }
-    let field = mayHaveSuggestionPopup(records, targetPID: pid, targetWindowID: windowID) ? root.flatMap {
-        focusedTextFieldFrame(app: AXUIElementCreateApplication(pid), root: $0, pid: pid, targetBounds: target.bounds)
+    let others = mayHaveSuggestionPopup(records, targetPID: pid, targetWindowID: windowID)
+    let app = AXUIElementCreateApplication(pid)
+    let field = others ? root.flatMap {
+        focusedTextFieldFrame(app: app, root: $0, pid: pid, targetBounds: target.bounds)
     } : nil
+    let helpTags = others ? axHelpTagFrames(completeObservedAXWindows(app) ?? []) : []
     return (appStatusStripRecords(records, targetPID: pid, targetWindowID: windowID, targetBounds: target.bounds) +
         attachedSuggestionPopupRecords(records, targetPID: pid, targetWindowID: windowID,
-                                       targetBounds: target.bounds, focusedField: field)).map(\.bounds)
+                                       targetBounds: target.bounds, focusedField: field)).map(\.bounds) + helpTags
+}
+
+/// A tooltip is an AX window of its app with the help-tag role (live Edge and Outlook: 18 pt tall on
+/// CG layer 103, shown while the pointer rests on a control). It never takes focus or input, so it
+/// does not block binding; pointer input inside it is refused.
+func axHelpTagRole(_ role: BoundedAXStringResult) -> Bool {
+    role.status == .complete && role.value == kAXHelpTagRole as String
+}
+
+func axHelpTagFrames(_ windows: [AXUIElement]) -> [CGRect] {
+    windows.compactMap { window in
+        axHelpTagRole(AXNodeReader.stringAttribute(window, kAXRoleAttribute)) ? AXNodeReader.frameAttribute(window) : nil
+    }
+}
+
+func matchesAnyFrame(_ bounds: CGRect, _ frames: [CGRect]) -> Bool {
+    frames.contains { screenCaptureBoundsMatchAXBounds(screenCapture: bounds, accessibility: $0) }
 }
 
 /// Live suggestion lists of the focused field in `root`, for telling the observer they are open.

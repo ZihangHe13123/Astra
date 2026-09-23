@@ -284,6 +284,8 @@ final class BackgroundTargetController: TargetSelecting {
                sharingIndicatorWithinTitlebar(candidate.bounds, targetBounds: record.bounds) {
                 return false
             }
+            // A tooltip never takes focus or input.
+            if axHelpTagRole(candidate.role) { return false }
             // The focused field's suggestion list is an AX window too; the catalog proved it from
             // live focus and geometry.
             if let candidateWindowID = candidate.windowID,

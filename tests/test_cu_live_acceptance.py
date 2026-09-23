@@ -198,6 +198,9 @@ def test_hover_point_is_the_fixture_link_center_on_screen():
 
 def test_status_strip_evidence_is_only_the_helper_waiver_marker():
     assert status_strip_seen(["[action_rejected] 2026 OVERLAY-PASSIVE status_strip [dx=3 dy=741 w=437 h=24]"])
+    # Live Edge exposes the strip as a help tag window; the tooltip waiver covers it.
+    assert status_strip_seen(["[action_rejected] 2026 OVERLAY-PASSIVE help_tag [dx=3 dy=741 w=249 h=24]"])
+    assert not status_strip_seen(["[action_rejected] 2026 OVERLAY-PASSIVE help_tag [dx=3 dy=100 w=249 h=120]"])
     assert not status_strip_seen(["[action_rejected] 2026 OVERLAY-DETAIL ax=false visible=true"])
 
 

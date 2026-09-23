@@ -17,6 +17,7 @@ import asyncio
 import ctypes
 import ctypes.util
 import json
+import re
 import secrets
 import subprocess
 import sys
@@ -167,9 +168,17 @@ def pick_suggestion_window(main: dict, windows: list[dict]) -> dict | None:
     return None
 
 
+PASSIVE_STRIP = re.compile(r"OVERLAY-PASSIVE (status_strip|help_tag) .*\bh=(\d+)\]")
+
+
 def status_strip_seen(lines) -> bool:
-    """The helper waived a hovered link's bottom-edge status strip during this run."""
-    return any("OVERLAY-PASSIVE status_strip" in line for line in lines)
+    """The helper waived a hovered link's status strip during this run. Edge exposes the strip as
+    a help tag (tooltip) window; either passive marker counts when it has the strip's height."""
+    for line in lines:
+        match = PASSIVE_STRIP.search(line)
+        if match and (match.group(1) == "status_strip" or int(match.group(2)) <= 32):
+            return True
+    return False
 
 
 def mouse_location() -> tuple[float, float] | None:

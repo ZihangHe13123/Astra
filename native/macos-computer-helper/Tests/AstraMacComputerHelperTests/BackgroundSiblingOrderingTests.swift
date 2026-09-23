@@ -218,3 +218,51 @@ func focusedFieldSuggestionListAXWindowBindsOnlyWithCatalogProof(proven: Bool) t
         }
     }
 }
+
+// Live Outlook and Edge (2026-09-23): resting the pointer on a toolbar control shows a tooltip, an
+// AX window with the help-tag role on CG layer 103. It stayed past the transient wait and blocked
+// every observation. A tooltip binds like the target; the role must be read completely.
+@Test(arguments: [BoundedAXStringStatus.complete, .truncated])
+func helpTagAXWindowDoesNotBlockBackgroundBinding(status: BoundedAXStringStatus) throws {
+    let bounds = CGRect(x: 25, y: 30, width: 1319, height: 768)
+    let targetElement = AXUIElementCreateApplication(2001)
+    let tooltipElement = AXUIElementCreateApplication(2004)
+    let target = TargetAXWindowRecord(windowID: 273, bounds: bounds, identity: CFHash(targetElement),
+        element: targetElement, role: BoundedAXStringResult(value: "AXWindow", status: .complete),
+        subrole: BoundedAXStringResult(value: "AXStandardWindow", status: .complete),
+        zOrder: 14, layer: 0, alpha: 1, isModal: false)
+    let tooltip = TargetAXWindowRecord(windowID: 802, bounds: CGRect(x: 45, y: 109, width: 200, height: 18),
+        identity: CFHash(tooltipElement), element: tooltipElement,
+        role: BoundedAXStringResult(value: "AXHelpTag", status: status),
+        subrole: BoundedAXStringResult(value: nil, status: .complete),
+        zOrder: 1, layer: 103, alpha: 1, isModal: nil)
+    let record = TargetCatalogRecord(appRef: "app", windowRef: "window", pid: 42, windowID: 273,
+        bounds: bounds, title: "Fixture", axWindows: [target, tooltip], containsUnselectedOverlay: false)
+    let catalog = ClosureTargetCatalog(recordProvider: { _, _ in record }, currentProvider: { _ in record })
+    let controller = BackgroundTargetController(catalog: catalog)
+    if status == .complete {
+        let selected = try controller.select(appRef: "app", windowRef: "window")
+        #expect(try controller.snapshotTargetState(selected).windowID == 273)
+    } else {
+        do {
+            _ = try controller.select(appRef: "app", windowRef: "window")
+            Issue.record("an unread role must keep blocking binding")
+        } catch let error as WindowObservationError {
+            guard case .overlayBlocked = error else {
+                Issue.record("unexpected observation error: \(error)")
+                return
+            }
+        }
+    }
+}
+
+@Test func helpTagFramesMatchTheirCGWindows() {
+    #expect(axHelpTagRole(BoundedAXStringResult(value: "AXHelpTag", status: .complete)))
+    #expect(!axHelpTagRole(BoundedAXStringResult(value: "AXWindow", status: .complete)))
+    #expect(!axHelpTagRole(BoundedAXStringResult(value: nil, status: .failed)))
+    let frame = CGRect(x: 45, y: 109, width: 200, height: 18)
+    #expect(matchesAnyFrame(frame, [frame]))
+    #expect(!matchesAnyFrame(CGRect(x: 45, y: 140, width: 200, height: 18), [frame]))
+    #expect(!matchesAnyFrame(frame, []))
+}
+
