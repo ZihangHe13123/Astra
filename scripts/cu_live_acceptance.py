@@ -1,8 +1,9 @@
 """Live CU acceptance in Edge against a local fixture, through Astra's real tool contract.
 
-Covers text entry into a web field under the ABC layout and under Pinyin, and typing a URL
-into the omnibox while its suggestion window opens. It only acts on the fixture window it
-opened, never replays an uncertain action, and restores the original input source.
+Covers text entry into a web field and typing a URL into the omnibox, each under the ABC
+layout and under Pinyin; keyboard delivery into the omnibox opens its suggestion window. It
+only acts on the fixture window it opened, never replays an uncertain action, and restores
+the original input source.
 
 Run from the project root, then leave the mouse and keyboard alone for about two minutes:
 
@@ -32,6 +33,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests/fixtures/cu-text-input.html"
 TITLE = "Astra CU Text Fixture"
 EDGE = "com.microsoft.edgemac"
+OMNIBOX_LABELS = ("Address", "地址", "搜索")
 ABC = "com.apple.keylayout.ABC"
 PINYIN = "com.apple.inputmethod.SCIM.ITABC"
 DIAGNOSTICS = Path("/tmp/astra-sipp-diagnostics.log")
@@ -250,14 +252,23 @@ class Runner:
                 "page_value": page.get("value"), "keydowns": page.get("keydowns"), "inputs": page.get("inputs"),
                 **typed, "passed": page.get("value") == marker}
 
-    async def omnibox(self, fixture: Fixture, nonce: str) -> dict:
-        self.input_source(ABC)
-        url = f"127.0.0.1:{self.args.port}/text?step=omnibox&nonce={nonce}"
-        typed = await self.type_into("AXTextField", ("Address", "地址", "搜索"), url)
-        outcome = {"name": "omnibox with suggestions", **typed, "typed_through_popup": False, "navigated": False}
+    async def navigated(self, fixture: Fixture, step: str, nonce: str) -> bool:
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline and not fixture.saw(step, nonce):
+            await asyncio.sleep(0.25)
+        return fixture.saw(step, nonce)
+
+    async def omnibox(self, fixture: Fixture, nonce: str, source: str, label: str) -> dict:
+        """Pass only when the local server receives this run's unique URL."""
+        self.input_source(source)
+        step = f"omnibox-{label}"
+        url = f"127.0.0.1:{self.args.port}/text?step={step}&nonce={nonce}"
+        typed = await self.type_into("AXTextField", OMNIBOX_LABELS, url)
+        outcome = {"name": f"omnibox ({label})", "input_source": source, **typed,
+                   "typed_through_popup": False, "navigated": False}
         if typed["unknown"]:
             return {**outcome, "passed": False}
-        # The suggestion window overlays the page, so read it as its own target (observation only).
+        # Keyboard delivery opens suggestions over the page; read that window as its own target.
         popup = await self.suggestion_popup()
         if popup is not None:
             observation = await self.observe(*popup)
@@ -270,12 +281,22 @@ class Runner:
                 # AXPress needs no activation, so the popup stays exactly as observed.
                 result, _ = await self.act(observation, [{"type": "click", "element_ref": pressable["element_ref"]}])
                 outcome["press_code"] = result.get("code") or ""
-                deadline = time.monotonic() + 8
-                while time.monotonic() < deadline and not fixture.saw("omnibox", nonce):
-                    await asyncio.sleep(0.25)
-                outcome["navigated"] = fixture.saw("omnibox", nonce)
-        # A blocked post-typing observation is expected while suggestions cover the page.
-        outcome["passed"] = outcome["typed_through_popup"] and typed["attempts"][-1]["dispatch"] == "acknowledged"
+                outcome["navigated"] = await self.navigated(fixture, step, nonce)
+        if not outcome["navigated"]:
+            # Without an open, pressable suggestion, read the omnibox itself and submit it.
+            observation = await self.observe(*await self.fixture_window())
+            field = next((node for node in nodes(observation.get("ax_tree")) if node.get("role") == "AXTextField"
+                          and node.get("element_ref") and any(label in " ".join(
+                              str(node.get(k) or "") for k in ("label", "title", "description")) for label in OMNIBOX_LABELS)),
+                         None)
+            if field is None:
+                return {**outcome, "passed": False, "error": "omnibox is not in the fixture observation"}
+            outcome["omnibox_has_url"] = nonce in str(field.get("value") or "")
+            result, _ = await self.act(observation, [{"type": "keypress", "key": "return",
+                                                      "element_ref": field["element_ref"]}])
+            outcome["return_code"] = result.get("code") or ""
+            outcome["navigated"] = await self.navigated(fixture, step, nonce)
+        outcome["passed"] = outcome["navigated"]
         return outcome
 
     async def run(self) -> bool:
@@ -297,7 +318,8 @@ class Runner:
             await self.fixture_window()
             scenarios = [("abc", lambda: self.web_field(fixture, ABC, "ABC")),
                          ("pinyin", lambda: self.web_field(fixture, PINYIN, "拼音")),
-                         ("omnibox", lambda: self.omnibox(fixture, nonce))]
+                         ("omnibox", lambda: self.omnibox(fixture, nonce, ABC, "abc")),
+                         ("omnibox-pinyin", lambda: self.omnibox(fixture, nonce, PINYIN, "pinyin"))]
             for key, scenario in scenarios:
                 if self.args.only and key not in self.args.only:
                     continue
@@ -334,7 +356,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--port", type=int, default=8771)
     parser.add_argument("--helper", type=Path, default=None, help="helper executable; default is the installed one")
-    parser.add_argument("--only", nargs="*", choices=["abc", "pinyin", "omnibox"], default=None)
+    parser.add_argument("--only", nargs="*", choices=["abc", "pinyin", "omnibox", "omnibox-pinyin"], default=None)
     parser.add_argument("--output", type=Path,
                         default=ROOT / ".scratch" / time.strftime("cu-live-acceptance-%Y%m%d-%H%M%S.json"))
     args = parser.parse_args()
