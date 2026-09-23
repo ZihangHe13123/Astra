@@ -65,6 +65,7 @@ class ComputerErrorCode(str, Enum):
     ACTION_TIMEOUT = "action_timeout"
     HELPER_FAILED = "helper_failed"
     UNKNOWN_OUTCOME = "unknown_outcome"
+    ACCESSIBILITY_ACTION_REFUSED = "accessibility_action_refused"
     FOREGROUND_TAKEOVER_REQUIRED = "foreground_takeover_required"
     REQUIRES_ACTIVE_FOREGROUND_TAKEOVER = "requires_active_foreground_takeover"
     BACKGROUND_ACTION_UNSUPPORTED = "background_action_unsupported"

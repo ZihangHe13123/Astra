@@ -142,6 +142,24 @@ def test_refused_replacement_keeps_plain_batches_on_precondition_guidance() -> N
     assert background is not None and background.code == "foreground_takeover_required"
 
 
+def test_refused_accessibility_action_says_nothing_was_sent_and_to_change_route() -> None:
+    """Live Finder 2026-09-23: AXPress on a search suggestion was refused by the app. The model
+    must learn that nothing happened and that repeating the same press cannot help."""
+    from agent.runtime.computer_protocol import ComputerActResult
+    from agent.runtime.tools.computer import _action_failure
+
+    error = ComputerError(ComputerErrorCode.ACCESSIBILITY_ACTION_REFUSED, "refused")
+    result = {"outcomes": [{"index": 0, "ok": False, "error_code": "accessibility_action_refused"}],
+              "last_acknowledged_action": -1}
+    parsed = ComputerActResult.from_mapping(result, action_count=1, response_ok=False, response_error=error)
+    failure = _action_failure(error, parsed.to_mapping())
+    assert failure.code == "accessibility_action_refused"
+    assert failure.retryable is True
+    assert "No input was dispatched" in failure.recovery_hint
+    assert "another way" in failure.recovery_hint
+    assert "Do not repeat this action batch" not in failure.recovery_hint
+
+
 def test_native_observation_timeout_preserves_error_identity() -> None:
     error = _failed("observation_timeout")
     assert error.code.value == "observation_timeout"

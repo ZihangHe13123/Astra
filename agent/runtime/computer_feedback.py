@@ -18,6 +18,7 @@ NEXT_STEPS = {
 
 _PRE_INPUT_REFUSALS = frozenset({
     "input_focus_required", "stale_snapshot", "target_not_frontmost", "target_gone", "secure_target", "out_of_bounds",
+    "accessibility_action_refused",
 })
 
 

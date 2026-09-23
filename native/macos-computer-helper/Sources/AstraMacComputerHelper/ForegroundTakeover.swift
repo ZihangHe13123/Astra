@@ -1026,7 +1026,7 @@ final class ForegroundPlanExecutor {
         case .targetGone?, .targetNotFrontmost?, .staleSnapshot?, .secureTarget?,
              .inputFocusRequired?: true
         case nil, .invalidAction?, .permissionDenied?, .outOfBounds?, .actionTimeout?,
-             .helperFailed?, .unknownOutcome?: false
+             .helperFailed?, .unknownOutcome?, .accessibilityActionRefused?: false
         }
     }
 

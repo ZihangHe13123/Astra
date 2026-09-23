@@ -891,6 +891,8 @@ final class Dispatcher {
         case .actionTimeout: return "action did not complete within its bound"
         case .helperFailed: return "native action failed"
         case .unknownOutcome: return "input may have been emitted; capture a fresh snapshot and do not replay"
+        case .accessibilityActionRefused:
+            return "the application refused this accessibility action; no input was dispatched"
         }
     }
 

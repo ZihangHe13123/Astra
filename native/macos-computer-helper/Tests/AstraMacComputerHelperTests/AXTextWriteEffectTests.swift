@@ -269,6 +269,23 @@ private func typeAction(_ method: ResolvedActionMethod) -> ResolvedAction {
     #expect(probes == 1)
 }
 
+// A refused AXSelectedText write changed nothing, like an unsupported one: keyboard delivery
+// takes over in the same foreground action instead of reporting an uncertain outcome.
+@Test func RefusedAXSelectedTextWriteIsUnsupportedNotUncertain() throws {
+    for axError in [AXError.attributeUnsupported, .illegalArgument, .notImplemented] {
+        let writer = SystemAXSelectedTextWriter(isSettable: { _ in (.success, true) }, setValue: { _, _ in axError })
+        #expect(try writer.writeSelectedText("Lyra", to: effectAX, validateBeforeMutation: {}) == .unsupported)
+    }
+    let ambiguous = SystemAXSelectedTextWriter(isSettable: { _ in (.success, true) }, setValue: { _, _ in .cannotComplete })
+    #expect(try ambiguous.writeSelectedText("Lyra", to: effectAX, validateBeforeMutation: {})
+        == .failed(.actionTimeout, inputStarted: true))
+    let poster = RecordingEffectPoster()
+    let performer = effectPerformer(poster: poster, writer: SystemAXSelectedTextWriter(
+        isSettable: { _ in (.success, true) }, setValue: { _, _ in .attributeUnsupported }))
+    #expect(try performer.perform(typeAction(.unicodeText)).inputStarted)
+    #expect(!poster.events.isEmpty)
+}
+
 @Test func WebAreaProbeWalksABoundedParentChain() {
     let chain = (101...104).map { AXUIElementCreateApplication(pid_t($0)) }
     func parent(_ element: AXUIElement) -> AXUIElement? {

@@ -137,6 +137,9 @@ _SAFE_ACTION_ERRORS = {
     ComputerErrorCode.OUT_OF_BOUNDS: "The action target is outside the current window.",
     ComputerErrorCode.SECURE_TARGET: "The action targets a protected control and requires user handoff.",
     ComputerErrorCode.INPUT_FOCUS_REQUIRED: "The intended text input element is not focused.",
+    ComputerErrorCode.ACCESSIBILITY_ACTION_REFUSED: (
+        "The application refused this accessibility action before acting on it."
+    ),
     ComputerErrorCode.ACTION_TIMEOUT: "The native action timed out.",
     ComputerErrorCode.OBSERVATION_TIMEOUT: "The native observation exceeded its time budget.",
     ComputerErrorCode.WINDOW_CONTENT_UNAVAILABLE: (
@@ -606,10 +609,14 @@ def _application_failure(error) -> ToolFailure:
             ComputerErrorCode.STALE_SNAPSHOT,
             ComputerErrorCode.INPUT_FOCUS_REQUIRED,
             ComputerErrorCode.REQUIRES_ACTIVE_FOREGROUND_TAKEOVER,
+            ComputerErrorCode.ACCESSIBILITY_ACTION_REFUSED,
         },
         recovery_hint=(
             "Focus the intended input element, capture a fresh snapshot, and retry the explicit text action."
             if code is ComputerErrorCode.INPUT_FOCUS_REQUIRED
+            else "No input was dispatched. Repeating the same action cannot help; reach the same effect "
+            "another way, such as keyboard navigation in the focused control, after a fresh snapshot."
+            if code is ComputerErrorCode.ACCESSIBILITY_ACTION_REFUSED
             else (
                 "Retry this exact snapshot and action batch with interaction_mode="
                 "'foreground_takeover'; the helper needs the app activated first."

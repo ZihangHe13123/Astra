@@ -584,6 +584,8 @@ enum ActionExecutionError: String, Error, Equatable {
     case actionTimeout = "action_timeout"
     case helperFailed = "helper_failed"
     case unknownOutcome = "unknown_outcome"
+    /// The application refused an accessibility action or attribute write before acting on it.
+    case accessibilityActionRefused = "accessibility_action_refused"
 }
 
 struct ActionPerformance {
@@ -1296,6 +1298,12 @@ struct SystemAXSelectedTextWriter: AXSelectedTextWriting {
         try validateBeforeMutation()
         let setError = setValue(element, text)
         guard setError == .success else {
+            // A refused write changed nothing, like an unsupported one; callers then use the
+            // keyboard or report that nothing was sent instead of an uncertain outcome.
+            if axErrorRefusedBeforeActing(setError) {
+                logActionRejected("AX-MAP raw=\(setError.rawValue) refused")
+                return .unsupported
+            }
             return .failed(mapAXActionError(setError), inputStarted: true)
         }
         // Only a readable, unchanged value across the settle window proves the write was
@@ -1642,10 +1650,10 @@ final class SystemActionPerformer: ActionProviding {
                 logActionRejected("PERFORM element-nil method=\(action.method)")
                 throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false)
             }
-            let error = AXUIElementPerformAction(element, kAXPressAction as CFString)
+            let error = performAXAction(element, kAXPressAction as CFString)
             guard error == .success else {
                 actionFailureDiagnostic("AXPress failed: AXError.rawValue=\(error.rawValue) role=\(action.verifiedElement?.roleResult.value ?? "?")")
-                throw ActionPerformFailure(error: mapAXActionError(error), inputStarted: true)
+                throw axMutationFailure(error)
             }
             return ActionPerformance(inputStarted: true)
         case .accessibilityIncrement:
@@ -1654,7 +1662,7 @@ final class SystemActionPerformer: ActionProviding {
                 throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false)
             }
             let error = performAXAction(element, kAXIncrementAction as CFString)
-            guard error == .success else { throw ActionPerformFailure(error: mapAXActionError(error), inputStarted: true) }
+            guard error == .success else { throw axMutationFailure(error) }
             return ActionPerformance(inputStarted: true)
         case .accessibilityDecrement:
             guard let element = action.element else {
@@ -1662,7 +1670,7 @@ final class SystemActionPerformer: ActionProviding {
                 throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false)
             }
             let error = performAXAction(element, kAXDecrementAction as CFString)
-            guard error == .success else { throw ActionPerformFailure(error: mapAXActionError(error), inputStarted: true) }
+            guard error == .success else { throw axMutationFailure(error) }
             return ActionPerformance(inputStarted: true)
         case .accessibilityText:
             guard let element = action.element else {
@@ -2048,6 +2056,33 @@ private final class AXActionIdentityProvider: AXNodeAttributeProvider {
     func actions() -> [BoundedAXStringResult] { [] }
     func children(remaining _: Int) -> [any AXNodeAttributeProvider] { [] }
     func sourceElement() -> AXUIElement? { element }
+}
+
+/// Errors with which the target application refused an AX mutation before acting on it. Live
+/// Finder answered AXPress on a search-suggestion item with kAXErrorAttributeUnsupported.
+func axErrorRefusedBeforeActing(_ error: AXError) -> Bool {
+    switch error {
+    case .actionUnsupported, .attributeUnsupported, .parameterizedAttributeUnsupported,
+         .notImplemented, .illegalArgument:
+        true
+    default:
+        false
+    }
+}
+
+/// A failed AX press, increment or decrement. Refusals, a vanished element and disabled
+/// accessibility prove nothing happened; a timeout or generic failure may already have acted.
+func axMutationFailure(_ error: AXError) -> ActionPerformFailure {
+    if axErrorRefusedBeforeActing(error) {
+        logActionRejected("AX-MAP raw=\(error.rawValue) refused")
+        return ActionPerformFailure(error: .accessibilityActionRefused, inputStarted: false)
+    }
+    switch error {
+    case .invalidUIElement, .invalidUIElementObserver, .apiDisabled:
+        return ActionPerformFailure(error: mapAXActionError(error), inputStarted: false)
+    default:
+        return ActionPerformFailure(error: mapAXActionError(error), inputStarted: true)
+    }
 }
 
 func mapAXActionError(_ error: AXError) -> ActionExecutionError {

@@ -68,6 +68,43 @@ import Testing
     #expect(writer.writes.isEmpty)
 }
 
+// Live Finder (2026-09-23): AXPress on a search-suggestion menu item returned
+// kAXErrorAttributeUnsupported. The app refused the press before acting, so nothing happened;
+// reporting unknown_outcome forced a needless handoff. Timeouts and generic failures stay unknown.
+@Test func accessibilityRefusalsReportNothingSentWhileAmbiguousErrorsStayUnknown() {
+    let element = AXUIElementCreateApplication(11)
+    let target = ActionElement(element: element, bounds: CGRect(x: 10, y: 10, width: 30, height: 20),
+        role: "AXMenuItem", subrole: nil, actions: [kAXPressAction as String])
+    let cases: [(AXError, ActionExecutionError, Bool)] = [
+        (.attributeUnsupported, .accessibilityActionRefused, false),
+        (.actionUnsupported, .accessibilityActionRefused, false),
+        (.notImplemented, .accessibilityActionRefused, false),
+        (.illegalArgument, .accessibilityActionRefused, false),
+        (.invalidUIElement, .staleSnapshot, false),
+        (.apiDisabled, .permissionDenied, false),
+        (.cannotComplete, .actionTimeout, true),
+        (.failure, .helperFailed, true),
+    ]
+    for method in [ResolvedActionMethod.accessibilityPress, .accessibilityIncrement, .accessibilityDecrement] {
+        for (axError, expected, inputStarted) in cases {
+            let performer = SystemActionPerformer(state: {
+                ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100),
+                                  axIdentity: 33)
+            }, lookup: { _, _ in target }, performAXAction: { _, _ in axError })
+            do {
+                _ = try performer.perform(ResolvedAction(source: .click(elementRef: "item"), method: method,
+                    screenPoint: nil, endScreenPoint: nil, element: element, verifiedElement: target))
+                Issue.record("a failed accessibility action was reported as delivered")
+            } catch let failure as ActionPerformFailure {
+                #expect(failure.error == expected)
+                #expect(failure.inputStarted == inputStarted)
+            } catch {
+                Issue.record("unexpected error: \(error)")
+            }
+        }
+    }
+}
+
 // Live Edge 152 (2026-09-23): text written into the address bar through AX read back
 // exactly, but Return did not navigate. Refuse native replacement there before any input.
 @Test func chromiumFamilyFieldsRefuseNativeReplacementBeforeInput() {

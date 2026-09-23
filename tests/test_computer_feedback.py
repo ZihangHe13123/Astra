@@ -61,6 +61,8 @@ def refused(code, outcome_code=None):
 
 @pytest.mark.parametrize("code", [
     "input_focus_required", "stale_snapshot", "target_not_frontmost", "target_gone", "secure_target", "out_of_bounds",
+    # Live Finder 2026-09-23: the app refused AXPress on a suggestion item before acting.
+    "accessibility_action_refused",
 ])
 def test_structured_pre_input_refusal_is_not_reported_as_uncertain_input(code):
     # The helper reports unknown_outcome whenever input may have started, so a specific
