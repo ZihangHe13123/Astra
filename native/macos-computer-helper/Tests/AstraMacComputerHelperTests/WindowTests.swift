@@ -2250,6 +2250,36 @@ func artifactBundleCloseAndEOFPreserveRetainedQuarantines(closeAcknowledged: Boo
                                            focusedField: field).map(\.windowID) == [10])
 }
 
+// Live Edge 152 (2026-09-23): after Return in the address field the page began loading, focus left
+// the field, and its 1002x199 suggestion list was still drawn, so the post-action observation
+// blocked. A list proven moments ago is waited out like a tooltip; anything else still blocks.
+@Test func recentlyProvenSuggestionListIsWaitedOutNotBlocked() {
+    let list = VisibleWindowRecord(pid: 42, windowID: 10, bounds: CGRect(x: 89, y: 70, width: 1002, height: 199),
+                                   layer: 0, alpha: 1, zOrder: 14)
+    let menu = VisibleWindowRecord(pid: 42, windowID: 11, bounds: CGRect(x: 600, y: 110, width: 244, height: 377),
+                                   layer: 8, alpha: 1, zOrder: 13)
+    let tooltip = VisibleWindowRecord(pid: 42, windowID: 12, bounds: CGRect(x: 300, y: 300, width: 84, height: 30),
+                                      layer: 3, alpha: 1, zOrder: 12)
+    let recent = RecentSuggestionPopups()
+    recent.record([list], at: 100)
+    let proven: (VisibleWindowRecord) -> Bool = { recent.contains($0, at: 101.5) }
+    #expect(overlaysMayBeTransient([list], containsAXOverlay: false, recentlyProvenSuggestionPopup: proven))
+    #expect(overlaysMayBeTransient([list, tooltip], containsAXOverlay: false, recentlyProvenSuggestionPopup: proven))
+    #expect(overlaysMayBeTransient([tooltip], containsAXOverlay: false, recentlyProvenSuggestionPopup: { _ in false }))
+    // Never proven, proven too long ago, or joined by a menu or an AX overlay: block at once.
+    #expect(!overlaysMayBeTransient([list], containsAXOverlay: false, recentlyProvenSuggestionPopup: { _ in false }))
+    #expect(!overlaysMayBeTransient([list], containsAXOverlay: false,
+                                    recentlyProvenSuggestionPopup: { recent.contains($0, at: 103.5) }))
+    #expect(!overlaysMayBeTransient([list, menu], containsAXOverlay: false, recentlyProvenSuggestionPopup: proven))
+    #expect(!overlaysMayBeTransient([list], containsAXOverlay: true, recentlyProvenSuggestionPopup: proven))
+    #expect(!overlaysMayBeTransient([], containsAXOverlay: false, recentlyProvenSuggestionPopup: proven))
+    // The memory is per window of the same app, and old entries age out.
+    let otherApp = VisibleWindowRecord(pid: 77, windowID: 10, bounds: list.bounds, layer: 0, alpha: 1, zOrder: 14)
+    #expect(!recent.contains(otherApp, at: 101))
+    recent.record([], at: 104)
+    #expect(!recent.contains(list, at: 104))
+}
+
 @Test func visibleOverlayInventoryFailsClosedWhenUnavailable() {
     #expect(containedVisibleOverlayOrUncertain(
         targetPID: 42,

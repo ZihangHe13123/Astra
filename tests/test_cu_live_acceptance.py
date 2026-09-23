@@ -309,3 +309,22 @@ def test_omnibox_click_does_not_submit_when_the_typing_observation_was_pending()
     assert result["passed"] is False and result["stop"] is True
     assert runner.act.await_count == 2
 
+
+def test_omnibox_click_fails_when_the_observation_after_return_was_pending():
+    observations = list(enumerate([
+        page("http://127.0.0.1:8771/text?step=setup-click&nonce=nonce123"),
+        page("http://127.0.0.1:8771/text?step=setup-click&nonce=nonce123"),
+        page(CLICK_URL),
+    ]))
+    pending = {"code": "post_action_observation_pending", "computer_receipt": {"dispatch_state": "acknowledged"}}
+    runner = runner_for_omnibox_click(observations, [ACKED, ACKED, pending])
+    result = asyncio.run(runner.omnibox_click(SimpleNamespace(), "nonce123", "com.apple.keylayout.ABC", "click"))
+    assert result["navigated"] is True
+    assert result["return_code"] == "post_action_observation_pending"
+    assert result["passed"] is False
+
+
+def test_the_click_route_submits_to_a_page_that_loads_like_a_real_site():
+    from scripts.cu_live_acceptance import SLOW_STEPS
+    assert SLOW_STEPS.get("omnibox-click", 0) >= 1
+

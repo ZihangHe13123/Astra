@@ -1164,6 +1164,7 @@ final class SystemWindowObserver: WindowObserving {
     private var targets: [String: WindowTarget] = [:]
     private var catalogWindowIdentities: [CatalogWindowIdentityKey: [CatalogWindowIdentityRecord]] = [:]
     private var catalogAbsenceTracker = CatalogWindowAbsenceTracker()
+    private let recentSuggestionPopups = RecentSuggestionPopups()
     private let windowServerInventory: () -> Set<CGWindowID>?
     private let catalogBuilder: (() throws -> WindowCatalogObservation)?
     private let catalogWindows: (() throws -> [CatalogSCWindow])?
@@ -2437,6 +2438,8 @@ final class SystemWindowObserver: WindowObserving {
             targetWindowID: current.windowID, targetBounds: current.frame, focusedField: focusedField) ?? withoutIndicators
         let suggestionPopups = attachedSuggestionPopupRecords(withoutIndicators, targetPID: target.pid,
             targetWindowID: current.windowID, targetBounds: current.frame, focusedField: focusedField)
+        let observedAt = ProcessInfo.processInfo.systemUptime
+        recentSuggestionPopups.record(suggestionPopups, at: observedAt)
         func placement(_ records: [VisibleWindowRecord]) -> String {
             records.map {
                 "[dx=\(Int($0.bounds.minX - current.frame.minX)) dy=\(Int($0.bounds.minY - current.frame.minY)) " +
@@ -2459,10 +2462,8 @@ final class SystemWindowObserver: WindowObserving {
             ? backgroundVisibleWindowAmbiguities(targetPID: target.pid, targetWindowID: current.windowID,
                 targetBounds: current.frame, records: overlayCandidates)
             : []
-        // Only small floating windows of the app itself (caret indicators, tooltips) may be
-        // waited out; menus, sheets, dialogs and AX-contained overlays block immediately.
-        let overlayMayBeTransient = !containsAXOverlay && !visibleOffenders.isEmpty && visibleOffenders.allSatisfy {
-            $0.layer > 0 && $0.bounds.width <= 200 && $0.bounds.height <= 200
+        let overlayMayBeTransient = overlaysMayBeTransient(visibleOffenders, containsAXOverlay: containsAXOverlay) {
+            self.recentSuggestionPopups.contains($0, at: observedAt)
         }
         if containsAXOverlay || containsVisibleOverlay {
             // Geometry and ordering only, never titles or content: enough to tell a tooltip or
@@ -4447,6 +4448,41 @@ func appStatusStripRegions(
 
 /// Snapshots name at most this many open suggestion lists.
 let maximumReportedSuggestionPopups = 4
+
+/// Overlays that may be waited out instead of blocking at once: small floating windows of the app
+/// (caret indicators, tooltips) and suggestion lists proven moments ago. Menus, sheets, dialogs and
+/// AX-contained overlays block immediately.
+func overlaysMayBeTransient(
+    _ offenders: [VisibleWindowRecord], containsAXOverlay: Bool,
+    recentlyProvenSuggestionPopup: (VisibleWindowRecord) -> Bool
+) -> Bool {
+    !containsAXOverlay && !offenders.isEmpty && offenders.allSatisfy {
+        ($0.layer > 0 && $0.bounds.width <= 200 && $0.bounds.height <= 200) || recentlyProvenSuggestionPopup($0)
+    }
+}
+
+/// Suggestion lists proven attached to a focused field, remembered for a few seconds. Return moves
+/// focus away while the list is still drawn (live Edge: 1002x199 as the page began loading), so the
+/// list can no longer be proven; it is then waited out like a tooltip rather than blocking at once.
+final class RecentSuggestionPopups {
+    static let memorySeconds: TimeInterval = 3
+    private let lock = NSLock()
+    private var provenAt: [CGWindowID: (pid: pid_t, time: TimeInterval)] = [:]
+
+    func record(_ popups: [VisibleWindowRecord], at now: TimeInterval) {
+        lock.lock()
+        defer { lock.unlock() }
+        provenAt = provenAt.filter { now - $0.value.time <= Self.memorySeconds }
+        for popup in popups { provenAt[popup.windowID] = (popup.pid, now) }
+    }
+
+    func contains(_ record: VisibleWindowRecord, at now: TimeInterval) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = provenAt[record.windowID] else { return false }
+        return entry.pid == record.pid && now - entry.time <= Self.memorySeconds
+    }
+}
 
 /// A focused text field's own suggestion list (live Edge: a separate window on the page's layer that
 /// encloses the address field and drops 199 to 471 pt below it; Finder drops its search list just

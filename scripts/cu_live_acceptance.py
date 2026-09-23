@@ -68,6 +68,11 @@ print(current())
 """
 
 
+# Pages that answer like a real site, not instantly: Edge keeps drawing the address field's
+# suggestion list while such a page starts loading.
+SLOW_STEPS = {"omnibox-click": 1.5}
+
+
 class Fixture:
     """Serves the page, keeps its last report, and records every requested URL."""
 
@@ -86,6 +91,8 @@ class Fixture:
                     self.send_error(404)
                     return
                 if path == "/text":
+                    step = parse_qs(urlsplit(self.path).query).get("step", [""])[0]
+                    time.sleep(SLOW_STEPS.get(step, 0))
                     data, kind = FIXTURE.read_bytes(), "text/html; charset=utf-8"
                 else:
                     data, kind = json.dumps(fixture.snapshot()).encode(), "application/json"
@@ -562,7 +569,8 @@ class Runner:
                                                      "element_ref": field["element_ref"]}])
         outcome["return_code"] = submitted.get("code") or ""
         outcome["navigated"] = await self.navigated(fixture, step, nonce)
-        outcome["passed"] = outcome["navigated"] and outcome["page_observable"]
+        # The list still drawn while the page loads must not block the observation after Return.
+        outcome["passed"] = outcome["navigated"] and outcome["page_observable"] and not outcome["return_code"]
         outcome["stop"] = not outcome["passed"]
         return outcome
 

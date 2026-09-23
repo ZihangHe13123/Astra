@@ -91,7 +91,8 @@ struct TargetCatalogRecord {
     let axWindows: [TargetAXWindowRecord]
     let containsUnselectedOverlay: Bool
     /// Every overlay is a small floating window of the target app, the shape of a caret
-    /// indicator or tooltip, so it may vanish on its own. It still blocks until it does.
+    /// indicator or tooltip, or a suggestion list proven moments ago, so it may vanish on its
+    /// own. It still blocks until it does.
     let overlayMayBeTransient: Bool
     let siblingOrdering: BackgroundSiblingOrderingProof?
     /// Windows proven to be the focused text field's own suggestion lists; they bind like the target.
