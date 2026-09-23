@@ -6,7 +6,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from scripts.cu_live_acceptance import (
-    SCENARIOS, Fixture, Runner, exact_fixture_address, observed_fixture_navigation,
+    SCENARIOS, Fixture, Runner, exact_fixture_address, hover_point, observed_fixture_navigation,
+    pick_suggestion_window, status_strip_seen,
 )
 
 
@@ -185,3 +186,126 @@ def test_type_into_does_not_replay_an_ax_write_with_unchanged_readback():
     result = asyncio.run(runner.type_into("AXTextField", ("Address",), "example"))
     assert result["last_code"] == "input_focus_required"
     assert runner.act.await_count == 1
+
+
+def test_hover_point_is_the_fixture_link_center_on_screen():
+    tree = {"role": "AXWindow", "children": [
+        {"role": "AXLink", "label": "Fixture hover link", "bounds": {"x": 40, "y": 200, "width": 120, "height": 20}},
+    ]}
+    assert hover_point(tree, {"x": 25, "y": 30, "width": 1319, "height": 768}) == (125, 240)
+    assert hover_point({"role": "AXWindow"}, {"x": 0, "y": 0, "width": 10, "height": 10}) is None
+
+
+def test_status_strip_evidence_is_only_the_helper_waiver_marker():
+    assert status_strip_seen(["[action_rejected] 2026 OVERLAY-PASSIVE status_strip [dx=3 dy=741 w=437 h=24]"])
+    assert not status_strip_seen(["[action_rejected] 2026 OVERLAY-DETAIL ax=false visible=true"])
+
+
+def test_omnibox_hover_types_by_shortcut_and_passes_only_with_strip_evidence():
+    assert "omnibox-hover" in SCENARIOS
+    typed = {"attempts": [{"code": "", "dispatch": "acknowledged", "acknowledged": 2}], "last_code": "",
+             "delivered": True, "unknown": False}
+    for strip in (False, True):
+        runner = runner_for_omnibox(typed, "127.0.0.1:8771/text?step=omnibox-hover&nonce=nonce123")
+        moves = []
+        runner.locate_pointer = lambda: (700.0, 5.0)
+        runner.move_pointer = lambda x, y: moves.append((x, y))
+        runner.hover_fixture_link = AsyncMock(return_value=(125, 240))
+        runner.diagnostics_offset = lambda: 0
+        runner.diagnostics_since = lambda _offset, seen=strip: (
+            ["OVERLAY-PASSIVE status_strip [dx=3 dy=741 w=437 h=24]"] if seen else [])
+        runner.navigated = AsyncMock(return_value=True)
+        runner.act = AsyncMock(return_value=({"code": "", "computer_receipt": {}}, None))
+        result = asyncio.run(runner.omnibox(SimpleNamespace(), "nonce123", "com.apple.keylayout.ABC", "hover",
+                                            select="hover"))
+        runner.hover_fixture_link.assert_awaited_once()
+        assert runner.type_omnibox.await_args.kwargs == {"select": "shortcut"}
+        assert result["status_strip_seen"] is strip
+        assert result["passed"] is strip
+        # The pointer returns to where the user left it.
+        assert moves == [(700.0, 5.0)]
+
+
+def test_suggestion_window_is_never_a_bottom_edge_status_strip():
+    """Live 20:48: a pointer left on the fixture link kept Edge's status strip open, and the runner
+    took that untitled window for the suggestion list."""
+    main = {"window_ref": "main", "title": "Astra CU Text Fixture", "bindable": True,
+            "bounds": {"x": 25, "y": 30, "width": 1319, "height": 768}}
+    strip = {"window_ref": "strip", "title": "", "bindable": True,
+             "bounds": {"x": 28, "y": 771, "width": 249, "height": 24}}
+    dropdown = {"window_ref": "dropdown", "title": "", "bindable": True,
+                "bounds": {"x": 89, "y": 70, "width": 1038, "height": 199}}
+    assert pick_suggestion_window(main, [main, strip, dropdown]) is dropdown
+    assert pick_suggestion_window(main, [main, strip]) is None
+
+
+def runner_for_omnibox_click(observations, results, *, overlay_wait_on=None):
+    runner = Runner.__new__(Runner)
+    runner.args = SimpleNamespace(port=8771)
+    runner.report = {"overlay_waits": []}
+    runner.input_source = lambda source: source
+    runner.open_fixture_tab = AsyncMock(return_value="127.0.0.1:8771/text?step=setup-click&nonce=nonce123")
+    runner.fixture_window = AsyncMock(return_value=("app", "window"))
+    calls = iter(observations)
+
+    async def observe(*_):
+        index, observation = next(calls)
+        if index == overlay_wait_on:
+            runner.report["overlay_waits"].append(0.5)
+        return observation
+
+    runner.observe = observe
+    runner.act = AsyncMock(side_effect=[(result, None) for result in results])
+    runner.navigated = AsyncMock(return_value=True)
+    return runner
+
+
+def page(value, **extra):
+    return {"snapshot_id": "s", "ax_tree": {"role": "AXTextField", "label": "Address", "element_ref": "field",
+                                            "value": value}, **extra}
+
+
+CLICK_URL = "127.0.0.1:8771/text?step=omnibox-click&nonce=nonce123"
+ACKED = {"code": "", "computer_receipt": {"dispatch_state": "acknowledged"}}
+
+
+def test_omnibox_click_types_and_submits_through_the_page_window():
+    observations = list(enumerate([
+        page("http://127.0.0.1:8771/text?step=setup-click&nonce=nonce123"),
+        page("http://127.0.0.1:8771/text?step=setup-click&nonce=nonce123",
+             suggestion_popups=[{"x": 64, "y": 40, "width": 1038, "height": 471}]),
+        page(CLICK_URL),
+    ]))
+    runner = runner_for_omnibox_click(observations, [ACKED, ACKED, ACKED])
+    result = asyncio.run(runner.omnibox_click(SimpleNamespace(), "nonce123", "com.apple.keylayout.ABC", "click"))
+    assert result["passed"] is True and result["popup_reported"] is True
+    sent = [call.args[1] for call in runner.act.await_args_list]
+    assert sent[0] == [{"type": "click", "element_ref": "field"}]
+    assert [action["type"] for action in sent[1]] == ["keypress", "type"]
+    assert sent[1][1]["text"] == CLICK_URL
+    assert sent[2] == [{"type": "keypress", "key": "return", "element_ref": "field"}]
+
+
+def test_omnibox_click_fails_when_the_page_was_observable_only_after_the_list_closed():
+    observations = list(enumerate([
+        page("http://127.0.0.1:8771/text?step=setup-click&nonce=nonce123"),
+        page("http://127.0.0.1:8771/text?step=setup-click&nonce=nonce123"),
+        page(CLICK_URL),
+    ]))
+    runner = runner_for_omnibox_click(observations, [ACKED, ACKED, ACKED], overlay_wait_on=1)
+    result = asyncio.run(runner.omnibox_click(SimpleNamespace(), "nonce123", "com.apple.keylayout.ABC", "click"))
+    assert result["page_observable"] is False
+    assert result["passed"] is False
+
+
+def test_omnibox_click_does_not_submit_when_the_typing_observation_was_pending():
+    observations = list(enumerate([
+        page("http://127.0.0.1:8771/text?step=setup-click&nonce=nonce123"),
+        page("http://127.0.0.1:8771/text?step=setup-click&nonce=nonce123"),
+    ]))
+    pending = {"code": "post_action_observation_pending", "computer_receipt": {"dispatch_state": "acknowledged"}}
+    runner = runner_for_omnibox_click(observations, [ACKED, pending])
+    result = asyncio.run(runner.omnibox_click(SimpleNamespace(), "nonce123", "com.apple.keylayout.ABC", "click"))
+    assert result["passed"] is False and result["stop"] is True
+    assert runner.act.await_count == 2
+

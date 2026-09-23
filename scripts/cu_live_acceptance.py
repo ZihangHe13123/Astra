@@ -14,9 +14,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import ctypes
+import ctypes.util
 import json
 import secrets
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -24,17 +27,22 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from agent.runtime.computer_backend import ComputerSessionManager
-from agent.runtime.macos_computer import HelperTransport, MacComputerBackend
-from agent.runtime.tools.computer import register_computer_tools
-from agent.runtime.tools.registry import ToolRegistry
-
 ROOT = Path(__file__).resolve().parents[1]
+# Test this checkout's tool layer against the helper; an installed editable package may point at
+# another checkout whose protocol does not match.
+sys.path.insert(0, str(ROOT))
+
+from agent.runtime.computer_backend import ComputerSessionManager  # noqa: E402
+from agent.runtime.macos_computer import HelperTransport, MacComputerBackend  # noqa: E402
+from agent.runtime.tools.computer import register_computer_tools  # noqa: E402
+from agent.runtime.tools.registry import ToolRegistry  # noqa: E402
+
 FIXTURE = ROOT / "tests/fixtures/cu-text-input.html"
 TITLE = "Astra CU Text Fixture"
 EDGE = "com.microsoft.edgemac"
 OMNIBOX_LABELS = ("Address", "地址", "搜索")
-SCENARIOS = ("abc", "pinyin", "omnibox", "omnibox-pinyin", "omnibox-shortcut")
+SCENARIOS = ("abc", "pinyin", "omnibox", "omnibox-pinyin", "omnibox-shortcut", "omnibox-hover", "omnibox-click")
+HOVER_LABEL = "Fixture hover link"
 ABC = "com.apple.keylayout.ABC"
 PINYIN = "com.apple.inputmethod.SCIM.ITABC"
 DIAGNOSTICS = Path("/tmp/astra-sipp-diagnostics.log")
@@ -126,12 +134,92 @@ def nodes(tree):
             yield from nodes(child)
 
 
+def hover_point(tree, window_bounds: dict) -> tuple[float, float] | None:
+    """Screen center of the fixture link; snapshot bounds are window-local logical points."""
+    for node in nodes(tree):
+        text = " ".join(str(node.get(key) or "") for key in ("label", "title", "description"))
+        bounds = node.get("bounds")
+        if node.get("role") == "AXLink" and HOVER_LABEL in text and isinstance(bounds, dict):
+            return (window_bounds["x"] + bounds["x"] + bounds["width"] / 2,
+                    window_bounds["y"] + bounds["y"] + bounds["height"] / 2)
+    return None
+
+
+def pick_suggestion_window(main: dict, windows: list[dict]) -> dict | None:
+    """The omnibox suggestion list: untitled, bindable, inside the fixture window, and not the thin
+    bottom-edge strip Edge shows for a hovered link."""
+    outer = main.get("bounds") or {}
+    for window in windows:
+        inner = window.get("bounds") or {}
+        if (window is not main and window.get("bindable") and not (window.get("title") or "")
+                and outer and inner and inner["x"] >= outer["x"] and inner["y"] >= outer["y"]
+                and inner["x"] + inner["width"] <= outer["x"] + outer["width"]
+                and inner["y"] + inner["height"] <= outer["y"] + outer["height"]
+                and inner["height"] > 32 and inner["y"] < outer["y"] + outer["height"] / 2):
+            return window
+    return None
+
+
+def status_strip_seen(lines) -> bool:
+    """The helper waived a hovered link's bottom-edge status strip during this run."""
+    return any("OVERLAY-PASSIVE status_strip" in line for line in lines)
+
+
+def mouse_location() -> tuple[float, float] | None:
+    """Where the pointer is now, so the hover scenario can put it back afterwards."""
+    class CGPoint(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+    graphics = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreGraphics"))
+    foundation = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreFoundation"))
+    graphics.CGEventCreate.restype = ctypes.c_void_p
+    graphics.CGEventCreate.argtypes = [ctypes.c_void_p]
+    graphics.CGEventGetLocation.restype = CGPoint
+    graphics.CGEventGetLocation.argtypes = [ctypes.c_void_p]
+    foundation.CFRelease.argtypes = [ctypes.c_void_p]
+    event = graphics.CGEventCreate(None)
+    if not event:
+        return None
+    try:
+        point = graphics.CGEventGetLocation(event)
+        return point.x, point.y
+    finally:
+        foundation.CFRelease(event)
+
+
+def post_mouse_move(x: float, y: float) -> None:
+    """A real mouse-moved event: a warp alone does not make the browser show a hover strip."""
+    class CGPoint(ctypes.Structure):
+        _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
+
+    graphics = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreGraphics"))
+    foundation = ctypes.cdll.LoadLibrary(ctypes.util.find_library("CoreFoundation"))
+    graphics.CGEventCreateMouseEvent.restype = ctypes.c_void_p
+    graphics.CGEventCreateMouseEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint32, CGPoint, ctypes.c_uint32]
+    graphics.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+    foundation.CFRelease.argtypes = [ctypes.c_void_p]
+    event = graphics.CGEventCreateMouseEvent(None, 5, CGPoint(x, y), 0)  # kCGEventMouseMoved
+    if not event:
+        raise RuntimeError("could not create a mouse-moved event")
+    try:
+        graphics.CGEventPost(0, event)  # kCGHIDEventTap
+    finally:
+        foundation.CFRelease(event)
+
+
 def find_ref(tree, role: str, *labels: str) -> str | None:
     for node in nodes(tree):
         text = " ".join(str(node.get(key) or "") for key in ("label", "title", "description"))
         if node.get("role") == role and node.get("element_ref") and any(label in text for label in labels):
             return node["element_ref"]
     return None
+
+
+def omnibox_field(tree) -> dict | None:
+    """Edge's address field in an observation of the page window."""
+    return next((node for node in nodes(tree) if node.get("role") == "AXTextField" and node.get("element_ref")
+                 and any(label in " ".join(str(node.get(key) or "") for key in ("label", "title", "description"))
+                         for label in OMNIBOX_LABELS)), None)
 
 
 def exact_fixture_address(value: object, url: str) -> bool:
@@ -153,6 +241,10 @@ def observed_fixture_navigation(tree: object, step: str, nonce: str, port: int) 
 
 
 class Runner:
+    # Real pointer control, replaceable in unit tests.
+    locate_pointer = staticmethod(mouse_location)
+    move_pointer = staticmethod(post_mouse_move)
+
     def __init__(self, args, work: Path):
         self.args = args
         self.report: dict = {"scenarios": [], "calls": [], "passed": False}
@@ -212,15 +304,8 @@ class Runner:
         main = next((w for w in windows if TITLE in (w.get("title") or "")), None)
         if main is None:
             return None
-        outer = main.get("bounds") or {}
-        for window in windows:
-            inner = window.get("bounds") or {}
-            if (window is not main and window.get("bindable") and not (window.get("title") or "")
-                    and outer and inner and inner["x"] >= outer["x"] and inner["y"] >= outer["y"]
-                    and inner["x"] + inner["width"] <= outer["x"] + outer["width"]
-                    and inner["y"] + inner["height"] <= outer["y"] + outer["height"]):
-                return app_ref, window["window_ref"]
-        return None
+        popup = pick_suggestion_window(main, windows)
+        return (app_ref, popup["window_ref"]) if popup else None
 
     async def observe(self, app_ref: str, window_ref: str) -> dict:
         waited = 0.0
@@ -329,6 +414,30 @@ class Runner:
                 and code in {"", "post_action_observation_pending"},
                 "unknown": receipt.get("dispatch_state") in {"unknown", "partial"}}
 
+    def diagnostics_offset(self) -> int:
+        return DIAGNOSTICS.stat().st_size if DIAGNOSTICS.exists() else 0
+
+    def diagnostics_since(self, offset: int) -> list[str]:
+        if not DIAGNOSTICS.exists():
+            return []
+        with DIAGNOSTICS.open("rb") as log:
+            log.seek(offset)
+            return log.read().decode("utf-8", "replace").splitlines()
+
+    async def hover_fixture_link(self) -> tuple[float, float]:
+        """Rest the real pointer on the fixture link so Edge shows its bottom-edge status strip."""
+        app_ref, windows = await self.edge_windows()
+        window = next((w for w in windows if w.get("bindable") and TITLE in (w.get("title") or "")), None)
+        if window is None:
+            raise RuntimeError("the fixture window is not in the catalog")
+        observation = await self.observe(app_ref, window["window_ref"])
+        point = hover_point(observation.get("ax_tree"), window.get("bounds") or {})
+        if point is None:
+            raise RuntimeError("the fixture hover link is not in the observation")
+        self.move_pointer(*point)
+        await asyncio.sleep(1.0)
+        return point
+
     async def omnibox(self, fixture: Fixture, nonce: str, source: str, label: str, *,
                       select: str = "bound") -> dict:
         """Pass only when the local server receives this run's unique URL."""
@@ -336,7 +445,23 @@ class Runner:
         self.input_source(source)
         step = f"omnibox-{label}"
         url = f"127.0.0.1:{self.args.port}/text?step={step}&nonce={nonce}"
-        typed = await self.type_omnibox(current_url, url, select=select)
+        hover = select == "hover"
+        strip_offset = self.diagnostics_offset() if hover else 0
+        resting = self.locate_pointer() if hover else None
+        try:
+            return await self.omnibox_flow(fixture, nonce, source, label, select, current_url, step, url,
+                                           hover, strip_offset)
+        finally:
+            if resting is not None:
+                # Later scenarios and the user's desktop must not inherit the hover strip.
+                self.move_pointer(*resting)
+
+    async def omnibox_flow(self, fixture: Fixture, nonce: str, source: str, label: str, select: str,
+                           current_url: str, step: str, url: str, hover: bool, strip_offset: int) -> dict:
+        hovered = await self.hover_fixture_link() if hover else None
+        # While hovering, type by the unbound Cmd+L route: the strip must not block observation,
+        # the pre-action check, or the typing itself.
+        typed = await self.type_omnibox(current_url, url, select="shortcut" if hover else select)
         outcome = {"name": f"omnibox ({label})", "input_source": source, **typed,
                    "typed_through_popup": False, "navigated": False}
         if not typed["delivered"]:
@@ -384,6 +509,60 @@ class Runner:
         except Exception as error:  # noqa: BLE001 - sent text must not be retried after observation fails
             return {**outcome, "passed": False, "stop": True, "error": str(error)}
         outcome["passed"] = outcome["navigated"]
+        if hover:
+            outcome["hover_point"] = hovered
+            outcome["status_strip_seen"] = status_strip_seen(self.diagnostics_since(strip_offset))
+            # Without the strip this run proves nothing about the waiver.
+            outcome["passed"] = outcome["navigated"] and outcome["status_strip_seen"]
+        outcome["stop"] = not outcome["passed"]
+        return outcome
+
+    async def omnibox_click(self, fixture: Fixture, nonce: str, source: str, label: str) -> dict:
+        """Click the address field, then type and submit through the page window while the field's
+        suggestion list is open: a model's route, with no targeting of the suggestion window."""
+        current_url = await self.open_fixture_tab(fixture, nonce, label)
+        self.input_source(source)
+        step = f"omnibox-{label}"
+        url = f"127.0.0.1:{self.args.port}/text?step={step}&nonce={nonce}"
+        outcome = {"name": f"omnibox ({label})", "input_source": source, "navigated": False}
+        observation = await self.observe(*await self.fixture_window())
+        field = omnibox_field(observation.get("ax_tree"))
+        if field is None or not exact_fixture_address(field.get("value"), current_url):
+            raise RuntimeError("Edge is not showing this case's fresh local fixture address")
+        clicked, _ = await self.act(observation, [{"type": "click", "element_ref": field["element_ref"]}])
+        outcome["click_code"] = clicked.get("code") or ""
+        waits = len(self.report.setdefault("overlay_waits", []))
+        try:
+            observation = await self.observe(*await self.fixture_window())
+        except RuntimeError as error:
+            return {**outcome, "passed": False, "stop": True, "error": str(error)}
+        # Observed at once, not after the suggestion list happened to close.
+        outcome["page_observable"] = len(self.report["overlay_waits"]) == waits
+        outcome["popup_reported"] = bool(observation.get("suggestion_popups"))
+        field = omnibox_field(observation.get("ax_tree"))
+        if field is None:
+            return {**outcome, "passed": False, "stop": True, "error": "omnibox is not in the page observation"}
+        ref = field["element_ref"]
+        typed, _ = await self.act(observation, [
+            {"type": "keypress", "key": "a", "modifiers": ["command"], "element_ref": ref},
+            {"type": "type", "element_ref": ref, "text": url},
+        ])
+        receipt = typed.get("computer_receipt") or {}
+        outcome["type_code"] = typed.get("code") or ""
+        outcome["unknown"] = receipt.get("dispatch_state") in {"unknown", "partial"}
+        # The helper must observe the page after typing, with the suggestion list still open.
+        if receipt.get("dispatch_state") != "acknowledged" or outcome["type_code"]:
+            return {**outcome, "passed": False, "stop": True}
+        observation = await self.observe(*await self.fixture_window())
+        field = omnibox_field(observation.get("ax_tree"))
+        outcome["omnibox_has_url"] = field is not None and exact_fixture_address(field.get("value"), url)
+        if not outcome["omnibox_has_url"]:
+            return {**outcome, "passed": False, "stop": True}
+        submitted, _ = await self.act(observation, [{"type": "keypress", "key": "return",
+                                                     "element_ref": field["element_ref"]}])
+        outcome["return_code"] = submitted.get("code") or ""
+        outcome["navigated"] = await self.navigated(fixture, step, nonce)
+        outcome["passed"] = outcome["navigated"] and outcome["page_observable"]
         outcome["stop"] = not outcome["passed"]
         return outcome
 
@@ -409,7 +588,10 @@ class Runner:
                          ("omnibox", lambda: self.omnibox(fixture, secrets.token_hex(4), ABC, "abc")),
                          ("omnibox-pinyin", lambda: self.omnibox(fixture, secrets.token_hex(4), PINYIN, "pinyin")),
                          ("omnibox-shortcut", lambda: self.omnibox(fixture, secrets.token_hex(4), ABC, "shortcut",
-                                                                   select="shortcut"))]
+                                                                   select="shortcut")),
+                         ("omnibox-hover", lambda: self.omnibox(fixture, secrets.token_hex(4), ABC, "hover",
+                                                                select="hover")),
+                         ("omnibox-click", lambda: self.omnibox_click(fixture, secrets.token_hex(4), ABC, "click"))]
             for key, scenario in scenarios:
                 if self.args.only and key not in self.args.only:
                     continue
