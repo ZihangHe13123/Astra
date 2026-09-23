@@ -9,6 +9,7 @@ from .computer_forms import safe_action_receipt
 NEXT_STEPS = {
     "continue_from_fresh_observation": "Requested choice states are verified. Use the returned fresh refs for remaining work, or report completion briefly. No extra read is needed for these choices; server saving is a separate result.",
     "observe_result": "Inspect the returned fresh observation first. If it proves the requested result, report it briefly. Otherwise call computer_snapshot(settle_ms=300). An acknowledgement is not a failed click: do not click the same button again because the observation looked unchanged. After two inconclusive reads, report unconfirmed.",
+    "follow_recovery": "The acknowledged actions were delivered and none after them were sent, but no fresh observation was returned, so the effect is unverified. Do not replay. Follow this result's Recovery field; if that cannot be done safely, hand this step to the user.",
     "refresh_snapshot": "This call did not dispatch input. Capture a fresh snapshot and decide whether the action is still needed; this does not authorize replaying an earlier uncertain action.",
     "handoff": "Input outcome is uncertain. Observe if possible, then report what remains unconfirmed. Do not replay the action.",
     "inspect_error": "This call did not dispatch input. Follow its error code and recovery hint; do not guess another API or target.",
@@ -41,7 +42,11 @@ def build_action_receipt(payload, *, mode, action_count, dispatch_attempted, err
     )
     dispatch = ("acknowledged" if acknowledged == action_count and action_count else
                 "partial" if acknowledged else "unknown" if dispatch_attempted else "not_dispatched")
+    # No fresh observation came back and its recovery may already have revoked the
+    # target, so the result's own Recovery decides how to observe next.
+    observation_pending = error_code == "post_action_observation_pending" and acknowledged > 0
     next_step = ("continue_from_fresh_observation" if all_verified else
+                 "follow_recovery" if observation_pending else
                  "observe_result" if dispatch == "acknowledged" or error_code == "effect_pending" else
                  "handoff" if dispatch in {"partial", "unknown"} else
                  "refresh_snapshot" if error_code == "stale_snapshot" else "inspect_error")

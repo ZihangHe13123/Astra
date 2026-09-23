@@ -93,7 +93,7 @@ Finder 翻页/关标签、WPS 保存/目录/输入法任务，再读取 [文件�
 
 - 语义按钮回执成功却没有效果，不连续重复 AXPress，也不默认改用未获支持的快捷键。正常授权下选择菜单等已观察到的新动作；未知结果仍遵守 no-replay。
 - 坐标默认是窗口相对逻辑坐标；若依据本次返回图片选点，明确传 coordinate_space="image_pixels"，工具按 published_image_size 转换。不可使用旧 Appshot 的屏幕坐标。优先用 `target_element_ref` 绑定具体目标控件。前台视觉坐标可省略引用，由最新快照限定窗口；引用失效必须重新观察。没有效果时不凭标题栏高度猜偏移、读取旧 AX 缓存再点，或改用全局 Tab/Return 重试。`action_observation` 仅提供匹配控件的值变化或目标标签仍在的证据；`unchanged` 不授权重放，`unknown` 不等于未执行，树里没有标签也不是关闭证明。
-- 弹窗切换后，`post_action_observation_pending` 表示后续界面未确认，不等于输入失败或保存成功。保留回执并优先按 `window_transition.next_observation` 用 fresh refs 正常申请观察；建议本身不授予权限，不重放原动作。
+- `post_action_observation_pending`／`next_step=follow_recovery`：动作已确认但没有返回新观察，后续界面未确认，不等于输入失败或保存成功。按本结果 Recovery 走（弹窗切换时即 `window_transition.next_observation`），不按 observe_result 截图；建议本身不授予权限，不重放原动作。
 
 ## Common Mistakes
 

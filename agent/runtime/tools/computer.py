@@ -1644,6 +1644,24 @@ def _fully_acknowledged_action_batch(value: Mapping[str, object] | None, count: 
     )
 
 
+_POST_OBSERVATION_ERROR_CODES = frozenset({
+    "helper_failed", "snapshot_failed", "observation_timeout", "target_gone",
+    "stale_target", "stale_snapshot", "overlay_blocked", "window_content_unavailable",
+    "target_not_frontmost", "permission_denied", "secure_target", "protected_context",
+    "unsafe_artifact", "user_activity_paused", "handoff_active", "session_changed",
+    "target_required",
+})
+
+
+def _post_observation_error_code(error: Exception) -> str | None:
+    """Disclose a bounded reason, never a helper/transport exception's contents."""
+    if isinstance(error, TimeoutError):
+        return "observation_timeout"
+    code = (error.error.code.value if isinstance(error, HelperApplicationError)
+            else error.code if isinstance(error, ComputerSessionError) else None)
+    return code if isinstance(code, str) and code in _POST_OBSERVATION_ERROR_CODES else None
+
+
 # Screenshots leave this module as request-local data URLs. Several remote gateways stop
 # draining request bodies somewhere around 1 MiB and let the client block until it reports
 # a write timeout, which surfaces as a provider timeout instead of a clean rejection. An
@@ -3129,6 +3147,12 @@ def register_computer_tools(
             return None
 
         def recovery_hint(recovery):
+            if manager.handed_off:
+                return (
+                    "Do not repeat this action batch. After the user yields control, "
+                    "read computer_status and follow its current computer_resume recovery; "
+                    "do not enumerate replacement refs while handoff is active."
+                )
             if recovery is not None and recovery.get("status") == "unmatched_window_observed":
                 return (
                     "Do not repeat this action batch. An unmatched window may obscure the target. "
@@ -3141,7 +3165,13 @@ def register_computer_tools(
                     "Do not repeat this action batch. Use the fresh window_transition refs "
                     "with computer_get_app_state through normal observation approval."
                 )
-            if recovery_catalog_attempted:
+            # A concurrent operation can revoke or replace the original target
+            # before this call gets to attempt its own catalog recovery.
+            if (
+                recovery_catalog_attempted
+                or manager.target is None
+                or manager.snapshot_target_binding != before_binding
+            ):
                 return (
                     "Do not repeat this action batch. Old refs were revoked. Call computer_apps, "
                     "then computer_get_app_state with fresh refs through normal observation approval."
@@ -3306,22 +3336,31 @@ def register_computer_tools(
                 "post-action computer snapshot failed error_type=%s",
                 type(observation_error).__name__,
             )
-            observation_code = (
-                observation_error.error.code.value if isinstance(observation_error, HelperApplicationError)
-                else observation_error.code if isinstance(observation_error, ComputerSessionError) else None
+            observation_code = _post_observation_error_code(observation_error)
+            # A checkpoint's validated prefix is the complete observed batch,
+            # not proof that its unexecuted suffix was delivered. Missing or
+            # malformed receipts must remain genuinely unknown.
+            acknowledged = _fully_acknowledged_action_batch(result.result, len(observed_actions))
+            failure_code = (
+                "post_action_observation_pending" if acknowledged
+                else ComputerErrorCode.UNKNOWN_OUTCOME.value
             )
-            if observation_code == ComputerErrorCode.WINDOW_CONTENT_UNAVAILABLE.value:
+            cause = {"observation_error_code": observation_code} if observation_code else {}
+            if observation_code in {
+                ComputerErrorCode.WINDOW_CONTENT_UNAVAILABLE.value,
+                ComputerErrorCode.OVERLAY_BLOCKED.value,
+            }:
                 unavailable = _application_failure(ComputerError(
-                    ComputerErrorCode.WINDOW_CONTENT_UNAVAILABLE, "",
+                    ComputerErrorCode(observation_code), "",
                 ))
                 return _failure(
-                    ComputerErrorCode.UNKNOWN_OUTCOME.value,
-                    unavailable.message,
+                    failure_code,
+                    ("Input dispatch is acknowledged. " if acknowledged else "") + unavailable.message,
                     retryable=False,
-                    recovery_hint=unavailable.recovery_hint,
+                    recovery_hint="Do not repeat this action batch. " + (unavailable.recovery_hint or ""),
                     details={
                         "observation_status": "post_action_observation_pending",
-                        "observation_error_code": observation_code,
+                        **cause,
                         "action_result": _model_action_metadata(result.result),
                     },
                 )
@@ -3332,12 +3371,17 @@ def register_computer_tools(
             if isinstance(recovery, ToolPrivateResult):
                 return recovery
             return _failure(
-                ComputerErrorCode.UNKNOWN_OUTCOME.value,
-                "The post-action window state was not observed. Check the action receipt and inspect the fresh window before deciding the result.",
+                failure_code,
+                ("Input dispatch is acknowledged. " if acknowledged else "")
+                + "The post-action window state was not observed; the effect remains unverified. "
+                + ("Only the acknowledged prefix was delivered; the remaining actions were not dispatched. "
+                   if acknowledged and checkpoint else "")
+                + "Check the action receipt before deciding the result.",
                 retryable=False,
                 recovery_hint=recovery_hint(recovery),
                 details={
                     "observation_status": "post_action_observation_pending",
+                    **cause,
                     "action_result": _model_action_metadata(result.result),
                     **({"window_transition": recovery} if recovery is not None else {}),
                 },

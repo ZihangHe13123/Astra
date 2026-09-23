@@ -158,7 +158,7 @@ def safe_action_receipt(value):
         "mode": {"background", "foreground_takeover"},
         "dispatch_state": {"not_dispatched", "attempted", "acknowledged", "partial", "unknown"},
         "verification_state": {"verified", "unverified"},
-        "next_step": {"continue_from_fresh_observation", "observe_result", "refresh_snapshot", "handoff", "inspect_error"},
+        "next_step": {"continue_from_fresh_observation", "observe_result", "follow_recovery", "refresh_snapshot", "handoff", "inspect_error"},
         "replay": {"forbidden"},
     }
     for key, options in enums.items():

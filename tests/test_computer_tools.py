@@ -26,6 +26,7 @@ from agent.runtime.computer_backend import (
     ComputerSessionManager,
     ComputerTarget,
 )
+from agent.runtime.computer_feedback import receipt_instruction
 from agent.runtime.computer_protocol import (
     ComputerError,
     ComputerErrorCode,
@@ -5681,7 +5682,7 @@ def test_unexpected_act_helper_failure_is_sanitized_unknown_outcome(
     assert sum(name == "act" for name, _value in backend.calls) == 1
 
 
-def test_post_action_snapshot_failure_is_unknown_outcome_with_ack_and_no_replay(
+def test_post_action_snapshot_failure_is_observation_pending_with_ack_and_no_replay(
     registry, manager, backend, monkeypatch, caplog,
 ):
     register(registry, manager)
@@ -5702,9 +5703,10 @@ def test_post_action_snapshot_failure_is_unknown_outcome_with_ack_and_no_replay(
         "actions": [{"type": "wait", "duration_ms": 0}],
     }))
 
-    assert result["code"] == "unknown_outcome"
+    assert result["code"] == "post_action_observation_pending"
     assert result["retryable"] is False
     assert result["recoverable"] is False
+    assert result["details"]["observation_error_code"] == "helper_failed"
     assert result["details"]["action_result"] == {
         "outcomes": [{"index": 0, "ok": True}],
         "last_acknowledged_action": 0,
@@ -5712,8 +5714,9 @@ def test_post_action_snapshot_failure_is_unknown_outcome_with_ack_and_no_replay(
         "effect_verification": "unverified",
     }
     assert result["computer_receipt"]["dispatch_state"] == "acknowledged"
-    assert result["computer_receipt"]["next_step"] == "observe_result"
+    assert result["computer_receipt"]["next_step"] == "follow_recovery"
     assert "Do not repeat" in result["recovery_hint"]
+    assert "Capture a fresh snapshot" in result["recovery_hint"]
     assert "PRIVATE-POST-ACTION-SNAPSHOT-FAILURE" not in json.dumps(result)
     assert "PRIVATE-POST-ACTION-SNAPSHOT-FAILURE" not in caplog.text
     assert sum(name == "act" for name, _value in backend.calls) == 1
@@ -5752,7 +5755,10 @@ def test_focus_checkpoint_observes_sent_prefix_without_replaying_suffix(
         "interaction_mode": "foreground_takeover",
     }))
     if observation_fails:
-        assert result["code"] == "unknown_outcome"
+        assert result["code"] == "post_action_observation_pending"
+        assert result["details"]["observation_error_code"] == "snapshot_failed"
+        assert result["computer_receipt"]["dispatch_state"] == "partial"
+        assert result["computer_receipt"]["next_step"] == "follow_recovery"
         metadata = result["details"]["action_result"]
         assert "Do not repeat" in result["recovery_hint"]
         assert observed_actions == []
@@ -6537,7 +6543,8 @@ def test_permanent_post_action_observation_failure_is_not_retried(registry, mana
     result = run(registry.execute("computer_act", {
         "snapshot_id": snapshot["snapshot_id"], "actions": [{"type": "wait", "duration_ms": 0}],
     }))
-    assert result["code"] == "unknown_outcome"
+    assert result["code"] == "post_action_observation_pending"
+    assert result["details"]["observation_error_code"] == "unsafe_artifact"
     assert attempts == 1
     assert sum(name == "act" for name, _value in backend.calls) == 1
 
@@ -6678,7 +6685,8 @@ def test_post_action_observation_has_one_total_deadline(registry, manager, backe
     result = run(registry.execute("computer_act", {
         "snapshot_id": snapshot["snapshot_id"], "actions": [{"type": "wait", "duration_ms": 0}],
     }))
-    assert result["code"] == "unknown_outcome"
+    assert result["code"] == "post_action_observation_pending"
+    assert result["details"]["observation_error_code"] == "observation_timeout"
     assert calls == ["snapshot"]
     assert sum(name == "act" for name, _ in backend.calls) == 1
 
@@ -6710,7 +6718,8 @@ def test_post_action_deadline_includes_encoding_queue(registry, manager, backend
         "snapshot_id": snapshot["snapshot_id"], "actions": [{"type": "wait", "duration_ms": 0}],
         "interaction_mode": "foreground_takeover",
     }))
-    assert result["code"] == "unknown_outcome"
+    assert result["code"] == "post_action_observation_pending"
+    assert result["details"]["observation_error_code"] == "observation_timeout"
     assert sum(name == "act" for name, _ in backend.calls) == 1
     assert sum(name == "takeover_end" for name, _ in backend.calls) == 1
 
@@ -6778,7 +6787,8 @@ def test_post_action_target_gone_returns_fresh_catalog_without_replaying_or_gran
     backend.catalog_window_ref = "modal-ref"
     backend.catalog_window_identity_ref = "modal-identity"
     result = run(registry.execute("computer_act", {"snapshot_id": initial["snapshot_id"], "actions": [{"type": "wait", "duration_ms": 0}]}))
-    assert result["code"] == "unknown_outcome"
+    assert result["code"] == "post_action_observation_pending"
+    assert result["details"]["observation_error_code"] == "target_gone"
     assert result["details"]["observation_status"] == "post_action_observation_pending"
     assert "not observed" in result["error"]
     recovery = result["details"]["window_transition"]
@@ -6787,6 +6797,9 @@ def test_post_action_target_gone_returns_fresh_catalog_without_replaying_or_gran
     assert "Other Fixture" not in json.dumps(recovery)
     assert manager.target is None
     assert not manager.grants
+    assert result["computer_receipt"]["next_step"] == "follow_recovery"
+    assert "computer_get_app_state" in result["recovery_hint"]
+    assert "computer_snapshot" not in receipt_instruction(result["computer_receipt"])
     assert sum(name == "act" for name, _ in backend.calls) == 1
     assert sum(name == "apps" for name, _ in backend.calls) == 2
 
@@ -6949,7 +6962,7 @@ def test_reobservation_requires_unique_exact_previous_window(
         "actions": [{"type": "wait", "duration_ms": 0}],
     }))
 
-    assert result["code"] == "unknown_outcome"
+    assert result["code"] == "post_action_observation_pending"
     assert not any(name == "get_app_state" for name, _ in backend.calls)
     assert sum(name == "act" for name, _ in backend.calls) == 1
 
@@ -6988,11 +7001,20 @@ def test_same_window_reobservation_rechecks_authority_inside_manager_lock(
         "actions": [{"type": "wait", "duration_ms": 0}],
     }))
 
-    assert result["code"] == "unknown_outcome"
+    assert result["code"] == "post_action_observation_pending"
     assert not any(name == "get_app_state" for name, _ in backend.calls)
     assert sum(name == "act" for name, _ in backend.calls) == 1
     if interruption == "handoff":
         assert manager.handed_off
+        rendered = ReActAgent._tool_result_context({"name": "computer_act", **result})
+        assert "Next step:" in rendered and "Recovery:" in rendered
+        assert result["computer_receipt"]["next_step"] == "follow_recovery"
+        assert result["computer_receipt"]["replay"] == "forbidden"
+        assert "computer_status" in result["recovery_hint"]
+        assert "computer_resume" in result["recovery_hint"]
+        assert "After the user yields control" in result["recovery_hint"]
+        assert "computer_apps" not in rendered
+        assert "Capture a fresh snapshot" not in rendered
     if interruption == "target":
         assert manager.target == ComputerTarget("app-2", "window-3")
 
@@ -7026,7 +7048,7 @@ def test_same_window_reobservation_failure_preserves_receipt_and_never_replays(
         "actions": [{"type": "wait", "duration_ms": 0}],
     }))
 
-    assert result["code"] == "unknown_outcome"
+    assert result["code"] == "post_action_observation_pending"
     assert result["details"]["action_result"]["last_acknowledged_action"] == 0
     assert result["details"]["action_result"]["effect_verification"] == "unverified"
     assert "PRIVATE-OBSERVATION" not in json.dumps(result)
@@ -7064,11 +7086,20 @@ def test_transition_recovery_is_bounded_and_never_replays(registry, manager, bac
     monkeypatch.setattr(backend, "apps", catalog_fail)
     monkeypatch.setattr(computer_tools, "_POST_ACTION_OBSERVATION_TIMEOUT_SECONDS", 0.04)
     result = run(registry.execute("computer_act", {"snapshot_id": initial["snapshot_id"], "actions": [{"type": "wait", "duration_ms": 0}]}))
-    assert result["code"] == "unknown_outcome"
+    assert result["code"] == "post_action_observation_pending"
     assert "window_transition" not in result["details"]
     assert "PRIVATE-RECOVERY" not in json.dumps(result)
     assert catalog_attempts == 1
     assert sum(name == "act" for name, _ in backend.calls) == 1
+    assert manager.target is None and not manager.grants
+    rendered = ReActAgent._tool_result_context({"name": "computer_act", **result})
+    assert "Next step:" in rendered and "Recovery:" in rendered
+    assert result["computer_receipt"]["next_step"] == "follow_recovery"
+    assert result["computer_receipt"]["replay"] == "forbidden"
+    assert "computer_apps" in result["recovery_hint"]
+    assert "computer_get_app_state" in result["recovery_hint"]
+    assert "computer_snapshot" not in rendered
+    assert "Capture a fresh snapshot" not in rendered
 
 
 def test_post_action_observation_does_not_capture_a_concurrently_replaced_target(registry, manager, backend, monkeypatch):
@@ -7084,9 +7115,19 @@ def test_post_action_observation_does_not_capture_a_concurrently_replaced_target
 
     monkeypatch.setattr(manager, "snapshot", replace_then_observe)
     result = run(registry.execute("computer_act", {"snapshot_id": initial["snapshot_id"], "actions": [{"type": "wait", "duration_ms": 0}]}))
-    assert result["code"] == "unknown_outcome"
+    assert result["code"] == "post_action_observation_pending"
     assert sum(name == "snapshot" for name, _ in backend.calls) == 1
     assert sum(name == "act" for name, _ in backend.calls) == 1
+    assert manager.target == ComputerTarget("app-2", "other-window")
+    assert not manager.grants
+    rendered = ReActAgent._tool_result_context({"name": "computer_act", **result})
+    assert "Next step:" in rendered and "Recovery:" in rendered
+    assert result["computer_receipt"]["next_step"] == "follow_recovery"
+    assert result["computer_receipt"]["replay"] == "forbidden"
+    assert "computer_apps" in result["recovery_hint"]
+    assert "computer_get_app_state" in result["recovery_hint"]
+    assert "computer_snapshot" not in rendered
+    assert "Capture a fresh snapshot" not in rendered
 
 
 @pytest.mark.parametrize("as_exception", [False, True])
@@ -7195,10 +7236,13 @@ def test_failed_second_catalog_refresh_does_not_return_revoked_first_refs(regist
     monkeypatch.setattr(backend, "apps", fail_second)
     result = run(registry.execute("computer_act", {"snapshot_id": initial["snapshot_id"], "actions": [{"type": "wait", "duration_ms": 0}]}))
     assert attempts == 2
-    assert result["code"] == "unknown_outcome"
+    assert result["code"] == "post_action_observation_pending"
     assert "window_transition" not in result["details"]
     assert "computer_apps" in result["recovery_hint"]
     assert manager.target is None and not manager.grants
+    # The target is revoked, so a snapshot cannot be the next step.
+    assert result["computer_receipt"]["next_step"] == "follow_recovery"
+    assert "computer_snapshot" not in receipt_instruction(result["computer_receipt"])
     assert sum(name == "act" for name, _ in backend.calls) == 1
 
 
@@ -7267,9 +7311,11 @@ def test_post_action_unavailable_pixels_preserve_capture_cause_and_stop_observin
         "actions": [{"type": "wait", "duration_ms": 0}],
     }))
 
-    assert result["code"] == "unknown_outcome"
+    assert result["code"] == "post_action_observation_pending"
     assert result["retryable"] is False
     assert result["details"]["observation_error_code"] == "window_content_unavailable"
+    assert result["computer_receipt"]["dispatch_state"] == "acknowledged"
+    assert result["computer_receipt"]["next_step"] == "follow_recovery"
     assert result["details"]["action_result"]["last_acknowledged_action"] == 0
     assert "capture/privacy state" in result["recovery_hint"]
     assert "Do not repeat" in result["recovery_hint"]
@@ -7277,6 +7323,94 @@ def test_post_action_unavailable_pixels_preserve_capture_cause_and_stop_observin
     assert "fresh_output" not in result
     assert "PRIVATE-EMPTY-IMAGE-DETAIL" not in json.dumps(result)
     assert attempts == 1
+    assert sum(name == "act" for name, _value in backend.calls) == 1
+
+
+@pytest.mark.parametrize("native_error", [False, True])
+def test_post_action_overlay_keeps_cause_without_repeating_input_or_observation(
+    registry, manager, backend, monkeypatch, native_error,
+):
+    register(registry, manager)
+    registry.set_approval_handler(lambda _request: asyncio.sleep(0, result="once"))
+    focus(registry)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    attempts = []
+
+    async def blocked(*_args, **_kwargs):
+        attempts.append("snapshot")
+        if native_error:
+            raise HelperApplicationError(ComputerError(
+                ComputerErrorCode.OVERLAY_BLOCKED, "PRIVATE-OVERLAY-DETAIL",
+            ))
+        raise ComputerSessionError("overlay_blocked", "PRIVATE-OVERLAY-DETAIL")
+
+    monkeypatch.setattr(backend, "snapshot", blocked)
+    result = run(registry.execute("computer_act", {
+        "snapshot_id": snapshot["snapshot_id"],
+        "actions": [{"type": "wait", "duration_ms": 0}],
+    }))
+    assert result["code"] == "post_action_observation_pending"
+    assert result["details"]["observation_error_code"] == "overlay_blocked"
+    assert result["computer_receipt"]["dispatch_state"] == "acknowledged"
+    assert result["computer_receipt"]["verification_state"] == "unverified"
+    assert result["computer_receipt"]["next_step"] == "follow_recovery"
+    assert result["computer_receipt"]["replay"] == "forbidden"
+    assert result["retryable"] is False
+    assert "overlay" in result["recovery_hint"].lower()
+    assert "Observe the visible popup as its own catalog target" in result["recovery_hint"]
+    assert "stop automatic input" not in receipt_instruction(result["computer_receipt"]).lower()
+    assert "Do not repeat" in result["recovery_hint"]
+    assert "PRIVATE-OVERLAY-DETAIL" not in json.dumps(result)
+    assert attempts == ["snapshot"]
+    assert sum(name == "act" for name, _value in backend.calls) == 1
+
+
+@pytest.mark.parametrize("native_result", [
+    None, {}, {"outcomes": [], "last_acknowledged_action": -1},
+    {"outcomes": [{"index": 7, "ok": True}], "last_acknowledged_action": 0},
+])
+def test_post_action_missing_delivery_proof_remains_unknown(
+    registry, manager, backend, monkeypatch, native_result,
+):
+    register(registry, manager)
+    registry.set_approval_handler(lambda _request: asyncio.sleep(0, result="once"))
+    focus(registry)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    backend.act_result = ComputerActionResult(result=native_result)
+
+    async def unavailable(*_args, **_kwargs):
+        raise ComputerSessionError("overlay_blocked")
+
+    monkeypatch.setattr(backend, "snapshot", unavailable)
+    result = run(registry.execute("computer_act", {
+        "snapshot_id": snapshot["snapshot_id"],
+        "actions": [{"type": "wait", "duration_ms": 0}],
+    }))
+    assert result["code"] == "unknown_outcome"
+    assert result["computer_receipt"]["dispatch_state"] == "unknown"
+    assert result["computer_receipt"]["replay"] == "forbidden"
+    assert sum(name == "act" for name, _value in backend.calls) == 1
+
+
+def test_post_action_unrecognized_observation_code_is_not_disclosed(
+    registry, manager, backend, monkeypatch,
+):
+    register(registry, manager)
+    registry.set_approval_handler(lambda _request: asyncio.sleep(0, result="once"))
+    focus(registry)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+
+    async def unavailable(*_args, **_kwargs):
+        raise ComputerSessionError("PRIVATE-ERROR-CODE", "PRIVATE-ERROR-MESSAGE")
+
+    monkeypatch.setattr(backend, "snapshot", unavailable)
+    result = run(registry.execute("computer_act", {
+        "snapshot_id": snapshot["snapshot_id"],
+        "actions": [{"type": "wait", "duration_ms": 0}],
+    }))
+    assert result["code"] == "post_action_observation_pending"
+    assert "observation_error_code" not in result["details"]
+    assert "PRIVATE-ERROR" not in json.dumps(result)
     assert sum(name == "act" for name, _value in backend.calls) == 1
 
 

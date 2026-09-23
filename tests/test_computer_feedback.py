@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent.runtime.computer_feedback import PendingClickGuard, build_action_receipt
+from agent.runtime.computer_feedback import PendingClickGuard, build_action_receipt, receipt_instruction
 from agent.runtime.react import ReActAgent
 
 
@@ -22,6 +22,42 @@ def test_acknowledged_submit_and_observation_failure_remain_observe_only():
     assert value["next_step"] == "observe_result"
     assert value["replay"] == "forbidden"
     assert receipt({}, error_code="stale_snapshot")["next_step"] == "handoff"
+
+
+@pytest.mark.parametrize("cause", [
+    "overlay_blocked", "window_content_unavailable", "target_gone", "snapshot_failed", "observation_timeout", None,
+])
+def test_acknowledged_missing_observation_defers_to_recovery(cause):
+    payload = {"action_result": ack(), **({"observation_error_code": cause} if cause else {})}
+    value = receipt(payload, error_code="post_action_observation_pending")
+    assert value["dispatch_state"] == "acknowledged"
+    assert value["verification_state"] == "unverified"
+    assert value["next_step"] == "follow_recovery"
+    assert value["replay"] == "forbidden"
+    guidance = receipt_instruction(value)
+    assert "Recovery" in guidance
+    assert "Do not replay" in guidance
+    # Nothing was observed and recovery may already have revoked the target, so the
+    # receipt must neither prescribe its own snapshot nor contradict Recovery.
+    for contradiction in ("computer_snapshot", "returned fresh observation", "input outcome is uncertain",
+                          "stop automatic input"):
+        assert contradiction not in guidance.lower()
+
+
+def test_observation_checkpoint_prefix_is_not_reported_as_uncertain_input():
+    value = build_action_receipt({"action_result": ack()}, mode="foreground_takeover", action_count=2,
+                                 dispatch_attempted=True, error_code="post_action_observation_pending")
+    assert value["dispatch_state"] == "partial"
+    assert value["next_step"] == "follow_recovery"
+    guidance = receipt_instruction(value)
+    assert "none after them were sent" in guidance
+    assert "input outcome is uncertain" not in guidance.lower()
+
+
+def test_observation_pending_code_is_not_delivery_proof():
+    value = receipt({}, error_code="post_action_observation_pending")
+    assert value["dispatch_state"] == "unknown"
+    assert value["next_step"] == "handoff"
 
 
 def test_checked_goals_need_final_matching_states():
