@@ -1369,7 +1369,9 @@ private func beginFailureConsumesPlanAndCleansUp(_ failure: TakeoverFixture.Fail
     #expect(result.cooperativeError == nil)
     #expect(result.lastAcknowledgedAction == 1)
     #expect(result.outcomes.map(\.index) == [0, 1])
-    #expect(result.outcomes.first?.observationRequired == true)
+    // Live 18:51: the tool layer rejects a checkpoint flag on any outcome but the last, so a
+    // resolved checkpoint must not stay on the wire (it turned the batch into unknown_outcome).
+    #expect(result.outcomes.dropLast().allSatisfy { !$0.observationRequired })
     #expect(fixture.log.values == ["keyboard_down", "keyboard_up", "keyboard_down", "keyboard_up"])
 }
 

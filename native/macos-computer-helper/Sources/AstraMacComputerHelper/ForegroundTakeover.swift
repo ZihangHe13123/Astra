@@ -1001,6 +1001,14 @@ final class ForegroundPlanExecutor {
                     )
                 }
                 logActionRejected("BOUND-FIELD-CONTINUE index=\(entries[nextIndex].sourceIndex)")
+                // The checkpoint is resolved, so it is no longer where this batch stops. Only the
+                // final outcome may carry an observation checkpoint on the wire.
+                if let last = outcomes.last, last.index == entry.sourceIndex {
+                    outcomes[outcomes.count - 1] = ActionOutcome(
+                        index: last.index, ok: last.ok, error: last.error,
+                        effectVerification: last.effectVerification, inputDiagnostics: last.inputDiagnostics
+                    )
+                }
             }
             if entry.backend != .wait { priorNonWaitInputMayHaveStarted = true }
         }

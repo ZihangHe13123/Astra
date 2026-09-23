@@ -74,3 +74,16 @@ def test_after_release_failure_requires_possible_input_and_keeps_original_cause(
     assert KeyboardFailureDiagnostics.from_mapping(data).to_mapping() == data
     with pytest.raises(ValueError):
         KeyboardFailureDiagnostics.from_mapping({**data, "input_may_have_started": False})
+
+
+def test_resolved_checkpoint_continues_as_a_plain_acknowledged_prefix():
+    """Live Edge 2026-09-23: after Cmd+L the helper proved the bound address field and typed on.
+    The resolved checkpoint leaves the wire; only the final outcome may still carry one."""
+    receipt = {"outcomes": [{"index": 0, "ok": True},
+                            {"index": 1, "ok": True, "observation_required": True}],
+               "last_acknowledged_action": 1}
+    result = ComputerActResult.from_mapping(receipt, action_count=2, response_ok=True, response_error=None)
+    assert result.to_mapping() == receipt
+    public = _model_action_metadata(result.to_mapping())
+    assert public["last_acknowledged_action"] == 1
+    assert public["observation_required"] is True
