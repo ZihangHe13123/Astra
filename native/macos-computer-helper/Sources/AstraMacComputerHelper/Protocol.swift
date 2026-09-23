@@ -170,6 +170,7 @@ func validSnapshotResponseInvariants(
         "display_id", "target_window_bounds", "cursor_visible",
         "virtual_pointer",
         "has_default_button", "default_button_element_ref",
+        "suggestion_popups",
     ])
     if case .on = textDetail {
         allowed.formUnion(["text_detail_artifact", "text_detail_metadata"])
@@ -187,6 +188,7 @@ func validSnapshotResponseInvariants(
           payload["display_id"].map(snapshotResponsePositiveWholeNumber) ?? true,
           payload["target_window_bounds"].map(snapshotResponseValidBounds) ?? true,
           payload["virtual_pointer"].map(snapshotResponseValidPoint) ?? true,
+          payload["suggestion_popups"].map(snapshotResponseValidSuggestionPopups) ?? true,
           case .object? = payload["ax_tree"]
     else { return false }
     if let cursor = payload["cursor_visible"], case .bool = cursor {} else if payload["cursor_visible"] != nil {
@@ -307,6 +309,14 @@ private func snapshotResponseValidPoint(_ value: JSONValue?) -> Bool {
           snapshotResponseFiniteNumber(values["y"]) != nil
     else { return false }
     return true
+}
+
+/// The focused field's open suggestion lists, window-local; present only when nonempty.
+private func snapshotResponseValidSuggestionPopups(_ value: JSONValue?) -> Bool {
+    guard case let .array(popups)? = value,
+          (1...maximumReportedSuggestionPopups).contains(popups.count)
+    else { return false }
+    return popups.allSatisfy(snapshotResponseValidBounds)
 }
 
 private func snapshotResponseFiniteNumber(_ value: JSONValue?) -> Double? {

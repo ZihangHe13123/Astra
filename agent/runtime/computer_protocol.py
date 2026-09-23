@@ -28,6 +28,8 @@ MAX_PUBLIC_AX_MAPPING_FIELDS = 128
 MAX_PUBLIC_AX_STRING_CHARACTERS = 512
 MAX_NATIVE_AX_DEPTH = 20
 MAX_NATIVE_AX_NODES = 1_000
+# Snapshots name at most this many open suggestion lists of the focused field (helper parity).
+MAX_SUGGESTION_POPUPS = 4
 TEXT_DETAIL_TRUNCATION_REASONS = (
     "depth_limit",
     "node_limit",
@@ -1066,6 +1068,7 @@ def validate_snapshot_payload(value: Any, *, snapshot_id: str | None = None) -> 
         "virtual_pointer",
         "has_default_button",
         "default_button_element_ref",
+        "suggestion_popups",
     } | detail_fields
     _reject_unknown_fields(value, allowed, "snapshot payload")
     missing = required - set(value)
@@ -1108,6 +1111,15 @@ def validate_snapshot_payload(value: Any, *, snapshot_id: str | None = None) -> 
             )
     if not isinstance(value["ax_tree"], Mapping):
         raise ValueError("snapshot payload ax_tree must be an object")  # noqa: TRY004 - wire validation
+    if "suggestion_popups" in value:
+        # The focused field's own suggestion lists, window-local; the helper omits an empty list.
+        popups = value["suggestion_popups"]
+        if not isinstance(popups, list) or not 1 <= len(popups) <= MAX_SUGGESTION_POPUPS:
+            raise ValueError(
+                f"snapshot payload suggestion_popups must list 1 to {MAX_SUGGESTION_POPUPS} bounds"
+            )
+        for popup in popups:
+            _validate_bounds(popup, "snapshot payload suggestion_popups item")
     if "has_default_button" in value and not isinstance(value["has_default_button"], bool):
         raise ValueError("snapshot payload default button presence must be a boolean")
     if "default_button_element_ref" in value:

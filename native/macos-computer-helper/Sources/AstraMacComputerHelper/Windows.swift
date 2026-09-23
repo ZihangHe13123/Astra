@@ -2121,6 +2121,16 @@ final class SystemWindowObserver: WindowObserving {
                 if let elementRef = prepared.defaultButton.elementRef {
                     payload["default_button_element_ref"] = .string(elementRef)
                 }
+                // A waived suggestion list is its own window, so this capture does not show it.
+                let suggestionPopups = liveSuggestionPopupRegions(
+                    pid: target.pid, windowID: target.windowID, root: expectedAXWindow
+                ).prefix(maximumReportedSuggestionPopups)
+                if !suggestionPopups.isEmpty {
+                    payload["suggestion_popups"] = .array(suggestionPopups.map {
+                        CGRectJSON.encode(CGRect(x: $0.minX - window.frame.minX, y: $0.minY - window.frame.minY,
+                                                 width: $0.width, height: $0.height))
+                    })
+                }
                 if case let .on(detailName) = textDetail,
                    let detail = prepared.detail
                 {
@@ -2417,7 +2427,28 @@ final class SystemWindowObserver: WindowObserving {
             candidate.isSharingIndicator && sharingIndicatorWithinTitlebar(candidate.bounds, targetBounds: current.frame)
                 ? candidate.windowID : nil
         })
-        let overlayCandidates = visibleWindows.filter { !indicatorIDs.contains($0.windowID) }
+        let withoutIndicators = visibleWindows.filter { !indicatorIDs.contains($0.windowID) }
+        let focusedField = selectedAXWindows.count == 1 &&
+            mayHaveSuggestionPopup(withoutIndicators, targetPID: target.pid, targetWindowID: current.windowID)
+            ? selectedAXWindows[0].element.flatMap {
+                focusedTextFieldFrame(app: app, root: $0, pid: target.pid, targetBounds: current.frame)
+            } : nil
+        let overlayCandidates = overlayCandidateRecords(withoutIndicators, targetPID: target.pid,
+            targetWindowID: current.windowID, targetBounds: current.frame, focusedField: focusedField) ?? withoutIndicators
+        let suggestionPopups = attachedSuggestionPopupRecords(withoutIndicators, targetPID: target.pid,
+            targetWindowID: current.windowID, targetBounds: current.frame, focusedField: focusedField)
+        func placement(_ records: [VisibleWindowRecord]) -> String {
+            records.map {
+                "[dx=\(Int($0.bounds.minX - current.frame.minX)) dy=\(Int($0.bounds.minY - current.frame.minY)) " +
+                "w=\(Int($0.bounds.width)) h=\(Int($0.bounds.height))]"
+            }.joined(separator: " ")
+        }
+        let strips = appStatusStripRecords(withoutIndicators, targetPID: target.pid,
+            targetWindowID: current.windowID, targetBounds: current.frame)
+        if !strips.isEmpty { logActionRejected("OVERLAY-PASSIVE status_strip \(placement(strips))") }
+        if !suggestionPopups.isEmpty {
+            logActionRejected("OVERLAY-PASSIVE suggestion_popup \(placement(suggestionPopups))")
+        }
         let containsVisibleOverlay = containedVisibleOverlayOrUncertain(
             targetPID: target.pid,
             targetWindowID: current.windowID,
@@ -2465,7 +2496,8 @@ final class SystemWindowObserver: WindowObserving {
             axWindows: axWindows,
             containsUnselectedOverlay: containsAXOverlay || containsVisibleOverlay,
             overlayMayBeTransient: overlayMayBeTransient,
-            siblingOrdering: siblingOrdering
+            siblingOrdering: siblingOrdering,
+            suggestionPopupWindowIDs: Set(suggestionPopups.map(\.windowID))
         )
     }
 
@@ -2481,10 +2513,16 @@ final class SystemWindowObserver: WindowObserving {
                   windowSharingIndicator(element, bounds: bounds) else { return nil }
             return bounds
         }
-        return records.filter { record in
+        let withoutIndicators = records.filter { record in
             record.pid != target.pid || record.windowID == target.windowID ||
                 !indicatorBounds.contains(record.bounds)
         }
+        let focusedField = mayHaveSuggestionPopup(withoutIndicators, targetPID: target.pid,
+                                                  targetWindowID: target.windowID) ? target.axElement.flatMap {
+            focusedTextFieldFrame(app: app, root: $0, pid: target.pid, targetBounds: target.bounds)
+        } : nil
+        return overlayCandidateRecords(withoutIndicators, targetPID: target.pid, targetWindowID: target.windowID,
+                                       targetBounds: target.bounds, focusedField: focusedField) ?? withoutIndicators
     }
 
     func planActions(
@@ -2805,7 +2843,7 @@ final class SystemWindowObserver: WindowObserving {
             throw ActionExecutionError.staleSnapshot
         }
         let performer = makeActionPerformer(target: target, snapshotContext: stored.snapshotContext)
-        let validator = BackgroundPIDActionGuardValidator { [weak self] in
+        let validator = BackgroundPIDActionGuardValidator(state: { [weak self] in
             guard let self else { throw ActionExecutionError.targetGone }
             let state = try self.backgroundTargetController().snapshotTargetState(target)
             return PIDActionTargetState(
@@ -2814,7 +2852,9 @@ final class SystemWindowObserver: WindowObserving {
                 isFrontmost: false,
                 isKeyWindow: false
             )
-        }
+        }, pointerExclusions: {
+            livePassiveOverlayRegions(pid: target.pid, windowID: target.windowID, root: target.axElement)
+        })
         let executor = PIDTargetedActionExecutor(
             poster: CGPIDTargetedInputPoster(),
             compatibility: pidCompatibility,
@@ -3236,7 +3276,9 @@ final class SystemWindowObserver: WindowObserving {
         virtualCursor.hide()
         let executor = PIDTargetedActionExecutor(
             poster: CGForegroundInputPoster(pointIsInTargetWindow: { point, pid in
-                foregroundPointBelongsToWindow(point, pid: pid, window: target.axElement)
+                foregroundPointBelongsToWindow(point, pid: pid, window: target.axElement) &&
+                    !livePassiveOverlayRegions(pid: pid, windowID: target.windowID, root: target.axElement)
+                        .contains { $0.contains(point) }
             }),
             compatibility: pidCompatibility,
             genericForegroundEnabled: true,
@@ -3263,7 +3305,9 @@ final class SystemWindowObserver: WindowObserving {
         )
         let keyboardExecutor = ForegroundKeyboardExecutor(
             poster: CGForegroundInputPoster(pointIsInTargetWindow: { point, pid in
-                foregroundPointBelongsToWindow(point, pid: pid, window: target.axElement)
+                foregroundPointBelongsToWindow(point, pid: pid, window: target.axElement) &&
+                    !livePassiveOverlayRegions(pid: pid, windowID: target.windowID, root: target.axElement)
+                        .contains { $0.contains(point) }
             }),
             compatibility: pidCompatibility,
             genericForegroundEnabled: true,
@@ -4365,6 +4409,149 @@ func backgroundVisibleWindowAmbiguities(
                 focusedBounds: record.bounds
             ) || approximatelyEqual(record.bounds, targetBounds))
     }
+}
+
+/// Browsers show a hovered link's address in a thin strip on the window's bottom edge (live Edge:
+/// 24 pt tall, 437 to 1283 pt wide, alpha animating). It takes no focus and hides no control of the
+/// window's own capture, so it does not block binding; pointer input inside it is still refused.
+func appStatusStripOverlay(_ record: VisibleWindowRecord, targetBounds: CGRect, targetLayer: Int) -> Bool {
+    let bounds = record.bounds
+    guard [bounds.minX, bounds.minY, bounds.width, bounds.height].allSatisfy(\.isFinite),
+          record.layer == targetLayer,
+          bounds.width > 0, bounds.height > 0, bounds.height <= 32,
+          bounds.minX >= targetBounds.minX, bounds.maxX <= targetBounds.maxX,
+          bounds.maxY <= targetBounds.maxY, targetBounds.maxY - bounds.maxY <= 8
+    else { return false }
+    return true
+}
+
+/// This app's bottom-edge status strips over the target, judged against the target's own live
+/// record. Without that record nothing is waived.
+func appStatusStripRecords(
+    _ records: [VisibleWindowRecord], targetPID: pid_t, targetWindowID: CGWindowID, targetBounds: CGRect
+) -> [VisibleWindowRecord] {
+    let selected = records.filter { $0.pid == targetPID && $0.windowID == targetWindowID }
+    guard selected.count == 1, let target = selected.first else { return [] }
+    return records.filter {
+        $0.pid == targetPID && $0.windowID != targetWindowID &&
+            appStatusStripOverlay($0, targetBounds: targetBounds, targetLayer: target.layer)
+    }
+}
+
+func appStatusStripRegions(
+    _ records: [VisibleWindowRecord], targetPID: pid_t, targetWindowID: CGWindowID, targetBounds: CGRect
+) -> [CGRect] {
+    appStatusStripRecords(records, targetPID: targetPID, targetWindowID: targetWindowID,
+                          targetBounds: targetBounds).map(\.bounds)
+}
+
+/// Snapshots name at most this many open suggestion lists.
+let maximumReportedSuggestionPopups = 4
+
+/// A focused text field's own suggestion list (live Edge: a separate window on the page's layer that
+/// encloses the address field and drops 199 to 471 pt below it; Finder drops its search list just
+/// under the field). Keyboard focus stays in the field, so the list does not block binding; pointer
+/// input inside it is refused. Menus and modal panels use other layers and still block.
+func attachedSuggestionPopup(
+    _ record: VisibleWindowRecord, focusedField field: CGRect, targetBounds: CGRect, targetLayer: Int
+) -> Bool {
+    let bounds = record.bounds
+    let reach: CGFloat = 16
+    guard [bounds.minX, bounds.minY, bounds.width, bounds.height,
+           field.minX, field.minY, field.width, field.height].allSatisfy(\.isFinite),
+          record.layer == targetLayer || record.layer == Int(CGWindowLevelForKey(.floatingWindow)),
+          bounds.width > 0, bounds.height > 0, field.width > 0, field.height > 0,
+          targetBounds.insetBy(dx: -1, dy: -1).contains(field),
+          // A list never covers most of its window; another document window would.
+          bounds.width <= targetBounds.width + 1, bounds.height <= targetBounds.height * 0.75
+    else { return false }
+    let overlap = min(bounds.maxX, field.maxX) - max(bounds.minX, field.minX)
+    guard overlap >= min(bounds.width, field.width) / 2 else { return false }
+    let hangsBelow = bounds.minY >= field.minY - reach && bounds.minY <= field.maxY + reach &&
+        bounds.maxY > field.maxY
+    let opensAbove = bounds.maxY >= field.minY - reach && bounds.maxY <= field.maxY + reach &&
+        bounds.minY < field.minY
+    return hangsBelow || opensAbove
+}
+
+/// This app's suggestion lists hanging from the focused field, judged against the target's own live
+/// record. Without that record or a focused field nothing is waived.
+func attachedSuggestionPopupRecords(
+    _ records: [VisibleWindowRecord], targetPID: pid_t, targetWindowID: CGWindowID, targetBounds: CGRect,
+    focusedField: CGRect?
+) -> [VisibleWindowRecord] {
+    guard let focusedField else { return [] }
+    let selected = records.filter { $0.pid == targetPID && $0.windowID == targetWindowID }
+    guard selected.count == 1, let target = selected.first else { return [] }
+    return records.filter {
+        $0.pid == targetPID && $0.windowID != targetWindowID &&
+            attachedSuggestionPopup($0, focusedField: focusedField, targetBounds: targetBounds,
+                                    targetLayer: target.layer)
+    }
+}
+
+/// Windows that may block exact binding: everything except this app's bottom-edge status strips and
+/// the suggestion lists of `focusedField`, the target's focused text field.
+func overlayCandidateRecords(
+    _ records: [VisibleWindowRecord]?, targetPID: pid_t, targetWindowID: CGWindowID, targetBounds: CGRect,
+    focusedField: CGRect? = nil
+) -> [VisibleWindowRecord]? {
+    guard let records else { return nil }
+    let passive = appStatusStripRecords(records, targetPID: targetPID, targetWindowID: targetWindowID,
+                                        targetBounds: targetBounds) +
+        attachedSuggestionPopupRecords(records, targetPID: targetPID, targetWindowID: targetWindowID,
+                                       targetBounds: targetBounds, focusedField: focusedField)
+    let passiveIDs = Set(passive.map(\.windowID))
+    return records.filter { !passiveIDs.contains($0.windowID) }
+}
+
+/// Only another on-screen window of the target app can be a suggestion list, so the focused field
+/// is read only then.
+func mayHaveSuggestionPopup(_ records: [VisibleWindowRecord], targetPID: pid_t, targetWindowID: CGWindowID) -> Bool {
+    records.contains { $0.pid == targetPID && $0.windowID != targetWindowID }
+}
+
+/// The frame of the app's focused text field when it is not secure and lies in `root`, the exact
+/// target window. An unreadable focus is no field.
+func focusedTextFieldFrame(app: AXUIElement, root: AXUIElement, pid: pid_t, targetBounds: CGRect) -> CGRect? {
+    let (error, value) = observationAXAttribute(app, kAXFocusedUIElementAttribute)
+    guard error == .success, let focused = decodeAXElement(value) else { return nil }
+    let role = AXNodeReader.stringAttribute(focused, kAXRoleAttribute)
+    let subrole = AXNodeReader.stringAttribute(focused, kAXSubroleAttribute)
+    guard role.status == .complete, subrole.status == .complete,
+          let roleValue = role.value,
+          [kAXTextFieldRole as String, kAXTextAreaRole as String, kAXComboBoxRole as String].contains(roleValue),
+          !keyboardFocusIsExplicitlySecure(role: roleValue, subrole: subrole.value),
+          let frame = AXNodeReader.frameAttribute(focused),
+          targetBounds.insetBy(dx: -1, dy: -1).contains(frame),
+          focusedElementBelongsToExactAXRoot(element: focused, root: root, pid: pid)
+    else { return nil }
+    return frame
+}
+
+/// Live rectangles over one window that bind but must not receive pointer input: this app's status
+/// strips and, while `root` holds the focused text field, that field's suggestion lists.
+func livePassiveOverlayRegions(pid: pid_t, windowID: CGWindowID, root: AXUIElement?) -> [CGRect] {
+    let records = systemVisibleWindowRecords()
+    guard let target = records.first(where: { $0.pid == pid && $0.windowID == windowID }) else { return [] }
+    let field = mayHaveSuggestionPopup(records, targetPID: pid, targetWindowID: windowID) ? root.flatMap {
+        focusedTextFieldFrame(app: AXUIElementCreateApplication(pid), root: $0, pid: pid, targetBounds: target.bounds)
+    } : nil
+    return (appStatusStripRecords(records, targetPID: pid, targetWindowID: windowID, targetBounds: target.bounds) +
+        attachedSuggestionPopupRecords(records, targetPID: pid, targetWindowID: windowID,
+                                       targetBounds: target.bounds, focusedField: field)).map(\.bounds)
+}
+
+/// Live suggestion lists of the focused field in `root`, for telling the observer they are open.
+func liveSuggestionPopupRegions(pid: pid_t, windowID: CGWindowID, root: AXUIElement) -> [CGRect] {
+    let records = systemVisibleWindowRecords()
+    guard let target = records.first(where: { $0.pid == pid && $0.windowID == windowID }),
+          mayHaveSuggestionPopup(records, targetPID: pid, targetWindowID: windowID),
+          let field = focusedTextFieldFrame(app: AXUIElementCreateApplication(pid), root: root, pid: pid,
+                                            targetBounds: target.bounds)
+    else { return [] }
+    return attachedSuggestionPopupRecords(records, targetPID: pid, targetWindowID: windowID,
+                                          targetBounds: target.bounds, focusedField: field).map(\.bounds)
 }
 
 func windowIsProvablyBehind(

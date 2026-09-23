@@ -133,6 +133,7 @@ class FakeComputerBackend:
         self.snapshot_root_label = "Fixture"
         self.has_default_button = False
         self.default_button_element_ref: str | None = None
+        self.suggestion_popups: list[dict[str, float]] | None = None
         self.snapshot_ax_tree_override: dict[str, object] | None = None
         self.status_error: Exception | None = None
         self.select_error: Exception | None = None
@@ -300,6 +301,7 @@ class FakeComputerBackend:
                 {"default_button_element_ref": self.default_button_element_ref}
                 if self.default_button_element_ref is not None else {}
             ),
+            **({"suggestion_popups": self.suggestion_popups} if self.suggestion_popups else {}),
             **detail_payload,
             **(
                 {
@@ -2319,6 +2321,33 @@ def test_snapshot_public_payload_copies_trusted_default_button_disclosure(
     payload = json.loads(result["fresh_output"])
     assert payload["has_default_button"] is True
     assert payload["default_button_element_ref"] == "snapshot-1:export"
+
+
+def test_snapshot_reports_the_focused_fields_open_suggestion_list(registry, manager, backend):
+    """Live Edge 2026-09-23: the address field's suggestion list is a separate window, so the capture
+    omits it. The model must learn it is open, that keys still reach the field, and why a pointer
+    inside it is refused."""
+    backend.suggestion_popups = [{"x": 64, "y": 40, "width": 1038, "height": 199}]
+    register(registry, manager)
+    focus(registry)
+
+    payload = json.loads(run(registry.execute("computer_snapshot", {"scope": "target_window"}))["fresh_output"])
+
+    assert payload["suggestion_popups"] == [{"x": 64, "y": 40, "width": 1038, "height": 199}]
+    assert "suggestion list is open" in payload["message"]
+    assert "not in this image" in payload["message"]
+    assert "Keys still go to the field" in payload["message"]
+    assert "Pointer input inside it is refused" in payload["message"]
+
+
+def test_snapshot_without_suggestion_list_says_nothing_about_one(registry, manager, backend):
+    register(registry, manager)
+    focus(registry)
+
+    payload = json.loads(run(registry.execute("computer_snapshot", {"scope": "target_window"}))["fresh_output"])
+
+    assert "suggestion_popups" not in payload
+    assert "suggestion list" not in payload["message"]
 
 
 def test_snapshot_public_payload_omits_default_button_ref_when_ax_tree_is_truncated(

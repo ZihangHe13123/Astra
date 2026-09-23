@@ -1575,3 +1575,21 @@ func scrollEncoderMapsPositiveContentOffsetsToDownAndRight(delta: Int32) throws 
     try poster.post(.mouseDragged(point: CGPoint(x: 10, y: 20)), to: 777, marker: 124)
     #expect(received.suffix(2).allSatisfy { $0.getDoubleValueField(.mouseEventDeltaX) == 0 && $0.getDoubleValueField(.mouseEventDeltaY) == 0 })
 }
+
+
+// A waived status strip still must not receive a background click meant for the page below it.
+@Test func backgroundPointerValidatorRefusesPointsInsideExcludedRegions() throws {
+    let bounds = CGRect(x: 25, y: 30, width: 1319, height: 768)
+    let guardValue = ActionGuard(pid: 42, windowID: 273, bounds: bounds, axIdentity: 5,
+        snapshotID: "snapshot", interactionMode: .background)
+    let validator = BackgroundPIDActionGuardValidator(state: {
+        PIDActionTargetState(target: ActionTargetState(pid: 42, windowID: 273, bounds: bounds, axIdentity: 5,
+                                                       focusedAXIdentity: 5, focusedAXBounds: bounds),
+                             snapshotID: "snapshot", isFrontmost: false, isKeyWindow: false)
+    }, pointerExclusions: { [CGRect(x: 28, y: 771, width: 437, height: 24)] })
+    try validator.revalidate(expected: guardValue, point: CGPoint(x: 400, y: 400))
+    try validator.revalidate(expected: guardValue, point: nil)
+    #expect(throws: ActionExecutionError.outOfBounds) {
+        try validator.revalidate(expected: guardValue, point: CGPoint(x: 100, y: 780))
+    }
+}

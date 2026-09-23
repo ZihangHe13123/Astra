@@ -84,6 +84,23 @@ def test_snapshot_payload_accepts_the_virtual_cursor_pointer() -> None:
     )
 
 
+def test_snapshot_payload_accepts_the_focused_fields_suggestion_popups() -> None:
+    validate_snapshot_payload(_snapshot_payload(
+        suggestion_popups=[{"x": 64.0, "y": 40.0, "width": 1038.0, "height": 199.0}],
+    ))
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [[], [{"x": 1.0, "y": 2.0, "width": 3.0, "height": 4.0}] * 5, [{"x": 1.0, "y": 2.0}],
+     [{"x": 1.0, "y": 2.0, "width": 0.0, "height": 4.0}], {"x": 1.0, "y": 2.0, "width": 3.0, "height": 4.0},
+     [{"x": 1.0, "y": 2.0, "width": 3.0, "height": 4.0, "layer": 0}]],
+)
+def test_suggestion_popups_shape_is_validated(bad) -> None:
+    with pytest.raises(ValueError):
+        validate_snapshot_payload(_snapshot_payload(suggestion_popups=bad))
+
+
 @pytest.mark.parametrize(
     "bad",
     [{"x": 1.0}, {"x": 1.0, "y": "2"}, {"x": 1.0, "y": 2.0, "z": 3.0}, True, {"x": 1.0, "y": float("nan")}],

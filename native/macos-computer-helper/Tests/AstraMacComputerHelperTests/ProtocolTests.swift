@@ -197,6 +197,26 @@ import Testing
     }
 }
 
+@Test func snapshotInvariantsAcceptOnlyBoundedSuggestionPopups() {
+    let popup = JSONValue.object(["x": .number(64), "y": .number(40), "width": .number(1038), "height": .number(199)])
+    #expect(validSnapshotResponseInvariants(
+        snapshotProtocolValue(payloadExtra: ["suggestion_popups": .array([popup])]),
+        textDetail: .off
+    ))
+    for malformed in [
+        JSONValue.array([]),
+        JSONValue.array(Array(repeating: popup, count: maximumReportedSuggestionPopups + 1)),
+        JSONValue.array([.object(["x": .number(1), "y": .number(2), "width": .number(0), "height": .number(3)])]),
+        JSONValue.array([.object(["x": .number(1), "y": .number(2)])]),
+        popup,
+    ] {
+        #expect(!validSnapshotResponseInvariants(
+            snapshotProtocolValue(payloadExtra: ["suggestion_popups": malformed]),
+            textDetail: .off
+        ))
+    }
+}
+
 @Test func getAppStateResponseRequiresRequestedArtifactAndExactDetailPairing() {
     let imageName = "snapshot-0123456789abcdef0123456789abcdef.png"
     let detailName = "snapshot-0123456789abcdef0123456789abcdef.ax.json"

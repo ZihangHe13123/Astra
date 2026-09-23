@@ -274,8 +274,14 @@ final class PopupPointerClickGuardValidator: PIDActionGuardValidating {
 /// requirement, no real-cursor movement promised by the caller.
 final class BackgroundPIDActionGuardValidator: PIDActionGuardValidating {
     private let state: () throws -> PIDActionTargetState
+    /// Regions of the target that bind but must not receive pointer input, such as a waived
+    /// status strip over the page.
+    private let pointerExclusions: () -> [CGRect]
 
-    init(state: @escaping () throws -> PIDActionTargetState) { self.state = state }
+    init(state: @escaping () throws -> PIDActionTargetState, pointerExclusions: @escaping () -> [CGRect] = { [] }) {
+        self.state = state
+        self.pointerExclusions = pointerExclusions
+    }
 
     func revalidate(expected: ActionGuard, point: CGPoint?) throws {
         let current = try state()
@@ -296,7 +302,9 @@ final class BackgroundPIDActionGuardValidator: PIDActionGuardValidating {
             throw ActionExecutionError.staleSnapshot
         }
         if let point {
-            guard point.x.isFinite, point.y.isFinite, current.target.bounds.contains(point) else {
+            guard point.x.isFinite, point.y.isFinite, current.target.bounds.contains(point),
+                  !pointerExclusions().contains(where: { $0.contains(point) })
+            else {
                 throw ActionExecutionError.outOfBounds
             }
         }

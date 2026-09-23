@@ -2153,6 +2153,103 @@ func artifactBundleCloseAndEOFPreserveRetainedQuarantines(closeAcknowledged: Boo
     #expect(records == nil)
 }
 
+// Live Edge 152 (2026-09-23): a hovered link's address appeared in a thin strip on the window's
+// bottom edge (24 pt tall, then 1283 pt wide, alpha animating). It blocked every observation and
+// the pre-action check, so no Edge action could run while the pointer rested on a link.
+@Test func appStatusStripOnTheBottomEdgeIsNotABlockingOverlay() {
+    let window = CGRect(x: 25, y: 30, width: 1319, height: 768)
+    func strip(_ bounds: CGRect, layer: Int = 0, pid: pid_t = 42) -> VisibleWindowRecord {
+        VisibleWindowRecord(pid: pid, windowID: 9, bounds: bounds, layer: layer, alpha: 0.55, zOrder: 14)
+    }
+    let narrow = strip(CGRect(x: 28, y: 771, width: 437, height: 24))
+    let wide = strip(CGRect(x: 28, y: 771, width: 1283, height: 24))
+    #expect(appStatusStripOverlay(narrow, targetBounds: window, targetLayer: 0))
+    #expect(appStatusStripOverlay(wide, targetBounds: window, targetLayer: 0))
+    // Taller bars, strips away from the bottom edge, other layers and strips leaving the window block.
+    #expect(!appStatusStripOverlay(strip(CGRect(x: 28, y: 745, width: 437, height: 50)), targetBounds: window, targetLayer: 0))
+    #expect(!appStatusStripOverlay(strip(CGRect(x: 28, y: 60, width: 437, height: 24)), targetBounds: window, targetLayer: 0))
+    #expect(!appStatusStripOverlay(strip(CGRect(x: 28, y: 740, width: 437, height: 24)), targetBounds: window, targetLayer: 0))
+    #expect(!appStatusStripOverlay(strip(CGRect(x: 28, y: 771, width: 437, height: 24), layer: 3),
+                                   targetBounds: window, targetLayer: 0))
+    #expect(!appStatusStripOverlay(strip(CGRect(x: 10, y: 771, width: 437, height: 24)), targetBounds: window, targetLayer: 0))
+
+    let target = VisibleWindowRecord(pid: 42, windowID: 273, bounds: window, layer: 0, alpha: 1, zOrder: 15)
+    let dropdown = VisibleWindowRecord(pid: 42, windowID: 10, bounds: CGRect(x: 89, y: 70, width: 1038, height: 199),
+        layer: 0, alpha: 1, zOrder: 13)
+    let withStrip = overlayCandidateRecords([narrow, target], targetPID: 42, targetWindowID: 273, targetBounds: window)
+    #expect(withStrip?.map(\.windowID) == [273])
+    #expect(!containedVisibleOverlayOrUncertain(targetPID: 42, targetWindowID: 273, targetBounds: window,
+                                                records: withStrip))
+    // A same-app dropdown still blocks, and another app's strip is not this app's overlay to waive.
+    let withDropdown = overlayCandidateRecords([wide, dropdown, target], targetPID: 42, targetWindowID: 273,
+                                               targetBounds: window)
+    #expect(withDropdown?.map(\.windowID) == [10, 273])
+    #expect(containedVisibleOverlayOrUncertain(targetPID: 42, targetWindowID: 273, targetBounds: window,
+                                               records: withDropdown))
+    #expect(overlayCandidateRecords([strip(narrow.bounds, pid: 77), target], targetPID: 42, targetWindowID: 273,
+                                    targetBounds: window)?.count == 2)
+    #expect(overlayCandidateRecords(nil, targetPID: 42, targetWindowID: 273, targetBounds: window) == nil)
+    #expect(appStatusStripRegions([narrow, dropdown, target], targetPID: 42, targetWindowID: 273,
+                                  targetBounds: window) == [narrow.bounds])
+}
+
+// Live Edge 152 (2026-09-23): clicking or typing in the address field opens its suggestion list, a
+// separate same-layer window that encloses the field (149,78 950x24) and drops 199 or 471 pt below.
+// It blocked every observation of the page, so the field could not be typed into or submitted.
+@Test func focusedFieldSuggestionListIsNotABlockingOverlay() {
+    let window = CGRect(x: 25, y: 30, width: 1319, height: 768)
+    let field = CGRect(x: 149, y: 78, width: 950, height: 24)
+    func popup(_ bounds: CGRect, layer: Int = 0, pid: pid_t = 42) -> VisibleWindowRecord {
+        VisibleWindowRecord(pid: pid, windowID: 10, bounds: bounds, layer: layer, alpha: 1, zOrder: 15)
+    }
+    let typed = popup(CGRect(x: 89, y: 70, width: 1038, height: 199))
+    let zeroSuggest = popup(CGRect(x: 89, y: 70, width: 1038, height: 471))
+    #expect(attachedSuggestionPopup(typed, focusedField: field, targetBounds: window, targetLayer: 0))
+    #expect(attachedSuggestionPopup(zeroSuggest, focusedField: field, targetBounds: window, targetLayer: 0))
+    // AppKit drops the list just under a search field; floating autofill lists hang the same way.
+    let search = CGRect(x: 740, y: 42, width: 200, height: 22)
+    let finder = CGRect(x: 0, y: 25, width: 1000, height: 600)
+    let list = CGRect(x: 715, y: 69, width: 240, height: 118)
+    #expect(attachedSuggestionPopup(popup(list), focusedField: search, targetBounds: finder, targetLayer: 0))
+    #expect(attachedSuggestionPopup(popup(list, layer: 3), focusedField: search, targetBounds: finder, targetLayer: 0))
+    #expect(attachedSuggestionPopup(popup(CGRect(x: 715, y: -80, width: 240, height: 118)),
+                                    focusedField: search, targetBounds: finder, targetLayer: 0))
+    // Menus and modal panels take the keyboard, so their layers keep blocking; so do windows that
+    // do not hang from the field.
+    #expect(!attachedSuggestionPopup(popup(list, layer: 8), focusedField: search, targetBounds: finder, targetLayer: 0))
+    #expect(!attachedSuggestionPopup(popup(list, layer: 101), focusedField: search, targetBounds: finder, targetLayer: 0))
+    #expect(!attachedSuggestionPopup(popup(CGRect(x: 715, y: 170, width: 240, height: 118)),
+                                     focusedField: search, targetBounds: finder, targetLayer: 0))
+    #expect(!attachedSuggestionPopup(popup(CGRect(x: 100, y: 69, width: 240, height: 118)),
+                                     focusedField: search, targetBounds: finder, targetLayer: 0))
+    #expect(!attachedSuggestionPopup(typed, focusedField: CGRect(x: 149, y: 900, width: 950, height: 24),
+                                     targetBounds: window, targetLayer: 0))
+    // A second document window that happens to start at the field is not a list.
+    #expect(!attachedSuggestionPopup(popup(CGRect(x: 89, y: 70, width: 1200, height: 700)),
+                                     focusedField: field, targetBounds: window, targetLayer: 0))
+    #expect(!attachedSuggestionPopup(popup(CGRect(x: 20, y: 70, width: 1330, height: 300)),
+                                     focusedField: field, targetBounds: window, targetLayer: 0))
+
+    let target = VisibleWindowRecord(pid: 42, windowID: 273, bounds: window, layer: 0, alpha: 1, zOrder: 16)
+    let waived = overlayCandidateRecords([typed, target], targetPID: 42, targetWindowID: 273, targetBounds: window,
+                                         focusedField: field)
+    #expect(waived?.map(\.windowID) == [273])
+    #expect(!containedVisibleOverlayOrUncertain(targetPID: 42, targetWindowID: 273, targetBounds: window,
+                                                records: waived))
+    // Without a focused field in the target, or for another app's window, the list still blocks.
+    #expect(overlayCandidateRecords([typed, target], targetPID: 42, targetWindowID: 273, targetBounds: window)?
+        .map(\.windowID) == [10, 273])
+    #expect(overlayCandidateRecords([popup(typed.bounds, pid: 77), target], targetPID: 42, targetWindowID: 273,
+                                    targetBounds: window, focusedField: field)?.count == 2)
+    #expect(mayHaveSuggestionPopup([typed, target], targetPID: 42, targetWindowID: 273))
+    #expect(!mayHaveSuggestionPopup([popup(typed.bounds, pid: 77), target], targetPID: 42, targetWindowID: 273))
+    // The waiver is judged against the target's own live record.
+    #expect(attachedSuggestionPopupRecords([typed], targetPID: 42, targetWindowID: 273, targetBounds: window,
+                                           focusedField: field).isEmpty)
+    #expect(attachedSuggestionPopupRecords([typed, target], targetPID: 42, targetWindowID: 273, targetBounds: window,
+                                           focusedField: field).map(\.windowID) == [10])
+}
+
 @Test func visibleOverlayInventoryFailsClosedWhenUnavailable() {
     #expect(containedVisibleOverlayOrUncertain(
         targetPID: 42,

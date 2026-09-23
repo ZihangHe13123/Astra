@@ -1971,6 +1971,15 @@ def _public_snapshot_payload(
                 "application effect. Inspect this fresh observation before continuing "
                 "or claiming completion."
             )
+    popups = snapshot.payload.get("suggestion_popups")
+    if scope == "target_window" and isinstance(popups, list) and popups:
+        payload["suggestion_popups"] = _bounded_public_value(popups)
+        payload["message"] += (
+            " The focused field's suggestion list is open at suggestion_popups (window coordinates). "
+            "It is a separate window, so it is not in this image or ax_tree. Keys still go to the "
+            "field: keep typing, use down/up then return to choose, or escape to close it. Pointer "
+            "input inside it is refused."
+        )
     return payload, png, identity, digest
 
 
@@ -2804,6 +2813,11 @@ def register_computer_tools(
             )
         except ComputerSessionError as exc:
             if exc.code == "unsafe_artifact":
+                # The session is poisoned below; keep the fixed-text reason for diagnosis.
+                logger.warning(
+                    "computer app state publication untrusted reason=%s cause=%s",
+                    str(exc)[:200], type(exc.__cause__).__name__ if exc.__cause__ else "",
+                )
                 with suppress(Exception):
                     manager.poison_artifact_session(clear_target=True)
                 trusted_target.clear()

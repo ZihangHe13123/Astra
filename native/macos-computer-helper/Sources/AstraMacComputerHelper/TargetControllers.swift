@@ -94,6 +94,8 @@ struct TargetCatalogRecord {
     /// indicator or tooltip, so it may vanish on its own. It still blocks until it does.
     let overlayMayBeTransient: Bool
     let siblingOrdering: BackgroundSiblingOrderingProof?
+    /// Windows proven to be the focused text field's own suggestion lists; they bind like the target.
+    let suggestionPopupWindowIDs: Set<CGWindowID>
 
     init(
         appRef: String,
@@ -105,9 +107,11 @@ struct TargetCatalogRecord {
         axWindows: [TargetAXWindowRecord],
         containsUnselectedOverlay: Bool = false,
         overlayMayBeTransient: Bool = false,
-        siblingOrdering: BackgroundSiblingOrderingProof? = nil
+        siblingOrdering: BackgroundSiblingOrderingProof? = nil,
+        suggestionPopupWindowIDs: Set<CGWindowID> = []
     ) {
         self.overlayMayBeTransient = overlayMayBeTransient
+        self.suggestionPopupWindowIDs = suggestionPopupWindowIDs
         self.appRef = appRef
         self.windowRef = windowRef
         self.pid = pid
@@ -277,6 +281,22 @@ final class BackgroundTargetController: TargetSelecting {
             }
             if candidate.windowID != nil, candidate.isSharingIndicator,
                sharingIndicatorWithinTitlebar(candidate.bounds, targetBounds: record.bounds) {
+                return false
+            }
+            // The focused field's suggestion list is an AX window too; the catalog proved it from
+            // live focus and geometry.
+            if let candidateWindowID = candidate.windowID,
+               record.suggestionPopupWindowIDs.contains(candidateWindowID) {
+                return false
+            }
+            // A hovered link's bottom-edge status strip is an AX window too (live Edge). Judge it
+            // by its mapped live layer; an unmapped or unordered strip keeps blocking.
+            if let candidateWindowID = candidate.windowID, let layer = candidate.layer,
+               let selectedLayer = selected.layer,
+               appStatusStripOverlay(
+                   VisibleWindowRecord(pid: record.pid, windowID: candidateWindowID, bounds: candidate.bounds,
+                                       layer: layer, alpha: candidate.alpha ?? 0, zOrder: candidate.zOrder ?? 0),
+                   targetBounds: record.bounds, targetLayer: selectedLayer) {
                 return false
             }
             guard candidate.windowID != nil else {

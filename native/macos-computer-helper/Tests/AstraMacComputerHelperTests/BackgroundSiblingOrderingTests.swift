@@ -141,3 +141,80 @@ func completeSiblingOrderingRevalidatesBeforeSnapshot(change: String) throws {
     fixture.replaceAX(2, element: AXUIElementCreateApplication(9999))
     #expect(!proof.covers(targetPID: fixture.pid, targetWindowID: 100, targetBounds: fixture.bounds, selected: fixture.ax[0], sibling: fixture.ax[2]))
 }
+
+// Live Edge 152 (2026-09-23): the hovered link's address strip is also an AX window of the app.
+// Its bottom-edge strip geometry, judged with its live layer, must not block binding, while a
+// same-app suggestion window of ordinary size still does.
+@Test(arguments: [false, true])
+func appStatusStripAXWindowDoesNotBlockBackgroundBinding(dropdown: Bool) throws {
+    let bounds = CGRect(x: 25, y: 30, width: 1319, height: 768)
+    let targetElement = AXUIElementCreateApplication(2001)
+    let stripElement = AXUIElementCreateApplication(2002)
+    func window(_ element: AXUIElement, id: CGWindowID, frame: CGRect, subrole: String, z: Int) -> TargetAXWindowRecord {
+        TargetAXWindowRecord(windowID: id, bounds: frame, identity: CFHash(element), element: element,
+            role: BoundedAXStringResult(value: "AXWindow", status: .complete),
+            subrole: BoundedAXStringResult(value: subrole, status: .complete),
+            zOrder: z, layer: 0, alpha: 1, isModal: false)
+    }
+    let overlayFrame = dropdown ? CGRect(x: 89, y: 70, width: 1038, height: 199)
+        : CGRect(x: 28, y: 771, width: 249, height: 24)
+    let record = TargetCatalogRecord(appRef: "app", windowRef: "window", pid: 42, windowID: 273,
+        bounds: bounds, title: "Astra CU Text Fixture",
+        axWindows: [window(targetElement, id: 273, frame: bounds, subrole: "AXStandardWindow", z: 16),
+                    window(stripElement, id: 9, frame: overlayFrame, subrole: "AXUnknown", z: 14)],
+        containsUnselectedOverlay: false)
+    let catalog = ClosureTargetCatalog(recordProvider: { _, _ in record }, currentProvider: { _ in record })
+    let controller = BackgroundTargetController(catalog: catalog)
+    if dropdown {
+        do {
+            _ = try controller.select(appRef: "app", windowRef: "window")
+            Issue.record("a same-app suggestion window must keep blocking binding")
+        } catch let error as WindowObservationError {
+            guard case .overlayBlocked = error else {
+                Issue.record("unexpected observation error: \(error)")
+                return
+            }
+        }
+    } else {
+        let target = try controller.select(appRef: "app", windowRef: "window")
+        #expect(try controller.snapshotTargetState(target).windowID == 273)
+    }
+}
+
+// The focused address field's suggestion list is an AX window of the app as well. It binds only
+// when the catalog proved it from live focus and geometry; an unproven window keeps blocking.
+@Test(arguments: [false, true])
+func focusedFieldSuggestionListAXWindowBindsOnlyWithCatalogProof(proven: Bool) throws {
+    let bounds = CGRect(x: 25, y: 30, width: 1319, height: 768)
+    let targetElement = AXUIElementCreateApplication(2001)
+    let popupElement = AXUIElementCreateApplication(2003)
+    func window(_ element: AXUIElement, id: CGWindowID, frame: CGRect, subrole: String, z: Int) -> TargetAXWindowRecord {
+        TargetAXWindowRecord(windowID: id, bounds: frame, identity: CFHash(element), element: element,
+            role: BoundedAXStringResult(value: "AXWindow", status: .complete),
+            subrole: BoundedAXStringResult(value: subrole, status: .complete),
+            zOrder: z, layer: 0, alpha: 1, isModal: false)
+    }
+    let record = TargetCatalogRecord(appRef: "app", windowRef: "window", pid: 42, windowID: 273,
+        bounds: bounds, title: "Astra CU Text Fixture",
+        axWindows: [window(targetElement, id: 273, frame: bounds, subrole: "AXStandardWindow", z: 16),
+                    window(popupElement, id: 10, frame: CGRect(x: 89, y: 70, width: 1038, height: 199),
+                           subrole: "AXUnknown", z: 15)],
+        containsUnselectedOverlay: false,
+        suggestionPopupWindowIDs: proven ? [10] : [11])
+    let catalog = ClosureTargetCatalog(recordProvider: { _, _ in record }, currentProvider: { _ in record })
+    let controller = BackgroundTargetController(catalog: catalog)
+    if proven {
+        let target = try controller.select(appRef: "app", windowRef: "window")
+        #expect(try controller.snapshotTargetState(target).windowID == 273)
+    } else {
+        do {
+            _ = try controller.select(appRef: "app", windowRef: "window")
+            Issue.record("an unproven same-app window must keep blocking binding")
+        } catch let error as WindowObservationError {
+            guard case .overlayBlocked = error else {
+                Issue.record("unexpected observation error: \(error)")
+                return
+            }
+        }
+    }
+}
