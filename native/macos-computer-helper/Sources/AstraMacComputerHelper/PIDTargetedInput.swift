@@ -963,6 +963,14 @@ final class PIDTargetedActionExecutor {
             guard now() <= deadline else { throw ActionExecutionError.actionTimeout }
             return
         }
+        if balancedRelease {
+            // The press reached the proven element; this release completes it at the same point.
+            // Controls change as they are pressed (live Outlook: the search box expands and opens
+            // its suggestions), and cleanup would post this same release anyway. The window checks
+            // above still apply; only the element is not proven again.
+            guard now() <= deadline else { throw ActionExecutionError.actionTimeout }
+            return
+        }
         guard let current = element(safeRegion.reference, expected.snapshotID),
               current.enabled != false,
               !current.isSecure,

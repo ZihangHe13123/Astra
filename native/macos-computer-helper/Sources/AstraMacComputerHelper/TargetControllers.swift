@@ -97,6 +97,8 @@ struct TargetCatalogRecord {
     let siblingOrdering: BackgroundSiblingOrderingProof?
     /// Windows proven to be the focused text field's own suggestion lists; they bind like the target.
     let suggestionPopupWindowIDs: Set<CGWindowID>
+    /// Their live CG frames, for an AX window that has not mapped to a window number yet.
+    let suggestionPopupFrames: [CGRect]
 
     init(
         appRef: String,
@@ -109,10 +111,12 @@ struct TargetCatalogRecord {
         containsUnselectedOverlay: Bool = false,
         overlayMayBeTransient: Bool = false,
         siblingOrdering: BackgroundSiblingOrderingProof? = nil,
-        suggestionPopupWindowIDs: Set<CGWindowID> = []
+        suggestionPopupWindowIDs: Set<CGWindowID> = [],
+        suggestionPopupFrames: [CGRect] = []
     ) {
         self.overlayMayBeTransient = overlayMayBeTransient
         self.suggestionPopupWindowIDs = suggestionPopupWindowIDs
+        self.suggestionPopupFrames = suggestionPopupFrames
         self.appRef = appRef
         self.windowRef = windowRef
         self.pid = pid
@@ -307,6 +311,9 @@ final class BackgroundTargetController: TargetSelecting {
                     targetPID: record.pid, targetWindowID: windowID, targetBounds: record.bounds,
                     selected: selected, sibling: candidate
                 ) == true { return false }
+                if record.suggestionPopupFrames.contains(where: { openingListFrame(candidate.bounds, matches: $0) }) {
+                    return false
+                }
                 logActionRejected("observation_validation=background_unmapped_sibling")
                 return true
             }

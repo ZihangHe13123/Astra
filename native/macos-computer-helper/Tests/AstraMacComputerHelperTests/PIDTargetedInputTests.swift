@@ -908,7 +908,10 @@ func staleFragmentLeaseCannotBorrowRearmedSessionForClickOrScroll(nextMarker: UI
     ])
 }
 
-@Test func safeElementReplacementAfterMouseDownIsUnknownAndUsesMatchingCleanup() {
+// Live Outlook (2026-09-23): pressing the search box expanded it and opened its suggestions. The
+// release was refused because the pressed element had changed, so a click that worked came back as
+// an unknown outcome. The release completes the press; the change is its effect, not a new target.
+@Test func safeElementChangingAfterMouseDownStillCompletesTheClick() {
     var identity = "canvas-original"
     let fixture = PIDExecutorFixture(
         enabled: [.click],
@@ -927,14 +930,34 @@ func staleFragmentLeaseCannotBorrowRearmedSessionForClickOrScroll(nextMarker: UI
         actions: safePlanned(safeClick(x: 15, y: 20), bounds: CGRect(x: 10, y: 10, width: 40, height: 40))
     )
 
-    #expect(result.error == .unknownOutcome)
-    #expect(result.lastAcknowledgedAction == -1)
+    #expect(result.error == nil)
+    #expect(result.lastAcknowledgedAction == 0)
     #expect(!result.cleanupFailed)
     #expect(fixture.poster.events.map(\.event) == [
         .mouseDown(point: CGPoint(x: 115, y: 220), clickCount: 1),
         .mouseUp(point: CGPoint(x: 115, y: 220), clickCount: 1),
     ])
     #expect(fixture.heldInputs.heldCount == 0)
+}
+
+// Before the press nothing has been sent, so a changed element still stops the click cleanly.
+@Test func safeElementChangedBeforeMouseDownSendsNothing() {
+    let fixture = PIDExecutorFixture(
+        enabled: [.click],
+        evidence: true,
+        elementLookup: { _, _ in
+            safeElement(identity: "canvas-replacement", bounds: CGRect(x: 10, y: 10, width: 40, height: 40))
+        }
+    )
+    let result = fixture.executor.run(
+        expected: fixture.guardValue,
+        application: fixture.application,
+        lease: fixture.lease,
+        actions: safePlanned(safeClick(x: 15, y: 20), bounds: CGRect(x: 10, y: 10, width: 40, height: 40))
+    )
+
+    #expect(result.error == .staleSnapshot)
+    #expect(fixture.poster.events.isEmpty)
 }
 
 private func pidGuard() -> ActionGuard {

@@ -266,3 +266,50 @@ func helpTagAXWindowDoesNotBlockBackgroundBinding(status: BoundedAXStringStatus)
     #expect(!matchesAnyFrame(frame, []))
 }
 
+// Live Outlook (2026-09-23): right after a click opened the search list, its AX window reported the
+// final 625x148 frame while its CG window was still 81 pt tall, so the AX window mapped to no window
+// number and blocked binding as an unknown sibling.
+@Test(arguments: [true, false])
+func openingSuggestionListAXWindowBindsWhileItsHeightLags(sameOrigin: Bool) throws {
+    let bounds = CGRect(x: 113, y: 85, width: 1210, height: 690)
+    let targetElement = AXUIElementCreateApplication(2001)
+    let listElement = AXUIElementCreateApplication(2005)
+    let target = TargetAXWindowRecord(windowID: 131, bounds: bounds, identity: CFHash(targetElement),
+        element: targetElement, role: BoundedAXStringResult(value: "AXWindow", status: .complete),
+        subrole: BoundedAXStringResult(value: "AXStandardWindow", status: .complete),
+        zOrder: 14, layer: 0, alpha: 1, isModal: false)
+    let list = TargetAXWindowRecord(windowID: nil,
+        bounds: CGRect(x: sameOrigin ? 456 : 300, y: 131, width: 625, height: 148),
+        identity: CFHash(listElement), element: listElement,
+        role: BoundedAXStringResult(value: "AXWindow", status: .complete),
+        subrole: BoundedAXStringResult(value: "AXUnknown", status: .complete),
+        zOrder: nil, layer: nil, alpha: nil, isModal: nil)
+    let record = TargetCatalogRecord(appRef: "app", windowRef: "window", pid: 552, windowID: 131,
+        bounds: bounds, title: "Outlook", axWindows: [target, list], containsUnselectedOverlay: false,
+        suggestionPopupWindowIDs: [10879], suggestionPopupFrames: [CGRect(x: 456, y: 131, width: 625, height: 81)])
+    let catalog = ClosureTargetCatalog(recordProvider: { _, _ in record }, currentProvider: { _ in record })
+    let controller = BackgroundTargetController(catalog: catalog)
+    if sameOrigin {
+        let selected = try controller.select(appRef: "app", windowRef: "window")
+        #expect(try controller.snapshotTargetState(selected).windowID == 131)
+    } else {
+        do {
+            _ = try controller.select(appRef: "app", windowRef: "window")
+            Issue.record("an unmapped window elsewhere must keep blocking binding")
+        } catch let error as WindowObservationError {
+            guard case .overlayBlocked = error else {
+                Issue.record("unexpected observation error: \(error)")
+                return
+            }
+        }
+    }
+}
+
+@Test func openingListFrameComparesOriginAndWidthOnly() {
+    let cg = CGRect(x: 456, y: 131, width: 625, height: 81)
+    #expect(openingListFrame(CGRect(x: 456, y: 131, width: 625, height: 148), matches: cg))
+    #expect(openingListFrame(CGRect(x: 457, y: 132, width: 626, height: 20), matches: cg))
+    #expect(!openingListFrame(CGRect(x: 456, y: 160, width: 625, height: 148), matches: cg))
+    #expect(!openingListFrame(CGRect(x: 456, y: 131, width: 500, height: 148), matches: cg))
+}
+

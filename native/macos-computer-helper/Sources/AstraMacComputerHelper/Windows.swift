@@ -2505,7 +2505,8 @@ final class SystemWindowObserver: WindowObserving {
             containsUnselectedOverlay: containsAXOverlay || containsVisibleOverlay,
             overlayMayBeTransient: overlayMayBeTransient,
             siblingOrdering: siblingOrdering,
-            suggestionPopupWindowIDs: Set(suggestionPopups.map(\.windowID))
+            suggestionPopupWindowIDs: Set(suggestionPopups.map(\.windowID)),
+            suggestionPopupFrames: suggestionPopups.map(\.bounds)
         )
     }
 
@@ -4539,6 +4540,14 @@ func attachedSuggestionPopup(
     let opensAbove = bounds.maxY >= field.minY - reach && bounds.maxY <= field.maxY + reach &&
         bounds.minY < field.minY
     return hangsBelow || opensAbove
+}
+
+/// A list's AX window can lag its CG window in height while it opens (live Outlook: 81 then 138 pt)
+/// and so maps to no window number yet; it is that list when origin and width agree.
+func openingListFrame(_ axFrame: CGRect, matches cgFrame: CGRect) -> Bool {
+    [axFrame.minX, axFrame.minY, axFrame.width, cgFrame.minX, cgFrame.minY, cgFrame.width].allSatisfy(\.isFinite) &&
+        abs(axFrame.minX - cgFrame.minX) <= 2 && abs(axFrame.minY - cgFrame.minY) <= 2 &&
+        abs(axFrame.width - cgFrame.width) <= 2
 }
 
 /// This app's suggestion lists hanging from the focused field, judged against the target's own live
