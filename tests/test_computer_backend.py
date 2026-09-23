@@ -2266,6 +2266,19 @@ def test_targetless_resume_releases_only_into_an_unbound_session(fake_backend, t
     assert fake_backend.select_calls == selects
     with pytest.raises(ComputerSessionError, match="target_required"):
         run(manager.snapshot())
+    # The user controlled the desktop; refs from the pre-handoff catalog must not bind.
+    assert manager.catalog_generation == 0
+    with pytest.raises(ComputerSessionError, match="catalog_required"):
+        run(manager.get_app_state("app", "window"))
+    assert fake_backend.select_calls == selects
+
+
+def test_targetless_user_activity_pause_keeps_takeover_cleanup_obligation(fake_backend, tmp_path):
+    manager = _unbound_after_catalog_refresh(fake_backend, tmp_path)
+    manager._takeover_cleanup_ref = "takeover-cleanup"
+    run(manager.pause_for_user_activity())
+    assert manager.handed_off and manager.suspended_target is None
+    assert manager._takeover_cleanup_ref == "takeover-cleanup"
 
 
 def test_targetless_resume_abort_or_newer_stop_keeps_user_control(fake_backend, tmp_path):

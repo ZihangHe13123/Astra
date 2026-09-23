@@ -1723,6 +1723,9 @@ class ComputerSessionManager:
             self._invalidate_cooperative_state()
             self.grants.clear()
             self._target_generation += 1
+            # The user controlled the desktop, so no earlier catalog ref may bind
+            # after release; a fresh apps() is required first.
+            self._last_catalog = None
             # Keep the stop until the unbound receipt passes publication.
             self._resume_publication_id = publication_id
 

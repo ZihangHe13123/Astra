@@ -7784,6 +7784,16 @@ def test_targetless_resume_publishes_unbound_receipt_without_native_calls(regist
     ))["error"] == ""
 
 
+def test_targetless_release_rejects_pre_handoff_catalog_refs(registry, manager, backend):
+    recipe = _targetless_handoff(registry, manager, backend)["next_observation"]
+    assert run(registry.execute(recipe["tool"], recipe["arguments"]))["verified"] is True
+    backend.calls.clear()
+    stale = run(registry.execute("computer_get_app_state", {"app_ref": "app-1", "window_ref": "window-1"}))
+    assert stale["code"] == "catalog_required"
+    assert "computer_apps" in stale["recovery_hint"]
+    assert not backend.calls
+
+
 @pytest.mark.parametrize("arguments", [
     {"app_ref": "app-1", "window_ref": "window-1"}, {"app_ref": "app-1"}, {"window_ref": "window-1"},
 ])
@@ -7834,6 +7844,17 @@ def test_local_runtime_targetless_handoff_resumes_unbound(registry, manager, mon
     resumed = run(registry.execute("computer_resume", {}))
     assert resumed["error"] == "" and resumed["verified"] is True
     assert not runtime.handed_off and runtime.target is None
+
+
+def test_local_runtime_cold_targetless_stop_and_release_never_start_helper(
+    registry, manager, monkeypatch, tmp_path,
+):
+    runtime = register_local(registry, manager, monkeypatch, tmp_path)
+    handed_off = json.loads(run(registry.execute("computer_handoff", {}))["output"])
+    assert handed_off["next_observation"] == {"tool": "computer_resume", "arguments": {}}
+    resumed = run(registry.execute("computer_resume", {}))
+    assert resumed["error"] == "" and resumed["verified"] is True
+    assert runtime.helper_started is False and not runtime.handed_off
 
 
 def test_overlay_failure_is_not_reported_as_expired_refs():

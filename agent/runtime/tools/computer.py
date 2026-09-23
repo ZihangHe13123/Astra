@@ -3449,7 +3449,7 @@ def register_computer_tools(
         *,
         _permission_call_id: str = "",
     ):
-        nonlocal resume_publication_owner
+        nonlocal resume_publication_owner, trusted_catalog_generation, observation_authority_generation
         blocked = preflight()
         if blocked:
             return blocked
@@ -3475,6 +3475,10 @@ def register_computer_tools(
                     return _session_failure(exc)
                 resume_publication_owner = _permission_call_id
                 publication_started = True
+                # Mirror the manager: the pre-handoff catalog is no longer authority.
+                trusted_catalog.clear()
+                trusted_catalog_generation = 0
+                observation_authority_generation += 1
                 trusted_target.clear()
                 trusted_snapshot.clear()
                 clear_computer_grants()
