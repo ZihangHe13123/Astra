@@ -126,6 +126,22 @@ def test_takeover_request_is_never_told_to_switch_to_takeover() -> None:
     assert "requires keyboardFocus" in text
 
 
+def test_refused_replacement_keeps_plain_batches_on_precondition_guidance() -> None:
+    from agent.runtime.macos_computer import HelperApplicationError
+    from agent.runtime.tools.computer import _plan_rejection_failure
+
+    exc = HelperApplicationError(
+        ComputerError(ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED, "the action batch is unsafe")
+    )
+    replaced = _plan_rejection_failure(exc, requested_takeover=True, replace_requested=True)
+    assert replaced is not None and "command+a" in replaced.recovery_hint
+    plain = _plan_rejection_failure(exc, requested_takeover=True)
+    assert plain is not None and "hand this step to the user" in plain.recovery_hint
+    # A background request is still told to escalate first.
+    background = _plan_rejection_failure(exc, requested_takeover=False, replace_requested=True)
+    assert background is not None and background.code == "foreground_takeover_required"
+
+
 def test_native_observation_timeout_preserves_error_identity() -> None:
     error = _failed("observation_timeout")
     assert error.code.value == "observation_timeout"

@@ -505,6 +505,7 @@ def _plan_rejection_failure(
     exc: BaseException,
     *,
     requested_takeover: bool,
+    replace_requested: bool = False,
 ) -> ToolFailure | None:
     """把 helper 的"后台直投不可行"翻译成**当下真能执行**的指引。
 
@@ -519,14 +520,21 @@ def _plan_rejection_failure(
     if exc.error.code is not ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED:
         return None
     if requested_takeover:
+        # Browser fields and active input methods refuse native replacement before input;
+        # selecting the field and typing reaches the same value through the keyboard path.
+        recovery_hint = (
+            "No input was dispatched. Native replacement is unavailable for this field. "
+            "Send keypress command+a on the same element_ref, then type the new text without "
+            "replace in the same batch."
+            if replace_requested else
+            "Foreground takeover was already requested, so switching modes cannot fix this. "
+            "The unmet precondition is in details.helper_message; satisfy it or hand this step to the user."
+        )
         return _failure(
             ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED.value,
             _SAFE_ACTION_ERRORS[ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED],
             retryable=False,
-            recovery_hint=(
-                "Foreground takeover was already requested, so switching modes cannot fix this. "
-                "The unmet precondition is in details.helper_message; satisfy it or hand this step to the user."
-            ),
+            recovery_hint=recovery_hint,
             details={
                 "requested_interaction_mode": ComputerInteractionMode.FOREGROUND_TAKEOVER.value,
                 "helper_message": exc.error.message,
@@ -2940,11 +2948,15 @@ def register_computer_tools(
             "action_classes": list(decision.action_classes),
         })
 
-    def _planning_failure(exc: BaseException, *, requested_takeover: bool = False) -> ToolFailure:
+    def _planning_failure(
+        exc: BaseException, *, requested_takeover: bool = False, replace_requested: bool = False,
+    ) -> ToolFailure:
         # manifest 只管 background 直投许可；background 不可行 ≠ 必须用户手点，而是可升级为
         # 显式授权的 foreground takeover（独立授权路径，不该被 manifest 卡住）。但已经请求接管
         # 时不许再建议切模式 —— 见 _plan_rejection_failure。
-        rejection = _plan_rejection_failure(exc, requested_takeover=requested_takeover)
+        rejection = _plan_rejection_failure(
+            exc, requested_takeover=requested_takeover, replace_requested=replace_requested,
+        )
         if rejection is not None:
             return rejection
         if isinstance(exc, HelperApplicationError):
@@ -3926,6 +3938,10 @@ def register_computer_tools(
             prepared.failure = _planning_failure(
                 exc,
                 requested_takeover=mode is ComputerInteractionMode.FOREGROUND_TAKEOVER,
+                replace_requested=any(
+                    action.get("type") == "type" and action.get("replace") is True
+                    for action in prepared.raw_actions
+                ),
             )
             return None
         background = classify_computer_batch(

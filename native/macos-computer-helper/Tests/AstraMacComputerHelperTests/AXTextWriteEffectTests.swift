@@ -1,5 +1,6 @@
 import ApplicationServices
 import CoreGraphics
+import Foundation
 import Testing
 @testable import AstraMacComputerHelperCore
 
@@ -29,13 +30,15 @@ private func effectProbe(values: [String?], selected: String? = nil,
 private func effectPerformer(poster: RecordingEffectPoster, writer: SystemAXSelectedTextWriter,
                              memory: AXTextWriteEffectMemory? = nil,
                              webContent: ((AXUIElement) -> Bool)? = nil,
+                             keyboardOnlyTextProcess: ((pid_t) -> Bool)? = nil,
                              textInputSafety: (() -> BackgroundTextInputSafety)? = nil) -> SystemActionPerformer {
     SystemActionPerformer(
         state: { ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100),
                                    axIdentity: 33) },
         lookup: { _, _ in effectField }, inputPoster: poster, selectedTextWriter: writer,
         focusedKeyboard: { _ in effectField }, textInputSafety: textInputSafety,
-        webContentProbe: webContent, axTextWriteMemory: memory)
+        webContentProbe: webContent, axTextWriteMemory: memory,
+        keyboardOnlyTextProcess: keyboardOnlyTextProcess)
 }
 
 private func typeAction(_ method: ResolvedActionMethod) -> ResolvedAction {
@@ -201,6 +204,69 @@ private func typeAction(_ method: ResolvedActionMethod) -> ResolvedAction {
     #expect(try performer.perform(typeAction(.unicodeText)).inputStarted)
     #expect(writes == 0)
     #expect(!poster.events.isEmpty)
+}
+
+// Live Edge 152 (2026-09-23): an AXSelectedText write put the URL in the address bar and
+// read back exactly, yet Return did not navigate. The browser's own input model never saw
+// the text. Keyboard-typed text in the same field opened suggestions and navigated.
+@Test func ChromiumFamilyProcessesNeverAttemptAXSelectedTextWrites() throws {
+    let poster = RecordingEffectPoster()
+    var writes = 0
+    var probed: [pid_t] = []
+    let writer = SystemAXSelectedTextWriter(
+        isSettable: { _ in (.success, true) }, setValue: { _, _ in writes += 1; return .success })
+    let performer = effectPerformer(poster: poster, writer: writer,
+        keyboardOnlyTextProcess: { probed.append($0); return true })
+    #expect(performer.preflightAXTextMutation(effectField) == .unsupported)
+    #expect(try performer.perform(typeAction(.unicodeText)).inputStarted)
+    #expect(writes == 0)
+    #expect(!poster.events.isEmpty)
+    #expect(!probed.isEmpty && probed.allSatisfy { $0 == 11 })
+    // Other processes keep the verified AX write.
+    let native = effectPerformer(poster: RecordingEffectPoster(), writer: writer,
+        keyboardOnlyTextProcess: { _ in false })
+    #expect(native.preflightAXTextMutation(effectField) == .settable)
+}
+
+@Test func ChromiumRendererBundleLayoutsAreRecognized() throws {
+    let files = FileManager.default
+    let root = files.temporaryDirectory.appendingPathComponent("astra-chromium-\(UUID().uuidString)")
+    defer { try? files.removeItem(at: root) }
+    func app(_ name: String, _ directories: [String]) throws -> URL {
+        let bundle = root.appendingPathComponent("\(name).app")
+        for path in directories + ["Contents/MacOS"] {
+            try files.createDirectory(at: bundle.appendingPathComponent(path), withIntermediateDirectories: true)
+        }
+        return bundle
+    }
+    // Chromium browsers keep renderer helpers inside the versioned framework.
+    #expect(applicationBundleShipsChromiumRenderer(try app("Edge", [
+        "Contents/Frameworks/Microsoft Edge Framework.framework/Versions/152.0.4191.66/Helpers/Microsoft Edge Helper (Renderer).app",
+    ])))
+    // Electron apps keep them directly under Frameworks.
+    #expect(applicationBundleShipsChromiumRenderer(try app("Code", ["Contents/Frameworks/Code Helper (Renderer).app"])))
+    // Helpers without a renderer, apps without frameworks, and plain files are not Chromium.
+    #expect(!applicationBundleShipsChromiumRenderer(try app("Pages", [
+        "Contents/Frameworks/Foo.framework/Versions/A/Helpers/Foo Helper.app",
+    ])))
+    #expect(!applicationBundleShipsChromiumRenderer(try app("Plain", [])))
+    let file = try app("File", ["Contents/Frameworks"])
+    #expect(files.createFile(atPath: file.appendingPathComponent("Contents/Frameworks/Fake (Renderer).app").path,
+                             contents: Data()))
+    #expect(!applicationBundleShipsChromiumRenderer(file))
+}
+
+@Test func ChromiumProcessClassificationIsCachedPerBundle() {
+    var probes = 0
+    let classifier = ChromiumProcessClassifier(
+        bundleURL: { $0 == 7 ? URL(fileURLWithPath: "/Applications/Edge.app") : nil },
+        bundleShipsRenderer: { _ in probes += 1; return true })
+    #expect(classifier.usesChromiumRenderer(pid: 7))
+    #expect(classifier.usesChromiumRenderer(pid: 7))
+    #expect(probes == 1)
+    #expect(!classifier.usesChromiumRenderer(pid: 8))
+    #expect(!classifier.usesChromiumRenderer(pid: 0))
+    #expect(probes == 1)
 }
 
 @Test func WebAreaProbeWalksABoundedParentChain() {

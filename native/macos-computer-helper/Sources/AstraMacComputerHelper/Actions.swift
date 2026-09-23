@@ -1054,6 +1054,66 @@ final class AXTextWriteEffectMemory: @unchecked Sendable {
     }
 }
 
+/// Chromium browsers and Electron apps ship "(Renderer)" helper apps. Their native text fields
+/// can take an AXSelectedText write that reads back exactly while the app's own input model
+/// never sees it (an address bar then ignores Return). Detect by bundle layout, not by name.
+func applicationBundleShipsChromiumRenderer(_ bundle: URL, fileManager: FileManager = .default) -> Bool {
+    func entries(_ directory: URL, limit: Int) -> ArraySlice<URL> {
+        ((try? fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles])) ?? []).prefix(limit)
+    }
+    func isRendererApp(_ url: URL) -> Bool {
+        url.lastPathComponent.hasSuffix("(Renderer).app") &&
+            (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+    }
+    for entry in entries(bundle.appendingPathComponent("Contents/Frameworks", isDirectory: true), limit: 256) {
+        // Electron keeps the helper beside its framework; Chromium browsers keep it inside
+        // the versioned framework.
+        if isRendererApp(entry) { return true }
+        guard entry.pathExtension == "framework" else { continue }
+        for version in entries(entry.appendingPathComponent("Versions", isDirectory: true), limit: 8)
+        where entries(version.appendingPathComponent("Helpers", isDirectory: true), limit: 64)
+            .contains(where: isRendererApp) {
+            return true
+        }
+    }
+    return false
+}
+
+/// One bundle-layout probe per application bundle in this helper lifetime.
+final class ChromiumProcessClassifier: @unchecked Sendable {
+    static let shared = ChromiumProcessClassifier()
+    private let lock = NSLock()
+    private var bundles: [String: Bool] = [:]
+    private let bundleURL: (pid_t) -> URL?
+    private let bundleShipsRenderer: (URL) -> Bool
+
+    init(
+        bundleURL: @escaping (pid_t) -> URL? = { NSRunningApplication(processIdentifier: $0)?.bundleURL },
+        bundleShipsRenderer: @escaping (URL) -> Bool = { applicationBundleShipsChromiumRenderer($0) }
+    ) {
+        self.bundleURL = bundleURL
+        self.bundleShipsRenderer = bundleShipsRenderer
+    }
+
+    func usesChromiumRenderer(pid: pid_t) -> Bool {
+        guard pid > 0, let bundle = bundleURL(pid) else { return false }
+        let key = bundle.standardizedFileURL.path
+        lock.lock()
+        if let known = bundles[key] {
+            lock.unlock()
+            return known
+        }
+        lock.unlock()
+        let result = bundleShipsRenderer(bundle)
+        lock.lock()
+        bundles[key] = result
+        lock.unlock()
+        if result { logActionRejected("TEXT-ROUTE chromium_family pid=\(pid) text uses keyboard delivery") }
+        return result
+    }
+}
+
 /// Web content text fields never take AXSelectedText writes usefully: WebKit rejects them and
 /// Chromium accepts them without changing the page. Detect by structure, not by app name.
 func axElementIsInsideWebArea(
@@ -1338,10 +1398,12 @@ final class SystemActionPerformer: ActionProviding {
     /// 改投对输入法免疫的 unicode 事件（实测：SCIM 激活下 unicode 串能进 WebKit 输入框并更新
     /// React 状态，而真实按键码会被候选窗截走）。see docs/macos-computer-use.md#input-delivery-contracts
     private let textInputSafety: (() -> BackgroundTextInputSafety)?
-    /// Web content detection and ignored-write memory. Default nil = no extra routing (legacy
-    /// unit paths unchanged); production injects both in `makeActionPerformer`.
+    /// Web content detection, ignored-write memory and the Chromium-family process probe.
+    /// Default nil = no extra routing (legacy unit paths unchanged); production injects all
+    /// three in `makeActionPerformer`.
     private let webContentProbe: ((AXUIElement) -> Bool)?
     private let axTextWriteMemory: AXTextWriteEffectMemory?
+    private let keyboardOnlyTextProcess: ((pid_t) -> Bool)?
 
     init(
         state: @escaping () throws -> ActionTargetState,
@@ -1358,10 +1420,12 @@ final class SystemActionPerformer: ActionProviding {
         focusAcquisition: ((ActionTargetState, ActionElement) -> ActionElement?)? = nil
         ,textInputSafety: (() -> BackgroundTextInputSafety)? = nil,
         webContentProbe: ((AXUIElement) -> Bool)? = nil,
-        axTextWriteMemory: AXTextWriteEffectMemory? = nil
+        axTextWriteMemory: AXTextWriteEffectMemory? = nil,
+        keyboardOnlyTextProcess: ((pid_t) -> Bool)? = nil
     ) {
         self.webContentProbe = webContentProbe
         self.axTextWriteMemory = axTextWriteMemory
+        self.keyboardOnlyTextProcess = keyboardOnlyTextProcess
         self.state = state
         self.lookup = lookup
         self.pointerLookup = pointerLookup
@@ -1398,14 +1462,21 @@ final class SystemActionPerformer: ActionProviding {
         return selectedTextWriter.preflightSelectedText(to: axElement)
     }
 
-    /// False routes the text to keyboard delivery: web content, or a process that already
-    /// ignored an AXSelectedText write in this helper lifetime.
+    /// False routes the text to keyboard delivery: web content, a Chromium-family process
+    /// whose own input model ignores AX-inserted text, or a process that already ignored an
+    /// AXSelectedText write in this helper lifetime.
     private func axTextWriteMayLand(_ element: AXUIElement) -> Bool {
-        if webContentProbe?(element) == true { return false }
+        if webContentProbe?(element) == true || inKeyboardOnlyTextProcess(element) { return false }
         guard let axTextWriteMemory else { return true }
         var pid: pid_t = 0
         guard AXUIElementGetPid(element, &pid) == .success else { return true }
         return !axTextWriteMemory.ignoresSelectedTextWrites(pid: pid)
+    }
+
+    private func inKeyboardOnlyTextProcess(_ element: AXUIElement) -> Bool {
+        guard let keyboardOnlyTextProcess else { return false }
+        var pid: pid_t = 0
+        return AXUIElementGetPid(element, &pid) == .success && keyboardOnlyTextProcess(pid)
     }
 
     private func rememberIgnoredAXTextWrite(_ element: AXUIElement) {
@@ -1431,8 +1502,11 @@ final class SystemActionPerformer: ActionProviding {
     }
 
     func preflightAXTextReplacement(_ element: ActionElement) -> AXTextMutationPreflight {
+        // A Chromium-family field can read back the replaced value while the app's own
+        // input model never saw it; refuse before input so keyboard typing is chosen instead.
         guard replacementTargetValidation != nil, !element.isSecure, element.enabled == true,
-              element.supportsAXSelectedTextWrite, let ax = element.element else { return .unsupported }
+              element.supportsAXSelectedTextWrite, let ax = element.element,
+              !inKeyboardOnlyTextProcess(ax) else { return .unsupported }
         return textValueReplacer.preflight(to: ax)
     }
 

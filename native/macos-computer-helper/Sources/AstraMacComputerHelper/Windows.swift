@@ -3038,7 +3038,8 @@ final class SystemWindowObserver: WindowObserving {
             // web fields go to keyboard delivery, other writes are read back, and processes
             // that ignored one are remembered for this helper lifetime.
             webContentProbe: { axElementIsInsideWebArea($0) },
-            axTextWriteMemory: .shared
+            axTextWriteMemory: .shared,
+            keyboardOnlyTextProcess: { ChromiumProcessClassifier.shared.usesChromiumRenderer(pid: $0) }
         )
     }
 

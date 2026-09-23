@@ -5,7 +5,9 @@ import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from scripts.cu_live_acceptance import Fixture, Runner, exact_fixture_address, observed_fixture_navigation
+from scripts.cu_live_acceptance import (
+    SCENARIOS, Fixture, Runner, exact_fixture_address, observed_fixture_navigation,
+)
 
 
 def runner_for_omnibox(typed, field_value="old address"):
@@ -59,6 +61,36 @@ def test_type_omnibox_selects_and_types_into_the_same_verified_field():
         {"type": "keypress", "key": "a", "modifiers": ["command"], "element_ref": "field"},
         {"type": "type", "element_ref": "field", "text": target},
     ]
+
+
+def test_type_omnibox_shortcut_variant_leaves_text_routing_to_the_helper():
+    """Cmd+L carries no element_ref, so the bound select-all rule does not apply; the
+    helper's application-level keyboard routing alone must carry the typed address."""
+    runner = Runner.__new__(Runner)
+    runner.fixture_window = AsyncMock(return_value=("app", "window"))
+    runner.observe = AsyncMock(return_value={"snapshot_id": "snapshot", "ax_tree": {
+        "role": "AXTextField", "label": "Address", "element_ref": "field", "value": "http://127.0.0.1:8771/text?step=setup-shortcut&nonce=nonce123"}})
+    runner.act = AsyncMock(return_value=({"code": "post_action_observation_pending",
+                                          "computer_receipt": {"dispatch_state": "acknowledged", "acknowledged": 2}}, None))
+    current = "127.0.0.1:8771/text?step=setup-shortcut&nonce=nonce123"
+    target = "127.0.0.1:8771/text?step=omnibox-shortcut&nonce=nonce123"
+    result = asyncio.run(runner.type_omnibox(current, target, select="shortcut"))
+    assert result["delivered"] is True
+    assert runner.act.await_args.args[1] == [
+        {"type": "keypress", "key": "l", "modifiers": ["command"]},
+        {"type": "type", "element_ref": "field", "text": target},
+    ]
+
+
+def test_omnibox_shortcut_scenario_is_selectable_and_passes_its_variant():
+    assert "omnibox-shortcut" in SCENARIOS
+    runner = runner_for_omnibox({"attempts": [{"code": "background_action_unsupported",
+                                               "dispatch": "not_dispatched"}],
+                                 "last_code": "background_action_unsupported", "delivered": False,
+                                 "unknown": False})
+    asyncio.run(runner.omnibox(SimpleNamespace(), "nonce123", "com.apple.keylayout.ABC", "shortcut",
+                               select="shortcut"))
+    assert runner.type_omnibox.await_args.kwargs == {"select": "shortcut"}
 
 
 def test_omnibox_uses_only_a_unique_exact_popup_row():

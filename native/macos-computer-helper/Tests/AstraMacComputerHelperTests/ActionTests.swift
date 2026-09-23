@@ -68,6 +68,23 @@ import Testing
     #expect(writer.writes.isEmpty)
 }
 
+// Live Edge 152 (2026-09-23): text written into the address bar through AX read back
+// exactly, but Return did not navigate. Refuse native replacement there before any input.
+@Test func chromiumFamilyFieldsRefuseNativeReplacementBeforeInput() {
+    let ax = AXUIElementCreateApplication(11)
+    let target = ActionElement(element: ax, bounds: CGRect(x: 10, y: 10, width: 30, height: 20),
+        role: kAXTextFieldRole as String, subrole: nil, actions: [])
+    func performer(chromium: Bool) -> SystemActionPerformer {
+        SystemActionPerformer(state: {
+            ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100), axIdentity: 33)
+        }, lookup: { _, _ in target }, textValueReplacer: ReplacementValueWriterSpy(verification: .verified),
+        replacementTargetValidation: { _ in }, focusedKeyboard: { _ in target },
+        keyboardOnlyTextProcess: { $0 == 11 && chromium })
+    }
+    #expect(performer(chromium: true).preflightAXTextReplacement(target) == .unsupported)
+    #expect(performer(chromium: false).preflightAXTextReplacement(target) == .settable)
+}
+
 private final class ReplacementValueWriterSpy: AXTextValueReplacing {
     let verification: ActionEffectVerification
     var writes: [String] = []

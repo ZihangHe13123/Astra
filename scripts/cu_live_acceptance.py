@@ -34,6 +34,7 @@ FIXTURE = ROOT / "tests/fixtures/cu-text-input.html"
 TITLE = "Astra CU Text Fixture"
 EDGE = "com.microsoft.edgemac"
 OMNIBOX_LABELS = ("Address", "地址", "搜索")
+SCENARIOS = ("abc", "pinyin", "omnibox", "omnibox-pinyin", "omnibox-shortcut")
 ABC = "com.apple.keylayout.ABC"
 PINYIN = "com.apple.inputmethod.SCIM.ITABC"
 DIAGNOSTICS = Path("/tmp/astra-sipp-diagnostics.log")
@@ -298,7 +299,7 @@ class Runner:
             raise RuntimeError(f"Edge did not load the local setup page for {label}")
         return url
 
-    async def type_omnibox(self, current_url: str, url: str) -> dict:
+    async def type_omnibox(self, current_url: str, url: str, *, select: str = "bound") -> dict:
         """Select the bound address field, then type once into the same field."""
         observation = await self.observe(*await self.fixture_window())
         field = next((node for node in nodes(observation.get("ax_tree"))
@@ -308,10 +309,14 @@ class Runner:
         if field is None or not exact_fixture_address(field.get("value"), current_url):
             raise RuntimeError("Edge is not showing this case's fresh local fixture address")
         ref = field["element_ref"]
-        # Both actions target the same bound field. A separate Cmd+L opens an
-        # Edge suggestion window and prevents a fresh observation of the field.
+        # Both actions run in one batch: a separate Cmd+L opens an Edge suggestion
+        # window and prevents a fresh observation of the field. The shortcut variant
+        # carries no element_ref, so the bound select-all rule cannot route the typed
+        # text; only the helper's application-level keyboard routing can.
+        selection = ({"type": "keypress", "key": "l", "modifiers": ["command"]} if select == "shortcut"
+                     else {"type": "keypress", "key": "a", "modifiers": ["command"], "element_ref": ref})
         result, _ = await self.act(observation, [
-            {"type": "keypress", "key": "a", "modifiers": ["command"], "element_ref": ref},
+            selection,
             {"type": "type", "element_ref": ref, "text": url},
         ])
         receipt = result.get("computer_receipt") or {}
@@ -324,13 +329,14 @@ class Runner:
                 and code in {"", "post_action_observation_pending"},
                 "unknown": receipt.get("dispatch_state") in {"unknown", "partial"}}
 
-    async def omnibox(self, fixture: Fixture, nonce: str, source: str, label: str) -> dict:
+    async def omnibox(self, fixture: Fixture, nonce: str, source: str, label: str, *,
+                      select: str = "bound") -> dict:
         """Pass only when the local server receives this run's unique URL."""
         current_url = await self.open_fixture_tab(fixture, nonce, label)
         self.input_source(source)
         step = f"omnibox-{label}"
         url = f"127.0.0.1:{self.args.port}/text?step={step}&nonce={nonce}"
-        typed = await self.type_omnibox(current_url, url)
+        typed = await self.type_omnibox(current_url, url, select=select)
         outcome = {"name": f"omnibox ({label})", "input_source": source, **typed,
                    "typed_through_popup": False, "navigated": False}
         if not typed["delivered"]:
@@ -401,7 +407,9 @@ class Runner:
             scenarios = [("abc", lambda: self.web_field(fixture, ABC, "ABC")),
                          ("pinyin", lambda: self.web_field(fixture, PINYIN, "拼音")),
                          ("omnibox", lambda: self.omnibox(fixture, secrets.token_hex(4), ABC, "abc")),
-                         ("omnibox-pinyin", lambda: self.omnibox(fixture, secrets.token_hex(4), PINYIN, "pinyin"))]
+                         ("omnibox-pinyin", lambda: self.omnibox(fixture, secrets.token_hex(4), PINYIN, "pinyin")),
+                         ("omnibox-shortcut", lambda: self.omnibox(fixture, secrets.token_hex(4), ABC, "shortcut",
+                                                                   select="shortcut"))]
             for key, scenario in scenarios:
                 if self.args.only and key not in self.args.only:
                     continue
@@ -438,7 +446,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--port", type=int, default=8771)
     parser.add_argument("--helper", type=Path, default=None, help="helper executable; default is the installed one")
-    parser.add_argument("--only", nargs="*", choices=["abc", "pinyin", "omnibox", "omnibox-pinyin"], default=None)
+    parser.add_argument("--only", nargs="*", choices=list(SCENARIOS), default=None)
     parser.add_argument("--output", type=Path,
                         default=ROOT / ".scratch" / time.strftime("cu-live-acceptance-%Y%m%d-%H%M%S.json"))
     args = parser.parse_args()

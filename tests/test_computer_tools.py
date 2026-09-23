@@ -4893,6 +4893,34 @@ def test_capable_helper_receives_exact_replacement_semantics(registry, manager, 
     assert sent == [[action]]
 
 
+def test_refused_replacement_recommends_select_all_and_typing(registry, manager, backend, monkeypatch):
+    """Live Edge 2026-09-23: browser fields refuse native replacement before any input.
+    The refusal must name the keyboard route that works instead of a user handoff."""
+    from agent.runtime.macos_computer import HelperApplicationError
+
+    backend.snapshot_ax_tree_override = {"role": "AXWindow",
+        "observation_capabilities": ["replace_text_v1", "auto_takeover_v1"],
+        "children": [{"role": "AXTextField", "element_ref": "snapshot-1:field", "label": "Address",
+                      "value": "old", "bounds": {"x": 10, "y": 10, "width": 50, "height": 20}}]}
+
+    async def refuse(*_args, **_kwargs):
+        raise HelperApplicationError(ComputerError(
+            ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED, "the action batch is unsafe"))
+
+    monkeypatch.setattr(backend, "plan_actions", refuse)
+    register(registry, manager)
+    focus(registry)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    result = run(registry.execute("computer_act", {"snapshot_id": snapshot["snapshot_id"],
+        "actions": [{"type": "type", "text": "example.com", "element_ref": "snapshot-1:field", "replace": True}]}))
+    assert result["code"] == "background_action_unsupported"
+    hint = result["recovery_hint"]
+    assert "No input was dispatched" in hint
+    assert "command+a" in hint and "without replace" in hint
+    assert "hand this step to the user" not in hint
+    assert not any(name in {"takeover_begin", "act"} for name, _ in backend.calls)
+
+
 @pytest.mark.parametrize("approval", ["once", "deny"])
 def test_dialog_intent_activates_before_an_ordinary_ax_button_with_normal_approval(
     registry, manager, backend, monkeypatch, approval,
