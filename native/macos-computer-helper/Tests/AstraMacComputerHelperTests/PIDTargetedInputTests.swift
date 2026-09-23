@@ -1385,6 +1385,90 @@ private func genericForegroundWindowEntry(_ action: NativeAction = .click(x: 15,
     #expect(fixture.heldInputs.heldCount == 0)
 }
 
+@Test func popupPointerDisappearingAfterDownReleasesPromptlyWithoutReplay() throws {
+    let expected = pidGuard()
+    let point = CGPoint(x: 115, y: 220)
+    var popupVisible = true
+    var proofCalls = 0
+    var proofCallsAtDown = 0
+    let validator = PopupPointerClickGuardValidator(
+        sealed: expected, authorizedPoint: point, popupProof: {
+            proofCalls += 1
+            return popupVisible
+        }
+    )
+    let poster = RecordingPIDPoster()
+    poster.onPost = { event in
+        if case .mouseDown = event {
+            proofCallsAtDown = proofCalls
+            popupVisible = false
+        }
+    }
+    let activity = PIDActivityMonitor()
+    let held = HeldInputRegistry()
+    let executor = PIDTargetedActionExecutor(
+        poster: poster, genericForegroundEnabled: true, activity: activity,
+        validator: validator, heldInputs: held, element: { _, _ in nil },
+        evidence: { _, _ in false }
+    )
+    let plan = try executor.preflight(
+        expected: expected,
+        application: PIDTargetApplication(bundleIdentifier: "unlisted.popup", version: "1"),
+        marker: activity.currentLeaseForTest().marker,
+        entries: [genericForegroundWindowEntry()]
+    )
+    let result = executor.executePrepared(
+        sourceIndex: 0, from: plan, expected: expected,
+        lease: activity.currentLeaseForTest()
+    )
+    #expect(result.error == nil)
+    #expect(result.lastAcknowledgedAction == 0)
+    #expect(result.outcomes.count == 1)
+    #expect(result.outcomes[0].ok)
+    #expect(result.outcomes[0].observationRequired)
+    #expect(proofCallsAtDown > 0)
+    #expect(proofCalls == proofCallsAtDown)
+    #expect(poster.events.map(\.event) == [
+        .mouseDown(point: point, clickCount: 1),
+        .mouseUp(point: point, clickCount: 1)
+    ])
+    #expect(held.heldCount == 0)
+}
+
+@Test func popupPointerSlowVisualProofCrossingDeadlineCannotPostMouseDown() throws {
+    let expected = pidGuard()
+    let point = CGPoint(x: 115, y: 220)
+    var time: TimeInterval = 0
+    let validator = PopupPointerClickGuardValidator(
+        sealed: expected, authorizedPoint: point, popupProof: {
+            time = 13
+            return true
+        }
+    )
+    let poster = RecordingPIDPoster()
+    let activity = PIDActivityMonitor()
+    let held = HeldInputRegistry()
+    let executor = PIDTargetedActionExecutor(
+        poster: poster, genericForegroundEnabled: true, activity: activity,
+        validator: validator, heldInputs: held, element: { _, _ in nil },
+        now: { time }
+    )
+    let plan = try executor.preflight(
+        expected: expected,
+        application: PIDTargetApplication(bundleIdentifier: "unlisted.popup", version: "1"),
+        marker: activity.currentLeaseForTest().marker,
+        entries: [genericForegroundWindowEntry()]
+    )
+    let result = executor.executePrepared(
+        sourceIndex: 0, from: plan, expected: expected,
+        lease: activity.currentLeaseForTest()
+    )
+    #expect(result.error == .actionTimeout)
+    #expect(result.lastAcknowledgedAction == -1)
+    #expect(poster.events.isEmpty)
+    #expect(held.heldCount == 0)
+}
+
 @Test(arguments: ["moved", "ax_lags", "cg_lags", "ax_jumps", "ax_resizes", "resized", "other_window", "jumped", "other_pid", "new_overlay"])
 func genericForegroundDragAllowsOnlyItsCapturedWindowTranslation(change: String) throws {
     let expected = pidGuard()

@@ -132,12 +132,16 @@ struct PIDActionTargetState {
 protocol PIDActionGuardValidating: AnyObject {
     func revalidate(expected: ActionGuard, point: CGPoint?) throws
     func revalidate(expected: ActionGuard, point: CGPoint?, dragDisplacement: CGVector?) throws
+    func revalidateBalancedRelease(expected: ActionGuard, point: CGPoint?, dragDisplacement: CGVector?) throws
     func revalidateAndObserveFocus(expected: ActionGuard, point: CGPoint?) throws -> KeyboardFocusObservation?
 }
 
 extension PIDActionGuardValidating {
     func revalidate(expected: ActionGuard, point: CGPoint?, dragDisplacement _: CGVector?) throws {
         try revalidate(expected: expected, point: point)
+    }
+    func revalidateBalancedRelease(expected: ActionGuard, point: CGPoint?, dragDisplacement: CGVector?) throws {
+        try revalidate(expected: expected, point: point, dragDisplacement: dragDisplacement)
     }
     func revalidateAndObserveFocus(expected: ActionGuard, point: CGPoint?) throws -> KeyboardFocusObservation? {
         try revalidate(expected: expected, point: point)
@@ -212,6 +216,55 @@ final class ExactPIDActionGuardValidator: PIDActionGuardValidating {
             }
         }
         return current.observedKeyboardFocus
+    }
+}
+
+/// Used only for a sealed, single coordinate click on an AXDialog popup.
+/// The popup can own the pointer while its parent remains the AX key window.
+/// Every pointer event rechecks exact live window, visibility, and hit proof.
+final class PopupPointerClickGuardValidator: PIDActionGuardValidating {
+    private let sealed: ActionGuard
+    private let authorizedPoint: CGPoint
+    private let popupProof: () -> Bool
+
+    init(sealed: ActionGuard, authorizedPoint: CGPoint, popupProof: @escaping () -> Bool) {
+        self.sealed = sealed
+        self.authorizedPoint = authorizedPoint
+        self.popupProof = popupProof
+    }
+
+    func revalidate(expected: ActionGuard, point: CGPoint?) throws {
+        try revalidate(expected: expected, point: point, dragDisplacement: nil)
+    }
+
+    func revalidate(expected: ActionGuard, point: CGPoint?, dragDisplacement: CGVector?) throws {
+        try validateSealed(expected: expected, point: point, dragDisplacement: dragDisplacement)
+        guard popupProof() else { throw ActionExecutionError.targetNotFrontmost }
+    }
+
+    /// Called only after a successful mouse-down. A popup may close as the
+    /// action's immediate effect; releasing the held button must not wait on
+    /// another screenshot or require that transient window to remain open.
+    func revalidateBalancedRelease(expected: ActionGuard, point: CGPoint?, dragDisplacement: CGVector?) throws {
+        try validateSealed(expected: expected, point: point, dragDisplacement: dragDisplacement)
+    }
+
+    private func validateSealed(expected: ActionGuard, point: CGPoint?, dragDisplacement: CGVector?) throws {
+        guard dragDisplacement == nil, expected.interactionMode == .foregroundTakeover,
+              expected.pid == sealed.pid, expected.windowID == sealed.windowID,
+              expected.bounds == sealed.bounds, expected.axIdentity == sealed.axIdentity,
+              expected.focusedAXIdentity == sealed.focusedAXIdentity,
+              expected.focusedAXBounds == sealed.focusedAXBounds,
+              expected.focusedRootPreference == sealed.focusedRootPreference,
+              expected.snapshotID == sealed.snapshotID
+        else { throw ActionExecutionError.staleSnapshot }
+        if let point {
+            guard point == authorizedPoint else { throw ActionExecutionError.outOfBounds }
+        }
+    }
+
+    func revalidateAndObserveFocus(expected _: ActionGuard, point _: CGPoint?) throws -> KeyboardFocusObservation? {
+        throw ActionExecutionError.invalidAction
     }
 }
 
@@ -813,7 +866,8 @@ final class PIDTargetedActionExecutor {
             }
             try activity.performPIDEvent(
                 lease: lease,
-                validate: { try self.revalidate(expected: expected, point: release.point, safeRegion: safeRegion, deadline: deadline, dragDisplacement: dragDisplacement) },
+                validate: { try self.revalidate(expected: expected, point: release.point, safeRegion: safeRegion,
+                    deadline: deadline, dragDisplacement: dragDisplacement, balancedRelease: true) },
                 mutation: { try heldInputs.finish(token: token) }
             )
         } catch is UserActivityMonitoringError {
@@ -873,11 +927,18 @@ final class PIDTargetedActionExecutor {
         point: CGPoint?,
         safeRegion: PointerSafeRegionAuthority,
         deadline: TimeInterval,
-        dragDisplacement: CGVector? = nil
+        dragDisplacement: CGVector? = nil,
+        balancedRelease: Bool = false
     ) throws {
         guard now() <= deadline else { throw ActionExecutionError.actionTimeout }
         do {
-            try validator.revalidate(expected: expected, point: point, dragDisplacement: dragDisplacement)
+            if balancedRelease {
+                try validator.revalidateBalancedRelease(
+                    expected: expected, point: point, dragDisplacement: dragDisplacement
+                )
+            } else {
+                try validator.revalidate(expected: expected, point: point, dragDisplacement: dragDisplacement)
+            }
         } catch {
             logActionRejected("PID-GUARD observation error=\(error) drag=\(dragDisplacement != nil)")
             throw error

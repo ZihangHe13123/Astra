@@ -52,6 +52,7 @@ struct ForegroundTakeoverPlanAuthority {
 struct ForegroundTakeoverExecutionAuthority {
     let planAuthority: ForegroundTakeoverPlanAuthority
     let lease: UserActivitySessionLease
+    let popupPointerPoint: CGPoint?
 }
 
 protocol ForegroundTakeoverCoordinating: AnyObject {
@@ -70,6 +71,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
 
     private final class Record {
         var authority: ForegroundTakeoverPlanAuthority
+        var popupPointerPoint: CGPoint?
         let lease: UserActivitySessionLease
         let oldFrontmostPID: pid_t?
         let fragmentAuthority: ForegroundFragmentAuthority?
@@ -85,11 +87,13 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         init(
             authority: ForegroundTakeoverPlanAuthority,
             lease: UserActivitySessionLease,
+            popupPointerPoint: CGPoint? = nil,
             oldFrontmostPID: pid_t?,
             fragmentAuthority: ForegroundFragmentAuthority? = nil,
             restorePreviousFocus: Bool = true
         ) {
             self.authority = authority
+            self.popupPointerPoint = popupPointerPoint
             self.lease = lease
             self.oldFrontmostPID = oldFrontmostPID
             self.fragmentAuthority = fragmentAuthority
@@ -104,6 +108,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
     private let applicationExists: (pid_t) -> Bool
     private let revalidate: (WindowTarget) throws -> WindowTarget
     private let takePlan: PlanConsumer
+    private let classifyPopupPointer: (ForegroundTakeoverPlanAuthority) -> CGPoint?
     private let beforeFragmentCommit: () -> Void
     private let lock = NSLock()
     private var records: [String: Record] = [:]
@@ -117,6 +122,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         applicationExists: @escaping (pid_t) -> Bool,
         revalidate: @escaping (WindowTarget) throws -> WindowTarget,
         takePlan: @escaping PlanConsumer,
+        classifyPopupPointer: @escaping (ForegroundTakeoverPlanAuthority) -> CGPoint? = popupPointerClickPoint,
         beforeFragmentCommit: @escaping () -> Void = {}
     ) {
         self.activity = activity
@@ -126,6 +132,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         self.applicationExists = applicationExists
         self.revalidate = revalidate
         self.takePlan = takePlan
+        self.classifyPopupPointer = classifyPopupPointer
         self.beforeFragmentCommit = beforeFragmentCommit
     }
 
@@ -231,6 +238,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         let lease: UserActivitySessionLease
         var activationAttempted = false
         var activeTarget: WindowTarget?
+        var popupPointerPoint: CGPoint?
         let notification: UserActivityPauseSignal
         do {
             notification = UserActivityPauseSignal(onOffer: declaration == nil ? nil : { [weak self] in
@@ -256,14 +264,22 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
                 interactionMode: .foregroundTakeover
             )
             let cursorPoint = try initialCursorPoint(actions: authority.actions, target: current)
+            // Classify this sealed plan once. A later action consumes the
+            // recorded point and rechecks the live popup before delivery.
+            popupPointerPoint = classifyPopupPointer(authority)
             activationAttempted = true
-            try activation.activate(foregroundTarget)
+            if let popupPoint = popupPointerPoint {
+                try activation.activatePopupPointerOnly(foregroundTarget, at: popupPoint)
+            } else {
+                try activation.activate(foregroundTarget)
+            }
             try cursor.show(at: cursorPoint)
             activeTarget = foregroundTarget
         } catch {
             let cleanupRecord = Record(
                 authority: authority,
                 lease: lease,
+                popupPointerPoint: popupPointerPoint,
                 oldFrontmostPID: oldPID,
                 fragmentAuthority: fragmentAuthority,
                 restorePreviousFocus: declaration?.restorePreviousFocus ?? true
@@ -304,6 +320,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
                 let cleanupRecord = Record(
                     authority: activeAuthority,
                     lease: lease,
+                    popupPointerPoint: popupPointerPoint,
                     oldFrontmostPID: oldPID,
                     fragmentAuthority: fragmentAuthority,
                     restorePreviousFocus: declaration?.restorePreviousFocus ?? true
@@ -322,6 +339,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         let record = Record(
             authority: activeAuthority,
             lease: lease,
+            popupPointerPoint: popupPointerPoint,
             oldFrontmostPID: oldPID,
             fragmentAuthority: fragmentAuthority,
             restorePreviousFocus: declaration?.restorePreviousFocus ?? true
@@ -399,12 +417,16 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
                 stage: fragment.declaration.stages[stage.stageIndex],
                 authority: stage
             )
+            let nextPopupPoint = classifyPopupPointer(next)
             lock.lock()
             guard records[takeoverRef] === active, !active.terminalClaimed else {
                 lock.unlock()
                 throw TakeoverError.authorityMismatch
             }
             active.authority = next
+            // A fragment replan replaces the sealed action/snapshot authority.
+            // Never carry a prior stage's popup point into its next stage.
+            active.popupPointerPoint = nextPopupPoint
             lock.unlock()
         } catch {
             next.dispatcher?.invalidatePlans()
@@ -639,14 +661,18 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         let matches = record.authority.plan.planRef == planRef &&
             record.authority.guardValue.snapshotID == snapshotID &&
             consumedGuard.map { sameSnapshotAuthority($0, record.authority.snapshotGuard) } == true
+        let planAuthority = record.authority
+        let popupPointerPoint = record.popupPointerPoint
+        let lease = record.lease
         lock.unlock()
         guard matches else {
             _ = cleanup(record, allowRestore: false)
             throw TakeoverError.authorityMismatch
         }
         return ForegroundTakeoverExecutionAuthority(
-            planAuthority: record.authority,
-            lease: record.lease
+            planAuthority: planAuthority,
+            lease: lease,
+            popupPointerPoint: popupPointerPoint
         )
     }
 
@@ -782,6 +808,7 @@ final class ForegroundPlanExecutor {
     private let now: () -> TimeInterval
     private let waitSleeper: (TimeInterval) -> Void
     private let effects: AXActionEffectVerifier
+    private let pointerOnlyPreflightState: (() throws -> ActionTargetState)?
 
     init(
         activity: any UserActivityMonitoring,
@@ -790,7 +817,8 @@ final class ForegroundPlanExecutor {
         keyboardExecutor: ForegroundKeyboardExecutor? = nil,
         now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         waitSleeper: @escaping (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
-        effectReader: any AXEffectReading = SystemAXEffectReader()
+        effectReader: any AXEffectReading = SystemAXEffectReader(),
+        pointerOnlyPreflightState: (() throws -> ActionTargetState)? = nil
     ) {
         self.activity = activity
         self.performer = performer
@@ -799,6 +827,7 @@ final class ForegroundPlanExecutor {
         self.now = now
         self.waitSleeper = waitSleeper
         self.effects = AXActionEffectVerifier(reader: effectReader, clock: now, sleeper: waitSleeper)
+        self.pointerOnlyPreflightState = pointerOnlyPreflightState
     }
 
     func run(
@@ -983,6 +1012,14 @@ final class ForegroundPlanExecutor {
               entries.count <= maximumNativeActions,
               entries.map(\.sourceIndex) == Array(entries.indices)
         else { throw ActionExecutionError.invalidAction }
+        if pointerOnlyPreflightState != nil {
+            guard entries.count == 1, let entry = entries.first,
+                  entry.backend == .foregroundPointer, entry.actionClass == .click,
+                  entry.source.kind == .click, entry.source.x != nil, entry.source.y != nil,
+                  entry.source.elementRef == nil, entry.source.targetElementRef == nil,
+                  entry.source.modifiers.isEmpty
+            else { throw ActionExecutionError.invalidAction }
+        }
         for entry in entries {
             switch entry.backend {
             case .axPress:
@@ -1030,7 +1067,7 @@ final class ForegroundPlanExecutor {
                 else { throw ActionExecutionError.invalidAction }
             }
         }
-        let current = try performer.currentTargetState()
+        let current = try pointerOnlyPreflightState?() ?? performer.currentTargetState()
         guard current.pid == expected.pid else { throw ActionExecutionError.targetNotFrontmost }
         if current.windowID != expected.windowID
             || current.axIdentity != expected.axIdentity
@@ -1198,6 +1235,141 @@ final class ForegroundPlanExecutor {
 
 private func exactTarget(_ lhs: WindowTarget, _ rhs: WindowTarget) -> Bool {
     sameTargetIdentity(lhs, rhs) && lhs.interactionMode == rhs.interactionMode
+}
+
+/// An exceptional authority for one coordinate click on an exact popup. The
+/// plan and the retained AX window must both prove this narrow shape before
+/// activation, preflight, or event delivery may use popup pointer validation.
+func popupPointerClickPoint(_ authority: ForegroundTakeoverPlanAuthority) -> CGPoint? {
+    // Ordinary plans leave by their sealed shape before any AX or CG query.
+    guard popupPointerPlanClickPoint(authority) != nil,
+          let retained = authority.target.axElement else { return nil }
+    let role = AXNodeReader.stringAttribute(retained, kAXRoleAttribute)
+    let subrole = AXNodeReader.stringAttribute(retained, kAXSubroleAttribute)
+    guard role.status == .complete, subrole.status == .complete,
+          role.value == "AXWindow", subrole.value == "AXDialog",
+          let windows = systemVisibleWindowInventory()
+    else { return nil }
+    return popupPointerClickPoint(
+        authority, role: role.value, subrole: subrole.value,
+        visibleWindows: windows
+    )
+}
+
+func popupPointerClickPoint(
+    _ authority: ForegroundTakeoverPlanAuthority,
+    role: String?, subrole: String?, visibleWindows: [VisibleWindowRecord],
+    diagnostic: (String) -> Void = logActionRejected
+) -> CGPoint? {
+    guard let point = popupPointerPlanClickPoint(authority),
+          role == "AXWindow", subrole == "AXDialog"
+    else { return nil }
+    let candidates = visibleWindows.filter { $0.windowID == authority.target.windowID }
+    // A layer-0 dialog is an ordinary window. It never enters the popup-only
+    // path and should not generate popup-gate diagnostics.
+    guard candidates.count == 1, let selected = candidates.first,
+          selected.pid == authority.target.pid, selected.layer > 0 else { return nil }
+    guard popupPointerHasLayeredShape(authority.target, visibleWindows: visibleWindows) else {
+        diagnostic(
+            "POPUP-POINTER-GATE-FAIL stage=popup_shape pid=\(authority.target.pid)"
+                + " windowID=\(authority.target.windowID)"
+        )
+        return nil
+    }
+    return point
+}
+
+private func popupPointerPlanClickPoint(_ authority: ForegroundTakeoverPlanAuthority) -> CGPoint? {
+    let target = authority.target
+    let guardValue = authority.guardValue
+    let plan = authority.plan
+    // begin receives the retained background snapshot target; the coordinator
+    // promotes that same identity to foreground only after activation.
+    guard guardValue.interactionMode == .foregroundTakeover,
+          plan.interactionMode == .foregroundTakeover, plan.requiresTakeover,
+          plan.cooperativeError == nil, plan.matches(actions: authority.actions),
+          plan.backends == [.foregroundPointer], plan.actionClasses == [.click],
+          authority.actions.count == 1, let action = authority.actions.first,
+          action.kind == .click, action.elementRef == nil, action.targetElementRef == nil,
+          action.elementIndex == nil, action.modifiers.isEmpty,
+          action.endX == nil, action.endY == nil, action.text == nil, action.key == nil,
+          action.deltaX == nil, action.deltaY == nil, action.durationMS == nil,
+          action.checked == nil, action.replace == nil,
+          guardMatchesExactTarget(guardValue, target),
+          sameSnapshotIdentity(authority.snapshotGuard, guardValue),
+          guardValue.focusedRootPreference == .selectedWindow,
+          let retained = target.axElement, let identity = target.axIdentity,
+          CFHash(retained) == identity,
+          let x = action.x, let y = action.y, x.isFinite, y.isFinite,
+          x > 0, y > 0, x < target.bounds.width, y < target.bounds.height
+    else { return nil }
+    return CGPoint(x: target.bounds.minX + x, y: target.bounds.minY + y)
+}
+
+/// A layer-0 AXDialog follows ordinary activation. Pointer-only activation
+/// requires a raised popup with a larger same-app parent behind it. Covering
+/// windows remain subject to the live pixel and exact AX hit proof.
+func popupPointerHasLayeredShape(
+    _ target: WindowTarget, visibleWindows: [VisibleWindowRecord]
+) -> Bool {
+    let selectedMatches = visibleWindows.filter { $0.windowID == target.windowID }
+    guard selectedMatches.count == 1, let selected = selectedMatches.first,
+          selected.pid == target.pid, selected.bounds == target.bounds,
+          selected.layer > 0, selected.alpha >= 0.99,
+          selected.zOrder >= 0, selected.zOrder != .max else { return false }
+    return visibleWindows.contains { parent in
+        parent.windowID != selected.windowID && parent.pid == target.pid &&
+            parent.alpha >= 0.99 && parent.zOrder >= 0 && parent.zOrder != .max &&
+            parent.bounds.width > selected.bounds.width &&
+            parent.bounds.height > selected.bounds.height &&
+            parent.bounds.contains(selected.bounds) &&
+            windowIsProvablyBehind(
+                candidateLayer: parent.layer, candidateOrder: parent.zOrder,
+                selectedLayer: selected.layer, selectedOrder: selected.zOrder
+            )
+    }
+}
+
+/// Recheck the consumed dispatcher entry before a popup is allowed to use a
+/// state read that does not depend on the parent's AX key-window status.
+func popupPointerClickEntriesMatch(
+    plan: DispatchPlan,
+    actions: [NativeAction],
+    expected: ActionGuard,
+    entries: [PlannedDispatchEntry]
+) -> Bool {
+    guard plan.interactionMode == .foregroundTakeover, plan.requiresTakeover,
+          plan.cooperativeError == nil, plan.matches(actions: actions),
+          plan.backends == [.foregroundPointer], plan.actionClasses == [.click],
+          actions.count == 1, let action = actions.first,
+          action.kind == .click, action.elementRef == nil, action.targetElementRef == nil,
+          action.elementIndex == nil, action.modifiers.isEmpty,
+          action.endX == nil, action.endY == nil, action.text == nil, action.key == nil,
+          action.deltaX == nil, action.deltaY == nil, action.durationMS == nil,
+          action.checked == nil, action.replace == nil,
+          let x = action.x, let y = action.y, x.isFinite, y.isFinite,
+          x > 0, y > 0, x < expected.bounds.width, y < expected.bounds.height,
+          entries.count == 1, let entry = entries.first,
+          entry.sourceIndex == 0, entry.source == action,
+          entry.backend == .foregroundPointer, entry.actionClass == .click,
+          entry.resolved == nil, entry.targetKeyboardFocus == nil,
+          let region = entry.pointerSafeRegion,
+          region.reference == foregroundWindowRegionReference,
+          region.identityToken == expected.snapshotID,
+          region.bounds == CGRect(origin: .zero, size: expected.bounds.size)
+    else { return false }
+    return true
+}
+
+func popupPointerSealedState(_ guardValue: ActionGuard) -> ActionTargetState {
+    ActionTargetState(
+        pid: guardValue.pid, windowID: guardValue.windowID, bounds: guardValue.bounds,
+        axIdentity: guardValue.axIdentity,
+        focusedAXIdentity: guardValue.focusedAXIdentity,
+        focusedAXBounds: guardValue.focusedAXBounds,
+        focusedRootPreference: guardValue.focusedRootPreference,
+        keyboardFocus: guardValue.keyboardFocus
+    )
 }
 
 private func sameTargetIdentity(_ lhs: WindowTarget, _ rhs: WindowTarget) -> Bool {

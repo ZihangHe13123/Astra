@@ -1340,6 +1340,125 @@ private func scrollbarAXPressReferences(
     #expect(provider.fallbackWindowIDs == [73])
 }
 
+@Test func paddedScaledParentPixelsFallBackToExactPopupWindow() throws {
+    let popup = CGRect(x: 89, y: 70, width: 1038, height: 199)
+    let parent = CGRect(x: 25, y: 30, width: 1319, height: 768)
+    // The live Edge popup produced a 2076x398 canvas containing the entire
+    // parent browser shrunk to 684x398, with the remaining width transparent.
+    let wrong = try popupCoverageImage(opaqueRect: CGRect(x: 0, y: 0, width: 684, height: 398))
+    let exact = try popupCoverageImage(opaqueRect: CGRect(x: 0, y: 0, width: 2076, height: 398))
+    #expect(windowImageHasScaledParentPadding(
+        wrong, expectedBounds: popup, sameApplicationWindowFrames: [parent]
+    ))
+    let provider = RecordingImageProvider(primaryError: nil, primaryImage: wrong, fallbackImage: exact)
+
+    let captured = try captureExactWindowImage(
+        windowID: 73, provider: provider,
+        expectedBounds: popup, sameApplicationWindowFrames: [parent]
+    )
+
+    #expect(provider.fallbackWindowIDs == [73])
+    #expect(captured.width == 2076 && captured.height == 398)
+    #expect(!windowImageHasScaledParentPadding(
+        captured, expectedBounds: popup, sameApplicationWindowFrames: [parent]
+    ))
+}
+
+@Test func paddedScaledParentFallbackCannotBePublishedAsPopup() throws {
+    let popup = CGRect(x: 89, y: 70, width: 1038, height: 199)
+    let parent = CGRect(x: 25, y: 30, width: 1319, height: 768)
+    let wrong = try popupCoverageImage(opaqueRect: CGRect(x: 0, y: 0, width: 684, height: 398))
+    let provider = RecordingImageProvider(primaryError: nil, primaryImage: wrong, fallbackImage: wrong)
+
+    #expect(throws: WindowObservationError.self) {
+        try captureExactWindowImage(
+            windowID: 73, provider: provider,
+            expectedBounds: popup, sameApplicationWindowFrames: [parent]
+        )
+    }
+    #expect(provider.fallbackWindowIDs == [73])
+}
+
+@Test func largePaddedScaledParentStillFallsBackAfterBoundedSampling() throws {
+    let popup = CGRect(x: 500, y: 100, width: 2500, height: 500)
+    let parent = CGRect(x: 0, y: 0, width: 4000, height: 2000)
+    let canvas = CGSize(width: 5000, height: 1000)
+    let wrong = try popupCoverageImage(
+        opaqueRect: CGRect(x: 0, y: 0, width: 2000, height: 1000), canvasSize: canvas
+    )
+    let exact = try popupCoverageImage(
+        opaqueRect: CGRect(x: 0, y: 0, width: 5000, height: 1000), canvasSize: canvas
+    )
+    #expect(windowImageHasScaledParentPadding(
+        wrong, expectedBounds: popup, sameApplicationWindowFrames: [parent]
+    ))
+    let provider = RecordingImageProvider(primaryError: nil, primaryImage: wrong, fallbackImage: exact)
+
+    _ = try captureExactWindowImage(
+        windowID: 73, provider: provider,
+        expectedBounds: popup, sameApplicationWindowFrames: [parent]
+    )
+
+    #expect(provider.fallbackWindowIDs == [73])
+}
+
+@Test func genuineTransparentPopupAndOpaqueBlackDoNotTriggerParentPaddingGuard() throws {
+    let popup = CGRect(x: 89, y: 70, width: 1038, height: 199)
+    let parent = CGRect(x: 25, y: 30, width: 1319, height: 768)
+    let transparent = try popupCoverageImage(opaqueRect: CGRect(x: 300, y: 50, width: 200, height: 100))
+    let opaqueBlack = try popupCoverageImage(opaqueRect: CGRect(x: 0, y: 0, width: 2076, height: 398))
+    for image in [transparent, opaqueBlack] {
+        #expect(!windowImageHasScaledParentPadding(
+            image, expectedBounds: popup, sameApplicationWindowFrames: [parent]
+        ))
+        let provider = RecordingImageProvider(primaryError: nil, primaryImage: image, fallbackImage: nil)
+        _ = try captureExactWindowImage(
+            windowID: 73, provider: provider,
+            expectedBounds: popup, sameApplicationWindowFrames: [parent]
+        )
+        #expect(provider.fallbackWindowIDs.isEmpty)
+    }
+}
+
+@Test func leftTransparentPopupWithDifferentParentAspectUsesPrimaryImage() throws {
+    let popup = CGRect(x: 89, y: 70, width: 1038, height: 199)
+    let differentlyShapedParent = CGRect(x: 25, y: 30, width: 1200, height: 800)
+    // Its alpha coverage is identical to the bad Edge image, but the nearby
+    // parent cannot account for the 684-pixel visible width when scaled.
+    let legitimate = try popupCoverageImage(opaqueRect: CGRect(x: 0, y: 0, width: 684, height: 398))
+    #expect(!windowImageHasScaledParentPadding(
+        legitimate, expectedBounds: popup, sameApplicationWindowFrames: [differentlyShapedParent]
+    ))
+    let provider = RecordingImageProvider(primaryError: nil, primaryImage: legitimate, fallbackImage: nil)
+
+    let captured = try captureExactWindowImage(
+        windowID: 73, provider: provider,
+        expectedBounds: popup, sameApplicationWindowFrames: [differentlyShapedParent]
+    )
+
+    #expect(captured.width == 2076 && captured.height == 398)
+    #expect(provider.fallbackWindowIDs.isEmpty)
+}
+
+@Test func leftTransparentPopupMatchingParentAspectFailsClosedIfFallbackMatches() throws {
+    let popup = CGRect(x: 89, y: 70, width: 1038, height: 199)
+    let parent = CGRect(x: 25, y: 30, width: 1319, height: 768)
+    // This is a legitimate transparent popup, but its pixels and geometry are
+    // identical to a scaled parent image. Pixel-only validation cannot tell.
+    let legitimate = try popupCoverageImage(opaqueRect: CGRect(x: 0, y: 0, width: 684, height: 398))
+    let provider = RecordingImageProvider(
+        primaryError: nil, primaryImage: legitimate, fallbackImage: legitimate
+    )
+
+    #expect(throws: WindowObservationError.self) {
+        try captureExactWindowImage(
+            windowID: 73, provider: provider,
+            expectedBounds: popup, sameApplicationWindowFrames: [parent]
+        )
+    }
+    #expect(provider.fallbackWindowIDs == [73])
+}
+
 @Test func popupGeometryFallbackFailureDoesNotCaptureAnotherSurface() {
     let provider = RecordingImageProvider(primaryError: .contentMismatch, fallbackImage: nil)
     #expect(throws: WindowObservationError.self) {
@@ -1491,23 +1610,42 @@ private func scrollbarAXPressReferences(
 
 private final class RecordingImageProvider: ExactWindowImageProviding {
     let primaryError: PrimaryWindowCaptureError?
+    let primary: CGImage?
     let image: CGImage?
     var fallbackWindowIDs: [CGWindowID] = []
 
-    init(primaryError: PrimaryWindowCaptureError?, fallbackImage: CGImage?) {
+    init(primaryError: PrimaryWindowCaptureError?, primaryImage: CGImage? = nil, fallbackImage: CGImage?) {
         self.primaryError = primaryError
+        primary = primaryImage
         self.image = fallbackImage
     }
 
     func primaryImage() throws -> CGImage {
         if let primaryError { throw primaryError }
-        return testImage()
+        return primary ?? testImage()
     }
 
     func fallbackImage(for windowID: CGWindowID) -> CGImage? {
         fallbackWindowIDs.append(windowID)
         return image
     }
+}
+
+private func popupCoverageImage(
+    opaqueRect: CGRect,
+    canvasSize: CGSize = CGSize(width: 2076, height: 398)
+) throws -> CGImage {
+    let width = Int(canvasSize.width)
+    let height = Int(canvasSize.height)
+    let context = try #require(CGContext(
+        data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: width * 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ))
+    context.clear(CGRect(origin: .zero, size: canvasSize))
+    context.setFillColor(CGColor(red: 0, green: 0, blue: 0, alpha: 1))
+    context.fill(opaqueRect)
+    return try #require(context.makeImage())
 }
 
 private func testImage() -> CGImage {

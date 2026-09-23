@@ -119,27 +119,36 @@ let foregroundWindowRegionReference = "__astra_foreground_window_region__"
 /// Accessibility hit testing resolves click-through system surfaces (e.g. the
 /// Dock's full-screen bookkeeping window) without exempting a whole app/layer.
 /// Require the exact retained AX window, not just a matching foreground PID.
-func foregroundPointBelongsToWindow(_ point: CGPoint, pid: pid_t, window: AXUIElement?) -> Bool {
-    guard point.x.isFinite, point.y.isFinite, let window else { return false }
+func foregroundPointBelongsToWindow(
+    _ point: CGPoint, pid: pid_t, window: AXUIElement?,
+    onFailure: ((PopupPointerProofFailureStage) -> Void)? = nil
+) -> Bool {
+    func reject(_ stage: PopupPointerProofFailureStage) -> Bool {
+        onFailure?(stage)
+        return false
+    }
+    guard point.x.isFinite, point.y.isFinite, let window else { return reject(.hitInvalidInput) }
     let system = AXUIElementCreateSystemWide()
-    guard AXUIElementSetMessagingTimeout(system, 0.2) == .success else { return false }
+    guard AXUIElementSetMessagingTimeout(system, 0.2) == .success else { return reject(.hitSystemTimeout) }
     var hit: AXUIElement?
     guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &hit) == .success,
-          var current = hit else { return false }
+          var current = hit else { return reject(.hitRead) }
     var owner: pid_t = 0
-    guard AXUIElementGetPid(current, &owner) == .success, owner == pid else { return false }
+    guard AXUIElementGetPid(current, &owner) == .success, owner == pid else { return reject(.hitPID) }
     for _ in 0..<12 {
         if CFEqual(current, window) { return true }
-        guard AXUIElementSetMessagingTimeout(current, 0.2) == .success else { return false }
+        guard AXUIElementSetMessagingTimeout(current, 0.2) == .success else {
+            return reject(.hitAncestorTimeout)
+        }
         var containing: CFTypeRef?
         if AXUIElementCopyAttributeValue(current, kAXWindowAttribute as CFString, &containing) == .success,
            let containing, CFGetTypeID(containing) == AXUIElementGetTypeID() {
-            return CFEqual(containing, window)
+            return CFEqual(containing, window) || reject(.hitWindowMismatch)
         }
         var parent: CFTypeRef?
         guard AXUIElementCopyAttributeValue(current, kAXParentAttribute as CFString, &parent) == .success,
-              let parent, CFGetTypeID(parent) == AXUIElementGetTypeID() else { return false }
+              let parent, CFGetTypeID(parent) == AXUIElementGetTypeID() else { return reject(.hitParentRead) }
         current = unsafeBitCast(parent, to: AXUIElement.self)
     }
-    return false
+    return reject(.hitDepth)
 }

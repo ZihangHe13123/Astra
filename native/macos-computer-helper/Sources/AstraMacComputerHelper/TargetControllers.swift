@@ -29,7 +29,16 @@ protocol TargetSelecting {
 
 protocol ApplicationActivationControlling {
     func activate(_ target: WindowTarget) throws
+    func activatePopupPointerOnly(_ target: WindowTarget, at point: CGPoint) throws
     func restore(pid: pid_t) throws
+}
+
+extension ApplicationActivationControlling {
+    // Existing injected activators keep the strict path unless they explicitly
+    // implement the narrower popup pointer authority.
+    func activatePopupPointerOnly(_ target: WindowTarget, at _: CGPoint) throws {
+        try activate(target)
+    }
 }
 
 struct TargetAXWindowRecord {
@@ -413,6 +422,129 @@ protocol ApplicationActivationRuntime {
     func raiseWindow(_ target: WindowTarget) -> Bool
     func frontmostPID() -> pid_t?
     func focusedWindowMatches(_ target: WindowTarget) -> Bool
+    func popupPointerWindowMatches(_ target: WindowTarget, at point: CGPoint) -> Bool
+}
+
+extension ApplicationActivationRuntime {
+    func popupPointerWindowMatches(_: WindowTarget, at _: CGPoint) -> Bool { false }
+}
+
+/// The focused AX window may remain the parent while a popup handles pointer
+/// input. This proof is intentionally restricted to a visible, raised dialog
+/// and one point on that exact window; it never authorizes keyboard input.
+enum PopupPointerProofFailureStage: String, CaseIterable {
+    case invalidTarget = "invalid_target"
+    case notFrontmost = "not_frontmost"
+    case axRole = "ax_role"
+    case selectedWindowCount = "selected_window_count"
+    case selectedWindowIdentity = "selected_window_identity"
+    case selectedWindowVisibility = "selected_window_visibility"
+    case coveringWindow = "covering_window"
+    case exactAXWindow = "exact_ax_window"
+    case windowInventory = "window_inventory"
+    case axRoleRead = "ax_role_read"
+    case hitInvalidInput = "hit_invalid_input"
+    case hitSystemTimeout = "hit_system_timeout"
+    case hitRead = "hit_read"
+    case hitPID = "hit_pid"
+    case hitAncestorTimeout = "hit_ancestor_timeout"
+    case hitWindowMismatch = "hit_window_mismatch"
+    case hitParentRead = "hit_parent_read"
+    case hitDepth = "hit_depth"
+}
+
+/// Bounded numeric geometry only. No CG window names or AX content is read.
+func popupPointerCoveringWindowDiagnostic(
+    selected: VisibleWindowRecord, candidate: VisibleWindowRecord
+) -> String {
+    func scalar(_ value: Double, limit: Double) -> String {
+        guard value.isFinite, abs(value) <= limit else { return "unavailable" }
+        return String(format: "%.2f", value)
+    }
+    return "selected_layer=\(selected.layer) selected_z=\(selected.zOrder)"
+        + " selected_alpha=\(scalar(selected.alpha, limit: 10))"
+        + " candidate_pid=\(candidate.pid) candidate_windowID=\(candidate.windowID)"
+        + " candidate_layer=\(candidate.layer) candidate_z=\(candidate.zOrder)"
+        + " candidate_alpha=\(scalar(candidate.alpha, limit: 10))"
+        + " dx=\(scalar(Double(candidate.bounds.minX - selected.bounds.minX), limit: 100_000))"
+        + " dy=\(scalar(Double(candidate.bounds.minY - selected.bounds.minY), limit: 100_000))"
+        + " w=\(scalar(Double(candidate.bounds.width), limit: 100_000))"
+        + " h=\(scalar(Double(candidate.bounds.height), limit: 100_000))"
+}
+
+func popupPointerWindowTopmostFailure(
+    targetPID: pid_t,
+    frontmostPID: pid_t?,
+    windowID: CGWindowID,
+    bounds: CGRect,
+    point: CGPoint,
+    role: String?,
+    subrole: String?,
+    visibleWindows: [VisibleWindowRecord],
+    onCoveringWindow: ((VisibleWindowRecord, VisibleWindowRecord) -> Void)? = nil
+) -> PopupPointerProofFailureStage? {
+    guard targetPID > 0, windowID > 0,
+          validTargetBounds(bounds), point.x.isFinite, point.y.isFinite,
+          point.x > bounds.minX, point.x < bounds.maxX,
+          point.y > bounds.minY, point.y < bounds.maxY
+    else { return .invalidTarget }
+    guard frontmostPID == targetPID else { return .notFrontmost }
+    guard role == "AXWindow", subrole == "AXDialog" else { return .axRole }
+    let matching = visibleWindows.filter { $0.windowID == windowID }
+    guard matching.count == 1, let selected = matching.first else { return .selectedWindowCount }
+    guard selected.pid == targetPID, selected.bounds == bounds else { return .selectedWindowIdentity }
+    guard
+          selected.layer > 0, selected.alpha >= 0.99,
+          selected.zOrder >= 0, selected.zOrder != .max
+    else { return .selectedWindowVisibility }
+    if let covering = visibleWindows.first(where: { candidate in
+        candidate.windowID != windowID && candidate.bounds.contains(point) &&
+            !windowIsProvablyBehind(
+                candidateLayer: candidate.layer, candidateOrder: candidate.zOrder,
+                selectedLayer: selected.layer, selectedOrder: selected.zOrder
+            )
+    }) {
+        onCoveringWindow?(selected, covering)
+        return .coveringWindow
+    }
+    return nil
+}
+
+func popupPointerWindowIsTopmost(
+    targetPID: pid_t,
+    frontmostPID: pid_t?,
+    windowID: CGWindowID,
+    bounds: CGRect,
+    point: CGPoint,
+    role: String?,
+    subrole: String?,
+    visibleWindows: [VisibleWindowRecord]
+) -> Bool {
+    popupPointerWindowTopmostFailure(
+        targetPID: targetPID, frontmostPID: frontmostPID, windowID: windowID,
+        bounds: bounds, point: point, role: role, subrole: subrole,
+        visibleWindows: visibleWindows
+    ) == nil
+}
+
+/// A covering CG window may be a click-through compositor surface. Its
+/// presence can be resolved only by fresh visual agreement for the exact
+/// popup rectangle and an independent system-wide AX hit on that popup.
+/// Every other geometry/authority failure remains final.
+func popupPointerProofAllowsDispatch(
+    geometryFailure: PopupPointerProofFailureStage?,
+    visualAgreement: () -> Bool,
+    exactAXHit: () -> Bool,
+    onGeometryFailure: (PopupPointerProofFailureStage) -> Void
+) -> Bool {
+    if let geometryFailure {
+        guard geometryFailure == .coveringWindow,
+              visualAgreement() else {
+            onGeometryFailure(geometryFailure)
+            return false
+        }
+    }
+    return exactAXHit()
 }
 
 struct SystemApplicationProcessLauncher: ApplicationProcessLaunching {
@@ -462,6 +594,19 @@ struct SystemApplicationProcessLauncher: ApplicationProcessLaunching {
 }
 
 struct SystemApplicationActivationRuntime: ApplicationActivationRuntime {
+    private let diagnostic: (String) -> Void
+    private let popupCompositorRegionMatches: (WindowTarget) -> Bool
+
+    init(
+        diagnostic: @escaping (String) -> Void = logActionRejected,
+        popupCompositorRegionMatches: @escaping (WindowTarget) -> Bool = {
+            popupPointerCompositorRegionMatches(target: $0)
+        }
+    ) {
+        self.diagnostic = diagnostic
+        self.popupCompositorRegionMatches = popupCompositorRegionMatches
+    }
+
     func applicationIdentity(pid: pid_t) -> ApplicationLaunchIdentity? {
         guard let application = NSRunningApplication(processIdentifier: pid), !application.isTerminated else {
             return nil
@@ -518,6 +663,47 @@ struct SystemApplicationActivationRuntime: ApplicationActivationRuntime {
         return CFEqual(focused, expected)
     }
 
+    func popupPointerWindowMatches(_ target: WindowTarget, at point: CGPoint) -> Bool {
+        func reject(_ stage: PopupPointerProofFailureStage, numbers: String? = nil) -> Bool {
+            diagnostic("POPUP-POINTER-PROOF-FAIL stage=\(stage.rawValue) pid=\(target.pid) windowID=\(target.windowID)"
+                + (numbers.map { " \($0)" } ?? ""))
+            return false
+        }
+        guard let expected = exactWindow(target) else { return reject(.exactAXWindow) }
+        guard let windows = systemVisibleWindowInventory() else { return reject(.windowInventory) }
+        let role = AXNodeReader.stringAttribute(expected, kAXRoleAttribute)
+        let subrole = AXNodeReader.stringAttribute(expected, kAXSubroleAttribute)
+        guard role.status == .complete, subrole.status == .complete else { return reject(.axRoleRead) }
+        var coveringNumbers: String?
+        let geometryFailure = popupPointerWindowTopmostFailure(
+            targetPID: target.pid, frontmostPID: frontmostPID(),
+            windowID: target.windowID, bounds: target.bounds, point: point,
+            role: role.value, subrole: subrole.value, visibleWindows: windows,
+            onCoveringWindow: { selected, candidate in
+                coveringNumbers = popupPointerCoveringWindowDiagnostic(selected: selected, candidate: candidate)
+            }
+        )
+        return popupPointerProofAllowsDispatch(
+            geometryFailure: geometryFailure,
+            visualAgreement: { popupCompositorRegionMatches(target) },
+            exactAXHit: {
+                guard frontmostPID() == target.pid else { return reject(.notFrontmost) }
+                guard let freshExpected = exactWindow(target) else { return reject(.exactAXWindow) }
+                let freshRole = AXNodeReader.stringAttribute(freshExpected, kAXRoleAttribute)
+                let freshSubrole = AXNodeReader.stringAttribute(freshExpected, kAXSubroleAttribute)
+                guard freshRole.status == .complete, freshSubrole.status == .complete else {
+                    return reject(.axRoleRead)
+                }
+                guard freshRole.value == "AXWindow", freshSubrole.value == "AXDialog" else {
+                    return reject(.axRole)
+                }
+                return foregroundPointBelongsToWindow(point, pid: target.pid, window: freshExpected,
+                    onFailure: { _ = reject($0) })
+            },
+            onGeometryFailure: { _ = reject($0, numbers: coveringNumbers) }
+        )
+    }
+
     private func exactWindow(_ target: WindowTarget) -> AXUIElement? {
         guard let expectedIdentity = target.axIdentity,
               let expectedElement = target.axElement
@@ -546,6 +732,7 @@ final class LaunchServicesApplicationActivationController: ApplicationActivation
     private let launcher: any ApplicationProcessLaunching
     private let now: () -> Date
     private let sleep: (TimeInterval) -> Void
+    private let diagnostic: (String) -> Void
     private let timeout: TimeInterval
     private let retryInterval: TimeInterval
     private let activationSettleInterval: TimeInterval
@@ -555,6 +742,7 @@ final class LaunchServicesApplicationActivationController: ApplicationActivation
         launcher: any ApplicationProcessLaunching = SystemApplicationProcessLauncher(),
         now: @escaping () -> Date = Date.init,
         sleep: @escaping (TimeInterval) -> Void = Thread.sleep,
+        diagnostic: @escaping (String) -> Void = logActionRejected,
         timeout: TimeInterval = 2,
         retryInterval: TimeInterval = 0.05,
         activationSettleInterval: TimeInterval = 0.3
@@ -563,6 +751,7 @@ final class LaunchServicesApplicationActivationController: ApplicationActivation
         self.launcher = launcher
         self.now = now
         self.sleep = sleep
+        self.diagnostic = diagnostic
         self.timeout = timeout
         self.retryInterval = retryInterval
         self.activationSettleInterval = activationSettleInterval
@@ -576,32 +765,75 @@ final class LaunchServicesApplicationActivationController: ApplicationActivation
         else { throw WindowObservationError.targetGone }
         runtime.unhide(pid: target.pid)
         let deadline = now().addingTimeInterval(timeout)
+        var lastFrontmost: Bool?
+        var lastSetFocused: Bool?
+        var lastRaised: Bool?
+        var lastFocusedMatch: Bool?
+        var attempts = 0
         while now() < deadline {
-            if runtime.frontmostPID() != target.pid {
+            let frontmost = runtime.frontmostPID() == target.pid
+            lastFrontmost = frontmost
+            if !frontmost {
                 if launchOnce(arguments: arguments, deadline: deadline) {
                     guard waitForFrontmost(pid: target.pid, deadline: deadline) else { continue }
+                    lastFrontmost = true
                 } else {
                     waitUntilNextLaunch(deadline: deadline)
                     continue
                 }
             }
-            while now() < deadline, runtime.frontmostPID() == target.pid {
+            while now() < deadline {
+                let currentlyFrontmost = runtime.frontmostPID() == target.pid
+                lastFrontmost = currentlyFrontmost
+                guard currentlyFrontmost else { break }
+                attempts += 1
                 let selected = runtime.setFocusedWindow(target)
+                lastSetFocused = selected
                 guard now() < deadline else { break }
                 let raised = runtime.raiseWindow(target)
+                lastRaised = raised
                 guard now() < deadline else { break }
-                if selected,
-                   raised,
-                   runtime.frontmostPID() == target.pid,
-                   runtime.focusedWindowMatches(target)
-                {
+                // Preserve short-circuit verification: a failed set/raise must
+                // not produce extra AX reads merely for diagnostics.
+                var focusedMatch: Bool?
+                if selected && raised {
+                    let stillFrontmost = runtime.frontmostPID() == target.pid
+                    lastFrontmost = stillFrontmost
+                    if stillFrontmost { focusedMatch = runtime.focusedWindowMatches(target) }
+                }
+                lastFocusedMatch = focusedMatch
+                if focusedMatch == true {
                     return
                 }
                 let retryDelay = min(retryInterval, deadline.timeIntervalSince(now()))
                 if retryDelay > 0 { sleep(retryDelay) }
             }
         }
+        func value(_ flag: Bool?) -> String {
+            flag.map { $0 ? "true" : "false" } ?? "not_checked"
+        }
+        diagnostic(
+            "ACTIVATE-FAIL pid=\(target.pid) windowID=\(target.windowID)"
+                + " attempts=\(attempts) frontmost=\(value(lastFrontmost))"
+                + " setFocusedWindow=\(value(lastSetFocused))"
+                + " raiseWindow=\(value(lastRaised))"
+                + " focusedWindowMatches=\(value(lastFocusedMatch))"
+        )
         throw WindowObservationError.targetNotFrontmost
+    }
+
+    func activatePopupPointerOnly(_ target: WindowTarget, at point: CGPoint) throws {
+        // The popup is already visible inside the frontmost process. Launching,
+        // raising, or setting AX focus can dismiss it; this path only observes.
+        guard target.interactionMode == .foregroundTakeover,
+              target.pid > 0, target.windowID > 0, target.axIdentity != nil,
+              runtime.frontmostPID() == target.pid,
+              runtime.popupPointerWindowMatches(target, at: point)
+        else {
+            diagnostic("POPUP-POINTER-ACTIVATE-FAIL pid=\(target.pid) windowID=\(target.windowID)")
+            throw WindowObservationError.targetNotFrontmost
+        }
+        diagnostic("POPUP-POINTER-ACTIVATE pid=\(target.pid) windowID=\(target.windowID)")
     }
 
     func restore(pid: pid_t) throws {

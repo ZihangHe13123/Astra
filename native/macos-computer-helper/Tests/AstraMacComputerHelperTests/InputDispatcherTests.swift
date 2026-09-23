@@ -12,6 +12,78 @@ extension InputDispatcher {
     }
 }
 
+@Test func popupPointerConsumeUsesSealedStateOnlyForOneRawClick() throws {
+    let click = NativeAction.click(x: 15, y: 15)
+    func fixture(_ actions: [NativeAction]) throws -> (
+        dispatcher: InputDispatcher, performer: InputDispatcherPerformerSpy,
+        plan: DispatchPlan, context: DispatchContext
+    ) {
+        let performer = InputDispatcherPerformerSpy()
+        let context = DispatchContext(guardValue: inputDispatcherForegroundGuard())
+        let dispatcher = InputDispatcher(
+            performer: performer,
+            application: inputDispatcherApplication,
+            syntheticPolicy: SyntheticInputPlanningPolicy(
+                pointerCapability: .available, keyboardCapability: .available,
+                registry: PIDInputCompatibilityRegistry(), genericForegroundEnabled: true
+            )
+        )
+        let plan = try dispatcher.plan(actions: actions, context: context)
+        // A popup can leave its parent as AXFocusedWindow after takeover.
+        performer.state = ActionTargetState(
+            pid: 11, windowID: 22, bounds: context.guardValue.bounds,
+            axIdentity: 33, focusedAXIdentity: 44
+        )
+        return (dispatcher, performer, plan, context)
+    }
+    let strict = try fixture([click])
+    #expect(throws: ActionExecutionError.self) {
+        try strict.dispatcher.consumeForegroundPlan(
+            strict.plan,
+            authority: foregroundConsumptionAuthority(
+                plan: strict.plan, context: strict.context, actions: [click]
+            )
+        )
+    }
+    let popup = try fixture([click])
+    #expect(popup.plan.backends == [.foregroundPointer])
+    var proofCalls = 0
+    let entries = try popup.dispatcher.consumeForegroundPlan(
+        popup.plan,
+        authority: foregroundConsumptionAuthority(
+            plan: popup.plan, context: popup.context, actions: [click]
+        ),
+        validateFocusMutation: {},
+        popupPointerOnlyState: {
+            proofCalls += 1
+            return popupPointerSealedState(popup.context.guardValue)
+        }
+    )
+    #expect(proofCalls == 1)
+    #expect(popupPointerClickEntriesMatch(
+        plan: popup.plan, actions: [click], expected: popup.context.guardValue,
+        entries: entries
+    ))
+    for actions in [[click, click], [click, .keypress(key: "return")]] {
+        let mixed = try fixture(actions)
+        var bypassCalls = 0
+        #expect(throws: ActionExecutionError.self) {
+            _ = try mixed.dispatcher.consumeForegroundPlan(
+                mixed.plan,
+                authority: foregroundConsumptionAuthority(
+                    plan: mixed.plan, context: mixed.context, actions: actions
+                ),
+                validateFocusMutation: {},
+                popupPointerOnlyState: {
+                    bypassCalls += 1
+                    return popupPointerSealedState(mixed.context.guardValue)
+                }
+            )
+        }
+        #expect(bypassCalls == 0)
+    }
+}
+
 @Test func fragmentDraftIsNotConsumableBeforeExactSingleUseSeal() throws {
     let performer = InputDispatcherPerformerSpy()
     let dispatcher = InputDispatcher(

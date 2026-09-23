@@ -123,6 +123,118 @@ import Testing
     expectTargetNotFrontmost { try controller.activate(target) }
 }
 
+@Test func popupPointerActivationRequiresItsExplicitPointProof() throws {
+    let target = activationTarget()
+    let point = CGPoint(x: 180, y: 122)
+    let runtime = ActivationRuntimeSpy(
+        identity: ApplicationLaunchIdentity(bundleURL: nil, localizedName: "Test"),
+        expected: target,
+        exactFocusedWindowMatches: false,
+        popupPointerMatches: true
+    )
+    runtime.markVerified()
+    let clock = ActivationTestClock()
+    let launcher = ProcessLauncherSpy()
+    let controller = LaunchServicesApplicationActivationController(
+        runtime: runtime, launcher: launcher,
+        now: { clock.now() }, sleep: { clock.sleep($0) },
+        timeout: 0.05, retryInterval: 0.05
+    )
+
+    try controller.activatePopupPointerOnly(target, at: point)
+    #expect(runtime.popupPointerMatchCount == 1)
+    #expect(runtime.lastPopupPoint == point)
+    #expect(launcher.invocations.isEmpty)
+    #expect(runtime.unhideCount == 0)
+    #expect(runtime.setFocusedWindowCount == 0)
+    #expect(runtime.raiseCount == 0)
+    #expect(runtime.focusedWindowMatchCount == 0)
+    // A regular activation for the same target still requires AX focus.
+    expectTargetNotFrontmost { try controller.activate(target) }
+    #expect(runtime.popupPointerMatchCount == 1)
+}
+
+@Test func popupPointerActivationFailsClosedWithoutFrontmostOrProof() {
+    let target = activationTarget()
+    let point = CGPoint(x: 180, y: 122)
+    for (frontmost, proof) in [(false, true), (true, false)] {
+        let runtime = ActivationRuntimeSpy(
+            identity: ApplicationLaunchIdentity(bundleURL: nil, localizedName: "Test"),
+            expected: target, exactFocusedWindowMatches: false,
+            frontmostMatches: frontmost, popupPointerMatches: proof
+        )
+        runtime.markVerified()
+        let clock = ActivationTestClock()
+        let launcher = ProcessLauncherSpy()
+        let controller = LaunchServicesApplicationActivationController(
+            runtime: runtime, launcher: launcher,
+            now: { clock.now() }, sleep: { clock.sleep($0) },
+            timeout: 0.05, retryInterval: 0.05
+        )
+        expectTargetNotFrontmost { try controller.activatePopupPointerOnly(target, at: point) }
+        #expect(runtime.popupPointerMatchCount == (frontmost ? 1 : 0))
+        #expect(launcher.invocations.isEmpty)
+        #expect(runtime.unhideCount == 0)
+        #expect(runtime.setFocusedWindowCount == 0)
+        #expect(runtime.raiseCount == 0)
+    }
+}
+
+@Test func activationFailureLogsTheLastExactWindowChecksOnce() {
+    let target = activationTarget()
+    let runtime = ActivationRuntimeSpy(
+        identity: ApplicationLaunchIdentity(bundleURL: nil, localizedName: "Test"),
+        expected: target,
+        exactFocusedWindowMatches: false
+    )
+    runtime.markVerified()
+    let clock = ActivationTestClock()
+    var lines: [String] = []
+    let controller = LaunchServicesApplicationActivationController(
+        runtime: runtime,
+        launcher: ProcessLauncherSpy(),
+        now: { clock.now() },
+        sleep: { clock.sleep($0) },
+        diagnostic: { lines.append($0) },
+        timeout: 0.05,
+        retryInterval: 0.05
+    )
+
+    expectTargetNotFrontmost { try controller.activate(target) }
+
+    #expect(lines.count == 1)
+    #expect(lines[0].contains("ACTIVATE-FAIL pid=42 windowID=24 attempts=1"))
+    #expect(lines[0].contains("frontmost=true setFocusedWindow=true raiseWindow=true focusedWindowMatches=false"))
+    #expect(!lines[0].contains("Document"))
+}
+
+@Test func activationFailureLogsSkippedFocusedMatchAfterSetRefusal() {
+    let target = activationTarget()
+    let runtime = ActivationRuntimeSpy(
+        identity: ApplicationLaunchIdentity(bundleURL: nil, localizedName: "Test"),
+        expected: target,
+        setFocusedWindowSucceeds: false
+    )
+    runtime.markVerified()
+    let clock = ActivationTestClock()
+    var lines: [String] = []
+    let controller = LaunchServicesApplicationActivationController(
+        runtime: runtime,
+        launcher: ProcessLauncherSpy(),
+        now: { clock.now() },
+        sleep: { clock.sleep($0) },
+        diagnostic: { lines.append($0) },
+        timeout: 0.05,
+        retryInterval: 0.05
+    )
+
+    expectTargetNotFrontmost { try controller.activate(target) }
+
+    #expect(lines.count == 1)
+    #expect(lines[0].contains("setFocusedWindow=false raiseWindow=true focusedWindowMatches=not_checked"))
+    #expect(runtime.focusedWindowMatchCount == 0)
+}
+
 @Test func nonzeroOpenExitRemainsTargetNotFrontmostAfterVerificationSignalsMatch() {
     let target = activationTarget()
     let runtime = ActivationRuntimeSpy(
@@ -459,23 +571,32 @@ private final class ActivationRuntimeSpy: ApplicationActivationRuntime {
     private let expected: WindowTarget
     private let exactFocusedWindowMatchesValue: Bool
     private let frontmostMatchesValue: Bool
+    private let setFocusedWindowSucceeds: Bool
+    private let popupPointerMatchesValue: Bool
     private let afterSetFocusedWindow: () -> Void
     private var verified = false
     private(set) var unhideCount = 0
     private(set) var setFocusedWindowCount = 0
     private(set) var raiseCount = 0
+    private(set) var focusedWindowMatchCount = 0
+    private(set) var popupPointerMatchCount = 0
+    private(set) var lastPopupPoint: CGPoint?
 
     init(
         identity: ApplicationLaunchIdentity?,
         expected: WindowTarget,
         exactFocusedWindowMatches: Bool = true,
         frontmostMatches: Bool = true,
+        setFocusedWindowSucceeds: Bool = true,
+        popupPointerMatches: Bool = false,
         afterSetFocusedWindow: @escaping () -> Void = {}
     ) {
         identityValue = identity
         self.expected = expected
         exactFocusedWindowMatchesValue = exactFocusedWindowMatches
         frontmostMatchesValue = frontmostMatches
+        self.setFocusedWindowSucceeds = setFocusedWindowSucceeds
+        popupPointerMatchesValue = popupPointerMatches
         self.afterSetFocusedWindow = afterSetFocusedWindow
     }
 
@@ -484,7 +605,7 @@ private final class ActivationRuntimeSpy: ApplicationActivationRuntime {
     func setFocusedWindow(_ target: WindowTarget) -> Bool {
         setFocusedWindowCount += 1
         afterSetFocusedWindow()
-        return target.axIdentity == expected.axIdentity
+        return setFocusedWindowSucceeds && target.axIdentity == expected.axIdentity
     }
     func raiseWindow(_ target: WindowTarget) -> Bool {
         raiseCount += 1
@@ -493,7 +614,13 @@ private final class ActivationRuntimeSpy: ApplicationActivationRuntime {
     func frontmostPID() -> pid_t? { verified && frontmostMatchesValue ? expected.pid : 999 }
     func focusedWindowIdentity(pid: pid_t) -> CFHashCode? { verified ? expected.axIdentity : nil }
     func focusedWindowMatches(_ target: WindowTarget) -> Bool {
-        verified && exactFocusedWindowMatchesValue && target.axIdentity == expected.axIdentity
+        focusedWindowMatchCount += 1
+        return verified && exactFocusedWindowMatchesValue && target.axIdentity == expected.axIdentity
+    }
+    func popupPointerWindowMatches(_ target: WindowTarget, at point: CGPoint) -> Bool {
+        popupPointerMatchCount += 1
+        lastPopupPoint = point
+        return verified && popupPointerMatchesValue && target.axIdentity == expected.axIdentity
     }
 
     func markVerified() { verified = true }

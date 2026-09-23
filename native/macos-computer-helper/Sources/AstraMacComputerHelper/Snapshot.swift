@@ -1519,12 +1519,16 @@ enum AXNodeReader {
         recoverFocusedBranch: Bool = false,
         budget: AXObservationBudget? = nil
     ) -> AXNode {
-        read(
+        let restore = budget?.install()
+        defer { restore?() }
+        let tree = read(
             provider: SystemAXNodeAttributeProvider(element: root, recoverFocusedBranch: recoverFocusedBranch),
             windowBounds: windowBounds,
             maximumDepth: maximumDepth,
             budget: budget
         )
+        PopupAXDiagnostics.recordIfNeeded(root: root, tree: tree, windowBounds: windowBounds)
+        return tree
     }
 
     static func read(

@@ -501,7 +501,8 @@ final class InputDispatcher: InputDispatching {
     func consumeForegroundPlan(
         _ plan: DispatchPlan,
         authority: ForegroundPlanConsumptionAuthority,
-        validateFocusMutation: () throws -> Void
+        validateFocusMutation: () throws -> Void,
+        popupPointerOnlyState: (() throws -> ActionTargetState)? = nil
     ) throws -> [PlannedDispatchEntry] {
         lock.lock()
         let record = records.removeValue(forKey: plan.planRef)
@@ -569,7 +570,18 @@ final class InputDispatcher: InputDispatching {
             try preflightForegroundEntry(entry, expected: record.guardValue,
                 validateFocusMutation: validateFocusMutation)
         }
-        try verify(expected: record.guardValue, current: performer.currentTargetState())
+        if let popupPointerOnlyState {
+            guard popupPointerClickEntriesMatch(
+                plan: plan, actions: authority.actions,
+                expected: record.guardValue, entries: record.entries
+            ) else {
+                consumeDiag("consumeForegroundPlan: popup pointer entry mismatch")
+                throw ActionExecutionError.staleSnapshot
+            }
+            try verify(expected: record.guardValue, current: popupPointerOnlyState())
+        } else {
+            try verify(expected: record.guardValue, current: performer.currentTargetState())
+        }
         return record.entries
     }
 

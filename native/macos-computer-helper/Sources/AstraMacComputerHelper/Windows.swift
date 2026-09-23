@@ -74,6 +74,8 @@ func validateWindowImageContent(_ image: CGImage) throws {
     case .none, .noneSkipFirst, .noneSkipLast: return
     default: break
     }
+    // If the bounded analysis cannot allocate, decline to publish this
+    // ambiguous popup capture through either source.
     guard let context = CGContext(
         data: nil, width: image.width, height: image.height,
         bitsPerComponent: 8, bytesPerRow: image.width * 4,
@@ -274,6 +276,74 @@ func primaryWindowContentHasExactSize(contentRect: CGRect, expectedBounds: CGRec
         && abs(contentRect.height - expectedBounds.height) < 0.01
 }
 
+/// A compositor-owned popup can report the popup's contentRect while SCK actually
+/// scales its containing window into the requested canvas, leaving a large
+/// transparent band. Only flag this distinctive shape when the visible pixels
+/// match the size of another, containing window from the same application.
+/// An intentionally transparent popup with that exact shape is indistinguishable
+/// from the wrong capture here; the exact-window fallback can reject it too.
+func windowImageHasScaledParentPadding(
+    _ image: CGImage,
+    expectedBounds: CGRect,
+    sameApplicationWindowFrames: [CGRect]
+) -> Bool {
+    let parents = sameApplicationWindowFrames.filter {
+        $0.width.isFinite && $0.height.isFinite && $0.width > expectedBounds.width &&
+            $0.height > expectedBounds.height * 1.5 && $0.contains(expectedBounds)
+    }
+    guard !parents.isEmpty, image.width >= 64, image.height >= 64,
+          image.alphaInfo != .none, image.alphaInfo != .noneSkipFirst,
+          image.alphaInfo != .noneSkipLast
+    else { return false }
+    // Keep the temporary RGBA bitmap at most 16 MiB without exempting larger
+    // popups from this check. Scaling both axes equally preserves the footprint.
+    let scale = min(1, 2_048.0 / Double(max(image.width, image.height)))
+    let sampleWidth = max(1, Int((Double(image.width) * scale).rounded()))
+    let sampleHeight = max(1, Int((Double(image.height) * scale).rounded()))
+    guard let context = CGContext(
+        data: nil, width: sampleWidth, height: sampleHeight,
+        bitsPerComponent: 8, bytesPerRow: sampleWidth * 4,
+        space: CGColorSpaceCreateDeviceRGB(),
+        bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+    ), let data = context.data else { return true }
+    let sampleRect = CGRect(x: 0, y: 0, width: sampleWidth, height: sampleHeight)
+    context.interpolationQuality = .none
+    context.clear(sampleRect)
+    context.draw(image, in: sampleRect)
+    let bytes = data.assumingMemoryBound(to: UInt8.self)
+    let halfWidth = sampleWidth / 2
+    // Ordinary images have content on the right. Reject them before scanning
+    // the left half for the much rarer scaled-parent footprint.
+    for y in 0..<sampleHeight {
+        let row = y * context.bytesPerRow
+        for x in halfWidth..<sampleWidth where bytes[row + x * 4 + 3] != 0 {
+            return false
+        }
+    }
+    var minX = sampleWidth
+    var maxX = -1
+    var minY = sampleHeight
+    var maxY = -1
+    for y in 0..<sampleHeight {
+        let row = y * context.bytesPerRow
+        for x in 0..<halfWidth where bytes[row + x * 4 + 3] != 0 {
+            minX = min(minX, x)
+            maxX = max(maxX, x)
+            minY = min(minY, y)
+            maxY = max(maxY, y)
+        }
+    }
+    guard minX <= 2, minY <= 2, maxY >= sampleHeight - 3,
+          maxX >= 0
+    else { return false }
+    let visibleWidth = CGFloat(maxX - minX + 1)
+    let visibleHeight = CGFloat(maxY - minY + 1)
+    return parents.contains { parent in
+        let scaledWidth = parent.width * visibleHeight / parent.height
+        return abs(scaledWidth - visibleWidth) <= max(4, scaledWidth * 0.015)
+    }
+}
+
 protocol ExactWindowImageProviding {
     func primaryImage() throws -> CGImage
     func fallbackImage(for windowID: CGWindowID) -> CGImage?
@@ -372,16 +442,36 @@ struct SystemExactWindowCommandRunner: ExactWindowCommandRunning {
 
 func captureExactWindowImage(
     windowID: CGWindowID,
-    provider: any ExactWindowImageProviding
+    provider: any ExactWindowImageProviding,
+    expectedBounds: CGRect? = nil,
+    sameApplicationWindowFrames: [CGRect] = []
 ) throws -> CGImage {
+    func isWrongSource(_ image: CGImage) -> Bool {
+        guard let expectedBounds else { return false }
+        return windowImageHasScaledParentPadding(
+            image, expectedBounds: expectedBounds,
+            sameApplicationWindowFrames: sameApplicationWindowFrames
+        )
+    }
     do {
-        return try provider.primaryImage()
+        let image = try provider.primaryImage()
+        guard !isWrongSource(image) else {
+            logActionRejected("CAPTURE-SOURCE primary=scaled_parent windowID=\(windowID) width=\(image.width) height=\(image.height)")
+            throw PrimaryWindowCaptureError.contentMismatch
+        }
+        return image
     } catch let error as PrimaryWindowCaptureError {
         switch error {
         case .timedOut, .contentMismatch:
             guard let image = provider.fallbackImage(for: windowID) else {
+                logActionRejected("CAPTURE-SOURCE fallback=unavailable windowID=\(windowID)")
                 throw WindowObservationError.captureFailed
             }
+            guard !isWrongSource(image) else {
+                logActionRejected("CAPTURE-SOURCE fallback=scaled_parent windowID=\(windowID) width=\(image.width) height=\(image.height)")
+                throw WindowObservationError.captureFailed
+            }
+            logActionRejected("CAPTURE-SOURCE fallback=accepted windowID=\(windowID) width=\(image.width) height=\(image.height)")
             return image
         }
     }
@@ -1640,6 +1730,7 @@ final class SystemWindowObserver: WindowObserving {
         let backingScale: CGFloat
         let observationBounds: CGRect
         let image: CGImage
+        var backgroundSingletonCaptured = false
         let imageStart = ProcessInfo.processInfo.systemUptime
         if let selectedDisplay {
             let excludedWindowID = cursorOverlayExclusionWindowID(
@@ -1669,6 +1760,7 @@ final class SystemWindowObserver: WindowObserving {
             captureBounds = CGRect(origin: .zero, size: window.frame.size)
             observationBounds = window.frame
             let role = AXNodeReader.stringAttribute(expectedAXWindow, kAXRoleAttribute)
+            let subrole = AXNodeReader.stringAttribute(expectedAXWindow, kAXSubroleAttribute)
             if role.status == .complete && role.value == kAXSheetRole {
                 guard let root = sheetCaptureWindow(element: expectedAXWindow, pid: target.pid,
                     windows: shareableBefore.windows) else { throw WindowObservationError.axWindowUnmatched }
@@ -1676,43 +1768,140 @@ final class SystemWindowObserver: WindowObserving {
             }
             let imageWindow = sheetImageRoot ?? window
             let imageGeometry = WindowGeometry(bounds: imageWindow.frame, backingScale: geometry.backingScale)
-            let captured: CGImage
-            if let backgroundSession {
-                captured = try backgroundSession.capture { selectedWindowID in
-                    guard selectedWindowID == window.windowID else {
-                        throw WindowObservationError.targetGone
+            let sameApplicationWindowFrames = shareableBefore.windows.compactMap { candidate -> CGRect? in
+                guard candidate.windowID != imageWindow.windowID,
+                      candidate.owningApplication?.processID == target.pid
+                else { return nil }
+                return candidate.frame
+            }
+            do {
+                let exactCaptured: CGImage
+                if let backgroundSession {
+                    exactCaptured = try backgroundSession.capture { selectedWindowID in
+                        guard selectedWindowID == window.windowID else {
+                            throw WindowObservationError.targetGone
+                        }
+                        return try waitForImage(
+                            window: imageWindow,
+                            geometry: imageGeometry,
+                            focusedTransientActive: false,
+                            sameApplicationWindowFrames: sameApplicationWindowFrames
+                        )
                     }
-                    return try waitForImage(
+                } else {
+                    exactCaptured = try waitForImage(
                         window: imageWindow,
                         geometry: imageGeometry,
-                        focusedTransientActive: false
+                        focusedTransientActive: sheetImageRoot == nil && (CFHash(focusedBefore) != CFHash(expectedAXWindow)
+                            || appOwnedOverlayActive),
+                        sameApplicationWindowFrames: sameApplicationWindowFrames
                     )
                 }
-            } else {
-                captured = try waitForImage(
-                    window: imageWindow,
-                    geometry: imageGeometry,
-                    focusedTransientActive: sheetImageRoot == nil && (CFHash(focusedBefore) != CFHash(expectedAXWindow)
-                        || appOwnedOverlayActive)
+                let exactGeometryRejected = (try? resolvedWindowImageGeometry(
+                    requested: geometry,
+                    imageWidth: exactCaptured.width,
+                    imageHeight: exactCaptured.height
+                )) == nil
+                // Background reads may recover only an exact, frontmost popup-like AX window.
+                // Other wrong-sized windows retain the ordinary capture refusal.
+                let backgroundPopupCandidate = sheetImageRoot == nil && exactGeometryRejected &&
+                    target.interactionMode == .background
+                let backgroundFrontmostNow = backgroundPopupCandidate ? liveFrontmostPID() : nil
+                let backgroundPopupAllowed = backgroundPopupCandidate &&
+                    scope == "target_window" &&
+                    popupSingletonAXRoleAllowed(role: role, subrole: subrole) &&
+                    backgroundFrontmostNow == target.pid
+                if backgroundPopupCandidate && !backgroundPopupAllowed {
+                    let roleKind = role.value == kAXWindowRole as String ? "window" :
+                        (role.value == kAXSheetRole as String ? "sheet" : "other")
+                    let subroleKind = subrole.value == "AXDialog" ? "dialog" :
+                        (subrole.value == "AXStandardWindow" ? "standard" : "other")
+                    let subroleIdentifier: String = {
+                        guard let value = subrole.value else { return "nil" }
+                        guard !value.isEmpty else { return "empty" }
+                        let asciiIdentifier = value.utf8.allSatisfy { byte in
+                            (65...90).contains(byte) || (97...122).contains(byte) ||
+                                (48...57).contains(byte)
+                        }
+                        return value.hasPrefix("AX") && value.utf8.count <= 48 && asciiIdentifier
+                            ? value : "unrecognized"
+                    }()
+                    logActionRejected(
+                        "CAPTURE-SOURCE singleton_filtered=background_gate_rejected"
+                            + " windowID=\(window.windowID) scopeTargetWindow=\(scope == "target_window")"
+                            + " roleStatus=\(role.status) roleKind=\(roleKind)"
+                            + " subroleStatus=\(subrole.status) subroleKind=\(subroleKind)"
+                            + " subroleIdentifier=\(subroleIdentifier)"
+                            + " frontmostMatch=\(backgroundFrontmostNow == target.pid)"
+                    )
+                }
+                let captured: CGImage
+                if sheetImageRoot == nil, exactGeometryRejected,
+                   (target.interactionMode == .foregroundTakeover || backgroundPopupAllowed) {
+                    if backgroundPopupAllowed {
+                        guard let backgroundSession else { throw WindowObservationError.targetGone }
+                        try backgroundSession.verifyFrontmost(liveFrontmostPID())
+                    }
+                    do {
+                        captured = try captureVerifiedPopupWithSingletonDisplayFilter(
+                            window: window,
+                            expected: PopupFilteredWindowIdentity(
+                                windowID: window.windowID, pid: target.pid, frame: window.frame
+                            ),
+                            availableWindows: shareableBefore.windows,
+                            displays: shareableBefore.displays,
+                            rejectedExactWindowImage: exactCaptured,
+                            requireCompositorProof: true
+                        )
+                    } catch {
+                        // An unavailable or inconclusive B.5 proof is an overlay
+                        // refusal, including singleton capture and budget errors.
+                        if backgroundPopupAllowed { throw WindowObservationError.overlayBlocked }
+                        throw error
+                    }
+                    if backgroundPopupAllowed {
+                        guard let backgroundSession else { throw WindowObservationError.targetGone }
+                        try backgroundSession.verifyFrontmost(liveFrontmostPID())
+                        guard exactAXWindowHasPopupCaptureRole(expectedAXWindow) else {
+                            logActionRejected(
+                                "CAPTURE-SOURCE singleton_filtered=post_capture_ax_role_rejected"
+                                    + " windowID=\(window.windowID)"
+                            )
+                            throw WindowObservationError.targetGone
+                        }
+                        backgroundSingletonCaptured = true
+                    }
+                    logActionRejected(
+                        "CAPTURE-SOURCE singleton_filtered=accepted windowID=\(window.windowID)"
+                            + " width=\(captured.width) height=\(captured.height)"
+                    )
+                } else { captured = exactCaptured }
+                if sheetImageRoot != nil {
+                    // SCK may render the whole parent composite for a sheet ID,
+                    // scaled into the sheet's requested dimensions. Capture the
+                    // proven owned root at its own size, then publish ONLY the sheet.
+                    let crop = try sheetImageCropRect(source: imageGeometry, target: window.frame,
+                        imageWidth: captured.width, imageHeight: captured.height)
+                    guard let cropped = captured.cropping(to: crop) else { throw WindowObservationError.axSerializationFailed }
+                    image = cropped
+                } else { image = captured }
+                let capturedGeometry = try resolvedWindowImageGeometry(
+                    requested: geometry,
+                    imageWidth: image.width,
+                    imageHeight: image.height
                 )
+                try validateWindowImageContent(image)
+                pixelSize = capturedGeometry.pixelSize
+                backingScale = capturedGeometry.backingScale
+            } catch {
+                if sheetImageRoot == nil, case WindowObservationError.captureFailed = error {
+                    PopupCaptureOwnerDiagnostics.recordIfNeeded(
+                        root: expectedAXWindow, targetPID: target.pid,
+                        targetWindow: window, windows: shareableBefore.windows
+                    )
+                }
+                throw error
             }
-            if sheetImageRoot != nil {
-                // SCK may render the whole parent composite for a sheet ID,
-                // scaled into the sheet's requested dimensions. Capture the
-                // proven owned root at its own size, then publish ONLY the sheet.
-                let crop = try sheetImageCropRect(source: imageGeometry, target: window.frame,
-                    imageWidth: captured.width, imageHeight: captured.height)
-                guard let cropped = captured.cropping(to: crop) else { throw WindowObservationError.axSerializationFailed }
-                image = cropped
-            } else { image = captured }
-            let capturedGeometry = try resolvedWindowImageGeometry(
-                requested: geometry,
-                imageWidth: image.width,
-                imageHeight: image.height
-            )
-            try validateWindowImageContent(image)
-            pixelSize = capturedGeometry.pixelSize
-            backingScale = capturedGeometry.backingScale
         }
         metrics.record(.image, startedAt: imageStart)
         let shareableAfter = try metrics.measure(.inventory) { try waitForShareableContent() }
@@ -1723,6 +1912,10 @@ final class SystemWindowObserver: WindowObserving {
         }
         guard let windowAfter = matchingCurrentWindow(for: target, in: shareableAfter.windows) else {
             throw WindowObservationError.targetGone
+        }
+        if backgroundSingletonCaptured {
+            guard let backgroundSession else { throw WindowObservationError.targetGone }
+            try backgroundSession.verifyFrontmost(liveFrontmostPID())
         }
         if let selectedDisplay {
             let postSelection = try selectDisplayCapture(
@@ -1775,6 +1968,17 @@ final class SystemWindowObserver: WindowObserving {
             else { throw WindowObservationError.targetNotFrontmost }
             focusedAfter = focused
             focusedAfterBounds = bounds
+        }
+        if backgroundSingletonCaptured {
+            guard let backgroundSession else { throw WindowObservationError.targetGone }
+            try backgroundSession.verifyFrontmost(liveFrontmostPID())
+            guard exactAXWindowHasPopupCaptureRole(expectedAXWindow) else {
+                logActionRejected(
+                    "CAPTURE-SOURCE singleton_filtered=pre_identity_ax_role_rejected"
+                        + " windowID=\(windowAfter.windowID)"
+                )
+                throw WindowObservationError.targetGone
+            }
         }
         let afterIdentity = target.interactionMode == .background
             ? CaptureIdentity(
@@ -2047,6 +2251,18 @@ final class SystemWindowObserver: WindowObserving {
                     snapshotID: snapshotID,
                     interactionMode: target.interactionMode
                 ) : nil
+                if backgroundSingletonCaptured {
+                    guard CFEqual(expectedFinal, expectedAXWindow),
+                          exactAXWindowHasPopupCaptureRole(expectedAXWindow) else {
+                        logActionRejected(
+                            "CAPTURE-SOURCE singleton_filtered=final_ax_role_rejected"
+                                + " windowID=\(finalWindow.windowID)"
+                        )
+                        throw WindowObservationError.targetGone
+                    }
+                    guard let backgroundSession else { throw WindowObservationError.targetGone }
+                    try backgroundSession.verifyFrontmost(liveFrontmostPID())
+                }
                 return FinalSnapshotPublicationAuthority(actionGuard: actionGuard)
             },
             publish: { png, prepared in
@@ -2883,6 +3099,9 @@ final class SystemWindowObserver: WindowObserving {
                   let dispatcher = execution.planAuthority.dispatcher
             else { throw TakeoverError.authorityMismatch }
             let authority = execution.planAuthority
+            let popupPoint = execution.popupPointerPoint
+            if popupPoint != nil { virtualCursor.hide() }
+            let popupRuntime = SystemApplicationActivationRuntime()
             let entries = try dispatcher.consumeForegroundPlan(
                 authority.plan,
                 authority: ForegroundPlanConsumptionAuthority(
@@ -2895,10 +3114,19 @@ final class SystemWindowObserver: WindowObserving {
                 ),
                 validateFocusMutation: {
                     try self.userActivity.assertNotPaused(lease: execution.lease)
+                },
+                popupPointerOnlyState: popupPoint.map { point in
+                    { () throws -> ActionTargetState in
+                        guard popupRuntime.popupPointerWindowMatches(authority.target, at: point) else {
+                            throw ActionExecutionError.targetNotFrontmost
+                        }
+                        return popupPointerSealedState(authority.guardValue)
+                    }
                 }
             )
             let result = executeForegroundActions(
                 authority: authority,
+                plannedPopupPoint: popupPoint,
                 lease: execution.lease,
                 snapshotID: snapshotID,
                 consumed: consumed,
@@ -2964,6 +3192,7 @@ final class SystemWindowObserver: WindowObserving {
 
     private func executeForegroundActions(
         authority: ForegroundTakeoverPlanAuthority,
+        plannedPopupPoint: CGPoint?,
         lease: UserActivitySessionLease,
         snapshotID: String,
         consumed: SnapshotActionContext,
@@ -2972,7 +3201,7 @@ final class SystemWindowObserver: WindowObserving {
     ) -> CooperativeActionResult {
         let target = authority.target
         let performer = makeActionPerformer(target: target, snapshotContext: consumed)
-        let validator = ExactPIDActionGuardValidator(stateForDrag: { [weak self] displacement in
+        let strictValidator = ExactPIDActionGuardValidator(stateForDrag: { [weak self] displacement in
             guard let self else { throw ActionExecutionError.targetGone }
             if displacement != nil {
                 return try self.currentCapturedDragTargetState(for: target, snapshotID: snapshotID)
@@ -2983,6 +3212,26 @@ final class SystemWindowObserver: WindowObserving {
                 expectedFocusedRootPreference: authority.guardValue.focusedRootPreference
             )
         })
+        let popupPoint: CGPoint? = {
+            guard let plannedPopupPoint,
+                  popupPointerClickEntriesMatch(
+                      plan: authority.plan, actions: authority.actions,
+                      expected: authority.guardValue, entries: entries
+                  )
+            else { return nil }
+            return plannedPopupPoint
+        }()
+        let popupRuntime = SystemApplicationActivationRuntime()
+        let validator: any PIDActionGuardValidating
+        if let popupPoint {
+            validator = PopupPointerClickGuardValidator(
+                sealed: authority.guardValue,
+                authorizedPoint: popupPoint,
+                popupProof: { popupRuntime.popupPointerWindowMatches(target, at: popupPoint) }
+            )
+        } else {
+            validator = strictValidator
+        }
         virtualCursor.hide()
         let executor = PIDTargetedActionExecutor(
             poster: CGForegroundInputPoster(pointIsInTargetWindow: { point, pid in
@@ -3004,7 +3253,11 @@ final class SystemWindowObserver: WindowObserving {
                 )
             },
             evidence: { _, expected in
-                (try? validator.revalidate(expected: expected, point: nil)) != nil
+                // A popup can close as soon as the balanced click completes.
+                // Posting is acknowledged, while its application effect needs
+                // a fresh observation instead of a second pixel proof or replay.
+                if popupPoint != nil { return false }
+                return (try? validator.revalidate(expected: expected, point: nil)) != nil
             }
         )
         let keyboardExecutor = ForegroundKeyboardExecutor(
@@ -3014,7 +3267,7 @@ final class SystemWindowObserver: WindowObserving {
             compatibility: pidCompatibility,
             genericForegroundEnabled: true,
             activity: userActivity,
-            validator: validator,
+            validator: strictValidator,
             focus: { [weak self] in
                 guard let self else { throw ActionExecutionError.staleSnapshot }
                 return self.currentKeyboardFocusObservation(
@@ -3045,9 +3298,17 @@ final class SystemWindowObserver: WindowObserving {
             activity: userActivity,
             performer: performer,
             pidExecutor: executor,
-            keyboardExecutor: keyboardExecutor
+            keyboardExecutor: keyboardExecutor,
+            pointerOnlyPreflightState: popupPoint.map { point in
+                { () throws -> ActionTargetState in
+                    guard popupRuntime.popupPointerWindowMatches(target, at: point) else {
+                        throw ActionExecutionError.targetNotFrontmost
+                    }
+                    return popupPointerSealedState(authority.guardValue)
+                }
+            }
         ).run(
-            expected: deliveryKeyboardFocusGuard(
+            expected: popupPoint == nil ? deliveryKeyboardFocusGuard(
                 base: authority.guardValue,
                 liveFocus: { [weak self] in
                     guard let self else { return .secureOrIndeterminate }
@@ -3057,7 +3318,7 @@ final class SystemWindowObserver: WindowObserving {
                         containerBounds: authority.guardValue.focusedAXBounds
                     )
                 }
-            ),
+            ) : authority.guardValue,
             application: authority.application,
             lease: lease,
             entries: entries,
@@ -3365,7 +3626,8 @@ final class SystemWindowObserver: WindowObserving {
     private func waitForImage(
         window: SCWindow,
         geometry: WindowGeometry,
-        focusedTransientActive: Bool
+        focusedTransientActive: Bool,
+        sameApplicationWindowFrames: [CGRect]
     ) throws -> CGImage {
         let configuration = SCStreamConfiguration()
         configuration.width = Int(geometry.pixelSize.width)
@@ -3403,7 +3665,11 @@ final class SystemWindowObserver: WindowObserving {
                 )
             }
         )
-        return try captureExactWindowImage(windowID: CGWindowID(window.windowID), provider: provider)
+        return try captureExactWindowImage(
+            windowID: CGWindowID(window.windowID), provider: provider,
+            expectedBounds: geometry.bounds,
+            sameApplicationWindowFrames: sameApplicationWindowFrames
+        )
     }
 
     private func matchingAXWindow(in app: AXUIElement, target: WindowTarget) -> AXUIElement? {
@@ -4092,6 +4358,132 @@ func windowIsProvablyBehind(
     else { return false }
     if candidateLayer != selectedLayer { return candidateLayer < selectedLayer }
     return candidateOrder > selectedOrder
+}
+
+enum PopupSingletonVisibilityProof: String, Equatable {
+    case proven
+    case inventoryUnavailable
+    case invalidTarget
+    case targetNotUnique
+    case targetIdentityMismatch
+    case targetNotVisible
+    case targetOrderingUnknown
+    case candidateBoundsUnknown
+    case intersectingWindowNotBehind
+}
+
+private func popupSingletonBoundsAreFinite(_ bounds: CGRect) -> Bool {
+    [bounds.minX, bounds.minY, bounds.maxX, bounds.maxY,
+     bounds.width, bounds.height].allSatisfy(\.isFinite) &&
+        bounds.width >= 0 && bounds.height >= 0
+}
+
+/// Metadata-only ordering diagnostic. The observation path now requires the
+/// target-rectangle compositor pixel proof; this result grants no authority.
+func popupSingletonVisibilityProof(
+    targetPID: pid_t,
+    targetWindowID: CGWindowID,
+    targetBounds: CGRect,
+    records: [VisibleWindowRecord]?
+) -> PopupSingletonVisibilityProof {
+    guard targetPID > 0, targetWindowID > 0,
+          popupSingletonBoundsAreFinite(targetBounds),
+          targetBounds.width > 0, targetBounds.height > 0
+    else { return .invalidTarget }
+    guard let records else { return .inventoryUnavailable }
+    let selectedMatches = records.filter { $0.windowID == targetWindowID }
+    guard selectedMatches.count == 1, let selected = selectedMatches.first else {
+        return .targetNotUnique
+    }
+    guard selected.pid == targetPID, selected.bounds == targetBounds else {
+        return .targetIdentityMismatch
+    }
+    guard selected.alpha.isFinite, selected.alpha > 0 else { return .targetNotVisible }
+    guard selected.zOrder >= 0, selected.zOrder != .max else {
+        return .targetOrderingUnknown
+    }
+    for candidate in records where candidate.windowID != targetWindowID {
+        guard popupSingletonBoundsAreFinite(candidate.bounds) else {
+            return .candidateBoundsUnknown
+        }
+        let overlap = candidate.bounds.intersection(targetBounds)
+        guard !overlap.isNull, overlap.width > 0, overlap.height > 0 else { continue }
+        guard windowIsProvablyBehind(
+            candidateLayer: candidate.layer, candidateOrder: candidate.zOrder,
+            selectedLayer: selected.layer, selectedOrder: selected.zOrder
+        ) else { return .intersectingWindowNotBehind }
+    }
+    return .proven
+}
+
+func popupSingletonAXRoleAllowed(
+    role: BoundedAXStringResult,
+    subrole: BoundedAXStringResult
+) -> Bool {
+    role.status == .complete && role.value == kAXWindowRole as String &&
+        subrole.status == .complete &&
+        (subrole.value == "AXDialog" || subrole.value == "AXUnknown")
+}
+
+private func exactAXWindowHasPopupCaptureRole(_ element: AXUIElement) -> Bool {
+    let role = AXNodeReader.stringAttribute(element, kAXRoleAttribute)
+    let subrole = AXNodeReader.stringAttribute(element, kAXSubroleAttribute)
+    return popupSingletonAXRoleAllowed(role: role, subrole: subrole)
+}
+
+/// A visual proof for the pointer gate's covering-window case. It only answers
+/// whether the popup's exact pixels are visible now; the caller must still
+/// require a fresh system-wide AX hit before dispatching a mouse event.
+func popupPointerCompositorRegionMatches(target: WindowTarget) -> Bool {
+    guard target.interactionMode == .foregroundTakeover,
+          target.pid > 0, target.windowID > 0,
+          let element = target.axElement,
+          let identity = target.axIdentity,
+          CFHash(element) == identity,
+          let axBounds = AXNodeReader.frameAttribute(element),
+          screenCaptureBoundsMatchAXBounds(
+              screenCapture: target.bounds, accessibility: axBounds
+          ),
+          liveFrontmostPID() == target.pid else { return false }
+    var axPID: pid_t = 0
+    guard AXUIElementGetPid(element, &axPID) == .success,
+          axPID == target.pid else { return false }
+    if let axWindowID = observedAXWindowID(element),
+       axWindowID != target.windowID { return false }
+    do {
+        let timeout = try AXObservationBudget.current?.phaseTimeout(maximum: 3) ?? 3
+        let content = try waitForAsync(timeout: timeout) {
+            try await SCShareableContent.excludingDesktopWindows(
+                true, onScreenWindowsOnly: true
+            )
+        }
+        let matches = content.windows.filter { $0.windowID == target.windowID }
+        guard matches.count == 1,
+              matches[0].owningApplication?.processID == target.pid,
+              screenCaptureBoundsMatchAXBounds(
+                  screenCapture: matches[0].frame, accessibility: target.bounds
+              ) else { return false }
+        let expected = PopupFilteredWindowIdentity(
+            windowID: target.windowID, pid: target.pid, frame: matches[0].frame
+        )
+        _ = try captureVerifiedPopupWithSingletonDisplayFilter(
+            window: matches[0], expected: expected,
+            availableWindows: content.windows,
+            displays: content.displays,
+            requireCompositorProof: true
+        )
+        guard CFHash(element) == identity,
+              let finalBounds = AXNodeReader.frameAttribute(element),
+              screenCaptureBoundsMatchAXBounds(
+                  screenCapture: expected.frame, accessibility: finalBounds
+              ),
+              liveFrontmostPID() == target.pid else { return false }
+        if let axWindowID = observedAXWindowID(element),
+           axWindowID != target.windowID { return false }
+        return true
+    } catch {
+        return false
+    }
 }
 
 func containedAppOwnedOverlayActive(
