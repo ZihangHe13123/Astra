@@ -2151,6 +2151,74 @@ func statefulAXPressEffectVerifiesAnyBoundedValueChange(role: String) throws {
     #expect(performer.performed.isEmpty)
 }
 
+@Test func commandASelectionAndTypeOnTheSameFieldKeepKeyboardDelivery() throws {
+    let performer = InputDispatcherPerformerSpy(textPreflight: .settable)
+    let dispatcher = InputDispatcher(
+        performer: performer,
+        application: inputDispatcherApplication,
+        syntheticPolicy: inputDispatcherSyntheticPolicy(),
+        backgroundTextInputSafety: InputDispatcherTextSafety(.safeASCIIKeyboardLayout)
+    )
+    let context = DispatchContext(guardValue: inputDispatcherForegroundGuard())
+    let actions: [NativeAction] = [
+        .keypress(key: "a", modifiers: ["command"], elementRef: "text"),
+        .type(text: "127.0.0.1:8771/text?step=omnibox-abc", elementRef: "text"),
+    ]
+
+    let background = try dispatcher.plan(actions: actions,
+        context: DispatchContext(guardValue: inputDispatcherBackgroundGuard()))
+    #expect(background.backends == [.foregroundKeyboard, .foregroundKeyboard])
+    #expect(background.cooperativeError == .backgroundActionUnsupported)
+
+    let plan = try dispatcher.plan(actions: actions, context: context)
+    #expect(plan.cooperativeError == nil)
+    #expect(plan.backends == [.foregroundKeyboard, .foregroundKeyboard])
+    let entries = try dispatcher.consumeForegroundPlan(
+        plan, authority: foregroundConsumptionAuthority(plan: plan, context: context, actions: actions)
+    )
+    #expect(entries.map(\.sourceIndex) == [0, 1])
+    #expect(entries.map(\.targetKeyboardFocus).allSatisfy { $0 != nil })
+    #expect(performer.performed.isEmpty)
+}
+
+@Test func keyboardSelectionRoutingIsLimitedToAdjacentMatchingOrdinaryType() throws {
+    let performer = InputDispatcherPerformerSpy(textPreflight: .settable)
+    performer.replacementPreflight = .settable
+    let dispatcher = InputDispatcher(
+        performer: performer,
+        application: inputDispatcherApplication,
+        syntheticPolicy: inputDispatcherSyntheticPolicy(),
+        backgroundTextInputSafety: InputDispatcherTextSafety(.safeASCIIKeyboardLayout)
+    )
+    let context = DispatchContext(guardValue: inputDispatcherForegroundGuard())
+    let replace = try NativeAction.parse(.object([
+        "type": .string("type"), "element_ref": .string("text"),
+        "text": .string("replacement"), "replace": .bool(true),
+    ]))
+    let scenarios: [([NativeAction], [DispatchBackend])] = [
+        ([.type(text: "ordinary", elementRef: "text")], [.axSelectedText]),
+        ([.keypress(key: "s", modifiers: ["command"], elementRef: "text"),
+          .type(text: "ordinary", elementRef: "text")], [.foregroundKeyboard, .axSelectedText]),
+        ([.keypress(key: "a", modifiers: ["command"], elementRef: "text"),
+          .type(text: "ordinary", elementRef: "other-text")], [.foregroundKeyboard, .axSelectedText]),
+        ([.keypress(key: "a", modifiers: ["command"], elementRef: "text"),
+          .wait(durationMS: 0), .type(text: "ordinary", elementRef: "text")],
+         [.foregroundKeyboard, .wait, .axSelectedText]),
+        ([.keypress(key: "a", modifiers: ["command"], elementRef: "text"), replace],
+         [.foregroundKeyboard, .axSelectedText]),
+    ]
+    for (actions, expectedBackends) in scenarios {
+        let plan = try dispatcher.plan(actions: actions, context: context)
+        #expect(plan.cooperativeError == nil)
+        #expect(plan.backends == expectedBackends)
+    }
+    let secure = try dispatcher.plan(actions: [
+        .keypress(key: "a", modifiers: ["command"], elementRef: "secure"),
+        .type(text: "must-not-type", elementRef: "secure"),
+    ], context: context)
+    #expect(secure.cooperativeError == .backgroundActionUnsupported)
+}
+
 @Test func foregroundKeyboardPlanWithoutFocusAuthorityFailsClosedBeforeRecord() throws {
     let performer = InputDispatcherPerformerSpy()
     // P1 后「无焦点权威」的 fail-closed 边界只对**未批 textEntry** 的 app 生效
@@ -2474,7 +2542,7 @@ private final class InputDispatcherPerformerSpy: ActionProviding {
                 actions: []
             )
         }
-        if reference == "text" {
+        if reference == "text" || reference == "other-text" {
             return ActionElement(
                 element: AXUIElementCreateApplication(11),
                 bounds: CGRect(x: 10, y: 10, width: 20, height: 20),

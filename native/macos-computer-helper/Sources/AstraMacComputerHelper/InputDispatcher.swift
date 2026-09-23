@@ -229,10 +229,15 @@ final class InputDispatcher: InputDispatching {
         let requiresSafeTextInput = actions.contains { $0.kind == .type }
         let textInputSafety = requiresSafeTextInput ? backgroundTextInputSafety.detect() : nil
         for (sourceIndex, action) in actions.enumerated() {
+            let preceding = sourceIndex > 0 ? actions[sourceIndex - 1] : nil
+            let followsBoundSelectAll = action.kind == .type && action.replace == nil
+                && action.elementRef != nil && action.elementRef == preceding?.elementRef
+                && preceding.flatMap { ApprovedKeyChord(action: $0) }?.rawValue == "command+a"
             var planned = try resolveBackground(
                 action,
                 expected: context.guardValue,
-                textInputSafety: textInputSafety
+                textInputSafety: textInputSafety,
+                followsBoundSelectAll: followsBoundSelectAll
             )
             if context.guardValue.interactionMode == .foregroundTakeover,
                planned.backend == .pidPointer,
@@ -634,7 +639,8 @@ final class InputDispatcher: InputDispatching {
     private func resolveBackground(
         _ action: NativeAction,
         expected: ActionGuard,
-        textInputSafety: BackgroundTextInputSafety?
+        textInputSafety: BackgroundTextInputSafety?,
+        followsBoundSelectAll: Bool
     ) throws -> PlannedAction {
         guard action.elementRef == nil || action.targetElementRef == nil else {
             throw ActionExecutionError.invalidAction
@@ -785,6 +791,15 @@ final class InputDispatcher: InputDispatching {
                     targetKeyboardFocus: authority, requiresTakeover: true)
             }
             guard !element.isSecure else { return .unsupported(backend: .axSelectedText, actionClass: .text) }
+            if followsBoundSelectAll {
+                // The caller selected this exact field with a keyboard chord. Keep the
+                // following insertion on the keyboard path so apps that handle text
+                // events separately from AXSelectedText see the new value too.
+                guard let focus = inputDispatchKeyboardFocusAuthority(element, localToWindowBounds: expected.bounds)
+                else { throw ActionExecutionError.inputFocusRequired }
+                logActionRejected("TYPE-ROUTE bound command+a selection uses foreground keyboard")
+                return .takeover(backend: .foregroundKeyboard, actionClass: .text, targetKeyboardFocus: focus)
+            }
             // 焦点权威在计划期可能**根本读不到**：macOS 只在 app 处于前台时才报
             // kAXFocusedUIElement（只读探针实测：后台 -25212 kAXErrorNoValue，前台才有值），
             // 而前台恰恰是这份计划要去批准的接管结果 ⇒ 要求计划期读到焦点是顺序上不可能满足的
