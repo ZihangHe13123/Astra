@@ -111,8 +111,9 @@ class Fixture:
         with self.lock:
             paths = list(self.requests)
         for path in paths:
-            query = parse_qs(urlsplit(path).query)
-            if query.get("step") == [step] and query.get("nonce") == [nonce]:
+            parsed = urlsplit(path)
+            query = parse_qs(parsed.query)
+            if parsed.path == "/text" and query.get("step") == [step] and query.get("nonce") == [nonce]:
                 return True
         return False
 
@@ -130,6 +131,24 @@ def find_ref(tree, role: str, *labels: str) -> str | None:
         if node.get("role") == role and node.get("element_ref") and any(label in text for label in labels):
             return node["element_ref"]
     return None
+
+
+def exact_fixture_address(value: object, url: str) -> bool:
+    """Edge may show the entered HTTP address with or without its scheme."""
+    return value in (url, f"http://{url}")
+
+
+def observed_fixture_navigation(tree: object, step: str, nonce: str, port: int) -> bool:
+    """Require this run's loaded page marker and address in the active Edge window."""
+    path = f"/text?step={step}&nonce={nonce}"
+    url = f"127.0.0.1:{port}{path}"
+    has_page_marker = any(node.get("role") == "AXStaticText" and node.get("value") == path
+                          for node in nodes(tree))
+    has_address = any(node.get("role") == "AXTextField" and exact_fixture_address(node.get("value"), url)
+                      and any(label in " ".join(str(node.get(k) or "") for k in
+                          ("label", "title", "description")) for label in OMNIBOX_LABELS)
+                      for node in nodes(tree))
+    return has_page_marker and has_address
 
 
 class Runner:
@@ -258,56 +277,108 @@ class Runner:
                 **typed, "passed": page.get("value") == marker}
 
     async def navigated(self, fixture: Fixture, step: str, nonce: str) -> bool:
-        deadline = time.monotonic() + 8
-        while time.monotonic() < deadline and not fixture.saw(step, nonce):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if fixture.saw(step, nonce):
+                try:
+                    observation = await self.observe(*await self.fixture_window())
+                    if observed_fixture_navigation(observation.get("ax_tree"), step, nonce, self.args.port):
+                        return True
+                except RuntimeError:
+                    pass  # Navigation may still be settling behind the suggestion window.
             await asyncio.sleep(0.25)
-        return fixture.saw(step, nonce)
+        return False
+
+    async def open_fixture_tab(self, fixture: Fixture, nonce: str, label: str) -> str:
+        """Give each omnibox case a fresh local page and a verifiable starting address."""
+        step = f"setup-{label}"
+        url = f"127.0.0.1:{self.args.port}/text?step={step}&nonce={nonce}"
+        subprocess.run(["open", "-a", "Microsoft Edge", f"http://{url}"], check=True, timeout=30)
+        if not await self.navigated(fixture, step, nonce):
+            raise RuntimeError(f"Edge did not load the local setup page for {label}")
+        return url
+
+    async def type_omnibox(self, current_url: str, url: str) -> dict:
+        """Select the bound address field, then type once into the same field."""
+        observation = await self.observe(*await self.fixture_window())
+        field = next((node for node in nodes(observation.get("ax_tree"))
+                      if node.get("role") == "AXTextField" and node.get("element_ref")
+                      and any(label in " ".join(str(node.get(k) or "") for k in
+                          ("label", "title", "description")) for label in OMNIBOX_LABELS)), None)
+        if field is None or not exact_fixture_address(field.get("value"), current_url):
+            raise RuntimeError("Edge is not showing this case's fresh local fixture address")
+        ref = field["element_ref"]
+        # Both actions target the same bound field. A separate Cmd+L opens an
+        # Edge suggestion window and prevents a fresh observation of the field.
+        result, _ = await self.act(observation, [
+            {"type": "keypress", "key": "a", "modifiers": ["command"], "element_ref": ref},
+            {"type": "type", "element_ref": ref, "text": url},
+        ])
+        receipt = result.get("computer_receipt") or {}
+        code = result.get("code") or ""
+        return {"attempts": [{"code": code, "dispatch": receipt.get("dispatch_state"),
+                              "acknowledged": receipt.get("acknowledged")}],
+                "last_code": code,
+                "delivered": receipt.get("dispatch_state") == "acknowledged"
+                and receipt.get("acknowledged") == 2
+                and code in {"", "post_action_observation_pending"},
+                "unknown": receipt.get("dispatch_state") in {"unknown", "partial"}}
 
     async def omnibox(self, fixture: Fixture, nonce: str, source: str, label: str) -> dict:
         """Pass only when the local server receives this run's unique URL."""
+        current_url = await self.open_fixture_tab(fixture, nonce, label)
         self.input_source(source)
         step = f"omnibox-{label}"
         url = f"127.0.0.1:{self.args.port}/text?step={step}&nonce={nonce}"
-        typed = await self.type_into("AXTextField", OMNIBOX_LABELS, url)
+        typed = await self.type_omnibox(current_url, url)
         outcome = {"name": f"omnibox ({label})", "input_source": source, **typed,
                    "typed_through_popup": False, "navigated": False}
-        if typed["unknown"] or typed["last_code"]:
+        if not typed["delivered"]:
+            outcome["stop"] = typed["unknown"] or typed["attempts"][-1]["dispatch"] == "acknowledged"
             return {**outcome, "passed": False}
-        # Keyboard delivery opens suggestions over the page; read that window as its own target.
-        popup = await self.suggestion_popup()
-        if popup is not None:
-            observation = await self.observe(*popup)
-            rows = [node for node in nodes(observation.get("ax_tree"))
-                    if url in " ".join(str(node.get(k) or "") for k in ("label", "title", "value", "description"))]
-            outcome["typed_through_popup"] = bool(rows)
-            pressable = next((node for node in rows if node.get("element_ref")
-                              and "AXPress" in (node.get("actions") or [])), None)
-            if pressable is not None:
-                # AXPress needs no activation, so the popup stays exactly as observed.
-                result, _ = await self.act(observation, [{"type": "click", "element_ref": pressable["element_ref"]}])
-                outcome["press_code"] = result.get("code") or ""
+        try:
+            # Keyboard delivery opens suggestions over the page; read that window as its own target.
+            popup = await self.suggestion_popup()
+            if popup is not None:
+                observation = await self.observe(*popup)
+                pressable = [node for node in nodes(observation.get("ax_tree"))
+                             if node.get("role") == "AXStaticText" and node.get("element_ref")
+                             and exact_fixture_address(node.get("value"), url)
+                             and "AXPress" in (node.get("actions") or [])]
+                outcome["typed_through_popup"] = len(pressable) == 1
+                if len(pressable) == 1:
+                    # AXPress needs no activation, so the popup stays exactly as observed.
+                    result, _ = await self.act(observation, [{"type": "click", "element_ref": pressable[0]["element_ref"]}])
+                    outcome["press_code"] = result.get("code") or ""
+                    outcome["navigated"] = await self.navigated(fixture, step, nonce)
+                    if not outcome["navigated"]:
+                        receipt = result.get("computer_receipt", {})
+                        outcome["unknown"] = receipt.get("dispatch_state") in {"unknown", "partial"}
+                        return {**outcome, "passed": False, "stop": True}
+                else:
+                    return {**outcome, "passed": False, "stop": True,
+                            "error": "no unique exact local URL in the suggestion window"}
+            if not outcome["navigated"]:
+                # With no popup, submit only a field whose whole value is this run's URL.
+                observation = await self.observe(*await self.fixture_window())
+                field = next((node for node in nodes(observation.get("ax_tree")) if node.get("role") == "AXTextField"
+                              and node.get("element_ref") and any(label in " ".join(
+                                  str(node.get(k) or "") for k in ("label", "title", "description"))
+                                  for label in OMNIBOX_LABELS)), None)
+                if field is None:
+                    return {**outcome, "passed": False, "stop": True,
+                            "error": "omnibox is not in the fixture observation"}
+                outcome["omnibox_has_url"] = exact_fixture_address(field.get("value"), url)
+                if not outcome["omnibox_has_url"]:
+                    return {**outcome, "passed": False, "stop": True}
+                result, _ = await self.act(observation, [{"type": "keypress", "key": "return",
+                                                          "element_ref": field["element_ref"]}])
+                outcome["return_code"] = result.get("code") or ""
                 outcome["navigated"] = await self.navigated(fixture, step, nonce)
-                if not outcome["navigated"]:
-                    receipt = result.get("computer_receipt", {})
-                    outcome["unknown"] = receipt.get("dispatch_state") in {"unknown", "partial"}
-                    return {**outcome, "passed": False}
-        if not outcome["navigated"]:
-            # Without an open, pressable suggestion, read the omnibox itself and submit it.
-            observation = await self.observe(*await self.fixture_window())
-            field = next((node for node in nodes(observation.get("ax_tree")) if node.get("role") == "AXTextField"
-                          and node.get("element_ref") and any(label in " ".join(
-                              str(node.get(k) or "") for k in ("label", "title", "description")) for label in OMNIBOX_LABELS)),
-                         None)
-            if field is None:
-                return {**outcome, "passed": False, "error": "omnibox is not in the fixture observation"}
-            outcome["omnibox_has_url"] = url in str(field.get("value") or "")
-            if not outcome["omnibox_has_url"]:
-                return {**outcome, "passed": False}
-            result, _ = await self.act(observation, [{"type": "keypress", "key": "return",
-                                                      "element_ref": field["element_ref"]}])
-            outcome["return_code"] = result.get("code") or ""
-            outcome["navigated"] = await self.navigated(fixture, step, nonce)
+        except Exception as error:  # noqa: BLE001 - sent text must not be retried after observation fails
+            return {**outcome, "passed": False, "stop": True, "error": str(error)}
         outcome["passed"] = outcome["navigated"]
+        outcome["stop"] = not outcome["passed"]
         return outcome
 
     async def run(self) -> bool:
@@ -329,8 +400,8 @@ class Runner:
             await self.fixture_window()
             scenarios = [("abc", lambda: self.web_field(fixture, ABC, "ABC")),
                          ("pinyin", lambda: self.web_field(fixture, PINYIN, "拼音")),
-                         ("omnibox", lambda: self.omnibox(fixture, nonce, ABC, "abc")),
-                         ("omnibox-pinyin", lambda: self.omnibox(fixture, nonce, PINYIN, "pinyin"))]
+                         ("omnibox", lambda: self.omnibox(fixture, secrets.token_hex(4), ABC, "abc")),
+                         ("omnibox-pinyin", lambda: self.omnibox(fixture, secrets.token_hex(4), PINYIN, "pinyin"))]
             for key, scenario in scenarios:
                 if self.args.only and key not in self.args.only:
                     continue
@@ -340,8 +411,8 @@ class Runner:
                     outcome = {"name": key, "passed": False, "error": str(error)}
                 self.report["scenarios"].append(outcome)
                 print(("PASS " if outcome["passed"] else "FAIL ") + json.dumps(outcome, ensure_ascii=False), flush=True)
-                if outcome.get("unknown"):
-                    print("Stopping: an action outcome is uncertain and will not be replayed.", flush=True)
+                if outcome.get("unknown") or outcome.get("stop"):
+                    print("Stopping: the current omnibox action needs inspection and will not be replayed.", flush=True)
                     break
             self.report["passed"] = bool(self.report["scenarios"]) and all(
                 s["passed"] for s in self.report["scenarios"])
