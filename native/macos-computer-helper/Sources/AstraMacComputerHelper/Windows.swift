@@ -2765,6 +2765,7 @@ final class SystemWindowObserver: WindowObserving {
                 else { return nil }
                 return AXScrollPressTarget(owner: owner, button: button)
             },
+            selectedTextWriter: SystemAXSelectedTextWriter(effectProbe: .live),
             replacementTargetValidation: { [weak self] expected in
                 guard let self, target.interactionMode == .foregroundTakeover,
                       let element = expected.element else { throw ActionExecutionError.staleSnapshot }
@@ -2792,7 +2793,12 @@ final class SystemWindowObserver: WindowObserving {
             // 文本布局安全检测也在此**显式装配**：每次调用实时读 TIS、不缓存（输入法随时会切）。
             // 它守的是"输入法激活时绝不做 AX 文本写"这条不变量 —— 实测 unicode 形态免疫输入法，
             // 而真实按键码会被候选窗截走。see docs/macos-computer-use.md#input-delivery-contracts
-            textInputSafety: { SystemBackgroundTextInputSafetyDetector().detect() }
+            textInputSafety: { SystemBackgroundTextInputSafetyDetector().detect() },
+            // Live Edge proved an accepted AXSelectedText write can leave the page unchanged:
+            // web fields go to keyboard delivery, other writes are read back, and processes
+            // that ignored one are remembered for this helper lifetime.
+            webContentProbe: { axElementIsInsideWebArea($0) },
+            axTextWriteMemory: .shared
         )
     }
 
@@ -3189,7 +3195,8 @@ final class SystemWindowObserver: WindowObserving {
                 observe: { self.currentKeyboardFocusObservation(of: $0, expectedPID: target.pid,
                     containerBounds: focusedBounds) },
                 belongs: { focusedElementBelongsToExactAXRoot(element: $0, root: expected, pid: target.pid) },
-                same: { CFEqual($0, $1) }
+                same: { CFEqual($0, $1) },
+                reject: { logActionRejected("TEXT-CONTINUITY-REJECT pid=\(target.pid) reason=\($0)") }
             ) else { throw ActionExecutionError.staleSnapshot }
             keyboardFocus = proof
         } else {

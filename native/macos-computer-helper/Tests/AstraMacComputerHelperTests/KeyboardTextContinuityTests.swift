@@ -52,10 +52,46 @@ private let continuityField = KeyboardFocusAuthority(identityToken: "ax:field",
         windowBounds: continuityBounds))
 }
 
+@Test func KeyboardTextContinuityAcceptsTheSameFieldRestyledByItsAutocomplete() {
+    // Live Edge 153: the omnibox field shifts and widens while its suggestion window opens.
+    let restyled = KeyboardFocusAuthority(identityToken: continuityField.identityToken,
+        bounds: continuityField.bounds.offsetBy(dx: 1, dy: 0).insetBy(dx: -4, dy: 0), role: "AXTextField", subrole: nil)
+    #expect(continuingTextRootIsProven(expectedPreference: .selectedWindow,
+        observedPreference: .containedOverlay, wanted: continuityField,
+        observedFocus: .authority(restyled), belongsToSelectedRoot: true, windowBounds: continuityBounds))
+    #expect(continuingTextRejectionReason(expectedPreference: .selectedWindow,
+        observedPreference: .containedOverlay, wanted: continuityField,
+        observedFocus: .authority(restyled), belongsToSelectedRoot: true, windowBounds: continuityBounds) == nil)
+    // The same identity outside the validated window is still no proof.
+    let escaped = KeyboardFocusAuthority(identityToken: continuityField.identityToken,
+        bounds: CGRect(x: 100, y: 40, width: 200, height: 30), role: "AXTextField", subrole: nil)
+    #expect(!continuingTextRootIsProven(expectedPreference: .selectedWindow,
+        observedPreference: .containedOverlay, wanted: continuityField,
+        observedFocus: .authority(escaped), belongsToSelectedRoot: true, windowBounds: continuityBounds))
+    #expect(continuingTextRejectionReason(expectedPreference: .selectedWindow,
+        observedPreference: .containedOverlay, wanted: continuityField,
+        observedFocus: .authority(escaped), belongsToSelectedRoot: true, windowBounds: continuityBounds)
+        == "focus_geometry_untrusted")
+}
+
+@Test func KeyboardTextContinuityNamesTheFirstFailedProofForDiagnostics() {
+    func reason(_ observed: KeyboardFocusObservation, belongs: Bool = true,
+                observedPreference: FocusedRootPreference = .containedOverlay) -> String? {
+        continuingTextRejectionReason(expectedPreference: .selectedWindow, observedPreference: observedPreference,
+            wanted: continuityField, observedFocus: observed, belongsToSelectedRoot: belongs,
+            windowBounds: continuityBounds)
+    }
+    let other = KeyboardFocusAuthority(identityToken: "ax:other", bounds: continuityField.bounds,
+        role: "AXTextField", subrole: nil)
+    #expect(reason(.authority(continuityField), observedPreference: .selectedWindow) == "root_preference")
+    #expect(reason(.authority(continuityField), belongs: false) == "focus_outside_selected_root")
+    #expect(reason(.authority(other)) == "focus_identity_changed")
+    #expect(reason(.stale) == "focus_not_authority")
+}
+
 @Test func KeyboardTextContinuityRejectsChangedOrUnknownFocus() {
     let changed = [
         KeyboardFocusAuthority(identityToken: "ax:other", bounds: continuityField.bounds, role: "AXTextField", subrole: nil),
-        KeyboardFocusAuthority(identityToken: continuityField.identityToken, bounds: continuityField.bounds.offsetBy(dx: 1, dy: 0), role: "AXTextField", subrole: nil),
         KeyboardFocusAuthority(identityToken: continuityField.identityToken, bounds: continuityField.bounds, role: "AXTextArea", subrole: nil),
         KeyboardFocusAuthority(identityToken: continuityField.identityToken, bounds: continuityField.bounds, role: "AXTextField", subrole: "AXSearchField"),
     ]

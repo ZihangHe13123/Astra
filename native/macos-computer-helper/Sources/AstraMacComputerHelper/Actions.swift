@@ -1007,6 +1007,67 @@ enum AXSelectedTextWriteResult: Equatable {
     case written
     case unsupported
     case failed(ActionExecutionError, inputStarted: Bool)
+    /// The application accepted the write, yet a readable value stayed unchanged for the whole
+    /// settle window (live: Edge web fields). Nothing was typed; callers deliver by keyboard.
+    case ineffective
+}
+
+/// Readback used to tell a real AXSelectedText write from one the application silently ignores.
+struct AXTextWriteEffectProbe {
+    let readValue: (AXUIElement) -> String?
+    let readSelectedText: (AXUIElement) -> String?
+    let settleMilliseconds: Int
+    let pollMilliseconds: Int
+    let sleepMilliseconds: (Int) -> Void
+
+    static let live = AXTextWriteEffectProbe(
+        readValue: { completeAXString($0, kAXValueAttribute) },
+        readSelectedText: { completeAXString($0, kAXSelectedTextAttribute) },
+        settleMilliseconds: 300, pollMilliseconds: 25,
+        sleepMilliseconds: { usleep(useconds_t(max(0, $0)) * 1_000) })
+}
+
+/// Truncated or failed reads are unknown, never evidence that a value is unchanged.
+private func completeAXString(_ element: AXUIElement, _ attribute: String) -> String? {
+    let result = AXNodeReader.stringAttribute(element, attribute)
+    guard result.status == .complete else { return nil }
+    return result.value
+}
+
+/// Processes that ignored an AXSelectedText write in this helper lifetime. Their later text is
+/// delivered by keyboard instead of repeating a write that is known not to land.
+final class AXTextWriteEffectMemory: @unchecked Sendable {
+    static let shared = AXTextWriteEffectMemory()
+    private let lock = NSLock()
+    private var ignoringPIDs: Set<pid_t> = []
+
+    func recordIgnoredSelectedTextWrite(pid: pid_t) {
+        lock.lock(); defer { lock.unlock() }
+        ignoringPIDs.insert(pid)
+    }
+
+    func ignoresSelectedTextWrites(pid: pid_t) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return ignoringPIDs.contains(pid)
+    }
+}
+
+/// Web content text fields never take AXSelectedText writes usefully: WebKit rejects them and
+/// Chromium accepts them without changing the page. Detect by structure, not by app name.
+func axElementIsInsideWebArea(
+    _ element: AXUIElement,
+    parent: (AXUIElement) -> AXUIElement? = { decodeAXElement(observationAXAttribute($0, kAXParentAttribute).1) },
+    role: (AXUIElement) -> String? = { completeAXString($0, kAXRoleAttribute) },
+    maximumDepth: Int = 64
+) -> Bool {
+    var current = parent(element)
+    var depth = 0
+    while let node = current, depth < maximumDepth {
+        if role(node) == "AXWebArea" { return true }
+        current = parent(node)
+        depth += 1
+    }
+    return false
 }
 
 enum AXTextMutationPreflight: Equatable {
@@ -1116,11 +1177,16 @@ extension AXSelectedTextWriting {
 struct SystemAXSelectedTextWriter: AXSelectedTextWriting {
     private let isSettable: (AXUIElement) -> (AXError, Bool)
     private let setValue: (AXUIElement, String) -> AXError
+    /// Effect readback. Default nil = legacy "API success means written"; production injects
+    /// the live probe in `makeActionPerformer`.
+    private let effectProbe: AXTextWriteEffectProbe?
 
     init(
         isSettable: ((AXUIElement) -> (AXError, Bool))? = nil,
-        setValue: ((AXUIElement, String) -> AXError)? = nil
+        setValue: ((AXUIElement, String) -> AXError)? = nil,
+        effectProbe: AXTextWriteEffectProbe? = nil
     ) {
+        self.effectProbe = effectProbe
         self.isSettable = isSettable ?? { element in
             var flag = DarwinBoolean(false)
             let error = AXUIElementIsAttributeSettable(
@@ -1161,11 +1227,22 @@ struct SystemAXSelectedTextWriter: AXSelectedTextWriting {
             return .failed(error, inputStarted: false)
         }
         try validateBeforeMutation()
+        let before = effectProbe?.readValue(element)
+        let selectedBefore = effectProbe?.readSelectedText(element)
         let setError = setValue(element, text)
         guard setError == .success else {
             return .failed(mapAXActionError(setError), inputStarted: true)
         }
-        return .written
+        // Only a readable, unchanged value across the settle window proves the write was
+        // ignored. Retyping the current selection legitimately leaves the value as it was.
+        guard let effectProbe, let before, !text.isEmpty, selectedBefore != text else { return .written }
+        var waited = 0
+        while true {
+            guard let after = effectProbe.readValue(element), after == before else { return .written }
+            if waited >= effectProbe.settleMilliseconds { return .ineffective }
+            effectProbe.sleepMilliseconds(effectProbe.pollMilliseconds)
+            waited += effectProbe.pollMilliseconds
+        }
     }
 
     func preflightSelectedText(to element: AXUIElement) -> AXTextMutationPreflight {
@@ -1227,6 +1304,10 @@ final class SystemActionPerformer: ActionProviding {
     /// 改投对输入法免疫的 unicode 事件（实测：SCIM 激活下 unicode 串能进 WebKit 输入框并更新
     /// React 状态，而真实按键码会被候选窗截走）。see docs/macos-computer-use.md#input-delivery-contracts
     private let textInputSafety: (() -> BackgroundTextInputSafety)?
+    /// Web content detection and ignored-write memory. Default nil = no extra routing (legacy
+    /// unit paths unchanged); production injects both in `makeActionPerformer`.
+    private let webContentProbe: ((AXUIElement) -> Bool)?
+    private let axTextWriteMemory: AXTextWriteEffectMemory?
 
     init(
         state: @escaping () throws -> ActionTargetState,
@@ -1241,8 +1322,12 @@ final class SystemActionPerformer: ActionProviding {
         heldInputs: HeldInputRegistry = .shared,
         focusedKeyboard: ((ActionElement?) throws -> ActionElement)? = nil,
         focusAcquisition: ((ActionTargetState, ActionElement) -> ActionElement?)? = nil
-        ,textInputSafety: (() -> BackgroundTextInputSafety)? = nil
+        ,textInputSafety: (() -> BackgroundTextInputSafety)? = nil,
+        webContentProbe: ((AXUIElement) -> Bool)? = nil,
+        axTextWriteMemory: AXTextWriteEffectMemory? = nil
     ) {
+        self.webContentProbe = webContentProbe
+        self.axTextWriteMemory = axTextWriteMemory
         self.state = state
         self.lookup = lookup
         self.pointerLookup = pointerLookup
@@ -1274,9 +1359,26 @@ final class SystemActionPerformer: ActionProviding {
 
     func preflightAXTextMutation(_ element: ActionElement) -> AXTextMutationPreflight {
         guard !element.isSecure, element.enabled == true, element.supportsAXSelectedTextWrite,
-              let axElement = element.element
+              let axElement = element.element, axTextWriteMayLand(axElement)
         else { return .unsupported }
         return selectedTextWriter.preflightSelectedText(to: axElement)
+    }
+
+    /// False routes the text to keyboard delivery: web content, or a process that already
+    /// ignored an AXSelectedText write in this helper lifetime.
+    private func axTextWriteMayLand(_ element: AXUIElement) -> Bool {
+        if webContentProbe?(element) == true { return false }
+        guard let axTextWriteMemory else { return true }
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(element, &pid) == .success else { return true }
+        return !axTextWriteMemory.ignoresSelectedTextWrites(pid: pid)
+    }
+
+    private func rememberIgnoredAXTextWrite(_ element: AXUIElement) {
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(element, &pid) == .success else { return }
+        axTextWriteMemory?.recordIgnoredSelectedTextWrite(pid: pid)
+        logActionRejected("AX-TEXT-INEFFECTIVE pid=\(pid) value unchanged after an accepted AXSelectedText write")
     }
 
     func preflightAXTextReplacement(_ element: ActionElement) -> AXTextMutationPreflight {
@@ -1489,6 +1591,11 @@ final class SystemActionPerformer: ActionProviding {
                 return ActionPerformance(inputStarted: true)
             case .unsupported:
                 throw ActionPerformFailure(error: .helperFailed, inputStarted: false)
+            case .ineffective:
+                // A background plan cannot switch to keyboard mid-action. Report that nothing
+                // was sent; the remembered process routes the retry to keyboard delivery.
+                rememberIgnoredAXTextWrite(element)
+                throw ActionPerformFailure(error: .inputFocusRequired, inputStarted: false)
             case let .failed(error, inputStarted):
                 throw ActionPerformFailure(error: error, inputStarted: inputStarted)
             }
@@ -1504,7 +1611,8 @@ final class SystemActionPerformer: ActionProviding {
             let current = try revalidateKeyboardTarget(action.verifiedElement)
             // 输入法不安全时绝不碰 AX 文本写（plan 侧同做双保险，两处都不许漏）。
             let layoutAllowsTextMutation = textInputSafety.map { $0() == .safeASCIIKeyboardLayout } ?? true
-            if layoutAllowsTextMutation, current.supportsAXSelectedTextWrite, let element = current.element {
+            if layoutAllowsTextMutation, current.supportsAXSelectedTextWrite, let element = current.element,
+               axTextWriteMayLand(element) {
                 let selectedTextResult = try selectedTextWriter.writeSelectedText(
                     text,
                     to: element,
@@ -1517,6 +1625,8 @@ final class SystemActionPerformer: ActionProviding {
                     return ActionPerformance(inputStarted: true)
                 case .unsupported:
                     break
+                case .ineffective:
+                    rememberIgnoredAXTextWrite(element)
                 case let .failed(error, inputStarted):
                     throw ActionPerformFailure(error: error, inputStarted: inputStarted)
                 }

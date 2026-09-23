@@ -599,6 +599,7 @@ final class ForegroundKeyboardExecutor {
             case .secure, .secureOrIndeterminate:
                 throw ActionExecutionError.secureTarget
             case .stale:
+                logActionRejected("KEY-VALIDATE focus observation stale")
                 throw ActionExecutionError.staleSnapshot
             }
             for action in actions {
@@ -628,6 +629,7 @@ final class ForegroundKeyboardExecutor {
                             else { throw ActionExecutionError.secureTarget }
                             focusChanged = true
                         } else {
+                            logActionRejected("KEY-VALIDATE focus changed sameIdentity=\(currentFocus.identityToken == expectedFocus.identityToken) sameRole=\(currentFocus.role == expectedFocus.role) textGeometryAllowed=\(allowTextGeometryTransition)")
                             throw ActionExecutionError.staleSnapshot
                         }
                     }
