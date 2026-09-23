@@ -398,13 +398,13 @@ ACT_SCHEMA = _object_schema(
     },
     required=("snapshot_id", "actions"),
 )
+# Both refs resume a suspended target; neither ends a targetless handoff.
 RESUME_SCHEMA = {
     "type": "object",
     "properties": {
-        "app_ref": {"type": "string"},
-        "window_ref": {"type": "string"},
+        "app_ref": {"type": "string", "minLength": 1},
+        "window_ref": {"type": "string", "minLength": 1},
     },
-    "required": ["app_ref", "window_ref"],
     "additionalProperties": False,
 }
 TAKEOVER_SCHEMA = {
@@ -1022,6 +1022,13 @@ class LocalComputerRuntime:
         self._helper_started = True
         return await (await self._ensure_manager()).resume(publication_id)
 
+    async def resume_unbound(self, publication_id: str) -> None:
+        # A targetless release performs no native I/O, so it never starts the helper.
+        manager = self._manager
+        if manager is None:
+            raise ComputerSessionError("handoff_inactive")
+        await manager.resume_unbound(publication_id)
+
     async def commit_resume_publication(self, publication_id: str) -> None:
         await (await self._ensure_manager()).commit_resume_publication(publication_id)
 
@@ -1029,6 +1036,11 @@ class LocalComputerRuntime:
         if self._manager is None:
             raise ComputerSessionError("stale_resume_publication")
         self._manager.validate_unbound_resume_publication(publication_id)
+
+    def validate_targetless_resume_publication(self, publication_id: str) -> None:
+        if self._manager is None:
+            raise ComputerSessionError("stale_resume_publication")
+        self._manager.validate_targetless_resume_publication(publication_id)
 
     async def abort_resume_publication(self, publication_id: str) -> None:
         manager = self._manager
@@ -2560,7 +2572,8 @@ def register_computer_tools(
         """Opaque suspended refs survive catalog refresh; never authorize input."""
         target = manager.suspended_target
         if target is None:
-            return {}
+            # A targetless stop resumes into an unbound session; there are no refs to reuse.
+            return {"next_observation": {"tool": "computer_resume", "arguments": {}}} if manager.handed_off else {}
         return {"next_observation": {
             "tool": "computer_resume",
             "arguments": {"app_ref": target.app_ref, "window_ref": target.window_ref},
@@ -3401,11 +3414,25 @@ def register_computer_tools(
                 "success": True,
                 "session_id": manager.session_id,
                 "handoff_active": True,
-                "message": "Automation input is blocked until computer_resume revalidates the target.",
+                "message": (
+                    "Automation input is blocked until computer_resume revalidates the target."
+                    if manager.suspended_target is not None else
+                    "Automation input is blocked. No window is bound; after the user yields control, "
+                    "call computer_resume without refs, then bind a fresh window."
+                ),
                 **resume_recovery(),
             })
         except ComputerSessionError as exc:
             return _session_failure(exc)
+
+    def targetless_resume_receipt() -> dict[str, Any]:
+        return {
+            "success": True,
+            "status": "resumed_unbound",
+            "session_id": manager.session_id,
+            "message": "User control ended. No window was bound during this handoff; no input was sent and no earlier authority was restored.",
+            "recovery_hint": "Call computer_apps, then choose an exact app_ref and window_ref for computer_get_app_state. New observation and input authorization are required.",
+        }
 
     def unbound_resume_receipt() -> dict[str, Any]:
         return {
@@ -3417,8 +3444,8 @@ def register_computer_tools(
         }
 
     async def computer_resume(
-        app_ref: str,
-        window_ref: str,
+        app_ref: str | None = None,
+        window_ref: str | None = None,
         *,
         _permission_call_id: str = "",
     ):
@@ -3430,10 +3457,33 @@ def register_computer_tools(
         publication_started = False
         try:
             suspended = manager.suspended_target
-            if suspended is None:
+            if suspended is None and not manager.handed_off:
                 return _failure(
                     "no_suspended_target", "There is no suspended Computer Use target to resume.",
                     retryable=False, recovery_hint="Do not call handoff to manufacture a suspended target. Use computer_apps and computer_get_app_state for normal observation; resolve any prior overlay failure first.",
+                )
+            if suspended is None:
+                if app_ref is not None or window_ref is not None:
+                    return _failure(
+                        "invalid_arguments",
+                        "This handoff has no suspended target. Call computer_resume without app_ref or window_ref.",
+                        retryable=False, details=resume_recovery(),
+                    )
+                try:
+                    await manager.resume_unbound(_permission_call_id)
+                except ComputerSessionError as exc:
+                    return _session_failure(exc)
+                resume_publication_owner = _permission_call_id
+                publication_started = True
+                trusted_target.clear()
+                trusted_snapshot.clear()
+                clear_computer_grants()
+                return json.dumps(targetless_resume_receipt())
+            if app_ref is None or window_ref is None:
+                return _failure(
+                    "invalid_arguments",
+                    "This handoff has a suspended target. Pass both supplied computer_resume refs.",
+                    retryable=False, details=resume_recovery(),
                 )
             if (
                 suspended.app_ref != app_ref
@@ -3605,11 +3655,17 @@ def register_computer_tools(
     def verify_resume(args: dict, result: dict) -> tuple[bool, str]:
         if manager.target is not None:
             return verify_snapshot(args, result)
+        targetless = manager.suspended_target is None
         try:
-            manager.validate_unbound_resume_publication(resume_publication_owner or "")
+            if targetless:
+                manager.validate_targetless_resume_publication(resume_publication_owner or "")
+            else:
+                manager.validate_unbound_resume_publication(resume_publication_owner or "")
             payload = json.loads(str(result.get("fresh_output") or result.get("output") or ""))
-            if payload != unbound_resume_receipt():
+            if payload != (targetless_resume_receipt() if targetless else unbound_resume_receipt()):
                 return False, "unbound resume receipt changed before publication"
+            if targetless:
+                return True, "verified targetless stop release; no window bound and no input sent"
             return True, "verified exact-target absence and revoked authority; no replacement bound"
         except (ComputerSessionError, ValueError, TypeError) as exc:
             return False, str(exc)
@@ -4161,7 +4217,7 @@ def register_computer_tools(
     ))
     registry.register(ToolDef("computer_handoff", "Block model input and transfer control to the user.", EMPTY_SCHEMA, computer_handoff, risk="write", approval="never", replay="safe", **common))
     registry.register(ToolDef(
-        "computer_resume", "Revalidate the handed-off target and return a fresh observation.", RESUME_SCHEMA, computer_resume,
+        "computer_resume", "Revalidate the handed-off target and return a fresh observation. After a targetless handoff, call it without refs to end user control unbound.", RESUME_SCHEMA, computer_resume,
         risk="write", approval="on_risk", replay="safe", result_persistence="request_local",
         postcondition=verify_resume, completion_finalizer=finalize_resume_publication, **common,
     ))

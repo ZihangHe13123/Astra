@@ -2224,6 +2224,85 @@ def test_robustness_absent_publication_refresh_blocks_late_commit_and_abort(fake
     assert not manager.handed_off and manager.target is None
 
 
+def _unbound_after_catalog_refresh(fake_backend, tmp_path):
+    fake_backend.apps_result = [{"app_ref": "app", "windows": [
+        {"window_ref": "window", "bindable": True, "window_identity_ref": "identity-window"},
+    ]}]
+    manager = ComputerSessionManager(fake_backend, cache_root=tmp_path)
+    run(manager.apps())
+    run(manager.select("app", "window"))
+    run(manager.snapshot())
+    # A catalog refresh intentionally revokes the ordinary binding.
+    run(manager.apps())
+    manager.grants.add("stale-grant")
+    assert manager.target is None and not manager.handed_off
+    return manager
+
+
+@pytest.mark.parametrize("pause", ["handoff", "pause_for_user_activity"])
+def test_targetless_stop_needs_no_window_selection_or_capture(fake_backend, tmp_path, pause):
+    manager = _unbound_after_catalog_refresh(fake_backend, tmp_path)
+    native = (list(fake_backend.select_calls), list(fake_backend.snapshot_calls), list(fake_backend.act_calls))
+    run(getattr(manager, pause)())
+    assert manager.handed_off and manager.suspended_target is None and manager.target is None
+    assert manager.grants == set()
+    assert manager._latest_snapshot is None and manager._pending_plan is None
+    run(manager.handoff())
+    assert manager.handed_off and manager.suspended_target is None
+    assert (fake_backend.select_calls, fake_backend.snapshot_calls, fake_backend.act_calls) == native
+
+
+def test_targetless_resume_releases_only_into_an_unbound_session(fake_backend, tmp_path):
+    manager = _unbound_after_catalog_refresh(fake_backend, tmp_path)
+    run(manager.handoff())
+    selects = list(fake_backend.select_calls)
+    with pytest.raises(ComputerSessionError, match="handoff_inactive"):
+        run(manager.resume("bound-release"))
+    run(manager.resume_unbound("targetless-release"))
+    assert manager.handed_off
+    manager.validate_targetless_resume_publication("targetless-release")
+    run(manager.commit_resume_publication("targetless-release"))
+    assert not manager.handed_off and manager.target is None and manager.grants == set()
+    assert fake_backend.select_calls == selects
+    with pytest.raises(ComputerSessionError, match="target_required"):
+        run(manager.snapshot())
+
+
+def test_targetless_resume_abort_or_newer_stop_keeps_user_control(fake_backend, tmp_path):
+    manager = _unbound_after_catalog_refresh(fake_backend, tmp_path)
+    with pytest.raises(ComputerSessionError, match="handoff_inactive"):
+        run(manager.resume_unbound("not-paused"))
+    run(manager.handoff())
+    run(manager.resume_unbound("aborted-release"))
+    run(manager.abort_resume_publication("aborted-release"))
+    assert manager.handed_off and manager.suspended_target is None and manager.grants == set()
+    with pytest.raises(ComputerSessionError, match="stale_resume_publication"):
+        run(manager.commit_resume_publication("aborted-release"))
+    run(manager.resume_unbound("late-release"))
+    with pytest.raises(ComputerSessionError, match="stale_resume_publication"):
+        run(manager.resume_unbound("overlapping-release"))
+    run(manager.handoff())
+    with pytest.raises(ComputerSessionError, match="stale_resume_publication"):
+        run(manager.commit_resume_publication("late-release"))
+    with pytest.raises(ComputerSessionError, match="stale_resume_publication"):
+        manager.validate_targetless_resume_publication("late-release")
+    assert manager.handed_off
+
+
+def test_repeated_handoff_during_absence_publication_keeps_bound_continuity(fake_backend, tmp_path):
+    manager = _robustness_vanished_menu(fake_backend, tmp_path)
+    run(manager.apps())
+    assert run(manager.resume("absence-release")) is None
+    run(manager.handoff())
+    assert manager.handed_off and manager.suspended_target == ComputerTarget("app", "menu")
+    assert manager._suspended_window_identity_ref == "identity-menu"
+    with pytest.raises(ComputerSessionError, match="stale_resume_publication"):
+        run(manager.commit_resume_publication("absence-release"))
+    with pytest.raises(ComputerSessionError, match="handoff_inactive"):
+        run(manager.resume_unbound("wrong-mode"))
+    assert manager.handed_off
+
+
 @pytest.mark.parametrize("uncertainty", ["empty", "missing_identity", "duplicate", "invalid_refs", "duplicate_refs", "unbindable", "restart", "catalog_error", "cancelled"])
 def test_robustness_resume_uncertainty_never_releases_handoff(fake_backend, tmp_path, uncertainty):
     # Missing or changed UI entries alone remain insufficient. The one case

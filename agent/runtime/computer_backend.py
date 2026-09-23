@@ -1702,16 +1702,29 @@ class ComputerSessionManager:
     async def handoff(self) -> None:
         async with self._lock:
             self._require_open()
-            self._pause_for_user(self._require_target())
+            self._stop_for_user()
 
     async def pause_for_user_activity(self) -> None:
         """Enter user-control state while retaining only active takeover cleanup."""
         async with self._lock:
             self._require_open()
-            self._pause_for_user(
-                self._require_target(),
-                preserve_takeover_cleanup=True,
-            )
+            self._stop_for_user(preserve_takeover_cleanup=True)
+
+    async def resume_unbound(self, publication_id: str) -> None:
+        """Release a targetless stop without selecting, capturing or sending input."""
+        async with self._lock:
+            self._require_open()
+            if not self._valid_window_identity_ref(publication_id):
+                raise ComputerSessionError("stale_resume_publication")
+            if self._resume_publication_id is not None:
+                raise ComputerSessionError("stale_resume_publication")
+            if not self._handed_off or self._suspended_target is not None or self._target is not None:
+                raise ComputerSessionError("handoff_inactive")
+            self._invalidate_cooperative_state()
+            self.grants.clear()
+            self._target_generation += 1
+            # Keep the stop until the unbound receipt passes publication.
+            self._resume_publication_id = publication_id
 
     async def resume(self, publication_id: str) -> ComputerTarget | None:
         async with self._lock:
@@ -1775,6 +1788,15 @@ class ComputerSessionManager:
             self._resume_publication_id != publication_id
             or not self._handed_off or self._target is not None
             or self._suspended_target is None
+        ):
+            raise ComputerSessionError("stale_resume_publication")
+
+    def validate_targetless_resume_publication(self, publication_id: str) -> None:
+        self._require_open()
+        if (
+            self._resume_publication_id != publication_id
+            or not self._handed_off or self._target is not None
+            or self._suspended_target is not None
         ):
             raise ComputerSessionError("stale_resume_publication")
 
@@ -1919,6 +1941,24 @@ class ComputerSessionManager:
         )
         self._suspended_target = target
         self._suspended_window_identity_ref = self._target_window_identity_ref
+        self._resume_candidate = None
+        self._resume_catalog_refreshed = False
+        self._resume_publication_id = None
+        self._handed_off = True
+        self.grants.clear()
+
+    def _stop_for_user(self, *, preserve_takeover_cleanup: bool = False) -> None:
+        """Stopping automation must never depend on first binding a window."""
+        if self._target is not None:
+            self._pause_for_user(self._target, preserve_takeover_cleanup=preserve_takeover_cleanup)
+            return
+        # Nothing to select, capture or send. Suspended continuity from a pending
+        # absence publication is kept; the pending release is not, so a late
+        # commit cannot undo this newer stop.
+        self._target_generation += 1
+        self._invalidate_cooperative_state(
+            preserve_takeover_cleanup=preserve_takeover_cleanup,
+        )
         self._resume_candidate = None
         self._resume_catalog_refreshed = False
         self._resume_publication_id = None

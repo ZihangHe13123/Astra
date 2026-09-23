@@ -967,13 +967,13 @@ def test_registers_computer_apps_with_repeat_and_budget_controls(registry, manag
     mode_schema = registry.get("computer_act").parameters["properties"]["interaction_mode"]
     assert mode_schema["enum"] == ["auto", "background", "foreground_takeover"]
     assert mode_schema["default"] == "auto"
+    # Both refs resume a suspended target; neither ends a targetless handoff.
     assert registry.get("computer_resume").parameters == {
         "type": "object",
         "properties": {
-            "app_ref": {"type": "string"},
-            "window_ref": {"type": "string"},
+            "app_ref": {"type": "string", "minLength": 1},
+            "window_ref": {"type": "string", "minLength": 1},
         },
-        "required": ["app_ref", "window_ref"],
         "additionalProperties": False,
     }
 
@@ -7739,6 +7739,101 @@ def test_resume_without_suspended_target_does_not_invent_recovery_refs(registry,
     assert 'next_observation' not in result.get('details', {})
     assert not backend.calls
     assert manager.handed_off is False
+
+
+def _targetless_handoff(registry, manager, backend):
+    register(registry, manager)
+    focus(registry)
+    # An automatic catalog refresh revokes the ordinary binding before any stop.
+    assert run(registry.execute("computer_apps", {}))["error"] == ""
+    assert manager.target is None and not manager.handed_off
+    backend.calls.clear()
+    handed_off = run(registry.execute("computer_handoff", {}))
+    assert handed_off["error"] == ""
+    return json.loads(handed_off["output"])
+
+
+def test_handoff_without_bound_target_stops_without_selecting(registry, manager, backend):
+    payload = _targetless_handoff(registry, manager, backend)
+    assert payload["handoff_active"] is True
+    assert payload["next_observation"] == {"tool": "computer_resume", "arguments": {}}
+    assert "No window is bound" in payload["message"]
+    assert not backend.calls
+    assert manager.handed_off and manager.suspended_target is None and not manager.grants
+    status = json.loads(run(registry.execute("computer_status", {}))["output"])
+    assert status["handoff_active"] is True and status["target"] is None
+    assert status["next_observation"] == payload["next_observation"]
+    blocked = run(registry.execute("computer_get_app_state", {"app_ref": "app-1", "window_ref": "window-1"}))
+    assert blocked["code"] == "handoff_active"
+    assert blocked["details"]["next_observation"] == payload["next_observation"]
+
+
+def test_targetless_resume_publishes_unbound_receipt_without_native_calls(registry, manager, backend):
+    recipe = _targetless_handoff(registry, manager, backend)["next_observation"]
+    resumed = run(registry.execute(recipe["tool"], recipe["arguments"]))
+    assert resumed["error"] == "" and resumed["verified"] is True
+    payload = json.loads(resumed.get("fresh_output") or resumed["output"])
+    assert payload["status"] == "resumed_unbound"
+    assert "computer_apps" in payload["recovery_hint"] and "computer_get_app_state" in payload["recovery_hint"]
+    assert not backend.calls
+    assert not manager.handed_off and manager.target is None and not manager.grants
+    assert run(registry.execute("computer_snapshot", {}))["code"] == "target_required"
+    assert run(registry.execute("computer_apps", {}))["error"] == ""
+    assert run(registry.execute(
+        "computer_get_app_state", {"app_ref": "app-1", "window_ref": "window-1"},
+    ))["error"] == ""
+
+
+@pytest.mark.parametrize("arguments", [
+    {"app_ref": "app-1", "window_ref": "window-1"}, {"app_ref": "app-1"}, {"window_ref": "window-1"},
+])
+def test_targetless_resume_rejects_refs_before_releasing(registry, manager, backend, arguments):
+    _targetless_handoff(registry, manager, backend)
+    rejected = run(registry.execute("computer_resume", arguments))
+    assert rejected["code"] == "invalid_arguments"
+    assert rejected["details"]["next_observation"]["arguments"] == {}
+    assert manager.handed_off and not backend.calls
+
+
+@pytest.mark.parametrize("arguments", [{}, {"app_ref": "app-1"}])
+def test_bound_resume_still_requires_both_supplied_refs(registry, manager, backend, arguments):
+    register(registry, manager)
+    focus(registry)
+    recipe = json.loads(run(registry.execute("computer_handoff", {}))["output"])["next_observation"]
+    backend.calls.clear()
+    rejected = run(registry.execute("computer_resume", arguments))
+    assert rejected["code"] == "invalid_arguments"
+    assert rejected["details"]["next_observation"] == recipe
+    assert manager.handed_off and manager.suspended_target is not None and not backend.calls
+
+
+@pytest.mark.parametrize("failure", ["postcondition", "commit", "cancelled"])
+def test_targetless_resume_publication_failure_keeps_the_stop(registry, manager, backend, monkeypatch, failure):
+    _targetless_handoff(registry, manager, backend)
+    if failure == "postcondition":
+        registry.get("computer_resume").postcondition = lambda args, result: (False, "publication refused")
+    else:
+        async def fail_commit(publication_id):
+            if failure == "cancelled":
+                raise asyncio.CancelledError()
+            raise RuntimeError("commit refused")
+        monkeypatch.setattr(manager, "commit_resume_publication", fail_commit)
+    result = run(registry.execute("computer_resume", {}))
+    assert result["code"] == "postcondition_failed"
+    assert manager.handed_off and manager.suspended_target is None
+    assert manager.target is None and not manager.grants
+
+
+def test_local_runtime_targetless_handoff_resumes_unbound(registry, manager, monkeypatch, tmp_path):
+    runtime = register_local(registry, manager, monkeypatch, tmp_path)
+    assert run(registry.execute("computer_apps", {}))["error"] == ""
+    assert run(registry.execute("computer_focus", {"app_ref": "app-1", "window_ref": "window-1"}))["error"] == ""
+    assert run(registry.execute("computer_apps", {}))["error"] == ""
+    handed_off = json.loads(run(registry.execute("computer_handoff", {}))["output"])
+    assert handed_off["next_observation"] == {"tool": "computer_resume", "arguments": {}}
+    resumed = run(registry.execute("computer_resume", {}))
+    assert resumed["error"] == "" and resumed["verified"] is True
+    assert not runtime.handed_off and runtime.target is None
 
 
 def test_overlay_failure_is_not_reported_as_expired_refs():
