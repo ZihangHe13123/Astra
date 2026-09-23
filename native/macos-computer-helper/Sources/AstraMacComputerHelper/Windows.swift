@@ -2201,12 +2201,26 @@ final class SystemWindowObserver: WindowObserving {
             candidate.isSharingIndicator && sharingIndicatorWithinTitlebar(candidate.bounds, targetBounds: current.frame)
                 ? candidate.windowID : nil
         })
+        let overlayCandidates = visibleWindows.filter { !indicatorIDs.contains($0.windowID) }
         let containsVisibleOverlay = containedVisibleOverlayOrUncertain(
             targetPID: target.pid,
             targetWindowID: current.windowID,
             targetBounds: current.frame,
-            records: visibleWindows.filter { !indicatorIDs.contains($0.windowID) }
+            records: overlayCandidates
         )
+        if containsAXOverlay || containsVisibleOverlay {
+            // Geometry and ordering only, never titles or content: enough to tell a tooltip or
+            // hover card from a sheet, menu or dialog in live evidence.
+            let selected = overlayCandidates.first { $0.pid == target.pid && $0.windowID == current.windowID }
+            let offenders = backgroundVisibleWindowAmbiguities(targetPID: target.pid, targetWindowID: current.windowID,
+                targetBounds: current.frame, records: overlayCandidates).map {
+                "[layer=\($0.layer) z=\($0.zOrder) alpha=\($0.alpha) dx=\(Int($0.bounds.minX - current.frame.minX)) " +
+                "dy=\(Int($0.bounds.minY - current.frame.minY)) w=\(Int($0.bounds.width)) h=\(Int($0.bounds.height))]"
+            }
+            logActionRejected("OVERLAY-DETAIL ax=\(containsAXOverlay) visible=\(containsVisibleOverlay) " +
+                "selectedLayer=\(selected.map { String($0.layer) } ?? "?") selectedZ=\(selected.map { String($0.zOrder) } ?? "?") " +
+                offenders.joined(separator: " "))
+        }
         let siblingOrdering = backgroundSiblingOrderingProof(
             targetPID: target.pid, targetWindowID: current.windowID, targetBounds: current.frame,
             axWindows: axWindows,
@@ -4030,8 +4044,18 @@ func backgroundVisibleWindowAmbiguityActive(
     targetBounds: CGRect,
     records: [VisibleWindowRecord]
 ) -> Bool {
+    !backgroundVisibleWindowAmbiguities(targetPID: targetPID, targetWindowID: targetWindowID,
+        targetBounds: targetBounds, records: records).isEmpty
+}
+
+func backgroundVisibleWindowAmbiguities(
+    targetPID: pid_t,
+    targetWindowID: CGWindowID,
+    targetBounds: CGRect,
+    records: [VisibleWindowRecord]
+) -> [VisibleWindowRecord] {
     let selected = records.filter { $0.pid == targetPID && $0.windowID == targetWindowID }
-    return records.contains { record in
+    return records.filter { record in
         let behind = selected.count == 1 && approximatelyEqual(selected[0].bounds, targetBounds) && windowIsProvablyBehind(
             candidateLayer: record.layer, candidateOrder: record.zOrder,
             selectedLayer: selected[0].layer, selectedOrder: selected[0].zOrder

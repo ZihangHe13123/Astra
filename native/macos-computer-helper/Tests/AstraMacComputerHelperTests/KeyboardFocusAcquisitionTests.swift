@@ -202,3 +202,36 @@ private func typeAction(target element: AXUIElement, verified: ActionElement) ->
     #expect(acquireCalls >= 1)
     #expect(setCalls == 1)
 }
+
+// Live Edge 153: after pressing a page button, AXFocused=true on a web field was applied
+// asynchronously and the immediate AXFocusedUIElement read still returned the button.
+@Test func KeyboardFocusAcquisitionWaitsBrieflyForAnAsynchronousFocusChange() {
+    let wanted = AXUIElementCreateApplication(201)
+    let previous = AXUIElementCreateApplication(202)
+    var reads = 0
+    let acquired = acquireKeyboardFocus(expected: makeTarget(role: "AXTextField", element: wanted),
+        setFocused: { _ in true },
+        readFocused: { reads += 1; return reads < 4 ? previous : wanted },
+        identity: { makeTarget(role: "AXTextField", element: $0) },
+        settleMilliseconds: 300, pollMilliseconds: 25, sleepMilliseconds: { _ in })
+    #expect(acquired?.element.map { CFEqual($0, wanted) } == true)
+    #expect(reads == 4)
+}
+
+@Test func KeyboardFocusAcquisitionStillReportsTheRealFocusAfterTheSettleWindow() {
+    let wanted = AXUIElementCreateApplication(201)
+    let previous = AXUIElementCreateApplication(202)
+    var reads = 0
+    var slept = 0
+    let acquired = acquireKeyboardFocus(expected: makeTarget(role: "AXTextField", element: wanted),
+        setFocused: { _ in true },
+        readFocused: { reads += 1; return previous },
+        identity: { makeTarget(role: "AXTextField", element: $0) },
+        settleMilliseconds: 300, pollMilliseconds: 25, sleepMilliseconds: { slept += $0 })
+    // The caller compares this identity and still refuses to type into the wrong element.
+    #expect(acquired?.element.map { CFEqual($0, previous) } == true)
+    #expect(slept == 300 && reads == 13)
+    #expect(acquireKeyboardFocus(expected: makeTarget(role: "AXTextField", element: wanted),
+        setFocused: { _ in false }, readFocused: { wanted },
+        identity: { makeTarget(role: "AXTextField", element: $0) }) == nil)
+}

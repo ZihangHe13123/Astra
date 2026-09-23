@@ -1265,23 +1265,52 @@ func acquireKeyboardFocusViaAX(
     state: ActionTargetState,
     expected: ActionElement
 ) -> ActionElement? {
-    guard let element = expected.element else { return nil }
-    guard AXUIElementSetAttributeValue(
-        element,
-        kAXFocusedAttribute as CFString,
-        kCFBooleanTrue
-    ) == .success else { return nil }
-    var value: CFTypeRef?
-    guard AXUIElementCopyAttributeValue(
-        AXUIElementCreateApplication(state.pid),
-        kAXFocusedUIElementAttribute as CFString,
-        &value
-    ) == .success, let focused = decodeAXElement(value) else { return nil }
-    return readActionElementIdentity(
-        provider: AXActionIdentityProvider(element: focused),
-        identityToken: "ax:\(CFHash(focused))",
-        windowBounds: .zero
+    acquireKeyboardFocus(
+        expected: expected,
+        setFocused: {
+            AXUIElementSetAttributeValue($0, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success
+        },
+        readFocused: {
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(
+                AXUIElementCreateApplication(state.pid),
+                kAXFocusedUIElementAttribute as CFString,
+                &value
+            ) == .success else { return nil }
+            return decodeAXElement(value)
+        },
+        identity: { focused in
+            readActionElementIdentity(
+                provider: AXActionIdentityProvider(element: focused),
+                identityToken: "ax:\(CFHash(focused))",
+                windowBounds: .zero
+            )
+        }
     )
+}
+
+/// Chromium applies an AX focus request asynchronously (live: Edge right after a page button
+/// press), so poll briefly for the requested element before judging the previous focus. The
+/// caller still compares the returned identity and refuses any other element.
+func acquireKeyboardFocus(
+    expected: ActionElement,
+    setFocused: (AXUIElement) -> Bool,
+    readFocused: () -> AXUIElement?,
+    identity: (AXUIElement) -> ActionElement?,
+    settleMilliseconds: Int = 300,
+    pollMilliseconds: Int = 25,
+    sleepMilliseconds: (Int) -> Void = { usleep(useconds_t(max(0, $0)) * 1_000) }
+) -> ActionElement? {
+    guard let element = expected.element, setFocused(element) else { return nil }
+    var focused = readFocused()
+    var waited = 0
+    while !(focused.map { CFEqual($0, element) } ?? false), waited < settleMilliseconds {
+        sleepMilliseconds(pollMilliseconds)
+        waited += pollMilliseconds
+        focused = readFocused()
+    }
+    guard let focused else { return nil }
+    return identity(focused)
 }
 
 final class SystemActionPerformer: ActionProviding {
