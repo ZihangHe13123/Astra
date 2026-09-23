@@ -52,6 +52,36 @@ import Testing
     ]) == Set<CGWindowID>([10, 11]))
 }
 
+// Live WPS 2026-09-23: a handoff was bound to a context menu. The user closed it, but Qt keeps one
+// menu window and orders it out, so it never left the inventory and resume could not release.
+@Test func cuCatalogAbsenceTreatsAnOrderedOutPopupAsClosed() {
+    let rows: [[String: Any]] = [
+        [kCGWindowNumber as String: 10023, kCGWindowLayer as String: 8, kCGWindowIsOnscreen as String: false],
+        [kCGWindowNumber as String: 20, kCGWindowLayer as String: 101],
+        [kCGWindowNumber as String: 11, kCGWindowLayer as String: 0, kCGWindowIsOnscreen as String: false],
+        [kCGWindowNumber as String: 12, kCGWindowLayer as String: 8, kCGWindowIsOnscreen as String: true],
+        [kCGWindowNumber as String: 13, kCGWindowLayer as String: true, kCGWindowIsOnscreen as String: false],
+    ]
+    // Minimized standard windows and anything with an unreadable layer stay present.
+    let present = CatalogWindowAbsenceTracker.validatedInventory(rows)
+    #expect(present == Set<CGWindowID>([11, 12, 13]))
+    var tracker = CatalogWindowAbsenceTracker()
+    tracker.record(reference: "identity-menu", windowID: 10023)
+    tracker.record(reference: "identity-document", windowID: 11)
+    #expect(tracker.confirmedAbsent(windowIDs: present) == ["identity-menu"])
+    // The same menu window ordered back in is present again.
+    let reopened = CatalogWindowAbsenceTracker.validatedInventory([
+        [kCGWindowNumber as String: 10023, kCGWindowLayer as String: 8, kCGWindowIsOnscreen as String: true],
+        [kCGWindowNumber as String: 11, kCGWindowLayer as String: 0],
+    ])
+    #expect(tracker.confirmedAbsent(windowIDs: reopened).isEmpty)
+    // A duplicate hidden row is still malformed.
+    #expect(CatalogWindowAbsenceTracker.validatedInventory([
+        [kCGWindowNumber as String: 10023, kCGWindowLayer as String: 8],
+        [kCGWindowNumber as String: 10023, kCGWindowLayer as String: 8],
+    ]) == nil)
+}
+
 @Test func cuCatalogAbsenceProducerDistinguishesHiddenAndTrulyClosedTargets() throws {
     var visibleTarget = true
     var inventory: Set<CGWindowID>? = [10, 11]

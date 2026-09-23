@@ -37,6 +37,7 @@ struct CatalogWindowAbsenceTracker {
         // A wholly empty WindowServer reply is not reliable evidence of a
         // vanished target (session/permission transitions can look empty).
         guard let rows, !rows.isEmpty, rows.count <= 16_384 else { return nil }
+        var seen = Set<CGWindowID>()
         var result = Set<CGWindowID>()
         for row in rows {
             guard let number = row[kCGWindowNumber as String] as? NSNumber,
@@ -44,9 +45,21 @@ struct CatalogWindowAbsenceTracker {
             let value = number.doubleValue
             guard value.isFinite, value > 0, value <= Double(CGWindowID.max),
                   value.rounded(.towardZero) == value,
-                  result.insert(CGWindowID(value)).inserted else { return nil }
+                  seen.insert(CGWindowID(value)).inserted else { return nil }
+            if !closedPopupRow(row) { result.insert(CGWindowID(value)) }
         }
         return result
+    }
+
+    /// A menu or popup that is ordered out is closed even when its window lives on: live WPS orders
+    /// one context-menu window out and back in under the same number, so it never leaves the
+    /// inventory. Standard-layer windows stay present off screen; minimized is not closed.
+    private static func closedPopupRow(_ row: [String: Any]) -> Bool {
+        guard let layer = row[kCGWindowLayer as String] as? NSNumber,
+              CFGetTypeID(layer) != CFBooleanGetTypeID(),
+              layer.doubleValue.isFinite, layer.doubleValue > 0
+        else { return false }
+        return (row[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue != true
     }
 }
 
