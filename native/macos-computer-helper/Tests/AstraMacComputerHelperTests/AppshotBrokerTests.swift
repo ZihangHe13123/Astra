@@ -190,7 +190,10 @@ private struct BrokerReadDiagnostics: CustomStringConvertible {
   var pendingMessages: [AppshotMessage] = []
   init(fd: Int32) { self.fd = fd }
   init(path: String) throws {
-    fd = socket(AF_UNIX, SOCK_STREAM, 0)
+    // Own the descriptor locally until it is usable. Throwing after `fd` is set would also run
+    // deinit, closing a number that another parallel test may already have reused.
+    let descriptor = socket(AF_UNIX, SOCK_STREAM, 0)
+    guard descriptor >= 0 else { throw AppshotBrokerError.systemFailure }
     var address = sockaddr_un()
     address.sun_family = sa_family_t(AF_UNIX)
     address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
@@ -199,14 +202,17 @@ private struct BrokerReadDiagnostics: CustomStringConvertible {
     }
     let result = withUnsafePointer(to: &address) { pointer in
       pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        Darwin.connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+        Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
       }
     }
-    guard result == 0 else {
-      Darwin.close(fd)
-      throw AppshotBrokerError.systemFailure
+    do {
+      guard result == 0 else { throw AppshotBrokerError.systemFailure }
+      try AppshotRuntimeDirectory.configureSocket(descriptor)
+    } catch {
+      Darwin.close(descriptor)
+      throw error
     }
-    try AppshotRuntimeDirectory.configureSocket(fd)
+    fd = descriptor
   }
   deinit { Darwin.close(fd) }
   func send(_ message: AppshotMessage) throws { try sendBytes(message.encodeFrame()) }
@@ -241,6 +247,32 @@ private struct BrokerReadDiagnostics: CustomStringConvertible {
         )))
     return try await receive()
   }
+}
+
+extension BrokerSocketClient {
+  /// True once the broker has closed this connection. Parallel test load can delay the broker's
+  /// socket loop far beyond a fixed sleep, so the wait is bounded rather than assumed.
+  func closedByPeer(timeout: TimeInterval = 2) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    var buffer = [UInt8](repeating: 0, count: 4096)
+    while Date() < deadline {
+      let count = read(fd, &buffer, buffer.count)
+      if count == 0 { return true }
+      if count < 0, errno != EAGAIN, errno != EWOULDBLOCK, errno != EINTR { return true }
+      try? await Task.sleep(nanoseconds: 5_000_000)
+    }
+    return false
+  }
+}
+
+/// Polls a broker-side count until it holds or a bound expires.
+@MainActor private func eventually(timeout: TimeInterval = 2, _ condition: () -> Bool) async -> Bool {
+  let deadline = Date().addingTimeInterval(timeout)
+  while !condition() {
+    if Date() >= deadline { return false }
+    try? await Task.sleep(nanoseconds: 5_000_000)
+  }
+  return true
 }
 
 extension AppshotBrokerTests {
@@ -388,8 +420,8 @@ extension AppshotBrokerTests {
           .init(
             type: "hello", version: 1, sessionId: "session", pid: Int(getpid()),
             processStart: start, clientNonce: nonce)))
-      try await Task.sleep(nanoseconds: 20_000_000)
-      #expect(broker.socketClientCount == 0)
+      #expect(await client.closedByPeer())
+      #expect(await eventually { broker.socketClientCount == 0 })
     }
     let oversized = try BrokerSocketClient(path: path)
     for _ in 0..<16 {
@@ -397,14 +429,16 @@ extension AppshotBrokerTests {
       try await Task.sleep(nanoseconds: 5_000_000)
     }
     try oversized.sendBytes(Data([32]))
-    try await Task.sleep(nanoseconds: 20_000_000)
-    #expect(broker.socketClientCount == 0)
+    #expect(await oversized.closedByPeer())
+    #expect(await eventually { broker.socketClientCount == 0 })
     var raw: [BrokerSocketClient] = []
     for _ in 0..<17 {
       raw.append(try BrokerSocketClient(path: path))
       try await Task.sleep(nanoseconds: 5_000_000)
     }
-    #expect(broker.socketClientCount == 16)
+    // The seventeenth unauthenticated client is refused; the first sixteen stay connected.
+    #expect(await raw[16].closedByPeer())
+    #expect(await eventually { broker.socketClientCount == 16 })
     #expect(broker.authenticatedClientCount == 0 && registrar.registered == 0)
     clock.offset += 2_000_000_001
     broker.poll()

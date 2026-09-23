@@ -423,9 +423,14 @@ private func shareable() -> AppshotShareableWindows {
 extension AppshotCaptureTests {
   @Test func enumerationNeverCompletesRetainsOwnership() throws {
     var calls = 0
-    let enumerator = AppshotShareableWindowEnumerator { _ in calls += 1 }
+    // The budget runs out only once the enumeration has started, however slow this run is.
+    let clock = ManualCaptureClock()
+    let enumerator = AppshotShareableWindowEnumerator { _ in
+      calls += 1
+      clock.advance(by: 1)
+    }
     #expect(throws: AppshotCaptureError.timedOut) {
-      try enumerator.read(deadline: .init(duration: 0.02))
+      try enumerator.read(deadline: .init(duration: 0.02, clock: { clock.now }))
     }
     #expect(throws: AppshotCaptureError.busy) { try enumerator.read(deadline: .init()) }
     #expect(calls == 1)
@@ -454,6 +459,16 @@ extension AppshotCaptureTests {
   }
 }
 
+/// Time that moves only when the test advances it. A loaded parallel run once spent the whole
+/// 0.15 s budget before the withheld read began, so the capture timed out without that read and
+/// the test waited for it forever.
+private final class ManualCaptureClock: @unchecked Sendable {
+  private let lock = NSLock()
+  private var value: TimeInterval = 1_000
+  var now: TimeInterval { lock.withLock { value } }
+  func advance(by seconds: TimeInterval) { lock.withLock { value += seconds } }
+}
+
 extension AppshotCaptureTests {
   @Test(arguments: [0, 1, 2], [false, true])
   func enumerationOwnershipCoversInitialPostImageAndFinalRead(phase: Int, cancel: Bool) async throws
@@ -468,7 +483,8 @@ extension AppshotCaptureTests {
       if reads <= phase { callback(.success(shareable())) } else { continuation.yield(callback) }
     }
     let coordinator = AppshotCaptureCoordinator(targets: provider, images: ImageFixture())
-    let deadline = AppshotCaptureDeadline(duration: 0.15)
+    let clock = ManualCaptureClock()
+    let deadline = AppshotCaptureDeadline(duration: 0.15, clock: { clock.now })
     let captureTask = Task {
       await withCheckedContinuation { continuation in
         coordinator.capture(for: recipient(), deadline: deadline) {
@@ -484,7 +500,7 @@ extension AppshotCaptureTests {
     let callback = await iterator.next()!
     // Concurrent admission is refused even when the operation is final revalidation.
     await #expect(throws: AppshotCaptureError.busy) { try await capture(coordinator).get() }
-    if cancel { deadline.cancel() }
+    if cancel { deadline.cancel() } else { clock.advance(by: 1) }
     let expected = cancel ? AppshotCaptureError.cancelled : .timedOut
     if let finalTask {
       await #expect(throws: expected) { try await finalTask.value }
@@ -522,8 +538,10 @@ extension AppshotCaptureTests {
       .makeStream()
     var iterator = stream.makeAsyncIterator()
     let enumerator = AppshotShareableWindowEnumerator { continuation.yield($0) }
-    let first = Task.detached { try enumerator.read(deadline: .init(duration: 0.02)) }
+    let clock = ManualCaptureClock()
+    let first = Task.detached { try enumerator.read(deadline: .init(duration: 0.02, clock: { clock.now })) }
     let old = await iterator.next()!
+    clock.advance(by: 1)
     await #expect(throws: AppshotCaptureError.timedOut) { try await first.value }
     old(.success(shareable()))
     let second = Task.detached { try enumerator.read(deadline: .init()) }

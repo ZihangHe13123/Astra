@@ -2853,6 +2853,41 @@ private func bundleDirectoryEntries(_ root: URL) throws -> [String] {
     try FileManager.default.contentsOfDirectory(atPath: root.path).sorted()
 }
 
+/// Close-fault tests free descriptors and then deliberately probe or reuse their numbers. Parallel
+/// Swift Testing shares one process, and every other test allocates the lowest free numbers, so a
+/// low descriptor can meanwhile belong to another test: a probe then misreports it, and `dup2`
+/// or `close` can replace another test's pipe and leave that test waiting. These descriptors
+/// therefore live in a private high range.
+private enum BundleTestDescriptorRange {
+    private static let lock = NSLock()
+    private static var nextSlot: Int32 = 0
+    private static let base: Int32 = 8192
+    private static let slotWidth: Int32 = 16
+    private static let slots: Int32 = 60
+
+    static func relocate(_ descriptor: Int32) -> Int32 {
+        guard descriptor >= 0, softLimitAllows(base + slots * slotWidth) else { return descriptor }
+        lock.lock()
+        let slot = nextSlot % slots
+        nextSlot += 1
+        lock.unlock()
+        let moved = Darwin.fcntl(descriptor, F_DUPFD_CLOEXEC, base + slot * slotWidth)
+        guard moved >= 0 else { return descriptor }
+        _ = Darwin.close(descriptor)
+        return moved
+    }
+
+    private static func softLimitAllows(_ wanted: Int32) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        var limit = rlimit()
+        guard getrlimit(RLIMIT_NOFILE, &limit) == 0 else { return false }
+        if limit.rlim_cur >= rlim_t(wanted) { return true }
+        guard limit.rlim_max >= rlim_t(wanted) else { return false }
+        limit.rlim_cur = rlim_t(wanted)
+        return setrlimit(RLIMIT_NOFILE, &limit) == 0
+    }
+}
+
 final class BundleTestArtifactSyscalls: ArtifactSyscalls {
     enum Fault: Equatable {
         case none
@@ -2872,6 +2907,16 @@ final class BundleTestArtifactSyscalls: ArtifactSyscalls {
         case closeAndReportEBADF(Int)
         case rename(Int)
         case directorySync
+
+        /// These faults free descriptors that the tests then probe or deliberately reuse.
+        var reusesDescriptorNumbers: Bool {
+            switch self {
+            case .close, .closeStillOpen, .closeAndReportEBADF, .initialAndRecoveryStatusFailingCloseStillOpen:
+                true
+            default:
+                false
+            }
+        }
     }
 
     let directoryFD: Int32
@@ -2907,7 +2952,8 @@ final class BundleTestArtifactSyscalls: ArtifactSyscalls {
             errno = EIO
             return -1
         }
-        return name.withCString { Darwin.openat(directoryFD, $0, flags, mode) }
+        let descriptor = name.withCString { Darwin.openat(directoryFD, $0, flags, mode) }
+        return fault.reusesDescriptorNumbers ? BundleTestDescriptorRange.relocate(descriptor) : descriptor
     }
 
     func directoryEntryNames(
