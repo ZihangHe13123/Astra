@@ -36,7 +36,8 @@ ABC = "com.apple.keylayout.ABC"
 PINYIN = "com.apple.inputmethod.SCIM.ITABC"
 DIAGNOSTICS = Path("/tmp/astra-sipp-diagnostics.log")
 DIAGNOSTIC_MARKERS = ("AX-TEXT-INEFFECTIVE", "TEXT-CONTINUITY-REJECT", "KEY-VALIDATE", "FOCUSED-ROOT",
-                      "TYPE-ROUTE", "PLAN-RESULT", "RESP-ERR", "TAKEOVER-FAIL")
+                      "TYPE-ROUTE", "PLAN-RESULT", "RESP-ERR", "TAKEOVER-FAIL", "OVERLAY-DETAIL",
+                      "observation_validation", "FOCUS-ACQUIRE")
 
 # Selects an input source by ID (when given) and prints the current one. No text is typed.
 TIS_SCRIPT = """
@@ -199,10 +200,20 @@ class Runner:
         return None
 
     async def observe(self, app_ref: str, window_ref: str) -> dict:
-        result, payload = await self.call("computer_get_app_state", {"app_ref": app_ref, "window_ref": window_ref})
-        if payload is None:
-            raise RuntimeError(f"fixture observation failed: {result.get('code')}: {result.get('error')}")
-        return payload
+        waited = 0.0
+        while True:
+            result, payload = await self.call("computer_get_app_state", {"app_ref": app_ref, "window_ref": window_ref})
+            if payload is not None:
+                if waited:
+                    self.report.setdefault("overlay_waits", []).append(round(waited, 1))
+                return payload
+            if result.get("code") != "overlay_blocked" or waited >= 4:
+                raise RuntimeError(f"fixture observation failed after {waited:.1f}s: "
+                                   f"{result.get('code')}: {result.get('error')}")
+            # Record how long an overlay lasts; OVERLAY-DETAIL in the diagnostics says what it was.
+            # A refused observation leaves the catalog, and so these refs, unchanged.
+            await asyncio.sleep(0.5)
+            waited += 0.5
 
     async def act(self, observation: dict, actions: list[dict]) -> tuple[dict, dict | None]:
         return await self.call("computer_act", {"snapshot_id": observation["snapshot_id"], "actions": actions})
