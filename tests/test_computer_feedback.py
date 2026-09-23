@@ -54,6 +54,34 @@ def test_observation_checkpoint_prefix_is_not_reported_as_uncertain_input():
     assert "input outcome is uncertain" not in guidance.lower()
 
 
+def refused(code, outcome_code=None):
+    return {"action_result": {"last_acknowledged_action": -1,
+                              "outcomes": [{"index": 0, "ok": False, "error_code": outcome_code or code}]}}
+
+
+@pytest.mark.parametrize("code", [
+    "input_focus_required", "stale_snapshot", "target_not_frontmost", "target_gone", "secure_target", "out_of_bounds",
+])
+def test_structured_pre_input_refusal_is_not_reported_as_uncertain_input(code):
+    # The helper reports unknown_outcome whenever input may have started, so a specific
+    # code with nothing acknowledged means nothing was sent.
+    value = receipt(refused(code), error_code=code)
+    assert value["dispatch_state"] == "not_dispatched"
+    assert value["next_step"] == ("refresh_snapshot" if code == "stale_snapshot" else "inspect_error")
+    assert "did not dispatch input" in receipt_instruction(value)
+
+
+@pytest.mark.parametrize("payload,code", [
+    ({}, "stale_snapshot"),
+    (refused("input_focus_required", "unknown_outcome"), "input_focus_required"),
+    (refused("helper_failed"), "helper_failed"),
+    (refused("unknown_outcome"), "unknown_outcome"),
+    ({"action_result": {"last_acknowledged_action": 0, "outcomes": [{"index": 0, "ok": True}]}}, "stale_snapshot"),
+])
+def test_missing_or_uncertain_refusal_evidence_stays_conservative(payload, code):
+    assert receipt(payload, error_code=code)["dispatch_state"] != "not_dispatched"
+
+
 def test_observation_pending_code_is_not_delivery_proof():
     value = receipt({}, error_code="post_action_observation_pending")
     assert value["dispatch_state"] == "unknown"
