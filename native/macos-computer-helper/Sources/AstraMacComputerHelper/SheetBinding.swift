@@ -62,9 +62,23 @@ func focusedElementBelongsToExactAXRoot(element focused: AXUIElement, root: AXUI
 
 // Reconstruct sheet membership on every inventory; focus loss removes the candidate.
 // CG matching and stored AX identity checks remain the caller's responsibility.
+/// A read that fails when its source changes under it: an app's window list is counted, then
+/// copied, and a tooltip, popup or tab opening in between fails the copy (live Edge and Outlook).
+/// Read again after a short pause before failing closed.
+func retryingTransientRead<Value>(
+    attempts: Int = 3, pause: () -> Void = { usleep(50_000) }, _ read: () -> Value?
+) -> Value? {
+    for attempt in 0..<max(1, attempts) {
+        if let value = read() { return value }
+        if attempt + 1 < attempts { pause() }
+    }
+    return nil
+}
+
 func completeObservedAXWindows(_ app: AXUIElement) -> [AXUIElement]? {
-    guard let windows = completeAXElementArray(app, attribute: kAXWindowsAttribute,
-        maximum: maximumObservedWindows) else { return nil }
+    guard let windows = retryingTransientRead({
+        completeAXElementArray(app, attribute: kAXWindowsAttribute, maximum: maximumObservedWindows)
+    }) else { return nil }
     guard windows.count < maximumObservedWindows, let owner = observedAXPID(app) else { return windows }
     let (error, value) = observationAXAttribute(app, kAXFocusedUIElementAttribute)
     guard error == .success, let focused = decodeAXElement(value) else { return windows }

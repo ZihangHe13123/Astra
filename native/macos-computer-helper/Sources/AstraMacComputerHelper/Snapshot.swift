@@ -1469,6 +1469,37 @@ protocol AXNodeAttributeProvider: AnyObject {
     func actions() -> [BoundedAXStringResult]
     func children(remaining: Int) -> [any AXNodeAttributeProvider]
     func sourceElement() -> AXUIElement?
+    /// Whether the last `children(remaining:)` left out children that are off screen.
+    var omittedOffscreenChildren: Bool { get }
+}
+
+extension AXNodeAttributeProvider {
+    var omittedOffscreenChildren: Bool { false }
+}
+
+/// A table's children with its off-screen rows left out, in their original order. Nothing is
+/// filtered unless the visible rows are a proper subset of the rows.
+func onScreenChildren<Element>(
+    _ children: [Element], rows: [Element], visibleRows: [Element],
+    hash: (Element) -> Int, same: (Element, Element) -> Bool
+) -> [Element]? {
+    guard !visibleRows.isEmpty, rows.count > visibleRows.count else { return nil }
+    func index(_ elements: [Element]) -> [Int: [Element]] {
+        Dictionary(grouping: elements, by: hash)
+    }
+    let rowIndex = index(rows)
+    let visibleIndex = index(visibleRows)
+    func member(_ element: Element, of index: [Int: [Element]]) -> Bool {
+        index[hash(element)]?.contains { same($0, element) } ?? false
+    }
+    guard visibleRows.allSatisfy({ member($0, of: rowIndex) }) else { return nil }
+    return children.filter { !member($0, of: rowIndex) || member($0, of: visibleIndex) }
+}
+
+/// A window's toolbar holds its primary controls (live Activity Monitor: the search field) but can
+/// follow a content group that uses up the observation budget, so it is read first.
+func prioritizeWindowToolbar<Element>(_ children: [Element], isToolbar: (Element) -> Bool) -> [Element] {
+    children.filter(isToolbar) + children.filter { !isToolbar($0) }
 }
 
 // Some AX windows omit their focused content branch from AXChildren. Recover only
@@ -1622,6 +1653,7 @@ enum AXNodeReader {
                     state: &state
                 ))
             }
+            if provider.omittedOffscreenChildren { childrenTruncated = true }
         }
         let label = state.take(provider.stringValue(for: kAXDescriptionAttribute)).value
         let title = state.take(provider.stringValue(for: kAXTitleAttribute)).value
@@ -1866,6 +1898,7 @@ private final class SystemAXNodeAttributeProvider: AXNodeAttributeProvider {
     private let recoverFocusedBranch: Bool
     private let inSheet: Bool
     private let sheetFocusedPath: [AXUIElement]?
+    private(set) var omittedOffscreenChildren = false
 
     init(element: AXUIElement, recoverFocusedBranch: Bool = false, inSheet: Bool = false,
          sheetFocusedPath: [AXUIElement]? = nil) {
@@ -1892,12 +1925,15 @@ private final class SystemAXNodeAttributeProvider: AXNodeAttributeProvider {
     }
 
     func children(remaining: Int) -> [any AXNodeAttributeProvider] {
-        let children = AXNodeReader.elementArrayAttribute(element, kAXChildrenAttribute, remaining: remaining)
+        let role = AXNodeReader.stringAttribute(element, kAXRoleAttribute)
+        let onScreenRows = onScreenTableChildren(role: role)
+        omittedOffscreenChildren = onScreenRows != nil
+        let children = onScreenRows.map { Array($0.prefix(max(0, remaining))) }
+            ?? AXNodeReader.elementArrayAttribute(element, kAXChildrenAttribute, remaining: remaining)
         let complete = recoverFocusedBranch ? insertingFocusedBranch(
             children: children, remaining: remaining, same: { CFEqual($0, $1) },
             recover: missingFocusedBranch
         ) : children
-        let role = AXNodeReader.stringAttribute(element, kAXRoleAttribute)
         let sheet = inSheet || (role.status == .complete && role.value == kAXSheetRole)
         // Resolve the same-process ancestry once per sheet observation. It only
         // changes read order for children already returned by AXChildren.
@@ -1905,12 +1941,32 @@ private final class SystemAXNodeAttributeProvider: AXNodeAttributeProvider {
         // File-column trees can exhaust the AX deadline before later Open/Cancel
         // siblings. Read those immediate controls first without expanding the
         // budget or inventing descendants; preserve order within both groups.
+        let window = role.status == .complete && role.value == kAXWindowRole
         let ordered = sheet ? prioritizeSheetChildren(complete, isButton: {
             let role = AXNodeReader.stringAttribute($0, kAXRoleAttribute)
             return role.status == .complete && role.value == kAXButtonRole
-        }, isFocusedBranch: { child in focusedPath.contains { CFEqual($0, child) } }) : complete
+        }, isFocusedBranch: { child in focusedPath.contains { CFEqual($0, child) } })
+            : window ? prioritizeWindowToolbar(complete, isToolbar: {
+                let role = AXNodeReader.stringAttribute($0, kAXRoleAttribute)
+                return role.status == .complete && role.value == kAXToolbarRole
+            }) : complete
         return ordered.map { SystemAXNodeAttributeProvider(element: $0, inSheet: sheet,
             sheetFocusedPath: sheet ? focusedPath : nil) }
+    }
+
+    /// Tables and outlines list every row, on screen or not (live Activity Monitor: 584 rows, 19 on
+    /// screen, 12,878 nodes taking 69 s). Keep only the rows on screen so the rest of the window,
+    /// such as its toolbar search field, fits the observation budget.
+    private func onScreenTableChildren(role: BoundedAXStringResult) -> [AXUIElement]? {
+        guard role.status == .complete, role.value == kAXTableRole || role.value == kAXOutlineRole else { return nil }
+        let visible = AXNodeReader.elementArrayAttribute(element, kAXVisibleRowsAttribute, remaining: maximumAXNodes)
+        guard !visible.isEmpty else { return nil }
+        let rows = AXNodeReader.elementArrayAttribute(element, kAXRowsAttribute, remaining: maximumAXNodes)
+        guard rows.count > visible.count else { return nil }
+        return onScreenChildren(
+            AXNodeReader.elementArrayAttribute(element, kAXChildrenAttribute, remaining: maximumAXNodes),
+            rows: rows, visibleRows: visible, hash: { Int(bitPattern: CFHash($0)) }, same: { CFEqual($0, $1) }
+        )
     }
 
     private func missingFocusedBranch() -> AXUIElement? {
