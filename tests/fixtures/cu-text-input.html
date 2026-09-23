@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Astra CU Text Fixture</title>
+<style>
+body{font:16px -apple-system,BlinkMacSystemFont,sans-serif;margin:40px;max-width:640px}
+input{font-size:18px;width:100%;padding:8px;margin:8px 0 16px}
+button{font-size:16px;padding:6px 14px}
+</style>
+</head>
+<body>
+<h1>Astra CU Text Fixture</h1>
+<p>Local page for live Computer Use acceptance. It reports only this field's value and event counts.</p>
+<input id="line" aria-label="Fixture line field" autocomplete="off" spellcheck="false">
+<button id="reset" type="button">Reset fixture</button>
+<script>
+let keydowns=0,inputs=0,run=0;
+const line=document.querySelector('#line');
+function publish(){
+ fetch('/report',{method:'POST',headers:{'Content-Type':'application/json'},
+  body:JSON.stringify({run,value:line.value,keydowns,inputs})}).catch(()=>{});
+}
+line.addEventListener('keydown',()=>{keydowns++;});
+line.addEventListener('input',()=>{inputs++;publish();});
+line.addEventListener('compositionend',publish);
+document.querySelector('#reset').onclick=()=>{line.value='';keydowns=0;inputs=0;run++;publish();};
+publish();
+</script>
+</body>
+</html>
