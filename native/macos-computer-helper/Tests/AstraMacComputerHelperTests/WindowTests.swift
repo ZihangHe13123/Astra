@@ -1821,6 +1821,24 @@ func artifactBundleCloseAndEOFPreserveRetainedQuarantines(closeAcknowledged: Boo
     ))
 }
 
+@Test func overlayScanTellsAFailedReadFromAFoundOverlay() {
+    let root = AXUIElementCreateApplication(42)
+    let child = AXUIElementCreateApplication(43)
+    let bounds = CGRect(x: 0, y: 0, width: 800, height: 600)
+    func scan(_ attributes: AXOverlayAttributes?) -> ContainedAXOverlayScan {
+        containedAXOverlayScan(root: root, targetBounds: bounds,
+            children: { element, _ in CFEqual(element, root) ? [child] : [] }, attributes: { _ in attributes })
+    }
+    #expect(scan(nil) == .uncertain)
+    #expect(scan(AXOverlayAttributes(role: BoundedAXStringResult(value: nil, status: .failed),
+        subrole: BoundedAXStringResult(value: nil, status: .complete), bounds: bounds)) == .uncertain)
+    #expect(scan(AXOverlayAttributes(role: BoundedAXStringResult(value: "AXSheet", status: .complete),
+        subrole: BoundedAXStringResult(value: nil, status: .complete),
+        bounds: CGRect(x: 100, y: 50, width: 400, height: 300))) == .overlay)
+    #expect(scan(AXOverlayAttributes(role: BoundedAXStringResult(value: "AXGroup", status: .complete),
+        subrole: BoundedAXStringResult(value: nil, status: .complete), bounds: bounds)) == .clear)
+}
+
 @Test func deepChildrenReadFailureSkipsTheBranchInsteadOfFailingTheWindow() {
     let root = AXUIElementCreateApplication(42)
     let shallow = AXUIElementCreateApplication(43)
@@ -2263,16 +2281,23 @@ func artifactBundleCloseAndEOFPreserveRetainedQuarantines(closeAcknowledged: Boo
     let recent = RecentSuggestionPopups()
     recent.record([list], at: 100)
     let proven: (VisibleWindowRecord) -> Bool = { recent.contains($0, at: 101.5) }
-    #expect(overlaysMayBeTransient([list], containsAXOverlay: false, recentlyProvenSuggestionPopup: proven))
-    #expect(overlaysMayBeTransient([list, tooltip], containsAXOverlay: false, recentlyProvenSuggestionPopup: proven))
-    #expect(overlaysMayBeTransient([tooltip], containsAXOverlay: false, recentlyProvenSuggestionPopup: { _ in false }))
+    #expect(overlaysMayBeTransient([list], axOverlay: .clear, recentlyProvenSuggestionPopup: proven))
+    #expect(overlaysMayBeTransient([list, tooltip], axOverlay: .clear, recentlyProvenSuggestionPopup: proven))
+    #expect(overlaysMayBeTransient([tooltip], axOverlay: .clear, recentlyProvenSuggestionPopup: { _ in false }))
     // Never proven, proven too long ago, or joined by a menu or an AX overlay: block at once.
-    #expect(!overlaysMayBeTransient([list], containsAXOverlay: false, recentlyProvenSuggestionPopup: { _ in false }))
-    #expect(!overlaysMayBeTransient([list], containsAXOverlay: false,
+    #expect(!overlaysMayBeTransient([list], axOverlay: .clear, recentlyProvenSuggestionPopup: { _ in false }))
+    #expect(!overlaysMayBeTransient([list], axOverlay: .clear,
                                     recentlyProvenSuggestionPopup: { recent.contains($0, at: 103.5) }))
-    #expect(!overlaysMayBeTransient([list, menu], containsAXOverlay: false, recentlyProvenSuggestionPopup: proven))
-    #expect(!overlaysMayBeTransient([list], containsAXOverlay: true, recentlyProvenSuggestionPopup: proven))
-    #expect(!overlaysMayBeTransient([], containsAXOverlay: false, recentlyProvenSuggestionPopup: proven))
+    #expect(!overlaysMayBeTransient([list, menu], axOverlay: .clear, recentlyProvenSuggestionPopup: proven))
+    #expect(!overlaysMayBeTransient([list], axOverlay: .overlay, recentlyProvenSuggestionPopup: proven))
+    #expect(!overlaysMayBeTransient([], axOverlay: .clear, recentlyProvenSuggestionPopup: proven))
+    // A page tree that failed a read may settle (live Edge after Return), so it is waited out
+    // alone or with a proven list; a found overlay or a menu still blocks at once.
+    #expect(overlaysMayBeTransient([], axOverlay: .uncertain, recentlyProvenSuggestionPopup: proven))
+    #expect(overlaysMayBeTransient([list], axOverlay: .uncertain, recentlyProvenSuggestionPopup: proven))
+    #expect(!overlaysMayBeTransient([menu], axOverlay: .uncertain, recentlyProvenSuggestionPopup: proven))
+    #expect(!overlaysMayBeTransient([], axOverlay: .overlay, recentlyProvenSuggestionPopup: proven))
+    #expect(!overlaysMayBeTransient([], axOverlay: .clear, recentlyProvenSuggestionPopup: proven))
     // The memory is per window of the same app, and old entries age out.
     let otherApp = VisibleWindowRecord(pid: 77, windowID: 10, bounds: list.bounds, layer: 0, alpha: 1, zOrder: 14)
     #expect(!recent.contains(otherApp, at: 101))

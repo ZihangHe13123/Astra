@@ -2420,10 +2420,10 @@ final class SystemWindowObserver: WindowObserving {
                 accessibility: $0.bounds
             )
         }
-        let containsAXOverlay = selectedAXWindows.count == 1 && selectedAXWindows.contains {
-            guard let element = $0.element else { return true }
-            return containsContainedAXOverlay(in: element, targetBounds: current.frame)
-        }
+        let axOverlay: ContainedAXOverlayScan = selectedAXWindows.count == 1
+            ? selectedAXWindows[0].element.map { containedAXOverlay(in: $0, targetBounds: current.frame) } ?? .uncertain
+            : .clear
+        let containsAXOverlay = axOverlay != .clear
         let indicatorIDs = Set(axWindows.compactMap { candidate in
             candidate.isSharingIndicator && sharingIndicatorWithinTitlebar(candidate.bounds, targetBounds: current.frame)
                 ? candidate.windowID : nil
@@ -2469,7 +2469,7 @@ final class SystemWindowObserver: WindowObserving {
             ? backgroundVisibleWindowAmbiguities(targetPID: target.pid, targetWindowID: current.windowID,
                 targetBounds: current.frame, records: overlayCandidates)
             : []
-        let overlayMayBeTransient = overlaysMayBeTransient(visibleOffenders, containsAXOverlay: containsAXOverlay) {
+        let overlayMayBeTransient = overlaysMayBeTransient(visibleOffenders, axOverlay: axOverlay) {
             self.recentSuggestionPopups.contains($0, at: observedAt)
         }
         if containsAXOverlay || containsVisibleOverlay {
@@ -2480,7 +2480,7 @@ final class SystemWindowObserver: WindowObserving {
                 "[layer=\($0.layer) z=\($0.zOrder) alpha=\($0.alpha) dx=\(Int($0.bounds.minX - current.frame.minX)) " +
                 "dy=\(Int($0.bounds.minY - current.frame.minY)) w=\(Int($0.bounds.width)) h=\(Int($0.bounds.height))]"
             }
-            logActionRejected("OVERLAY-DETAIL ax=\(containsAXOverlay) visible=\(containsVisibleOverlay) " +
+            logActionRejected("OVERLAY-DETAIL ax=\(axOverlay.rawValue) visible=\(containsVisibleOverlay) " +
                 "transient=\(overlayMayBeTransient) " +
                 "selectedLayer=\(selected.map { String($0.layer) } ?? "?") selectedZ=\(selected.map { String($0.zOrder) } ?? "?") " +
                 offenders.joined(separator: " "))
@@ -3770,8 +3770,8 @@ final class SystemWindowObserver: WindowObserving {
         return matches.count == 1 ? matches[0] : nil
     }
 
-    private func containsContainedAXOverlay(in root: AXUIElement, targetBounds: CGRect) -> Bool {
-        containedAXOverlayOrUncertain(
+    private func containedAXOverlay(in root: AXUIElement, targetBounds: CGRect) -> ContainedAXOverlayScan {
+        containedAXOverlayScan(
             root: root,
             targetBounds: targetBounds,
             children: completeAXChildren,
@@ -4263,12 +4263,29 @@ func mapCompleteAXElements<T>(
 let maximumContainedOverlayDepth = 8
 let maximumShallowOverlayDepth = 2
 
+/// What the shallow AX scan of a window found. `uncertain` is a read that failed, such as a
+/// Chromium page tree rebuilt during navigation; `overlay` is a sheet, dialog or window inside it.
+enum ContainedAXOverlayScan: String, Equatable {
+    case clear
+    case uncertain
+    case overlay
+}
+
 func containedAXOverlayOrUncertain(
     root: AXUIElement,
     targetBounds: CGRect,
     children: (AXUIElement, Int) -> [AXUIElement]?,
     attributes: (AXUIElement) -> AXOverlayAttributes?
 ) -> Bool {
+    containedAXOverlayScan(root: root, targetBounds: targetBounds, children: children, attributes: attributes) != .clear
+}
+
+func containedAXOverlayScan(
+    root: AXUIElement,
+    targetBounds: CGRect,
+    children: (AXUIElement, Int) -> [AXUIElement]?,
+    attributes: (AXUIElement) -> AXOverlayAttributes?
+) -> ContainedAXOverlayScan {
     var queue: [(element: AXUIElement, depth: Int)] = [(root, 0)]
     var visited: [AXUIElement] = []
     var remaining = 128
@@ -4290,14 +4307,14 @@ func containedAXOverlayOrUncertain(
             guard remaining > 0 else {
                 if depth <= maximumShallowOverlayDepth {
                     overlayDiagnostic("shallow scan budget exhausted (depth=\(depth)) — window stays uncertain")
-                    return true
+                    return .uncertain
                 }
                 // Breadth-first order guarantees the shallow layer — where
                 // sheets and dialogs live — was fully visited before the
                 // budget ran out at a deeper level. Proceeding without a
                 // positive overlay finding is therefore sound here.
                 overlayDiagnostic("scan budget exhausted at depth=\(depth) — shallow layer fully checked, no overlay")
-                return false
+                return .clear
             }
             remaining -= 1
         }
@@ -4308,7 +4325,7 @@ func containedAXOverlayOrUncertain(
                   values.role.value != nil
             else {
                 overlayDiagnostic("role read failed during overlay scan (depth=\(depth))")
-                return true
+                return .uncertain
             }
             // Chromium/Electron accessibility trees commonly fail to expose
             // subrole for ordinary descendants. A failed subrole read is not
@@ -4322,7 +4339,7 @@ func containedAXOverlayOrUncertain(
             if isOverlay {
                 guard let bounds = values.bounds else {
                     overlayDiagnostic("overlay role \(values.role.value ?? "?") has unreadable bounds")
-                    return true
+                    return .overlay
                 }
                 if trustedFocusedWindow(
                     expectedIdentity: 1,
@@ -4330,7 +4347,7 @@ func containedAXOverlayOrUncertain(
                     focusedIdentity: 2,
                     focusedBounds: bounds
                 ) || approximatelyEqual(bounds, targetBounds) {
-                    return true
+                    return .overlay
                 }
             }
         }
@@ -4344,7 +4361,7 @@ func containedAXOverlayOrUncertain(
         guard let descendants = children(candidate, remaining) else {
             if depth <= maximumShallowOverlayDepth {
                 overlayDiagnostic("shallow children read failed (depth=\(depth)) — window stays uncertain")
-                return true
+                return .uncertain
             }
             // Sheets and dialogs hang directly off the window as shallow AX
             // descendants. A failed children read deep inside a content tree
@@ -4355,7 +4372,7 @@ func containedAXOverlayOrUncertain(
         }
         queue.append(contentsOf: descendants.map { ($0, depth + 1) })
     }
-    return false
+    return .clear
 }
 
 private func overlayDiagnostic(_ reason: String) {
@@ -4458,14 +4475,20 @@ func appStatusStripRegions(
 let maximumReportedSuggestionPopups = 4
 
 /// Overlays that may be waited out instead of blocking at once: small floating windows of the app
-/// (caret indicators, tooltips) and suggestion lists proven moments ago. Menus, sheets, dialogs and
+/// (caret indicators), suggestion lists proven moments ago, and a window AX tree that failed a read
+/// (live Edge: the page tree is rebuilt while Return loads the page). Menus, sheets, dialogs and
 /// AX-contained overlays block immediately.
 func overlaysMayBeTransient(
-    _ offenders: [VisibleWindowRecord], containsAXOverlay: Bool,
+    _ offenders: [VisibleWindowRecord], axOverlay: ContainedAXOverlayScan,
     recentlyProvenSuggestionPopup: (VisibleWindowRecord) -> Bool
 ) -> Bool {
-    !containsAXOverlay && !offenders.isEmpty && offenders.allSatisfy {
+    let waitable = offenders.allSatisfy {
         ($0.layer > 0 && $0.bounds.width <= 200 && $0.bounds.height <= 200) || recentlyProvenSuggestionPopup($0)
+    }
+    switch axOverlay {
+    case .overlay: return false
+    case .uncertain: return waitable
+    case .clear: return !offenders.isEmpty && waitable
     }
 }
 
