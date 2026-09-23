@@ -2208,16 +2208,25 @@ final class SystemWindowObserver: WindowObserving {
             targetBounds: current.frame,
             records: overlayCandidates
         )
+        let visibleOffenders = containsVisibleOverlay
+            ? backgroundVisibleWindowAmbiguities(targetPID: target.pid, targetWindowID: current.windowID,
+                targetBounds: current.frame, records: overlayCandidates)
+            : []
+        // Only small floating windows of the app itself (caret indicators, tooltips) may be
+        // waited out; menus, sheets, dialogs and AX-contained overlays block immediately.
+        let overlayMayBeTransient = !containsAXOverlay && !visibleOffenders.isEmpty && visibleOffenders.allSatisfy {
+            $0.layer > 0 && $0.bounds.width <= 200 && $0.bounds.height <= 200
+        }
         if containsAXOverlay || containsVisibleOverlay {
             // Geometry and ordering only, never titles or content: enough to tell a tooltip or
             // hover card from a sheet, menu or dialog in live evidence.
             let selected = overlayCandidates.first { $0.pid == target.pid && $0.windowID == current.windowID }
-            let offenders = backgroundVisibleWindowAmbiguities(targetPID: target.pid, targetWindowID: current.windowID,
-                targetBounds: current.frame, records: overlayCandidates).map {
+            let offenders = visibleOffenders.map {
                 "[layer=\($0.layer) z=\($0.zOrder) alpha=\($0.alpha) dx=\(Int($0.bounds.minX - current.frame.minX)) " +
                 "dy=\(Int($0.bounds.minY - current.frame.minY)) w=\(Int($0.bounds.width)) h=\(Int($0.bounds.height))]"
             }
             logActionRejected("OVERLAY-DETAIL ax=\(containsAXOverlay) visible=\(containsVisibleOverlay) " +
+                "transient=\(overlayMayBeTransient) " +
                 "selectedLayer=\(selected.map { String($0.layer) } ?? "?") selectedZ=\(selected.map { String($0.zOrder) } ?? "?") " +
                 offenders.joined(separator: " "))
         }
@@ -2239,6 +2248,7 @@ final class SystemWindowObserver: WindowObserving {
             title: current.title ?? target.title,
             axWindows: axWindows,
             containsUnselectedOverlay: containsAXOverlay || containsVisibleOverlay,
+            overlayMayBeTransient: overlayMayBeTransient,
             siblingOrdering: siblingOrdering
         )
     }

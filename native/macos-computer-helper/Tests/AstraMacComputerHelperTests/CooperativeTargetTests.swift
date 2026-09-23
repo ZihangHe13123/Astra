@@ -485,3 +485,63 @@ private final class SentinelCaptureProvider: ExactWindowImageProviding {
     let target = try controller.select(appRef: "app", windowRef: "window")
     #expect(target.windowID == catalog.initial.windowID)
 }
+
+private final class SequencedTargetCatalog: TargetCataloging {
+    private var records: [TargetCatalogRecord]
+    private(set) var reads = 0
+
+    init(_ records: [TargetCatalogRecord]) { self.records = records }
+
+    private func next() -> TargetCatalogRecord? {
+        reads += 1
+        return records.count > 1 ? records.removeFirst() : records.first
+    }
+
+    func record(appRef: String, windowRef: String) throws -> TargetCatalogRecord? { next() }
+    func currentRecord(for target: WindowTarget) throws -> TargetCatalogRecord? { next() }
+}
+
+private func overlaid(_ base: TargetCatalogRecord, transient: Bool) -> TargetCatalogRecord {
+    TargetCatalogRecord(appRef: base.appRef, windowRef: base.windowRef, pid: base.pid, windowID: base.windowID,
+        bounds: base.bounds, title: base.title, axWindows: base.axWindows, containsUnselectedOverlay: true,
+        overlayMayBeTransient: transient)
+}
+
+private func expectOverlayBlocked(_ body: () throws -> Void) {
+    do {
+        try body()
+        Issue.record("expected overlay_blocked")
+    } catch WindowObservationError.overlayBlocked {
+    } catch {
+        Issue.record("unexpected error: \(error)")
+    }
+}
+
+// Live Edge 153: after an input-source switch macOS draws an 84×77 layer-3 indicator at the
+// caret for about 1.5 s, owned by the application itself.
+@Test func backgroundSelectionWaitsOutASmallTransientAppOverlay() throws {
+    let clear = FixtureTargetCatalog().initial
+    let catalog = SequencedTargetCatalog([overlaid(clear, transient: true), overlaid(clear, transient: true), clear])
+    var slept = 0
+    let target = try BackgroundTargetController(catalog: catalog, sleepMilliseconds: { slept += $0 })
+        .select(appRef: "app", windowRef: "window")
+    #expect(target.windowID == 24)
+    #expect(catalog.reads == 3 && slept == 200)
+}
+
+@Test func backgroundSelectionStillBlocksPersistentOrNonTransientOverlays() {
+    let clear = FixtureTargetCatalog().initial
+    var slept = 0
+    expectOverlayBlocked {
+        _ = try BackgroundTargetController(catalog: SequencedTargetCatalog([overlaid(clear, transient: true)]),
+            sleepMilliseconds: { slept += $0 }).select(appRef: "app", windowRef: "window")
+    }
+    #expect(slept == 2_000)
+    slept = 0
+    let menu = SequencedTargetCatalog([overlaid(clear, transient: false), clear])
+    expectOverlayBlocked {
+        _ = try BackgroundTargetController(catalog: menu, sleepMilliseconds: { slept += $0 })
+            .select(appRef: "app", windowRef: "window")
+    }
+    #expect(slept == 0 && menu.reads == 1)
+}

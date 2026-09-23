@@ -81,6 +81,9 @@ struct TargetCatalogRecord {
     let title: String
     let axWindows: [TargetAXWindowRecord]
     let containsUnselectedOverlay: Bool
+    /// Every overlay is a small floating window of the target app, the shape of a caret
+    /// indicator or tooltip, so it may vanish on its own. It still blocks until it does.
+    let overlayMayBeTransient: Bool
     let siblingOrdering: BackgroundSiblingOrderingProof?
 
     init(
@@ -92,8 +95,10 @@ struct TargetCatalogRecord {
         title: String,
         axWindows: [TargetAXWindowRecord],
         containsUnselectedOverlay: Bool = false,
+        overlayMayBeTransient: Bool = false,
         siblingOrdering: BackgroundSiblingOrderingProof? = nil
     ) {
+        self.overlayMayBeTransient = overlayMayBeTransient
         self.appRef = appRef
         self.windowRef = windowRef
         self.pid = pid
@@ -129,17 +134,44 @@ final class BackgroundTargetController: TargetSelecting {
     // Deliberately retained but never called. Injection gives tests a sentinel
     // proving background selection and observation cannot cross this boundary.
     private let activation: (any ApplicationActivationControlling)?
+    private let transientOverlaySettleMilliseconds: Int
+    private let transientOverlayPollMilliseconds: Int
+    private let sleepMilliseconds: (Int) -> Void
 
     init(
         catalog: any TargetCataloging,
-        activation: (any ApplicationActivationControlling)? = nil
+        activation: (any ApplicationActivationControlling)? = nil,
+        transientOverlaySettleMilliseconds: Int = 2_000,
+        transientOverlayPollMilliseconds: Int = 100,
+        sleepMilliseconds: @escaping (Int) -> Void = { usleep(useconds_t(max(0, $0)) * 1_000) }
     ) {
         self.catalog = catalog
         self.activation = activation
+        self.transientOverlaySettleMilliseconds = transientOverlaySettleMilliseconds
+        self.transientOverlayPollMilliseconds = transientOverlayPollMilliseconds
+        self.sleepMilliseconds = sleepMilliseconds
+    }
+
+    /// Waits out a small floating overlay of the target app (live: the input-source indicator
+    /// macOS draws at the caret for ~1.5 s after a switch). Anything larger, AX-contained or
+    /// still present after the settle window blocks exactly as before.
+    private func recordAfterTransientOverlay(_ fetch: () throws -> TargetCatalogRecord?) throws -> TargetCatalogRecord? {
+        var record = try fetch()
+        var waited = 0
+        while let current = record, current.containsUnselectedOverlay, current.overlayMayBeTransient,
+              waited < transientOverlaySettleMilliseconds {
+            sleepMilliseconds(transientOverlayPollMilliseconds)
+            waited += transientOverlayPollMilliseconds
+            record = try fetch()
+        }
+        if waited > 0 {
+            logActionRejected("OVERLAY-TRANSIENT waited_ms=\(waited) cleared=\(record?.containsUnselectedOverlay == false)")
+        }
+        return record
     }
 
     func select(appRef: String, windowRef: String) throws -> WindowTarget {
-        guard let record = try catalog.record(appRef: appRef, windowRef: windowRef) else {
+        guard let record = try recordAfterTransientOverlay({ try catalog.record(appRef: appRef, windowRef: windowRef) }) else {
             throw observationFailure("no catalog record for app_ref=\(appRef) window_ref=\(windowRef)")
         }
         let selected = try exactSelectedAXWindow(record)
@@ -163,7 +195,7 @@ final class BackgroundTargetController: TargetSelecting {
         guard target.interactionMode == .background,
               let expectedIdentity = target.axIdentity,
               let expectedElement = target.axElement,
-              let record = try catalog.currentRecord(for: target),
+              let record = try recordAfterTransientOverlay({ try catalog.currentRecord(for: target) }),
               record.appRef == target.appRef,
               record.windowRef == target.windowRef,
               record.pid == target.pid,
