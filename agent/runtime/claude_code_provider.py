@@ -229,7 +229,7 @@ class ClaudeCodeProvider:
     def _arguments(self, command: str, workdir: str, bridged: bool) -> list[str]:
         model = (self.config.model or "sonnet").strip()
         arguments = [command, "-p", "--output-format", "stream-json", "--verbose", "--input-format", "stream-json",
-                     "--model", model, "--system-prompt-file", os.path.join(workdir, "system.md"),
+                     "--include-partial-messages", "--model", model, "--system-prompt-file", os.path.join(workdir, "system.md"),
                      "--restricted", "--tools", "", "--strict-mcp-config", "--disable-slash-commands",
                      "--no-session-persistence", "--max-turns", "1", "--permission-mode", "dontAsk"]
         if bridged:
@@ -276,7 +276,7 @@ class ClaudeCodeProvider:
         idle = float(getattr(self.config, "idle_timeout", 0) or 0) or 300.0
         overall = getattr(self.config, "overall_timeout", None)
         deadline = loop.time() + float(overall) if overall else None
-        reasoning, content, calls = "", "", []
+        reasoning, content, streamed, calls = "", "", "", []
         while True:
             wait = idle if deadline is None else max(0.0, min(idle, deadline - loop.time()))
             try:
@@ -291,20 +291,35 @@ class ClaudeCodeProvider:
                 continue
             if not isinstance(event, dict):
                 continue
-            if event.get("type") == "assistant":
+            if event.get("type") == "stream_event":
+                delta = (event.get("event") or {}).get("delta") or {}
+                if (event.get("event") or {}).get("type") != "content_block_delta" or not isinstance(delta, dict):
+                    continue
+                if delta.get("type") == "text_delta" and delta.get("text"):
+                    streamed += str(delta["text"])
+                    yield {"type": "chunk", "content": str(delta["text"])}
+                elif delta.get("type") == "thinking_delta" and delta.get("thinking"):
+                    piece = str(delta["thinking"])
+                    reasoning += piece
+                    yield {"type": "reasoning", "content": piece}
+            elif event.get("type") == "assistant":
                 for block in (event.get("message") or {}).get("content") or []:
                     if not isinstance(block, dict):
                         continue
-                    if block.get("type") == "thinking" and block.get("thinking"):
-                        delta = ("" if not reasoning else "\n\n") + str(block["thinking"])
-                        reasoning += delta
-                        yield {"type": "reasoning", "content": delta}
+                    if block.get("type") == "thinking" and block.get("thinking") and not reasoning:
+                        # Only when the thinking was not streamed piece by piece.
+                        reasoning = str(block["thinking"])
+                        yield {"type": "reasoning", "content": reasoning}
                     elif block.get("type") == "text" and block.get("text"):
                         content += str(block["text"])
                     elif block.get("type") == "tool_use":
                         calls.append(self._call(block, names))
             elif event.get("type") == "result":
-                yield self._final(event, content, calls, reasoning)
+                final = self._final(event, content, calls, reasoning)
+                # Astra shows prose only from chunks: send whatever the stream did not.
+                if final["content"].startswith(streamed) and final["content"][len(streamed):]:
+                    yield {"type": "chunk", "content": final["content"][len(streamed):]}
+                yield final
                 return
 
     @staticmethod

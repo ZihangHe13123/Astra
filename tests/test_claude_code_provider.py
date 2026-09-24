@@ -47,6 +47,9 @@ if scenario in {"tools", "foreign"}:
     emit(denied)
     emit({"type": "result", "subtype": "error_max_turns", "is_error": True, "num_turns": 2, "usage": usage})
 elif scenario == "text":
+    for piece in ("Hello ", "from "):
+        emit({"type": "stream_event", "event": {"type": "content_block_delta", "index": 1,
+                                                 "delta": {"type": "text_delta", "text": piece}}})
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "Hello from Claude."}]}})
     emit({"type": "result", "subtype": "success", "is_error": False, "usage": usage, "result": "Hello from Claude."})
 elif scenario == "not_logged_in":
@@ -115,7 +118,8 @@ def test_cli_runs_isolated_and_bills_only_the_signed_in_subscription(fake_cli, m
     collect(provider(command).chat_stream(MESSAGES, [READ_FILE]))
     seen = json.loads(record.read_text())
     argv = seen["argv"]
-    for flag in ("-p", "--restricted", "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence"):
+    for flag in ("-p", "--restricted", "--strict-mcp-config", "--disable-slash-commands", "--no-session-persistence",
+                 "--include-partial-messages"):
         assert flag in argv
     assert argv[argv.index("--tools") + 1] == ""
     assert argv[argv.index("--model") + 1] == "sonnet"
@@ -164,6 +168,22 @@ def test_plain_answer_without_tools_starts_no_bridge(fake_cli, monkeypatch):
     final = collect(provider(command).chat_stream(MESSAGES))[-1]
     assert final["type"] == "done" and final["content"] == "Hello from Claude."
     assert "--mcp-config" not in json.loads(record.read_text())["argv"]
+
+
+def test_answer_text_always_reaches_the_screen_as_chunks(fake_cli, monkeypatch):
+    """Live Astra 2026-09-24: a reply arrived only in the final event, and Astra, which shows
+    prose from chunks alone, displayed nothing. Streamed pieces go out as they come and the rest
+    at the end, so the chunks always add up to the answer."""
+    command, _ = fake_cli
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "text")
+    events = collect(provider(command).chat_stream(MESSAGES))
+    chunks = [e["content"] for e in events if e["type"] == "chunk"]
+    assert chunks == ["Hello ", "from ", "Claude."]
+    assert "".join(chunks) == events[-1]["content"]
+    # Text before tool calls is shown too, even with no partial stream.
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "tools")
+    events = collect(provider(command).chat_stream(MESSAGES, [READ_FILE]))
+    assert [e["content"] for e in events if e["type"] == "chunk"] == ["Reading it."]
 
 
 def test_transcript_keeps_tool_results_and_screenshots_in_order():
