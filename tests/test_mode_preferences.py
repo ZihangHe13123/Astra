@@ -126,7 +126,7 @@ def test_classic_cli_reports_and_sets_effort_without_budget_controls(monkeypatch
     from agent.cli.main import handle_slash
     _settings(monkeypatch, tmp_path, {})
     agent = SimpleNamespace(llm=_client())
-    for command in ["/mode low", "/mode high", "/mode max", "/mode"]:
+    for command in ["/mode low", "/mode high", "/mode xhigh", "/mode max", "/mode"]:
         asyncio.run(handle_slash(command, agent))
     output = capsys.readouterr().out
     for effort in REASONING_EFFORTS:

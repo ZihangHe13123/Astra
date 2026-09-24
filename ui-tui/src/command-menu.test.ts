@@ -329,8 +329,8 @@ assert.equal(currentModel.command, "deepseek-v4-flash");
 assert.equal(currentModel.description, "current · OMLX · 8000 · http://192.0.2.10:8000/v1");
 
 // Reasoning intensity replaces both old mode selectors.
-assert.deepEqual(slashCommandSuggestions("/mode ").map((item) => item.command), ["low", "high", "max"]);
-for (const effort of ["low", "high", "max"]) {
+assert.deepEqual(slashCommandSuggestions("/mode ").map((item) => item.command), ["low", "high", "xhigh", "max"]);
+for (const effort of ["low", "high", "xhigh", "max"]) {
   assert.equal(submitSlashCommand(`/mode ${effort}`, 0), `/mode ${effort}`);
   assert.equal(completeSlashCommand(`/mode ${effort}`, 0), `/mode ${effort}`);
 }

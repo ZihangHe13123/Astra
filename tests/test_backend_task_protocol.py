@@ -111,7 +111,7 @@ def test_backend_exposes_tasks_command_without_blocking_protocol(tmp_path: Path)
         assert f"Reasoning effort: {effort}" in result["output"]
         assert "does not apply" in result["output"]  # this fixture uses Qwen
         assert "max_tokens" not in result["output"]
-    assert "/mode [low|high|max]" in mode_results[3]["output"]
+    assert "/mode [low|high|xhigh|max]" in mode_results[3]["output"]
     assert all("Unknown reasoning effort" in e["error"] for e in mode_results[4:])
     assert json.loads(settings.read_text())["reasoning_effort"] == "max"
     model_events = [e for e in events if e.get("type") == "model_info"]

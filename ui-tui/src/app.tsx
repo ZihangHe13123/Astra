@@ -584,7 +584,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     modelKey: "deepseek-flash",
     contextUsed: 0,
     contextLimit: 128_000 as number | undefined,
-    reasoningEffort: undefined as "low" | "high" | "max" | undefined,
+    reasoningEffort: undefined as "low" | "high" | "xhigh" | "max" | undefined,
     codeMode: undefined as "native" | "code" | "both" | undefined,
     personas: [] as { name: string; description: string }[],
   });

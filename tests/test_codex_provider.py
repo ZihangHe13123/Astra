@@ -156,6 +156,15 @@ def test_max_uses_highest_advertised_effort_supported_by_endpoint():
     assert provider._body([], None, None, "account")["reasoning"]["effort"] == "max"
 
 
+def test_xhigh_runs_as_is_or_at_the_highest_level_below_it():
+    def effort(levels):
+        provider = CodexProvider(config(reasoning_effort="xhigh", reasoning_levels=levels))
+        return provider._body([], None, None, "account")["reasoning"]["effort"]
+    assert effort(("low", "medium", "high", "xhigh")) == "xhigh"
+    assert effort(("low", "medium", "high")) == "high"
+    assert effort(()) == "xhigh"
+
+
 def test_device_login_uses_independent_private_store(monkeypatch):
     requests, progress = [], []
     original_sleep = asyncio.sleep

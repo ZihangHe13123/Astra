@@ -52,8 +52,12 @@ class CodexProvider:
             # Intersect the model catalog with this endpoint's wire enum: the
             # catalog can advertise "ultra" while /responses rejects that value.
             effort = next((v for v in ("max", "xhigh", "high", "medium", "low", "minimal", "none") if v in levels), "xhigh")
+        elif effort == "xhigh" and levels and effort not in levels:
+            # A model without xhigh runs at its highest level below it.
+            effort = next((v for v in ("high", "medium", "low", "minimal") if v in levels), levels[-1])
         elif levels and effort not in levels:
-            raise codex_auth.CodexAuthError(f"This Codex model supports reasoning efforts: {', '.join(levels)}; use /mode high or /mode max.")
+            raise codex_auth.CodexAuthError(f"This Codex model supports reasoning efforts: {', '.join(levels)}; "
+                                            "use /mode high, /mode xhigh or /mode max.")
         body = {"model": self.config.model, "instructions": instructions, "input": items,
                 "store": False, "stream": True, "reasoning": {"effort": effort, "summary": "auto"},
                 "include": ["reasoning.encrypted_content"]}

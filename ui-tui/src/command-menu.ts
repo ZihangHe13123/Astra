@@ -43,7 +43,7 @@ const SLASH_COMMANDS: SlashCommandSuggestion[] = [
   { command: "/changes", description: "review the change ledger of recent turns", takesArgs: true, group: "CHAT" },
   { command: "/think", description: "toggle reasoning display", group: "CHAT" },
   { command: "/model", description: "show or switch model", takesArgs: true, group: "MODEL" },
-  { command: "/mode", description: "set reasoning effort (low/high/max)", takesArgs: true, group: "MODEL" },
+  { command: "/mode", description: "set reasoning effort (low/high/xhigh/max)", takesArgs: true, group: "MODEL" },
   { command: "/connect", description: "connect a provider and choose its model", takesArgs: true, group: "MODEL" },
   { command: "/persona", description: "show or switch prompt persona", takesArgs: true, group: "MODEL" },
   { command: "/search", description: "show or switch web search provider", takesArgs: true, group: "TOOLS" },
@@ -217,7 +217,8 @@ const CONTEXT_INDEX_OPTIONS: SlashCommandSuggestion[] = [
 const MODE_OPTIONS: SlashCommandSuggestion[] = [
   { command: "low", description: "light reasoning", completion: "/mode low", submitValue: "/mode low", kind: "command" },
   { command: "high", description: "standard reasoning (default)", completion: "/mode high", submitValue: "/mode high", kind: "command" },
-  { command: "max", description: "deepest reasoning", completion: "/mode max", submitValue: "/mode max", kind: "command" },
+  { command: "xhigh", description: "deeper reasoning, costs more than high", completion: "/mode xhigh", submitValue: "/mode xhigh", kind: "command" },
+  { command: "max", description: "deepest reasoning, costs the most", completion: "/mode max", submitValue: "/mode max", kind: "command" },
 ];
 
 const DIAGNOSTIC_SECTIONS: SlashCommandSuggestion[] = [

@@ -18,7 +18,7 @@ type CaptureOptions = {
   tools?: Array<{ id: string; name: string; arguments?: string; startedAt: number }>;
   toolArguments?: string;
   expanded?: boolean;
-  reasoningEffort?: "low" | "high" | "max";
+  reasoningEffort?: "low" | "high" | "xhigh" | "max";
   codeMode?: "native" | "code" | "both";
   memory?: React.ComponentProps<typeof ActivityDock>["memory"];
   showReasoning?: boolean;

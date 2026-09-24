@@ -39,7 +39,7 @@ export type ActivitySummaryInput = {
   columns: number;
   model?: string;
   showReasoning?: boolean;
-  reasoningEffort?: "low" | "high" | "max";
+  reasoningEffort?: "low" | "high" | "xhigh" | "max";
   codeMode?: "native" | "code" | "both";
   expanded?: boolean;
   tokensPerSecond?: number;
@@ -102,7 +102,7 @@ export function buildActivitySummary(input: ActivitySummaryInput): string[] {
   const segments: string[] = [];
   const active = input.tools[0];
   const pendingApproval = input.pendingApproval;
-  const reasoningEffort = ["low", "high", "max"].includes(input.reasoningEffort ?? "")
+  const reasoningEffort = ["low", "high", "xhigh", "max"].includes(input.reasoningEffort ?? "")
     ? input.reasoningEffort
     : undefined;
   const codeMode = input.codeMode && CODE_MODE_LABEL[input.codeMode];
@@ -288,7 +288,7 @@ export function ActivityDock({
   contextLimit?: number;
   status: string;
   showReasoning: boolean;
-  reasoningEffort?: "low" | "high" | "max";
+  reasoningEffort?: "low" | "high" | "xhigh" | "max";
   codeMode?: "native" | "code" | "both";
   generationStats?: GenerationStats | null;
   sessionName: string;

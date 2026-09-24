@@ -12,10 +12,12 @@ from agent.runtime.json_preferences import update_preferences
 from agent.runtime.deepseek import is_deepseek_model
 from agent.runtime.llm import LLMConfig
 
-REASONING_EFFORTS = ("low", "high", "max")
+# xhigh sits between high and max: deeper reasoning than high at far less than max's cost
+# (claude.ai labels max "5.5x or more usage"; Claude Code's docs call max prone to overthinking).
+REASONING_EFFORTS = ("low", "high", "xhigh", "max")
 DEFAULT_REASONING_EFFORT = "high"
 _LEGACY_MODES = {"coding": "max", "chat": "high"}
-MODE_USAGE = "Usage: /mode [low|high|max]"
+MODE_USAGE = "Usage: /mode [low|high|xhigh|max]"
 
 
 def _settings_path() -> Path:
@@ -78,9 +80,12 @@ def set_reasoning_effort(llm, effort: str) -> None:
 def reasoning_effort_status(config: LLMConfig) -> str:
     text = f"Reasoning effort: {config.reasoning_effort}"
     if config.provider == "openai-codex":
-        text += "\nCodex returns reasoning summaries; max uses the model's highest advertised effort."
+        text += ("\nCodex returns reasoning summaries; max uses the model's highest advertised effort, "
+                 "and xhigh the highest one up to xhigh.")
     elif config.provider == "claude-code":
         text += "\nClaude Code applies it as --effort (low, medium, high, xhigh, max)."
     elif not is_deepseek_model(config.model):
         text += "\nSaved preference only; the current model adapter does not apply reasoning effort."
+    elif config.reasoning_effort == "xhigh":
+        text += "\nDeepSeek runs xhigh as high."
     return text

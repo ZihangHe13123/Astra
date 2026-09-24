@@ -189,6 +189,8 @@ assert.deepEqual(buildActivitySummary({ ...baseWithMode, columns: 130 }),
   ["READY", "EFFORT MAX", "Qwen3.6-35B-A3B", "PLAN 1/2", "CTX 38%", "R"]);
 assert.deepEqual(buildActivitySummary({ ...baseWithMode, columns: 130, reasoningEffort: "high" }),
   ["READY", "EFFORT HIGH", "Qwen3.6-35B-A3B", "PLAN 1/2", "CTX 38%", "R"]);
+assert.deepEqual(buildActivitySummary({ ...baseWithMode, columns: 130, reasoningEffort: "xhigh" }),
+  ["READY", "EFFORT XHIGH", "Qwen3.6-35B-A3B", "PLAN 1/2", "CTX 38%", "R"]);
 
 // Standard: MAX / HIGH
 assert.deepEqual(buildActivitySummary({ ...baseWithMode, columns: 90 }),
@@ -201,6 +203,8 @@ assert.deepEqual(buildActivitySummary({ ...baseWithMode, columns: 60 }),
   ["READY", "MAX", "Qwen3.6-35B-A3B", "P1/2", "C38%", "R"]);
 assert.deepEqual(buildActivitySummary({ ...baseWithMode, columns: 60, reasoningEffort: "high" }),
   ["READY", "HIGH", "Qwen3.6-35B-A3B", "P1/2", "C38%", "R"]);
+assert.deepEqual(buildActivitySummary({ ...baseWithMode, columns: 60, reasoningEffort: "xhigh" }),
+  ["READY", "XHIGH", "Qwen3.6-35B-A3B", "P1/2", "C38%", "R"]);
 
 // --- reasoningEffort display during active tool ---
 

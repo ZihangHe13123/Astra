@@ -97,10 +97,11 @@
 /mode
 /mode low
 /mode high
+/mode xhigh
 /mode max
 ```
 
-默认 `high`。选定的 `reasoning_effort` 保存到 `.astra/settings.json`，从下一次模型请求起应用。目前 DeepSeek 适配器发送该参数；其他适配器保留原行为，并说明该偏好未生效。输出预算仍由模型配置控制，`/think` 单独控制是否显示思考内容。
+默认 `high`。`xhigh` 比 `high` 想得更深、token 花费更高，但远低于 `max`；`max` 最耗额度，也容易想过头。选定的 `reasoning_effort` 保存到 `.astra/settings.json`，从下一次模型请求起应用。DeepSeek、Codex 和 Claude 适配器会发送该参数：DeepSeek 把 `xhigh` 当 `high` 执行，不支持 `xhigh` 的 Codex 模型按它低于 `xhigh` 的最高档执行。其他适配器保留原行为，并说明该偏好未生效。输出预算仍由模型配置控制，`/think` 单独控制是否显示思考内容。
 
 旧 `agent_mode` 的 `coding` 迁移到 `max`，`chat` 迁移到 `high`。旧 coding/chat 命令和 `/mode code` 已退休。普通会话使用原生工具，工具暴露方式不再作为用户模式选项。
 

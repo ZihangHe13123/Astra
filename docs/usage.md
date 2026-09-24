@@ -148,14 +148,18 @@ Use `current_time` when an exact current time or a different timezone is needed.
 /mode
 /mode low
 /mode high
+/mode xhigh
 /mode max
 ```
 
-The default is `high`. The selected `reasoning_effort` is saved in
-`.astra/settings.json` and applies to the next model request. The DeepSeek
-adapter sends this parameter; other adapters keep their existing behavior and
-report that the preference is not applied. Model configuration continues to
-own the output budget. `/think` controls reasoning visibility separately.
+The default is `high`. `xhigh` reasons more deeply than `high` at a higher token
+cost, still well below `max`, which costs the most and can overthink. The
+selected `reasoning_effort` is saved in `.astra/settings.json` and applies to the
+next model request. The DeepSeek, Codex and Claude adapters send it: DeepSeek
+runs `xhigh` as `high`, and a Codex model without `xhigh` runs at its highest
+level below it. Other adapters keep their existing behavior and report that the
+preference is not applied. Model configuration continues to own the output
+budget. `/think` controls reasoning visibility separately.
 
 Old saved `agent_mode` values migrate as `coding` → `max`, `chat` → `high`.
 The coding/chat commands and `/mode code` selector are retired. Normal sessions
