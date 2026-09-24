@@ -30,6 +30,10 @@ async def probe_profile(
     api_key: str | None = None,
     base_url: str | None = None,
 ) -> ConnectionProbe:
+    if profile.provider == "claude-code":
+        from agent.runtime.claude_code_provider import MODELS, login_status
+        ready, message = await login_status(timeout=timeout)
+        return ConnectionProbe(ready, message, MODELS if ready else ())
     if profile.provider == "openai-codex":
         from agent.runtime.codex_auth import fetch_models
         try:
@@ -133,6 +137,11 @@ async def connect_provider(route_id: str, *, base_url: str = "", api_key: str = 
             if on_progress is None:
                 raise ValueError("Sign in first with astra auth login.")
             await device_login(on_progress)
+    if route_id == "claude-code":
+        from agent.runtime.claude_code_provider import login_status
+        ready, message = await login_status()
+        if not ready:
+            raise ValueError(message)
     profile = record_profile(provider_id, record)
     catalog = await discover_endpoint(ProviderEndpoint(provider_id, profile.provider_label, profile, inferred=True),
                                       force=True, timeout=30 if route_id == "codex" else 4)

@@ -473,6 +473,9 @@ async def discover_endpoint(endpoint: ProviderEndpoint, *, force: bool = False,
             if endpoint.profile.provider == "openai-codex":
                 from agent.runtime.codex_auth import fetch_models
                 items = await fetch_models()
+            elif endpoint.profile.provider == "claude-code":
+                from agent.runtime.claude_code_provider import MODELS
+                items = [{"id": model} for model in MODELS]
             else:
                 async with httpx.AsyncClient(timeout=timeout) as client:
                     response = await client.get(endpoint.profile.base_url.rstrip("/") + "/models", headers=headers)
@@ -527,7 +530,7 @@ async def discover_model_catalog(timeout: float = 4.0, *, provider_id: str | Non
 
 def provider_menu_items(catalog: ModelCatalog) -> list[dict]:
     def connected(profile: ModelProfile) -> bool:
-        if profile.provider == "openai-codex":
+        if profile.provider in {"openai-codex", "claude-code"}:
             return bool(profile.api_key())
         return bool(profile.api_key()) or not profile.api_key_env or urlsplit(profile.base_url).hostname in {"localhost", "127.0.0.1", "::1"}
     endpoints = {e.id: e for e in provider_endpoints()}

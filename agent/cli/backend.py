@@ -1819,7 +1819,8 @@ async def _main(startup_started: float):
         _send({"type": "model_info", "model": agent.llm.config.model,
                "model_key": current_model_key,
                "reasoning_effort": (agent.llm.config.reasoning_effort
-                                    if is_deepseek_model(agent.llm.config.model) or agent.llm.config.provider == "openai-codex" else None),
+                                    if is_deepseek_model(agent.llm.config.model)
+                                    or agent.llm.config.provider in {"openai-codex", "claude-code"} else None),
                "code_mode": agent.code_mode,
                "personas": personas,
                "models": [entry.to_event(current=entry.key == current_model_key)

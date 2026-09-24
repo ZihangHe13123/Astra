@@ -56,3 +56,11 @@ def _codex_factory(config):
 
 
 DEFAULT_PROVIDER_REGISTRY.register("openai-codex", _codex_factory)
+
+
+def _claude_code_factory(config):
+    from .claude_code_provider import ClaudeCodeProvider
+    return ClaudeCodeProvider(config)
+
+
+DEFAULT_PROVIDER_REGISTRY.register("claude-code", _claude_code_factory)

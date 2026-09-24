@@ -1033,12 +1033,12 @@ def _worker_llm(
     resolved = _resolve_model(model)
     if (
         isinstance(active, LLMClient)
-        and active.config.provider == "openai-codex"
+        and active.config.provider in {"openai-codex", "claude-code"}
         and not _is_local_endpoint(active.config.base_url)
         and resolved.lower().startswith("deepseek-")
     ):
         raise ValueError(
-            f"openai-codex is incompatible with the DeepSeek model override '{resolved}'. "
+            f"{active.config.provider} is incompatible with the DeepSeek model override '{resolved}'. "
             "Omit the override to inherit the parent model or select a compatible Codex model; "
             "worker overrides do not switch providers or credentials."
         )

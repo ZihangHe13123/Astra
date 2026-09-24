@@ -29,6 +29,9 @@ class ConnectionRoute:
 ROUTES = (
     ConnectionRoute("codex", "ChatGPT / Codex", "Subscription · sign in with ChatGPT",
                     "https://chatgpt.com/backend-api/codex", "", "oauth"),
+    # The official claude CLI signs its own requests; Astra never sees the Claude login.
+    ConnectionRoute("claude-code", "Claude / Claude Code", "Subscription · your signed-in claude CLI",
+                    "claude-code://local", "", "oauth"),
     ConnectionRoute("deepseek", "DeepSeek", "API", "https://api.deepseek.com", "DEEPSEEK_API_KEY"),
     ConnectionRoute("qwen38", "Qwen / Model Studio", "Token Plan · Beijing", "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1", "QWEN38_API_KEY"),
     ConnectionRoute("qwen-token-sg", "Qwen / Model Studio", "Token Plan · Singapore", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", "QWEN_TOKEN_SG_API_KEY"),
@@ -75,6 +78,8 @@ def read_connections() -> dict[str, dict]:
 
 
 def validate_base_url(value: str) -> str:
+    if value.strip() == "claude-code://local":
+        return "claude-code://local"
     url = value.strip().rstrip("/")
     parsed = urlsplit(url)
     if (parsed.scheme not in {"http", "https"} or not parsed.hostname
@@ -95,7 +100,7 @@ def connection_record(route_id: str, *, base_url: str = "", api_key: str = "", a
         raise ValueError("Use Custom OpenAI-compatible for a different endpoint.")
     if route.auth_mode == "oauth":
         if api_key or api_key_env:
-            raise ValueError("ChatGPT uses device login, not an API key.")
+            raise ValueError(f"{route.provider} uses its own sign-in, not an API key.")
         return route.id, {"label": f"{route.provider} · {route.label}", "base_url": url,
                          "route_id": route.id, "auth_mode": "oauth"}
     if api_key_env and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", api_key_env):
@@ -114,6 +119,13 @@ def connection_record(route_id: str, *, base_url: str = "", api_key: str = "", a
 
 
 def record_profile(provider_id: str, record: dict) -> ModelProfile:
+    if record.get("route_id") == "claude-code":
+        from agent.runtime.claude_code_provider import BASE_URL, claude_command
+        return ModelProfile(base_url=BASE_URL, context_limit=200_000, provider="claude-code",
+            api_key_env="", api_key_resolver=lambda: "claude-cli" if claude_command() else "",
+            catalog_provider=provider_id, provider_label=str(record["label"]),
+            capabilities=frozenset({"streaming", "tools", "reasoning", "vision"}),
+            reasoning_levels=("low", "medium", "high", "xhigh", "max"))
     if record.get("route_id") == "codex":
         from agent.runtime.codex_auth import BASE_URL, credential_hint
         return ModelProfile(base_url=BASE_URL, context_limit=32_768, provider="openai-codex",

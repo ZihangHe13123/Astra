@@ -79,6 +79,8 @@ def reasoning_effort_status(config: LLMConfig) -> str:
     text = f"Reasoning effort: {config.reasoning_effort}"
     if config.provider == "openai-codex":
         text += "\nCodex returns reasoning summaries; max uses the model's highest advertised effort."
+    elif config.provider == "claude-code":
+        text += "\nClaude Code applies it as --effort (low, medium, high, xhigh, max)."
     elif not is_deepseek_model(config.model):
         text += "\nSaved preference only; the current model adapter does not apply reasoning effort."
     return text

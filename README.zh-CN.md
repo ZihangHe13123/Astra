@@ -97,6 +97,24 @@ astra --gui
 
 模型返回推理摘要时，Astra 会显示摘要。更多说明见[登录、推理摘要与故障排查](docs/codex-oauth.md)。
 
+#### Claude / Claude Code
+
+通过你自己登录的官方原版 [Claude Code](https://code.claude.com/docs/en/setup) 命令行使用 Claude 订阅。
+Astra 每次请求模型时启动 `claude`，不会读取、保存或转发你的 Claude 登录凭证。
+用量按 Claude Code / Agent SDK 的速率计入你的 Claude 套餐。
+
+1. 在终端安装命令行并用 Claude 账号登录：
+
+   ```text
+   curl -fsSL https://claude.ai/install.sh | bash
+   claude auth login
+   ```
+2. 在 **Astra 内部**输入 `/connect`，选择 **Claude / Claude Code → Subscription**，再在 `/model` 中选择 `opus`、`sonnet` 或 `haiku`。
+
+命令行运行时不带它自己的工具、设置文件、MCP 服务或会话记录；Astra 环境中的 `ANTHROPIC_*` 变量不会传给它，
+因此模型切换工具或 API Key 都不会改变请求的去向或计费方式。若 `claude` 不在 `PATH` 中，
+请把 `ASTRA_CLAUDE_CODE_COMMAND` 设为它的绝对路径。
+
 #### API 服务与本地模型
 
 编辑安装目录中的 `.env`。例如，使用内置 DeepSeek 配置时，将已有的对应条目设为以下值，并填入你自己的 API Key：
