@@ -474,8 +474,8 @@ async def discover_endpoint(endpoint: ProviderEndpoint, *, force: bool = False,
                 from agent.runtime.codex_auth import fetch_models
                 items = await fetch_models()
             elif endpoint.profile.provider == "claude-code":
-                from agent.runtime.claude_code_provider import MODELS
-                items = [{"id": model} for model in MODELS]
+                from agent.runtime.claude_code_provider import CONTEXT_WINDOWS, MODELS
+                items = [{"id": model, "context_length": CONTEXT_WINDOWS[model]} for model in MODELS]
             else:
                 async with httpx.AsyncClient(timeout=timeout) as client:
                     response = await client.get(endpoint.profile.base_url.rstrip("/") + "/models", headers=headers)

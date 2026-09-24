@@ -17,7 +17,7 @@ from agent.runtime.providers import DEFAULT_PROVIDER_REGISTRY
 FAKE_CLI = r'''#!__PYTHON__
 import json, os, sys, time
 record = {"argv": sys.argv[1:], "cwd": os.getcwd(), "pid": os.getpid(),
-          "env": {k: v for k, v in os.environ.items() if k.startswith(("ANTHROPIC_", "CLAUDE_CODE_USE_"))}}
+          "env": {k: v for k, v in os.environ.items() if k.startswith(("ANTHROPIC_", "CLAUDE_CODE_USE_", "ENABLE_TOOL_SEARCH"))}}
 if sys.argv[1:3] == ["auth", "status"]:
     print(json.dumps({"loggedIn": True, "authMethod": "claude.ai", "subscriptionType": "max"}))
     sys.exit(0)
@@ -37,7 +37,7 @@ emit({"type": "assistant", "message": {"content": [{"type": "thinking", "thinkin
 usage = {"input_tokens": 10, "cache_creation_input_tokens": 5, "cache_read_input_tokens": 100, "output_tokens": 7}
 denied = {"type": "user", "message": {"content": [{"type": "tool_result", "is_error": True, "content": "denied"}]}}
 if scenario in {"tools", "foreign"}:
-    name = "mcp__astra__read_file" if scenario == "tools" else "Bash"
+    name = "mcp__astra__read_file" if scenario == "tools" else "ToolSearch"
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "Reading it."}]}})
     emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_1", "name": name,
                                                         "input": {"path": "a.txt"}}]}})
@@ -99,12 +99,13 @@ def test_native_tool_calls_come_back_as_an_astra_tool_batch(fake_cli):
                               "prompt_cache_hit_tokens": 100, "prompt_cache_miss_tokens": 15}
 
 
-def test_a_call_outside_astras_tools_is_rejected(fake_cli, monkeypatch):
+def test_a_call_outside_astras_tools_is_rejected_by_name(fake_cli, monkeypatch):
+    """Live Astra 2026-09-24: with tool search on, Claude reached for Claude Code's ToolSearch."""
     command, _ = fake_cli
     monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "foreign")
-    with pytest.raises(LLMResponseError) as error:
+    with pytest.raises(ClaudeCodeError) as error:
         collect(provider(command).chat_stream(MESSAGES, [READ_FILE]))
-    assert error.value.code == "invalid_tool_arguments"
+    assert "ToolSearch" in error.value.public_message and "no tool was run" in error.value.public_message
 
 
 def test_cli_runs_isolated_and_bills_only_the_signed_in_subscription(fake_cli, monkeypatch):
@@ -129,11 +130,12 @@ def test_cli_runs_isolated_and_bills_only_the_signed_in_subscription(fake_cli, m
     assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
     assert "--json-schema" not in argv
     [(name, server)] = seen["servers"].items()
-    assert name == "astra" and server["command"] == sys.executable
+    assert name == "astra" and server["command"] == sys.executable and server["alwaysLoad"] is True
     assert server["args"][0].endswith("claude_code_tool_bridge.py")
     assert seen["tools"] == [{"name": "read_file", "description": "Read a file.",
                               "inputSchema": READ_FILE["function"]["parameters"]}]
-    assert seen["env"] == {}
+    # Only the switch that keeps every Astra tool loaded up front, never a routing variable.
+    assert seen["env"] == {"ENABLE_TOOL_SEARCH": "false"}
     assert Path(seen["cwd"]).name.startswith("astra-claude-code-")
     assert "You are Astra." in seen["system"] and "Astra runs your tool calls" in seen["system"]
     assert seen["stdin"]["type"] == "user"
@@ -248,7 +250,8 @@ def test_route_profile_and_catalog_need_no_api_key(monkeypatch):
     assert profile.provider == "claude-code" and "vision" in profile.capabilities
     catalog = asyncio.run(model_catalog.discover_endpoint(
         model_catalog.ProviderEndpoint(provider_id, profile.provider_label, profile, inferred=True), force=True))
-    assert {entry.model_id for entry in catalog.entries} >= {"fable", "opus", "sonnet", "haiku"}
+    windows = {entry.model_id: entry.profile.context_limit for entry in catalog.entries}
+    assert windows == {"fable": 1_000_000, "opus": 1_000_000, "sonnet": 1_000_000, "haiku": 200_000}
 
 
 def test_connecting_requires_a_signed_in_cli(monkeypatch):

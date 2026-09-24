@@ -31,8 +31,10 @@ from .token_estimator import estimate_messages_tokens
 
 BASE_URL = "claude-code://local"
 COMMAND_ENV = "ASTRA_CLAUDE_CODE_COMMAND"
-# Aliases the CLI resolves to the newest model the signed-in account can use.
+# Aliases the CLI resolves to the newest model the signed-in account can use, with their context
+# windows: current Fable, Opus and Sonnet run with 1M tokens on every plan, Haiku with 200K.
 MODELS = ("fable", "opus", "sonnet", "haiku")
+CONTEXT_WINDOWS = {"fable": 1_000_000, "opus": 1_000_000, "sonnet": 1_000_000, "haiku": 200_000}
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 BRIDGE = str(Path(__file__).with_name("claude_code_tool_bridge.py"))
 BRIDGE_NAME = "astra"
@@ -71,8 +73,12 @@ def claude_command() -> str | None:
 
 
 def child_environment(base: dict[str, str] | None = None) -> dict[str, str]:
-    return {k: v for k, v in (os.environ if base is None else base).items()
-            if not k.startswith(ROUTING_ENV_PREFIXES)}
+    environment = {k: v for k, v in (os.environ if base is None else base).items()
+                   if not k.startswith(ROUTING_ENV_PREFIXES)}
+    # Tool search would hide Astra's tools behind Claude Code's own ToolSearch call, which the
+    # one-response limit leaves no room for (live Astra: the first real task failed on it).
+    environment["ENABLE_TOOL_SEARCH"] = "false"
+    return environment
 
 
 async def login_status(command: str | None = None, timeout: float = 15) -> tuple[bool, str]:
@@ -234,7 +240,8 @@ class ClaudeCodeProvider:
                      "--no-session-persistence", "--max-turns", "1", "--permission-mode", "dontAsk"]
         if bridged:
             servers = {"mcpServers": {BRIDGE_NAME: {"command": sys.executable,
-                                                    "args": [BRIDGE, os.path.join(workdir, "tools.json")]}}}
+                                                    "args": [BRIDGE, os.path.join(workdir, "tools.json")],
+                                                    "alwaysLoad": True}}}
             arguments += ["--mcp-config", json.dumps(servers)]
         effort = str(getattr(self.config, "reasoning_effort", "") or "").strip().lower()
         if effort in EFFORTS:
@@ -324,11 +331,14 @@ class ClaudeCodeProvider:
 
     @staticmethod
     def _call(block: dict, names: frozenset[str]) -> dict:
-        name = str(block.get("name") or "")
-        name = name[len(TOOL_PREFIX):] if name.startswith(TOOL_PREFIX) else ""
+        raw = str(block.get("name") or "")
+        name = raw[len(TOOL_PREFIX):] if raw.startswith(TOOL_PREFIX) else ""
+        if name not in names:
+            shown = raw if re.fullmatch(r"[A-Za-z0-9_-]{1,80}", raw) else "an unnamed tool"
+            raise ClaudeCodeError(f"Claude used {shown}, which Astra did not offer; no tool was run. Retry the request.")
         arguments = block.get("input")
-        if name not in names or not isinstance(arguments, dict) or not block.get("id"):
-            raise LLMResponseError("invalid_tool_arguments", "Claude Code returned a call outside Astra's tools.")
+        if not isinstance(arguments, dict) or not block.get("id"):
+            raise LLMResponseError("invalid_tool_arguments", "Claude Code returned a malformed tool call.")
         return {"id": str(block["id"]), "name": name, "arguments": json.dumps(arguments, ensure_ascii=False)}
 
     def _final(self, result: dict, content: str, calls: list[dict], reasoning: str) -> dict:

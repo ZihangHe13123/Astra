@@ -121,7 +121,7 @@ def connection_record(route_id: str, *, base_url: str = "", api_key: str = "", a
 def record_profile(provider_id: str, record: dict) -> ModelProfile:
     if record.get("route_id") == "claude-code":
         from agent.runtime.claude_code_provider import BASE_URL, claude_command
-        return ModelProfile(base_url=BASE_URL, context_limit=200_000, provider="claude-code",
+        return ModelProfile(base_url=BASE_URL, context_limit=1_000_000, provider="claude-code",
             api_key_env="", api_key_resolver=lambda: "claude-cli" if claude_command() else "",
             catalog_provider=provider_id, provider_label=str(record["label"]),
             capabilities=frozenset({"streaming", "tools", "reasoning", "vision"}),
