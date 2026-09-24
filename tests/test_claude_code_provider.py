@@ -21,6 +21,10 @@ record = {"argv": sys.argv[1:], "cwd": os.getcwd(), "pid": os.getpid(),
 if sys.argv[1:3] == ["auth", "status"]:
     print(json.dumps({"loggedIn": True, "authMethod": "claude.ai", "subscriptionType": "max"}))
     sys.exit(0)
+if os.environ.get("FAKE_CLAUDE_SCENARIO") == "old_flags" and "--thinking-display" in sys.argv:
+    # How a CLI without an option exits: a usage error on stderr, nothing on stdout.
+    sys.stderr.write("error: unknown option '--thinking-display'\n")
+    sys.exit(1)
 record["system"] = open(sys.argv[sys.argv.index("--system-prompt-file") + 1]).read()
 if "--mcp-config" in sys.argv:
     servers = json.loads(sys.argv[sys.argv.index("--mcp-config") + 1])["mcpServers"]
@@ -54,7 +58,7 @@ if scenario == "marker_rejected" and marked:
     emit({"type": "result", "subtype": "success", "is_error": True, "num_turns": 1, "usage": usage,
           "result": "API Error: 400 A maximum of 4 blocks with cache_control may be provided. Found 5."})
     sys.exit(0)
-if scenario in {"answers_history", "marker_rejected"}:
+if scenario in {"answers_history", "marker_rejected", "old_flags"}:
     scenario = "text"
 if scenario == "hang":
     time.sleep(60)
@@ -88,6 +92,7 @@ READ_FILE = {"type": "function", "function": {"name": "read_file", "description"
 def fresh_provider_state(tmp_path, monkeypatch):
     monkeypatch.setattr(ClaudeCodeProvider, "replay", True)
     monkeypatch.setattr(ClaudeCodeProvider, "cache_marker", True)
+    monkeypatch.setattr(ClaudeCodeProvider, "thinking_display", True)
     workdir = tmp_path / "claude-code"
     workdir.mkdir()
     monkeypatch.setattr(ccp, "workspace", lambda: str(workdir))
@@ -166,6 +171,8 @@ def test_cli_runs_isolated_and_bills_only_the_signed_in_subscription(fake_cli, m
     assert argv[argv.index("--tools") + 1] == ""
     assert argv[argv.index("--model") + 1] == "sonnet"
     assert argv[argv.index("--effort") + 1] == "high"
+    # Thinking arrives as summaries instead of nothing, so a long think does not look stalled.
+    assert argv[argv.index("--thinking-display") + 1] == "summarized"
     # One response, then stop: every call is denied, so the CLI can never run a tool itself.
     assert argv[argv.index("--max-turns") + 1] == "1"
     assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
@@ -413,3 +420,15 @@ def test_workspace_is_a_fixed_private_directory_outside_projects(tmp_path, monke
     first, second = ccp.workspace(), ccp.workspace()
     assert first == second and Path(first).name == "claude-code" and Path(first).is_dir()
     assert str(tmp_path) in first and (Path(first).stat().st_mode & 0o777) == 0o700
+
+
+@pytest.mark.parametrize("messages", [MESSAGES, HISTORY], ids=["single turn", "replayed history"])
+def test_cli_that_rejects_thinking_display_is_retried_without_it(fake_cli, monkeypatch, messages):
+    """A CLI without an option exits before printing anything: the step is retried without
+    thinking summaries rather than failing, and later steps leave the option out."""
+    command, record = fake_cli
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "old_flags")
+    final = collect(provider(command).chat_stream(messages, [READ_FILE]))[-1]
+    assert final["content"] == "Hello from Claude."
+    assert "--thinking-display" not in json.loads(record.read_text())["argv"]
+    assert ClaudeCodeProvider.thinking_display is False and ClaudeCodeProvider.replay is True

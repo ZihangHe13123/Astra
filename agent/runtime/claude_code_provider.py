@@ -375,11 +375,25 @@ class _Fallback(Exception):
         self.message = message
 
 
+class _Lines:
+    """The CLI's output, remembering whether it printed anything at all."""
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.seen = False
+
+    async def read(self, timeout: float) -> bytes:
+        line = await asyncio.wait_for(self.stream.readline(), timeout)
+        self.seen = self.seen or bool(line)
+        return line
+
+
 class ClaudeCodeProvider:
     # Turned off for the rest of the process when this CLI rejects them: turn-by-turn replay
-    # (falls back to one transcript turn) and Astra's cache breakpoint.
+    # (falls back to one transcript turn), Astra's cache breakpoint and thinking summaries.
     replay = True
     cache_marker = True
+    thinking_display = True
 
     def __init__(self, config, *, command: str | None = None):
         self.config = config
@@ -395,6 +409,11 @@ class ClaudeCodeProvider:
                      "--include-partial-messages", "--model", model, "--system-prompt-file", os.path.join(files, "system.md"),
                      "--restricted", "--tools", "", "--strict-mcp-config", "--disable-slash-commands",
                      "--no-session-persistence", "--max-turns", "1", "--permission-mode", "dontAsk"]
+        if type(self).thinking_display:
+            # Current models return no thinking text unless asked (live Astra 2026-09-24: one step in
+            # sixty showed any), so a long think looked like a stalled backend. Summaries stream as
+            # reasoning; billing counts the thinking either way. The Agent SDK's thinking.display.
+            arguments += ["--thinking-display", "summarized"]
         if bridged:
             servers = {"mcpServers": {BRIDGE_NAME: {"command": sys.executable,
                                                     "args": [BRIDGE, os.path.join(files, "tools.json")],
@@ -407,7 +426,7 @@ class ClaudeCodeProvider:
 
     async def chat_stream(self, messages, tools=None, tool_choice=None, *, omit_tool_choice=False,
                           generation_overrides=None) -> AsyncGenerator[dict, None]:
-        for _ in range(3):
+        for _ in range(4):
             started = False
             try:
                 async for event in self._stream(messages, tools, None if omit_tool_choice else tool_choice):
@@ -457,45 +476,51 @@ class ClaudeCodeProvider:
                 start_new_session=True, limit=64 * 1024 * 1024)
             try:
                 assert process.stdin is not None and process.stdout is not None
-                await self._replay(process, turns[:-1])
-                await self._send(process, {"type": "user", "message": {"role": "user", "content": turns[-1][1]}})
+                lines = _Lines(process.stdout)
+                await self._replay(process, lines, turns[:-1])
+                await self._send(process, lines, {"type": "user", "message": {"role": "user", "content": turns[-1][1]}})
                 process.stdin.close()
-                async for event in self._events(process, marked):
+                async for event in self._events(lines, marked):
                     yield event
             finally:
                 _terminate(process)
                 await process.wait()
 
-    @staticmethod
-    async def _send(process, frame: dict) -> None:
+    async def _send(self, process, lines: _Lines, frame: dict) -> None:
         try:
             process.stdin.write((json.dumps(frame, ensure_ascii=False) + "\n").encode())
             await process.stdin.drain()
         except (BrokenPipeError, ConnectionResetError):
-            raise _Fallback("replay", "Claude Code stopped reading the conversation. " + LOGIN_HINT) from None
+            raise self._ended(lines, "replay", "Claude Code stopped reading the conversation. " + LOGIN_HINT) from None
 
-    async def _replay(self, process, turns: list[tuple[str, list[dict]]]) -> None:
+    async def _replay(self, process, lines: _Lines, turns: list[tuple[str, list[dict]]]) -> None:
         """Append earlier turns without a request: each user turn waits for the CLI's zero-turn
         result, so the following assistant turn cannot land ahead of it."""
         for role, blocks in turns:
             if role == "assistant":
-                await self._send(process, {"type": "assistant", "message": {"role": "assistant", "content": blocks}})
+                await self._send(process, lines, {"type": "assistant", "message": {"role": "assistant", "content": blocks}})
                 continue
-            await self._send(process, {"type": "user", "message": {"role": "user", "content": blocks},
-                                       "shouldQuery": False})
-            await self._acknowledged(process)
+            await self._send(process, lines, {"type": "user", "message": {"role": "user", "content": blocks},
+                                              "shouldQuery": False})
+            await self._acknowledged(lines)
 
-    @staticmethod
-    async def _acknowledged(process) -> None:
+    def _ended(self, lines: _Lines, fallback: str, message: str) -> Exception:
+        """The CLI closed its output. Nothing at all means it refused to start, which is how a
+        version without an option Astra passes behaves; otherwise the given fallback applies."""
+        if not lines.seen and type(self).thinking_display:
+            return _Fallback("thinking_display", "Claude Code did not start; retry the request.")
+        return _Fallback(fallback, message) if fallback else ClaudeCodeError(message)
+
+    async def _acknowledged(self, lines: _Lines) -> None:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + ACK_TIMEOUT
         while True:
             try:
-                line = await asyncio.wait_for(process.stdout.readline(), max(0.0, deadline - loop.time()))
+                line = await lines.read(max(0.0, deadline - loop.time()))
             except TimeoutError:
                 raise ClaudeCodeError("Claude Code did not take the conversation history in time; retry the request.") from None
             if not line:
-                raise _Fallback("replay", "Claude Code ended while reading the conversation. " + LOGIN_HINT)
+                raise self._ended(lines, "replay", "Claude Code ended while reading the conversation. " + LOGIN_HINT)
             try:
                 event = json.loads(line)
             except ValueError:
@@ -507,7 +532,7 @@ class ClaudeCodeProvider:
             # A CLI that answers a history turn instead of appending it would spend a request per turn.
             raise _Fallback("replay", "Claude Code answered an earlier turn instead of the latest one; retry the request.")
 
-    async def _events(self, process, marked: bool = False) -> AsyncGenerator[dict, None]:
+    async def _events(self, lines: _Lines, marked: bool = False) -> AsyncGenerator[dict, None]:
         loop = asyncio.get_running_loop()
         idle = float(getattr(self.config, "idle_timeout", 0) or 0) or 300.0
         overall = getattr(self.config, "overall_timeout", None)
@@ -516,11 +541,11 @@ class ClaudeCodeProvider:
         while True:
             wait = idle if deadline is None else max(0.0, min(idle, deadline - loop.time()))
             try:
-                line = await asyncio.wait_for(process.stdout.readline(), wait)
+                line = await lines.read(wait)
             except TimeoutError:
                 raise LLMIdleTimeout("Claude Code made no progress before the idle or overall timeout.") from None
             if not line:
-                raise ClaudeCodeError("Claude Code ended without an answer. " + LOGIN_HINT)
+                raise self._ended(lines, "", "Claude Code ended without an answer. " + LOGIN_HINT)
             try:
                 event = json.loads(line)
             except ValueError:
