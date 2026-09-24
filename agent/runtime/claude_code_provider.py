@@ -11,6 +11,10 @@ redirect such as a provider switcher cannot move the request), no skills and no 
 Astra's tools reach it only through a local MCP bridge that lists them and never runs them, so
 Claude calls them natively; the CLI denies each call and stops after that single response, and
 Astra runs the calls itself with its own approvals.
+
+Earlier turns are replayed as native turns before the last one asks for the answer, so each
+request repeats the previous one's prefix and reads it from the prompt cache instead of writing
+the whole conversation again (live 2026-09-24: one tool round written per step instead of all).
 """
 from __future__ import annotations
 
@@ -41,12 +45,20 @@ BRIDGE_NAME = "astra"
 TOOL_PREFIX = f"mcp__{BRIDGE_NAME}__"
 # Claude accepts tool names up to 64 characters, and the bridge prefix counts.
 TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,%d}" % (64 - len(TOOL_PREFIX)))
-# Anything that would move billing, routing or model aliases away from the signed-in subscription:
-# keys, endpoints, alias overrides (a provider switcher sets ANTHROPIC_DEFAULT_*_MODEL[_NAME]) and
-# cloud-provider selectors. The subscription login needs none of them.
-ROUTING_ENV_PREFIXES = ("ANTHROPIC_", "CLAUDE_CODE_USE_")
+# Dropped from the CLI's environment: anything that would move billing, routing or model aliases
+# away from the signed-in subscription (a provider switcher sets ANTHROPIC_DEFAULT_*_MODEL[_NAME]),
+# and whatever a parent Claude Code session or the user's shell set for their own sessions
+# (effort, entrypoint, host sockets, MCP tuning), so every Astra request behaves the same wherever
+# Astra was started. Only the CLI's own login location is kept.
+STRIPPED_ENV_PREFIXES = ("ANTHROPIC_", "CLAUDE", "MCP_")
+KEPT_ENV = frozenset({"CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"})
 IMAGE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
 LOGIN_HINT = "Install the Claude Code CLI (https://claude.ai/install.sh) and run `claude auth login` in a terminal."
+# Astra's one cache breakpoint; the CLI spends the other three the API allows. One hour, as the
+# CLI is told to use for its own, because a longer breakpoint may not follow a shorter one.
+CACHE_MARKER = {"type": "ephemeral", "ttl": "1h"}
+# A replayed turn is acknowledged without any request; the first also waits for the CLI to start.
+ACK_TIMEOUT = 60.0
 
 
 class ClaudeCodeError(LLMResponseError):
@@ -74,11 +86,30 @@ def claude_command() -> str | None:
 
 def child_environment(base: dict[str, str] | None = None) -> dict[str, str]:
     environment = {k: v for k, v in (os.environ if base is None else base).items()
-                   if not k.startswith(ROUTING_ENV_PREFIXES)}
+                   if not k.startswith(STRIPPED_ENV_PREFIXES) or k in KEPT_ENV}
     # Tool search would hide Astra's tools behind Claude Code's own ToolSearch call, which the
     # one-response limit leaves no room for (live Astra: the first real task failed on it).
     environment["ENABLE_TOOL_SEARCH"] = "false"
+    # A token countdown the CLI appends to each request would differ every time and move the
+    # cached prefix; Astra keeps its own budget.
+    environment["CLAUDE_CODE_TOTAL_TOKENS_REMINDER"] = "off"
+    environment["CLAUDE_CODE_PROMPT_CACHE_TTL"] = CACHE_MARKER["ttl"]
     return environment
+
+
+def workspace() -> str:
+    """The CLI's working directory: fixed, private and outside any project. The CLI tells Claude
+    its working directory and git status on every request, so a fresh temporary directory each
+    time changed the prompt right after the first message and nothing past it was ever cached."""
+    if sys.platform == "darwin":
+        base = Path.home() / "Library" / "Caches" / "Astra"
+    elif os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "Astra"
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "astra"
+    path = base / "claude-code"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return str(path)
 
 
 async def login_status(command: str | None = None, timeout: float = 15) -> tuple[bool, str]:
@@ -155,17 +186,134 @@ def _content_blocks(content) -> list[dict]:
     return blocks
 
 
-def system_prompt(messages: list[dict], tools: list[dict] | None, tool_choice=None) -> str:
-    sections = [_text(m.get("content")) for m in messages if m.get("role") in {"system", "developer"}]
+def _leading_system(messages: list[dict]) -> int:
+    count = 0
+    while count < len(messages) and messages[count].get("role") in {"system", "developer"}:
+        count += 1
+    return count
+
+
+def system_prompt(messages: list[dict], tools: list[dict] | None) -> str:
+    """Astra's leading system messages. Later ones stay where they are in the conversation, and
+    nothing that changes from step to step goes here, since the whole cached prefix follows it."""
+    sections = [_text(m.get("content")) for m in messages[:_leading_system(messages)]]
     if tools:
-        forced = tool_choice.get("function", {}).get("name") if isinstance(tool_choice, dict) else None
-        sections.append(
-            "# Tools\nAstra runs your tool calls and shows each result in the next message of the "
-            "transcript. Call tools directly, several at once when they are independent."
-            + (f" You must call `{forced}` now." if forced else
-               " Do not call any tool now." if tool_choice == "none" else
-               " You must call at least one tool now." if tool_choice == "required" else ""))
+        sections.append("# Tools\nAstra runs your tool calls itself and returns each result in the next "
+                        "message. Call tools directly, several at once when they are independent.")
     return "\n\n".join(s for s in sections if s.strip())
+
+
+def tool_choice_note(tool_choice) -> str:
+    forced = tool_choice.get("function", {}).get("name") if isinstance(tool_choice, dict) else None
+    return (f"You must call `{forced}` now." if forced else
+            "Do not call any tool now." if tool_choice == "none" else
+            "You must call at least one tool now." if tool_choice == "required" else "")
+
+
+def _reminder(text: str) -> dict:
+    return {"type": "text", "text": f"<system-reminder>\n{text}\n</system-reminder>"}
+
+
+def _call_text(call: dict) -> dict:
+    function = call.get("function") or {}
+    name = str(function.get("name", ""))
+    # The same name Claude sees in its tool list, so it does not copy a different form.
+    native = TOOL_PREFIX + name if TOOL_NAME.fullmatch(name) else name
+    return {"type": "text", "text": "[tool call " + json.dumps(
+        {"id": call.get("id", ""), "name": native, "arguments": function.get("arguments", "{}")},
+        ensure_ascii=False) + "]"}
+
+
+def _tool_input(arguments) -> dict:
+    if isinstance(arguments, dict):
+        return arguments
+    try:
+        value = json.loads(arguments or "{}")
+    except (TypeError, ValueError):
+        return {"arguments": str(arguments)}
+    return value if isinstance(value, dict) else {"arguments": value}
+
+
+def _tool_use_id(raw, used: set[str]) -> str:
+    """Claude's pattern for a call id, unique in the conversation; other providers' ids can hold
+    other characters or repeat in every turn. Derived from history alone, so a replay is stable."""
+    base = re.sub(r"[^A-Za-z0-9_-]", "_", str(raw or ""))[:60] or "call"
+    candidate, suffix = base, 1
+    while candidate in used:
+        suffix += 1
+        candidate = f"{base}_{suffix}"
+    used.add(candidate)
+    return candidate
+
+
+def conversation(messages: list[dict], names: frozenset[str]) -> list[tuple[str, list[dict]]] | None:
+    """The conversation after the system prompt as alternating native turns, starting and ending
+    with a user turn: tool results first in each user turn, then text, images and later system
+    messages as reminders. Calls to tools not offered now stay text, with their results, so the
+    request stays valid. None when the conversation ends on Claude's own words (a prefill), which a
+    replay cannot continue."""
+    turns: list[tuple[str, list[dict], list[dict]]] = []  # role, tool results, other blocks
+    used: set[str] = set()
+    pending: dict[str, str] = {}  # Astra's id -> native id, for calls of the latest assistant turn
+    for message in messages[_leading_system(messages):]:
+        role = message.get("role")
+        if role == "assistant":
+            blocks: list[dict] = []
+            text = _text(message.get("content"))
+            if text.strip():
+                blocks.append({"type": "text", "text": text})
+            calls: dict[str, str] = {}
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                name = str(function.get("name") or "")
+                if name in names and TOOL_NAME.fullmatch(name):
+                    native = _tool_use_id(call.get("id"), used)
+                    calls[str(call.get("id") or "")] = native
+                    blocks.append({"type": "tool_use", "id": native, "name": TOOL_PREFIX + name,
+                                   "input": _tool_input(function.get("arguments"))})
+                else:
+                    blocks.append(_call_text(call))
+            if not blocks:
+                continue
+            if turns and turns[-1][0] == "assistant":
+                turns[-1][2].extend(blocks)
+            else:
+                turns.append(("assistant", [], blocks))
+                pending = {}
+            pending.update(calls)
+            continue
+        if not turns or turns[-1][0] != "user":
+            turns.append(("user", [], []))
+        results, blocks = turns[-1][1], turns[-1][2]
+        if role == "tool":
+            call_id = str(message.get("tool_call_id") or "")
+            content = _content_blocks(message.get("content")) or [{"type": "text", "text": "(no output)"}]
+            native = pending.pop(call_id, None)
+            if native is not None:
+                results.append({"type": "tool_result", "tool_use_id": native, "content": content})
+            else:
+                blocks.extend([{"type": "text", "text": f"[tool result for call {call_id}]"}, *content])
+        elif role in {"system", "developer"}:
+            text = _text(message.get("content"))
+            if text.strip():
+                blocks.append(_reminder(text))
+        else:
+            blocks.extend(_content_blocks(message.get("content")))
+    if not turns or turns[-1][0] != "user":
+        return None
+    if turns[0][0] != "user":
+        turns.insert(0, ("user", [], [{"type": "text", "text": "[Earlier messages are not shown.]"}]))
+    for index, (role, _, blocks) in enumerate(turns):
+        if role != "assistant":
+            continue
+        # Every native call needs its result in the next turn; a lost one is reported as such.
+        answered = {r["tool_use_id"] for r in turns[index + 1][1]}
+        turns[index + 1][1].extend(
+            {"type": "tool_result", "tool_use_id": b["id"], "is_error": True,
+             "content": [{"type": "text", "text": "No result was recorded for this call."}]}
+            for b in blocks if b["type"] == "tool_use" and b["id"] not in answered)
+    return [(role, (results + blocks) or [{"type": "text", "text": "(empty message)"}])
+            if role == "user" else (role, blocks) for role, results, blocks in turns]
 
 
 def bridge_tools(tools: list[dict]) -> list[dict]:
@@ -184,25 +332,17 @@ def bridge_tools(tools: list[dict]) -> list[dict]:
 
 
 def transcript(messages: list[dict]) -> list[dict]:
-    """The conversation as one user turn of native blocks, images kept in place."""
+    """The conversation as one user turn of native blocks, images kept in place: the fallback when
+    it cannot be replayed turn by turn."""
     blocks: list[dict] = [{"type": "text", "text": "Conversation so far, oldest first. Reply as the assistant to its last message."}]
-    for message in messages:
+    for message in messages[_leading_system(messages):]:
         role = message.get("role")
-        if role in {"system", "developer"}:
-            continue
         if role == "tool":
             blocks.append({"type": "text", "text": f"\n[tool result for call {message.get('tool_call_id', '')}]"})
         else:
-            blocks.append({"type": "text", "text": f"\n[{role}]"})
+            blocks.append({"type": "text", "text": f"\n[{'system' if role == 'developer' else role}]"})
         blocks.extend(_content_blocks(message.get("content")))
-        for call in message.get("tool_calls") or []:
-            function = call.get("function") or {}
-            name = str(function.get("name", ""))
-            # The same name Claude sees in its tool list, so it does not copy a different form.
-            native = TOOL_PREFIX + name if TOOL_NAME.fullmatch(name) else name
-            blocks.append({"type": "text", "text": "[tool call "
-                           + json.dumps({"id": call.get("id", ""), "name": native,
-                                         "arguments": function.get("arguments", "{}")}, ensure_ascii=False) + "]"})
+        blocks.extend(_call_text(call) for call in message.get("tool_calls") or [])
     return blocks
 
 
@@ -226,7 +366,21 @@ def _failure(result: dict) -> ClaudeCodeError:
     return ClaudeCodeError("Claude Code reported an error and returned no answer; retry the request.")
 
 
+class _Fallback(Exception):
+    """A CLI behaviour the request relied on is unavailable; retry without it for this process."""
+
+    def __init__(self, switch: str, message: str):
+        super().__init__(message)
+        self.switch = switch
+        self.message = message
+
+
 class ClaudeCodeProvider:
+    # Turned off for the rest of the process when this CLI rejects them: turn-by-turn replay
+    # (falls back to one transcript turn) and Astra's cache breakpoint.
+    replay = True
+    cache_marker = True
+
     def __init__(self, config, *, command: str | None = None):
         self.config = config
         self.command = command
@@ -235,15 +389,15 @@ class ClaudeCodeProvider:
     def supports_forced_tool_choice(self) -> bool:
         return False
 
-    def _arguments(self, command: str, workdir: str, bridged: bool) -> list[str]:
+    def _arguments(self, command: str, files: str, bridged: bool) -> list[str]:
         model = (self.config.model or "sonnet").strip()
         arguments = [command, "-p", "--output-format", "stream-json", "--verbose", "--input-format", "stream-json",
-                     "--include-partial-messages", "--model", model, "--system-prompt-file", os.path.join(workdir, "system.md"),
+                     "--include-partial-messages", "--model", model, "--system-prompt-file", os.path.join(files, "system.md"),
                      "--restricted", "--tools", "", "--strict-mcp-config", "--disable-slash-commands",
                      "--no-session-persistence", "--max-turns", "1", "--permission-mode", "dontAsk"]
         if bridged:
             servers = {"mcpServers": {BRIDGE_NAME: {"command": sys.executable,
-                                                    "args": [BRIDGE, os.path.join(workdir, "tools.json")],
+                                                    "args": [BRIDGE, os.path.join(files, "tools.json")],
                                                     "alwaysLoad": True}}}
             arguments += ["--mcp-config", json.dumps(servers)]
         effort = str(getattr(self.config, "reasoning_effort", "") or "").strip().lower()
@@ -253,35 +407,107 @@ class ClaudeCodeProvider:
 
     async def chat_stream(self, messages, tools=None, tool_choice=None, *, omit_tool_choice=False,
                           generation_overrides=None) -> AsyncGenerator[dict, None]:
+        for _ in range(3):
+            started = False
+            try:
+                async for event in self._stream(messages, tools, None if omit_tool_choice else tool_choice):
+                    started = True
+                    yield event
+                return
+            except _Fallback as fallback:
+                if started or not getattr(type(self), fallback.switch):
+                    raise ClaudeCodeError(fallback.message) from None
+                setattr(type(self), fallback.switch, False)
+        raise ClaudeCodeError("Claude Code could not complete the request; retry it.")
+
+    def _turns(self, prepared: list[dict], names: frozenset[str], note: str) -> tuple[list[tuple[str, list[dict]]], bool]:
+        """Native turns to send, and whether Astra's cache breakpoint is among them."""
+        turns = conversation(prepared, names) if type(self).replay else None
+        if turns is None:
+            blocks = transcript(prepared)
+            return [("user", blocks + ([{"type": "text", "text": note}] if note else []))], False
+        if note:
+            turns[-1][1].append(_reminder(note))
+        if not type(self).cache_marker or len(turns) < 3:
+            return turns, False
+        # The newest turn is sent differently the next time, once it is no longer the one asking
+        # for the answer, so its cached copy is never reused: the breakpoint goes on the user turn
+        # before it (never on a tool call, whose breakpoint the CLI drops). The next request finds
+        # this one's entry a few blocks back from its own breakpoint.
+        blocks = turns[-3][1]
+        blocks[-1] = {**blocks[-1], "cache_control": dict(CACHE_MARKER)}
+        return turns, True
+
+    async def _stream(self, messages, tools, tool_choice) -> AsyncGenerator[dict, None]:
         command = self.command or claude_command()
         if command is None:
             raise ClaudeCodeError("Claude Code CLI not found. " + LOGIN_HINT)
         listed = bridge_tools([t for t in tools or [] if isinstance(t, dict)])
         names = frozenset(t["name"] for t in listed)
         prepared = _messages_for_capabilities(messages, self.config.capabilities, names, self.config.vision_detail)
-        user = {"type": "user", "message": {"role": "user", "content": transcript(prepared)}}
-        with tempfile.TemporaryDirectory(prefix="astra-claude-code-") as workdir:
-            Path(workdir, "system.md").write_text(
-                system_prompt(prepared, listed, None if omit_tool_choice else tool_choice) or "You are a helpful assistant.",
-                encoding="utf-8")
+        turns, marked = self._turns(prepared, names, tool_choice_note(tool_choice) if listed else "")
+        with tempfile.TemporaryDirectory(prefix="astra-claude-code-") as files:
+            Path(files, "system.md").write_text(system_prompt(prepared, listed) or "You are a helpful assistant.",
+                                                encoding="utf-8")
             if listed:
-                Path(workdir, "tools.json").write_text(json.dumps(listed, ensure_ascii=False), encoding="utf-8")
+                Path(files, "tools.json").write_text(json.dumps(listed, ensure_ascii=False), encoding="utf-8")
             process = await asyncio.create_subprocess_exec(
-                *self._arguments(command, workdir, bool(listed)), cwd=workdir, env=child_environment(),
+                *self._arguments(command, files, bool(listed)), cwd=workspace(), env=child_environment(),
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
                 start_new_session=True, limit=64 * 1024 * 1024)
             try:
                 assert process.stdin is not None and process.stdout is not None
-                process.stdin.write((json.dumps(user, ensure_ascii=False) + "\n").encode())
-                await process.stdin.drain()
+                await self._replay(process, turns[:-1])
+                await self._send(process, {"type": "user", "message": {"role": "user", "content": turns[-1][1]}})
                 process.stdin.close()
-                async for event in self._events(process):
+                async for event in self._events(process, marked):
                     yield event
             finally:
                 _terminate(process)
                 await process.wait()
 
-    async def _events(self, process) -> AsyncGenerator[dict, None]:
+    @staticmethod
+    async def _send(process, frame: dict) -> None:
+        try:
+            process.stdin.write((json.dumps(frame, ensure_ascii=False) + "\n").encode())
+            await process.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            raise _Fallback("replay", "Claude Code stopped reading the conversation. " + LOGIN_HINT) from None
+
+    async def _replay(self, process, turns: list[tuple[str, list[dict]]]) -> None:
+        """Append earlier turns without a request: each user turn waits for the CLI's zero-turn
+        result, so the following assistant turn cannot land ahead of it."""
+        for role, blocks in turns:
+            if role == "assistant":
+                await self._send(process, {"type": "assistant", "message": {"role": "assistant", "content": blocks}})
+                continue
+            await self._send(process, {"type": "user", "message": {"role": "user", "content": blocks},
+                                       "shouldQuery": False})
+            await self._acknowledged(process)
+
+    @staticmethod
+    async def _acknowledged(process) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + ACK_TIMEOUT
+        while True:
+            try:
+                line = await asyncio.wait_for(process.stdout.readline(), max(0.0, deadline - loop.time()))
+            except TimeoutError:
+                raise ClaudeCodeError("Claude Code did not take the conversation history in time; retry the request.") from None
+            if not line:
+                raise _Fallback("replay", "Claude Code ended while reading the conversation. " + LOGIN_HINT)
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(event, dict) or event.get("type") != "result":
+                continue
+            if event.get("num_turns") == 0 and not event.get("is_error"):
+                return
+            # A CLI that answers a history turn instead of appending it would spend a request per turn.
+            raise _Fallback("replay", "Claude Code answered an earlier turn instead of the latest one; retry the request.")
+
+    async def _events(self, process, marked: bool = False) -> AsyncGenerator[dict, None]:
         loop = asyncio.get_running_loop()
         idle = float(getattr(self.config, "idle_timeout", 0) or 0) or 300.0
         overall = getattr(self.config, "overall_timeout", None)
@@ -325,7 +551,7 @@ class ClaudeCodeProvider:
                     elif block.get("type") == "tool_use":
                         calls.append(self._call(block))
             elif event.get("type") == "result":
-                final = self._final(event, content, calls, reasoning)
+                final = self._final(event, content, calls, reasoning, marked)
                 # Astra shows prose only from chunks: send whatever the stream did not.
                 if final["content"].startswith(streamed) and final["content"][len(streamed):]:
                     yield {"type": "chunk", "content": final["content"][len(streamed):]}
@@ -344,10 +570,13 @@ class ClaudeCodeProvider:
             raise LLMResponseError("invalid_tool_arguments", "Claude Code returned a malformed tool call.")
         return {"id": str(block["id"]), "name": name, "arguments": json.dumps(arguments, ensure_ascii=False)}
 
-    def _final(self, result: dict, content: str, calls: list[dict], reasoning: str) -> dict:
+    def _final(self, result: dict, content: str, calls: list[dict], reasoning: str, marked: bool = False) -> dict:
         # With tools the CLI stops at its one-turn limit right after the calls; that is the answer.
         stopped_for_calls = bool(calls) and result.get("subtype") == "error_max_turns"
         if not stopped_for_calls and (result.get("is_error") or result.get("subtype") != "success"):
+            if marked and "cache_control" in str(result.get("result") or ""):
+                # The API refused the breakpoint (a CLI that spends all four itself): answer without it.
+                raise _Fallback("cache_marker", "Claude Code rejected the request's cache breakpoint; retry the request.")
             raise _failure(result)
         if not calls:
             content = content or str(result.get("result") or "")
