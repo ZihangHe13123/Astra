@@ -37,7 +37,7 @@ emit({"type": "assistant", "message": {"content": [{"type": "thinking", "thinkin
 usage = {"input_tokens": 10, "cache_creation_input_tokens": 5, "cache_read_input_tokens": 100, "output_tokens": 7}
 denied = {"type": "user", "message": {"content": [{"type": "tool_result", "is_error": True, "content": "denied"}]}}
 if scenario in {"tools", "foreign"}:
-    name = "mcp__astra__read_file" if scenario == "tools" else "ToolSearch"
+    name = "mcp__astra__read_file" if scenario == "tools" else "execute_shell"
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "Reading it."}]}})
     emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_1", "name": name,
                                                         "input": {"path": "a.txt"}}]}})
@@ -99,13 +99,15 @@ def test_native_tool_calls_come_back_as_an_astra_tool_batch(fake_cli):
                               "prompt_cache_hit_tokens": 100, "prompt_cache_miss_tokens": 15}
 
 
-def test_a_call_outside_astras_tools_is_rejected_by_name(fake_cli, monkeypatch):
-    """Live Astra 2026-09-24: with tool search on, Claude reached for Claude Code's ToolSearch."""
+def test_a_plain_or_unoffered_tool_name_reaches_astras_registry(fake_cli, monkeypatch):
+    """Live Astra 2026-09-24: Claude called execute_shell by the plain name it read in the
+    transcript, and the turn failed. Astra's registry, not the provider, decides whether a name
+    exists; an unknown one gets a recoverable error the model can act on."""
     command, _ = fake_cli
     monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "foreign")
-    with pytest.raises(ClaudeCodeError) as error:
-        collect(provider(command).chat_stream(MESSAGES, [READ_FILE]))
-    assert "ToolSearch" in error.value.public_message and "no tool was run" in error.value.public_message
+    final = collect(provider(command).chat_stream(MESSAGES, [READ_FILE]))[-1]
+    assert final["type"] == "tool_calls"
+    assert [c["name"] for c in final["calls"]] == ["execute_shell", "execute_shell"]
 
 
 def test_cli_runs_isolated_and_bills_only_the_signed_in_subscription(fake_cli, monkeypatch):
@@ -201,7 +203,7 @@ def test_transcript_keeps_tool_results_and_screenshots_in_order():
     ])
     texts = [b.get("text", "") for b in blocks]
     assert not any("hidden" in t for t in texts)
-    assert any('"name": "computer_snapshot"' in t for t in texts)
+    assert any('"name": "mcp__astra__computer_snapshot"' in t for t in texts)
     assert "\n[tool result for call call_1]" in texts
     image = next(b for b in blocks if b["type"] == "image")
     assert image["source"] == {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="}

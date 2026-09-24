@@ -197,8 +197,11 @@ def transcript(messages: list[dict]) -> list[dict]:
         blocks.extend(_content_blocks(message.get("content")))
         for call in message.get("tool_calls") or []:
             function = call.get("function") or {}
+            name = str(function.get("name", ""))
+            # The same name Claude sees in its tool list, so it does not copy a different form.
+            native = TOOL_PREFIX + name if TOOL_NAME.fullmatch(name) else name
             blocks.append({"type": "text", "text": "[tool call "
-                           + json.dumps({"id": call.get("id", ""), "name": function.get("name", ""),
+                           + json.dumps({"id": call.get("id", ""), "name": native,
                                          "arguments": function.get("arguments", "{}")}, ensure_ascii=False) + "]"})
     return blocks
 
@@ -272,13 +275,13 @@ class ClaudeCodeProvider:
                 process.stdin.write((json.dumps(user, ensure_ascii=False) + "\n").encode())
                 await process.stdin.drain()
                 process.stdin.close()
-                async for event in self._events(process, names):
+                async for event in self._events(process):
                     yield event
             finally:
                 _terminate(process)
                 await process.wait()
 
-    async def _events(self, process, names: frozenset[str]) -> AsyncGenerator[dict, None]:
+    async def _events(self, process) -> AsyncGenerator[dict, None]:
         loop = asyncio.get_running_loop()
         idle = float(getattr(self.config, "idle_timeout", 0) or 0) or 300.0
         overall = getattr(self.config, "overall_timeout", None)
@@ -320,7 +323,7 @@ class ClaudeCodeProvider:
                     elif block.get("type") == "text" and block.get("text"):
                         content += str(block["text"])
                     elif block.get("type") == "tool_use":
-                        calls.append(self._call(block, names))
+                        calls.append(self._call(block))
             elif event.get("type") == "result":
                 final = self._final(event, content, calls, reasoning)
                 # Astra shows prose only from chunks: send whatever the stream did not.
@@ -330,14 +333,14 @@ class ClaudeCodeProvider:
                 return
 
     @staticmethod
-    def _call(block: dict, names: frozenset[str]) -> dict:
+    def _call(block: dict) -> dict:
+        """A native call as Astra's call. Claude sometimes repeats the plain name it read in the
+        transcript (live: execute_shell for mcp__astra__execute_shell); Astra's registry decides
+        whether a name exists and answers an unknown one with a recoverable error, as for any model."""
         raw = str(block.get("name") or "")
-        name = raw[len(TOOL_PREFIX):] if raw.startswith(TOOL_PREFIX) else ""
-        if name not in names:
-            shown = raw if re.fullmatch(r"[A-Za-z0-9_-]{1,80}", raw) else "an unnamed tool"
-            raise ClaudeCodeError(f"Claude used {shown}, which Astra did not offer; no tool was run. Retry the request.")
+        name = raw[len(TOOL_PREFIX):] if raw.startswith(TOOL_PREFIX) else raw
         arguments = block.get("input")
-        if not isinstance(arguments, dict) or not block.get("id"):
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name) or not isinstance(arguments, dict) or not block.get("id"):
             raise LLMResponseError("invalid_tool_arguments", "Claude Code returned a malformed tool call.")
         return {"id": str(block["id"]), "name": name, "arguments": json.dumps(arguments, ensure_ascii=False)}
 
