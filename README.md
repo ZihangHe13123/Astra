@@ -124,9 +124,10 @@ Usage counts against your Claude plan at the Claude Code / Agent SDK rate.
    claude auth login
    ```
 2. **Inside Astra**, enter `/connect`, select **Claude / Claude Code → Subscription**,
-   then choose `opus`, `sonnet` or `haiku` in `/model`.
+   then choose `fable`, `opus`, `sonnet` or `haiku` in `/model`.
 
-The CLI runs without its own tools, settings files, MCP servers or saved sessions,
+Claude calls Astra's tools natively through a local bridge that never runs them; Astra runs
+them with its usual approvals. The CLI runs without its own tools, settings files or saved sessions,
 and `ANTHROPIC_*` variables in Astra's environment are not passed to it, so a
 provider switcher or API key cannot redirect or bill the request. If `claude` is
 not on `PATH`, set `ASTRA_CLAUDE_CODE_COMMAND` to its absolute path.

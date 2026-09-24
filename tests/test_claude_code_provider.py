@@ -11,7 +11,7 @@ import pytest
 from agent.cli import connections, model_catalog, provider_connections
 from agent.runtime import claude_code_provider as ccp
 from agent.runtime.claude_code_provider import ClaudeCodeError, ClaudeCodeProvider
-from agent.runtime.llm import LLMConfig, LLMIdleTimeout
+from agent.runtime.llm import LLMConfig, LLMIdleTimeout, LLMResponseError
 from agent.runtime.providers import DEFAULT_PROVIDER_REGISTRY
 
 FAKE_CLI = r'''#!__PYTHON__
@@ -21,8 +21,11 @@ record = {"argv": sys.argv[1:], "cwd": os.getcwd(), "pid": os.getpid(),
 if sys.argv[1:3] == ["auth", "status"]:
     print(json.dumps({"loggedIn": True, "authMethod": "claude.ai", "subscriptionType": "max"}))
     sys.exit(0)
-if "--system-prompt-file" in sys.argv:
-    record["system"] = open(sys.argv[sys.argv.index("--system-prompt-file") + 1]).read()
+record["system"] = open(sys.argv[sys.argv.index("--system-prompt-file") + 1]).read()
+if "--mcp-config" in sys.argv:
+    servers = json.loads(sys.argv[sys.argv.index("--mcp-config") + 1])["mcpServers"]
+    record["servers"] = servers
+    record["tools"] = json.load(open(servers["astra"]["args"][1]))
 record["stdin"] = json.loads(sys.stdin.readline())
 json.dump(record, open(os.environ["FAKE_CLAUDE_RECORD"], "w"))
 scenario = os.environ.get("FAKE_CLAUDE_SCENARIO", "tools")
@@ -32,10 +35,19 @@ if scenario == "hang":
     time.sleep(60)
 emit({"type": "assistant", "message": {"content": [{"type": "thinking", "thinking": "Need the file."}]}})
 usage = {"input_tokens": 10, "cache_creation_input_tokens": 5, "cache_read_input_tokens": 100, "output_tokens": 7}
-if scenario == "tools":
-    emit({"type": "result", "subtype": "success", "is_error": False, "usage": usage,
-          "structured_output": {"content": "", "tool_calls": [{"name": "read_file", "arguments": {"path": "a.txt"}}]}})
+denied = {"type": "user", "message": {"content": [{"type": "tool_result", "is_error": True, "content": "denied"}]}}
+if scenario in {"tools", "foreign"}:
+    name = "mcp__astra__read_file" if scenario == "tools" else "Bash"
+    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "Reading it."}]}})
+    emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_1", "name": name,
+                                                        "input": {"path": "a.txt"}}]}})
+    emit(denied)
+    emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_2", "name": name,
+                                                        "input": {"path": "b.txt"}}]}})
+    emit(denied)
+    emit({"type": "result", "subtype": "error_max_turns", "is_error": True, "num_turns": 2, "usage": usage})
 elif scenario == "text":
+    emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "Hello from Claude."}]}})
     emit({"type": "result", "subtype": "success", "is_error": False, "usage": usage, "result": "Hello from Claude."})
 elif scenario == "not_logged_in":
     emit({"type": "result", "subtype": "success", "is_error": True, "result": "Not logged in · Please run /login"})
@@ -71,21 +83,29 @@ def collect(stream):
 MESSAGES = [{"role": "system", "content": "You are Astra."}, {"role": "user", "content": "Read a.txt"}]
 
 
-def test_tool_call_comes_back_as_an_astra_tool_batch(fake_cli):
+def test_native_tool_calls_come_back_as_an_astra_tool_batch(fake_cli):
     command, _ = fake_cli
     events = collect(provider(command).chat_stream(MESSAGES, [READ_FILE]))
     assert events[0] == {"type": "reasoning", "content": "Need the file."}
     final = events[-1]
     assert final["type"] == "tool_calls" and final["finish_reason"] == "tool_calls"
-    [call] = final["calls"]
-    assert call["name"] == "read_file" and json.loads(call["arguments"]) == {"path": "a.txt"}
-    assert call["id"].startswith("call_")
+    assert final["content"] == "Reading it."
+    assert [(c["id"], c["name"], json.loads(c["arguments"])) for c in final["calls"]] == [
+        ("toolu_1", "read_file", {"path": "a.txt"}), ("toolu_2", "read_file", {"path": "b.txt"})]
     assert final["usage"] == {"prompt_tokens": 115, "completion_tokens": 7, "total_tokens": 122,
                               "prompt_cache_hit_tokens": 100, "prompt_cache_miss_tokens": 15}
 
 
+def test_a_call_outside_astras_tools_is_rejected(fake_cli, monkeypatch):
+    command, _ = fake_cli
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "foreign")
+    with pytest.raises(LLMResponseError) as error:
+        collect(provider(command).chat_stream(MESSAGES, [READ_FILE]))
+    assert error.value.code == "invalid_tool_arguments"
+
+
 def test_cli_runs_isolated_and_bills_only_the_signed_in_subscription(fake_cli, monkeypatch):
-    """No built-in tools, settings, MCP or skills; API-key or endpoint overrides never reach it."""
+    """No built-in tools, settings, skills or other MCP servers; overrides never reach the CLI."""
     command, record = fake_cli
     monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-should-not-leak")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://redirect.invalid")
@@ -100,20 +120,50 @@ def test_cli_runs_isolated_and_bills_only_the_signed_in_subscription(fake_cli, m
     assert argv[argv.index("--tools") + 1] == ""
     assert argv[argv.index("--model") + 1] == "sonnet"
     assert argv[argv.index("--effort") + 1] == "high"
-    schema = json.loads(argv[argv.index("--json-schema") + 1])
-    assert schema["properties"]["tool_calls"]["items"]["properties"]["name"]["enum"] == ["read_file"]
+    # One response, then stop: every call is denied, so the CLI can never run a tool itself.
+    assert argv[argv.index("--max-turns") + 1] == "1"
+    assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
+    assert "--json-schema" not in argv
+    [(name, server)] = seen["servers"].items()
+    assert name == "astra" and server["command"] == sys.executable
+    assert server["args"][0].endswith("claude_code_tool_bridge.py")
+    assert seen["tools"] == [{"name": "read_file", "description": "Read a file.",
+                              "inputSchema": READ_FILE["function"]["parameters"]}]
     assert seen["env"] == {}
     assert Path(seen["cwd"]).name.startswith("astra-claude-code-")
-    assert "You are Astra." in seen["system"] and '"read_file"' in seen["system"]
+    assert "You are Astra." in seen["system"] and "Astra runs your tool calls" in seen["system"]
     assert seen["stdin"]["type"] == "user"
 
 
-def test_plain_answer_without_tools_uses_no_schema(fake_cli, monkeypatch):
+def test_bridge_lists_astras_tools_and_never_runs_them(tmp_path):
+    tools = ccp.bridge_tools([READ_FILE, {"type": "function", "function": {"name": "bad name!", "parameters": {}}}])
+    assert [t["name"] for t in tools] == ["read_file"]
+    path = tmp_path / "tools.json"
+    path.write_text(json.dumps(tools))
+    requests = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                {"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "read_file", "arguments": {}}}]
+
+    async def run():
+        process = await asyncio.create_subprocess_exec(sys.executable, ccp.BRIDGE, str(path),
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+        out, _ = await process.communicate("".join(json.dumps(r) + "\n" for r in requests).encode())
+        return [json.loads(line) for line in out.decode().splitlines()]
+
+    replies = asyncio.run(run())
+    assert [r["id"] for r in replies] == [1, 2, 3]
+    assert replies[0]["result"]["capabilities"] == {"tools": {}}
+    assert replies[1]["result"]["tools"] == tools
+    assert replies[2]["result"]["isError"] is True
+
+
+def test_plain_answer_without_tools_starts_no_bridge(fake_cli, monkeypatch):
     command, record = fake_cli
     monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "text")
     final = collect(provider(command).chat_stream(MESSAGES))[-1]
     assert final["type"] == "done" and final["content"] == "Hello from Claude."
-    assert "--json-schema" not in json.loads(record.read_text())["argv"]
+    assert "--mcp-config" not in json.loads(record.read_text())["argv"]
 
 
 def test_transcript_keeps_tool_results_and_screenshots_in_order():
@@ -178,7 +228,7 @@ def test_route_profile_and_catalog_need_no_api_key(monkeypatch):
     assert profile.provider == "claude-code" and "vision" in profile.capabilities
     catalog = asyncio.run(model_catalog.discover_endpoint(
         model_catalog.ProviderEndpoint(provider_id, profile.provider_label, profile, inferred=True), force=True))
-    assert {entry.model_id for entry in catalog.entries} >= {"opus", "sonnet", "haiku"}
+    assert {entry.model_id for entry in catalog.entries} >= {"fable", "opus", "sonnet", "haiku"}
 
 
 def test_connecting_requires_a_signed_in_cli(monkeypatch):

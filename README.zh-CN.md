@@ -109,9 +109,9 @@ Astra 每次请求模型时启动 `claude`，不会读取、保存或转发你�
    curl -fsSL https://claude.ai/install.sh | bash
    claude auth login
    ```
-2. 在 **Astra 内部**输入 `/connect`，选择 **Claude / Claude Code → Subscription**，再在 `/model` 中选择 `opus`、`sonnet` 或 `haiku`。
+2. 在 **Astra 内部**输入 `/connect`，选择 **Claude / Claude Code → Subscription**，再在 `/model` 中选择 `fable`、`opus`、`sonnet` 或 `haiku`。
 
-命令行运行时不带它自己的工具、设置文件、MCP 服务或会话记录；Astra 环境中的 `ANTHROPIC_*` 变量不会传给它，
+Claude 通过本地桥接原生调用 Astra 的工具，桥接从不执行工具，仍由 Astra 按原有审批执行。命令行运行时不带它自己的工具、设置文件或会话记录；Astra 环境中的 `ANTHROPIC_*` 变量不会传给它，
 因此模型切换工具或 API Key 都不会改变请求的去向或计费方式。若 `claude` 不在 `PATH` 中，
 请把 `ASTRA_CLAUDE_CODE_COMMAND` 设为它的绝对路径。
 
