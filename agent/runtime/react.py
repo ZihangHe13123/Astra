@@ -1598,10 +1598,10 @@ class ReActAgent(AgentBase):
             }
         canonical_content = storage_content if storage_content != chat_content else chat_content
         self.context.add_user(canonical_content, provenance=(
-            str(msg.metadata["source"]) if msg.metadata.get("source") in {"session_wakeup", "command_workflow"}
+            str(msg.metadata["source"]) if msg.metadata.get("source") in {"session_wakeup", "command_workflow", "peer_message"}
             else "goal_continuation" if msg.metadata.get("goal_round") else ""
         ))
-        if msg.metadata.get("source") == "command_workflow":
+        if msg.metadata.get("source") in {"command_workflow", "peer_message"} and msg.metadata.get("display_command"):
             self.context.messages[user_index]["display_command"] = msg.metadata["display_command"]
         if storage_content == chat_content:
             storage_content = None

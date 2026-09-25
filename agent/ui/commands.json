@@ -947,6 +947,14 @@
     "options": []
   },
   {
+    "command": "/peers",
+    "description": "other Astra sessions on this computer: list; name NEW_NAME renames this one",
+    "group": "SYSTEM",
+    "id": "F52",
+    "takes_args": true,
+    "options": []
+  },
+  {
     "command": "/help",
     "description": "show command help",
     "group": "SYSTEM",

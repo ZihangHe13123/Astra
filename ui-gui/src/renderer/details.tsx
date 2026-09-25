@@ -102,7 +102,7 @@ export function Details({ state, panel, setPanel, selection, width, onWidth, clo
   </aside>;
 }
 
-const eventLabels: Record<string, string> = { task_status: "任务状态", generation_progress: "生成进度", working_memory: "工作计划", yolo_status: "工具权限", computer_status: "电脑控制", gui_appshot: "窗口捕获", wakeup_status: "定时提醒", turn_changes: "文件改动", usage: "用量", gui_model_result: "模型切换结果" };
+const eventLabels: Record<string, string> = { task_status: "任务状态", generation_progress: "生成进度", working_memory: "工作计划", yolo_status: "工具权限", computer_status: "电脑控制", gui_appshot: "窗口捕获", wakeup_status: "定时提醒", peer_message: "会话互通", turn_changes: "文件改动", usage: "用量", gui_model_result: "模型切换结果" };
 function statusLabel(status?: string) { return ({ running: "运行中", active: "进行中", scheduled: "已安排", completed: "已完成", idle: "待命", pending: "等待中", in_progress: "进行中", done: "已完成", cancelled: "已取消", failed: "失败", interrupted: "已中断", paused: "已暂停", ready: "就绪" } as Record<string, string>)[status || ""] || status || ""; }
 function RawDetails({ value, label = "诊断详情" }: { value: unknown; label?: string }) {
   const [open, setOpen] = useState(false);

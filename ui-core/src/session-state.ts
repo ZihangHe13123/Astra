@@ -157,6 +157,9 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
     case "error": append("error", event.message || "请求失败"); state.busy = ["pending", "running", "cancelling"].includes(state.info.task_status?.task?.status); state.stream = ""; notice(); break;
     case "steering": break; // The submitted user message is already present.
     case "gui_notice": append("system", event.message); break;
+    // Another Astra session on this computer: shown as a notice, never as the user's words.
+    case "peer_message":
+      append("system", `${event.direction === "in" ? "来自" : "发给"} ${event.peer}（${event.state}）：${event.text}`); break;
     default: state.info = { ...state.info, [event.type]: event }; break;
   }
   return state;

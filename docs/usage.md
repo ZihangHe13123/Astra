@@ -193,6 +193,35 @@ host-execution operations still use their existing approval checks. On
 messaging channels the interactive question tool returns a recoverable failure,
 so the model can ask again in ordinary text instead of opening a hidden wait.
 
+## Other Astra sessions
+
+Astra sessions open on the same computer can hand each other work. Ask one in
+plain words, for example "ask the session doing the slides which figure it
+used", and Astra calls `peer_list` to find the other session and `peer_send` to
+open a task for it. When the other session is idle it starts a turn on its own
+with the request, marked as coming from another session rather than from you,
+and reports back with `peer_task_update`: `working`, `input-required` to ask a
+question, then `completed`, `failed` or `rejected`. The reply starts a turn in
+the session that asked. A session that is busy reads its mail when its current
+turn ends.
+
+```text
+/peers
+/peers name <new name>
+```
+
+`/peers` lists the open sessions and this session's open tasks with them.
+A session is named after the start of its first request; `/peers name` renames
+it, and the name survives reopening the session. Mail waits for a closed session
+until it is opened again.
+
+Each session works with its own tools and permissions, so a session in YOLO mode
+does the requested work without approvals, as it would for your own request. A
+request from another session never changes what you asked this one to do. To
+keep two sessions from talking forever, a task holds at most 20 messages, a
+finished task takes no more, and a session opens at most 20 tasks an hour. The
+directory, mailbox and task board are one SQLite file, `.astra/peers.db`.
+
 ## TUI themes
 
 Use `/theme` to list the Ink TUI themes. `/theme hermes`, `/theme classic`,

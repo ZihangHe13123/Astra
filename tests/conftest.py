@@ -64,6 +64,13 @@ def _isolate_learning_archive(tmp_path, monkeypatch, _isolate_application_enviro
 
 
 @pytest.fixture(autouse=True)
+def _isolate_peer_mailbox(tmp_path, monkeypatch, _isolate_application_environment):
+    # A test backend would otherwise list itself in the user's real directory of
+    # open Astra sessions, where the user's own sessions could message it.
+    monkeypatch.setenv("ASTRA_PEER_DB", str(tmp_path / "peers.db"))
+
+
+@pytest.fixture(autouse=True)
 def _isolate_session_recall_db(request, tmp_path, monkeypatch, _isolate_application_environment):
     if request.node.get_closest_marker("allow_real_session_recall_db") is not None:
         return

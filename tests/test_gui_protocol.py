@@ -86,7 +86,7 @@ def test_command_catalog_covers_the_tui_roots():
     block = source.split("const SLASH_COMMANDS:", 1)[1].split("];", 1)[0]
     roots = re.findall(r'command: "(/[^" ]+)"', block)
     catalog = queries.command_catalog()
-    assert len(roots) == 50
+    assert len(roots) == 51
     assert sorted(roots) == sorted(c["command"] for c in catalog)
     assert len(set(c["id"] for c in catalog)) == len(roots)
 

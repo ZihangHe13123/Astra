@@ -1054,7 +1054,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         setToolResults(restoredTools);
         const visibleMessages = event.messages.filter(
           (m: any) =>
-            m.role === "user" || m.role === "reasoning" || m.role === "assistant",
+            m.role === "user" || m.role === "reasoning" || m.role === "assistant" || m.role === "system",
         );
         timeRailCursorRef.current.reset();
         const decoratedMessages = visibleMessages.map((m: any, index: number) => {
@@ -1490,6 +1490,9 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           textBatcher.accept(event);
           if (event.type === "wakeup_status") {
             if (event.message) addMessageRef.current("system", event.message);
+          } else if (event.type === "peer_message") {
+            // Another Astra session on this computer: a notice, never the user's words.
+            addMessageRef.current("system", `PEER ${event.direction === "in" ? "←" : "→"} ${event.peer} · ${event.state} · ${event.task_id}\n${event.text}`);
           } else if (event.type === "restart_status") {
             restartPendingRef.current = ["draining", "awaiting_ack", "exiting"].includes(event.state);
             if (event.state === "cancelled") restart.cancel();

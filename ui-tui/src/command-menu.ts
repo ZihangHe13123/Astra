@@ -81,6 +81,7 @@ const SLASH_COMMANDS: SlashCommandSuggestion[] = [
   { command: "/reconnect", description: "restart backend connection", group: "SYSTEM" },
   { command: "/restart", description: "restart backend after current work is delivered; cancel stops waiting", takesArgs: true, group: "SYSTEM" },
   { command: "/wakeup", description: "session wakeups: status, cancel, after/every SECONDS PROMPT", takesArgs: true, group: "SYSTEM" },
+  { command: "/peers", description: "other Astra sessions on this computer; name NEW_NAME renames this one", takesArgs: true, group: "SYSTEM" },
   { command: "/help", description: "show command help", group: "SYSTEM" },
 ];
 

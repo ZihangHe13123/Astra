@@ -1,6 +1,6 @@
 """Backend — 被 Ink TUI 子进程调用，stdin/stdout JSON 协议"""
 
-from agent.runtime.paths import sessions_dir
+from agent.runtime.paths import sessions_dir, state_path
 from agent.runtime.appshot_media import AppshotMediaError
 
 import sys
@@ -74,6 +74,8 @@ from agent.runtime.user_questions import UserQuestionBroker
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
 from agent.cli.session_lifecycle import ControlledRestart, RESTART_EXIT_CODE
 from agent.runtime.session_wakeup import SessionWakeups, visible_wakeup_history, wakeup_prompt
+from agent.runtime.peer_link import (HEARTBEAT_SECONDS, PeerError, PeerLink, default_name, fallback_name,
+                                     incoming_prompt)
 from agent.runtime.tools.code import register_code_tools
 from agent.runtime.tools.files import register_file_tools
 from agent.runtime.tools.git import register_git_tools
@@ -1267,6 +1269,104 @@ async def _main(startup_started: float):
         }, "required": ["outcome"]}, fn=_report_wakeup, cache_results=False,
     ))
 
+    # Other Astra sessions on this computer: one shared mailbox (agent/runtime/peer_link.py).
+    try:
+        peer_link: PeerLink | None = PeerLink(os.getenv("ASTRA_PEER_DB") or state_path("peers.db"))
+    except Exception:
+        logger.exception("peer mailbox unavailable")
+        peer_link = None
+    peer_clock = {"heartbeat": 0.0, "inbox": 0.0}
+
+    def _peer() -> PeerLink:
+        if peer_link is None or not peer_link.peer_id:
+            raise ValueError("Messaging other Astra sessions is available in a local Work session only.")
+        return peer_link
+
+    def _peer_event(direction: str, peer: str, task_id: str, state: str, text: str) -> None:
+        _send({"type": "peer_message", "direction": direction, "peer": peer, "task_id": task_id,
+               "state": state, "text": text[:4000]})
+
+    def _peer_overview(link: PeerLink) -> str:
+        lines = [f"This session: {link.name} ({link.peer_id})", "Open sessions:"]
+        lines += [f"- {p['name']} ({p['peer_id']}) · {p['status']} · {p['workspace']}" for p in link.peers()] or ["- none"]
+        lines.append("Open tasks:")
+        lines += [f"- {t['task_id']} · {'to' if t['role'] == 'requester' else 'from'} {t['with']} · {t['state']} · {t['title']}"
+                  for t in link.tasks()] or ["- none"]
+        return "\n".join(lines)
+
+    async def _peer_list() -> str:
+        link = _peer()
+        peers = await asyncio.to_thread(link.peers)
+        tasks = await asyncio.to_thread(link.tasks)
+        return json.dumps({"you": {"name": link.name, "peer_id": link.peer_id}, "open_sessions": peers,
+                           "open_tasks": tasks}, ensure_ascii=False)
+
+    async def _peer_send(text: str, to: str = "", task_id: str = "") -> str:
+        link = _peer()
+        try:
+            result = await asyncio.to_thread(link.send, text, to=to, task_id=task_id)
+        except PeerError as exc:
+            raise ValueError(str(exc)) from None
+        _peer_event("out", result["to"], result["task_id"], result["state"], text)
+        return json.dumps(result, ensure_ascii=False)
+
+    async def _peer_task_update(task_id: str, state: str, text: str = "") -> str:
+        link = _peer()
+        try:
+            result = await asyncio.to_thread(link.update, task_id, state, text)
+        except PeerError as exc:
+            raise ValueError(str(exc)) from None
+        _peer_event("out", result["to"], result["task_id"], result["state"], text or state)
+        return json.dumps(result, ensure_ascii=False)
+
+    tools.register(ToolDef(
+        name="peer_list",
+        description="List the other Astra sessions open on this computer (name, peer_id, idle or busy, workspace) and this session's open tasks with them.",
+        parameters={"type": "object", "properties": {}}, fn=_peer_list, cache_results=False,
+        idempotent=True, parallel_safe=True,
+    ))
+    tools.register(ToolDef(
+        name="peer_send",
+        description=("Hand work to another Astra session on this computer, or add to a task you share with one. "
+                     "Without task_id this opens a task for the session named in `to` (name or peer_id from peer_list) "
+                     "and returns its task_id; that session works on it with its own tools and context, and its replies "
+                     "arrive here as a new turn. With task_id it sends a follow-up or answers the task's input-required "
+                     "question. Use it when another session's work or context helps the user's request; never for thanks "
+                     "or acknowledgements."),
+        parameters={"type": "object", "properties": {
+            "text": {"type": "string", "maxLength": 20000},
+            "to": {"type": "string", "maxLength": 200},
+            "task_id": {"type": "string", "maxLength": 200},
+        }, "required": ["text"]}, fn=_peer_send, risk="write", cache_results=False, max_calls_per_turn=8,
+    ))
+    tools.register(ToolDef(
+        name="peer_task_update",
+        description=("Report on a task another Astra session gave this session: working (started, will take a while), "
+                     "input-required (text is your question), completed (text is the result), failed (text is the reason) "
+                     "or rejected (it should not be done; text says why). The session that asked may set canceled to "
+                     "withdraw it. completed, failed, rejected and canceled close the task."),
+        parameters={"type": "object", "properties": {
+            "task_id": {"type": "string", "maxLength": 200},
+            "state": {"type": "string", "enum": ["working", "input-required", "completed", "failed", "rejected", "canceled"]},
+            "text": {"type": "string", "maxLength": 20000},
+        }, "required": ["task_id", "state"]}, fn=_peer_task_update, risk="write", cache_results=False, max_calls_per_turn=8,
+    ))
+
+    def _first_request(messages: list[dict]) -> str:
+        return next((message_display_text(m.get("content", "")) for m in messages
+                     if m.get("role") == "user" and not m.get("provenance")), "")
+
+    def _peer_answer(messages: list[dict]) -> str:
+        """The last thing a peer-started turn said, which is the result when it reported nothing."""
+        for message in reversed(messages):
+            if message.get("role") == "user" and message.get("provenance") == "peer_message":
+                break
+            if message.get("role") == "assistant" and not message.get("tool_calls"):
+                text = message_display_text(message.get("content", "")).strip()
+                if text:
+                    return text
+        return ""
+
     manual_reviews: set[asyncio.Task] = set()
     startup_tasks: set[asyncio.Task] = set()
     agent_turn_lock = asyncio.Lock()
@@ -1679,6 +1779,16 @@ async def _main(startup_started: float):
                                                          "provenance": "wakeup_notification"})
                         _send({"type": "chunk", "content": summary})
                 _send({"type": "done"})
+            if msg.metadata.get("peer_tasks") and peer_link is not None:
+                # New tasks the turn did not report on get its answer as their result.
+                answer = _peer_answer(agent.context.messages)
+                try:
+                    finished = await asyncio.to_thread(peer_link.finish_unreported, msg.metadata["peer_tasks"], answer)
+                except Exception:
+                    logger.exception("could not report peer task results")
+                    finished = []
+                for item in finished:
+                    _peer_event("out", item["to"], item["task_id"], item["state"], answer or "No result.")
             await agent.context.save_async()
             if bar_mode.active:
                 if turn_completed and not was_cancelled and not failed_message:
@@ -1847,7 +1957,7 @@ async def _main(startup_started: float):
             if message.get("_meta", {}).get("type") == "reasoning_context":
                 continue
             item = {
-                "role": message["role"],
+                "role": "system" if message.get("provenance") == "peer_message" else message["role"],
                 "content": message_display_text(message.get("display_command", message.get("content", ""))),
             }
             timestamp = _valid_message_timestamp(message.get("timestamp"))
@@ -2235,7 +2345,61 @@ async def _main(startup_started: float):
                     status = wakeups.finish(plan["id"], outcome="failed", summary="Could not start the wakeup turn.")
                     if status:
                         _wakeup_event(status, status["summary"])
+            if peer_link is not None:
+                await _peer_tick()
             await asyncio.sleep(0.25)
+
+    def _turn_busy() -> bool:
+        return (agent_turn_lock.locked() or appshot_admission.reserved
+                or (active_task is not None and not active_task.done())
+                or any(not task.done() for task in (*goal_tasks, *manual_reviews)))
+
+    async def _peer_tick() -> None:
+        """Keep this session listed, and when it is idle start a turn with any mail it has."""
+        assert peer_link is not None
+        now = time.monotonic()
+        busy = _turn_busy()
+        local = not (active_channel.get() or bar_mode.active or minimal_mode.active or local_mode.active)
+        session = Path(agent.context.session_path).stem if agent.context.session_path else ""
+        try:
+            if not busy and local and session and peer_link.peer_id != f"{peer_link.site}:{session}":
+                if peer_link.peer_id:
+                    await asyncio.to_thread(peer_link.leave)
+                first = _first_request(agent.context.messages)
+                await asyncio.to_thread(peer_link.join, session, default_name(first, session), workspace=os.getcwd())
+                peer_clock["heartbeat"] = now
+            elif peer_link.peer_id and now - peer_clock["heartbeat"] >= HEARTBEAT_SECONDS:
+                peer_clock["heartbeat"] = now
+                if not busy and local and peer_link.name == fallback_name(session):
+                    # Named before its first request; the request now gives a readable name.
+                    first = _first_request(agent.context.messages)
+                    if first:
+                        with suppress(PeerError):
+                            await asyncio.to_thread(peer_link.rename, default_name(first, session))
+                await asyncio.to_thread(peer_link.heartbeat, "busy" if busy or not local else "idle")
+            if (busy or not local or restart.draining or not peer_link.peer_id
+                    or agent.llm.config.connection_required or now - peer_clock["inbox"] < 1.0):
+                return
+            peer_clock["inbox"] = now
+            if not await asyncio.to_thread(peer_link.has_mail):
+                return
+            messages = await asyncio.to_thread(peer_link.claim_inbox)
+        except Exception:
+            logger.exception("peer mailbox tick failed")
+            return
+        if not messages:
+            return
+        for message in messages:
+            _peer_event("in", message["sender_name"], message["task_id"], message["state"] or message["task_state"],
+                        message["body"])
+        display = "\n\n".join(f"PEER ← {m['sender_name']} · {m['state'] or m['task_state']} · {m['task_id']}\n{m['body']}"
+                              for m in messages)
+        given = [m["task_id"] for m in messages if m["assignee"] == peer_link.peer_id]
+        msg = Msg(sender="peer", role="user",
+                  content=build_user_message_content(incoming_prompt(messages, peer_link.peer_id)),
+                  metadata={"source": "peer_message", "display_command": display, "peer_tasks": given})
+        if not _start_message(msg, display):
+            await asyncio.to_thread(peer_link.release, messages)
 
     lifecycle_task = asyncio.create_task(_lifecycle_tick(), name="session-lifecycle")
 
@@ -2486,6 +2650,22 @@ async def _main(startup_started: float):
                                                    interval_seconds=seconds if parts[1] == "every" else 0)
                     except ValueError as exc:
                         _wakeup_event(wakeups.status(), str(exc))
+                    continue
+                if c == "/peers" or c.startswith("/peers "):
+                    argument = c[len("/peers"):].strip()
+                    output, error = "", ""
+                    try:
+                        link = _peer()
+                        if argument.startswith("name "):
+                            output = f"This session is now called {await asyncio.to_thread(link.rename, argument[5:])}."
+                        elif argument:
+                            raise ValueError("Usage: /peers [name NEW_NAME]")
+                        else:
+                            output = await asyncio.to_thread(_peer_overview, link)
+                    except (ValueError, PeerError) as exc:
+                        error = str(exc)
+                    _send({"type": "tool_result", "name": "peers", "output": output, "error": error, "code": ""})
+                    _send({"type": "done"})
                     continue
                 if c == "/restart" or c.startswith("/restart "):
                     try:
@@ -3713,6 +3893,9 @@ async def _main(startup_started: float):
                         _send({"type": "done"})
     finally:
         wakeups.cancel("backend_closed")
+        if peer_link is not None:
+            with suppress(Exception):
+                peer_link.leave()
         lifecycle_task.cancel()
         with suppress(asyncio.CancelledError):
             await lifecycle_task

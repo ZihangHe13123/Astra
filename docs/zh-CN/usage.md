@@ -119,6 +119,19 @@
 
 <a id="tui-themes"></a>
 
+## 其他 Astra 会话
+
+同一台电脑上开着的多个 Astra 会话可以互相派活。直接用自然语言说，比如"问问做幻灯片的那个会话用的是哪张图"，Astra 会先用 `peer_list` 找到对方，再用 `peer_send` 给它开一个任务。对方空闲时会自己开一轮处理，并标明这是另一个会话发来的，不是你本人说的；处理过程中用 `peer_task_update` 汇报：`working`，需要反问时用 `input-required`，最后是 `completed`、`failed` 或 `rejected`。回复会在发起方那边开一轮。对方正忙时，会在当前这一轮结束后再看信。
+
+```text
+/peers
+/peers name <新名字>
+```
+
+`/peers` 列出当前开着的其他会话，以及本会话和它们之间还没结束的任务。会话默认以第一个请求的开头命名，`/peers name` 可以改名，重新打开会话后名字不变。发给已关闭会话的信会一直等到它再次打开。
+
+每个会话都用自己的工具和权限干活：开了 YOLO 的会话处理别的会话派来的活时同样免审批，和处理你本人的请求一样。别的会话的请求不会改变你交给本会话的任务。为了防止两个会话无休止地来回对话，每个任务最多 20 条消息，结束的任务不再接收消息，每个会话每小时最多新开 20 个任务。在线名册、消息箱和任务表都在同一个 SQLite 文件 `.astra/peers.db` 里。
+
 ## 终端主题
 
 `/theme` 列出 Ink TUI 主题。`/theme hermes`、`classic`、`nord`、`dracula`、`solarized` 和 `gruvbox` 会立即切换。默认 `hermes` 是参考 Hermes CLI 的暖金与奶油色主题；`classic` 保留鲜明的 ANSI 配色。选择单独保存到 `.astra/tui-settings.json`。

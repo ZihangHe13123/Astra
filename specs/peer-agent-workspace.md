@@ -1,7 +1,9 @@
 # Peer Agent workspace
 
-Status: proposal; not implemented or approved for implementation. This public
-summary preserves the design questions without personal deployment inventories.
+Status: the local stage, sessions on one computer, is implemented (see Local
+stage below). The cross-machine design remains a proposal and is not approved
+for implementation. This public summary preserves the design questions without
+personal deployment inventories.
 
 ## Intended use
 
@@ -33,6 +35,35 @@ cross-process operation before adopting them.
 - Send artifact metadata separately from file bytes. Validate declared size and
   content hash, land files in an inbox, and avoid overwriting an active workspace.
   Preserve both copies of conflicting binary documents.
+
+## Local stage (implemented)
+
+Astra sessions open on the same computer can hand each other tasks
+(`agent/runtime/peer_link.py`; usage in [docs/usage.md](../docs/usage.md)).
+
+- One SQLite file in the state directory, `peers.db`, holds the directory of open
+  sessions, the mailbox and the task board. SQLite's file locks make it safe
+  across backend processes; every write is one short `BEGIN IMMEDIATE`
+  transaction.
+- A peer is a session, identified as `{site}:{session}`. A reopened session keeps
+  its identity, its name and its unread mail.
+- Task states follow A2A: submitted, working, input-required, completed, failed,
+  canceled and rejected. Taking a task's mail moves it to working, and the
+  requester answering a question moves it back to working. Order comes from the
+  mailbox sequence, never from clocks.
+- An idle session in local Work mode claims its mail every second and starts a
+  turn with it; a busy session reads its mail when its turn ends. The turn says
+  the request comes from another session, not the user, and grants nothing. The
+  work runs with the receiving session's own permissions.
+- If a turn that read a task's mail ends while the requester still has the last
+  word, the turn's answer becomes the result.
+- Two sessions must not talk forever: a task holds at most 20 messages, a
+  finished task takes no more, and a session opens at most 20 tasks an hour.
+- Tools: `peer_list`, `peer_send` and `peer_task_update`. Commands: `/peers`
+  and `/peers name`.
+
+The cross-machine stage keeps these envelopes and replaces only the transport
+underneath, adding the pairing, authentication and encryption described above.
 
 ## Decisions still required
 

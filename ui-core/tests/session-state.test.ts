@@ -132,3 +132,11 @@ test('disconnect terminates a pending connection so reopened settings can retry'
  assert.equal(state.info.connection_result.request_id,'login');
  assert.match(state.info.connection_result.error,/中断/);
 });
+test("another Astra session's message is a notice, never the user's words", () => {
+  let state = projectEvent(initialSession("a"), { type: "peer_message", direction: "in", peer: "跑测试", task_id: "mac:t-1", state: "completed", text: "2 failures" });
+  state = projectEvent(state, { type: "peer_message", direction: "out", peer: "跑测试", task_id: "mac:t-2", state: "submitted", text: "Run lint" });
+  assert.deepEqual(state.messages.map(m => [m.role, m.content]), [
+    ["system", "来自 跑测试（completed）：2 failures"], ["system", "发给 跑测试（submitted）：Run lint"]]);
+  state = projectEvent(state, { type: "history", session_id: "s", messages: [{ role: "system", content: "PEER ← 跑测试 · submitted · mac:t-3\nHi" }] });
+  assert.equal(state.messages[0].role, "system");
+});

@@ -12,7 +12,7 @@ import {
 
 assert.deepEqual(
   slashCommandSuggestions("/").map((item) => item.command),
-  ["/image", "/bar", "/minimal", "/sip", "/reset", "/compress", "/undo", "/retry", "/changes", "/think", "/model", "/mode", "/connect", "/persona", "/search", "/tool", "/gallery", "/memory", "/skills", "/learn", "/tools", "/browser", "/computer", "/conclave", "/appshot", "/tasks", "/budget", "/resume", "/cancel", "/goal", "/today", "/session", "/handoff", "/theme", "/timeline", "/health", "/doctor", "/diagnostics", "/maintenance", "/sandbox", "/vision-tiles", "/context-index", "/mcp", "/yolo", "/permissions", "/reload", "/reconnect", "/restart", "/wakeup", "/help"],
+  ["/image", "/bar", "/minimal", "/sip", "/reset", "/compress", "/undo", "/retry", "/changes", "/think", "/model", "/mode", "/connect", "/persona", "/search", "/tool", "/gallery", "/memory", "/skills", "/learn", "/tools", "/browser", "/computer", "/conclave", "/appshot", "/tasks", "/budget", "/resume", "/cancel", "/goal", "/today", "/session", "/handoff", "/theme", "/timeline", "/health", "/doctor", "/diagnostics", "/maintenance", "/sandbox", "/vision-tiles", "/context-index", "/mcp", "/yolo", "/permissions", "/reload", "/reconnect", "/restart", "/wakeup", "/peers", "/help"],
 );
 
 assert.deepEqual(
@@ -30,7 +30,7 @@ assert.deepEqual(
 
 assert.deepEqual(
   slashCommandSuggestions("/pe").map((item) => item.command),
-  ["/persona", "/permissions"],
+  ["/persona", "/permissions", "/peers"],
 );
 
 assert.deepEqual(
