@@ -7422,6 +7422,52 @@ def test_post_action_overlay_keeps_cause_without_repeating_input_or_observation(
     assert sum(name == "act" for name, _value in backend.calls) == 1
 
 
+def test_post_action_overlay_hands_over_to_the_popup_the_action_opened(
+    registry, manager, backend, monkeypatch,
+):
+    """Live WeChat 4.1: clicking its search box opened a list window over the main window."""
+    register(registry, manager)
+    registry.set_approval_handler(lambda _request: asyncio.sleep(0, result="once"))
+    focus(registry)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    original_apps = backend.apps
+    attempts = []
+
+    async def blocked(*_args, **_kwargs):
+        attempts.append("snapshot")
+        raise ComputerSessionError("overlay_blocked", "PRIVATE-OVERLAY-DETAIL")
+
+    async def with_popup():
+        catalog = await original_apps()
+        catalog.apps[0]["windows"].append({
+            "window_ref": "popup-ref", "title": "", "bindable": True, "binding_status": "ready",
+            "window_identity_ref": "popup-identity",
+            "bounds": {"x": 49, "y": 37, "width": 368, "height": 96},
+        })
+        return catalog
+
+    monkeypatch.setattr(backend, "snapshot", blocked)
+    monkeypatch.setattr(backend, "apps", with_popup)
+    result = run(registry.execute("computer_act", {
+        "snapshot_id": snapshot["snapshot_id"],
+        "actions": [{"type": "wait", "duration_ms": 0}],
+    }))
+    transition = result["details"]["window_transition"]
+    assert result["code"] == "post_action_observation_pending"
+    assert result["details"]["observation_error_code"] == "overlay_blocked"
+    assert transition["status"] == "new_window_observed"
+    assert transition["next_observation"] == {
+        "tool": "computer_get_app_state",
+        "arguments": {"app_ref": "app-1", "window_ref": "popup-ref"},
+    }
+    assert "new window" in result["recovery_hint"] and "Do not repeat" in result["recovery_hint"]
+    assert result["computer_receipt"]["replay"] == "forbidden"
+    assert "PRIVATE-OVERLAY-DETAIL" not in json.dumps(result)
+    # Neither the input nor the covered target's observation is repeated.
+    assert attempts == ["snapshot"]
+    assert sum(name == "act" for name, _value in backend.calls) == 1
+
+
 @pytest.mark.parametrize("native_result", [
     None, {}, {"outcomes": [], "last_acknowledged_action": -1},
     {"outcomes": [{"index": 7, "ok": True}], "last_acknowledged_action": 0},

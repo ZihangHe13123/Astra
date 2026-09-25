@@ -3120,7 +3120,7 @@ def register_computer_tools(
                 )
                 _runtime_takeover_event("foreground_takeover_end", decision)
 
-        async def recover_window_transition(deadline: float, *, action_result=None):
+        async def recover_window_transition(deadline: float, *, action_result=None, reobserve: bool = True):
             nonlocal recovery_catalog_attempted
             if not before_identity:
                 return None
@@ -3131,7 +3131,8 @@ def register_computer_tools(
                         if before_authority != observation_authority_generation:
                             return None
                         may_reobserve = (
-                            before_binding is not None
+                            reobserve
+                            and before_binding is not None
                             and manager.snapshot_target_binding == before_binding
                             and _fully_acknowledged_action_batch(action_result, len(normalized))
                         )
@@ -3395,6 +3396,38 @@ def register_computer_tools(
                 else ComputerErrorCode.UNKNOWN_OUTCOME.value
             )
             cause = {"observation_error_code": observation_code} if observation_code else {}
+            covering = None
+            if observation_code == ComputerErrorCode.OVERLAY_BLOCKED.value:
+                # A popup the action opened (a menu, dropdown or search list; live WeChat 4.1:
+                # the search box's list) is a window of its own: hand over to it instead of
+                # stopping at the parent it covers. Neither the input nor the covered target's
+                # observation is repeated.
+                covering = await recover_window_transition(
+                    observation_deadline, action_result=result.result, reobserve=False,
+                )
+                if (
+                    isinstance(covering, Mapping)
+                    and covering.get("status") == "new_window_observed"
+                    and covering.get("next_observation")
+                ):
+                    return _failure(
+                        failure_code,
+                        ("Input dispatch is acknowledged. " if acknowledged else "")
+                        + "The action opened a new window of this application over the target.",
+                        retryable=False,
+                        recovery_hint=(
+                            "Do not repeat this action batch. Observe the new window with the "
+                            "window_transition refs through normal observation approval, then act "
+                            "inside it or use its observed dismissal control. The previous target "
+                            "stays covered until that window closes; then refresh computer_apps."
+                        ),
+                        details={
+                            "observation_status": "post_action_observation_pending",
+                            **cause,
+                            "action_result": _model_action_metadata(result.result),
+                            "window_transition": dict(covering),
+                        },
+                    )
             if observation_code in {
                 ComputerErrorCode.WINDOW_CONTENT_UNAVAILABLE.value,
                 ComputerErrorCode.OVERLAY_BLOCKED.value,
@@ -3402,6 +3435,11 @@ def register_computer_tools(
                 unavailable = _application_failure(ComputerError(
                     ComputerErrorCode(observation_code), "",
                 ))
+                # The covered target itself is no next observation while the overlay stays.
+                windows = (
+                    {"window_transition": {k: v for k, v in covering.items() if k != "next_observation"}}
+                    if isinstance(covering, Mapping) else {}
+                )
                 return _failure(
                     failure_code,
                     ("Input dispatch is acknowledged. " if acknowledged else "") + unavailable.message,
@@ -3411,6 +3449,7 @@ def register_computer_tools(
                         "observation_status": "post_action_observation_pending",
                         **cause,
                         "action_result": _model_action_metadata(result.result),
+                        **windows,
                     },
                 )
             recovery = (
