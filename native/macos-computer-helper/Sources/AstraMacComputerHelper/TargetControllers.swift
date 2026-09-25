@@ -478,6 +478,7 @@ enum PopupPointerProofFailureStage: String, CaseIterable {
     case hitInvalidInput = "hit_invalid_input"
     case hitSystemTimeout = "hit_system_timeout"
     case hitRead = "hit_read"
+    case hitNotImplemented = "hit_not_implemented"
     case hitPID = "hit_pid"
     case hitAncestorTimeout = "hit_ancestor_timeout"
     case hitWindowMismatch = "hit_window_mismatch"

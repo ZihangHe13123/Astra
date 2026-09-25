@@ -255,3 +255,24 @@ import Testing
     #expect(bounded.contains("candidate_alpha=unavailable"))
     #expect(bounded.contains("dx=unavailable"))
 }
+
+@Test func windowServerRoutingProvesOnlyAPointTheAppCannotHitTest() {
+    let routedToTarget: (windowID: CGWindowID, pid: pid_t)? = (windowID: 24, pid: 42)
+    // Live WeChat 4.1: every hit test answers kAXErrorNotImplemented; the window server then decides.
+    #expect(windowServerRoutingProvesPoint(hitFailure: .hitNotImplemented, routed: routedToTarget,
+                                           targetWindowID: 24, targetPID: 42))
+    // A mouse-down reaching another window, another process's window, or nothing is refused.
+    #expect(!windowServerRoutingProvesPoint(hitFailure: .hitNotImplemented, routed: (windowID: 25, pid: 42),
+                                            targetWindowID: 24, targetPID: 42))
+    #expect(!windowServerRoutingProvesPoint(hitFailure: .hitNotImplemented, routed: (windowID: 24, pid: 43),
+                                            targetWindowID: 24, targetPID: 42))
+    #expect(!windowServerRoutingProvesPoint(hitFailure: .hitNotImplemented, routed: nil,
+                                            targetWindowID: 24, targetPID: 42))
+    // Every other hit-test failure stays final, even where the window server agrees.
+    for failure in PopupPointerProofFailureStage.allCases where failure != .hitNotImplemented {
+        #expect(!windowServerRoutingProvesPoint(hitFailure: failure, routed: routedToTarget,
+                                                targetWindowID: 24, targetPID: 42))
+    }
+    #expect(!windowServerRoutingProvesPoint(hitFailure: nil, routed: routedToTarget,
+                                            targetWindowID: 24, targetPID: 42))
+}

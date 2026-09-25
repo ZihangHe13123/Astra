@@ -4651,8 +4651,12 @@ func foregroundPointAccepted(_ point: CGPoint, pid: pid_t, target: WindowTarget)
         return false
     }
     var failure: PopupPointerProofFailureStage?
-    guard foregroundPointBelongsToWindow(point, pid: pid, window: target.axElement, onFailure: { failure = $0 }) else {
-        return reject(failure?.rawValue ?? "unknown")
+    if !foregroundPointBelongsToWindow(point, pid: pid, window: target.axElement, onFailure: { failure = $0 }) {
+        let routed = failure == .hitNotImplemented ? mouseDownRoutedWindow(at: point) : nil
+        guard windowServerRoutingProvesPoint(hitFailure: failure, routed: routed,
+                                             targetWindowID: target.windowID, targetPID: pid)
+        else { return reject(failure?.rawValue ?? "unknown") }
+        logActionRejected("FG-POINT-ROUTED pid=\(pid) windowID=\(target.windowID)")
     }
     guard !livePassiveOverlayRegions(pid: pid, windowID: target.windowID, root: target.axElement)
         .contains(where: { $0.contains(point) }) else { return reject("passive_overlay") }

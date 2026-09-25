@@ -131,8 +131,10 @@ func foregroundPointBelongsToWindow(
     let system = AXUIElementCreateSystemWide()
     guard AXUIElementSetMessagingTimeout(system, 0.2) == .success else { return reject(.hitSystemTimeout) }
     var hit: AXUIElement?
-    guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &hit) == .success,
-          var current = hit else { return reject(.hitRead) }
+    let hitError = AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &hit)
+    guard hitError == .success, var current = hit else {
+        return reject(hitError == .notImplemented ? .hitNotImplemented : .hitRead)
+    }
     var owner: pid_t = 0
     guard AXUIElementGetPid(current, &owner) == .success, owner == pid else { return reject(.hitPID) }
     for _ in 0..<12 {
@@ -151,4 +153,37 @@ func foregroundPointBelongsToWindow(
         current = unsafeBitCast(parent, to: AXUIElement.self)
     }
     return reject(.hitDepth)
+}
+
+/// Some applications do not implement Accessibility hit testing at all: WeChat 4.1 answers
+/// kAXErrorNotImplemented at every point, so no click into it could be proven. Only then may the
+/// window server's own mouse-down routing prove the point; every other hit-test failure stays final.
+func windowServerRoutingProvesPoint(
+    hitFailure: PopupPointerProofFailureStage?,
+    routed: (windowID: CGWindowID, pid: pid_t)?,
+    targetWindowID: CGWindowID,
+    targetPID: pid_t
+) -> Bool {
+    guard hitFailure == .hitNotImplemented, let routed, targetWindowID > 0, targetPID > 0 else { return false }
+    return routed.windowID == targetWindowID && routed.pid == targetPID
+}
+
+/// The window a mouse-down at a global (top-left origin) point reaches as the window server routes
+/// it, past click-through surfaces such as the Dock's full-screen window. The query needs this
+/// process to be an AppKit application; it becomes one with the prohibited activation policy, so it
+/// can never take focus or appear in the Dock. Requests run on the main thread; anywhere else, nil.
+func mouseDownRoutedWindow(at point: CGPoint) -> (windowID: CGWindowID, pid: pid_t)? {
+    guard Thread.isMainThread, point.x.isFinite, point.y.isFinite else { return nil }
+    let number: Int = MainActor.assumeIsolated {
+        let application = NSApplication.shared
+        if application.activationPolicy() != .prohibited { _ = application.setActivationPolicy(.prohibited) }
+        let primaryHeight = CGDisplayBounds(CGMainDisplayID()).height
+        return NSWindow.windowNumber(at: NSPoint(x: point.x, y: primaryHeight - point.y), belowWindowWithWindowNumber: 0)
+    }
+    guard number > 0, number <= Int(UInt32.max),
+          let info = CGWindowListCopyWindowInfo([.optionIncludingWindow], CGWindowID(number)) as? [[String: Any]],
+          info.count == 1,
+          let owner = (info[0][kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+    else { return nil }
+    return (CGWindowID(number), owner)
 }
