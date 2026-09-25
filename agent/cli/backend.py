@@ -1308,7 +1308,11 @@ async def _main(startup_started: float):
         except PeerError as exc:
             raise ValueError(str(exc)) from None
         _peer_event("out", result["to"], result["task_id"], result["state"], text)
-        return json.dumps(result, ensure_ascii=False)
+        # Live 2026-09-25: the asker slept and polled peer_list for the reply, which can only
+        # arrive once its own turn ends, until the repeat guard stopped the turn.
+        return json.dumps({**result, "next": f"Sent to {result['to']}. Its reply arrives here as a new turn after "
+                           "this turn ends, so finish this turn now and tell the user what you asked. Do not wait, "
+                           "sleep or poll peer_list for it."}, ensure_ascii=False)
 
     async def _peer_task_update(task_id: str, state: str, text: str = "") -> str:
         link = _peer()
@@ -1321,7 +1325,9 @@ async def _main(startup_started: float):
 
     tools.register(ToolDef(
         name="peer_list",
-        description="List the other Astra sessions open on this computer (name, peer_id, idle or busy, workspace) and this session's open tasks with them.",
+        description=("List the other Astra sessions open on this computer (name, peer_id, idle or busy, workspace) and "
+                     "this session's open tasks with them. Not a way to wait for a reply: replies arrive as a new turn "
+                     "once this turn ends."),
         parameters={"type": "object", "properties": {}}, fn=_peer_list, cache_results=False,
         idempotent=True, parallel_safe=True,
     ))
@@ -1331,8 +1337,9 @@ async def _main(startup_started: float):
                      "Without task_id this opens a task for the session named in `to` (name or peer_id from peer_list) "
                      "and returns its task_id; that session works on it with its own tools and context, and its replies "
                      "arrive here as a new turn. With task_id it sends a follow-up or answers the task's input-required "
-                     "question. Use it when another session's work or context helps the user's request; never for thanks "
-                     "or acknowledgements."),
+                     "question. Replies can only arrive after this turn ends, so after sending, finish the turn and tell "
+                     "the user what you asked; do not wait, sleep or poll for the reply. Use it when another session's "
+                     "work or context helps the user's request; never for thanks or acknowledgements."),
         parameters={"type": "object", "properties": {
             "text": {"type": "string", "maxLength": 20000},
             "to": {"type": "string", "maxLength": 200},

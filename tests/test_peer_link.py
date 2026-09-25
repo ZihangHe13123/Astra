@@ -45,6 +45,8 @@ def test_a_task_round_trip_follows_a2a_states(pair):
     assert tests.claim_inbox() == []  # each message is handed out once
     tests.release([given])  # a turn that could not start leaves its mail unread
     assert [m["seq"] for m in tests.claim_inbox()] == [given["seq"]]
+    # Taking the mail is starting on it: the asker sees working, not an untouched task.
+    assert [(t["task_id"], t["state"]) for t in ppt.tasks()] == [(task_id, "working")]
 
     tests.update(task_id, "input-required", "All of them, or only tests/unit?")
     [question] = ppt.claim_inbox()

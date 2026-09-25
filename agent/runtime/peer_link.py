@@ -289,6 +289,12 @@ class PeerLink:
             if rows:
                 db.execute(f"UPDATE peer_messages SET delivered_at=? WHERE seq IN ({','.join('?' * len(rows))})",
                            (self.clock(), *[r["seq"] for r in rows]))
+                # Taking a new task's mail is starting on it: the asker sees working, not a task nobody
+                # has picked up (live 2026-09-25: the asker polled a task the other session was doing).
+                taken = sorted({r["task_id"] for r in rows if r["assignee"] == self.peer_id})
+                if taken:
+                    db.execute(f"UPDATE peer_tasks SET state='working', updated_at=? WHERE state='submitted' "
+                               f"AND task_id IN ({','.join('?' * len(taken))})", (self.clock(), *taken))
         return [dict(r) for r in rows]
 
     def release(self, messages: list[dict]) -> None:
