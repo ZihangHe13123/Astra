@@ -844,6 +844,7 @@ final class Dispatcher {
         case WindowObservationError.axSerializationFailed:
             pair = ("helper_failed", "Accessibility tree preparation failed before artifact publication")
         default:
+            logActionRejected("observation_failure=\(observationFailureStage(error))")
             pair = ("helper_failed", "native window observation failed")
         }
         return Self.failure(requestID: requestID, message: pair.1, code: pair.0)
@@ -869,20 +870,7 @@ final class Dispatcher {
         default:
             // Keep the public transactional failure contract while retaining
             // bounded stage evidence locally; never log the raw exception.
-            switch error {
-            case WindowObservationError.axSerializationFailed:
-                logActionRejected("app_state_failure=ax_serialization")
-            case WindowObservationError.captureFailed:
-                logActionRejected("app_state_failure=capture")
-            case WindowObservationError.artifactPublisherFailed:
-                logActionRejected("app_state_failure=artifact_publisher")
-            case WindowObservationError.invalidCapturePath:
-                logActionRejected("app_state_failure=capture_path")
-            case WindowObservationError.displayUnavailable:
-                logActionRejected("app_state_failure=display")
-            default:
-                logActionRejected("app_state_failure=other")
-            }
+            logActionRejected("app_state_failure=\(observationFailureStage(error))")
             pair = (GetAppStateErrorCode.snapshotFailed.rawValue, "transactional target snapshot failed")
         }
         return Self.failure(requestID: requestID, message: pair.1, code: pair.0)

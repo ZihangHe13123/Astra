@@ -381,6 +381,8 @@ struct BackgroundSnapshotSession {
 
     func verifyFrontmost(_ currentPID: pid_t?) throws {
         guard let currentPID, currentPID == sentinelPID else {
+            logActionRejected("observation_validation=background_frontmost_changed sentinel=\(sentinelPID)"
+                + " current=\(currentPID.map(String.init) ?? "unknown")")
             throw WindowObservationError.targetNotFrontmost
         }
     }
@@ -796,24 +798,35 @@ final class LaunchServicesApplicationActivationController: ApplicationActivation
         runtime.unhide(pid: target.pid)
         let deadline = now().addingTimeInterval(timeout)
         var lastFrontmost: Bool?
+        // Which application the last check saw in front: "unknown" when it could not tell.
+        var lastFrontmostPID: pid_t??
         var lastSetFocused: Bool?
         var lastRaised: Bool?
         var lastFocusedMatch: Bool?
         var attempts = 0
+        var launches = 0
+        var launchFailures = 0
+        func targetIsFrontmost() -> Bool {
+            let pid = runtime.frontmostPID()
+            lastFrontmostPID = .some(pid)
+            return pid == target.pid
+        }
         while now() < deadline {
-            let frontmost = runtime.frontmostPID() == target.pid
+            let frontmost = targetIsFrontmost()
             lastFrontmost = frontmost
             if !frontmost {
+                launches += 1
                 if launchOnce(arguments: arguments, deadline: deadline) {
-                    guard waitForFrontmost(pid: target.pid, deadline: deadline) else { continue }
+                    guard waitForFrontmost(deadline: deadline, frontmost: targetIsFrontmost) else { continue }
                     lastFrontmost = true
                 } else {
+                    launchFailures += 1
                     waitUntilNextLaunch(deadline: deadline)
                     continue
                 }
             }
             while now() < deadline {
-                let currentlyFrontmost = runtime.frontmostPID() == target.pid
+                let currentlyFrontmost = targetIsFrontmost()
                 lastFrontmost = currentlyFrontmost
                 guard currentlyFrontmost else { break }
                 attempts += 1
@@ -827,7 +840,7 @@ final class LaunchServicesApplicationActivationController: ApplicationActivation
                 // not produce extra AX reads merely for diagnostics.
                 var focusedMatch: Bool?
                 if selected && raised {
-                    let stillFrontmost = runtime.frontmostPID() == target.pid
+                    let stillFrontmost = targetIsFrontmost()
                     lastFrontmost = stillFrontmost
                     if stillFrontmost { focusedMatch = runtime.focusedWindowMatches(target) }
                 }
@@ -842,12 +855,14 @@ final class LaunchServicesApplicationActivationController: ApplicationActivation
         func value(_ flag: Bool?) -> String {
             flag.map { $0 ? "true" : "false" } ?? "not_checked"
         }
+        let seenFrontmost = lastFrontmostPID.map { $0.map(String.init) ?? "unknown" } ?? "not_checked"
         diagnostic(
             "ACTIVATE-FAIL pid=\(target.pid) windowID=\(target.windowID)"
                 + " attempts=\(attempts) frontmost=\(value(lastFrontmost))"
                 + " setFocusedWindow=\(value(lastSetFocused))"
                 + " raiseWindow=\(value(lastRaised))"
                 + " focusedWindowMatches=\(value(lastFocusedMatch))"
+                + " lastFrontmostPID=\(seenFrontmost) launches=\(launches) launchFailures=\(launchFailures)"
         )
         throw WindowObservationError.targetNotFrontmost
     }
@@ -875,7 +890,7 @@ final class LaunchServicesApplicationActivationController: ApplicationActivation
         while now() < deadline {
             if runtime.frontmostPID() == pid { return }
             if launchOnce(arguments: arguments, deadline: deadline) {
-                if waitForFrontmost(pid: pid, deadline: deadline) { return }
+                if waitForFrontmost(deadline: deadline, frontmost: { runtime.frontmostPID() == pid }) { return }
             } else {
                 waitUntilNextLaunch(deadline: deadline)
             }
@@ -895,13 +910,13 @@ final class LaunchServicesApplicationActivationController: ApplicationActivation
         return true
     }
 
-    private func waitForFrontmost(pid: pid_t, deadline: Date) -> Bool {
+    private func waitForFrontmost(deadline: Date, frontmost: () -> Bool) -> Bool {
         let settleDeadline = min(
             deadline,
             now().addingTimeInterval(activationSettleInterval)
         )
         while now() < settleDeadline {
-            if runtime.frontmostPID() == pid { return true }
+            if frontmost() { return true }
             let delay = min(retryInterval, settleDeadline.timeIntervalSince(now()))
             if delay > 0 { sleep(delay) }
         }

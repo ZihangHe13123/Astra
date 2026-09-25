@@ -208,6 +208,63 @@ import Testing
     #expect(!lines[0].contains("Document"))
 }
 
+@Test func activationFailureNamesTheApplicationSeenInFrontAndEveryLaunch() {
+    let target = activationTarget()
+    // The launch succeeds but another application (999) stays in front: the live WeChat shape.
+    let runtime = ActivationRuntimeSpy(
+        identity: ApplicationLaunchIdentity(bundleURL: nil, localizedName: "Test"),
+        expected: target
+    )
+    let clock = ActivationTestClock()
+    var lines: [String] = []
+    let launcher = ProcessLauncherSpy()
+    let controller = LaunchServicesApplicationActivationController(
+        runtime: runtime,
+        launcher: launcher,
+        now: { clock.now() },
+        sleep: { clock.sleep($0) },
+        diagnostic: { lines.append($0) },
+        timeout: 1,
+        retryInterval: 0.05,
+        activationSettleInterval: 0.3
+    )
+
+    expectTargetNotFrontmost { try controller.activate(target) }
+
+    #expect(lines.count == 1)
+    #expect(lines[0].contains("attempts=0 frontmost=false"))
+    #expect(lines[0].contains("lastFrontmostPID=999 launches=\(launcher.invocations.count) launchFailures=0"))
+    #expect(launcher.invocations.count > 1)
+}
+
+@Test func activationFailureCountsRefusedLaunches() {
+    let target = activationTarget()
+    let runtime = ActivationRuntimeSpy(
+        identity: ApplicationLaunchIdentity(bundleURL: nil, localizedName: "Test"),
+        expected: target
+    )
+    let clock = ActivationTestClock()
+    var lines: [String] = []
+    let launcher = ProcessLauncherSpy(status: 1)
+    let controller = LaunchServicesApplicationActivationController(
+        runtime: runtime,
+        launcher: launcher,
+        now: { clock.now() },
+        sleep: { clock.sleep($0) },
+        diagnostic: { lines.append($0) },
+        timeout: 1,
+        retryInterval: 0.05,
+        activationSettleInterval: 0.3
+    )
+
+    expectTargetNotFrontmost { try controller.activate(target) }
+
+    let launches = launcher.invocations.count
+    #expect(launches > 1)
+    #expect(lines.count == 1)
+    #expect(lines[0].contains("launches=\(launches) launchFailures=\(launches)"))
+}
+
 @Test func activationFailureLogsSkippedFocusedMatchAfterSetRefusal() {
     let target = activationTarget()
     let runtime = ActivationRuntimeSpy(

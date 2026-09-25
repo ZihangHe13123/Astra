@@ -260,6 +260,25 @@ enum WindowObservationError: Error {
     case observationTimedOut
 }
 
+/// A bounded label for the local diagnostics log: which failure, never its message.
+func observationFailureStage(_ error: Error) -> String {
+    switch error {
+    case WindowObservationError.axSerializationFailed: return "ax_serialization"
+    case WindowObservationError.captureFailed: return "capture"
+    case WindowObservationError.artifactPublisherFailed: return "artifact_publisher"
+    case WindowObservationError.invalidCapturePath: return "capture_path"
+    case WindowObservationError.displayUnavailable: return "display"
+    case WindowObservationError.targetNotFrontmost: return "target_not_frontmost"
+    case WindowObservationError.invalidScope: return "invalid_scope"
+    case WindowObservationError.capturePublicationUncertain: return "capture_publication_uncertain"
+    case WindowObservationError.artifactQuotaExceeded: return "artifact_quota"
+    default:
+        // A Swift error bridges to its type name and case number.
+        let bridged = error as NSError
+        return "other domain=\(bridged.domain.prefix(96)) code=\(bridged.code)"
+    }
+}
+
 let applicationMenuBarMaximumDepth = 4
 
 enum PrimaryWindowCaptureError: Error { case timedOut, contentMismatch }
@@ -1495,14 +1514,16 @@ final class SystemWindowObserver: WindowObserving {
         guard let artifactName else {
             throw WindowObservationError.invalidCapturePath
         }
-        let captured: SnapshotCaptureTransactionResult<Void> = try captureSnapshot(
-            target: target,
-            scope: scope,
-            artifactName: artifactName,
-            textDetail: textDetail,
-            subtree: subtree,
-            prepareCommit: { _ in SnapshotFinalCommit(result: (), commit: {}) }
-        )
+        let captured: SnapshotCaptureTransactionResult<Void> = try retryingBackgroundFocusChange(target) {
+            try captureSnapshot(
+                target: target,
+                scope: scope,
+                artifactName: artifactName,
+                textDetail: textDetail,
+                subtree: subtree,
+                prepareCommit: { _ in SnapshotFinalCommit(result: (), commit: {}) }
+            )
+        }
         snapshotSucceeded = true
         return captured.snapshot
         } catch {
@@ -1564,28 +1585,30 @@ final class SystemWindowObserver: WindowObserving {
         )
         let captured: SnapshotCaptureTransactionResult<AppStateObservation>
         do {
-            captured = try captureSnapshot(
-                target: candidate,
-                scope: scope,
-                artifactName: artifactName,
-                textDetail: textDetail,
-                prepareCommit: { snapshot in
-                    let observation = AppStateObservation(
-                        target: candidate,
-                        catalogGeneration: requestedGeneration,
-                        snapshot: snapshot
-                    )
-                    guard validGetAppStateResponse(
-                        result: observation.helperResultJSON,
-                        snapshot: snapshot,
-                        request: request
-                    ) else { throw WindowObservationError.captureFailed }
-                    return SnapshotFinalCommit(
-                        result: observation,
-                        commit: { self.targets[windowRef] = candidate }
-                    )
-                }
-            )
+            captured = try retryingBackgroundFocusChange(candidate) {
+                try captureSnapshot(
+                    target: candidate,
+                    scope: scope,
+                    artifactName: artifactName,
+                    textDetail: textDetail,
+                    prepareCommit: { snapshot in
+                        let observation = AppStateObservation(
+                            target: candidate,
+                            catalogGeneration: requestedGeneration,
+                            snapshot: snapshot
+                        )
+                        guard validGetAppStateResponse(
+                            result: observation.helperResultJSON,
+                            snapshot: snapshot,
+                            request: request
+                        ) else { throw WindowObservationError.captureFailed }
+                        return SnapshotFinalCommit(
+                            result: observation,
+                            commit: { self.targets[windowRef] = candidate }
+                        )
+                    }
+                )
+            }
         } catch WindowObservationError.targetGone {
             let current = try controller.select(appRef: appRef, windowRef: windowRef)
             _ = try resolveCatalogTarget(
@@ -1601,6 +1624,22 @@ final class SystemWindowObserver: WindowObserving {
         } catch {
             if !operationBudget.available { throw WindowObservationError.observationTimedOut }
             throw error
+        }
+    }
+
+    /// A background read fails closed when the front application changes, or the
+    /// window moves, while it runs. Both are ordinary while the user keeps working,
+    /// and nothing is published before final validation, so read once more.
+    private func retryingBackgroundFocusChange<Value>(
+        _ target: WindowTarget,
+        _ capture: () throws -> Value
+    ) throws -> Value {
+        do {
+            return try capture()
+        } catch WindowObservationError.targetNotFrontmost where target.interactionMode == .background {
+            try AXObservationBudget.current?.check()
+            logActionRejected("observation_retry=background_focus_changed")
+            return try capture()
         }
     }
 
@@ -1621,6 +1660,7 @@ final class SystemWindowObserver: WindowObserving {
         let backgroundFrontmostPID: pid_t?
         if target.interactionMode == .background {
             guard let frontmostPID = liveFrontmostPID() else {
+                logActionRejected("observation_validation=frontmost_unreadable")
                 throw WindowObservationError.targetNotFrontmost
             }
             backgroundFrontmostPID = frontmostPID

@@ -132,7 +132,10 @@ _SAFE_ACTION_ERRORS = {
     ComputerErrorCode.TARGET_GONE: "The selected application or window is no longer available.",
     ComputerErrorCode.OVERLAY_BLOCKED: "An overlay or uncertain occluding window blocks exact target binding. This is not evidence of expired references.",
     ComputerErrorCode.AX_WINDOW_UNMATCHED: "The window is present, but its Accessibility identity could not be matched uniquely. This is not evidence of expired references or a system prohibition on interaction.",
-    ComputerErrorCode.TARGET_NOT_FRONTMOST: "The selected window is no longer frontmost.",
+    ComputerErrorCode.TARGET_NOT_FRONTMOST: (
+        "The selected window is not frontmost. Either it could not be brought to the front "
+        "or another window took focus; this error does not say which."
+    ),
     ComputerErrorCode.STALE_SNAPSHOT: "The action snapshot is stale.",
     ComputerErrorCode.OUT_OF_BOUNDS: "The action target is outside the current window.",
     ComputerErrorCode.SECURE_TARGET: "The action targets a protected control and requires user handoff.",
