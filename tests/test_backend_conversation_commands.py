@@ -205,10 +205,12 @@ def test_failed_fixture_leave_reports_error_and_keeps_backend_usable(protocol, t
     _command(protocol, "/fixture private_test")
     protocol.send({"type": "message", "text": "keep this draft"})
     _completed_turn(protocol)
-    directory = tmp_path / "sessions/fixture"
-    parked = tmp_path / "fixture-backup"
-    directory.rename(parked)
-    directory.write_text("temporarily blocked", encoding="utf-8")
+    # Fail the leave's save in place by occupying the header's temporary name.
+    # The session directory cannot be moved aside: the open session holds its
+    # writer lease inside it, and Windows refuses to rename a directory while
+    # a file beneath it is open.
+    blocker = tmp_path / "sessions/fixture/private_test.header.tmp"
+    blocker.mkdir()
     try:
         boundary = len(protocol.seen)
         _command(protocol, "/fixture leave")
@@ -216,8 +218,7 @@ def test_failed_fixture_leave_reports_error_and_keeps_backend_usable(protocol, t
         assert any(e.get("type") == "mode_info" and e.get("mode") == "local" for e in turn)
         assert any(e.get("type") == "tool_result" and e.get("error") for e in turn)
     finally:
-        directory.unlink()
-        parked.rename(directory)
+        blocker.rmdir()
     _command(protocol, "/fixture leave")
     assert protocol.seen[-1]["type"] == "done"
 
