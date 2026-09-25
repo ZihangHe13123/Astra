@@ -890,8 +890,10 @@ final class ForegroundPlanExecutor {
             logActionRejected("FG-COMPAT-DENIED backend=other bundle=\(application.bundleIdentifier) v=\(application.version)")
             return stopped(cooperativeError: .backgroundActionUnsupported)
         } catch let error as ActionExecutionError {
+            logActionRejected("FG-PREFLIGHT error=\(error)")
             return stopped(error: error)
         } catch {
+            logActionRejected("FG-PREFLIGHT error=other")
             return stopped(error: .helperFailed)
         }
 
@@ -956,6 +958,11 @@ final class ForegroundPlanExecutor {
                 }
             }
             outcomes.append(contentsOf: result.outcomes)
+            if result.error != nil || result.cooperativeError != nil {
+                logActionRejected("FG-EXECUTE index=\(entry.sourceIndex) backend=\(entry.backend)"
+                    + " error=\(result.error.map { "\($0)" } ?? "none")"
+                    + " cooperative=\(result.cooperativeError.map { "\($0)" } ?? "none")")
+            }
             guard result.error == nil, result.cooperativeError == nil else {
                 let reportedError = priorNonWaitInputMayHaveStarted && observationFailed(result)
                     ? ActionExecutionError.unknownOutcome

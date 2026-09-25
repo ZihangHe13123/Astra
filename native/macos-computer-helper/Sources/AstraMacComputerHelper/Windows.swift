@@ -3326,9 +3326,7 @@ final class SystemWindowObserver: WindowObserving {
         virtualCursor.hide()
         let executor = PIDTargetedActionExecutor(
             poster: CGForegroundInputPoster(pointIsInTargetWindow: { point, pid in
-                foregroundPointBelongsToWindow(point, pid: pid, window: target.axElement) &&
-                    !livePassiveOverlayRegions(pid: pid, windowID: target.windowID, root: target.axElement)
-                        .contains { $0.contains(point) }
+                foregroundPointAccepted(point, pid: pid, target: target)
             }),
             compatibility: pidCompatibility,
             genericForegroundEnabled: true,
@@ -3355,9 +3353,7 @@ final class SystemWindowObserver: WindowObserving {
         )
         let keyboardExecutor = ForegroundKeyboardExecutor(
             poster: CGForegroundInputPoster(pointIsInTargetWindow: { point, pid in
-                foregroundPointBelongsToWindow(point, pid: pid, window: target.axElement) &&
-                    !livePassiveOverlayRegions(pid: pid, windowID: target.windowID, root: target.axElement)
-                        .contains { $0.contains(point) }
+                foregroundPointAccepted(point, pid: pid, target: target)
             }),
             compatibility: pidCompatibility,
             genericForegroundEnabled: true,
@@ -4647,6 +4643,22 @@ func focusedTextFieldFrame(app: AXUIElement, root: AXUIElement, pid: pid_t, targ
 
 /// Live rectangles over one window that bind but must not receive pointer input: this app's status
 /// strips and tooltips and, while `root` holds the focused text field, that field's suggestion lists.
+/// The last check before a pointer event is posted: the point must hit the exact retained window,
+/// outside the app's passive overlays. A refusal is stale_snapshot with nothing sent; name its stage.
+func foregroundPointAccepted(_ point: CGPoint, pid: pid_t, target: WindowTarget) -> Bool {
+    func reject(_ stage: String) -> Bool {
+        logActionRejected("FG-POINT-REJECT stage=\(stage) pid=\(pid) windowID=\(target.windowID)")
+        return false
+    }
+    var failure: PopupPointerProofFailureStage?
+    guard foregroundPointBelongsToWindow(point, pid: pid, window: target.axElement, onFailure: { failure = $0 }) else {
+        return reject(failure?.rawValue ?? "unknown")
+    }
+    guard !livePassiveOverlayRegions(pid: pid, windowID: target.windowID, root: target.axElement)
+        .contains(where: { $0.contains(point) }) else { return reject("passive_overlay") }
+    return true
+}
+
 func livePassiveOverlayRegions(pid: pid_t, windowID: CGWindowID, root: AXUIElement?) -> [CGRect] {
     let records = systemVisibleWindowRecords()
     guard let target = records.first(where: { $0.pid == pid && $0.windowID == windowID }) else { return [] }
