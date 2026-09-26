@@ -119,7 +119,8 @@ def setup_source(install: Installation, extras: list[str], *, repair: bool = Fal
     with exclusive(install):
         services = ServiceMaintenance(install)
         preflight(install, allowed_pids=services.allowed_pids)
-        dependencies.check_node(install.root)
+        dependencies.check_node(install.root, gui=gui or dependencies.gui_enabled(install))
+        dependencies.npm_command()
         dependencies.ensure_uv(install)
         selected = dependencies.enabled_extras(install, extras)
         ready = not repair and dependencies.is_ready(install) and selected == install.metadata.get("extras")

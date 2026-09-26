@@ -100,9 +100,12 @@ class LocalChanges:
         self.remote_paths = sorted(name for name in self.base.keys() | self.incoming.keys()
                                    if self.base.get(name) != self.incoming.get(name))
         for name in self.remote_paths:
-            generated = tuple(f"{ui}/{part}/" for ui in ("ui-tui", "ui-core", "ui-gui") for part in ("node_modules", "dist"))
-            private = (name == ".env" or name.startswith((".sessions/", ".venv/", *generated))
-                       or (name.startswith(".astra/") and not name.startswith(".astra/skills/")))
+            # Reserve aliases on every platform: a source tree prepared on Linux
+            # must not overwrite private state on Windows/default macOS volumes.
+            normalized = name.casefold()
+            generated = tuple(f"{ui}/{part}" for ui in ("ui-tui", "ui-core", "ui-gui") for part in ("node_modules", "dist"))
+            private = (normalized == ".env" or any(_overlaps(normalized, part) for part in (".sessions", ".venv", *generated))
+                       or (_overlaps(normalized, ".astra") and not normalized.startswith(".astra/skills/")))
             if private:
                 raise LauncherError(f"Incoming source changes target private/generated state at {name!r}. "
                                     "Resolve the upstream contents before updating; user data was preserved.")

@@ -232,7 +232,8 @@ def update_source(install: Installation, *, check: bool = False, recover: bool =
                     return receipt(install, outcome="current", before=before, target=target)
         # Resolve required tooling before moving any environment or source file.
         dependencies.uv_command(install)
-        dependencies.check_node(install.root)
+        dependencies.check_node(install.root, gui=dependencies.gui_enabled(install))
+        dependencies.npm_command()
         extras = dependencies.enabled_extras(install)
         plan = environment_plan(install, before, target, repair, local.paths)
         # Include the shared package on upgrades that introduce it, before it

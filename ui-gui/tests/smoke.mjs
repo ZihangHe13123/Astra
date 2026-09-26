@@ -265,10 +265,12 @@ try {
  assert.ok(firstFinishedGoal,'the ordered fixture starts a successful reader before the intentional failure');
  await page.waitForFunction(goal=>window.__delegateEvents.some(event=>event.goal===goal&&event.current_tool==='read_file'),firstFinishedGoal);
  const delegateBounds=await app.evaluate(({BrowserWindow})=>{
-   const window=BrowserWindow.getAllWindows()[0];const bounds=window.getBounds();window.setBounds({...bounds,width:1320,height:820});return bounds;
+   // Layout assertions measure the web contents, not native window borders.
+   // Windows setBounds(1320) leaves innerWidth smaller than 1320.
+   const window=BrowserWindow.getAllWindows()[0];const bounds=window.getBounds();window.setContentSize(1320,820);return bounds;
  });
  await page.waitForFunction(()=>innerWidth===1320); await page.screenshot({path:join(output,'delegates-running-1320.png')});
- await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setBounds({width:1000,height:820}));
+ await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setContentSize(1000,820));
  await page.waitForFunction(()=>innerWidth===1000); await page.screenshot({path:join(output,'delegates-running-1000.png')});
  await app.evaluate(({BrowserWindow},bounds)=>BrowserWindow.getAllWindows()[0].setBounds(bounds),delegateBounds);
  passed('three independent delegate cards show two running and one queued at 1320px and 1000px');
@@ -360,7 +362,7 @@ try {
  assert.match(await suggestions.getByRole('option').first().innerText(),/\/bar leave/);
  await composerInput.fill('/minimal'); await page.getByText('先执行 /bar leave 返回通用模式',{exact:true}).waitFor();
  await composerInput.fill('/bar ');
- await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setSize(1000,700));
+ await app.evaluate(({BrowserWindow})=>BrowserWindow.getAllWindows()[0].setContentSize(1000,700));
  await page.waitForFunction(()=>innerWidth===1000);
  const suggestionBounds=await page.locator('.command-suggestions').boundingBox();
  assert.ok(suggestionBounds.y>=58&&suggestionBounds.x>=0&&suggestionBounds.x+suggestionBounds.width<=1000);
@@ -424,7 +426,7 @@ try {
  await page.waitForFunction(id=>[...document.querySelectorAll('[data-message-id]')].find(el=>el.dataset.messageId===id)?.querySelector('details')?.open,reasoningId);
  passed('reasoning expansion survives leaving and reentering the virtual message window');
  const priorBounds=await app.evaluate(({BrowserWindow})=>{
-   const window=BrowserWindow.getAllWindows()[0];const bounds=window.getBounds();window.setBounds({...bounds,width:1000,height:800});return bounds;
+   const window=BrowserWindow.getAllWindows()[0];const bounds=window.getBounds();window.setContentSize(1000,800);return bounds;
  });
  await page.waitForFunction(()=>innerWidth<=1100);
  await page.locator('.messages-scroll').evaluate(el=>{el.scrollTop=(el.scrollHeight-el.clientHeight)*.45;});

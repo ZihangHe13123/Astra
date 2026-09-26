@@ -10,7 +10,14 @@ or automatic stable-release download is available.
 
 ## First installation
 
-Install Python 3.11+, Node.js 18+ (including npm), and Git. Setup uses the
+Install Python 3.11+, Node.js 18+ for the TUI (including npm), and Git.
+The optional desktop GUI requires **Node.js 22.12.0+**, including subsequent
+updates and repairs once the GUI is enabled. Setup/update checks this before
+installing dependencies or pausing companion services. If Node is too old,
+upgrade to a supported Node.js LTS, open a new terminal (especially on Windows),
+check `node --version`, then retry `astra setup --gui --repair`.
+
+Setup uses the
 committed Python and Node dependency locks. If uv is missing, setup installs a
 private copy; it does not install Python packages globally. On Windows, the
 launcher runs in CMD or PowerShell; the agent's [Bash tool](execution.md#minimal-bash-environment)

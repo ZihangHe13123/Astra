@@ -70,7 +70,8 @@ def source(tmp_path, monkeypatch):
     (checkout / ".env").write_text("private configuration")
     monkeypatch.setattr(update, "legacy_processes", lambda install: [])
     monkeypatch.setattr(dependencies, "uv_command", lambda *args: "uv")
-    monkeypatch.setattr(dependencies, "check_node", lambda root: "22.0.0")
+    monkeypatch.setattr(dependencies, "npm_command", lambda: "npm")
+    monkeypatch.setattr(dependencies, "check_node", lambda root, **kwargs: "22.12.0")
     monkeypatch.setattr(dependencies, "python_health", lambda install: None)
     monkeypatch.setattr(dependencies, "validate", lambda install: None)
 

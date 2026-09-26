@@ -148,6 +148,8 @@ jobs:
           uv run --locked --no-sync python -m pytest -q
           --basetemp="${{ runner.temp }}/astra-launcher-pytest"
           tests/test_launcher.py tests/test_launcher_windows_bootstrap.py
+          tests/test_launcher_prerequisites.py tests/test_launcher_private_paths.py
+          tests/test_launcher_posix_bootstrap.py
           tests/test_launcher_services.py tests/test_launcher_service_launchd.py
           tests/test_launcher_service_windows.py tests/test_launcher_service_embedding.py
           tests/test_embedding_runtime.py tests/test_posix_scripts.py tests/test_auxiliary_scripts.py

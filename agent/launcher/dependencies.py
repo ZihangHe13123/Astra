@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -15,6 +16,8 @@ from .installation import Installation, runtime_environment
 
 PYTHON_PROBE = "import openai, yaml, httpx, mcp, opentelemetry, websockets, PIL"
 LOCK_FILES = ("pyproject.toml", "uv.lock", "ui-tui/package.json", "ui-tui/package-lock.json")
+TUI_NODE_MIN_VERSION = (18, 0, 0)
+GUI_NODE_MIN_VERSION = (22, 12, 0)
 
 
 def gui_enabled(install: Installation) -> bool:
@@ -66,8 +69,7 @@ def gui_ready(install: Installation) -> bool:
 
 
 def gui_health(install: Installation) -> None:
-    run([node_command(), "-e", "const [a,b]=process.versions.node.split('.').map(Number);"
-         "if(a<22 || (a===22 && b<12)) { console.error('GUI requires Node.js 22.12 or newer'); process.exit(1); }"], cwd=install.root)
+    check_node(install.root, gui=True)
     gui_executable(install)
 
 
@@ -85,13 +87,25 @@ def gui_executable(install: Installation) -> str:
 def node_command() -> str:
     node = shutil.which("node")
     if not node:
-        raise LauncherError("Node.js 18 or newer is required. Install a supported Node.js LTS, then run astra setup.")
+        raise LauncherError("The Node.js executable was not found on PATH.")
     return node
 
 
-def check_node(root: Path) -> str:
-    return run([node_command(), "-e", "if(+process.versions.node.split('.')[0]<18)process.exit(1);"
-                "console.log(process.versions.node)"], cwd=root)
+def check_node(root: Path, *, gui: bool = False) -> str:
+    """Read-only prerequisite shared by setup, maintenance and health checks."""
+    minimum = GUI_NODE_MIN_VERSION if gui else TUI_NODE_MIN_VERSION
+    requirement = f"{'GUI' if gui else 'TUI'} requires Node.js {'.'.join(map(str, minimum))} or newer"
+    recovery = ("Install a supported Node.js LTS (including npm), open a new terminal, "
+                f"then run astra setup{' --gui' if gui else ''} --repair.")
+    try:
+        version = run([node_command(), "-p", "process.versions.node"], cwd=root, timeout=30)
+    except LauncherError as exc:
+        raise LauncherError(f"{requirement}. {exc} {recovery}") from exc
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise LauncherError(f"{requirement}; could not determine a stable Node.js version. {recovery}")
+    if tuple(map(int, version.split("."))) < minimum:
+        raise LauncherError(f"{requirement}; found {version}. {recovery}")
+    return version
 
 
 def node_health(install: Installation) -> None:
@@ -99,6 +113,13 @@ def node_health(install: Installation) -> None:
     if install.kind == "source":
         run([node_command(), "--input-type=module", "-e", "await import('react'); await import('ink'); await import('tsx');"],
             cwd=install.ui, timeout=60)
+
+
+def npm_command() -> str:
+    npm = shutil.which("npm.cmd" if os.name == "nt" else "npm")
+    if not npm:
+        raise LauncherError("npm is missing. Install it with Node.js, open a new terminal, then run astra setup.")
+    return npm
 
 
 def python_health(install: Installation) -> None:
@@ -176,10 +197,8 @@ def check_environment_ownership(install: Installation) -> None:
 
 def synchronize(install: Installation, extras: list[str], *, python: bool = True, node: bool = True, build: bool = True) -> None:
     uv = uv_command(install)
-    check_node(install.root)
-    npm = shutil.which("npm.cmd" if os.name == "nt" else "npm")
-    if not npm:
-        raise LauncherError("npm is missing. Install it with Node.js, then run astra setup.")
+    check_node(install.root, gui=gui_enabled(install))
+    npm = npm_command()
     env = dict(os.environ, UV_PROJECT_ENVIRONMENT=str(install.root / ".venv"))
     env.pop("VIRTUAL_ENV", None)
     # Explicit environment ownership; do not let inherited uv flags redirect installation.
@@ -238,7 +257,7 @@ def record_environment(install: Installation, extras: list[str]) -> None:
     write_json(install.control / "environment.json", {
         "schema": 1, "root": str(install.root), "fingerprint": fingerprint(install), "extras": extras,
         "python": run([str(install.python), "-c", "import sys;print(sys.version.split()[0])"], cwd=install.root),
-        "node": check_node(install.root),
+        "node": check_node(install.root, gui=gui_enabled(install)),
     })
     if gui_enabled(install):
         write_json(install.control / "gui-environment.json", {
@@ -267,9 +286,9 @@ def diagnostics(install: Installation) -> dict:
             problems.append({"component": "environment", "message": str(exc)})
         if gui_enabled(install):
             try:
+                gui_health(install)
                 if not gui_ready(install):
                     raise LauncherError("Desktop dependencies are unverified or changed. Run astra setup --gui.")
-                gui_health(install)
             except LauncherError as exc:
                 problems.append({"component": "gui", "message": str(exc)})
         report["gui"] = {"enabled": gui_enabled(install),

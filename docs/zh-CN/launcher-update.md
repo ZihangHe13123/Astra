@@ -10,7 +10,9 @@
 
 ## 首次安装
 
-先安装 Python 3.11+、Node.js 18+（含 npm）和 Git。安装使用仓库锁定的 Python 与 Node 依赖；缺少 uv 时会安装私有副本，不向全局 Python 环境安装包。Windows 启动器可在 CMD 或 PowerShell 中运行，Agent 的 [Bash 工具](execution.md#minimal-bash-environment)另行使用 WSL。
+先安装 Python 3.11+、终端界面所需的 Node.js 18+（含 npm）和 Git。可选桌面 GUI 需要 **Node.js 22.12.0+**；启用 GUI 后，更新和修复也使用这个要求。安装器会在安装依赖或暂停配套服务之前检查版本。版本不足时，升级到受支持的 Node.js LTS，打开新终端（Windows 尤其需要），用 `node --version` 确认后重试 `astra setup --gui --repair`。
+
+安装使用仓库锁定的 Python 与 Node 依赖；缺少 uv 时会安装私有副本，不向全局 Python 环境安装包。Windows 启动器可在 CMD 或 PowerShell 中运行，Agent 的 [Bash 工具](execution.md#minimal-bash-environment)另行使用 WSL。
 
 Windows：
 
