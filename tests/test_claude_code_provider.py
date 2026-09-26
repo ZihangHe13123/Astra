@@ -10,11 +10,12 @@ import pytest
 
 from agent.cli import connections, model_catalog, provider_connections
 from agent.runtime import claude_code_provider as ccp
-from agent.runtime.claude_code_provider import ClaudeCodeError, ClaudeCodeProvider
-from agent.runtime.llm import LLMConfig, LLMIdleTimeout, LLMResponseError
+from agent.runtime.claude_code_provider import ClaudeCodeError, ClaudeCodeProvider, workspace as cli_workspace
+from agent.runtime.llm import LLMConfig, LLMIdleTimeout
+from agent.runtime.process_env import pid_alive
 from agent.runtime.providers import DEFAULT_PROVIDER_REGISTRY
 
-FAKE_CLI = r'''#!__PYTHON__
+FAKE_CLI = r'''
 import json, os, sys, time
 record = {"argv": sys.argv[1:], "cwd": os.getcwd(), "pid": os.getpid(),
           "env": {k: v for k, v in os.environ.items() if k.startswith(("ANTHROPIC_", "CLAUDE", "MCP_", "ENABLE_TOOL_SEARCH"))}}
@@ -100,9 +101,17 @@ def fresh_provider_state(tmp_path, monkeypatch):
 
 @pytest.fixture
 def fake_cli(tmp_path, monkeypatch):
-    path = tmp_path / "claude"
-    path.write_text(FAKE_CLI.replace("__PYTHON__", sys.executable))
-    path.chmod(0o755)
+    path = tmp_path / "claude.py"
+    path.write_text(FAKE_CLI, encoding="utf-8")
+    spawn = asyncio.create_subprocess_exec
+
+    async def run_fake(command, *args, **kwargs):
+        # Windows cannot execute a shebang script; keep real pipes/processes on every OS.
+        if str(command) == str(path):
+            return await spawn(sys.executable, str(path), *args, **kwargs)
+        return await spawn(command, *args, **kwargs)
+
+    monkeypatch.setattr(ccp.asyncio, "create_subprocess_exec", run_fake)
     record = tmp_path / "record.json"
     monkeypatch.setenv("FAKE_CLAUDE_RECORD", str(record))
     return path, record
@@ -281,8 +290,7 @@ def test_idle_cli_is_stopped_with_its_process(fake_cli, monkeypatch):
     with pytest.raises(LLMIdleTimeout):
         collect(provider(command, idle_timeout=1.0).chat_stream(MESSAGES))
     pid = json.loads(record.read_text())["pid"]
-    with pytest.raises(ProcessLookupError):
-        os.kill(pid, 0)
+    assert not pid_alive(pid)
 
 
 def test_login_status_reads_only_the_cli_status(fake_cli):
@@ -414,12 +422,14 @@ def test_conversation_keeps_calls_valid_across_providers():
 
 
 def test_workspace_is_a_fixed_private_directory_outside_projects(tmp_path, monkeypatch):
-    monkeypatch.undo()
-    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    first, second = ccp.workspace(), ccp.workspace()
+    first, second = cli_workspace(), cli_workspace()
     assert first == second and Path(first).name == "claude-code" and Path(first).is_dir()
-    assert str(tmp_path) in first and (Path(first).stat().st_mode & 0o777) == 0o700
+    assert str(tmp_path) in first
+    if os.name != "nt":
+        assert (Path(first).stat().st_mode & 0o777) == 0o700
 
 
 @pytest.mark.parametrize("messages", [MESSAGES, HISTORY], ids=["single turn", "replayed history"])

@@ -117,14 +117,18 @@ async def login_status(command: str | None = None, timeout: float = 15) -> tuple
     command = command or claude_command()
     if command is None:
         return False, "Claude Code CLI not found. " + LOGIN_HINT
+    # A pending TUI read can lock an inherited Windows stdin pipe. This probe needs no input.
     process = await asyncio.create_subprocess_exec(
-        command, "auth", "status", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        command, "auth", "status", stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
         env=child_environment(), start_new_session=True)
     try:
         output, _ = await asyncio.wait_for(process.communicate(), timeout)
     except TimeoutError:
-        _terminate(process)
         return False, "Claude Code did not report its login status in time."
+    finally:
+        _terminate(process)
+        await process.wait()
     try:
         status = json.loads(output or b"{}")
     except ValueError:
@@ -139,13 +143,16 @@ async def login_status(command: str | None = None, timeout: float = 15) -> tuple
 def _terminate(process) -> None:
     if process.returncode is not None:
         return
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
+    if os.name != "nt":
         try:
-            process.kill()
-        except ProcessLookupError:
+            os.killpg(process.pid, signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError):
             pass
+    try:
+        process.kill()
+    except ProcessLookupError:
+        pass
 
 
 def _text(content) -> str:
