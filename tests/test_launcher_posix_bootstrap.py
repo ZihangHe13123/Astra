@@ -24,6 +24,15 @@ def shell_path(path):
     return f"/{value[0].lower()}{value[2:]}" if os.name == "nt" else value
 
 
+def caller_pwd(bash, directory):
+    """How Bash names a caller's working directory. Git Bash on Windows spells the temp
+    directory as its /tmp mount, not the drive path that shell_path builds."""
+    return subprocess.run(
+        [bash, "--noprofile", "--norc", "-c", 'printf "%s" "$PWD"'],
+        cwd=directory, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+    ).stdout
+
+
 def script(path, content):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("#!/bin/bash\n" + content, encoding="utf-8", newline="\n")
@@ -63,14 +72,15 @@ def invoke(bootstrap, override=None):
 
 @pytest.mark.parametrize("old_candidate", ["python3", "python3.11"])
 def test_unsupported_path_python_falls_back_to_supported_venv(bootstrap, old_candidate):
-    _, root, binaries = bootstrap
+    bash, root, binaries = bootstrap
     fake_python(binaries / old_candidate, "old", False)
     fake_python(root / ".venv/bin/python", "venv", True)
     result = invoke(bootstrap)
     assert result.returncode == 23, result.stdout + result.stderr
     lines = result.stdout.splitlines()
     assert lines[0] == "selected:venv"
-    assert lines[1] == shell_path(root.parent)
+    # Python runs in the caller's directory, spelled as that Bash spells it.
+    assert lines[1] == caller_pwd(bash, root.parent)
     assert lines[3:] == ["version", "two words", "中文", "literal!bang", "a & b"]
 
 
