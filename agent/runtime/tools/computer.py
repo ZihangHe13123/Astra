@@ -507,6 +507,23 @@ def _app_state_identity_failure(error: ComputerError, *, target_bound: bool = Tr
     )
 
 
+def _select_all_replacements(raw_actions) -> tuple[dict[str, Any], ...] | None:
+    """Browser fields and active input methods refuse native replacement before any input.
+
+    The documented route selects the bound field with command+a and types the new text; the
+    helper proves that exact field's focus before typing. None when nothing is to replace.
+    """
+    rewritten: list[dict[str, Any]] = []
+    for action in raw_actions:
+        if action.get("type") == "type" and action.get("replace") is True and action.get("element_ref"):
+            rewritten.append({"type": "keypress", "key": "a", "modifiers": ["command"],
+                              "element_ref": action["element_ref"]})
+            rewritten.append({key: value for key, value in action.items() if key != "replace"})
+        else:
+            rewritten.append(dict(action))
+    return tuple(rewritten) if len(rewritten) != len(raw_actions) else None
+
+
 def _plan_rejection_failure(
     exc: BaseException,
     *,
@@ -3973,13 +3990,35 @@ def register_computer_tools(
             # 新语义(2026-09-02, requires_active): foreground takeover 是独立显式
             # 授权路径, 不再要求先以 background 提交同一批动作; pending digest
             # 仅作可选的批次一致性校验(为空即跳过)。
+        async def plan_in(interaction_mode: ComputerInteractionMode) -> ComputerActionPlan:
+            try:
+                return await manager.plan_actions(
+                    snapshot_id, list(prepared.actions), interaction_mode=interaction_mode,
+                )
+            except HelperApplicationError as exc:
+                # A field that refuses native replacement is selected and typed into instead,
+                # before approval, so the grant and every batch_hash check cover this batch.
+                rewritten = (
+                    _select_all_replacements(prepared.raw_actions)
+                    if interaction_mode is ComputerInteractionMode.FOREGROUND_TAKEOVER
+                    and exc.error.code is ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED
+                    else None
+                )
+                if rewritten is None:
+                    raise
+                try:
+                    actions = tuple(ComputerAction.from_mapping(action) for action in rewritten)
+                    replanned = await manager.plan_actions(
+                        snapshot_id, list(actions), interaction_mode=interaction_mode,
+                    )
+                except Exception:  # noqa: BLE001 - report the original, documented refusal
+                    raise exc from None
+                prepared.raw_actions, prepared.actions = rewritten, actions
+                return replanned
+
         try:
             try:
-                plan = await manager.plan_actions(
-                    snapshot_id,
-                    list(prepared.actions),
-                    interaction_mode=mode,
-                )
+                plan = await plan_in(mode)
             except HelperApplicationError as exc:
                 # Only a typed, pre-input rejection can preserve this exact
                 # snapshot for one foreground plan. Transport loss never does.
@@ -3992,7 +4031,7 @@ def register_computer_tools(
             if automatic and (plan is None or plan.requires_takeover):
                 mode = ComputerInteractionMode.FOREGROUND_TAKEOVER
                 prepared.mode = mode
-                plan = await manager.plan_actions(snapshot_id, list(prepared.actions), interaction_mode=mode)
+                plan = await plan_in(mode)
             assert plan is not None
         except asyncio.CancelledError:
             prepared_acts.pop(call_id, None)

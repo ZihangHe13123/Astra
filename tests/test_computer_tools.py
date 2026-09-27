@@ -4950,6 +4950,49 @@ def test_refused_replacement_recommends_select_all_and_typing(registry, manager,
     assert not any(name in {"takeover_begin", "act"} for name, _ in backend.calls)
 
 
+def test_refused_replacement_is_selected_and_typed_under_the_same_approval(registry, manager, backend, monkeypatch):
+    """Live Edge 2026-09-26: an address bar refused native replacement three times, costing a round
+    trip each. The tool now selects the bound field and types, the route its refusal documents."""
+    from agent.runtime.macos_computer import HelperApplicationError
+
+    backend.snapshot_ax_tree_override = {"role": "AXWindow",
+        "observation_capabilities": ["replace_text_v1", "auto_takeover_v1"],
+        "children": [{"role": "AXTextField", "element_ref": "snapshot-1:field", "label": "Address",
+                      "value": "old", "bounds": {"x": 10, "y": 10, "width": 50, "height": 20}}]}
+    original_plan = backend.plan_actions
+    planned = []
+
+    async def refuse_native_replacement(target, snapshot_id, actions, interaction_mode):
+        planned.append([action.to_mapping() for action in actions])
+        if any(action.replace for action in actions):
+            raise HelperApplicationError(ComputerError(
+                ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED, "the action batch is unsafe"))
+        return await original_plan(target, snapshot_id, actions, interaction_mode)
+
+    monkeypatch.setattr(backend, "plan_actions", refuse_native_replacement)
+    monkeypatch.setattr("agent.runtime.tools.computer.enabled_pid_actions", lambda *_: frozenset({"press", "text"}))
+    requests = []
+
+    async def approve(request):
+        requests.append(request)
+        return "once"
+
+    registry.set_approval_handler(approve)
+    register(registry, manager)
+    focus(registry)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    result = run(registry.execute("computer_act", {"snapshot_id": snapshot["snapshot_id"],
+        "actions": [{"type": "type", "text": "example.com", "element_ref": "snapshot-1:field", "replace": True}]}))
+    assert not result.get("error"), result
+    select_all = {"type": "keypress", "key": "a", "modifiers": ["command"], "element_ref": "snapshot-1:field"}
+    typed = {"type": "type", "text": "example.com", "element_ref": "snapshot-1:field"}
+    # Background, then foreground refused the replacement; one more foreground plan selects and types.
+    assert len(planned) == 3 and planned[-1] == [select_all, typed]
+    [act] = [value for name, value in backend.calls if name == "act"]
+    assert act[1] == [select_all, typed]
+    assert len(requests) == 1  # one approval, for the batch that runs
+
+
 @pytest.mark.parametrize("approval", ["once", "deny"])
 def test_dialog_intent_activates_before_an_ordinary_ax_button_with_normal_approval(
     registry, manager, backend, monkeypatch, approval,
