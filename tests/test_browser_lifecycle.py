@@ -130,6 +130,42 @@ def test_release_rearms_router_and_unlocks_real_endpoint_for_other_owner(tmp_pat
     asyncio.run(scenario())
 
 
+def _file_request_from_other_window(endpoint):
+    import json
+    import os
+    import time
+    from agent.runtime.browser_control_transport import RELEASE_REQUEST
+    path = endpoint / RELEASE_REQUEST
+    path.write_text(json.dumps({"pid": os.getpid() + 1, "label": "跑测试", "at": time.time()}))
+    path.chmod(0o600)
+    return path
+
+
+def test_idle_owner_hands_the_endpoint_to_the_window_that_asked(tmp_path):
+    async def scenario():
+        endpoint = tmp_path / "endpoint"
+        router = BrowserBackendRouter(Backend(), lambda: ExtensionBrowserBackend(endpoint_dir=endpoint))
+        manager = BrowserSessionManager(tmp_path / "browser.db", router)
+        register_browser_tools(ToolRegistry(), manager=manager)
+        lifecycle = manager.lifecycle
+        await router._extension().transport.start()
+        # Nothing asked: the idle owner keeps the channel and its tabs; there is no idle timeout.
+        assert await lifecycle.hand_over_if_requested(busy=False) is None
+        request = _file_request_from_other_window(endpoint)
+        # A busy owner, or one with a browser operation in flight, keeps it too.
+        assert await lifecycle.hand_over_if_requested(busy=True) is None
+        async with lifecycle._operation_lock:
+            assert await lifecycle.hand_over_if_requested(busy=False) is None
+        assert router.extension.transport._lock_fd is not None and request.exists()
+        handed = await lifecycle.hand_over_if_requested(busy=False)
+        assert handed["label"] == "跑测试"
+        assert not request.exists() and router.extension is None
+        other = BrowserControlTransport(endpoint)
+        await other.start()  # the lock is free for the window that asked
+        await other.close()
+    asyncio.run(scenario())
+
+
 def test_local_browser_command_rejects_unknown_actions(tmp_path):
     registry, _ = setup(tmp_path)
     output, error = asyncio.run(execute_browser_command(["kill"], registry))

@@ -74,6 +74,7 @@ from agent.runtime.user_questions import UserQuestionBroker
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
 from agent.cli.session_lifecycle import ControlledRestart, RESTART_EXIT_CODE
 from agent.runtime.session_wakeup import SessionWakeups, visible_wakeup_history, wakeup_prompt
+from agent.runtime.browser_control_transport import set_owner_label_provider
 from agent.runtime.peer_link import (HEARTBEAT_SECONDS, PeerError, PeerLink, default_name, fallback_name,
                                      incoming_prompt)
 from agent.runtime.tools.code import register_code_tools
@@ -953,18 +954,18 @@ async def _main(startup_started: float):
             else llm_config.capabilities
         ),
     )
-    browser_backend = None
     chrome_path = find_chrome()
     if chrome_path:
-        browser_backend = CdpBrowserBackend(chrome_path)
-        browser_backend = register_browser_tools(tools, backend=browser_backend, enable_extension=True).backend
+        browser_manager = register_browser_tools(tools, backend=CdpBrowserBackend(chrome_path), enable_extension=True)
     else:
-        browser_backend = register_browser_tools(
+        browser_manager = register_browser_tools(
             tools,
             extract_fn=create_browser_extract_fn(),
             status_fn=create_browser_status_fn(),
             enable_extension=True,
-        ).backend
+        )
+    browser_backend = browser_manager.backend
+    browser_lifecycle = browser_manager.lifecycle
     browser_startup = getattr(browser_backend, 'startup', None)
     if callable(browser_startup):
         startup_result = browser_startup()
@@ -1276,6 +1277,15 @@ async def _main(startup_started: float):
         logger.exception("peer mailbox unavailable")
         peer_link = None
     peer_clock = {"heartbeat": 0.0, "inbox": 0.0}
+
+    def _window_name() -> str:
+        if peer_link is not None and peer_link.name:
+            return peer_link.name
+        return Path(agent.context.session_path).stem if agent.context.session_path else ""
+
+    # Other Astra windows name this one when it holds the browser channel.
+    set_owner_label_provider(_window_name)
+    browser_clock = {"handover": 0.0}
 
     def _peer() -> PeerLink:
         if peer_link is None or not peer_link.peer_id:
@@ -2354,12 +2364,31 @@ async def _main(startup_started: float):
                         _wakeup_event(status, status["summary"])
             if peer_link is not None:
                 await _peer_tick()
+            if browser_lifecycle is not None:
+                await _browser_handover_tick()
             await asyncio.sleep(0.25)
 
     def _turn_busy() -> bool:
         return (agent_turn_lock.locked() or appshot_admission.reserved
                 or (active_task is not None and not active_task.done())
                 or any(not task.done() for task in (*goal_tasks, *manual_reviews)))
+
+    async def _browser_handover_tick() -> None:
+        """Hand the browser channel to another Astra window that asked for it, while this one is idle."""
+        now = time.monotonic()
+        if now - browser_clock["handover"] < 0.5:
+            return
+        browser_clock["handover"] = now
+        try:
+            request = await browser_lifecycle.hand_over_if_requested(busy=_turn_busy())
+        except Exception:
+            logger.exception("browser handover failed")
+            return
+        if request:
+            window = request.get("label") or f"PID {request['pid']}"
+            _send({"type": "tool_result", "name": "browser", "code": "", "error": "",
+                   "output": f"Browser control handed to Astra window {window}, which asked for it. "
+                             "The next browser task here reconnects and observes again."})
 
     async def _peer_tick() -> None:
         """Keep this session listed, and when it is idle start a turn with any mail it has."""

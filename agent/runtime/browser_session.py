@@ -356,6 +356,8 @@ class BrowserSessionManager:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self.backend = backend
+        # Set by register_browser_tools; the runtime hands control over through it.
+        self.lifecycle = None
         self._initialize()
 
     @contextmanager

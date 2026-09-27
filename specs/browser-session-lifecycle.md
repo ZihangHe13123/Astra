@@ -17,6 +17,10 @@ limit the environment inherited by browser children. Keep the native CU helper.
   Close Astra-owned CDP resources. Lazily reconnect with fresh handles.
 - All local frontends support `/browser [status|stop]`; the agent has a matching
   `browser_stop` tool. No idle timeout, lock stealing, or implicit process kill.
+- Amended 2026-09-27: a runtime that cannot take the endpoint files a release
+  request and waits briefly; the owner releases through the same stop path, only
+  while it has no turn or browser operation running. Still no idle timeout,
+  stealing, or kill.
 
 ## MCP recovery
 

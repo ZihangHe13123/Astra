@@ -172,7 +172,7 @@ async def test_availability_uses_lock_not_pid_and_does_not_claim_or_rewrite_endp
     await first.start()
     before = first.descriptor_path.read_bytes()
     assert first.endpoint_availability()['state'] == 'owned_here'
-    assert second.endpoint_availability() == {'state': 'owned_elsewhere', 'owner_pid': os.getpid()}
+    assert second.endpoint_availability() == {'state': 'owned_elsewhere', 'owner_pid': os.getpid(), 'owner_label': ''}
     assert first.descriptor_path.read_bytes() == before
     assert second._server is None and second._lock_fd is None
     with pytest.raises(BrowserEndpointOwnedError):
@@ -445,3 +445,39 @@ async def test_close_serializes_with_listener_startup(tmp_path,monkeypatch):
         assert not server.descriptor_path.exists()
     finally:
         await server.close()
+
+
+@run_async
+async def test_release_requests_are_seen_only_by_the_owner_and_only_when_fresh(tmp_path):
+    import time
+    from agent.runtime.browser_control_transport import RELEASE_REQUEST, RELEASE_REQUEST_MAX_AGE
+    directory = tmp_path / 'runtime'
+    owner, other = BrowserControlTransport(directory), BrowserControlTransport(directory)
+    path = directory / RELEASE_REQUEST
+
+    def write(value):
+        path.write_text(json.dumps(value))
+        path.chmod(0o600)
+
+    await owner.start()
+    try:
+        now = time.time()
+        write({'pid': os.getpid() + 1, 'label': '跑测试\n"x"', 'at': now})
+        assert owner.release_request(now=now) == {'pid': os.getpid() + 1, 'label': '跑测试 x'}
+        assert other.release_request(now=now) is None  # not the lock holder
+        assert owner.release_request(now=now + RELEASE_REQUEST_MAX_AGE + 1) is None  # stale
+        write({'pid': os.getpid(), 'label': 'self', 'at': now})
+        assert owner.release_request(now=now) is None  # never hands over to itself
+        for malformed in ({'pid': 'x', 'at': now}, {'pid': True, 'at': now}, {'pid': 7, 'at': 'now'}, [1]):
+            write(malformed)
+            assert owner.release_request(now=now) is None
+        # A runtime withdraws only its own request.
+        write({'pid': os.getpid() + 1, 'at': now})
+        other.withdraw_release_request()
+        assert path.exists()
+        other.request_release()
+        assert json.loads(path.read_text())['pid'] == os.getpid()
+        other.withdraw_release_request()
+        assert not path.exists()
+    finally:
+        await owner.close()

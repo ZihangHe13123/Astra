@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import errno
 import json
 import os
@@ -10,7 +11,9 @@ import secrets
 import stat
 import struct
 import sys
+import time
 import uuid
+from collections.abc import Callable
 
 MAX_FRAME = 1024 * 1024
 UPLOAD_OPERATIONS = frozenset({'upload_prepare','upload_chunk','upload_commit','upload_abort'})
@@ -33,7 +36,9 @@ class BrowserUnsupportedOperation(RuntimeError):
                     'Use current snapshot capabilities and an available action, or reload Astra Browser Control.'}
 
 BROWSER_ENDPOINT_RECOVERY = (
-    'No browser input was dispatched. This runtime cannot use the extension endpoint now. '
+    'No browser input was dispatched. Another Astra window holds the browser channel and was '
+    'asked to hand it over; it does so by itself as soon as it is idle, so retry the browser '
+    'call once after that window finishes its turn, without polling. '
     'For an ordinary UI task, if the user has not required the browser channel and native '
     'computer tools are available, call computer_apps and bind the same visible target. '
     'Otherwise use the owning runtime, or run /browser stop there to release control. '
@@ -41,17 +46,80 @@ BROWSER_ENDPOINT_RECOVERY = (
     'just to complete a form; diagnose processes only when that is the user task.'
 )
 
+# Cooperative handover between Astra windows (specs/browser-session-lifecycle.md):
+# a runtime that cannot take the lock files a request; the owner releases only while idle.
+RELEASE_REQUEST = 'release.request'
+OWNER_INFO = 'owner.json'
+RELEASE_REQUEST_MAX_AGE = 15.0
+HANDOVER_WAIT_SECONDS = 8.0
+HANDOVER_POLL_SECONDS = 0.2
+_owner_label_provider: Callable[[], str] | None = None
+
+
+def set_owner_label_provider(provider: Callable[[], str] | None) -> None:
+    """Name this runtime's window for other windows' ownership errors and handover notices."""
+    global _owner_label_provider
+    _owner_label_provider = provider
+
+
+def clean_owner_label(value: object) -> str:
+    if not isinstance(value, str):
+        return ''
+    printable = ''.join(ch if ch.isprintable() and ch not in '\'"' else ' ' for ch in value)
+    return ' '.join(printable.split())[:60]
+
+
+def current_owner_label() -> str:
+    try:
+        return clean_owner_label(_owner_label_provider()) if _owner_label_provider is not None else ''
+    except Exception:  # noqa: BLE001 - a name is optional; the lock is not
+        return ''
+
+
+def _read_private_json(path: Path) -> object:
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+        with os.fdopen(fd, 'rb') as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
+                return None
+            if os.name != 'nt' and (info.st_uid != os.getuid() or info.st_mode & 0o077):
+                return None
+            return json.loads(stream.read(4097))
+    except (OSError, ValueError):
+        return None
+
+
+def _write_private_json(path: Path, value: dict) -> None:
+    temp = path.parent / f'.{path.name}-{uuid.uuid4().hex}'
+    out = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        with os.fdopen(out, 'w') as stream:
+            json.dump(value, stream)
+        os.replace(temp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            temp.unlink()
+        raise
+
 
 class BrowserEndpointOwnedError(RuntimeError):
     code = 'browser_endpoint_owned'
 
-    def __init__(self, owner_pid: int | None):
+    def __init__(self, owner_pid: int | None, owner_label: str = '', *, waited: bool = False):
         owner_pid = owner_pid if type(owner_pid) is int and 0 < owner_pid <= 2**31 - 1 else None
         self.owner_pid = owner_pid
+        self.owner_label = clean_owner_label(owner_label)
+        self.waited = waited
+        window = f' by Astra window "{self.owner_label}"' if self.owner_label else ''
         owner = f' (owner metadata reports Astra PID {owner_pid})' if owner_pid is not None else ''
-        super().__init__(
-            f'Browser control endpoint is already owned{owner}. '
+        situation = (
+            'It was asked to hand over and stayed busy; it hands over by itself once its turn ends. '
+            if waited else
             'Another Astra runtime holds the local endpoint lock before browser attachment. '
+        )
+        super().__init__(
+            f'Browser control endpoint is already owned{window}{owner}. {situation}'
             'Use that runtime, or run /browser stop there and retry here. '
             'The extension Disconnect button does not release this process lock; '
             'do not delete owner.lock or attribute this error to a browser debugger.'
@@ -181,7 +249,8 @@ class BrowserControlTransport:
                     fcntl.flock(fd, fcntl.LOCK_UN)
             except OSError as exc:
                 if exc.errno in (errno.EACCES, errno.EAGAIN):
-                    return {'state': 'owned_elsewhere', 'owner_pid': self._reported_owner_pid()}
+                    return {'state': 'owned_elsewhere', 'owner_pid': self._reported_owner_pid(),
+                            'owner_label': self._reported_owner_label()}
                 return {'state': 'unavailable'}
             return {'state': 'available'}
         finally:
@@ -206,7 +275,7 @@ class BrowserControlTransport:
                 os.close(fd)
                 if exc.errno not in (errno.EACCES, errno.EAGAIN):
                     raise
-                raise BrowserEndpointOwnedError(self._reported_owner_pid()) from None
+                raise BrowserEndpointOwnedError(self._reported_owner_pid(), self._reported_owner_label()) from None
             self._lock_fd = fd
             try:
                 self._server = await asyncio.start_server(self._accept, '127.0.0.1', 0)
@@ -216,6 +285,10 @@ class BrowserControlTransport:
                 with os.fdopen(out, 'w') as stream:
                     json.dump(descriptor, stream); stream.flush(); os.fsync(stream.fileno())
                 os.replace(temp, self.descriptor_path)
+                # Advisory only: names this window in other windows' errors. The token stays out.
+                with contextlib.suppress(OSError):
+                    _write_private_json(self.directory / OWNER_INFO,
+                                        {'pid': os.getpid(), 'label': current_owner_label()})
             except BaseException:
                 await self._close_unlocked()
                 raise
@@ -235,6 +308,44 @@ class BrowserControlTransport:
             return pid if type(pid) is int and 0 < pid <= 2**31 - 1 else None
         except (OSError, ValueError):
             return None
+
+    def _reported_owner_label(self) -> str:
+        value = _read_private_json(self.directory / OWNER_INFO)
+        return clean_owner_label(value.get('label')) if isinstance(value, dict) else ''
+
+    def request_release(self) -> None:
+        """Ask the owning runtime to hand the endpoint over once it is idle."""
+        private_directory(self.directory)
+        _write_private_json(self.directory / RELEASE_REQUEST,
+                            {'pid': os.getpid(), 'label': current_owner_label(), 'at': time.time()})
+
+    def withdraw_release_request(self) -> None:
+        """Remove this runtime's own request; another runtime's request stays."""
+        value = _read_private_json(self.directory / RELEASE_REQUEST)
+        if isinstance(value, dict) and value.get('pid') == os.getpid():
+            with contextlib.suppress(OSError):
+                (self.directory / RELEASE_REQUEST).unlink()
+
+    def release_request(self, *, now: float | None = None) -> dict | None:
+        """A fresh request from another runtime, seen only while this one holds the lock."""
+        if self._lock_fd is None:
+            return None
+        value = _read_private_json(self.directory / RELEASE_REQUEST)
+        if not isinstance(value, dict):
+            return None
+        pid, at = value.get('pid'), value.get('at')
+        if type(pid) is not int or not 0 < pid <= 2**31 - 1 or pid == os.getpid():
+            return None
+        if isinstance(at, bool) or not isinstance(at, (int, float)):
+            return None
+        age = (time.time() if now is None else now) - at
+        if not 0 <= age <= RELEASE_REQUEST_MAX_AGE:
+            return None
+        return {'pid': pid, 'label': clean_owner_label(value.get('label'))}
+
+    def clear_release_request(self) -> None:
+        with contextlib.suppress(OSError):
+            (self.directory / RELEASE_REQUEST).unlink()
 
     async def wait_connected(self, timeout: float = 45) -> None:
         """Wait only for authentication; never enqueue or repeat browser actions."""
@@ -382,4 +493,8 @@ class BrowserControlTransport:
                 if json.loads(self.descriptor_path.read_text()).get('token') == self._token:
                     self.descriptor_path.unlink()
             except (OSError, ValueError): pass
+            owner = _read_private_json(self.directory / OWNER_INFO)
+            if isinstance(owner, dict) and owner.get('pid') == os.getpid():
+                with contextlib.suppress(OSError):
+                    (self.directory / OWNER_INFO).unlink()
             os.close(self._lock_fd); self._lock_fd = None

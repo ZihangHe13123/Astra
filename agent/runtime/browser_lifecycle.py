@@ -81,6 +81,24 @@ class BrowserLifecycle:
                 self.active.clear()
         self._release_pending = False
 
+    async def hand_over_if_requested(self, *, busy: bool) -> dict | None:
+        """Release control to another Astra window that asked for it, only while this one is idle.
+
+        Same path as /browser stop; there is still no idle timeout or lock stealing
+        (specs/browser-session-lifecycle.md).
+        """
+        if busy or self._release_pending or self._operation_lock.locked():
+            return None
+        extension = getattr(self.manager.backend, "extension", None)
+        transport = getattr(extension, "transport", None)
+        read = getattr(transport, "release_request", None)
+        request = read() if callable(read) else None
+        if not isinstance(request, dict):
+            return None
+        await self.stop()
+        transport.clear_release_request()
+        return request
+
     async def stop(self) -> str:
         self._generation += 1
         self.active.clear()

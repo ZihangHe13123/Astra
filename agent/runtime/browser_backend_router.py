@@ -1,11 +1,14 @@
 """Keep logical tabs bound to their original transport across explicit switches."""
 from __future__ import annotations
 import asyncio
-from .browser_control_transport import BROWSER_ENDPOINT_RECOVERY, BrowserEndpointOwnedError
+from .browser_control_transport import (
+    BROWSER_ENDPOINT_RECOVERY, HANDOVER_POLL_SECONDS, HANDOVER_WAIT_SECONDS, BrowserEndpointOwnedError,
+)
 
 
 class BrowserBackendRouter:
     supports_transport_selection = True
+    handover_wait = HANDOVER_WAIT_SECONDS
     def __init__(self, primary, extension_factory, *, auto_connect=False, launch_browser=None, setup_error=''):
         self.primary = primary
         self.extension_factory = extension_factory
@@ -37,7 +40,7 @@ class BrowserBackendRouter:
                     if self._closed:
                         raise ConnectionError('Browser runtime is closed')
                     transport = self._extension().transport
-                    await transport.start()
+                    await self._start_or_request_handover(transport)
                     if self._closed:
                         raise ConnectionError('Browser runtime closed while starting listener')
                     self._startup_error = ''
@@ -56,6 +59,30 @@ class BrowserBackendRouter:
             self._startup_error = str(exc)
             self._ownership_error = isinstance(exc, BrowserEndpointOwnedError)
             raise
+
+    async def _start_or_request_handover(self, transport):
+        """Take the endpoint, or ask the Astra window holding it to hand over while it is idle."""
+        try:
+            await transport.start()
+            return
+        except BrowserEndpointOwnedError:
+            request = getattr(transport, 'request_release', None)
+            if not callable(request):
+                raise
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.handover_wait
+        request()
+        try:
+            while True:
+                await asyncio.sleep(HANDOVER_POLL_SECONDS)
+                try:
+                    await transport.start()
+                    return
+                except BrowserEndpointOwnedError as exc:
+                    if self._closed or loop.time() >= deadline:
+                        raise BrowserEndpointOwnedError(exc.owner_pid, exc.owner_label, waited=True) from None
+        finally:
+            transport.withdraw_release_request()
 
     async def prepare_open(self):
         if self.auto_connect:
@@ -108,7 +135,7 @@ class BrowserBackendRouter:
             if not isinstance(availability, dict):
                 return False, 'Extension endpoint status could not be verified.'
             if availability.get('state') == 'owned_elsewhere':
-                error = BrowserEndpointOwnedError(availability.get('owner_pid'))
+                error = BrowserEndpointOwnedError(availability.get('owner_pid'), availability.get('owner_label', ''))
                 return False, f'{error.code}: {error} Next: {BROWSER_ENDPOINT_RECOVERY}'
             if availability.get('state') in {'unavailable', 'closed'}:
                 return False, 'Extension endpoint unavailable; inspect setup before connecting.'

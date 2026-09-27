@@ -86,6 +86,8 @@ def register_browser_tools(
         manager.backend = BrowserBackendRouter(manager.backend, ExtensionBrowserBackend, **auto_browser_options())
 
     lifecycle = BrowserLifecycle(manager)
+    # The runtime's idle tick hands control over to another Astra window through it.
+    manager.lifecycle = lifecycle
     active = lifecycle.active
     registry.hooks.on_session_end(lifecycle.end_session)
     registry.hooks.on_before_tool(lifecycle.before_tool)

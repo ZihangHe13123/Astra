@@ -6,6 +6,75 @@ from agent.runtime.browser_control_transport import BrowserControlTransport
 from agent.runtime.extension_browser_backend import ExtensionBrowserBackend
 
 
+@pytest.fixture(autouse=True)
+def short_handover_wait(monkeypatch):
+    # A real owner here has no lifecycle to hand over, so keep the contender's wait short.
+    monkeypatch.setattr(BrowserBackendRouter, 'handover_wait', 0.3)
+
+
+def test_busy_owner_is_asked_to_hand_over_and_named_when_it_does_not(tmp_path):
+    import json
+    import os
+    from agent.runtime import browser_control_transport as transport_module
+
+    async def scenario():
+        transport_module.set_owner_label_provider(lambda: '做PPT')
+        first = BrowserControlTransport(tmp_path / 'endpoint')
+        await first.start()
+        transport_module.set_owner_label_provider(lambda: '跑测试')
+        router = BrowserBackendRouter(Backend('cdp'), lambda: ExtensionBrowserBackend(endpoint_dir=tmp_path / 'endpoint'),
+                                      auto_connect=True)
+        request_path = tmp_path / 'endpoint' / transport_module.RELEASE_REQUEST
+        filed = []
+
+        async def watch():
+            while not request_path.exists():
+                await asyncio.sleep(0.02)
+            filed.append(json.loads(request_path.read_text()))
+
+        watcher = asyncio.create_task(watch())
+        with pytest.raises(transport_module.BrowserEndpointOwnedError) as failure:
+            await router.prepare_open()
+        await asyncio.wait_for(watcher, 1)
+        # The request named the window that asked; it was withdrawn when that window gave up.
+        assert filed[0]['pid'] == os.getpid() and filed[0]['label'] == '跑测试'
+        assert not request_path.exists()
+        assert failure.value.waited and failure.value.owner_label == '做PPT'
+        assert '"做PPT"' in str(failure.value) and 'hands over by itself' in str(failure.value)
+        await router.close_connection()
+        await first.close()
+        assert not (tmp_path / 'endpoint' / transport_module.OWNER_INFO).exists()
+    try:
+        asyncio.run(scenario())
+    finally:
+        transport_module.set_owner_label_provider(None)
+
+
+def test_idle_owner_releasing_on_request_lets_the_waiting_window_in(tmp_path):
+    from agent.runtime.browser_control_transport import RELEASE_REQUEST
+
+    async def scenario():
+        first = BrowserControlTransport(tmp_path / 'endpoint')
+        await first.start()
+        ext = ExtensionBrowserBackend(endpoint_dir=tmp_path / 'endpoint')
+        router = BrowserBackendRouter(Backend('cdp'), lambda: ext, auto_connect=True)
+        router.handover_wait = 5
+
+        async def idle_owner():
+            while not (tmp_path / 'endpoint' / RELEASE_REQUEST).exists():
+                await asyncio.sleep(0.02)
+            await first.close()
+            first.clear_release_request()
+
+        async def contender():
+            await router._start_or_request_handover(ext.transport)
+            return ext.transport.endpoint_availability()['state']
+        _, state = await asyncio.wait_for(asyncio.gather(idle_owner(), contender()), 5)
+        assert state in {'owned_here', 'ready'}
+        await router.close_connection()
+    asyncio.run(scenario())
+
+
 def test_status_reports_live_ownership_without_connecting_and_recovers_when_released(tmp_path):
     async def scenario():
         first = BrowserControlTransport(tmp_path / 'endpoint')
