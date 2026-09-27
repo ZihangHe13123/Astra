@@ -36,9 +36,10 @@ class BrowserUnsupportedOperation(RuntimeError):
                     'Use current snapshot capabilities and an available action, or reload Astra Browser Control.'}
 
 BROWSER_ENDPOINT_RECOVERY = (
-    'No browser input was dispatched. Another Astra window holds the browser channel and was '
-    'asked to hand it over; it does so by itself as soon as it is idle, so retry the browser '
-    'call once after that window finishes its turn, without polling. '
+    'No browser input was dispatched. Another Astra window holds the browser channel. Opening, '
+    'connecting or listing tabs here asks it to hand over, which it does by itself once idle, '
+    'so retry once after that window finishes its turn, without polling; a status check asks '
+    'nothing. '
     'For an ordinary UI task, if the user has not required the browser channel and native '
     'computer tools are available, call computer_apps and bind the same visible target. '
     'Otherwise use the owning runtime, or run /browser stop there to release control. '
