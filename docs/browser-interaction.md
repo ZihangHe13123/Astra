@@ -129,11 +129,19 @@ Edge or sending global keys to compensate for approval.
 
 Ordinary startup and status checks do not acquire the browser endpoint. The
 first browser operation enters the serialized readiness/connection path.
-The extension endpoint has one runtime owner. `already owned` reports an advisory
+The extension endpoint has one runtime owner at a time. When another Astra window
+holds it, opening, connecting or listing tabs here files a release request and waits a
+few seconds. The owning window hands control over by itself once it has no turn and no
+browser operation running, and shows "Browser control handed to Astra window ...". Its
+logical tabs and refs expire; it reconnects the next time it needs the browser. There is
+no idle timeout: an idle owner keeps its tabs until another window asks.
+
+If the owner stays busy, `already owned` names that window and reports an advisory
 owner PID; verify the process, start time, terminal and listener before identifying
 the instance. A quiet CPU sample does not mean its session can be discarded.
 Continue in the owning instance, or run `/browser stop` there to release control
-without exiting Astra. `/browser status` inspects without acquiring the endpoint.
+without exiting Astra. `/browser status` inspects without acquiring the endpoint and
+never asks for a handover.
 Switching or resetting conversations also releases old connections and logical
 handles; persisted rows remain history only. Release drains dispatched operations.
 If cleanup fails, new work stays blocked until `/browser stop` succeeds. Disconnecting the extension does not release the process lock;
