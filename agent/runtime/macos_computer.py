@@ -770,8 +770,14 @@ class MacComputerBackend:
             interaction_mode is ComputerInteractionMode.BACKGROUND
             and not response.ok
             and response.error is not None
-            and response.error.code is ComputerErrorCode.PROTOCOL_MISMATCH
-            and response.error.message == "action payload is invalid"
+            # Current helpers refuse the mode; older ones called the payload invalid.
+            and (
+                response.error.code is ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED
+                or (
+                    response.error.code is ComputerErrorCode.PROTOCOL_MISMATCH
+                    and response.error.message == "action payload is invalid"
+                )
+            )
             and any(
                 action.get("type") in {"click", "right_click", "double_click", "scroll", "drag"}
                 and action.get("x") is not None

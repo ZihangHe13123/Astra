@@ -5045,13 +5045,18 @@ def test_takeover_required_plan_is_validated_and_returned_without_losing_snapsho
     assert plan.pid_action_classes == ("click",)
 
 
-@pytest.mark.parametrize('mode,anchored,message,expected', [
-    ('background', False, 'action payload is invalid', 'background_action_unsupported'),
-    ('background', True, 'action payload is invalid', 'protocol_mismatch'),
-    ('foreground_takeover', False, 'action payload is invalid', 'protocol_mismatch'),
-    ('background', False, 'plan_actions contains an invalid action', 'protocol_mismatch'),
+UNSAFE_BATCH = 'the action batch is unsafe for background or foreground automation'
+
+
+@pytest.mark.parametrize('mode,anchored,code,message,expected', [
+    # Current helpers refuse background coordinates as a mode.
+    ('background', False, 'background_action_unsupported', UNSAFE_BATCH, 'background_action_unsupported'),
+    ('background', False, 'protocol_mismatch', 'action payload is invalid', 'background_action_unsupported'),
+    ('background', True, 'protocol_mismatch', 'action payload is invalid', 'protocol_mismatch'),
+    ('foreground_takeover', False, 'protocol_mismatch', 'action payload is invalid', 'protocol_mismatch'),
+    ('background', False, 'protocol_mismatch', 'plan_actions contains an invalid action', 'protocol_mismatch'),
 ])
-def test_unanchored_background_pointer_rejection_has_actionable_recovery(mode, anchored, message, expected):
+def test_unanchored_background_pointer_rejection_has_actionable_recovery(mode, anchored, code, message, expected):
     from agent.runtime.macos_computer import HelperApplicationError
     from agent.runtime.tools.computer import _plan_rejection_failure
 
@@ -5059,7 +5064,7 @@ def test_unanchored_background_pointer_rejection_has_actionable_recovery(mode, a
     async def request(req):
         requests.append(req.operation)
         return ComputerResponse(req.request_id, ok=False, error=ComputerError(
-            ComputerErrorCode.PROTOCOL_MISMATCH, message,
+            ComputerErrorCode(code), message,
         ))
 
     transport = StaticTransport(ComputerResponse('unused', ok=True))
@@ -5074,6 +5079,7 @@ def test_unanchored_background_pointer_rejection_has_actionable_recovery(mode, a
     assert failure.value.error.code.value == expected
     assert requests == ['plan_actions']  # No act or automatic mode switch.
     if expected == 'background_action_unsupported':
+        assert 'requires target_element_ref' in failure.value.error.message
         recovery = _plan_rejection_failure(failure.value, requested_takeover=False)
         assert recovery.code == 'foreground_takeover_required'
         assert "interaction_mode='foreground_takeover'" in recovery.recovery_hint

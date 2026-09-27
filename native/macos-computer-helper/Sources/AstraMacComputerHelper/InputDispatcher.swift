@@ -1415,8 +1415,12 @@ final class InputDispatcher: InputDispatching {
         guard let reference = pointerReference(for: action) else {
             let points = pointerLocalPoints(action)
             guard !points.isEmpty else { return nil }
-            guard expected.interactionMode == .foregroundTakeover,
-                  syntheticPolicy.allowsForeground(application: application, intents: [.pointer(.click)])
+            // Unanchored window coordinates exist only for an explicit foreground takeover.
+            // This refuses the mode, not the payload; it is no protocol error.
+            guard expected.interactionMode == .foregroundTakeover else {
+                throw InputDispatchError.backgroundActionUnsupported
+            }
+            guard syntheticPolicy.allowsForeground(application: application, intents: [.pointer(.click)])
             else { throw ActionExecutionError.invalidAction }
             let localBounds = CGRect(origin: .zero, size: expected.bounds.size)
             guard inputDispatchValidLocalRect(localBounds, within: expected.bounds.size),

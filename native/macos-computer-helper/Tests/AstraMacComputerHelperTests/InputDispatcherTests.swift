@@ -2926,7 +2926,8 @@ func genericForegroundPlansUnknownAppPointerWithoutAXDescendants(kind: String) t
             context: DispatchContext(guardValue: inputDispatcherForegroundGuard())
         )
     }
-    #expect(throws: ActionExecutionError.invalidAction) {
+    // Background mode refuses unanchored coordinates as a mode, not as a malformed payload.
+    #expect(throws: InputDispatchError.backgroundActionUnsupported) {
         _ = try dispatcher.plan(
             actions: [NativeAction.click(x: 15, y: 15)],
             context: DispatchContext(guardValue: inputDispatcherBackgroundGuard())

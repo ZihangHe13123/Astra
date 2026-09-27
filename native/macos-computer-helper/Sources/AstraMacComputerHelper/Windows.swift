@@ -2673,6 +2673,9 @@ final class SystemWindowObserver: WindowObserving {
                 plan = try fragment == nil
                     ? dispatcher.plan(actions: resolvedActions, context: context)
                     : dispatcher.planFragmentDraft(actions: resolvedActions, context: context)
+            } catch InputDispatchError.backgroundActionUnsupported {
+                planDiag("PLAN-REFUSED background pointer needs target_element_ref or foreground takeover")
+                return CooperativePlanResult(summary: nil, error: .cooperative(.backgroundActionUnsupported))
             } catch {
                 planDiag("PLAN-THROW dispatcher.plan: \(error)")
                 // Preserve typed refusal (for example a clipped pointer region)
