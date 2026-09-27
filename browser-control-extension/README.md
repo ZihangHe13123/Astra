@@ -2,7 +2,7 @@
 
 This MV3 extension is independent of `browser-extension` (Activity URLs). It does
 not record browsing, expand the recorder's permissions, or expose a network,
-cookie, arbitrary JavaScript, or shell proxy. For current macOS auto-connect setup
+cookie, arbitrary JavaScript, or shell proxy. For Windows/macOS auto-connect setup
 and acceptance evidence, see [browser interaction](../docs/browser-interaction.md).
 CDP remains an explicit alternative.
 
@@ -14,6 +14,18 @@ CDP remains an explicit alternative.
 2. Copy the actual extension ID. Register the separate native messaging host
    `com.astra.browser_control` with Astra's native-host installer, supplying that
    exact ID. Start Astra's extension transport runtime before connecting.
+
+   ```text
+   astra browser-control install --browser edge --extension-id YOUR_EXTENSION_ID
+   astra browser-control status --browser edge
+   ```
+
+   Use `--browser chrome` only when intentionally binding Chrome. Installation is
+   separate from `astra setup`: setup does not discover IDs or grant browser access.
+   Windows writes only HKCU for the selected browser and uses a private Python
+   command launcher; macOS retains its shell host. Use a stable source checkout.
+   On Windows run these commands in an ordinary standalone CMD/PowerShell, not
+   an isolated agent shell whose registry may be invisible to the browser.
 3. Open this extension's popup and press **Connect to Astra**. On a regular
    HTTP(S) page, press **Allow current tab** and accept that site's permission
    prompt. A native host connection alone grants no tabs.
@@ -24,10 +36,20 @@ CDP remains an explicit alternative.
    for new agent tabs**. This explicitly requests optional HTTP(S) host
    permissions; it never grants existing tabs automatically.
 6. **Stop and revoke all tabs** disconnects the host and clears all grants.
-   A host disconnect or worker restart also clears control. Reconnect and grant
-   tabs explicitly; no queued action is replayed. Granted Chrome host permissions
-   may remain installed, but they do not authorize any control without new tab
-   grants. Remove these permissions through the browser's extension settings.
+   With auto-connect enabled, a brief host disconnect can restore exact live-tab
+   grants in the same browser session after revalidation. Browser restart or
+   extension reload requires fresh grants. No queued action is replayed. Granted
+   host permissions may remain installed, but do not authorize existing tabs by
+   themselves. Remove these permissions through the browser's extension settings.
+
+The popup preserves native connection errors while retrying. Registration status
+is not proof of connection: only the ready handshake enables **Allow current tab**.
+For a moved checkout or repairable owned installation, first run `/browser stop`
+in the owning Astra session, then `astra browser-control repair --browser edge`.
+To remove only this host, use `astra browser-control uninstall --browser edge`;
+remove the extension separately. Neither action touches Activity URLs. See the
+[integration diagnostics](../docs/browser-interaction.md#check-and-repair-the-optional-integration)
+for ACL, policy and source-installation boundaries and the manual smoke test.
 
 ## Capabilities and boundaries
 
@@ -106,7 +128,7 @@ CDP remains an explicit alternative.
 ## Local checks
 
 ```sh
-node --test browser-control-extension/tests/*.test.mjs
+node --test browser-control-extension/tests/control.test.mjs browser-control-extension/tests/worker.test.mjs
 ```
 
 Mocked Chrome API tests cover grants, origin changes, stop/disconnect, private

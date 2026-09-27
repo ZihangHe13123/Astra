@@ -41,6 +41,19 @@ astra
 
 除非明确设置 `SANDBOX_WORKDIR`，当前目录就是工作区。启动器独立定位自己的安装目录，不依赖当前项目。日常启动只检查环境，不拉取代码或安装依赖。
 
+## 可选 Browser Control（Windows/macOS）
+
+核心安装不会自动装扩展或授予浏览器访问权。需要操作日常 Edge/Chrome 时，先从稳定源码仓库手动加载 `browser-control-extension`，再绑定实际扩展 ID：
+
+Windows 请使用自行打开的普通 CMD/PowerShell，不要在隔离的 Agent 终端内登记宿主。
+
+```text
+astra browser-control install --browser edge --extension-id YOUR_EXTENSION_ID
+astra browser-control status --browser edge
+```
+
+`repair` 和 `uninstall` 只处理核验归属后的安装器文件；修复前先在拥有端点的 Astra 会话执行 `/browser stop`。Windows 使用当前用户 HKCU 注册，macOS 保留原有清单位置。安装 Edge 宿主不会绑定 Chrome 或改动 Activity URLs。`astra doctor` 只检查该可选集成、不启动浏览器；未配置不会判定核心安装失败。随后按[浏览器操作](browser-interaction.md)完成连接和逐标签页授权。
+
 <a id="upgrade-an-older-checkout"></a>
 
 ## 升级旧安装

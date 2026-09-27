@@ -134,10 +134,11 @@ def _file_request_from_other_window(endpoint):
     import json
     import os
     import time
+    from agent.runtime.browser_control_storage import open_private
     from agent.runtime.browser_control_transport import RELEASE_REQUEST
     path = endpoint / RELEASE_REQUEST
-    path.write_text(json.dumps({"pid": os.getpid() + 1, "label": "跑测试", "at": time.time()}))
-    path.chmod(0o600)
+    with os.fdopen(open_private(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL), 'w') as stream:
+        json.dump({"pid": os.getpid() + 1, "label": "跑测试", "at": time.time()}, stream)
     return path
 
 

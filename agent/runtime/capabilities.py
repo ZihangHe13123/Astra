@@ -225,8 +225,8 @@ def build_runtime_capabilities(agent, sandbox=None, mcp_manager=None) -> Capabil
     missing = sorted(interactive - tool_names)
     report.add(
         "browser.interactive",
-        CapabilityState.AVAILABLE if not missing else CapabilityState.UNSUPPORTED,
-        "headed takeover and resume are available" if not missing else "missing: " + ", ".join(missing),
+        CapabilityState.CONFIGURED if not missing else CapabilityState.UNSUPPORTED,
+        "tools registered; live host/extension readiness is checked separately" if not missing else "missing: " + ", ".join(missing),
     )
 
     if sandbox is None:

@@ -91,6 +91,10 @@ def _run_gate(args: argparse.Namespace, gate_temp: Path) -> None:
     check("Ruff", [str(RUFF), "check", "agent", "tests", "scripts"])
     check("Pyright", [str(PYRIGHT), "agent", "scripts/phase_t_provider_smoke.py",
                     "scripts/phase_t_gate.py", "scripts/wheel_smoke.py"])
+    check("Browser Control extension tests", [
+        "node", "--test", "browser-control-extension/tests/control.test.mjs",
+        "browser-control-extension/tests/worker.test.mjs",
+    ])
 
     core_root = PROJECT_ROOT / "ui-core"
     check("Shared UI build", [str(NPM), "run", "build"], cwd=core_root)

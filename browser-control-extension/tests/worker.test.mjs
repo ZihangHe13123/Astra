@@ -14,6 +14,21 @@ function fixture(local={},session={}){
  return {api,worker,ports,ui,ready,connect,local,session,alarms};
 }
 test('manual mode waits for authenticated ready and disconnect clears grants',async()=>{const f=fixture();await tick();assert.equal(f.ports.length,0);await f.ui({operation:'connect'});assert.equal(f.worker.control.state().enabled,false);await f.ready();await f.ui({operation:'grant',tabId:1});assert.deepEqual(f.worker.control.state().grantedTabIds,[1]);f.ports[0].onDisconnect.fire();await tick();assert.equal(f.worker.control.state().enabled,false);assert.deepEqual(f.worker.control.state().grantedTabIds,[]);assert.equal(f.ports.length,1);});
+test('native error is visible while retrying and clears after successful handshake',async()=>{
+ const f=fixture({autoConnect:true});await tick();
+ f.api.runtime.lastError={message:'Specified native messaging host not found.'};f.ports[0].onDisconnect.fire();delete f.api.runtime.lastError;
+ let state=(await f.ui({operation:'state'})).result;
+ assert.equal(state.connected,false);assert.equal(state.connectionState,'waiting');assert.match(state.connectionError,/host not found/);
+ await f.connect();assert.equal((await f.ui({operation:'state'})).result.connectionError,'');
+ f.ports[0].onDisconnect.fire();assert.equal((await f.ui({operation:'state'})).result.connectionError,'');
+ await f.ui({operation:'stop'});
+});
+test('synchronous native errors are bounded plain text and stop clears them',async()=>{
+ const f=fixture();await tick();f.api.runtime.connectNative=()=>{throw Error('blocked\n'+ 'x'.repeat(500));};
+ const state=(await f.ui({operation:'connect'})).result;
+ assert.equal(state.connected,false);assert.equal(state.connectionError.length,400);assert.ok(!state.connectionError.includes('\n'));
+ assert.equal((await f.ui({operation:'stop'})).result.connectionError,'');
+});
 test('auto startup waits for ready and restores exact owned paused session grants',async()=>{const f=fixture({autoConnect:true},{grants:[{tabId:1,origin:'https://example.com',owned:true,paused:true}]});await tick();assert.equal(f.ports.length,1);assert.equal(f.worker.control.state().enabled,false);await f.ready();assert.deepEqual(f.worker.control.exportGrants(),[{tabId:1,origin:'https://example.com',owned:true,paused:true}]);assert.equal((await f.ui({operation:'state'})).result.connected,true);});
 test('stop while connecting persists opt-out and cancels alarm across worker wake',async()=>{const f=fixture({autoConnect:true});await tick();await f.ui({operation:'stop'});await f.ready();assert.equal(f.worker.control.state().enabled,false);assert.equal(f.local.autoConnect,false);assert.deepEqual(f.session.grants,[]);assert.equal(f.alarms.size,0);const g=fixture(f.local,f.session);await tick();assert.equal(g.ports.length,0);});
 test('offline navigation and removal revoke saved grants before reconnect',async()=>{const f=fixture({autoConnect:true},{grants:[{tabId:1,origin:'https://example.com',owned:false,paused:false}]});await tick();await f.ready();f.ports[0].onDisconnect.fire();f.api.tabs.onUpdated.fire(1,{url:'https://other.test'});await tick();await f.ui({operation:'connect'});await f.ready();assert.deepEqual(f.worker.control.state().grantedTabIds,[]);assert.deepEqual(f.session.grants,[]);});

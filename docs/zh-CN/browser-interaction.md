@@ -2,13 +2,13 @@
 
 [首页](../../README.zh-CN.md) · [文档导航](README.md) · [English](../browser-interaction.md)
 
-[日常浏览器配置：macOS Edge](#everyday-browser-setup-macos-edge) · [模型操作流程](#model-workflow) · [多个 Astra 实例](#multiple-astra-instances) · [当前限制](#current-limits) · [表单编辑与验证](#form-editing-and-verification) · [选择状态与精简观察](#choice-states-and-compact-observations) · [批量设置选择状态](#checked-choice-batches) · [更新与验证](#updating-and-verifying)
+[日常浏览器配置：Windows 和 macOS](#everyday-browser-setup-macos-edge) · [模型操作流程](#model-workflow) · [多个 Astra 实例](#multiple-astra-instances) · [当前限制](#current-limits) · [表单编辑与验证](#form-editing-and-verification) · [选择状态与精简观察](#choice-states-and-compact-observations) · [批量设置选择状态](#checked-choice-batches) · [更新与验证](#updating-and-verifying)
 
 CDP 后端返回结构化页面观察，支持最新快照中的 `ref:<id>` 目标，也保留唯一 CSS 选择器。更新工具后重启 Astra。此 Chromium 集成不包含 Safari 控制。
 
 <a id="everyday-browser-setup-macos-edge"></a>
 
-## 日常浏览器配置：macOS Edge
+## 日常浏览器配置：Windows 和 macOS
 
 独立的 `browser-control-extension` 通过 Native Messaging 连接日常使用的 Edge。原有 **Astra Activity URLs** 只记录活动网址，不能操作页面；应保留它，其权限没有改变。
 
@@ -16,10 +16,10 @@ CDP 后端返回结构化页面观察，支持最新快照中的 `ref:<id>` 目�
 2. 从同一稳定仓库运行下面的安装命令，将占位符换成实际的 32 字母 ID。
 
 ```sh
-.venv/bin/python scripts/install_browser_control_host.py --browser edge --extension-id YOUR_EXTENSION_ID
+astra browser-control install --browser edge --extension-id YOUR_EXTENSION_ID
 ```
 
-Chrome 使用 `--browser chrome`。安装器只注册该 ID，并记录当前仓库和 Python 路径；移动仓库或环境后需要重装。临时 worktree 不允许安装。Windows 继续使用 CDP，当前尚未提供 Windows 原生宿主注册安装器。
+Chrome 使用 `--browser chrome`。安装器只注册该 ID，并记录当前仓库和 Python 路径；移动仓库或环境后显式运行 `repair`。临时 worktree 和缺少扩展资源的包安装不允许安装宿主。Windows 只写所选浏览器当前用户的 HKCU NativeMessagingHosts 注册项，无需管理员权限；`%LOCALAPPDATA%\Astra\browser-control-host` 和运行时端点采用仅当前用户/SYSTEM 可访问的受保护 ACL。macOS 保留原有清单位置。
 
 3. 更新 Python 文件后重启 Astra。安装器管理的宿主与仓库匹配时，首次浏览器任务（包括发现标签页）才会取得端点并启动监听。聊天启动仅核验配置，不占用端点、不启动 Edge，也不等待浏览器。
 4. 更新扩展文件后，在 Edge 中重新加载 **Astra Browser Control**。0.2.0 版本引入 storage/alarms 权限和就绪协议，需接受扩展权限更新，并在弹窗中启用一次 **Auto-connect**。
@@ -32,7 +32,24 @@ Chrome 使用 `--browser chrome`。安装器只注册该 ID，并记录当前仓
 
 **Stop and revoke all tabs** 会关闭自动连接、取消重试并清空已保存和当前授权，重启后仍保持停止。只取消 **Auto-connect** 勾选则关闭未来重试和已保存授权，但允许已经连接的手动会话继续。
 
-`ASTRA_BROWSER_TRANSPORT=cdp` 或 `manual` 保留旧版手动连接方式；`auto` 或 `extension` 显式要求自动模式，宿主缺失或不匹配时直接报告配置错误。`ASTRA_BROWSER_APP=edge` 或 `chrome` 指定应用；两个宿主都安装时优先 Edge。自动模式连接失败不会悄悄切换到 CDP，已有 CDP 绑定也保持原目标。当前不提供 Windows/Safari 自动连接。
+`ASTRA_BROWSER_TRANSPORT=cdp` 或 `manual` 保留旧版手动连接方式；`auto` 或 `extension` 显式要求自动模式，宿主缺失或不匹配时直接报告配置错误。`ASTRA_BROWSER_APP=edge` 或 `chrome` 指定应用；两个宿主都安装时优先 Edge。自动模式连接失败不会悄悄切换到 CDP，已有 CDP 绑定也保持原目标。当前不提供 Safari 和 Linux 原生宿主安装。
+
+### 检查和修复可选集成
+
+Windows 宿主管理命令应在你自行打开的普通 CMD/PowerShell 中运行。隔离的 Agent 或打包应用进程可能读回自己写入的注册表项，但 Edge 看不到它。安装器会拒绝已知的隔离/打包环境；不要移除检查或改写全机器注册来绕过。此前在该环境尝试过安装的，应在普通终端显式 `repair`；若受管理文件也不存在，则用实际扩展 ID 执行 `install`。
+
+```text
+astra browser-control status --browser edge --json
+astra browser-control repair --browser edge
+```
+
+状态检查和 `astra doctor` 不启动宿主或浏览器。`configured` 只表示注册有效，不等于扩展已连接或标签页已授权；在 Astra 内用 `/doctor browser` 或 `/browser status` 查看就绪状态。只有原生连接、尚未恢复扩展授权时不会报告可用。弹窗保留原生连接的具体错误，不再只显示等待状态。
+
+修复/卸载会核验归属，拒绝覆盖外部注册、手改文件、重解析点和硬链接。显式修复可以收紧旧 Windows 安装的 ACL，但不会抢占活跃端点；请先在原 Astra 会话执行 `/browser stop`，不要删除锁文件。普通操作失败会恢复原有受管理文件和注册项；未知文件需要人工排查。
+
+Windows 使用 Python `.cmd` 启动器、二进制标准输入输出和固定模块入口，不把浏览器参数拼入 shell。宿主目录含 `%` 或换行会在安装前拒绝。若组织策略禁用命令启动器或 Native Messaging，应联系策略管理员；Astra 不会降低安全策略或偷偷切换传输方式。
+
+真实浏览器验收：停止现有 Astra 浏览器会话，用仓库虚拟环境 Python 运行 `scripts/browser_control_smoke.py`，按提示打开临时本地页面，**只授权该标签页**。脚本核对读取、填写、一次点击、运行时重启重连且不重放写操作，以及手动撤销授权；不会访问私人页面或申请全站权限。
 
 <a id="model-workflow"></a>
 
@@ -76,7 +93,7 @@ Chrome 使用 `--browser chrome`。安装器只注册该 ID，并记录当前仓
 卸载原生宿主：
 
 ```sh
-.venv/bin/python scripts/install_browser_control_host.py --browser edge --uninstall
+astra browser-control uninstall --browser edge
 ```
 
 之后在 Edge 移除控制扩展，不会卸载 Activity URLs 或改变活动历史。

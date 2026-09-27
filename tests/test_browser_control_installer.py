@@ -40,8 +40,8 @@ def test_install_rolls_back_launcher_if_manifest_write_fails(tmp_path,monkeypatc
     assert not list(tmp_path.rglob(HOST_NAME+'.json'))
 
 
-def test_install_rejects_windows_before_creating_files(tmp_path, monkeypatch):
-    monkeypatch.setattr('scripts.install_browser_control_host.sys.platform', 'win32')
-    with pytest.raises(RuntimeError, match='macOS only'):
+def test_install_rejects_unsupported_platform_before_creating_files(tmp_path, monkeypatch):
+    monkeypatch.setattr('scripts.install_browser_control_host.sys.platform', 'linux')
+    with pytest.raises(RuntimeError, match='Windows and macOS'):
         install(extension_id='a' * 32, browser='edge', home=tmp_path)
     assert list(tmp_path.iterdir()) == []

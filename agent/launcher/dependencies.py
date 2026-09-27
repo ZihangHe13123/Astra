@@ -267,6 +267,11 @@ def record_environment(install: Installation, extras: list[str]) -> None:
 
 def diagnostics(install: Installation) -> dict:
     report = install.describe()
+    from agent.runtime.browser_control_install import status as browser_control_status
+    report["browser_control"] = {
+        browser: browser_control_status(browser=browser, repo=install.root)
+        for browser in ("edge", "chrome")
+    }
     problems = []
     for label, probe in (("python", lambda: python_health(install)),
                          ("node", lambda: node_health(install))):

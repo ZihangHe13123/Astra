@@ -58,6 +58,27 @@ selects another one. The launcher finds its own installation independently of
 your working project. Normal startup checks the environment; it does not fetch
 code or install dependencies.
 
+## Optional Browser Control (Windows/macOS)
+
+Core setup does not install an extension or grant browser access. To control an
+ordinary Edge/Chrome session, manually load `browser-control-extension` from the
+stable source checkout, then bind its actual ID:
+
+On Windows use a standalone CMD/PowerShell, not an isolated agent terminal.
+
+```text
+astra browser-control install --browser edge --extension-id YOUR_EXTENSION_ID
+astra browser-control status --browser edge
+```
+
+`repair` and `uninstall` operate only on verified installer-owned artifacts. Stop
+the owning browser session with `/browser stop` before repair. Windows uses a
+per-user HKCU registration; macOS retains its manifest locations. No Chrome or
+Activity URLs binding is changed by an Edge install. `astra doctor` checks this
+optional integration without starting the browser; missing configuration does
+not make the core installation unhealthy. Complete the connection and per-tab
+grant steps in [browser interaction](browser-interaction.md).
+
 ## Upgrade an older checkout
 
 An older installation needs **one manual pull** to obtain the new launcher.

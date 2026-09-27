@@ -118,7 +118,7 @@ def test_normal_gate_uses_external_temporary_storage_and_excludes_performance(mo
 
     assert phase_t_gate.main([]) == 0
     assert [label for label, _, _ in calls] == [
-        "Ruff", "Pyright", "Shared UI build", "Shared UI tests", "TUI tests", "TUI typecheck/build", "Python tests",
+        "Ruff", "Pyright", "Browser Control extension tests", "Shared UI build", "Shared UI tests", "TUI tests", "TUI typecheck/build", "Python tests",
     ]
     command = calls[-1][1]
     assert command[command.index("-m", 3) + 1] == "not context_index_performance"
@@ -220,13 +220,13 @@ def test_failed_stage_only_continues_when_requested_and_gate_still_fails(monkeyp
     assert raised.value.code not in (None, 0)
     if keep_going:
         assert calls == [
-            "Ruff", "Pyright", "Shared UI build", "Shared UI tests", "TUI tests", "TUI typecheck/build", "Python tests",
+            "Ruff", "Pyright", "Browser Control extension tests", "Shared UI build", "Shared UI tests", "TUI tests", "TUI typecheck/build", "Python tests",
             "isolated wheel smoke", "Context Index performance", "shared Appshot Swift tests", "macOS Swift tests",
         ]
         assert "TUI tests" in str(raised.value) and "Python tests" in str(raised.value)
         assert not temporary_paths[0].exists()
     else:
-        assert calls == ["Ruff", "Pyright", "Shared UI build", "Shared UI tests", "TUI tests"]
+        assert calls == ["Ruff", "Pyright", "Browser Control extension tests", "Shared UI build", "Shared UI tests", "TUI tests"]
     assert "real provider 4K smoke" not in calls
     assert "automated gate passed" not in capsys.readouterr().out
 

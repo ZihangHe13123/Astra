@@ -25,6 +25,11 @@ on:
       - 'agent/runtime/tools/comfyui.py'
       - 'tests/test_public_image_boundary.py'
       - 'agent/cli/browser_commands.py'
+      - 'agent/cli/diagnostics.py'
+      - 'agent/runtime/capabilities.py'
+      - 'scripts/install_browser_control_host.py'
+      - 'scripts/browser_control_smoke.py'
+      - 'browser-control-extension/**'
       - 'tests/test_browser*.py'
       - 'tests/test_cdp_backend.py'
       - 'tests/test_mcp*.py'
@@ -73,6 +78,11 @@ on:
       - 'agent/runtime/tools/comfyui.py'
       - 'tests/test_public_image_boundary.py'
       - 'agent/cli/browser_commands.py'
+      - 'agent/cli/diagnostics.py'
+      - 'agent/runtime/capabilities.py'
+      - 'scripts/install_browser_control_host.py'
+      - 'scripts/browser_control_smoke.py'
+      - 'browser-control-extension/**'
       - 'tests/test_browser*.py'
       - 'tests/test_cdp_backend.py'
       - 'tests/test_mcp*.py'
@@ -169,3 +179,7 @@ jobs:
           tests/test_cdp_backend.py
           tests/test_browser_backend_router.py tests/test_browser_control_transport.py
           tests/test_extension_browser_backend.py tests/test_browser_auto_connect.py
+          tests/test_browser_control_installer.py tests/test_browser_control_windows.py
+          tests/test_browser_control_management.py tests/test_capabilities.py
+      - name: Exercise Browser Control extension state and permission contracts
+        run: node --test browser-control-extension/tests/control.test.mjs browser-control-extension/tests/worker.test.mjs

@@ -5,22 +5,17 @@ import json
 import os
 from pathlib import Path
 import socket
-import stat
 import struct
 import sys
 import threading
-from .browser_control_transport import MAX_FRAME, default_endpoint_dir, encode_frame, private_directory
+from .browser_control_transport import MAX_FRAME, default_endpoint_dir, encode_frame
+from .browser_control_storage import check_directory, read_private
 
 
 def read_descriptor(directory: Path) -> dict:
-    private_directory(directory)
-    fd = os.open(directory / 'endpoint.json', os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
-    with os.fdopen(fd, 'rb') as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or (os.name != 'nt' and (info.st_uid != os.getuid() or info.st_mode & 0o077)):
-            raise PermissionError('Unsafe browser control descriptor')
-        data = json.loads(stream.read(4097))
-    if type(data.get('port')) is not int or not 0 < data['port'] < 65536 or not isinstance(data.get('token'), str) or len(data['token']) < 32:
+    check_directory(directory)
+    data = json.loads(read_private(directory / 'endpoint.json', 4096))
+    if not isinstance(data, dict) or type(data.get('port')) is not int or not 0 < data['port'] < 65536 or not isinstance(data.get('token'), str) or len(data['token']) < 32:
         raise ValueError('Invalid browser control descriptor')
     return data
 
@@ -80,7 +75,15 @@ def main() -> int:
     # Chromium supplies its origin as an extra argument; manifests restrict it.
     options, _ = parser.parse_known_args()
     try:
-        bridge(options.endpoint_dir, os.fdopen(os.dup(sys.stdin.fileno()), "rb", buffering=0), sys.stdout.buffer)
+        if os.name == 'nt':
+            import msvcrt
+            msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+            msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+        # A daemon reader owns this unbuffered duplicate for this one-shot host.
+        # Closing it from the main thread can deadlock behind a pending Windows
+        # CRT read. Process exit closes it after the socket side disconnects.
+        input_stream = os.fdopen(os.dup(sys.stdin.fileno()), 'rb', buffering=0)
+        bridge(options.endpoint_dir, input_stream, sys.stdout.buffer)
         return 0
     except (OSError, ValueError, EOFError):
         print('Astra browser control unavailable. Start the runtime and reconnect the extension.', file=sys.stderr)

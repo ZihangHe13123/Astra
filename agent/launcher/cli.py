@@ -58,6 +58,11 @@ def parser() -> argparse.ArgumentParser:
     activity.add_argument("args", nargs=argparse.REMAINDER)
     auth = commands.add_parser("auth", help="Manage Astra's ChatGPT / Codex subscription login")
     auth.add_argument("action", choices=("login", "status", "logout"), nargs="?", default="status")
+    browser = commands.add_parser("browser-control", help="Manage the opt-in Edge/Chrome native host (Windows/macOS)")
+    browser.add_argument("action", choices=("install", "repair", "status", "uninstall"), nargs="?", default="status")
+    browser.add_argument("--browser", choices=("edge", "chrome"), default="edge")
+    browser.add_argument("--extension-id")
+    browser.add_argument("--json", action="store_true")
     return result
 
 
@@ -77,6 +82,9 @@ def isolated_maintenance(install: Installation, argv: list[str]) -> int:
             bundle.writestr("agent/__init__.py", "")
             bundle.writestr("agent/runtime/__init__.py", "")
             bundle.write(package.parent / "runtime/instance_lock.py", "agent/runtime/instance_lock.py")
+            for name in ("browser_control_install", "browser_control_registry", "browser_control_storage",
+                         "browser_control_windows", "browser_control_repair"):
+                bundle.write(package.parent / f"runtime/{name}.py", f"agent/runtime/{name}.py")
             for path in sorted(package.glob("*.py")):
                 bundle.write(path, f"agent/launcher/{path.name}")
         child_env = dict(os.environ)
@@ -177,6 +185,15 @@ def main(argv: list[str] | None = None, *, root: Path | None = None) -> int:
         install = discover(root or options.root)
         command = "version" if options.version else "setup" if options.setup_only else options.command
         as_json = getattr(options, "json", False)
+        if command == "browser-control":
+            from agent.runtime.browser_control_install import main as browser_control
+            args = [options.action, "--browser", options.browser, "--repo", str(install.root),
+                    "--python", str(install.python)]
+            if options.extension_id:
+                args.extend(["--extension-id", options.extension_id])
+            if as_json:
+                args.append("--json")
+            return browser_control(args)
         if command == "auth":
             return subprocess.run([str(install.python), "-m", "agent.cli.codex_auth_cli", options.action],
                 cwd=install.root, env=runtime_environment(install, Path.cwd()), check=False).returncode

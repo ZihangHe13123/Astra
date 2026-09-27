@@ -4,10 +4,12 @@ export function installWorker(api,{retryDelays=[1000,3000,10000],handshakeTimeou
   const control=createControl(api);
   let stoppedGeneration=0,permissionRevision=0;
   let port=null,autoConnect=false,saved=[],phase='stopped',epoch=0,retries=0,timer=null,handshake=null;
+  let connectionError='';
+  const errorText=value=>String(value || 'Native host disconnected. Start Astra and reconnect.').replace(/[\u0000-\u001f\u007f]/g,' ').slice(0,400);
   // Storage/lifecycle writes are ordered, but cancellation invalidates authority immediately.
   let tail=Promise.resolve();
   const serial=fn=>{const result=tail.then(fn);tail=result.catch(()=>{});return result;};
-  const state=()=>({...control.state(),autoConnect,connected:phase==='ready'&&control.state().enabled,connectionState:phase==='ready'&&!control.state().enabled?'connecting':phase});
+  const state=()=>({...control.state(),autoConnect,connected:phase==='ready'&&control.state().enabled,connectionState:phase==='ready'&&!control.state().enabled?'connecting':phase,connectionError});
   const persist=()=>api.storage.session.set({grants:autoConnect?saved:[]});
   function cancelTimers(){clearTimeout(timer);clearTimeout(handshake);timer=handshake=null;}
   function retry(){
@@ -31,9 +33,9 @@ export function installWorker(api,{retryDelays=[1000,3000,10000],handshakeTimeou
     const token=++epoch;
     let current;
     try {current=api.runtime.connectNative('com.astra.browser_control');port=current;}
-    catch {phase='stopped';retry();return;}
+    catch(error) {connectionError=errorText(error?.message);phase='stopped';retry();return;}
     let readyGate=null;
-    current.onDisconnect.addListener(()=>{void api.runtime.lastError;disconnected(current);});
+    current.onDisconnect.addListener(()=>{const error=api.runtime.lastError;if(port===current)connectionError=errorText(error?.message);disconnected(current);});
     current.onMessage.addListener(request=>{
       if(port!==current || epoch!==token) return;
       if(request?.type==='astra_control_ready' && request.version===1) {
@@ -51,7 +53,7 @@ export function installWorker(api,{retryDelays=[1000,3000,10000],handshakeTimeou
           // Send it first so new runtimes know capabilities before becoming ready.
           current.postMessage({id:'astra_control_capabilities',ok:true,result:control.capabilities()});
           current.postMessage({id:'astra_control_ready',ok:true,result:{version:1}});
-          phase='ready';retries=0;
+          phase='ready';retries=0;connectionError='';
           await api.alarms.clear(RETRY_ALARM);
         });
         readyGate.catch(()=>{if(port===current){disconnected(current);current.disconnect();}});
@@ -69,11 +71,11 @@ export function installWorker(api,{retryDelays=[1000,3000,10000],handshakeTimeou
         });
       }).catch(()=>{if(port===current){disconnected(current);current.disconnect();}});
     });
-    handshake=setTimeout(()=>{if(port===current){disconnected(current);current.disconnect();}},handshakeTimeoutMs);handshake.unref?.();
+    handshake=setTimeout(()=>{if(port===current){connectionError='Native host handshake timed out. Start Astra and check astra browser-control status.';disconnected(current);current.disconnect();}},handshakeTimeoutMs);handshake.unref?.();
   }
   function stop(){
     stoppedGeneration++;autoConnect=false;epoch++;cancelTimers();const old=port;port=null;
-    control.stop();phase='stopped';old?.disconnect();
+    control.stop();phase='stopped';connectionError='';old?.disconnect();
     return serial(async()=>{autoConnect=false;saved=[];await api.storage.local.set({autoConnect:false});await persist();await api.alarms.clear(RETRY_ALARM);});
   }
   const initialGeneration=stoppedGeneration;

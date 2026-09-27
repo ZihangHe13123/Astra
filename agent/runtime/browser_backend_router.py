@@ -140,8 +140,12 @@ class BrowserBackendRouter:
             if availability.get('state') in {'unavailable', 'closed'}:
                 return False, 'Extension endpoint unavailable; inspect setup before connecting.'
             connected = self.extension is not None and self.extension.transport.ready
-            return connected, ('Extension auto-connect: connected' if connected else
-                'Extension auto-connect: idle; the first browser task acquires the endpoint and connects automatically. Enable Auto-connect in Astra Browser Control once.')
+            if connected:
+                return True, 'Extension auto-connect: connected; controller ready'
+            if self.extension is not None and self.extension.transport.connected:
+                return False, 'Extension auto-connect: connected; controller not ready (restoring grants)'
+            return False, ('Extension auto-connect: idle; host configured, transport disconnected. '
+                'The first browser task acquires the endpoint and connects automatically. Enable Auto-connect in Astra Browser Control once.')
         return await self.default.status()
 
     async def extract(self, *args, **kwargs):

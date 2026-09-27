@@ -240,6 +240,14 @@ async def build_doctor_report(agent, sandbox=None, mcp_manager=None, section: st
             available = "browser, computer, mcp, memory, metrics, sandbox, skills, tasks"
             return f"Unknown doctor section: {section}. Available: {available}"
         lines = [f"Agent doctor ({section}):", selected.render()]
+        if prefix == "browser":
+            from agent.runtime.browser_control_install import status as host_status
+            from .browser_commands import execute_browser_command
+            for browser in ("edge", "chrome"):
+                host = host_status(browser=browser)
+                lines.append(f"Native host ({browser}): {host['state']}; {host.get('message', 'live connection checked below')}")
+            output, error = await execute_browser_command(["status"], agent.tools)
+            lines.append(output or error)
         if prefix == "mcp" and mcp_manager is not None:
             lines.append(mcp_manager.report())
         return "\n".join(lines)

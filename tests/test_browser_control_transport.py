@@ -456,8 +456,10 @@ async def test_release_requests_are_seen_only_by_the_owner_and_only_when_fresh(t
     path = directory / RELEASE_REQUEST
 
     def write(value):
-        path.write_text(json.dumps(value))
-        path.chmod(0o600)
+        from agent.runtime.browser_control_storage import open_private
+        path.unlink(missing_ok=True)
+        with os.fdopen(open_private(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL), 'w') as stream:
+            json.dump(value, stream)
 
     await owner.start()
     try:
@@ -468,7 +470,8 @@ async def test_release_requests_are_seen_only_by_the_owner_and_only_when_fresh(t
         assert owner.release_request(now=now + RELEASE_REQUEST_MAX_AGE + 1) is None  # stale
         write({'pid': os.getpid(), 'label': 'self', 'at': now})
         assert owner.release_request(now=now) is None  # never hands over to itself
-        for malformed in ({'pid': 'x', 'at': now}, {'pid': True, 'at': now}, {'pid': 7, 'at': 'now'}, [1]):
+        for malformed in ({'pid': 'x', 'at': now}, {'pid': True, 'at': now}, {'pid': 7, 'at': 'now'},
+                          {'pid': 7, 'at': 10**400}, {'pid': 7, 'at': float('nan')}, [1]):
             write(malformed)
             assert owner.release_request(now=now) is None
         # A runtime withdraws only its own request.

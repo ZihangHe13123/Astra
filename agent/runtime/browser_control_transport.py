@@ -15,6 +15,8 @@ import time
 import uuid
 from collections.abc import Callable
 
+from .browser_control_storage import check_directory, open_private, private_directory, read_private
+
 MAX_FRAME = 1024 * 1024
 UPLOAD_OPERATIONS = frozenset({'upload_prepare','upload_chunk','upload_commit','upload_abort'})
 OPERATIONS = UPLOAD_OPERATIONS | frozenset({'tabs','attach','open','snapshot','click','type','fill','check','read','select','wait','screenshot','handoff','resume','close'})
@@ -79,21 +81,14 @@ def current_owner_label() -> str:
 
 def _read_private_json(path: Path) -> object:
     try:
-        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
-        with os.fdopen(fd, 'rb') as stream:
-            info = os.fstat(stream.fileno())
-            if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
-                return None
-            if os.name != 'nt' and (info.st_uid != os.getuid() or info.st_mode & 0o077):
-                return None
-            return json.loads(stream.read(4097))
+        return json.loads(read_private(path, 4096))
     except (OSError, ValueError):
         return None
 
 
 def _write_private_json(path: Path, value: dict) -> None:
     temp = path.parent / f'.{path.name}-{uuid.uuid4().hex}'
-    out = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    out = open_private(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     try:
         with os.fdopen(out, 'w') as stream:
             json.dump(value, stream)
@@ -133,15 +128,6 @@ def default_endpoint_dir() -> Path:
     if os.name == 'nt':
         return Path(os.environ.get('LOCALAPPDATA', Path.home() / 'AppData/Local')) / 'Astra/browser-control'
     return Path(os.environ.get('XDG_RUNTIME_DIR', Path.home() / '.local/state')) / 'astra/browser-control'
-
-
-def private_directory(path: Path) -> None:
-    path.mkdir(parents=True, mode=0o700, exist_ok=True)
-    info = path.lstat()
-    if not stat.S_ISDIR(info.st_mode) or path.is_symlink():
-        raise PermissionError('Browser control directory must not be a symlink')
-    if os.name != 'nt' and (info.st_uid != os.getuid() or info.st_mode & 0o077):
-        raise PermissionError('Browser control directory must be user-owned and mode 0700')
 
 
 def encode_frame(value: dict) -> bytes:
@@ -220,17 +206,13 @@ class BrowserControlTransport:
         if self._lock_fd is not None:
             return {'state': 'ready' if self.ready else 'owned_here'}
         try:
-            directory = self.directory.lstat()
+            check_directory(self.directory)
         except FileNotFoundError:
             return {'state': 'available'}
         except OSError:
             return {'state': 'unavailable'}
-        if not stat.S_ISDIR(directory.st_mode) or self.directory.is_symlink():
-            return {'state': 'unavailable'}
-        if os.name != 'nt' and (directory.st_uid != os.getuid() or directory.st_mode & 0o077):
-            return {'state': 'unavailable'}
         try:
-            fd = os.open(self.directory / 'owner.lock', os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+            fd = open_private(self.directory / 'owner.lock', os.O_RDWR)
         except FileNotFoundError:
             return {'state': 'available'}
         except OSError:
@@ -263,11 +245,10 @@ class BrowserControlTransport:
                 return
             self._closed = False
             private_directory(self.directory)
-            fd = os.open(self.directory / 'owner.lock', os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0), 0o600)
+            fd = open_private(self.directory / 'owner.lock', os.O_CREAT | os.O_RDWR)
             try:
                 if os.name == 'nt':
                     import msvcrt
-                    os.write(fd, b'0'); os.lseek(fd, 0, 0)
                     msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                 else:
                     import fcntl
@@ -278,11 +259,12 @@ class BrowserControlTransport:
                     raise
                 raise BrowserEndpointOwnedError(self._reported_owner_pid(), self._reported_owner_label()) from None
             self._lock_fd = fd
+            temp = None
             try:
                 self._server = await asyncio.start_server(self._accept, '127.0.0.1', 0)
                 descriptor = {'port':self._server.sockets[0].getsockname()[1], 'token':self._token, 'pid':os.getpid()}
                 temp = self.directory / f'.endpoint-{uuid.uuid4().hex}'
-                out = os.open(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                out = open_private(temp, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
                 with os.fdopen(out, 'w') as stream:
                     json.dump(descriptor, stream); stream.flush(); os.fsync(stream.fileno())
                 os.replace(temp, self.descriptor_path)
@@ -291,13 +273,15 @@ class BrowserControlTransport:
                     _write_private_json(self.directory / OWNER_INFO,
                                         {'pid': os.getpid(), 'label': current_owner_label()})
             except BaseException:
+                if temp is not None:
+                    temp.unlink(missing_ok=True)
                 await self._close_unlocked()
                 raise
 
     def _reported_owner_pid(self) -> int | None:
         """Read advisory ownership metadata without exposing the endpoint token."""
         try:
-            fd = os.open(self.descriptor_path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+            fd = open_private(self.descriptor_path, os.O_RDONLY)
             with os.fdopen(fd, 'rb') as stream:
                 info = os.fstat(stream.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_size > 4096:
@@ -339,7 +323,10 @@ class BrowserControlTransport:
             return None
         if isinstance(at, bool) or not isinstance(at, (int, float)):
             return None
-        age = (time.time() if now is None else now) - at
+        try:
+            age = (time.time() if now is None else now) - at
+        except OverflowError:
+            return None
         if not 0 <= age <= RELEASE_REQUEST_MAX_AGE:
             return None
         return {'pid': pid, 'label': clean_owner_label(value.get('label'))}
@@ -491,7 +478,8 @@ class BrowserControlTransport:
             self._server = None
         if self._lock_fd is not None:
             try:
-                if json.loads(self.descriptor_path.read_text()).get('token') == self._token:
+                descriptor = json.loads(read_private(self.descriptor_path, 4096))
+                if isinstance(descriptor, dict) and descriptor.get('token') == self._token:
                     self.descriptor_path.unlink()
             except (OSError, ValueError): pass
             owner = _read_private_json(self.directory / OWNER_INFO)

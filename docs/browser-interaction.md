@@ -7,7 +7,9 @@ The CDP backend returns structured page observations and supports
 supported. Restart Astra to load the updated tools. Safari control is not part of
 this Chromium integration.
 
-## Everyday browser setup (macOS Edge)
+<a id="everyday-browser-setup-macos-edge"></a>
+
+## Everyday browser setup (Windows and macOS)
 
 The independent `browser-control-extension` connects your existing Edge through
 Native Messaging. Keep the existing **Astra Activity URLs** recorder extension;
@@ -18,13 +20,16 @@ it cannot operate pages and its permissions have not changed.
 2. From the stable checkout run (replace the ID with the actual 32-letter ID):
 
    ```sh
-   .venv/bin/python scripts/install_browser_control_host.py --browser edge --extension-id YOUR_EXTENSION_ID
+   astra browser-control install --browser edge --extension-id YOUR_EXTENSION_ID
    ```
 
    Chrome uses `--browser chrome`. The installer registers only that exact ID,
-   and records the current checkout and Python path. Reinstall after moving the
-   checkout/environment. Temporary worktree installation is rejected. Windows
-   retains CDP; a native-host registry installer for Windows is not included yet.
+   and records the current checkout and Python path. Use explicit `repair` after
+   moving the checkout/environment. Temporary worktrees and incomplete package
+   installations are rejected. Windows registers only the selected browser's
+   current-user HKCU NativeMessagingHosts key; no administrator rights are needed.
+   Files under `%LOCALAPPDATA%\Astra\browser-control-host` and the runtime endpoint
+   use owner/SYSTEM-only protected ACLs. macOS keeps its existing manifest locations.
 3. Restart Astra after updating Python files. With an installer-owned native host
    matching this checkout, the first extension browser task (including tab
    discovery) acquires the endpoint and starts the listener. Chat startup only
@@ -65,7 +70,45 @@ Manual connection remains available. Set `ASTRA_BROWSER_TRANSPORT=cdp` (or
 then produces a setup error. `ASTRA_BROWSER_APP=edge` or `chrome` chooses the
 installed app; if both hosts are installed, Edge is preferred. Auto mode never
 silently switches to CDP after a connection failure, and existing bound CDP tabs
-retain their targets. Windows/Safari auto-connect is not included in this version.
+retain their targets. Safari and Linux native-host installation are not included.
+
+### Check and repair the optional integration
+
+On Windows, run host-management commands from your own ordinary CMD/PowerShell
+window. An isolated agent or packaged process can read back registry writes that
+Edge cannot see. The installer refuses known isolated/packaged environments;
+do not disable that check or switch to a machine-wide registration to work around it.
+An earlier attempt in such an environment needs an explicit `repair` from the
+ordinary terminal (or `install` with the exact extension ID if no owned files exist).
+
+```text
+astra browser-control status --browser edge --json
+astra browser-control repair --browser edge
+```
+
+Status and `astra doctor` do not start a host or browser. `configured` means the
+registration is valid, not that the extension is connected or any tab is granted;
+use `/doctor browser` or `/browser status` inside Astra for live readiness. A native
+socket alone is not ready until extension grant restoration finishes. The popup
+shows the native connection error as well as its retry state.
+
+Repair/uninstall verify ownership and refuse foreign registrations, edited files,
+reparse points and hard links. Repair can tighten an older Windows installation's
+ACLs, but refuses a live endpoint: first run `/browser stop` in its owning Astra
+session. Never delete its lock to take over. Normal failures restore previously
+owned files/registration; unknown artifacts require manual investigation.
+
+Windows uses a Python `.cmd` launcher, binary stdio and a fixed module entrypoint;
+no browser argument is interpolated into a command. A native-host directory
+containing `%` or a newline is rejected before installation. If your organization
+blocks command launchers or Native Messaging, consult its policy administrator;
+Astra does not weaken those policies or silently switch transport.
+
+For a real-browser smoke test, stop the current Astra browser session, run
+`python scripts/browser_control_smoke.py` with the checkout's virtualenv Python,
+and follow its prompts on the disposable loopback page. Grant **only that tab**.
+The script checks read/fill/click, runtime restart/reconnect without replay, and
+manual revocation. It never requests private pages or broad site access.
 
 ## Model workflow
 
@@ -181,7 +224,7 @@ sends that token to the browser. At most one Astra runtime owns this endpoint.
 Uninstall the native host with:
 
 ```sh
-.venv/bin/python scripts/install_browser_control_host.py --browser edge --uninstall
+astra browser-control uninstall --browser edge
 ```
 
 Then remove the control extension in Edge. This does not uninstall Activity URLs

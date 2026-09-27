@@ -44,10 +44,13 @@ class ExtensionBrowserBackend:
         self._page_capabilities = {}
 
     async def status(self):
+        ready = getattr(self.transport, 'ready', self.transport.connected)
         info = getattr(self.transport, 'controller_capabilities', {})
         detail = (f'Browser control extension connected; controller={info.get("extensionVersion") or "legacy/unreported"}; '
                   'effective checked-state routes are reported by snapshots; screenshots require CDP')
-        return self.transport.connected, (detail if self.transport.connected else 'Start control in the Astra browser control extension popup')
+        if self.transport.connected and not ready:
+            return False, 'Browser native host connected; waiting for extension readiness and grant restoration'
+        return ready, (detail if ready else 'Start control in the Astra browser control extension popup')
 
     async def release_session(self):
         transport = self.transport

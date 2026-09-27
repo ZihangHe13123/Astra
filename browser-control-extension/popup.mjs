@@ -10,6 +10,7 @@ async function refresh() {
   document.querySelector('#grant').disabled=!state.connected;
   const labels={waiting:'Waiting for Astra. Automatic retry enabled.',connecting:'Connecting to Astra…',reconnecting:'Reconnecting to Astra…',stopped:'Stopped. Click Connect after starting Astra.'};
   status.textContent=state.connected ? `Connected. Granted tabs: ${state.grantedTabIds.join(', ') || 'none'}` : labels[state.connectionState];
+  if(!state.connected && state.connectionError)status.textContent+=` ${state.connectionError}`;
 }
 function bind(id,action){document.querySelector(id).addEventListener('click',()=>action().catch(error=>{status.textContent=error.message;}));}
 bind('#connect',async()=>{await send('connect');await refresh();});
