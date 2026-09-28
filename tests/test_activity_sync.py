@@ -500,8 +500,10 @@ def test_sync_is_partial_when_events_succeed_but_summary_root_is_missing(sync_fi
     assert report.error == "summary_root_unavailable"
 
 
+@pytest.mark.parametrize("recursion_limit", (None, 5_000), ids=("default_limit", "raised_limit"))
 def test_complete_adversarial_records_are_malformed_and_cursor_reaches_following_event(
     sync_fixture: SyncFixture,
+    recursion_limit: int | None,
 ):
     deeply_nested = (
         b'{"id":1,"kind":"focus","timestamp":"2026-08-26T06:40:01Z","nested":'
@@ -523,7 +525,14 @@ def test_complete_adversarial_records_are_malformed_and_cursor_reaches_following
     payload = deeply_nested + outside_sqlite_integer + valid
     sync_fixture.write_raw(payload)
 
-    report = sync_fixture.sync()
+    # Python 3.11 stops json.loads at sys.getrecursionlimit() (importing jedi raises it to 3000);
+    # 3.12+ ignore that limit, so the 1,500-level line can decode and must still be rejected.
+    previous_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(recursion_limit or previous_limit)
+    try:
+        report = sync_fixture.sync()
+    finally:
+        sys.setrecursionlimit(previous_limit)
 
     assert (report.malformed_lines, report.events_imported) == (2, 1)
     assert sync_fixture.store.get_cursor(str(sync_fixture.source)).byte_offset == len(payload)

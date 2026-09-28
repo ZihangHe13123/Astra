@@ -28,6 +28,7 @@ _MAX_SELECTION_DEPTH = 6
 _MAX_SELECTION_VALUES = 64
 _MAX_SELECTION_CHARS = 4096
 _MAX_EVENT_ID = 2**63 - 1
+_MAX_EVENT_DEPTH = 256
 _SUMMARY_FILENAME = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2})-"
     r"[A-Za-z0-9]+-(?P<granularity>10min|6h)-.+\.md$"
@@ -155,6 +156,19 @@ def _selection_text(value: Any) -> str:
     return " ".join(selected)
 
 
+def _nesting_exceeds(value: Any, limit: int) -> bool:
+    """Check nesting iteratively; json.loads' own depth limit varies by Python version and recursion limit."""
+    pending = [(value, 1)]
+    while pending:
+        item, depth = pending.pop()
+        if isinstance(item, (dict, list)):
+            if depth > limit:
+                return True
+            children = item.values() if isinstance(item, dict) else item
+            pending.extend((child, depth + 1) for child in children)
+    return False
+
+
 def normalize_event(segment_id: str, payload: dict[str, Any], imported_at: str | None = None) -> ActivityEvent | None:
     """Normalize the stable searchable fields while preserving raw local evidence."""
     if not isinstance(payload, dict):
@@ -169,6 +183,8 @@ def normalize_event(segment_id: str, payload: dict[str, Any], imported_at: str |
     ):
         return None
     if not isinstance(occurred_at, str) or not is_valid_timestamp(occurred_at):
+        return None
+    if _nesting_exceeds(payload, _MAX_EVENT_DEPTH):
         return None
 
     app = payload.get("app")
