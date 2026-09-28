@@ -25,7 +25,8 @@ npm --prefix ui-core run build
 npm --prefix ui-tui ci
 ```
 
-The development extra pins pytest, Ruff and Pyright. Add `--extra embedding`
+`.python-version` pins 3.11, so `uv sync` without `--python`, for example in a new
+worktree, uses the same interpreter as CI. The development extra pins pytest, Ruff and Pyright. Add `--extra embedding`
 when the local embedding backend is needed; model downloads and native helper
 installation are separate. On an existing environment, `uv sync --inexact`
 preserves additional installed packages. The shared `astra setup` command uses

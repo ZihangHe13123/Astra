@@ -22,7 +22,7 @@ npm --prefix ui-core run build
 npm --prefix ui-tui ci
 ```
 
-`dev` extra 固定 pytest、Ruff 和 Pyright 的版本。需要本地嵌入后端时添加 `--extra embedding`；模型下载和原生辅助程序安装另行处理。已有环境可使用 `uv sync --inexact` 保留额外安装的包。
+`.python-version` 固定为 3.11，所以不带 `--python` 运行 `uv sync`（例如在新 worktree 中）也会使用与 CI 相同的解释器。`dev` extra 固定 pytest、Ruff 和 Pyright 的版本。需要本地嵌入后端时添加 `--extra embedding`；模型下载和原生辅助程序安装另行处理。已有环境可使用 `uv sync --inexact` 保留额外安装的包。
 
 统一入口 `astra setup` 使用 `uv sync --locked --inexact`，记录启用的 extras 和依赖是否需要更新，执行锁定依赖安装及界面构建；仍会检查依赖冲突。上述手动命令适合开发与发布检查，之后可运行 `astra setup` 记录验证过的环境。
 
