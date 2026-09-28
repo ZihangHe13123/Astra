@@ -5,7 +5,7 @@ import { projectEvent, textContent, type SessionState, type UIEvent, type Messag
 import type { CommandDescription, Preferences, SessionEntry } from "../bridge.js";
 import { Approval, CommandPalette, Modal, ModelPicker, ModelSettings, Question } from "./controls.js";
 import { Details, type Panel } from "./details.js";
-import { latestDoc } from "./doc-preview.js";
+import { docPathFromTool, latestDoc } from "./doc-preview.js";
 import { modelConnection } from "./model-connection.js";
 import { SessionMenu, SessionActionDialog, type SessionAction } from "./session-actions.js";
 import { modeCommand, modeChoices, localCommandEntry } from "../local-mode.js";
@@ -192,6 +192,16 @@ function App() {
       if (number && Number(number) < 1) { fail("结果编号从 1 开始。"); return false; }
       setSelection(old => ({ index: number ? Number(number) : undefined, serial: old.serial + 1 }));
       setPanel(name === "/tool" ? "tools" : "files"); return;
+    }
+    const docCommand = value.match(/^\/doc(?:\s+(open))?(?:\s+(\d+))?$/);
+    if (docCommand) {
+      const tools = state?.tools || [];
+      const number = docCommand[2] ? Number(docCommand[2]) : undefined;
+      const path = number ? docPathFromTool(tools.find(t => Number(t.result_index) === number) || {})
+        : [...tools].reverse().map(t => docPathFromTool(t)).find(Boolean);
+      if (!path) { fail(number ? `结果 ${number} 不是文档工具的结果。` : "还没有文档结果。先让 Astra 用文档工具写一份文档。"); return false; }
+      if (docCommand[1]) { if (state) void window.astra.file(state.id, path, "open").catch(fail); return; }
+      docFollow.current = true; setDocTarget({ path, serial: Date.now() }); setPanel("files"); return;
     }
     if (value === "/changes") { setPanel("changes"); return; }
     if (value.startsWith("/theme")) { const t = value.split(/\s+/)[1]; if (t) {

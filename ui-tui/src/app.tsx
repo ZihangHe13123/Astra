@@ -2,6 +2,7 @@ import type { ProviderInfo, ConnectionRoute } from "./types.js";
 import { ConnectionPanel } from "./components/connection-panel.js";
 import { appshotRejectionNotice } from "./appshot-rejection.js";
 import { openImageGallery } from "./image-gallery.js";
+import { documentDetail, findDocumentResult, followDocumentView, openDocument, type DocumentLineStyle } from "./document-view.js";
 import type { AppshotConsumer, AppshotDraftState } from "./appshot-client.js";
 import type { AppshotManifestReader } from "./appshot-input.js";
 import type { GenerationProgress, GenerationStats, InputSubmission, LocalModeDefinition } from "./types.js";
@@ -65,7 +66,7 @@ import type {
   VisionPreprocessEvent,
   ComputerStateEvent,
 } from "./types.js";
-import { loadThemeName, saveThemeName, THEMES, THEME_NAMES, isThemeName } from "./theme.js";
+import { loadThemeName, saveThemeName, THEMES, THEME_NAMES, isThemeName, type UiTheme } from "./theme.js";
 import { loadTimelineDisplay, saveTimelineDisplay } from "./tui-settings.js";
 import {
   resolveTimelineCommand,
@@ -100,6 +101,7 @@ import {
   shouldCollapseToolResult,
   summarizeToolResult,
   toolResultBody,
+  wrapStyledLines,
   wrapToolResult,
   type ToolResultRecord,
 } from "./tool-results.js";
@@ -467,14 +469,28 @@ const HistoryOutput = memo(function HistoryOutput({ lines, generation, runtimeMo
   </Static>;
 });
 
+function detailLineProps(style: DocumentLineStyle | undefined, theme: UiTheme, error: boolean) {
+  switch (style) {
+    case "title": return { bold: true, color: theme.header };
+    case "heading": return { bold: true, color: theme.accentAlt };
+    case "meta": return { dimColor: true, color: theme.muted };
+    case "pending": return { dimColor: true, italic: true, color: theme.muted };
+    case "comment": return { color: theme.warning };
+    case "code": return { color: theme.codeBlock };
+    default: return { color: error ? theme.danger : theme.text };
+  }
+}
+
 function ToolDetailsPanel({
   result,
   lines,
+  styles,
   pageSize,
   offset,
 }: {
   result: ToolResultRecord;
   lines: string[];
+  styles?: DocumentLineStyle[];
   pageSize: number;
   offset: number;
 }) {
@@ -489,7 +505,7 @@ function ToolDetailsPanel({
         {chrome?.detailTitle ? `${chrome.detailTitle} // ` : ""}Tool #{result.id} · {result.name} · lines {safeOffset + 1}-{end}/{lines.length}
       </Text>
       {visible.map((line, index) => (
-        <Text key={`${result.id}-${safeOffset + index}`} color={result.error ? theme.danger : theme.text}>
+        <Text key={`${result.id}-${safeOffset + index}`} {...detailLineProps(styles?.[safeOffset + index], theme, Boolean(result.error))}>
           {line || " "}
         </Text>
       ))}
@@ -1349,6 +1365,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         const nextResults = [...toolResultsRef.current, result].slice(-MAX_TOOL_RESULTS);
         toolResultsRef.current = nextResults;
         setToolResults(nextResults);
+        // An open document view follows new writes to the same document.
+        setOpenToolResultId((current) => followDocumentView(current, toolResultsRef.current, result));
         const body = toolResultBody(result);
         if (shouldCollapseToolResult(body, TOOL_COLLAPSE_CHARS, TOOL_COLLAPSE_LINES)) {
           const lineCount = body.split(/\r?\n/).length;
@@ -1798,6 +1816,24 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
       openToolDetails(toolDetailsMatch[1]);
       return;
     }
+    const documentMatch = trimmedText.match(/^\/doc(?:\s+(.*))?$/i);
+    if (documentMatch) {
+      const argument = (documentMatch[1] ?? "").trim();
+      const openMatch = argument.match(/^open(?:\s+(.*))?$/i);
+      if (openMatch) {
+        void openDocument(toolResultsRef.current, (openMatch[1] ?? "").trim()).then(
+          (message) => addMessage("system", message),
+          () => addMessage("error", "无法用系统程序打开文档。请检查文件是否仍然存在。"),
+        );
+      } else if (argument && !/^[1-9]\d*$/u.test(argument)) {
+        addMessage("error", "用法：/doc [编号] · /doc open [编号]");
+      } else {
+        const target = findDocumentResult(toolResultsRef.current, argument);
+        if (target) openToolDetails(String(target.id));
+        else addMessage("system", "还没有文档结果。先让 Astra 用文档工具写一份文档，再使用 /doc。");
+      }
+      return;
+    }
     const galleryMatch = trimmedText.match(/^\/gallery(?:\s+(.*))?$/i);
     if (galleryMatch) {
       void openImageGallery(toolResultsRef.current, galleryMatch[1]).then(
@@ -1921,7 +1957,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
             "YOLO: /yolo [on|off|status] works during replies. Ctrl+Y also works in approval panels.",
             `CHAT     /image  /bar  /minimal${localMode ? `  ${localMode.command}` : ""}  /reset  /compress  /undo  /retry  /changes  /think`,
             "MODEL    /model  /connect  /persona",
-            "TOOLS    /search  /tool  /memory  /skills  /learn  /tools  /browser  /computer  /conclave",
+            "TOOLS    /search  /tool  /doc  /memory  /skills  /learn  /tools  /browser  /computer  /conclave",
             "SESSION  /tasks  /resume  /cancel  /session  /handoff",
             "CAPTURE  /appshot status · shortcut · enable · disable",
             "DISPLAY  /theme  /timeline",
@@ -1971,9 +2007,19 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     : toolResults.find((item) => item.id === openToolResultId);
   const openToolBody = openToolResult ? toolResultBody(openToolResult) : undefined;
   const toolWrapWidth = Math.max(20, columns - 8);
+  // Document results show the current file, styled per line, instead of the raw result.
+  const openDocumentLines = useMemo(
+    () => openToolResult ? documentDetail(openToolResult) : undefined,
+    [openToolResult],
+  );
+  const openStyledLines = useMemo(
+    () => openDocumentLines ? wrapStyledLines(openDocumentLines, toolWrapWidth) : undefined,
+    [openDocumentLines, toolWrapWidth],
+  );
   const openToolLines = useMemo(
-    () => openToolBody === undefined ? [] : wrapToolResult(openToolBody, toolWrapWidth),
-    [openToolBody, toolWrapWidth],
+    () => openStyledLines ? openStyledLines.map((line) => line.text)
+      : openToolBody === undefined ? [] : wrapToolResult(openToolBody, toolWrapWidth),
+    [openStyledLines, openToolBody, toolWrapWidth],
   );
   const openToolLineCount = openToolLines.length;
   const approvalLineCount = approvalRequests[0]
@@ -2238,6 +2284,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         <ToolDetailsPanel
           result={openToolResult}
           lines={openToolLines}
+          styles={openStyledLines?.map((line) => line.style)}
           pageSize={toolDetailPageSize}
           offset={toolDetailOffset}
         />

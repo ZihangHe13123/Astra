@@ -49,6 +49,7 @@ const SLASH_COMMANDS: SlashCommandSuggestion[] = [
   { command: "/search", description: "show or switch web search provider", takesArgs: true, group: "TOOLS" },
   { command: "/tool", description: "open latest or numbered tool result details", takesArgs: true, group: "TOOLS" },
   { command: "/gallery", description: "open latest or numbered image search gallery", takesArgs: true, group: "TOOLS" },
+  { command: "/doc", description: "view the latest or numbered document; /doc open uses the system app", takesArgs: true, group: "TOOLS" },
   { command: "/memory", description: "inspect or update working/core memory", takesArgs: true, group: "TOOLS" },
   { command: "/skills", description: "list, inspect, or create local skills", takesArgs: true, group: "TOOLS" },
   { command: "/learn", description: "discuss skill improvements, save, and undo changes", takesArgs: true, group: "TOOLS" },

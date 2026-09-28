@@ -1,5 +1,6 @@
 import stringWidth from "string-width";
 import { imageSearchSummary } from "./image-gallery.js";
+import { documentSummary, type DocumentLine } from "./document-view.js";
 
 export interface ToolResultRecord {
   id: number;
@@ -23,6 +24,9 @@ function graphemeSegments(text: string): string[] {
 }
 
 export function toolResultBody(result: ToolResultRecord): string {
+  // Documents show one line in the transcript; Ctrl+O shows the document itself.
+  const document = documentSummary(result);
+  if (document) return document;
   return imageSearchSummary(result) ?? (result.output || result.error || "(done)");
 }
 
@@ -79,6 +83,11 @@ export function wrapToolResult(content: string, width: number): string[] {
     if (line) wrapped.push(line);
   }
   return wrapped.length ? wrapped : ["(empty result)"];
+}
+
+/** Wrap styled lines, repeating each line's style on its continuation rows. */
+export function wrapStyledLines(lines: DocumentLine[], width: number): DocumentLine[] {
+  return lines.flatMap((line) => wrapToolResult(line.text, width).map((text) => ({ text, style: line.style })));
 }
 
 export function clampToolDetailOffset(offset: number, lineCount: number, pageSize: number): number {
