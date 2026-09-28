@@ -118,6 +118,8 @@ concurrency:
 
 jobs:
   launcher:
+    # Runs only in the public repository; the private dev repository skips the job.
+    if: github.repository == 'ZihangHe13123/Astra'
     strategy:
       fail-fast: false
       matrix:

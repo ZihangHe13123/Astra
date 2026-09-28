@@ -122,7 +122,9 @@ native command forwarding, real Git updates, process exclusion and recovery on
 all three platforms. A passing local macOS run does not establish Windows CMD,
 PowerShell or Linux acceptance; verify the target commit's completed jobs.
 
-Private-repository runs consume the account's GitHub Actions allowance. Standard
+The workflows run only in the public repository (`ZihangHe13123/Astra`); in the
+private development repository every job is skipped, so pushes there use no
+Actions minutes. Private-repository runs consume the account's GitHub Actions allowance. Standard
 GitHub-hosted runners are free for public repositories; larger runners are
 billed separately. See [Actions billing](https://docs.github.com/en/actions/concepts/billing-and-usage).
 When private-repository minutes are exhausted, retain local acceptance results

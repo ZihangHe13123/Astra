@@ -85,7 +85,7 @@ uv run --locked --extra dev --extra mcp --extra tracing --extra server --extra n
 
 独立的 [Launcher compatibility 工作流](../../.github/workflows/launcher.yml) 在 push 或 pull request 涉及其列出的启动器文件时自动运行，也支持 **Run workflow**。它在三个平台检查源码发现、原生命令转发、真实 Git 更新、进程排除和恢复。本机 macOS 通过不能替代 Windows CMD、PowerShell 或 Linux 验收，应检查目标 commit 对应任务的最终结果。
 
-私有仓库运行消耗账号的 GitHub Actions 配额。公开仓库使用标准 GitHub 托管 runner 免费，较大型 runner 单独计费，详见 [Actions 计费说明（英文）](https://docs.github.com/en/actions/concepts/billing-and-usage)。私有仓库额度用完时，可以保留本地验收记录，将暂时无法运行的平台检查留待补验；购买额外额度是可选项。如果 GitHub 同时提示付款失败，应先检查账户账单状态。被拦截而未启动的任务不能算测试已执行。
+工作流只在公开仓库（`ZihangHe13123/Astra`）运行；在私有开发仓库中所有任务都会跳过，推送不消耗 Actions 额度。私有仓库运行消耗账号的 GitHub Actions 配额。公开仓库使用标准 GitHub 托管 runner 免费，较大型 runner 单独计费，详见 [Actions 计费说明（英文）](https://docs.github.com/en/actions/concepts/billing-and-usage)。私有仓库额度用完时，可以保留本地验收记录，将暂时无法运行的平台检查留待补验；购买额外额度是可选项。如果 GitHub 同时提示付款失败，应先检查账户账单状态。被拦截而未启动的任务不能算测试已执行。
 
 Maintenance 使用 `--keep-going` 在一次运行中收集相互独立的失败；任一项失败，整体仍以失败退出。本地默认遇到首个失败即停止。
 
