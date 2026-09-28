@@ -34,6 +34,7 @@ Documentation = "https://github.com/ZihangHe13123/Astra/blob/main/docs/README.md
 
 [project.optional-dependencies]
 notebook = ["nbclient>=0.10,<1", "nbformat>=5.10,<6", "ipykernel>=6,<8"]
+documents = ["python-docx>=1.1,<2", "markdown-it-py>=3,<5"]
 hindsight = ["hindsight-client==0.6.1"]
 mcp = ["mcp>=1.27,<2"]
 server = ["starlette>=0.27", "uvicorn>=0.29"]

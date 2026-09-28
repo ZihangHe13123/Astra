@@ -852,6 +852,8 @@ class ToolRegistry:
             "memory": r"\b(memory|hindsight|recall|reflect)\b|记忆|记住|回忆|反思|工作计划|核心记忆",
             "skills": r"\bskills?\b|技能|学习复盘|learning review",
             "image": r"\.(png|jpe?g|webp|gif)\b|\b(image|picture|screenshot|comfyui|draw)\b|图片|图像|截图|生图|画图",
+            "documents": r"\.(md|markdown|docx)\b|\b(docx|pdf|reports?|proposals?|documents?|essays?|thesis|write-?ups?)\b"
+                         r"|文档|报告|提案|论文|计划书|讲稿|导出",
         }
         available = set(self.groups)
         return {group for group, pattern in patterns.items() if group in available and re.search(pattern, lower)}

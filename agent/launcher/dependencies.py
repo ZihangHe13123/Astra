@@ -171,7 +171,8 @@ def enabled_extras(install: Installation, requested: list[str] | None = None) ->
                      cwd=install.root)
         installed = set(json.loads(output))
         for package, extra in {"pytest": "dev", "uvicorn": "server", "nbclient": "notebook",
-                               "hindsight-client": "hindsight", "mlx-embeddings": "embedding", "textual": "legacy-tui"}.items():
+                               "hindsight-client": "hindsight", "mlx-embeddings": "embedding", "textual": "legacy-tui",
+                               "python-docx": "documents"}.items():
             if package in installed:
                 extras.add(extra)
     extras.update(requested or [])

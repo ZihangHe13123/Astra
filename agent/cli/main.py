@@ -33,6 +33,7 @@ from ..runtime.task_store import (
 )
 from ..runtime.tools.registry import ToolRegistry
 from ..runtime.tools.code import register_code_tools
+from ..runtime.tools.documents import register_document_tools
 from ..runtime.tools.files import register_file_tools
 from ..runtime.tools.git import register_git_tools
 from ..runtime.tools.time import register_time_tools
@@ -895,6 +896,7 @@ async def _async_init(llm_config: LLMConfig, sandbox_timeout: int, workdir: str)
     agent_holder = {}
     register_code_tools(tools, sandbox)
     register_file_tools(tools, workdir=workdir, sandbox=sandbox)
+    register_document_tools(tools)
     register_git_tools(tools, workdir=workdir)
     register_time_tools(tools)
     register_memory_tools(

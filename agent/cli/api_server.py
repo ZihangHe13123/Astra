@@ -204,6 +204,7 @@ async def _bootstrap_agent():
 
     # Register core tools (lighter than full backend — no sandbox/docker)
     from agent.runtime.tools.code import register_code_tools
+    from agent.runtime.tools.documents import register_document_tools
     from agent.runtime.tools.files import register_file_tools
     from agent.runtime.tools.git import register_git_tools
     from agent.runtime.tools.image import register_image_tools, select_vision_tiles_from_holder
@@ -218,6 +219,7 @@ async def _bootstrap_agent():
     agent_holder = {}
     register_code_tools(tools, sandbox)
     register_file_tools(tools, workdir=os.getcwd(), sandbox=sandbox)
+    register_document_tools(tools)
     register_git_tools(tools, workdir=os.getcwd())
     register_time_tools(tools)
     register_memory_tools(tools, memory_store, session_id=_current_memory_session)

@@ -78,6 +78,7 @@ from agent.runtime.browser_control_transport import set_owner_label_provider
 from agent.runtime.peer_link import (HEARTBEAT_SECONDS, PeerError, PeerLink, default_name, fallback_name,
                                      incoming_prompt)
 from agent.runtime.tools.code import register_code_tools
+from agent.runtime.tools.documents import register_document_tools
 from agent.runtime.tools.files import register_file_tools
 from agent.runtime.tools.git import register_git_tools
 from agent.runtime.tools.time import register_time_tools
@@ -852,6 +853,7 @@ async def _main(startup_started: float):
         on_process_event=lambda event: _send({"type": "process_status", **event}),
     )
     register_file_tools(tools, workdir=os.getcwd(), sandbox=sandbox)
+    register_document_tools(tools)
     register_git_tools(tools, workdir=os.getcwd())
     register_time_tools(tools)
     register_memory_tools(
