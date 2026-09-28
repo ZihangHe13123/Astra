@@ -4,7 +4,7 @@
 
 The `documents` tool group writes a Markdown document section by section, handles review comments and exports Word, PDF or HTML copies. The document stays an ordinary `.md` file that you can open and edit in any editor while Astra works on it.
 
-[Document format](#document-format) · [Tools](#tools) · [Safe editing](#safe-editing) · [Review comments](#review-comments) · [Export](#export) · [Desktop preview](#desktop-preview) · [Limits](#limits)
+[Document format](#document-format) · [Tools](#tools) · [Safe editing](#safe-editing) · [Review comments](#review-comments) · [Export](#export) · [Desktop preview](#desktop-preview) · [Terminal view](#terminal-view) · [Limits](#limits)
 
 ## Document format
 
@@ -101,6 +101,18 @@ In the [desktop GUI](gui.md), the **Files** panel opens the document Astra is wr
 - The preview renders Markdown with its images and lists open review comments above the text.
 - **Source** switches to the raw text.
 - Closing the panel, switching tabs or pressing **← Back** stops following documents for the rest of that session.
+
+## Terminal view
+
+In the terminal UI, each doc tool result is one transcript line, for example `文档 report.md · 写入「结果」 · 1 节待写 · /doc 12 查看`. The activity dock labels the tools `DOC NEW`, `DOC WRITE`, `DOC EXPORT` and so on.
+
+| Command | Effect |
+| --- | --- |
+| `/doc` | Open the newest document in the details view |
+| `/doc <result>` | Open the document of a numbered tool result |
+| `/doc open [result]` | Open the document with the system's default app |
+
+The details view reads the current file. It hides section markers, highlights headings, review comments and pending sections, and aligns tables by display width. While it is open, it follows new writes to the same document. **Ctrl+O** opens the newest tool result as before; use `/doc` when another tool ran last.
 
 ## Limits
 
