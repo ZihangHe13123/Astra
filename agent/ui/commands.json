@@ -423,17 +423,6 @@
         "completion": "/learn undo "
       },
       {
-        "command": "legacy pending",
-        "description": "inspect historical candidates",
-        "completion": "/learn legacy pending",
-        "submitValue": "/learn legacy pending"
-      },
-      {
-        "command": "legacy show",
-        "description": "read one historical candidate",
-        "completion": "/learn legacy show "
-      },
-      {
         "command": "mode",
         "description": "set off or review mode",
         "completion": "/learn mode "

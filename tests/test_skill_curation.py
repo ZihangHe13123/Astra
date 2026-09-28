@@ -1,19 +1,18 @@
 import asyncio
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from agent.cli.learning_commands import execute_learning_command
 from agent.runtime.instance_lock import InstanceAlreadyRunning
 from agent.runtime.learning import LearningStore
-from agent.runtime.memory import MemoryStore
 from agent.runtime.skill_curation import SkillCurator
 from agent.runtime.skill_learning import LearnedSkills
 from agent.runtime.skills import SkillStore
 from agent.runtime.tools.registry import ToolRegistry
 from agent.runtime.tools.skills import register_skill_tools
+from tests.learning_fixtures import stage_legacy_proposal
 
 
 def skill(name, body="Read the error, check its cause, and report limits."):
@@ -249,12 +248,12 @@ def test_bad_or_truncated_model_output_never_changes_files(learned):
 
 def test_retired_commands_do_not_activate_old_candidates(learned):
     store = LearningStore(learned.root.parent / "learning.db")
-    item = store.stage("legacy", "skill_create", {"name": "old-one", "content": skill("old-one")}, "Historical candidate")
-    memory = MemoryStore(learned.root.parent / "memory.db")
-    for command in (["approve", "all"], ["repair", "all"], ["summarize"], ["legacy", "approve", item["id"]]):
-        output, error = asyncio.run(execute_learning_command(store, SimpleNamespace(), memory, learned.skills,
-                                                            command, session_id="test", messages=[]))
-        assert error and not output
+    item = stage_legacy_proposal(store, "legacy", "skill_create", {"name": "old-one", "content": skill("old-one")},
+                                 "Historical candidate")
+    for command in (["approve", "all"], ["repair", "all"], ["summarize"], ["legacy", "approve", item["id"]],
+                    ["legacy", "pending"], ["pending"]):
+        output, error = asyncio.run(execute_learning_command(store, learned.skills, command))
+        assert "retired" in error and not output
     assert store.count() == 1
     assert not learned._snapshot("old-one")
 
@@ -374,9 +373,7 @@ def test_off_disables_saving_and_direct_dispatch_cannot_bypass_conversational_re
     register_skill_tools(registry, learned.skills)
     result = asyncio.run(registry.execute("skill_manage", {"action": "create", "origin": "auto", "name": "blocked", "content": skill("blocked")}))
     assert "Learning is off" in result["error"]
-    output, error = asyncio.run(execute_learning_command(store, SimpleNamespace(llm=Model([action("keep", "debug-one")])),
-                                                        MemoryStore(learned.root.parent / "memory.db"), learned.skills,
-                                                        ["review"], session_id="test", messages=[]))
+    output, error = asyncio.run(execute_learning_command(store, learned.skills, ["review"]))
     assert not output and "Review now starts a conversation" in error
 
 
@@ -387,6 +384,10 @@ def test_background_and_candidate_hooks_removed_from_runtime():
         assert "advance_review_counter(" not in source
         assert "LEARNING_REVIEW_AUTO" not in source
         assert "register_learning_tools(" not in source
+        assert "reset_review_counter(" not in source
+    for retired in ("agent/runtime/tools/learning.py", "agent/runtime/learning_lifecycle.py",
+                    "agent/runtime/learning_queue.py", "agent/cli/legacy_learning_commands.py"):
+        assert not (root / retired).exists(), retired
     source = (root / "agent/runtime/react.py").read_text()
     assert "learning_reminder(" not in source
     assert "lifecycle.end_request(" not in source

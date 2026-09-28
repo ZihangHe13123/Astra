@@ -9,9 +9,10 @@ from queue import Empty, Queue
 
 from agent.runtime.learning import LearningStore
 from agent.runtime.skills import SkillStore
+from tests.learning_fixtures import stage_legacy_proposal
 
 
-def test_reset_resends_dashboard_snapshot_after_learning_state_changes(tmp_path: Path):
+def test_reset_resends_dashboard_snapshot_after_skill_state_changes(tmp_path: Path):
     settings = tmp_path / "settings.json"
     settings.write_text(
         json.dumps({"selected_model": "Qwen3.6-35B-A3B"}),
@@ -21,16 +22,6 @@ def test_reset_resends_dashboard_snapshot_after_learning_state_changes(tmp_path:
     sessions_dir.mkdir()
     learning_path = tmp_path / "learning.db"
     store = LearningStore(learning_path)
-    proposal = store.stage(
-        "dashboard-refresh",
-        "memory",
-        {
-            "scope": "user",
-            "content": "User prefers concise status output",
-            "evidence": "简洁显示状态",
-        },
-        "Dashboard refresh fixture",
-    )
     env = os.environ.copy()
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
@@ -92,13 +83,10 @@ def test_reset_resends_dashboard_snapshot_after_learning_state_changes(tmp_path:
         raise AssertionError(f"Timed out waiting for event; seen={seen}")
 
     try:
-        initial = wait_for(
-            lambda event: event.get("type") == "startup_banner"
-            and event.get("learning", {}).get("legacy_pending") == 1
-        )
+        initial = wait_for(lambda event: event.get("type") == "startup_banner")
         assert initial["skills"] == 1  # Packaged astra-core is always available.
 
-        store.reject(proposal["id"])
+        SkillStore(tmp_path / "skills").create("manual-example", "---\nname: manual-example\ndescription: User-provided example\n---\n\nKeep user content.\n", "user")
         proc.stdin.write(json.dumps({"type": "command", "cmd": "/reset"}) + "\n")
         proc.stdin.flush()
         wait_for(lambda event: event.get("type") == "session_info")
@@ -107,14 +95,12 @@ def test_reset_resends_dashboard_snapshot_after_learning_state_changes(tmp_path:
             timeout=5,
         )
 
-        assert refreshed["learning"]["legacy_pending"] == 0
         assert refreshed["learning"]["pending"] == 0
         assert refreshed["learning"]["auto"] is False
         assert refreshed["learning"]["learned"] == 0
-        assert refreshed["skills"] == 1
+        assert refreshed["skills"] == 2
 
-        SkillStore(tmp_path / "skills").create("manual-example", "---\nname: manual-example\ndescription: User-provided example\n---\n\nKeep user content.\n", "user")
-        store.stage("migration-fixture", "skill_create", {
+        stage_legacy_proposal(store, "migration-fixture", "skill_create", {
             "name": "auto-example", "content": "---\nname: auto-example\ndescription: Historical automatic summary\n---\n\nCheck the result.\n",
         }, "Automatic task summary")
         proc.stdin.write(json.dumps({"type": "command", "cmd": "/learn migrate"}) + "\n")

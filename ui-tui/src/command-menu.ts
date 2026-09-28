@@ -275,8 +275,6 @@ const LEARN_SUBCOMMANDS: SlashCommandSuggestion[] = [
   { command: "migrate", description: "import historical automatic summaries; preserve user skills", completion: "/learn migrate", submitValue: "/learn migrate", kind: "command" },
   { command: "history", description: "show changes and reasons", completion: "/learn history", submitValue: "/learn history", kind: "command" },
   { command: "undo", description: "restore a learning change by run ID", completion: "/learn undo ", kind: "command" },
-  { command: "legacy pending", description: "inspect historical candidates", completion: "/learn legacy pending", submitValue: "/learn legacy pending", kind: "command" },
-  { command: "legacy show", description: "read one historical candidate", completion: "/learn legacy show ", kind: "command" },
   { command: "mode", description: "set off or review mode", completion: "/learn mode ", kind: "command" },
 ];
 

@@ -37,7 +37,7 @@ const info = {
   skills: 15,
   tools: 72,
   model: "deepseek-v4-pro",
-  learning: { mode: "review" as const, auto: false, pending: 0, learned: 2, legacy_pending: 19 },
+  learning: { mode: "review" as const, auto: false, pending: 0, learned: 2 },
   mcp: [{ name: "local", state: "ready" }],
 };
 

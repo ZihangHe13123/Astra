@@ -237,10 +237,9 @@ assert.equal(completeSlashCommand("/memory time", 0), "/memory timeline ");
 assert.deepEqual(slashCommandSuggestions("/skills ").map((item) => item.command), ["list", "show", "create"]);
 assert.deepEqual(
   slashCommandSuggestions("/learn ").map((item) => item.command),
-  ["status", "review", "migrate", "history", "undo", "legacy pending", "legacy show", "mode"],
+  ["status", "review", "migrate", "history", "undo", "mode"],
 );
 assert.equal(submitSlashCommand("/learn hist", 0), "/learn history");
-assert.equal(submitSlashCommand("/learn legacy p", 0), "/learn legacy pending");
 assert.equal(submitSlashCommand("/learn undo", 0), null); // Requires an explicit run ID.
 
 assert.deepEqual(slashCommandSuggestions("hello"), []);

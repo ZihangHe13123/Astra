@@ -13,12 +13,12 @@ from ..learning_evidence import evidence_messages
 from .registry import ToolDef, ToolRegistry, approval_justification_schema
 
 if TYPE_CHECKING:
-    from ..learning_lifecycle import LearningLifecycle
+    from ..learning import LearningStore
 
 
 def register_skill_tools(
     registry: ToolRegistry, store: SkillStore, *,
-    learning_getter: Callable[[], LearningLifecycle] | None = None,
+    learning_getter: Callable[[], LearningStore] | None = None,
     session_id: Callable[[], str] = lambda: "default",
     messages: Callable[[], list[dict]] = lambda: [],
 ) -> None:
@@ -61,7 +61,7 @@ def register_skill_tools(
             return json.dumps({**result, "origin": "user", "notice": "User-added skill; excluded from /learn review."}, ensure_ascii=False)
         if origin != "auto":
             raise ValueError("Skill origin must be auto or user")
-        mode = (learning_getter().store.mode() if learning_getter is not None
+        mode = (learning_getter().mode() if learning_getter is not None
                 else LearningStore(store.root.parent / "learning.db").mode())
         if mode == "off":
             raise ValueError("Learning is off; use /learn mode review to enable saving skills")

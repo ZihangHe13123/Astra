@@ -90,7 +90,6 @@ it; the legacy name `review` does not turn on scheduled maintenance. Explicit
 ## Migrate an older library
 
 ```text
-/learn legacy pending
 /learn migrate
 ```
 
@@ -98,7 +97,9 @@ Migration backs up the old SQLite store and imports eligible automatic skill
 summaries using the existing file transaction and undo mechanism. It records
 original IDs and destinations, so repeating migration does not duplicate skills.
 Name collisions and old patches cannot overwrite user skills. Original database
-records remain available as history.
+records remain available as history. The old candidate queue itself (the
+reviewer, trials and the `/learn legacy` commands) is retired; `/learn` shows how
+many candidates are not yet migrated.
 
 Observations and environment notes stay in the historical archive rather than
 becoming skills. They can be retrieved through

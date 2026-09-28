@@ -297,20 +297,14 @@ def test_backend_protocol_messages_keep_only_safe_diagnostics():
         "provider echoed SENSITIVE_SENTINEL Bearer provider-secret \x1b[31m"
     )
 
-    stream = backend_module._stream_error_message(exc)
-    learning = backend_module._learning_review_error_message(exc, 180.0)
+    rendered = backend_module._stream_error_message(exc)
 
-    for rendered, component in (
-        (stream, "backend-stream"),
-        (learning, "learning-review"),
-    ):
-        _assert_sensitive_text_absent(rendered)
-        assert "SensitiveProviderError" in rendered
-        assert "status=503" in rendered
-        assert "request_id=req-safe_123" in rendered
-        assert f"component={component}" in rendered
-        assert len(rendered) <= 320
-    assert "timeout=180s" in learning
+    _assert_sensitive_text_absent(rendered)
+    assert "SensitiveProviderError" in rendered
+    assert "status=503" in rendered
+    assert "request_id=req-safe_123" in rendered
+    assert "component=backend-stream" in rendered
+    assert len(rendered) <= 320
 
 
 @pytest.mark.parametrize("code", ["context_budget_unavailable", "context_budget_exceeded", "appshot_vision_unavailable"])
@@ -346,24 +340,6 @@ def test_backend_stream_terminal_log_omits_exception_value(caplog):
     assert "status=503" in caplog.text
     assert "request_id=req-safe_123" in caplog.text
     assert "component=backend-stream" in caplog.text
-
-
-def test_learning_review_stderr_omits_exception_value(capsys):
-    write_learning_error = getattr(backend_module, "_write_learning_review_error", None)
-    assert callable(write_learning_error), "learning review error writer is missing"
-    exc = SensitiveProviderError(
-        "SENSITIVE_SENTINEL Bearer provider-secret \x1b[31m"
-    )
-
-    write_learning_error(exc, 180.0)
-    stderr = capsys.readouterr().err
-
-    _assert_sensitive_text_absent(stderr)
-    assert "type=SensitiveProviderError" in stderr
-    assert "component=learning-review" in stderr
-    assert "status=503" in stderr
-    assert "request_id=req-safe_123" in stderr
-    assert "timeout=180s" in stderr
 
 
 def test_llm_terminal_retry_log_omits_exception_value(monkeypatch, caplog):

@@ -1,12 +1,10 @@
-"""User-triggered skill curation; legacy proposals are explicitly separate."""
+"""User-triggered skill curation; the old candidate queue is retired."""
 
 import asyncio
 import json
-from collections.abc import Callable
 
 from agent.runtime.async_io import durable_io
-from agent.runtime.learning import LearningReviewer, LearningStore
-from agent.runtime.memory import MemoryStore
+from agent.runtime.learning import LearningStore
 from agent.runtime.skill_learning import LearnedSkills
 from agent.runtime.skill_provenance import automatic_names
 from agent.runtime.skills import SkillStore
@@ -18,17 +16,15 @@ LEARN_USAGE = """Usage:
   /learn history [run-id]       # changes and reasons
   /learn undo <run-id>          # restore a change if files are unchanged
   /learn mode <off|review>      # disable/enable direct skill saving
-  /learn legacy pending        # historical candidates, not a required queue
-  /learn legacy show <id>       # inspect a historical candidate
-  /learn legacy rollback <id>   # restore a historical applied change
 """
 
+RETIRED_ACTIONS = {
+    "legacy", "pending", "list", "show", "reject", "rollback", "summarize", "remember",
+    "repair", "repair-all", "repair_all", "approve", "approve-all", "approve_all",
+}
 
-async def execute_learning_command(
-    store: LearningStore, reviewer: LearningReviewer, memory: MemoryStore, skills: SkillStore,
-    args: list[str], *, session_id: str, messages: list[dict],
-    on_progress: Callable[[str], None] | None = None,
-) -> tuple[str, str]:
+
+async def execute_learning_command(store: LearningStore, skills: SkillStore, args: list[str]) -> tuple[str, str]:
     action = args[0].lower() if args else "status"
     try:
         learned = LearnedSkills(skills)
@@ -41,11 +37,10 @@ async def execute_learning_command(
                     "Review scope: automatic summaries only; user-added and built-in skills are excluded.\n"
                     "Quality review: conversational and user-triggered (/learn review); proposals first, no background review.\n"
                     f"Last review: {json.dumps(state['last_review'], ensure_ascii=False)}\n"
-                    f"Historical pending candidates: {store.count('pending')} (/learn legacy pending). "
-                    "These are preserved history, not a required learning queue.\n"
                     f"Legacy migration: {sum(item.get('destination') == 'auto' for item in migrated.values())} imported, "
                     f"{sum(item.get('destination') == 'history' for item in migrated.values())} history-only, "
-                    f"{sum(row['id'] not in migrated for row in pending)} not yet migrated (/learn migrate).", "")
+                    f"{sum(row['id'] not in migrated for row in pending)} not yet migrated (/learn migrate). "
+                    "Old candidates stay searchable as history through session_search (source_type=learning).", "")
         if action == "migrate" and len(args) == 1:
             from agent.runtime.skill_migration import format_migration, migrate_legacy
 
@@ -63,17 +58,9 @@ async def execute_learning_command(
             return f"Restored changes from {args[1]}. Record: {result['id']}", ""
         if action == "mode" and len(args) == 2:
             return f"Direct skill learning: {store.set_mode(args[1])}. Manual /learn review remains available.", ""
-        if action in {"legacy", "pending", "list", "show", "rollback"}:
-            from .legacy_learning_commands import execute_learning_command as legacy_command
-
-            legacy_args = args[1:] if action == "legacy" else args
-            if not legacy_args or legacy_args[0] not in {"pending", "list", "show", "rollback", "reject"}:
-                return "", "Historical candidates support pending/show/reject/rollback only. Use /learn review for learned skills."
-            output, error = await legacy_command(store, reviewer, memory, skills, legacy_args,
-                                                session_id=session_id, messages=messages)
-            return "Historical learning (inactive workflow):\n" + output, error
-        if action in {"summarize", "remember", "repair", "repair-all", "repair_all", "approve", "approve-all", "approve_all"}:
-            return "", "The candidate workflow is retired. /learn review checks learned skills; /learn legacy pending reads old candidates."
+        if action in RETIRED_ACTIONS:
+            return "", ("The old candidate queue is retired. /learn review checks learned skills, /learn migrate "
+                        "imports candidates not yet migrated, and session_search (source_type=learning) finds them as history.")
         return "", LEARN_USAGE
     except asyncio.CancelledError:
         raise

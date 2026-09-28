@@ -325,7 +325,7 @@ export type PyEvent =
 export type StartupInfo = {
   skills: number;
   mcp: { name: string; state: string; tools?: number; error?: string }[];
-  learning: { mode: "off" | "review"; auto: boolean; pending: number; learned?: number | null; legacy_pending?: number; error?: string };
+  learning: { mode: "off" | "review"; auto: boolean; pending: number; learned?: number | null; error?: string };
   tools: number;
   model: string;
 };

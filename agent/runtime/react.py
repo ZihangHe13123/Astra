@@ -64,7 +64,7 @@ from .vision_preprocessor import VisionPreprocessError, VisionPreprocessor, Visi
 if TYPE_CHECKING:
     from .context_index.broker import ContextIndexBroker
     from .hindsight_provider import HindsightMemoryProvider
-    from .learning import LearningReviewer, LearningStore
+    from .learning import LearningStore
     from .memory import MemoryStore
     from .memory_retainer import MemoryRetainer
     from .memory_router import MemoryRouter
@@ -263,7 +263,6 @@ class ReActAgent(AgentBase):
         self._sandbox: Any | None = None
         self._mcp_manager: Any | None = None
         self._learning_store: "LearningStore | None" = None
-        self._learning_reviewer: "LearningReviewer | None" = None
         self.task_store = task_store
         self.memory_store = memory_store
         if memory_router is not None:

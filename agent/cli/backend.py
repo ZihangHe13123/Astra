@@ -96,9 +96,7 @@ from agent.runtime.tools.conclave import register_conclave_tools
 from agent.runtime.tools.delegate import register_delegate_tools
 from agent.runtime.context_index.workspace import resolve_workspace
 from agent.runtime.session_recall import SessionRecall as _SessionRecall
-from agent.runtime.learning import (
-    LearningProviderError, LearningReviewer, LearningReviewResultError, LearningStore,
-)
+from agent.runtime.learning import LearningStore
 from agent.runtime.goal_verifier import (
     GoalVerifier,
     build_goal_start_message,
@@ -347,17 +345,6 @@ def _stream_error_message(exc: Exception) -> str:
     return format_provider_error(exc, component="backend-stream")
 
 
-def _learning_review_error_message(exc: Exception, timeout: float) -> str:
-    """Return a safe terminal reason for an optional learning review."""
-    if isinstance(exc, (LearningReviewResultError, LearningProviderError)):
-        return str(exc)
-    return format_provider_error(
-        exc,
-        component="learning-review",
-        timeout=timeout,
-    )
-
-
 def _log_stream_provider_error(exc: Exception) -> None:
     """Log a backend provider failure without rendering its traceback value."""
     summary = summarize_provider_error(exc)
@@ -369,13 +356,6 @@ def _log_stream_provider_error(exc: Exception) -> None:
         summary.status_code,
         summary.request_id,
     )
-
-
-def _write_learning_review_error(exc: Exception, timeout: float) -> None:
-    """Write the learning-review failure using only safe provider diagnostics."""
-    detail = _learning_review_error_message(exc, timeout)
-    logger.warning("learning review failed: %s", detail)
-    print(f"learning review failed: {detail}", file=sys.stderr, flush=True)
 
 
 def _finish_pending_tool_calls(
@@ -867,7 +847,7 @@ async def _main(startup_started: float):
     )
     register_skill_tools(
         tools, skill_store,
-        learning_getter=lambda: agent_holder["agent"]._learning_reviewer.lifecycle,
+        learning_getter=lambda: agent_holder["agent"]._learning_store,
         messages=lambda: list(agent_holder["agent"].context.messages) if agent_holder else [],
         session_id=lambda: Path(agent_holder["agent"].context.session_path).stem if agent_holder else "default",
     )
@@ -1097,7 +1077,6 @@ async def _main(startup_started: float):
 
     llm = LLMClient(llm_config)
     learning_store = LearningStore()
-    learning_reviewer = LearningReviewer(llm, learning_store, memory_store, skill_store)
     goal_verifier = GoalVerifier(llm)
     _, system_prompt, persona_state = startup_persona(os.getenv("AGENT_PERSONA"))
     agent = ReActAgent(
@@ -1121,7 +1100,6 @@ async def _main(startup_started: float):
     agent._sandbox = sandbox
     agent._mcp_manager = mcp_manager
     agent._learning_store = learning_store
-    agent._learning_reviewer = learning_reviewer
     register_conversation_tools(agent, sandbox=sandbox, mcp_manager=mcp_manager,
                                 startup_profile=lambda: startup_profile_report, process_manager=process_manager)
     computer_state_emitter = ComputerStateEmitter(computer_runtime, _send)
@@ -1384,14 +1362,10 @@ async def _main(startup_started: float):
     agent_turn_lock = asyncio.Lock()
     goal_tasks: set[asyncio.Task] = set()
 
-    async def _run_skill_command(parts: list[str], session: str, messages: list[dict]) -> None:
+    async def _run_skill_command(parts: list[str]) -> None:
         _send({"type": "learning_review_status", "status": "running"})
         try:
-            output, error = await execute_learning_command(
-                learning_store, learning_reviewer, memory_store, skill_store, parts,
-                session_id=session, messages=messages,
-                on_progress=lambda message: _send({"type": "learning_review", "message": message, "proposal_ids": []}),
-            )
+            output, error = await execute_learning_command(learning_store, skill_store, parts)
             agent._refresh_skill_catalog(force=True)
             _send_startup_status()
             _send({"type": "tool_result", "name": "learn", "output": output, "error": error, "code": ""})
@@ -2122,7 +2096,6 @@ async def _main(startup_started: float):
                    "pending": 0,
                    "learned": learned_count,
                    "error": learning_error,
-                   "legacy_pending": learning_store.count("pending"),
                },
                "tools": len(tools.tool_names),
                "model": agent.llm.config.model,
@@ -3340,7 +3313,6 @@ async def _main(startup_started: float):
                     agent.reset_conversation()
                     agent.context.set_session(str(startup_session_path()))
                     agent.begin_session()
-                    learning_store.reset_review_counter(_current_memory_session())
                     await _send_history()
                     await _send_model_info(refresh=True)
                     _send_session_info()
@@ -3437,14 +3409,11 @@ async def _main(startup_started: float):
                         if any(not task.done() for task in manual_reviews):
                             _send({"type": "learning_review", "message": "A skill review is already running. Use Ctrl+C to cancel it.", "proposal_ids": []})
                             continue
-                        task = asyncio.create_task(_run_skill_command(learn_parts, _current_memory_session(), list(agent.context.messages)), name="manual-skill-review")
+                        task = asyncio.create_task(_run_skill_command(learn_parts), name="manual-skill-review")
                         manual_reviews.add(task)
                         task.add_done_callback(manual_reviews.discard)
                     else:
-                        output, error = await execute_learning_command(
-                            learning_store, learning_reviewer, memory_store, skill_store, learn_parts,
-                            session_id=_current_memory_session(), messages=list(agent.context.messages),
-                        )
+                        output, error = await execute_learning_command(learning_store, skill_store, learn_parts)
                         agent._refresh_skill_catalog(force=True)
                         _send_startup_status()
                         _send({"type": "tool_result", "name": "learn", "output": output, "error": error, "code": ""})

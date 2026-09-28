@@ -2778,22 +2778,6 @@ def test_bad_request_is_not_retried(monkeypatch):
     assert attempts == 1
 
 
-def test_learning_review_timeout_error_has_type_and_deadline():
-    from agent.cli.backend import _learning_review_error_message
-
-    assert _learning_review_error_message(TimeoutError(), 180.0) == (
-        "Provider request timed out "
-        "[type=TimeoutError, component=learning-review, timeout=180s]"
-    )
-    assert _learning_review_error_message(
-        RuntimeError("provider down"),
-        180.0,
-    ) == (
-        "Provider request failed "
-        "[type=RuntimeError, component=learning-review, timeout=180s]"
-    )
-
-
 def test_qwen38_profile_declares_thinking_required():
     from agent.cli.models import model_profiles
 

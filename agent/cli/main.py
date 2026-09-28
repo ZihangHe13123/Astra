@@ -45,7 +45,7 @@ from ..runtime.tools.session_recall import register_session_recall_tools
 from ..runtime.tools.activity import register_activity_tools
 from ..runtime.context_index import create_context_index_broker
 from ..runtime.tools.context_index import register_context_index_tools
-from ..runtime.learning import LearningReviewer, LearningStore
+from ..runtime.learning import LearningStore
 from ..sandbox.local import LocalSandbox
 from ..sandbox.docker import DockerSandbox
 from ..sandbox.router import SandboxRouter
@@ -381,9 +381,6 @@ async def handle_slash(cmd: str, agent: ReActAgent) -> Msg | None:
         agent.reset_conversation()
         agent.context.save()
         agent.begin_session()
-        learning_store = getattr(agent, "_learning_store", None)
-        if learning_store is not None:
-            learning_store.reset_review_counter(Path(agent.context.session_path).stem or "default")
         print("  \033[90mContext cleared.\033[0m\n")
 
     elif command == "/compress":
@@ -564,19 +561,10 @@ async def handle_slash(cmd: str, agent: ReActAgent) -> Msg | None:
 
     elif command == "/learn":
         store = getattr(agent, "_learning_store", None)
-        reviewer = getattr(agent, "_learning_reviewer", None)
-        if store is None or reviewer is None or agent.memory_store is None or agent.skill_store is None:
-            print("  Learning Review is unavailable.\n")
+        if store is None or agent.skill_store is None:
+            print("  Skill learning is unavailable.\n")
         else:
-            output, error = await execute_learning_command(
-                store,
-                reviewer,
-                agent.memory_store,
-                agent.skill_store,
-                parts[1:],
-                session_id=Path(agent.context.session_path).stem or "default",
-                messages=list(agent.context.messages),
-            )
+            output, error = await execute_learning_command(store, agent.skill_store, parts[1:])
             print(f"  {error or output}\n")
 
     elif command == "/search":
@@ -896,7 +884,7 @@ async def _async_init(llm_config: LLMConfig, sandbox_timeout: int, workdir: str)
     )
     register_skill_tools(
         tools, skill_store,
-        learning_getter=lambda: agent_holder["agent"]._learning_reviewer.lifecycle,
+        learning_getter=lambda: agent_holder["agent"]._learning_store,
         messages=lambda: list(agent_holder["agent"].context.messages) if agent_holder else [],
         session_id=lambda: Path(agent_holder["agent"].context.session_path).stem if agent_holder else "default",
     )
@@ -956,7 +944,6 @@ async def _async_init(llm_config: LLMConfig, sandbox_timeout: int, workdir: str)
 
     llm = LLMClient(llm_config)
     learning_store = LearningStore()
-    learning_reviewer = LearningReviewer(llm, learning_store, memory_store, skill_store)
     _, system_prompt, persona_state = startup_persona(os.getenv("AGENT_PERSONA"))
     agent = ReActAgent(
         name="agent",
@@ -977,7 +964,6 @@ async def _async_init(llm_config: LLMConfig, sandbox_timeout: int, workdir: str)
     agent._sandbox = sandbox
     agent._mcp_manager = mcp_manager
     agent._learning_store = learning_store
-    agent._learning_reviewer = learning_reviewer
     register_conversation_tools(agent, sandbox=sandbox, mcp_manager=mcp_manager)
     register_conclave_tools(tools, llm_getter=lambda: agent.llm)
     setattr(agent, "_search_provider_state", search_provider_state)
