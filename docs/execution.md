@@ -155,6 +155,13 @@ Tool execution uses the following guards and controls:
   the legacy core/request-relevant group routing and `activate_tool_group`
   behavior. This reduces the first uncached prompt but causes more prefix-cache
   invalidations.
+- `AGENT_TOOL_EXPOSE` and `AGENT_TOOL_HIDE` take comma-separated tool names.
+  The first adds opt-in tools to the manifest: `conclave` (the `/conclave`
+  command works without it), `notebook_execute`, `skills_list` (the prompt
+  already lists skills in `<available-skills>`), `project_verifier_init`,
+  `git_pull`, `git_reset` and `git_revert`. The second removes default tools.
+  A tool named in both stays hidden. Hidden tools remain available to modes
+  and workflows that list them explicitly.
 - `AGENT_MAX_REACT_ITERATIONS=50` sets a coarse total-turn safety ceiling. Set
   it to `0` for no fixed ceiling; repeated-call, failure-circuit, prompt-budget,
   and cancellation guards remain active.

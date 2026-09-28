@@ -278,4 +278,7 @@ def register_conclave_tools(
         group="conclave",
         sandboxed=False,
         timeout=600.0,
+        # /conclave runs the panel directly; the model-facing tool is opt-in
+        # (AGENT_TOOL_EXPOSE=conclave) because its schema ships on every request.
+        expose_by_default=False,
     ))

@@ -8,6 +8,8 @@
 
 ## 范围与行为
 
+`notebook_execute` 默认不在工具清单中。设置 `AGENT_TOOL_EXPOSE=notebook_execute` 后模型才能使用它；否则 Notebook 通过 `execute_shell` 在内核自己的环境中运行。
+
 `notebook_execute` 复用 Python 执行审批、所选 Local/Docker 沙箱和后台进程管理。单元编号从 1 开始，包含 Markdown 单元，区间两端均包含；支持跳过单元、逐单元超时和保存输出，不自动安装依赖。
 
 每次调用使用新内核，不自动补跑前面的初始化单元；有依赖时从第 1 个单元选起。`kernel_name` 指已安装 Jupyter kernelspec 名称，不是 Python 路径。工作目录为源 Notebook 所在目录。

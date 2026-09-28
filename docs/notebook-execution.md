@@ -4,6 +4,10 @@
 
 ## Scope and behavior
 
+`notebook_execute` is not in the default tool list. Set
+`AGENT_TOOL_EXPOSE=notebook_execute` to offer it to the model; without it,
+notebooks run through `execute_shell` in the kernel's own environment.
+
 `notebook_execute` reuses Python execution approval, the selected Local/Docker
 sandbox and detached process supervisor. It adds selection by inclusive 1-based
 cell range (counting markdown cells too), optional skipped cells, per-cell timeout,

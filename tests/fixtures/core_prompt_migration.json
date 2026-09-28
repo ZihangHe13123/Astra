@@ -1,12 +1,13 @@
 {
   "source_commit": "ab72bfd4d1df1baabcc70897d11318215d369bd4",
-  "core_sha256": "365bde64da657b52a3d8519a70d289d7ec7c69414c8ba1114af64d482ef73fb8",
+  "core_sha256": "9b247e6a76d48c070ae66e7fb519c2d3b17e1898fd81ef6edb6cd64eade8edf6",
   "profile_sha256": {
-    "lyra": "6cf15668e577050e575460f6d6ad424ab84f9e7879fcf888658d07f6fb894059"
+    "lyra": "312dd0fcc5c92198edf36349b6d99ea2b89720f19df20fda45d5a17695199114"
   },
   "learning_contract_update": "2026-09-13: direct skill saving and manual review; persona text unchanged",
   "history_retrieval_update": "2026-09-13: model-initiated local history lookup; persona text unchanged",
   "persona_update": "2026-09-14: public Lyra definition; retired preset bodies are no longer bundled",
   "workflow_guidance_update": "2026-09-18: replace blanket verification mandates with proportionate skill guidance and reusable evidence; retain the public Lyra persona",
-  "browser_research_update": "2026-09-19: autonomous browser follow-up, direct task tabs, and focused source reads; keep research skill selection voluntary"
+  "browser_research_update": "2026-09-19: autonomous browser follow-up, direct task tabs, and focused source reads; keep research skill selection voluntary",
+  "skill_catalog_update": "2026-09-28: check existing skills against <available-skills> instead of skills_list; persona text unchanged"
 }

@@ -127,6 +127,9 @@ def register_skill_tools(
         approval="never",
         idempotent=True,
         group="skills",
+        # The same list is already in the prompt as <available-skills>; command
+        # workflows and delegates keep it through their explicit allowlists.
+        expose_by_default=False,
     ))
     registry.register(ToolDef(
         name="project_verifier_init",
@@ -141,6 +144,7 @@ def register_skill_tools(
         approval="on_risk",
         max_calls_per_turn=1,
         group="skills",
+        expose_by_default=False,
     ))
     registry.register(ToolDef(
         name="skill_view",

@@ -12,7 +12,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from collections.abc import Set as AbstractSet
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -289,6 +289,11 @@ class ToolRegistry:
         self.max_fresh_chars = self._positive_int_env("TOOL_MAX_FRESH_RESULT_CHARS", 100_000)
         configured_dir = os.getenv("TOOL_RESULT_DIR", "").strip()
         self.artifact_dir = Path(artifact_dir or configured_dir or ".astra/tool-results").expanduser().resolve()
+        # Every default schema is sent on every request, so the manifest is
+        # tunable without code changes: AGENT_TOOL_EXPOSE adds opt-in tools and
+        # AGENT_TOOL_HIDE removes default ones (hide wins when both name a tool).
+        self._exposed_tool_names = self._tool_names_env("AGENT_TOOL_EXPOSE")
+        self._hidden_tool_names = self._tool_names_env("AGENT_TOOL_HIDE")
 
     def set_approval_handler(self, handler: ApprovalHandler | None) -> None:
         """Attach an interactive approval broker supplied by a frontend."""
@@ -469,6 +474,21 @@ class ToolRegistry:
         except ValueError:
             return default
         return value if value > 0 else default
+
+    @staticmethod
+    def _tool_names_env(name: str) -> frozenset[str]:
+        return frozenset(item.strip() for item in os.getenv(name, "").split(",") if item.strip())
+
+    def _apply_exposure_overrides(self, tool: ToolDef) -> ToolDef:
+        if tool.expose_by_default and tool.name in self._hidden_tool_names:
+            return replace(tool, expose_by_default=False)
+        if (
+            not tool.expose_by_default
+            and tool.name in self._exposed_tool_names
+            and tool.name not in self._hidden_tool_names
+        ):
+            return replace(tool, expose_by_default=True)
+        return tool
 
     @classmethod
     def _schema_errors(
@@ -676,6 +696,7 @@ class ToolRegistry:
         return safe
 
     def register(self, tool: ToolDef, *, owner: str = ""):
+        tool = self._apply_exposure_overrides(tool)
         self._ensure_approval_question_required(tool)
         self._validate_definition(tool)
         if tool.name in self._tools:
@@ -690,6 +711,7 @@ class ToolRegistry:
         clean_owner = str(owner).strip()
         if not clean_owner:
             raise ValueError("tool owner is required")
+        tools = [self._apply_exposure_overrides(tool) for tool in tools]
         names: set[str] = set()
         for tool in tools:
             self._ensure_approval_question_required(tool)

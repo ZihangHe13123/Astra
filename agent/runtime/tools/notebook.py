@@ -58,4 +58,7 @@ def register_notebook_tools(registry, execute_python, permission_check, permissi
         fn=execute, sandboxed=True, risk="execute", approval="on_risk", group="code",
         timeout=None, permission_check=permission, permission_grant=permission_grant,
         approval_justification=True,
+        # Opt-in with AGENT_TOOL_EXPOSE=notebook_execute; notebooks otherwise run
+        # through execute_shell with the kernel's own environment.
+        expose_by_default=False,
     ))

@@ -321,6 +321,8 @@ def register_git_tools(
             approval="never" if readonly else "on_risk",
             idempotent=readonly,
             group="git",
+            # Rarely used; execute_shell covers them. AGENT_TOOL_EXPOSE brings them back.
+            expose_by_default=name not in {"git_pull", "git_revert", "git_reset"},
             permission_check=None if readonly else _git_permission_check(name),
             permission_grant=None if readonly else _git_permission_grant,
         ))
