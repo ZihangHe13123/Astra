@@ -110,6 +110,9 @@ def test_exa_request_uses_existing_credentials_and_image_extras(monkeypatch, tmp
     assert registry.get("search_web").parallel_safe
     assert registry.get("web_extract").parallel_safe
     assert not registry.get("extract_url").parallel_safe
+    visible = {item["function"]["name"] for item in registry.to_openai_tools()}
+    assert {"search_web", "fetch_url", "web_extract", "search_images"} <= visible
+    assert not {"extract_url", "search_status"} & visible
 
 
 def test_image_noise_filter_preview_failures_and_source_diversity(tmp_path):

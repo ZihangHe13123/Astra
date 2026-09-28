@@ -159,7 +159,9 @@ Tool execution uses the following guards and controls:
   The first adds opt-in tools to the manifest: `conclave` (the `/conclave`
   command works without it), `notebook_execute`, `skills_list` (the prompt
   already lists skills in `<available-skills>`), `project_verifier_init`,
-  `git_pull`, `git_reset` and `git_revert`. The second removes default tools.
+  `git_pull`, `git_reset`, `git_revert`, `extract_url` and `browser_extract`
+  (`fetch_url` and `web_extract` read pages; the browser tools render them) and
+  `search_status`. The second removes default tools.
   A tool named in both stays hidden. Hidden tools remain available to modes
   and workflows that list them explicitly.
 - `AGENT_MAX_REACT_ITERATIONS=50` sets a coarse total-turn safety ceiling. Set

@@ -1027,6 +1027,8 @@ def register_browser_tools(
         fn=_browser_extract, risk="network", approval="never", idempotent=True,
         trace_context=_browser_trace_context,
         group="browser",
+        # fetch_url/web_extract cover plain reads; opt in with AGENT_TOOL_EXPOSE=browser_extract.
+        expose_by_default=False, allow_hidden_execution=True,
     ))
 
     register(ToolDef(

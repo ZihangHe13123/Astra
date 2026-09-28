@@ -328,11 +328,12 @@ class TestRegisterWithBackend:
         register_browser_tools(reg, manager=manager, backend=CdpBrowserBackend("/fake/chrome"))
         names = {item["name"] for item in reg.describe()}
         assert {
-            "browser_open", "browser_snapshot", "browser_extract", "browser_click",
+            "browser_open", "browser_snapshot", "browser_click",
             "browser_fill", "browser_select", "browser_wait", "browser_screenshot",
             "browser_handoff", "browser_resume", "browser_close", "browser_status",
         } <= names
         assert "browser_type" not in names
+        assert "browser_extract" not in names and reg.get("browser_extract") is not None
         assert reg.get("browser_type") is not None
         schemas = {item["function"]["name"] for item in reg.to_openai_tools()}
         assert "browser_fill" in schemas and "browser_type" not in schemas

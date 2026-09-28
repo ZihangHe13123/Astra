@@ -1,4 +1,4 @@
-"""web tools: search_web, fetch_url, extract_url (Exa + SearXNG)."""
+"""web tools: search_web, fetch_url, web_extract, opt-in extract_url (Exa + SearXNG)."""
 
 import asyncio
 import atexit
@@ -1601,7 +1601,8 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
 
         text = _html_to_text(body)
         if not text or len(text) < 50:
-            return f"(Empty/minimal content — page may require JavaScript or is behind anti-bot protection. Try extract_url instead. URL: {url})"
+            return (f"(Empty/minimal content — page may require JavaScript or is behind anti-bot protection. "
+                    f"Try web_extract, or browser_open and browser_snapshot. URL: {url})")
 
         return _format_content(url, text, max_length)
 
@@ -1784,7 +1785,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         name="fetch_url",
         description=(
             "抓取静态 HTML 并返回清洗后的文本，不返回原始 HTML，也不执行 JS；script/style 等内容会被移除。"
-            "结果未包含答案不代表源 HTML 没有答案。结果带 URL 缓存；需渲染时可用 extract_url，需展开或站内查询时可用浏览器交互。"
+            "结果未包含答案不代表源 HTML 没有答案。结果带 URL 缓存；需渲染时可用 web_extract，需展开或站内查询时可用浏览器交互。"
         ),
         parameters={
             "type": "object",
@@ -1804,6 +1805,8 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         parameters={"type": "object", "properties": {}},
         fn=_search_status, risk="network", approval="never", idempotent=True,
         sandboxed=True, group="web",
+        # Diagnostics only; opt in with AGENT_TOOL_EXPOSE=search_status.
+        expose_by_default=False, allow_hidden_execution=True,
     ))
 
     registry.register(ToolDef(
@@ -1830,6 +1833,9 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         },
         fn=_extract_url, risk="network", approval="never", idempotent=True,
         sandboxed=True, group="web",
+        # fetch_url and web_extract read pages, the browser tools render them;
+        # opt in with AGENT_TOOL_EXPOSE=extract_url.
+        expose_by_default=False, allow_hidden_execution=True,
     ))
 
     return search_provider_state

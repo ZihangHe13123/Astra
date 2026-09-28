@@ -101,7 +101,7 @@ macOS 示例：
 - `TOOL_FAILURE_THRESHOLD=3` 在等价错误连续出现后打开单工具熔断，并禁用工具做最后一次综合回答。
 - `PROMPT_CACHE_STABLE_TOOLS=1` 在工作会话中保持一份稳定的模型工具清单；预算和熔断仍在执行阶段检查，不在 ReAct 迭代间删除 schema。
 - 设为 `PROMPT_CACHE_STABLE_TOOLS=0` 后，可用 `TOOL_PROGRESSIVE_EXPOSURE=1` 恢复旧核心/相关工具组及 `activate_tool_group`，以缩小首次未缓存提示，但会增加前缀缓存失效。
-- `AGENT_TOOL_EXPOSE` 和 `AGENT_TOOL_HIDE` 接受逗号分隔的工具名。前者把默认不开放的工具加入清单：`conclave`（不开放也能用 `/conclave` 命令）、`notebook_execute`、`skills_list`（提示中的 `<available-skills>` 已列出技能）、`project_verifier_init`、`git_pull`、`git_reset` 和 `git_revert`；后者从清单中去掉默认工具。同一工具同时出现在两者中时保持隐藏。明确列出这些工具的模式和工作流仍可使用它们。
+- `AGENT_TOOL_EXPOSE` 和 `AGENT_TOOL_HIDE` 接受逗号分隔的工具名。前者把默认不开放的工具加入清单：`conclave`（不开放也能用 `/conclave` 命令）、`notebook_execute`、`skills_list`（提示中的 `<available-skills>` 已列出技能）、`project_verifier_init`、`git_pull`、`git_reset`、`git_revert`、`extract_url` 和 `browser_extract`（读网页用 `fetch_url` 和 `web_extract`，渲染页面用浏览器工具）以及 `search_status`；后者从清单中去掉默认工具。同一工具同时出现在两者中时保持隐藏。明确列出这些工具的模式和工作流仍可使用它们。
 - `AGENT_MAX_REACT_ITERATIONS=50` 为整轮设置粗粒度上限；`0` 表示无固定次数上限，重复调用、熔断、提示预算和取消检查仍有效。
 
 `AGENT_TRACE_ENABLED=1` 启用 OpenTelemetry spans。安装 SDK 和 OTLP exporter 后，`OTEL_EXPORTER_OTLP_ENDPOINT` 指向 Phoenix 或其他兼容收集器。

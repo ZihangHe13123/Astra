@@ -228,7 +228,8 @@ class TestRegistration:
     def test_openai_tools_include_browser(self, registry):
         schemas = registry.to_openai_tools(groups={"browser"})
         schema_names = {s["function"]["name"] for s in schemas}
-        assert EXPECTED_TOOLS - {"browser_type"} <= schema_names
+        assert EXPECTED_TOOLS - {"browser_type", "browser_extract"} <= schema_names
+        assert "browser_extract" not in schema_names
 
     def test_browser_type_is_explicit_compatibility_only(self, registry):
         schemas = registry.to_openai_tools(groups={"browser"})

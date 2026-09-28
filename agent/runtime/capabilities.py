@@ -208,7 +208,7 @@ def build_runtime_capabilities(agent, sandbox=None, mcp_manager=None) -> Capabil
 
     tools = getattr(agent, "tools", None)
     tool_names = {item["name"] for item in tools.describe()} if tools is not None else set()
-    read_tools = {"extract_url", "search_web"} & tool_names
+    read_tools = {"fetch_url", "web_extract", "extract_url", "search_web"} & tool_names
     report.add(
         "browser.read",
         CapabilityState.AVAILABLE if read_tools else CapabilityState.UNSUPPORTED,
