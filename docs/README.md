@@ -29,6 +29,7 @@ language; the indexes label language-specific references.
 | Add MCP, web search, QQ messaging, image tools or 163 mail | [Optional integrations](integrations.md) |
 | Find and visually inspect image references | [Image search](search-images.md) |
 | Run notebooks | [Notebook execution](notebook-execution.md) |
+| Write documents section by section and export Word, PDF or HTML | [Documents](documents.md) |
 | Diagnose slow responses and tools | [Runtime profiling](runtime-responsiveness.md) |
 
 ## How Astra works

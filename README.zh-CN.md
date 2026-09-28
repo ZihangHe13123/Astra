@@ -15,6 +15,7 @@ Astra 主要通过模型 API 帮你查资料、处理文件和操作应用。对
 | **电脑操作（Computer Use）** | 操作浏览器页面和选定的 macOS 应用窗口，详见[浏览器操作](docs/zh-CN/browser-interaction.md)和 [Mac 指南](docs/zh-CN/macos-computer-use.md)。 |
 | **把窗口带入对话** | [Appshot](docs/zh-CN/appshot.md) 可在 macOS 和 Windows 上将窗口截图及可用的界面文字加入草稿，补充问题后再发送。 |
 | **资料研究与日常工作** | 搜索网页、读写文件、运行代码和执行 Notebook，并按需配置工具权限。 |
+| **文档写作** | 逐节写 Markdown 文档，处理写在文件里的审阅评论，并导出 Word、PDF 或 HTML。见[文档写作](docs/zh-CN/documents.md)。 |
 | **记忆与技能** | 保存偏好、检索相关历史、积累可复用的方法；手动检查自动总结的技能，用户加入的技能不参与这类检查。 |
 | **继续已有工作** | 查看任务记录、取消执行，并通过保存的检查点恢复符合条件的任务。 |
 | **自选模型与工具** | 切换模型配置、连接本地服务，或启用 MCP、QQ 消息等可选集成。 |

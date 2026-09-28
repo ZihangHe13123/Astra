@@ -17,6 +17,7 @@
 | 添加搜索、MCP、QQ 消息、图片工具或 163 邮箱 | [可选集成](integrations.md) |
 | 查找并实际查看图片参考 | [图片搜索](search-images.md) |
 | 执行 Notebook 并保存结果 | [Notebook 执行](notebook-execution.md) |
+| 逐节写文档并导出 Word、PDF 或 HTML | [文档写作](documents.md) |
 
 ## 电脑操作与窗口捕获
 

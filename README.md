@@ -17,6 +17,7 @@ optional local model endpoints.
 | **Computer use** | Work with browser pages and selected macOS application windows. See the [browser](docs/browser-interaction.md) and [Mac](docs/macos-computer-use.md) guides. |
 | **Bring a window into chat** | [Appshot](docs/appshot.md) adds a screenshot and available interface text to your draft on macOS and Windows. Add a question, then send it. |
 | **Research and everyday work** | Search the web, read and edit files, run code and execute notebooks with configurable tool permissions. |
+| **Documents** | Write a Markdown document section by section, handle review comments left in the file, and export Word, PDF or HTML. See [documents](docs/documents.md). |
 | **Memory and skills** | Keep preferences, retrieve useful history and save reusable methods. Manually review automatically learned skills without changing user-added ones. |
 | **Continue your work** | Inspect task history, cancel work and resume eligible tasks with saved checkpoints. |
 | **Choose your tools** | Switch model profiles, connect local endpoints or add optional MCP servers, QQ messaging and other integrations. |
