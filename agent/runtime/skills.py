@@ -93,12 +93,29 @@ class SkillStore:
         end = content.find("\n---", 4)
         if end < 0:
             raise ValueError("SKILL.md frontmatter is not closed")
-        values: dict[str, str] = {}
+        # Indented lines continue the previous key: folded (>) or literal (|)
+        # blocks and wrapped plain values all become one line, as the catalog
+        # shows each description on a single line.
+        parts: dict[str, list[str]] = {}
+        key = ""
         for line in content[4:end].splitlines():
-            if ":" not in line:
+            if not line.strip():
                 continue
-            key, value = line.split(":", 1)
-            values[key.strip()] = value.strip().strip("\"'")
+            if line[:1] in (" ", "\t"):
+                if key:
+                    parts[key].append(line.strip())
+                continue
+            if ":" not in line:
+                key = ""
+                continue
+            key, value = (item.strip() for item in line.split(":", 1))
+            parts[key] = [value]
+        values: dict[str, str] = {}
+        for key, (first, *rest) in parts.items():
+            if re.fullmatch(r"[>|][1-9+-]{0,2}", first):
+                values[key] = " ".join(rest)
+            else:
+                values[key] = " ".join([first, *rest]).strip().strip("\"'")
         if not values.get("name") or not values.get("description"):
             raise ValueError("SKILL.md frontmatter requires name and description")
         return values

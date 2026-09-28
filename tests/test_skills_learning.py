@@ -90,6 +90,34 @@ def test_skill_store_supports_one_level_categories_without_breaking_name_lookup(
     assert "[coding]" in store.catalog_prompt()
 
 
+@pytest.mark.parametrize("block", [">", "|", ">-", "|2"])
+def test_skill_frontmatter_folds_multiline_values_into_one_line(block):
+    header = SkillStore._frontmatter(
+        "---\n"
+        "name: graph-rag\n"
+        f"description: {block}\n"
+        "  Use when running GraphRAG\n"
+        "\n"
+        "  with a local model: extract, build, query.\n"
+        "category: operations\n"
+        "---\n# Graph RAG\n"
+    )
+    assert header == {
+        "name": "graph-rag",
+        "description": "Use when running GraphRAG with a local model: extract, build, query.",
+        "category": "operations",
+    }
+
+
+def test_skill_frontmatter_keeps_single_line_values_and_joins_wrapped_ones():
+    header = SkillStore._frontmatter(
+        '---\nname: "search-debugging"\ndescription: "Diagnose search\n  provider failures."\n---\n'
+    )
+    assert header == {"name": "search-debugging", "description": "Diagnose search provider failures."}
+    with pytest.raises(ValueError, match="requires name and description"):
+        SkillStore._frontmatter("---\nname: empty\ndescription: >\n---\n")
+
+
 def test_learning_reviewer_discards_session_provenance_skill(tmp_path):
     class FakeLLM:
         async def chat(self, messages):
