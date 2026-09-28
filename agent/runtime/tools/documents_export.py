@@ -28,7 +28,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .documents import _MARKER, fenced_lines, parse_document, remove_comment
+from .documents import _MARKER, fenced_lines, heading_of, parse_document, remove_comment
 
 FORMATS = ("docx", "pdf", "html")
 ENGINES = ("auto", "python-docx", "pandoc")
@@ -195,6 +195,7 @@ def export_with_pandoc(
     title: str | None,
     template: Path | None,
     warnings: list[str],
+    paper: str = "a4",
 ) -> None:
     with tempfile.TemporaryDirectory(prefix="astra-export-") as work:
         source = Path(work) / "input.md"
@@ -206,6 +207,11 @@ def export_with_pandoc(
         ]
         if fmt == "html":
             args += ["--standalone", "--metadata", f"title={title or output.stem}"]
+        if fmt != "html" and _title_mode(markdown):
+            # Like the built-in exporter: the only level-1 heading becomes the Title and
+            # the other headings move up a level. pandoc takes the Title only from a
+            # heading that opens the document and would turn any other one into text.
+            args.append("--shift-heading-level-by=-1")
         if template is not None and fmt != "html":
             args += ["--reference-doc", str(template)]
         completed = _run(args, timeout=180, cwd=base_dir)
@@ -213,7 +219,78 @@ def export_with_pandoc(
             detail = (completed.stderr or completed.stdout or "").strip()[-2000:]
             raise ExportError("export_failed", f"pandoc failed ({completed.returncode}): {detail}")
         warnings.extend(line.strip() for line in completed.stderr.splitlines()[:10] if line.strip())
+        if fmt != "html" and template is None and zipfile.is_zipfile(target):
+            _polish_pandoc_docx(target, paper)
         _atomic_move(target, output)
+
+
+def _title_mode(markdown: str) -> bool:
+    """Whether the document opens with its only level-1 heading."""
+    lines = markdown.splitlines(keepends=True)
+    fenced = fenced_lines(lines)
+    headings = [(index, found[0]) for index, line in enumerate(lines)
+                if not fenced[index] and (found := heading_of(line.rstrip("\r\n"))) is not None]
+    if not headings or headings[0][1] != 1 or sum(level == 1 for _, level in headings) != 1:
+        return False
+    return not "".join(lines[:headings[0][0]]).strip()
+
+
+_PAGE_TWIPS = {"a4": (11906, 16838), "letter": (12240, 15840)}
+_MARGIN_TWIPS = 1417  # 25 mm, as in the built-in exporter
+_GRID_BORDERS = "<w:tblBorders>" + "".join(
+    f'<w:{side} w:val="single" w:sz="4" w:space="0" w:color="auto" />'
+    for side in ("top", "left", "bottom", "right", "insideH", "insideV")
+) + "</w:tblBorders>"
+
+
+def _polish_pandoc_docx(docx: Path, paper: str) -> None:
+    """Give pandoc's default reference layout the built-in exporter's page and tables.
+
+    pandoc leaves the page size to the reader (Letter in LibreOffice), sizes tables to its
+    own narrower text width and draws only a header rule. Use the requested paper with
+    25 mm margins, full-width tables and grid borders, as the python-docx exporter does.
+    """
+    width, height = _PAGE_TWIPS.get(paper, _PAGE_TWIPS["a4"])
+    text_width = width - 2 * _MARGIN_TWIPS
+    with zipfile.ZipFile(docx) as archive:
+        entries = [(info, archive.read(info.filename)) for info in archive.infolist()]
+    document = next((data for info, data in entries if info.filename == "word/document.xml"), None)
+    if document is None:
+        return
+    xml = document.decode("utf-8")
+
+    def table_properties(match: re.Match[str]) -> str:
+        properties = re.sub(r"<w:tblW\b[^>]*/>", '<w:tblW w:type="pct" w:w="5000" />', match.group(0))
+        if "<w:tblBorders" not in properties:
+            # Schema order: tblW comes before tblBorders.
+            properties = re.sub(r"(<w:tblW\b[^>]*/>)", lambda found: found.group(1) + _GRID_BORDERS, properties, count=1)
+        return properties
+
+    def table_grid(match: re.Match[str]) -> str:
+        columns = [int(value) for value in re.findall(r'<w:gridCol w:w="(\d+)"', match.group(0))]
+        total = sum(columns)
+        if not total:
+            return match.group(0)
+        return "<w:tblGrid>" + "".join(
+            f'<w:gridCol w:w="{max(1, round(text_width * value / total))}" />' for value in columns
+        ) + "</w:tblGrid>"
+
+    xml = re.sub(r"<w:tblPr>.*?</w:tblPr>", table_properties, xml, flags=re.S)
+    xml = re.sub(r"<w:tblGrid>.*?</w:tblGrid>", table_grid, xml, flags=re.S)
+    if "<w:pgSz" not in xml:
+        margin = _MARGIN_TWIPS
+        page = (f'<w:pgSz w:w="{width}" w:h="{height}" /><w:pgMar w:top="{margin}" w:right="{margin}" '
+                f'w:bottom="{margin}" w:left="{margin}" w:header="708" w:footer="708" w:gutter="0" />')
+        if re.search(r"<w:sectPr\b[^>]*/>", xml):
+            xml = re.sub(r"<w:sectPr\b([^>]*)/>", lambda found: f"<w:sectPr{found.group(1)}>{page}</w:sectPr>", xml, count=1)
+        elif "</w:sectPr>" in xml:
+            # pandoc's section only holds footnote settings, which precede pgSz in the schema.
+            xml = xml.replace("</w:sectPr>", page + "</w:sectPr>", 1)
+        else:
+            xml = xml.replace("</w:body>", f"<w:sectPr>{page}</w:sectPr></w:body>", 1)
+    with zipfile.ZipFile(docx, "w", zipfile.ZIP_DEFLATED) as archive:
+        for info, data in entries:
+            archive.writestr(info, xml.encode("utf-8") if info.filename == "word/document.xml" else data)
 
 
 # ---- LibreOffice -------------------------------------------------------------------------
@@ -249,11 +326,64 @@ def _link_system_fonts(profile: Path) -> None:
                 continue
 
 
-def _prefer_cjk_font(docx: Path) -> None:
-    """Give East Asian text one installed font so the PDF does not mix fallbacks.
+# Office fonts a stock Mac lacks and LibreOffice has no stand-in for (Calibri and Cambria
+# get Carlito and Caladea): family, font file name prefix, installed replacement.
+_MAC_FONT_STANDINS = (
+    ("Aptos", "aptos", "Helvetica Neue"),
+    ("Aptos Display", "aptos", "Helvetica Neue"),
+    ("Consolas", "consola", "Menlo"),
+)
 
-    Only the temporary copy converted to PDF is changed; the Word export keeps
-    its theme fonts, which Word resolves itself.
+
+def _replace_missing_fonts(profile: Path) -> None:
+    """Map Office fonts this Mac lacks to installed ones in the throwaway profile.
+
+    Otherwise LibreOffice falls back to an unrelated font (a rounded Japanese one on
+    macOS), which hits pandoc's Aptos body text and the Consolas code font. LibreOffice
+    only applies replacement entries marked Always, so installed families are skipped.
+    """
+    if sys.platform != "darwin":
+        return
+    installed: set[str] = set()
+    for raw in _MAC_FONT_DIRS:
+        folder = Path(raw).expanduser()
+        if folder.is_dir():
+            installed.update(item.name.lower() for item in folder.iterdir())
+    pairs = [(family, standin) for family, prefix, standin in _MAC_FONT_STANDINS
+             if not any(name.startswith(prefix) for name in installed)]
+    if not pairs:
+        return
+    entries = "".join(
+        '<item oor:path="/org.openoffice.Office.Common/Font/Substitution/FontPairs">'
+        f'<node oor:name="_{index}" oor:op="replace">'
+        '<prop oor:name="Always" oor:op="fuse"><value>true</value></prop>'
+        '<prop oor:name="OnScreenOnly" oor:op="fuse"><value>false</value></prop>'
+        f'<prop oor:name="ReplaceFont" oor:op="fuse"><value>{family}</value></prop>'
+        f'<prop oor:name="SubstituteFont" oor:op="fuse"><value>{standin}</value></prop>'
+        "</node></item>\n"
+        for index, (family, standin) in enumerate(pairs)
+    )
+    config = profile / "user" / "registrymodifications.xcu"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    config.write_text(
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<oor:items xmlns:oor="http://openoffice.org/2001/registry" xmlns:xs="http://www.w3.org/2001/XMLSchema" '
+        'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">\n'
+        '<item oor:path="/org.openoffice.Office.Common/Font/Substitution">'
+        '<prop oor:name="Replacement" oor:op="fuse"><value>true</value></prop></item>\n'
+        f"{entries}</oor:items>\n",
+        encoding="utf-8",
+    )
+
+
+def _prefer_cjk_font(docx: Path) -> None:
+    """Give a CJK document one installed font so the PDF does not mix fallbacks.
+
+    East Asian text and the Latin text around it (digits, words, italics) share the
+    font, so an italic number in a Chinese sentence does not switch to an unrelated
+    serif. Fonts a style names explicitly, such as the code font, stay. Only the
+    temporary copy converted to PDF is changed; the Word export keeps its theme fonts,
+    which Word resolves itself.
     """
     if sys.platform != "darwin":
         return
@@ -268,8 +398,13 @@ def _prefer_cjk_font(docx: Path) -> None:
     styles = contents.get("word/styles.xml")
     if styles is None:
         return
-    text = re.sub(r'\s+w:eastAsiaTheme="[^"]*"', "", styles.decode("utf-8"))
-    text = re.sub(r'<w:rFonts\b(?![^>]*\bw:eastAsia=)', f'<w:rFonts w:eastAsia="{font}"', text)
+    text = re.sub(r'\s+w:(?:ascii|hAnsi|eastAsia)Theme="[^"]*"', "", styles.decode("utf-8"))
+    for attribute in ("eastAsia", "ascii", "hAnsi"):
+        text = re.sub(rf'<w:rFonts\b(?![^>]*\bw:{attribute}=)', f'<w:rFonts w:{attribute}="{font}"', text)
+    if not re.search(r"<w:rPrDefault>\s*<w:rPr>(?:(?!</w:rPr>)[\s\S])*<w:rFonts\b", text):
+        text = re.sub(r"(<w:rPrDefault>\s*<w:rPr>)",
+                      lambda found: f'{found.group(1)}<w:rFonts w:ascii="{font}" w:hAnsi="{font}" w:eastAsia="{font}" />',
+                      text, count=1)
     with zipfile.ZipFile(docx, "w", zipfile.ZIP_DEFLATED) as archive:
         for info, data in entries:
             archive.writestr(info, text.encode("utf-8") if info.filename == "word/styles.xml" else data)
@@ -279,6 +414,7 @@ def convert_to_pdf(soffice: str, docx: Path, output: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="astra-pdf-") as work:
         profile = Path(work) / "profile"
         _link_system_fonts(profile)
+        _replace_missing_fonts(profile)
         source = Path(work) / f"{docx.stem or 'document'}.docx"
         shutil.copyfile(docx, source)
         _prefer_cjk_font(source)
@@ -502,15 +638,19 @@ class _DocxBuilder:
             return
         prefix = ""
         if self.lists and self.lists[-1]["fresh"]:
-            styles, prefix = self._list_style()
+            box = self._task_box(children)
+            ordered = self.lists[-1]["ordered"]
+            # A task item shows its box where the bullet would be, not a bullet and a box.
+            styles, prefix = (("List Paragraph", "List"), "") if box and not ordered else self._list_style()
             paragraph = self._paragraph(*styles)
             if paragraph.style is None or paragraph.style.name not in ("List Bullet", "List Bullet 2", "List Bullet 3"):
-                if not self.lists[-1]["ordered"]:
+                if not ordered and not box:
                     prefix = "\u2022 "
                 paragraph.paragraph_format.left_indent = Mm(6 * len(self.lists))
             elif len(self.lists) > 1:
                 # Nested bullets indent past their parent item, whatever the parent list type.
                 paragraph.paragraph_format.left_indent = Mm(6.35 * (len(self.lists) + 1))
+            prefix += box
             self.lists[-1]["fresh"] = False
         elif self.lists:
             paragraph = self._paragraph("List Continue", "List Paragraph")
@@ -519,20 +659,25 @@ class _DocxBuilder:
             paragraph = self._paragraph("Quote")
         else:
             paragraph = self._paragraph()
-        children = self._task_marker(children)
         if prefix:
             paragraph.add_run(prefix)
         self._inline(paragraph, children)
 
-    def _task_marker(self, children: list[Any]) -> list[Any]:
+    @staticmethod
+    def _task_box(children: list[Any]) -> str:
+        """Strip a list item's GitHub task marker and return the box that replaces it.
+
+        The boxes are the ones pandoc uses; U+2611 can turn into a colour emoji when
+        LibreOffice makes the PDF.
+        """
         if not children or children[0].type != "text":
-            return children
+            return ""
         first = children[0]
         match = re.match(r"^\[([ xX])\]\s+", first.content)
-        if not match or not self.lists:
-            return children
-        first.content = ("\u2611 " if match.group(1).lower() == "x" else "\u2610 ") + first.content[match.end():]
-        return children
+        if not match:
+            return ""
+        first.content = first.content[match.end():]
+        return "\u2612 " if match.group(1).lower() == "x" else "\u2610 "
 
     def _inline(self, paragraph: Any, children: list[Any], *, bold: bool = False) -> None:
         state = {"bold": 1 if bold else 0, "italic": 0, "strike": 0}
@@ -771,7 +916,7 @@ def export_document(
             assert pandoc is not None
             export_with_pandoc(
                 pandoc, markdown, base_dir=base_dir, output=stage, fmt="docx" if fmt == "pdf" else fmt,
-                title=title, template=template, warnings=warnings,
+                title=title, template=template, warnings=warnings, paper=paper,
             )
         elif fmt == "html":
             export_html(markdown, output=stage, title=title, images=images)

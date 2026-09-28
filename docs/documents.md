@@ -82,13 +82,13 @@ In a development checkout, `uv sync --inexact --extra documents` does the same. 
 The built-in Word exporter supports:
 
 - headings (the single title becomes the Word *Title* style), paragraphs, bold, italic, strikethrough and inline code;
-- links, and bullet, numbered, nested and task lists;
+- links, and bullet, numbered, nested and task lists (a task item shows ☐ or ☒ instead of a bullet);
 - tables with column alignment, code blocks, quotes and horizontal rules;
 - PNG, JPEG, GIF, BMP, TIFF and WebP images.
 
-On macOS, headless LibreOffice may not see system fonts, so the PDF conversion links them into its temporary profile and, when the text contains Chinese, Japanese or Korean, sets an installed CJK font (Hiragino Sans GB first) in the temporary Word copy. The exported Word file itself is unchanged.
+On macOS, headless LibreOffice may not see system fonts, so the PDF conversion links them into its temporary profile and replaces Office fonts the Mac lacks: Aptos with Helvetica Neue and Consolas with Menlo. When the text contains Chinese, Japanese or Korean, the temporary Word copy also gives all body text one installed CJK font (Hiragino Sans GB first), Latin letters and digits included; fonts a style names explicitly, such as the code font, stay. The exported Word file itself is unchanged.
 
-Pass a `.docx` file as `template` to reuse its styles, for example a course or company template. Without a template, the page size is A4 (`paper` switches to Letter).
+Pass a `.docx` file as `template` to reuse its styles, for example a course or company template. Without a template, both engines use A4 paper (`paper` switches to Letter) with 25 mm margins and draw tables across the text width with grid lines. When a document opens with its only level-1 heading, pandoc also turns that heading into the Word *Title* and moves the other headings up one level.
 
 Images must be local files inside the allowed roots. Remote images are not downloaded, and SVG is not supported in Word; both are replaced by their alt text with a warning. Raw HTML, footnotes and math are not converted by the built-in exporter; pandoc handles more Markdown.
 

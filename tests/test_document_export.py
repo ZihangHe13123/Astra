@@ -1,7 +1,9 @@
 import asyncio
 import json
 import os
+import re
 import sys
+import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
@@ -24,6 +26,7 @@ needs_docx = pytest.mark.skipif(
 needs_markdown_it = pytest.mark.skipif(
     not documents_export.markdown_it_available(), reason="markdown-it-py not installed"
 )
+W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 
 def run(coro):
@@ -138,7 +141,8 @@ def test_python_docx_export_renders_structure(tmp_path, monkeypatch):
     texts = [text for _, text in paragraphs]
     assert "1. First goal with bold and code." in texts
     assert any(text.startswith("2. Second goal with a link") for text in texts)
-    assert "☑ done item" in texts and "☐ open item" in texts
+    # Task items show their box instead of a bullet.
+    assert ("List Paragraph", "☒ done item") in paragraphs and ("List Paragraph", "☐ open item") in paragraphs
     assert "A quoted remark." in texts
     assert not any("@astra" in text or "astra:section" in text for text in texts)
     table = document.tables[0]
@@ -228,6 +232,63 @@ def test_auto_engine_prefers_pandoc_with_safe_arguments(tmp_path, monkeypatch):
     assert "@astra" not in record["input"]
 
 
+def test_pandoc_takes_the_title_only_from_a_document_that_opens_with_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("ASTRA_PANDOC", str(fake_pandoc(tmp_path)))
+    log = tmp_path / "pandoc-args.json"
+    cases = {
+        "# T\n\n## A\n\n```sh\n# not a heading\n```\n": True,
+        "Draft note.\n\n# T\n\n## A\n": False,
+        "# One\n\n# Two\n": False,
+        "## A\n\n# T\n": False,
+    }
+    for markdown, shifted in cases.items():
+        export_document(markdown, base_dir=tmp_path, output=tmp_path / "out.docx", fmt="docx", resolve_image=inside(tmp_path))
+        args = json.loads(log.read_text(encoding="utf-8"))["args"]
+        assert ("--shift-heading-level-by=-1" in args) is shifted, markdown
+    export_document("# T\n\n## A\n", base_dir=tmp_path, output=tmp_path / "out.html", fmt="html", resolve_image=inside(tmp_path))
+    assert "--shift-heading-level-by=-1" not in json.loads(log.read_text(encoding="utf-8"))["args"]
+
+
+PANDOC_TABLE = (
+    '<w:tbl><w:tblPr><w:tblStyle w:val="Table" /><w:tblW w:type="auto" w:w="0" /><w:tblLook w:firstRow="1" /></w:tblPr>'
+    '<w:tblGrid><w:gridCol w:w="2640" /><w:gridCol w:w="5280" /></w:tblGrid>'
+    "<w:tr><w:tc><w:p /></w:tc><w:tc><w:p /></w:tc></w:tr></w:tbl>"
+)
+
+
+@pytest.mark.parametrize(("section", "paper", "size"), [
+    ('<w:sectPr><w:footnotePr><w:numRestart w:val="eachSect" /></w:footnotePr></w:sectPr>', "a4", ("11906", "16838")),
+    ("<w:sectPr />", "letter", ("12240", "15840")),
+    ("", "a4", ("11906", "16838")),
+], ids=["footnote-section", "empty-section", "no-section"])
+def test_pandoc_word_output_gets_the_page_and_table_layout(tmp_path, section, paper, size):
+    docx = tmp_path / "out.docx"
+    with zipfile.ZipFile(docx, "w") as archive:
+        archive.writestr("[Content_Types].xml", "<Types />")
+        archive.writestr(
+            "word/document.xml",
+            f'<w:document xmlns:w="{W[1:-1]}"><w:body>{PANDOC_TABLE}<w:p />{section}</w:body></w:document>',
+        )
+    documents_export._polish_pandoc_docx(docx, paper)
+    with zipfile.ZipFile(docx) as archive:
+        assert archive.read("[Content_Types].xml") == b"<Types />"
+        root = ET.fromstring(archive.read("word/document.xml"))
+    properties = root.find(f".//{W}tblPr")
+    assert [child.tag for child in properties] == [f"{W}tblStyle", f"{W}tblW", f"{W}tblBorders", f"{W}tblLook"]
+    assert properties[1].attrib == {f"{W}type": "pct", f"{W}w": "5000"}
+    assert [border.tag for border in properties[2]] == [
+        f"{W}{side}" for side in ("top", "left", "bottom", "right", "insideH", "insideV")
+    ]
+    columns = [int(column.get(f"{W}w")) for column in root.iter(f"{W}gridCol")]
+    text_width = int(size[0]) - 2 * 1417
+    assert abs(sum(columns) - text_width) <= 1 and abs(columns[1] - 2 * columns[0]) <= 1
+    sections = list(root.iter(f"{W}sectPr"))
+    assert len(sections) == 1
+    page, margins = sections[0][-2:]
+    assert (page.tag, page.get(f"{W}w"), page.get(f"{W}h")) == (f"{W}pgSz", *size)
+    assert margins.tag == f"{W}pgMar" and margins.get(f"{W}left") == "1417"
+
+
 def test_missing_engines_report_how_to_install(tmp_path, monkeypatch):
     monkeypatch.setattr(documents_export, "find_pandoc", lambda: None)
     monkeypatch.setattr(documents_export, "python_docx_available", lambda: False)
@@ -301,6 +362,7 @@ def test_export_tool_validates_output_and_needs_approval_outside_the_workspace(t
 @needs_docx
 def test_pdf_copy_pins_an_installed_cjk_font_on_macos(tmp_path, monkeypatch):
     from docx import Document
+    from docx.enum.style import WD_STYLE_TYPE
 
     font_file = tmp_path / "cjk.ttc"
     font_file.write_bytes(b"font")
@@ -309,12 +371,33 @@ def test_pdf_copy_pins_an_installed_cjk_font_on_macos(tmp_path, monkeypatch):
     chinese, english = tmp_path / "zh.docx", tmp_path / "en.docx"
     for path, text in ((chinese, "中文段落"), (english, "English only")):
         document = Document()
+        document.styles.add_style("Code Text", WD_STYLE_TYPE.CHARACTER).font.name = "Consolas"
         document.add_paragraph(text)
         document.save(str(path))
+    # A template may leave the document defaults without fonts.
+    with zipfile.ZipFile(chinese) as archive:
+        entries = [(info, archive.read(info.filename)) for info in archive.infolist()]
+    with zipfile.ZipFile(chinese, "w") as archive:
+        for info, data in entries:
+            if info.filename == "word/styles.xml":
+                data = re.sub(r"(<w:rPrDefault>\s*<w:rPr>)\s*<w:rFonts[^>]*/>", r"\1", data.decode("utf-8")).encode("utf-8")
+            archive.writestr(info, data)
     documents_export._prefer_cjk_font(chinese)
     documents_export._prefer_cjk_font(english)
-    styles = zipfile.ZipFile(chinese).read("word/styles.xml").decode("utf-8")
-    assert "eastAsiaTheme" not in styles and 'w:eastAsia="Test CJK"' in styles
+
+    def fonts(element):
+        found = element.find(f"{W}rPr/{W}rFonts")
+        return {key.removeprefix(W): value for key, value in found.attrib.items()}
+
+    root = ET.fromstring(zipfile.ZipFile(chinese).read("word/styles.xml"))
+    styles = {item.get(f"{W}styleId"): item for item in root.iter(f"{W}style")}
+    defaults = fonts(root.find(f"{W}docDefaults/{W}rPrDefault"))
+    heading = fonts(styles["Heading1"])
+    code = fonts(styles["CodeText"])
+    assert defaults == {"ascii": "Test CJK", "hAnsi": "Test CJK", "eastAsia": "Test CJK"}
+    assert heading["ascii"] == heading["hAnsi"] == heading["eastAsia"] == "Test CJK"
+    assert not {"asciiTheme", "hAnsiTheme", "eastAsiaTheme"} & heading.keys()
+    assert code["ascii"] == "Consolas" and code["eastAsia"] == "Test CJK"
     assert "eastAsiaTheme" in zipfile.ZipFile(english).read("word/styles.xml").decode("utf-8")
     assert Document(str(chinese)).paragraphs[0].text == "中文段落"
 
@@ -333,15 +416,48 @@ def test_system_fonts_are_linked_into_the_libreoffice_profile_on_macos(tmp_path,
     assert [item.resolve() for item in linked] == [fonts.resolve()]
 
 
+def test_office_fonts_the_mac_lacks_get_stand_ins_in_the_libreoffice_profile(tmp_path, monkeypatch):
+    fonts = tmp_path / "fonts"
+    fonts.mkdir()
+    (fonts / "consola.ttf").write_bytes(b"font")
+    monkeypatch.setattr(documents_export, "_MAC_FONT_DIRS", (str(fonts), str(tmp_path / "missing")))
+    monkeypatch.setattr(documents_export.sys, "platform", "linux")
+    documents_export._replace_missing_fonts(tmp_path / "linux-profile")
+    assert not (tmp_path / "linux-profile").exists()
+    monkeypatch.setattr(documents_export.sys, "platform", "darwin")
+    documents_export._replace_missing_fonts(tmp_path / "profile")
+    name = "{http://openoffice.org/2001/registry}name"
+    root = ET.parse(tmp_path / "profile" / "user" / "registrymodifications.xcu").getroot()
+    switch = root.find("item/prop")
+    assert (switch.get(name), switch.findtext("value")) == ("Replacement", "true")
+    pairs = {}
+    for node in root.iter("node"):
+        values = {prop.get(name): prop.findtext("value") for prop in node.iter("prop")}
+        assert (values["Always"], values["OnScreenOnly"]) == ("true", "false")
+        pairs[values["ReplaceFont"]] = values["SubstituteFont"]
+    # Consolas is installed here, so it keeps its own font.
+    assert pairs == {"Aptos": "Helvetica Neue", "Aptos Display": "Helvetica Neue"}
+
+
 @needs_docx
 @pytest.mark.skipif(sys.platform != "darwin" or documents_export.find_soffice() is None, reason="macOS LibreOffice check")
-def test_chinese_text_is_drawn_with_a_cjk_font_in_the_pdf(tmp_path, monkeypatch):
+def test_chinese_pdf_uses_one_cjk_font_and_a_monospace_code_font(tmp_path, monkeypatch):
     pypdf = pytest.importorskip("pypdf")
     monkeypatch.setattr(documents_export, "find_pandoc", lambda: None)
     output = tmp_path / "zh.pdf"
-    export_document("# 手势识别评测\n\n侧对时规则明显下降。\n", base_dir=tmp_path, output=output, fmt="pdf", resolve_image=inside(tmp_path))
-    fonts = set()
+    export_document(
+        "# 手势识别评测\n\n侧对时规则下降 *12* 个点，见 `eval.py`。\n",
+        base_dir=tmp_path, output=output, fmt="pdf", resolve_image=inside(tmp_path),
+    )
+    runs: list[tuple[str, str]] = []
+
+    def visit(text, matrix, text_matrix, font, size):
+        if text.strip() and font is not None:
+            runs.append((str(font.get("/BaseFont")), text.strip()))
+
     for page in pypdf.PdfReader(str(output)).pages:
-        for font in page["/Resources"]["/Font"].values():
-            fonts.add(str(font.get_object()["/BaseFont"]))
-    assert any(name in font for font in fonts for name in ("Hiragino", "STHeiti", "Songti", "ArialUnicode")), fonts
+        page.extract_text(visitor_text=visit)
+    code = [font for font, text in runs if "eval" in text]
+    assert code and all("Menlo" in font or "Consolas" in font for font in code), runs
+    cjk = ("Hiragino", "STHeiti", "Songti", "ArialUnicode")
+    assert all(any(name in font for name in cjk) for font, text in runs if "eval" not in text), runs
