@@ -1,5 +1,6 @@
 """Native Windows acceptance for storage, registry and the generated launcher."""
 import asyncio
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -34,6 +35,32 @@ def isolated_registry(monkeypatch):
                 winreg.DeleteKey(winreg.HKEY_CURRENT_USER, path)
             except FileNotFoundError:
                 pass
+
+
+def make_user_owned(*paths):
+    # Plain mkdir/write stand in for storage made before the ACL hardening.
+    # Windows gives them the token's default owner: the user under UAC, but
+    # BUILTIN\Administrators for an administrator without UAC, as on GitHub's
+    # Windows runners. Repair adopts only user-owned storage, so name the owner.
+    from agent.runtime.browser_control_windows import user_sid
+    for path in paths:
+        subprocess.run(['icacls', str(path), '/setowner', f'*{user_sid()}'], check=True, capture_output=True)
+
+
+def owner(path):
+    # Not Get-Acl: Windows PowerShell started below a pwsh step inherits pwsh's
+    # PSModulePath and fails to load pwsh's Microsoft.PowerShell.Security.
+    from agent.runtime import browser_control_windows as windows
+    kernel, advapi = windows.api()
+    sid, descriptor = ctypes.c_void_p(), ctypes.c_void_p()
+    with windows.handle(path) as value:
+        error = advapi.GetSecurityInfo(value, 1, 1, ctypes.byref(sid), None, None, None, ctypes.byref(descriptor))
+    if error:
+        raise ctypes.WinError(error)
+    try:
+        return windows.sid_string(sid)
+    finally:
+        kernel.LocalFree(descriptor)
 
 
 def test_isolated_install_refuses_before_writing_files_or_registry(tmp_path, isolated_registry, monkeypatch):
@@ -250,6 +277,7 @@ def test_acl_repair_only_tightens_verified_inactive_storage(tmp_path, isolated_r
     endpoint = paths['launcher'].parent.parent / 'browser-control'
     endpoint.mkdir()
     (endpoint / 'owner.lock').write_bytes(b'0')
+    make_user_owned(endpoint, endpoint / 'owner.lock')
     installer.repair(home=tmp_path, repo=REPO)
     check_directory(endpoint)
     read_private(endpoint / 'owner.lock')
@@ -297,6 +325,7 @@ def test_handover_metadata_is_private_and_legacy_permissions_can_be_repaired(tmp
                 RELEASE_REQUEST: {'pid': 43, 'label': 'other window', 'at': 1.0}}
     for name, value in metadata.items():
         (endpoint / name).write_text(json.dumps(value))
+        make_user_owned(endpoint / name)
     installer.repair(home=tmp_path, repo=REPO)
     for name, value in metadata.items():
         assert json.loads(read_private(endpoint / name)) == value
@@ -316,12 +345,27 @@ def test_endpoint_repair_preserves_unrecognized_handover_files(tmp_path, metadat
     (endpoint / 'owner.lock').write_bytes(b'0')
     request = endpoint / 'release.request'
     request.write_text(json.dumps(metadata))
+    make_user_owned(endpoint, endpoint / 'owner.lock', request)
     before = request.read_bytes()
     with pytest.raises(ValueError, match='handover'):
         repair_endpoint_permissions(endpoint)
     assert request.read_bytes() == before
     with pytest.raises(PermissionError):
         check_directory(endpoint)
+
+
+def test_endpoint_repair_refuses_storage_the_user_does_not_own(tmp_path):
+    from agent.runtime.browser_control_repair import repair_endpoint_permissions
+    from agent.runtime.browser_control_windows import user_sid
+    endpoint = tmp_path / 'endpoint'
+    endpoint.mkdir()
+    (endpoint / 'owner.lock').write_bytes(b'0')
+    if owner(endpoint) == user_sid():
+        pytest.skip('this token already gives new objects to the current user')
+    # Storage an administrator made without UAC is left for manual recovery.
+    with pytest.raises(PermissionError, match='owned by the current user'):
+        repair_endpoint_permissions(endpoint)
+    assert owner(endpoint) != user_sid()
 
 
 def test_invalid_launcher_path_and_worktree_fail_before_mutation(tmp_path, isolated_registry):
