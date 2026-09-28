@@ -68,6 +68,7 @@ export function formatToolName(name: string): string {
     web_extract: "FETCH",
     doc_create: "DOC NEW",
     doc_outline: "DOC READ",
+    doc_edit: "DOC EDIT",
     doc_write_section: "DOC WRITE",
     doc_add_section: "DOC ADD",
     doc_remove_section: "DOC CUT",

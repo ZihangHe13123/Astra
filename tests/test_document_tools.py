@@ -342,12 +342,46 @@ def test_read_only_roots_need_approval_before_document_writes(tmp_path):
     assert "ToolApprovalRequired" in again["error"]
 
 
+def test_doc_edit_dispatches_each_action(tmp_path):
+    registry = make_registry(tmp_path)
+    create(registry)
+    written = call(registry, "doc_edit", {"path": "plan.md", "action": "write", "section_id": "background",
+                                          "content": "It matters."})
+    assert written["action"] == "write" and written["section"]["id"] == "background"
+    added = call(registry, "doc_edit", {"path": "plan.md", "action": "add", "heading": "Risks",
+                                        "intent": "What could fail", "after": "method"})
+    assert added["action"] == "add"
+    assert [item["id"] for item in call(registry, "doc_outline", {"path": "plan.md"})["sections"]] == [
+        "background", "method", "risks", "budget"]
+    assert call(registry, "doc_edit", {"path": "plan.md", "action": "remove", "section_id": "risks"})["action"] == "remove"
+
+    path = tmp_path / "plan.md"
+    path.write_text(path.read_text(encoding="utf-8") + "\n<!-- @astra: add numbers -->\n", encoding="utf-8")
+    outline = call(registry, "doc_outline", {"path": "plan.md"})
+    assert outline["open_comments"] == 1 and outline["comments"][0]["text"] == "add numbers"
+    resolved = call(registry, "doc_edit", {"path": "plan.md", "action": "resolve_comment",
+                                           "comment_id": outline["comments"][0]["id"], "note": "Added numbers"})
+    assert resolved["action"] == "resolve_comment" and resolved["open_comments"] == 0
+
+
+def test_doc_edit_requires_the_fields_of_its_action(tmp_path):
+    registry = make_registry(tmp_path)
+    create(registry)
+    before = (tmp_path / "plan.md").read_text(encoding="utf-8")
+    for args, missing in (({"action": "write", "section_id": "background"}, "content"),
+                          ({"action": "add"}, "heading"),
+                          ({"action": "remove"}, "section_id"),
+                          ({"action": "resolve_comment"}, "comment_id")):
+        result = call(registry, "doc_edit", {"path": "plan.md", **args})
+        assert result.get("code") == "invalid_arguments" and missing in result["error"], (args, result)
+    assert (tmp_path / "plan.md").read_text(encoding="utf-8") == before
+
+
 def test_documents_group_routing(tmp_path):
     registry = make_registry(tmp_path)
-    assert registry.tool_names_for_group("documents") == [
-        "doc_create", "doc_outline", "doc_write_section", "doc_add_section",
-        "doc_remove_section", "doc_comments", "doc_resolve_comment", "doc_export",
-    ]
+    assert registry.tool_names_for_group("documents") == ["doc_create", "doc_outline", "doc_edit", "doc_export"]
+    for alias in ("doc_write_section", "doc_add_section", "doc_remove_section", "doc_comments", "doc_resolve_comment"):
+        assert registry.get(alias) is not None and not registry.get(alias).expose_by_default
     for prompt in ("帮我起草一份项目提案", "write a report on sales", "把大纲导出成 PDF", "export notes.md to Word"):
         assert "documents" in registry.select_groups(prompt), prompt
     for prompt in ("documentation for the API", "fix the flaky test"):

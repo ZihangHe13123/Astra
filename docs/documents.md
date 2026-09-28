@@ -32,18 +32,16 @@ Written text…
 
 ## Tools
 
-The group is not in the default tool list. Astra activates it for requests about documents, reports, proposals, theses or exports, or on demand.
+With the default stable tool manifest (`PROMPT_CACHE_STABLE_TOOLS=1`) these four tools are always offered. With progressive routing, Astra activates the group for requests about documents, reports, proposals, theses or exports, or on demand.
 
 | Tool | Purpose |
 | --- | --- |
 | `doc_create` | Create a document with a title, lead and one pending placeholder per section |
-| `doc_outline` | Show sections with id, level, status, word count and hash; optionally one section's text |
-| `doc_write_section` | Replace one section's body, and optionally its heading |
-| `doc_add_section` | Insert a section before or after another, or at the end |
-| `doc_remove_section` | Delete a section and its sub-sections |
-| `doc_comments` | List open review comments with their section and nearby text |
-| `doc_resolve_comment` | Remove a handled comment and record a note |
+| `doc_outline` | Show sections with id, level, status, word count and hash, and the open review comments; optionally one section's text |
+| `doc_edit` | `write` a section's body (optionally its heading), `add` a section before or after another or at the end, `remove` a section with its sub-sections, or `resolve_comment` with a note |
 | `doc_export` | Export Word, PDF or HTML |
+
+The earlier per-action tools (`doc_write_section`, `doc_add_section`, `doc_remove_section`, `doc_comments`, `doc_resolve_comment`) still run for old transcripts but are no longer offered to the model.
 
 ## Safe editing
 
@@ -61,7 +59,7 @@ Write instructions anywhere in the document as HTML comments:
 The pilot covers three people. <!-- @astra: say who the three people are -->
 ```
 
-Then ask Astra to handle the comments. It lists them with `doc_comments`, edits the affected sections and resolves each comment. A comment that needs your decision stays open with an explanation.
+Then ask Astra to handle the comments. It reads them from `doc_outline`, edits the affected sections and resolves each comment with `doc_edit`. A comment that needs your decision stays open with an explanation.
 
 ## Export
 

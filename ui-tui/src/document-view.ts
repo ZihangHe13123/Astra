@@ -28,6 +28,12 @@ function payload(result: DocumentResult): Record<string, unknown> | undefined {
 }
 
 const clean = (value: unknown) => String(value ?? "").replace(CONTROL, " ").trim();
+const EDIT_ACTIONS: Record<string, string> = {
+  write: "doc_write_section",
+  add: "doc_add_section",
+  remove: "doc_remove_section",
+  resolve_comment: "doc_resolve_comment",
+};
 const fileName = (path: string) => path.split(/[\\/]/).pop() || path;
 
 /** The Markdown document a successful doc_* result refers to (the source of an export). */
@@ -46,7 +52,9 @@ export function documentSummary(result: DocumentResult & { id?: number }): strin
   const heading = section.id === "_lead" ? "导语" : clean(section.heading || section.id);
   const count = (value: unknown) => typeof value === "number" ? value : 0;
   const parts = [`文档 ${clean(fileName(path))}`];
-  switch (result.name) {
+  // doc_edit reports its action; the per-action tools remain as hidden aliases.
+  const kind = result.name === "doc_edit" ? EDIT_ACTIONS[String(data.action)] ?? result.name : result.name;
+  switch (kind) {
     case "doc_create": parts.push(`新建 ${Array.isArray(data.sections) ? data.sections.length : 0} 节`); break;
     case "doc_write_section": parts.push(`写入「${heading}」`); break;
     case "doc_add_section": parts.push(`新增「${heading}」`); break;
@@ -57,7 +65,7 @@ export function documentSummary(result: DocumentResult & { id?: number }): strin
     case "doc_export": parts.push(`导出 ${clean(data.format)}（${clean(data.engine)}）`); break;
   }
   if (count(data.pending_sections)) parts.push(`${count(data.pending_sections)} 节待写`);
-  if (count(data.open_comments) && !["doc_comments", "doc_resolve_comment"].includes(result.name)) {
+  if (count(data.open_comments) && !["doc_comments", "doc_resolve_comment"].includes(kind)) {
     parts.push(`${count(data.open_comments)} 条评论`);
   }
   if (Array.isArray(data.warnings) && data.warnings.length) parts.push(`${data.warnings.length} 条警告`);

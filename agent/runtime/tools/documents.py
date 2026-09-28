@@ -447,7 +447,7 @@ def _check_body(content: str, level: int, *, lead: bool = False) -> tuple[str | 
             raise DocumentError(
                 "invalid_content",
                 f"The lead may not contain headings (line {index + 1}).",
-                "Put headed text in a section with doc_add_section.",
+                "Put headed text in a new section with doc_edit action=add.",
             )
         leading = all(_is_blank(item) for item in body_lines[:index])
         if found_level == level and leading and taken is None:
@@ -460,7 +460,7 @@ def _check_body(content: str, level: int, *, lead: bool = False) -> tuple[str | 
                     f"Content line {index + 1} is a level-{found_level} heading, which would "
                     f"end this level-{level} section."
                 ),
-                "Use deeper headings inside a section, or doc_add_section for a new section.",
+                "Use deeper headings inside a section, or doc_edit action=add for a new section.",
             )
     if taken is not None:
         first = next(index for index, line in enumerate(body_lines) if not _is_blank(line))
@@ -576,7 +576,7 @@ def replace_section(document: Document, section_id: str, content: str, heading: 
         raise DocumentError(
             "invalid_content",
             "Section content is empty.",
-            "Write the section text, or use doc_remove_section to delete it.",
+            "Write the section text with doc_edit action=write, or delete it with action=remove.",
         )
     block = _render_section(
         section.id, section.level, new_heading or taken or section.heading, body,
@@ -640,7 +640,7 @@ def remove_comment(document: Document, comment_id: str) -> list[str]:
         raise DocumentError(
             "comment_not_found",
             f"No open comment with id '{comment_id}'. Open comments: {known}",
-            "Call doc_comments to list the current comments.",
+            "Call doc_outline to list the current comments.",
         )
     text = document.text
     starts = _line_starts(document.lines)
@@ -693,6 +693,13 @@ def outline_view(path: Path, document: Document, sha256: str) -> dict[str, Any]:
 
 def section_markdown(document: Document, section: Section) -> str:
     return "".join(document.lines[section.heading_line:section.end]).replace("\r\n", "\n").rstrip("\n")
+
+
+def comment_views(document: Document) -> list[dict[str, Any]]:
+    return [
+        {"id": item.id, "text": item.text, "section_id": item.section_id, "line": item.line, "context": item.context}
+        for item in document.comments
+    ]
 
 
 def register_document_tools(
@@ -854,7 +861,7 @@ def register_document_tools(
                 raise DocumentError(
                     "doc_exists",
                     f"Document already exists: {target}",
-                    "Continue it with doc_outline and doc_write_section, or choose a new path.",
+                    "Continue it with doc_outline and doc_edit, or choose a new path.",
                 )
             text = build_document(title, lead, sections)
             document = parse_document(text)
@@ -869,6 +876,7 @@ def register_document_tools(
             target = resolve(path, write=False)
             document, sha256 = load(target)
             view = outline_view(target, document, sha256)
+            view["comments"] = comment_views(document)
             if section_id == LEAD_ID:
                 view["section"] = {
                     "id": LEAD_ID,
@@ -989,16 +997,7 @@ def register_document_tools(
                 "path": str(target),
                 "sha256": sha256,
                 "open_comments": len(document.comments),
-                "comments": [
-                    {
-                        "id": item.id,
-                        "text": item.text,
-                        "section_id": item.section_id,
-                        "line": item.line,
-                        "context": item.context,
-                    }
-                    for item in document.comments
-                ],
+                "comments": comment_views(document),
             }
         return run(action)
 
@@ -1027,6 +1026,51 @@ def register_document_tools(
             }
         return run(action)
 
+    # One model-facing edit tool keeps the manifest small; the per-action tools
+    # above stay registered as hidden aliases for old transcripts and callers.
+    edit_actions: dict[str, tuple[str, tuple[str, ...]]] = {
+        "write": ("Write document section", ("section_id", "content")),
+        "add": ("Add document section", ("heading",)),
+        "remove": ("Remove document section", ("section_id",)),
+        "resolve_comment": ("Resolve document comment", ("comment_id",)),
+    }
+
+    def _doc_edit(
+        path: str,
+        action: str,
+        section_id: str = "",
+        content: str | None = None,
+        heading: str = "",
+        expected_hash: str = "",
+        intent: str = "",
+        level: int = 0,
+        after: str = "",
+        before: str = "",
+        comment_id: str = "",
+        note: str = "",
+        _task_id: str = "",
+    ) -> str | ToolFailure:
+        if action not in edit_actions:
+            return failure("invalid_arguments", f"Unknown doc_edit action: {action}",
+                           "Use write, add, remove or resolve_comment.", retryable=False)
+        given = {"section_id": section_id, "content": content, "heading": heading, "comment_id": comment_id}
+        missing = [name for name in edit_actions[action][1]
+                   if given[name] is None or (name != "content" and not given[name])]
+        if missing:
+            return failure("invalid_arguments", f"doc_edit action={action} needs {', '.join(missing)}",
+                           "Add the missing fields and call doc_edit again.", retryable=False)
+        if action == "write":
+            result = _doc_write_section(path, section_id, content or "", heading, expected_hash, _task_id)
+        elif action == "add":
+            result = _doc_add_section(path, heading, content or "", intent, level, after, before, section_id, _task_id)
+        elif action == "remove":
+            result = _doc_remove_section(path, section_id, expected_hash, _task_id)
+        else:
+            result = _doc_resolve_comment(path, comment_id, note, _task_id)
+        if isinstance(result, str):
+            result = json.dumps({"action": action, **json.loads(result)}, ensure_ascii=False)
+        return result
+
     path_schema = {
         "type": "string",
         "description": "Markdown document path (.md or .markdown), relative to the workspace or absolute",
@@ -1048,7 +1092,7 @@ def register_document_tools(
         description=(
             "Create a new Markdown document for section-by-section writing: a title, an optional lead and one "
             "pending placeholder per section, each with an intent saying what it will hold. Refuses an existing "
-            "path. Then fill one section per doc_write_section call, in reading order, so the user can follow "
+            "path. Then fill one section per doc_edit action=write call, in reading order, so the user can follow "
             "progress. Use doc_export for Word, PDF or HTML copies."
         ),
         parameters={
@@ -1088,8 +1132,9 @@ def register_document_tools(
         name="doc_outline",
         description=(
             "Read a Markdown document's structure: title, lead, and every section's id, heading, level, status "
-            "(pending or written), word count and hash, plus open review comments. Pass section_id (or '_lead') "
-            "to also get that section's current Markdown before rewriting it."
+            "(pending or written), word count and hash, plus the open review comments (id, section, nearby text) "
+            "that reviewers write as <!-- @astra: instruction -->. Pass section_id (or '_lead') to also get that "
+            "section's current Markdown before rewriting it."
         ),
         parameters={
             "type": "object",
@@ -1104,6 +1149,47 @@ def register_document_tools(
         fn=_doc_outline,
         risk="read",
         permission_check=permission_check("Read document outline", write=False),
+        **common,
+    ))
+
+    def edit_permission_check(args: dict) -> dict | None:
+        operation = edit_actions.get(str(args.get("action") or ""), ("Edit document",))[0]
+        return permission_check(operation, write=True)(args)
+
+    registry.register(ToolDef(
+        name="doc_edit",
+        description=(
+            "Change a Markdown document section by section. action=write replaces one section's body (content "
+            "without the section's own heading; optional new heading; section_id '_lead' is the text under the "
+            "title). action=add inserts a section after or before another, or at the end; without content it is "
+            "a pending placeholder described by intent. action=remove deletes a section with its sub-sections. "
+            "action=resolve_comment removes a handled review comment and records a note. Filling a pending "
+            "placeholder needs no hash; rewriting or removing a written section needs expected_hash from the "
+            "latest doc_outline or edit result, and the call is refused if the section changed since."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": path_schema,
+                "action": {"type": "string", "enum": list(edit_actions)},
+                "section_id": {"type": "string", "description": "write/remove: target section; add: optional id for the new section"},
+                "content": {"type": "string", "description": "write: new Markdown body (required); add: optional body"},
+                "heading": {"type": "string", "description": "add: heading of the new section (required); write: optional new heading"},
+                "expected_hash": hash_schema,
+                "intent": {"type": "string", "description": "add: what a pending section will contain"},
+                "level": {"type": "integer", "minimum": 2, "maximum": 6, "description": "add: default the anchor section's level, else 2"},
+                "after": {"type": "string", "description": "add: insert after this section id"},
+                "before": {"type": "string", "description": "add: insert before this section id"},
+                "comment_id": {"type": "string", "description": "resolve_comment: comment id from doc_outline"},
+                "note": {"type": "string", "description": "resolve_comment: one sentence on how it was handled"},
+                **approval_justification_schema(),
+            },
+            "required": ["path", "action"],
+            "additionalProperties": False,
+        },
+        fn=_doc_edit,
+        risk="write",
+        permission_check=edit_permission_check,
         **common,
     ))
     registry.register(ToolDef(
@@ -1131,6 +1217,8 @@ def register_document_tools(
         fn=_doc_write_section,
         risk="write",
         permission_check=permission_check("Write document section", write=True),
+        expose_by_default=False,
+        allow_hidden_execution=True,
         **common,
     ))
     registry.register(ToolDef(
@@ -1158,6 +1246,8 @@ def register_document_tools(
         fn=_doc_add_section,
         risk="write",
         permission_check=permission_check("Add document section", write=True),
+        expose_by_default=False,
+        allow_hidden_execution=True,
         **common,
     ))
     registry.register(ToolDef(
@@ -1180,6 +1270,8 @@ def register_document_tools(
         fn=_doc_remove_section,
         risk="write",
         permission_check=permission_check("Remove document section", write=True),
+        expose_by_default=False,
+        allow_hidden_execution=True,
         **common,
     ))
     registry.register(ToolDef(
@@ -1187,7 +1279,7 @@ def register_document_tools(
         description=(
             "List the open review comments in a Markdown document. Reviewers write them anywhere in the file as "
             "<!-- @astra: instruction -->. Each comment has an id, its section and nearby text. Act on a comment "
-            "with the other doc tools, then call doc_resolve_comment."
+            "with doc_edit, then resolve it with doc_edit action=resolve_comment."
         ),
         parameters={
             "type": "object",
@@ -1198,6 +1290,8 @@ def register_document_tools(
         fn=_doc_comments,
         risk="read",
         permission_check=permission_check("Read document comments", write=False),
+        expose_by_default=False,
+        allow_hidden_execution=True,
         **common,
     ))
     registry.register(ToolDef(
@@ -1220,6 +1314,8 @@ def register_document_tools(
         fn=_doc_resolve_comment,
         risk="write",
         permission_check=permission_check("Resolve document comment", write=True),
+        expose_by_default=False,
+        allow_hidden_execution=True,
         **common,
     ))
 

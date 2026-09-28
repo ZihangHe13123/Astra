@@ -33,6 +33,15 @@ assert.match(documentSummary(result(3, "doc_create", { path, pending_sections: 3
 assert.match(documentSummary(result(4, "doc_resolve_comment", { path, open_comments: 1 }))!, /已处理 1 条评论，剩 1 条 · \/doc 4/);
 assert.match(documentSummary(result(5, "doc_export", { path: "/w/a.pdf", source: path, format: "pdf", engine: "pandoc + LibreOffice", warnings: ["x"] }))!,
   /导出 pdf（pandoc \+ LibreOffice） · 1 条警告/);
+// doc_edit is summarized by its action, like the per-action aliases.
+assert.equal(documentSummary(result(10, "doc_edit", { action: "write", path, section: { id: "results", heading: "结果" } })),
+  "文档 报告.md · 写入「结果」 · /doc 10 查看");
+assert.match(documentSummary(result(11, "doc_edit", { action: "add", path, pending_sections: 1, section: { id: "risks", heading: "风险" } }))!,
+  /新增「风险」 · 1 节待写/);
+assert.match(documentSummary(result(12, "doc_edit", { action: "remove", path, removed: { heading: "风险" } }))!, /删除「风险」/);
+assert.equal(documentSummary(result(13, "doc_edit", { action: "resolve_comment", path, open_comments: 1 })),
+  "文档 报告.md · 已处理 1 条评论，剩 1 条 · /doc 13 查看");
+assert.equal(documentPath(result(14, "doc_edit", { action: "write", path })), path);
 
 // Rendering hides markers, marks comments and pending text, keeps code, aligns tables.
 const lines = renderDocument([

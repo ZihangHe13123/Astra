@@ -32,18 +32,16 @@
 
 ## 工具
 
-这个工具组默认不在工具列表里。请求涉及文档、报告、提案、论文或导出时，Astra 会自动激活它，也可以按需激活。
+在默认的稳定工具清单下（`PROMPT_CACHE_STABLE_TOOLS=1`），这四个工具始终提供给模型。改用渐进式路由时，请求涉及文档、报告、提案、论文或导出，Astra 才激活这个工具组，也可以按需激活。
 
 | 工具 | 作用 |
 | --- | --- |
 | `doc_create` | 新建文档：标题、导语、每节一个待写占位 |
-| `doc_outline` | 列出各节的 id、级别、状态、字数和哈希；可附带某一节的原文 |
-| `doc_write_section` | 替换一节正文，可顺便改标题 |
-| `doc_add_section` | 在某节前后或文末插入新节 |
-| `doc_remove_section` | 删除一节及其小节 |
-| `doc_comments` | 列出待处理的审阅评论、所在节和附近文字 |
-| `doc_resolve_comment` | 删除已处理的评论并记录说明 |
+| `doc_outline` | 列出各节的 id、级别、状态、字数和哈希，以及待处理的审阅评论；可附带某一节的原文 |
+| `doc_edit` | `write` 替换一节正文（可顺便改标题），`add` 在某节前后或文末插入新节，`remove` 删除一节及其小节，`resolve_comment` 删除已处理的评论并记录说明 |
 | `doc_export` | 导出 Word、PDF 或 HTML |
+
+早先按操作拆分的工具（`doc_write_section`、`doc_add_section`、`doc_remove_section`、`doc_comments`、`doc_resolve_comment`）仍可执行，用于旧会话记录，但不再提供给模型。
 
 ## 安全修改
 
@@ -61,7 +59,7 @@
 试点包括三个人。<!-- @astra: 写清楚是哪三个人 -->
 ```
 
-然后让 Astra 处理评论。它会用 `doc_comments` 列出评论，修改相关的节，再逐条标记为已处理。需要你来决定的评论会保留，并附上说明。
+然后让 Astra 处理评论。它会从 `doc_outline` 读出评论，修改相关的节，再用 `doc_edit` 逐条标记为已处理。需要你来决定的评论会保留，并附上说明。
 
 ## 导出
 
