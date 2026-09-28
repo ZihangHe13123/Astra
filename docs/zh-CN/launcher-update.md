@@ -80,7 +80,7 @@ git pull --ff-only
 
 ## 日常启动
 
-在工作项目目录运行 `astra`；当前目录及文件权限、`SANDBOX_WORKDIR` 决定工作区，不决定安装位置。源码包装脚本和已注册命令使用同一套标准库参数解析器：`astra` 启动 Ink，`astra --cli` 显式启动旧文本 CLI，`astra --tui` 保留旧 Textual 入口，`agent-lab` 保留原兼容行为。
+在工作项目目录运行 `astra`；当前目录及文件权限、`SANDBOX_WORKDIR` 决定工作区，不决定安装位置。源码包装脚本和已注册命令使用同一套标准库参数解析器：`astra` 启动 Ink，`astra --cli` 显式启动旧文本 CLI，`agent-lab` 保留原兼容行为。
 
 正常启动不联网取代码或安装软件。若手动改过锁文件或绕过更新器拉取源码，环境显示未验证时运行 `astra setup`。
 

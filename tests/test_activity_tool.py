@@ -336,7 +336,6 @@ def test_activity_registration_is_local_and_after_session_search():
     local_frontends = [
         root / "agent/cli/main.py",
         root / "agent/cli/backend.py",
-        root / "agent/cli/tui_app.py",
     ]
     for path in local_frontends:
         source = path.read_text()

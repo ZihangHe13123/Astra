@@ -1006,7 +1006,7 @@ def test_gui_entry_is_separate_from_default_tui(source, monkeypatch):
     assert calls == ["gui", "tui"]
     assert cli.parser().parse_args(["setup", "--gui"]).setup_gui
     with pytest.raises(SystemExit):
-        cli.main(["--gui", "--tui"], root=install.root)
+        cli.main(["--gui", "--cli"], root=install.root)
 
 
 def test_gui_code_updates_rebuild_only_when_enabled(source, monkeypatch):

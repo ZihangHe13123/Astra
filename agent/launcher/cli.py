@@ -25,7 +25,6 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(prog="astra", description="Start Astra or manage its installation without a model connection.")
     result.add_argument("--version", action="store_true", help="show the installed version")
     result.add_argument("--cli", action="store_true", help="use the legacy text CLI explicitly")
-    result.add_argument("--tui", action="store_true", help="use the legacy Textual UI explicitly")
     result.add_argument("--ink", action="store_true", help=argparse.SUPPRESS)
     result.add_argument("--gui", action="store_true", help="open the desktop interface (requires astra setup --gui)")
     result.add_argument("--setup-only", action="store_true", help="compatibility alias for setup")
@@ -100,7 +99,7 @@ def isolated_maintenance(install: Installation, argv: list[str]) -> int:
             signal.signal(signal.SIGINT, previous)
 
 
-def launch(install: Installation, *, cli: bool = False, textual: bool = False, activity: list[str] | None = None) -> int:
+def launch(install: Installation, *, cli: bool = False, activity: list[str] | None = None) -> int:
     if install.kind == "source":
         if not dependencies.is_ready(install):
             raise LauncherError("Run astra setup once to prepare/verify this checkout's locked dependencies.")
@@ -108,9 +107,9 @@ def launch(install: Installation, *, cli: bool = False, textual: bool = False, a
     workspace = Path.cwd()
     env = runtime_environment(install, workspace)
     env["ASTRA_LAUNCHER_PID"] = str(os.getpid())
-    if cli or textual or activity is not None:
+    if cli or activity is not None:
         command = [str(install.python), "-m", "agent.cli.main"]
-        command.extend(["activity", *(activity or [])] if activity is not None else ["--tui"] if textual else [])
+        command.extend(["activity", *(activity or [])] if activity is not None else [])
     else:
         dependencies.check_node(install.root)
         entry = install.ui / ("src/index.tsx" if install.kind == "source" else "dist/tui.mjs")
@@ -174,8 +173,8 @@ def choose_local_files(preview: dict) -> str:
 def main(argv: list[str] | None = None, *, root: Path | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     options = parser().parse_args(arguments)
-    if sum((options.gui, options.cli, options.tui, options.ink)) > 1:
-        parser().error("Choose only one interface: --gui, --cli, --tui or --ink.")
+    if sum((options.gui, options.cli, options.ink)) > 1:
+        parser().error("Choose only one interface: --gui, --cli or --ink.")
     if options.gui and options.command:
         parser().error("Use astra --gui to launch, or astra setup --gui to install desktop dependencies.")
     if options.command == "update" and (options.keep_local or options.overwrite_local) and (
@@ -228,7 +227,7 @@ def main(argv: list[str] | None = None, *, root: Path | None = None) -> int:
         if options.gui:
             from .gui import launch_gui
             return launch_gui(install)
-        return launch(install, cli=options.cli, textual=options.tui,
+        return launch(install, cli=options.cli,
                       activity=options.args if command == "activity" else None)
     except (LauncherError, OSError) as exc:
         print(f"Astra: {exc}", file=sys.stderr)

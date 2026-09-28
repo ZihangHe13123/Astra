@@ -1,15 +1,13 @@
 import asyncio
 import base64
 import hashlib
-import importlib
 import json
 import os
 import re
-import sys
 import tempfile
 import time
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -7729,7 +7727,6 @@ def test_all_agent_entrypoints_wire_saved_vision_tile_preference():
     project_root = Path(__file__).resolve().parents[1]
     for relative in (
         "agent/cli/main.py",
-        "agent/cli/tui_app.py",
         "agent/cli/backend.py",
         "agent/cli/api_server.py",
     ):
@@ -7738,7 +7735,6 @@ def test_all_agent_entrypoints_wire_saved_vision_tile_preference():
 
     for relative in (
         "agent/cli/main.py",
-        "agent/cli/tui_app.py",
         "agent/cli/backend.py",
     ):
         source = (project_root / relative).read_text(encoding="utf-8")
@@ -7749,7 +7745,6 @@ def test_all_agent_entrypoints_wire_one_saved_context_index_broker_and_tool():
     project_root = Path(__file__).resolve().parents[1]
     for relative in (
         "agent/cli/main.py",
-        "agent/cli/tui_app.py",
         "agent/cli/backend.py",
         "agent/cli/api_server.py",
     ):
@@ -7846,73 +7841,6 @@ def test_classic_cli_constructs_saved_off_agent(monkeypatch, tmp_path):
 
     assert len(constructed) == 1
     assert constructed[0].vision_tiles_enabled is False
-
-
-def test_legacy_tui_constructs_saved_off_agent_and_routes_command(monkeypatch, tmp_path):
-    textual = ModuleType("textual")
-    textual_app = ModuleType("textual.app")
-    textual_widgets = ModuleType("textual.widgets")
-    rich = ModuleType("rich")
-    rich_text = ModuleType("rich.text")
-
-    class App:
-        pass
-
-    class Widget:
-        pass
-
-    Widget.Submitted = object
-
-    class RichText:
-        @staticmethod
-        def from_markup(value):
-            return value
-
-    textual_app.App = App
-    textual_app.ComposeResult = object
-    textual_widgets.Header = Widget
-    textual_widgets.Input = Widget
-    textual_widgets.RichLog = Widget
-    textual_widgets.Static = Widget
-    rich_text.Text = RichText
-    monkeypatch.setitem(sys.modules, "textual", textual)
-    monkeypatch.setitem(sys.modules, "textual.app", textual_app)
-    monkeypatch.setitem(sys.modules, "textual.widgets", textual_widgets)
-    monkeypatch.setitem(sys.modules, "rich", rich)
-    monkeypatch.setitem(sys.modules, "rich.text", rich_text)
-    sys.modules.pop("agent.cli.tui_app", None)
-    tui_module = importlib.import_module("agent.cli.tui_app")
-
-    settings = tmp_path / "settings.json"
-    settings.write_text('{"vision_tiles_enabled": false}', encoding="utf-8")
-    monkeypatch.setenv("AGENT_SETTINGS_PATH", str(settings))
-    monkeypatch.setenv("SANDBOX_DOCKER", "false")
-    monkeypatch.setenv("AGENT_MEMORY_PATH", str(tmp_path / "memory.db"))
-    monkeypatch.setenv("AGENT_SKILLS_PATH", str(tmp_path / "skills"))
-    monkeypatch.setattr(tui_module, "SESSION_DEFAULT", tmp_path / "session.json")
-    config = LLMConfig(
-        model="deepseek-v4-flash-vision-exp",
-        api_key="local",
-        base_url="http://127.0.0.1:9/v1",
-        capabilities=frozenset({"vision", "tools"}),
-        vision_preprocess=VisionPreprocessPolicy(),
-    )
-
-    _, agent = tui_module.create_agent(config, 1, str(tmp_path))
-
-    assert agent.vision_tiles_enabled is False
-    messages = []
-    view = object.__new__(tui_module.AgentTUI)
-    view.agent = agent
-    view._write_rich = lambda message, **kwargs: messages.append((message, kwargs))
-    view.query_one = lambda _widget: SimpleNamespace(refresh_bar=lambda _agent: None)
-    view._handle_slash("/vision-tiles on")
-    assert agent.vision_tiles_enabled is True
-    assert "Vision tiles: ON" in messages[-1][0]
-    view._handle_slash("/context-index session")
-    assert agent.context_index_broker.mode == "session"
-    assert "Active mode: SESSION" in messages[-1][0]
-    sys.modules.pop("agent.cli.tui_app", None)
 
 
 def test_api_bootstrap_constructs_saved_off_agent(monkeypatch, tmp_path):

@@ -2,7 +2,6 @@
 
 支持两种模式:
   python -m agent.cli.main           # 普通 CLI（默认）
-  python -m agent.cli.main --tui     # TUI 模式（需 textual）
   python -m agent.cli.main --ink     # Ink TUI 模式（需 Node.js）
 """
 
@@ -85,7 +84,6 @@ from ..runtime.prompts import get_prompt_profile, prompt_profiles
 from .render import render_text, render_tool_block, StreamRenderer, ReasoningRenderer, render_status_bar
 from .search_preferences import SEARCH_PROVIDERS, resolve_startup_search_provider, save_selected_search_provider
 
-# run_tui 懒加载，见 _run_tui_mode()
 from .sessions import (
     SessionNameError,
     delete_session,
@@ -1024,19 +1022,6 @@ async def _async_init(llm_config: LLMConfig, sandbox_timeout: int, workdir: str)
                 await close()
 
 
-def _run_tui_mode(config, sandbox_timeout, workdir):
-    try:
-        from .tui_app import run_tui as _tui_run
-    except ImportError as e:
-        print(f"\033[31m[Error] TUI 模式不可用: {e}\033[0m")
-        print("请安装: pip install textual")
-        sys.exit(1)
-    _tui_run(config, sandbox_timeout, workdir)
-
-
-
-
-
 def main():
     setup_logging("cli")
     load_project_env(Path(__file__).resolve().parents[2])
@@ -1051,7 +1036,6 @@ def main():
     configure_tracing()
 
     # ── 参数解析 ──
-    tui_mode = "--tui" in args
     ink_mode = "--ink" in args
 
     startup_model, startup_base_url = resolve_startup_model(
@@ -1102,9 +1086,7 @@ def main():
     sandbox_timeout = _int_env("SANDBOX_TIMEOUT", 30)
     workdir = os.getenv("SANDBOX_WORKDIR", os.getenv("HOME", os.getcwd()))
 
-    if tui_mode:
-        _run_tui_mode(config, sandbox_timeout, workdir)
-    elif ink_mode:
+    if ink_mode:
         import subprocess
         # 找 Node.js TUI 脚本
         ui_dir = Path(__file__).parent.parent.parent / "ui-tui"

@@ -499,7 +499,6 @@ def test_local_surfaces_register_after_image_tools_and_api_surface_does_not():
     for filename, marker in (
         ("main.py", "async def _async_init"),
         ("backend.py", "async def main"),
-        ("tui_app.py", "def create_agent"),
     ):
         source = (root / filename).read_text(encoding="utf-8")
         factory = source[source.index(marker):]
@@ -514,7 +513,6 @@ def test_local_shutdown_paths_await_computer_teardown():
     expected_followups = {
         "main.py": ("agent.context.save()", "await stop_browser.fn()", "agent.close_external_memory()", "mcp_manager.close()", "await close()"),
         "backend.py": ("await agent.context.save_async()", "await stop_browser.fn()", "agent.close_external_memory()", "mcp_manager.close()", "await close()"),
-        "tui_app.py": ("self.agent.context.save()", "self.agent.close_external_memory()", "await close()"),
     }
     for filename, followups in expected_followups.items():
         source = (root / filename).read_text(encoding="utf-8")

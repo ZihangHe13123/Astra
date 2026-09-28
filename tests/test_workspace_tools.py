@@ -6,7 +6,7 @@ from agent.runtime.tools.workspace import register_workspace_tools
 from agent.sandbox.local import LocalSandbox
 
 ROOT = Path(__file__).resolve().parents[1]
-ENTRY_POINTS = ("agent/cli/backend.py", "agent/cli/main.py", "agent/cli/tui_app.py", "agent/cli/api_server.py")
+ENTRY_POINTS = ("agent/cli/backend.py", "agent/cli/main.py", "agent/cli/api_server.py")
 WORKSPACE_FAMILIES = {"register_code_tools", "register_file_tools", "register_document_tools",
                       "register_git_tools", "register_time_tools"}
 

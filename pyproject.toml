@@ -43,7 +43,6 @@ tracing = [
   "opentelemetry-sdk>=1.28",
   "opentelemetry-exporter-otlp-proto-http>=1.28",
 ]
-legacy-tui = ["rich>=13", "textual>=0.80"]
 embedding = ["mlx-embeddings>=0.1,<0.2; sys_platform == 'darwin'", "numpy>=1.26"]
 dev = ["pytest==9.1.1", "ruff==0.16.4", "pyright==1.1.411", "pypdf>=5", "numpy>=1.26", "pydantic>=2,<3"]
 
@@ -153,4 +152,3 @@ pythonVersion = "3.11"
 venvPath = "."
 venv = ".venv"
 include = ["agent"]
-exclude = ["agent/cli/tui_app.py"]

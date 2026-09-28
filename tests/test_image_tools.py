@@ -297,7 +297,6 @@ def test_all_local_image_entrypoints_register_request_scoped_tile_selector():
     project_root = Path(__file__).resolve().parents[1]
     entrypoints = (
         "agent/cli/main.py",
-        "agent/cli/tui_app.py",
         "agent/cli/backend.py",
         "agent/cli/api_server.py",
     )

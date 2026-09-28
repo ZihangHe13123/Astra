@@ -111,7 +111,7 @@ the workspace, subject to existing filesystem permissions and explicit
 
 All source wrappers and the installed `astra` entrypoint route through the same
 standard-library command parser. `astra` selects Ink. `astra --cli` selects the
-legacy text CLI explicitly; `astra --tui` retains the legacy Textual entry.
+legacy text CLI explicitly.
 `agent-lab` keeps its existing legacy compatibility behavior.
 
 Normal startup checks the recorded environment and starts it. It does not fetch
