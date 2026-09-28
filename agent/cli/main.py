@@ -32,12 +32,8 @@ from ..runtime.task_store import (
     format_today,
 )
 from ..runtime.tools.registry import ToolRegistry
-from ..runtime.tools.code import register_code_tools
-from ..runtime.tools.documents import register_document_tools
-from ..runtime.tools.files import register_file_tools
-from ..runtime.tools.git import register_git_tools
-from ..runtime.tools.time import register_time_tools
 from ..runtime.tools.web import register_web_tools, create_browser_extract_fn, create_browser_status_fn
+from ..runtime.tools.workspace import register_workspace_tools
 from ..runtime.tools.image import register_image_tools, select_vision_tiles_from_holder
 from ..runtime.tools.computer import register_local_computer_runtime
 from ..runtime.tools.browser import register_browser_tools
@@ -894,11 +890,7 @@ async def _async_init(llm_config: LLMConfig, sandbox_timeout: int, workdir: str)
     )
     context_index_broker.start_background(memory_store.path)
     agent_holder = {}
-    register_code_tools(tools, sandbox)
-    register_file_tools(tools, workdir=workdir, sandbox=sandbox)
-    register_document_tools(tools)
-    register_git_tools(tools, workdir=workdir)
-    register_time_tools(tools)
+    register_workspace_tools(tools, sandbox, workdir=workdir)
     register_memory_tools(
         tools,
         memory_store,

@@ -203,25 +203,17 @@ async def _bootstrap_agent():
     context_index_broker.start_background(memory_store.path)
 
     # Register core tools (lighter than full backend — no sandbox/docker)
-    from agent.runtime.tools.code import register_code_tools
-    from agent.runtime.tools.documents import register_document_tools
-    from agent.runtime.tools.files import register_file_tools
-    from agent.runtime.tools.git import register_git_tools
     from agent.runtime.tools.image import register_image_tools, select_vision_tiles_from_holder
     from agent.runtime.tools.memory import register_memory_tools
     from agent.runtime.tools.session_recall import register_session_recall_tools
     from agent.runtime.tools.skills import register_skill_tools
-    from agent.runtime.tools.time import register_time_tools
     from agent.runtime.tools.web import register_web_tools
+    from agent.runtime.tools.workspace import register_workspace_tools
     from agent.sandbox.local import LocalSandbox
 
     sandbox = LocalSandbox(timeout=30, workdir=os.getcwd())
     agent_holder = {}
-    register_code_tools(tools, sandbox)
-    register_file_tools(tools, workdir=os.getcwd(), sandbox=sandbox)
-    register_document_tools(tools)
-    register_git_tools(tools, workdir=os.getcwd())
-    register_time_tools(tools)
+    register_workspace_tools(tools, sandbox, workdir=os.getcwd())
     register_memory_tools(tools, memory_store, session_id=_current_memory_session)
     register_skill_tools(tools, skill_store)
     register_session_recall_tools(tools)
