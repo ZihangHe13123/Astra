@@ -1,4 +1,11 @@
-"""Model-directed native learning, using normal task tools for verification."""
+"""Model-directed native learning, using normal task tools for verification.
+
+No entry point registers these tools since learning moved to direct skill saving
+and manual /learn review (2026-09-13; tests/test_skill_curation.py guards that).
+They remain the only way to open candidate trials, so tests/test_learning_lifecycle.py
+drives the legacy candidate queue through them. Delete this module together with
+the LearningLifecycle trial methods and the legacy /learn candidate commands.
+"""
 
 from __future__ import annotations
 
