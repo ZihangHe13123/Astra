@@ -12,6 +12,7 @@ const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const folder = mkdtempSync(join(tmpdir(), 'astra-desktop-smoke-'));
 const workspace = join(folder, '工作区 with spaces'); mkdirSync(workspace);
 const target = join(workspace, 'receipt.txt');
+const report = join(workspace, 'report.md');
 const output = join(root, 'output/playwright/gui'); mkdirSync(output, { recursive: true });
 const requests = [];
 const delegateGoals = ['DELEGATE_GUI_ALPHA', 'DELEGATE_GUI_BETA', 'DELEGATE_GUI_FAILURE'];
@@ -55,7 +56,13 @@ const server = createServer(async (req, res) => {
       return;
     }
   }
-  const call = delegateGoal && !delegateRead ? ['read_file', { path: target }]
+  // A document is written in two tool steps; the Files panel must follow it.
+  const docStep = !delegateGoal && text.includes('写文档') ? payload.messages.slice(lastUser + 1).filter(m => m.role === 'tool').length : -1;
+  const call = docStep === 0 ? ['doc_create', { path: report, title: '评测报告', lead: '规则在侧对时准确率下降。',
+      sections: [{ heading: '结果', intent: '各朝向的准确率' }, { heading: '方法', intent: '对比的模型' }] }]
+    : docStep === 1 ? ['doc_write_section', { path: report, section_id: '结果',
+      content: '| 朝向 | 规则 F1 |\n| --- | --- |\n| 正对 | 0.95 |\n| 侧对 | 0.71 |\n\n**侧对**时下降明显。' }]
+    : delegateGoal && !delegateRead ? ['read_file', { path: target }]
     : !answered && delegateParent ? ['delegate_task', { tasks: delegateGoals.map(goal => ({
       goal, mode: 'explorer', fork_turns: 'none', tools: ['read_file'], max_turns: 4,
     })) }]
@@ -640,6 +647,20 @@ try {
  assert.deepEqual(closedHistory.history.delegates.map(item=>item.process_id).sort(),delegateIds);
  assert.deepEqual(closedHistory.history.delegates.map(item=>item.status).sort(),['completed','completed','failed']);
  passed('explicit close releases the runtime while preserving its saved history');
+ await page.getByRole('button',{name:'新对话',exact:false}).click();
+ await submit('请写文档：评测报告');
+ for(let i=0;i<2;i++){ await page.getByRole('button',{name:'允许一次',exact:true}).waitFor({timeout:15000}); await page.getByRole('button',{name:'允许一次',exact:true}).click(); }
+ await idle();
+ assert.match(readFileSync(report,'utf8'), /\| 侧对 \| 0\.71 \|/);
+ await page.getByRole('tab',{name:'文件',exact:true,selected:true}).waitFor({timeout:15000});
+ await page.locator('.doc-preview table').waitFor({timeout:15000});
+ assert.equal(await page.locator('.doc-preview h1').innerText(),'评测报告');
+ assert.match(await page.locator('.doc-preview').innerText(),/Pending: 对比的模型/);
+ assert.equal(await page.locator('.doc-preview').innerText().then(t=>t.includes('astra:section')),false);
+ await page.screenshot({path:join(output,'document-preview.png')});
+ await page.getByRole('button',{name:'源码',exact:false}).click(); await page.locator('pre.file-preview').filter({hasText:'astra:section'}).waitFor();
+ await page.getByRole('button',{name:'关闭详情',exact:true}).click();
+ passed('document tools write section by section and the Files panel follows the document');
  // Full host shutdown/relaunch restores the last session and the final keystroke,
  // without invoking the model. This is separate from a renderer-only reload.
  await page.getByRole('button',{name:'新对话',exact:false}).click();

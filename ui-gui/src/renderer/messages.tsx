@@ -4,15 +4,16 @@ import remarkGfm from "remark-gfm";
 import { Check, Copy, RotateCcw } from "lucide-react";
 import type { Message } from "@astra/ui-core/session-state";
 import { windowRange, messageOffsets } from "./message-window.js";
+import { resolveAgainst } from "./doc-preview.js";
 
-function InlineImage({ src, alt, runtime }: { src?: string; alt?: string; runtime?: string }) {
+function InlineImage({ src, alt, runtime, base }: { src?: string; alt?: string; runtime?: string; base?: string }) {
   const [url, setURL] = useState<string>();
   useEffect(() => {
     let live = true; setURL(undefined);
     if (src && /^https:\/\//i.test(src)) setURL(src);
-    else if (src && runtime) void window.astra.file(runtime, src, "preview").then(value => { if (live) setURL(value.data); }).catch(() => {});
+    else if (src && runtime) void window.astra.file(runtime, resolveAgainst(base, src), "preview").then(value => { if (live) setURL(value.data); }).catch(() => {});
     return () => { live = false; };
-  }, [src, runtime]);
+  }, [src, runtime, base]);
   return url ? <img src={url} alt={alt || "图片"} loading="lazy"/> : <span className="muted">{alt || "图片预览不可用"}</span>;
 }
 function CopyButton({ text, label = "复制消息", fail }: { text: string | (() => string); label?: string; fail: (e: unknown) => void }) {
@@ -26,15 +27,16 @@ function CodeBlock({ children, fail }: { children?: React.ReactNode; fail: (e: u
   const code = useRef<HTMLPreElement>(null);
   return <div className="code-block"><div className="copy-code"><CopyButton label="复制代码" text={() => code.current?.textContent || ""} fail={fail}/></div><pre ref={code}>{children}</pre></div>;
 }
-export const Markdown = memo(function Markdown({ text, runtime, fail }: { text: string; runtime?: string; fail: (e: unknown) => void }) {
+/** ``base`` is the folder that relative image and link targets are resolved against (a previewed document). */
+export const Markdown = memo(function Markdown({ text, runtime, fail, base }: { text: string; runtime?: string; fail: (e: unknown) => void; base?: string }) {
   const components = useMemo(() => ({
-    img: ({ src, alt }: { src?: string; alt?: string }) => <InlineImage src={src} alt={alt} runtime={runtime}/>,
-    a: ({ href, children }: React.ComponentProps<"a">) => <a href={href} onClick={e => { e.preventDefault(); if (!href) return;
+    img: ({ src, alt }: { src?: string; alt?: string }) => <InlineImage src={src} alt={alt} runtime={runtime} base={base}/>,
+    a: ({ href, children }: React.ComponentProps<"a">) => <a href={href} onClick={e => { e.preventDefault(); if (!href || href.startsWith("#")) return;
       if (/^https?:\/\//i.test(href)) void window.astra.openExternal(href).catch(fail);
-      else if (runtime) void window.astra.file(runtime, href, "open").catch(fail);
+      else if (runtime) void window.astra.file(runtime, resolveAgainst(base, href), "open").catch(fail);
     }}>{children}</a>,
     pre: ({ children }: React.ComponentProps<"pre">) => <CodeBlock fail={fail}>{children}</CodeBlock>,
-  }), [runtime, fail]);
+  }), [runtime, fail, base]);
   return <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml urlTransform={url => /^(?:https?:\/\/|\/|[A-Za-z]:[\\/]|\.\.?\/)/.test(url) || !/^[a-z][a-z\d+.-]*:/i.test(url) ? url : ""} components={components}>{text}</ReactMarkdown>;
 });
 const MessageRow = memo(function MessageRow({ message: m, runtime, timeline, reasoning, expanded, retry, fail }: {

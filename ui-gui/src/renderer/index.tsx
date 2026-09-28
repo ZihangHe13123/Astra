@@ -5,6 +5,7 @@ import { projectEvent, textContent, type SessionState, type UIEvent, type Messag
 import type { CommandDescription, Preferences, SessionEntry } from "../bridge.js";
 import { Approval, CommandPalette, Modal, ModelPicker, ModelSettings, Question } from "./controls.js";
 import { Details, type Panel } from "./details.js";
+import { latestDoc } from "./doc-preview.js";
 import { modelConnection } from "./model-connection.js";
 import { SessionMenu, SessionActionDialog, type SessionAction } from "./session-actions.js";
 import { modeCommand, modeChoices, localCommandEntry } from "../local-mode.js";
@@ -41,6 +42,8 @@ function App() {
   const [sessionDialog, setSessionDialog] = useState<{ action: "rename" | "delete"; entry: SessionEntry; title: string }>();
   const [toast, setToast] = useState("");
   const [selection, setSelection] = useState<{ index?: number; serial: number }>({ serial: 0 });
+  const [docTarget, setDocTarget] = useState<{ path: string; serial: number }>();
+  const docFollow = useRef(true);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [initialModelKey, setInitialModelKey] = useState<string>();
   const [olderLoading, setOlderLoading] = useState(false);
@@ -56,6 +59,15 @@ function App() {
   const state = states[active];
   const localDefinition = state?.info.local_mode_info?.definition;
   const commandModes = useMemo(() => [...builtinCommandModes, ...(localDefinition ? [{ mode: "local", ...localDefinition }] : [])], [localDefinition]);
+  // Open the Files panel on the document the agent is writing until the user closes or leaves it.
+  const newestDoc = useMemo(() => state ? latestDoc(state.tools) : undefined, [state?.tools]);
+  useEffect(() => { docFollow.current = true; setDocTarget(undefined); }, [state?.id, state?.session]);
+  useEffect(() => {
+    if (!newestDoc || !docFollow.current) return;
+    setDocTarget({ path: newestDoc.path, serial: newestDoc.index });
+    setPanel("files");
+  }, [newestDoc?.path, newestDoc?.index]);
+  const leaveDoc = () => { if (docTarget) docFollow.current = false; };
   const key = preview ? `${preview.mode}:${preview.session_id}` : state && !state.isDraft ? `${state.mode}:${state.session}` : `new:${state?.workspace || workspace}`;
   const draft = prefs.drafts[key] || "";
   const files = prefs.attachments[key] || [];
@@ -107,10 +119,10 @@ function App() {
       if ((e.metaKey || e.ctrlKey) && e.key === ".") { e.preventDefault(); void send({ type: "command", cmd: "/cancel" }); }
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "o") { e.preventDefault(); setPanel("tools"); }
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "l") { e.preventDefault(); setPanel("context"); }
-      if (e.key === "Escape" && !modal) setPanel(undefined);
+      if (e.key === "Escape" && !modal) { if (panel === "files") leaveDoc(); setPanel(undefined); }
     };
     window.addEventListener("keydown", listener); return () => window.removeEventListener("keydown", listener);
-  }, [active, modal, workspace, state?.isDraft, preview]);
+  }, [active, modal, workspace, state?.isDraft, preview, panel, docTarget]);
   useEffect(() => { setFollow(true); setOlderLoading(false); }, [active, preview?.session_id, preview?.mode]);
   useEffect(() => { if (follow && scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight; }, [state?.revision, active, preview, follow]);
   useEffect(() => {
@@ -363,7 +375,7 @@ function App() {
       <button className="account" onClick={() => setModal("settings")}><span className="account-icon">A</span><span>Astra 本地工作区<small>{model?.model && model.model !== "none" ? model.model : "连接你的模型"}</small></span><Settings size={17}/></button>
     </aside>
     <main className="main"><header className="topbar"><div>{!side && <button className="icon" aria-label="显示侧栏" onClick={() => setSide(true)}><PanelLeft size={18}/></button>}<Folder size={17}/><span className="title" title={currentTitle}>{currentTitle}</span><span className="mode-badge">{preview ? "只读历史" : state?.mode && state.mode !== "work" ? state.mode : ""}</span></div>
-      <div><span className="workspace" title={state?.workspace || workspace}>{(state?.workspace || workspace).split(/[\\/]/).pop()}</span>{historyLoading || state?.status === "connecting" || state?.status === "loading" ? <LoaderCircle size={16} className="spin"/> : null}<button className="icon" aria-label="执行详情" onClick={() => setPanel(panel ? undefined : "tools")}><PanelRight size={18}/></button></div></header>
+      <div><span className="workspace" title={state?.workspace || workspace}>{(state?.workspace || workspace).split(/[\\/]/).pop()}</span>{historyLoading || state?.status === "connecting" || state?.status === "loading" ? <LoaderCircle size={16} className="spin"/> : null}<button className="icon" aria-label="执行详情" onClick={() => { if (panel) leaveDoc(); setPanel(panel ? undefined : "tools"); }}><PanelRight size={18}/></button></div></header>
       <div className={`body ${panel && state && !preview ? "with-details" : ""}`}><div className="conversation"><div className="messages-scroll" aria-busy={historyLoading} data-history-request={preview?.request || 0} ref={scroller} onScroll={e => { const t = e.currentTarget; if (!t.clientHeight) return; setFollow(t.scrollHeight - t.scrollTop - t.clientHeight < 120); }}>
         <div className="messages">
           {!messages.length && <section className="welcome"><div className="welcome-mark">A</div><h1>从一个想法开始。</h1><p>对话、研究、编写代码，或把手头的事情交给 Astra。</p><div className="welcome-actions"><button onClick={() => { void openModels(); }}><SlidersHorizontal size={16}/>连接或选择模型</button><button onClick={() => showCommands()}><Command size={16}/>浏览全部功能</button></div></section>}
@@ -397,7 +409,7 @@ function App() {
           </div>}
           <div className="composer-foot"><span>{state?.status === "ready" ? state.busy ? "运行中" : "就绪" : state ? state.status === "disconnected" ? "后端已断开" : "连接后端中…" : "本地运行 · 模型自主选择工具"}</span><span>Enter 发送 · Shift Enter 换行</span></div>
         </div>
-      </div>{panel && state && !preview && <Details state={state} panel={panel} setPanel={setPanel} selection={selection} width={prefs.detailWidth || 420} onWidth={detailWidth => savePrefs({ detailWidth })} close={() => setPanel(undefined)} fail={fail}/>}</div>
+      </div>{panel && state && !preview && <Details state={state} panel={panel} setPanel={next => { if (next !== "files") leaveDoc(); setPanel(next); }} selection={selection} width={prefs.detailWidth || 420} onWidth={detailWidth => savePrefs({ detailWidth })} close={() => { leaveDoc(); setPanel(undefined); }} fail={fail} doc={docFollow.current ? docTarget : undefined} onDocDismiss={leaveDoc}/>}</div>
     </main>
     {toast && <div className="toast" role="alert"><span>{toast}</span><button className="icon" onClick={() => setToast("")} aria-label="关闭提示"><X size={16}/></button></div>}
     {modal === "commands" && <CommandPalette commands={commands} labels={commandNames(commandModes)} initialFilter={commandQuery} close={() => setModal(undefined)} run={command}/>}
