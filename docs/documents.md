@@ -25,7 +25,7 @@ Written text…
 ```
 
 - The first level-1 heading is the title; the text under it is the lead (section id `_lead`).
-- Every other `#` heading starts a section, which runs until the next heading of the same or a higher level, so a level-2 section contains its level-3 sub-sections.
+- Every other `#` heading starts a section, which runs until the next heading of the same or a higher level, so a level-2 section contains its level-3 sub-sections. Writing a section replaces only its own text, up to its first sub-section; removing a section also removes its sub-sections.
 - The HTML comment above a heading keeps the section's id stable when its heading changes. Headings you add yourself without a marker get an id derived from the heading text.
 - A section Astra has not written yet shows a visible `*Pending: …*` line.
 - Markers and comments are invisible in rendered Markdown. Nothing inside fenced code blocks is treated as a heading, marker or comment.
@@ -38,7 +38,7 @@ With the default stable tool manifest (`PROMPT_CACHE_STABLE_TOOLS=1`) these four
 | --- | --- |
 | `doc_create` | Create a document with a title, lead and one pending placeholder per section |
 | `doc_outline` | Show sections with id, level, status, word count and hash, and the open review comments; optionally one section's text |
-| `doc_edit` | `write` a section's body (optionally its heading), `add` a section before or after another or at the end, `remove` a section with its sub-sections, or `resolve_comment` with a note |
+| `doc_edit` | `write` a section's own text (optionally its heading; sub-sections stay), `add` a section before or after another or at the end, `remove` a section with its sub-sections, or `resolve_comment` with a note |
 | `doc_export` | Export Word, PDF or HTML |
 
 The earlier per-action tools (`doc_write_section`, `doc_add_section`, `doc_remove_section`, `doc_comments`, `doc_resolve_comment`) still run for old transcripts but are no longer offered to the model.
@@ -46,7 +46,7 @@ The earlier per-action tools (`doc_write_section`, `doc_add_section`, `doc_remov
 ## Safe editing
 
 - Filling an untouched pending section needs no extra argument.
-- Rewriting or removing a written section needs the `expected_hash` from the latest outline. If you changed that section in the meantime, the call fails with `section_changed` and your text stays; Astra rereads it and redoes the edit.
+- Rewriting a written section, or removing a section whose own text or sub-sections were written, needs the `expected_hash` from the latest outline. The hash covers the sub-sections, so editing a sub-section changes its parent's hash. If you changed that section in the meantime, the call fails with `section_changed` and your text stays; Astra rereads it and redoes the edit.
 - Every write is atomic, and Astra refuses it if the file changed while the edit was prepared.
 - Writes create file checkpoints, so `checkpoint_restore` and the turn change history work as they do for the file tools.
 - Paths follow the same [filesystem policy](execution.md) as the file tools: the workspace is writable, and other locations need approval.

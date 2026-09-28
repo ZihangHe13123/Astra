@@ -314,7 +314,9 @@ def parse_document(text: str) -> Document:
             if headings[later][1] <= level:
                 end = starts[later]
                 break
-        body = lines[line_index + 1:end]
+        # Pending means the section's own text is still the placeholder; its
+        # sub-sections are separate sections with their own status.
+        body = lines[line_index + 1:body_end]
         marker_status = (attrs or {}).get("status", "")
         intent = (attrs or {}).get("intent", "")
         meaningful = [_strip_newline(item).strip() for item in body if not _is_blank(item)]
@@ -578,11 +580,25 @@ def replace_section(document: Document, section_id: str, content: str, heading: 
             "Section content is empty.",
             "Write the section text with doc_edit action=write, or delete it with action=remove.",
         )
+    if section.body_end < section.end and _contains_heading(body):
+        raise DocumentError(
+            "invalid_content",
+            f"Section '{section.id}' has sub-sections ({', '.join(subsection_ids(document, section))}); "
+            "its own text cannot add headings.",
+            "Write each sub-section with its own section_id, or add one with doc_edit action=add.",
+        )
     block = _render_section(
         section.id, section.level, new_heading or taken or section.heading, body,
         pending=False, intent="", newline=newline,
     )
-    return _splice(document.lines[:section.start], block, document.lines[section.end:], newline)
+    # Only the section's own text is replaced; its sub-sections stay in place.
+    return _splice(document.lines[:section.start], block, document.lines[section.body_end:], newline)
+
+
+def _contains_heading(text: str) -> bool:
+    lines = [item + "\n" for item in text.split("\n")]
+    fenced = fenced_lines(lines)
+    return any(not fenced[index] and heading_of(line.rstrip("\n")) is not None for index, line in enumerate(lines))
 
 
 def insert_section(
@@ -692,7 +708,12 @@ def outline_view(path: Path, document: Document, sha256: str) -> dict[str, Any]:
 
 
 def section_markdown(document: Document, section: Section) -> str:
-    return "".join(document.lines[section.heading_line:section.end]).replace("\r\n", "\n").rstrip("\n")
+    """The section's heading and own text, i.e. what a write replaces; sub-sections excluded."""
+    return "".join(document.lines[section.heading_line:section.body_end]).replace("\r\n", "\n").rstrip("\n")
+
+
+def subsection_ids(document: Document, section: Section) -> list[str]:
+    return [item.id for item in document.sections if section.start < item.start < section.end]
 
 
 def comment_views(document: Document) -> list[dict[str, Any]]:
@@ -830,12 +851,15 @@ def register_document_tools(
         except (OSError, ValueError) as exc:
             return failure("document_error", str(exc))
 
-    def guard(section: Section, expected_hash: str, action: str) -> None:
-        if section.pristine_pending and not expected_hash:
+    def guard(section: Section, expected_hash: str, action: str, *, untouched: bool | None = None) -> None:
+        untouched = section.pristine_pending if untouched is None else untouched
+        if untouched and not expected_hash:
             return
         if not expected_hash:
             raise DocumentError(
                 "hash_required",
+                f"Section '{section.id}' or its sub-sections already have content; {action} needs its expected_hash."
+                if section.pristine_pending else
                 f"Section '{section.id}' already has content; {action} needs its expected_hash.",
                 "Call doc_outline with this section_id, check its current text, then pass its hash.",
                 current_hash=section.hash,
@@ -885,7 +909,8 @@ def register_document_tools(
                 }
             elif section_id:
                 section = document.section(section_id)
-                view["section"] = {**section_view(section), "markdown": section_markdown(document, section)}
+                view["section"] = {**section_view(section), "markdown": section_markdown(document, section),
+                                   "subsections": subsection_ids(document, section)}
             return view
         return run(action)
 
@@ -973,7 +998,9 @@ def register_document_tools(
             target = resolve(path, write=True)
             document, sha256 = load(target)
             section = document.section(section_id)
-            guard(section, expected_hash, "removing it")
+            # Removing takes the sub-sections too, so any written one needs the hash.
+            subtree = [item for item in document.sections if section.start <= item.start < section.end]
+            guard(section, expected_hash, "removing it", untouched=all(item.pristine_pending for item in subtree))
             lines = remove_section(document, section_id)
             new_sha, checkpoint_id = commit(
                 target, lines, expected_sha256=sha256, operation="doc_remove_section", task_id=_task_id,
@@ -1134,7 +1161,7 @@ def register_document_tools(
             "Read a Markdown document's structure: title, lead, and every section's id, heading, level, status "
             "(pending or written), word count and hash, plus the open review comments (id, section, nearby text) "
             "that reviewers write as <!-- @astra: instruction -->. Pass section_id (or '_lead') to also get that "
-            "section's current Markdown before rewriting it."
+            "section's own Markdown (without its sub-sections) and its sub-section ids before rewriting it."
         ),
         parameters={
             "type": "object",
@@ -1159,13 +1186,14 @@ def register_document_tools(
     registry.register(ToolDef(
         name="doc_edit",
         description=(
-            "Change a Markdown document section by section. action=write replaces one section's body (content "
-            "without the section's own heading; optional new heading; section_id '_lead' is the text under the "
-            "title). action=add inserts a section after or before another, or at the end; without content it is "
+            "Change a Markdown document section by section. action=write replaces one section's own text up to its "
+            "first sub-section, which stays (content without the section's own heading; optional new heading; "
+            "section_id '_lead' is the text under the title). action=add inserts a section after or before another, or at the end; without content it is "
             "a pending placeholder described by intent. action=remove deletes a section with its sub-sections. "
             "action=resolve_comment removes a handled review comment and records a note. Filling a pending "
-            "placeholder needs no hash; rewriting or removing a written section needs expected_hash from the "
-            "latest doc_outline or edit result, and the call is refused if the section changed since."
+            "placeholder needs no hash; rewriting a written section, or removing one whose text or sub-sections "
+            "were written, needs expected_hash from the latest doc_outline or edit result, and the call is "
+            "refused if the section changed since."
         ),
         parameters={
             "type": "object",
@@ -1195,8 +1223,9 @@ def register_document_tools(
     registry.register(ToolDef(
         name="doc_write_section",
         description=(
-            "Replace one section's body (and optionally its heading) in a Markdown document. Content is the body "
-            "without the section's own heading; deeper sub-headings are allowed. Filling a pending placeholder "
+            "Replace one section's own text up to its first sub-section (and optionally its heading) in a Markdown "
+            "document. Content is the text without the section's own heading; deeper headings are allowed only "
+            "while the section has no sub-sections. Filling a pending placeholder "
             "needs no hash. Rewriting a written section requires expected_hash from the latest doc_outline or "
             "write result; if someone edited the section since, the call is refused so their text is never lost. "
             "Use section_id '_lead' for the text under the title."
@@ -1253,8 +1282,8 @@ def register_document_tools(
     registry.register(ToolDef(
         name="doc_remove_section",
         description=(
-            "Delete a section together with its sub-sections. A written section needs expected_hash from the "
-            "latest doc_outline; an untouched pending placeholder does not."
+            "Delete a section together with its sub-sections. If the section or any sub-section was written, "
+            "pass expected_hash from the latest doc_outline; untouched pending placeholders need none."
         ),
         parameters={
             "type": "object",

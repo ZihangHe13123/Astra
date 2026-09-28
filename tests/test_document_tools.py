@@ -386,3 +386,57 @@ def test_documents_group_routing(tmp_path):
         assert "documents" in registry.select_groups(prompt), prompt
     for prompt in ("documentation for the API", "fix the flaky test"):
         assert "documents" not in registry.select_groups(prompt), prompt
+
+
+def create_nested(registry: ToolRegistry) -> dict:
+    return call(registry, "doc_create", {"path": "nested.md", "title": "Plan", "sections": [
+        {"heading": "2 Candidates", "intent": "Candidate places"},
+        {"heading": "2.1 Scoring", "intent": "How we score", "level": 3},
+        {"heading": "3 Budget", "intent": "Costs"},
+    ]})
+
+
+def statuses(registry: ToolRegistry) -> list[tuple[str, str]]:
+    return [(item["id"], item["status"]) for item in call(registry, "doc_outline", {"path": "nested.md"})["sections"]]
+
+
+def test_writing_a_parent_keeps_its_sub_sections(tmp_path):
+    registry = make_registry(tmp_path)
+    create_nested(registry)
+    assert statuses(registry) == [("2-candidates", "pending"), ("2-1-scoring", "pending"), ("3-budget", "pending")]
+
+    written = call(registry, "doc_edit", {"path": "nested.md", "action": "write", "section_id": "2-candidates",
+                                          "content": "Three places."})
+    assert written["action"] == "write"
+    assert statuses(registry) == [("2-candidates", "written"), ("2-1-scoring", "pending"), ("3-budget", "pending")]
+    text = (tmp_path / "nested.md").read_text(encoding="utf-8")
+    assert text.index("Three places.") < text.index('id="2-1-scoring"') < text.index("*Pending: How we score*")
+
+    view = call(registry, "doc_outline", {"path": "nested.md", "section_id": "2-candidates"})["section"]
+    assert view["markdown"].startswith("## 2 Candidates") and "Three places." in view["markdown"]
+    assert "Scoring" not in view["markdown"] and view["subsections"] == ["2-1-scoring"]
+
+
+def test_a_parent_with_sub_sections_refuses_headings_and_guards_its_subtree(tmp_path):
+    registry = make_registry(tmp_path)
+    create_nested(registry)
+    refused = call(registry, "doc_edit", {"path": "nested.md", "action": "write", "section_id": "2-candidates",
+                                          "content": "Intro\n\n### Extra\n\nMore"})
+    assert refused["code"] == "invalid_content" and "2-1-scoring" in refused["error"]
+
+    call(registry, "doc_edit", {"path": "nested.md", "action": "write", "section_id": "2-1-scoring", "content": "Points."})
+    outline = {item["id"]: item for item in call(registry, "doc_outline", {"path": "nested.md"})["sections"]}
+    assert outline["2-candidates"]["status"] == "pending"
+    # Removing the parent also removes the written child, so it needs the hash.
+    assert call(registry, "doc_edit", {"path": "nested.md", "action": "remove",
+                                       "section_id": "2-candidates"})["code"] == "hash_required"
+
+    call(registry, "doc_edit", {"path": "nested.md", "action": "write", "section_id": "2-1-scoring",
+                                "content": "Points, revised.", "expected_hash": outline["2-1-scoring"]["hash"]})
+    stale = call(registry, "doc_edit", {"path": "nested.md", "action": "remove", "section_id": "2-candidates",
+                                        "expected_hash": outline["2-candidates"]["hash"]})
+    assert stale["code"] == "section_changed"
+    fresh = {item["id"]: item for item in call(registry, "doc_outline", {"path": "nested.md"})["sections"]}
+    removed = call(registry, "doc_edit", {"path": "nested.md", "action": "remove", "section_id": "2-candidates",
+                                          "expected_hash": fresh["2-candidates"]["hash"]})
+    assert removed["action"] == "remove" and statuses(registry) == [("3-budget", "pending")]
