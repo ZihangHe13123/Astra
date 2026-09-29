@@ -55,6 +55,7 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
           connection_pending: { ...state.info.connection_pending, status: "completed" },
           connection_result: { type: "connection_result", request_id: state.info.connection_pending.request_id, error: "连接已中断，请重新发起登录或连接。" } };
       }
+      if (state.questions.length) append("system", "连接已中断，未完成的问题已失效；需要时请重新提问。");
       state.approvals = []; state.questions = []; notice(); break;
     case "gui_user":
       if (!event.submission_id || !state.messages.some(m => m.id === event.submission_id)) {
@@ -135,7 +136,11 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
       state.approvals = [...state.approvals.filter(a => a.request_id !== event.request_id), event]; break;
     case "approval_resolved": state.approvals = state.approvals.filter(a => a.request_id !== event.request_id); break;
     case "user_question_request": state.questions = [...state.questions.filter(a => a.request_id !== event.request_id), event]; break;
-    case "user_question_resolved": state.questions = state.questions.filter(a => a.request_id !== event.request_id); break;
+    case "user_question_pending":
+      state.questions = state.questions.map(a => a.request_id === event.request_id ? { ...a, state: "pending" } : a); break;
+    case "user_question_resolved":
+      state.questions = state.questions.filter(a => a.request_id !== event.request_id);
+      if (event.state === "expired") append("system", event.reason || "问题已失效，请重新提问。"); break;
     case "approval_response_rejected":
       state.approvals = state.approvals.filter(a => a.request_id !== event.request_id);
       append("error", event.reason); notice(); break;

@@ -22,8 +22,8 @@ NPM_COMMAND = dependencies.npm_command
 
 @pytest.mark.parametrize("gui,version,accepted", [
     (False, "17.9.1", False), (False, "18.0.0", True), (False, "20.17.0", True),
-    (True, "18.20.0", False), (True, "20.19.0", False), (True, "22.11.9", False),
-    (True, "22.12.0", True), (True, "22.12.1", True), (True, "24.21.0", True),
+    (True, "18.20.0", False), (True, "20.19.0", False), (True, "22.11.9", False), (True, "22.18.9", False),
+    (True, "22.19.0", True), (True, "22.19.1", True), (True, "24.21.0", True),
 ])
 def test_node_version_boundaries(tmp_path, monkeypatch, gui, version, accepted):
     monkeypatch.setattr(dependencies, "node_command", lambda: "node")
@@ -35,17 +35,17 @@ def test_node_version_boundaries(tmp_path, monkeypatch, gui, version, accepted):
             CHECK_NODE(tmp_path, gui=gui)
         message = str(error.value)
         assert version in message
-        assert ("22.12.0" if gui else "18.0.0") in message
+        assert ("22.19.0" if gui else "18.0.0") in message
         assert ("GUI" if gui else "TUI") in message
         assert "astra setup" in message
         assert "new terminal" in message
 
 
-@pytest.mark.parametrize("version", ["", "not-node", "22.12", "22.12.0-rc.1"])
+@pytest.mark.parametrize("version", ["", "not-node", "22.12", "22.19.0-rc.1"])
 def test_invalid_node_probe_is_actionable(tmp_path, monkeypatch, version):
     monkeypatch.setattr(dependencies, "node_command", lambda: "node")
     monkeypatch.setattr(dependencies, "run", lambda *args, **kwargs: version)
-    with pytest.raises(LauncherError, match=r"GUI requires Node.js 22.12.0"):
+    with pytest.raises(LauncherError, match=r"GUI requires Node.js 22.19.0"):
         CHECK_NODE(tmp_path, gui=True)
 
 
@@ -54,7 +54,7 @@ def test_missing_node_reports_selected_target(tmp_path, monkeypatch, gui):
     monkeypatch.setattr(dependencies.shutil, "which", lambda _: None)
     with pytest.raises(LauncherError) as error:
         CHECK_NODE(tmp_path, gui=gui)
-    assert ("GUI requires Node.js 22.12.0" if gui else "TUI requires Node.js 18.0.0") in str(error.value)
+    assert ("GUI requires Node.js 22.19.0" if gui else "TUI requires Node.js 18.0.0") in str(error.value)
 
 
 def test_failed_probe_keeps_cause_and_recovery_hint(tmp_path, monkeypatch):
@@ -93,7 +93,7 @@ def test_old_node_rejected_before_mutation_or_service_stop(source, companion, mo
         pytest.fail("prerequisites must be checked before bootstrapping or synchronization")
     monkeypatch.setattr(dependencies, "ensure_uv", must_not_mutate)
     monkeypatch.setattr(dependencies, "synchronize", must_not_mutate)
-    with pytest.raises(LauncherError, match=r"GUI requires Node.js 22.12.0"):
+    with pytest.raises(LauncherError, match=r"GUI requires Node.js 22.19.0"):
         if mode.startswith("setup"):
             setup.setup_source(inst, [], gui=mode == "setup", repair=mode == "setup-repair")
         else:
@@ -150,7 +150,7 @@ def test_doctor_reports_old_node_even_with_incomplete_gui(source, monkeypatch):
     monkeypatch.setattr(dependencies, "run", lambda *args, **kwargs: "20.17.0")
     report = dependencies.diagnostics(inst)
     problem = next(item for item in report["problems"] if item["component"] == "gui")
-    assert "GUI requires Node.js 22.12.0" in problem["message"]
+    assert "GUI requires Node.js 22.19.0" in problem["message"]
     assert "20.17.0" in problem["message"]
     assert not report["gui"]["healthy"]
 
@@ -166,7 +166,7 @@ def test_synchronize_defensively_checks_gui_before_installing(source, monkeypatc
         assert command[0] == "node", "must not run uv/npm with an unsupported Node"
         return "20.17.0"
     monkeypatch.setattr(dependencies, "run", probe)
-    with pytest.raises(LauncherError, match=r"GUI requires Node.js 22.12.0"):
+    with pytest.raises(LauncherError, match=r"GUI requires Node.js 22.19.0"):
         SYNCHRONIZE(inst, [])
     assert len(calls) == 1
 
@@ -176,7 +176,7 @@ def test_gui_health_uses_shared_requirement_before_electron(source, monkeypatch)
     monkeypatch.setattr(dependencies, "check_node", CHECK_NODE)
     monkeypatch.setattr(dependencies, "node_command", lambda: "node")
     monkeypatch.setattr(dependencies, "run", lambda *args, **kwargs: "20.17.0")
-    with pytest.raises(LauncherError, match=r"GUI requires Node.js 22.12.0"):
+    with pytest.raises(LauncherError, match=r"GUI requires Node.js 22.19.0"):
         dependencies.gui_health(inst)
     assert not (inst.root / "ui-gui").exists()
 

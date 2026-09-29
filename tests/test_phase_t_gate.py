@@ -32,6 +32,7 @@ def _source_archive(tmp_path, names):
     "agent/.env.local", "agent/persona.local.json", "agent/private.key",
     "native/appshot-core/.build/private.txt", "docs/superpowers/private.md",
     "docs/validation/private.md", "evals/coding/results/private.json",
+    "agent/runtime/tools/comfyui.py", "agent/runtime/writing_mode.py", "tests/test_comfyui_tools.py", "session_recall.py",
 ])
 def test_source_distribution_refuses_private_or_generated_files(tmp_path, relative):
     path = _source_archive(tmp_path, [relative])
@@ -43,6 +44,10 @@ def _public_source_inputs():
     return [
         "agent/cli/main.py", "agent/runtime/prompts.py", "config/models.yaml",
         "ui-tui/src/index.tsx", "astra.py", "README.md", "pyproject.toml", "PKG-INFO",
+        "packaging/desktop-runtime.lock.json", "scripts/package_desktop.py",
+        "agent/launcher/desktop_distribution.py", "agent/launcher/desktop_runtime.py",
+        "agent/launcher/desktop_update.py", "agent/runtime/tools/workspace_dependencies.py",
+        "ui-gui/src/main/packaged-runtime.ts",
         "ui-tui/package.json", "ui-tui/package-lock.json", "ui-tui/tsconfig.json",
         "ui-core/package.json", "ui-core/package-lock.json", "ui-core/tsconfig.json",
         "ui-core/src/backend-protocol.ts", "ui-core/src/backend-handshake.ts", "ui-core/src/types.ts",
@@ -62,6 +67,10 @@ def test_source_distribution_keeps_public_cli_shared_ui_desktop_and_configuratio
 @pytest.mark.parametrize("missing", [
     "ui-core/package-lock.json", "ui-core/src/backend-protocol.ts", "ui-gui/package-lock.json",
     "ui-gui/build.mjs", "ui-gui/src/preload/index.ts", "ui-tui/package-lock.json",
+    "packaging/desktop-runtime.lock.json", "scripts/package_desktop.py",
+    "agent/launcher/desktop_distribution.py", "agent/launcher/desktop_runtime.py",
+    "agent/launcher/desktop_update.py", "agent/runtime/tools/workspace_dependencies.py",
+    "ui-gui/src/main/packaged-runtime.ts",
 ])
 def test_source_distribution_requires_shared_ui_and_desktop_build_inputs(tmp_path, missing):
     path = _source_archive(tmp_path, [name for name in _public_source_inputs() if name != missing])
@@ -279,3 +288,14 @@ def test_wheel_smoke_rejects_a_module_supplied_only_by_dependency_site_packages(
     )
     assert result.returncode != 0
     assert "AssertionError: agent.runtime.session_recall" in result.stderr
+
+
+@pytest.mark.parametrize("private", ["agent/runtime/tools/comfyui.py", "agent/runtime/writing_mode.py", "session_recall.py",
+                                    "agent/.env", "agent/private.key", "agent/__pycache__/test.pyc"])
+def test_wheel_rejects_private_payloads(tmp_path, private):
+    import zipfile
+    wheel = tmp_path / "test.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(private, "private payload")
+    with pytest.raises(SystemExit, match="non-public path"):
+        wheel_smoke.check_wheel_distribution(wheel)

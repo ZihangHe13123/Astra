@@ -17,7 +17,7 @@ from .installation import Installation, runtime_environment
 PYTHON_PROBE = "import openai, yaml, httpx, mcp, opentelemetry, websockets, PIL"
 LOCK_FILES = ("pyproject.toml", "uv.lock", "ui-tui/package.json", "ui-tui/package-lock.json")
 TUI_NODE_MIN_VERSION = (18, 0, 0)
-GUI_NODE_MIN_VERSION = (22, 12, 0)
+GUI_NODE_MIN_VERSION = (22, 19, 0)
 
 
 def gui_enabled(install: Installation) -> bool:
@@ -74,6 +74,12 @@ def gui_health(install: Installation) -> None:
 
 
 def gui_executable(install: Installation) -> str:
+    if install.kind == "desktop":
+        resources = install.root.parent.parent
+        path = resources.parent / ("MacOS/Astra" if sys.platform == "darwin" else "Astra.exe")
+        if not path.is_file():
+            raise LauncherError("The packaged desktop executable is missing. Restore or reinstall the application.")
+        return str(path)
     # Requiring Electron 44 can download binaries. Health checks and launches
     # must remain read-only; only explicit setup/update installs components.
     package = install.root / "ui-gui/node_modules/electron"

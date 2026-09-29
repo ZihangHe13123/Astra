@@ -21,6 +21,7 @@ export interface QuestionCardProps {
   maxHeight?: number;
   onAnswer: (requestId: string, answers: UserQuestionAnswer[]) => void;
   onCancel: (requestId: string) => void;
+  onEditing?: (requestId: string, editing: boolean) => void;
   submissionRejection?: { requestId: string; reason: string } | null;
 }
 
@@ -47,6 +48,7 @@ export function QuestionCard({
   maxHeight,
   onAnswer,
   onCancel,
+  onEditing,
   submissionRejection = null,
 }: QuestionCardProps) {
   const theme = useTheme();
@@ -75,6 +77,13 @@ export function QuestionCard({
     }).state);
   }, [request.request_id, submissionRejection]);
 
+  useEffect(() => {
+    if (request.mode !== "timed" || !onEditing || !customEntry || !active || pending) return;
+    onEditing(request.request_id, true);
+    const heartbeat = setInterval(() => onEditing(request.request_id, true), 20_000);
+    return () => { clearInterval(heartbeat); onEditing(request.request_id, false); };
+  }, [request.request_id, request.mode, customEntry, active, pending, onEditing]);
+
   const question = state.request.questions[state.index];
   const draft = state.drafts[state.index];
   const options = question?.options ?? [];
@@ -82,6 +91,7 @@ export function QuestionCard({
   const contentWidth = Math.max(16, panelWidth - 4);
 
   const apply = (...actions: QuestionAction[]): QuestionTransition => {
+    if (request.mode === "timed") onEditing?.(request.request_id, true);
     let transition: QuestionTransition = { state };
     for (const action of actions) {
       transition = transitionQuestion(transition.state, action);
@@ -99,7 +109,7 @@ export function QuestionCard({
   };
 
   useInput((input, key) => {
-    if (key.ctrl || (key.meta && !key.escape)) return;
+    if (key.ctrl || key.tab || (key.meta && !key.escape)) return;
     if (maxHeight !== undefined && (key.pageUp || key.pageDown)) {
       setScrollOffset((current) => Math.max(0, Math.min(maxScrollOffset,
         current + (key.pageUp ? -bodyPageSize : bodyPageSize))));
@@ -179,7 +189,7 @@ export function QuestionCard({
   }, { isActive: active && customEntry && pending === null && maxHeight === undefined });
 
   useInput((input, key) => {
-    if (key.ctrl || (key.meta && !key.escape)) return;
+    if (key.ctrl || key.tab || (key.meta && !key.escape)) return;
     if (key.escape) { apply({ type: "cancel" }); return; }
     if (key.return) { commitCustom(customText); return; }
     if (key.pageUp || key.pageDown) {
@@ -222,7 +232,7 @@ export function QuestionCard({
     : pending === "cancel"
       ? "Cancelling question…"
       : !active
-        ? "Question paused while approval is active"
+        ? request.state === "pending" ? "Tab to answer · work continues" : "Question paused while approval is active"
         : customEntry
           ? "Enter save custom answer"
           : interactionHint;
@@ -284,7 +294,7 @@ export function QuestionCard({
     >
       <Text bold color={theme.accentAlt} wrap="truncate-end">
         {truncateDisplay(
-          `◆ Question · ${state.index + 1}/${state.request.questions.length}${question?.header ? ` · ${question.header}` : ""}`,
+          `◆ Question${request.state === "pending" ? " · work continues · Tab to switch" : ""} · ${state.index + 1}/${state.request.questions.length}${question?.header ? ` · ${question.header}` : ""}`,
           contentWidth,
         )}
       </Text>

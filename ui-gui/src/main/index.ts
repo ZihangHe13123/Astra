@@ -10,16 +10,20 @@ import { Runtime } from "./runtime.js";
 import { QueryClient } from "./query-client.js";
 import { sessionAction } from "./session-actions.js";
 import { hasOngoingWork } from "./ongoing-work.js";
+import { QuitCoordinator, type QuitReason } from "./quit.js";
 import { PreferenceWriter } from "./preferences.js";
-import { filePreview } from "./file-preview.js";
+import { DocumentPreviewService, sourceVersion } from "./file-preview.js";
+import { configurePackagedRuntime, acquirePackagedLease } from "./packaged-runtime.js";
 import { ClipboardFiles } from "./clipboard-files.js";
 import { DesktopAppshot } from "./appshot.js";
 import { checkedCommand, checkedPreferences, checkedString, externalURL, inside } from "./validation.js";
 
-const root = resolve(process.env.AGENT_PROJECT_ROOT || join(__dirname, "../.."));
-const python = process.env.AGENT_PYTHON || join(root, ".venv", process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
+const packaged = configurePackagedRuntime({ isPackaged: app.isPackaged, resourcesPath: process.resourcesPath,
+  appData: app.getPath("appData"), platform: process.platform, arch: process.arch });
+const root = packaged?.root ?? resolve(process.env.AGENT_PROJECT_ROOT || join(__dirname, "../.."));
+const python = packaged?.python ?? process.env.AGENT_PYTHON ?? join(root, ".venv", process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
 let workspace = resolve(process.env.ASTRA_WORKSPACE || process.cwd());
-const data = resolve(process.env.ASTRA_HOME || join(root, ".astra"));
+const data = packaged?.data ?? resolve(process.env.ASTRA_HOME || join(root, ".astra"));
 const gui = join(data, "gui");
 mkdirSync(gui, { recursive: true, mode: 0o700 });
 const identity = createHash("sha256").update(`${root}\0${data}`).digest("hex").slice(0, 16);
@@ -30,9 +34,12 @@ let window: BrowserWindow | undefined;
 let tray: Tray | undefined;
 let quitting = false;
 let quitFinished = false;
-let closePrompt = false;
+let leaseLost = false;
 let active = "";
 const runtimes = new Map<string, Runtime>();
+const previews = new DocumentPreviewService();
+const previewRequests = new Map<string, AbortController>();
+let desktopLease: { close(): Promise<void> } | undefined;
 let queries = new QueryClient(root, python);
 const appshot = new DesktopAppshot(() => active,
   id => process.env.ASTRA_GUI_DISABLE_APPSHOT !== "1" && !!runtimes.get(id) && runtimes.get(id)?.state.status !== "disconnected",
@@ -82,7 +89,7 @@ function checkSender(event: Electron.IpcMainEvent | Electron.IpcMainInvokeEvent)
 function register(method: string, handler: (...args: any[]) => any) {
   ipcMain.handle(`astra:${method}`, (event, ...args) => {
     checkSender(event);
-    if (quitting && !["bootstrap", "preferences"].includes(method)) throw new Error("应用正在退出，请稍候。");
+    if ((quitting || leaseLost) && !["bootstrap", "preferences"].includes(method)) throw new Error("应用正在退出，请稍候。");
     return handler(...args);
   });
 }
@@ -124,6 +131,7 @@ register("create", (options: { session?: string; mode?: string; workspace?: stri
 });
 register("select", id => { active = id === "" ? "" : runtime(id).id; appshot.update(); });
 function forgetRuntime(rt: Runtime) {
+  for (const [key, controller] of previewRequests) if (key.startsWith(`${rt.id}:`)) { controller.abort(); previewRequests.delete(key); }
   runtimes.delete(rt.id);
   if (active === rt.id) { active = ""; preferences.lastSession = null; savePreferences(); }
   appshot.forget(rt.id);
@@ -156,7 +164,7 @@ register("appshot", async (id, action, value = "") => {
   } else rt.accept({ type: "gui_notice", message: await appshot.command(rt.id, value) });
 });
 register("query", (method, params = {}, id) => {
-  if (!["sessions", "history", "commands", "changes"].includes(method)) throw new Error("Unsupported query");
+  if (!["sessions", "history", "commands", "changes", "request_timeline"].includes(method)) throw new Error("Unsupported query");
   if (!params || typeof params !== "object" || Array.isArray(params) || JSON.stringify(params).length > 32768) throw new Error("Invalid query");
   return method === "changes" ? runtime(id).query(method, params) : queries.query(method, params);
 });
@@ -213,15 +221,25 @@ register("clipboardImage", async () => {
   const path = join(folder, `${randomUUID()}.png`); await writeFile(path, bytes, { mode: 0o600 }); selectedFiles.add(path); clipboardFiles.add(path); return path;
 });
 register("openExternal", value => shell.openExternal(externalURL(value)));
-register("file", async (id, value, action) => {
+register("cancelPreview", (id, requestId) => {
+  const rt = runtime(id);
+  const key = `${rt.id}:${checkedString(requestId, "preview request", 100)}`;
+  previewRequests.get(key)?.abort();
+});
+register("file", async (id, value, action, requestId) => {
   const path = authorizedFile(id, value);
   if (action === "reveal") { shell.showItemInFolder(path); return { path }; }
   if (action === "open") { const error = await shell.openPath(path); if (error) throw new Error(error); return { path }; }
+  if (action === "version") return { path, sourceVersion: await sourceVersion(path) };
   if (action !== "preview") throw new Error("Unknown file action");
-  return filePreview(path);
+  const key = `${runtime(id).id}:${requestId === undefined ? randomUUID() : checkedString(requestId, "preview request", 100)}`;
+  if (previewRequests.has(key)) throw new Error("Preview request is already pending");
+  const controller = new AbortController(); previewRequests.set(key, controller);
+  try { return await previews.preview(path, controller.signal, () => authorizedFile(id, value)); }
+  finally { if (previewRequests.get(key) === controller) previewRequests.delete(key); }
 });
 
-async function quit() {
+async function performQuit() {
   if (quitting) return;
   quitting = true;
   await Promise.all([...runtimes.values()].map(rt => rt.close()));
@@ -237,9 +255,35 @@ async function quit() {
     await dialog.showMessageBox(window!, { type: "error", message: "草稿未能保存，已取消退出", detail: `请先复制需要保留的内容。\n${String(error)}` });
     return;
   }
+  await previews.dispose();
   await clipboardFiles.cleanup(preferences.attachments, preferences.drafts).catch(error => console.error("Astra clipboard cleanup:", error));
+  await desktopLease?.close();
   quitFinished = true;
   app.quit();
+}
+const quitCoordinator = new QuitCoordinator({
+  inspect: () => [...runtimes.values()].some(r => hasOngoingWork(r.state)),
+  confirm: async reason => {
+    const background = reason === "window";
+    const options: Electron.MessageBoxOptions = { type: "question", message: "仍有任务或会话提醒在运行",
+      detail: background ? "后台继续会保留后端运行，可从托盘重新打开。" : "退出会停止所有会话后端，已安排的提醒也将在应用关闭期间暂停。",
+      buttons: background ? ["后台继续", "停止并退出", "返回"] : ["停止并退出", "返回"],
+      cancelId: background ? 2 : 1, defaultId: background ? 0 : 1 };
+    const { response } = window && !window.isDestroyed() && window.isVisible()
+      ? await dialog.showMessageBox(window, options) : await dialog.showMessageBox(options);
+    if (background && response === 0) return "background";
+    return response === (background ? 1 : 0) ? "quit" : "cancel";
+  },
+  perform: performQuit,
+  hide: () => window?.hide(),
+  focus: () => { if (process.platform === "darwin") app.focus({ steal: true }); },
+});
+function requestQuit(reason: QuitReason) {
+  if (quitting) return;
+  void quitCoordinator.request(reason).catch(error => {
+    console.error("Astra quit cancelled:", error);
+    void dialog.showMessageBox({ type: "error", message: "退出未完成", detail: "任务状态或确认窗口不可用，请稍后再试。" });
+  });
 }
 function showWindow() {
   if (window && !window.isDestroyed()) { window.show(); window.focus(); return; }
@@ -256,13 +300,7 @@ function showWindow() {
   window.on("close", event => {
     if (quitting) return;
     event.preventDefault();
-    const ongoing = [...runtimes.values()].some(r => hasOngoingWork(r.state));
-    if (!ongoing) { void quit(); return; }
-    if (closePrompt) return;
-    closePrompt = true;
-    void dialog.showMessageBox(window!, { type: "question", message: "仍有任务或会话提醒在运行", detail: "后台继续会保留后端运行，可从托盘重新打开。", buttons: ["后台继续", "停止并退出", "返回"], cancelId: 2, defaultId: 0 })
-      .then(({ response }) => { if (response === 0) window?.hide(); else if (response === 1) void quit(); })
-      .finally(() => { closePrompt = false; });
+    requestQuit("window");
   });
   window.webContents.once("did-finish-load", ready);
   void window.loadURL("astra://app/index.html");
@@ -271,11 +309,19 @@ function showWindow() {
 if (!app.requestSingleInstanceLock({ workspace })) { ready(); app.quit(); }
 else {
   app.on("second-instance", (_event, _argv, _cwd, extra) => { const requested = extra as { workspace?: string }; if (typeof requested?.workspace === "string") workspace = requested.workspace; showWindow(); broadcast({ refresh: true }); });
-  app.on("before-quit", event => { if (!quitFinished) { event.preventDefault(); if (!quitting) void quit(); } });
-  // quit() flushes the last renderer draft after beforeunload, then exits explicitly.
+  app.on("before-quit", event => { if (!quitFinished) { event.preventDefault(); requestQuit("quit"); } });
+  // performQuit() flushes the last renderer draft after beforeunload, then exits explicitly.
   app.on("window-all-closed", () => {});
   app.on("activate", showWindow);
   void app.whenReady().then(async () => {
+    desktopLease = await acquirePackagedLease(packaged, { onLost: error => {
+      if (quitting || leaseLost) return;
+      leaseLost = true;
+      console.error("Astra installation protection lost:", error);
+      void dialog.showMessageBox({ type: "error", message: "安装保护进程已退出",
+        detail: "为避免与更新发生冲突，Astra 将保存草稿并停止当前任务后退出。请重新打开应用。",
+        buttons: ["停止并退出"] }).then(() => performQuit()).catch(cause => console.error("Astra protected exit failed:", cause));
+    } });
     const staticRoot = realpathSync(join(__dirname, "renderer"));
     protocol.handle("astra", request => {
       const url = new URL(request.url);
@@ -296,8 +342,12 @@ else {
     const icon = nativeImage.createFromBitmap(pixels, { width: 22, height: 22 });
     if (process.platform === "darwin") icon.setTemplateImage(true);
     tray = new Tray(icon); tray.setToolTip("Astra");
-    tray.setContextMenu(Menu.buildFromTemplate([{ label: "打开 Astra", click: showWindow }, { label: "停止并退出", click: () => { void quit(); } }]));
+    tray.setContextMenu(Menu.buildFromTemplate([{ label: "打开 Astra", click: showWindow }, { label: "停止并退出", click: () => requestQuit("quit") }]));
     tray.on("click", showWindow);
     showWindow();
+  }).catch(async error => {
+    console.error("Astra desktop startup failed:", error);
+    await dialog.showMessageBox({ type: "error", message: "Astra 启动失败", detail: String(error) });
+    await performQuit();
   });
 }

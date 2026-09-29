@@ -140,3 +140,20 @@ test("another Astra session's message is a notice, never the user's words", () =
   state = projectEvent(state, { type: "history", session_id: "s", messages: [{ role: "system", content: "PEER ← 跑测试 · submitted · mac:t-3\nHi" }] });
   assert.equal(state.messages[0].role, "system");
 });
+
+test('timed questions stay answerable after completion and expire visibly on disconnect', () => {
+  let state = projectEvent(initialSession('a'), {type:'user_question_request',request_id:'q',state:'waiting',mode:'timed',questions:[]});
+  state = projectEvent(state, {type:'user_question_pending',request_id:'q',state:'pending'});
+  state = projectEvent(state, {type:'done'});
+  assert.equal(state.questions[0].state, 'pending');
+  assert.equal(state.busy, false);
+  state = projectEvent(state, {type:'gui_disconnected'});
+  assert.equal(state.questions.length, 0);
+  assert.match(state.messages.at(-1)?.content || '', /失效/);
+});
+
+test('expired question notices survive history replacement when recovered after restart', () => {
+  let state = projectEvent(initialSession('a'), {type:'history',messages:[],session_id:'s'});
+  state = projectEvent(state, {type:'user_question_resolved',request_id:'old',state:'expired',reason:'Question expired after backend restart.'});
+  assert.match(state.messages.at(-1)?.content || '', /expired after backend restart/);
+});

@@ -1,4 +1,5 @@
 import type { SessionState, UIEvent } from "@astra/ui-core/session-state";
+import type { FilePreview } from "./file-preview-types.js";
 
 export type SessionEntry = { name: string; mode: string; modified: number };
 export type Preferences = { theme: string; drafts: Record<string, string>; attachments: Record<string, string[]>; workspaces: Record<string, string>; pinned: string[]; projects: string[]; titles: Record<string, string>; timeline: boolean; detailWidth?: number; lastSession?: { session: string; mode: string; workspace: string } | null };
@@ -20,7 +21,8 @@ export interface DesktopBridge {
   appshot(id: string, action: "command" | "remove", value: string): Promise<void>;
   droppedPaths(files: File[]): string[];
   openExternal(url: string): Promise<void>;
-  file(id: string, path: string, action: "preview" | "open" | "reveal"): Promise<{ text?: string; data?: string; truncated?: boolean; path?: string }>;
+  file(id: string, path: string, action: "preview" | "open" | "reveal" | "version", requestId?: string): Promise<FilePreview>;
+  cancelPreview(id: string, requestId: string): Promise<void>;
   onEvents(handler: (events: DesktopEvent[]) => void): () => void;
 }
 declare global { interface Window { astra: DesktopBridge; } }

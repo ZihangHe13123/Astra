@@ -35,8 +35,9 @@ export class Runtime {
       PYTHONPATH: [this.root, process.env.PYTHONPATH].filter(Boolean).join(delimiter),
       AGENT_SESSION: this.restartSession || this.session,
       ASTRA_UI_SURFACE: "gui", ASTRA_TUI_PID: String(process.pid), ASTRA_TUI_RESTART: "1", ASTRA_EVENT_SCOPE: this.scope,
+      ASTRA_PROFILE_QUERY: process.env.ASTRA_PROFILE_QUERY ?? "1",
       PYTHONUNBUFFERED: "1" };
-    const child = spawn(this.python, ["-m", "agent.cli.backend"], { cwd: this.workspace, env, windowsHide: true });
+    const child = spawn(this.python, [...(process.env.ASTRA_DESKTOP_RUNTIME === "1" ? ["-P"] : []), "-m", "agent.cli.backend"], { cwd: this.workspace, env, windowsHide: true });
     this.child = child;
     const logDir = process.env.AGENT_LOG_DIR || join(this.root, ".logs");
     mkdirSync(logDir, { recursive: true });

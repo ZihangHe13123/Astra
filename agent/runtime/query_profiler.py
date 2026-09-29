@@ -43,6 +43,11 @@ def _usage_int(usage: dict[str, Any], key: str) -> int:
         return 0
 
 
+def _reported_usage(usage: dict[str, Any], key: str) -> int | None:
+    value = usage.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
 def _split_system_context(system: str) -> tuple[str, str]:
     """Split the stable system prefix from Astra's per-turn overlay."""
     marker = f"\n\n{_TURN_CONTEXT_MARKER}"
@@ -127,8 +132,8 @@ class PromptCacheTracker:
         now: float,
     ) -> dict[str, Any]:
         usage = usage or {}
-        cache_read = _usage_int(usage, "prompt_cache_hit_tokens")
-        cache_miss = _usage_int(usage, "prompt_cache_miss_tokens")
+        cache_read = _reported_usage(usage, "prompt_cache_hit_tokens")
+        cache_miss = _reported_usage(usage, "prompt_cache_miss_tokens")
         key = (model, session_id)
         current = {
             **fingerprint,
@@ -141,16 +146,20 @@ class PromptCacheTracker:
             self._previous[key] = current
         if previous is None:
             return {
-                "status": "baseline",
+                "status": "baseline" if cache_read is not None else "unknown",
                 "cache_read_tokens": cache_read,
                 "reusable_prefix_segments": 0,
                 "reusable_prefix_tokens_estimate": 0,
                 "reusable_prefix_ratio_estimate": 0.0,
             }
 
-        drop = int(previous.get("cache_read_tokens", 0)) - cache_read
-        previous_read = int(previous.get("cache_read_tokens", 0))
-        material = previous_read > 0 and drop >= 2_000 and cache_read < previous_read * 0.95
+        previous_read = previous.get("cache_read_tokens")
+        if cache_read is not None and isinstance(previous_read, int):
+            comparable_cache = True
+            drop = previous_read - cache_read
+            material = previous_read > 0 and drop >= 2_000 and cache_read < previous_read * 0.95
+        else:
+            comparable_cache, drop, material = False, 0, False
         causes: list[str] = []
         for field, label in (
             ("model_hash", "model"),
@@ -186,7 +195,7 @@ class PromptCacheTracker:
         if material and not causes and gap_seconds >= 300:
             causes.append("possible_cache_ttl_or_server_eviction")
         return {
-            "status": "material_drop" if material else "stable",
+            "status": "material_drop" if material else "stable" if comparable_cache else "unknown",
             "cache_read_tokens": cache_read,
             "previous_cache_read_tokens": previous_read,
             "drop_tokens": max(0, drop),
@@ -216,9 +225,12 @@ class QueryProfiler:
         step: int,
         model: str,
         root: Path,
+        session_path: str | Path | None = None,
     ) -> None:
         self.enabled = enabled
         self.session_id = session_id
+        from .session_identity import session_key
+        self.session_key = session_key(session_path)
         self.request_id = request_id
         self.step = step
         self.model = model
@@ -242,6 +254,7 @@ class QueryProfiler:
         step: int,
         model: str,
         root: Path,
+        session_path: str | Path | None = None,
     ) -> "QueryProfiler":
         return cls(
             enabled=_truthy("ASTRA_PROFILE_QUERY"),
@@ -250,6 +263,7 @@ class QueryProfiler:
             step=step,
             model=model,
             root=root,
+            session_path=session_path,
         )
 
     @contextmanager
@@ -336,7 +350,7 @@ class QueryProfiler:
         first = self.first_event_at
         cache = _CACHE_TRACKER.observe(
             model=self.model,
-            session_id=self.session_id,
+            session_id=self.session_key or self.session_id,
             fingerprint=self.fingerprint,
             usage=usage,
             now=time.time(),
@@ -344,6 +358,7 @@ class QueryProfiler:
         event = {
             "timestamp": time.time(),
             "session_id": self.session_id,
+            "session_key": self.session_key,
             "request_id": self.request_id,
             "step": self.step,
             "model": self.model,
@@ -357,13 +372,14 @@ class QueryProfiler:
             "fingerprint": self.fingerprint,
             "cache": cache,
             "usage": {
-                key: _usage_int(usage or {}, key)
+                key: _reported_usage(usage or {}, key)
                 for key in (
                     "prompt_tokens",
                     "completion_tokens",
                     "prompt_cache_hit_tokens",
                     "prompt_cache_miss_tokens",
                 )
+                if _reported_usage(usage or {}, key) is not None
             },
             "error": error[:240],
         }

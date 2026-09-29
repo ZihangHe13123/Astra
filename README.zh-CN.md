@@ -50,7 +50,7 @@ cd Astra
 
 ### 可选：桌面预览版
 
-源码中提供了 Electron 桌面预览版，需要 **Node.js 22.12+**：
+源码中提供了 Electron 桌面预览版，需要 **Node.js 22.19+**：
 
 ```text
 astra setup --gui

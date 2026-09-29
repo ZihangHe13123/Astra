@@ -1114,6 +1114,37 @@ def register_document_tools(
         "permission_grant": permission_grant,
     }
 
+    def _doc_check(path: str) -> str | ToolFailure:
+        from .document_inspection import inspect_saved_document
+
+        return run(lambda: inspect_saved_document(access.resolve(path, write=False)))
+
+    registry.register(ToolDef(
+        name="doc_check",
+        description=(
+            "Read-only structure check of a saved DOCX, PPTX or XLSX deliverable. Reopens bounded ZIP/XML "
+            "parts, checks required parts and internal relationships, and reports missing formula caches. "
+            "Never writes the source, accesses external links, recalculates formulas or verifies page layout. "
+            "Use this after saving Office files, and separately inspect rendered pages before delivery."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Saved .docx, .pptx or .xlsx path, relative to workspace or absolute"},
+                **approval_justification_schema(),
+            },
+            "required": ["path"],
+            "additionalProperties": False,
+        },
+        fn=_doc_check,
+        risk="read",
+        idempotent=True,
+        parallel_safe=True,
+        replay="safe",
+        permission_check=permission_check("Inspect saved Office document", write=False),
+        **common,
+    ))
+
     registry.register(ToolDef(
         name="doc_create",
         description=(

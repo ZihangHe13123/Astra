@@ -16,7 +16,8 @@ const bridge: DesktopBridge = {
   clipboardImage: () => invoke("clipboardImage"),
   appshot: (id, action, value) => invoke("appshot", id, action, value),
   droppedPaths: files => files.map(file => webUtils.getPathForFile(file)).filter(Boolean),
-  openExternal: url => invoke("openExternal", url), file: (id, path, action) => invoke("file", id, path, action),
+  openExternal: url => invoke("openExternal", url), file: (id, path, action, requestId) => invoke("file", id, path, action, requestId),
+  cancelPreview: (id, requestId) => invoke("cancelPreview", id, requestId),
   onEvents: handler => {
     const listener = (_: unknown, events: DesktopEvent[]) => handler(events);
     ipcRenderer.on("astra:events", listener);

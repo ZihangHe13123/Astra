@@ -379,10 +379,10 @@ def test_doc_edit_requires_the_fields_of_its_action(tmp_path):
 
 def test_documents_group_routing(tmp_path):
     registry = make_registry(tmp_path)
-    assert registry.tool_names_for_group("documents") == ["doc_create", "doc_outline", "doc_edit", "doc_export"]
+    assert registry.tool_names_for_group("documents") == ["doc_check", "doc_create", "doc_outline", "doc_edit", "doc_export"]
     for alias in ("doc_write_section", "doc_add_section", "doc_remove_section", "doc_comments", "doc_resolve_comment"):
         assert registry.get(alias) is not None and not registry.get(alias).expose_by_default
-    for prompt in ("帮我起草一份项目提案", "write a report on sales", "把大纲导出成 PDF", "export notes.md to Word"):
+    for prompt in ("帮我起草一份项目提案", "write a report on sales", "把大纲导出成 PDF", "export notes.md to Word", "inspect saved.xlsx", "check slides.pptx"):
         assert "documents" in registry.select_groups(prompt), prompt
     for prompt in ("documentation for the API", "fix the flaky test"):
         assert "documents" not in registry.select_groups(prompt), prompt

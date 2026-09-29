@@ -627,3 +627,11 @@ test("short viewport keeps custom entry bounded while preserving the entire answ
     assert.deepEqual(answers, [[{ id: "storage", selected: [], custom }]]);
   } finally { instance.unmount(); }
 });
+
+test('pending question tells the user work continues and stays answerable', async () => {
+  const {output, instance} = await capture(100, {...request, mode:'timed',state:'pending'});
+  try {
+    assert.match(latestFrame(output), /work continues/i);
+    assert.match(latestFrame(output), /Choose storage/);
+  } finally { instance.unmount(); }
+});

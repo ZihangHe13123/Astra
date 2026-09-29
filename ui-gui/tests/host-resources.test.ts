@@ -3,11 +3,25 @@ import assert from "node:assert/strict";
 import { mkdtemp, readFile, readdir, rm, writeFile, truncate } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { initialSession } from "@astra/ui-core/session-state";
+import { initialSession, projectEvent } from "@astra/ui-core/session-state";
 import { hasOngoingWork } from "../src/main/ongoing-work.js";
 import { PreferenceWriter } from "../src/main/preferences.js";
 import { filePreview, TEXT_PREVIEW_LIMIT } from "../src/main/file-preview.js";
 import { ClipboardFiles } from "../src/main/clipboard-files.js";
+
+test("unknown startup state and unconfirmed submissions cannot quit as idle", () => {
+  let state = initialSession("fixture");
+  assert.equal(hasOngoingWork(state), true);
+  state = projectEvent(state, { type: "gui_ready" });
+  assert.equal(hasOngoingWork(state), false);
+  state = projectEvent(state, { type: "gui_user", text: "Run work", submission_id: "request" });
+  assert.equal(state.busy, false);
+  assert.equal(hasOngoingWork(state), true);
+  state = projectEvent(state, { type: "submission_status", submission_id: "request", status: "unknown" });
+  assert.equal(hasOngoingWork(state), true);
+  state = projectEvent(state, { type: "message_rejected", submission_id: "request" });
+  assert.equal(hasOngoingWork(state), false);
+});
 
 test("session lifecycle protects scheduled and running reminders, but not completed plans", () => {
   const state = { ...initialSession("fixture"), status: "ready" };

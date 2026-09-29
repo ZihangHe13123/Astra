@@ -1,0 +1,13 @@
+.file-preview-panel { min-width: 0; }
+.preview-warning { padding: 8px 10px; border-left: 3px solid #b58b28; background: color-mix(in srgb, #b58b28 10%, transparent); overflow-wrap: anywhere; }
+.pdf-preview { width: 100%; min-width: 0; }
+.pdf-preview .actions { align-items: center; }
+.pdf-page { line-height: 0; overflow: auto; }
+.pdf-page canvas { display: block; max-width: 100%; background: white; }
+.spreadsheet-preview select { max-width: 100%; }
+.spreadsheet-scroll { max-height: 65vh; overflow: auto; margin-top: 8px; border: 1px solid var(--line); }
+.spreadsheet-scroll table { border-collapse: collapse; white-space: pre-wrap; width: max-content; min-width: 100%; font-size: 12px; }
+.spreadsheet-scroll th, .spreadsheet-scroll td { min-width: 72px; max-width: 260px; padding: 6px 8px; border: 1px solid var(--line); overflow-wrap: anywhere; text-align: left; vertical-align: top; }
+.spreadsheet-scroll th { position: sticky; background: var(--panel, Canvas); font-weight: 500; }
+.spreadsheet-scroll thead th { top: 0; z-index: 1; }
+.spreadsheet-scroll tbody th { left: 0; min-width: 30px; }

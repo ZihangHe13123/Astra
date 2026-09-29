@@ -1,0 +1,68 @@
+name: Standalone desktop package
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    if: github.repository == 'ZihangHe13123/Astra'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-26
+            target: darwin-arm64
+          - os: windows-2025
+            target: win32-x64
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          version: '0.11.27'
+          python-version: '3.12.14'
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          download-from-astral-mirror: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22.23.1'
+      - name: Prepare locked build dependencies
+        run: |
+          uv sync --locked --extra dev
+          npm --prefix ui-core ci
+          npm --prefix ui-gui ci
+          npm --prefix ui-gui run build
+      - name: Distribution regression contracts
+        run: |
+          uv run --no-sync python -m pytest -q tests/test_desktop_distribution.py tests/test_launcher_prerequisites.py
+          npm --prefix ui-gui test
+      - name: Build native macOS helper
+        if: runner.os == 'macOS'
+        run: bash scripts/build_macos_computer_helper.sh --output-root "$RUNNER_TEMP/astra-native"
+      - name: Build standalone macOS application
+        if: runner.os == 'macOS'
+        run: uv run --no-sync python scripts/package_desktop.py --target '${{ matrix.target }}' --output "$RUNNER_TEMP/astra-release" --native-helper "$RUNNER_TEMP/astra-native/AstraMacComputerHelper.app"
+      - name: Build standalone Windows application
+        if: runner.os == 'Windows'
+        run: uv run --no-sync python scripts/package_desktop.py --target '${{ matrix.target }}' --output "$RUNNER_TEMP/astra-release"
+      - name: Relocated packaged application acceptance
+        run: node ui-gui/tests/packaged-smoke.mjs "$RUNNER_TEMP/astra-release"
+      - name: Archive exact application permissions and internal links
+        run: tar -czf "$RUNNER_TEMP/astra-${{ matrix.target }}.tar.gz" -C "$RUNNER_TEMP" astra-release
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: astra-${{ matrix.target }}-unsigned
+          path: ${{ runner.temp }}/astra-${{ matrix.target }}.tar.gz
+          retention-days: 7

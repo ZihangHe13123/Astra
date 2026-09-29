@@ -126,7 +126,7 @@ def test_query_profiler_does_not_persist_provider_error_content(tmp_path):
     )
     raw = (tmp_path / ".astra" / "query-profile.jsonl").read_text(encoding="utf-8")
     assert "ProviderError" in raw
-    assert json.loads(raw)["usage"]["prompt_tokens"] == 0
+    assert "prompt_tokens" not in json.loads(raw)["usage"]
 
 
 def test_prompt_cache_tracker_attributes_material_schema_drop():

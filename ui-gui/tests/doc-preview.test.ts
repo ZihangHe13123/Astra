@@ -4,9 +4,9 @@ import {dirname, docPathFromTool, isMarkdownPath, latestDoc, openComments, resol
 
 const result = (name: string, output: unknown, extra: Record<string, unknown> = {}) => ({name, output: JSON.stringify(output), ...extra});
 
-test('doc tool results point at the Markdown document, including the export source', () => {
+test('doc tool results follow the saved document, including exported Office files', () => {
  assert.equal(docPathFromTool(result('doc_write_section', {path: '/w/notes/plan.md'})), '/w/notes/plan.md');
- assert.equal(docPathFromTool(result('doc_export', {path: '/w/plan.docx', source: '/w/plan.md'})), '/w/plan.md');
+ assert.equal(docPathFromTool(result('doc_export', {path: '/w/plan.docx', source: '/w/plan.md'})), '/w/plan.docx');
  assert.equal(docPathFromTool(result('doc_write_section', {path: '/w/plan.md'}, {error: 'section_changed'})), undefined);
  assert.equal(docPathFromTool(result('write_file', {path: '/w/plan.md'})), undefined);
  assert.equal(docPathFromTool(result('doc_outline', {path: '/w/plan.txt'})), undefined);
@@ -43,4 +43,12 @@ test('open review comments are listed outside fenced code only', () => {
   '```md', '<!-- @astra: not a comment -->', '```', '<!-- @astra:', '  spans lines', '-->',
  ].join('\n');
  assert.deepEqual(openComments(text), ['tighten this', 'spans lines']);
+});
+
+
+test('document export follows supported saved artifacts and ignores unsuccessful output', () => {
+ for (const extension of ['pdf', 'docx', 'pptx', 'xlsx'])
+  assert.equal(docPathFromTool(result('doc_export', {path:`/w/report.${extension}`, source:'/w/report.md'})), `/w/report.${extension}`);
+ assert.equal(docPathFromTool(result('doc_export', {path:'/w/report.pdf', success:false})), undefined);
+ assert.equal(docPathFromTool(result('doc_export', {path:'/w/report.pdf', error:'failed'})), undefined);
 });

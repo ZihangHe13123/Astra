@@ -673,6 +673,10 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     rejection: null as { requestId: string; reason: string } | null,
   });
   const questionRequest = questionProtocol.request;
+  const questionRequestRef = useRef(questionRequest);
+  questionRequestRef.current = questionRequest;
+  const [questionFocused, setQuestionFocused] = useState(true);
+  const questionCapturesInput = questionRequest !== null && (questionRequest.state !== "pending" || questionFocused);
   const [approvalDetailOpen, setApprovalDetailOpen] = useState(false);
   const [approvalDetailOffset, setApprovalDetailOffset] = useState(0);
   const startupAnimationEnabled = process.env.TUI_STARTUP_ANIMATION !== "0"
@@ -710,8 +714,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     commandMenuVisible,
   });
 
-  const compactQuestion = questionRequest !== null && approvalRequests.length === 0 && rows < 20;
-  const interactionActive = approvalRequests.length > 0 || questionRequest !== null || connectionOpen;
+  const compactQuestion = questionCapturesInput && approvalRequests.length === 0 && rows < 20;
+  const interactionActive = approvalRequests.length > 0 || questionCapturesInput || connectionOpen;
   const pendingApproval = approvalRequests[0];
   const queuedApprovalCallIds = approvalRequests.map((request) => request.call_id);
   const pendingApprovalSummary: PendingApprovalSummary | undefined = pendingApproval
@@ -892,7 +896,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
       setActiveTools([]);
       setActiveProcesses([]);
       setApprovalRequests([]);
-      setQuestionProtocol({ request: null, rejection: null });
+      setQuestionProtocol(current => current.request?.state === "pending" ? current : { request: null, rejection: null });
       updateActiveTask(null);
       cancelRequestedRef.current = false;
     }
@@ -1326,10 +1330,15 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         addMessage("error", event.reason);
         break;
       case "user_question_request":
+        setQuestionFocused(true);
         closeToolDetails();
         setQuestionProtocol((current) => reduceQuestionProtocolState(current, event));
         break;
+      case "user_question_pending":
+        setQuestionProtocol((current) => reduceQuestionProtocolState(current, event));
+        break;
       case "user_question_resolved":
+        if (event.state === "expired") addMessage("system", event.reason || "Question expired. Please ask again.");
         setQuestionProtocol((current) => reduceQuestionProtocolState(current, event));
         break;
       case "user_question_response_rejected":
@@ -1574,6 +1583,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         runtimeTimingRef.current = null;
         procRef.current = null;
         if (disposed || lifecycle?.closing) return;
+        if (questionRequestRef.current) addMessageRef.current("system", "Unanswered question expired after backend disconnect. Please ask again if needed.");
+        setQuestionProtocol({ request: null, rejection: null });
         receiveEvent('{"type":"done"}');
         clearStreamingDisplayRef.current();
         const pendingAppshot=appshotInputRef.current?.snapshot().pending;
@@ -1714,6 +1725,10 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     if (!questionRequest || questionRequest.request_id !== requestId) return;
     send({ type: "user_question_cancel", request_id: requestId });
   }, [questionRequest, send]);
+
+  const questionEditing = useCallback((requestId: string, editing: boolean) => {
+    send({ type: "user_question_editing", request_id: requestId, editing });
+  }, [send]);
 
   const openToolDetails = useCallback((requestedId?: string) => {
     const available = toolResultsRef.current;
@@ -2075,7 +2090,11 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
       setApprovalDetailOffset(transition.detailOffset);
       return;
     }
-    if (questionRequest) return;
+    if (questionRequest?.state === "pending" && key.tab) {
+      setQuestionFocused(current => !current);
+      return;
+    }
+    if (questionCapturesInput) return;
     if (openToolResult) {
       if (key.escape || input === "q" || (key.ctrl && input === "o")) {
         closeToolDetails();
@@ -2240,14 +2259,17 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
             />
           )}
 
+          {questionRequest?.state === "pending" && !questionCapturesInput && approvalRequests.length === 0 &&
+            <Text color={theme.muted} wrap="truncate-end">Optional question waiting · {questionRequest.questions[0]?.question} · Tab to answer</Text>}
           {questionRequest && (
-            <Box flexDirection="column" display={approvalRequests.length ? "none" : "flex"}><QuestionCard
+            <Box flexDirection="column" display={approvalRequests.length || !questionCapturesInput ? "none" : "flex"}><QuestionCard
               request={questionRequest}
-              active={!openToolResult && approvalRequests.length === 0}
+              active={questionCapturesInput && !openToolResult && approvalRequests.length === 0}
               width={columns}
               maxHeight={Math.max(6, rows - 2)}
               onAnswer={submitQuestionAnswer}
               onCancel={cancelQuestion}
+              onEditing={questionEditing}
               submissionRejection={questionProtocol.rejection}
             /></Box>
           )}
@@ -2258,7 +2280,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           onAppshotStateChange={updateAppshotDraft}
           onAppshotRelease={releaseAppshot}
           onSubmit={submit}
-          disabled={connectionOpen || Boolean(openToolResult) || approvalRequests.length > 0 || questionRequest !== null}
+          disabled={connectionOpen || Boolean(openToolResult) || approvalRequests.length > 0 || questionCapturesInput}
           yolo={yolo}
           sessionList={sessionList}
           barSessionList={barSessionList}

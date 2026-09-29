@@ -229,6 +229,19 @@ try {
  await page.getByText('你好，Astra 桌面连接成功。',{exact:true}).waitFor({timeout:30000}); await idle();
  const first = (await page.evaluate(()=>window.astra.bootstrap())).active;
  assert.equal(requests.length, 1); passed('first message creates backend and executes once');
+ const requestCountBeforeTimeline=requests.length;
+ await page.getByRole('button',{name:'执行详情',exact:true}).click();
+ await page.getByRole('tab',{name:'上下文',exact:true}).click();
+ await page.locator('.request-metrics').first().waitFor();
+ const timelineResult=await page.evaluate(async()=>{
+   const b=await window.astra.bootstrap(),s=b.sessions.find(s=>s.id===b.active);
+   return window.astra.query('request_timeline',{name:s.session,mode:s.mode});
+ });
+ assert.ok(timelineResult.records.length>0);assert.ok(timelineResult.records[0].request_id);
+ assert.ok(timelineResult.records[0].total_ms>=0);assert.equal(requests.length,requestCountBeforeTimeline);
+ await page.screenshot({path:join(output,'request-timeline.png')});
+ await page.getByRole('button',{name:'关闭详情',exact:true}).click();
+ passed('request timeline reads actual request metrics without an additional model call');
  await page.locator('.model-button').click(); await page.getByRole('dialog',{name:'选择模型',exact:true}).waitFor();
  await page.getByRole('button',{name:'模型与账号',exact:false}).click();
  await page.getByRole('dialog',{name:'模型与账号'}).waitFor();
@@ -495,6 +508,16 @@ try {
    });
    assert.equal(closePrompt.calls.length,1); assert.match(closePrompt.calls[0].message,/仍有任务或会话提醒/);
    assert.equal(closePrompt.calls[0].buttons[2],'返回'); assert.equal(closePrompt.closed,false); assert.equal(closePrompt.visible,true);
+   const appQuitPrompt=await app.evaluate(async({app,BrowserWindow,dialog})=>{
+     const original=dialog.showMessageBox;const calls=[];const window=BrowserWindow.getAllWindows()[0];
+     dialog.showMessageBox=async(...args)=>{calls.push(args.at(-1));return {response:1,checkboxChecked:false};};
+     try {
+       app.quit();await new Promise(resolve=>setImmediate(resolve));
+       return {calls,closed:window.isDestroyed()};
+     } finally {dialog.showMessageBox=original;}
+   });
+   assert.equal(appQuitPrompt.calls.length,1);assert.match(appQuitPrompt.calls[0].message,/仍有任务或会话提醒/);
+   assert.deepEqual(appQuitPrompt.calls[0].buttons,['停止并退出','返回']);assert.equal(appQuitPrompt.closed,false);
    const retained=await page.evaluate(async id=>(await window.astra.bootstrap()).sessions.find(s=>s.id===id),reminderRuntime);
    assert.equal(retained.status,'ready'); assert.equal(retained.info.wakeup_status.plan.state,'scheduled');
  } finally {
@@ -505,7 +528,7 @@ try {
    },reminderRuntime);
  }
  assert.equal(requests.length,reminderRequests);
- passed('real scheduled wakeup blocks close and delete, Return preserves the window, and cancel releases the plan');
+ passed('real scheduled wakeup blocks close, delete and app quit; Return preserves the backend and cancellation releases the plan');
  // Large history is browsed without creating a backend or invoking a model.
  const historyName='desktop-long-history';
  writeFileSync(join(folder,'sessions',historyName+'.json'),JSON.stringify({messages:Array.from({length:10000},(_,i)=>
