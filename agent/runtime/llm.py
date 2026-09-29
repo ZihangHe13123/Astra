@@ -1352,6 +1352,12 @@ class LLMClient:
             return self._provider_factory(config)
         return self.provider_registry.create(config.provider, config)
 
+    @property
+    def served_model(self) -> str:
+        """The concrete model behind a configured alias, once the adapter has seen one answer."""
+        served = getattr(self.provider, "served_model", "")
+        return served if isinstance(served, str) else ""
+
     def switch_model(
         self,
         model: str,

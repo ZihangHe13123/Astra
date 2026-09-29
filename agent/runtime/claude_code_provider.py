@@ -53,6 +53,9 @@ TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,%d}" % (64 - len(TOOL_PREFIX)))
 STRIPPED_ENV_PREFIXES = ("ANTHROPIC_", "CLAUDE", "MCP_")
 KEPT_ENV = frozenset({"CLAUDE_CONFIG_DIR", "CLAUDE_CODE_OAUTH_TOKEN"})
 IMAGE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
+# What the CLI's first line may name as the model an alias resolved to (`claude-sonnet-5`,
+# `claude-opus-5[1m]`); anything else is not shown.
+MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,79}")
 LOGIN_HINT = "Install the Claude Code CLI (https://claude.ai/install.sh) and run `claude auth login` in a terminal."
 # Astra's one cache breakpoint; the CLI spends the other three the API allows. One hour, as the
 # CLI is told to use for its own, because a longer breakpoint may not follow a shorter one.
@@ -406,6 +409,9 @@ class ClaudeCodeProvider:
         self.config = config
         self.command = command
         self._estimate_calibration = 1.0
+        # The concrete model the CLI resolved the alias to, known after its first request. Astra only
+        # reports it to the UI: it never enters a request, so the cached prefix is untouched.
+        self.served_model = ""
 
     def supports_forced_tool_choice(self) -> bool:
         return False
@@ -532,12 +538,24 @@ class ClaudeCodeProvider:
                 event = json.loads(line)
             except ValueError:
                 continue
-            if not isinstance(event, dict) or event.get("type") != "result":
+            if not isinstance(event, dict):
+                continue
+            if event.get("type") == "system":
+                self._note(event)
+            if event.get("type") != "result":
                 continue
             if event.get("num_turns") == 0 and not event.get("is_error"):
                 return
             # A CLI that answers a history turn instead of appending it would spend a request per turn.
             raise _Fallback("replay", "Claude Code answered an earlier turn instead of the latest one; retry the request.")
+
+    def _note(self, event: dict) -> None:
+        """The CLI's init line names the model the alias resolved to; an older CLI resolves the same
+        alias to an older model, which is otherwise invisible."""
+        if event.get("subtype") == "init":
+            model = str(event.get("model") or "").strip()
+            if MODEL_ID.fullmatch(model):
+                self.served_model = model
 
     async def _events(self, lines: _Lines, marked: bool = False) -> AsyncGenerator[dict, None]:
         loop = asyncio.get_running_loop()
@@ -582,6 +600,8 @@ class ClaudeCodeProvider:
                         content += str(block["text"])
                     elif block.get("type") == "tool_use":
                         calls.append(self._call(block))
+            elif event.get("type") == "system":
+                self._note(event)
             elif event.get("type") == "result":
                 final = self._final(event, content, calls, reasoning, marked)
                 # Astra shows prose only from chunks: send whatever the stream did not.

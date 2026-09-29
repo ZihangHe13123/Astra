@@ -1901,9 +1901,15 @@ async def _main(startup_started: float):
         else:
             _send(result)
 
+    def _served_model() -> str:
+        """The concrete model behind an alias such as claude-code's `sonnet`, once a request has shown it."""
+        served = getattr(agent.llm, "served_model", "")
+        return served if isinstance(served, str) and served != agent.llm.config.model else ""
+
     async def _send_model_info(*, refresh: bool = False):
         if refresh:
             await _refresh_model_catalog()
+        served = _served_model()
         ctx = agent.context
         used = ctx.estimate_prompt_tokens()
         limit = ctx.max_prompt_tokens
@@ -1933,7 +1939,8 @@ async def _main(startup_started: float):
                "context_used": used,
                "context_pct": round(pct, 1),
                "context_limit": limit,
-               "show_reasoning": ctx.show_reasoning})
+               "show_reasoning": ctx.show_reasoning,
+               **({"served_model": served} if served else {})})
 
     async def _send_history():
         hist = []
@@ -3658,7 +3665,9 @@ async def _main(startup_started: float):
                                    "error": f"Unknown model: {arg}. Current model unchanged." if selection_id else "",
                                    "code": "unknown_model" if selection_id else ""}, selection_id)
                     else:
-                        lines = [f"Current model: {agent.llm.config.model} @ {agent.llm.config.base_url}", "Available:"]
+                        served = _served_model()
+                        serving = f" (serving {served})" if served else ""
+                        lines = [f"Current model: {agent.llm.config.model}{serving} @ {agent.llm.config.base_url}", "Available:"]
                         for provider in dict.fromkeys(item.provider_label for item in catalog.entries):
                             lines.append(f"  [{provider}]")
                             for item in catalog.entries:

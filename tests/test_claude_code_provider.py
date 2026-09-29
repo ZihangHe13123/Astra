@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -11,7 +12,7 @@ import pytest
 from agent.cli import connections, model_catalog, provider_connections
 from agent.runtime import claude_code_provider as ccp
 from agent.runtime.claude_code_provider import ClaudeCodeError, ClaudeCodeProvider, workspace as cli_workspace
-from agent.runtime.llm import LLMConfig, LLMIdleTimeout
+from agent.runtime.llm import LLMClient, LLMConfig, LLMIdleTimeout
 from agent.runtime.process_env import pid_alive
 from agent.runtime.providers import DEFAULT_PROVIDER_REGISTRY
 
@@ -34,7 +35,7 @@ if "--mcp-config" in sys.argv:
 scenario = os.environ.get("FAKE_CLAUDE_SCENARIO", "tools")
 emit = lambda value: (print(json.dumps(value)), sys.stdout.flush())
 usage = {"input_tokens": 10, "cache_creation_input_tokens": 5, "cache_read_input_tokens": 100, "output_tokens": 7}
-emit({"type": "system", "subtype": "init", "model": "claude-sonnet-5"})
+emit({"type": "system", "subtype": "init", "model": os.environ.get("FAKE_CLAUDE_MODEL", "claude-sonnet-5")})
 record["frames"] = []
 for line in sys.stdin:
     frame = json.loads(line)
@@ -364,6 +365,77 @@ def test_first_turn_has_no_history_and_no_breakpoint(fake_cli, monkeypatch):
     collect(provider(command).chat_stream(MESSAGES, [READ_FILE]))
     frames = json.loads(record.read_text())["frames"]
     assert len(frames) == 1 and "shouldQuery" not in frames[0] and not cache_markers(frames)
+
+
+@pytest.mark.parametrize("messages", [MESSAGES, HISTORY], ids=["single turn", "replayed history"])
+def test_model_the_alias_resolved_to_is_reported(fake_cli, monkeypatch, messages):
+    """Live Astra 2026-09-29: an older CLI still resolved the alias `sonnet` to claude-sonnet-5
+    after 5.5 was out, and nothing on screen said so. The CLI's init line names the model; a
+    replayed history consumes that line while waiting for its first acknowledgement."""
+    command, _ = fake_cli
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "text")
+    claude = provider(command)
+    assert claude.served_model == ""
+    collect(claude.chat_stream(messages, [READ_FILE]))
+    assert claude.served_model == "claude-sonnet-5"
+    monkeypatch.setenv("FAKE_CLAUDE_MODEL", "claude-sonnet-5-5")
+    collect(claude.chat_stream(messages, [READ_FILE]))
+    assert claude.served_model == "claude-sonnet-5-5"
+
+
+def test_the_reported_model_never_changes_what_the_next_request_sends(fake_cli, monkeypatch):
+    """The prompt cache keys on the request prefix. Knowing the resolved model is display only:
+    the system prompt, tools, replayed turns, cache breakpoint, environment and command line of
+    the next request are exactly those of the first."""
+    command, record = fake_cli
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "text")
+    claude = provider(command)
+
+    def sent() -> str:
+        collect(claude.chat_stream(HISTORY, [READ_FILE]))
+        seen = json.loads(record.read_text())
+        seen["pid"] = 0
+        # Only the random name of the scratch directory differs between two runs.
+        return re.sub(r"astra-claude-code-\w+", "SCRATCH", json.dumps(seen, sort_keys=True))
+
+    first = sent()
+    assert claude.served_model == "claude-sonnet-5"
+    assert sent() == first
+    assert '"cache_control"' in first
+
+
+@pytest.mark.parametrize("model", ["claude-opus-5[1m]", "claude-sonnet-5-5", "sonnet"])
+def test_model_names_the_cli_may_report_are_kept(fake_cli, monkeypatch, model):
+    command, _ = fake_cli
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "text")
+    monkeypatch.setenv("FAKE_CLAUDE_MODEL", model)
+    claude = provider(command)
+    collect(claude.chat_stream(MESSAGES))
+    assert claude.served_model == model
+
+
+@pytest.mark.parametrize("model", ["claude sonnet", "<b>claude</b>", "-claude", "x" * 200])
+def test_an_unusable_model_name_is_not_kept(fake_cli, monkeypatch, model):
+    """CLI output is never shown verbatim; only a plain model id reaches the screen."""
+    command, _ = fake_cli
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "text")
+    monkeypatch.setenv("FAKE_CLAUDE_MODEL", model)
+    claude = provider(command)
+    collect(claude.chat_stream(MESSAGES))
+    assert claude.served_model == ""
+
+
+def test_llm_client_passes_on_the_model_only_where_the_adapter_knows_it(fake_cli, monkeypatch):
+    command, _ = fake_cli
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "text")
+    claude = provider(command)
+    client = LLMClient(claude.config, provider=claude)
+    assert client.served_model == ""
+    collect(client.chat_stream(MESSAGES))
+    assert client.served_model == "claude-sonnet-5"
+    # Adapters without the notion (OpenAI-compatible endpoints, test doubles) report nothing.
+    assert LLMClient(LLMConfig(model="m"), provider=object()).served_model == ""
+    assert LLMClient(LLMConfig(model="m"), provider=type("P", (), {"served_model": 5})()).served_model == ""
 
 
 def test_cli_that_answers_history_falls_back_to_one_transcript_turn(fake_cli, monkeypatch):
