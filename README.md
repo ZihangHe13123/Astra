@@ -55,7 +55,7 @@ user PATH, and creates `.env` if needed. Existing configuration is preserved.
 
 ### Optional desktop preview
 
-The source checkout also includes an Electron desktop preview. It needs **Node.js 22.12+**:
+The source checkout also includes an Electron desktop preview. It needs **Node.js 22.19+**:
 
 ```text
 astra setup --gui

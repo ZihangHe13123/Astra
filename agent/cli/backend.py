@@ -808,10 +808,19 @@ async def _main(startup_started: float):
     )
     startup_profiler.mark("sandbox")
     tools = ToolRegistry()
+    def _question_identity() -> dict[str, str]:
+        from agent.runtime.session_identity import session_key
+        path = Path(agent.context.session_path).resolve()
+        return {"session_id": path.stem, "session_scope": session_key(path),
+                "task_id": str(agent_holder.get("question_task_id", ""))}
+
     question_broker = UserQuestionBroker(
         _send,
         available=lambda: not active_channel.get(),
+        identity=_question_identity,
+        journal_dir=sessions_dir(PROJECT_ROOT) / ".questions",
     )
+    question_followups: set[str] = set()
     register_user_question_tools(tools, question_broker.ask)
     channel_manager_holder: dict[str, ChannelManager] = {}
     register_channel_tools(
@@ -851,6 +860,8 @@ async def _main(startup_started: float):
         messages=lambda: list(agent_holder["agent"].context.messages) if agent_holder else [],
         session_id=lambda: Path(agent_holder["agent"].context.session_path).stem if agent_holder else "default",
     )
+    from agent.runtime.tools.workspace_dependencies import register_workspace_dependency_tools
+    register_workspace_dependency_tools(tools)
     register_session_recall_tools(tools)
     register_activity_tools(tools)
     context_index_broker = create_context_index_broker(
@@ -1711,6 +1722,8 @@ async def _main(startup_started: float):
         except asyncio.CancelledError:
             lifecycle.cancel()
             was_cancelled = True
+            question_broker.supersede("Question expired because its task was cancelled.")
+            agent.clear_user_question_answers()
             if task_id:
                 await delegate_mailbox.cancel_task(task_id)
             logger.info("stream cancelled; saving context and ending turn")
@@ -1975,6 +1988,9 @@ async def _main(startup_started: float):
             delegates.update({pid: item for pid, item in delegate_statuses.items() if item.get("session_id") == session_id})
         _send({"type": "history", "session_id": session_id, "messages": hist,
                "tool_results": results, "delegates": list(delegates.values())})
+        identity = _question_identity()
+        question_broker.expire_other_sessions(identity["session_id"], identity["session_scope"])
+        question_broker.recover_expired(identity["session_id"], identity["session_scope"])
 
     def _send_session_info():
         if bar_mode.active or minimal_mode.active or local_mode.active:
@@ -2218,12 +2234,20 @@ async def _main(startup_started: float):
             return False
         if appshot_turn_owned and active_task is not None and not active_task.done():
             return False
+        if msg.metadata.get("source") != "user_question_answer":
+            for question_id in question_broker.queued_request_ids:
+                if agent.user_question_answer_consumed(question_id):
+                    question_broker.acknowledge_answer(question_id)
+            question_broker.supersede("Question expired because a new task replaced its original request.")
+            agent.clear_user_question_answers()
+            question_followups.clear()
         request_id = msg.metadata.get("request_id") or msg.id
         active_task_persisted = _task_tracking_enabled()
         persisted = active_task_persisted and task_store is not None
         active_task_id = str(resume_task["id"] if resume_task is not None else request_id)
         goal_turn_generation += 1
         _reply_done = False
+        agent_holder["question_task_id"] = active_task_id
         msg.metadata["request_id"] = str(request_id)
         msg.metadata["goal_turn_generation"] = goal_turn_generation
         entered = False
@@ -2250,6 +2274,7 @@ async def _main(startup_started: float):
                     if run is None:
                         run = {"id": str(request_id), "status": "running", "input_text": input_text}
                     active_task_id = str(run["id"])
+                    agent_holder["question_task_id"] = active_task_id
                     msg.metadata.pop("task_id", None)
                     if not bar_mode.active and not local_mode.active:
                         msg.metadata["task_id"] = active_task_id
@@ -2311,6 +2336,43 @@ async def _main(startup_started: float):
         send=_send,
     )
 
+    async def _question_answer_tick() -> None:
+        # Never inject a previous task's answer into an unrelated active turn.
+        if (active_channel.get() or restart.draining or appshot_admission.reserved
+                or agent.llm.config.connection_required):
+            return
+        identity = _question_identity()
+        busy = active_task is not None and not active_task.done() and not _reply_done
+        if agent_turn_lock.locked() and not busy:
+            return
+        question_broker.expire_other_sessions(identity["session_id"], identity["session_scope"])
+        answer = question_broker.next_answer(session_id=identity["session_id"], session_scope=identity["session_scope"],
+                                              task_id=active_task_id, busy=busy)
+        if answer is None:
+            return
+        text = ("The user answered an earlier optional question. Apply this answer to the original request "
+                "identified below. It does not grant risky-tool approval.\n" + json.dumps(answer, ensure_ascii=False))
+        msg = Msg(sender="user", role="user", content=build_user_message_content(text),
+                  metadata={"source": "user_question_answer", "question_request_id": answer["request_id"],
+                            "question_task_id": answer.get("task_id", "")})
+        if agent.user_question_answer_consumed(answer["request_id"]):
+            question_broker.acknowledge_answer(answer["request_id"])
+            agent.remove_user_question_answer(answer["request_id"])
+            question_followups.discard(answer["request_id"])
+        elif answer["request_id"] in question_followups:
+            if not busy:
+                question_broker.supersede("Answer delivery expired before session persistence; please answer again.")
+                question_followups.discard(answer["request_id"])
+        elif busy:
+            agent.queue_user_question_answer(answer["request_id"], text,
+                                             session_scope=answer.get("session_scope", ""), task_id=answer.get("task_id", ""))
+        else:
+            # A final model response may end before the inbox is drained. Start
+            # one follow-up instead of acknowledging transient steering early.
+            agent.remove_user_question_answer(answer["request_id"])
+            if await _launch_message(msg, text):
+                question_followups.add(answer["request_id"])
+
     async def _lifecycle_tick() -> None:
         while True:
             busy = (agent_turn_lock.locked() or appshot_admission.reserved
@@ -2337,6 +2399,7 @@ async def _main(startup_started: float):
                     status = wakeups.finish(plan["id"], outcome="failed", summary="Could not start the wakeup turn.")
                     if status:
                         _wakeup_event(status, status["summary"])
+            await _question_answer_tick()
             if peer_link is not None:
                 await _peer_tick()
             if browser_lifecycle is not None:
@@ -2350,12 +2413,15 @@ async def _main(startup_started: float):
 
     async def _browser_handover_tick() -> None:
         """Hand the browser channel to another Astra window that asked for it, while this one is idle."""
+        lifecycle = browser_lifecycle
+        if lifecycle is None:
+            return
         now = time.monotonic()
         if now - browser_clock["handover"] < 0.5:
             return
         browser_clock["handover"] = now
         try:
-            request = await browser_lifecycle.hand_over_if_requested(busy=_turn_busy())
+            request = await lifecycle.hand_over_if_requested(busy=_turn_busy())
         except Exception:
             logger.exception("browser handover failed")
             return
@@ -2518,6 +2584,11 @@ async def _main(startup_started: float):
                         "reason": reason,
                         "retryable": retryable,
                     })
+
+            elif cmd.get("type") == "user_question_editing":
+                editing = cmd.get("editing")
+                if isinstance(editing, bool):
+                    question_broker.set_editing(str(cmd.get("request_id") or ""), editing)
 
             elif cmd.get("type") == "user_question_cancel":
                 request_id = str(cmd.get("request_id") or "")
@@ -3255,6 +3326,7 @@ async def _main(startup_started: float):
                     elif not target_id:
                         output, error = "", "No active task. Usage: /cancel [task-id]"
                     elif active_task is not None and not active_task.done() and target_id == active_task_id:
+                        question_broker.close("The task was cancelled.")
                         active_task.cancel()
                         # The owning turn records cancellation during cleanup.
                         # Keep this command free to accept the next live control
@@ -3309,6 +3381,8 @@ async def _main(startup_started: float):
                                 _send({"type": "tool_result", "name": "resume", "output": "", "error": str(exc), "code": ""})
                                 _send({"type": "done"})
                 elif c == "/reset":
+                    question_broker.supersede("Question expired because the conversation was reset.")
+                    question_followups.clear()
                     if wakeups.status()["state"] in {"scheduled", "running"}:
                         _wakeup_event(wakeups.cancel("session_reset"), "Session wakeup stopped because the conversation was reset.")
                         await _stop_wakeup_turn()

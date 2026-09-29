@@ -818,3 +818,18 @@ test("an alias shows the version it resolved to once an answer has named it", as
     assert.doesNotMatch(h.frame(), /sonnet-5/);
   } finally { h.app.unmount(); }
 });
+
+test('timed question survives done and Tab returns to composer while retaining the card',async()=>{
+  const h=await setup(130,40);
+  try {
+    h.child.event({type:'user_question_request',request_id:'timed-q',mode:'timed',state:'waiting',questions:[{id:'language',question:'Optional language preference',multi_select:false}]});
+    h.child.event({type:'user_question_pending',request_id:'timed-q',state:'pending'});
+    h.child.event({type:'done'});
+    await settle();
+    assert.match(h.frame(),/Optional language preference/);
+    await h.key('\t');
+    await h.submit('continue researching');
+    assert.deepEqual(h.child.commands.at(-1),{type:'message',text:'continue researching'});
+    assert.match(h.frame(),/Optional language preference/);
+  } finally {h.app.unmount();}
+});

@@ -1,5 +1,9 @@
 # 桌面 GUI 预览版
 
+桌面端支持 [可稍后回答的可选提问](../async-user-questions.md)、[PDF/Office 本地预览](../desktop-document-preview.md)，以及上下文面板中的请求执行时间线。时间线区分服务商用量与客户端估算；未采集的数据保持空缺。桌面后端默认记录有界的脱敏指标，可用 `ASTRA_PROFILE_QUERY=0` 关闭；记录不包含完整提示词。
+
+窗口关闭、应用菜单退出、Cmd+Q 和托盘退出共用任务检查，尚未确认的消息提交也会受到保护。独立本地安装包和离线更新、回滚的构建说明见 [桌面分发](../desktop-distribution.md)；正式签名、公证和跨平台实机验收单独记录。
+
 [首页](../../README.zh-CN.md) · [文档导航](README.md) · [English](../gui.md)
 
 Astra 的源码桌面预览版使用 Electron 和现有 Python 后端，支持对话、模型连接、独立后台会话、
@@ -8,7 +12,10 @@ Astra 的源码桌面预览版使用 Electron 和现有 Python 后端，支持�
 
 ## 安装和启动
 
-需要完整源码仓库、Python 3.11+、Git，以及 **Node.js 22.12+（含 npm）**。
+本地独立应用打包及恢复更新见[桌面发行说明](../desktop-distribution.md)。独立包自带 Python 和 Electron；
+下面介绍源码安装方式。
+
+需要完整源码仓库、Python 3.11+、Git，以及 **Node.js 22.19+（含 npm）**。
 已经注册 `astra` 命令的安装可直接运行：
 
 ```text
@@ -28,7 +35,7 @@ astra --gui
 不注册全局命令也可以在源码目录用 `./astra.sh --gui` 或 `.\astra.bat --gui` 启动。
 
 直接运行 `astra` 仍打开 Ink。只安装终端版不会下载 Electron；`setup --gui` 安装锁定的桌面组件，
-并记录组件选择供后续更新使用。目前没有独立安装包。Linux 桌面使用属于实验范围，原有 Python/TUI 平台支持不变。
+并记录组件选择供后续更新使用。尚未提供正式签名的公共安装程序。Linux 桌面使用属于实验范围，原有 Python/TUI 平台支持不变。
 
 窗口打开后启动命令会返回，关闭发起命令的终端不会结束桌面。对同一安装/数据目录再次启动，会聚焦已有窗口。
 再次打开桌面会恢复最近活跃会话及未发送草稿，恢复本身不会发起模型请求。

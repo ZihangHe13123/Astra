@@ -36,6 +36,12 @@ class Installation:
     def python(self) -> Path:
         if self.kind == "source":
             return self.root / ".venv" / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+        if self.kind == "desktop":
+            metadata = read_json(self.root / "desktop-installation.json")
+            candidate = (self.root / metadata["python"]).resolve()
+            if not candidate.is_relative_to(self.root.parent / "python") or not candidate.is_file():
+                raise LauncherError("The desktop Python runtime is missing or outside its bundle.")
+            return candidate
         return Path(sys.executable)
 
     @property
@@ -72,6 +78,10 @@ class Installation:
 def discover(root: Path | None = None) -> Installation:
     location = (root if root is not None else Path(__file__).resolve().parents[2]).resolve()
     source = False
+    desktop = read_json(location / "desktop-installation.json")
+    if desktop and (desktop.get("schema") != 1 or desktop.get("distribution") != "astra-desktop"
+                    or not isinstance(desktop.get("python"), str)):
+        raise LauncherError("Invalid desktop installation metadata.")
     version = "unknown"
     pyproject = location / "pyproject.toml"
     if pyproject.is_file():
@@ -81,10 +91,12 @@ def discover(root: Path | None = None) -> Installation:
             version = str(project.get("version", version))
         except (OSError, ValueError) as exc:
             raise LauncherError(f"Invalid Astra pyproject.toml: {exc}") from exc
-    if root is not None and not source:
+    if root is not None and not source and not desktop:
         raise LauncherError(f"Not an Astra source installation: {location}")
     owner = "git" if source and (location / ".git").exists() else "source archive"
-    if not source:
+    if desktop:
+        version, owner = str(desktop["version"]), "desktop installer"
+    elif not source:
         try:
             distribution = importlib.metadata.distribution("agent-lab-local")
             version = distribution.version
@@ -95,10 +107,18 @@ def discover(root: Path | None = None) -> Installation:
     data = Path(configured).expanduser().resolve() if configured else (location / ".astra" if source else user_home())
     sessions = Path(os.environ.get("AGENT_SESSION_DIR", str(location / ".sessions" if source and not configured
                                                              else data / "sessions"))).expanduser().resolve()
+    if desktop:
+        application = location.parent
+        if location.parent.parent.name.lower() == "resources":
+            application = location.parents[3] if location.parents[2].name == "Contents" else location.parents[2]
+        if data.is_relative_to(application):
+            raise LauncherError("Desktop user data must be outside the application bundle.")
+        sessions = data / "sessions"
     # Installation locks cannot be bypassed by selecting a different profile/data directory.
     identity = hashlib.sha256(os.path.normcase(str(location)).encode()).hexdigest()[:20]
     control = location / ".astra/launcher" if source else user_home() / "launcher" / identity
-    return Installation(location, "source" if source else "installed", owner, data, sessions, control, version)
+    return Installation(location, "desktop" if desktop else "source" if source else "installed",
+                        owner, data, sessions, control, version)
 
 
 def runtime_environment(install: Installation, workspace: Path) -> dict[str, str]:
@@ -112,6 +132,11 @@ def runtime_environment(install: Installation, workspace: Path) -> dict[str, str
     env.setdefault("ASTRA_WORKSPACE", str(workspace.resolve()))
     env.setdefault("AGENT_LOG_DIR", str(install.root / ".logs" if install.kind == "source" else install.data / "logs"))
     env.setdefault("ASTRA_PROXY_MODE", "off")
+    if install.kind == "desktop":
+        for key in ("PYTHONHOME", "VIRTUAL_ENV"):
+            env.pop(key, None)
+        env.update(PYTHONPATH=str(install.root), PYTHONNOUSERSITE="1", PYTHONDONTWRITEBYTECODE="1",
+                   AGENT_LOG_DIR=str(install.data / "logs"))
     if env["ASTRA_PROXY_MODE"].lower() == "off":
         for key in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
             env.pop(key, None)

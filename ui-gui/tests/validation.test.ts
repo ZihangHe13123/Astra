@@ -29,3 +29,9 @@ test('model selection accepts only a single model and blank pages clear restored
  assert.equal(checkedCommand({type:'select_model',model_key:'codex::model',request_id:'x'}).model_key,'codex::model');
  assert.deepEqual(checkedPreferences({lastSession:null}),{lastSession:null});
 });
+
+test('question editing is a bounded boolean control and cannot inject a message',()=>{
+  assert.equal(checkedCommand({type:'user_question_editing',request_id:'q',editing:true}).editing,true);
+  assert.throws(()=>checkedCommand({type:'user_question_editing',request_id:'q',editing:'yes'}));
+  assert.throws(()=>checkedCommand({type:'user_question_editing',request_id:'q',editing:true,text:'injected'}));
+});

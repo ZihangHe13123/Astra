@@ -1,17 +1,19 @@
-// Follow Markdown documents that the agent writes with the doc_* tools.
+// Follow saved documents that the agent writes or exports with the doc_* tools.
 // Tool entries from the session state; only these fields are read.
 type ToolLike = { readonly [key: string]: unknown };
 
 export const isMarkdownPath = (path: string) => /\.(md|markdown)$/i.test(path);
 
-/** The Markdown document a successful doc_* tool result refers to. */
+/** The saved document a successful doc_* tool result refers to. */
 export function docPathFromTool(tool: ToolLike): string | undefined {
   const name = typeof tool.name === "string" ? tool.name : "";
   if (!name.startsWith("doc_") || tool.error || typeof tool.output !== "string" || !tool.output) return undefined;
   try {
     const result = JSON.parse(tool.output);
-    const path = name === "doc_export" ? result?.source : result?.path;
-    return typeof path === "string" && isMarkdownPath(path) ? path : undefined;
+    if (result?.success === false || result?.error) return undefined;
+    const path = result?.path;
+    if (typeof path === "string" && /\.(md|markdown|pdf|docx|pptx|xlsx)$/i.test(path)) return path;
+    return name === "doc_export" && typeof result?.source === "string" && isMarkdownPath(result.source) ? result.source : undefined;
   } catch { return undefined; }
 }
 

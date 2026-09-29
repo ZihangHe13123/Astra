@@ -12,6 +12,7 @@ export interface QuestionProtocolState {
 
 type QuestionProtocolEvent =
   | UserQuestionRequest
+  | Extract<PyEvent, { type: "user_question_pending" }>
   | Extract<PyEvent, { type: "user_question_resolved" }>
   | Extract<PyEvent, { type: "user_question_response_rejected" }>;
 
@@ -24,6 +25,7 @@ export function reduceQuestionProtocolState(
     return { request: event, rejection: null };
   }
   if (state.request?.request_id !== event.request_id) return state;
+  if (event.type === "user_question_pending") return { ...state, request: { ...state.request!, state: "pending" } };
   if (event.type === "user_question_resolved" || !event.retryable) {
     return { request: null, rejection: null };
   }

@@ -1,10 +1,11 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
-import { FileDiff, Terminal, Layers, Users, X, ExternalLink, FolderOpen, FileCode, Eye } from "lucide-react";
+import React, { useEffect, useRef, useState } from "react";
+import { FileDiff, Terminal, Layers, Users, X, FolderOpen } from "lucide-react";
 import type { SessionState, UIEvent } from "@astra/ui-core/session-state";
 import { DelegateCards } from "./delegates.js";
 import { toolEmptyOutput, toolExpanded, toolStatus } from "./tool-status.js";
-import { Markdown } from "./messages.js";
-import { dirname, isMarkdownPath, openComments } from "./doc-preview.js";
+import { RequestTimeline } from "./request-timeline.js";
+import { docPathFromTool } from "./doc-preview.js";
+import { FilePreviewPanel } from "./file-preview-panel.js";
 
 export type Panel = "tools" | "changes" | "files" | "context" | "team";
 export function Details({ state, panel, setPanel, selection, width, onWidth, close, fail, doc, onDocDismiss }: { state: SessionState; panel: Panel; setPanel: (p: Panel) => void; selection: { index?: number; serial: number }; width: number; onWidth: (width: number) => void; close: () => void; fail: (e: unknown) => void; doc?: { path: string; serial: number }; onDocDismiss?: () => void }) {
@@ -16,10 +17,7 @@ export function Details({ state, panel, setPanel, selection, width, onWidth, clo
   const [changes, setChanges] = useState<any>();
   const [turn, setTurn] = useState(1);
   const [file, setFile] = useState<number>();
-  const [preview, setPreview] = useState<{ text?: string; data?: string; path?: string; truncated?: boolean }>();
-  const [docView, setDocView] = useState<"rendered" | "source">("rendered");
-  const markdown = preview?.text !== undefined && isMarkdownPath(preview?.path || "");
-  const comments = useMemo(() => markdown ? openComments(preview?.text || "") : [], [markdown, preview]);
+  const [preview, setPreview] = useState<{ path: string; serial: number }>();
   useEffect(() => {
     if (!selection.index || !["tools", "files"].includes(panel)) return;
     const target = `${state.id}:${panel}:${selection.serial}`;
@@ -37,7 +35,7 @@ export function Details({ state, panel, setPanel, selection, width, onWidth, clo
       .then(result => { if (!cancelled) setChanges(result); }).catch(fail);
     return () => { cancelled = true; };
   }, [panel, turn, file, state.id, state.mode, state.session, state.status, state.info.turn_changes]);
-  const openFile = (path: string) => { const request = ++previewRequest.current; void window.astra.file(state.id, path, "preview").then(value => { if (request === previewRequest.current) setPreview(value); }).catch(fail); };
+  const openFile = (path: string) => { setPreview({path, serial: ++previewRequest.current}); };
   // Follow the document the agent is writing: each new doc_* result reloads it.
   useEffect(() => { if (doc && panel === "files") openFile(doc.path); }, [doc?.serial, doc?.path, panel, state.id]);
   const tabs = [{ id: "tools", label: "执行", icon: Terminal }, { id: "changes", label: "改动", icon: FileDiff }, { id: "files", label: "文件", icon: FolderOpen }, { id: "context", label: "上下文", icon: Layers }, { id: "team", label: "Team", icon: Users }] as const;
@@ -46,7 +44,7 @@ export function Details({ state, panel, setPanel, selection, width, onWidth, clo
     try { const result = JSON.parse(tool.output); return result.type === "image_search" && result.success && Array.isArray(result.images) ? [{ ...result, index: tool.result_index || index + 1 }] : []; }
     catch { return []; }
   });
-  const artifacts = [...new Set([...state.tools.map(t => t.artifact_path), ...Object.values(state.processes).map(p => p.artifact_path)].filter(Boolean))];
+  const artifacts = [...new Set([...state.tools.flatMap(t => [t.artifact_path, docPathFromTool(t)]), ...Object.values(state.processes).map(p => p.artifact_path)].filter(Boolean))];
   useEffect(() => { previewRequest.current++; setFile(undefined); setTurn(1); setPreview(undefined); setChanges(undefined); }, [state.id, state.mode, state.session]);
   return <aside className="details-panel" ref={panelRef} style={{ width }} aria-label="执行详情面板">
     <div className="panel-resizer" role="separator" tabIndex={0} aria-label="调整详情宽度" aria-orientation="vertical" aria-valuemin={260} aria-valuemax={720} aria-valuenow={Math.round(width)}
@@ -57,13 +55,7 @@ export function Details({ state, panel, setPanel, selection, width, onWidth, clo
       onPointerCancel={() => { drag.current = undefined; if (panelRef.current) panelRef.current.style.width = `${width}px`; }}/>
     <div className="panel-tabs" role="tablist">{tabs.map(t => <button key={t.id} role="tab" aria-selected={panel === t.id} onClick={() => { previewRequest.current++; setPreview(undefined); setPanel(t.id); }}><t.icon size={15}/>{t.label}</button>)}<button className="icon" onClick={close} aria-label="关闭详情"><X size={15}/></button></div>
     <div className="panel-content" ref={content}>
-      {preview ? <><button className="text-button" onClick={() => { if (doc && preview.path === doc.path) onDocDismiss?.(); setPreview(undefined); }}>← 返回</button><h3>{preview.path?.split(/[\\/]/).pop()}</h3>
-        <div className="actions">{markdown && <button onClick={() => setDocView(docView === "rendered" ? "source" : "rendered")}>{docView === "rendered" ? <><FileCode size={14}/> 源码</> : <><Eye size={14}/> 预览</>}</button>}<button onClick={() => { void window.astra.file(state.id, preview.path!, "open").catch(fail); }}><ExternalLink size={14}/> 系统打开</button><button onClick={() => { void window.astra.file(state.id, preview.path!, "reveal").catch(fail); }}><FolderOpen size={14}/> 定位</button></div>
-        {preview.data ? <img className="preview-image" src={preview.data} alt="文件预览"/> : markdown && docView === "rendered" ? <>
-          {comments.length > 0 && <section className="summary-card doc-comments"><h4>待处理评论 <span className="count">{comments.length}</span></h4>{comments.map((comment, i) => <p key={i} className="small">{comment}</p>)}</section>}
-          <div className="doc-preview"><Markdown text={preview.text || ""} runtime={state.id} base={dirname(preview.path || "")} fail={fail}/></div>
-        </> : <pre className="file-preview">{preview.text}</pre>}{preview.truncated && <p className="muted">仅预览前 256 KiB，原文件保持完整。</p>}
-      </> : panel === "tools" ? <>
+      {preview ? <FilePreviewPanel runtime={state.id} path={preview.path} serial={preview.serial} fail={fail} dismiss={() => { if (doc && preview.path === doc.path) onDocDismiss?.(); setPreview(undefined); }}/> : panel === "tools" ? <>
         <DelegateCards delegates={state.delegates} runtime={state.id} fail={fail} openFile={openFile}/>
         <h3>工具与进程 <span className="count">{state.tools.length}</span></h3>
         {!state.tools.length && <p className="muted">工具运行后，结果会显示在这里。</p>}
@@ -105,6 +97,7 @@ export function Details({ state, panel, setPanel, selection, width, onWidth, clo
         <h3>当前上下文</h3><dl><dt>工作区</dt><dd>{state.workspace}</dd><dt>会话</dt><dd>{state.session}</dd><dt>模式</dt><dd>{state.mode}</dd><dt>模型</dt><dd>{state.info.model_info?.model || "未连接"}{state.info.model_info?.served_model ? `（实际：${state.info.model_info.served_model}）` : ""}</dd><dt>上下文</dt><dd>{state.info.model_info?.context_used?.toLocaleString() || 0} / {state.info.model_info?.context_limit?.toLocaleString() || "—"}</dd></dl>
         {Number(state.info.model_info?.context_limit) > 0 && <div className="context-meter"><progress aria-label="上下文使用量" value={Number(state.info.model_info.context_used || 0)} max={Number(state.info.model_info.context_limit)}/><small className="muted">按当前模型的上下文预算显示</small></div>}
         {state.info.wakeup_status?.plan && <section className="summary-card"><h4>定时提醒 · {statusLabel(state.info.wakeup_status.plan.state)}</h4><p>{state.info.wakeup_status.message || state.info.wakeup_status.plan.prompt || "等待下一次唤醒"}</p></section>}
+        <RequestTimeline key={`${state.id}:${state.mode}:${state.session}`} state={state}/>
         <h4 className="diagnostics-title">原始诊断</h4>
         {Object.entries(state.info).filter(([key]) => !["history", "model_info", "session_list", "backend_hello", "connection_auth", "connection_pending"].includes(key)).map(([key, event]) => <RawDetails key={key} label={eventLabels[key] || key} value={event}/>)}
       </>}

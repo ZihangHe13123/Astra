@@ -224,14 +224,33 @@ export function Approval({ event, send }: { event: UIEvent; send: (c: UIEvent) =
 export function Question({ event, send }: { event: UIEvent; send: (c: UIEvent) => Promise<void> }) {
   const [answers, setAnswers] = useState<Record<string, { selected: string[]; custom?: string }>>({});
   const [pending, setPending] = useState(false);
-  React.useEffect(() => { setPending(false); }, [event]);
-  return <form className="interactive-card" onSubmit={e => { e.preventDefault(); setPending(true); void send({ type: "user_question_response", request_id: event.request_id,
-    answers: event.questions.map((q: UIEvent) => ({ id: q.id, selected: answers[q.id]?.selected || [], custom: answers[q.id]?.custom || "" })) }).catch(() => setPending(false)); }}>
-    <span className="eyebrow">需要你的意见</span>{event.questions.map((q: UIEvent) => <fieldset key={q.id}><legend>{q.question}</legend>
+  const [editing, setEditing] = useState(false);
+  const sendRef = React.useRef(send);
+  sendRef.current = send;
+  React.useEffect(() => { setPending(false); }, [event.rejection]);
+  React.useEffect(() => {
+    if (event.mode !== "timed") return;
+    const report = () => { void sendRef.current({ type: "user_question_editing", request_id: event.request_id, editing }).catch(() => {}); };
+    report();
+    const heartbeat = editing ? setInterval(report, 20_000) : undefined;
+    return () => {
+      clearInterval(heartbeat);
+      if (editing) void sendRef.current({ type: "user_question_editing", request_id: event.request_id, editing: false }).catch(() => {});
+    };
+  }, [editing, event.request_id, event.mode]);
+  return <form className="interactive-card" onFocusCapture={() => setEditing(true)}
+    onBlurCapture={e => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setEditing(false); }}
+    onSubmit={e => { e.preventDefault(); if (pending) return; setPending(true); setEditing(false);
+      void send({ type: "user_question_response", request_id: event.request_id,
+        answers: event.questions.map((q: UIEvent) => ({ id: q.id, selected: answers[q.id]?.selected || [], custom: answers[q.id]?.custom || "" })) }).catch(() => setPending(false)); }}>
+    <span className="eyebrow">{event.state === "pending" ? "可稍后回答 · 工作继续进行" : "需要你的意见"}</span>
+    {event.mode === "timed" && <p>可选问题；未回答不表示同意。重启或开始新任务后问题失效。</p>}
+    {event.rejection && <p role="alert">{event.rejection.reason}</p>}
+    {event.questions.map((q: UIEvent) => <fieldset key={q.id} disabled={pending}><legend>{q.question}</legend>
       {(q.options || []).map((o: UIEvent) => <label className="option" key={o.label}><input type={q.multi_select ? "checkbox" : "radio"} name={q.id} checked={answers[q.id]?.selected?.includes(o.label) || false}
-        onChange={e => setAnswers(old => ({ ...old, [q.id]: { ...old[q.id], selected: q.multi_select ? e.target.checked ? [...(old[q.id]?.selected || []), o.label] : (old[q.id]?.selected || []).filter(x => x !== o.label) : [o.label] } }))}/>
+        onChange={e => setAnswers(old => ({ ...old, [q.id]: { custom: q.multi_select ? old[q.id]?.custom : "", selected: q.multi_select ? e.target.checked ? [...(old[q.id]?.selected || []), o.label] : (old[q.id]?.selected || []).filter(x => x !== o.label) : [o.label] } }))}/>
         <span>{o.label}{o.description && <small>{o.description}</small>}</span></label>)}
-      <textarea rows={2} placeholder="也可以直接输入你的想法" value={answers[q.id]?.custom || ""} onChange={e => setAnswers(old => ({ ...old, [q.id]: { selected: old[q.id]?.selected || [], custom: e.target.value } }))}/>
-    </fieldset>)}<div className="actions"><button className="primary" disabled={pending}>发送答复</button><button type="button" onClick={() => { setPending(true); void send({ type: "user_question_cancel", request_id: event.request_id }).catch(() => setPending(false)); }}>取消</button></div>
+      <textarea rows={2} placeholder="也可以直接输入你的想法" value={answers[q.id]?.custom || ""} onChange={e => setAnswers(old => ({ ...old, [q.id]: { selected: q.multi_select ? old[q.id]?.selected || [] : [], custom: e.target.value } }))}/>
+    </fieldset>)}<div className="actions"><button className="primary" disabled={pending}>发送答复</button><button type="button" disabled={pending} onClick={() => { setPending(true); setEditing(false); void send({ type: "user_question_cancel", request_id: event.request_id }).catch(() => setPending(false)); }}>取消</button></div>
   </form>;
 }

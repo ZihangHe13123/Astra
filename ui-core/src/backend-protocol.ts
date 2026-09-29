@@ -9,7 +9,7 @@ export type ProtocolDiagnostic = {
 const diagnosticEvents = new Set([
   "chunk", "reasoning", "done", "error", "history", "tool_result", "tool_calls",
   "task_started", "task_status", "generation_stats", "generation_progress", "context_compaction", "model_info",
-  "computer_state", "process_status", "user_question_request", "tool_approval_request",
+  "computer_state", "process_status", "user_question_request", "user_question_pending", "user_question_resolved", "tool_approval_request",
 ]);
 const errorTypes = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "URIError", "EvalError"]);
 

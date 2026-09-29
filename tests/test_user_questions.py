@@ -690,3 +690,234 @@ def test_late_response_cannot_resolve_newer_request():
         assert await second == answers
 
     asyncio.run(scenario())
+
+
+def test_timed_question_returns_pending_and_late_answer_is_delivered_once_to_origin():
+    async def scenario():
+        events = []
+        identity = {"session_id": "session-a", "task_id": "task-a"}
+        broker = UserQuestionBroker(events.append, available=lambda: True, identity=lambda: identity)
+        result = await broker.ask(sample_questions(), mode="timed", optional=True, timeout_seconds=0.01, call_id="call-a")
+        assert result["state"] == "pending" and "answers" not in result
+        assert "not approval" in result["message"].lower()
+        assert broker.pending_count == 1
+        assert events[-1]["type"] == "user_question_pending"
+        assert events[0]["session_id"] == "session-a"
+        assert events[0]["task_id"] == "task-a" and events[0]["call_id"] == "call-a"
+        answers = {"answers": [{"id": "storage", "selected": ["Markdown"]}]}
+        assert broker.resolve(result["request_id"], answers) == (True, "", False)
+        assert broker.resolve(result["request_id"], answers)[0] is False
+        assert broker.next_answer(session_id="session-b", task_id="task-a", busy=False) is None
+        assert broker.next_answer(session_id="session-a", task_id="unrelated-task", busy=True) is None
+        late = broker.next_answer(session_id="session-a", task_id="task-a", busy=True)
+        assert late["questions"] == sample_questions()
+        assert late["answers"] == answers["answers"]
+        assert late["request_id"] == result["request_id"] and late["call_id"] == "call-a"
+        broker.acknowledge_answer(late["request_id"])
+        assert broker.next_answer(session_id="session-a", task_id="task-a", busy=False) is None
+        assert broker.pending_count == 0
+    asyncio.run(scenario())
+
+
+def test_timed_question_refuses_required_input_and_tool_retains_pending_contract():
+    async def scenario():
+        broker = UserQuestionBroker(lambda _: None, available=lambda: True)
+        with pytest.raises(ValueError, match="optional"):
+            await broker.ask(sample_questions(), mode="timed", timeout_seconds=0.01)
+        registry = ToolRegistry()
+        register_user_question_tools(registry, broker.ask)
+        result = await registry.execute("ask_user_question", {
+            "questions": sample_questions(), "mode": "timed", "optional": True, "timeout_seconds": 0.01,
+        }, call_id="call-tool")
+        assert result["error"] == ""
+        assert json.loads(result["output"])["state"] == "pending"
+        broker.close("shutdown")
+    asyncio.run(scenario())
+
+
+def test_editing_holds_timed_question_and_answer_before_deadline_stays_synchronous():
+    async def scenario():
+        events = []
+        broker = UserQuestionBroker(events.append, available=lambda: True)
+        task = asyncio.create_task(broker.ask(sample_questions(), mode="timed", optional=True, timeout_seconds=0.02))
+        await asyncio.sleep(0)
+        request_id = events[0]["request_id"]
+        assert broker.set_editing(request_id, True)
+        await asyncio.sleep(0.04)
+        assert not task.done() and not any(e["type"] == "user_question_pending" for e in events)
+        answer = {"answers": [{"id": "storage", "selected": ["Markdown"]}]}
+        assert broker.resolve(request_id, answer)[0]
+        assert await task == answer
+        assert broker.next_answer(session_id="", task_id="", busy=False) is None
+    asyncio.run(scenario())
+
+
+def test_pending_question_expires_on_session_change_and_cancel_never_produces_answer():
+    async def scenario():
+        events = []
+        broker = UserQuestionBroker(events.append, available=lambda: True,
+                                    identity=lambda: {"session_id": "session-a", "task_id": "task-a"})
+        result = await broker.ask(sample_questions(), mode="timed", optional=True, timeout_seconds=0.01)
+        broker.expire_other_sessions("session-b")
+        assert events[-1]["state"] == "expired"
+        assert broker.resolve(result["request_id"], {"answers": []})[0] is False
+        assert broker.pending_count == 0
+        assert broker.next_answer(session_id="session-b", task_id="", busy=False) is None
+        result = await broker.ask(sample_questions(), mode="timed", optional=True, timeout_seconds=0.01)
+        assert broker.cancel(result["request_id"], "dismissed")[0]
+        assert events[-1]["state"] == "cancelled"
+        assert broker.next_answer(session_id="session-a", task_id="", busy=False) is None
+    asyncio.run(scenario())
+
+
+def test_timed_question_shutdown_expires_durably_without_persisting_contents(tmp_path):
+    async def scenario():
+        events = []
+        broker = UserQuestionBroker(events.append, available=lambda: True,
+                                    identity=lambda: {"session_id": "s", "task_id": "t"}, journal_dir=tmp_path)
+        result = await broker.ask(sample_questions(), mode="timed", optional=True, timeout_seconds=0.01)
+        broker.close("Backend is shutting down.")
+        record = json.loads((tmp_path / f"{result['request_id']}.json").read_text())
+        assert record["state"] == "expired"
+        assert "questions" not in record and "answers" not in record
+        recovered = []
+        replacement = UserQuestionBroker(recovered.append, available=lambda: True, journal_dir=tmp_path)
+        replacement.recover_expired("s")
+        assert recovered[-1]["state"] == "expired"
+        assert replacement.resolve(result["request_id"], {"answers": []})[0] is False
+        replacement.recover_expired("s")
+        assert len(recovered) == 1
+    asyncio.run(scenario())
+
+
+def test_edit_hold_release_returns_pending_promptly():
+    async def scenario():
+        events = []
+        broker = UserQuestionBroker(events.append, available=lambda: True)
+        task = asyncio.create_task(broker.ask(sample_questions(), mode="timed", optional=True, timeout_seconds=0.01))
+        await asyncio.sleep(0)
+        request_id = events[0]["request_id"]
+        broker.set_editing(request_id, True)
+        await asyncio.sleep(0.02)
+        broker.set_editing(request_id, False)
+        result = await asyncio.wait_for(task, 0.5)
+        assert result["state"] == "pending"
+        broker.close("shutdown")
+    asyncio.run(scenario())
+
+
+def test_user_answer_inbox_persists_consumed_input_and_keeps_unconsumed_reply():
+    async def scenario():
+        registry = ToolRegistry()
+        class ReplyLLM:
+            config = ClarifyThenExecuteLLM._Config()
+            async def chat_stream(self, messages, tools):
+                self.messages = messages
+                yield {"type": "done", "content": "Answer seen", "usage": None}
+        llm = ReplyLLM()
+        agent = ReActAgent("agent", llm, registry, max_iterations=2, progressive_tools=False)
+        agent.queue_user_question_answer("q", "Original question q answer: Markdown")
+        agent.queue_user_question_answer("q", "Original question q answer: Markdown")
+        await agent.reply(Msg(content=[ContentBlock.text("Continue independent work")]))
+        assert agent.user_question_answer_consumed("q")
+        saved = [m for m in agent.context.messages if m.get("provenance") == "user_question_answer"]
+        assert len(saved) == 1 and "Markdown" in saved[0]["content"]
+        agent.queue_user_question_answer("later", "Answer arriving after the final request")
+        assert not agent.user_question_answer_consumed("later")
+        agent.remove_user_question_answer("later")
+        assert not agent.user_question_answer_consumed("later")
+    asyncio.run(scenario())
+
+
+def test_new_task_explicitly_expires_pending_and_queued_answers():
+    async def scenario():
+        events = []
+        broker = UserQuestionBroker(events.append, available=lambda: True)
+        result = await broker.ask(sample_questions(), mode="timed", optional=True, timeout_seconds=0.01)
+        broker.resolve(result["request_id"], {"answers": [{"id": "storage", "selected": ["Markdown"]}]})
+        broker.supersede("A new task replaced the original request.")
+        assert broker.next_answer(session_id="", task_id="", busy=False) is None
+        assert events[-1]["state"] == "expired"
+        result = await broker.ask(sample_questions(), mode="timed", optional=True, timeout_seconds=0.01)
+        broker.supersede("A new task replaced the original request.")
+        assert broker.resolve(result["request_id"], {"answers": []})[0] is False
+        assert events[-1]["state"] == "expired"
+    asyncio.run(scenario())
+
+
+def test_question_inbox_cannot_cross_session_or_task_when_context_is_borrowed():
+    async def scenario():
+        class ReplyLLM:
+            config = ClarifyThenExecuteLLM._Config()
+            async def chat_stream(self, messages, tools):
+                yield {"type": "done", "content": "Independent reply", "usage": None}
+        agent = ReActAgent("agent", ReplyLLM(), ToolRegistry(), max_iterations=2, progressive_tools=False)
+        agent.queue_user_question_answer("other", "PRIVATE ANSWER", session_scope="different", task_id="task-original")
+        await agent.reply(Msg(content=[ContentBlock.text("different task")], metadata={"task_id":"task-other"}))
+        assert not agent.user_question_answer_consumed("other")
+        assert not any("PRIVATE ANSWER" in str(m.get("content", "")) for m in agent.context.messages)
+    asyncio.run(scenario())
+
+
+def test_followup_question_answer_is_acknowledged_only_after_session_save():
+    async def scenario():
+        class ReplyLLM:
+            config = ClarifyThenExecuteLLM._Config()
+            async def chat_stream(self, messages, tools):
+                assert agent.user_question_answer_consumed("q-followup")
+                assert saved
+                yield {"type": "done", "content": "Preference applied", "usage": None}
+        agent = ReActAgent("agent", ReplyLLM(), ToolRegistry(), max_iterations=2, progressive_tools=False)
+        saved = []
+        async def save():
+            saved.append(list(agent.context.messages))
+        agent.context.save_async = save
+        await agent.reply(Msg(content=[ContentBlock.text("Earlier answer: Markdown")],
+                              metadata={"source":"user_question_answer", "question_request_id":"q-followup"}))
+    asyncio.run(scenario())
+
+
+def test_crashed_question_recovery_is_scoped_and_redacted(tmp_path, monkeypatch):
+    record = {"request_id":"d"*32,"pid":123456,"session_id":"same","session_scope":"work", "state":"pending"}
+    (tmp_path / ('d'*32 + '.json')).write_text(json.dumps(record))
+    def dead_process(*_args):
+        raise ProcessLookupError()
+    monkeypatch.setattr('agent.runtime.user_questions.os.kill', dead_process)
+    events = []
+    broker = UserQuestionBroker(events.append, available=lambda:True, journal_dir=tmp_path)
+    broker.recover_expired("same", "writing")
+    assert events == []
+    broker.recover_expired("same", "work")
+    assert events[-1]["state"] == "expired"
+    assert "restart" in events[-1]["reason"]
+    assert json.loads((tmp_path / ('d'*32 + '.json')).read_text())["state"] == "expired"
+
+
+def test_late_answer_journal_write_failure_is_retryable_and_never_drops_question(tmp_path, monkeypatch):
+    async def scenario():
+        broker=UserQuestionBroker(lambda _:None,available=lambda:True,journal_dir=tmp_path)
+        result=await broker.ask(sample_questions(),mode="timed",optional=True,timeout_seconds=0.01)
+        original=broker._record
+        def fail(*_args):
+            raise OSError("Disk unavailable")
+        monkeypatch.setattr(broker,"_record",fail)
+        accepted,reason,retryable=broker.resolve(result["request_id"],{"answers":[{"id":"storage","selected":["Markdown"]}]})
+        assert not accepted and retryable and "save" in reason.lower()
+        assert broker.pending_count == 1
+        monkeypatch.setattr(broker,"_record",original)
+        broker.close("shutdown")
+    asyncio.run(scenario())
+
+
+def test_question_expiry_still_clears_control_when_journal_is_unavailable(tmp_path, monkeypatch):
+    async def scenario():
+        events=[]
+        broker=UserQuestionBroker(events.append,available=lambda:True,journal_dir=tmp_path)
+        await broker.ask(sample_questions(),mode="timed",optional=True,timeout_seconds=0.01)
+        def fail(*_args):
+            raise OSError("Disk unavailable")
+        monkeypatch.setattr(broker,"_record",fail)
+        broker.close("Backend is shutting down.")
+        assert broker.pending_count == 0
+        assert events[-1]["state"] == "expired"
+    asyncio.run(scenario())

@@ -344,6 +344,8 @@ class ReActAgent(AgentBase):
         self.forced_tool_name: str | None = None
         self._fresh_tool_context: dict[str, str] = {}
         self._request_local_tool_context_ids: set[str] = set()
+        self._user_question_answers: dict[str, tuple[str, str, str]] = {}
+        self._consumed_user_question_answers: set[str] = set()
         self._steering: list[str] = []
         self._steering_seen: set[str] = set()  # texts already queued this task
         self._memory_turn_key = ""
@@ -505,6 +507,22 @@ class ReActAgent(AgentBase):
             return
         self._steering_seen.add(text)
         self._steering.append(text)
+
+    def queue_user_question_answer(self, request_id: str, text: str, *, session_scope: str = "", task_id: str = "") -> None:
+        """Queue a correlated user answer until a complete tool step can admit it."""
+        if request_id not in self._consumed_user_question_answers:
+            self._user_question_answers.setdefault(request_id, (text, session_scope, task_id))
+
+    def user_question_answer_consumed(self, request_id: str) -> bool:
+        return request_id in self._consumed_user_question_answers
+
+    def remove_user_question_answer(self, request_id: str) -> None:
+        self._user_question_answers.pop(request_id, None)
+        self._consumed_user_question_answers.discard(request_id)
+
+    def clear_user_question_answers(self) -> None:
+        self._user_question_answers.clear()
+        self._consumed_user_question_answers.clear()
 
     def _refresh_skill_catalog(self, *, force: bool = False) -> bool:
         """Refresh skill metadata and rebuild the stable system suffix."""
@@ -3340,6 +3358,9 @@ class ReActAgent(AgentBase):
         if not has_content:
             yield with_request({"type": "done", "content": ""})
             return
+        if msg.metadata.get("source") == "user_question_answer" and msg.metadata.get("question_request_id"):
+            await self.context.save_async()
+            self._consumed_user_question_answers.add(str(msg.metadata["question_request_id"]))
         if emit_events and vision_event is not None:
             yield with_request(vision_event)
 
@@ -3401,6 +3422,19 @@ class ReActAgent(AgentBase):
             finish_reason = ""
             estimate_tokens = getattr(self.llm, "estimate_tokens", None)
             transient_messages: list[dict] = []
+            # Structured late answers are durable user input. Admit them only
+            # between complete model/tool steps to preserve tool-call ordering.
+            from agent.runtime.session_identity import session_key
+            question_answers = [(qid, text) for qid, (text, scope, owner_task) in self._user_question_answers.items()
+                                if (not scope or scope == session_key(self.context.session_path))
+                                and (not owner_task or owner_task == str(task_id or msg.metadata.get("runtime_task_id") or ""))]
+            for _, answer_text in question_answers:
+                self.context.add_user(answer_text, provenance="user_question_answer")
+            if question_answers:
+                await self.context.save_async()
+                for question_request_id, _ in question_answers:
+                    self._consumed_user_question_answers.add(question_request_id)
+                    self._user_question_answers.pop(question_request_id, None)
             if self._steering:
                 steering_texts = list(self._steering)
                 self._steering.clear()
@@ -3447,6 +3481,7 @@ class ReActAgent(AgentBase):
             _t_prep_start = _time.perf_counter()
             profiler_kwargs = {
                 "session_id": session_id,
+                "session_path": self.context.session_path,
                 "request_id": str(request_id),
                 "step": step,
                 "model": str(
@@ -4816,6 +4851,8 @@ class ReActAgent(AgentBase):
         self._request_local_tool_context_ids.clear()
         self._steering.clear()
         self._steering_seen.clear()
+        self._user_question_answers.clear()
+        self._consumed_user_question_answers.clear()
         self._task_mutated_paths.clear()
         self._task_context_paths.clear()
         self._active_skill_names.clear()

@@ -1966,3 +1966,110 @@ def test_time_budget_interrupts_real_backend_and_only_explicit_continue_restarts
             _stop_protocol_backend(proc)
         server.shutdown()
         server.server_close()
+
+
+class _TimedQuestionOpenAIHandler(_QuestionOpenAIHandler):
+    def _sse(self, chunks):
+        for chunk in chunks:
+            for choice in chunk.get("choices", []):
+                for call in choice.get("delta", {}).get("tool_calls", []):
+                    function = call.get("function", {})
+                    if function.get("name") == "ask_user_question":
+                        arguments = json.loads(function["arguments"])
+                        arguments.update(mode="timed", optional=True, timeout_seconds=0.01)
+                        function["arguments"] = json.dumps(arguments)
+        super()._sse(chunks)
+
+
+def test_backend_timed_question_late_answer_starts_one_correlated_followup(tmp_path):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _TimedQuestionOpenAIHandler)
+    server.requests = []
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    session = f"backend_timed_{uuid.uuid4().hex}"
+    proc, _, seen, wait_for = _start_question_protocol_backend(tmp_path, server.server_port, session)
+    try:
+        wait_for(lambda event: event.get("type") == "model_info")
+        proc.stdin.write(json.dumps({"type": "message", "text": "choose optional storage, continue other work"}) + "\n")
+        proc.stdin.flush()
+        request = wait_for(lambda event: event.get("type") == "user_question_request")
+        assert request["session_id"] == session
+        assert request["call_id"] == "call-user-question"
+        wait_for(lambda event: event.get("type") == "user_question_pending")
+        wait_for(lambda event: event.get("type") == "done", timeout=20)
+        command = {"type": "user_question_response", "request_id": request["request_id"],
+                   "answers": [{"id": "storage", "selected": ["Markdown"]}]}
+        proc.stdin.write(json.dumps(command) + "\n" + json.dumps(command) + "\n")
+        proc.stdin.flush()
+        wait_for(lambda event: event.get("type") == "user_question_resolved")
+        wait_for(lambda event: event.get("type") == "user_question_response_rejected")
+        wait_for(lambda event: event.get("type") == "done", timeout=20)
+        assert len(server.requests) == 3
+        user_messages = [message["content"] for message in server.requests[-1]["messages"] if message.get("role") == "user"]
+        late = next(str(message) for message in user_messages if request["request_id"] in str(message))
+        assert "call-user-question" in late and "Choose storage" in late and "Markdown" in late
+        assert request["task_id"] in late
+    finally:
+        _stop_protocol_backend(proc)
+        server.shutdown()
+        server.server_close()
+
+
+class _DelayedTimedQuestionOpenAIHandler(_TimedQuestionOpenAIHandler):
+    def _sse(self, chunks):
+        if len(self.server.requests) == 2:
+            self.server.second_request.set()
+            self.server.release_response.wait(10)
+        super()._sse(chunks)
+
+
+def test_late_question_answer_during_final_response_is_not_lost(tmp_path):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _DelayedTimedQuestionOpenAIHandler)
+    server.requests = []
+    server.second_request = threading.Event()
+    server.release_response = threading.Event()
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    proc, _, seen, wait_for = _start_question_protocol_backend(tmp_path, server.server_port, "timed_final_race")
+    try:
+        wait_for(lambda event: event.get("type") == "model_info")
+        proc.stdin.write(json.dumps({"type": "message", "text": "Ask an optional question and keep working"}) + "\n")
+        proc.stdin.flush()
+        request = wait_for(lambda event: event.get("type") == "user_question_request")
+        wait_for(lambda event: event.get("type") == "user_question_pending")
+        assert server.second_request.wait(5)
+        proc.stdin.write(json.dumps({"type": "user_question_response", "request_id": request["request_id"],
+                                     "answers": [{"id": "storage", "selected": ["Markdown"]}]}) + "\n")
+        proc.stdin.flush()
+        wait_for(lambda event: event.get("type") == "user_question_resolved")
+        time.sleep(0.4)  # permit the inbox tick while final response is in flight
+        server.release_response.set()
+        wait_for(lambda event: event.get("type") == "done", timeout=5)
+        wait_for(lambda event: event.get("type") == "done", timeout=5)
+        assert len(server.requests) == 3
+        assert any(request["request_id"] in str(m.get("content")) and m.get("role") == "user"
+                   for m in server.requests[-1]["messages"])
+    finally:
+        server.release_response.set()
+        _stop_protocol_backend(proc)
+        server.shutdown()
+        server.server_close()
+
+
+def test_reset_expires_timed_question_even_when_session_path_is_unchanged(tmp_path):
+    server=ThreadingHTTPServer(("127.0.0.1",0),_TimedQuestionOpenAIHandler)
+    server.requests=[]
+    threading.Thread(target=server.serve_forever,daemon=True).start()
+    proc,_,seen,wait_for=_start_question_protocol_backend(tmp_path,server.server_port,"timed_reset")
+    try:
+        wait_for(lambda e:e.get("type")=="model_info")
+        proc.stdin.write(json.dumps({"type":"message","text":"Ask an optional preference"})+"\n")
+        proc.stdin.flush()
+        request=wait_for(lambda e:e.get("type")=="user_question_request")
+        wait_for(lambda e:e.get("type")=="done")
+        proc.stdin.write(json.dumps({"type":"command","cmd":"/reset"})+"\n")
+        proc.stdin.flush()
+        wait_for(lambda e:e.get("type")=="history")
+        assert any(e.get("type")=="user_question_resolved" and e.get("request_id")==request["request_id"] and e.get("state")=="expired" for e in seen)
+    finally:
+        _stop_protocol_backend(proc)
+        server.shutdown()
+        server.server_close()

@@ -9,7 +9,10 @@ an active target; the [design and current coverage](design/gui.md) track the rem
 
 ## Install and launch
 
-Use a complete source checkout, Python 3.11+, Git and **Node.js 22.12+ with npm**.
+For a self-contained local application, see [standalone desktop builds and recovery](desktop-distribution.md).
+Those builds include Python and Electron; the following instructions are for source installations.
+
+Use a complete source checkout, Python 3.11+, Git and **Node.js 22.19+ with npm**.
 In an installation with the `astra` command registered:
 
 ```text
@@ -80,6 +83,9 @@ have not been configured yet.
   automatically repeat the model request.
 - Tool approvals and structured questions appear inline. Send changes to Stop while
   work is active and the draft is empty; typing a new instruction allows steering.
+  Optional questions can use a timed wait: the question remains answerable while
+  independent work continues. Required decisions retain blocking waits; a timeout
+  grants no approval. See [asynchronous questions](async-user-questions.md).
 - **执行详情** opens tools/processes, per-turn file diffs, files/images, context and
   Team state. Missing/expired snapshots and unconfirmed changes are labelled separately.
   Large text previews are bounded; use **系统打开** for the complete file.
@@ -92,6 +98,20 @@ Markdown images and files can be previewed from the current workspace and Astra'
 artifact storage. Use the file picker to explicitly open an external file. Raw HTML
 and executable URL schemes are not rendered. These presentation rules do not change
 the model's tool permissions.
+
+PDF files have a local page reader. DOCX/PPTX previews convert a private snapshot
+locally and report missing fonts; XLSX previews show saved cell values and clearly
+label missing formula caches. Refresh a preview after its source changes. Cancelling
+or leaving the preview cancels its pending conversion. `doc_check` reports package
+structure separately from visual inspection and formula recalculation. See
+[document preview and limits](desktop-document-preview.md).
+
+The Context panel includes a request timeline with preparation time, first-response
+latency, provider usage, cache metrics and separately labelled client estimates.
+Missing measurements stay uncollected. Desktop backends enable redacted metrics by
+default; `ASTRA_PROFILE_QUERY=0` disables collection. Records contain hashes, counts
+and timings, not prompt bodies, and use bounded log rotation. The viewer is read-only
+and never starts a model request; old unscoped records are not attributed to a session.
 
 ## Command help while typing
 
@@ -173,6 +193,9 @@ offers **后台继续**, **停止并退出** or **返回**. Reopen hidden window
 Backend restarts use `/restart` and its existing visible-acknowledgement protocol.
 GUI and backend restarts are different: closing the desktop ends its owned backends.
 Session wakeups still require a live backend and do not become offline schedules.
+Application-menu quit, macOS Cmd+Q and tray exit use the same task guard. Startup and
+unconfirmed submissions also require a decision; returning from the dialog retains
+the backend. Repeated quit requests share one confirmation.
 
 ## Updates and diagnostics
 
@@ -192,6 +215,9 @@ If you update source manually with Git rather than `astra update`, run
 `astra setup --gui --repair` afterward to rebuild the desktop assets.
 GUI preferences live under the installation data directory's `gui/` folder. Backend
 logs follow `AGENT_LOG_DIR`; detached launch diagnostics live under `gui/launches/`.
+For self-contained local builds with a bundled Python runtime and explicit offline
+update/rollback, see [desktop distribution](desktop-distribution.md). Signing,
+notarization and platform acceptance are separate release checks.
 
 ## Keyboard
 

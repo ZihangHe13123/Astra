@@ -43,6 +43,8 @@ def active_instances(install: Installation) -> list[dict]:
 def exclusive(install: Installation, *, allow_pending: bool = False):
     try:
         with InstanceLock(install.control / "update.lock"):
+            if not allow_pending and (install.control / "desktop-pending.json").exists():
+                raise LauncherError("A desktop update was interrupted. Run the desktop updater recover action first.")
             if not allow_pending and any((install.control / name).exists() for name in ("pending.json", "services.json")):
                 raise LauncherError("An update was interrupted. Run astra update --recover before starting Astra.")
             yield

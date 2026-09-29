@@ -4,7 +4,8 @@ import { delegateActive } from "@astra/ui-core/delegates";
 /** One lifecycle predicate for closing a session, deleting it and closing the window. */
 export function hasOngoingWork(state: SessionState): boolean {
   if (state.status === "disconnected") return false;
-  return state.busy || !!state.approvals.length || !!state.questions.length
+  return state.status !== "ready" || state.messages.some(message => ["pending", "unknown"].includes(message.submissionState || ""))
+    || state.busy || !!state.approvals.length || !!state.questions.length
     || ["pending", "running", "cancelling"].includes(state.info.task_status?.task?.status)
     || Object.values(state.processes).some(process => process.status === "running")
     || Object.values(state.delegates).some(delegateActive)

@@ -58,6 +58,12 @@ export interface UserQuestionAnswer {
 export type UserQuestionRequest = {
   type: "user_question_request";
   request_id: string;
+  mode?: "blocking" | "timed";
+  state?: "waiting" | "pending";
+  session_id?: string;
+  session_scope?: string;
+  task_id?: string;
+  call_id?: string;
   questions: UserQuestion[];
 };
 
@@ -241,10 +247,12 @@ export type PyEvent =
       reason: string;
     }
   | UserQuestionRequest
+  | { type: "user_question_pending"; request_id: string; state: "pending" }
   | {
       type: "user_question_resolved";
       request_id: string;
-      state: "answered" | "cancelled";
+      state: "answered" | "cancelled" | "expired";
+      reason?: string;
     }
   | {
       type: "user_question_response_rejected";
@@ -438,6 +446,7 @@ export type TuiCommand =
   | { type: "tool_approval_response"; request_id: string; decision: "once" | "session" | "deny" }
   | { type: "user_question_response"; request_id: string; answers: UserQuestionAnswer[] }
   | { type: "user_question_cancel"; request_id: string }
+  | { type: "user_question_editing"; request_id: string; editing: boolean }
   | { type: "exit" };
 
 export type ToolApprovalRequest = Extract<PyEvent, { type: "tool_approval_request" }>;

@@ -58,12 +58,13 @@ export function checkedCommand(value: unknown): Record<string, any> {
     select_model: ["model_key", "request_id"], message: ["text", "submission_id"], image: ["path", "prompt", "submission_id"], command: ["cmd"],
     connect_provider: ["request_id", "route_id", "base_url", "api_key", "api_key_env"],
     cancel_connection: ["request_id"], refresh_models: [], tool_approval_response: ["request_id", "decision"],
-    user_question_response: ["request_id"], user_question_cancel: ["request_id"],
+    user_question_response: ["request_id"], user_question_cancel: ["request_id"], user_question_editing: ["request_id"],
     submission_status: ["submission_id"], restart_ack: ["request_id"],
   };
   if (!Object.hasOwn(fields, c.type)) throw new Error("Unsupported command");
   const allowed = ["type", ...fields[c.type], ...(c.type === "refresh_models" ? ["provider_id", "force"] : []),
-    ...(c.type === "user_question_response" ? ["answers"] : [])];
+    ...(c.type === "user_question_response" ? ["answers"] : []),
+    ...(c.type === "user_question_editing" ? ["editing"] : [])];
   if (Object.keys(c).some(key => !allowed.includes(key))) throw new Error("Unexpected command field");
   for (const field of fields[c.type]) checkedString(c[field], field);
   if (["message", "image", "submission_status"].includes(c.type) && !/^[A-Za-z0-9_-]{1,128}$/.test(c.submission_id)) throw new Error("Invalid submission ID");
@@ -71,6 +72,7 @@ export function checkedCommand(value: unknown): Record<string, any> {
   if (c.type === "command" && !c.cmd.startsWith("/")) throw new Error("Commands must begin with /");
   if (c.type === "tool_approval_response" && !["once", "session", "deny"].includes(c.decision)) throw new Error("Invalid approval decision");
   if (c.type === "user_question_response" && !Array.isArray(c.answers)) throw new Error("Missing answers");
+  if (c.type === "user_question_editing" && typeof c.editing !== "boolean") throw new Error("Invalid editing state");
   if (c.type === "refresh_models") {
     if (c.provider_id !== undefined) checkedString(c.provider_id, "provider", 256);
     if (c.force !== undefined && typeof c.force !== "boolean") throw new Error("Invalid force value");

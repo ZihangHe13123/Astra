@@ -18,12 +18,15 @@ from .locking import RuntimeLease
 
 
 def launch_gui(install: Installation) -> int:
-    if install.kind != "source":
+    if install.kind not in {"source", "desktop"}:
         raise LauncherError("This distribution does not include the desktop interface. Use a complete source checkout.")
-    if not dependencies.is_ready(install) or not dependencies.gui_ready(install):
-        raise LauncherError("Run astra setup --gui once to prepare this checkout's desktop dependencies.")
-    dependencies.python_health(install)
-    dependencies.gui_health(install)
+    if install.kind == "source":
+        if not dependencies.is_ready(install) or not dependencies.gui_ready(install):
+            raise LauncherError("Run astra setup --gui once to prepare this checkout's desktop dependencies.")
+        dependencies.python_health(install)
+        dependencies.gui_health(install)
+    else:
+        dependencies.gui_executable(install)
     directory = install.data / "gui" / "launches"
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     request = uuid.uuid4().hex
@@ -59,7 +62,8 @@ def supervise(root: Path, ready: Path) -> int:
         env = runtime_environment(install, Path(os.environ.get("ASTRA_WORKSPACE", str(root))))
         env.update(ASTRA_GUI_READY_FILE=str(ready), ASTRA_LAUNCHER_PID=str(os.getpid()))
         env.pop("ELECTRON_RUN_AS_NODE", None)
-        process = subprocess.Popen([executable, str(root / "ui-gui")], cwd=root, env=env,
+        arguments = [executable] if install.kind == "desktop" else [executable, str(root / "ui-gui")]
+        process = subprocess.Popen(arguments, cwd=root, env=env,
                                    stdin=subprocess.DEVNULL)
 
         def stop(_signum, _frame):

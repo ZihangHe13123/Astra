@@ -57,3 +57,11 @@ test("matching terminal rejection clears only that request", () => {
 
   assert.deepEqual(next, { request: null, rejection: null });
 });
+
+test('timeout updates the existing request without dropping a draft or rejection', () => {
+  const state = {request, rejection:{requestId:request.request_id,reason:'Try again'}};
+  const next = reduceQuestionProtocolState(state, {type:'user_question_pending',request_id:request.request_id,state:'pending'});
+  assert.equal(next.request?.state,'pending');
+  assert.equal(next.request?.questions, request.questions);
+  assert.equal(next.rejection, state.rejection);
+});

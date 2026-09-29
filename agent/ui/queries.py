@@ -107,6 +107,10 @@ def query(request: dict, *, agent=None) -> object:
         return command_catalog()
     if method == "sessions":
         return list_sessions()
+    if method == "request_timeline":
+        from agent.ui.request_timeline import request_timeline
+        return request_timeline(_session_path(str(params.get("name", "")), str(params.get("mode", "work"))),
+                                limit=params.get("limit", 100))
     if method == "history":
         return history(str(params.get("name", "")), str(params.get("mode", "work")),
                        before=params.get("before"), limit=int(params.get("limit", 200)))

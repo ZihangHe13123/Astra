@@ -9,24 +9,43 @@ The wheel itself is installed into a temporary target without dependency resolut
 from __future__ import annotations
 
 import subprocess
+import stat
 import sys
 import sysconfig
 import tarfile
 import tempfile
 import tomllib
+import zipfile
 from pathlib import Path, PurePosixPath
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
-def check_source_distribution(path: Path) -> None:
-    config = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
-    included = config["tool"]["hatch"]["build"]["targets"]["sdist"]["only-include"]
+def _private_distribution_path(relative: str) -> bool:
+    path = PurePosixPath(relative)
     blocked_parts = {
-        ".git", ".hg", ".venv", ".venv-wsl", ".logs", ".tmp", ".worktrees",
+        ".git", ".hg", ".venv", ".venv-wsl", ".logs", ".sessions", ".tmp", ".worktrees",
         ".build", ".swiftpm", "node_modules", "__pycache__", ".pytest_cache",
         ".ruff_cache", ".mypy_cache", ".cache", ".vite", "output", "test-results", "playwright-report",
     }
+    return (
+        bool(blocked_parts.intersection(path.parts))
+        or path.name in {"persona.local.json", ".DS_Store"}
+        or (path.name.startswith(".env") and path.name != ".env.example")
+        or path.suffix in {".pem", ".p12", ".pfx", ".key", ".pyc", ".pyo", ".tsbuildinfo"}
+        or relative in {"agent/runtime/tools/comfyui.py", "agent/runtime/writing_mode.py",
+                        "tests/test_comfyui_tools.py", "session_recall.py"}
+        or (".astra" in path.parts and not relative.startswith(".astra/skills/"))
+        or relative.startswith((
+            "docs/superpowers/", "docs/validation/", "evals/coding/results/",
+            "ui-core/dist/", "ui-gui/dist/", "ui-tui/dist/",
+        ))
+    )
+
+
+def check_source_distribution(path: Path) -> None:
+    config = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    included = config["tool"]["hatch"]["build"]["targets"]["sdist"]["only-include"]
     names = set()
     with tarfile.open(path) as archive:
         for member in archive:
@@ -34,20 +53,10 @@ def check_source_distribution(path: Path) -> None:
             if member.isdir():
                 continue
             relative = PurePosixPath(*parts[1:]).as_posix()
-            name = PurePosixPath(relative).name
             allowed = relative == "PKG-INFO" or any(
                 relative == entry or relative.startswith(f"{entry}/") for entry in included
             )
-            private = (
-                bool(blocked_parts.intersection(parts))
-                or name in {"persona.local.json", ".DS_Store"}
-                or (name.startswith(".env") and name != ".env.example")
-                or PurePosixPath(relative).suffix in {".pem", ".p12", ".pfx", ".key", ".pyc", ".pyo", ".tsbuildinfo"}
-                or relative.startswith((
-                    "docs/superpowers/", "docs/validation/", "evals/coding/results/",
-                    "ui-core/dist/", "ui-gui/dist/", "ui-tui/dist/",
-                ))
-            )
+            private = _private_distribution_path(relative)
             if not member.isfile() or ".." in parts or member.name.startswith("/") or not allowed or private:
                 raise SystemExit(f"Source distribution contains a non-public path: {relative}")
             names.add(relative)
@@ -61,10 +70,27 @@ def check_source_distribution(path: Path) -> None:
         "ui-gui/build.mjs", "ui-gui/index.html", "ui-gui/src/main/index.ts",
         "ui-gui/src/preload/index.ts", "ui-gui/src/renderer/index.tsx", "ui-gui/src/bridge.ts",
         "ui-tui/package.json", "ui-tui/package-lock.json", "ui-tui/tsconfig.json", "ui-tui/src/index.tsx",
+        "packaging/desktop-runtime.lock.json", "scripts/package_desktop.py",
+        "agent/launcher/desktop_distribution.py", "agent/launcher/desktop_runtime.py",
+        "agent/launcher/desktop_update.py", "agent/runtime/tools/workspace_dependencies.py",
+        "ui-gui/src/main/packaged-runtime.ts",
     }
     if missing := required - names:
         raise SystemExit(f"Source distribution is missing public inputs: {sorted(missing)}")
     print("Source distribution smoke passed: public inputs present; local artifacts excluded")
+
+
+def check_wheel_distribution(path: Path) -> None:
+    with zipfile.ZipFile(path) as archive:
+        for entry in archive.infolist():
+            if entry.is_dir():
+                continue
+            name = PurePosixPath(entry.filename)
+            allowed = name.parts and (name.parts[0] == "agent" or name.parts[0].endswith(".dist-info"))
+            if (not allowed or name.is_absolute() or ".." in name.parts
+                    or stat.S_ISLNK(entry.external_attr >> 16) or _private_distribution_path(entry.filename)):
+                raise SystemExit(f"Wheel contains a non-public path: {entry.filename}")
+    print("Wheel content smoke passed: only the public package and distribution metadata are included")
 
 
 SMOKE_CODE = r"""
@@ -83,6 +109,8 @@ def deny_network(event, arguments):
 
 sys.addaudithook(deny_network)
 for name in ("agent.runtime.session_recall", "agent.cli.main", "agent.cli.backend",
+             "agent.launcher.desktop_distribution", "agent.launcher.desktop_update",
+             "agent.runtime.tools.workspace_dependencies",
              "agent.runtime.context_index.embedding_runtime",
              "agent.runtime.context_index.embedding_worker",
              "agent.evals.context_index_benchmark.resources"):
@@ -134,6 +162,7 @@ def main() -> int:
         candidates = list(wheels.glob("*.whl"))
         if len(candidates) != 1:
             raise SystemExit("Wheel smoke expected exactly one freshly built wheel")
+        check_wheel_distribution(candidates[0])
         run([
             "uv", "pip", "install", "--offline", "--no-deps", "--no-python-downloads",
             "--python", sys.executable, "--target", str(installed), str(candidates[0]),

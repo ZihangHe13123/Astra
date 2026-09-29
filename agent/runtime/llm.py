@@ -95,26 +95,34 @@ def _usage_dict(usage) -> dict | None:
         or (prompt_tokens + completion_tokens)
     )
     details = getattr(usage, "prompt_tokens_details", None)
-    has_native_hit = hasattr(usage, "prompt_cache_hit_tokens")
+    native_hit = getattr(usage, "prompt_cache_hit_tokens", None)
+    detail_hit = getattr(details, "cached_tokens", None) if details is not None else None
     cache_hit = int(
-        getattr(usage, "prompt_cache_hit_tokens", 0)
-        or (getattr(details, "cached_tokens", 0) if details is not None else 0)
-        or 0
+        native_hit if native_hit is not None else detail_hit or 0
     )
     raw_miss = getattr(usage, "prompt_cache_miss_tokens", None)
-    has_cache_telemetry = raw_miss is not None or has_native_hit or details is not None
+    has_cache_telemetry = raw_miss is not None or native_hit is not None or detail_hit is not None
     cache_miss = int(
         raw_miss
         if raw_miss is not None
         else (max(0, prompt_tokens - cache_hit) if has_cache_telemetry else 0)
     )
-    return {
+    result = {
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": total_tokens,
         "prompt_cache_hit_tokens": cache_hit,
         "prompt_cache_miss_tokens": cache_miss,
     }
+    # Missing provider telemetry is unknown; reported zero remains a real value.
+    for name in ("prompt_tokens", "completion_tokens"):
+        if getattr(usage, name, None) is None:
+            result.pop(name, None)
+    if native_hit is None and detail_hit is None:
+        result.pop("prompt_cache_hit_tokens", None)
+    if raw_miss is None and (native_hit is None and detail_hit is None or getattr(usage, "prompt_tokens", None) is None):
+        result.pop("prompt_cache_miss_tokens", None)
+    return result
 
 
 class LLMIdleTimeout(TimeoutError):

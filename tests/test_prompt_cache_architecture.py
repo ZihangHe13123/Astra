@@ -237,8 +237,26 @@ def test_provider_without_cache_telemetry_does_not_invent_misses():
     )
 
     normalized = _usage_dict(usage)
-    assert normalized["prompt_cache_hit_tokens"] == 0
-    assert normalized["prompt_cache_miss_tokens"] == 0
+    assert "prompt_cache_hit_tokens" not in normalized
+    assert "prompt_cache_miss_tokens" not in normalized
+
+
+def test_null_cache_fields_are_unavailable_but_reported_zero_is_known():
+    usage = SimpleNamespace(prompt_tokens=8, completion_tokens=2, total_tokens=10,
+                            prompt_cache_hit_tokens=None, prompt_cache_miss_tokens=None,
+                            prompt_tokens_details=SimpleNamespace(cached_tokens=None))
+    assert "prompt_cache_hit_tokens" not in _usage_dict(usage)
+    usage.prompt_tokens_details.cached_tokens = 0
+    assert _usage_dict(usage)["prompt_cache_hit_tokens"] == 0
+    assert _usage_dict(usage)["prompt_cache_miss_tokens"] == 8
+    usage.prompt_cache_hit_tokens = 0
+    usage.prompt_tokens_details.cached_tokens = 4
+    assert _usage_dict(usage)["prompt_cache_hit_tokens"] == 0
+
+
+def test_partial_cache_metrics_do_not_fill_unknown_counterpart_with_zero():
+    assert _usage_dict(SimpleNamespace(prompt_cache_hit_tokens=2)).get("prompt_cache_miss_tokens") is None
+    assert _usage_dict(SimpleNamespace(prompt_cache_miss_tokens=2)).get("prompt_cache_hit_tokens") is None
 
 
 def test_tool_routing_ignores_synthetic_compression_recap():

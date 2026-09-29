@@ -29,7 +29,10 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Iterator, Protocol
+from typing import TYPE_CHECKING, Any, Iterator, Protocol
+
+if TYPE_CHECKING:
+    from .browser_lifecycle import BrowserLifecycle
 
 
 def _now() -> str:
@@ -357,7 +360,7 @@ class BrowserSessionManager:
         self._lock = threading.RLock()
         self.backend = backend
         # Set by register_browser_tools; the runtime hands control over through it.
-        self.lifecycle = None
+        self.lifecycle: BrowserLifecycle | None = None
         self._initialize()
 
     @contextmanager

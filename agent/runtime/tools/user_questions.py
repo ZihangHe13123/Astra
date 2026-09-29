@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -173,14 +174,21 @@ class UserQuestionCancelled(RuntimeError):
 
 def register_user_question_tools(
     registry: ToolRegistry,
-    ask_questions: Callable[[list[dict]], Awaitable[dict]],
+    ask_questions: Callable[..., Awaitable[dict]],
 ) -> None:
     """Register the model-facing user-question tool."""
 
-    async def _ask_user_question(questions: list[dict]) -> str | ToolFailure:
+    supports_wait_mode = "mode" in inspect.signature(ask_questions).parameters
+
+    async def _ask_user_question(questions: list[dict], mode: str = "blocking", optional: bool = False,
+                                 timeout_seconds: float = 30, _permission_call_id: str = "") -> str | ToolFailure:
+        from ..user_questions import validate_wait
+        validate_wait(mode, optional, timeout_seconds)
         request = normalize_questions(questions)
         try:
-            raw_answer = await ask_questions(request)
+            raw_answer = (await ask_questions(request, mode=mode, optional=optional,
+                                              timeout_seconds=timeout_seconds, call_id=_permission_call_id)
+                          if supports_wait_mode or mode == "timed" else await ask_questions(request))
         except UserQuestionUnavailable as exc:
             return ToolFailure(
                 code="user_question_unavailable",
@@ -195,19 +203,25 @@ def register_user_question_tools(
                 retryable=True,
                 recovery_hint="Wait for the user's next message or ask a revised question.",
             )
-        answer = normalize_answers(request, raw_answer)
+        answer = raw_answer if raw_answer.get("state") == "pending" else normalize_answers(request, raw_answer)
         return json.dumps(answer, ensure_ascii=False, separators=(",", ":"))
 
     registry.register(ToolDef(
         name="ask_user_question",
         description=(
             "Ask the top-level user a structured question. This call pauses for the top-level user. "
+            "Use mode=timed with optional=true only for optional preferences or information: after timeout it returns "
+            "pending and you may continue independent work while the question remains answerable. "
+            "Required answers and authorization must remain blocking. Unanswered never means approval. "
             "This must be the only tool call in its assistant step; it may be repeated. "
             "It does not grant risky-tool approval."
         ),
         parameters={
             "type": "object",
             "properties": {
+                "mode": {"type": "string", "enum": ["blocking", "timed"], "default": "blocking"},
+                "optional": {"type": "boolean", "default": False},
+                "timeout_seconds": {"type": "number", "exclusiveMinimum": 0, "maximum": 300, "default": 30},
                 "questions": {
                     "type": "array",
                     "minItems": MIN_QUESTIONS,
