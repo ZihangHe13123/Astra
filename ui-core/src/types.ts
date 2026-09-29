@@ -283,7 +283,7 @@ export type PyEvent =
       details?: Record<string, unknown>;
       artifact_ref?: string;
     }
-  | { type: "model_info"; model: string; model_key?: string; reasoning_effort?: "low" | "high" | "max" | null; code_mode?: "native" | "code" | "both"; personas?: { name: string; description: string }[]; models?: (string | ModelInfo)[]; providers?: ProviderInfo[]; connection_routes?: ConnectionRoute[]; recent_models?: string[]; provider_errors?: Record<string, string>; total_tokens: number; prompt_tokens: number; completion_tokens: number; cache_hit_tokens?: number; cache_miss_tokens?: number; context_pct: number; context_used?: number; context_limit: number; show_reasoning?: boolean }
+  | { type: "model_info"; model: string; model_key?: string; served_model?: string; reasoning_effort?: "low" | "high" | "max" | null; code_mode?: "native" | "code" | "both"; personas?: { name: string; description: string }[]; models?: (string | ModelInfo)[]; providers?: ProviderInfo[]; connection_routes?: ConnectionRoute[]; recent_models?: string[]; provider_errors?: Record<string, string>; total_tokens: number; prompt_tokens: number; completion_tokens: number; cache_hit_tokens?: number; cache_miss_tokens?: number; context_pct: number; context_used?: number; context_limit: number; show_reasoning?: boolean }
   | { type: "session_info"; name: string; messages: number }
     | { type: "cache_status"; cache_hit_tokens: number; cache_miss_tokens: number }
 

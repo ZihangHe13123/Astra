@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createRoot } from "react-dom/client";
 import { ArrowUp, Square, Plus, Search, PanelLeft, PanelRight, ChevronDown, Folder, Settings, Paperclip, X, Copy, RotateCcw, ChevronRight, Command, Pin, Moon, Sun, Monitor, ArrowLeft, LoaderCircle, SlidersHorizontal, FileDiff, Terminal, Check } from "lucide-react";
 import { projectEvent, textContent, type SessionState, type UIEvent, type Message } from "@astra/ui-core/session-state";
+import { modelDisplayName } from "@astra/ui-core/model-label";
 import type { CommandDescription, Preferences, SessionEntry } from "../bridge.js";
 import { Approval, CommandPalette, Modal, ModelPicker, ModelSettings, Question } from "./controls.js";
 import { Details, type Panel } from "./details.js";
@@ -382,7 +383,7 @@ function App() {
         {groups.recent.map(group => <React.Fragment key={group.label}><div className="history-date">{group.label}</div>{group.entries.map(entryButton)}</React.Fragment>)}
         {!historyFiltered.length && <p className="sidebar-empty">{search ? "没有匹配的会话。" : "你的对话会保存在这里。"}</p>}
       </div>
-      <button className="account" onClick={() => setModal("settings")}><span className="account-icon">A</span><span>Astra 本地工作区<small>{model?.model && model.model !== "none" ? model.model : "连接你的模型"}</small></span><Settings size={17}/></button>
+      <button className="account" onClick={() => setModal("settings")}><span className="account-icon">A</span><span>Astra 本地工作区<small>{model?.model && model.model !== "none" ? modelDisplayName(model.model, model.served_model) : "连接你的模型"}</small></span><Settings size={17}/></button>
     </aside>
     <main className="main"><header className="topbar"><div>{!side && <button className="icon" aria-label="显示侧栏" onClick={() => setSide(true)}><PanelLeft size={18}/></button>}<Folder size={17}/><span className="title" title={currentTitle}>{currentTitle}</span><span className="mode-badge">{preview ? "只读历史" : state?.mode && state.mode !== "work" ? state.mode : ""}</span></div>
       <div><span className="workspace" title={state?.workspace || workspace}>{(state?.workspace || workspace).split(/[\\/]/).pop()}</span>{historyLoading || state?.status === "connecting" || state?.status === "loading" ? <LoaderCircle size={16} className="spin"/> : null}<button className="icon" aria-label="执行详情" onClick={() => { if (panel) leaveDoc(); setPanel(panel ? undefined : "tools"); }}><PanelRight size={18}/></button></div></header>
@@ -412,7 +413,7 @@ function App() {
               onChange={value => savePrefs({ drafts: { ...prefs.drafts, [key]: value } })} onSubmit={() => { void submit(); }}
               onPaste={e => { if ([...e.clipboardData.items].some(i => i.type.startsWith("image/"))) { e.preventDefault(); void window.astra.clipboardImage().then(p => { if (p) attach([p]); }).catch(fail); } }}/>
             <div className="composer-bottom"><div><button className="icon" aria-label="添加附件" onClick={() => { void window.astra.choose("files").then(attach).catch(fail); }}><Plus size={20}/></button><button className={`permission ${state?.info.yolo_status?.yolo ? "yolo" : ""}`} onClick={() => { void openSessionSettings("permissions"); }} title="工具审批设置">{state?.info.yolo_status?.yolo ? "完全访问" : "按需审批"}</button></div>
-              <div><button className="model-button" onClick={() => { void openModels(); }}>{model?.model && model.model !== "none" ? model.model : "选择模型"}<ChevronDown size={13}/></button>
+              <div><button className="model-button" title={model?.served_model ? `${model.model}（实际：${model.served_model}）` : undefined} onClick={() => { void openModels(); }}>{model?.model && model.model !== "none" ? modelDisplayName(model.model, model.served_model) : "选择模型"}<ChevronDown size={13}/></button>
                 <select aria-label="推理强度" value={model?.reasoning_effort || "high"} disabled={!model?.reasoning_effort} onChange={e => command(`/mode ${e.target.value}`)}><option value="low">低</option><option value="high">高</option><option value="xhigh">超高</option><option value="max">最高</option></select>
                 {state?.busy && !draft.trim() && !files.length && !hasAppshot ? <button className="send" aria-label="停止" onClick={() => command("/cancel")}><Square size={16} fill="currentColor"/></button> : <button className="send" aria-label="发送" disabled={sending || opening || (!draft.trim() && !files.length && !hasAppshot)} onClick={() => { void submit(); }}><ArrowUp size={19}/></button>}
               </div></div>

@@ -1,4 +1,5 @@
 import type { ProviderInfo, ConnectionRoute } from "./types.js";
+import { modelDisplayName } from "./model-label.js";
 import { ConnectionPanel } from "./components/connection-panel.js";
 import { appshotRejectionNotice } from "./appshot-rejection.js";
 import { openImageGallery } from "./image-gallery.js";
@@ -598,6 +599,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     model: "deepseek-flash", total: 0, prompt: 0, completion: 0, ctxPct: 0,
     cacheHit: 0, cacheMiss: 0,
     modelKey: "deepseek-flash",
+    servedModel: undefined as string | undefined,
     contextUsed: 0,
     contextLimit: 128_000 as number | undefined,
     reasoningEffort: undefined as "low" | "high" | "xhigh" | "max" | undefined,
@@ -947,6 +949,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         setInfo({
           model: event.model, total: event.total_tokens,
           modelKey: event.model_key ?? event.model,
+          servedModel: event.served_model,
           prompt: event.prompt_tokens, completion: event.completion_tokens,
           cacheHit: event.cache_hit_tokens ?? 0,
           cacheMiss: event.cache_miss_tokens ?? 0,
@@ -2142,7 +2145,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           now={toolClock}
           memory={workingMemory}
           lastTool={toolResults[toolResults.length - 1]}
-          model={info.model}
+          model={modelDisplayName(info.model, info.servedModel)}
           totalTokens={info.total}
           promptTokens={info.prompt}
           cacheHitTokens={info.cacheHit}

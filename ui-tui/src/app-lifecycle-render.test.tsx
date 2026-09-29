@@ -793,3 +793,28 @@ test("current request silence replaces old speed and recovers on output and comp
     assert.doesNotMatch(h.frame(), /NO OUTPUT|GENERATING|MODEL WAIT/);
   } finally { h.app.unmount(); }
 });
+
+test("an alias shows the version it resolved to once an answer has named it", async () => {
+  // Live Astra 2026-09-29: an older Claude Code CLI kept resolving `sonnet` to Sonnet 5 after 5.5 was
+  // out, and the status line only said `sonnet`.
+  const h = await setup(150, 32);
+  try {
+    const info = { type: "model_info", model: "sonnet", reasoning_effort: "high", total_tokens: 4200, prompt_tokens: 4000, completion_tokens: 200, context_pct: 5, context_limit: 1000000 };
+    h.child.event(info);
+    h.child.event({ type: "history", messages: [{ role: "assistant", content: "restored answer" }] });
+    await settle();
+    assert.match(h.frame(), /READY.*sonnet.*CTX 5%/);
+    assert.doesNotMatch(h.frame(), /sonnet-5/);
+    h.child.event({ ...info, served_model: "claude-sonnet-5" });
+    await settle();
+    assert.match(h.frame(), /READY.*sonnet-5 .*CTX 5%/);
+    assert.doesNotMatch(h.frame(), /claude-sonnet/);
+    h.child.event({ ...info, served_model: "claude-sonnet-5-5" });
+    await settle();
+    assert.match(h.frame(), /READY.*sonnet-5-5.*CTX 5%/);
+    // Switching models starts over: nothing is known until the next answer.
+    h.child.event(info);
+    await settle();
+    assert.doesNotMatch(h.frame(), /sonnet-5/);
+  } finally { h.app.unmount(); }
+});

@@ -102,7 +102,7 @@ export function Details({ state, panel, setPanel, selection, width, onWidth, clo
         {!Object.keys(state.teams).length && <p className="muted">当前没有 Team 活动。</p>}
         {state.info.working_memory && <><h4>当前计划</h4><PlanSummary memory={state.info.working_memory.memory}/></>}
       </> : <>
-        <h3>当前上下文</h3><dl><dt>工作区</dt><dd>{state.workspace}</dd><dt>会话</dt><dd>{state.session}</dd><dt>模式</dt><dd>{state.mode}</dd><dt>模型</dt><dd>{state.info.model_info?.model || "未连接"}</dd><dt>上下文</dt><dd>{state.info.model_info?.context_used?.toLocaleString() || 0} / {state.info.model_info?.context_limit?.toLocaleString() || "—"}</dd></dl>
+        <h3>当前上下文</h3><dl><dt>工作区</dt><dd>{state.workspace}</dd><dt>会话</dt><dd>{state.session}</dd><dt>模式</dt><dd>{state.mode}</dd><dt>模型</dt><dd>{state.info.model_info?.model || "未连接"}{state.info.model_info?.served_model ? `（实际：${state.info.model_info.served_model}）` : ""}</dd><dt>上下文</dt><dd>{state.info.model_info?.context_used?.toLocaleString() || 0} / {state.info.model_info?.context_limit?.toLocaleString() || "—"}</dd></dl>
         {Number(state.info.model_info?.context_limit) > 0 && <div className="context-meter"><progress aria-label="上下文使用量" value={Number(state.info.model_info.context_used || 0)} max={Number(state.info.model_info.context_limit)}/><small className="muted">按当前模型的上下文预算显示</small></div>}
         {state.info.wakeup_status?.plan && <section className="summary-card"><h4>定时提醒 · {statusLabel(state.info.wakeup_status.plan.state)}</h4><p>{state.info.wakeup_status.message || state.info.wakeup_status.plan.prompt || "等待下一次唤醒"}</p></section>}
         <h4 className="diagnostics-title">原始诊断</h4>
