@@ -220,6 +220,8 @@ register("clipboardImage", async () => {
   const folder = join(gui, "attachments"); await mkdir(folder, { recursive: true, mode: 0o700 });
   const path = join(folder, `${randomUUID()}.png`); await writeFile(path, bytes, { mode: 0o600 }); selectedFiles.add(path); clipboardFiles.add(path); return path;
 });
+// The window denies every web permission, so the renderer cannot use navigator.clipboard to write.
+register("copyText", text => clipboard.writeText(checkedString(text, "clipboard text", 16 * 1024 * 1024)));
 register("openExternal", value => shell.openExternal(externalURL(value)));
 register("cancelPreview", (id, requestId) => {
   const rt = runtime(id);

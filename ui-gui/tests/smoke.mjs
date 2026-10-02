@@ -364,6 +364,18 @@ try {
  await page.reload(); await page.getByRole('textbox',{name:'消息'}).waitFor();
  await page.getByText('你好，Astra 桌面连接成功。',{exact:true}).waitFor();
  assert.equal(await page.getByText('你好，Astra 桌面连接成功。',{exact:true}).count(),1); passed('renderer reload restores one copy of history');
+ // The window denies every web permission, so navigator.clipboard cannot write: copying goes through the main process.
+ const reply=page.locator('.message.assistant').filter({hasText:'你好，Astra 桌面连接成功。'});
+ const greeting=(await page.evaluate(()=>window.astra.bootstrap())).sessions.flatMap(s=>s.messages).find(m=>m.role==='assistant'&&m.content.startsWith('你好，Astra 桌面连接成功。')).content;
+ const clipboardText=()=>app.evaluate(({clipboard})=>clipboard.readText());
+ await app.evaluate(({clipboard})=>clipboard.writeText('剪贴板里原有的内容'));
+ await reply.getByRole('button',{name:'复制消息'}).click();
+ await reply.getByRole('button',{name:'已复制'}).waitFor({timeout:5000});
+ assert.equal(await clipboardText(),greeting); assert.ok(greeting.includes('```python'),'the whole message is copied as written, markdown included');
+ await reply.getByRole('button',{name:'复制代码'}).click();
+ await reply.getByRole('button',{name:'已复制'}).first().waitFor({timeout:5000});
+ assert.equal((await clipboardText()).trim(),'print("hello")');
+ assert.equal(await page.locator('.toast').count(),0); passed('the message and code copy buttons write the clipboard through the main process');
  await page.getByRole('textbox',{name:'消息'}).fill('未发送草稿');
  await app.evaluate(({dialog}, path) => { dialog.showOpenDialog=async()=>({canceled:false,filePaths:[path]}); }, target);
  await page.getByRole('button',{name:'添加附件',exact:true}).click();
