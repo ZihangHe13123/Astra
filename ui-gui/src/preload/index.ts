@@ -14,6 +14,7 @@ const bridge: DesktopBridge = {
     if (result !== true) throw new Error(String(result));
   },
   clipboardImage: () => invoke("clipboardImage"),
+  copyText: text => invoke("copyText", text),
   appshot: (id, action, value) => invoke("appshot", id, action, value),
   droppedPaths: files => files.map(file => webUtils.getPathForFile(file)).filter(Boolean),
   openExternal: url => invoke("openExternal", url), file: (id, path, action, requestId) => invoke("file", id, path, action, requestId),

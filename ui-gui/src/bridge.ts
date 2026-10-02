@@ -18,6 +18,7 @@ export interface DesktopBridge {
   flushPreferences(value: Partial<Preferences>): void;
   choose(kind: "files" | "folder"): Promise<string[]>;
   clipboardImage(): Promise<string | null>;
+  copyText(text: string): Promise<void>;
   appshot(id: string, action: "command" | "remove", value: string): Promise<void>;
   droppedPaths(files: File[]): string[];
   openExternal(url: string): Promise<void>;

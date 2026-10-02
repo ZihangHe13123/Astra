@@ -20,7 +20,7 @@ function CopyButton({ text, label = "复制消息", fail }: { text: string | (()
   const [copied, setCopied] = useState(false);
   useEffect(() => { if (!copied) return; const t = setTimeout(() => setCopied(false), 1600); return () => clearTimeout(t); }, [copied]);
   return <button className="icon" aria-label={copied ? "已复制" : label} title={copied ? "已复制" : label} onClick={() => {
-    void navigator.clipboard.writeText(typeof text === "function" ? text() : text).then(() => setCopied(true)).catch(fail);
+    void window.astra.copyText(typeof text === "function" ? text() : text).then(() => setCopied(true)).catch(fail);
   }}>{copied ? <Check size={14}/> : <Copy size={14}/>}</button>;
 }
 function CodeBlock({ children, fail }: { children?: React.ReactNode; fail: (e: unknown) => void }) {
