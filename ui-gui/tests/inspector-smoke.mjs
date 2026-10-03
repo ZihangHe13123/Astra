@@ -55,6 +55,10 @@ const passed = name => { checks.push(name); console.log('PASS', name); };
 try {
   app = await electron.launch({ args: [join(root, 'ui-gui')], env, timeout: 30000 });
   const page = await app.firstWindow(); page.setDefaultTimeout(30000);
+  // The first scenarios inspect chat and records side by side. Native launch
+  // bounds may be narrower on CI; the later 1000px case tests automatic close.
+  await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setContentSize(1320, 768));
+  await page.waitForFunction(() => window.innerWidth === 1320);
   console.log("START", folder);
   const errors = []; page.on('pageerror', error => errors.push(error.message));
   const submit = async text => { await page.getByRole('textbox', { name: '消息' }).fill(text); await page.getByRole('button', { name: '发送', exact: true }).click(); };

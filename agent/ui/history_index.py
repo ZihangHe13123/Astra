@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Callable, Iterator, TextIO
 
 from agent.cli.images import message_display_text
+from agent.runtime.file_change_time import change_time_token
 from agent.runtime.paths import state_path
 from agent.runtime.session_store import SessionStore
 
@@ -216,7 +217,7 @@ def _signature(store: SessionStore) -> str:
     for path in (store.legacy_path, store.snapshot_path, store.jsonl_path, store.header_path):
         try:
             stat = path.stat()
-            values.append((stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns))
+            values.append((stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, change_time_token(path, stat)))
         except FileNotFoundError:
             values.append(None)
     return json.dumps([_VERSION, *values], separators=(",", ":"))
