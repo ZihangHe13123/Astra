@@ -1574,10 +1574,15 @@ async def _main(startup_started: float):
                 if event["type"] == "chunk":
                     _sr_chunks.append(event["content"])
                     if tick is None:
-                        _send({"type": "chunk", "content": event["content"]})
+                        _send({"type": "chunk", "content": event["content"],
+                               **{key: event[key] for key in ("request_id", "stream_id") if key in event}})
                 elif event["type"] == "reasoning":
                     if tick is None:
-                        _send({"type": "reasoning", "content": event["content"]})
+                        _send({"type": "reasoning", "content": event["content"],
+                               **{key: event[key] for key in ("request_id", "stream_id") if key in event}})
+                elif event["type"] in {"tool_preparing", "message_source"}:
+                    if tick is None:
+                        _send(event)
                 elif event["type"] == "generation_progress":
                     _send({
                         "type": "generation_progress",
@@ -1653,7 +1658,7 @@ async def _main(startup_started: float):
                             call_id = str(call.get("id") or "")
                             if call_id:
                                 pending_tool_calls[call_id] = str(call.get("name") or "tool")
-                        _send({"type": "tool_calls", "calls": visible_calls})
+                        _send({"type": "tool_calls", "calls": visible_calls, "request_id": event.get("request_id", "")})
                 elif event["type"] == "tool_progress":
                     if bar_mode.active and event.get("name") in BAR_SCENE_TOOL_NAMES:
                         continue
@@ -1709,7 +1714,7 @@ async def _main(startup_started: float):
                         "cache_miss_tokens": cache_miss,
                     })
                     if tick is None:
-                        _send({"type": "done"})
+                        _send({"type": "done", "request_id": event.get("request_id", "")})
                     # ── Log assistant response ──
                     try:
                         if _sr_auto is not None and _sr_sid and _sr_chunks:
@@ -1957,16 +1962,24 @@ async def _main(startup_started: float):
                **({"served_model": served} if served else {})})
 
     async def _send_history():
+        from agent.runtime.message_source import message_source_ref
         hist = []
-        for message in visible_wakeup_history(agent.context.messages):
+        source_positions = {id(message): index for index, message in enumerate(agent.context.messages)}
+        history_mode = "bar" if bar_mode.active else "minimal" if minimal_mode.active else "local" if local_mode.active else "work"
+        history_session = Path(agent.context.session_path).stem if agent.context.session_path else ""
+        for position, message in enumerate(visible_wakeup_history(agent.context.messages)):
             if message.get("role") not in ("user", "assistant"):
                 continue
             if message.get("_meta", {}).get("type") == "reasoning_context":
                 continue
             item = {
+                "id": f"{history_mode}:{history_session}:{position}",
                 "role": "system" if message.get("provenance") == "peer_message" else message["role"],
                 "content": message_display_text(message.get("display_command", message.get("content", ""))),
             }
+            raw_index = source_positions.get(id(message))
+            if raw_index is not None:
+                item["source_ref"] = message_source_ref(message, raw_index)
             timestamp = _valid_message_timestamp(message.get("timestamp"))
             if timestamp is not None:
                 item["timestamp"] = timestamp
@@ -2637,6 +2650,8 @@ async def _main(startup_started: float):
                 try:
                     max_bytes = int(os.getenv("MAX_IMAGE_UPLOAD_BYTES", str(10 * 1024 * 1024)))
                     msg = Msg(sender="user", role="user", content=build_user_message_content(text, max_bytes=max_bytes))
+                    if sid:
+                        msg.metadata["submission_id"] = sid
                     accepted = await _launch_message(msg, text)
                 except Exception as exc:
                     accepted = False
@@ -2660,6 +2675,8 @@ async def _main(startup_started: float):
                         max_bytes=max_bytes,
                     )
                     msg = Msg(sender="user", role="user", content=blocks)
+                    if sid:
+                        msg.metadata["submission_id"] = sid
                     accepted = await _launch_message(msg, f"/image {cmd.get('path', '')} {cmd.get('prompt', '')}".strip())
                 except Exception as e:
                     accepted = False

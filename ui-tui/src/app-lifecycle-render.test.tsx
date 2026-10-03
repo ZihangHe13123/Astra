@@ -47,6 +47,23 @@ async function setup(columns = 90, rows = 30, appshotClientFactory?: (consumer:a
 }
 async function tool(h: Awaited<ReturnType<typeof setup>>) { h.child.event({ type: "tool_result", name: "read_file", output: "detail line\n".repeat(20), error: "" }); await settle(); await h.key("\x0f"); assert.match(h.frame(), /Tool #1/); }
 
+test("tool parameter preparation is visible before execution and clears on cancellation", async () => {
+  const h = await setup(160, 40);
+  try {
+    await h.submit("prepare a file");
+    h.child.event({ type: "tool_preparing", attempt_id: "p", state: "preparing", calls: [
+      { index: 0, call_id: "c", name: "write_file", summary: "report.md", argument_chars: 1024 },
+    ] });
+    await settle();
+    assert.match(h.frame(), /准备 WRITE_FILE/);
+    assert.match(h.frame(), /1,024/);
+    assert.doesNotMatch(h.frame(), /RUN WRITE|LAST.*WRITE|Tool #1/);
+    h.child.event({ type: "done" });
+    await settle();
+    assert.doesNotMatch(h.frame(), /准备 WRITE_FILE/);
+  } finally { h.app.unmount(); }
+});
+
 test("idle teammate stops activity and a finished parent accepts a fresh turn", async () => {
   const h = await setup(143, 40);
   const dock = () => h.frame().split("\n").filter((line) => /\bCTX \d+%/.test(line)).join("\n");

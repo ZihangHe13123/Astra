@@ -124,3 +124,19 @@
 .request-metrics dl { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:6px 12px; }
 .request-metrics dt { overflow-wrap:anywhere; }
 .request-metrics dd { margin:0; }
+
+/* Tool preparation is intentionally outside the executed tool result list. */
+.tool-preparation { margin: 16px 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+.preparing-call { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; margin-top: 8px; }
+.preparing-call p { flex-basis: 100%; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; max-height: 7em; overflow: auto; font-size: 13px; }
+.message.located-message { outline: 2px solid var(--accent); outline-offset: 5px; border-radius: 8px; }
+.session-log-panel .panel-tabs strong { margin-right: auto; font-size: 14px; }
+.session-log-record { padding: 10px 0; border-bottom: 1px solid var(--line); }
+.session-log-record.selected { border-left: 2px solid var(--accent); padding-left: 10px; }
+.session-log-heading { display: flex; width: 100%; gap: 8px; text-align: left; justify-content: space-between; align-items: baseline; }
+.session-log-heading strong { font-size: 13px; }
+.session-log-record p { overflow-wrap: anywhere; }
+.session-log-raw { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 55vh; overflow: auto; font-size: 12px; padding: 10px; background: var(--bg); border-radius: 6px; }
+.session-log-pagination { justify-content: space-between; padding-top: 14px; flex-wrap: wrap; }
+
+.message.user.has-source .message-actions { display: flex; justify-content: flex-end; }

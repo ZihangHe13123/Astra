@@ -63,6 +63,8 @@ async def stream_with_progress(
                 raise event
             meaningful = event.get("type") in {"tool_calls", "done"} or (
                 event.get("type") in {"chunk", "reasoning"} and bool(event.get("content"))
+            ) or (
+                event.get("type") == "tool_preparing" and event.get("state") == "preparing" and bool(event.get("calls"))
             )
             now = time.monotonic()
             first_output = meaningful and not received_output

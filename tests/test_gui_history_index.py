@@ -53,12 +53,15 @@ def _message(text, role="user", **kwargs):
 
 
 def _oracle(store, before=None, limit=200):
-    messages = visible_wakeup_history(store.load(readonly=True)["messages"])
+    from agent.ui.session_log import message_source_ref
+    canonical = store.load(readonly=True)["messages"]
+    references = {id(message): message_source_ref(message, i) for i, message in enumerate(canonical)}
+    messages = visible_wakeup_history(canonical)
     end = max(0, min(len(messages), before if before is not None else len(messages)))
     start = max(0, end - min(max(1, limit), 1000))
     visible = [{"id": f"work:demo:{i}", "role": m["role"],
                 "content": message_display_text(m.get("display_command", m.get("content", ""))),
-                "timestamp": m.get("timestamp")}
+                "timestamp": m.get("timestamp"), "source_ref": references[id(m)]}
                for i, m in enumerate(messages) if start <= i < end
                and m.get("role") in ("user", "assistant")
                and m.get("_meta", {}).get("type") != "reasoning_context"]

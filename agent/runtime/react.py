@@ -3348,9 +3348,30 @@ class ReActAgent(AgentBase):
             request_id=str(request_id),
         )
 
+        stream_scope = uuid.uuid4().hex
+        stream_phase = ""
+        from .message_source import message_source_ref
+        source_bindings: list[tuple[dict, int, str]] = []
+
+        def bind_source(target: dict, message: dict) -> None:
+            # Hold identities, not message objects: compacted file payloads
+            # must be released even during an unbounded agent turn.
+            source_bindings.append((target, id(message), message_source_ref(message, 0)["digest"]))
+
+        def prune_sources() -> None:
+            present = {id(message) for message in self.context.messages}
+            source_bindings[:] = [binding for binding in source_bindings if binding[1] in present]
+
         def with_request(event: dict) -> dict:
             event["request_id"] = request_id
+            if event.get("type") in {"chunk", "reasoning"}:
+                event["stream_id"] = f"{stream_scope}:{stream_phase or step}"
             return event
+
+        def append_assistant(message: dict) -> None:
+            self.context.add_assistant_raw(message)
+            if emit_events:
+                bind_source({"stream_id": f"{stream_scope}:{stream_phase or step}"}, message)
 
         _turn_prepare_started = _time.perf_counter()
         has_content, user_index, storage_content, vision_event = await self._prepare_turn(msg)
@@ -3358,6 +3379,8 @@ class ReActAgent(AgentBase):
         if not has_content:
             yield with_request({"type": "done", "content": ""})
             return
+        if emit_events and msg.metadata.get("submission_id") and user_index is not None:
+            bind_source({"submission_id": msg.metadata["submission_id"]}, self.context.messages[user_index])
         if msg.metadata.get("source") == "user_question_answer" and msg.metadata.get("question_request_id"):
             await self.context.save_async()
             self._consumed_user_question_answers.add(str(msg.metadata["question_request_id"]))
@@ -3399,6 +3422,8 @@ class ReActAgent(AgentBase):
         ):
             check_work_budget()
             step += 1
+            stream_phase = uuid.uuid4().hex
+            prune_sources()
             background_delegates_running = False
             if self.delegate_mailbox is not None and task_id:
                 drain_for = getattr(self.delegate_mailbox, "drain_for", None)
@@ -3536,6 +3561,7 @@ class ReActAgent(AgentBase):
             )
             if budget_estimate is not None:
                 prompt_estimate = budget_estimate
+            prune_sources()
             # Forced compaction can happen even when no token estimator is
             # available. Never retain a pre-compaction message index.
             user_index = next((i for i in range(len(self.context.messages) - 1, -1, -1)
@@ -3680,6 +3706,16 @@ class ReActAgent(AgentBase):
                                 and current_prefill is None
                             ):
                                 yield with_request({"type": "chunk", "content": event["content"]})
+                        elif event["type"] == "tool_preparing":
+                            if emit_events and not forced_tool:
+                                # A core-looking tool name can be registered
+                                # with a stricter argument persistence policy.
+                                calls = []
+                                for call in event.get("calls", []):
+                                    tool = self.tools.get(str(call.get("name") or ""))
+                                    calls.append(call if tool is not None and tool.argument_persistence == "durable"
+                                                 else {**call, "summary": ""})
+                                yield with_request({**event, "calls": calls})
                         elif event["type"] == "tool_calls":
                             tool_calls = event["calls"]
                             provider_state = event.get("_provider_state")
@@ -3699,6 +3735,7 @@ class ReActAgent(AgentBase):
                             usage = event.get("usage")
                         elif event["type"] == "generation_recovery":
                             full_content = full_reasoning = ""
+                            stream_phase = uuid.uuid4().hex
                             if emit_events:
                                 yield with_request({**event, "type": "error", "recoverable": True})
                         elif event["type"] in {"generation_stats", "generation_progress"} and emit_events:
@@ -3821,7 +3858,7 @@ class ReActAgent(AgentBase):
                     tool_call_failure.details.get("argument_chars", 0),
                 )
                 if full_content and not forced_tool:
-                    self.context.add_assistant_raw(
+                    append_assistant(
                         self._assistant_message(full_content, None, full_reasoning)
                     )
                     last_text = full_content
@@ -3962,7 +3999,7 @@ class ReActAgent(AgentBase):
                         "recoverable": True,
                     })
                     break
-            self.context.add_assistant_raw(
+            append_assistant(
                 self._assistant_message("" if forced_tool else full_content, tool_calls, full_reasoning, provider_state)
             )
             if task_id and self.task_store is not None:
@@ -4116,7 +4153,8 @@ class ReActAgent(AgentBase):
                 if direct_tool is not None and not tool_events[0].get("error"):
                     direct_text = str(tool_events[0].get("output") or "").strip()
                     if direct_text:
-                        self.context.add_assistant_raw({"role": "assistant", "content": direct_text})
+                        stream_phase = f"{step}:direct"
+                        append_assistant({"role": "assistant", "content": direct_text})
                         await self.context.save_async()
                         last_text = direct_text
                         completed_normally = True
@@ -4323,6 +4361,7 @@ class ReActAgent(AgentBase):
             })
 
         if stop_reason:
+            stream_phase = "final"
             final_text = ""
             final_reasoning = ""
             final_provider_state = None
@@ -4369,6 +4408,9 @@ class ReActAgent(AgentBase):
                                 final_provider_state = event.get("_provider_state")
                                 final_text = event.get("content", final_text)
                                 final_reasoning = event.get("reasoning_content", final_reasoning)
+                            elif event["type"] == "generation_recovery":
+                                final_text = final_reasoning = ""
+                                stream_phase = uuid.uuid4().hex
                             elif event["type"] in {"generation_stats", "generation_progress"} and emit_events:
                                 yield with_request(event)
                     finally:
@@ -4378,10 +4420,11 @@ class ReActAgent(AgentBase):
 
             if not final_text.strip() or final_tool_calls:
                 final_provider_state = None
+                stream_phase = "fallback"
                 final_text = self._fallback_stop_answer(stop_reason)
                 if emit_events:
                     yield with_request({"type": "chunk", "content": final_text})
-            self.context.add_assistant_raw(self._assistant_message(final_text, None, final_reasoning, final_provider_state))
+            append_assistant(self._assistant_message(final_text, None, final_reasoning, final_provider_state))
             last_text = final_text
 
         if user_index is not None and storage_content is not None:
@@ -4404,6 +4447,16 @@ class ReActAgent(AgentBase):
         # Once completion is visible it must already be durable. Automatic
         # memory retention and external sync below are best-effort bookkeeping.
         await self.context.save_async()
+        if emit_events and self.context.session_path:
+            # Only bind messages still present verbatim after persistence. A
+            # compaction or recovery rewrite must never redirect an old bubble.
+            positions = {id(message): index for index, message in enumerate(self.context.messages)}
+            for target, identity, digest in source_bindings:
+                index = positions.get(identity)
+                if index is not None:
+                    reference = message_source_ref(self.context.messages[index], index)
+                    if reference["digest"] == digest:
+                        yield with_request({"type": "message_source", **target, "source_ref": reference})
         yield with_request({"type": "done", "content": last_text})
         if (
             completed_normally

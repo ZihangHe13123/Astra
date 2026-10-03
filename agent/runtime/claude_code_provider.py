@@ -32,6 +32,7 @@ from pathlib import Path
 
 from .llm import LLMIdleTimeout, LLMResponseError, _messages_for_capabilities
 from .token_estimator import estimate_messages_tokens
+from .tool_preparation import with_tool_preparation
 
 BASE_URL = "claude-code://local"
 COMMAND_ENV = "ASTRA_CLAUDE_CODE_COMMAND"
@@ -331,7 +332,9 @@ def bridge_tools(tools: list[dict]) -> list[dict]:
     listed = []
     for tool in tools:
         function = tool.get("function") if isinstance(tool, dict) else None
-        name = function.get("name") if isinstance(function, dict) else None
+        if not isinstance(function, dict):
+            continue
+        name = function.get("name")
         if not isinstance(name, str) or not TOOL_NAME.fullmatch(name):
             continue
         schema = function.get("parameters")
@@ -437,13 +440,18 @@ class ClaudeCodeProvider:
             arguments += ["--effort", effort]
         return arguments
 
+    @with_tool_preparation
     async def chat_stream(self, messages, tools=None, tool_choice=None, *, omit_tool_choice=False,
                           generation_overrides=None) -> AsyncGenerator[dict, None]:
         for _ in range(4):
+            yield {"type": "_tool_preparation_reset"}
             started = False
             try:
                 async for event in self._stream(messages, tools, None if omit_tool_choice else tool_choice):
-                    started = True
+                    # Display-only previews must not change the CLI's existing
+                    # bounded compatibility fallback policy.
+                    if event.get("type") != "_tool_preparation":
+                        started = True
                     yield event
                 return
             except _Fallback as fallback:
@@ -563,6 +571,10 @@ class ClaudeCodeProvider:
         overall = getattr(self.config, "overall_timeout", None)
         deadline = loop.time() + float(overall) if overall else None
         reasoning, content, streamed, calls = "", "", "", []
+        preview_blocks: dict[int, dict] = {}
+        preview_ids: dict[str, int] = {}
+        preview_streamed: set[int] = set()
+        next_preview_index = 0
         while True:
             wait = idle if deadline is None else max(0.0, min(idle, deadline - loop.time()))
             try:
@@ -578,8 +590,24 @@ class ClaudeCodeProvider:
             if not isinstance(event, dict):
                 continue
             if event.get("type") == "stream_event":
-                delta = (event.get("event") or {}).get("delta") or {}
-                if (event.get("event") or {}).get("type") != "content_block_delta" or not isinstance(delta, dict):
+                partial = event.get("event") or {}
+                if partial.get("type") == "message_start":
+                    preview_blocks.clear()
+                if partial.get("type") == "content_block_start":
+                    block = partial.get("content_block") or {}
+                    block_index = partial.get("index")
+                    if block.get("type") == "tool_use" and isinstance(block_index, int) and not isinstance(block_index, bool):
+                        call_id = str(block.get("id") or "")
+                        raw_name = str(block.get("name") or "")
+                        name = raw_name[len(TOOL_PREFIX):] if raw_name.startswith(TOOL_PREFIX) else raw_name
+                        preview = {"index": next_preview_index, "call_id": call_id, "name": name}
+                        next_preview_index += 1
+                        preview_blocks[block_index] = preview
+                        if call_id:
+                            preview_ids[call_id] = preview["index"]
+                        yield {"type": "_tool_preparation", **preview, "delta": ""}
+                delta = partial.get("delta") or {}
+                if partial.get("type") != "content_block_delta" or not isinstance(delta, dict):
                     continue
                 if delta.get("type") == "text_delta" and delta.get("text"):
                     streamed += str(delta["text"])
@@ -588,6 +616,13 @@ class ClaudeCodeProvider:
                     piece = str(delta["thinking"])
                     reasoning += piece
                     yield {"type": "reasoning", "content": piece}
+                elif delta.get("type") == "input_json_delta" and isinstance(delta.get("partial_json"), str):
+                    block_index = partial.get("index")
+                    preview = preview_blocks.get(block_index) if isinstance(block_index, int) else None
+                    if preview is not None:
+                        if delta["partial_json"]:
+                            preview_streamed.add(preview["index"])
+                        yield {"type": "_tool_preparation", **preview, "delta": delta["partial_json"]}
             elif event.get("type") == "assistant":
                 for block in (event.get("message") or {}).get("content") or []:
                     if not isinstance(block, dict):
@@ -599,7 +634,16 @@ class ClaudeCodeProvider:
                     elif block.get("type") == "text" and block.get("text"):
                         content += str(block["text"])
                     elif block.get("type") == "tool_use":
-                        calls.append(self._call(block))
+                        call = self._call(block)
+                        calls.append(call)
+                        index = preview_ids.get(call["id"])
+                        if index is None:
+                            index = next_preview_index
+                            next_preview_index += 1
+                            preview_ids[call["id"]] = index
+                        if index not in preview_streamed:
+                            yield {"type": "_tool_preparation", "index": index, "call_id": call["id"],
+                                   "name": call["name"], "arguments": call["arguments"]}
             elif event.get("type") == "system":
                 self._note(event)
             elif event.get("type") == "result":

@@ -97,7 +97,7 @@ export function activityVisualState(status: string, toolCount: number, hasPendin
   const normalized = status.trim().toLowerCase();
   if (normalized === "disconnected" || /\b(?:failed|error)\b/.test(normalized)) return "error";
   if (hasPendingApproval || toolCount > 0 || normalized === COMPACTION_LABEL || normalized === "thinking" || normalized.startsWith("task ")
-    || /^(?:model wait|generating|no output)\b/.test(normalized) || normalized === "bar · talking") return "busy";
+    || /^(?:model wait|generating|no output)\b/.test(normalized) || normalized.startsWith("准备 ") || normalized === "bar · talking") return "busy";
   return "idle";
 }
 

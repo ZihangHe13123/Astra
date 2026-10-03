@@ -46,7 +46,7 @@ jobs:
         run: |
           npm --prefix ui-core test
           npm --prefix ui-gui test
-          uv run --no-sync python -m pytest -q tests/test_gui_protocol.py
+          uv run --no-sync python -m pytest -q tests/test_gui_protocol.py tests/test_gui_history_index.py tests/test_gui_session_log.py
       - name: Desktop doctor
         run: uv run --no-sync python astra.py doctor --json
       - name: Electron and Python loopback acceptance
@@ -54,4 +54,6 @@ jobs:
           TMPDIR: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
-        run: npm --prefix ui-gui run test:e2e
+        run: |
+          npm --prefix ui-gui run test:e2e
+          node ui-gui/tests/inspector-smoke.mjs

@@ -20,7 +20,7 @@ from agent.cli.images import message_display_text
 from agent.runtime.paths import state_path
 from agent.runtime.session_store import SessionStore
 
-_VERSION = 1
+_VERSION = 2
 _CHUNK = 64 * 1024
 
 
@@ -148,13 +148,40 @@ class _Projection:
 
     def reset(self) -> None:
         self.db.execute(f"DELETE FROM {self.table}")
+        self.db.execute(f"DELETE FROM raw_{self.table}")
+        self.db.execute(f"DELETE FROM calls_{self.table}")
         self.raw_count = self.total = 0
         self.hidden = False
 
     def add(self, message: object) -> None:
         if not isinstance(message, dict):
             raise ValueError("Session message must be an object")
+        raw_index = self.raw_count
         self.raw_count += 1
+        from agent.runtime.message_source import message_source_ref
+        from agent.ui.session_log import MAX_RECORD_BYTES
+        reference = message_source_ref(message, raw_index)
+        tool_calls = message.get("tool_calls")
+        calls = [call["id"] for call in tool_calls
+                 if isinstance(call, dict) and isinstance(call.get("id"), str) and 1 <= len(call["id"]) <= 512] if isinstance(tool_calls, list) else []
+        if isinstance(message.get("tool_call_id"), str) and 1 <= len(message["tool_call_id"]) <= 512:
+            calls.append(message["tool_call_id"])
+        # Keep only bounded JSON excerpts in the new inspection projection.
+        # The source parser already holds one canonical message; avoid another
+        # history-sized raw copy in memory or in the disposable cache.
+        excerpt = bytearray()
+        raw_bytes = 0
+        for chunk in json.JSONEncoder(ensure_ascii=False).iterencode(message):
+            for offset in range(0, len(chunk), _CHUNK):
+                encoded = chunk[offset:offset + _CHUNK].encode("utf-8")
+                raw_bytes += len(encoded)
+                if len(excerpt) < MAX_RECORD_BYTES:
+                    excerpt.extend(encoded[:MAX_RECORD_BYTES - len(excerpt)])
+        self.db.execute(f"INSERT INTO raw_{self.table} VALUES (?,?,?,?,?,?)",
+                        (raw_index, reference["digest"], bytes(excerpt),
+                         str(message.get("role", ""))[:128], None, raw_bytes))
+        self.db.executemany(f"INSERT INTO calls_{self.table} VALUES (?,?)",
+                            ((raw_index, call) for call in dict.fromkeys(calls)))
         provenance = message.get("provenance", "")
         if message.get("role") == "user" and provenance in ("", "session_wakeup"):
             self.hidden = provenance == "session_wakeup"
@@ -166,19 +193,21 @@ class _Projection:
             return
         if message.get("_meta", {}).get("type") == "reasoning_context":
             return
+        self.db.execute(f"UPDATE raw_{self.table} SET chat_position=? WHERE position=?", (position, raw_index))
         payload = {"role": message["role"],
                    "content": message_display_text(message.get("display_command", message.get("content", ""))),
-                   "timestamp": message.get("timestamp")}
+                   "timestamp": message.get("timestamp"), "source_ref": reference}
         self.db.execute(f"INSERT INTO {self.table} VALUES (?,?)",
                         (position, json.dumps(payload, ensure_ascii=False)))
 
     def adopt(self, staged: _Projection) -> None:
         # Swap table names instead of copying another history-sized set of
         # text rows. The previous generation becomes reusable scratch space.
-        self.db.execute("ALTER TABLE messages RENAME TO discarded")
-        self.db.execute("ALTER TABLE staged RENAME TO messages")
-        self.db.execute("ALTER TABLE discarded RENAME TO staged")
-        self.db.execute("DELETE FROM staged")
+        for prefix in ("", "raw_", "calls_"):
+            self.db.execute(f"ALTER TABLE {prefix}messages RENAME TO {prefix}discarded")
+            self.db.execute(f"ALTER TABLE {prefix}staged RENAME TO {prefix}messages")
+            self.db.execute(f"ALTER TABLE {prefix}discarded RENAME TO {prefix}staged")
+            self.db.execute(f"DELETE FROM {prefix}staged")
         self.raw_count, self.total, self.hidden = staged.raw_count, staged.total, staged.hidden
 
 
@@ -242,14 +271,14 @@ def _rebuild(store: SessionStore, db: sqlite3.Connection) -> int:
     header = _read_document(store.header_path, db, staged)
     if header and header.get("messages") is True:
         current.adopt(staged)
-    db.execute("DELETE FROM staged")
+    staged.reset()
     return current.total
 
 
-def _cache_path(store: SessionStore) -> Path:
+def _cache_path(store: SessionStore, *, version: int = _VERSION) -> Path:
     cache = Path(os.environ.get("ASTRA_GUI_HISTORY_CACHE", "").strip() or state_path("gui", "history-index"))
     identity = hashlib.sha256(str(store.legacy_path.resolve()).encode()).hexdigest()
-    return cache / f"v{_VERSION}-{identity}.sqlite3"
+    return cache / f"v{version}-{identity}.sqlite3"
 
 
 def _create_private(path: Path) -> None:
@@ -280,6 +309,11 @@ def _database(path: Path) -> Iterator[sqlite3.Connection]:
         db.execute("CREATE TABLE IF NOT EXISTS metadata (id INTEGER PRIMARY KEY, signature TEXT, total INTEGER)")
         db.execute("CREATE TABLE IF NOT EXISTS messages (position INTEGER PRIMARY KEY, payload TEXT NOT NULL)")
         db.execute("CREATE TABLE IF NOT EXISTS staged (position INTEGER PRIMARY KEY, payload TEXT NOT NULL)")
+        for table in ("messages", "staged"):
+            db.execute(f"CREATE TABLE IF NOT EXISTS raw_{table} (position INTEGER PRIMARY KEY, digest TEXT NOT NULL, payload BLOB NOT NULL, role TEXT NOT NULL, chat_position INTEGER, raw_bytes INTEGER NOT NULL)")
+            db.execute(f"CREATE TABLE IF NOT EXISTS calls_{table} (position INTEGER NOT NULL, call_id TEXT NOT NULL, PRIMARY KEY (position, call_id))")
+            db.execute(f"CREATE INDEX IF NOT EXISTS calls_{table}_id ON calls_{table} (call_id)")
+            db.execute(f"CREATE INDEX IF NOT EXISTS raw_{table}_digest ON raw_{table} (digest)")
         db.commit()
         yield db
     finally:
@@ -287,15 +321,22 @@ def _database(path: Path) -> Iterator[sqlite3.Connection]:
 
 
 def discard_history_index(store: SessionStore) -> None:
-    """Remove a deleted session's presentation copy, waiting for active readers."""
-    path = _cache_path(store)
+    """Remove this session's known cache generations, waiting for active readers."""
+    # Upgrading the projection leaves the old private presentation copy on
+    # disk. Delete only exact identities for schemas we created, never glob
+    # across other sessions or infer a source path from cache contents.
+    for version in (1, _VERSION):
+        _discard_index(_cache_path(store, version=version))
+
+
+def _discard_index(path: Path) -> None:
     if not path.exists():
         return
     cleared = False
     try:
         with _database(path) as db:
             db.execute("BEGIN IMMEDIATE")
-            for table in ("messages", "staged", "metadata"):
+            for table in ("messages", "staged", "raw_messages", "raw_staged", "calls_messages", "calls_staged", "metadata"):
                 db.execute(f"DELETE FROM {table}")
             db.commit()
             # Shrink any pages previously used by an older cached generation too.
@@ -314,12 +355,15 @@ def discard_history_index(store: SessionStore) -> None:
             raise
 
 
-def history_page(store: SessionStore, *, before: int | None = None, limit: int = 200) -> dict:
+def history_page(store: SessionStore, *, before: int | None = None, limit: int = 200, source_ref: dict | None = None) -> dict:
     """Return a stable page without keeping complete histories in memory."""
+    if source_ref is not None:
+        from agent.ui.session_log import checked_source_ref
+        checked_source_ref(source_ref)
     path = _cache_path(store)
     for attempt in range(2):
         try:
-            return _read_page(store, path, before=before, limit=limit)
+            return _read_page(store, path, before=before, limit=limit, source_ref=source_ref)
         except sqlite3.DatabaseError as exc:
             if attempt or not _corrupt(exc):
                 raise
@@ -329,7 +373,7 @@ def history_page(store: SessionStore, *, before: int | None = None, limit: int =
     raise AssertionError("Unreachable history cache retry")
 
 
-def _read_page(store: SessionStore, path: Path, *, before: int | None, limit: int) -> dict:
+def _read_page(store: SessionStore, path: Path, *, before: int | None, limit: int, source_ref: dict | None = None) -> dict:
     with _database(path) as db:
         for _attempt in range(3):
             signature = _signature(store)
@@ -342,15 +386,29 @@ def _read_page(store: SessionStore, path: Path, *, before: int | None, limit: in
                 db.execute("INSERT OR REPLACE INTO metadata VALUES (1,?,?)", (signature, total))
             else:
                 total = row[1]
+            target = {}
+            if source_ref is not None:
+                from agent.ui.session_log import chat_source, resolve_source
+                target_status, target_index = resolve_source(db, source_ref)
+                chat_position = None
+                if target_index is not None:
+                    _, chat_position = chat_source(db, target_index)
+                    if chat_position is None:
+                        target_status = "unmapped"
+                    else:
+                        before = min(total, chat_position + max(1, limit // 2) + 1)
+                target = {"target_status": target_status, "target_position": chat_position}
             end = max(0, min(total, int(before) if before is not None else total))
             start = max(0, end - min(max(1, limit), 1000))
             messages = [{"position": position, **json.loads(payload)} for position, payload in db.execute(
                 "SELECT position,payload FROM messages WHERE position>=? AND position<? ORDER BY position",
                 (start, end))]
+            if source_ref is not None and target["target_status"] != "found":
+                messages = []
             if signature != _signature(store):
                 db.rollback()
                 continue
             db.commit()
             return {"messages": messages, "before": start, "has_more": start > 0, "total": total,
-                    "revision": hashlib.sha256(signature.encode()).hexdigest()}
+                    "revision": hashlib.sha256(signature.encode()).hexdigest(), **target}
     raise OSError("Session changed while loading history; retry the page")

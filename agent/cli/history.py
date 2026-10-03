@@ -51,6 +51,8 @@ def history_tool_results(messages: list[dict], saved_results: list[dict], limit:
             # Older arbitrary tool text has no reliable completion status.
             continue
         if result["name"]:
+            if call_id:
+                result["call_id"] = call_id
             restored.append((saved_order, result))
     # Parallel calls are appended to conversation history in call order, while
     # LAST follows their actual completion order whenever the journal has it.
