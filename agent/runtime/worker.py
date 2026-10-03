@@ -71,6 +71,8 @@ class WorkerSpec:
     agent_name: str = ""
     keep_alive: bool = False
     workspace_root: str = ""
+    resume_conv_path: str = ""
+    resume_instruction: str = ""
 
     def __post_init__(self) -> None:
         worker_type = self.worker_type.strip()
@@ -89,6 +91,8 @@ class WorkerSpec:
         object.__setattr__(
             self, "workspace_root", str(self.workspace_root or "").strip()
         )
+        object.__setattr__(self, "resume_conv_path", str(self.resume_conv_path or "").strip())
+        object.__setattr__(self, "resume_instruction", str(self.resume_instruction or "").strip())
         object.__setattr__(
             self,
             "reasoning_effort",
@@ -124,6 +128,7 @@ class WorkerSpec:
             "agent_name": self.agent_name,
             "keep_alive": self.keep_alive,
             "workspace_root": self.workspace_root,
+            **({"resume_conv_path": self.resume_conv_path} if self.resume_conv_path else {}),
         }
 
     def process_metadata(self) -> dict[str, Any]:

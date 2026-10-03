@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -26,6 +27,14 @@ DEFAULT_SESSION_DATA = {
 
 
 class SessionStore:
+    @classmethod
+    def for_subagent(cls, session_path: str | Path, key: str) -> "SessionStore":
+        """Return an isolated canonical journal for one worker identity."""
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", key):
+            raise ValueError("subagent identity must be 1-128 safe ASCII filename characters")
+        parent = cls(session_path)
+        return cls(parent.legacy_path.parent / ".artifacts" / f"{parent.legacy_path.stem}.{key}.conv.json")
+
     def __init__(self, path: str | Path):
         self.legacy_path = Path(path)
         if self.legacy_path.suffix != ".json":
@@ -381,11 +390,13 @@ class SessionStore:
     def _replay_jsonl(self, data: dict[str, Any]) -> None:
         messages = list(data.get("messages", []))
         try:
-            with open(self.jsonl_path, "r", encoding="utf-8") as f:
+            # Decode each record independently: a torn UTF-8 tail must not
+            # prevent inspection of earlier complete checkpoints.
+            with open(self.jsonl_path, "rb") as f:
                 for line in f:
                     try:
                         event = json.loads(line)
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, UnicodeDecodeError):
                         continue
 
                     event_type = event.get("type")
@@ -401,6 +412,10 @@ class SessionStore:
                         if isinstance(idx, int) and idx < len(messages):
                             continue
                         messages.append(msg)
+                    elif event_type == "subagent_checkpoint":
+                        from .subagent_conversation import apply_checkpoint
+
+                        messages, data["subagent_state"] = apply_checkpoint(event, messages)
         except OSError:
             return
         data["messages"] = messages
