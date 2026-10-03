@@ -1,14 +1,15 @@
 import React, { useEffect, useRef, useState } from "react";
-import { FileDiff, Terminal, Layers, Users, X, FolderOpen } from "lucide-react";
+import { FileDiff, Terminal, Layers, Users, X, FolderOpen, FileText } from "lucide-react";
 import type { SessionState, UIEvent } from "@astra/ui-core/session-state";
 import { DelegateCards } from "./delegates.js";
 import { toolEmptyOutput, toolExpanded, toolStatus } from "./tool-status.js";
 import { RequestTimeline } from "./request-timeline.js";
 import { docPathFromTool } from "./doc-preview.js";
+import { ToolPreparation } from "./tool-preparation.js";
 import { FilePreviewPanel } from "./file-preview-panel.js";
 
-export type Panel = "tools" | "changes" | "files" | "context" | "team";
-export function Details({ state, panel, setPanel, selection, width, onWidth, close, fail, doc, onDocDismiss }: { state: SessionState; panel: Panel; setPanel: (p: Panel) => void; selection: { index?: number; serial: number }; width: number; onWidth: (width: number) => void; close: () => void; fail: (e: unknown) => void; doc?: { path: string; serial: number }; onDocDismiss?: () => void }) {
+export type Panel = "tools" | "changes" | "files" | "context" | "team" | "logs";
+export function Details({ state, panel, setPanel, selection, width, onWidth, close, fail, doc, onDocDismiss, openLog }: { state: SessionState; panel: Panel; setPanel: (p: Panel) => void; selection: { index?: number; serial: number }; width: number; onWidth: (width: number) => void; close: () => void; fail: (e: unknown) => void; doc?: { path: string; serial: number }; onDocDismiss?: () => void; openLog?: (callId: string) => void }) {
   const content = useRef<HTMLDivElement>(null);
   const previewRequest = useRef(0);
   const locatedSelection = useRef("");
@@ -38,7 +39,7 @@ export function Details({ state, panel, setPanel, selection, width, onWidth, clo
   const openFile = (path: string) => { setPreview({path, serial: ++previewRequest.current}); };
   // Follow the document the agent is writing: each new doc_* result reloads it.
   useEffect(() => { if (doc && panel === "files") openFile(doc.path); }, [doc?.serial, doc?.path, panel, state.id]);
-  const tabs = [{ id: "tools", label: "执行", icon: Terminal }, { id: "changes", label: "改动", icon: FileDiff }, { id: "files", label: "文件", icon: FolderOpen }, { id: "context", label: "上下文", icon: Layers }, { id: "team", label: "Team", icon: Users }] as const;
+  const tabs = [{ id: "tools", label: "执行", icon: Terminal }, { id: "changes", label: "改动", icon: FileDiff }, { id: "files", label: "文件", icon: FolderOpen, FileText }, { id: "context", label: "上下文", icon: Layers }, { id: "team", label: "Team", icon: Users }, { id: "logs", label: "记录", icon: FileText }] as const;
   const galleries = state.tools.flatMap((tool, index) => {
     if (tool.name !== "search_images" || tool.error) return [];
     try { const result = JSON.parse(tool.output); return result.type === "image_search" && result.success && Array.isArray(result.images) ? [{ ...result, index: tool.result_index || index + 1 }] : []; }
@@ -53,13 +54,15 @@ export function Details({ state, panel, setPanel, selection, width, onWidth, clo
       onPointerMove={e => { if (drag.current && panelRef.current) panelRef.current.style.width = `${Math.max(260, Math.min(720, drag.current.width + drag.current.x - e.clientX))}px`; }}
       onPointerUp={e => { if (drag.current) { onWidth(Math.max(260, Math.min(720, drag.current.width + drag.current.x - e.clientX))); drag.current = undefined; e.currentTarget.releasePointerCapture(e.pointerId); } }}
       onPointerCancel={() => { drag.current = undefined; if (panelRef.current) panelRef.current.style.width = `${width}px`; }}/>
-    <div className="panel-tabs" role="tablist">{tabs.map(t => <button key={t.id} role="tab" aria-selected={panel === t.id} onClick={() => { previewRequest.current++; setPreview(undefined); setPanel(t.id); }}><t.icon size={15}/>{t.label}</button>)}<button className="icon" onClick={close} aria-label="关闭详情"><X size={15}/></button></div>
+    <div className="panel-tabs" role="tablist">{tabs.filter(t => t.id !== "logs" || openLog).map(t => <button key={t.id} role="tab" aria-selected={panel === t.id} onClick={() => { previewRequest.current++; setPreview(undefined); setPanel(t.id); }}><t.icon size={15}/>{t.label}</button>)}<button className="icon" onClick={close} aria-label="关闭详情"><X size={15}/></button></div>
     <div className="panel-content" ref={content}>
       {preview ? <FilePreviewPanel runtime={state.id} path={preview.path} serial={preview.serial} fail={fail} dismiss={() => { if (doc && preview.path === doc.path) onDocDismiss?.(); setPreview(undefined); }}/> : panel === "tools" ? <>
+        <ToolPreparation preparation={state.preparation}/>
         <DelegateCards delegates={state.delegates} runtime={state.id} fail={fail} openFile={openFile}/>
         <h3>工具与进程 <span className="count">{state.tools.length}</span></h3>
         {!state.tools.length && <p className="muted">工具运行后，结果会显示在这里。</p>}
-        {[...state.tools].sort((a, b) => Number(toolStatus(b) === "running") - Number(toolStatus(a) === "running")).map((tool, i) => <details className="tool-detail" data-result-index={tool.result_index} key={tool.call_id || i} open={toolExpanded(tool)}><summary><span className={`status-dot ${toolStatus(tool)}`}/><strong>{tool.result_index ? `${tool.result_index}. ` : ""}{tool.name}</strong><span className="muted small">{statusLabel(toolStatus(tool))}{tool.duration_ms != null ? ` · ${tool.duration_ms >= 1000 ? `${(tool.duration_ms / 1000).toFixed(1)} 秒` : `${tool.duration_ms} ms`}` : ""}</span></summary>
+        {[...state.tools].sort((a, b) => Number(toolStatus(b) === "running") - Number(toolStatus(a) === "running")).map((tool, i) => <details className="tool-detail" data-result-index={tool.result_index} key={`${tool.result_index || i}:${tool.call_id || "tool"}`} open={toolExpanded(tool)}><summary><span className={`status-dot ${toolStatus(tool)}`}/><strong>{tool.result_index ? `${tool.result_index}. ` : ""}{tool.name}</strong><span className="muted small">{statusLabel(toolStatus(tool))}{tool.duration_ms != null ? ` · ${tool.duration_ms >= 1000 ? `${(tool.duration_ms / 1000).toFixed(1)} 秒` : `${tool.duration_ms} ms`}` : ""}</span></summary>
+          {tool.call_id && openLog && <button className="small" onClick={() => openLog(tool.call_id)}>查看会话记录</button>}
           {tool.arguments && <details><summary>参数</summary><pre>{typeof tool.arguments === "string" ? tool.arguments : JSON.stringify(tool.arguments, null, 2)}</pre></details>}
           {tool.progress && toolStatus(tool) === "running" && <p>{tool.progress.message || tool.progress.stage}</p>}
           {tool.error && <p className="error-text">{tool.error}</p>}{(tool.output || toolEmptyOutput(tool)) && <pre>{tool.output || toolEmptyOutput(tool)}</pre>}

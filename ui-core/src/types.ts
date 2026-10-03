@@ -92,6 +92,8 @@ export type AppshotAdmissionEvent =
   | {type:'message_rejected'; submission_id:string; code:string; retryable:boolean}
   | {type:'submission_status'; submission_id:string; status:'accepted'|'rejected'|'pending'|'unknown'; code?:string; retryable?:boolean};
 export type PyEvent =
+  | { type: "tool_preparing"; attempt_id: string; state: "preparing" | "finished" | "discarded"; calls: import("./tool-preparation.js").PreparingCall[]; request_id?: string }
+  | { type: "message_source"; stream_id?: string; submission_id?: string; source_ref: { index: number; digest: string } }
   | ({ type: "delegate_status" } & import("./delegates.js").DelegateView)
   | AppshotAdmissionEvent
   | ContextCompactionEvent

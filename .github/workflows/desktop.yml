@@ -40,13 +40,23 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: '22.23.1'
-      - name: Prepare optional desktop with the real launcher
+      - name: Prepare optional desktop with the real launcher (POSIX)
+        if: runner.os != 'Windows'
         run: uv run --locked --extra dev python astra.py setup --gui --extra dev
+      - name: Prepare optional desktop with the source launcher (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        # Seed the pinned interpreter, then let the wrapper select its base
+        # executable. Windows setup cannot replace the environment running it.
+        run: |
+          uv sync --locked --extra dev
+          if errorlevel 1 exit /b %errorlevel%
+          call astra.bat setup --gui --extra dev
       - name: Shared client and desktop tests
         run: |
           npm --prefix ui-core test
           npm --prefix ui-gui test
-          uv run --no-sync python -m pytest -q tests/test_gui_protocol.py
+          uv run --no-sync python -m pytest -q tests/test_gui_protocol.py tests/test_gui_history_index.py tests/test_gui_session_log.py tests/test_file_change_time.py
       - name: Desktop doctor
         run: uv run --no-sync python astra.py doctor --json
       - name: Electron and Python loopback acceptance
@@ -54,4 +64,6 @@ jobs:
           TMPDIR: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
-        run: npm --prefix ui-gui run test:e2e
+        run: |
+          npm --prefix ui-gui run test:e2e
+          node ui-gui/tests/inspector-smoke.mjs

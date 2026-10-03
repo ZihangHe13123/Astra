@@ -21,6 +21,7 @@ from .network import active_proxy_for_url
 from .provider_errors import summarize_provider_error
 from .providers import DEFAULT_PROVIDER_REGISTRY, ProviderRegistry
 from .token_estimator import estimate_messages_tokens, messages_to_tokenize_text
+from .tool_preparation import with_tool_preparation
 from .tracing import trace_span
 from .vision_policy import VisionPreprocessPolicy
 
@@ -919,6 +920,7 @@ class OpenAICompatibleProvider:
         host = urllib.parse.urlparse(self.config.base_url).hostname or ""
         return not (host.lower() == "api.deepseek.com" and "reasoning" in self.config.capabilities)
 
+    @with_tool_preparation
     async def chat_stream(
         self,
         messages: list[dict],
@@ -1057,6 +1059,10 @@ class OpenAICompatibleProvider:
                                     if not isinstance(tc.function.arguments, str):
                                         raise LLMResponseError("invalid_tool_arguments", "Tool argument delta must be text; no tool was executed.")
                                     tool_calls_buffer[idx]["arguments"] += tc.function.arguments
+                            yield {"type": "_tool_preparation", "index": idx,
+                                   "call_id": tool_calls_buffer[idx]["id"],
+                                   "name": tool_calls_buffer[idx]["name"],
+                                   "arguments": tool_calls_buffer[idx]["arguments"]}
 
             chunk_events = consume_chunks()
             try:
@@ -1074,6 +1080,7 @@ class OpenAICompatibleProvider:
             asyncio.TimeoutError,
         ) + TRANSPORT_REQUEST_ERRORS
         while True:
+            yield {"type": "_tool_preparation_reset"}
             timing = _StreamReadTiming()
             stream_events = _consume_stream(timing)
             try:

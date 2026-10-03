@@ -164,7 +164,7 @@ register("appshot", async (id, action, value = "") => {
   } else rt.accept({ type: "gui_notice", message: await appshot.command(rt.id, value) });
 });
 register("query", (method, params = {}, id) => {
-  if (!["sessions", "history", "commands", "changes", "request_timeline"].includes(method)) throw new Error("Unsupported query");
+  if (!["sessions", "history", "commands", "changes", "request_timeline", "session_log"].includes(method)) throw new Error("Unsupported query");
   if (!params || typeof params !== "object" || Array.isArray(params) || JSON.stringify(params).length > 32768) throw new Error("Invalid query");
   return method === "changes" ? runtime(id).query(method, params) : queries.query(method, params);
 });

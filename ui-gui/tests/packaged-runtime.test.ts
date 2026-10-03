@@ -67,10 +67,15 @@ test('loss of an acquired lease is reported to the host', {skip:process.platform
  const root=realpathSync(mkdtempSync(join(tmpdir(),'astra-lease-loss-')));const python=join(root,'lease');
  try{
   writeFileSync(python,'#!/usr/bin/python3\nimport time\nprint(\'{"ready":true}\',flush=True)\ntime.sleep(0.05)\n',{mode:0o755});
-  let lost;
-  const lease=await acquirePackagedLease({root,python,data:root},{onLost:error=>{lost=error;}});
-  await new Promise(resolve=>setTimeout(resolve,250));
-  assert.match(String(lost),/lease.*exit|lease.*lost/i);
-  await lease.close();
+  let reportLost!: (error: Error) => void;
+  const lost=new Promise<Error>(resolve=>{reportLost=resolve;});
+  const lease=await acquirePackagedLease({root,python,data:root},{onLost:reportLost});
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+   const error=await Promise.race([lost,new Promise<never>((_,reject)=>{
+    timeout=setTimeout(()=>reject(new Error('Acquired lease loss was not reported within 5 seconds')),5000);
+   })]);
+   assert.match(String(error),/lease.*exit|lease.*lost/i);
+  } finally {clearTimeout(timeout);await lease.close();}
  }finally{rmSync(root,{recursive:true,force:true});}
 });

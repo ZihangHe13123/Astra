@@ -1,7 +1,7 @@
 import "./file-preview.css";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { ArrowUp, Square, Plus, Search, PanelLeft, PanelRight, ChevronDown, Folder, Settings, Paperclip, X, Copy, RotateCcw, ChevronRight, Command, Pin, Moon, Sun, Monitor, ArrowLeft, LoaderCircle, SlidersHorizontal, FileDiff, Terminal, Check } from "lucide-react";
+import { ArrowUp, Square, Plus, Search, PanelLeft, PanelRight, ChevronDown, Folder, Settings, Paperclip, X, Copy, RotateCcw, ChevronRight, Command, Pin, Moon, Sun, Monitor, ArrowLeft, LoaderCircle, SlidersHorizontal, FileDiff, Terminal, Check, FileText } from "lucide-react";
 import { projectEvent, textContent, type SessionState, type UIEvent, type Message } from "@astra/ui-core/session-state";
 import { modelDisplayName } from "@astra/ui-core/model-label";
 import type { CommandDescription, Preferences, SessionEntry } from "../bridge.js";
@@ -12,6 +12,8 @@ import { modelConnection } from "./model-connection.js";
 import { SessionMenu, SessionActionDialog, type SessionAction } from "./session-actions.js";
 import { modeCommand, modeChoices, localCommandEntry } from "../local-mode.js";
 import { migrateBlankDraft } from "./drafts.js";
+import { ToolPreparation } from "./tool-preparation.js";
+import { SessionLogPanel, sameSource, recordChatSource, supportsSessionLog, type LogTarget, type SessionLogRecord, type SourceRef } from "./session-log.js";
 import { MessageList } from "./messages.js";
 import { DelegateHistory, DelegateSummary } from "./delegates.js";
 import { CommandInput } from "./command-input.js";
@@ -44,6 +46,9 @@ function App() {
   const [sessionDialog, setSessionDialog] = useState<{ action: "rename" | "delete"; entry: SessionEntry; title: string }>();
   const [toast, setToast] = useState("");
   const [selection, setSelection] = useState<{ index?: number; serial: number }>({ serial: 0 });
+  const [logTarget, setLogTarget] = useState<LogTarget>({ serial: 0 });
+  const [chatLocation, setChatLocation] = useState<{ id: string; serial: number }>();
+  const logNavigation = useRef(0);
   const [docTarget, setDocTarget] = useState<{ path: string; serial: number }>();
   const docFollow = useRef(true);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -59,6 +64,11 @@ function App() {
   const [opening, setOpening] = useState(false);
   const fail = useCallback((e: unknown) => setToast(e instanceof Error ? e.message : String(e)), []);
   const state = states[active];
+  const logCandidate = preview ? { name: preview.session_id as string, mode: preview.mode as string } : state && !state.isDraft ? { name: state.session, mode: state.mode } : undefined;
+  const logSession = logCandidate?.name && supportsSessionLog(logCandidate.mode) ? logCandidate : undefined;
+  const logScope = logSession ? `${logSession.mode}:${logSession.name}` : "";
+  const logScopeRef = useRef(logScope); logScopeRef.current = logScope;
+  useEffect(() => { logNavigation.current++; setChatLocation(undefined); setLogTarget(old => ({ serial: old.serial + 1 })); if (!logScope) setPanel(old => old === "logs" ? undefined : old); }, [logScope]);
   const localDefinition = state?.info.local_mode_info?.definition;
   const commandModes = useMemo(() => [...builtinCommandModes, ...(localDefinition ? [{ mode: "local", ...localDefinition }] : [])], [localDefinition]);
   // Open the Files panel on the document the agent is writing until the user closes or leaves it.
@@ -125,7 +135,7 @@ function App() {
     };
     window.addEventListener("keydown", listener); return () => window.removeEventListener("keydown", listener);
   }, [active, modal, workspace, state?.isDraft, preview, panel, docTarget]);
-  useEffect(() => { setFollow(true); setOlderLoading(false); }, [active, preview?.session_id, preview?.mode]);
+  useEffect(() => { setFollow(!preview?.locatedFromLog); setOlderLoading(false); }, [active, preview?.session_id, preview?.mode]);
   useEffect(() => { if (follow && scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight; }, [state?.revision, active, preview, follow]);
   useEffect(() => {
     const event = state?.info.restart_ready;
@@ -171,7 +181,7 @@ function App() {
     captureStarting.current = true;
     void create().catch(fail).finally(() => { captureStarting.current = false; });
   }, [active, preview, nativeCapture.connection, nativeCapture.enabled, workspace]);
-  const select = (id: string) => { historyRequest.current++; setActive(id); setPreview(undefined); setHistoryLoading(false); void window.astra.select(id).catch(fail); };
+  const select = (id: string) => { historyRequest.current++; setChatLocation(undefined); setActive(id); setPreview(undefined); setHistoryLoading(false); void window.astra.select(id).catch(fail); };
   const send = async (command: UIEvent) => {
     try {
       if (!active || !state) throw new Error("先创建或继续一个会话。");
@@ -283,6 +293,28 @@ function App() {
 
   };
   const messages: Message[] = useMemo(() => preview ? preview.messages.map((m: Message) => ({ ...m, content: textContent(m.content) })) : state?.messages || [], [preview?.messages, state?.messages]);
+  const openLog = (target: { source_ref?: SourceRef; call_id?: string } = {}) => {
+    if (!logSession) return;
+    logNavigation.current++; docFollow.current = false; setLogTarget(old => ({ ...target, serial: old.serial + 1 })); setPanel("logs");
+  };
+  const locateLog = async (record: SessionLogRecord, revision: string, isCurrent: () => boolean) => {
+    const source = recordChatSource(record);
+    if (!source || !logSession) throw new Error("此记录没有可验证的聊天位置。");
+    const generation = ++logNavigation.current, scope = logScope, historyGeneration = historyRequest.current;
+    const page = await window.astra.query("history", { name: logSession.name, mode: logSession.mode, source_ref: source, limit: 80 });
+    if (!isCurrent() || generation !== logNavigation.current || scope !== logScopeRef.current || historyGeneration !== historyRequest.current) return;
+    if (page.revision !== revision) throw new Error("会话记录已更新，请刷新记录后重新定位。");
+    if (page.target_status !== "found" || !page.target_id) throw new Error(page.target_status === "stale" ? "此记录已变化或被压缩，原位置不再匹配。" : "此记录无法唯一关联到可见聊天消息。");
+    const existing = messages.find(message => ["user", "assistant"].includes(message.role) && sameSource(message.source_ref, source));
+    if (window.matchMedia("(max-width: 1100px)").matches) setPanel(undefined);
+    setFollow(false);
+    if (existing) setChatLocation({ id: existing.id, serial: generation });
+    else {
+      // A read-only window leaves the live runtime and its task untouched.
+      setPreview({ ...page, request: historyGeneration, locatedFromLog: true, locatedFromRuntime: active || undefined });
+      setChatLocation({ id: page.target_id, serial: generation });
+    }
+  };
   const loadOlder = async () => {
     if (!preview?.has_more || olderLoading) return;
     const request = historyRequest.current; const before = preview.before; setOlderLoading(true); setFollow(false);
@@ -294,7 +326,7 @@ function App() {
         if (request === historyRequest.current) { setPreview({ ...page, request }); setFollow(true); setToast("历史已在其他窗口更新，已载入最新记录。"); }
         return;
       }
-      if (request === historyRequest.current) setPreview((old: any) => old?.session_id === page.session_id && old?.mode === page.mode && old?.before === before ? { ...page, request: old.request, messages: [...page.messages, ...old.messages] } : old);
+      if (request === historyRequest.current) setPreview((old: any) => old?.session_id === page.session_id && old?.mode === page.mode && old?.before === before ? { ...old, ...page, request: old.request, messages: [...page.messages, ...old.messages] } : old);
     } catch (error) { fail(error); } finally { if (request === historyRequest.current) setOlderLoading(false); }
   };
   const currentTitle = preview ? sessionTitle({ name: preview.session_id, mode: preview.mode, modified: 0 }, prefs.titles) : !state || state.isDraft ? "新对话" : sessionTitle({ name: state.session, mode: state.mode, modified: 0 }, prefs.titles);
@@ -387,14 +419,14 @@ function App() {
       <button className="account" onClick={() => setModal("settings")}><span className="account-icon">A</span><span>Astra 本地工作区<small>{model?.model && model.model !== "none" ? modelDisplayName(model.model, model.served_model) : "连接你的模型"}</small></span><Settings size={17}/></button>
     </aside>
     <main className="main"><header className="topbar"><div>{!side && <button className="icon" aria-label="显示侧栏" onClick={() => setSide(true)}><PanelLeft size={18}/></button>}<Folder size={17}/><span className="title" title={currentTitle}>{currentTitle}</span><span className="mode-badge">{preview ? "只读历史" : state?.mode && state.mode !== "work" ? state.mode : ""}</span></div>
-      <div><span className="workspace" title={state?.workspace || workspace}>{(state?.workspace || workspace).split(/[\\/]/).pop()}</span>{historyLoading || state?.status === "connecting" || state?.status === "loading" ? <LoaderCircle size={16} className="spin"/> : null}<button className="icon" aria-label="执行详情" onClick={() => { if (panel) leaveDoc(); setPanel(panel ? undefined : "tools"); }}><PanelRight size={18}/></button></div></header>
-      <div className={`body ${panel && state && !preview ? "with-details" : ""}`}><div className="conversation"><div className="messages-scroll" aria-busy={historyLoading} data-history-request={preview?.request || 0} ref={scroller} onScroll={e => { const t = e.currentTarget; if (!t.clientHeight) return; setFollow(t.scrollHeight - t.scrollTop - t.clientHeight < 120); }}>
+      <div>{logSession && <button className="icon" aria-label="查看会话记录" onClick={() => openLog()}><FileText size={17}/></button>}<span className="workspace" title={state?.workspace || workspace}>{(state?.workspace || workspace).split(/[\\/]/).pop()}</span>{historyLoading || state?.status === "connecting" || state?.status === "loading" ? <LoaderCircle size={16} className="spin"/> : null}<button className="icon" aria-label="执行详情" onClick={() => { if (panel) leaveDoc(); setPanel(panel ? undefined : "tools"); }}><PanelRight size={18}/></button></div></header>
+      <div className={`body ${(panel === "logs" && logSession || panel && panel !== "logs" && state && !preview) ? "with-details" : ""}`}><div className="conversation"><div className="messages-scroll" aria-busy={historyLoading} data-history-request={preview?.request || 0} ref={scroller} onScroll={e => { const t = e.currentTarget; if (!t.clientHeight) return; setFollow(t.scrollHeight - t.scrollTop - t.clientHeight < 120); }}>
         <div className="messages">
           {!messages.length && <section className="welcome"><div className="welcome-mark">A</div><h1>从一个想法开始。</h1><p>对话、研究、编写代码，或把手头的事情交给 Astra。</p><div className="welcome-actions"><button onClick={() => { void openModels(); }}><SlidersHorizontal size={16}/>连接或选择模型</button><button onClick={() => showCommands()}><Command size={16}/>浏览全部功能</button></div></section>}
           {preview?.has_more && <button className="load-more" disabled={olderLoading} onClick={() => { void loadOlder(); }}>{olderLoading ? "加载中…" : "加载更早历史"}</button>}
-          <MessageList key={preview ? `preview:${preview.mode}:${preview.session_id}` : active || "blank"} messages={messages} runtime={preview ? undefined : state?.id} timeline={prefs.timeline} reasoning={model?.show_reasoning !== false} scroller={scroller} follow={follow} retry={retry} fail={fail}/>
+          <MessageList key={preview ? `preview:${preview.mode}:${preview.session_id}` : active || "blank"} messages={messages} runtime={preview ? undefined : state?.id} timeline={prefs.timeline} reasoning={model?.show_reasoning !== false} scroller={scroller} follow={follow} retry={retry} fail={fail} openLog={logSession ? source_ref => openLog({ source_ref }) : undefined} locate={chatLocation}/>
           {preview?.delegates?.length > 0 && <DelegateHistory key={`${preview.mode}:${preview.session_id}`} delegates={preview.delegates} fail={fail}/>}
-          {state && !preview && <>{state.tools.length > 0 && <button className="execution-summary" onClick={() => setPanel("tools")}><Terminal size={15}/>{state.tools.filter(t => t.status === "running").length ? "工具正在执行" : `${state.tools.length} 项工具结果`}<ChevronRight size={15}/></button>}
+          {state && !preview && <><ToolPreparation preparation={state.preparation}/>{state.tools.length > 0 && <button className="execution-summary" onClick={() => setPanel("tools")}><Terminal size={15}/>{state.tools.filter(t => t.status === "running").length ? "工具正在执行" : `${state.tools.length} 项工具结果`}<ChevronRight size={15}/></button>}
             <DelegateSummary delegates={state.delegates} open={() => setPanel("tools")}/>
             {state.approvals.map(e => <Approval key={e.request_id} event={e} send={respond}/>)}{state.questions.map(e => <Question key={e.request_id} event={e} send={respond}/>)}
             {state.busy && <div className="generating"><span className="pulse"/>Astra 正在工作<span>{state.info.generation_progress?.phase === "waiting" ? "等待模型响应" : ""}</span></div>}
@@ -402,10 +434,10 @@ function App() {
           </>}
         </div></div>
         <div className="composer-wrap">
-          {!follow && messages.length > 0 && <button className="jump-latest" onClick={() => setFollow(true)}>回到最新消息 ↓</button>}
+          {!follow && messages.length > 0 && <button className="jump-latest" onClick={() => { if (preview?.locatedFromRuntime) select(preview.locatedFromRuntime); else if (preview?.locatedFromLog) browse({ name: preview.session_id, mode: preview.mode, modified: 0 }); else setFollow(true); }}>回到最新消息 ↓</button>}
           {!preview && currentConnection.configured === false && <div className="connection-status" role="status"><span>当前模型尚未连接，请先登录或配置 API Key。</span><button onClick={() => configureModels(model?.model_key)}>连接模型</button></div>}
           {!preview && appshotUnavailable && <div className="connection-status" role="status"><span>窗口捕获暂不可用，不影响对话。</span><button onClick={() => { void window.astra.appshot(active, "command", "/appshot status").catch(fail); }}>检查连接</button></div>}
-          {preview ? <div className="history-banner"><span>只读浏览历史，不会启动模型。</span><button className="primary" onClick={() => { void create({ session: preview.session_id, mode: preview.mode, workspace: prefs.workspaces[`${preview.mode}:${preview.session_id}`] || workspace }).catch(fail); }}>继续此会话 <ArrowUp size={14}/></button></div> : <div className="composer" onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); attach(window.astra.droppedPaths([...e.dataTransfer.files])); }}>
+          {preview ? <div className="history-banner"><span>{preview.locatedFromLog ? "只读定位窗口，显示该记录附近的消息。" : "只读浏览历史，不会启动模型。"}</span>{preview.locatedFromRuntime && states[preview.locatedFromRuntime] && <button onClick={() => select(preview.locatedFromRuntime)}>返回已打开的会话</button>}<button className="primary" onClick={() => { void create({ session: preview.session_id, mode: preview.mode, workspace: prefs.workspaces[`${preview.mode}:${preview.session_id}`] || workspace }).catch(fail); }}>继续此会话 <ArrowUp size={14}/></button></div> : <div className="composer" onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); attach(window.astra.droppedPaths([...e.dataTransfer.files])); }}>
             {!!state?.info.gui_appshot?.attachments?.length && <div className="attachment-list">{state.info.gui_appshot.attachments.map((a: UIEvent) => <span key={a.id}>{a.label}<button className="icon" aria-label="移除窗口捕获" onClick={() => { void window.astra.appshot(active, "remove", a.id).catch(fail); }}><X size={12}/></button></span>)}</div>}
             {state?.info.gui_appshot?.pending && <div className="attachment-list"><span>窗口捕获：{state.info.gui_appshot.pending.status === "unknown" ? "接收状态未知" : "等待接收确认"}</span><button onClick={() => command("/appshot pending status")}>查询状态</button><button onClick={() => command("/appshot pending discard")}>丢弃附件</button></div>}
             {!!files.length && <div className="attachment-list">{files.map(path => <span key={path}><Paperclip size={12}/>{path.split(/[\\/]/).pop()}<button className="icon" aria-label="移除附件" onClick={() => setPrefs(old => ({ ...old, attachments: { ...old.attachments, [key]: files.filter(f => f !== path) } }))}><X size={12}/></button></span>)}</div>}
@@ -421,7 +453,7 @@ function App() {
           </div>}
           <div className="composer-foot"><span>{state?.status === "ready" ? state.busy ? "运行中" : "就绪" : state ? state.status === "disconnected" ? "后端已断开" : "连接后端中…" : "本地运行 · 模型自主选择工具"}</span><span>Enter 发送 · Shift Enter 换行</span></div>
         </div>
-      </div>{panel && state && !preview && <Details state={state} panel={panel} setPanel={next => { if (next !== "files") leaveDoc(); setPanel(next); }} selection={selection} width={prefs.detailWidth || 420} onWidth={detailWidth => savePrefs({ detailWidth })} close={() => { leaveDoc(); setPanel(undefined); }} fail={fail} doc={docFollow.current ? docTarget : undefined} onDocDismiss={leaveDoc}/>}</div>
+      </div>{panel === "logs" && logSession ? <SessionLogPanel key={logScope} session={logSession.name} mode={logSession.mode} target={logTarget} width={prefs.detailWidth || 420} close={() => { logNavigation.current++; setPanel(undefined); }} locate={locateLog}/> : panel && panel !== "logs" && state && !preview && <Details state={state} panel={panel} setPanel={next => { if (next === "logs") { openLog(); return; } if (next !== "files") leaveDoc(); setPanel(next); }} selection={selection} width={prefs.detailWidth || 420} onWidth={detailWidth => savePrefs({ detailWidth })} close={() => { leaveDoc(); setPanel(undefined); }} fail={fail} doc={docFollow.current ? docTarget : undefined} onDocDismiss={leaveDoc} openLog={logSession ? call_id => openLog({ call_id }) : undefined}/>}</div>
     </main>
     {toast && <div className="toast" role="alert"><span>{toast}</span><button className="icon" onClick={() => setToast("")} aria-label="关闭提示"><X size={16}/></button></div>}
     {modal === "commands" && <CommandPalette commands={commands} labels={commandNames(commandModes)} initialFilter={commandQuery} close={() => setModal(undefined)} run={command}/>}

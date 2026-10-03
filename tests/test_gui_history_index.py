@@ -6,6 +6,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -53,12 +54,15 @@ def _message(text, role="user", **kwargs):
 
 
 def _oracle(store, before=None, limit=200):
-    messages = visible_wakeup_history(store.load(readonly=True)["messages"])
+    from agent.ui.session_log import message_source_ref
+    canonical = store.load(readonly=True)["messages"]
+    references = {id(message): message_source_ref(message, i) for i, message in enumerate(canonical)}
+    messages = visible_wakeup_history(canonical)
     end = max(0, min(len(messages), before if before is not None else len(messages)))
     start = max(0, end - min(max(1, limit), 1000))
     visible = [{"id": f"work:demo:{i}", "role": m["role"],
                 "content": message_display_text(m.get("display_command", m.get("content", ""))),
-                "timestamp": m.get("timestamp")}
+                "timestamp": m.get("timestamp"), "source_ref": references[id(m)]}
                for i, m in enumerate(messages) if start <= i < end
                and m.get("role") in ("user", "assistant")
                and m.get("_meta", {}).get("type") != "reasoning_context"]
@@ -215,7 +219,7 @@ def test_corrupt_message_leaf_page_rebuilds_cache_without_touching_source(store)
     _same(store)
     source = store.legacy_path.read_bytes()
     cache = history_index._cache_path(store)
-    with sqlite3.connect(cache) as db:
+    with closing(sqlite3.connect(cache)) as db:
         size = db.execute("PRAGMA page_size").fetchone()[0]
         page = db.execute("SELECT rootpage FROM sqlite_master WHERE name='messages'").fetchone()[0]
     with cache.open("r+b") as handle:
@@ -230,7 +234,7 @@ def test_corrupt_message_leaf_page_rebuilds_cache_without_touching_source(store)
             page = int.from_bytes(header[8:12], "big")
         handle.seek((page - 1) * size)
         handle.write(b"\xff")
-    with sqlite3.connect(cache) as db:
+    with closing(sqlite3.connect(cache)) as db:
         assert db.execute("SELECT total FROM metadata").fetchone()[0] == 50
         with pytest.raises(sqlite3.DatabaseError, match="malformed"):
             db.execute("SELECT payload FROM messages ORDER BY position DESC").fetchall()

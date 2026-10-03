@@ -328,7 +328,12 @@ try {
    assert.ok(request.messages.some(message=>message.role==='tool'&&String(message.content).includes('apple')),'each child must actually read the local fixture');
  }
  delegateGates.get(delegateGoals[2]).release();
+ // A narrow native window shows either details or chat. Return through the
+ // visible control before asserting the parent's rendered reply, then reopen
+ // the cards to verify their terminal states at either window width.
+ await page.getByRole('button',{name:'关闭详情',exact:true}).click();
  await page.getByText('DELEGATE_GUI_PARENT_DONE',{exact:true}).waitFor({timeout:30000}); await idle();
+ await page.getByTestId('delegate-summary').click();
  await page.waitForFunction(()=>{
    const cards=[...document.querySelectorAll('section[aria-label="委派任务"] article[data-delegate-id]')];
    return cards.length===3&&cards.filter(card=>card.dataset.status==='completed').length===2&&cards.filter(card=>card.dataset.status==='failed').length===1;

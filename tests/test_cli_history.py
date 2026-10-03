@@ -27,12 +27,12 @@ def test_history_restores_saved_results_and_timing_only_for_current_conversation
     assert saved == events
     assert store.recent_tool_results("current", limit=1) == events[-1:]
     assert history_tool_results([_message(event) for event in events], saved) == [
-        {"name": "read_file", "output": "saved output", "error": "", "duration_ms": 18},
-        {"name": "context_open", "output": "saved output", "error": "missing context", "duration_ms": 0},
+        {"name": "read_file", "call_id": "read", "output": "saved output", "error": "", "duration_ms": 18},
+        {"name": "context_open", "call_id": "open", "output": "saved output", "error": "missing context", "duration_ms": 0},
     ]
     assert history_tool_results([], saved) == []
     assert history_tool_results([_message(events[-1])], saved) == [
-        {"name": "context_open", "output": "saved output", "error": "missing context", "duration_ms": 0},
+        {"name": "context_open", "call_id": "open", "output": "saved output", "error": "missing context", "duration_ms": 0},
     ]
 
 
@@ -40,8 +40,8 @@ def test_history_without_task_database_preserves_known_outcomes_without_inventin
     events = [_event("a", "read_file"), _event("b", "context_open", error="missing context")]
     restored = history_tool_results([_message(event) for event in events], [])
     assert restored == [
-        {"name": "read_file", "output": "saved output", "error": ""},
-        {"name": "context_open", "output": "", "error": "missing context"},
+        {"name": "read_file", "call_id": "a", "output": "saved output", "error": ""},
+        {"name": "context_open", "call_id": "b", "output": "", "error": "missing context"},
     ]
     assert history_tool_results([{"role": "tool", "content": "unknown legacy outcome"}], []) == []
 

@@ -12,6 +12,10 @@ on:
       - 'agent/cli/backend.py'
       - 'agent/runtime/subagent_*.py'
       - 'agent/runtime/session_store.py'
+      - 'agent/runtime/file_change_time.py'
+      - 'agent/ui/history_index.py'
+      - 'tests/test_file_change_time.py'
+      - 'tests/test_gui_history_index.py'
       - 'agent/runtime/agent_team.py'
       - 'agent/runtime/worker.py'
       - 'agent/runtime/tools/delegate.py'
@@ -72,6 +76,10 @@ on:
       - 'agent/cli/backend.py'
       - 'agent/runtime/subagent_*.py'
       - 'agent/runtime/session_store.py'
+      - 'agent/runtime/file_change_time.py'
+      - 'agent/ui/history_index.py'
+      - 'tests/test_file_change_time.py'
+      - 'tests/test_gui_history_index.py'
       - 'agent/runtime/agent_team.py'
       - 'agent/runtime/worker.py'
       - 'agent/runtime/tools/delegate.py'
@@ -186,6 +194,8 @@ jobs:
           tests/test_runtime_maintenance.py
           tests/test_browser_upload.py tests/test_backend_conversation_commands.py
           tests/test_event_writer.py tests/test_event_stream.py tests/test_backend_terminal_shutdown.py
+          tests/test_tool_preparation.py tests/test_stream_inspection.py tests/test_gui_session_log.py
+          tests/test_file_change_time.py tests/test_gui_history_index.py
           tests/test_backend_task_protocol.py::test_backend_exposes_tasks_command_without_blocking_protocol
           tests/test_backend_task_protocol.py::test_protocol_fixture_drains_stderr_during_startup
           tests/test_backend_task_protocol.py::test_protocol_fixture_keeps_startup_failure_diagnostics

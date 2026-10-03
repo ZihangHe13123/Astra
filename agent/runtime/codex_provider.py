@@ -13,6 +13,7 @@ from .llm import (LLMIdleTimeout, LLMResponseError, _RequestBudget, _RequestCapT
                   _StreamReadTiming, _messages_for_capabilities)
 from .network import active_proxy_for_url
 from .token_estimator import estimate_messages_tokens
+from .tool_preparation import with_tool_preparation
 
 
 class CodexRequestError(LLMResponseError):
@@ -73,6 +74,7 @@ class CodexProvider:
                                        if isinstance(tool_choice, dict) else tool_choice or "auto")
         return body
 
+    @with_tool_preparation
     async def chat_stream(self, messages, tools=None, tool_choice=None, *, omit_tool_choice=False,
                           generation_overrides=None) -> AsyncGenerator[dict, None]:
         stream = self._chat_stream(messages, tools, tool_choice, omit_tool_choice=omit_tool_choice)
@@ -92,6 +94,7 @@ class CodexProvider:
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False, transport=self.transport,
                 proxy=active_proxy_for_url(codex_auth.BASE_URL) if self.transport is None else None) as client:
             while budget.can_attempt():
+                yield {"type": "_tool_preparation_reset"}
                 budget.begin_attempt()
                 data = await budget.run(lambda: codex_auth.credentials(client=client), cap=30)
                 body = self._body(messages, tools, tool_choice, data["account_id"], omit_tool_choice)
@@ -146,6 +149,12 @@ class CodexProvider:
                         kind = event.get("type", "")
                         tool_stream.observe(event)
                         output_stream.observe(event)
+                        tool = tool_stream.calls.get(event.get("output_index"))
+                        if tool is not None and (kind.startswith("response.function_call_arguments.")
+                                or (event.get("item") or {}).get("type") == "function_call"):
+                            yield {"type": "_tool_preparation", "index": event["output_index"],
+                                   "call_id": tool.get("call_id", ""), "name": tool.get("name", ""),
+                                   "arguments": tool.get("arguments", "")}
                         if kind in {"response.output_text.delta", "response.refusal.delta"}:
                             delta = str(event.get("delta") or "")
                             if delta:
@@ -202,6 +211,7 @@ class CodexProvider:
                 except httpx.RequestError as exc:
                     if visible or not budget.can_attempt():
                         raise LLMResponseError("stream_closed", "Codex connection failed; partial calls were discarded.") from exc
+                    yield {"type": "_tool_preparation_reset"}
                     await budget.backoff(min(8, 2 ** (budget.attempts - 1)))
                 finally:
                     if response is not None:

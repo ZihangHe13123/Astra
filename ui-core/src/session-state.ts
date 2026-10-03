@@ -1,11 +1,13 @@
 import { reduceAgentTeamEvent, type AgentTeamView } from "./agent-team-state.js";
 import type { PyEvent } from "./types.js";
 import { delegateActive, reduceDelegateEvent, type DelegateView } from "./delegates.js";
+import { reduceToolPreparation, type ToolPreparation } from "./tool-preparation.js";
 
 /** Platform-independent projection. The backend remains the execution authority. */
 export type UIEvent = { type: string; [key: string]: any };
 export type Message = {
   id: string; role: string; content: string; timestamp?: number; pending?: boolean;
+  stream_id?: string; source_ref?: { index: number; digest: string };
   submissionState?: "pending" | "accepted" | "rejected" | "unknown"; submissionError?: string;
 };
 export type SessionState = {
@@ -13,6 +15,7 @@ export type SessionState = {
   messages: Message[]; tools: UIEvent[]; approvals: UIEvent[]; questions: UIEvent[];
   processes: Record<string, UIEvent>; delegates: Record<string, DelegateView>; teams: Record<string, AgentTeamView>; info: Record<string, UIEvent>;
   notices: UIEvent[]; stream: string; serial: number; revision: number;
+  preparation?: ToolPreparation;
 };
 export function initialSession(id: string, workspace = ""): SessionState {
   return { id, workspace, session: "", mode: "work", status: "connecting", busy: false, isDraft: false,
@@ -29,6 +32,10 @@ export function plainText(text: string): string {
 }
 export function projectEvent(previous: SessionState, event: UIEvent): SessionState {
   const state: SessionState = { ...previous, revision: previous.revision + 1 };
+  // Unscoped side-command completion must not erase another running turn's preview.
+  if (!(event.type === "done" && !event.request_id && ["pending", "running", "cancelling"].includes(previous.info.task_status?.task?.status))) {
+    state.preparation = reduceToolPreparation(previous.preparation, event);
+  }
   // Configuration and diagnostics do not turn a blank page into a conversation.
   if (["gui_user", "task_started", "chunk", "reasoning", "tool_calls"].includes(event.type)
       || event.type === "history" && event.messages?.length) state.isDraft = false;
@@ -36,7 +43,8 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
     if (!content) return;
     state.serial++;
     state.messages = [...state.messages, { id: id || `${state.id}:${state.serial}`, role, content,
-      timestamp: typeof event.timestamp === "number" ? event.timestamp : Date.now() / 1000 }];
+      timestamp: typeof event.timestamp === "number" ? event.timestamp : Date.now() / 1000,
+      ...(event.stream_id ? { stream_id: event.stream_id } : {}) }];
   };
   const notice = () => { state.notices = [...state.notices, event].slice(-200); };
   switch (event.type) {
@@ -89,15 +97,18 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
         connection_pending: { ...pending, type: "connection_pending", request_id: event.request_id,
           status: event.type === "connection_result" ? "completed" : "pending" } }; break;
     }
-    case "session_info": state.session = event.name; state.info = { ...state.info, session_info: event }; break;
+    case "session_info":
+      if (state.session !== event.name) state.preparation = undefined;
+      state.session = event.name; state.info = { ...state.info, session_info: event }; break;
     case "mode_info":
-      if (event.mode !== state.mode) state.isDraft = false;
+      if (event.mode !== state.mode) { state.isDraft = false; state.preparation = undefined; }
       state.mode = event.mode;
       state.session = event.bar_session || event.minimal_session || event.local_session || state.session;
       state.info = { ...state.info, mode_info: event }; break;
     case "history":
       state.messages = (event.messages || []).map((m: UIEvent, i: number) => ({
         id: m.id || `history:${event.session_id}:${i}`, role: m.role, content: textContent(m.content), timestamp: m.timestamp,
+        ...(m.source_ref ? { source_ref: m.source_ref } : {}),
       }));
       state.tools = (event.tool_results || []).map((r: UIEvent, i: number) => ({ ...r, type: "tool_result", status: r.error ? "failed" : "completed", historical: true, result_index: i + 1, call_id: r.call_id || `history-tool:${i}` }));
       state.delegates = (event.delegates || []).reduce(reduceDelegateEvent, {});
@@ -106,15 +117,25 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
     case "task_status":
       state.info = { ...state.info, task_status: event };
       state.busy = ["pending", "running", "cancelling"].includes(event.task?.status);
+      if (!state.busy && event.task?.id === previous.info.task_status?.task?.id) state.preparation = undefined;
       break;
     case "chunk":
     case "reasoning": {
       const role = event.type === "chunk" ? "assistant" : "reasoning";
       const last = state.messages[state.messages.length - 1];
-      if (last && last.id === state.stream && last.role === role) {
+      if (last && last.id === state.stream && last.role === role && last.stream_id === event.stream_id) {
         state.messages = [...state.messages.slice(0, -1), { ...last, content: last.content + event.content }];
       } else { append(role, event.content); state.stream = state.messages[state.messages.length - 1]?.id || ""; }
       state.busy = true; break;
+    }
+    case "tool_preparing": break;
+    case "message_source": {
+      const ref = event.source_ref;
+      if (!ref || !Number.isSafeInteger(ref.index) || ref.index < 0 || !/^[a-f0-9]{64}$/.test(ref.digest)) break;
+      state.messages = state.messages.map(message => (
+        event.stream_id && message.stream_id === event.stream_id || event.submission_id && message.id === event.submission_id
+      ) ? { ...message, source_ref: ref } : message);
+      break;
     }
     case "tool_calls":
       state.stream = "";

@@ -38,13 +38,16 @@ def list_sessions() -> list[dict]:
     return sorted(result, key=lambda s: s["modified"], reverse=True)
 
 
-def history(name: str, mode: str = "work", *, before: int | None = None, limit: int = 200) -> dict:
+def history(name: str, mode: str = "work", *, before: int | None = None, limit: int = 200, source_ref: dict | None = None) -> dict:
     store = SessionStore(_session_path(name, mode))
     if not store.exists:
         raise FileNotFoundError("Session does not exist")
-    result = history_page(store, before=before, limit=limit)
+    result = history_page(store, before=before, limit=limit, source_ref=source_ref)
     for message in result["messages"]:
         message["id"] = f"{mode}:{name}:{message.pop('position')}"
+    if "target_position" in result:
+        target_position = result.pop("target_position")
+        result["target_id"] = f"{mode}:{name}:{target_position}" if target_position is not None else None
     return {"session_id": name, "mode": mode, **result, "delegates": delegate_history(store)}
 
 
@@ -111,9 +114,14 @@ def query(request: dict, *, agent=None) -> object:
         from agent.ui.request_timeline import request_timeline
         return request_timeline(_session_path(str(params.get("name", "")), str(params.get("mode", "work"))),
                                 limit=params.get("limit", 100))
+    if method == "session_log":
+        from agent.ui.session_log import session_log
+        store = SessionStore(_session_path(str(params.get("name", "")), str(params.get("mode", "work"))))
+        return session_log(store, before=params.get("before"), limit=params.get("limit", 25),
+                           source_ref=params.get("source_ref"), call_id=params.get("call_id"))
     if method == "history":
         return history(str(params.get("name", "")), str(params.get("mode", "work")),
-                       before=params.get("before"), limit=int(params.get("limit", 200)))
+                       before=params.get("before"), limit=int(params.get("limit", 200)), source_ref=params.get("source_ref"))
     if method == "changes" and agent is not None:
         return changes(agent, int(params.get("turn", 1)), params.get("index"))
     raise ValueError("Unknown UI query")

@@ -497,6 +497,7 @@ class AppshotAdmission:
             stage = "launch"
             if isinstance(prepared, _PreparedAppshotCompaction):
                 prepared.install()
+            msg.metadata["submission_id"] = sid
             if not self.launch(msg, text):
                 raise AppshotValidationError("backend_busy")
             handed_off = True
