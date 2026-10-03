@@ -1,5 +1,6 @@
 /** New inspection UI acceptance: real Electron, real Python, isolated local model. */
 import { _electron as electron } from 'playwright';
+import { expect } from '@playwright/test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { execFile } from 'node:child_process';
@@ -72,6 +73,7 @@ async function terminateFixture(app) {
   }
 }
 let app, failure;
+const quitDiagnostic = { state: null, events: [], stderr: "" };
 const errors = [];
 const checks = [];
 const passed = name => { checks.push(name); console.log('PASS', name); };
@@ -117,7 +119,9 @@ try {
   passed('partial arguments are visible without admitted tools; log reads do not select or execute a runtime');
   releaseArguments();
   await page.getByText('INSPECTOR_DONE', { exact: true }).waitFor({ timeout: 30000 });
-  await page.waitForFunction(async () => { const b = await window.astra.bootstrap(); const s = b.sessions.find(s => s.id === b.active); return !s.busy && s.messages.some(m => m.content === 'INSPECTOR_DONE' && m.source_ref) && s.messages.some(m => m.role === 'user' && m.source_ref); });
+  // waitForFunction treats an async predicate's Promise as truthy; poll the
+  // awaited IPC result on the test side so false actually triggers another read.
+  await expect.poll(async () => { const b = await page.evaluate(() => window.astra.bootstrap()); const s = b.sessions.find(s => s.id === b.active); return !s.busy && s.messages.some(m => m.content === 'INSPECTOR_DONE' && m.source_ref) && s.messages.some(m => m.role === 'user' && m.source_ref); }, { timeout: 30000 }).toBe(true);
   assert.equal(await page.getByLabel('工具参数准备进度').count(), 0);
   assert.equal(readFileSync(target, 'utf8'), 'READ_ONLY_FIXTURE');
   await page.locator('.message.assistant').filter({ hasText: 'INSPECTOR_DONE' }).getByRole('button', { name: '查看消息记录' }).click();
@@ -199,11 +203,11 @@ try {
   assert.equal(requests.length, requestsBeforeHistory);
   passed('changed revision refuses a stale jump and preserves the currently viewed conversation');
   releaseBackground();
-  await page.waitForFunction(async runtime => {
-    const state = (await window.astra.bootstrap()).sessions.find(s => s.id === runtime);
+  await expect.poll(async () => {
+    const state = (await page.evaluate(() => window.astra.bootstrap())).sessions.find(s => s.id === runtime);
     return !state.busy && state.info.task_status?.task?.status === 'completed'
       && state.messages.some(message => message.role === 'assistant' && message.content.includes('BACKGROUND_DONE'));
-  }, runtime);
+  }, { timeout: 30000 }).toBe(true);
   assert.deepEqual(errors, []);
 } catch (error) {
   failure = error; console.error(error);
@@ -211,6 +215,46 @@ try {
 } finally {
   releaseArguments(); releaseBackground();
   if (app) {
+    // Playwright detaches its Node debugger immediately after app.quit(). Keep
+    // bounded lifecycle evidence on stdout, which survives that disconnection.
+    for (const event of ['exit', 'close']) app.process().once(event, (code, signal) => quitDiagnostic.events.push(JSON.stringify({ event: `launcher-${event}`, code, signal, time: Date.now() })));
+    let stdout = '';
+    app.process().stdout?.on('data', chunk => {
+      stdout = (stdout + chunk.toString()).slice(-16384);
+      const lines = stdout.split('\n'); stdout = lines.pop();
+      for (const line of lines) if (line.startsWith('ASTRA_FIXTURE_QUIT ')) {
+        quitDiagnostic.events.push(line.slice(19));
+        if (quitDiagnostic.events.length > 40) quitDiagnostic.events.shift();
+      }
+    });
+    app.process().stderr?.on('data', chunk => { quitDiagnostic.stderr = (quitDiagnostic.stderr + chunk.toString()).slice(-8192); });
+    await bounded((async () => {
+      const page = await app.firstWindow();
+      quitDiagnostic.state = await page.evaluate(async () => (await window.astra.bootstrap()).sessions.map(state => ({
+        id: state.id, status: state.status, busy: state.busy,
+        pendingSubmissions: state.messages.filter(message => ['pending', 'unknown'].includes(message.submissionState)).length,
+        approvals: state.approvals.length, questions: state.questions.length, task: state.info.task_status?.task?.status,
+        processes: Object.values(state.processes).map(process => process.status), delegates: Object.values(state.delegates).map(delegate => delegate.status),
+        teams: Object.values(state.teams).map(team => team.status), wakeup: state.info.wakeup_status?.plan?.state,
+      })));
+      await app.evaluate(({ app, BrowserWindow, dialog }) => {
+        const trace = (event, detail = {}) => process.stdout.write('ASTRA_FIXTURE_QUIT ' + JSON.stringify({ event, time: Date.now(), ...detail }) + '\n');
+        for (const event of ['before-quit', 'will-quit', 'quit']) app.on(event, () => trace(event));
+        for (const window of BrowserWindow.getAllWindows()) {
+          const id = window.id;
+          window.on('close', () => trace('window-close', { id })); window.on('closed', () => trace('window-closed', { id }));
+          window.webContents.on('destroyed', () => trace('web-contents-destroyed', { id }));
+        }
+        const original = dialog.showMessageBox.bind(dialog);
+        dialog.showMessageBox = (...args) => {
+          const options = args.at(-1);
+          trace('dialog', { message: options?.message, detail: options?.detail, buttons: options?.buttons });
+          const result = original(...args); void result.then(response => trace('dialog-result', response), error => trace('dialog-error', { error: String(error) }));
+          return result;
+        };
+        trace('installed', { pid: process.pid, windows: BrowserWindow.getAllWindows().map(window => ({ id: window.id, visible: window.isVisible() })) });
+      });
+    })(), 'Quit diagnostics setup', 3000).catch(error => { quitDiagnostic.events.push(String(error)); });
     // After a failed assertion, stop only this isolated fixture's remaining
     // work through the ordinary quit confirmation. Never dismiss other dialogs.
     if (failure) await bounded(app.evaluate(({ dialog }) => {
@@ -224,7 +268,7 @@ try {
     }), 'Fixture quit confirmation', 2000).catch(error => console.error(error));
     try { await bounded(app.close(), 'Electron close', 30000); }
     catch (error) {
-      failure ||= error; console.error(error);
+      failure ||= error; console.error(error); quitDiagnostic.launcher = { pid: app.process().pid, exitCode: app.process().exitCode, signalCode: app.process().signalCode }; console.error('QUIT_DIAGNOSTIC', JSON.stringify(quitDiagnostic));
       await bounded(terminateFixture(app), 'Fixture process cleanup', 6000).catch(error => { failure ||= error; console.error(error); });
     }
   }
@@ -233,6 +277,7 @@ try {
     server.closeAllConnections();
   }), 'Fixture HTTP close', 3000).catch(error => { failure ||= error; console.error(error); });
 }
+writeFileSync(join(output, 'quit-diagnostic.json'), JSON.stringify(quitDiagnostic, null, 2));
 writeFileSync(join(output, 'inspector-result.json'), JSON.stringify({ checks, errors, folder, success: !failure, ...(failure ? { failure: String(failure) } : {}) }, null, 2));
 if (failure) throw failure;
 console.log(JSON.stringify({ checks: checks.length, output, folder }));
