@@ -1,6 +1,7 @@
 """Content-verified navigation reads bounded canonical records without resuming."""
 import json
 import sqlite3
+from contextlib import closing
 
 import pytest
 
@@ -146,7 +147,7 @@ def test_delete_removes_legacy_and_current_cache_only_for_selected_session(store
     write(store, [message("selected private messages")])
     log()
     legacy = history_index._cache_path(store, version=1)
-    with sqlite3.connect(legacy) as db:
+    with closing(sqlite3.connect(legacy)) as db, db:
         db.execute("CREATE TABLE messages (position INTEGER PRIMARY KEY, payload TEXT NOT NULL)")
         db.execute("INSERT INTO messages VALUES (0, 'legacy private messages')")
     other = SessionStore(store.legacy_path.with_name("other.json"))
