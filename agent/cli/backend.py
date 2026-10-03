@@ -917,6 +917,7 @@ async def _main(startup_started: float):
         on_session_event=lambda session_id, event: SessionStore(
             session_path(session_id)
         ).append_subagent_event(event),
+        conv_store_for=lambda session_id, key: SessionStore.for_subagent(session_path(session_id), key),
         task_store=task_store,
         sandbox=sandbox,
     )

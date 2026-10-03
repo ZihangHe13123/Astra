@@ -261,6 +261,8 @@ class AgentTeamStore:
                 db.execute(
                     "ALTER TABLE team_agents ADD COLUMN restart_count INTEGER NOT NULL DEFAULT 0"
                 )
+            if "conv_path" not in agent_columns:
+                db.execute("ALTER TABLE team_agents ADD COLUMN conv_path TEXT NOT NULL DEFAULT ''")
 
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -633,6 +635,12 @@ class AgentTeamStore:
                 "UPDATE team_agents SET transcript_path=?, updated_at=? WHERE id=?",
                 (str(transcript_path), now, str(agent_id)),
             )
+        return self.get_agent(agent_id) or {}
+
+    def set_agent_conv_path(self, agent_id: str, conv_path: str) -> dict[str, Any]:
+        with self._lock, self._connection() as db:
+            db.execute("UPDATE team_agents SET conv_path=?, updated_at=? WHERE id=?",
+                       (str(conv_path), time.time(), str(agent_id)))
         return self.get_agent(agent_id) or {}
 
     def prepare_agent_restart(self, team_id: str, target: str) -> dict[str, Any]:
