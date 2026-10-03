@@ -2,6 +2,8 @@
 import { _electron as electron } from 'playwright';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -49,7 +51,28 @@ writeFileSync(join(folder, 'settings.json'), JSON.stringify({ selected_model: 'i
 writeFileSync(join(folder, 'models.yaml'), `version: 1\nproviders:\n  test:\n    label: Local fixture\n    provider: openai-compatible\n    base_url: http://127.0.0.1:${port}/v1\n    api_key_env: ''\n    context_limit: 131072\n    capabilities: [tools, streaming]\nmodels:\n  inspector-test:\n    provider: openai-compatible\n    base_url: http://127.0.0.1:${port}/v1\n    api_key_env: ''\n    context_limit: 131072\n    capabilities: [tools, streaming]\n`);
 const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/API_KEY|TOKEN|SECRET|^AGENT_|^ASTRA_|^LLM_|^SANDBOX_|^ELECTRON_/.test(key)));
 const env = { ...cleanEnv, ASTRA_GUI_DISABLE_APPSHOT: '1', AGENT_PROJECT_ROOT: root, AGENT_PYTHON: process.env.AGENT_PYTHON || join(root, '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python'), ASTRA_ENV_FILE: join(folder, '.env'), ASTRA_HOME: folder, AGENT_SETTINGS_PATH: join(folder, 'settings.json'), AGENT_SESSION_DIR: sessionDir, AGENT_TASK_DB: join(folder, 'tasks.db'), ASTRA_APPROVAL_DB: join(folder, 'approvals.db'), ASTRA_EVENT_DB: join(folder, 'events.db'), AGENT_MEMORY_PATH: join(folder, 'memory.db'), AGENT_LEARNING_PATH: join(folder, 'learning.db'), AGENT_SKILLS_PATH: join(folder, 'skills'), AGENT_MODELS_FILE: join(folder, 'models.yaml'), AGENT_USER_MODELS_FILE: join(folder, 'missing-models.yaml'), AGENT_LOG_DIR: join(folder, 'logs'), AGENT_MCP_CONFIG: join(folder, 'missing-mcp.json'), AGENT_TOOL_POLICY: 'locked', SANDBOX_DOCKER: 'false', SANDBOX_WORKDIR: workspace, ASTRA_WORKSPACE: workspace, LEARNING_REVIEW_AUTO: '0' };
-let app;
+const runFile = promisify(execFile);
+async function bounded(promise, label, timeout) {
+  let timer;
+  try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeout} ms`)), timeout); })]); }
+  finally { clearTimeout(timer); }
+}
+async function terminateFixture(app) {
+  const child = app.process();
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const pid = child.pid;
+  assert.ok(Number.isSafeInteger(pid) && pid > 0, 'only terminate this fixture Electron PID');
+  if (process.platform === 'win32') await runFile('taskkill.exe', ['/PID', String(pid), '/T', '/F'], { timeout: 5000, windowsHide: true });
+  else {
+    const { stdout } = await runFile('ps', ['-axo', 'pid=,ppid='], { timeout: 3000 });
+    const rows = stdout.trim().split('\n').map(line => line.trim().split(/\s+/).map(Number));
+    const owned = new Set([pid]);
+    for (let changed = true; changed;) { changed = false; for (const [id, parent] of rows) if (owned.has(parent) && !owned.has(id)) { owned.add(id); changed = true; } }
+    for (const id of [...owned].reverse()) { try { process.kill(id, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; } }
+  }
+}
+let app, failure;
+const errors = [];
 const checks = [];
 const passed = name => { checks.push(name); console.log('PASS', name); };
 try {
@@ -60,7 +83,22 @@ try {
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setContentSize(1320, 768));
   await page.waitForFunction(() => window.innerWidth === 1320);
   console.log("START", folder);
-  const errors = []; page.on('pageerror', error => errors.push(error.message));
+  page.on('pageerror', error => errors.push(error.message));
+  const waitForLocatedViewport = async id => {
+    // Visibility only establishes a mounted row. ResizeObserver then measures
+    // its height and a later frame restores the scroll anchor using new offsets.
+    await page.waitForFunction(id => {
+      const el = [...document.querySelectorAll('.located-message')].find(node => node.dataset.messageId === id);
+      if (!el) return false;
+      const rect = el.getBoundingClientRect(), viewport = el.closest('.messages-scroll').getBoundingClientRect();
+      const visible = rect.height > 0 && rect.top >= viewport.top - 40 && rect.top < viewport.bottom;
+      const previous = window.__inspectorViewportProbe;
+      const stable = visible && previous?.visible && previous.id === id && Math.abs(previous.top - rect.top) < 1 && Math.abs(previous.height - rect.height) < 1;
+      const since = stable ? previous.since : performance.now();
+      window.__inspectorViewportProbe = { id, visible, top: rect.top, height: rect.height, viewportTop: viewport.top, viewportBottom: viewport.bottom, since };
+      return visible && performance.now() - since >= 100;
+    }, id, { polling: 'raf', timeout: 10000 });
+  };
   const submit = async text => { await page.getByRole('textbox', { name: '消息' }).fill(text); await page.getByRole('button', { name: '发送', exact: true }).click(); };
   await page.getByRole('textbox', { name: '消息' }).waitFor();
   await submit('PREPARE_INSPECTOR');
@@ -95,11 +133,21 @@ try {
   await toolCard.getByRole('button', { name: '查看会话记录' }).click();
   await page.locator('.session-log-record.selected .session-log-raw').waitFor();
   assert.match(await page.locator('.session-log-record.selected .session-log-raw').innerText(), /inspector-call/);
+  const previousLocationId = await page.locator('.located-message').getAttribute('data-message-id');
   await page.getByRole('button', { name: '定位到聊天' }).click();
+  // This tool-only message is absent from the live chat. Wait for this query's
+  // read-only window, not the highlight left by the previous answer lookup.
+  await page.getByText('只读定位窗口，显示该记录附近的消息。').waitFor();
+  await page.waitForFunction(previous => {
+    const located = document.querySelector('.located-message');
+    return located && located.getAttribute('data-message-id') !== previous;
+  }, previousLocationId);
   await page.locator('.located-message').waitFor();
   assert.equal((await page.evaluate(() => window.astra.bootstrap())).active, runtime);
-  if (await page.getByRole('button', { name: '返回已打开的会话' }).count()) await page.getByRole('button', { name: '返回已打开的会话' }).click();
-  if (await page.getByRole('button', { name: '关闭会话记录' }).count()) await page.getByRole('button', { name: '关闭会话记录' }).click();
+  await page.getByRole('button', { name: '返回已打开的会话' }).click();
+  await page.locator('.history-banner').waitFor({ state: 'detached' });
+  await page.getByRole('button', { name: '关闭会话记录' }).click();
+  await page.getByRole('textbox', { name: '消息' }).waitFor();
   passed('tool call cards locate their canonical call record without switching or stopping the backend');
   await submit('BACKGROUND_INSPECTOR');
   await page.getByText('BACKGROUND_STILL_RUNNING', { exact: true }).waitFor();
@@ -120,6 +168,7 @@ try {
   await page.getByRole('button', { name: '定位到聊天' }).click();
   const located = page.locator(`.located-message[data-message-id="work:${oldSession}:${oldIndex}"]`);
   await located.waitFor();
+  await waitForLocatedViewport(`work:${oldSession}:${oldIndex}`);
   assert.ok(await located.evaluate(el => { const parent = el.closest('.messages-scroll'); const rect = el.getBoundingClientRect(); const viewport = parent.getBoundingClientRect(); return rect.top >= viewport.top - 40 && rect.top < viewport.bottom; }));
   assert.ok(await page.locator('.measured-message').count() < 100);
   snapshot = await page.evaluate(() => window.astra.bootstrap());
@@ -136,6 +185,7 @@ try {
   await page.getByRole('button', { name: '定位到聊天' }).click();
   await page.getByLabel('原始会话记录面板').waitFor({ state: 'detached' });
   await located.waitFor();
+  await waitForLocatedViewport(`work:${oldSession}:${oldIndex}`);
   assert.ok(await located.evaluate(el => { const rect = el.getBoundingClientRect(); const viewport = el.closest('.messages-scroll').getBoundingClientRect(); return rect.height > 0 && rect.top >= viewport.top - 40 && rect.top < viewport.bottom; }));
   await page.screenshot({ path: join(output, 'narrow-history-location.png') });
   await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0].setContentSize(1320, 768));
@@ -149,16 +199,40 @@ try {
   assert.equal(requests.length, requestsBeforeHistory);
   passed('changed revision refuses a stale jump and preserves the currently viewed conversation');
   releaseBackground();
-  await page.waitForFunction(async runtime => !(await window.astra.bootstrap()).sessions.find(s => s.id === runtime).busy, runtime);
+  await page.waitForFunction(async runtime => {
+    const state = (await window.astra.bootstrap()).sessions.find(s => s.id === runtime);
+    return !state.busy && state.info.task_status?.task?.status === 'completed'
+      && state.messages.some(message => message.role === 'assistant' && message.content.includes('BACKGROUND_DONE'));
+  }, runtime);
   assert.deepEqual(errors, []);
-  writeFileSync(join(output, 'inspector-result.json'), JSON.stringify({ checks, errors, folder }, null, 2));
-  console.log(JSON.stringify({ checks: checks.length, output, folder }));
 } catch (error) {
-  console.error(error);
-  if (app) { const page = await app.firstWindow(); console.error((await page.locator('body').innerText()).slice(-6000)); await page.screenshot({ path: join(output, 'failure.png') }); }
-  throw error;
+  failure = error; console.error(error);
+  if (app) await bounded((async () => { const page = await app.firstWindow(); console.error((await page.locator('body').innerText()).slice(-6000)); console.error('Viewport diagnostic', await page.evaluate(() => ({ width: innerWidth, probe: window.__inspectorViewportProbe }))); await page.screenshot({ path: join(output, 'failure.png'), timeout: 2000 }); })(), 'Failure diagnostics', 3000).catch(error => console.error(error));
 } finally {
   releaseArguments(); releaseBackground();
-  if (app) { const forced = setTimeout(() => app.process().kill("SIGKILL"), 5000); await app.close().catch(() => {}); clearTimeout(forced); }
-  await new Promise(resolve => server.close(resolve));
+  if (app) {
+    // After a failed assertion, stop only this isolated fixture's remaining
+    // work through the ordinary quit confirmation. Never dismiss other dialogs.
+    if (failure) await bounded(app.evaluate(({ dialog }) => {
+      const original = dialog.showMessageBox.bind(dialog);
+      dialog.showMessageBox = (...args) => {
+        const options = args.at(-1);
+        const stop = options?.buttons?.indexOf('停止并退出') ?? -1;
+        return options?.message === '仍有任务或会话提醒在运行' && stop >= 0
+          ? Promise.resolve({ response: stop, checkboxChecked: false }) : original(...args);
+      };
+    }), 'Fixture quit confirmation', 2000).catch(error => console.error(error));
+    try { await bounded(app.close(), 'Electron close', 30000); }
+    catch (error) {
+      failure ||= error; console.error(error);
+      await bounded(terminateFixture(app), 'Fixture process cleanup', 6000).catch(error => { failure ||= error; console.error(error); });
+    }
+  }
+  await bounded(new Promise((resolve, reject) => {
+    server.close(error => error ? reject(error) : resolve());
+    server.closeAllConnections();
+  }), 'Fixture HTTP close', 3000).catch(error => { failure ||= error; console.error(error); });
 }
+writeFileSync(join(output, 'inspector-result.json'), JSON.stringify({ checks, errors, folder, success: !failure, ...(failure ? { failure: String(failure) } : {}) }, null, 2));
+if (failure) throw failure;
+console.log(JSON.stringify({ checks: checks.length, output, folder }));
