@@ -1,45 +1,12 @@
 import React, { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
-import { Check, Copy, RotateCcw, FileText } from "lucide-react";
+import { RotateCcw, FileText } from "lucide-react";
 import type { Message } from "@astra/ui-core/session-state";
 import { windowRange, messageOffsets } from "./message-window.js";
 import type { SourceRef } from "./session-log.js";
-import { resolveAgainst } from "./doc-preview.js";
+import { CopyButton } from "./copy-button.js";
+import { Markdown } from "./markdown.js";
+export { Markdown } from "./markdown.js";
 
-function InlineImage({ src, alt, runtime, base }: { src?: string; alt?: string; runtime?: string; base?: string }) {
-  const [url, setURL] = useState<string>();
-  useEffect(() => {
-    let live = true; setURL(undefined);
-    if (src && /^https:\/\//i.test(src)) setURL(src);
-    else if (src && runtime) void window.astra.file(runtime, resolveAgainst(base, src), "preview").then(value => { if (live) setURL(value.data); }).catch(() => {});
-    return () => { live = false; };
-  }, [src, runtime, base]);
-  return url ? <img src={url} alt={alt || "图片"} loading="lazy"/> : <span className="muted">{alt || "图片预览不可用"}</span>;
-}
-function CopyButton({ text, label = "复制消息", fail }: { text: string | (() => string); label?: string; fail: (e: unknown) => void }) {
-  const [copied, setCopied] = useState(false);
-  useEffect(() => { if (!copied) return; const t = setTimeout(() => setCopied(false), 1600); return () => clearTimeout(t); }, [copied]);
-  return <button className="icon" aria-label={copied ? "已复制" : label} title={copied ? "已复制" : label} onClick={() => {
-    void window.astra.copyText(typeof text === "function" ? text() : text).then(() => setCopied(true)).catch(fail);
-  }}>{copied ? <Check size={14}/> : <Copy size={14}/>}</button>;
-}
-function CodeBlock({ children, fail }: { children?: React.ReactNode; fail: (e: unknown) => void }) {
-  const code = useRef<HTMLPreElement>(null);
-  return <div className="code-block"><div className="copy-code"><CopyButton label="复制代码" text={() => code.current?.textContent || ""} fail={fail}/></div><pre ref={code}>{children}</pre></div>;
-}
-/** ``base`` is the folder that relative image and link targets are resolved against (a previewed document). */
-export const Markdown = memo(function Markdown({ text, runtime, fail, base }: { text: string; runtime?: string; fail: (e: unknown) => void; base?: string }) {
-  const components = useMemo(() => ({
-    img: ({ src, alt }: { src?: string; alt?: string }) => <InlineImage src={src} alt={alt} runtime={runtime} base={base}/>,
-    a: ({ href, children }: React.ComponentProps<"a">) => <a href={href} onClick={e => { e.preventDefault(); if (!href || href.startsWith("#")) return;
-      if (/^https?:\/\//i.test(href)) void window.astra.openExternal(href).catch(fail);
-      else if (runtime) void window.astra.file(runtime, resolveAgainst(base, href), "open").catch(fail);
-    }}>{children}</a>,
-    pre: ({ children }: React.ComponentProps<"pre">) => <CodeBlock fail={fail}>{children}</CodeBlock>,
-  }), [runtime, fail, base]);
-  return <ReactMarkdown remarkPlugins={[remarkGfm]} skipHtml urlTransform={url => /^(?:https?:\/\/|\/|[A-Za-z]:[\\/]|\.\.?\/)/.test(url) || !/^[a-z][a-z\d+.-]*:/i.test(url) ? url : ""} components={components}>{text}</ReactMarkdown>;
-});
 const MessageRow = memo(function MessageRow({ message: m, runtime, timeline, reasoning, expanded, retry, fail, openLog, located }: {
   message: Message; runtime?: string; timeline: boolean; reasoning: boolean; expanded: Map<string, boolean>; retry?: () => void; fail: (e: unknown) => void; openLog?: (source: SourceRef) => void; located?: boolean;
 }) {

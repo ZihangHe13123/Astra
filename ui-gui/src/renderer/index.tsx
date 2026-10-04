@@ -20,6 +20,8 @@ import { CommandInput } from "./command-input.js";
 import { commandNames, describeCommands, modeSessionTarget, type CommandMode } from "./command-help.js";
 import { sessionTitle, sidebarGroups } from "./sidebar.js";
 import "./style.css";
+import "katex/dist/katex.min.css";
+import "./rich-markdown.css";
 
 const defaults: Preferences = { theme: "system", drafts: {}, attachments: {}, workspaces: {}, pinned: [], projects: [], titles: {}, timeline: true };
 const builtinCommandModes: CommandMode[] = [

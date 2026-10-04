@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 from typing import BinaryIO
@@ -27,31 +28,38 @@ class InstanceLock:
         if self._file is not None:
             return
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle = self.path.open("a+b")
+        # No buffered or seed writes before ownership: Windows byte locks may
+        # cover an empty file while its owner is replacing the PID metadata.
+        handle = self.path.open("a+b", buffering=0)
         try:
-            handle.seek(0, os.SEEK_END)
-            if handle.tell() == 0:
-                handle.write(b"\0")
-                handle.flush()
             handle.seek(0)
-            if os.name == "nt":
-                import msvcrt
+            try:
+                if os.name == "nt":
+                    import msvcrt
 
-                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-            else:
-                import fcntl
+                    # _locking explicitly supports byte ranges beyond EOF.
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
 
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except (BlockingIOError, OSError) as exc:
-            handle.close()
-            raise InstanceAlreadyRunning(
-                f"another instance owns {self.path}"
-            ) from exc
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK):
+                    raise InstanceAlreadyRunning(f"another instance owns {self.path}") from exc
+                raise
 
-        handle.seek(0)
-        handle.truncate()
-        handle.write(f"{os.getpid()}\n".encode("ascii"))
-        handle.flush()
+            handle.seek(0)
+            handle.truncate()
+            handle.write(f"{os.getpid()}\n".encode("ascii"))
+            handle.flush()
+        except BaseException as exc:
+            # Closing also releases a lock already acquired before metadata
+            # failed. Keep that original error if close itself reports failure.
+            try:
+                handle.close()
+            except OSError as close_error:
+                exc.add_note(f"Closing instance lock also failed: {close_error}")
+            raise
         self._file = handle
 
     def release(self) -> None:

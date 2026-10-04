@@ -13,5 +13,7 @@ test("the renderer never uses the web clipboard, which this window's permissions
 });
 
 test("the copy button writes through the desktop bridge", () => {
-  assert.match(readFileSync(new URL("../src/renderer/messages.tsx", import.meta.url), "utf8"), /window\.astra\.copyText\(/);
+  for (const name of ["copy-button.tsx", "mermaid-block.tsx"]) {
+    assert.match(readFileSync(new URL(`../src/renderer/${name}`, import.meta.url), "utf8"), /window\.astra\.copyText\(/);
+  }
 });
