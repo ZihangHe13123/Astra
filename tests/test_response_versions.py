@@ -7,7 +7,8 @@ from types import SimpleNamespace
 import pytest
 
 from agent.cli.response_versions import ResponseVersions
-from agent.runtime.context import AgentContext
+from agent.runtime.context import AgentContext, normalize_replay_messages
+from agent.core.msg import ContentBlock, Msg
 from agent.runtime.conversation_branches import ConversationBranches
 from agent.runtime.session_store import SessionStore
 
@@ -162,3 +163,68 @@ def test_notification_failure_cannot_reset_an_already_adopted_branch(tmp_path):
     persisted = SessionStore(context.session_path).load(readonly=True)["messages"]
     assert persisted[:-1] == selected
     assert persisted[-1]["content"] == "next"
+
+
+@pytest.mark.parametrize("shape", ["text_parts", "image_placeholder", "api_content", "null_tool_content", "tool_text_parts", "legacy_reasoning"])
+def test_regeneration_freezes_runtime_replay_shape_before_model_execution(tmp_path, shape):
+    context, model, controller, command, sent, changes = fixture(tmp_path)
+    raw = copy.deepcopy(context.messages)
+    if shape == "text_parts":
+        raw[0]["content"] = [{"type": "text", "text": "change a file and explain"}]
+    elif shape == "image_placeholder":
+        image = Msg(sender="user", role="user", content=[ContentBlock.text("change a file and explain"),
+            ContentBlock.image_url("data:image/png;base64,aGVsbG8=", source_path="fixture.png")])
+        raw[0]["content"] = image.to_storage_content()
+        assert isinstance(raw[0]["content"], list)
+    elif shape == "api_content":
+        raw[0]["api_content"] = "Retired prompt sidecar"
+    elif shape == "null_tool_content":
+        raw[1]["content"] = None
+    elif shape == "tool_text_parts":
+        raw[2]["content"] = [{"type": "text", "text": "Successfully wrote the file"}]
+    else:
+        raw.insert(3, {"role": "user", "content": "[Old reasoning context]\n\nSaved tool reasoning",
+                       "_meta": {"type": "reasoning_context"}})
+    store = SessionStore(context.session_path, branch_id="main")
+    store.save({"system_prompt": context.system_prompt, "messages": raw}, snapshot=True)
+    before = {path: (path.read_bytes(), path.stat().st_mtime_ns) for path in store.related_paths() if path.is_file()}
+    context.messages = copy.deepcopy(raw)
+    state = controller.state()
+    command.update(branch_id=state["branch_id"], revision=state["revision"], source_ref=state["targets"][0]["source_ref"])
+    expected, _ = normalize_replay_messages(raw[:command["source_ref"]["index"]])
+    asyncio.run(controller.regenerate(command))
+    assert len(model.requests) == 1
+    assert context.messages[:-1] == expected
+    assert context.messages[-1]["content"] == "Alternative"
+    assert normalize_replay_messages(expected)[0] == expected
+    assert controller.state()["groups"][0]["user_text"].startswith("change a file and explain")
+    assert store.load(readonly=True)["messages"] == raw
+    assert all((path.read_bytes(), path.stat().st_mtime_ns) == contents for path, contents in before.items())
+    if shape == "image_placeholder":
+        assert "[Image: fixture.png]" in model.requests[0]["messages"][1]["content"]
+    if shape == "legacy_reasoning":
+        assert model.requests[0]["messages"][2]["reasoning_content"] == "Saved tool reasoning"
+
+
+def test_unrestorable_original_request_fails_before_spending_a_model_call(tmp_path):
+    context, model, controller, command, sent, changes = fixture(tmp_path)
+    raw = copy.deepcopy(context.messages)
+    raw[0]["content"] = [{"type": "image_url", "image_url": {"url": "data:image/png;base64,aGVsbG8="}}]
+    SessionStore(context.session_path).save({"messages": raw}, snapshot=True)
+    state = controller.state()
+    command.update(revision=state["revision"], source_ref=state["targets"][0]["source_ref"])
+    with pytest.raises(ValueError, match="original request"):
+        asyncio.run(controller.regenerate(command))
+    assert model.requests == [] and context.branch_id == "main"
+
+
+def test_completed_but_invalid_tool_chain_is_not_silently_discarded_during_regeneration(tmp_path):
+    context, model, controller, command, sent, changes = fixture(tmp_path)
+    raw = copy.deepcopy(context.messages)
+    raw[1]["tool_calls"][0]["function"]["arguments"] = "{broken"
+    SessionStore(context.session_path).save({"messages": raw}, snapshot=True)
+    state = controller.state()
+    command.update(revision=state["revision"], source_ref=state["targets"][0]["source_ref"])
+    with pytest.raises(ValueError, match="tool observations"):
+        asyncio.run(controller.regenerate(command))
+    assert model.requests == [] and context.branch_id == "main"

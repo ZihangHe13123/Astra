@@ -405,3 +405,26 @@ def test_legacy_synthetic_user_envelopes_are_not_regeneration_anchors(tmp_path):
     prepared = prepare(branches, 3)
     assert branches.state()["groups"][0]["user_text"] == "actual"
     assert prepared["seed"]["messages"] == messages[:3]
+
+
+def test_normalized_image_request_keeps_its_version_group_after_compaction(tmp_path):
+    image = {"role": "user", "content": [{"type": "text", "text": "image question"},
+             {"type": "text", "text": "[Image: fixture.png]"}], "timestamp": 1700000010}
+    original = {**answer("image answer"), "timestamp": 1700000011}
+    _, branches = initial(tmp_path, [user("earlier"), answer("earlier answer"), image, original])
+    prepared = prepare(branches, 3)
+    data = copy.deepcopy(prepared["seed"])
+    data["messages"].append({**answer("alternative"), "timestamp": 1700000012})
+    candidate = SessionStore(branches.logical_path, branch_id=prepared["candidate_branch_id"])
+    candidate.save(data)
+    state = branches.finish_candidate(prepared["candidate_branch_id"])
+    group_id = state["groups"][0]["id"]
+    compacted = [{**user("recap"), "metadata": {"synthetic": True}}, *data["messages"][-2:]]
+    candidate.save({"messages": compacted}, append_from=0, snapshot=True)
+    state = branches.state()
+    assert state["groups"][0]["source_ref"] == message_source_ref(compacted[-1], 2)
+    next_version = prepare(branches, 2)
+    assert next_version["group_id"] == group_id and len(branches.state()["groups"]) == 1
+    branches.finish_candidate(next_version["candidate_branch_id"], status="cancelled")
+    selected = select(branches, group_id, state["groups"][0]["versions"][0]["id"])
+    assert selected["state"]["groups"][0]["source_ref"] == message_source_ref(original, 3)
