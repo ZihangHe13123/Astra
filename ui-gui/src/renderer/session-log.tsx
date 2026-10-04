@@ -35,8 +35,8 @@ export function SessionLogCard({ record, selected, select, locate }: { record: S
 }
 
 /** Read-only persisted session records. Requests never create or control a runtime. */
-export function SessionLogPanel({ session, mode, target, width, close, locate }: {
-  session: string; mode: string; target: LogTarget; width: number; close: () => void; locate: (record: SessionLogRecord, revision: string, isCurrent: () => boolean) => Promise<void>;
+export function SessionLogPanel({ session, mode, branchId, responseRevision, target, width, close, locate }: {
+  session: string; mode: string; branchId?: string; responseRevision?: number; target: LogTarget; width: number; close: () => void; locate: (record: SessionLogRecord, revision: string, isCurrent: () => boolean) => Promise<void>;
 }) {
   const [page, setPage] = useState<SessionLogPage>();
   const [selected, setSelected] = useState<number>();
@@ -47,13 +47,13 @@ export function SessionLogPanel({ session, mode, target, width, close, locate }:
   const [cursors, setCursors] = useState<(number | undefined)[]>([undefined]);
   const serial = useRef(0);
   const content = useRef<HTMLDivElement>(null);
-  const scope = `${mode}:${session}`;
+  const scope = `${mode}:${session}:${branchId || ""}:${responseRevision || ""}`;
   const scopeRef = useRef(scope); scopeRef.current = scope;
   const request = async (params: Record<string, unknown>, stack: (number | undefined)[], expectedRevision?: string) => {
     const generation = ++serial.current, requestScope = scope;
     setBusy(true); setLocating(false); setError(""); setNotice("");
     try {
-      const value: SessionLogPage = await window.astra.query("session_log", { name: session, mode, limit: 25, ...params });
+      const value: SessionLogPage = await window.astra.query("session_log", { name: session, mode, branch_id: branchId, limit: 25, ...params });
       if (generation !== serial.current || requestScope !== scopeRef.current) return;
       if (expectedRevision && value.revision !== expectedRevision) {
         setPage(undefined); setSelected(undefined); setCursors([undefined]);

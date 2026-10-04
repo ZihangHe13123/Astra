@@ -13,6 +13,7 @@ from dataclasses import replace
 import inspect
 import logging
 import platform
+import re
 import shlex
 import time
 import uuid
@@ -113,6 +114,8 @@ from agent.runtime.tools.user_questions import register_user_question_tools
 from agent.runtime.memory_consolidation import MemoryConsolidator
 from agent.runtime.session_handoff import generate_handoff, save_handoff
 from agent.runtime.session_store import SessionStore
+from agent.runtime.conversation_branches import ConversationBranches, branch_scope
+from agent.cli.response_versions import ResponseVersions
 from agent.sandbox.local import LocalSandbox
 from agent.sandbox.docker import DockerSandbox
 from agent.sandbox.router import SandboxRouter
@@ -658,7 +661,7 @@ def _save_handoff(agent: ReActAgent, task_store: TaskStore | None, *, notes: str
     if getattr(agent, "local_mode", False):
         return None
     try:
-        session_id = Path(agent.context.session_path).stem if agent.context.session_path else "default"
+        session_id = agent.context.session_scope
         text = generate_handoff(
             session_id=session_id,
             task_store=task_store,
@@ -680,7 +683,7 @@ async def main():
     global _event_writer
     # Establish IPC before environment/model initialization, including failures.
     _write_event({"type": "backend_hello", "protocol_version": 1,
-                  "capabilities": ["ui_queries", "session_ownership", "gui_ready"]})
+                  "capabilities": ["ui_queries", "session_ownership", "gui_ready", "response_versions"]})
     startup_started = time.perf_counter()
     load_project_env(PROJECT_ROOT)
     profile = RuntimeProfiler.from_env(PROJECT_ROOT)
@@ -734,7 +737,7 @@ async def _main(startup_started: float):
     task_store: TaskStore | None = None
     try:
         task_store = TaskStore()
-        await durable_io(task_store.recover_interrupted, session_id=startup_session_id)
+        await durable_io(task_store.recover_interrupted, session_id=SessionStore(initial_session_path).session_scope)
     except Exception as exc:
         print(f"[backend] task persistence disabled: {exc}", file=sys.stderr, flush=True)
 
@@ -811,7 +814,7 @@ async def _main(startup_started: float):
     def _question_identity() -> dict[str, str]:
         from agent.runtime.session_identity import session_key
         path = Path(agent.context.session_path).resolve()
-        return {"session_id": path.stem, "session_scope": session_key(path),
+        return {"session_id": path.stem, "session_scope": session_key(path) + (":" + agent.context.branch_id if agent.context.branch_id != "main" else ""),
                 "task_id": str(agent_holder.get("question_task_id", ""))}
 
     question_broker = UserQuestionBroker(
@@ -841,24 +844,24 @@ async def _main(startup_started: float):
     register_memory_tools(
         tools,
         memory_store,
-        session_id=lambda: Path(agent_holder["agent"].context.session_path).stem if agent_holder else "default",
+        session_id=lambda: agent_holder["agent"].context.session_scope if agent_holder else "default",
     )
     register_goal_tools(
         tools,
         task_store,
-        session_id=lambda: Path(agent_holder["agent"].context.session_path).stem if agent_holder else "default",
+        session_id=lambda: agent_holder["agent"].context.session_scope if agent_holder else "default",
         on_goal_event=lambda goal: _send({"type": "goal_status", "goal": goal}),
     )
     register_plan_tools(
         tools,
         memory_store,
-        session_id=lambda: Path(agent_holder["agent"].context.session_path).stem if agent_holder else "default",
+        session_id=lambda: agent_holder["agent"].context.session_scope if agent_holder else "default",
     )
     register_skill_tools(
         tools, skill_store,
         learning_getter=lambda: agent_holder["agent"]._learning_store,
         messages=lambda: list(agent_holder["agent"].context.messages) if agent_holder else [],
-        session_id=lambda: Path(agent_holder["agent"].context.session_path).stem if agent_holder else "default",
+        session_id=lambda: agent_holder["agent"].context.session_scope if agent_holder else "default",
     )
     from agent.runtime.tools.workspace_dependencies import register_workspace_dependency_tools
     register_workspace_dependency_tools(tools)
@@ -878,6 +881,19 @@ async def _main(startup_started: float):
         ),
     )
     delegate_statuses: dict[str, dict] = {}
+
+    def _delegate_store(scope: str) -> SessionStore:
+        ctx = agent_holder.get("agent").context if agent_holder.get("agent") else None
+        if re.fullmatch(r"branch_[0-9a-f]{16}_[0-9a-f]{32}", scope):
+            branch = scope.rsplit("_", 1)[-1]
+            if ctx is None or branch_scope(ctx.session_path, branch) != scope:
+                raise ValueError("Delegate belongs to a different conversation branch")
+            return SessionStore(ctx.session_path, branch_id=branch)
+        return SessionStore(session_path(scope), branch_id="main")
+
+    def _delegate_conversation_store(scope: str, key: str) -> SessionStore:
+        parent = _delegate_store(scope)
+        return SessionStore.for_subagent(parent.logical_path, key, branch_id=parent.branch_id)
 
     def _send_delegate_status(event: dict) -> None:
         # Live state wins over a read-only historical "interrupted" projection
@@ -904,7 +920,7 @@ async def _main(startup_started: float):
             else []
         ),
         session_id_getter=lambda: (
-            Path(agent_holder["agent"].context.session_path).stem
+            agent_holder["agent"].context.session_scope
             if "agent" in agent_holder
             and agent_holder["agent"].context.session_path
             else "default"
@@ -914,10 +930,8 @@ async def _main(startup_started: float):
             **event,
         }),
         on_delegate_event=_send_delegate_status,
-        on_session_event=lambda session_id, event: SessionStore(
-            session_path(session_id)
-        ).append_subagent_event(event),
-        conv_store_for=lambda session_id, key: SessionStore.for_subagent(session_path(session_id), key),
+        on_session_event=lambda session_id, event: _delegate_store(session_id).append_subagent_event(event),
+        conv_store_for=_delegate_conversation_store,
         task_store=task_store,
         sandbox=sandbox,
     )
@@ -1147,7 +1161,7 @@ async def _main(startup_started: float):
     startup_profiler.mark("agent_and_session_setup")
 
     def _current_memory_session() -> str:
-        return Path(agent.context.session_path).stem if agent.context.session_path else "default"
+        return agent.context.session_scope
 
     def _send_working_memory() -> None:
         if bar_mode.active or minimal_mode.active or local_mode.active:
@@ -1262,6 +1276,7 @@ async def _main(startup_started: float):
         logger.exception("peer mailbox unavailable")
         peer_link = None
     peer_clock = {"heartbeat": 0.0, "inbox": 0.0}
+    peer_lock = asyncio.Lock()  # identity changes and claim/release share one owner
 
     def _window_name() -> str:
         if peer_link is not None and peer_link.name:
@@ -1273,9 +1288,23 @@ async def _main(startup_started: float):
     browser_clock = {"handover": 0.0}
 
     def _peer() -> PeerLink:
-        if peer_link is None or not peer_link.peer_id:
-            raise ValueError("Messaging other Astra sessions is available in a local Work session only.")
+        if (peer_link is None or not peer_link.peer_id
+                or peer_link.peer_id != f"{peer_link.site}:{agent.context.session_scope}"):
+            raise ValueError("Messaging other Astra sessions is available after the current conversation branch joins the local mailbox.")
         return peer_link
+
+    async def _peer_sync_locked() -> None:
+        """Called under peer_lock; never retarget a claimed batch to a new identity."""
+        if peer_link is None or active_channel.get() or bar_mode.active or minimal_mode.active or local_mode.active:
+            return
+        session = agent.context.session_scope
+        if peer_link.peer_id == f"{peer_link.site}:{session}":
+            return
+        if peer_link.peer_id:
+            await durable_io(peer_link.leave)
+        first = _first_request(agent.context.messages)
+        await durable_io(peer_link.join, session, default_name(first, session), workspace=os.getcwd())
+        peer_clock.update(heartbeat=time.monotonic(), inbox=0.0)
 
     def _peer_event(direction: str, peer: str, task_id: str, state: str, text: str) -> None:
         _send({"type": "peer_message", "direction": direction, "peer": peer, "task_id": task_id,
@@ -1795,6 +1824,8 @@ async def _main(startup_started: float):
                 for item in finished:
                     _peer_event("out", item["to"], item["task_id"], item["state"], answer or "No result.")
             await agent.context.save_async()
+            if os.getenv("ASTRA_UI_SURFACE") == "gui":
+                _send({"type": "response_versions", **ConversationBranches(agent.context.session_path).state(branch_id=agent.context.branch_id)})
             if bar_mode.active:
                 if turn_completed and not was_cancelled and not failed_message:
                     bar_mode.complete_turn()
@@ -1987,7 +2018,7 @@ async def _main(startup_started: float):
         saved_results = []
         if _task_tracking_enabled() and task_store is not None and agent.context.session_path:
             try:
-                saved_results = await durable_io(task_store.recent_tool_results, Path(agent.context.session_path).stem)
+                saved_results = await durable_io(task_store.recent_tool_results, agent.context.session_scope)
             except Exception:
                 logger.exception("could not restore saved tool details")
         results = history_tool_results(agent.context.messages, saved_results)
@@ -1999,9 +2030,12 @@ async def _main(startup_started: float):
             from agent.ui.delegates import delegate_history
             restored_delegates = await durable_io(delegate_history, SessionStore(agent.context.session_path))
             delegates = {item["process_id"]: item for item in restored_delegates}
-            delegates.update({pid: item for pid, item in delegate_statuses.items() if item.get("session_id") == session_id})
+            delegates.update({pid: item for pid, item in delegate_statuses.items() if item.get("session_id") == agent.context.session_scope})
         _send({"type": "history", "session_id": session_id, "messages": hist,
+               "branch_id": agent.context.branch_id,
                "tool_results": results, "delegates": list(delegates.values())})
+        if os.getenv("ASTRA_UI_SURFACE") == "gui":
+            _send({"type": "response_versions", **ConversationBranches(agent.context.session_path).state(branch_id=agent.context.branch_id)})
         identity = _question_identity()
         question_broker.expire_other_sessions(identity["session_id"], identity["session_scope"])
         question_broker.recover_expired(identity["session_id"], identity["session_scope"])
@@ -2158,6 +2192,8 @@ async def _main(startup_started: float):
     if bar_mode.active:
         _send_bar_state()
 
+    if os.getenv("ASTRA_UI_SURFACE") == "gui":
+        await durable_io(ConversationBranches(agent.context.session_path).recover_interrupted)
     if restored:
         await _send_history()
 
@@ -2182,6 +2218,7 @@ async def _main(startup_started: float):
     active_wakeup = False
     goal_turn_generation = 0
     _reply_done = False  # True once {"type": "done"} is sent; post-processing may still run
+    _response_regenerating = False
 
     async def _stop_wakeup_turn() -> None:
         # A tool inside this turn may stop repetition without awaiting its own parent.
@@ -2191,8 +2228,22 @@ async def _main(startup_started: float):
             with suppress(asyncio.CancelledError, Exception):
                 await active_task
 
+    def _response_head_current() -> bool:
+        if os.getenv("ASTRA_UI_SURFACE") != "gui":
+            return True
+        try:
+            selected, _ = ConversationBranches(agent.context.session_path).resolve()
+            if selected == agent.context.branch_id:
+                return True
+        except Exception:
+            logger.exception("could not verify the selected conversation branch")
+        _send({"type": "error", "message": "Conversation selection could not be verified. Reopen this session before sending more messages."})
+        return False
+
     async def _launch_message(msg: Msg, input_text: str, resume_task: dict | None = None) -> bool:
         nonlocal active_task, active_task_id, goal_turn_generation, _reply_done
+        if _response_regenerating or not _response_head_current():
+            return False
         if restart.draining:
             _send({"type": "restart_status", "state": restart.state, "request_id": restart.request_id,
                    "message": "Restart is pending. Use /restart cancel before starting more work."})
@@ -2226,7 +2277,7 @@ async def _main(startup_started: float):
         if (resume_task is None and _task_tracking_enabled() and task_store is not None
                 and all(block.type == "text" for block in msg.content)):
             from agent.runtime.task_resume import budget_resume_candidate, resume_prompt
-            session_id = Path(agent.context.session_path).stem if agent.context.session_path else ""
+            session_id = agent.context.session_scope
             candidate = await durable_io(budget_resume_candidate, task_store, session_id, input_text)
             if candidate is not None:
                 resume_task = await durable_io(task_store.prepare_resume, candidate["id"])
@@ -2241,6 +2292,8 @@ async def _main(startup_started: float):
 
     def _start_message(msg: Msg, input_text: str, resume_task: dict | None = None, *, appshot_turn_owned: bool = False) -> bool:
         nonlocal active_task, active_task_id, active_task_persisted, active_wakeup, goal_turn_generation, _reply_done
+        if _response_regenerating or not _response_head_current():
+            return False
         active_wakeup = msg.metadata.get("source") == "session_wakeup"
         if agent.llm.config.connection_required:
             _send({"type": "error", "message": "Use /connect and select a model before sending a message."})
@@ -2278,7 +2331,7 @@ async def _main(startup_started: float):
                     assert task_store is not None
                     run = task_store.start_run(
                         str(request_id), input_text,
-                        session_id=Path(agent.context.session_path).stem if agent.context.session_path else "",
+                        session_id=agent.context.session_scope,
                         model=agent.llm.config.model,
                     )
 
@@ -2425,6 +2478,127 @@ async def _main(startup_started: float):
                 or (active_task is not None and not active_task.done())
                 or any(not task.done() for task in (*goal_tasks, *manual_reviews)))
 
+    async def _response_changed() -> None:
+        question_broker.supersede("Question expired because the reply version changed.")
+        question_followups.clear()
+        agent_holder["question_task_id"] = ""
+        # The selected head already changed. Finish/release an older inbox read
+        # before rebinding; a failed directory refresh cannot undo publication.
+        try:
+            async with peer_lock:
+                await _peer_sync_locked()
+        except Exception:
+            logger.exception("could not refresh conversation branch mailbox")
+        await _send_history()
+        await _send_model_info()
+        _send_session_info()
+        _send_session_list()
+        _send_working_memory()
+
+    response_versions = ResponseVersions(agent, _send, _response_changed)
+    response_receipts: dict[str, tuple[str, dict | None]] = {}
+
+    async def _response_guard() -> None:
+        if restart.draining or _turn_busy():
+            raise ValueError("Finish or stop the current work before changing reply versions.")
+        if (pending_tool_approvals or any(not item.done() for item in approval_resolutions.values())
+                or question_broker.pending_count or question_broker.queued_request_ids
+                or wakeups.status()["state"] in {"scheduled", "running"}):
+            raise ValueError("Resolve pending questions, approvals and scheduled work before changing reply versions.")
+        # A retained teammate/process can still write or deliver a report after
+        # the main answer. Wait for it to stop before changing its parent context.
+        processes = await durable_io(process_manager.list, include_completed=False)
+        delegates = await durable_io(delegate_mailbox.manager.list, include_completed=False)
+        if processes or delegates or any(item.get("status") in {"queued", "running", "idle"}
+                                        for item in delegate_statuses.values()):
+            raise ValueError("Stop active processes and teammates before changing reply versions.")
+        if peer_link is not None:
+            async with peer_lock:
+                await _peer_sync_locked()
+                if (await durable_io(peer_link.tasks) or await durable_io(peer_link.has_mail)):
+                    raise ValueError("Finish peer tasks and read pending replies before changing reply versions.")
+        if _turn_busy():
+            raise ValueError("The conversation became busy; try again after it finishes.")
+
+    async def _response_operation(command: dict) -> None:
+        nonlocal active_task, active_task_id, active_task_persisted, _reply_done, _response_regenerating
+        request_id = command.get("request_id")
+        if not isinstance(request_id, str) or not request_id or len(request_id) > 128:
+            _send({"type": "response_operation_result", "request_id": "", "error": "Invalid request identity"})
+            return
+        payload = json.dumps(command, sort_keys=True)
+        if request_id in response_receipts:
+            previous, receipt = response_receipts[request_id]
+            if previous != payload:
+                _send({"type": "response_operation_result", "request_id": request_id, "error": "Request identity was reused"})
+            elif receipt is not None:
+                _send(receipt)
+            return
+        response_receipts[request_id] = (payload, None)
+
+        def receipt(error: str = "") -> None:
+            result = {"type": "response_operation_result", "request_id": request_id, "error": error}
+            response_receipts[request_id] = (payload, result)
+            _send(result)
+            if len(response_receipts) > 256:
+                for old_id, (_, old_result) in list(response_receipts.items()):
+                    if old_result is not None and old_id != request_id:
+                        response_receipts.pop(old_id)
+                        break
+
+        try:
+            if _reply_done and active_task is not None and not _response_regenerating:
+                with suppress(asyncio.CancelledError, Exception):
+                    await active_task
+            await _response_guard()
+            response_versions._identity(command)
+            if command["type"] == "response_select":
+                async with agent_turn_lock:
+                    await response_versions.select(command)
+                receipt()
+                return
+            if agent.llm.config.connection_required:
+                raise ValueError("Connect a model before regenerating a reply.")
+        except Exception as exc:
+            receipt(str(exc))
+            return
+
+        _response_regenerating = True
+        _reply_done = False
+        active_task_id = request_id
+        active_task_persisted = False
+        _send({"type": "task_started", "task": {"id": request_id, "status": "running", "input_text": "Regenerate reply"}})
+        entered = False
+
+        async def generate() -> None:
+            nonlocal _response_regenerating, _reply_done, entered
+            entered = True
+            outcome, error = "completed", ""
+            try:
+                async with agent_turn_lock:
+                    await response_versions.regenerate(command)
+            except asyncio.CancelledError:
+                outcome, error = "cancelled", "Regeneration cancelled. The previous reply is still selected."
+            except Exception as exc:
+                outcome, error = "failed", str(exc)
+                logger.exception("response regeneration failed")
+            finally:
+                _response_regenerating = False
+                _reply_done = True
+                _send({"type": "task_status", "task": {"id": request_id, "status": outcome}})
+                receipt(error)
+
+        def before_start(task: asyncio.Task) -> None:
+            nonlocal _response_regenerating, _reply_done
+            if task.cancelled() and not entered:
+                _response_regenerating = False
+                _reply_done = True
+                _send({"type": "task_status", "task": {"id": request_id, "status": "cancelled"}})
+                receipt("Regeneration cancelled before starting.")
+
+        active_task = asyncio.create_task(generate(), name=f"response-{request_id}")
+        active_task.add_done_callback(before_start)
+
     async def _browser_handover_tick() -> None:
         """Hand the browser channel to another Astra window that asked for it, while this one is idle."""
         lifecycle = browser_lifecycle
@@ -2446,51 +2620,65 @@ async def _main(startup_started: float):
                              "The next browser task here reconnects and observes again."})
 
     async def _peer_tick() -> None:
-        """Keep this session listed, and when it is idle start a turn with any mail it has."""
+        """Claim mail only for the same idle branch observed before the read."""
         assert peer_link is not None
-        now = time.monotonic()
-        busy = _turn_busy()
-        local = not (active_channel.get() or bar_mode.active or minimal_mode.active or local_mode.active)
-        session = Path(agent.context.session_path).stem if agent.context.session_path else ""
-        try:
-            if not busy and local and session and peer_link.peer_id != f"{peer_link.site}:{session}":
-                if peer_link.peer_id:
-                    await asyncio.to_thread(peer_link.leave)
-                first = _first_request(agent.context.messages)
-                await asyncio.to_thread(peer_link.join, session, default_name(first, session), workspace=os.getcwd())
-                peer_clock["heartbeat"] = now
-            elif peer_link.peer_id and now - peer_clock["heartbeat"] >= HEARTBEAT_SECONDS:
-                peer_clock["heartbeat"] = now
-                if not busy and local and peer_link.name == fallback_name(session):
-                    # Named before its first request; the request now gives a readable name.
-                    first = _first_request(agent.context.messages)
-                    if first:
-                        with suppress(PeerError):
-                            await asyncio.to_thread(peer_link.rename, default_name(first, session))
-                await asyncio.to_thread(peer_link.heartbeat, "busy" if busy or not local else "idle")
-            if (busy or not local or restart.draining or not peer_link.peer_id
-                    or agent.llm.config.connection_required or now - peer_clock["inbox"] < 1.0):
-                return
-            peer_clock["inbox"] = now
-            if not await asyncio.to_thread(peer_link.has_mail):
-                return
-            messages = await asyncio.to_thread(peer_link.claim_inbox)
-        except Exception:
-            logger.exception("peer mailbox tick failed")
-            return
-        if not messages:
-            return
-        for message in messages:
-            _peer_event("in", message["sender_name"], message["task_id"], message["state"] or message["task_state"],
-                        message["body"])
-        display = "\n\n".join(f"PEER ← {m['sender_name']} · {m['state'] or m['task_state']} · {m['task_id']}\n{m['body']}"
-                              for m in messages)
-        given = [m["task_id"] for m in messages if m["assignee"] == peer_link.peer_id]
-        msg = Msg(sender="peer", role="user",
-                  content=build_user_message_content(incoming_prompt(messages, peer_link.peer_id)),
-                  metadata={"source": "peer_message", "display_command": display, "peer_tasks": given})
-        if not _start_message(msg, display):
-            await asyncio.to_thread(peer_link.release, messages)
+        async with peer_lock:
+            session = agent.context.session_scope
+            now = time.monotonic()
+            messages: list[dict] = []
+            admitted = False
+
+            def current_idle() -> bool:
+                return (agent.context.session_scope == session
+                        and peer_link.peer_id == f"{peer_link.site}:{session}"
+                        and not (_turn_busy() or _response_regenerating or restart.draining
+                                 or active_channel.get() or bar_mode.active or minimal_mode.active
+                                 or local_mode.active or agent.llm.config.connection_required))
+
+            try:
+                if not _turn_busy() and not _response_regenerating:
+                    await _peer_sync_locked()
+                if peer_link.peer_id and now - peer_clock["heartbeat"] >= HEARTBEAT_SECONDS:
+                    peer_clock["heartbeat"] = now
+                    if current_idle() and peer_link.name == fallback_name(session):
+                        first = _first_request(agent.context.messages)
+                        if first:
+                            with suppress(PeerError):
+                                await durable_io(peer_link.rename, default_name(first, session))
+                    await durable_io(peer_link.heartbeat, "idle" if current_idle() else "busy")
+                if not current_idle() or now - peer_clock["inbox"] < 1.0:
+                    return
+                peer_clock["inbox"] = now
+                if not await durable_io(peer_link.has_mail) or not current_idle():
+                    return
+
+                def claim() -> None:
+                    # Keep the claimed batch even if cancellation arrives while
+                    # the durable database operation finishes in its worker.
+                    messages.extend(peer_link.claim_inbox())
+
+                await durable_io(claim)
+                if not messages or not current_idle():
+                    return
+                display = "\n\n".join(f"PEER ← {m['sender_name']} · {m['state'] or m['task_state']} · {m['task_id']}\n{m['body']}"
+                                      for m in messages)
+                given = [m["task_id"] for m in messages if m["assignee"] == peer_link.peer_id]
+                msg = Msg(sender="peer", role="user",
+                          content=build_user_message_content(incoming_prompt(messages, peer_link.peer_id)),
+                          metadata={"source": "peer_message", "display_command": display, "peer_tasks": given})
+                # No await between the final scope/busy proof and admission.
+                admitted = _start_message(msg, display)
+                if admitted:
+                    for message in messages:
+                        _peer_event("in", message["sender_name"], message["task_id"],
+                                    message["state"] or message["task_state"], message["body"])
+            except Exception:
+                logger.exception("peer mailbox tick failed")
+            finally:
+                if messages and not admitted:
+                    # peer_lock prevents join/leave from changing release's
+                    # recipient filter while this old branch batch is owned.
+                    await durable_io(peer_link.release, messages)
 
     lifecycle_task = asyncio.create_task(_lifecycle_tick(), name="session-lifecycle")
 
@@ -2519,6 +2707,20 @@ async def _main(startup_started: float):
             if cmd.get("type") == "exit":
                 terminal_output_failed = cmd.get("reason") == "terminal_output_failure"
                 break
+
+            elif cmd.get("type") in {"response_regenerate", "response_select"}:
+                await _response_operation(cmd)
+
+            elif _response_regenerating and cmd.get("type") in {"message", "image"}:
+                sid = cmd.get("submission_id")
+                if sid:
+                    existing = gui_submissions.begin(cmd)
+                    _send(existing if existing is not None else gui_submissions.finish(sid, False))
+                else:
+                    _send({"type": "tool_result", "name": "retry", "output": "", "code": "", "error": "Wait for regeneration or stop it before sending a message."})
+
+            elif _response_regenerating and cmd.get("type") == "command" and str(cmd.get("cmd", "")).strip().split(maxsplit=1)[:1] != ["/cancel"]:
+                _send({"type": "tool_result", "name": "retry", "output": "", "code": "", "error": "Wait for regeneration or stop it before changing the conversation."})
 
             elif cmd.get("type") == "ui_query":
                 from agent.ui.queries import query
@@ -2719,6 +2921,16 @@ async def _main(startup_started: float):
                     _send({"type": "done"})
                     continue
                 c = raw_command.strip()
+                if c == "/retry" and os.getenv("ASTRA_UI_SURFACE") == "gui":
+                    state = response_versions.state()
+                    if state["targets"]:
+                        await _response_operation({"type": "response_regenerate", "request_id": uuid.uuid4().hex,
+                                                   "branch_id": state["branch_id"], "revision": state["revision"],
+                                                   "source_ref": state["targets"][-1]["source_ref"]})
+                    else:
+                        _send({"type": "tool_result", "name": "retry", "output": "", "code": "", "error": "No complete reply is available to regenerate."})
+                        _send({"type": "done"})
+                    continue
                 try:
                     workflow = workflow_message(c)
                     if workflow is not None:
@@ -3379,7 +3591,7 @@ async def _main(startup_started: float):
                     else:
                         task_id = parts[1].strip()
                         task = await durable_io(task_store.get_task, task_id)
-                        current_session = Path(agent.context.session_path).stem if agent.context.session_path else ""
+                        current_session = agent.context.session_scope
                         if task is None:
                             _send({"type": "tool_result", "name": "resume", "output": "", "error": f"Unknown task: {task_id}", "code": ""})
                             _send({"type": "done"})
@@ -3405,7 +3617,7 @@ async def _main(startup_started: float):
                         _wakeup_event(wakeups.cancel("session_reset"), "Session wakeup stopped because the conversation was reset.")
                         await _stop_wakeup_turn()
                     latest_user_request = ""
-                    current_memory_session = Path(agent.context.session_path).stem or "default"
+                    current_memory_session = agent.context.session_scope
                     memory_store.clear_working(current_memory_session)
                     agent.end_session("reset")
                     await agent.context.save_async()
@@ -3476,7 +3688,7 @@ async def _main(startup_started: float):
                         output, error = execute_memory_command(
                             memory_store,
                             memory_parts,
-                            session_id=Path(agent.context.session_path).stem or "default",
+                            session_id=agent.context.session_scope,
                             router=agent.memory_router,
                             retainer=agent.memory_retainer,
                         )

@@ -55,6 +55,7 @@ export function checkedCommand(value: unknown): Record<string, any> {
   if (!value || typeof value !== "object" || Array.isArray(value) || JSON.stringify(value).length > 2 * 1024 * 1024) throw new Error("Invalid command");
   const c = value as Record<string, any>;
   const fields: Record<string, string[]> = {
+    response_regenerate: ["request_id", "branch_id"], response_select: ["request_id", "branch_id", "group_id", "version_id"],
     select_model: ["model_key", "request_id"], message: ["text", "submission_id"], image: ["path", "prompt", "submission_id"], command: ["cmd"],
     connect_provider: ["request_id", "route_id", "base_url", "api_key", "api_key_env"],
     cancel_connection: ["request_id"], refresh_models: [], tool_approval_response: ["request_id", "decision"],
@@ -62,11 +63,20 @@ export function checkedCommand(value: unknown): Record<string, any> {
     submission_status: ["submission_id"], restart_ack: ["request_id"],
   };
   if (!Object.hasOwn(fields, c.type)) throw new Error("Unsupported command");
-  const allowed = ["type", ...fields[c.type], ...(c.type === "refresh_models" ? ["provider_id", "force"] : []),
+  const allowed = ["type", ...fields[c.type], ...(["response_regenerate", "response_select"].includes(c.type) ? ["revision"] : []), ...(c.type === "response_regenerate" ? ["source_ref"] : []), ...(c.type === "refresh_models" ? ["provider_id", "force"] : []),
     ...(c.type === "user_question_response" ? ["answers"] : []),
     ...(c.type === "user_question_editing" ? ["editing"] : [])];
   if (Object.keys(c).some(key => !allowed.includes(key))) throw new Error("Unexpected command field");
   for (const field of fields[c.type]) checkedString(c[field], field);
+  if (["response_regenerate", "response_select"].includes(c.type)) {
+    if (!Number.isSafeInteger(c.revision) || c.revision < 0) throw new Error("Invalid conversation revision");
+    for (const field of fields[c.type]) if (!/^[A-Za-z0-9_.:-]{1,128}$/.test(c[field])) throw new Error(`Invalid ${field}`);
+    if (c.type === "response_regenerate") {
+      const source = c.source_ref;
+      if (!source || typeof source !== "object" || Array.isArray(source) || Object.keys(source).some(k => !["index", "digest"].includes(k))
+          || !Number.isSafeInteger(source.index) || source.index < 0 || typeof source.digest !== "string" || !/^[a-f0-9]{64}$/.test(source.digest)) throw new Error("Invalid response source");
+    }
+  }
   if (["message", "image", "submission_status"].includes(c.type) && !/^[A-Za-z0-9_-]{1,128}$/.test(c.submission_id)) throw new Error("Invalid submission ID");
   if (c.type === "select_model" && (!/^[^\s]+$/.test(c.model_key) || c.model_key.length > 512)) throw new Error("Invalid model key");
   if (c.type === "command" && !c.cmd.startsWith("/")) throw new Error("Commands must begin with /");

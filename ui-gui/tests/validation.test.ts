@@ -35,3 +35,13 @@ test('question editing is a bounded boolean control and cannot inject a message'
   assert.throws(()=>checkedCommand({type:'user_question_editing',request_id:'q',editing:'yes'}));
   assert.throws(()=>checkedCommand({type:'user_question_editing',request_id:'q',editing:true,text:'injected'}));
 });
+
+test('response commands require bounded identities and verified source shape', () => {
+  const regenerate = { type: 'response_regenerate', request_id: 'request-1', branch_id: 'base', revision: 1, source_ref: { index: 1, digest: 'a'.repeat(64) } };
+  assert.deepEqual(checkedCommand(regenerate), regenerate);
+  assert.equal(checkedCommand({ type: 'response_select', request_id: 'request-2', branch_id: 'base', revision: 1, group_id: 'group-1', version_id: 'v2' }).version_id, 'v2');
+  for (const patch of [{ request_id: '' }, { branch_id: 'x'.repeat(257) }, { revision: '2' }, { revision: -1 }, { revision: 1.5 }, { revision: 'r\n/retry' }, { text: 'injected' },
+    { source_ref: { index: -1, digest: 'a'.repeat(64) } }, { source_ref: { index: 1.5, digest: 'a'.repeat(64) } },
+    { source_ref: { index: 1, digest: 'invalid' } }, { source_ref: { index: 1, digest: 'a'.repeat(64), path: '/tmp' } },
+  ]) assert.throws(() => checkedCommand({ ...regenerate, ...patch }));
+});

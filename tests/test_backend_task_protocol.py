@@ -268,11 +268,15 @@ def test_backend_history_preserves_message_timestamps_and_tool_activity(tmp_path
     history = next(event for event in events if event.get("type") == "history")
 
     assert completed.returncode == 0, completed.stderr
-    assert history["messages"] == [
+    assert [{key: item[key] for key in ("role", "content", "timestamp")} for item in history["messages"]] == [
         {"role": "user", "content": "old question", "timestamp": 1_750_000_000.0},
         {"role": "assistant", "content": "old answer", "timestamp": 1_750_000_060.0},
     ]
-    assert history["tool_results"] == [{"name": "context_open", "output": "saved context", "error": "", "duration_ms": 18}]
+    assert [item["id"] for item in history["messages"]] == ["work:timestamp_history:0", "work:timestamp_history:1"]
+    assert [item["source_ref"]["index"] for item in history["messages"]] == [0, 1]
+    assert all(len(item["source_ref"]["digest"]) == 64 for item in history["messages"])
+    assert history["branch_id"] == "main"
+    assert history["tool_results"] == [{"name": "context_open", "output": "saved context", "error": "", "duration_ms": 18, "call_id": "saved-call"}]
     assert history["session_id"] == "timestamp_history"
 
 

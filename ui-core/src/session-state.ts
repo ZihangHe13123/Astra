@@ -1,4 +1,5 @@
 import { reduceAgentTeamEvent, type AgentTeamView } from "./agent-team-state.js";
+import type { ResponseVersions, ResponseOperation, ResponseRegeneration } from "./response-versions.js";
 import type { PyEvent } from "./types.js";
 import { delegateActive, reduceDelegateEvent, type DelegateView } from "./delegates.js";
 import { reduceToolPreparation, type ToolPreparation } from "./tool-preparation.js";
@@ -16,6 +17,8 @@ export type SessionState = {
   processes: Record<string, UIEvent>; delegates: Record<string, DelegateView>; teams: Record<string, AgentTeamView>; info: Record<string, UIEvent>;
   notices: UIEvent[]; stream: string; serial: number; revision: number;
   preparation?: ToolPreparation;
+  responseVersions?: ResponseVersions; responseOperation?: ResponseOperation; regeneration?: ResponseRegeneration;
+  branchId?: string;
 };
 export function initialSession(id: string, workspace = ""): SessionState {
   return { id, workspace, session: "", mode: "work", status: "connecting", busy: false, isDraft: false,
@@ -55,6 +58,7 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
     case "gui_ready": state.status = "ready"; state.workspace = event.workspace || state.workspace; break;
     case "gui_disconnected":
       state.status = "disconnected"; state.busy = false; state.stream = "";
+      state.responseOperation = undefined; state.regeneration = undefined;
       state.delegates = Object.fromEntries(Object.entries(state.delegates).map(([id, d]) => [id, delegateActive(d) ? { ...d, status: "interrupted", current_tool: "" } : d]));
       state.tools = state.tools.map(t => t.status === "running" ? { ...t, status: "interrupted" } : t);
       state.messages = state.messages.map(m => m.submissionState === "pending" ? { ...m, submissionState: "unknown" } : m);
@@ -97,15 +101,38 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
         connection_pending: { ...pending, type: "connection_pending", request_id: event.request_id,
           status: event.type === "connection_result" ? "completed" : "pending" } }; break;
     }
+    case "response_versions":
+      state.responseVersions = { revision: event.revision, active_branch: event.active_branch, branch_id: event.branch_id,
+        choices: event.choices || [], groups: event.groups || [], targets: event.targets || [] };
+      state.branchId = event.branch_id; break;
+    case "response_operation_pending":
+      state.responseOperation = { request_id: event.request_id, operation: event.operation, source_ref: event.source_ref };
+      if (event.operation === "response_regenerate" && event.source_ref) state.regeneration = {
+        request_id: event.request_id, source_ref: event.source_ref, status: "running", content: "" };
+      break;
+    case "response_regeneration": {
+      if (state.responseOperation?.request_id !== event.request_id && state.regeneration?.request_id !== event.request_id) break;
+      if (event.status === "failed" || event.status === "cancelled") state.regeneration = undefined;
+      else if (event.status === "running" || event.status === "completed" && state.regeneration) state.regeneration = {
+        request_id: event.request_id, source_ref: event.source_ref || state.regeneration?.source_ref,
+        status: event.status, content: typeof event.content === "string" ? event.content : (state.regeneration?.content || "") + (event.delta || "") };
+      break;
+    }
+    case "response_operation_result":
+      if (state.responseOperation?.request_id !== event.request_id) break;
+      state.responseOperation = undefined; state.regeneration = undefined;
+      if (event.error) notice(); break;
     case "session_info":
-      if (state.session !== event.name) state.preparation = undefined;
+      if (state.session !== event.name) { state.preparation = undefined; state.responseVersions = undefined; state.branchId = undefined; state.regeneration = undefined; }
       state.session = event.name; state.info = { ...state.info, session_info: event }; break;
     case "mode_info":
-      if (event.mode !== state.mode) { state.isDraft = false; state.preparation = undefined; }
+      if (event.mode !== state.mode) { state.isDraft = false; state.preparation = undefined; state.responseVersions = undefined; state.branchId = undefined; state.regeneration = undefined; }
       state.mode = event.mode;
       state.session = event.bar_session || event.minimal_session || event.local_session || state.session;
       state.info = { ...state.info, mode_info: event }; break;
     case "history":
+      state.regeneration = undefined;
+      if (typeof event.branch_id === "string") state.branchId = event.branch_id;
       state.messages = (event.messages || []).map((m: UIEvent, i: number) => ({
         id: m.id || `history:${event.session_id}:${i}`, role: m.role, content: textContent(m.content), timestamp: m.timestamp,
         ...(m.source_ref ? { source_ref: m.source_ref } : {}),

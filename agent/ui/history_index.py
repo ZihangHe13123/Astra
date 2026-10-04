@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -18,6 +19,7 @@ from typing import Callable, Iterator, TextIO
 
 from agent.cli.images import message_display_text
 from agent.runtime.file_change_time import change_time_token
+from agent.runtime.conversation_branches import BranchConflict, ConversationBranches, checked_branch_id
 from agent.runtime.paths import state_path
 from agent.runtime.session_store import SessionStore
 
@@ -277,8 +279,12 @@ def _rebuild(store: SessionStore, db: sqlite3.Connection) -> int:
 
 
 def _cache_path(store: SessionStore, *, version: int = _VERSION) -> Path:
+    return _source_cache_path(store.legacy_path, version=version)
+
+
+def _source_cache_path(source: Path, *, version: int = _VERSION) -> Path:
     cache = Path(os.environ.get("ASTRA_GUI_HISTORY_CACHE", "").strip() or state_path("gui", "history-index"))
-    identity = hashlib.sha256(str(store.legacy_path.resolve()).encode()).hexdigest()
+    identity = hashlib.sha256(str(source.resolve()).encode()).hexdigest()
     return cache / f"v{version}-{identity}.sqlite3"
 
 
@@ -321,13 +327,23 @@ def _database(path: Path) -> Iterator[sqlite3.Connection]:
         db.close()
 
 
-def discard_history_index(store: SessionStore) -> None:
+def discard_history_index(store: SessionStore, *, related_paths: list[Path] | None = None) -> None:
     """Remove this session's known cache generations, waiting for active readers."""
     # Upgrading the projection leaves the old private presentation copy on
     # disk. Delete only exact identities for schemas we created, never glob
     # across other sessions or infer a source path from cache contents.
-    for version in (1, _VERSION):
-        _discard_index(_cache_path(store, version=version))
+    related = store.related_paths() if related_paths is None else related_paths
+    heads = ConversationBranches(store.logical_path).root / "heads"
+    sources = {store.logical_path, store.legacy_path}
+    for path in related:
+        # Paths came from SessionStore's symlink-checked ownership inventory.
+        # Include orphan heads too: a failed publication can leave their files
+        # behind, but must not leave a recoverable private presentation cache.
+        if path.parent == heads and (match := re.fullmatch(r"([0-9a-f]{32})(?:\.snapshot|\.header)?\.(?:json|jsonl)", path.name)):
+            sources.add(heads / f"{match[1]}.json")
+    for source in sources:
+        for version in (1, _VERSION):
+            _discard_index(_source_cache_path(source, version=version))
 
 
 def _discard_index(path: Path) -> None:
@@ -356,15 +372,29 @@ def _discard_index(path: Path) -> None:
             raise
 
 
-def history_page(store: SessionStore, *, before: int | None = None, limit: int = 200, source_ref: dict | None = None) -> dict:
+def check_query_branch(store: SessionStore, branch_id: str | None = None) -> str:
+    """Keep a pinned read view on the currently selected logical branch."""
+    if branch_id is not None and checked_branch_id(branch_id) != store.branch_id:
+        raise BranchConflict("Conversation branch changed; refresh before reading")
+    active, _ = ConversationBranches(store.logical_path).resolve()
+    if active != store.branch_id:
+        raise BranchConflict("Conversation branch changed while reading; refresh before continuing")
+    return active
+
+
+def history_page(store: SessionStore, *, before: int | None = None, limit: int = 200, source_ref: dict | None = None,
+                 branch_id: str | None = None) -> dict:
     """Return a stable page without keeping complete histories in memory."""
+    check_query_branch(store, branch_id)
     if source_ref is not None:
         from agent.ui.session_log import checked_source_ref
         checked_source_ref(source_ref)
     path = _cache_path(store)
     for attempt in range(2):
         try:
-            return _read_page(store, path, before=before, limit=limit, source_ref=source_ref)
+            result = _read_page(store, path, before=before, limit=limit, source_ref=source_ref)
+            check_query_branch(store, branch_id)
+            return {**result, "branch_id": store.branch_id}
         except sqlite3.DatabaseError as exc:
             if attempt or not _corrupt(exc):
                 raise

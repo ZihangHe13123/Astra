@@ -4,20 +4,22 @@ import type { Message } from "@astra/ui-core/session-state";
 import { windowRange, messageOffsets } from "./message-window.js";
 import type { SourceRef } from "./session-log.js";
 import { CopyButton } from "./copy-button.js";
+import { responseForMessage, ResponseVersionNav, type ResponseControls } from "./response-versions.js";
 import { Markdown } from "./markdown.js";
 export { Markdown } from "./markdown.js";
 
-const MessageRow = memo(function MessageRow({ message: m, runtime, timeline, reasoning, expanded, retry, fail, openLog, located }: {
-  message: Message; runtime?: string; timeline: boolean; reasoning: boolean; expanded: Map<string, boolean>; retry?: () => void; fail: (e: unknown) => void; openLog?: (source: SourceRef) => void; located?: boolean;
+export const MessageRow = memo(function MessageRow({ message: m, runtime, timeline, reasoning, expanded, responses, fail, openLog, located }: {
+  message: Message; runtime?: string; timeline: boolean; reasoning: boolean; expanded: Map<string, boolean>; responses?: ResponseControls; fail: (e: unknown) => void; openLog?: (source: SourceRef) => void; located?: boolean;
 }) {
+  const response = responseForMessage(m, responses);
   const [open, setOpen] = useState(() => expanded.get(m.id) || false);
   const toggle = (e: React.SyntheticEvent<HTMLDetailsElement>) => { expanded.set(m.id, e.currentTarget.open); setOpen(e.currentTarget.open); };
-  return <article data-message-id={m.id} className={`message ${m.role}${m.source_ref && openLog ? " has-source" : ""}${located ? " located-message" : ""}`}>
+  return <article data-message-id={m.id} data-response-group-id={response.group?.id} data-response-pending={response.pending || undefined} className={`message ${m.role}${m.source_ref && openLog ? " has-source" : ""}${located ? " located-message" : ""}`}>
     {m.role === "reasoning" ? reasoning && <details className="reasoning" open={open} onToggle={toggle}><summary>推理 / 摘要</summary><Markdown text={m.content} runtime={runtime} fail={fail}/></details> : m.role === "tool" ? <details className="command-result" open={open} onToggle={toggle}><summary>操作结果</summary><Markdown text={m.content} runtime={runtime} fail={fail}/></details> : <>
       <div className="message-head"><span>{m.role === "user" ? "你" : m.role === "assistant" ? "Astra" : m.role === "error" ? "请求未完成" : "提示"}</span>{timeline && m.timestamp && <time>{new Date(m.timestamp * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>}</div>
-      <div className="message-body"><Markdown text={m.content} runtime={runtime} fail={fail}/></div>
+      <div className="message-body">{response.pending && !response.content ? <p className="response-pending-label" role="status"><span className="pulse"/>正在重新生成回复…</p> : <Markdown text={response.content} runtime={runtime} fail={fail}/>}</div>
       {m.submissionState === "rejected" ? <p className="small error-text" role="status">未发送：{m.submissionError || "后端拒收；可检查并重新发送草稿。"}</p> : m.submissionState === "unknown" ? <p className="small muted" role="status">接收状态未知，请先确认后端状态，避免重复发送。</p> : m.pending && <span className="muted small">正在等待接收确认…</span>}
-      <div className="message-actions"><CopyButton text={m.content} fail={fail}/>{openLog && m.source_ref && <button className="icon" aria-label="查看消息记录" title="查看已保存的会话记录" onClick={() => openLog(m.source_ref!)}><FileText size={14}/></button>}{retry && <button className="icon" aria-label="重试回复" onClick={retry}><RotateCcw size={14}/></button>}</div>
+      <div className="message-actions"><CopyButton text={response.content} fail={fail}/>{!response.pending && openLog && m.source_ref && <button className="icon" aria-label="查看消息记录" title="查看已保存的会话记录" onClick={() => openLog(m.source_ref!)}><FileText size={14}/></button>}{response.target && responses && <button className="icon" aria-label="重新生成回复" title="重新生成这条回复；保留已有版本" disabled={responses.busy} onClick={() => responses.regenerate(response.target!.source_ref)}><RotateCcw size={14}/></button>}{response.group && responses && <ResponseVersionNav group={response.group} busy={responses.busy} select={responses.select}/>}</div>
     </>}
     {openLog && m.source_ref && (m.role === "reasoning" && reasoning || m.role === "tool") && <div className="message-actions"><button className="icon" aria-label="查看消息记录" title="查看已保存的会话记录" onClick={() => openLog(m.source_ref!)}><FileText size={14}/></button></div>}
   </article>;
@@ -25,8 +27,8 @@ const MessageRow = memo(function MessageRow({ message: m, runtime, timeline, rea
 
 /** Measured window: all loaded messages remain reachable; only viewport + overscan mount.
  * Heights are kept by message id, so prepending a page preserves the visible anchor. */
-export const MessageList = memo(function MessageList({ messages, runtime, timeline, reasoning, scroller, follow, retry, fail, openLog, locate }: {
-  messages: Message[]; runtime?: string; timeline: boolean; reasoning: boolean; scroller: React.RefObject<HTMLDivElement>; follow: boolean; retry?: () => void; fail: (e: unknown) => void; openLog?: (source: SourceRef) => void; locate?: { id: string; serial: number };
+export const MessageList = memo(function MessageList({ messages, runtime, timeline, reasoning, scroller, follow, responses, fail, openLog, locate }: {
+  messages: Message[]; runtime?: string; timeline: boolean; reasoning: boolean; scroller: React.RefObject<HTMLDivElement>; follow: boolean; responses?: ResponseControls; fail: (e: unknown) => void; openLog?: (source: SourceRef) => void; locate?: { id: string; serial: number };
 }) {
   const list = useRef<HTMLDivElement>(null);
   const sizes = useRef(new Map<string, number>());
@@ -105,7 +107,7 @@ export const MessageList = memo(function MessageList({ messages, runtime, timeli
   return <div className="message-window" ref={list} data-total-messages={messages.length}>
     <div aria-hidden="true" style={{ height: offsets[range.start] }}/>
     {messages.slice(range.start, range.end).map(m => <div className="measured-message" data-row-id={m.id} key={m.id}>
-      <MessageRow message={m} openLog={openLog} located={m.id === locate?.id} runtime={runtime} timeline={timeline} reasoning={reasoning} expanded={expanded.current} retry={runtime && m.role === "assistant" && m === messages.at(-1) ? retry : undefined} fail={fail}/>
+      <MessageRow message={m} openLog={openLog} located={m.id === locate?.id} runtime={runtime} timeline={timeline} reasoning={reasoning} expanded={expanded.current} responses={responses} fail={fail}/>
     </div>)}
     <div aria-hidden="true" style={{ height: offsets[messages.length] - offsets[range.end] }}/>
   </div>;

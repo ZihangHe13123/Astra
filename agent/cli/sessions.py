@@ -240,14 +240,33 @@ def rename_session(old_name: str, new_name: str) -> None:
 
 
 def _rename_session(old_name: str, new_name: str) -> None:
+    from agent.runtime.conversation_branches import ConversationBranches
+
     old_store = SessionStore(session_path(old_name))
     new_store = SessionStore(session_path(new_name))
     if not old_store.exists:
         raise FileNotFoundError(f"Session '{old_name}' not found")
     if new_store.exists:
         raise FileExistsError(f"Session '{new_name}' already exists")
+    # The manifest and every branch head form one logical conversation. A
+    # sequence of file renames cannot move that publication boundary atomically.
+    # Refuse before moving media or any source; GUI display titles remain safe.
+    if (ConversationBranches(old_store.logical_path).all_related_paths()
+            or ConversationBranches(new_store.logical_path).all_related_paths()):
+        raise ValueError("Conversation has reply versions and cannot be renamed on disk; change its display title instead")
+    old_paths = old_store.related_paths()
+    pairs = list(zip(old_store.related_paths(include_branches=False), new_store.related_paths(include_branches=False)))
+    paired = {old for old, _ in pairs}
+    # Preserve legacy subagent journals included by the ownership inventory.
+    for old_path in old_paths:
+        if old_path not in paired:
+            suffix = old_path.name[len(old_store.logical_path.stem):]
+            pairs.append((old_path, old_path.with_name(new_store.logical_path.stem + suffix)))
+    for _, destination in pairs:
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError(f"Session destination already exists: {destination.name}")
     old_store.appshot_media.rename_to(new_store.appshot_media)
-    for old_path, new_path in zip(old_store.related_paths(), new_store.related_paths()):
+    for old_path, new_path in pairs:
         if old_path.exists():
             new_path.parent.mkdir(parents=True, exist_ok=True)
             old_path.rename(new_path)
@@ -263,10 +282,8 @@ def delete_session(name: str) -> None:
 
 
 def _delete_session(name: str) -> None:
-    store = SessionStore(session_path(name))
-    if not store.exists:
-        raise FileNotFoundError(f"Session '{name}' not found")
-    store.appshot_media.delete()
-    for path in store.related_paths():
-        if path.exists():
-            path.unlink()
+    # Reuse the branch inventory, media checks, projection disposal and scoped
+    # working-state transaction. The session lease is reentrant in this process.
+    from agent.ui.session_actions import act
+
+    act({"action": "delete", "name": name, "mode": "work"})

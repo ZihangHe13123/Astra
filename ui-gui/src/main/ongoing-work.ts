@@ -5,7 +5,7 @@ import { delegateActive } from "@astra/ui-core/delegates";
 export function hasOngoingWork(state: SessionState): boolean {
   if (state.status === "disconnected") return false;
   return state.status !== "ready" || state.messages.some(message => ["pending", "unknown"].includes(message.submissionState || ""))
-    || state.busy || !!state.approvals.length || !!state.questions.length
+    || !!state.responseOperation || !!state.regeneration || state.busy || !!state.approvals.length || !!state.questions.length
     || ["pending", "running", "cancelling"].includes(state.info.task_status?.task?.status)
     || Object.values(state.processes).some(process => process.status === "running")
     || Object.values(state.delegates).some(delegateActive)

@@ -75,6 +75,9 @@ def _same(store, **params):
     actual = queries.history("demo", **params)
     assert actual.pop("revision")
     assert actual.pop("delegates") == []
+    assert actual.pop("branch_id") == "main"
+    versions = actual.pop("response_versions")
+    assert versions["branch_id"] == "main" and versions["groups"] == [] and versions["targets"] == []
     assert actual == expected
     return actual
 

@@ -1,0 +1,8 @@
+.response-versions{display:inline-flex;align-items:center;gap:3px;font-size:12px;color:var(--muted)}
+.response-versions span{min-width:34px;text-align:center;font-variant-numeric:tabular-nums}
+.message[data-response-pending=true] .message-actions{opacity:1}
+.response-pending-label{color:var(--muted);font-size:13px;display:flex;align-items:center;gap:8px}
+.earlier-response-versions{border:1px solid var(--line);border-radius:10px;padding:10px 14px;margin-bottom:16px;font-size:13px}
+.earlier-response-versions summary{cursor:pointer;color:var(--muted)}
+.earlier-response-version{border-top:1px solid var(--line);padding:10px 0}
+.earlier-response-version p{white-space:pre-wrap;overflow-wrap:anywhere;max-height:5em;overflow:auto;margin:5px 0}

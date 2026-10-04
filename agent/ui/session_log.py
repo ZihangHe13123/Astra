@@ -48,9 +48,9 @@ def chat_source(db, index: int) -> tuple[dict | None, int | None]:
 
 
 def session_log(store: SessionStore, *, before: int | None = None, limit: int = 25,
-                source_ref: dict | None = None, call_id: str | None = None) -> dict:
+                source_ref: dict | None = None, call_id: str | None = None, branch_id: str | None = None) -> dict:
     """Return at most 50 records and 16 KiB per raw excerpt from one session."""
-    from agent.ui.history_index import _database, _cache_path, _signature, history_page
+    from agent.ui.history_index import _database, _cache_path, _signature, check_query_branch, history_page
 
     if type(limit) is not int or not 1 <= limit <= MAX_RECORDS:
         raise ValueError("Log limit must be between 1 and 50")
@@ -64,8 +64,9 @@ def session_log(store: SessionStore, *, before: int | None = None, limit: int = 
         raise ValueError("Use one log target at a time")
     if not store.exists:
         raise FileNotFoundError("Session does not exist")
+    check_query_branch(store, branch_id)
     for _attempt in range(3):
-        history_page(store, limit=1)
+        history_page(store, limit=1, branch_id=branch_id)
         with _database(_cache_path(store)) as db:
             db.execute("BEGIN")
             signature = _signature(store)
@@ -102,7 +103,8 @@ def session_log(store: SessionStore, *, before: int | None = None, limit: int = 
                                     "raw_bytes": size, "tool_call_ids": calls, "chat_position": chat_position, "chat_source_ref": chat_reference})
             if signature != _signature(store):
                 continue
+            check_query_branch(store, branch_id)
             return {"records": records, "before": start, "has_more": start > 0,
                     "total": total, "revision": hashlib.sha256(signature.encode()).hexdigest(),
-                    "target_status": target_status, "target_index": target_index}
+                    "target_status": target_status, "target_index": target_index, "branch_id": store.branch_id}
     raise OSError("Session changed while reading logs; retry the page")

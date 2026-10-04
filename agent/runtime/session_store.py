@@ -28,17 +28,22 @@ DEFAULT_SESSION_DATA = {
 
 class SessionStore:
     @classmethod
-    def for_subagent(cls, session_path: str | Path, key: str) -> "SessionStore":
+    def for_subagent(cls, session_path: str | Path, key: str, *, branch_id: str | None = None) -> "SessionStore":
         """Return an isolated canonical journal for one worker identity."""
         if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}", key):
             raise ValueError("subagent identity must be 1-128 safe ASCII filename characters")
-        parent = cls(session_path)
+        parent = cls(session_path, branch_id=branch_id)
         return cls(parent.legacy_path.parent / ".artifacts" / f"{parent.legacy_path.stem}.{key}.conv.json")
 
-    def __init__(self, path: str | Path):
-        self.legacy_path = Path(path)
-        if self.legacy_path.suffix != ".json":
-            self.legacy_path = self.legacy_path.with_suffix(".json")
+    def __init__(self, path: str | Path, branch_id: str | None = None):
+        from .conversation_branches import ConversationBranches, branch_scope
+        self.logical_path = Path(path)
+        if self.logical_path.suffix != ".json":
+            self.logical_path = self.logical_path.with_suffix(".json")
+        self._branches = ConversationBranches(self.logical_path)
+        # Resolve once: an in-flight save remains attached to its original head.
+        self.branch_id, self.legacy_path = self._branches.resolve(branch_id)
+        self.session_scope = branch_scope(self.logical_path, self.branch_id)
         self.jsonl_path = self.legacy_path.with_suffix(".jsonl")
         self.snapshot_path = self.legacy_path.with_name(f"{self.legacy_path.stem}.snapshot.json")
         self.header_path = self.legacy_path.with_name(f"{self.legacy_path.stem}.header.json")
@@ -74,6 +79,9 @@ class SessionStore:
         )
         self._run_id = ""
         self._closed = False
+        if self.branch_id != "main":
+            for related in self.related_paths(include_branches=False):
+                self._branches._safe(related)
 
     @property
     def exists(self) -> bool:
@@ -82,10 +90,10 @@ class SessionStore:
     @property
     def appshot_media(self):
         from .appshot_media import AppshotMediaStore
-        return AppshotMediaStore(self.legacy_path)
+        return AppshotMediaStore(self.logical_path)
 
-    def related_paths(self) -> list[Path]:
-        return [
+    def related_paths(self, *, include_branches: bool = True) -> list[Path]:
+        paths = [
             self.legacy_path,
             self.jsonl_path,
             self.snapshot_path,
@@ -97,6 +105,26 @@ class SessionStore:
             self.raw_tool_calls_path,
             self.approval_audit_path,
         ]
+        if include_branches:
+            if self.branch_id != "main":
+                paths.extend(SessionStore(self.logical_path, branch_id="main").related_paths(include_branches=False))
+            artifacts = self.logical_path.parent / ".artifacts"
+            if artifacts.exists():
+                self._branches._safe(artifacts)
+                pattern = re.compile(re.escape(self.logical_path.stem) + r"\.([A-Za-z0-9][A-Za-z0-9_-]{0,127})\.conv\.")
+                for path in artifacts.iterdir():
+                    match = pattern.match(path.name)
+                    if not match:
+                        continue
+                    self._branches._safe(path)
+                    if path.is_file():
+                        paths.append(path)
+                        child = SessionStore(artifacts / f"{self.logical_path.stem}.{match[1]}.conv.json", branch_id="main")
+                        paths.extend(child.related_paths(include_branches=False))
+            paths.extend(self._branches.all_related_paths())
+            for path in paths:
+                self._branches._safe(path)
+        return list(dict.fromkeys(paths))
 
     def append_diagnostic(self, event: dict[str, Any]) -> Path:
         """Persist non-canonical provider/tool diagnostics for audit."""

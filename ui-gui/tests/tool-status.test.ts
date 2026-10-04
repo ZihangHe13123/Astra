@@ -20,3 +20,11 @@ test('background delegates count as ongoing work until independently settled', (
  s=projectEvent(s,{type:'task_status',task:{status:'completed'}});assert.equal(hasOngoingWork(s),true);
  s=projectEvent(s,{type:'delegate_status',process_id:'child',status:'cancelled'});assert.equal(hasOngoingWork(s),false);
 });
+
+test('a response path operation protects the session until a receipt settles it', () => {
+ let state=projectEvent(initialSession('a'),{type:'gui_ready'});
+ state=projectEvent(state,{type:'response_operation_pending',operation:'response_select',request_id:'select'});
+ assert.equal(hasOngoingWork(state),true);
+ state=projectEvent(state,{type:'response_operation_result',request_id:'select'});
+ assert.equal(hasOngoingWork(state),false);
+});
