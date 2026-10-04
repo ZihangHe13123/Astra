@@ -3,6 +3,9 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createRoot } from "react-dom/client";
 import { ArrowUp, Square, Plus, Search, PanelLeft, PanelRight, ChevronDown, Folder, Settings, Paperclip, X, Copy, RotateCcw, ChevronRight, Command, Pin, Moon, Sun, Monitor, ArrowLeft, LoaderCircle, SlidersHorizontal, FileDiff, Terminal, Check, FileText } from "lucide-react";
 import { projectEvent, textContent, type SessionState, type UIEvent, type Message } from "@astra/ui-core/session-state";
+import { responseControlsBusy, responseOperationActive, type ResponseSource, type ResponseGroup } from "@astra/ui-core/response-versions";
+import { EarlierResponseVersions, type ResponseControls } from "./response-versions.js";
+import "./response-versions.css";
 import { modelDisplayName } from "@astra/ui-core/model-label";
 import type { CommandDescription, Preferences, SessionEntry } from "../bridge.js";
 import { Approval, CommandPalette, Modal, ModelPicker, ModelSettings, Question } from "./controls.js";
@@ -68,9 +71,20 @@ function App() {
   const state = states[active];
   const logCandidate = preview ? { name: preview.session_id as string, mode: preview.mode as string } : state && !state.isDraft ? { name: state.session, mode: state.mode } : undefined;
   const logSession = logCandidate?.name && supportsSessionLog(logCandidate.mode) ? logCandidate : undefined;
-  const logScope = logSession ? `${logSession.mode}:${logSession.name}` : "";
+  const responseVersions = state?.responseVersions;
+  const responsePending = responseOperationActive(state);
+  const responseBusy = responseControlsBusy(state);
+  const responseRequest = useRef(new Set<string>());
+  const logBranch = preview && preview.locatedFromRuntime !== active ? preview.branch_id : state?.branchId;
+  const logResponseRevision = preview && preview.locatedFromRuntime !== active ? preview.response_versions?.revision : responseVersions?.revision;
+  const logScope = logSession ? `${logSession.mode}:${logSession.name}:${logBranch || ""}:${logResponseRevision || ""}` : "";
   const logScopeRef = useRef(logScope); logScopeRef.current = logScope;
   useEffect(() => { logNavigation.current++; setChatLocation(undefined); setLogTarget(old => ({ serial: old.serial + 1 })); if (!logScope) setPanel(old => old === "logs" ? undefined : old); }, [logScope]);
+  useEffect(() => {
+    logNavigation.current++; setChatLocation(undefined); setOlderLoading(false);
+    setPanel(old => old === "logs" ? undefined : old);
+    setPreview((old: any) => old?.locatedFromRuntime === active ? undefined : old);
+  }, [active, state?.branchId, responseVersions?.revision]);
   const localDefinition = state?.info.local_mode_info?.definition;
   const commandModes = useMemo(() => [...builtinCommandModes, ...(localDefinition ? [{ mode: "local", ...localDefinition }] : [])], [localDefinition]);
   // Open the Files panel on the document the agent is writing until the user closes or leaves it.
@@ -193,7 +207,23 @@ function App() {
   const respond = async (value: UIEvent) => {
     try { await window.astra.send(active, value); } catch (error) { fail(error); throw error; }
   };
+  const responseAction = async (operation: "response_regenerate" | "response_select", source?: ResponseSource, group_id?: string, version_id?: string) => {
+    if (!state || preview || !responseVersions || responseBusy || responseRequest.current.has(state.id)) { fail("请等待当前工作结束，再选择或重新生成回复。"); return false; }
+    responseRequest.current.add(state.id);
+    try {
+      await window.astra.send(state.id, { type: operation, request_id: crypto.randomUUID(),
+        branch_id: responseVersions.branch_id, revision: responseVersions.revision,
+        ...(operation === "response_regenerate" ? { source_ref: source } : { group_id, version_id }) });
+      return true;
+    } catch (error) { fail(error); return false; }
+    finally { responseRequest.current.delete(state.id); }
+  };
   const command = async (value: string, target?: SessionState) => {
+    if (value === "/retry") {
+      const target = responseVersions?.targets.at(-1);
+      if (!target || preview) { fail("当前没有可重新生成的已保存回复；请先继续会话并等待回复完成。"); return false; }
+      return responseAction("response_regenerate", target.source_ref);
+    }
     if (value === "/model" || value === "/connect") { void openModels(); return; }
     if (value === "/session" || value === "/session list") { showSessions(); return; }
     const historyMode = modeSessionTarget(value, commandModes);
@@ -243,11 +273,17 @@ function App() {
   };
   const openModels = () => openSessionSettings("model-picker");
   const configureModels = (modelKey?: string) => { setInitialModelKey(modelKey); void openSessionSettings("models"); };
-  const commandRef = useRef(command); commandRef.current = command;
-  const retry = useCallback(() => { void commandRef.current("/retry"); }, []);
+  const responseActionRef = useRef(responseAction); responseActionRef.current = responseAction;
+  const regenerateResponse = useCallback((source: ResponseSource) => { void responseActionRef.current("response_regenerate", source); }, []);
+  const selectResponse = useCallback((group: string, version: string) => { void responseActionRef.current("response_select", undefined, group, version); }, []);
+  const responseControls = useMemo<ResponseControls | undefined>(() => !preview && responseVersions ? {
+    versions: responseVersions, regeneration: state?.regeneration, busy: responseBusy,
+    regenerate: regenerateResponse, select: selectResponse,
+  } : undefined, [!!preview, responseVersions, state?.regeneration, responseBusy, regenerateResponse, selectResponse]);
   const submit = async () => {
     let submittedKey = key;
     let submittedRuntime = "";
+    if (responsePending || state && responseRequest.current.has(state.id)) { fail("回复版本操作进行中，草稿已保留；请完成或停止后再发送。"); return; }
     if (sending || (!draft.trim() && !files.length && !hasAppshot)) return;
     setSending(true);
     try {
@@ -303,7 +339,7 @@ function App() {
     const source = recordChatSource(record);
     if (!source || !logSession) throw new Error("此记录没有可验证的聊天位置。");
     const generation = ++logNavigation.current, scope = logScope, historyGeneration = historyRequest.current;
-    const page = await window.astra.query("history", { name: logSession.name, mode: logSession.mode, source_ref: source, limit: 80 });
+    const page = await window.astra.query("history", { name: logSession.name, mode: logSession.mode, branch_id: logBranch, source_ref: source, limit: 80 });
     if (!isCurrent() || generation !== logNavigation.current || scope !== logScopeRef.current || historyGeneration !== historyRequest.current) return;
     if (page.revision !== revision) throw new Error("会话记录已更新，请刷新记录后重新定位。");
     if (page.target_status !== "found" || !page.target_id) throw new Error(page.target_status === "stale" ? "此记录已变化或被压缩，原位置不再匹配。" : "此记录无法唯一关联到可见聊天消息。");
@@ -319,16 +355,16 @@ function App() {
   };
   const loadOlder = async () => {
     if (!preview?.has_more || olderLoading) return;
-    const request = historyRequest.current; const before = preview.before; setOlderLoading(true); setFollow(false);
+    const request = historyRequest.current, scope = logScope; const before = preview.before; setOlderLoading(true); setFollow(false);
     try {
-      let page = await window.astra.query("history", { name: preview.session_id, mode: preview.mode, before });
-      if (request !== historyRequest.current) return;
+      let page = await window.astra.query("history", { name: preview.session_id, mode: preview.mode, branch_id: preview.branch_id, before });
+      if (request !== historyRequest.current || scope !== logScopeRef.current) return;
       if (page.revision !== preview.revision) {
-        page = await window.astra.query("history", { name: preview.session_id, mode: preview.mode });
-        if (request === historyRequest.current) { setPreview({ ...page, request }); setFollow(true); setToast("历史已在其他窗口更新，已载入最新记录。"); }
+        page = await window.astra.query("history", { name: preview.session_id, mode: preview.mode, branch_id: preview.branch_id });
+        if (request === historyRequest.current && scope === logScopeRef.current) { setPreview({ ...page, request }); setFollow(true); setToast("历史已在其他窗口更新，已载入最新记录。"); }
         return;
       }
-      if (request === historyRequest.current) setPreview((old: any) => old?.session_id === page.session_id && old?.mode === page.mode && old?.before === before ? { ...old, ...page, request: old.request, messages: [...page.messages, ...old.messages] } : old);
+      if (request === historyRequest.current && scope === logScopeRef.current) setPreview((old: any) => old?.session_id === page.session_id && old?.mode === page.mode && old?.before === before ? { ...old, ...page, request: old.request, messages: [...page.messages, ...old.messages] } : old);
     } catch (error) { fail(error); } finally { if (request === historyRequest.current) setOlderLoading(false); }
   };
   const currentTitle = preview ? sessionTitle({ name: preview.session_id, mode: preview.mode, modified: 0 }, prefs.titles) : !state || state.isDraft ? "新对话" : sessionTitle({ name: state.session, mode: state.mode, modified: 0 }, prefs.titles);
@@ -425,8 +461,9 @@ function App() {
       <div className={`body ${(panel === "logs" && logSession || panel && panel !== "logs" && state && !preview) ? "with-details" : ""}`}><div className="conversation"><div className="messages-scroll" aria-busy={historyLoading} data-history-request={preview?.request || 0} ref={scroller} onScroll={e => { const t = e.currentTarget; if (!t.clientHeight) return; setFollow(t.scrollHeight - t.scrollTop - t.clientHeight < 120); }}>
         <div className="messages">
           {!messages.length && <section className="welcome"><div className="welcome-mark">A</div><h1>从一个想法开始。</h1><p>对话、研究、编写代码，或把手头的事情交给 Astra。</p><div className="welcome-actions"><button onClick={() => { void openModels(); }}><SlidersHorizontal size={16}/>连接或选择模型</button><button onClick={() => showCommands()}><Command size={16}/>浏览全部功能</button></div></section>}
+          <EarlierResponseVersions messages={messages} controls={responseControls}/>
           {preview?.has_more && <button className="load-more" disabled={olderLoading} onClick={() => { void loadOlder(); }}>{olderLoading ? "加载中…" : "加载更早历史"}</button>}
-          <MessageList key={preview ? `preview:${preview.mode}:${preview.session_id}` : active || "blank"} messages={messages} runtime={preview ? undefined : state?.id} timeline={prefs.timeline} reasoning={model?.show_reasoning !== false} scroller={scroller} follow={follow} retry={retry} fail={fail} openLog={logSession ? source_ref => openLog({ source_ref }) : undefined} locate={chatLocation}/>
+          <MessageList key={preview ? `preview:${preview.mode}:${preview.session_id}` : active || "blank"} messages={messages} runtime={preview ? undefined : state?.id} timeline={prefs.timeline} reasoning={model?.show_reasoning !== false} scroller={scroller} follow={follow} responses={responseControls} fail={fail} openLog={logSession ? source_ref => openLog({ source_ref }) : undefined} locate={chatLocation}/>
           {preview?.delegates?.length > 0 && <DelegateHistory key={`${preview.mode}:${preview.session_id}`} delegates={preview.delegates} fail={fail}/>}
           {state && !preview && <><ToolPreparation preparation={state.preparation}/>{state.tools.length > 0 && <button className="execution-summary" onClick={() => setPanel("tools")}><Terminal size={15}/>{state.tools.filter(t => t.status === "running").length ? "工具正在执行" : `${state.tools.length} 项工具结果`}<ChevronRight size={15}/></button>}
             <DelegateSummary delegates={state.delegates} open={() => setPanel("tools")}/>
@@ -439,7 +476,7 @@ function App() {
           {!follow && messages.length > 0 && <button className="jump-latest" onClick={() => { if (preview?.locatedFromRuntime) select(preview.locatedFromRuntime); else if (preview?.locatedFromLog) browse({ name: preview.session_id, mode: preview.mode, modified: 0 }); else setFollow(true); }}>回到最新消息 ↓</button>}
           {!preview && currentConnection.configured === false && <div className="connection-status" role="status"><span>当前模型尚未连接，请先登录或配置 API Key。</span><button onClick={() => configureModels(model?.model_key)}>连接模型</button></div>}
           {!preview && appshotUnavailable && <div className="connection-status" role="status"><span>窗口捕获暂不可用，不影响对话。</span><button onClick={() => { void window.astra.appshot(active, "command", "/appshot status").catch(fail); }}>检查连接</button></div>}
-          {preview ? <div className="history-banner"><span>{preview.locatedFromLog ? "只读定位窗口，显示该记录附近的消息。" : "只读浏览历史，不会启动模型。"}</span>{preview.locatedFromRuntime && states[preview.locatedFromRuntime] && <button onClick={() => select(preview.locatedFromRuntime)}>返回已打开的会话</button>}<button className="primary" onClick={() => { void create({ session: preview.session_id, mode: preview.mode, workspace: prefs.workspaces[`${preview.mode}:${preview.session_id}`] || workspace }).catch(fail); }}>继续此会话 <ArrowUp size={14}/></button></div> : <div className="composer" onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); attach(window.astra.droppedPaths([...e.dataTransfer.files])); }}>
+          {preview ? <div className="history-banner"><span>{preview.locatedFromLog ? "只读定位窗口，显示该记录附近的消息。" : "只读浏览历史，不会启动模型。"}{preview.response_versions?.groups?.some((group: ResponseGroup) => group.versions.filter(v => v.status === "completed").length > 1) && " 有已保存的回复版本，继续会话后可切换。"}</span>{preview.locatedFromRuntime && states[preview.locatedFromRuntime] && <button onClick={() => select(preview.locatedFromRuntime)}>返回已打开的会话</button>}<button className="primary" onClick={() => { void create({ session: preview.session_id, mode: preview.mode, workspace: prefs.workspaces[`${preview.mode}:${preview.session_id}`] || workspace }).catch(fail); }}>继续此会话 <ArrowUp size={14}/></button></div> : <div className="composer" onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); attach(window.astra.droppedPaths([...e.dataTransfer.files])); }}>
             {!!state?.info.gui_appshot?.attachments?.length && <div className="attachment-list">{state.info.gui_appshot.attachments.map((a: UIEvent) => <span key={a.id}>{a.label}<button className="icon" aria-label="移除窗口捕获" onClick={() => { void window.astra.appshot(active, "remove", a.id).catch(fail); }}><X size={12}/></button></span>)}</div>}
             {state?.info.gui_appshot?.pending && <div className="attachment-list"><span>窗口捕获：{state.info.gui_appshot.pending.status === "unknown" ? "接收状态未知" : "等待接收确认"}</span><button onClick={() => command("/appshot pending status")}>查询状态</button><button onClick={() => command("/appshot pending discard")}>丢弃附件</button></div>}
             {!!files.length && <div className="attachment-list">{files.map(path => <span key={path}><Paperclip size={12}/>{path.split(/[\\/]/).pop()}<button className="icon" aria-label="移除附件" onClick={() => setPrefs(old => ({ ...old, attachments: { ...old.attachments, [key]: files.filter(f => f !== path) } }))}><X size={12}/></button></span>)}</div>}
@@ -450,12 +487,12 @@ function App() {
             <div className="composer-bottom"><div><button className="icon" aria-label="添加附件" onClick={() => { void window.astra.choose("files").then(attach).catch(fail); }}><Plus size={20}/></button><button className={`permission ${state?.info.yolo_status?.yolo ? "yolo" : ""}`} onClick={() => { void openSessionSettings("permissions"); }} title="工具审批设置">{state?.info.yolo_status?.yolo ? "完全访问" : "按需审批"}</button></div>
               <div><button className="model-button" title={model?.served_model ? `${model.model}（实际：${model.served_model}）` : undefined} onClick={() => { void openModels(); }}>{model?.model && model.model !== "none" ? modelDisplayName(model.model, model.served_model) : "选择模型"}<ChevronDown size={13}/></button>
                 <select aria-label="推理强度" value={model?.reasoning_effort || "high"} disabled={!model?.reasoning_effort} onChange={e => command(`/mode ${e.target.value}`)}><option value="low">低</option><option value="high">高</option><option value="xhigh">超高</option><option value="max">最高</option></select>
-                {state?.busy && !draft.trim() && !files.length && !hasAppshot ? <button className="send" aria-label="停止" onClick={() => command("/cancel")}><Square size={16} fill="currentColor"/></button> : <button className="send" aria-label="发送" disabled={sending || opening || (!draft.trim() && !files.length && !hasAppshot)} onClick={() => { void submit(); }}><ArrowUp size={19}/></button>}
+                {(responsePending || state?.busy && !draft.trim() && !files.length && !hasAppshot) ? <button className="send" aria-label="停止" onClick={() => command("/cancel")}><Square size={16} fill="currentColor"/></button> : <button className="send" aria-label="发送" disabled={sending || opening || responsePending || (!draft.trim() && !files.length && !hasAppshot)} onClick={() => { void submit(); }}><ArrowUp size={19}/></button>}
               </div></div>
           </div>}
           <div className="composer-foot"><span>{state?.status === "ready" ? state.busy ? "运行中" : "就绪" : state ? state.status === "disconnected" ? "后端已断开" : "连接后端中…" : "本地运行 · 模型自主选择工具"}</span><span>Enter 发送 · Shift Enter 换行</span></div>
         </div>
-      </div>{panel === "logs" && logSession ? <SessionLogPanel key={logScope} session={logSession.name} mode={logSession.mode} target={logTarget} width={prefs.detailWidth || 420} close={() => { logNavigation.current++; setPanel(undefined); }} locate={locateLog}/> : panel && panel !== "logs" && state && !preview && <Details state={state} panel={panel} setPanel={next => { if (next === "logs") { openLog(); return; } if (next !== "files") leaveDoc(); setPanel(next); }} selection={selection} width={prefs.detailWidth || 420} onWidth={detailWidth => savePrefs({ detailWidth })} close={() => { leaveDoc(); setPanel(undefined); }} fail={fail} doc={docFollow.current ? docTarget : undefined} onDocDismiss={leaveDoc} openLog={logSession ? call_id => openLog({ call_id }) : undefined}/>}</div>
+      </div>{panel === "logs" && logSession ? <SessionLogPanel key={logScope} session={logSession.name} mode={logSession.mode} branchId={logBranch} responseRevision={logResponseRevision} target={logTarget} width={prefs.detailWidth || 420} close={() => { logNavigation.current++; setPanel(undefined); }} locate={locateLog}/> : panel && panel !== "logs" && state && !preview && <Details state={state} panel={panel} setPanel={next => { if (next === "logs") { openLog(); return; } if (next !== "files") leaveDoc(); setPanel(next); }} selection={selection} width={prefs.detailWidth || 420} onWidth={detailWidth => savePrefs({ detailWidth })} close={() => { leaveDoc(); setPanel(undefined); }} fail={fail} doc={docFollow.current ? docTarget : undefined} onDocDismiss={leaveDoc} openLog={logSession ? call_id => openLog({ call_id }) : undefined}/>}</div>
     </main>
     {toast && <div className="toast" role="alert"><span>{toast}</span><button className="icon" onClick={() => setToast("")} aria-label="关闭提示"><X size={16}/></button></div>}
     {modal === "commands" && <CommandPalette commands={commands} labels={commandNames(commandModes)} initialFilter={commandQuery} close={() => setModal(undefined)} run={command}/>}

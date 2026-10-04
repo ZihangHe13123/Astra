@@ -1,3 +1,4 @@
+import { ResponseOperations } from "./response-operations.js";
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import { randomUUID } from "node:crypto";
@@ -19,6 +20,7 @@ export class Runtime {
   private closePromise?: Promise<void>;
   private waiters = new Set<{ resolve: () => void; reject: (error: Error) => void }>();
   private restartSession = "";
+  private responseOperations = new ResponseOperations(event => this.accept(event));
   private modelSelection?: { request_id: string; resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> };
   private queries = new Map<string, { resolve: (value: any) => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
   private submissions = new Map<string, { resolve: () => void; reject: (error: Error) => void; timer: ReturnType<typeof setTimeout> }>();
@@ -63,6 +65,7 @@ export class Runtime {
         if (pending) { clearTimeout(pending.timer); this.queries.delete(e.request_id); e.error ? pending.reject(new Error(e.error)) : pending.resolve(e.result); }
         return;
       }
+      if (e.type === "response_operation_result" && this.responseOperations.finish(e)) return;
       this.accept(e);
       if (["message_accepted", "message_rejected", "submission_status"].includes(e.type)) {
         const pending = this.submissions.get(e.submission_id);
@@ -101,6 +104,7 @@ export class Runtime {
       }
       for (const pending of this.submissions.values()) { clearTimeout(pending.timer); pending.reject(new Error("后端已断开，请求是否接收尚未确认。草稿已保留，未自动重发。")); }
       this.submissions.clear();
+      this.responseOperations.disconnect();
       for (const waiter of this.waiters) waiter.reject(new Error("Backend disconnected before accepting the request"));
       this.waiters.clear();
       // Keep in sync with agent.cli.session_lifecycle.RESTART_EXIT_CODE.
@@ -149,6 +153,10 @@ export class Runtime {
       this.waiters.add(entry);
     });
     if (this.closing || this.state.status === "disconnected") throw new Error("Backend disconnected; request was not sent");
+    if (["response_regenerate", "response_select"].includes(command.type)) {
+      return this.responseOperations.run(command, value => this.write(value));
+    }
+    if (["message", "image"].includes(command.type) && this.responseOperations.active) throw new Error("回复版本操作进行中，草稿已保留；请完成或停止后再发送。");
     if (command.type === "select_model") {
       if (this.modelSelection) throw new Error("模型正在切换，请稍候。");
       return new Promise<void>((resolve, reject) => {

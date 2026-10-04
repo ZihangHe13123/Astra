@@ -92,6 +92,9 @@ export type AppshotAdmissionEvent =
   | {type:'message_rejected'; submission_id:string; code:string; retryable:boolean}
   | {type:'submission_status'; submission_id:string; status:'accepted'|'rejected'|'pending'|'unknown'; code?:string; retryable?:boolean};
 export type PyEvent =
+  | ({ type: "response_versions" } & import("./response-versions.js").ResponseVersions)
+  | { type: "response_regeneration"; request_id: string; source_ref: import("./response-versions.js").ResponseSource; status: "running" | "completed" | "failed" | "cancelled"; delta?: string; content?: string }
+  | { type: "response_operation_result"; request_id: string; error?: string }
   | { type: "tool_preparing"; attempt_id: string; state: "preparing" | "finished" | "discarded"; calls: import("./tool-preparation.js").PreparingCall[]; request_id?: string }
   | { type: "message_source"; stream_id?: string; submission_id?: string; source_ref: { index: number; digest: string } }
   | ({ type: "delegate_status" } & import("./delegates.js").DelegateView)

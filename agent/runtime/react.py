@@ -367,7 +367,7 @@ class ReActAgent(AgentBase):
 
     def end_session(self, reason: str = "shutdown") -> None:
         """Dispatch session lifecycle hooks once for the current session."""
-        session_id = Path(self.context.session_path).stem if self.context.session_path else "default"
+        session_id = self.context.session_scope
         if session_id == self._last_ended_session:
             return
         self._last_ended_session = session_id
@@ -406,7 +406,7 @@ class ReActAgent(AgentBase):
             }
         try:
             outcome = await provider.sync_session(
-                session_path,
+                self.context._session_store.legacy_path if self.context._session_store is not None else session_path,
                 list(self.context.messages),
                 force=force,
                 reason=reason,
@@ -2223,7 +2223,7 @@ class ReActAgent(AgentBase):
         )
         with profile.phase("sanitize_tool_history"):
             self.context.sanitize_tool_history()
-        session_id = Path(self.context.session_path).stem if self.context.session_path else "default"
+        session_id = self.context.session_scope
         if current_user_index is None:
             current_user_index = next(
                 (
@@ -3428,7 +3428,7 @@ class ReActAgent(AgentBase):
             if self.delegate_mailbox is not None and task_id:
                 drain_for = getattr(self.delegate_mailbox, "drain_for", None)
                 envelopes = (
-                    self.delegate_mailbox.drain_for(str(task_id), session_id)
+                    self.delegate_mailbox.drain_for(str(task_id), self.context.session_scope)
                     if callable(drain_for)
                     else self.delegate_mailbox.drain(str(task_id))
                 )
@@ -3450,8 +3450,11 @@ class ReActAgent(AgentBase):
             # Structured late answers are durable user input. Admit them only
             # between complete model/tool steps to preserve tool-call ordering.
             from agent.runtime.session_identity import session_key
+            answer_scope = session_key(self.context.session_path)
+            if self.context.branch_id != "main":
+                answer_scope += ":" + self.context.branch_id
             question_answers = [(qid, text) for qid, (text, scope, owner_task) in self._user_question_answers.items()
-                                if (not scope or scope == session_key(self.context.session_path))
+                                if (not scope or scope == answer_scope)
                                 and (not owner_task or owner_task == str(task_id or msg.metadata.get("runtime_task_id") or ""))]
             for _, answer_text in question_answers:
                 self.context.add_user(answer_text, provenance="user_question_answer")
@@ -4286,7 +4289,7 @@ class ReActAgent(AgentBase):
             if self.delegate_mailbox is not None and task_id:
                 drain_for = getattr(self.delegate_mailbox, "drain_for", None)
                 envelopes = (
-                    self.delegate_mailbox.drain_for(str(task_id), session_id)
+                    self.delegate_mailbox.drain_for(str(task_id), self.context.session_scope)
                     if callable(drain_for)
                     else self.delegate_mailbox.drain(str(task_id))
                 )
@@ -4465,7 +4468,7 @@ class ReActAgent(AgentBase):
             and self.memory_router is not None
             and self.memory_retainer is not None
         ):
-            session_id = Path(self.context.session_path).stem if self.context.session_path else "default"
+            session_id = self.context.session_scope
             core_was_written = any(
                 event.get("name") == "memory" and (event.get("args") or {}).get("action") == "core_add"
                 for event in completed_tool_events
@@ -4590,8 +4593,7 @@ class ReActAgent(AgentBase):
         store = getattr(self, "_turn_change_store", None)
         if store is None:
             return None
-        session_path = self.context.session_path
-        session_key = Path(session_path).stem if session_path else "default"
+        session_key = self.context.session_scope
         if self._turn_change_store_session != session_key:
             return None
         return store
@@ -4609,8 +4611,7 @@ class ReActAgent(AgentBase):
         """
         if self.turn_change_store() is not None:
             return "available"
-        session_path = self.context.session_path
-        session_key = Path(session_path).stem if session_path else "default"
+        session_key = self.context.session_scope
         try:
             evidence = session_history_evidence(self._turn_change_workspace(), session_key)
         except Exception:
@@ -4633,7 +4634,7 @@ class ReActAgent(AgentBase):
 
     def _current_turn_change_store(self) -> "TurnChangeStore | None":
         """Session-owned turn-change store; rebuilt when the session changes."""
-        session_key = Path(self.context.session_path).stem if self.context.session_path else "default"
+        session_key = self.context.session_scope
         store = getattr(self, "_turn_change_store", None)
         if store is not None and self._turn_change_store_session == session_key:
             return store

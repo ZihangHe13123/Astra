@@ -7,6 +7,7 @@ session name and namespace only; it never writes a renderer-supplied path.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import sys
 from contextlib import contextmanager
@@ -34,7 +35,7 @@ def _session_path(name: str, mode: str) -> Path:
 
 
 @contextmanager
-def _clear_working_state(name: str, mode: str) -> Iterator[None]:
+def _clear_working_state(name: str, mode: str, *, branch_scopes: tuple[str, ...] = ()) -> Iterator[None]:
     """Clear only existing work-session state; never initialize core memory."""
     from agent.runtime.memory import default_memory_path
 
@@ -50,7 +51,9 @@ def _clear_working_state(name: str, mode: str) -> Iterator[None]:
             # Same targeted deletion as MemoryStore.clear_working. Keep the
             # transaction open until file cleanup succeeds, so a refusal does
             # not discard the session's working state.
-            db.execute("DELETE FROM working_memories WHERE session_id=?", (name,))
+            identities = tuple(dict.fromkeys((name, *branch_scopes)))
+            placeholders = ",".join("?" for _ in identities)
+            db.execute(f"DELETE FROM working_memories WHERE session_id IN ({placeholders})", identities)
         yield
         db.commit()
     except BaseException:
@@ -84,12 +87,21 @@ def act(request: object) -> dict:
     try:
         if not store.exists:
             raise FileNotFoundError(f"Session '{name}' not found")
-        with _clear_working_state(name, mode):
+        # Validate every branch-owned path before deleting shared media or
+        # clearing working state. Keep this inventory while removing heads so
+        # their derived cache identities remain available after publication
+        # metadata has gone away.
+        related_paths = store.related_paths()
+        from agent.runtime.conversation_branches import ConversationBranches, branch_scope
+        heads = ConversationBranches(store.logical_path).root / "heads"
+        branch_scopes = tuple({branch_scope(store.logical_path, match[1]) for file in related_paths
+                               if file.parent == heads and (match := re.fullmatch(r"([0-9a-f]{32})(?:\.snapshot|\.header)?\.(?:json|jsonl)", file.name))})
+        with _clear_working_state(name, mode, branch_scopes=branch_scopes):
             store.appshot_media.delete()
-            for related in store.related_paths():
+            discard_history_index(store, related_paths=related_paths)
+            for related in related_paths:
                 if related.exists():
                     related.unlink()
-            discard_history_index(store)
     finally:
         del lease
     return {**result, "deleted": True}

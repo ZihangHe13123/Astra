@@ -330,10 +330,19 @@ class AgentContext:
         return self._session_path
 
     @property
+    def branch_id(self) -> str:
+        return self._session_store.branch_id if self._session_store is not None else "main"
+
+    @property
+    def session_scope(self) -> str:
+        return self._session_store.session_scope if self._session_store is not None else "default"
+
+    @property
     def total_tokens(self) -> int:
         return self.total_prompt_tokens + self.total_completion_tokens
 
-    def set_session(self, path: str):
+    def set_session(self, path: str, *, branch_id: str | None = None):
+        store = SessionStore(path, branch_id=branch_id)
         if self.enforce_session_ownership:
             from agent.ui.session_ownership import claim_session
             lease = claim_session(path)
@@ -344,7 +353,7 @@ class AgentContext:
         self.runtime_projection.reset()
         self._session_path = path
         self._session_lease = lease
-        self._session_store = SessionStore(path)
+        self._session_store = store
         self._saved_message_count = 0
         if self.compressor is not None:
             self.compressor.reset()
@@ -524,7 +533,7 @@ class AgentContext:
         }
         return data
 
-    def stage_session(self, path: str):
+    def stage_session(self, path: str, *, branch_id: str | None = None):
         """Load a candidate without resetting the active session on bad media."""
         candidate = copy.copy(self)
         candidate.system_projection = copy.deepcopy(self.system_projection)
@@ -532,10 +541,10 @@ class AgentContext:
         candidate.messages = []
         candidate._message_token_costs = []
         candidate.compressor = None  # never reset the live compressor in preview
-        candidate.set_session(path)
+        candidate.set_session(path, branch_id=branch_id)
         candidate.reset()
         assert candidate._session_store is not None  # initialized by set_session
-        if candidate._session_store.exists and not candidate.load():
+        if candidate._session_store.exists and not candidate.load(readonly=True):
             raise OSError("session_load_failed")
         candidate.compressor = self.compressor
         return candidate
@@ -544,7 +553,7 @@ class AgentContext:
         """Called after the agent resets its per-session runtime state."""
         self.__dict__.update(candidate.__dict__)
 
-    def load(self) -> bool:
+    def load(self, *, readonly: bool = False) -> bool:
         if not self._session_path:
             return False
         if not self._session_store:
@@ -552,7 +561,7 @@ class AgentContext:
         if not self._session_store.exists:
             return False
         try:
-            data = self._session_store.load()
+            data = self._session_store.load(readonly=readonly)
             # Verify media before changing any live prompt/persona/history state.
             raw = data.get("messages", [])
             migrated = _restore_legacy_reasoning_content(_strip_images_from_messages(raw))

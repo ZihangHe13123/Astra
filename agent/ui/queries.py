@@ -10,7 +10,7 @@ from pathlib import Path
 
 from agent.cli import sessions
 from agent.runtime.session_store import SessionStore
-from agent.ui.history_index import history_page
+from agent.ui.history_index import check_query_branch, history_page
 from agent.ui.delegates import delegate_history
 
 
@@ -38,17 +38,26 @@ def list_sessions() -> list[dict]:
     return sorted(result, key=lambda s: s["modified"], reverse=True)
 
 
-def history(name: str, mode: str = "work", *, before: int | None = None, limit: int = 200, source_ref: dict | None = None) -> dict:
+def history(name: str, mode: str = "work", *, before: int | None = None, limit: int = 200, source_ref: dict | None = None,
+            branch_id: str | None = None) -> dict:
+    from agent.runtime.conversation_branches import ConversationBranches
+
     store = SessionStore(_session_path(name, mode))
     if not store.exists:
         raise FileNotFoundError("Session does not exist")
-    result = history_page(store, before=before, limit=limit, source_ref=source_ref)
+    result = history_page(store, before=before, limit=limit, source_ref=source_ref, branch_id=branch_id)
     for message in result["messages"]:
         message["id"] = f"{mode}:{name}:{message.pop('position')}"
     if "target_position" in result:
         target_position = result.pop("target_position")
         result["target_id"] = f"{mode}:{name}:{target_position}" if target_position is not None else None
-    return {"session_id": name, "mode": mode, **result, "delegates": delegate_history(store)}
+    # Browsing history can navigate durable groups, including compacted ones,
+    # but cannot regenerate replies until a backend owns the conversation.
+    # Avoid loading the entire source solely to derive regeneration targets.
+    versions = ConversationBranches(store.logical_path).state(store.branch_id, messages=[])
+    delegates = delegate_history(store)
+    check_query_branch(store, branch_id)
+    return {"session_id": name, "mode": mode, **result, "delegates": delegates, "response_versions": versions}
 
 
 def changes(agent, turn: int = 1, index: int | None = None) -> dict:
@@ -118,10 +127,11 @@ def query(request: dict, *, agent=None) -> object:
         from agent.ui.session_log import session_log
         store = SessionStore(_session_path(str(params.get("name", "")), str(params.get("mode", "work"))))
         return session_log(store, before=params.get("before"), limit=params.get("limit", 25),
-                           source_ref=params.get("source_ref"), call_id=params.get("call_id"))
+                           source_ref=params.get("source_ref"), call_id=params.get("call_id"), branch_id=params.get("branch_id"))
     if method == "history":
         return history(str(params.get("name", "")), str(params.get("mode", "work")),
-                       before=params.get("before"), limit=int(params.get("limit", 200)), source_ref=params.get("source_ref"))
+                       before=params.get("before"), limit=int(params.get("limit", 200)), source_ref=params.get("source_ref"),
+                       branch_id=params.get("branch_id"))
     if method == "changes" and agent is not None:
         return changes(agent, int(params.get("turn", 1)), params.get("index"))
     raise ValueError("Unknown UI query")
