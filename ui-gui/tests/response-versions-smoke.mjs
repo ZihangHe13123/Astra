@@ -16,6 +16,10 @@ const workspace = join(folder, 'workspace'); mkdirSync(workspace);
 const sessionDir = join(folder, 'sessions'); mkdirSync(sessionDir);
 const output = join(root, 'output/playwright/response-versions'); mkdirSync(output, { recursive: true });
 const target = join(workspace, 'write-once.txt');
+const imagePath = join(workspace, 'branch-image.png');
+const imageBytes = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+ip1sAAAAASUVORK5CYII=', 'base64');
+const imageMarker = '[Image: branch-image.png]';
+writeFileSync(imagePath, imageBytes);
 const answers = { a: 'ANSWER_BRANCH_ALPHA', b: 'ANSWER_BRANCH_BETA', a2: 'CONTINUATION_ALPHA_ONLY', b2: 'CONTINUATION_BETA_ORIGINAL', b2v2: 'CONTINUATION_BETA_REVISED' };
 let phase = 'original', releaseRegeneration, releaseCancellation;
 const regenerationGate = new Promise(resolve => { releaseRegeneration = resolve; });
@@ -54,7 +58,7 @@ await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 const port = server.address().port;
 writeFileSync(join(folder, '.env'), '');
 writeFileSync(join(folder, 'settings.json'), JSON.stringify({ selected_model: 'versions-test' }));
-writeFileSync(join(folder, 'models.yaml'), `version: 1\nproviders:\n  test:\n    label: Local fixture\n    provider: openai-compatible\n    base_url: http://127.0.0.1:${port}/v1\n    api_key_env: ''\n    context_limit: 131072\n    capabilities: [tools, streaming]\nmodels:\n  versions-test:\n    provider: openai-compatible\n    base_url: http://127.0.0.1:${port}/v1\n    api_key_env: ''\n    context_limit: 131072\n    capabilities: [tools, streaming]\n`);
+writeFileSync(join(folder, 'models.yaml'), `version: 1\nproviders:\n  test:\n    label: Local fixture\n    provider: openai-compatible\n    base_url: http://127.0.0.1:${port}/v1\n    api_key_env: ''\n    context_limit: 131072\n    capabilities: [tools, streaming, vision]\nmodels:\n  versions-test:\n    provider: openai-compatible\n    base_url: http://127.0.0.1:${port}/v1\n    api_key_env: ''\n    context_limit: 131072\n    capabilities: [tools, streaming, vision]\n`);
 const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/API_KEY|TOKEN|SECRET|^AGENT_|^ASTRA_|^LLM_|^SANDBOX_|^ELECTRON_/.test(key)));
 const env = { ...cleanEnv, ASTRA_GUI_DISABLE_APPSHOT: '1', AGENT_PROJECT_ROOT: root, AGENT_PYTHON: process.env.AGENT_PYTHON || join(root, '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python'), ASTRA_ENV_FILE: join(folder, '.env'), ASTRA_HOME: folder, AGENT_SETTINGS_PATH: join(folder, 'settings.json'), AGENT_SESSION_DIR: sessionDir, AGENT_TASK_DB: join(folder, 'tasks.db'), ASTRA_APPROVAL_DB: join(folder, 'approvals.db'), ASTRA_EVENT_DB: join(folder, 'events.db'), AGENT_MEMORY_PATH: join(folder, 'memory.db'), AGENT_LEARNING_PATH: join(folder, 'learning.db'), AGENT_SKILLS_PATH: join(folder, 'skills'), AGENT_MODELS_FILE: join(folder, 'models.yaml'), AGENT_USER_MODELS_FILE: join(folder, 'missing-models.yaml'), AGENT_LOG_DIR: join(folder, 'logs'), AGENT_MCP_CONFIG: join(folder, 'missing-mcp.json'), AGENT_TOOL_POLICY: 'locked', SANDBOX_DOCKER: 'false', SANDBOX_WORKDIR: workspace, ASTRA_WORKSPACE: workspace, LEARNING_REVIEW_AUTO: '0' };
 const runFile = promisify(execFile);
@@ -126,20 +130,35 @@ try {
     return { source: message.source_ref, branch, returnedBranch: log.branch_id, revision: log.revision, status: log.target_status, records: log.records.map(record => record.raw) };
   }, text);
 
+  // Exercise the real GUI image admission path, which saves text/Image parts
+  // and later normalizes them when staging a conversation version.
+  await app.evaluate(({ dialog }, path) => { dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [path] }); }, imagePath);
+  await page.getByRole('button', { name: '添加附件', exact: true }).click();
+  await expect(page.getByRole('button', { name: '移除附件', exact: true })).toHaveCount(1);
+  await composer.fill('ROOT_BRANCH_QUESTION');
+  await page.screenshot({ path: join(output, 'image-root-input.png') });
   await submit('ROOT_BRANCH_QUESTION');
   await page.getByRole('button', { name: '允许一次', exact: true }).waitFor();
   assert.equal(existsSync(target), false);
   await page.getByRole('button', { name: '允许一次', exact: true }).click();
   await completed(answers.a);
+  await expect(page.getByRole('button', { name: '移除附件', exact: true })).toHaveCount(0);
+  const initialImageUser = requests[0].payload.messages.find(message => message.role === 'user');
+  assert.ok(Array.isArray(initialImageUser.content), 'the original vision request must carry structured image content');
+  assert.ok(initialImageUser.content.some(part => part.type === 'image_url' && part.image_url?.url.startsWith('data:image/png;base64,')), 'the original provider receives actual fixture image pixels');
   assert.equal(readFileSync(target, 'utf8'), 'ORIGINAL_EFFECT');
   const originalWriteTime = statSync(target, { bigint: true }).mtimeNs;
   const originalState = await state(), originalPids = await backendPids();
   assert.equal(originalPids.length, 1, 'one live fixture backend should own this conversation');
-  const originalUser = originalState.messages.find(message => message.role === 'user' && message.content === 'ROOT_BRANCH_QUESTION');
+  const originalUser = originalState.messages.find(message => message.role === 'user' && message.content.includes('ROOT_BRANCH_QUESTION'));
   assert.ok(originalUser);
   await expect.poll(() => activeLog(answers.a)).not.toBeNull();
   const logA = await activeLog(answers.a);
   assert.equal(logA.status, 'found');
+  const originalCanonicalUser = logA.records.map(record => JSON.parse(record)).find(message => message.role === 'user');
+  assert.ok(Array.isArray(originalCanonicalUser.content), 'the canonical user must use the real Msg image storage representation');
+  assert.ok(originalCanonicalUser.content.some(part => part.type === 'text' && part.text === imageMarker));
+  assert.ok(originalCanonicalUser.content.some(part => part.type === 'text' && part.text.includes('ROOT_BRANCH_QUESTION')));
   await composer.fill('DRAFT_MUST_SURVIVE_REGENERATION');
   phase = 'regenerate-b';
   const beforeRegenerate = requests.length, beforeNavigation = navigations;
@@ -153,8 +172,13 @@ try {
   assert.equal(await page.evaluate(() => window.__responseVersionsToken), originalToken);
   assert.equal(navigations, beforeNavigation);
   assert.equal(await composer.inputValue(), 'DRAFT_MUST_SURVIVE_REGENERATION');
-  assert.equal((await state()).messages.filter(message => message.role === 'user' && message.content === 'ROOT_BRANCH_QUESTION').length, 1);
-  const regeneratedPayload = assertPayload('regenerate-b', ['ROOT_BRANCH_QUESTION', 'original-write', 'ORIGINAL_EFFECT'], [answers.a]);
+  assert.equal((await state()).messages.filter(message => message.role === 'user' && message.content.includes('ROOT_BRANCH_QUESTION')).length, 1);
+  const regeneratedPayload = assertPayload('regenerate-b', ['ROOT_BRANCH_QUESTION', imageMarker, 'original-write', 'ORIGINAL_EFFECT'], [answers.a]);
+  const regeneratedUsers = regeneratedPayload.messages.filter(message => message.role === 'user');
+  assert.equal(regeneratedUsers.length, 1, 'normalizing an image seed must not duplicate or lose the original user');
+  assert.equal(typeof regeneratedUsers[0].content, 'string', 'regeneration uses the normalized saved image placeholder');
+  assert.ok(regeneratedUsers[0].content.includes(imageMarker));
+  assert.ok(!regeneratedUsers[0].content.includes('data:image/'), 'regeneration must not invent a second image admission');
   assert.equal(regeneratedPayload.tools?.length || 0, 0, 'reply regeneration must not advertise executable tools');
   releaseRegeneration(); await completed(answers.b);
   assert.equal((await state()).id, originalState.id);
@@ -163,7 +187,7 @@ try {
   assert.equal(await page.evaluate(() => window.__responseVersionsToken), originalToken);
   assert.equal(await composer.inputValue(), 'DRAFT_MUST_SURVIVE_REGENERATION');
   await expect(reply(answers.b).getByRole('group', { name: '回复版本', exact: true })).toContainText('2 / 2');
-  passed('regeneration preserves the user, draft, renderer and backend while disabling duplicate actions and retaining tool background');
+  passed('regeneration preserves an image user, draft, renderer and backend while normalizing the saved seed and retaining tool background');
 
   await select(answers.b, 'previous', answers.a);
   await expect(reply(answers.b)).toHaveCount(0);
@@ -171,6 +195,7 @@ try {
   const restoredA = await activeLog(answers.a);
   assert.equal(restoredA.status, 'found');
   assert.ok(restoredA.records.some(record => record.includes(answers.a)));
+  assert.deepEqual(restoredA.records.map(record => JSON.parse(record)).find(message => message.role === 'user'), originalCanonicalUser, 'regenerating an image reply leaves the original branch storage parts unchanged');
   await select(answers.a, 'next', answers.b);
   await expect.poll(() => activeLog(answers.b)).not.toBeNull();
   const logB = await activeLog(answers.b);
@@ -191,11 +216,11 @@ try {
 
   await select(answers.b, 'previous', answers.a);
   phase = 'continue-a'; await submit('FOLLOWUP_FOR_ALPHA'); await completed(answers.a2);
-  assertPayload('continue-a', ['ROOT_BRANCH_QUESTION', answers.a, 'FOLLOWUP_FOR_ALPHA'], [answers.b, 'FOLLOWUP_FOR_BETA', answers.b2]);
+  assertPayload('continue-a', ['ROOT_BRANCH_QUESTION', imageMarker, answers.a, 'FOLLOWUP_FOR_ALPHA'], [answers.b, 'FOLLOWUP_FOR_BETA', answers.b2]);
   await select(answers.a, 'next', answers.b);
   await expect(reply(answers.a2)).toHaveCount(0);
   phase = 'continue-b'; await submit('FOLLOWUP_FOR_BETA'); await completed(answers.b2);
-  assertPayload('continue-b', ['ROOT_BRANCH_QUESTION', answers.b, 'FOLLOWUP_FOR_BETA'], [answers.a, 'FOLLOWUP_FOR_ALPHA', answers.a2]);
+  assertPayload('continue-b', ['ROOT_BRANCH_QUESTION', imageMarker, answers.b, 'FOLLOWUP_FOR_BETA'], [answers.a, 'FOLLOWUP_FOR_ALPHA', answers.a2]);
   await select(answers.b, 'previous', answers.a);
   await expect(reply(answers.a2)).toBeVisible(); await expect(reply(answers.b2)).toHaveCount(0);
   await select(answers.a, 'next', answers.b);
@@ -271,6 +296,7 @@ try {
   await select(answers.a, 'next', answers.b); await expect(reply(answers.b2v2)).toBeVisible();
   await page.screenshot({ path: join(output, 'reopened-branch-selection.png') });
   assert.equal(statSync(target, { bigint: true }).mtimeNs, originalWriteTime);
+  assert.deepEqual(readFileSync(imagePath), imageBytes, 'the original attached image remains unchanged across every branch operation');
   passed('closing and reopening the backend restores the selected nested branch and all alternate continuations');
   assert.deepEqual(errors, []); assert.deepEqual(externalRequests, []);
 } catch (error) {

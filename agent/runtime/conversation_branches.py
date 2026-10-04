@@ -82,7 +82,9 @@ def _user(message: dict) -> bool:
     # Share the compressor's legacy-prefix/provenance policy. A recap or a
     # background worker envelope must never become a regeneration request.
     from .context_compressor import _is_synthetic_user_turn
-    return message.get("role") == "user" and not _is_synthetic_user_turn(message)
+    meta = message.get("_meta")
+    legacy_reasoning = isinstance(meta, dict) and meta.get("type") == "reasoning_context"
+    return message.get("role") == "user" and not legacy_reasoning and not _is_synthetic_user_turn(message)
 
 
 def _messages_digest(messages: list[dict]) -> str:
@@ -128,6 +130,9 @@ def _targets(messages: list[dict]) -> list[tuple[int, int]]:
             return False
         if _user(message):
             return True
+        meta = message.get("_meta")
+        if isinstance(meta, dict) and meta.get("type") == "reasoning_context":
+            return False
         provenance = message.get("provenance")
         if provenance in {"delegate", "notification", "tool_image", "user_question_answer"}:
             return False
@@ -384,7 +389,7 @@ class ConversationBranches:
                                  for number, value in enumerate(group["versions"].values(), 1)]}
             target = by_prefix.get(version.get("prefix_digest"))
             if target is None and version.get("dated_anchor"):
-                matches = by_anchor.get((group.get("user_digest"), version["reply_ref"]["digest"]), [])
+                matches = by_anchor.get((version.get("user_digest", group.get("user_digest")), version["reply_ref"]["digest"]), [])
                 if len(matches) == 1:
                     target = matches[0]
             if target is not None:
@@ -414,6 +419,21 @@ class ConversationBranches:
             anchor = next((user for user, final in _targets(messages) if final == reply), None)
             if anchor is None:
                 raise BranchConflict("Only a complete final reply can be regenerated")
+            from .context import normalize_replay_messages
+            raw_seed = messages[:reply]
+            normalized_seed, _ = normalize_replay_messages(raw_seed)
+            normalized_request, _ = normalize_replay_messages([messages[anchor]])
+            last_request = next((message for message in reversed(normalized_seed) if _user(message)), None)
+            if (not normalized_request or last_request is None
+                    or _messages_digest([last_request]) != _messages_digest(normalized_request)):
+                raise BranchConflict("The original request cannot be restored completely")
+
+            def tool_bindings(items: list[dict]) -> list[tuple[str, str]]:
+                return [("call", call["id"]) for item in items for call in item.get("tool_calls") or []] + [
+                    ("result", item.get("tool_call_id", "")) for item in items if item.get("role") == "tool"]
+
+            if not _complete_tools(normalized_seed) or tool_bindings(normalized_seed) != tool_bindings(raw_seed):
+                raise BranchConflict("Completed tool observations cannot be restored completely")
             choices = manifest["branches"][branch_id]["choices"]
             prefix_digest = _messages_digest(messages[:reply + 1])
             user_digest = message_source_ref(messages[anchor], anchor)["digest"]
@@ -429,7 +449,7 @@ class ConversationBranches:
                 group = manifest["groups"][choice["group_id"]]
                 if version.get("prefix_digest") == prefix_digest or (
                         dated_anchor and version.get("dated_anchor") and same_anchor_count == 1
-                        and group.get("user_digest") == user_digest
+                        and version.get("user_digest", group.get("user_digest")) == user_digest
                         and version["reply_ref"]["digest"] == source_ref["digest"]):
                     position = index
                     break
@@ -444,6 +464,7 @@ class ConversationBranches:
                     "user_digest": user_digest,
                     "versions": {original_id: {"id": original_id, "branch_id": branch_id, "last_head": branch_id,
                                                 "status": "completed", "reply_ref": source_ref,
+                                                "user_digest": user_digest,
                                                 "prefix_digest": prefix_digest,
                                                 "dated_anchor": dated_anchor,
                                                 "response_text": _text(messages[reply])[:4000]}}}
@@ -476,7 +497,7 @@ class ConversationBranches:
                 group_id = choices[position]["group_id"]
             candidate_id, version_id = uuid.uuid4().hex, uuid.uuid4().hex
             seed = copy.deepcopy(data)
-            seed["messages"] = seed["messages"][:reply]
+            seed["messages"] = normalized_seed
             seed.update(runtime_context_projection={}, system_prompt_projection={}, last_prompt_tokens=0)
             self._atomic_json(self._head_path(candidate_id), seed)
             candidate_choices = copy.deepcopy(choices[:position]) + [{"group_id": group_id, "version_id": version_id}]
@@ -517,6 +538,7 @@ class ConversationBranches:
                 reply = targets[-1][1]
                 self._freeze(version["id"], data)
                 version.update(reply_ref=message_source_ref(data["messages"][reply], reply),
+                               user_digest=message_source_ref(messages[targets[-1][0]], targets[-1][0])["digest"],
                                prefix_digest=_messages_digest(messages),
                                dated_anchor=_dated(messages[targets[-1][0]]) and _dated(messages[reply]),
                                response_text=_text(data["messages"][reply])[:4000])

@@ -149,6 +149,23 @@ def _restore_legacy_reasoning_content(messages: list[dict]) -> list[dict]:
     return restored
 
 
+def normalize_replay_messages(messages: list[dict], *, validate: Callable[[dict], Any] | None = None) -> tuple[list[dict], bool]:
+    """Return the runtime's replay form without modifying the stored source.
+
+    A fork must freeze this form before generation: image placeholders, retired
+    sidecars and tool compatibility cleanup can change both shape and count.
+    """
+    migrated = _restore_legacy_reasoning_content(_strip_images_from_messages(copy.deepcopy(messages)))
+    if validate is not None:
+        for message in migrated:
+            validate(message)
+    normalized = _strip_orphan_tool_calls(migrated)
+    retired_sidecar = False
+    for message in normalized:
+        retired_sidecar = message.pop("api_content", None) is not None or retired_sidecar
+    return normalized, retired_sidecar
+
+
 def _strip_orphan_tool_calls(messages: list[dict]) -> list[dict]:
     """Clean malformed and orphaned tool-call chains before provider replay.
 
@@ -564,10 +581,9 @@ class AgentContext:
             data = self._session_store.load(readonly=readonly)
             # Verify media before changing any live prompt/persona/history state.
             raw = data.get("messages", [])
-            migrated = _restore_legacy_reasoning_content(_strip_images_from_messages(raw))
             from .appshot_media import hydrate_content
-            for message in migrated:
-                hydrate_content(message.get("content"), self.session_path)
+            normalized, retired_sidecar = normalize_replay_messages(
+                raw, validate=lambda message: hydrate_content(message.get("content"), self.session_path))
             self.system_projection = SystemPromptProjection(data.get("system_prompt_projection"))
             self.runtime_projection = RuntimeContextProjection(data.get("runtime_context_projection"))
             migration = data.get("system_prompt_migration")
@@ -626,10 +642,7 @@ class AgentContext:
                     self.persona_relationship_context = ""
                     self.persona_affect = ""
                 self._system_token_cost = _estimate_value_tokens(self.effective_system_prompt)
-            self.messages = _strip_orphan_tool_calls(migrated)
-            retired_sidecar = False
-            for message in self.messages:
-                retired_sidecar = message.pop("api_content", None) is not None or retired_sidecar
+            self.messages = normalized
             self._rebuild_token_cache()
             self.show_reasoning = data.get("show_reasoning", True)
             self.total_prompt_tokens = data.get("total_prompt_tokens", 0)
