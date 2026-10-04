@@ -67,3 +67,4 @@ jobs:
         run: |
           npm --prefix ui-gui run test:e2e
           node ui-gui/tests/inspector-smoke.mjs
+          node ui-gui/tests/markdown-smoke.mjs

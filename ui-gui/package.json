@@ -17,17 +17,28 @@
   "dependencies": {
     "@astra/ui-core": "file:../ui-core",
     "@deepseek-ai/libreoffice-kit": "0.1.1",
+    "dompurify": "3.4.16",
     "fast-xml-parser": "5.11.2",
     "fflate": "0.8.3",
+    "katex": "0.16.47",
     "lucide-react": "0.468.0",
+    "mdast-util-from-markdown": "2.0.3",
+    "mdast-util-gfm": "3.1.0",
+    "mermaid": "12.1.0",
+    "micromark-extension-gfm": "3.0.0",
     "pdfjs-dist": "6.3.289",
     "react": "18.3.1",
     "react-dom": "18.3.1",
     "react-markdown": "10.1.0",
-    "remark-gfm": "4.0.1"
+    "rehype-highlight": "7.0.2",
+    "rehype-katex": "7.0.1",
+    "remark-gfm": "4.0.1",
+    "remark-math": "6.0.0"
   },
   "devDependencies": {
     "@playwright/test": "1.59.1",
+    "@types/hast": "3.0.5",
+    "@types/mdast": "4.0.4",
     "@types/node": "25.8.0",
     "@types/react": "18.3.0",
     "@types/react-dom": "18.3.0",
@@ -35,6 +46,7 @@
     "esbuild": "0.28.2",
     "tsx": "4.19.0",
     "typescript": "5.9.3",
+    "vfile": "6.0.3",
     "vite": "8.3.0"
   },
   "overrides": {
