@@ -1,6 +1,7 @@
 import React, { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { RotateCcw, FileText } from "lucide-react";
 import type { Message } from "@astra/ui-core/session-state";
+import { expandRestoredReasoning } from "./restored-reasoning.js";
 import { windowRange, messageOffsets } from "./message-window.js";
 import type { SourceRef } from "./session-log.js";
 import { CopyButton } from "./copy-button.js";
@@ -27,9 +28,10 @@ export const MessageRow = memo(function MessageRow({ message: m, runtime, timeli
 
 /** Measured window: all loaded messages remain reachable; only viewport + overscan mount.
  * Heights are kept by message id, so prepending a page preserves the visible anchor. */
-export const MessageList = memo(function MessageList({ messages, runtime, timeline, reasoning, scroller, follow, responses, fail, openLog, locate }: {
+export const MessageList = memo(function MessageList({ messages: sourceMessages, runtime, timeline, reasoning, scroller, follow, responses, fail, openLog, locate }: {
   messages: Message[]; runtime?: string; timeline: boolean; reasoning: boolean; scroller: React.RefObject<HTMLDivElement>; follow: boolean; responses?: ResponseControls; fail: (e: unknown) => void; openLog?: (source: SourceRef) => void; locate?: { id: string; serial: number };
 }) {
+  const messages = useMemo(() => expandRestoredReasoning(sourceMessages, reasoning), [sourceMessages, reasoning]);
   const list = useRef<HTMLDivElement>(null);
   const sizes = useRef(new Map<string, number>());
   const expanded = useRef(new Map<string, boolean>());
@@ -104,7 +106,7 @@ export const MessageList = memo(function MessageList({ messages, runtime, timeli
     for (const row of list.current.querySelectorAll<HTMLElement>("[data-row-id]")) observer.observe(row);
     return () => { observer.disconnect(); cancelAnimationFrame(frame); };
   }, [range.start, range.end, messages]);
-  return <div className="message-window" ref={list} data-total-messages={messages.length}>
+  return <div className="message-window" ref={list} data-total-messages={sourceMessages.length}>
     <div aria-hidden="true" style={{ height: offsets[range.start] }}/>
     {messages.slice(range.start, range.end).map(m => <div className="measured-message" data-row-id={m.id} key={m.id}>
       <MessageRow message={m} openLog={openLog} located={m.id === locate?.id} runtime={runtime} timeline={timeline} reasoning={reasoning} expanded={expanded.current} responses={responses} fail={fail}/>

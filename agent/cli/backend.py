@@ -1994,20 +1994,27 @@ async def _main(startup_started: float):
 
     async def _send_history():
         from agent.runtime.message_source import message_source_ref
+        from agent.ui.reasoning import legacy_reasoning_text, reasoning_display_fields
         hist = []
+        gui_history = os.getenv("ASTRA_UI_SURFACE") == "gui"
         source_positions = {id(message): index for index, message in enumerate(agent.context.messages)}
         history_mode = "bar" if bar_mode.active else "minimal" if minimal_mode.active else "local" if local_mode.active else "work"
         history_session = Path(agent.context.session_path).stem if agent.context.session_path else ""
         for position, message in enumerate(visible_wakeup_history(agent.context.messages)):
             if message.get("role") not in ("user", "assistant"):
                 continue
-            if message.get("_meta", {}).get("type") == "reasoning_context":
+            legacy_reasoning = legacy_reasoning_text(message) if gui_history else None
+            if (message.get("_meta") or {}).get("type") == "reasoning_context" and not legacy_reasoning:
                 continue
             item = {
                 "id": f"{history_mode}:{history_session}:{position}",
                 "role": "system" if message.get("provenance") == "peer_message" else message["role"],
                 "content": message_display_text(message.get("display_command", message.get("content", ""))),
             }
+            if legacy_reasoning:
+                item.update(role="reasoning", content=legacy_reasoning)
+            elif gui_history:
+                item.update(reasoning_display_fields(message))
             raw_index = source_positions.get(id(message))
             if raw_index is not None:
                 item["source_ref"] = message_source_ref(message, raw_index)

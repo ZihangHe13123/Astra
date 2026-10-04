@@ -315,7 +315,7 @@ export type PyEvent =
       notice?: string;
     }
   | { type: "session_list"; sessions: { name: string; messages: number; current: boolean }[] }
-  | { type: "history"; messages: { role: string; content: string; timestamp?: number }[]; session_id?: string; delegates?: import("./delegates.js").DelegateView[]; tool_results?: { name: string; output: string; error: string; duration_ms?: number; artifact_path?: string; output_truncated?: boolean }[] }
+  | { type: "history"; messages: { role: string; content: string; reasoning_content?: string; timestamp?: number }[]; session_id?: string; delegates?: import("./delegates.js").DelegateView[]; tool_results?: { name: string; output: string; error: string; duration_ms?: number; artifact_path?: string; output_truncated?: boolean }[] }
   | { type: "working_memory"; session_id: string; memory: WorkingMemory }
   | ({ type: "generation_stats" } & GenerationStats)
   | ({ type: "generation_progress" } & GenerationProgress)

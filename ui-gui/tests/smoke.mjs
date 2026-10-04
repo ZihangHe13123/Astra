@@ -1,5 +1,6 @@
 /** Desktop acceptance: real Python backend, isolated data, loopback-only model. */
 import { _electron as electron } from 'playwright';
+import { expect } from '@playwright/test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import { execFileSync } from 'node:child_process';
@@ -15,6 +16,7 @@ const target = join(workspace, 'receipt.txt');
 const report = join(workspace, 'report.md');
 const output = join(root, 'output/playwright/gui'); mkdirSync(output, { recursive: true });
 const requests = [];
+const savedReasoning = '先确认请求，再整理结果。';
 const delegateGoals = ['DELEGATE_GUI_ALPHA', 'DELEGATE_GUI_BETA', 'DELEGATE_GUI_FAILURE'];
 const delegateReports = ['Alpha verified the local receipt.', 'Beta independently verified the local receipt.'];
 // Hold only loopback model responses. Real delegate scheduling, file tools,
@@ -89,10 +91,12 @@ const server = createServer(async (req, res) => {
     chunk({ role: 'assistant', tool_calls: [{ index: 0, id: 'call-' + requests.length, type: 'function', function: { name: call[0], arguments: JSON.stringify(call[1]) } }] });
     chunk({}, 'tool_calls');
   } else {
-    chunk({ role: 'assistant', reasoning_content: '先确认请求，再整理结果。' });
+    chunk({ role: 'assistant', reasoning_content: savedReasoning });
     if (delegateGoal) chunk({ content: delegateReports[delegateGoals.indexOf(delegateGoal)] });
     else if (delegateParent) chunk({ content: 'DELEGATE_GUI_PARENT_DONE' });
     else if (text.includes('慢速A')) { chunk({ content: '会话 A 正在运行。' }); await new Promise(r=>setTimeout(r, 2500)); chunk({ content: '\n\n会话 A 已完成。' }); }
+    else if (text.includes('REASONING_VISIBLE_PROBE')) chunk({ content: 'VISIBLE_REASONING_PROBE_DONE' });
+    else if (text.includes('REASONING_HIDDEN_PROBE')) chunk({ content: 'HIDDEN_REASONING_PROBE_DONE' });
     else chunk({ content: answered ? '操作完成，结果已核验。' : '你好，Astra 桌面连接成功。\n\n| 项目 | 状态 |\n| --- | --- |\n| 后端 | 已连接 |\n\n```python\nprint("hello")\n```' });
     chunk({}, 'stop');
   }
@@ -102,7 +106,7 @@ await new Promise(r => server.listen(0, '127.0.0.1', r));
 const port = server.address().port;
 writeFileSync(join(folder, '.env'), '');
 writeFileSync(join(folder, 'settings.json'), JSON.stringify({ selected_model: 'gui-test' }));
-writeFileSync(join(folder, 'models.yaml'), `version: 1\nproviders:\n  test:\n    label: Local fixture\n    provider: openai-compatible\n    base_url: http://127.0.0.1:${port}/v1\n    api_key_env: ''\n    context_limit: 131072\n    capabilities: [tools, streaming]\nmodels:\n  gui-test:\n    provider: openai-compatible\n    base_url: http://127.0.0.1:${port}/v1\n    api_key_env: ''\n    context_limit: 131072\n    capabilities: [tools, streaming]\n`);
+writeFileSync(join(folder, 'models.yaml'), `version: 1\nproviders:\n  test:\n    label: Local fixture\n    provider: openai-compatible\n    base_url: http://127.0.0.1:${port}/v1\n    api_key_env: ''\n    context_limit: 131072\n    capabilities: [tools, streaming, reasoning]\nmodels:\n  gui-test:\n    provider: openai-compatible\n    base_url: http://127.0.0.1:${port}/v1\n    api_key_env: ''\n    context_limit: 131072\n    capabilities: [tools, streaming, reasoning]\n`);
 // A preset without credentials must lead to configuration, not an attempted switch.
 const modelsPath=join(folder,'models.yaml');
 writeFileSync(modelsPath,readFileSync(modelsPath,'utf8')+`  missing-model:\n    provider: openai-compatible\n    base_url: https://api.deepseek.com\n    api_key_env: GUI_MISSING_API_KEY\n    context_limit: 131072\n`);
@@ -117,6 +121,23 @@ let app;
 const checks = [];
 const passed = name => { checks.push(name); console.log('PASS', name); };
 const snapshotName = (snapshot, id) => snapshot.sessions.find(s=>s.id===id).session;
+async function bounded(promise,label,timeout) {
+ let timer;
+ try { return await Promise.race([promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error(`${label} timed out after ${timeout} ms`)),timeout);})]); }
+ finally { clearTimeout(timer); }
+}
+function terminateFixture(app) {
+ const child=app.process();
+ if(child.exitCode!==null||child.signalCode!==null)return;
+ const pid=child.pid;assert.ok(Number.isSafeInteger(pid)&&pid>0,'only terminate this fixture Electron PID');
+ if(process.platform==='win32')execFileSync('taskkill.exe',['/PID',String(pid),'/T','/F'],{timeout:5000,windowsHide:true});
+ else {
+   const rows=execFileSync('ps',['-axo','pid=,ppid='],{encoding:'utf8',timeout:3000}).trim().split('\n').map(line=>line.trim().split(/\s+/).map(Number));
+   const owned=new Set([pid]);
+   for(let changed=true;changed;){changed=false;for(const [id,parent] of rows)if(owned.has(parent)&&!owned.has(id)){owned.add(id);changed=true;}}
+   for(const id of [...owned].reverse())try{process.kill(id,'SIGKILL');}catch(error){if(error.code!=='ESRCH')throw error;}
+ }
+}
 try {
  app = await electron.launch({ args:[join(root,'ui-gui')], env, timeout:30000 });
  const page = await app.firstWindow();
@@ -711,10 +732,24 @@ try {
  await app.close(); app=undefined;
  app=await electron.launch({args:[join(root,'ui-gui')],env,timeout:30000});
  const restored=await app.firstWindow(); restored.on('pageerror',e=>errors.push(e.message));
- await restored.waitForFunction(async name=>{const b=await window.astra.bootstrap();return b.sessions.some(s=>s.session===name&&s.status==='ready');},last);
+ // firstWindow can resolve before its initial navigation has committed.
+ // Locator waits survive that navigation; an immediate evaluate does not.
+ await restored.getByRole('textbox',{name:'消息'}).waitFor({timeout:30000});
+ const restoredState=()=>restored.evaluate(async()=>{const boot=await window.astra.bootstrap();return boot.sessions.find(s=>s.id===boot.active);});
+ const restoredIdle=async()=>{await expect.poll(async()=>{const current=await restoredState();return current?.status==='ready'&&!current.busy&&!current.approvals.length&&!current.questions.length;},{timeout:30000}).toBe(true);};
+ const restoredSubmit=async text=>{await restored.getByRole('textbox',{name:'消息'}).fill(text);await restored.getByRole('button',{name:'发送',exact:true}).click();};
+ const expandSavedReasoning=async()=>{
+   const details=restored.locator('details.reasoning').filter({hasText:savedReasoning});
+   await expect(details).toHaveCount(1);
+   if(!(await details.evaluate(el=>el.open))) await details.locator('summary').click();
+   await expect(details.getByText(savedReasoning,{exact:true})).toBeVisible();
+ };
+ await expect.poll(async()=>{const current=await restoredState();return current?.session===last&&current.status==='ready';},{timeout:30000}).toBe(true);
  assert.equal(await restored.getByRole('textbox',{name:'消息'}).inputValue(),'退出前的草稿');
  await restored.getByText('你好，Astra 桌面连接成功。',{exact:true}).waitFor();
- assert.equal(requests.length,beforeRelaunch); passed('full desktop relaunch restores history and draft without requesting a model');
+ await expandSavedReasoning();
+ await restored.screenshot({path:join(output,'reasoning-restored-relaunch.png')});
+ assert.equal(requests.length,beforeRelaunch); passed('full desktop relaunch restores history, saved reasoning and draft without requesting a model');
  await restored.getByRole('button',{name:delegateSession.title,exact:true}).first().click();
  await restored.getByText('只读浏览历史，不会启动模型。',{exact:true}).waitFor();
  await restored.locator('.delegate-history > summary').click();
@@ -736,10 +771,62 @@ try {
  await restored.evaluate(()=>{window.__restarted=false;window.astra.onEvents(events=>{if(events.some(e=>e.event?.type==='backend_hello'))window.__restarted=true;});});
  await restored.getByRole('textbox',{name:'消息'}).fill('/restart');
  await restored.getByRole('button',{name:'发送',exact:true}).click();
- await restored.waitForFunction(async()=>window.__restarted&&(await window.astra.bootstrap()).sessions.some(s=>s.status==='ready'),null,{timeout:30000});
+ await expect.poll(async()=>restored.evaluate(async()=>window.__restarted&&(await window.astra.bootstrap()).sessions.some(s=>s.status==='ready')),{timeout:30000}).toBe(true);
  await restored.getByText('你好，Astra 桌面连接成功。',{exact:true}).waitFor();
  assert.equal(await restored.getByText('你好，Astra 桌面连接成功。',{exact:true}).count(),1);
- assert.equal(requests.length,beforeRelaunch); passed('controlled backend restart preserves history and does not resend the model request');
+ await expandSavedReasoning();
+ await restored.screenshot({path:join(output,'reasoning-restored-backend-restart.png')});
+ assert.equal(requests.length,beforeRelaunch); passed('controlled backend restart preserves history and saved reasoning without resending the model request');
+ const closedReasoningRuntime=(await restoredState()).id;
+ const restoredRow=restored.locator('.session-row').filter({has:restored.getByTitle(last,{exact:true})});
+ await restoredRow.getByRole('button',{name:/^会话操作：/}).click();
+ await restored.getByRole('menuitem',{name:'关闭会话后端',exact:true}).click();
+ await expect.poll(async()=>(await restored.evaluate(()=>window.astra.bootstrap())).sessions.some(s=>s.id===closedReasoningRuntime)).toBe(false);
+ await restored.getByTitle(last,{exact:true}).click();
+ await restored.getByText('只读浏览历史，不会启动模型。',{exact:true}).waitFor();
+ await expandSavedReasoning();
+ assert.equal(requests.length,beforeRelaunch);
+ await restored.getByRole('button',{name:'继续此会话',exact:true}).click();
+ await restoredIdle(); await expandSavedReasoning();
+ assert.notEqual((await restoredState()).id,closedReasoningRuntime);
+ assert.equal((await restoredState()).session,last);
+ assert.equal((await restoredState()).messages.filter(message=>message.role==='reasoning').length,0,'saved reasoning is derived for display, not added as a canonical state row');
+ assert.equal(requests.length,beforeRelaunch);
+ await restored.screenshot({path:join(output,'reasoning-reopened-history.png')});
+ passed('closing the backend and reopening read-only or continued history keeps saved reasoning expandable without model calls');
+
+ // Display settings must not turn persisted provider reasoning into a new
+ // conversation turn or change the canonical prefix on the next request.
+ await restoredSubmit('REASONING_VISIBLE_PROBE');
+ await restored.getByText('VISIBLE_REASONING_PROBE_DONE',{exact:true}).waitFor(); await restoredIdle();
+ const visiblePayload=requests.at(-1);
+ assert.equal(requests.length,beforeRelaunch+1);
+ await restoredSubmit('/think off');
+ await expect.poll(async()=>(await restoredState()).info.model_info?.show_reasoning).toBe(false);
+ await expect(restored.locator('details.reasoning')).toHaveCount(0);
+ assert.equal(requests.length,beforeRelaunch+1,'hiding reasoning is a local display command');
+ await restored.screenshot({path:join(output,'reasoning-display-hidden.png')});
+ await restoredSubmit('REASONING_HIDDEN_PROBE');
+ await restored.getByText('HIDDEN_REASONING_PROBE_DONE',{exact:true}).waitFor(); await restoredIdle();
+ const hiddenPayload=requests.at(-1);
+ assert.equal(requests.length,beforeRelaunch+2);
+ for(const [payload,expected] of [[visiblePayload,['重启恢复测试','REASONING_VISIBLE_PROBE']],[hiddenPayload,['重启恢复测试','REASONING_VISIBLE_PROBE','REASONING_HIDDEN_PROBE']]]) {
+   const users=payload.messages.filter(m=>m.role==='user');
+   assert.equal(users.length,expected.length);
+   for(const [index,text] of expected.entries()) assert.ok(String(users[index].content).includes(text));
+ }
+ assert.ok([...visiblePayload.messages,...hiddenPayload.messages].every(m=>m.role!=='reasoning'));
+ const canonicalPrefix=visiblePayload.messages.filter(m=>m.role!=='system'&&m.role!=='developer').slice(0,-1);
+ assert.deepEqual(hiddenPayload.messages.filter(m=>m.role!=='system'&&m.role!=='developer').slice(0,canonicalPrefix.length),canonicalPrefix);
+ const savedReply=canonicalPrefix.find(m=>m.role==='assistant');
+ assert.ok(savedReply,'the previously saved answer is replayed exactly once');
+ assert.equal(savedReply.reasoning_content,savedReasoning,'provider reasoning already in the canonical assistant remains unchanged');
+ assert.equal(hiddenPayload.messages.filter(m=>m.role==='assistant'&&m.content===savedReply.content).length,1);
+ await restoredSubmit('/think on');
+ await expect.poll(async()=>(await restoredState()).info.model_info?.show_reasoning).toBe(true);
+ await expect.poll(()=>restored.locator('details.reasoning').count()).toBeGreaterThan(0);
+ assert.equal(requests.length,beforeRelaunch+2,'showing stored reasoning does not request a model');
+ passed('reasoning visibility changes preserve provider conversation prefixes, roles and user cardinality on following model requests');
  assert.deepEqual(errors, []); passed('no renderer exceptions');
  writeFileSync(join(output,'result.json'),JSON.stringify({checks,isolatedData:folder,historyMs:measurements,platform:process.platform},null,2));
  console.log('Artifacts:',output);
@@ -753,6 +840,16 @@ try {
  console.error('Isolated diagnostic data:',folder); process.exitCode=1;
 } finally {
  for(const gate of delegateGates.values()) gate.release();
- if(app) await app.close();
- server.closeAllConnections();await new Promise(r=>server.close(r));
+ if(app) {
+   if(process.exitCode)await bounded(app.evaluate(({dialog})=>{
+     const original=dialog.showMessageBox.bind(dialog);
+     dialog.showMessageBox=(...args)=>{
+       const options=args.at(-1),stop=options?.buttons?.indexOf('停止并退出')??-1;
+       return options?.message==='仍有任务或会话提醒在运行'&&stop>=0?Promise.resolve({response:stop,checkboxChecked:false}):original(...args);
+     };
+   }),'Fixture quit confirmation',2000).catch(error=>console.error(error));
+   try{await bounded(app.close(),'Electron close',30000);}
+   catch(error){process.exitCode=1;console.error(error);try{terminateFixture(app);}catch(cleanup){console.error(cleanup);}}
+ }
+ server.closeAllConnections();await bounded(new Promise(r=>server.close(r)),'Fixture HTTP close',3000).catch(error=>{process.exitCode=1;console.error(error);});
 }
