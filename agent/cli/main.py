@@ -76,6 +76,7 @@ from agent.cli.browser_commands import execute_browser_command
 from .computer_commands import execute_computer_command
 from .memory_commands import execute_memory_command
 from .skill_commands import execute_skill_command
+from .guidance_commands import execute_guidance_command
 from .learning_commands import execute_learning_command
 from .conversation_commands import register_conversation_tools
 from ..runtime.command_workflows import workflow_message, raw_command as normalize_direct_command
@@ -556,8 +557,18 @@ async def handle_slash(cmd: str, agent: ReActAgent) -> Msg | None:
         if store is None:
             print("  Skills are unavailable.\n")
         else:
-            output, error = execute_skill_command(store, parts[1:])
+            output, error = execute_skill_command(store, parts[1:], agent=agent)
             print(f"  {error or output}\n")
+
+    elif command == "/guidance":
+        output, error = execute_guidance_command(agent, parts[1:])
+        print(f"  {error or output}\n")
+
+    elif command == "/jobs":
+        from .jobs_commands import execute_jobs_command
+
+        output, error = execute_jobs_command(parts[1:], workdir=agent._source_tracking_workdir())
+        print(f"  {error or output}\n")
 
     elif command == "/learn":
         store = getattr(agent, "_learning_store", None)
@@ -781,6 +792,8 @@ async def handle_slash(cmd: str, agent: ReActAgent) -> Msg | None:
     /search [provider]  — Show / switch search provider (auto, exa, searxng)
     /memory             — Inspect or update working/core memory
     /skills             — List, inspect, or create local procedural skills
+    /guidance           — Inspect pending guidance or apply it with refresh --now
+    /jobs               — Manage persistent reminders/checks and read their local inbox
     /learn              — Save skills; discuss /learn review before applying changes
     /connect <n> <url>  — Probe, save and switch a model connection
     /tools              — List available tools

@@ -294,7 +294,7 @@ def test_query_worker_handles_multiple_requests_and_exits_at_eof(store):
     assert [r["id"] for r in responses] == ["one", "bad", "two"]
     assert responses[0]["result"]["messages"][0]["content"] == "hello"
     assert responses[1]["ok"] is False
-    assert len(responses[2]["result"]) == 52
+    assert responses[2]["result"] == queries.command_catalog()
 
 
 def test_history_includes_only_the_selected_sessions_public_delegate_reports(store):

@@ -52,7 +52,7 @@ from .metrics import runtime_metrics
 from .micro_compact import micro_compact_tool_results
 from .process_env import hidden_process_creationflags
 from .stream_progress import stream_with_progress
-from .project_instructions import ProjectInstructions
+from .project_instructions import ProjectInstructions, tool_paths
 from .prompts import DEFAULT_SYSTEM_PROMPT, persona_generation_overrides
 from .query_profiler import QueryProfiler
 from .tool_failure import ToolFailure
@@ -307,6 +307,7 @@ class ReActAgent(AgentBase):
         self._active_skill_names: set[str] = set()
         self._project_instructions: ProjectInstructions | None = None
         self._project_instructions_workdir = ""
+        self._guidance_state: dict | None = None
         self._task_mutated_paths: set[str] = set()
         self._task_context_paths: set[str] = set()
         self._verification_required = False
@@ -530,6 +531,15 @@ class ReActAgent(AgentBase):
             # Minimal and local modes are zero-injection presets: skills and
             # project instructions must never leak into their sessions.
             return False
+        snapshot = getattr(self.context, "guidance_snapshot", {})
+        if (snapshot.get("version") == 1 and isinstance(snapshot.get("catalog"), str)
+                and isinstance(snapshot.get("names"), list)
+                and all(isinstance(name, str) for name in snapshot["names"])):
+            # Maintenance saves files immediately; the running conversation
+            # keeps its applied catalog until an explicit application boundary.
+            self._skill_catalog_snapshot = str(snapshot.get("catalog") or "")
+            self._available_skill_names = set(snapshot.get("names", []))
+            return False
         if self.skill_store is None:
             block = ""
             names: set[str] = set()
@@ -565,6 +575,10 @@ class ReActAgent(AgentBase):
             # instructions must never leak into their sessions even on forced
             # refreshes.
             return False
+        if getattr(self.context, "guidance_snapshot", {}).get("version") == 1:
+            previous = self.context._stable_system_suffix
+            self._ensure_session_guidance()
+            return previous != self.context._stable_system_suffix
         workdir = str(self._source_tracking_workdir())
         changed_root = workdir != self._project_instructions_workdir
         if self._project_instructions is None or changed_root:
@@ -580,6 +594,93 @@ class ReActAgent(AgentBase):
         if changed:
             self.context.set_stable_system_suffix(suffix)
         return changed or changed_root
+
+    def _guidance_scope(self) -> dict:
+        from .paths import state_dir
+        skills_root = getattr(self.skill_store, "root", None)
+        return {"workdir": str(self._source_tracking_workdir()),
+                "skills_root": str(Path(skills_root).resolve()) if skills_root is not None else "",
+                "home": str(state_dir().resolve())}
+
+    def _ensure_session_guidance(self, *, refresh: bool = False) -> None:
+        """Apply one scoped snapshot; never silently refresh a live prefix."""
+        if self.minimal_mode or self.local_mode:
+            return
+        scope = self._guidance_scope()
+        snapshot = getattr(self.context, "guidance_snapshot", {})
+        valid = (snapshot.get("version") == 1 and snapshot.get("scope") == scope
+                 and isinstance(snapshot.get("catalog"), str)
+                 and isinstance(snapshot.get("names"), list)
+                 and all(isinstance(name, str) for name in snapshot["names"])
+                 and isinstance(snapshot.get("project"), dict))
+        if refresh or not valid:
+            previous = snapshot.get("project", {}) if valid else {}
+            self.context.guidance_snapshot = {}
+            self._refresh_skill_catalog(force=True)
+            project = ProjectInstructions(scope["workdir"])
+            if isinstance(previous, dict) and isinstance(previous.get("seen"), list):
+                project.discover({str(project.root / path) for path in previous["seen"]
+                                  if isinstance(path, str) and not Path(path).is_absolute()
+                                  and ".." not in Path(path).parts})
+            snapshot = {"version": 1, "scope": scope, "catalog": self._skill_catalog_snapshot,
+                        "names": sorted(self._available_skill_names), "project": project.snapshot()}
+            self.context.guidance_snapshot = snapshot
+            self._project_instructions = project
+            self._guidance_state = snapshot
+            self._tool_cost_revision = -1
+        elif getattr(self, "_guidance_state", None) is not snapshot:
+            self._project_instructions = ProjectInstructions(scope["workdir"], snapshot=snapshot["project"])
+            self._guidance_state = snapshot
+            self._tool_cost_revision = -1
+        self._skill_catalog_snapshot = snapshot["catalog"]
+        self._available_skill_names = set(snapshot["names"])
+        self._project_instructions_workdir = scope["workdir"]
+        project = self._project_instructions
+        if project is not None:
+            from .project_trust import ProjectTrust
+            if project.trusted != ProjectTrust.for_path(scope["workdir"]).trusted:
+                # Current authority wins immediately, independently of cache
+                # economics. A snapshot is context, never a permission grant.
+                project = ProjectInstructions(scope["workdir"], snapshot=snapshot["project"])
+                self._project_instructions = project
+            snapshot["project"] = project.snapshot()
+        project_block = project.base_prompt if project is not None else ""
+        suffix = "\n\n".join(part for part in (project_block, snapshot["catalog"]) if part)
+        if suffix != self.context._stable_system_suffix:
+            self.context.set_stable_system_suffix(suffix)
+
+    def refresh_session_guidance(self) -> dict:
+        """Explicit user-command application; callers must require an idle turn."""
+        self._ensure_session_guidance(refresh=True)
+        self._stable_tool_schema_key = None
+        self._stable_tool_schemas = []
+        return self.guidance_status()
+
+    def guidance_status(self) -> dict:
+        if self.minimal_mode or self.local_mode:
+            return {"enabled": False, "pending": {"project": False, "skills": False, "tools": False},
+                    "message": "Project and skill guidance is disabled in this mode."}
+        self._ensure_session_guidance()
+        snapshot = self.context.guidance_snapshot
+        project = self._project_instructions
+        assert project is not None
+        fresh = ProjectInstructions(project.workdir)
+        fresh.discover({str(project.root / path) for path in project.snapshot()["seen"]})
+
+        def contents(state: dict) -> tuple:
+            records = {item["path"]: (item["body"], item["base"]) for item in state["records"]}
+            rules = {item["path"]: (item["body"], item["patterns"]) for item in state["rules"]}
+            return records, rules
+
+        disk_catalog = self.skill_store.catalog_prompt() if self.skill_store is not None else ""
+        frozen_tools = snapshot.get("tools", {})
+        return {"enabled": True, "scope": snapshot["scope"],
+                "applied": {"project_sources": project.sources, "skills": sorted(self._available_skill_names)},
+                "pending": {"project": contents(fresh.snapshot()) != contents(project.snapshot()),
+                            "skills": disk_catalog != snapshot["catalog"],
+                            "tools": bool(frozen_tools) and frozen_tools.get("revision") != self.tools.schema_revision},
+                "warnings": list(project.warnings),
+                "message": "Saved changes apply in a new conversation. Use /guidance refresh --now to apply them here."}
 
     def _active_skill_contract(self) -> str:
         if self.skill_store is None or not self._active_skill_names:
@@ -948,6 +1049,9 @@ class ReActAgent(AgentBase):
                 # charged to its prompt.
                 return 0
             from .token_estimator import estimate_value_tokens
+            applied = self._applied_tool_schemas()
+            if applied is not None:
+                return estimate_value_tokens(applied)
             allowlist = getattr(self, "tool_allowlist", None)
             if allowlist is not None and getattr(self, "minimal_mode", False):
                 # Minimal exposes a fixed catalog. Count that catalog,
@@ -968,7 +1072,7 @@ class ReActAgent(AgentBase):
     def refresh_tool_token_cost(self) -> None:
         """Synchronize prompt accounting after dynamic registry changes."""
         revision = self.tools.schema_revision
-        if revision == self._tool_cost_revision:
+        if revision == self._tool_cost_revision and self._applied_tool_schemas() is None:
             return
         self.context.set_tools_token_cost(self._estimate_tools_cost())
         self._tool_cost_revision = revision
@@ -977,6 +1081,7 @@ class ReActAgent(AgentBase):
         """Force the next turn to rebuild the model-visible tool schemas."""
         self._stable_tool_schema_key = None
         self._stable_tool_schemas = []
+        getattr(self.context, "guidance_snapshot", {}).pop("tools", None)
         # Reloading code can change schema accounting without changing the
         # registry revision, so refresh the prompt cost explicitly as well.
         self._tool_cost_revision = -1
@@ -1093,6 +1198,25 @@ class ReActAgent(AgentBase):
         msg.metadata["request_id"] = request_id
         return request_id
 
+    def _tool_application_key(self) -> dict:
+        return {"allowlist": sorted(self.tool_allowlist) if self.tool_allowlist is not None else None,
+                "code_mode": self.code_mode, "vision": self._vision_tile_tool_enabled()}
+
+    def _applied_tool_schemas(self) -> list[dict] | None:
+        snapshot = getattr(self.context, "guidance_snapshot", {})
+        applied = snapshot.get("tools", {})
+        if not isinstance(applied, dict) or "schemas" not in applied or not self.prompt_cache_stable_tools:
+            return None
+        if self.tool_allowlist is not None and not self.minimal_mode:
+            return None
+        schemas = applied.get("schemas")
+        if (not isinstance(schemas, list) or applied.get("key") != self._tool_application_key()
+                or not all(isinstance(item, dict) and item.get("type") == "function"
+                           and isinstance(item.get("function"), dict)
+                           and isinstance(item["function"].get("name"), str) for item in schemas)):
+            return None
+        return schemas
+
     def _available_tool_schemas(
         self,
         user_text: str,
@@ -1110,6 +1234,11 @@ class ReActAgent(AgentBase):
                 if self.tool_allowlist is not None
                 else None
             )
+            snapshot = getattr(self.context, "guidance_snapshot", {})
+            application_key = self._tool_application_key()
+            applied = self._applied_tool_schemas()
+            if applied is not None:
+                return copy.deepcopy(applied)
             key = (
                 allowlist,
                 tuple(self.tools.tool_names),
@@ -1125,6 +1254,9 @@ class ReActAgent(AgentBase):
                 schemas = self._filter_vision_tile_schema(schemas)
                 self._stable_tool_schema_key = key
                 self._stable_tool_schemas = copy.deepcopy(self._apply_code_mode(schemas))
+            if snapshot.get("version") == 1:
+                snapshot["tools"] = {"key": application_key, "revision": self.tools.schema_revision,
+                                     "schemas": copy.deepcopy(self._stable_tool_schemas)}
             # Availability, call budgets and circuit breakers are enforced by
             # the execution layer. Removing schemas mid-loop destroys the
             # provider's cached prefix without adding safety.
@@ -1532,7 +1664,7 @@ class ReActAgent(AgentBase):
     ) -> tuple[bool, int | None, object | None, dict | None]:
         if not msg.has_user_content():
             return False, None, None, None
-        self._refresh_skill_catalog()
+        self._ensure_session_guidance()
         user_text = msg.get_text()
         continuation = bool(
             re.fullmatch(
@@ -1545,9 +1677,6 @@ class ReActAgent(AgentBase):
             self._task_context_paths.clear()
             self._active_skill_names.clear()
             self._verification_required = False
-        # Project instructions are small and budgeted; reload at each genuine
-        # turn boundary so edits to AGENTS.md/rules take effect without restart.
-        self._refresh_project_instructions(force=True)
         observed = await self.drain_observed()
         for obs in observed:
             text = obs.get_text()
@@ -2346,6 +2475,8 @@ class ReActAgent(AgentBase):
         def turn_context_text() -> str:
             dynamic_blocks: list[str] = []
             if self._project_instructions is not None:
+                if self._project_instructions.discovered_prompt:
+                    dynamic_blocks.append(self._project_instructions.discovered_prompt)
                 path_rules = self._project_instructions.rules_for(self._task_context_paths)
                 if path_rules:
                     dynamic_blocks.append(path_rules)
@@ -2729,6 +2860,9 @@ class ReActAgent(AgentBase):
                     self._active_skill_names.add(skill_name)
             if not result.get("error"):
                 self._task_context_paths.update(self._tool_mutation_paths(name, args))
+                if self._project_instructions is not None and not self.minimal_mode and not self.local_mode:
+                    self._project_instructions.discover(tool_paths(args) | self._tool_mutation_paths(name, args))
+                    self.context.guidance_snapshot["project"] = self._project_instructions.snapshot()
                 for key in ("directory", "root"):
                     value = args.get(key)
                     if isinstance(value, str) and value.strip():

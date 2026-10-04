@@ -329,6 +329,7 @@ class AgentContext:
     _tools_token_cost: int = 0
     _stable_system_suffix: str = field(default="", init=False, repr=False)
     _system_prompt_migration: dict = field(default_factory=dict, init=False, repr=False)
+    guidance_snapshot: dict = field(default_factory=dict, init=False, repr=False)
     system_projection: SystemPromptProjection = field(default_factory=SystemPromptProjection, init=False, repr=False)
     runtime_projection: RuntimeContextProjection = field(default_factory=RuntimeContextProjection, init=False, repr=False)
 
@@ -366,6 +367,7 @@ class AgentContext:
         else:
             lease = None
         self._system_prompt_migration = {}
+        self.guidance_snapshot = {}
         self.system_projection.reset()
         self.runtime_projection.reset()
         self._session_path = path
@@ -548,6 +550,8 @@ class AgentContext:
             "total_cache_miss_tokens": self.total_cache_miss_tokens,
             "last_prompt_tokens": self.last_prompt_tokens,
         }
+        if self.guidance_snapshot:
+            data["guidance_snapshot"] = copy.deepcopy(self.guidance_snapshot)
         return data
 
     def stage_session(self, path: str, *, branch_id: str | None = None):
@@ -586,6 +590,8 @@ class AgentContext:
                 raw, validate=lambda message: hydrate_content(message.get("content"), self.session_path))
             self.system_projection = SystemPromptProjection(data.get("system_prompt_projection"))
             self.runtime_projection = RuntimeContextProjection(data.get("runtime_context_projection"))
+            guidance = data.get("guidance_snapshot")
+            self.guidance_snapshot = copy.deepcopy(guidance) if isinstance(guidance, dict) else {}
             migration = data.get("system_prompt_migration")
             self._system_prompt_migration = dict(migration) if isinstance(migration, dict) else {}
             loaded_prompt = data.get("system_prompt")
@@ -861,6 +867,7 @@ class AgentContext:
         ))
 
     def reset(self):
+        self.guidance_snapshot = {}
         self.system_projection.reset()
         self.runtime_projection.reset()
         self.messages.clear()
