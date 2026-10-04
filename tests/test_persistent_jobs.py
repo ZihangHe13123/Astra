@@ -211,6 +211,9 @@ def test_worker_environment_pins_home_and_never_adopts_live_session(tmp_path, mo
 def test_real_launcher_command_persists_reminder_across_processes(tmp_path):
     home = tmp_path / "home"
     env = {**os.environ, "ASTRA_HOME": str(home), "ASTRA_ENV_FILE": str(home / ".env")}
+    help_result = subprocess.run([sys.executable, str(ROOT / "astra.py"), "jobs", "--help"], cwd=tmp_path,
+                                 env=env, text=True, capture_output=True, timeout=30)
+    assert help_result.returncode == 0 and "reminders" in help_result.stdout and "serve" in help_result.stdout
     def command(*args):
         process = subprocess.run([sys.executable, str(ROOT / "astra.py"), "jobs", *args], cwd=tmp_path,
                                  env=env, text=True, capture_output=True, timeout=30)
