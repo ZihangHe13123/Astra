@@ -61,6 +61,9 @@ def check_source_distribution(path: Path) -> None:
                 raise SystemExit(f"Source distribution contains a non-public path: {relative}")
             names.add(relative)
     required = {
+        "AGENTS.md", "CLAUDE.md", "agent/runtime/AGENTS.md",
+        "agent/cli/jobs_commands.py", "agent/cli/jobs_worker.py",
+        "agent/runtime/jobs/store.py", "agent/runtime/jobs/scheduler.py",
         "agent/cli/main.py", "agent/runtime/prompts.py", "config/models.yaml",
         "astra.py", "README.md", "pyproject.toml",
         "ui-core/package.json", "ui-core/package-lock.json", "ui-core/tsconfig.json",
@@ -109,6 +112,7 @@ def deny_network(event, arguments):
 
 sys.addaudithook(deny_network)
 for name in ("agent.runtime.session_recall", "agent.cli.main", "agent.cli.backend",
+             "agent.runtime.jobs.store", "agent.runtime.jobs.scheduler", "agent.cli.jobs_commands",
              "agent.launcher.desktop_distribution", "agent.launcher.desktop_update",
              "agent.runtime.tools.workspace_dependencies",
              "agent.runtime.context_index.embedding_runtime",
@@ -137,6 +141,19 @@ entry_points = {entry.name: entry for entry in distribution.entry_points if entr
 for name in ("astra", "agent-lab", "agent-lab-backend", "agent-lab-eval"):
     assert callable(entry_points[name].load()), name
 print("Wheel smoke passed: installed CLI, session_recall, catalog, memory runtime/fixture and entry points")
+jobs = importlib.import_module("agent.cli.jobs_commands")
+job_store = importlib.import_module("agent.runtime.jobs.store").JobStore
+job_scheduler = importlib.import_module("agent.runtime.jobs.scheduler")
+home = installed.parent / "jobs-smoke-home"
+output, error = jobs.execute_jobs_command(["add", "wheel-fixture", "--after", "60", "--reminder",
+                                           "--prompt", "Installed reminder"], home=home)
+assert not error, error
+job = __import__("json").loads(output)
+result = job_scheduler.tick(job_store(home), manual_job=job["id"])
+assert result["executed"][0]["state"] == "completed", result
+inbox = job_store(home).inbox()
+assert inbox[0]["output"] == "Installed reminder" and inbox[0]["delivery_state"] == "delivered"
+print("Wheel jobs smoke passed: installed reminder, occurrence and local receipt")
 """
 
 

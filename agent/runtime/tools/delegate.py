@@ -14,6 +14,8 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from ..runtime_context_projection import RuntimeContextProjection
+from ..worker_guidance import WorkerGuidance
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Callable
 from urllib.parse import urlparse
@@ -1335,9 +1337,21 @@ def _finalize_detached_worktree(root: Path, worktree: Path) -> bool:
     return changed
 
 
+def _worker_request_frame(spec, messages, registry, *, finalizing, evidence, notes,
+                          latest_assignment, retry_reason, retry_pending):
+    """Choose the existing investigation/report frame without changing its contract."""
+    if finalizing:
+        return (_finalization_messages(spec, evidence, notes, latest_assignment=latest_assignment,
+                                       retry_reason=retry_reason), [], False)
+    if spec.requested_tools is not None:
+        return messages, registry.to_openai_tools(names=set(spec.requested_tools)), retry_pending
+    return messages, registry.to_openai_tools(), retry_pending
+
+
 async def _bounded_worker_request(
     messages: list[dict], *, registry: ToolRegistry, llm: Any, schemas: list[dict],
     max_tokens: int, notice: dict | None, write_blocked: bool, timeout: float,
+    projection: RuntimeContextProjection | None = None,
 ) -> list[dict]:
     """Keep runtime notices out of the user-task boundary used by compaction."""
     request = provider_messages(messages, include_recovery_metadata=True)
@@ -1349,7 +1363,16 @@ async def _bounded_worker_request(
             "[RECOVERY WRITE BLOCK] A previous operation has an unknown outcome. "
             "Only read tools are available. Inspect and report; do not retry writes."
         )
-    if additions:
+    if projection is not None:
+        history = messages[1:]
+        inserts = projection.project(history, "\n\n".join(additions))
+        projected = request[:1]
+        for index, message in enumerate(request[1:]):
+            projected.extend(inserts.get(index, []))
+            projected.append(message)
+        projected.extend(inserts.get(len(history), []))
+        request = projected
+    elif additions:
         request[0] = {**request[0], "content":
                       str(request[0].get("content") or "") + "\n\n" + "\n\n".join(additions)}
     return await asyncio.wait_for(
@@ -1509,6 +1532,8 @@ def register_delegate_tools(
             else DELEGATE_SYSTEM_PROMPT
         )
         native_workspace = spec.workspace_root or str(Path.cwd().resolve())
+        guidance = WorkerGuidance(native_workspace, (conversation_data or {}).get("state", {}), durable=conversation is not None)
+        system_text += guidance.system_suffix
         system_text += (
             "\n\n## Runtime paths\n"
             f"- Native workspace root: {native_workspace}\n"
@@ -1601,6 +1626,7 @@ def register_delegate_tools(
                 "last_result": last_result, "evidence_fragments": list(evidence_fragments[-10:]),
                 "investigation_notes": list(investigation_notes[-4:]),
                 "execution_observations": list(execution_observations[-64:]),
+                **guidance.checkpoint(),
             }
             await durable_io(conversation.save, snapshot, state)
             if not conversation_bound:
@@ -1945,24 +1971,14 @@ def register_delegate_tools(
                         and loop.time() >= investigation_deadline
                     )
                 )
-                if finalizing:
-                    sub_schemas_list = []
-                    finalization_retry_pending = False
-                    request_messages = _finalization_messages(
-                        spec,
-                        evidence_fragments,
-                        investigation_notes,
-                        latest_assignment=latest_assignment,
-                        retry_reason=finalization_retry_reason,
-                    )
-                elif spec.requested_tools is not None:
-                    sub_schemas_list = sub_registry.to_openai_tools(
-                        names=set(spec.requested_tools)
-                    )
-                    request_messages = messages
-                else:
-                    sub_schemas_list = sub_registry.to_openai_tools()
-                    request_messages = messages
+                request_messages, sub_schemas_list, finalization_retry_pending = _worker_request_frame(
+                    spec, messages, sub_registry, finalizing=finalizing,
+                    evidence=evidence_fragments, notes=investigation_notes,
+                    latest_assignment=latest_assignment, retry_reason=finalization_retry_reason,
+                    retry_pending=finalization_retry_pending,
+                )
+
+                sub_schemas_list = guidance.schemas(sub_schemas_list, finalizing=finalizing)
 
                 request_max_tokens = (
                     2048 if finalizing and callable(getattr(llm, "chat_limited", None))
@@ -1974,6 +1990,7 @@ def register_delegate_tools(
                         request_messages, registry=sub_registry, llm=llm, schemas=sub_schemas_list,
                         max_tokens=request_max_tokens, notice=notice, write_blocked=write_blocked,
                         timeout=remaining if finalizing else max(0.001, remaining - finalization_reserve),
+                        projection=guidance.projection,
                     )
                     # A lost response still used one request. Reserve it before
                     # dispatch so repeated crashes cannot refresh this budget.
@@ -2260,7 +2277,8 @@ def register_delegate_tools(
                                 saved_output = saved_output[:8000] + "\n[Tool output truncated at 8000 characters]"
                         return tc_id, tc_name, output, saved_output
 
-                    async def record_tool_result(result: tuple[str, str, str, str], *, turn: int = turns) -> None:
+                    async def record_tool_result(result: tuple[str, str, str, str], *, turn: int = turns,
+                                                 calls: tuple[dict, ...] = tuple(tool_calls_raw)) -> None:
                         tc_id, tc_name, output, saved_output = result
                         durable_output = saved_output if conversation is not None else output
                         evidence_fragments.append(
@@ -2269,6 +2287,9 @@ def register_delegate_tools(
                         if len(evidence_fragments) > _FINALIZATION_EVIDENCE_ITEMS:
                             evidence_fragments.pop(0)
                         message = {"role": "tool", "tool_call_id": tc_id, "content": durable_output}
+                        call = next((item for item in calls if item["id"] == tc_id), {})
+                        message, output, saved_output = guidance.decorate_result(
+                            message, output, saved_output, call.get("arguments", "{}"))
                         if conversation is not None and saved_output != output:
                             message["api_content"] = output
                         messages.append(message)

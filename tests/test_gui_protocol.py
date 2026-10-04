@@ -1,6 +1,5 @@
 """Cross-process ownership and read-only desktop queries, without model calls."""
 import gc
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -81,13 +80,13 @@ def test_receipt_same_id_is_never_admitted_twice():
     assert ledger.begin({**command, "submission_id": "../invalid"})["code"] == "invalid_submission"
 
 
-def test_command_catalog_covers_the_tui_roots():
-    source = (ROOT / "ui-tui/src/command-menu.ts").read_text()
-    block = source.split("const SLASH_COMMANDS:", 1)[1].split("];", 1)[0]
-    roots = re.findall(r'command: "(/[^" ]+)"', block)
+def test_command_catalog_has_unique_roots_and_ids():
+    # Cross-client coverage is exercised through slashCommandSuggestions in
+    # the TUI's actual command-menu test, rather than parsing its source text.
     catalog = queries.command_catalog()
-    assert len(roots) == 52
-    assert sorted(roots) == sorted(c["command"] for c in catalog)
+    roots = [item["command"] for item in catalog]
+    assert roots and all(root.startswith("/") and " " not in root for root in roots)
+    assert len(set(roots)) == len(roots)
     assert len(set(c["id"] for c in catalog)) == len(roots)
 
 

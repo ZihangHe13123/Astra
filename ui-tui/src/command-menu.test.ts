@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import {
   completeSlashCommand,
   groupedSuggestionRowCount,
@@ -10,10 +11,14 @@ import {
   visibleSuggestionWindow,
 } from "./command-menu.js";
 
-assert.deepEqual(
-  slashCommandSuggestions("/").map((item) => item.command),
-  ["/image", "/bar", "/minimal", "/sip", "/reset", "/compress", "/undo", "/retry", "/changes", "/think", "/model", "/mode", "/connect", "/persona", "/search", "/tool", "/gallery", "/doc", "/memory", "/skills", "/learn", "/tools", "/browser", "/computer", "/conclave", "/appshot", "/tasks", "/budget", "/resume", "/cancel", "/goal", "/today", "/session", "/handoff", "/theme", "/timeline", "/health", "/doctor", "/diagnostics", "/maintenance", "/sandbox", "/vision-tiles", "/context-index", "/mcp", "/yolo", "/permissions", "/reload", "/reconnect", "/restart", "/wakeup", "/peers", "/help"],
+const commandCatalog: { command: string; id: string }[] = JSON.parse(
+  readFileSync(new URL("../../agent/ui/commands.json", import.meta.url), "utf8"),
 );
+const roots = slashCommandSuggestions("/").map((item) => item.command);
+assert.deepEqual([...roots].sort(), commandCatalog.map((item) => item.command).sort());
+assert.equal(new Set(roots).size, roots.length);
+assert.equal(completeSlashCommand("/guid", 0), "/guidance ");
+assert.equal(submitSlashCommand("/guidance", 0), "/guidance");
 
 assert.deepEqual(
   slashCommandSuggestions("/computer ").map((item) => item.command),

@@ -55,6 +55,8 @@ def parser() -> argparse.ArgumentParser:
     local.add_argument("--overwrite-local", action="store_true", help="back up local files, then use the incoming versions")
     activity = commands.add_parser("activity", help="Manage activity recording (legacy command compatibility)")
     activity.add_argument("args", nargs=argparse.REMAINDER)
+    jobs = commands.add_parser("jobs", help="Manage persistent reminders and read-only scheduled checks")
+    jobs.add_argument("args", nargs=argparse.REMAINDER)
     auth = commands.add_parser("auth", help="Manage Astra's ChatGPT / Codex subscription login")
     auth.add_argument("action", choices=("login", "status", "logout"), nargs="?", default="status")
     browser = commands.add_parser("browser-control", help="Manage the opt-in Edge/Chrome native host (Windows/macOS)")
@@ -195,6 +197,9 @@ def main(argv: list[str] | None = None, *, root: Path | None = None) -> int:
             return browser_control(args)
         if command == "auth":
             return subprocess.run([str(install.python), "-m", "agent.cli.codex_auth_cli", options.action],
+                cwd=install.root, env=runtime_environment(install, Path.cwd()), check=False).returncode
+        if command == "jobs":
+            return subprocess.run([str(install.python), "-m", "agent.cli.jobs_commands", *options.args],
                 cwd=install.root, env=runtime_environment(install, Path.cwd()), check=False).returncode
         if command in {"setup", "update"}:
             if options.setup_only:

@@ -16,9 +16,11 @@ language; the indexes label language-specific references.
 | Use the source desktop preview, model login and file diffs | [Desktop GUI](gui.md) |
 | Select a model, adjust reasoning and use terminal commands | [Everyday use](usage.md) |
 | Restart safely or check back within the current session | [Session lifecycle](session-lifecycle.md) |
+| Run persistent reminders/checks and inspect local delivery receipts | [Persistent jobs](persistent-jobs.md) |
 | Configure sandboxing, host file access and tool permissions | [Tool execution](execution.md) |
 | Understand what is saved, injected or retrieved | [Memory overview](memory.md) |
 | Save learned skills, review a batch, migrate old candidates or undo changes | [Skill learning](skill-learning.md) |
+| Share AGENTS.md across coding assistants and inspect pending conversation guidance | [Project guidance](project-guidance.md) |
 | Search earlier conversations and saved observations | [Local history retrieval](local-history-retrieval.md) |
 | Look up recorded computer activity | [Activity history](activity-history.md) |
 | Configure activity recording | [macOS browser URLs](macos-browser-activity.md), [Windows activity](windows-activity.md) |

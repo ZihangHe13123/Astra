@@ -12,6 +12,7 @@
 | 使用源码桌面预览版、模型登录和文件差异 | [桌面 GUI](gui.md) |
 | 选择模型、调整推理、使用终端命令 | [日常使用](usage.md) |
 | 受控重启、会话内稍后继续或定期检查 | [会话生命周期](session-lifecycle.md) |
+| 保存定时提醒、只读检查与本地送达回执 | [持久任务](persistent-jobs.md) |
 | 配置沙箱、主机文件访问和工具权限 | [工具执行](execution.md) |
 | 选择 Lyra 或定制本地人格、了解酒吧模式 | [Lyra 人格](persona.md) |
 | 添加搜索、MCP、QQ 消息、图片工具或 163 邮箱 | [可选集成](integrations.md) |

@@ -29,6 +29,11 @@ on:
       - 'agent/runtime/event_writer.py'
       - 'agent/runtime/event_stream.py'
       - 'agent/runtime/session_wakeup.py'
+      - 'agent/runtime/jobs/**'
+      - 'agent/cli/jobs*.py'
+      - 'tests/test_persistent_jobs*.py'
+      - 'tests/test_guidance_snapshots.py'
+      - 'tests/test_backend_guidance.py'
       - 'agent/runtime/browser*.py'
       - 'agent/runtime/cdp_backend.py'
       - 'agent/runtime/extension_browser_backend.py'
@@ -95,6 +100,11 @@ on:
       - 'agent/runtime/event_writer.py'
       - 'agent/runtime/event_stream.py'
       - 'agent/runtime/session_wakeup.py'
+      - 'agent/runtime/jobs/**'
+      - 'agent/cli/jobs*.py'
+      - 'tests/test_persistent_jobs*.py'
+      - 'tests/test_guidance_snapshots.py'
+      - 'tests/test_backend_guidance.py'
       - 'agent/runtime/browser*.py'
       - 'agent/runtime/cdp_backend.py'
       - 'agent/runtime/extension_browser_backend.py'
@@ -205,6 +215,8 @@ jobs:
           tests/test_backend_task_protocol.py::test_protocol_fixture_keeps_startup_failure_diagnostics
           tests/test_context_index_semantic.py
           tests/test_session_lifecycle_protocol.py tests/test_session_wakeup_protocol.py
+          tests/test_persistent_jobs.py tests/test_persistent_jobs_worker.py
+          tests/test_guidance_snapshots.py tests/test_backend_guidance.py
           tests/test_subagent_conversation.py tests/test_subagent_resume.py
           tests/test_subagent_replay.py tests/test_delegate_conversation_resume.py
           tests/test_browser_lifecycle.py tests/test_browser_child_environment.py tests/test_mcp_recovery.py

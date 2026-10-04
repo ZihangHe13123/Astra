@@ -158,7 +158,7 @@ from agent.cli.context_index_preferences import load_context_index_preferences
 from agent.cli.browser_commands import execute_browser_command
 from agent.cli.computer_commands import ComputerStateEmitter, approval_choices, execute_computer_command
 from agent.cli.memory_commands import execute_memory_command
-from agent.cli.skill_commands import execute_skill_command
+from agent.cli.guidance_commands import execute_guidance_or_skill_command, guidance_command_busy
 from agent.cli.learning_commands import execute_learning_command
 from agent.cli.conversation_commands import register_conversation_tools
 from agent.runtime.command_workflows import workflow_message, raw_command as normalize_direct_command
@@ -3703,16 +3703,24 @@ async def _main(startup_started: float):
                     if not error:
                         _send_working_memory()
                     _send({"type": "done"})
-                elif c.startswith("/skills"):
+                elif c.split(maxsplit=1)[0] == "/jobs":
+                    from agent.cli.jobs_commands import execute_jobs_command
+
                     try:
-                        skill_parts = shlex.split(c)[1:]
+                        job_parts = shlex.split(c)[1:]
+                        output, error = execute_jobs_command(job_parts, workdir=agent._source_tracking_workdir())
                     except ValueError as exc:
-                        output, error = "", f"Invalid skills command: {exc}"
-                    else:
-                        output, error = execute_skill_command(skill_store, skill_parts)
+                        output, error = "", f"Invalid jobs command: {exc}"
+                    _send({"type": "tool_result", "name": "jobs", "output": output, "error": error, "code": ""})
+                    if active_task is None or active_task.done() or _reply_done:
+                        _send({"type": "done"})
+                elif c.split(maxsplit=1)[0] in {"/guidance", "/skills"}:
+                    busy = await guidance_command_busy(active_task, _reply_done, manual_reviews, apply_now="--now" in c.split())
+                    name, output, error = execute_guidance_or_skill_command(agent, skill_store, c, busy=busy)
                     _send_startup_status()
-                    _send({"type": "tool_result", "name": "skills", "output": output, "error": error, "code": ""})
-                    _send({"type": "done"})
+                    _send({"type": "tool_result", "name": name, "output": output, "error": error, "code": ""})
+                    if not busy or _reply_done:
+                        _send({"type": "done"})
                 elif c == "/learn" or c.startswith("/learn "):
                     try:
                         learn_parts = shlex.split(c)[1:]
@@ -4064,6 +4072,9 @@ async def _main(startup_started: float):
                     t0 = time.perf_counter()
                     parts = c.split(maxsplit=1)
                     target = parts[1].strip().lower() if len(parts) > 1 else "all"
+                    if target in {"all", "skills"} and await guidance_command_busy(active_task, _reply_done, manual_reviews, apply_now=True):
+                        _send({"type": "tool_result", "name": "reload", "output": "", "error": "Finish or cancel the active task before applying guidance.", "code": ""})
+                        continue
                     results: dict[str, str] = {}
                     # --- code: reload core Python modules + swap agent class ---
                     if target in ("all", "code"):
@@ -4094,7 +4105,8 @@ async def _main(startup_started: float):
                         agent.set_persona(new_state, new_prompt)
                         results["persona"] = f"→ {new_state.persona_id}"
                     if target in ("all", "skills"):
-                        agent._refresh_skill_catalog(force=True)
+                        agent.refresh_session_guidance()
+                        await agent.context.save_async(allow_empty=True)
                         results["skills"] = f"{len(agent._available_skill_names)} skills"
                     if target in ("all", "model"):
                         new_catalog = configured_model_catalog()

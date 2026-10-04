@@ -952,6 +952,39 @@
     "options": []
   },
   {
+    "command": "/guidance",
+    "description": "show applied and pending project/skill guidance",
+    "group": "SYSTEM",
+    "id": "F54",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "status",
+        "description": "inspect the current conversation's applied guidance",
+        "completion": "/guidance status",
+        "submitValue": "/guidance status"
+      },
+      {
+        "command": "refresh --now",
+        "description": "apply saved changes to this idle conversation",
+        "completion": "/guidance refresh --now",
+        "submitValue": "/guidance refresh --now"
+      }
+    ]
+  },
+  {
+    "command": "/jobs",
+    "description": "persistent reminders/checks: list, add, history and local inbox",
+    "group": "SYSTEM",
+    "id": "F55",
+    "takes_args": true,
+    "options": [
+      {"command": "list", "description": "show saved jobs", "completion": "/jobs list", "submitValue": "/jobs list"},
+      {"command": "inbox", "description": "read results and delivery receipts", "completion": "/jobs inbox", "submitValue": "/jobs inbox"},
+      {"command": "history", "description": "inspect execution outcomes and missed slots", "completion": "/jobs history", "submitValue": "/jobs history"}
+    ]
+  },
+  {
     "command": "/help",
     "description": "show command help",
     "group": "SYSTEM",
