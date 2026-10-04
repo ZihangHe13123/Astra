@@ -22,8 +22,9 @@ from agent.runtime.file_change_time import change_time_token
 from agent.runtime.conversation_branches import BranchConflict, ConversationBranches, checked_branch_id
 from agent.runtime.paths import state_path
 from agent.runtime.session_store import SessionStore
+from agent.ui.reasoning import legacy_reasoning_text, reasoning_display_fields
 
-_VERSION = 2
+_VERSION = 3
 _CHUNK = 64 * 1024
 
 
@@ -186,7 +187,8 @@ class _Projection:
         self.db.executemany(f"INSERT INTO calls_{self.table} VALUES (?,?)",
                             ((raw_index, call) for call in dict.fromkeys(calls)))
         provenance = message.get("provenance", "")
-        if message.get("role") == "user" and provenance in ("", "session_wakeup"):
+        if (message.get("role") == "user" and provenance in ("", "session_wakeup")
+                and (message.get("_meta") or {}).get("type") != "reasoning_context"):
             self.hidden = provenance == "session_wakeup"
         if provenance != "wakeup_notification" and self.hidden:
             return
@@ -194,12 +196,17 @@ class _Projection:
         self.total += 1
         if message.get("role") not in ("user", "assistant"):
             return
-        if message.get("_meta", {}).get("type") == "reasoning_context":
+        legacy_reasoning = legacy_reasoning_text(message)
+        if (message.get("_meta") or {}).get("type") == "reasoning_context" and not legacy_reasoning:
             return
         self.db.execute(f"UPDATE raw_{self.table} SET chat_position=? WHERE position=?", (position, raw_index))
         payload = {"role": message["role"],
                    "content": message_display_text(message.get("display_command", message.get("content", ""))),
                    "timestamp": message.get("timestamp"), "source_ref": reference}
+        if legacy_reasoning:
+            payload.update(role="reasoning", content=legacy_reasoning)
+        else:
+            payload.update(reasoning_display_fields(message))
         self.db.execute(f"INSERT INTO {self.table} VALUES (?,?)",
                         (position, json.dumps(payload, ensure_ascii=False)))
 
@@ -342,7 +349,7 @@ def discard_history_index(store: SessionStore, *, related_paths: list[Path] | No
         if path.parent == heads and (match := re.fullmatch(r"([0-9a-f]{32})(?:\.snapshot|\.header)?\.(?:json|jsonl)", path.name)):
             sources.add(heads / f"{match[1]}.json")
     for source in sources:
-        for version in (1, _VERSION):
+        for version in range(1, _VERSION + 1):
             _discard_index(_source_cache_path(source, version=version))
 
 

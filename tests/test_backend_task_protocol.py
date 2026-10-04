@@ -12,6 +12,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from queue import Empty, Queue
 
+import pytest
+
 from agent.runtime import session_recall
 from agent.runtime.approval_inbox import ApprovalInbox
 from agent.runtime.session_store import SessionStore
@@ -209,7 +211,8 @@ def test_backend_exposes_tasks_command_without_blocking_protocol(tmp_path: Path)
     assert any(event.get("type") == "done" for event in events)
 
 
-def test_backend_history_preserves_message_timestamps_and_tool_activity(tmp_path: Path):
+@pytest.mark.parametrize("surface", ["gui", "tui"])
+def test_backend_history_preserves_message_timestamps_and_tool_activity(tmp_path: Path, surface):
     settings = tmp_path / "settings.json"
     settings.write_text(
         json.dumps({"selected_model": "Qwen3.6-35B-A3B"}),
@@ -221,7 +224,7 @@ def test_backend_history_preserves_message_timestamps_and_tool_activity(tmp_path
         "system_prompt": "sys",
         "messages": [
             {"role": "user", "content": "old question", "timestamp": 1_750_000_000.0},
-            {"role": "assistant", "content": "old answer", "timestamp": 1_750_000_060.0, "tool_calls": [
+            {"role": "assistant", "content": "old answer", "reasoning_content": "Saved thinking", "timestamp": 1_750_000_060.0, "tool_calls": [
                 {"id": "saved-call", "type": "function", "function": {"name": "context_open", "arguments": "{}"}},
             ]},
             {"role": "tool", "tool_call_id": "saved-call", "content": "[Tool result: context_open | status: success]\nsaved context"},
@@ -248,6 +251,7 @@ def test_backend_history_preserves_message_timestamps_and_tool_activity(tmp_path
         "SANDBOX_DOCKER": "false",
         "AGENT_MCP_CONFIG": str(tmp_path / "missing-mcp.json"),
         "PYTHONUNBUFFERED": "1",
+        "ASTRA_UI_SURFACE": surface,
     })
 
     completed = subprocess.run(
@@ -276,6 +280,10 @@ def test_backend_history_preserves_message_timestamps_and_tool_activity(tmp_path
     assert [item["source_ref"]["index"] for item in history["messages"]] == [0, 1]
     assert all(len(item["source_ref"]["digest"]) == 64 for item in history["messages"])
     assert history["branch_id"] == "main"
+    if surface == "gui":
+        assert history["messages"][1]["reasoning_content"] == "Saved thinking"
+    else:
+        assert "reasoning_content" not in history["messages"][1]
     assert history["tool_results"] == [{"name": "context_open", "output": "saved context", "error": "", "duration_ms": 18, "call_id": "saved-call"}]
     assert history["session_id"] == "timestamp_history"
 

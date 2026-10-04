@@ -8,6 +8,7 @@ import { reduceToolPreparation, type ToolPreparation } from "./tool-preparation.
 export type UIEvent = { type: string; [key: string]: any };
 export type Message = {
   id: string; role: string; content: string; timestamp?: number; pending?: boolean;
+  reasoning_content?: string;
   stream_id?: string; source_ref?: { index: number; digest: string };
   submissionState?: "pending" | "accepted" | "rejected" | "unknown"; submissionError?: string;
 };
@@ -136,6 +137,8 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
       state.messages = (event.messages || []).map((m: UIEvent, i: number) => ({
         id: m.id || `history:${event.session_id}:${i}`, role: m.role, content: textContent(m.content), timestamp: m.timestamp,
         ...(m.source_ref ? { source_ref: m.source_ref } : {}),
+        ...(m.role === "assistant" && typeof m.reasoning_content === "string" && m.reasoning_content.trim()
+          ? { reasoning_content: m.reasoning_content } : {}),
       }));
       state.tools = (event.tool_results || []).map((r: UIEvent, i: number) => ({ ...r, type: "tool_result", status: r.error ? "failed" : "completed", historical: true, result_index: i + 1, call_id: r.call_id || `history-tool:${i}` }));
       state.delegates = (event.delegates || []).reduce(reduceDelegateEvent, {});
