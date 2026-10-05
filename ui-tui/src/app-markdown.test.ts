@@ -9,7 +9,7 @@ import {
   shouldRefreshToolClock,
   shouldShowWelcome,
 } from "./app.js";
-import type { ChatMessage, UserQuestionAnswer, UserQuestionRequest } from "./types.js";
+import type { ChatMessage, PyEvent, UserQuestionAnswer, UserQuestionRequest } from "./types.js";
 
 const idleWelcomeState = {
   backendStatus: "ready" as const,
@@ -216,7 +216,6 @@ assert.match(hostileSummary, /\\u\{E0020\}/);
 assert.deepEqual(hostileAnswers, unchangedHostileAnswers);
 
 const appSource = readFileSync(new URL("./app.tsx", import.meta.url), "utf8");
-const typesSource = readFileSync(new URL("../../ui-core/src/types.ts", import.meta.url), "utf8");
 const appModule = await import("./app.js");
 const submitStreamLifecyclePolicy = (appModule as unknown as Record<string, unknown>)
   .submitStreamLifecyclePolicy;
@@ -238,7 +237,16 @@ for (const { input, expected } of [
     input,
   );
 }
-assert.match(typesSource, /type: "history"; messages: \{ role: string; content: string; timestamp\?: number \}\[\]/);
+// The history event carries each restored message's saved time as optional
+// epoch seconds. Enforced by the type checker (`tsc --noEmit` in the build),
+// not at run time; unrelated fields on the event do not affect it.
+({
+  type: "history",
+  messages: [
+    { role: "user", content: "saved with a time", timestamp: 1_789_876_091 },
+    { role: "assistant", content: "saved without a time" },
+  ],
+}) satisfies Extract<PyEvent, { type: "history" }>;
 assert.match(appSource, /m\.timestamp \* 1000/);
 assert.match(appSource, /options\.timestamp \?\? Date\.now\(\)/);
 assert.match(appSource, /timeRailCursorRef/);
