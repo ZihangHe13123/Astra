@@ -247,7 +247,6 @@ for (const { input, expected } of [
     { role: "assistant", content: "saved without a time" },
   ],
 }) satisfies Extract<PyEvent, { type: "history" }>;
-assert.match(appSource, /m\.timestamp \* 1000/);
 assert.match(appSource, /options\.timestamp \?\? Date\.now\(\)/);
 assert.match(appSource, /timeRailCursorRef/);
 assert.match(appSource, /useState\(loadTimelineDisplay\)/u);

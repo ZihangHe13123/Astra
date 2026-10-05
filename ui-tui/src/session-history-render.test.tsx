@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { EventEmitter } from "node:events";
@@ -7,6 +10,7 @@ import { PassThrough, Writable } from "node:stream";
 import React from "react";
 import { render } from "ink";
 import stripAnsi from "strip-ansi";
+import { saveTimelineDisplay } from "./tui-settings.js";
 
 class FakeBackend extends EventEmitter {
   exitCode = null;
@@ -31,6 +35,13 @@ childProcess.spawn = ((_command: string, args: string[]) => {
 childProcess.execFile = (() => { throw new Error("History tests must not run Appshot"); }) as unknown as typeof childProcess.execFile;
 syncBuiltinESMExports();
 process.env.TUI_STARTUP_ANIMATION = "0";
+// App reads the theme and the timeline switch from tui-settings.json when it
+// mounts. ASTRA_HOME outranks the project directory, so a private one keeps the
+// developer's own settings out of what these tests render.
+const settingsHome = mkdtempSync(join(tmpdir(), "astra-history-render-"));
+process.env.ASTRA_HOME = settingsHome;
+saveTimelineDisplay(true);
+test.after(() => rmSync(settingsHome, { recursive: true, force: true }));
 const { default: App } = await import("./app.js");
 
 class Input extends PassThrough {
@@ -56,8 +67,7 @@ function appshot() {
   }) as any;
 }
 const settle = () => new Promise(resolve => setTimeout(resolve, 60));
-
-test("session replacement prints each restored message once, in order", async () => {
+function mountApp() {
   const stdin = new Input();
   const stdout = new Output();
   // Debug mode reprints entire frames, hiding irreversible Static writes.
@@ -66,6 +76,11 @@ test("session replacement prints each restored message once, in order", async ()
     debug: false, patchConsole: false, exitOnCtrlC: false,
   });
   const captured = () => stripAnsi(stdout.chunks.join(""));
+  return { app, stdin, stdout, captured };
+}
+
+test("session replacement prints each restored message once, in order", async () => {
+  const { app, stdin, stdout, captured } = mountApp();
   const submit = async (text: string) => {
     stdin.write(text); await settle(); stdin.write("\r"); await settle();
   };
@@ -113,5 +128,36 @@ test("session replacement prints each restored message once, in order", async ()
     await settle();
     expectOnceInOrder(["FRESH_REPLY_AFTER_RESET"]);
     assert.doesNotMatch(captured(), /USER_GREETING|ASSISTANT_GREETING|THIRD_REPLY/);
+  } finally { app.unmount(); }
+});
+
+test("restored messages show their saved time on the time rail", async () => {
+  const { app, stdout, captured } = mountApp();
+  // Saved times are epoch seconds. Local date parts keep the expected labels
+  // the same in every time zone.
+  const savedAt = (minute: number, second: number) => new Date(2025, 5, 15, 17, minute, second).getTime() / 1000;
+  // The separator and role prefix between a label and its message belong to the
+  // theme, so read only the time-shaped text ahead of the message on its line.
+  const railLabels = (marker: string) => {
+    const lines = captured().split(/\r?\n/u).filter(line => line.includes(marker));
+    assert.equal(lines.length, 1, `${marker} must print once`);
+    return lines[0].slice(0, lines[0].indexOf(marker)).match(/\d{2}:\d{2}|\+\d{2}s/gu) ?? [];
+  };
+  try {
+    await settle();
+    backend.event({ type: "model_info", model: "test", total_tokens: 0, prompt_tokens: 0, completion_tokens: 0, context_pct: 0 });
+    await settle();
+    stdout.chunks = [];
+    backend.event({ type: "history", session_id: "saved", messages: [
+      { role: "user", content: "SAVED_FIRST", timestamp: savedAt(6, 40) },
+      { role: "assistant", content: "SAVED_SAME_MINUTE", timestamp: savedAt(6, 52) },
+      { role: "user", content: "SAVED_WITHOUT_TIME" },
+      { role: "assistant", content: "SAVED_NEXT_MINUTE", timestamp: savedAt(7, 5) },
+    ] });
+    await settle();
+    assert.deepEqual(railLabels("SAVED_FIRST"), ["17:06"]);
+    assert.deepEqual(railLabels("SAVED_SAME_MINUTE"), ["+52s"]);
+    assert.deepEqual(railLabels("SAVED_WITHOUT_TIME"), []);
+    assert.deepEqual(railLabels("SAVED_NEXT_MINUTE"), ["17:07"]);
   } finally { app.unmount(); }
 });
