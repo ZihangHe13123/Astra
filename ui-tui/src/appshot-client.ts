@@ -60,6 +60,11 @@ export const APPSHOT_ERROR_CODES = [
   "protocol_invalid",
   "broker_unavailable",
 ] as const;
+/** `notice` event codes. `helper_unavailable` is client-only: a helper that is not installed cannot report it. */
+export type AppshotNotice =
+  | "recipient_disconnected"
+  | "broker_unavailable"
+  | "helper_unavailable";
 export type AppshotClientSnapshot = {
   connection: "disconnected" | "connecting" | "connected";
   enabled: boolean;
@@ -98,6 +103,8 @@ type Descriptor = {
   socketPath: string;
 };
 export interface AppshotDependencies {
+  /** False when the optional native helper cannot be resolved; absent means it can. */
+  helperInstalled?(): boolean;
   currentUID(): number;
   identity(signal: AbortSignal): Promise<Identity>;
   discover(signal: AbortSignal): Promise<Descriptor>;
@@ -278,10 +285,20 @@ export function readAppshotDescriptor(runtime: string, uid: number): any {
     closeSync(fd);
   }
 }
-export function productionAppshotDependencies(): AppshotDependencies {
+export function productionAppshotDependencies(
+  environment: NodeJS.ProcessEnv = process.env,
+): AppshotDependencies {
   let helper: string;
-  const executable = () => (helper = resolveAppshotHelper());
+  const executable = () => (helper = resolveAppshotHelper(environment));
   return {
+    helperInstalled: () => {
+      try {
+        executable();
+        return true;
+      } catch {
+        return false;
+      }
+    },
     currentUID: () => process.getuid!(),
     now: () => process.hrtime.bigint(),
     identity: async (signal) =>
@@ -375,7 +392,11 @@ export class AppshotClient extends EventEmitter {
   private heartbeat?: ReturnType<typeof setInterval>;
   private stableTimer?: ReturnType<typeof setTimeout>;
   private reconnectAttempts = 0;
+  private reconnectEpoch = 0;
   private disconnectNotified = false;
+  private gaveUp = new Set<AppshotNotice>();
+  // "missing" only while this client has never resolved the optional helper.
+  private helper: "unknown" | "missing" | "present" = "unknown";
   private starting?: Promise<void>;
   private pending = new Map<
     string,
@@ -424,7 +445,26 @@ export class AppshotClient extends EventEmitter {
       this.abort.signal.addEventListener("abort", done, { once: true });
     });
   }
+  /** Automatic retrying has stopped: say so once, until a connection is established again. */
+  private giveUp(code: Exclude<AppshotNotice, "recipient_disconnected">) {
+    if (this.abort.signal.aborted || this.gaveUp.has(code)) return;
+    this.gaveUp.add(code);
+    this.emit("notice", code);
+  }
+  private helperAbsent() {
+    try {
+      return (this.options.windowsDeps ?? this.deps).helperInstalled?.() === false;
+    } catch {
+      return false; // An unusable probe decides nothing; the ordinary start reports the failure.
+    }
+  }
   private async run() {
+    // An optional helper that was never there leaves nothing to launch, so input has nothing to
+    // retry. One that vanishes later is an ordinary failure below, and input keeps retrying it.
+    if (this.helper !== "present") {
+      this.helper = this.helperAbsent() ? "missing" : "present";
+      if (this.helper === "missing") return this.giveUp("helper_unavailable");
+    }
     this.state = { ...this.state, connection: "connecting" };
     this.changed();
     let launched = false;
@@ -478,7 +518,7 @@ export class AppshotClient extends EventEmitter {
     if (!this.abort.signal.aborted) {
       this.state = { ...this.state, connection: "disconnected" };
       this.changed();
-      this.emit("notice", "broker_unavailable");
+      this.giveUp("broker_unavailable");
     }
   }
   private handshake(
@@ -511,6 +551,7 @@ export class AppshotClient extends EventEmitter {
                 throw unavailable();
               ready = true;
               clearTimeout(timer);
+              this.gaveUp.clear();
               this.state = { ...this.state, connection: "connected" };
               this.sendState();
               this.heartbeat = setInterval(
@@ -576,17 +617,18 @@ export class AppshotClient extends EventEmitter {
             this.disconnectNotified = true;
             this.emit("notice", "recipient_disconnected");
           }
+          // Input can reconnect and drop again while an earlier reconnect still waits:
+          // only the newest disconnect decides what happens next.
+          const epoch = ++this.reconnectEpoch;
           if (!this.abort.signal.aborted && this.reconnectAttempts < 5) {
             const delay = Math.min(5000, (this.options.retryMS ?? 500) * 2 ** this.reconnectAttempts++);
             queueMicrotask(async () => {
               const previous = this.starting;
               if (previous) await previous;
               await this.pause(delay);
-              if (!this.abort.signal.aborted) void this.start();
+              if (!this.abort.signal.aborted && epoch === this.reconnectEpoch) void this.start();
             });
-          } else if (!this.abort.signal.aborted) {
-            this.emit("notice", "broker_unavailable");
-          }
+          } else this.giveUp("broker_unavailable");
         } else reject(unavailable());
       });
       this.write({
@@ -656,7 +698,8 @@ export class AppshotClient extends EventEmitter {
   }
   recordInput() {
     this.lastInput = (this.options.windowsDeps ?? this.deps).now();
-    if (this.state.connection === "disconnected" && !this.starting && !this.abort.signal.aborted) {
+    // Input retries a broker that went away, never a helper that was not installed to begin with.
+    if (this.state.connection === "disconnected" && !this.starting && this.helper !== "missing" && !this.abort.signal.aborted) {
       this.reconnectAttempts = 0;
       this.disconnectNotified = false;
       void this.start();

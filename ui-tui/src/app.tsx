@@ -1689,9 +1689,13 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
       : new AppshotClient({ consumer,
           ...(process.platform === "win32" ? { windowsDeps: productionWindowsAppshotDependencies() } : {}) });
     appshotClientRef.current = client;
-    const notice = (code: string) => addMessageRef.current("system", code === "broker_unavailable"
-      ? "Appshot：连接未恢复，已暂停自动重试；在本窗口按键可重试。"
-      : `Appshot: ${code}`);
+    const notice = (code: string) => {
+      // A missing optional helper is not a lost connection: nothing to retry, nothing to announce.
+      if (code === "helper_unavailable") return;
+      addMessageRef.current("system", code === "broker_unavailable"
+        ? "Appshot：连接未恢复，已暂停自动重试；在本窗口按键可重试。"
+        : `Appshot: ${code}`);
+    };
     let recipientHintShown = false;
     const changed = () => {
       if (client.state.connection !== "connected") return;

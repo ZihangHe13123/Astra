@@ -577,6 +577,43 @@ test("Appshot commands stay local while busy and input activity follows Ink only
   } finally {h.app.unmount(); await settle();} assert.equal(closes,1);
 });
 
+const appshotNotices = (h: Awaited<ReturnType<typeof setup>>) =>
+  h.frame().split("\n").filter((line) => /Appshot[：:]/.test(line)).map((line) => line.slice(line.indexOf("Appshot")).trim());
+
+test("typing without the optional Appshot helper installed prints nothing about Appshot", async () => {
+  const { mkdtempSync, realpathSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { AppshotClient } = await import("./appshot-client.js");
+  const { productionWindowsAppshotDependencies } = await import("./appshot-windows.js");
+  // A source installation whose helper bundle was never built; the real Windows resolution runs.
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "appshot-no-helper-"));
+  const h = await setup(90, 30, (consumer) => new AppshotClient({ platform: "win32", consumer,
+    windowsDeps: productionWindowsAppshotDependencies({ LOCALAPPDATA: root, AGENT_PROJECT_ROOT: root }) }));
+  try {
+    for (const key of "0123456789") await h.key(key);
+    assert.match(h.frame(), /0123456789/);
+    assert.deepEqual(appshotNotices(h), []);
+  } finally { h.app.unmount(); await settle(); rmSync(root, { recursive: true, force: true }); }
+});
+
+test("typing retries an unreachable Appshot broker without repeating its retry notice", async () => {
+  const { AppshotClient } = await import("./appshot-client.js");
+  let launches = 0;
+  const deps: any = { currentUID: () => 501, now: () => process.hrtime.bigint(),
+    identity: async () => ({ pid: process.pid, uid: 501, process_start: "1", monotonic_ns: "100" }),
+    discover: async () => { throw new Error("no broker"); }, connect: async () => { throw new Error("no broker"); },
+    launch: async () => { launches++; } };
+  const h = await setup(90, 30, (consumer) => new AppshotClient({ platform: "darwin", deps, consumer, retryMS: 1 }));
+  try {
+    assert.equal(launches, 1);
+    for (const key of "0123456789") await h.key(key);
+    // A key that lands while a retry is still in flight joins it, so the count is only bounded below.
+    assert.ok(launches > 1, "typing retried the broker");
+    assert.deepEqual(appshotNotices(h), ["Appshot：连接未恢复，已暂停自动重试；在本窗口按键可重试。"]);
+  } finally { h.app.unmount(); await settle(); }
+});
+
 
 test("Appshot busy submission has typed admission, matching replay settlement and restart status without resend", async()=>{
  const {readFileSync}=await import('node:fs');
