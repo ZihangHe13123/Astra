@@ -3,6 +3,7 @@ import React, { useState } from "react";
 import { Box, Text, useInput } from "ink";
 import TextInput from "ink-text-input";
 import type { ConnectionRoute, TuiCommand } from "../types.js";
+import { singleLineFieldText } from "../paste-command.js";
 import { useTheme } from "../theme-context.js";
 
 export interface ConnectionPanelProps {
@@ -63,7 +64,7 @@ export function ConnectionPanel({ routes, pending, error, authorization, onSave,
     else if (key.downArrow) setIndex(i => Math.min(filtered.length - 1, i + 1));
     else if (key.return) choose();
     else if (key.backspace || key.delete) { setQuery(q => q.slice(0, -1)); setIndex(0); }
-    else if (input) { setQuery(q => q + input.replace(/[\x00-\x1f\x7f]/g, "")); setIndex(0); }
+    else if (input) { setQuery(q => singleLineFieldText(q + input)); setIndex(0); }
   });
   const submitText = () => {
     if (stage === "url") { setBaseUrl(value.trim()); moveTo("auth"); }
@@ -83,7 +84,7 @@ export function ConnectionPanel({ routes, pending, error, authorization, onSave,
         <Text>Waiting for ChatGPT authorization…</Text>
         <Text dimColor>If disabled, enable Codex device-code login in ChatGPT Settings → Security, then reconnect.</Text>
       </Box> : <Text>Connecting and checking model list…</Text>
-      : textEntry ? <TextInput value={value} onChange={setValue} onSubmit={submitText}
+      : textEntry ? <TextInput value={value} onChange={next => setValue(singleLineFieldText(next))} onSubmit={submitText}
         mask={stage === "key" ? "*" : undefined} placeholder={stage === "url" ? "https://…/v1" : undefined} />
       : <>
         {query && <Text dimColor>Filter: {query}</Text>}

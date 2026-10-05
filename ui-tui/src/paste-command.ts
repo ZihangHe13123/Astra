@@ -84,6 +84,15 @@ export function normalizePastedText(text: string): string {
     .replace(/\u0000/g, "");
 }
 
+// Plain text fields read the terminal through ink-text-input or their own
+// handler, with no paste buffering. Clean the whole value rather than the
+// inserted piece: Ink can hand over one marker in two reads.
+export function singleLineFieldText(value: string, lineBreak = ""): string {
+  return normalizePastedText(value)
+    .replace(/[\n\t]+/g, lineBreak)
+    .replace(/[\u0000-\u001f\u007f]/g, "");
+}
+
 export function pastedTextPreview(text: string, max = 72): string {
   const first = normalizePastedText(text)
     .split("\n")

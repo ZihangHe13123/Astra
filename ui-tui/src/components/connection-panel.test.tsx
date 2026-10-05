@@ -66,3 +66,42 @@ assert.match(authorizationFrame, /cancel connection/);
 await oauthPress("\u001b");
 assert.equal(oauthCancelled, 1);
 oauth.unmount();
+
+// A terminal in bracketed-paste mode wraps pasted text in ESC[200~ … ESC[201~. The
+// markers can arrive in the same read as the text, in their own, or split in two.
+const paste = async (chunks: string[]) => {
+  const input = new Input(), output = new Output();
+  const saved: Extract<TuiCommand, { type: "connect_provider" }>[] = [];
+  const panel = render(<ThemeProvider theme={THEMES.glitchcity}>
+    <ConnectionPanel routes={[{ id: "custom", provider: "Provider", label: "Regular API", base_url: "", api_key_env: "", key_available: false }]}
+      pending={false} error="" onSave={r => saved.push(r)} onCancel={() => {}} />
+  </ThemeProvider>, { stdin: input as unknown as NodeJS.ReadStream, stdout: output as unknown as NodeJS.WriteStream,
+    stderr: output as unknown as NodeJS.WriteStream, debug: true, patchConsole: false, exitOnCtrlC: false });
+  await new Promise(r => setTimeout(r, 30));
+  let atSubmit = ""; // the frame on screen when the last chunk, Enter, is pressed
+  for (const chunk of chunks) {
+    atSubmit = stripAnsi(output.chunks.at(-1) ?? "");
+    input.write(chunk); await new Promise(r => setTimeout(r, 40));
+  }
+  panel.unmount();
+  return { saved: saved.map(r => [r.base_url, r.api_key, r.api_key_env]), atSubmit, frames: output.chunks.map(chunk => stripAnsi(chunk)) };
+};
+const wrap = (text: string) => `\u001b[200~${text}\u001b[201~`;
+const url = "https://provider.example/v1", secret = "secret-test-123";
+for (const key of [
+  [wrap(secret)],
+  ["\u001b[200~", secret, "\u001b[201~"],
+  ["\u001b[20", `0~${secret.slice(0, 6)}`, `${secret.slice(6)}\u001b[2`, "01~"],
+  [wrap(`${secret}\r\n`)], // copied together with its line ending
+]) {
+  const { saved, atSubmit, frames } = await paste(["\r", "\r", wrap(url), "\r", "\r", ...key, "\r"]);
+  assert.deepEqual(saved, [[url, secret, ""]]);
+  // One mask character per key character: nothing else is left in the field.
+  assert.equal((atSubmit.match(/\*/g) ?? []).length, secret.length);
+  assert.equal(frames.some(frame => frame.includes(secret)), false);
+}
+const environment = await paste(["\r", "\r", wrap(url), "\r", "\u001b[B", "\r", wrap("OTHER_KEY"), "\r"]);
+assert.deepEqual(environment.saved, [[url, "", "OTHER_KEY"]]);
+const filtered = await paste([wrap("prov"), "\r", "\r", wrap(url), "\r", "\r", wrap(secret), "\r"]);
+assert.equal(filtered.frames.some(frame => /Filter: prov +│/.test(frame)), true);
+assert.deepEqual(filtered.saved, [[url, secret, ""]]);

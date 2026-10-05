@@ -4,6 +4,7 @@ import TextInput from "ink-text-input";
 import stringWidth from "string-width";
 import { graphemeBoundary } from "../grapheme-editing.js";
 import { escapeApprovalDisplayText } from "../approval-preview.js";
+import { singleLineFieldText } from "../paste-command.js";
 import {
   createQuestionState,
   transitionQuestion,
@@ -208,8 +209,10 @@ export function QuestionCard({
       return;
     }
     if (key.upArrow || key.downArrow || key.tab) return;
-    setCustomText(customText.slice(0, customCursor) + input + customText.slice(customCursor));
-    setCustomCursor(customCursor + input.length);
+    // Clean everything up to the cursor so paste markers never count as answer text.
+    const head = singleLineFieldText(customText.slice(0, customCursor) + input, " ");
+    setCustomText(head + customText.slice(customCursor));
+    setCustomCursor(head.length);
   }, { isActive: active && customEntry && pending === null && maxHeight !== undefined });
 
   const commitCustom = (value: string) => {
@@ -335,7 +338,7 @@ export function QuestionCard({
               <Text color={theme.accentAlt}>Custom answer: </Text>
               <TextInput
                 value={customText}
-                onChange={setCustomText}
+                onChange={(next) => setCustomText(singleLineFieldText(next, " "))}
                 onSubmit={commitCustom}
                 placeholder="Type your answer"
                 focus={active && pending === null}

@@ -5,6 +5,7 @@ import {
   normalizePastedText,
   pastedTextPreview,
   resolvePastedTextSubmitText,
+  singleLineFieldText,
   updatePastedTextInput,
 } from "./paste-command.js";
 
@@ -68,3 +69,13 @@ for (const chunk of [
 }
 assert.equal(buffered, null);
 assert.equal(completed, originalLongPaste);
+
+// Plain text fields clean their whole value: Ink drops a read's leading ESC and
+// can hand over one marker in two reads.
+assert.equal(singleLineFieldText("\u001b[200~secret-test-123\u001b[201~"), "secret-test-123");
+assert.equal(singleLineFieldText("[200~secret-test-123\u001b[201~"), "secret-test-123");
+let field = "";
+for (const chunk of ["\u001b[20", "0~secret-", "test-123\r\n\u001b[2", "01~"]) field = singleLineFieldText(field + chunk);
+assert.equal(field, "secret-test-123");
+assert.equal(singleLineFieldText("first\r\n\tsecond\u0000 line\u007f", " "), "first second line");
+assert.equal(singleLineFieldText("纯文本 👩‍💻 [20] ~ 200"), "纯文本 👩‍💻 [20] ~ 200");

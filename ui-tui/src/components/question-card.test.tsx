@@ -628,6 +628,50 @@ test("short viewport keeps custom entry bounded while preserving the entire answ
   } finally { instance.unmount(); }
 });
 
+test("custom entry keeps only the pasted text from a bracketed terminal paste", async () => {
+  const customRequest: UserQuestionRequest = {
+    type: "user_question_request",
+    request_id: "question-custom-paste",
+    questions: [{ id: "notes", question: "Any constraints?", multi_select: false }],
+  };
+  const answer = "Keep Windows behavior";
+  const pastes: Array<[string[], string]> = [
+    [[`\u001b[200~${answer}\u001b[201~`], answer],
+    [["\u001b[200~", answer, "\u001b[201~"], answer],
+    [["\u001b[200~first line\r\nsecond line\u001b[201~"], "first line second line"],
+  ];
+  for (const maxHeight of [undefined, 11]) {
+    for (const [chunks, expected] of pastes) {
+      const answers: UserQuestionAnswer[][] = [];
+      const { stdin, instance } = await capture(90, customRequest, {
+        maxHeight, onAnswer: (_id, value) => answers.push(value),
+      });
+      try {
+        for (const chunk of ["c", ...chunks, "\r", "\r"]) {
+          stdin.write(chunk);
+          await new Promise((resolve) => setTimeout(resolve, 25));
+        }
+        assert.deepEqual(answers, [[{ id: "notes", selected: [], custom: expected }]],
+          `maxHeight ${maxHeight}, ${chunks.length} read(s)`);
+      } finally { instance.unmount(); }
+    }
+  }
+});
+
+test("short viewport leaves the cursor after text pasted into the middle of an answer", async () => {
+  const answers: UserQuestionAnswer[][] = [];
+  const { stdin, instance } = await capture(90, {
+    ...request, questions: [request.questions[1]],
+  }, { maxHeight: 11, onAnswer: (_id, value) => answers.push(value) });
+  try {
+    for (const chunk of ["c", "ab", "\u001b[D", "\u001b[200~X\u001b[201~", "Y", "\r", "\r"]) {
+      stdin.write(chunk);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    assert.deepEqual(answers, [[{ id: "notes", selected: [], custom: "aXYb" }]]);
+  } finally { instance.unmount(); }
+});
+
 test('pending question tells the user work continues and stays answerable', async () => {
   const {output, instance} = await capture(100, {...request, mode:'timed',state:'pending'});
   try {
