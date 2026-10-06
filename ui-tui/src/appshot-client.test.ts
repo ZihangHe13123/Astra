@@ -79,6 +79,21 @@ function fixture(consumer?: any) {
     },
   };
 }
+/** A broker that accepts hello, then drops the client on its first state report. */
+function droppingSocket() {
+  const socket = new FakeSocket();
+  const write = socket.write.bind(socket);
+  socket.write = (data: Buffer) => {
+    const result = write(data);
+    if (socket.sent.at(-1)?.type === "client_state") queueMicrotask(() => socket.destroy());
+    return result;
+  };
+  return socket;
+}
+async function eventually(predicate: () => boolean, label: string) {
+  for (let i = 0; i < 400 && !predicate(); i++) await new Promise((r) => setTimeout(r, 5));
+  assert.ok(predicate(), label);
+}
 test("injected Darwin transport authenticates when the host has no POSIX uid API", async () => {
   const getuid = process.getuid;
   try {
@@ -478,6 +493,188 @@ test("repeated post-handshake disconnects stop and coalesce notices; input retri
     assert.equal(connections, 7);
     assert.equal(f.client.state.connection, "connected");
   } finally { await f.client.close(); }
+});
+
+test("an unreachable broker announces the paused retry once, however many keys retry it", async () => {
+  const f = fixture();
+  const notices: string[] = [];
+  f.client.on("notice", code => notices.push(code));
+  f.deps.discover = async () => { throw Error("no broker"); };
+  try {
+    await f.client.start();
+    assert.deepEqual(notices, ["broker_unavailable"]);
+    for (let key = 1; key <= 10; key++) {
+      f.client.recordInput();
+      assert.equal(f.client.state.connection, "connecting", "the key itself retries");
+      await f.client.start(); // joins the retry that key started
+      assert.equal(f.launches, 1 + key);
+    }
+    assert.equal(f.client.state.connection, "disconnected");
+    assert.deepEqual(notices, ["broker_unavailable"]);
+  } finally { await f.client.close(); }
+});
+
+test("a broker that went away is retried by a key; a restored connection re-arms the paused notice", async () => {
+  const f = fixture();
+  const notices: string[] = [];
+  f.client.on("notice", code => notices.push(code));
+  let reachable = true, socket = f.socket;
+  const discover = f.deps.discover;
+  f.deps.discover = async () => { if (!reachable) throw Error("no broker"); return discover(); };
+  f.deps.connect = async () => (socket = new FakeSocket());
+  const lose = () => { reachable = false; socket.destroy(); };
+  const paused = () => notices.filter(code => code === "broker_unavailable").length;
+  try {
+    await f.client.start();
+    assert.equal(f.client.state.connection, "connected");
+    lose();
+    await eventually(() => paused() === 1, "automatic retries give up");
+    assert.deepEqual(notices, ["recipient_disconnected", "broker_unavailable"]);
+    for (let key = 0; key < 5; key++) {
+      f.client.recordInput();
+      assert.equal(f.client.state.connection, "connecting", "the key itself retries");
+      await f.client.start();
+    }
+    assert.equal(paused(), 1);
+    reachable = true;
+    f.client.recordInput();
+    await f.client.start();
+    assert.equal(f.client.state.connection, "connected");
+    lose();
+    await eventually(() => paused() === 2, "the restored connection re-armed the notice");
+  } finally { await f.client.close(); }
+});
+
+test("keys pressed while the broker keeps dropping connections do not multiply the paused notice", async () => {
+  const f = fixture();
+  const notices: string[] = [];
+  let connections = 0;
+  f.client.on("notice", code => notices.push(code));
+  f.deps.connect = async () => { connections++; return droppingSocket(); };
+  const paused = () => notices.filter(code => code === "broker_unavailable").length;
+  try {
+    await f.client.start();
+    for (let key = 0; key < 10; key++) {
+      f.client.recordInput();
+      assert.equal(f.client.state.connection, "connecting", "the key itself retries");
+      await f.client.start();
+    }
+    assert.equal(connections, 11);
+    await eventually(() => paused() === 1, "the retry budget runs out");
+    // Reconnects left waiting by the earlier drops must neither connect again nor pause again.
+    await new Promise(r => setTimeout(r, 80));
+    assert.equal(paused(), 1);
+    assert.equal(connections, 16);
+  } finally { await f.client.close(); }
+});
+
+test("giving up also cancels a reconnect that is still waiting", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const settled = () => new Promise<void>(r => setImmediate(r));
+  const f = fixture();
+  const notices: string[] = [];
+  let connections = 0;
+  f.client.on("notice", code => notices.push(code));
+  f.deps.connect = async () => { connections++; return droppingSocket(); };
+  try {
+    await f.client.start();
+    for (const backoff of [1, 2, 4, 8]) {
+      await settled();
+      t.mock.timers.tick(backoff);
+      await settled();
+    }
+    assert.equal(connections, 5); // the last budgeted reconnect now waits 16 ms
+    await f.client.start(); // an explicit start, such as the desktop's connection check
+    assert.equal(connections, 6);
+    assert.deepEqual(notices, ["recipient_disconnected", "broker_unavailable"]);
+    await settled();
+    t.mock.timers.tick(16);
+    await settled();
+    assert.equal(connections, 6);
+    assert.deepEqual(notices, ["recipient_disconnected", "broker_unavailable"]);
+  } finally { await f.client.close(); }
+});
+
+test("a missing optional helper is reported once and keys do not retry it; start() looks again", async () => {
+  const f = fixture();
+  const notices: string[] = [];
+  let installed = false, probes = 0, attempts = 0;
+  f.client.on("notice", code => notices.push(code));
+  f.client.on("change", state => { if (state.connection === "connecting") attempts++; });
+  f.deps.helperInstalled = () => { probes++; return installed; };
+  try {
+    await f.client.start();
+    for (let key = 0; key < 10; key++) {
+      f.client.recordInput();
+      await new Promise(r => setTimeout(r, 1));
+    }
+    assert.deepEqual(notices, ["helper_unavailable"]);
+    assert.deepEqual([probes, attempts, f.launches, f.connects], [1, 0, 0, 0]);
+    assert.equal(f.client.state.connection, "disconnected");
+    await f.client.start(); // an explicit start, such as the desktop's connection check
+    assert.equal(probes, 2);
+    assert.deepEqual(notices, ["helper_unavailable"]);
+    installed = true;
+    await f.client.start();
+    assert.equal(f.client.state.connection, "connected");
+    assert.deepEqual(notices, ["helper_unavailable"]);
+  } finally { await f.client.close(); }
+});
+
+test("a helper that disappears after the client used it is still retried by keys", async () => {
+  const f = fixture();
+  const notices: string[] = [];
+  f.client.on("notice", code => notices.push(code));
+  let installed = true, socket = f.socket;
+  f.deps.helperInstalled = () => installed;
+  const identity = f.deps.identity;
+  f.deps.identity = async () => { if (!installed) throw Error("helper gone"); return identity(); };
+  f.deps.connect = async () => (socket = new FakeSocket());
+  try {
+    await f.client.start();
+    assert.equal(f.client.state.connection, "connected");
+    installed = false; // an uninstall or a rebuild takes the helper and its broker away
+    socket.destroy();
+    await eventually(() => notices.includes("broker_unavailable"), "automatic retries give up");
+    f.client.recordInput();
+    assert.equal(f.client.state.connection, "connecting", "the key itself retries");
+    await f.client.start();
+    installed = true;
+    f.client.recordInput();
+    await f.client.start();
+    assert.equal(f.client.state.connection, "connected");
+    assert.deepEqual(notices, ["recipient_disconnected", "broker_unavailable"]);
+  } finally { await f.client.close(); }
+});
+
+test("production Darwin dependencies without an installed helper stay idle under input", async () => {
+  const { productionAppshotDependencies } = await import("./appshot-client.js");
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  // A complete installation root that simply has no .astra/bin helper bundle.
+  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "appshot-no-helper-"));
+  const client = new AppshotClient({
+    platform: "darwin",
+    deps: productionAppshotDependencies({ AGENT_PROJECT_ROOT: root }),
+    retryMS: 1,
+  });
+  const notices: string[] = [];
+  let attempts = 0;
+  client.on("notice", code => notices.push(code));
+  client.on("change", state => { if (state.connection === "connecting") attempts++; });
+  try {
+    await client.start();
+    for (let key = 0; key < 10; key++) {
+      client.recordInput();
+      await new Promise(r => setTimeout(r, 1));
+    }
+    assert.deepEqual(notices, ["helper_unavailable"]);
+    assert.equal(attempts, 0);
+  } finally {
+    await client.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
 
 test("recalibration discards a future activity value from the previous connection", async () => {

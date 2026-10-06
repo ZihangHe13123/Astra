@@ -101,6 +101,25 @@ test("Windows read with different recipient is rejected and close cancels outsta
   f.pipes[0].deliver(f.offer("next")); await tick(); await f.client.close();
   assert.equal(f.reads[1].signal.aborted, true); f.reads[1].resolve(f.reads[1].offer); await tick(); assert.equal(f.staged.length, 0);
 });
+test("Windows installation without the optional helper stays idle under input and never offers a retry", async () => {
+  const { mkdtempSync, realpathSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const { productionWindowsAppshotDependencies } = await import("./appshot-windows.js");
+  // A source installation: the root and LOCALAPPDATA exist, the helper bundle was never built.
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "appshot-no-helper-"));
+  const client = new AppshotClient({ platform: "win32", retryMS: 1,
+    windowsDeps: productionWindowsAppshotDependencies({ LOCALAPPDATA: root, AGENT_PROJECT_ROOT: root }) });
+  const notices: string[] = []; let attempts = 0;
+  client.on("notice", code => notices.push(code));
+  client.on("change", state => { if (state.connection === "connecting") attempts++; });
+  try {
+    await client.start();
+    for (let key = 0; key < 10; key++) { client.recordInput(); await new Promise(r => setTimeout(r, 1)); }
+    assert.deepEqual(notices, ["helper_unavailable"]); assert.equal(attempts, 0);
+    assert.equal(client.state.connection, "disconnected");
+  } finally { await client.close(); rmSync(root, { recursive: true, force: true }); }
+});
 test("v1 bytes fail the Windows client without invoking any file reader", async () => {
   const f = await fixture(); try {
     f.pipes[0].push(Buffer.from(JSON.stringify({ ...f.offer(), version: 1 }) + "\n")); await tick();

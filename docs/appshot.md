@@ -77,9 +77,12 @@ claim activity. This requires macOS Automation access to Terminal; if unavailabl
 A background window starting up does not select itself.
 Appshot reconnects use exponential backoff and stop after five consecutive
 short-lived connections; repeated disconnect notices are coalesced. Input in a
-disconnected TUI retries the connection. A connection must remain established
-for ten seconds to reset the retry budget. Resizing or changing display modes
-does not recreate the client or discard its recipient activity.
+disconnected TUI retries the connection; the paused-retry notice is not
+repeated until a connection is established again. A connection must remain
+established for ten seconds to reset the retry budget. Without the native
+helper installed, the TUI prints no Appshot notice and input does not retry;
+install the helper and restart Astra. Resizing or changing display modes does
+not recreate the client or discard its recipient activity.
 `context_budget_exceeded` and `context_budget_unavailable` retain the draft.
 Appshot checks the resolved model context window minus output reserve; the status
 bar percentage and ordinary proactive compression use the separate 50% threshold.

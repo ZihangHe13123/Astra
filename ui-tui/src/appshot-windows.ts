@@ -20,6 +20,8 @@ export type WindowsAppshotDescriptor = {
 export type WindowsAppshotOffer = Extract<WindowsAppshotBrokerMessage, { type: "attach_offer" }>;
 /** Native discovery/transport, not Node's unauthenticated named-pipe connection. */
 export interface WindowsAppshotDependencies {
+  /** False when the optional native helper cannot be resolved; absent means it can. */
+  helperInstalled?(): boolean;
   identity(signal: AbortSignal): Promise<WindowsAppshotIdentity>;
   discover(signal: AbortSignal): Promise<WindowsAppshotDescriptor>;
   connect(descriptor: WindowsAppshotDescriptor, signal: AbortSignal): Promise<Duplex>;
@@ -177,6 +179,7 @@ export function productionWindowsAppshotDependencies(environment: NodeJS.Process
     return actual;
   };
   return {
+    helperInstalled: () => { try { get(); return true; } catch { return false; } },
     identity: signal => get().identity(signal), discover: signal => get().discover(signal),
     connect: (descriptor, signal) => get().connect(descriptor, signal), launch: signal => get().launch(signal),
     verifyOffer: (offer, recipient, signal) => get().verifyOffer(offer, recipient, signal),
