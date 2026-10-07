@@ -782,6 +782,8 @@ try {
  await restoredRow.getByRole('button',{name:/^会话操作：/}).click();
  await restored.getByRole('menuitem',{name:'关闭会话后端',exact:true}).click();
  await expect.poll(async()=>(await restored.evaluate(()=>window.astra.bootstrap())).sessions.some(s=>s.id===closedReasoningRuntime)).toBe(false);
+ // The row is drawn from renderer state, which hears of the removal in a later batched event.
+ await expect(restoredRow.locator('.session-status')).toHaveCount(0);
  await restored.getByTitle(last,{exact:true}).click();
  await restored.getByText('只读浏览历史，不会启动模型。',{exact:true}).waitFor();
  await expandSavedReasoning();
@@ -794,6 +796,24 @@ try {
  assert.equal(requests.length,beforeRelaunch);
  await restored.screenshot({path:join(output,'reasoning-reopened-history.png')});
  passed('closing the backend and reopening read-only or continued history keeps saved reasoning expandable without model calls');
+
+ // The main process forgets a closed runtime before the renderer receives that batched removal
+ // event. Closing through the bridge and clicking the row in the same task as the reply puts the
+ // click inside that window, while the row is still drawn as open.
+ const forgottenRuntime=(await restoredState()).id;
+ await restored.evaluate(async({id,name})=>{
+   await window.astra.close(id);
+   [...document.querySelectorAll('.session-row > button')].find(button=>button.title===name).click();
+ },{id:forgottenRuntime,name:last});
+ await restored.getByText('只读浏览历史，不会启动模型。',{exact:true}).waitFor();
+ assert.equal(await restored.locator('.toast').count(),0,'a row whose backend just closed opens its saved history, not an error');
+ await expandSavedReasoning();
+ await restored.getByRole('button',{name:'继续此会话',exact:true}).click();
+ await restoredIdle();
+ assert.notEqual((await restoredState()).id,forgottenRuntime);
+ assert.equal((await restoredState()).session,last);
+ assert.equal(requests.length,beforeRelaunch);
+ passed('a session row clicked before the renderer learns its backend closed opens read-only history instead of an error');
 
  // Display settings must not turn persisted provider reasoning into a new
  // conversation turn or change the canonical prefix on the next request.
