@@ -205,7 +205,7 @@ function App() {
     captureStarting.current = true;
     void create().catch(fail).finally(() => { captureStarting.current = false; });
   }, [active, preview, nativeCapture.connection, nativeCapture.enabled, workspace]);
-  const select = (id: string) => { historyRequest.current++; setChatLocation(undefined); setActive(id); setPreview(undefined); setHistoryLoading(false); void window.astra.select(id).catch(fail); };
+  const select = (id: string, refused: (error: unknown, request: number) => void = fail) => { const request = ++historyRequest.current; setChatLocation(undefined); setActive(id); setPreview(undefined); setHistoryLoading(false); void window.astra.select(id).catch(error => refused(error, request)); };
   const send = async (command: UIEvent) => {
     try {
       if (!active || !state) throw new Error("先创建或继续一个会话。");
@@ -340,15 +340,22 @@ function App() {
   };
   const attach = (paths: string[]) => setPrefs(old => ({ ...old, attachments: { ...old.attachments, [key]: [...new Set([...(old.attachments[key] || []), ...paths])] } }));
   const browse = (entry: SessionEntry) => {
-    const request = ++historyRequest.current;
     const matches = Object.values(states).filter(s => s.session === entry.name && s.mode === entry.mode);
     const open = matches.find(s => s.status !== "disconnected") || matches.at(-1);
-    if (open) select(open.id);
-    else { setHistoryLoading(true); void window.astra.query("history", { name: entry.name, mode: entry.mode }).then(p => {
-      if (request !== historyRequest.current) return;
-      setActive(""); setPreview({ ...p, request }); setHistoryLoading(false); void window.astra.select("").catch(fail);
-    }).catch(e => { if (request === historyRequest.current) { setHistoryLoading(false); fail(e); } }); }
-
+    const showHistory = () => {
+      const request = ++historyRequest.current;
+      setHistoryLoading(true); void window.astra.query("history", { name: entry.name, mode: entry.mode }).then(p => {
+        if (request !== historyRequest.current) return;
+        setActive(""); setPreview({ ...p, request }); setHistoryLoading(false); void window.astra.select("").catch(fail);
+      }).catch(e => { if (request === historyRequest.current) { setHistoryLoading(false); fail(e); } });
+    };
+    if (!open) { showHistory(); return; }
+    // The main process forgets a closed runtime before its batched removal event reaches this
+    // window. If that is why it refused the row, show the saved history instead of the error.
+    select(open.id, async (error, request) => {
+      const closed = await window.astra.bootstrap().then(boot => !boot.sessions.some(s => s.id === open.id), () => false);
+      if (!closed) fail(error); else if (request === historyRequest.current) showHistory();
+    });
   };
   const messages: Message[] = useMemo(() => preview ? preview.messages.map((m: Message) => ({ ...m, content: textContent(m.content) })) : state?.messages || [], [preview?.messages, state?.messages]);
   const openLog = (target: { source_ref?: SourceRef; call_id?: string } = {}) => {
