@@ -194,9 +194,13 @@ def test_voice_that_is_off_or_not_set_up_contacts_nothing(tmp_path, endpoint):
         return players, status
 
     players, status = asyncio.run(scenario(enabled=False, base_url=endpoint.url))
-    assert (players, endpoint.requests, status["state"]) == ([], [], "off")
+    assert (players, endpoint.requests, status["state"], status["configured"]) == ([], [], "off", True)
     players, status = asyncio.run(scenario(enabled=True))
     assert (players, endpoint.requests) == ([], []) and "not set up" in status["error"]
+    # A client tells "switched off" from "nothing to switch on" without reading the error text.
+    assert status["configured"] is False
+    _, status = asyncio.run(scenario(enabled=False))
+    assert (status["configured"], status["error"]) == (False, "")
 
 
 def test_endpoint_failure_is_reported_and_the_next_reply_tries_again(tmp_path, endpoint):

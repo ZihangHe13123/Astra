@@ -1,7 +1,7 @@
 import type { CommandDescription } from "../bridge.js";
 import type { UIEvent } from "@astra/ui-core/session-state";
 
-const navigationCommands = new Set(["/model", "/connect", "/session", "/permissions", "/persona", "/theme", "/changes", "/tool", "/gallery", "/doc"]);
+const navigationCommands = new Set(["/model", "/connect", "/session", "/permissions", "/persona", "/voice", "/theme", "/changes", "/tool", "/gallery", "/doc"]);
 export function opensCommandInterface(command: string): boolean { return navigationCommands.has(command); }
 export function filterCommands(commands: CommandDescription[], query: string, names: Record<string, string>): CommandDescription[] {
   const text = query.trim().toLowerCase();

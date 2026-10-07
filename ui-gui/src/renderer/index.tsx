@@ -21,6 +21,8 @@ import { MessageList } from "./messages.js";
 import { DelegateHistory, DelegateSummary } from "./delegates.js";
 import { CommandInput } from "./command-input.js";
 import { commandNames, describeCommands, modeSessionTarget, type CommandMode } from "./command-help.js";
+import { VoiceSettings } from "./voice.js";
+import { voiceAnswer, voiceButton, voiceNotice, withVoiceOptions } from "./voice-state.js";
 import { sessionTitle, sidebarGroups } from "./sidebar.js";
 import "./style.css";
 import "katex/dist/katex.min.css";
@@ -45,7 +47,7 @@ function App() {
   const [search, setSearch] = useState("");
   const [side, setSide] = useState(true);
   const [panel, setPanel] = useState<Panel>();
-  const [modal, setModal] = useState<"commands" | "models" | "model-picker" | "settings" | "permissions" | "sessions" | "persona">();
+  const [modal, setModal] = useState<"commands" | "models" | "model-picker" | "settings" | "permissions" | "sessions" | "persona" | "voice">();
   const [sessionMode, setSessionMode] = useState<string>();
   const [commandQuery, setCommandQuery] = useState("");
   const [sessionDialog, setSessionDialog] = useState<{ action: "rename" | "delete"; entry: SessionEntry; title: string }>();
@@ -75,6 +77,8 @@ function App() {
   const responsePending = responseOperationActive(state);
   const responseBusy = responseControlsBusy(state);
   const responseRequest = useRef(new Set<string>());
+  const voiceStatus = state?.info.voice_status;
+  const voiceReply = useRef<{ runtime: string; action: string; seen?: UIEvent; at: number }>();
   const logBranch = preview && preview.locatedFromRuntime !== active ? preview.branch_id : state?.branchId;
   const logResponseRevision = preview && preview.locatedFromRuntime !== active ? preview.response_versions?.revision : responseVersions?.revision;
   const logScope = logSession ? `${logSession.mode}:${logSession.name}:${logBranch || ""}:${logResponseRevision || ""}` : "";
@@ -184,6 +188,10 @@ function App() {
   const openSessionSettings = async (next: "models" | "model-picker" | "permissions" | "persona") => {
     try { await ensureSession(); setModal(next); } catch (e) { fail(e); }
   };
+  // Asking for the status makes the backend read the settings file again, so the panel shows what is saved now.
+  const openVoice = async (target?: SessionState) => {
+    try { const rt = target || await ensureSession(); voiceReply.current = undefined; setModal("voice"); await window.astra.send(rt.id, { type: "command", cmd: "/voice status" }); } catch (e) { fail(e); }
+  };
   const newChat = (work = workspace) => {
     historyRequest.current++; setPreview(undefined); setHistoryLoading(false); setFollow(true); setPanel(undefined);
     setWorkspace(work); savePrefs({ lastSession: null });
@@ -230,6 +238,7 @@ function App() {
     if (historyMode) { showSessions(historyMode); return; }
     if (value === "/permissions") { await openSessionSettings("permissions"); return; }
     if (value === "/persona") { await openSessionSettings("persona"); return; }
+    if (/^\/voice(?:\s+(?:status|list))?$/i.test(value)) { await openVoice(target); return; }
     if (value === "/help") { showCommands(); return; }
     if (/^\/(tool|gallery)(?:\s+\d+)?$/.test(value)) {
       const [name, number] = value.split(/\s+/);
@@ -268,9 +277,20 @@ function App() {
         const match = value.slice(7).trim().match(/^(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+([\s\S]*))?$/);
         if (!match) throw new Error("用法：/image <路径> [说明]");
         await window.astra.send(rt.id, { type: "image", path: match[1] || match[2] || match[3], prompt: match[4] || "Describe this image.", submission_id: crypto.randomUUID() });
+      } else if (/^\/voice\s/i.test(value)) {
+        // The backend answers a /voice command with a status that carries a message; that one is shown once.
+        voiceReply.current = { runtime: rt.id, action: value.split(/\s+/)[1].toLowerCase(), seen: rt.info.voice_status, at: Date.now() };
+        try { await window.astra.send(rt.id, { type: "command", cmd: value }); } catch (error) { voiceReply.current = undefined; throw error; }
       } else await window.astra.send(rt.id, { type: "command", cmd: value });
     } catch (error) { fail(error); return false; }
   };
+  useEffect(() => {
+    const waiting = voiceReply.current;
+    if (!waiting) return;
+    if (waiting.runtime !== state?.id || Date.now() - waiting.at > 10000) { voiceReply.current = undefined; return; }
+    if (!voiceStatus || voiceStatus === waiting.seen || voiceStatus.message === undefined) return;
+    voiceReply.current = undefined; setToast(voiceAnswer(waiting.action, voiceStatus));
+  }, [voiceStatus, state?.id]);
   const openModels = () => openSessionSettings("model-picker");
   const configureModels = (modelKey?: string) => { setInitialModelKey(modelKey); void openSessionSettings("models"); };
   const responseActionRef = useRef(responseAction); responseActionRef.current = responseAction;
@@ -372,7 +392,10 @@ function App() {
   const appshotStatus = state?.info.gui_appshot;
   const appshotUnavailable = appshotStatus?.broker?.connection === "disconnected" && appshotStatus?.notice;
   const model = state?.info.model_info;
-  const commands = useMemo(() => describeCommands([...catalog, ...localCommandEntry(localDefinition)].map(c => c.command === "/persona" && model?.personas ? { ...c, options: model.personas.map((p: UIEvent) => ({ command: p.name, description: p.description, completion: `/persona ${p.name}` })) } : c), commandModes), [catalog, model?.personas, commandModes, localDefinition]);
+  const commands = useMemo(() => describeCommands([...catalog, ...localCommandEntry(localDefinition)].map(c => c.command === "/persona" && model?.personas ? { ...c, options: model.personas.map((p: UIEvent) => ({ command: p.name, description: p.description, completion: `/persona ${p.name}` })) }
+    : c.command === "/voice" ? withVoiceOptions(c, voiceStatus) : c), commandModes), [catalog, model?.personas, commandModes, localDefinition, voiceStatus?.voice, voiceStatus?.voices?.join("\n")]);
+  const voiceLine = voiceNotice(voiceStatus);
+  const voiceControl = voiceButton(voiceStatus);
   useEffect(() => {
     if (state?.status !== "ready" || !state.session || state.isDraft || preview) return;
     setPrefs(old => ({ ...old, lastSession: { session: state.session, mode: state.mode, workspace: state.workspace },
@@ -475,7 +498,7 @@ function App() {
         <div className="composer-wrap">
           {!follow && messages.length > 0 && <button className="jump-latest" onClick={() => { if (preview?.locatedFromRuntime) select(preview.locatedFromRuntime); else if (preview?.locatedFromLog) browse({ name: preview.session_id, mode: preview.mode, modified: 0 }); else setFollow(true); }}>回到最新消息 ↓</button>}
           {!preview && currentConnection.configured === false && <div className="connection-status" role="status"><span>当前模型尚未连接，请先登录或配置 API Key。</span><button onClick={() => configureModels(model?.model_key)}>连接模型</button></div>}
-          {!preview && ["speaking", "starting"].includes(state?.info.voice_status?.state) && <div className="connection-status" role="status"><span>正在朗读回复。</span><button onClick={() => command("/voice stop")}>停止朗读</button></div>}
+          {!preview && voiceLine && <div className="connection-status" role="status"><span>{voiceLine.text}</span>{voiceLine.action === "stop" ? <button onClick={() => { void send({ type: "command", cmd: "/voice stop" }); }}>停止朗读</button> : <button onClick={() => { void openVoice(); }}>语音设置</button>}</div>}
           {!preview && appshotUnavailable && <div className="connection-status" role="status"><span>窗口捕获暂不可用，不影响对话。</span><button onClick={() => { void window.astra.appshot(active, "command", "/appshot status").catch(fail); }}>检查连接</button></div>}
           {preview ? <div className="history-banner"><span>{preview.locatedFromLog ? "只读定位窗口，显示该记录附近的消息。" : "只读浏览历史，不会启动模型。"}{preview.response_versions?.groups?.some((group: ResponseGroup) => group.versions.filter(v => v.status === "completed").length > 1) && " 有已保存的回复版本，继续会话后可切换。"}</span>{preview.locatedFromRuntime && states[preview.locatedFromRuntime] && <button onClick={() => select(preview.locatedFromRuntime)}>返回已打开的会话</button>}<button className="primary" onClick={() => { void create({ session: preview.session_id, mode: preview.mode, workspace: prefs.workspaces[`${preview.mode}:${preview.session_id}`] || workspace }).catch(fail); }}>继续此会话 <ArrowUp size={14}/></button></div> : <div className="composer" onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); attach(window.astra.droppedPaths([...e.dataTransfer.files])); }}>
             {!!state?.info.gui_appshot?.attachments?.length && <div className="attachment-list">{state.info.gui_appshot.attachments.map((a: UIEvent) => <span key={a.id}>{a.label}<button className="icon" aria-label="移除窗口捕获" onClick={() => { void window.astra.appshot(active, "remove", a.id).catch(fail); }}><X size={12}/></button></span>)}</div>}
@@ -485,7 +508,7 @@ function App() {
               commands={commands} modes={commandModes} mode={state?.mode || "work"} attachments={!!files.length || hasAppshot}
               onChange={value => savePrefs({ drafts: { ...prefs.drafts, [key]: value } })} onSubmit={() => { void submit(); }}
               onPaste={e => { if ([...e.clipboardData.items].some(i => i.type.startsWith("image/"))) { e.preventDefault(); void window.astra.clipboardImage().then(p => { if (p) attach([p]); }).catch(fail); } }}/>
-            <div className="composer-bottom"><div><button className="icon" aria-label="添加附件" onClick={() => { void window.astra.choose("files").then(attach).catch(fail); }}><Plus size={20}/></button><button className={`permission ${state?.info.yolo_status?.yolo ? "yolo" : ""}`} onClick={() => { void openSessionSettings("permissions"); }} title="工具审批设置">{state?.info.yolo_status?.yolo ? "完全访问" : "按需审批"}</button></div>
+            <div className="composer-bottom"><div><button className="icon" aria-label="添加附件" onClick={() => { void window.astra.choose("files").then(attach).catch(fail); }}><Plus size={20}/></button><button className={`permission ${state?.info.yolo_status?.yolo ? "yolo" : ""}`} onClick={() => { void openSessionSettings("permissions"); }} title="工具审批设置">{state?.info.yolo_status?.yolo ? "完全访问" : "按需审批"}</button>{voiceControl && <button className={`permission voice ${voiceControl.on ? "on" : ""}`} onClick={() => { void openVoice(); }} title="语音朗读设置">{voiceControl.label}</button>}</div>
               <div><button className="model-button" title={model?.served_model ? `${model.model}（实际：${model.served_model}）` : undefined} onClick={() => { void openModels(); }}>{model?.model && model.model !== "none" ? modelDisplayName(model.model, model.served_model) : "选择模型"}<ChevronDown size={13}/></button>
                 <select aria-label="推理强度" value={model?.reasoning_effort || "high"} disabled={!model?.reasoning_effort} onChange={e => command(`/mode ${e.target.value}`)}><option value="low">低</option><option value="high">高</option><option value="xhigh">超高</option><option value="max">最高</option></select>
                 {(responsePending || state?.busy && !draft.trim() && !files.length && !hasAppshot) ? <button className="send" aria-label="停止" onClick={() => command("/cancel")}><Square size={16} fill="currentColor"/></button> : <button className="send" aria-label="发送" disabled={sending || opening || responsePending || (!draft.trim() && !files.length && !hasAppshot)} onClick={() => { void submit(); }}><ArrowUp size={19}/></button>}
@@ -502,6 +525,7 @@ function App() {
     {sessionDialog && <SessionActionDialog key={`${sessionDialog.action}:${sessionDialog.entry.mode}:${sessionDialog.entry.name}`} action={sessionDialog.action} title={sessionDialog.title} close={() => setSessionDialog(undefined)} confirm={confirmSessionAction}/>}
     {modal === "sessions" && <Modal title="管理会话" close={() => setModal(undefined)}><div className="form"><label>对话模式<select aria-label="筛选对话模式" value={sessionMode || ""} onChange={e => setSessionMode(e.target.value || undefined)}><option value="">全部模式</option><option value="work">通用</option>{commandModes.map(mode => <option key={mode.mode} value={mode.mode}>{mode.label}</option>)}</select></label><input aria-label="筛选会话" value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索会话…"/>{historyFiltered.filter(entry => !sessionMode || entry.mode === sessionMode).map(entryButton)}{!historyFiltered.some(entry => !sessionMode || entry.mode === sessionMode) && <p className="muted">暂无匹配的会话。</p>}</div></Modal>}
     {modal === "persona" && <Modal title="人格设置" close={() => setModal(undefined)}><div className="form"><p className="muted small">选择当前会话使用的人格。</p>{(model?.personas || []).map((p: UIEvent) => <button key={p.name} onClick={() => { setModal(undefined); void command(`/persona ${p.name}`); }}><span>{p.name}<small>{p.description}</small></span></button>)}</div></Modal>}
+    {modal === "voice" && <VoiceSettings status={voiceStatus} ready={state?.status === "ready"} run={cmd => { void send({ type: "command", cmd }); }} close={() => setModal(undefined)}/>}
     {modal === "permissions" && <Modal title="权限与对话模式" close={() => setModal(undefined)}><div className="form"><h3>工具审批</h3><p className="muted small">控制工具操作是否需要你确认。</p>
       <div className="choice-grid">{[{ value: false, name: "按需审批", description: "按现有权限规则确认操作" }, { value: true, name: "完全访问", description: "直接执行工具操作，跳过审批" }].map(option => <button key={option.name} disabled={state?.status !== "ready"} aria-pressed={!!state?.info.yolo_status?.yolo === option.value} className={!!state?.info.yolo_status?.yolo === option.value ? "selected" : ""} onClick={() => { setModal(undefined); void command(`/yolo ${option.value ? "on" : "off"}`); }}><strong>{option.name}</strong><small>{option.description}</small></button>)}</div>
       <h3>对话模式</h3><div className="choice-grid">{modeChoices(localDefinition).map(option => <button key={option.mode} disabled={state?.status !== "ready" || !!state?.busy || option.mode === state?.mode || state?.mode !== "work" && option.mode !== "work"} aria-pressed={option.mode === (state?.mode || "work")} onClick={() => { void changeMode(option.mode); }}><strong>{option.label}</strong><small>{option.description}</small></button>)}</div>
@@ -514,6 +538,7 @@ function App() {
       <button onClick={() => { void openSessionSettings("permissions"); }}>权限与对话模式 <ChevronRight size={15}/></button>
       <button onClick={() => showSessions()}>管理会话 <ChevronRight size={15}/></button>
       <button onClick={() => { void command("/persona"); }}>人格设置 <ChevronRight size={15}/></button>
+      <button onClick={() => { void command("/voice"); }}>语音朗读 <ChevronRight size={15}/></button>
       <button onClick={() => { setModal(undefined); void command("/diagnostics"); }}>查看诊断 <ChevronRight size={15}/></button>
       <button onClick={() => { setModal(undefined); void command("/restart"); }}>重启当前后端 <RotateCcw size={15}/></button>
       <button onClick={() => showCommands()}>全部功能与设置 <ChevronRight size={15}/></button>

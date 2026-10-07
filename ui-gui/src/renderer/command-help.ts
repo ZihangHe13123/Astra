@@ -35,6 +35,13 @@ const usage: Record<string, string> = {
   "/peers": "/peers · /peers name <新名字>", "/voice": "/voice on · off · stop · list · use <音色> · test [文字]",
 };
 
+/** Subcommands of an ordinary command, as [label, description]. */
+const optionHelp: Record<string, [string, string]> = {
+  "/voice on": ["开启朗读", "回复生成时自动朗读"], "/voice off": ["关闭朗读", "不再朗读回复"],
+  "/voice stop": ["停止朗读", "立刻停下正在朗读的内容"], "/voice list": ["音色与设置", "查看音色，打开语音设置"],
+  "/voice test": ["试听", "用当前音色朗读一句示例"],
+};
+
 export function commandNames(modes: CommandMode[]): Record<string, string> {
   return { ...names, ...Object.fromEntries(modes.map(mode => [mode.command.slice(1), `${mode.label}模式`])) };
 }
@@ -64,7 +71,7 @@ export function describeCommands(catalog: CommandDescription[], modes: CommandMo
     return { ...command, description: mode?.description || descriptions[command.command.slice(1)] || command.description,
       options: command.options.filter(option => option.completion.trim() !== command.command).map(option => {
         const action = option.completion.trim().slice(command.command.length + 1);
-        const translated = mode && modeActionHelp(action, mode);
+        const translated = mode && modeActionHelp(action, mode) || optionHelp[option.completion.trim()];
         return translated ? { ...option, description: translated[1] } : option;
       }) };
   });
@@ -94,7 +101,7 @@ export function suggestCommands(catalog: CommandDescription[], draft: string, mo
     const value = option.completion.trim();
     const mode = modes.find(mode => mode.command === command.command);
     const action = value.slice(command.command.length + 1);
-    const translated = mode && modeActionHelp(action, mode);
+    const translated = mode && modeActionHelp(action, mode) || optionHelp[value];
     return { value, label: translated?.[0] || option.command, description: option.description,
       more: command.options.some(other => other.completion.trim().startsWith(`${value} `)), hint: modeHint(command.command) };
   });

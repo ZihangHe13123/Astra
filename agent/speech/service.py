@@ -111,6 +111,7 @@ class SpeechService:
         settings = self.settings
         return {
             "enabled": settings.enabled,
+            "configured": not settings.problem,
             "state": self._state if settings.enabled or self.speaking else "off",
             "voice": settings.profile.name,
             "voices": [voice.name for voice in settings.voices],
