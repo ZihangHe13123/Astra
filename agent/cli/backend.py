@@ -143,6 +143,8 @@ from agent.cli.connections import (
 from agent.cli.diagnostics import build_doctor_report, build_runtime_diagnostics
 from agent.cli.environment import load_project_env
 from agent.cli.persona_preferences import save_selected_persona, startup_persona
+from agent.cli.voice_preferences import VoicePreferences, execute_voice_command
+from agent.speech.service import SpeechService
 from agent.cli.search_preferences import (
     SEARCH_PROVIDERS,
     resolve_startup_search_provider,
@@ -1132,6 +1134,10 @@ async def _main(startup_started: float):
     tools.hooks.on_tool_result(computer_state_emitter.observe_tool_result)
     tools.hooks.on_tool_error(computer_state_emitter.observe_tool_error)
     tools.hooks.on_session_end(computer_state_emitter.observe_session_end)
+    # Spoken output is presentation only: it hears the reply stream and never touches the context.
+    voice_preferences = VoicePreferences()
+    voice = SpeechService(voice_preferences, lambda status: _send({"type": "voice_status", **status}))
+    tools.hooks.on_session_end(lambda _session_id, _reason: voice.stop())
     tools.hooks.on_runtime_event(computer_state_emitter.observe_runtime_event)
     register_run_code_tool(tools, agent_getter=lambda: agent_holder["agent"])
     # The configured/discovered profile already carries a safe context limit.
@@ -1555,6 +1561,8 @@ async def _main(startup_started: float):
 
         _sr_chunks: list[str] = []
         _sr_sid = ""
+        if tick is None:
+            voice.begin_turn()
         lifecycle.start()
         try:
             # ── Session recall auto-logging ──
@@ -1605,6 +1613,7 @@ async def _main(startup_started: float):
                     if tick is None:
                         _send({"type": "chunk", "content": event["content"],
                                **{key: event[key] for key in ("request_id", "stream_id") if key in event}})
+                        voice.feed(event["content"])
                 elif event["type"] == "reasoning":
                     if tick is None:
                         _send({"type": "reasoning", "content": event["content"],
@@ -1744,6 +1753,7 @@ async def _main(startup_started: float):
                     })
                     if tick is None:
                         _send({"type": "done", "request_id": event.get("request_id", "")})
+                        voice.finish()
                     # ── Log assistant response ──
                     try:
                         if _sr_auto is not None and _sr_sid and _sr_chunks:
@@ -1762,6 +1772,8 @@ async def _main(startup_started: float):
             if task_id:
                 await delegate_mailbox.cancel_task(task_id)
             logger.info("stream cancelled; saving context and ending turn")
+            if tick is None:
+                voice.stop()
             _finish_pending_tool_calls(
                 pending_tool_calls,
                 _send,
@@ -1777,6 +1789,8 @@ async def _main(startup_started: float):
             failed_message = _stream_error_message(e)
             lifecycle.fail(failed_message)
             _log_stream_provider_error(e)
+            if tick is None:
+                voice.stop()
             _finish_pending_tool_calls(
                 pending_tool_calls,
                 _send,
@@ -2204,6 +2218,7 @@ async def _main(startup_started: float):
     if restored:
         await _send_history()
 
+    voice.report(force=True)
     if os.getenv("ASTRA_UI_SURFACE") == "gui":
         _send({"type": "yolo_status", "yolo": agent.tools.yolo})
         _send({"type": "gui_ready", "workspace": str(Path(sandbox_workdir).resolve()),
@@ -2267,6 +2282,7 @@ async def _main(startup_started: float):
             # Auto-steering: user typed while the agent is working.
             # Inject as a mid-run correction instead of rejecting.
             agent.queue_steering(input_text)
+            voice.stop()
             _send({"type": "steering", "message": f"Steering injected into running task {active_task_id}.", "text": input_text})
             return True
         if active_task is not None:
@@ -2999,12 +3015,12 @@ async def _main(startup_started: float):
                         _send({"type": "restart_status", "state": restart.state,
                                "request_id": restart.request_id, "message": str(exc)})
                     continue
-                if restart.draining and c.split(maxsplit=1)[:1] not in (["/cancel"], ["/yolo"]):
+                if restart.draining and c.split(maxsplit=1)[:1] not in (["/cancel"], ["/yolo"], ["/voice"]):
                     _send({"type": "restart_status", "state": restart.state,
                            "request_id": restart.request_id,
                            "message": "Restart is pending; use /restart cancel before changing the session."})
                     continue
-                if c.lower().split(maxsplit=1)[:1] not in (["/learn"], ["/yolo"], ["/cancel"]):
+                if c.lower().split(maxsplit=1)[:1] not in (["/learn"], ["/yolo"], ["/cancel"], ["/voice"]):
                     await _cancel_manual_reviews()
                 if c.lower().split(maxsplit=1)[:1] == ["/yolo"]:
                     # A control acknowledgement is not a model/tool completion.
@@ -3026,6 +3042,14 @@ async def _main(startup_started: float):
                                 for request_id in tuple(pending_yolo_approvals):
                                     resolve_tool_approval(request_id, "once")
                     _send({"type": "yolo_status", "yolo": agent.tools.yolo, "error": error})
+                elif c.lower().split(maxsplit=1)[:1] == ["/voice"]:
+                    # Like /yolo, a control acknowledgement: it works in every mode and
+                    # during a turn, and is neither a task nor part of the conversation.
+                    try:
+                        message, error = execute_voice_command(voice, voice_preferences, shlex.split(c)[1:])
+                    except ValueError as exc:
+                        message, error = "", f"Invalid voice command: {exc}"
+                    voice.report(force=True, message=message, error=error)
                 elif c == "/bar" or c.startswith("/bar "):
                     if minimal_mode.active:
                         _send({"type": "tool_result", "name": "bar", "output": "", "error": "Minimal mode is open. Use /minimal leave first.", "code": ""})
@@ -3557,9 +3581,15 @@ async def _main(startup_started: float):
                     _send({"type": "done"})
                 elif c == "/cancel" or c.startswith("/cancel "):
                     target_id = c.split(maxsplit=1)[1].strip() if " " in c else active_task_id
+                    was_speaking = c == "/cancel" and voice.speaking
+                    if was_speaking:
+                        voice.stop()
                     if c == "/cancel" and any(not task.done() for task in manual_reviews):
                         await _cancel_manual_reviews()
                         output, error = "Skill review cancelled.", ""
+                    elif was_speaking and (active_task is None or active_task.done() or _reply_done):
+                        # The reply itself is complete; only its audio was still running.
+                        output, error, target_id = "Stopped speaking.", "", ""
                     elif not target_id:
                         output, error = "", "No active task. Usage: /cancel [task-id]"
                     elif active_task is not None and not active_task.done() and target_id == active_task_id:
@@ -4256,6 +4286,8 @@ async def _main(startup_started: float):
         if pending_resolutions:
             await asyncio.gather(*pending_resolutions, return_exceptions=True)
         await delegate_mailbox.cancel_all()
+        with suppress(Exception):
+            await voice.close()
         try:
             if computer_runtime is not None:
                 await computer_runtime.shutdown()

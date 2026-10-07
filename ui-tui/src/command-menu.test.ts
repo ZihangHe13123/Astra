@@ -348,3 +348,11 @@ assert.equal(submitSlashCommand("/budget off", 0), "/budget off");
 
 assert.deepEqual(slashCommandSuggestions("/browser ").map((item) => item.command), ["status", "stop"]);
 assert.equal(completeSlashCommand("/browser st", 1), "/browser stop");
+
+// /voice offers its fixed actions and the voices the backend reported.
+const voiceContext = { voices: ["温暖搭档", "深夜温柔"] };
+assert.deepEqual(slashCommandSuggestions("/voice ", [], [], voiceContext).map((item) => item.submitValue), [
+  "/voice on", "/voice off", "/voice stop", "/voice list", "/voice test", "/voice use 温暖搭档", "/voice use 深夜温柔",
+]);
+assert.deepEqual(slashCommandSuggestions("/voice use 深", [], [], voiceContext).map((item) => item.submitValue), ["/voice use 深夜温柔"]);
+assert.deepEqual(slashCommandSuggestions("/voice s", [], [], {}).map((item) => item.command), ["stop"]);

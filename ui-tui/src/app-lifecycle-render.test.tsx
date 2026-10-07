@@ -887,3 +887,53 @@ test('timed question survives done and Tab returns to composer while retaining t
     assert.match(h.frame(),/Optional language preference/);
   } finally {h.app.unmount();}
 });
+
+test("voice commands work during a reply, and the badge follows the reported state", async () => {
+  const h = await setup();
+  const voices = ["温暖搭档", "深夜温柔"];
+  try {
+    await h.submit("first");
+    h.child.event({ type: "chunk", content: "LIVE VOICE REPLY" });
+    await settle();
+    for (const cmd of ["/voice on", "/voice use 深夜温柔", "/voice stop"]) {
+      await h.submit(cmd);
+      assert.deepEqual(h.child.commands.at(-1), { type: "command", cmd });
+      assert.match(h.frame(), /LIVE VOICE REPLY/, "voice control must keep streaming content");
+    }
+    assert.doesNotMatch(h.frame(), /│ VOICE /);
+    h.child.event({ type: "voice_status", enabled: true, state: "idle", voice: "深夜温柔", voices, error: "", message: "Voice is on · 深夜温柔." });
+    await settle();
+    assert.match(h.frame(), /│ VOICE /);
+    assert.match(h.stdout.chunks.map(stripAnsi).join(""), /Voice is on · 深夜温柔\./);
+    h.child.event({ type: "voice_status", enabled: false, state: "off", voice: "深夜温柔", voices, error: "" });
+    await settle();
+    assert.doesNotMatch(h.frame(), /│ VOICE /);
+  } finally { h.app.unmount(); }
+});
+
+test("a speech failure is shown once, however many status events repeat it", async () => {
+  const h = await setup();
+  try {
+    const failed = { type: "voice_status", enabled: true, voice: "", voices: [], error: "Speech endpoint is unreachable: ConnectError" };
+    for (const state of ["speaking", "idle", "idle"]) h.child.event({ ...failed, state });
+    await settle();
+    assert.equal(h.frame().match(/Voice: Speech endpoint is unreachable/g)?.length, 1);
+  } finally { h.app.unmount(); }
+});
+
+test("the first Ctrl+C silences a reply still being spoken instead of leaving the app", async () => {
+  const originalExit = process.exit; let exits = 0;
+  process.exit = (() => { exits++; }) as never;
+  const h = await setup();
+  try {
+    h.child.event({ type: "voice_status", enabled: true, state: "speaking", voice: "", voices: [], error: "" });
+    await settle();
+    await h.key("\x03");
+    assert.equal(exits, 0);
+    assert.deepEqual(h.child.commands.at(-1), { type: "command", cmd: "/voice stop" });
+    h.child.event({ type: "voice_status", enabled: true, state: "idle", voice: "", voices: [], error: "" });
+    await settle();
+    await h.key("\x03");
+    assert.equal(exits, 1);
+  } finally { process.exit = originalExit; h.app.unmount(); }
+});

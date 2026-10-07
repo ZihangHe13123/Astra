@@ -333,6 +333,7 @@ export type PyEvent =
   | { type: "task_started"; task: TaskInfo }
   | { type: "task_status"; task: TaskInfo | null }
   | { type: "yolo_status"; yolo: boolean; error?: string }
+  | { type: "voice_status"; enabled: boolean; state: "off" | "idle" | "starting" | "speaking"; voice: string; voices: string[]; error?: string; message?: string }
   | ({ type: "startup_banner" } & StartupInfo);
 
 export type StartupInfo = {

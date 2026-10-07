@@ -28,6 +28,7 @@ language; the indexes label language-specific references.
 | Operate browser pages and forms | [Browser interaction](browser-interaction.md) |
 | Operate a selected Mac application window | [macOS Computer Use](macos-computer-use.md) |
 | Attach a window screenshot to a conversation | [Appshot setup and use](appshot.md) |
+| Have replies read aloud by a local model or a speech API | [Voice output](voice.md) |
 | Add MCP, web search, QQ messaging, image tools or 163 mail | [Optional integrations](integrations.md) |
 | Find and visually inspect image references | [Image search](search-images.md) |
 | Run notebooks | [Notebook execution](notebook-execution.md) |

@@ -136,6 +136,10 @@
 
 `/theme` 列出 Ink TUI 主题。`/theme hermes`、`classic`、`nord`、`dracula`、`solarized` 和 `gruvbox` 会立即切换。默认 `hermes` 是参考 Hermes CLI 的暖金与奶油色主题；`classic` 保留鲜明的 ANSI 配色。选择单独保存到 `.astra/tui-settings.json`。
 
+## 语音朗读
+
+`/voice on` 通过已配置的语音接口把回复念出来，`/voice use <名字>` 切换音色，`/voice stop` 让当前回复安静下来。朗读不会进入对话。配置方法见[语音朗读](voice.md)。
+
 <a id="durable-tasks"></a>
 
 ## 持久任务
