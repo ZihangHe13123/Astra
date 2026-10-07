@@ -29,6 +29,7 @@ export type CommandMenuContext = {
   localSessions?: SessionMenuItem[];
   localMode?: LocalModeDefinition | null;
   personas?: { name: string; description: string }[];
+  voices?: string[];
 };
 
 const SLASH_COMMANDS: SlashCommandSuggestion[] = [
@@ -68,6 +69,7 @@ const SLASH_COMMANDS: SlashCommandSuggestion[] = [
   { command: "/handoff", description: "compose, save, and revise a continuation brief", takesArgs: true, group: "SESSION" },
   { command: "/theme", description: "show or switch terminal color theme", takesArgs: true, group: "DISPLAY" },
   { command: "/timeline", description: "toggle conversation timeline display", takesArgs: true, group: "DISPLAY" },
+  { command: "/voice", description: "read replies aloud · [on|off|stop|list|use <voice>|test]", takesArgs: true, group: "DISPLAY" },
   { command: "/health", description: "show harness diagnostics", group: "SYSTEM" },
   { command: "/doctor", description: "discuss diagnosis and repairs; --raw for report", takesArgs: true, group: "SYSTEM" },
   { command: "/diagnostics", description: "explain runtime state; --raw for snapshot", takesArgs: true, group: "SYSTEM" },
@@ -251,6 +253,14 @@ const THEME_OPTIONS: SlashCommandSuggestion[] = THEME_NAMES.map((name) => ({
 const TIMELINE_OPTIONS: SlashCommandSuggestion[] = [
   { command: "on", description: "show timestamps and the shared time rail", completion: "/timeline on", submitValue: "/timeline on", kind: "command", group: "TIMELINE" },
   { command: "off", description: "hide timestamps while preserving model time awareness", completion: "/timeline off", submitValue: "/timeline off", kind: "command", group: "TIMELINE" },
+];
+
+const VOICE_OPTIONS: SlashCommandSuggestion[] = [
+  { command: "on", description: "read replies aloud", completion: "/voice on", submitValue: "/voice on", kind: "command", group: "VOICE" },
+  { command: "off", description: "stay silent", completion: "/voice off", submitValue: "/voice off", kind: "command", group: "VOICE" },
+  { command: "stop", description: "stop speaking now", completion: "/voice stop", submitValue: "/voice stop", kind: "command", group: "VOICE" },
+  { command: "list", description: "show the voices that can be selected", completion: "/voice list", submitValue: "/voice list", kind: "command", group: "VOICE" },
+  { command: "test", description: "speak a sample line with the selected voice", completion: "/voice test", submitValue: "/voice test", kind: "command", group: "VOICE" },
 ];
 
 function fuzzyMatch(value: string, query: string): boolean {
@@ -541,6 +551,15 @@ export function slashCommandSuggestions(
   if (timelineMatch && (trimmed.toLowerCase() === "/timeline" || trimmed === "/timeline " || timelineMatch[1] !== undefined)) {
     const query = (timelineMatch[1] ?? "").trim().toLowerCase();
     return TIMELINE_OPTIONS.filter((item) => item.command.startsWith(query));
+  }
+  const voiceMatch = trimmed.match(/^\/voice(?:\s+([\s\S]*))?$/i);
+  if (voiceMatch && (trimmed.toLowerCase() === "/voice" || trimmed === "/voice " || voiceMatch[1] !== undefined)) {
+    const query = (voiceMatch[1] ?? "").trim().toLowerCase();
+    const voices: SlashCommandSuggestion[] = (context.voices ?? []).map((name) => ({
+      command: `use ${name}`, description: "speak with this voice",
+      completion: `/voice use ${name}`, submitValue: `/voice use ${name}`, kind: "command", group: "VOICE",
+    }));
+    return [...VOICE_OPTIONS, ...voices].filter((item) => item.command.toLowerCase().startsWith(query));
   }
   const memoryMatch = trimmed.match(/^\/memory(?:\s+([\s\S]*))?$/i);
   if (memoryMatch && (trimmed.toLowerCase() === "/memory" || trimmed === "/memory " || memoryMatch[1] !== undefined)) {

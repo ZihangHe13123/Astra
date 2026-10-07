@@ -8,7 +8,7 @@ export const names: Record<string, string> = {
   undo:"撤销回复", retry:"重试回复", changes:"查看改动", think:"推理显示", model:"选择模型", mode:"推理强度", connect:"连接模型",
   persona:"选择人格", search:"搜索来源", tool:"工具结果", gallery:"图片画廊", doc:"文档", memory:"记忆", skills:"技能", learn:"技能学习",
   tools:"可用工具", browser:"浏览器控制", computer:"电脑控制", conclave:"专家研究", appshot:"窗口捕获", tasks:"任务", budget:"时间预算",
-  resume:"恢复任务", cancel:"停止任务", goal:"目标", today:"今日任务", session:"会话管理", handoff:"交接", theme:"外观", timeline:"时间线",
+  resume:"恢复任务", cancel:"停止任务", goal:"目标", today:"今日任务", session:"会话管理", handoff:"交接", theme:"外观", timeline:"时间线", voice:"语音朗读",
   health:"运行健康", doctor:"诊断", diagnostics:"诊断详情", maintenance:"维护", sandbox:"沙箱", "vision-tiles":"图像分块",
   "context-index":"上下文索引", mcp:"MCP 集成", yolo:"权限模式", permissions:"工具权限", reload:"热重载", reconnect:"重新连接",
   restart:"受控重启", wakeup:"会话提醒", peers:"会话互通", help:"帮助",
@@ -22,7 +22,7 @@ const descriptions: Record<string, string> = {
   browser:"查看或释放会话的浏览器控制", computer:"查看、设置或停止电脑控制", conclave:"开展专家研究并讨论结论", appshot:"查看、启用或配置窗口捕获",
   tasks:"查看任务运行记录", budget:"设置本轮时间预算，单位为秒；off 关闭", resume:"恢复指定的中断任务，需要任务 ID", cancel:"停止当前或指定任务",
   goal:"设置、查看、暂停或继续会话目标", today:"查看今天的任务记录", session:"浏览、继续或管理已保存会话", handoff:"整理并保存交接说明",
-  theme:"选择界面外观", timeline:"显示或隐藏消息时间", health:"查看运行健康报告", doctor:"讨论诊断与修复；--raw 查看原始报告",
+  theme:"选择界面外观", timeline:"显示或隐藏消息时间", voice:"朗读回复：开关、停止、选择音色或试听", health:"查看运行健康报告", doctor:"讨论诊断与修复；--raw 查看原始报告",
   diagnostics:"解释运行状态；--raw 查看原始快照", maintenance:"预览或执行运行数据维护", sandbox:"查看或切换 Docker 隔离",
   "vision-tiles":"查看或切换 DeepSeek 原始像素图像分块", "context-index":"设置历史上下文建议", mcp:"查看 MCP 服务器与工具状态",
   yolo:"切换工具审批，也可指定 on / off / status", permissions:"打开工具审批与对话模式设置", reload:"重新加载代码、人格、技能或模型配置",
@@ -32,7 +32,7 @@ const usage: Record<string, string> = {
   "/image": "/image <图片路径> [说明]", "/undo": "/undo [1–50]", "/tool": "/tool [编号]", "/gallery": "/gallery [编号]", "/doc": "/doc [编号] · /doc open [编号]",
   "/budget": "/budget <秒数|off>", "/resume": "/resume <任务 ID>", "/cancel": "/cancel [任务 ID]",
   "/mode": "/mode <low|high|xhigh|max>", "/wakeup": "/wakeup status · /wakeup after <秒数> <提示词>",
-  "/peers": "/peers · /peers name <新名字>",
+  "/peers": "/peers · /peers name <新名字>", "/voice": "/voice on · off · stop · list · use <音色> · test [文字]",
 };
 
 export function commandNames(modes: CommandMode[]): Record<string, string> {

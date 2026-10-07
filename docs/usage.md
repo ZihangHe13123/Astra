@@ -230,6 +230,12 @@ switch immediately. `hermes` is the default warm gold-and-cream skin modeled
 after Hermes CLI; `classic` preserves the original bright ANSI styling. The
 selection is saved separately in `.astra/tui-settings.json`.
 
+## Voice output
+
+`/voice on` reads replies aloud through a configured speech endpoint, `/voice use
+<name>` switches voice and `/voice stop` silences the current reply. Speech never
+enters the conversation. See [Voice output](voice.md) for setup.
+
 ## Durable tasks
 
 Every user turn is journaled to `.astra/tasks.db` using SQLite WAL.

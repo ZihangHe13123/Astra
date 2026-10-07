@@ -709,6 +709,45 @@
     ]
   },
   {
+    "command": "/voice",
+    "description": "read replies aloud · [on|off|stop|list|use <voice>|test]",
+    "group": "DISPLAY",
+    "id": "F56",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "on",
+        "description": "read replies aloud",
+        "completion": "/voice on",
+        "submitValue": "/voice on"
+      },
+      {
+        "command": "off",
+        "description": "stay silent",
+        "completion": "/voice off",
+        "submitValue": "/voice off"
+      },
+      {
+        "command": "stop",
+        "description": "stop speaking now",
+        "completion": "/voice stop",
+        "submitValue": "/voice stop"
+      },
+      {
+        "command": "list",
+        "description": "show the voices that can be selected",
+        "completion": "/voice list",
+        "submitValue": "/voice list"
+      },
+      {
+        "command": "test",
+        "description": "speak a sample line with the selected voice",
+        "completion": "/voice test",
+        "submitValue": "/voice test"
+      }
+    ]
+  },
+  {
     "command": "/health",
     "description": "show harness diagnostics",
     "group": "SYSTEM",

@@ -336,7 +336,7 @@ export function submitStreamLifecyclePolicy(
   text: string,
   timelineCommand: ReturnType<typeof resolveTimelineCommand> = resolveTimelineCommand(text, false),
 ): SubmitStreamLifecycle {
-  if (timelineCommand !== null || /^\/(?:cancel|theme|restart|wakeup|yolo|help)(?:\s|$)/i.test(text.trim())) {
+  if (timelineCommand !== null || /^\/(?:cancel|theme|restart|wakeup|yolo|voice|help)(?:\s|$)/i.test(text.trim())) {
     return "preserve";
   }
   return "clear";
@@ -649,6 +649,9 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   }, []);
   const [learningReviewStatus, setLearningReviewStatus] = useState<"queued" | "running" | null>(null);
   const [yolo, setYolo] = useState(false);
+  const [voice, setVoice] = useState<{ badge?: "on" | "speaking"; voices: string[] }>({ voices: [] });
+  // Ctrl+C reads these outside React's render cycle.
+  const voiceRef = useRef({ speaking: false, error: "" });
   const [workingMemory, setWorkingMemory] = useState<WorkingMemory>({});
   const [toolResults, setToolResults] = useState<ToolResultRecord[]>([]);
   const [generationStats, setGenerationStats] = useState<GenerationStats | null>(null);
@@ -1173,6 +1176,15 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           event.status === "queued" || event.status === "running" ? event.status : null,
         );
         break;
+      case "voice_status": {
+        const speaking = event.state === "speaking" || event.state === "starting";
+        setVoice({ badge: speaking ? "speaking" : event.enabled ? "on" : undefined, voices: event.voices });
+        if (event.message) addMessage("system", event.message);
+        // The same failure is reported with every later status; say it once.
+        if (event.error && (event.message !== undefined || event.error !== voiceRef.current.error)) addMessage("error", `Voice: ${event.error}`);
+        voiceRef.current = { speaking, error: event.error ?? "" };
+        break;
+      }
       case "yolo_status":
         setYolo(event.yolo);
         if (event.error) {
@@ -1602,6 +1614,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         clearTimeout(appshotStatusTimerRef.current);
         setBackendStatus("disconnected");
         setYolo(false);
+        setVoice({ voices: [] });
+        voiceRef.current = { speaking: false, error: "" };
         setStartupVisible(false);
         restartPendingRef.current = false;
         const session = restart.onExit(code);
@@ -1766,7 +1780,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
 
   const submit = useCallback((submission: InputSubmission) => {
     const text = submission.text;
-    if (restartPendingRef.current && !/^\/(?:restart(?: cancel)?|wakeup(?: cancel)?|cancel|yolo(?:\s.*)?|exit|quit)$/.test(text.trim())) {
+    if (restartPendingRef.current && !/^\/(?:restart(?: cancel)?|wakeup(?: cancel)?|cancel|yolo(?:\s.*)?|voice(?:\s.*)?|exit|quit)$/.test(text.trim())) {
       if (submission.submissionId) appshotInputRef.current?.rejectSubmission(submission.submissionId);
       addMessage("system", "Restart is pending. Use /restart cancel before starting more work.");
       return;
@@ -1875,7 +1889,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
       return;
     }
     const timelineCommand = resolveTimelineCommand(text, timelineVisibleRef.current);
-    const controlWhileBusy = /^\/(?:cancel|theme|timeline|reconnect|restart|wakeup|yolo|help)(?:\s|$)/i.test(trimmedText);
+    const controlWhileBusy = /^\/(?:cancel|theme|timeline|reconnect|restart|wakeup|yolo|voice|help)(?:\s|$)/i.test(trimmedText);
     const streamLifecycle = submitStreamLifecyclePolicy(text, timelineCommand);
     if (busyRef.current && !controlWhileBusy) {
       // Auto-steering: send as a normal message; the backend routes it
@@ -1992,7 +2006,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
             "TOOLS    /search  /tool  /doc  /memory  /skills  /learn  /tools  /browser  /computer  /conclave",
             "SESSION  /tasks  /resume  /cancel  /session  /handoff",
             "CAPTURE  /appshot status · shortcut · enable · disable",
-            "DISPLAY  /theme  /timeline",
+            "DISPLAY  /theme  /timeline  /voice",
             "SYSTEM   /health  /doctor  /diagnostics  /maintenance  /sandbox  /vision-tiles  /mcp  /yolo  /permissions  /reload  /reconnect  /restart  /wakeup  /help",
           ].join("\n"));
         } else if (text === "/reconnect") {
@@ -2072,6 +2086,12 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         cancelRequestedRef.current = true;
         addMessage("system", "Cancelling active task… Press Ctrl+C again to force exit.");
         send({ type: "command", cmd: "/cancel" });
+        return;
+      }
+      if (voiceRef.current.speaking) {
+        // A reply can still be heard after its turn ended: the first Ctrl+C silences it.
+        voiceRef.current.speaking = false;
+        send({ type: "command", cmd: "/voice stop" });
         return;
       }
       if (lifecycle) void lifecycle.requestExit("user_exit");
@@ -2296,6 +2316,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           onSubmit={submit}
           disabled={connectionOpen || Boolean(openToolResult) || approvalRequests.length > 0 || questionCapturesInput}
           yolo={yolo}
+          voice={voice.badge}
+          voices={voice.voices}
           sessionList={sessionList}
           barSessionList={barSessionList}
           minimalSessionList={minimalSessionList}

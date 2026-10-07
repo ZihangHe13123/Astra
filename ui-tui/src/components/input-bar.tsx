@@ -56,6 +56,9 @@ interface Props {
   onAppshotStateChange?: (state:AppshotDraftState)=>void;
   disabled: boolean;
   yolo?: boolean;
+  /** Shown while replies are read aloud; brighter while one is being spoken. */
+  voice?: "on" | "speaking";
+  voices?: string[];
   sessionList: SessionMenuItem[];
   barSessionList?: SessionMenuItem[];
   minimalSessionList?: SessionMenuItem[];
@@ -129,6 +132,8 @@ export const InputBar = forwardRef<AppshotInputHandle, Props>(function InputBar(
   appshotManifestReader, onAppshotRelease, onAppshotStateChange,
   disabled,
   yolo = false,
+  voice,
+  voices,
   sessionList,
   barSessionList = [],
   minimalSessionList = [],
@@ -331,6 +336,7 @@ export const InputBar = forwardRef<AppshotInputHandle, Props>(function InputBar(
     localSessions: localSessionList,
     localMode,
     personas,
+    voices,
   };
   const commandSuggestions = disabled || menuDismissed ? [] : slashCommandSuggestions(input, sessionList, modelList, commandContext);
   const modelSuggestionIndex = selectedModelSuggestion === null ? -1 : commandSuggestions.findIndex(
@@ -574,7 +580,7 @@ export const InputBar = forwardRef<AppshotInputHandle, Props>(function InputBar(
 
   const prompt = isBar ? "say" : isMinimal || isLocal ? "you" : chrome?.promptLabel ?? "you";
   const viewport = inputViewport(input, cursorOffset, Math.max(1,
-    columns - 4 - stringWidth(prompt) - 1 - (yolo && !isBar && !isLocal ? 5 : 0)));
+    columns - 4 - stringWidth(prompt) - 1 - (yolo && !isBar && !isLocal ? 5 : 0) - (voice ? 6 : 0)));
 
   return (
     <Box flexDirection="column">
@@ -616,6 +622,7 @@ export const InputBar = forwardRef<AppshotInputHandle, Props>(function InputBar(
       )}
       <Box borderStyle={chrome?.inputFrameStyle ?? chrome?.frameStyle ?? "single"} borderColor={disabled ? theme.subtle : theme.accentAlt} paddingX={1}>
         {yolo && !isBar && !isLocal && <Text bold color={theme.warning}>YOLO </Text>}
+        {voice && <Text bold={voice === "speaking"} dimColor={voice === "on"} color={theme.accentAlt}>VOICE </Text>}
         <Text bold={theme.prefixBold} color={theme.accent}>
           {prompt}{" "}
         </Text>
