@@ -99,8 +99,14 @@ server with the same endpoint works; only the `request` fields differ.
 
 `/voice` works in every mode and while a reply is running. Speech also stops
 when you send a message, cancel, or change session. In the terminal the first
-Ctrl+C silences a reply that is still being spoken; in the desktop app use the
-stop button shown while speaking, or Cmd/Ctrl+.
+Ctrl+C silences a reply that is still being spoken.
+
+In the desktop app the same settings have a panel: `/voice`, Settings → 语音朗读,
+or the voice button beside the composer, which appears once a speech endpoint is
+set and shows whether voice is on and which voice is selected. The panel switches
+voice on and off, selects a voice and speaks a test line. While something is
+being spoken, a line above the composer offers to stop it, and Cmd/Ctrl+. stops
+it as well. If a reply could not be spoken, that line shows the reason.
 
 A reply starts being spoken at its first clause, then one sentence at a time.
 When the engine is slower than speech, Astra waits before a sentence rather than

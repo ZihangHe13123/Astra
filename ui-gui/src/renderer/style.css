@@ -48,6 +48,11 @@
 
 .connection-status { display:flex; align-items:center; justify-content:space-between; gap:12px; margin:0 5px 8px; color:var(--muted); font-size:12px; }
 .connection-status button { font-size:12px; padding:4px 8px; }
+.connection-status span { min-width:0; overflow-wrap:anywhere; }
+.connection-status button { flex-shrink:0; }
+.permission.voice { display:block; flex-shrink:1; min-width:0; max-width:170px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.permission.voice.on { color:var(--text); }
+.voice-actions { display:flex; align-items:center; gap:10px; }
 .model-feedback { margin-top:14px; }
 
 .live-session-row { display:flex; align-items:center; position:relative; }

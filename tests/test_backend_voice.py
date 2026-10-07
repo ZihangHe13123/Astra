@@ -86,8 +86,8 @@ def test_reply_is_read_aloud_without_entering_the_conversation(tmp_path, monkeyp
     try:
         wait(lambda event: event.get("type") == "model_info")
         startup = wait(lambda event: voice(event))
-        assert (startup["enabled"], startup["state"], startup["voice"], startup["voices"]) == (
-            True, "idle", "warm", ["cool", "warm"])
+        assert (startup["enabled"], startup["configured"], startup["state"], startup["voice"], startup["voices"]) == (
+            True, True, "idle", "warm", ["cool", "warm"])
 
         send({"type": "message", "text": "你好"})
         wait_all(lambda event: voice(event, state="speaking"), lambda event: event.get("type") == "done", completed)
