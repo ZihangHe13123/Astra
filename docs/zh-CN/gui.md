@@ -158,9 +158,16 @@ Doctor 单独报告 GUI 组件状态。启动时不会后台安装缺少的软�
 | 新对话 | Cmd+N | Ctrl+N |
 | 命令面板 | Cmd+K | Ctrl+K |
 | 取消当前任务 | Cmd+. | Ctrl+. |
+| 工具审批：允许一次 / 本会话允许 / 拒绝 | Cmd+Enter / Cmd+Shift+Enter / Cmd+Delete | Ctrl+Enter / Ctrl+Shift+Enter / Ctrl+Backspace |
 | 工具详情 | Cmd+Shift+O | Ctrl+Shift+O |
 | 上下文详情 | Cmd+Shift+L | Ctrl+Shift+L |
 | 关闭弹窗/详情 | Escape | Escape |
+
+审批快捷键在窗口内任何位置都作用于最早的一条待审批请求。焦点所在的输入框里有文字时，
+这几个键照常用于发送和删除，草稿不会被当成答复；有弹窗打开时不生效。请求被滚动到视野外时，
+第一次按键只把它滚回来，再按一次才答复。审批卡片不会自己
+抢焦点；点击或用 Tab 进入卡片后，Y 或 Enter 允许一次，A 本会话允许，N 或 Escape 拒绝，
+和终端里一样。
 
 <a id="development-checks"></a>
 

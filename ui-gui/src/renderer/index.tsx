@@ -497,7 +497,7 @@ function App() {
           {preview?.delegates?.length > 0 && <DelegateHistory key={`${preview.mode}:${preview.session_id}`} delegates={preview.delegates} fail={fail}/>}
           {state && !preview && <><ToolPreparation preparation={state.preparation}/>{state.tools.length > 0 && <button className="execution-summary" onClick={() => setPanel("tools")}><Terminal size={15}/>{state.tools.filter(t => t.status === "running").length ? "工具正在执行" : `${state.tools.length} 项工具结果`}<ChevronRight size={15}/></button>}
             <DelegateSummary delegates={state.delegates} open={() => setPanel("tools")}/>
-            {state.approvals.map(e => <Approval key={e.request_id} event={e} send={respond}/>)}{state.questions.map(e => <Question key={e.request_id} event={e} send={respond}/>)}
+            {state.approvals.map((e, index) => <Approval key={e.request_id} event={e} send={respond} windowKeys={index === 0 && !modal && !sessionDialog}/>)}{state.questions.map(e => <Question key={e.request_id} event={e} send={respond}/>)}
             {state.busy && <div className="generating"><span className="pulse"/>Astra 正在工作<span>{state.info.generation_progress?.phase === "waiting" ? "等待模型响应" : ""}</span></div>}
             {state.status === "disconnected" && <div className="disconnected"><p>后端已断开，已显示的内容仍保留。</p><button onClick={() => command("/reconnect")}>重新连接</button></div>}
           </>}
