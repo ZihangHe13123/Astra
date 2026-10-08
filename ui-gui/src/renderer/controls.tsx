@@ -1,6 +1,7 @@
 import { connectionFlow, filterCommands, moveSelection, opensCommandInterface } from "./control-state.js";
 import { modelConnection } from "./model-connection.js";
 import { names } from "./command-help.js";
+import { approvalDecision, approvalKeyHint, typingIn } from "./approval-keys.js";
 import React, { useState } from "react";
 import { X, Check, ChevronRight, ExternalLink, LoaderCircle } from "lucide-react";
 import type { CommandDescription } from "../bridge.js";
@@ -211,14 +212,43 @@ export function ModelSettings({ state, send, close, initialModelKey }: {
     </section></div>
   </Modal>;
 }
-export function Approval({ event, send }: { event: UIEvent; send: (c: UIEvent) => Promise<void> }) {
+export function Approval({ event, send, windowKeys = false }: { event: UIEvent; send: (c: UIEvent) => Promise<void>; windowKeys?: boolean }) {
   const [pending, setPending] = useState(false);
-  return <section className="approval interactive-card"><span className="eyebrow">需要你的许可</span><h3>{event.approval_title || event.tool_name}</h3>
+  const choices: string[] = event.choices || ["once", "session", "deny"];
+  const decide = (decision: string) => {
+    if (pending) return;
+    setPending(true); void send({ type: "tool_approval_response", request_id: event.request_id, decision }).catch(() => setPending(false));
+  };
+  const latest = React.useRef({ decide, choices }); latest.current = { decide, choices };
+  const actions = React.useRef<HTMLDivElement>(null);
+  // The Cmd/Ctrl keys answer the oldest pending approval from anywhere in the window. A key pressed
+  // inside an approval card belongs to that card alone.
+  React.useEffect(() => {
+    if (!windowKeys) return;
+    const listener = (e: KeyboardEvent) => {
+      const target = e.target instanceof Element ? e.target : null;
+      if (target?.closest(".approval")) return;
+      const typing = typingIn(target?.closest("input,textarea,[contenteditable='true']") as HTMLInputElement | null);
+      const decision = approvalDecision(e, { in: "window", typing }, latest.current.choices);
+      if (!decision) return;
+      e.preventDefault();
+      // A request scrolled out of sight is shown first; the next press answers it.
+      const row = actions.current?.getBoundingClientRect(), view = (actions.current?.closest(".messages-scroll") || document.documentElement).getBoundingClientRect();
+      if (row && (row.top < view.top || row.bottom > view.bottom)) { actions.current?.closest(".approval")?.scrollIntoView({ block: "nearest" }); return; }
+      latest.current.decide(decision);
+    };
+    window.addEventListener("keydown", listener); return () => window.removeEventListener("keydown", listener);
+  }, [windowKeys]);
+  const mac = typeof navigator !== "undefined" && navigator.platform.includes("Mac");
+  return <section className="approval interactive-card" tabIndex={0} aria-label={`需要你的许可：${event.approval_title || event.tool_name}`} onKeyDown={e => {
+    const decision = approvalDecision(e.nativeEvent, { in: "card", onButton: e.target instanceof HTMLButtonElement }, choices);
+    // Stopping here keeps Escape from also closing a side panel.
+    if (decision) { e.preventDefault(); e.stopPropagation(); decide(decision); }
+  }}><span className="eyebrow">需要你的许可</span><h3>{event.approval_title || event.tool_name}</h3>
     <p>{event.approval_question || event.reason}</p><pre>{event.approval_summary || event.detail || event.target || JSON.stringify(event.arguments, null, 2)}</pre>
     {event.scope && <p className="small muted">范围：{event.scope}</p>}
-    <div className="actions">{(event.choices || ["once", "session", "deny"]).map((decision: string) => <button key={decision} disabled={pending} className={decision === "once" ? "primary" : ""} onClick={() => {
-      setPending(true); void send({ type: "tool_approval_response", request_id: event.request_id, decision }).catch(() => setPending(false));
-    }}>{({ once: "允许一次", session: "本会话允许", deny: "拒绝" } as Record<string, string>)[decision]}</button>)}</div>
+    <div className="actions" ref={actions}>{choices.map((decision: string) => <button key={decision} disabled={pending} className={decision === "once" ? "primary" : ""} onClick={() => decide(decision)}>{({ once: "允许一次", session: "本会话允许", deny: "拒绝" } as Record<string, string>)[decision]}</button>)}</div>
+    <p className="approval-keys small muted">{approvalKeyHint(choices, windowKeys, mac)}</p>
   </section>;
 }
 export function Question({ event, send }: { event: UIEvent; send: (c: UIEvent) => Promise<void> }) {

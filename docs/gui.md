@@ -227,9 +227,17 @@ notarization and platform acceptance are separate release checks.
 | New conversation | Cmd+N | Ctrl+N |
 | Command panel | Cmd+K | Ctrl+K |
 | Cancel current task | Cmd+. | Ctrl+. |
+| Tool approval: allow once / allow for the session / deny | Cmd+Enter / Cmd+Shift+Enter / Cmd+Delete | Ctrl+Enter / Ctrl+Shift+Enter / Ctrl+Backspace |
 | Tool details | Cmd+Shift+O | Ctrl+Shift+O |
 | Context details | Cmd+Shift+L | Ctrl+Shift+L |
 | Close dialog/details | Escape | Escape |
+
+The approval keys answer the oldest pending approval from anywhere in the window. In a
+field that holds text they keep sending and deleting, so a draft is never taken for an
+answer, and they are off while a dialog is open. A request scrolled out of sight is
+shown by the first press and answered by the next. An approval card never takes the focus
+by itself; after a click or Tab into it, Y or Enter allows once, A allows for the
+session, and N or Escape denies, as in the terminal.
 
 ## Development checks
 

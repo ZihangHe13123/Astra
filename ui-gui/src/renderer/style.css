@@ -53,6 +53,8 @@
 .permission.voice { display:block; flex-shrink:1; min-width:0; max-width:170px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .permission.voice.on { color:var(--text); }
 .voice-actions { display:flex; align-items:center; gap:10px; }
+.approval:focus-within { border-color:var(--muted); box-shadow:0 0 0 2px var(--soft); }
+.approval-keys { margin:12px 0 0; }
 .model-feedback { margin-top:14px; }
 
 .live-session-row { display:flex; align-items:center; position:relative; }
