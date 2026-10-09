@@ -42,6 +42,9 @@ def test_source_distribution_refuses_private_or_generated_files(tmp_path, relati
 
 def _public_source_inputs():
     return [
+        "AGENTS.md", "CLAUDE.md", "agent/runtime/AGENTS.md",
+        "agent/cli/jobs_commands.py", "agent/cli/jobs_worker.py",
+        "agent/runtime/jobs/store.py", "agent/runtime/jobs/scheduler.py",
         "agent/cli/main.py", "agent/runtime/prompts.py", "config/models.yaml",
         "ui-tui/src/index.tsx", "astra.py", "README.md", "pyproject.toml", "PKG-INFO",
         "packaging/desktop-runtime.lock.json", "scripts/package_desktop.py",
@@ -71,12 +74,15 @@ def test_source_distribution_keeps_public_cli_shared_ui_desktop_and_configuratio
     "agent/launcher/desktop_distribution.py", "agent/launcher/desktop_runtime.py",
     "agent/launcher/desktop_update.py", "agent/runtime/tools/workspace_dependencies.py",
     "ui-gui/src/main/packaged-runtime.ts",
+    "AGENTS.md", "CLAUDE.md", "agent/runtime/AGENTS.md",
+    "agent/cli/jobs_commands.py", "agent/cli/jobs_worker.py",
+    "agent/runtime/jobs/store.py", "agent/runtime/jobs/scheduler.py",
 ])
 def test_source_distribution_requires_shared_ui_and_desktop_build_inputs(tmp_path, missing):
     path = _source_archive(tmp_path, [name for name in _public_source_inputs() if name != missing])
     with pytest.raises(SystemExit, match="missing public inputs") as raised:
         wheel_smoke.check_source_distribution(path)
-    assert missing in str(raised.value)
+    assert str(raised.value).endswith(f": {[missing]}")
 
 
 def test_source_distribution_rejects_incomplete_public_inputs(tmp_path):
