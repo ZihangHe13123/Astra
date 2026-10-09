@@ -942,7 +942,17 @@ def test_registers_computer_apps_with_repeat_and_budget_controls(registry, manag
     assert "effect" in definition.description
     assert registry.get("computer_snapshot").result_persistence == "request_local"
     assert registry.get("computer_get_app_state").result_persistence == "request_local"
-    assert registry.get("computer_get_app_state").parameters == {
+    app_state_parameters = registry.get("computer_get_app_state").parameters
+    # Both non-default observation options cost an approval; the schema says so.
+    assert "approval" in app_state_parameters["properties"]["scope"]["description"]
+    assert "approval" in app_state_parameters["properties"]["text_detail"]["description"]
+    assert {
+        **app_state_parameters,
+        "properties": {
+            name: {key: value for key, value in schema.items() if key != "description"}
+            for name, schema in app_state_parameters["properties"].items()
+        },
+    } == {
         "type": "object",
         "properties": {
             "app_ref": {"type": "string", "minLength": 1},
@@ -961,7 +971,9 @@ def test_registers_computer_apps_with_repeat_and_budget_controls(registry, manag
         "required": ["app_ref", "window_ref"],
         "additionalProperties": False,
     }
-    assert registry.get("computer_snapshot").parameters["properties"]["text_detail"] == {
+    snapshot_text_detail = registry.get("computer_snapshot").parameters["properties"]["text_detail"]
+    assert "approval" in snapshot_text_detail["description"]
+    assert {key: value for key, value in snapshot_text_detail.items() if key != "description"} == {
         "type": "string",
         "enum": ["off", "on"],
         "default": "off",
@@ -2590,6 +2602,38 @@ def test_snapshot_subtree_ref_on_unknown_anchor_does_not_claim_stale_snapshot(
     blob = json.dumps(result, ensure_ascii=False)
     assert "stale_target" in blob, f"unknown anchor must report stale_target, got: {blob[:300]}"
     assert result.get("code") != "stale_snapshot"
+
+
+def test_unknown_subtree_ref_recovery_keeps_the_bound_target(registry, manager, backend):
+    backend.snapshot_ax_tree_override = {
+        "role": "AXWindow",
+        "children": [{"role": "AXScrollArea", "element_ref": "snapshot-1:anchor"}],
+    }
+    register(registry, manager)
+    focus(registry)
+
+    result = run(registry.execute("computer_snapshot", {
+        "scope": "target_window",
+        "subtree_ref": "snapshot-1:does-not-exist",
+    }))
+
+    # Only the element reference is out of date. Sending the model back to
+    # computer_apps would drop a binding that still works.
+    assert result["code"] == "stale_target"
+    assert "computer_snapshot" in result["recovery_hint"]
+    assert "computer_apps" not in result["recovery_hint"]
+
+
+def test_observing_after_the_catalog_refresh_says_how_to_bind_again(registry, manager):
+    register(registry, manager)
+    focus(registry)
+    refreshed = run(registry.execute("computer_apps", {}))
+    assert refreshed["error"] == ""
+
+    result = run(registry.execute("computer_snapshot", {}))
+
+    assert result["code"] == "target_required"
+    assert "computer_get_app_state" in result["recovery_hint"]
 
 
 def test_snapshot_subtree_ref_over_budget_fails_without_dropping_whole_tree(
