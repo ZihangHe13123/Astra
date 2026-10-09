@@ -113,6 +113,48 @@ default; `ASTRA_PROFILE_QUERY=0` disables collection. Records contain hashes, co
 and timings, not prompt bodies, and use bounded log rotation. The viewer is read-only
 and never starts a model request; old unscoped records are not attributed to a session.
 
+## Interactive cards
+
+A reply can contain a small interactive display: a calculator with sliders, a stepper through
+a process, a comparison with toggles. The model writes it as a fenced code block whose language
+is `card`, holding an HTML fragment with its own `<style>` and `<script>`:
+
+````markdown
+```card
+<h3>Compound interest</h3>
+<label>Years <input id="years" type="range" min="1" max="40" value="20"></label>
+<p>1,000 grows to <strong id="total"></strong></p>
+<script>
+  const years = document.getElementById("years"), total = document.getElementById("total");
+  const show = () => { total.textContent = Math.round(1000 * 1.05 ** years.value).toLocaleString(); };
+  years.addEventListener("input", show); show();
+</script>
+```
+````
+
+The desktop runs a finished block in place; while the block is still being written, and
+whenever it cannot run, its source is shown instead. **查看源码** switches between the two.
+The terminal and message channels show the block as code, so a reply should still make sense
+without the card.
+
+What a card can and cannot do:
+
+- It runs in a frame of its own with no access to Astra: no bridge, no conversation, no files,
+  no storage. It receives its own source and the theme colours, and reports its height.
+- It loads nothing and reaches nothing. Scripts, styles, images and fonts must be inline
+  (`data:` images are allowed); requests, WebSockets, WebRTC, forms, pop-ups and navigation are
+  refused. Links inside a card do not open. A card that navigates its frame is stopped and its
+  source shown.
+- It may use the theme through the CSS variables `--bg`, `--panel`, `--soft`, `--hover`, `--line`,
+  `--text`, `--muted`, `--accent`, `--on-accent` and `--error`, and inherits plain styles for
+  text, buttons, inputs and tables, so it follows light and dark themes.
+- It keeps its state only while it is on screen in an open conversation: scrolling it far out
+  of view, switching to the source, or reopening the conversation starts it again.
+- A block over 200,000 characters is shown as source.
+
+Models do not know about cards unless told. Put the format above in a skill or in your
+project instructions, and say that cards are for the desktop.
+
 ## Command help while typing
 
 The composer starts at one line, grows with its content, and scrolls internally
