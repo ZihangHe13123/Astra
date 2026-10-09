@@ -664,7 +664,13 @@ def register_code_tools(
             stream=stream,
         )
         processes.observe(process)
-        return _process_result({**result, **processes.describe(process)})
+        # describe() refreshes the status; the reader arguments of this read say
+        # where the next one continues.
+        return _process_result({
+            **result,
+            **processes.describe(process),
+            "output_reader": result["output_reader"],
+        })
 
     async def _process_cancel(process_id: str) -> str:
         process = processes.get(process_id)
@@ -822,7 +828,12 @@ def register_code_tools(
     ))
     registry.register(ToolDef(
         name="process_read",
-        description="Read live or completed output incrementally from a background sandbox process.",
+        description=(
+            "Read live or completed output incrementally from a background sandbox process. "
+            "Without offset or byte_offset, each call continues after the previous such call "
+            "(one cursor per stream). A call with offset or byte_offset reads from that "
+            "position and does not move the cursor."
+        ),
         parameters={
             "type": "object",
             "properties": {
@@ -853,7 +864,7 @@ def register_code_tools(
         },
         fn=_process_read,
         risk="read",
-        # Omitting offset advances the per-process cursor.
+        # Omitting offset and byte_offset advances the per-stream cursor.
         idempotent=False,
         repeat_guard=False,
         group="code",

@@ -698,7 +698,9 @@ class ProcessManager:
             "artifact_path": str(process.output_path) if process.output_path.exists() else "",
             "output_reader": {
                 "tool": "delegate_read" if process.kind == "subagent" else "process_read",
-                "arguments": {"process_id": process.process_id, "offset": 0, "max_chars": 12000},
+                # No offset: the reader's own cursor continues after the last
+                # read. A fixed offset 0 would return the first page every time.
+                "arguments": {"process_id": process.process_id, "max_chars": 12000},
             },
             "execution_owner": "supervisor" if process.external else "backend",
             "supervisor_pid": process.supervisor_pid if process.external else None,
@@ -808,7 +810,6 @@ class ProcessManager:
         )
         if byte_offset is not None:
             start_byte = max(0, byte_offset)
-            legacy_start = 0
         elif offset is not None:
             start_byte = self._byte_offset_for_char(path, legacy_start)
         else:
@@ -829,19 +830,43 @@ class ProcessManager:
                 error = str(process.result.get("error") or "")
                 if error:
                     fallback_content += ("\n" if fallback_content else "") + f"[stderr]\n{error}"
+            # The text is in memory, so byte and character positions map directly.
+            if byte_offset is not None:
+                legacy_start = len(
+                    fallback_content.encode("utf-8")[:start_byte].decode("utf-8", errors="ignore")
+                )
+            else:
+                start_byte = len(fallback_content[:legacy_start].encode("utf-8"))
             content = fallback_content[legacy_start:legacy_start + max(1, max_chars)]
-            next_byte = legacy_start + len(content.encode("utf-8"))
+            next_byte = len(fallback_content[:legacy_start + len(content)].encode("utf-8"))
             total_bytes = len(fallback_content.encode("utf-8"))
 
         next_legacy = legacy_start + len(content)
-        if offset is None:
+        # Only a read without an explicit position uses and advances the cursor,
+        # so looking at another part of the output does not lose the place.
+        if offset is None and byte_offset is None:
             process.read_offsets[stream] = next_legacy
             process.read_byte_offsets[stream] = next_byte
             if stream == "combined":
                 process.read_offset = next_legacy
         status = self.status(process)
-        return {
-            **self.describe(process),
+        description = self.describe(process)
+        # Where the next read continues from this one.
+        reader_arguments: dict[str, Any] = {
+            "process_id": process.process_id,
+            "stream": stream,
+            "max_chars": 12000,
+        }
+        if byte_offset is not None:
+            reader_arguments["byte_offset"] = next_byte
+        elif offset is not None:
+            reader_arguments["offset"] = next_legacy
+        description["output_reader"] = {
+            **description["output_reader"],
+            "arguments": reader_arguments,
+        }
+        result = {
+            **description,
             "stream": stream,
             "offset": legacy_start,
             "next_offset": next_legacy,
@@ -855,6 +880,11 @@ class ProcessManager:
             ),
             "total_bytes": total_bytes,
         }
+        if byte_offset is not None:
+            # A byte position does not say how many characters precede it.
+            for key in ("offset", "next_offset", "offset_unit", "total_chars"):
+                del result[key]
+        return result
 
     def list(self, *, include_completed: bool = True) -> list[dict]:
         processes = [
