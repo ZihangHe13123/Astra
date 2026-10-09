@@ -2,6 +2,10 @@
 
 import asyncio
 import json
+import os
+import shlex
+import subprocess
+import sys
 
 import pytest
 
@@ -31,6 +35,88 @@ def test_local_execution_receipt_survives_registry(tool, args, code, tmp_path):
             assert json.loads(json.dumps(safe))["execution"] == result["execution"]
             context = ReActAgent._tool_result_context({**result, "name": tool, "tool_output": result.get("output")})
             assert "status: success" not in context if code else "status: success" in context
+        finally:
+            await sandbox.close()
+    asyncio.run(run())
+
+
+def _python_command(code: str) -> str:
+    argv = [sys.executable, "-c", code]
+    return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("execute_python", {"code": "import time\ntime.sleep(5)"}),
+    ("execute_shell", {"command": _python_command("import time; time.sleep(5)")}),
+])
+def test_foreground_run_stopped_at_the_sandbox_limit_is_timed_out_and_says_how_to_rerun(
+    tool, args, tmp_path,
+):
+    async def run():
+        registry = ToolRegistry()
+        sandbox = LocalSandbox(timeout=1, workdir=str(tmp_path))
+        register_code_tools(registry, sandbox)
+        try:
+            result = await registry.execute(tool, {**args, "foreground_yield_ms": 0})
+            assert result["execution"] == {"status": "timed_out", "exit_code": -1}
+            text = result["output"] + result["error"]
+            assert "[Timeout] Execution exceeded 1s" in text
+            for expected in ("foreground_yield_ms", "background=true", "process_poll", "process_read"):
+                assert expected in text, expected
+            context = ReActAgent._tool_result_context({**result, "name": tool, "tool_output": text})
+            assert "status: success" not in context
+        finally:
+            await sandbox.close()
+    asyncio.run(run())
+
+
+def test_rerunning_as_the_timeout_message_says_outlives_the_sandbox_limit(tmp_path):
+    async def run():
+        registry = ToolRegistry()
+        sandbox = LocalSandbox(timeout=1, workdir=str(tmp_path))
+        register_code_tools(registry, sandbox)
+        code = "import time\ntime.sleep(1.5)\nprint('finished')"
+        try:
+            stopped = await registry.execute("execute_python", {"code": code, "foreground_yield_ms": 0})
+            assert stopped["execution"]["status"] == "timed_out"
+            rerun = await registry.execute("execute_python", {"code": code, "foreground_yield_ms": 20_000})
+            assert rerun["execution"] == {"status": "completed", "exit_code": 0}
+            assert "finished" in rerun["output"]
+        finally:
+            await sandbox.close()
+    asyncio.run(run())
+
+
+def test_timeout_without_an_unlimited_background_path_does_not_suggest_one(tmp_path):
+    """A sandbox whose limit also covers background runs must not be told to rerun that way."""
+    class LimitedSandbox:
+        workdir = str(tmp_path)
+
+        async def execute_python_stream(self, code, on_output):
+            return {"output": "", "error": "[Timeout] Docker execution exceeded 5s", "exit_code": -1}
+
+    registry = ToolRegistry()
+    register_code_tools(registry, LimitedSandbox())
+    result = asyncio.run(registry.execute("execute_python", {"code": "slow", "foreground_yield_ms": 0}))
+    assert result["execution"] == {"status": "timed_out", "exit_code": -1}
+    assert "[Timeout] Docker execution exceeded 5s" in result["output"]
+    assert "background=true" not in result["output"]
+
+
+def test_failed_shell_command_error_keeps_stdout_stderr_and_exit_code(tmp_path):
+    async def run():
+        registry = ToolRegistry()
+        sandbox = LocalSandbox(timeout=10, workdir=str(tmp_path))
+        register_code_tools(registry, sandbox)
+        command = _python_command(
+            "import sys; print('out-line'); print('err-line', file=sys.stderr); sys.exit(7)"
+        )
+        try:
+            result = await registry.execute("execute_shell", {"command": command, "foreground_yield_ms": 0})
+            assert result["output"] == ""
+            for expected in ("out-line", "err-line", "exit code 7"):
+                assert expected in result["error"], expected
+            assert result["execution"] == {"status": "completed", "exit_code": 7}
         finally:
             await sandbox.close()
     asyncio.run(run())
