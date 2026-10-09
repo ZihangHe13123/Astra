@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -7228,6 +7229,448 @@ def test_fetch_url_prefers_beautifulsoup_article_text(monkeypatch):
         assert "Useful Title Useful article text" in result["output"]
         assert "Navigation noise" not in result["output"]
         assert "Footer noise" not in result["output"]
+
+    run(scenario())
+
+
+def _fake_web_transport(monkeypatch, *, get=None, post=None):
+    """Answer every web tool request from memory and record it.
+
+    The tools swallow transport exceptions, so tests assert on the returned
+    call list instead of relying on a handler that raises.
+    """
+    import agent.runtime.tools.web as web_module
+
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, payload, url):
+            self.text = payload if isinstance(payload, str) else json.dumps(payload)
+            self.url = url
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return json.loads(self.text)
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def get(self, url, **kwargs):
+            calls.append(("get", url))
+            if get is None:
+                raise RuntimeError(f"no GET handler: {url}")
+            return FakeResponse(get(url), url)
+
+        async def post(self, url, **kwargs):
+            calls.append(("post", url))
+            if post is None:
+                raise RuntimeError(f"no POST handler: {url}")
+            return FakeResponse(post(url, kwargs.get("json")), url)
+
+    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    return calls
+
+
+def _exa_first_page(_url, _payload):
+    return {
+        "resolvedSearchType": "auto",
+        "results": [{
+            "title": "Exa first page",
+            "url": "https://exa.example.test/one",
+            "highlights": ["Exa highlight."],
+        }],
+    }
+
+
+def _searxng_query(url):
+    return dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+
+
+@pytest.mark.parametrize("extra,sent", [
+    ({"page": 2}, {"pageno": "2"}),
+    ({"engine": "google"}, {"engines": "google"}),
+    ({"language": "ja"}, {"language": "ja"}),
+    ({"category": "it"}, {"categories": "it"}),
+    ({"include_content": True}, {}),
+])
+def test_search_web_auto_keeps_searxng_only_parameters_off_exa(monkeypatch, extra, sent):
+    def searxng(url):
+        if "/search?" not in url:
+            return "<html><body>Inline page body with enough words to be kept as content.</body></html>"
+        return {
+            "query": "latest model report",
+            "number_of_results": 40,
+            "results": [{
+                "title": f"SearXNG page {_searxng_query(url)['pageno']}",
+                "url": "https://searx.example.test/hit",
+                "content": "snippet",
+            }],
+        }
+
+    monkeypatch.setenv("EXA_API_KEY", "test-exa-key")
+    monkeypatch.setenv("WEB_SEARCH_PROVIDER", "auto")
+    calls = _fake_web_transport(monkeypatch, get=searxng, post=_exa_first_page)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        # Without the extra parameter this query is one that auto sends to Exa.
+        plain = await registry.execute("search_web", {"query": "latest model report"})
+        assert "Exa first page" in plain["output"]
+        assert calls == [("post", "https://api.exa.ai/search")]
+
+        result = await registry.execute("search_web", {"query": "latest model report", **extra})
+
+        assert result["error"] == ""
+        assert [kind for kind, _ in calls].count("post") == 1
+        search_urls = [url for kind, url in calls if kind == "get" and "/search?" in url]
+        assert len(search_urls) == 1
+        assert _searxng_query(search_urls[0]).items() >= sent.items()
+        assert f"SearXNG page {extra.get('page', 1)}" in result["output"]
+        assert "Exa first page" not in result["output"]
+        if extra.get("include_content"):
+            assert "Inline page body" in result["output"]
+
+    run(scenario())
+
+
+def test_search_web_forced_exa_names_the_parameters_it_did_not_apply(monkeypatch):
+    monkeypatch.setenv("EXA_API_KEY", "test-exa-key")
+    calls = _fake_web_transport(monkeypatch, post=_exa_first_page)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        first = await registry.execute("search_web", {"query": "agent runtimes", "provider": "exa"})
+        second = await registry.execute("search_web", {
+            "query": "agent runtimes",
+            "provider": "exa",
+            "page": 2,
+            "engine": "google",
+            "language": "ja",
+        })
+
+        assert "Exa first page" in first["output"]
+        assert "Not applied" not in first["output"]
+        # Exa has no second page: the same hits must not read as a new page.
+        assert "Exa first page" in second["output"]
+        note = next((line for line in second["output"].splitlines() if line.startswith("Not applied")), "")
+        assert "page=2" in note
+        assert "engine=google" in note
+        assert "language=ja" in note
+        assert "first results" in note
+        assert all(kind == "post" for kind, _ in calls)
+
+    run(scenario())
+
+
+def test_search_web_exa_fallback_names_the_parameters_it_did_not_apply(monkeypatch):
+    def searxng_down(url):
+        raise RuntimeError("searxng down")
+
+    monkeypatch.setenv("EXA_API_KEY", "test-exa-key")
+    monkeypatch.setenv("WEB_SEARCH_PROVIDER", "auto")
+    calls = _fake_web_transport(monkeypatch, get=searxng_down, post=_exa_first_page)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        result = await registry.execute("search_web", {"query": "obscure named thing", "page": 3})
+
+        assert [kind for kind, _ in calls] == ["get", "post"]
+        assert "Exa first page" in result["output"]
+        note = next((line for line in result["output"].splitlines() if line.startswith("Not applied")), "")
+        assert "page=3" in note
+
+    run(scenario())
+
+
+def _one_site_results(url):
+    hits = [
+        {"title": f"Docs {index}", "url": f"https://docs.example.test/page-{index}", "content": "doc"}
+        for index in range(1, 7)
+    ]
+    hits.insert(2, {"title": "Other site", "url": "https://other.example.test/a", "content": "other"})
+    return {"query": _searxng_query(url)["q"], "number_of_results": 900, "results": hits}
+
+
+def test_search_web_site_query_is_not_capped_per_domain(monkeypatch):
+    _fake_web_transport(monkeypatch, get=_one_site_results)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        result = await registry.execute("search_web", {
+            "query": "site:docs.example.test asyncio",
+            "provider": "searxng",
+            "max_results": 6,
+        })
+
+        listed = re.findall(r"URL: (\S+)", result["output"])
+        assert [url for url in listed if "docs.example.test" in url] == [
+            f"https://docs.example.test/page-{index}" for index in range(1, 6)
+        ]
+        assert len(listed) == 6
+        assert "per site" not in result["output"]
+        assert not result.get("partial")
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("query", ["asyncio docs", "asyncio docs -site:spam.example.test"])
+def test_search_web_says_when_the_per_domain_cap_left_results_out(monkeypatch, query):
+    _fake_web_transport(monkeypatch, get=_one_site_results)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        result = await registry.execute("search_web", {
+            "query": query,
+            "provider": "searxng",
+            "max_results": 6,
+        })
+
+        listed = re.findall(r"URL: (\S+)", result["output"])
+        assert listed == [
+            "https://docs.example.test/page-1",
+            "https://docs.example.test/page-2",
+            "https://other.example.test/a",
+        ]
+        note = next((line for line in result["output"].splitlines() if line.startswith("Shown:")), "")
+        assert note.startswith(f"Shown: {len(listed)} results,")
+        assert "at most 2 per site" in note
+        assert "4 more" in note
+        assert "site:" in note
+        assert result["partial"] is True
+
+    run(scenario())
+
+
+_LISTING_PAGE = (
+    "<html><body><nav>Navigation noise</nav><main><h1>Thread title</h1>"
+    "<article><p>First post says the launch moved to Tuesday.</p></article>"
+    "<article><p>Second post corrects it to Wednesday.</p></article>"
+    "<article><p>Third post confirms Wednesday at noon.</p></article>"
+    "</main><footer>Footer noise</footer></body></html>"
+)
+
+
+def test_fetch_url_and_web_extract_keep_every_article_of_a_listing_page(monkeypatch):
+    import agent.runtime.tools.web as web_module
+
+    async def safe_url(url):
+        return True
+
+    _fake_web_transport(monkeypatch, get=lambda url: _LISTING_PAGE)
+    monkeypatch.setattr(web_module, "_is_safe_public_url", safe_url)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        fetched = await registry.execute("fetch_url", {"url": "https://example.test/thread"})
+        extracted = await registry.execute("web_extract", {
+            "urls": ["https://example.test/thread"],
+            "provider": "http",
+        })
+        page = json.loads(extracted["output"])["results"][0]
+
+        for text in (fetched["output"], page["content"]):
+            assert "Thread title" in text
+            assert "moved to Tuesday" in text
+            assert "corrects it to Wednesday" in text
+            assert "Wednesday at noon" in text
+            assert "Navigation noise" not in text
+            assert "Footer noise" not in text
+
+    run(scenario())
+
+
+def test_fetch_url_returns_a_short_non_html_body_as_it_is(monkeypatch):
+    bodies = {
+        "https://example.test/health": '{"status": "ok"}',
+        "https://example.test/ping": "pong\n",
+        "https://example.test/app": (
+            '<!doctype html><html><head><script src="/app.js"></script></head>'
+            '<body><div id="root"></div></body></html>'
+        ),
+    }
+    _fake_web_transport(monkeypatch, get=bodies.__getitem__)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        health = await registry.execute("fetch_url", {"url": "https://example.test/health"})
+        ping = await registry.execute("fetch_url", {"url": "https://example.test/ping"})
+        shell = await registry.execute("fetch_url", {"url": "https://example.test/app"})
+
+        assert health["output"].endswith('{"status": "ok"}')
+        assert ping["output"].endswith("pong")
+        for result in (health, ping):
+            assert "Empty/minimal" not in result["output"]
+            assert "JavaScript" not in result["output"]
+        # An HTML page that yields no text still gets the rendering hint.
+        assert "Empty/minimal content" in shell["output"]
+        assert "web_extract" in shell["output"]
+
+    run(scenario())
+
+
+def test_fetch_url_truncation_states_the_full_length_and_how_to_get_more(monkeypatch):
+    pages = {
+        "https://example.test/long": f"<html><body><p>{'word ' * 600}</p></body></html>",
+        "https://example.test/huge": f"<html><body><p>{'word ' * 12000}</p></body></html>",
+    }
+    _fake_web_transport(monkeypatch, get=pages.__getitem__)
+
+    async def scenario():
+        # Keep the registry's own inline preview out of the way of the longest page.
+        registry = ToolRegistry(max_inline_chars=100_000)
+        register_web_tools(registry, None)
+        clipped = await registry.execute("fetch_url", {"url": "https://example.test/long", "max_length": 500})
+        whole = await registry.execute("fetch_url", {"url": "https://example.test/long", "max_length": 5000})
+        maxed = await registry.execute("fetch_url", {"url": "https://example.test/huge", "max_length": 50000})
+
+        assert "first 500 of 2999 characters" in clipped["output"]
+        assert "max_length" in clipped["output"]
+        assert "web_extract" in clipped["output"]
+        assert clipped["partial"] is True
+
+        assert "truncated" not in whole["output"]
+        assert not whole.get("partial")
+
+        # At the largest max_length the only way to more is another tool.
+        tail = maxed["output"][-400:]
+        assert "first 50000 of 59999 characters" in tail
+        assert "web_extract" in tail
+        assert "larger max_length" not in tail
+        assert maxed["partial"] is True
+
+    run(scenario())
+
+
+def test_web_extract_tells_unresolved_hosts_and_bad_schemes_from_private_addresses(monkeypatch):
+    import socket
+
+    import agent.runtime.tools.web as web_module
+
+    lookups = []
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        lookups.append(host)
+        if host == "intranet.example.test":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", port))]
+        raise socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided, or not known")
+
+    calls = _fake_web_transport(monkeypatch)
+    monkeypatch.setattr(web_module.socket, "getaddrinfo", fake_getaddrinfo)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        result = await registry.execute("web_extract", {
+            "urls": [
+                "https://mistyped.example.test/page",
+                "ftp://files.example.test/report.txt",
+                "http://intranet.example.test/admin",
+                "http://127.0.0.1/private",
+            ],
+            "provider": "http",
+        })
+        payload = json.loads(result["output"])
+        unresolved, scheme, private_name, private_ip = payload["results"]
+
+        assert "could not resolve the host name" in unresolved["error"]
+        assert "http://" in scheme["error"] and "https://" in scheme["error"]
+        for entry in (unresolved, scheme):
+            assert "Blocked" not in entry["error"]
+            assert "private" not in entry["error"]
+            assert entry["backend"] != "blocked"
+        # The security block itself is unchanged for real private targets.
+        for entry in (private_name, private_ip):
+            assert entry["error"] == "Blocked: URL targets localhost, credentials, or a private/internal address"
+            assert entry["backend"] == "blocked"
+        assert payload["success"] is False
+        assert all(not entry["content"] for entry in payload["results"])
+        assert calls == []
+        assert set(lookups) == {"mistyped.example.test", "intranet.example.test"}
+
+    run(scenario())
+
+
+def test_public_url_check_rejects_the_same_targets_whatever_the_wording(monkeypatch):
+    import socket
+
+    import agent.runtime.tools.web as web_module
+
+    resolved = {
+        "public.example.test": ["93.184.216.34"],
+        "intranet.example.test": ["10.0.0.5"],
+        "mixed.example.test": ["93.184.216.34", "10.0.0.5"],
+    }
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        if host not in resolved:
+            raise socket.gaierror(socket.EAI_NONAME, "not known")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port)) for address in resolved[host]]
+
+    monkeypatch.setattr(web_module.socket, "getaddrinfo", fake_getaddrinfo)
+    rejected = [
+        "http://127.0.0.1/x",
+        "http://[::1]/x",
+        "http://10.1.2.3/",
+        "http://169.254.169.254/latest/meta-data",
+        "http://localhost:8080/",
+        "http://printer.local/",
+        "http://service.internal/",
+        "http://user:secret@public.example.test/",
+        "ftp://public.example.test/file",
+        "public.example.test/no-scheme",
+        "https://mistyped.example.test/",
+        "https://intranet.example.test/",
+        "https://mixed.example.test/",
+    ]
+    accepted = ["https://public.example.test/page", "https://8.8.8.8/"]
+
+    async def scenario():
+        for url in rejected:
+            assert await web_module._is_safe_public_url(url) is False, url
+        for url in accepted:
+            assert await web_module._is_safe_public_url(url) is True, url
+
+    run(scenario())
+
+
+def test_web_extract_lists_urls_left_out_by_the_five_url_limit(monkeypatch):
+    import agent.runtime.tools.web as web_module
+
+    async def safe_url(url):
+        return True
+
+    def page(url):
+        return f"<html><body><main><p>Body of {url} with enough words to count as real content.</p></main></body></html>"
+
+    calls = _fake_web_transport(monkeypatch, get=page)
+    monkeypatch.setattr(web_module, "_is_safe_public_url", safe_url)
+    urls = [f"https://example.test/page-{index}" for index in range(1, 8)]
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        result = await registry.execute("web_extract", {"urls": urls, "provider": "http"})
+        payload = json.loads(result["output"])
+
+        assert [entry["url"] for entry in payload["results"]] == urls[:5]
+        assert payload["not_processed"]["urls"] == urls[5:]
+        assert "5" in payload["not_processed"]["reason"]
+        assert sorted(url for _, url in calls) == urls[:5]
+        assert result["partial"] is True
+
+        within_limit = await registry.execute("web_extract", {"urls": urls[:5], "provider": "http"})
+        assert "not_processed" not in json.loads(within_limit["output"])
+        assert not within_limit.get("partial")
 
     run(scenario())
 
