@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
-from collections.abc import Mapping, MutableMapping
+from collections.abc import Callable, Mapping, MutableMapping
 
 
 # Browser children need OS/GUI configuration, not the agent's model/mail tokens
@@ -79,7 +79,7 @@ def pid_alive(pid: int) -> bool:
         if not handle:
             # 只有 ERROR_INVALID_PARAMETER 才是"pid 不存在"；访问被拒等查询失败
             # 无法证明进程已退出，保守视为存活（F3）。
-            get_last_error = getattr(ctypes, "get_last_error", None)
+            get_last_error: Callable[[], int] | None = getattr(ctypes, "get_last_error", None)
             error = int(get_last_error()) if callable(get_last_error) else 0
             return error != error_invalid_parameter
         try:

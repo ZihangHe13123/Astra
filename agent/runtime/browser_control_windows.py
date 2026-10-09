@@ -8,6 +8,8 @@ from functools import lru_cache
 import os
 from pathlib import Path
 
+_WINDOWS_ONLY = 'Browser Control Win32 storage requires native Windows'
+
 
 class SecurityAttributes(c.Structure):
     _fields_ = [('length', w.DWORD), ('descriptor', c.c_void_p), ('inherit', w.BOOL)]
@@ -26,7 +28,9 @@ class Acl(c.Structure):
 
 
 @lru_cache(maxsize=1)
-def api():
+def api() -> tuple[c.CDLL, c.CDLL]:
+    if os.name != 'nt':
+        raise RuntimeError(_WINDOWS_ONLY)
     kernel = c.WinDLL('kernel32', use_last_error=True)
     advapi = c.WinDLL('advapi32', use_last_error=True)
     signatures = [
@@ -53,6 +57,8 @@ def api():
 
 
 def checked(result):
+    if os.name != 'nt':
+        raise RuntimeError(_WINDOWS_ONLY)
     if not result:
         raise c.WinError(c.get_last_error())
     return result
@@ -96,6 +102,8 @@ def security_attributes():
 
 
 def reject_reparse_parents(path):
+    if os.name != 'nt':
+        raise RuntimeError(_WINDOWS_ONLY)
     # Do not follow junctions, including those above the private directory.
     for parent in (Path(path).absolute(), *Path(path).absolute().parents):
         try:
@@ -107,6 +115,8 @@ def reject_reparse_parents(path):
 
 @contextmanager
 def handle(path, *, access=0x20080, disposition=3, attributes=None):
+    if os.name != 'nt':
+        raise RuntimeError(_WINDOWS_ONLY)
     kernel, _ = api()
     reject_reparse_parents(path)
     value = kernel.CreateFileW(str(Path(path).absolute()), access, 3,
@@ -121,6 +131,8 @@ def handle(path, *, access=0x20080, disposition=3, attributes=None):
 
 
 def validate_handle(value, *, directory=False, permissions=True):
+    if os.name != 'nt':
+        raise RuntimeError(_WINDOWS_ONLY)
     kernel, advapi = api()
     info = FileInformation()
     checked(kernel.GetFileInformationByHandle(value, c.byref(info)))
@@ -166,6 +178,8 @@ def check_directory(path):
 
 
 def make_directory(path):
+    if os.name != 'nt':
+        raise RuntimeError(_WINDOWS_ONLY)
     path = Path(path)
     reject_reparse_parents(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -179,6 +193,8 @@ def make_directory(path):
 
 
 def open_file(path, flags, *, permissions=True):
+    if os.name != 'nt':
+        raise RuntimeError(_WINDOWS_ONLY)
     import msvcrt
     kernel, _ = api()
     access = 0x80000000 if not flags & (os.O_WRONLY | os.O_RDWR) else 0xC0000000
@@ -200,6 +216,8 @@ def open_file(path, flags, *, permissions=True):
 
 def tighten(path, *, directory=False):
     """Only used by explicit repair after all owned artifacts are verified."""
+    if os.name != 'nt':
+        raise RuntimeError(_WINDOWS_ONLY)
     _, advapi = api()
     with handle(path, access=0x60080) as value:
         validate_handle(value, directory=directory, permissions=False)

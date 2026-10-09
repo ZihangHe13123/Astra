@@ -91,6 +91,8 @@ class BrowserLifecycle:
             return None
         extension = getattr(self.manager.backend, "extension", None)
         transport = getattr(extension, "transport", None)
+        if transport is None:
+            return None
         read = getattr(transport, "release_request", None)
         request = read() if callable(read) else None
         if not isinstance(request, dict):

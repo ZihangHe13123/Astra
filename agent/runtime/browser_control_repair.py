@@ -26,6 +26,8 @@ def check_owned(path, *, directory=False):
 
 @contextmanager
 def existing_lock(path):
+    if os.name != 'nt':
+        raise RuntimeError('Browser Control repair requires native Windows')
     import msvcrt
     fd = windows.open_file(path, os.O_RDWR, permissions=False)
     try:
