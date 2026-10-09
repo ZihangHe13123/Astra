@@ -72,7 +72,10 @@ class LearnedSkills:
         if (parts.is_absolute() or ".." in parts.parts or any(":" in p for p in parts.parts)
                 or (parts.as_posix() != "SKILL.md" and (not parts.parts or parts.parts[0] not in
                     {"references", "templates", "scripts", "assets"}))):
-            raise ValueError("Invalid learned skill path")
+            raise ValueError(
+                "Invalid learned skill path: use SKILL.md or a relative path under "
+                "references/, templates/, scripts/ or assets/"
+            )
         path = self.root / "learned" / name / parts
         # Do not follow a user-provided symlink, including the learned root.
         for parent in (path, *path.parents):
@@ -233,8 +236,13 @@ class LearnedSkills:
                 sources = state["skills"][name]["sources"]
                 self._path(name, file_path)
                 if action == "patch":
-                    if not old_string or files.get(file_path, "").count(old_string) != 1 or old_string == new_string:
-                        raise ValueError("Patch must replace exactly one nonempty, distinct substring")
+                    if not old_string or old_string == new_string:
+                        raise ValueError("Patch requires distinct non-empty old_string and new_string")
+                    if file_path not in files:
+                        raise ValueError(f"Skill file not found: {name}/{file_path}")
+                    count = files[file_path].count(old_string)
+                    if count != 1:
+                        raise ValueError(f"old_string must match exactly once (found {count})")
                     content = files[file_path].replace(old_string, new_string, 1)
                 elif action != "write_file" or file_path == "SKILL.md":
                     raise ValueError("Use create/patch for SKILL.md; write_file is for supporting files")

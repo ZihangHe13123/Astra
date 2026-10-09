@@ -43,13 +43,26 @@ def register_skill_tools(
 
         name = store._validate_name(name)
         file_path = Path(file_path.replace("\\", "/")).as_posix()
+        if origin not in {"auto", "user"}:
+            raise ValueError("Skill origin must be auto or user")
+        # A skill keeps the origin it was created with. A refusal names the
+        # origin that works for this skill, so the model does not have to guess.
+        existing = next((item for item in store.list() if item["name"] == name), None)
+        learned = (name in automatic_names(read_learning_state(store.root))
+                   or bool(existing and existing["origin"] == "auto"))
+        if existing and existing["origin"] == "builtin":
+            raise ValueError(f"Skill origins are fixed: {name} is a built-in skill and skill_manage cannot change it")
         if origin == "user":
             # The model can install/edit a skill at the user's request without
             # turning supplied content into an automatic learning target.
-            existing = next((item for item in store.list() if item["name"] == name), None)
-            if (name in automatic_names(read_learning_state(store.root))
-                    or (existing and existing["origin"] in {"auto", "builtin"})):
-                raise ValueError("Skill origins are fixed; do not reclassify an automatic or built-in skill")
+            if learned:
+                raise ValueError(
+                    f"Skill origins are fixed: {name} is a learned skill (origin=auto), so origin=user cannot "
+                    + ("replace it. Choose another name for the user's skill."
+                       if action == "create" else
+                       "change it. To edit it, call again with origin=auto; it stays a learned skill "
+                       "that /learn review may revise.")
+                )
             if action == "create":
                 result = store.create(name, content, category="user")
             elif action == "patch":
@@ -59,8 +72,14 @@ def register_skill_tools(
             else:
                 raise ValueError("Unknown skill action")
             return json.dumps({**result, "origin": "user", "notice": "User-added skill; excluded from /learn review."}, ensure_ascii=False)
-        if origin != "auto":
-            raise ValueError("Skill origin must be auto or user")
+        if action in {"patch", "write_file"} and not learned:
+            if existing is not None:
+                raise ValueError(
+                    f"{name} is a user-owned skill (origin=user), which automatic learning (origin=auto) cannot "
+                    "change. If the user asked for this edit, call again with origin=user; otherwise leave it as it is."
+                )
+            if store.read_allowed and store._existing_skill_dir(name) is None:
+                raise ValueError(f"Skill not found: {name}. Create it with action=create, or check the name in the skill catalog.")
         mode = (learning_getter().mode() if learning_getter is not None
                 else LearningStore(store.root.parent / "learning.db").mode())
         if mode == "off":
@@ -197,10 +216,12 @@ def register_skill_tools(
         name="skill_manage",
         description=(
             "Create or conservatively patch a local procedural skill, or write a supporting file. "
-            "Store reusable how-to knowledge, not user facts, secrets, transient errors, or one-off narratives."
-            "Choose origin=auto only for your own reusable summaries; these save to learned/ and may be reviewed. "
-            "When the user supplies a skill or asks you to add/install/edit one, choose origin=user; "
+            "Store reusable how-to knowledge, not user facts, secrets, transient errors, or one-off narratives. "
+            "For create, choose origin=auto only for your own reusable summaries; these save to learned/ and may be reviewed. "
+            "When the user supplies a skill or asks you to add/install one, choose origin=user; "
             "these user-owned skills are excluded from review. Never relabel user content as automatic learning. "
+            "A skill keeps the origin it was created with: for patch and write_file pass the skill's own origin, "
+            "shown as [origin: auto] or [origin: user] in the skill catalog; built-in skills cannot be changed. "
             "First inspect the catalog and read an existing skill before updating it. Include when to use it, "
             "steps, source context, and limitations; distinguish observations from verified facts. "
             "Automatic learning cannot change manual/pinned/user-edited skills. No learning quota or separate trial is required. "
@@ -209,19 +230,41 @@ def register_skill_tools(
         parameters={
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["create", "patch", "write_file"]},
-                "name": {"type": "string"},
-                "content": {"type": "string"},
-                "file_path": {"type": "string", "default": "SKILL.md"},
-                "old_string": {"type": "string"},
-                "new_string": {"type": "string"},
+                "action": {
+                    "type": "string", "enum": ["create", "patch", "write_file"],
+                    "description": (
+                        "create: add a new skill from a complete SKILL.md. patch: replace one piece of text in a "
+                        "file of an existing skill. write_file: write a whole supporting file (not SKILL.md)."
+                    ),
+                },
+                "name": {"type": "string", "description": "Skill name: lowercase letters, digits and hyphens."},
+                "content": {
+                    "type": "string",
+                    "description": (
+                        "create: the complete SKILL.md. It must begin with YAML frontmatter between two --- lines "
+                        "holding `name:` (equal to the name argument) and `description:`, followed by the body. "
+                        "write_file: the whole content of the supporting file. Not used by patch."
+                    ),
+                },
+                "file_path": {
+                    "type": "string", "default": "SKILL.md",
+                    "description": (
+                        "patch/write_file: the file inside the skill. SKILL.md (patch only) or a supporting file "
+                        "under references/, templates/, scripts/ or assets/."
+                    ),
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "patch: exact text to replace; it must occur exactly once in the file.",
+                },
+                "new_string": {"type": "string", "description": "patch: the replacement text."},
                 "category": {
                     "type": "string",
                     "description": "Legacy hint; auto skills use learned/, user additions use user/.",
                 },
                 "origin": {
                     "type": "string", "enum": ["auto", "user"],
-                    "description": "auto: your own task summary; user: content supplied or explicitly added/installed by the user, including when you do it for them.",
+                    "description": "create: auto for your own task summary; user for content supplied or explicitly added/installed by the user, including when you do it for them. patch/write_file: the origin the skill already has.",
                 },
             },
             "required": ["action", "name", "origin"],
