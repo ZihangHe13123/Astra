@@ -493,11 +493,14 @@ def test_read_image_tool_attaches_image_to_next_llm_turn(tmp_path):
             and any(part.get("type") == "image_url" for part in msg["content"])
         ]
         assert image_messages
-        assert any(
-            part.get("type") == "text"
-            and "What is in this image?" in part.get("text", "")
-            for part in image_messages[0]["content"]
+        note = next(
+            line
+            for part in image_messages[0]["content"] if part.get("type") == "text"
+            for line in part.get("text", "").splitlines() if "What is in this image?" in line
         )
+        # The model wrote the question when it called the tool, so it must not be handed back as the user's words.
+        assert "用户" not in note and "user" not in note.lower()
+        assert "调用工具" in note
         image_part = next(part for part in image_messages[0]["content"] if part["type"] == "image_url")
         assert image_part["image_url"]["url"].startswith("data:image/png;base64,")
 
