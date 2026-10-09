@@ -6320,6 +6320,38 @@ def test_apply_patch_rejects_standard_unified_diff_without_side_effects(tmp_path
     run(scenario())
 
 
+@pytest.mark.parametrize(
+    "original,expected",
+    [
+        (b"keep\na  \nb\n", b"keep\na\nB\n"),        # hunk at the end: final newline stays
+        (b"\na  \nb\nrest\n", b"\na\nB\nrest\n"),  # hunk after a leading blank line
+        (b"a  \nb", b"a\nB"),                           # no final newline before, none after
+    ],
+)
+def test_apply_patch_whitespace_tolerant_match_keeps_the_other_lines(tmp_path, original, expected):
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "drift.txt"
+        target.write_bytes(original)
+        patch = "\n".join([
+            "*** Begin Patch",
+            "*** Update File: drift.txt",
+            "@@",
+            " a",
+            "-b",
+            "+B",
+            "*** End Patch",
+        ])
+
+        result = await registry.execute("apply_patch", {"patch": patch})
+
+        assert result["error"] == ""
+        assert target.read_bytes() == expected
+
+    run(scenario())
+
+
 def test_apply_patch_accepts_the_example_from_its_own_description(tmp_path):
     async def scenario():
         registry = ToolRegistry()

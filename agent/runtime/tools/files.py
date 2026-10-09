@@ -1189,7 +1189,13 @@ def register_file_tools(
                 "checkpoint_id": checkpoint_id,
             }, ensure_ascii=False)
         except Exception as exc:
-            return f"Error writing file: {exc}"
+            return ToolFailure(
+                code="file_write_failed",
+                message=f"Could not write file {full}: {exc}",
+                retryable=True,
+                recovery_hint="The file was not written. Check the content and that the directory is writable, then retry.",
+                details={"path": str(full)},
+            )
         finally:
             if temporary is not None:
                 try:
@@ -1432,7 +1438,13 @@ def register_file_tools(
         try:
             content = raw.decode("utf-8-sig")
         except UnicodeDecodeError as exc:
-            return f"Error: file is not valid UTF-8: {exc}"
+            return ToolFailure(
+                code="file_not_utf8",
+                message=f"File is not valid UTF-8: {full}",
+                retryable=False,
+                recovery_hint="Convert the file to UTF-8 before editing it.",
+                details={"path": str(full), "error": str(exc)},
+            )
 
         match_old = old
         replacement = new
@@ -1616,11 +1628,17 @@ def register_file_tools(
             "to keep the next response within the context budget.</NOTE>"
         ))
 
-    def _minimal_editor_file_view(full: Path, view_range: list[int] | None) -> str:
+    def _minimal_editor_file_view(full: Path, view_range: list[int] | None) -> str | ToolFailure:
         try:
             content = full.read_text(encoding="utf-8-sig")
         except UnicodeDecodeError as exc:
-            return f"Error: file is not valid UTF-8: {exc}"
+            return ToolFailure(
+                code="file_not_utf8",
+                message=f"File is not valid UTF-8: {full}",
+                retryable=False,
+                recovery_hint="This editor reads UTF-8 text only.",
+                details={"path": str(full), "error": str(exc)},
+            )
         lines = content.split("\n")
         initial_line = 1
         final_line: int | None = None

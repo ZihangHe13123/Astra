@@ -191,10 +191,9 @@ def _apply_hunks(path: Path, content: str, hunks: tuple[PatchHunk, ...]) -> str:
             raise PatchError(f"hunk {number} matched {match_count} places (whitespace-tolerant) in {path}; add more context")
         # Reconstruct: original lines before match + new_block + original lines after matched region
         match_end = match_start + len(norm_block_lines)
-        before = "\n".join(updated_lines[:match_start])
-        after = "\n".join(updated_lines[match_end:])
-        parts = [before, new_block, after]
-        return "\n".join(part for part in parts if part)
+        # Keep every other line as it is, including empty ones: dropping an
+        # empty "before" or "after" loses a leading blank line or the final newline.
+        return "\n".join([*updated_lines[:match_start], new_block, *updated_lines[match_end:]])
 
     updated = content
     for number, hunk in enumerate(hunks, start=1):

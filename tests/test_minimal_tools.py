@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -139,6 +140,48 @@ def test_str_replace_editor_str_replace_writes_a_trailing_whitespace_match(tmp_p
 
     assert "edited successfully" in replaced["output"]
     assert target.read_bytes() == b"ALPHA\nbeta\n"
+
+
+def test_str_replace_editor_does_not_report_success_when_nothing_was_written(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    register_file_tools(registry, str(tmp_path))
+    binary = tmp_path / "latin1.txt"
+    original = b"caf\xe9 one\n"
+    binary.write_bytes(original)
+
+    replaced = run(registry.execute("str_replace_editor", {
+        "command": "str_replace", "path": str(binary), "old_str": "one", "new_str": "two",
+    }))
+    assert replaced["code"] == "file_not_utf8"
+    assert replaced["output"] == ""
+    assert binary.read_bytes() == original
+
+    viewed = run(registry.execute("str_replace_editor", {"command": "view", "path": str(binary)}))
+    assert viewed["code"] == "file_not_utf8"
+    assert viewed["output"] == ""
+
+    edited = run(registry.execute("edit_file", {"path": str(binary), "old": "one", "new": "two"}))
+    assert edited["code"] == "file_not_utf8"
+    assert edited["recovery_hint"]
+
+
+
+@pytest.mark.skipif(os.name == "nt" or os.geteuid() == 0, reason="needs POSIX directory permissions")
+def test_str_replace_editor_create_reports_a_failed_write(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    register_file_tools(registry, str(tmp_path))
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o555)
+    try:
+        created = run(registry.execute("str_replace_editor", {
+            "command": "create", "path": str(locked / "new.txt"), "file_text": "text\n",
+        }))
+    finally:
+        locked.chmod(0o755)
+    assert created["code"] == "file_write_failed"
+    assert created["output"] == ""
+    assert not (locked / "new.txt").exists()
 
 
 def test_str_replace_editor_marks_only_clipped_views_partial(tmp_path: Path, monkeypatch) -> None:
