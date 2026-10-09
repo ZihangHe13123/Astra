@@ -77,6 +77,18 @@ def test_invalid_schedule_does_not_replace_existing_plan(kwargs):
     assert owner.status()["id"] == original["id"]
 
 
+def test_rejected_times_name_the_schema_parameters():
+    owner, _ = scheduler()
+    # The default lifetime is one hour, so a one-hour delay needs a longer lifetime.
+    with pytest.raises(ValueError) as rejected:
+        schedule(owner, delay_seconds=3600)
+    message = str(rejected.value)
+    assert "lifetime_seconds must be greater than delay_seconds" in message
+    assert "interval_seconds must be 0 or at least 60" in message
+    assert "expiry" not in message
+    assert schedule(owner, delay_seconds=3600, lifetime_seconds=7200)["state"] == "scheduled"
+
+
 def test_failure_stops_repetition():
     owner, now = scheduler()
     plan = schedule(owner, interval_seconds=60)
