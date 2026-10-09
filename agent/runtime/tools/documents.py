@@ -716,6 +716,15 @@ def subsection_ids(document: Document, section: Section) -> list[str]:
     return [item.id for item in document.sections if section.start < item.start < section.end]
 
 
+def enclosing_hashes(document: Document, start: int) -> list[dict[str, str]]:
+    """Hashes of the sections that contain the line ``start``, outermost first.
+
+    A section's hash covers its sub-sections, so a change at ``start`` gives
+    each of these sections a new hash.
+    """
+    return [{"id": item.id, "hash": item.hash} for item in document.sections if item.start < start < item.end]
+
+
 def comment_views(document: Document) -> list[dict[str, Any]]:
     return [
         {"id": item.id, "text": item.text, "section_id": item.section_id, "line": item.line, "context": item.context}
@@ -867,8 +876,10 @@ def register_document_tools(
         if expected_hash.strip().lower() != section.hash:
             raise DocumentError(
                 "section_changed",
-                f"Section '{section.id}' changed since hash {expected_hash} was read (now {section.hash}).",
-                "Someone edited this section. Read it again with doc_outline and redo the edit on the current text.",
+                f"Section '{section.id}' or one of its sub-sections changed since hash {expected_hash} was read "
+                f"(now {section.hash}).",
+                "A section's hash covers its sub-sections, so an edit to a sub-section (your own included) changes "
+                "this hash. Read the section again with doc_outline and redo the edit on the current text.",
                 current_hash=section.hash,
             )
 
@@ -952,7 +963,11 @@ def register_document_tools(
             if section_id == LEAD_ID:
                 result["section"] = {"id": LEAD_ID, "words": updated.lead_words, "hash": updated.lead_hash}
             else:
-                result["section"] = section_view(updated.section(section_id))
+                written = updated.section(section_id)
+                result["section"] = section_view(written)
+                parents = enclosing_hashes(updated, written.start)
+                if parents:
+                    result["parent_hashes"] = parents
             return result
         return run(action)
 
@@ -978,14 +993,19 @@ def register_document_tools(
                 target, lines, expected_sha256=sha256, operation="doc_add_section", task_id=_task_id,
             )
             updated = parse_document("".join(lines))
-            return {
+            added = updated.section(new_id)
+            result: dict[str, Any] = {
                 "path": str(target),
                 "sha256": new_sha,
                 "status": "added",
-                "section": section_view(updated.section(new_id)),
+                "section": section_view(added),
                 "sections": [item.id for item in updated.sections],
                 "checkpoint_id": checkpoint_id,
             }
+            parents = enclosing_hashes(updated, added.start)
+            if parents:
+                result["parent_hashes"] = parents
+            return result
         return run(action)
 
     def _doc_remove_section(
@@ -1006,7 +1026,7 @@ def register_document_tools(
                 target, lines, expected_sha256=sha256, operation="doc_remove_section", task_id=_task_id,
             )
             updated = parse_document("".join(lines))
-            return {
+            result: dict[str, Any] = {
                 "path": str(target),
                 "sha256": new_sha,
                 "status": "removed",
@@ -1014,6 +1034,12 @@ def register_document_tools(
                 "sections": [item.id for item in updated.sections],
                 "checkpoint_id": checkpoint_id,
             }
+            # The sections that held the removed one keep their ids (they come first) and get new hashes.
+            held_by = {item.id for item in document.sections if item.start < section.start < item.end}
+            parents = [{"id": item.id, "hash": item.hash} for item in updated.sections if item.id in held_by]
+            if parents:
+                result["parent_hashes"] = parents
+            return result
         return run(action)
 
     def _doc_comments(path: str) -> str | ToolFailure:
@@ -1104,7 +1130,11 @@ def register_document_tools(
     }
     hash_schema = {
         "type": "string",
-        "description": "Section hash from the latest doc_outline or write result; guards against overwriting edits made since",
+        "description": (
+            "Section hash from the latest doc_outline or edit result. It covers the section together with its "
+            "sub-sections, so editing a sub-section changes it; an edit result lists the new hashes of the "
+            "enclosing sections as parent_hashes"
+        ),
     }
     common = {
         "group": "documents",
@@ -1224,7 +1254,8 @@ def register_document_tools(
             "action=resolve_comment removes a handled review comment and records a note. Filling a pending "
             "placeholder needs no hash; rewriting a written section, or removing one whose text or sub-sections "
             "were written, needs expected_hash from the latest doc_outline or edit result, and the call is "
-            "refused if the section changed since."
+            "refused if the section changed since. A hash covers the section with its sub-sections: after you "
+            "edit a sub-section, use the enclosing section's new hash from that result's parent_hashes."
         ),
         parameters={
             "type": "object",
@@ -1258,7 +1289,8 @@ def register_document_tools(
             "document. Content is the text without the section's own heading; deeper headings are allowed only "
             "while the section has no sub-sections. Filling a pending placeholder "
             "needs no hash. Rewriting a written section requires expected_hash from the latest doc_outline or "
-            "write result; if someone edited the section since, the call is refused so their text is never lost. "
+            "write result; if the section or one of its sub-sections changed since, the call is refused so that "
+            "text is never lost. "
             "Use section_id '_lead' for the text under the title."
         ),
         parameters={
