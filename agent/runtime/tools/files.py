@@ -19,10 +19,17 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..tool_execution import PartialResult
 from ..tool_failure import ToolFailure
 from ..file_checkpoints import FileCheckpointStore
 from ..turn_change_store import current_turn_change_store
-from .file_patch import PatchError, apply_patch as apply_file_patch, parse_patch, patch_summary
+from .file_patch import (
+    PatchError,
+    PatchFormatError,
+    apply_patch as apply_file_patch,
+    parse_patch,
+    patch_summary,
+)
 from .registry import ToolRegistry, ToolDef, approval_justification_schema
 
 
@@ -55,6 +62,39 @@ def _strip_regex_meta(needle: str) -> str:
     return re.sub(r"[.*+?^${}()|[\]\\]", "", needle).strip()
 
 
+def _glob_segments_match(parts: tuple[str, ...], segments: tuple[str, ...]) -> bool:
+    import fnmatch as _fnmatch
+
+    if not segments:
+        return not parts
+    if segments[0] == "**":
+        return any(
+            _glob_segments_match(parts[index:], segments[1:])
+            for index in range(len(parts) + 1)
+        )
+    return (
+        bool(parts)
+        and _fnmatch.fnmatch(parts[0], segments[0])
+        and _glob_segments_match(parts[1:], segments[1:])
+    )
+
+
+def _search_glob_matches(relative_parts: tuple[str, ...], glob_filter: str) -> bool:
+    """Apply a content-search glob to one file below the search directory.
+
+    A glob without ``/`` filters by file name. A glob with ``/`` is matched
+    against the path relative to the search directory, where ``**`` spans any
+    number of directories.
+    """
+    import fnmatch as _fnmatch
+
+    pattern = glob_filter.replace("\\", "/")
+    if "/" not in pattern:
+        return _fnmatch.fnmatch(relative_parts[-1], pattern)
+    segments = tuple(part for part in pattern.split("/") if part not in {"", "."})
+    return _glob_segments_match(relative_parts, segments)
+
+
 def _content_near_miss_suggestions(
     search: Path,
     needle: str,
@@ -73,8 +113,6 @@ def _content_near_miss_suggestions(
     content containing "compression" without false-positiving on unrelated
     words. Bounded the same way as :func:`_near_miss_suggestions`.
     """
-    import fnmatch as _fnmatch
-
     clean = _strip_regex_meta(needle)
     if len(clean) < 4:
         return []
@@ -93,7 +131,7 @@ def _content_near_miss_suggestions(
             _is_search_noise(part) for part in relative.parts
         ):
             continue
-        if not _fnmatch.fnmatch(candidate.name, glob_filter):
+        if not _search_glob_matches(relative.parts, glob_filter):
             continue
         try:
             st = candidate.stat()
@@ -130,11 +168,9 @@ def _near_miss_suggestions(
     """Probe close filename matches after a failed search.
 
     Mirrors the search loops' noise pruning and stays bounded so a zero-result
-    search costs little. Returns up to ``limit`` relative paths, preferring
-    full relative paths over bare basenames.
+    search costs little. Returns up to ``limit`` paths relative to ``search``,
+    trying the full relative path before the file name alone.
     """
-    import fnmatch as _fnmatch
-
     clean = _strip_regex_meta(needle)
     dirname = "/".join(
         p for p in dirname.replace("\\", "/").split("/")
@@ -158,7 +194,7 @@ def _near_miss_suggestions(
             continue
         if dirname and not str(relative).replace("\\", "/").startswith(dirname + "/"):
             continue
-        if not _fnmatch.fnmatch(candidate.name, glob_filter):
+        if not _search_glob_matches(relative.parts, glob_filter):
             continue
         relative_paths.append(str(relative))
         basenames.append(candidate.name)
@@ -167,8 +203,13 @@ def _near_miss_suggestions(
     suggestions: list[str] = []
     for pool in (relative_paths, basenames):
         for match in difflib.get_close_matches(clean, pool, n=limit, cutoff=0.6):
-            if match not in suggestions:
-                suggestions.append(match)
+            # A file-name match is reported by its path so it can be opened.
+            paths = [match] if pool is relative_paths else [
+                path for path, name in zip(relative_paths, basenames) if name == match
+            ]
+            for path in paths:
+                if path not in suggestions:
+                    suggestions.append(path)
         if len(suggestions) >= limit:
             break
     return suggestions[:limit]
@@ -482,6 +523,29 @@ def register_file_tools(
         return value if value > 0 else default
 
     chunk_char_limit = positive_env("TOOL_FILE_CHUNK_CHARS", 6_000)
+
+    def read_file_limits() -> tuple[int, int, int]:
+        """Return read_file's page byte cap, line byte cap and default line limit."""
+        try:
+            return (
+                max(1_024, int(os.getenv("READ_FILE_MAX_PAGE_BYTES", str(1024 * 1024)))),
+                max(1_024, int(os.getenv("READ_FILE_MAX_LINE_BYTES", str(256 * 1024)))),
+                max(1, int(os.getenv("READ_FILE_DEFAULT_LINES", "400"))),
+            )
+        except ValueError:
+            return 1024 * 1024, 256 * 1024, 400
+
+    # Counting every line of a larger file on each partial page would make
+    # paging slow; include_metadata already reads the whole file for its hash.
+    read_file_count_lines_max_bytes = 64 * 1024 * 1024
+
+    def _tool_path(target: Path) -> str:
+        """Render a path the file tools accept back: workspace-relative inside it."""
+        try:
+            return str(target.relative_to(access.workspace))
+        except ValueError:
+            return str(target)
+
     def audit_transaction(event: str, transaction: FileWriteTransaction, **details) -> None:
         transaction_dir.mkdir(parents=True, exist_ok=True)
         record = {
@@ -764,14 +828,7 @@ def register_file_tools(
                 recovery_hint="Provide a regular file path rather than a directory, pipe, socket, or device.",
                 details={"path": str(full)},
             )
-        try:
-            max_page_bytes = max(1_024, int(os.getenv("READ_FILE_MAX_PAGE_BYTES", str(1024 * 1024))))
-            max_line_bytes = max(1_024, int(os.getenv("READ_FILE_MAX_LINE_BYTES", str(256 * 1024))))
-            default_lines = max(1, int(os.getenv("READ_FILE_DEFAULT_LINES", "400")))
-        except ValueError:
-            max_page_bytes = 1024 * 1024
-            max_line_bytes = 256 * 1024
-            default_lines = 400
+        max_page_bytes, max_line_bytes, default_lines = read_file_limits()
         if byte_offset is not None and offset:
             return ToolFailure(
                 code="invalid_arguments",
@@ -810,10 +867,20 @@ def register_file_tools(
                             if exc.reason != "unexpected end of data" or len(candidate) - exc.start > 4:
                                 raise
                             candidate = candidate[:exc.start]
+                    # limit counts lines here too: stop after that many line ends.
+                    page_end = 0
+                    for _ in range(max(0, resolved_limit)):
+                        newline_at = candidate.find(b"\n", page_end)
+                        if newline_at < 0:
+                            page_end = len(candidate)
+                            break
+                        page_end = newline_at + 1
+                    candidate = candidate[:page_end]
                     selected_raw.extend(candidate)
                     reached_eof = start_byte + len(candidate) >= file_stat.st_size
                     if not reached_eof:
                         next_byte_offset = start_byte + len(candidate)
+                        line_truncated = bool(candidate) and not candidate.endswith(b"\n")
                 else:
                     # Skip requested logical lines with bounded memory. Very
                     # long lines are drained in chunks rather than materialized.
@@ -833,17 +900,18 @@ def register_file_tools(
                         if not chunk:
                             reached_eof = True
                             break
-                        prefix = chunk
                         oversized_line = len(chunk) > max_line_bytes and not chunk.endswith(b"\n")
-                        if oversized_line:
-                            prefix = chunk[:max_line_bytes]
-                            line_truncated = True
-                            next_byte_offset = line_start + len(prefix)
-                            while chunk and not chunk.endswith(b"\n"):
-                                chunk = handle.readline(max_line_bytes + 1)
+                        keep = max_line_bytes if oversized_line else len(chunk)
                         remaining = max_page_bytes - len(selected_raw)
-                        if len(prefix) > remaining:
-                            prefix = prefix[:remaining]
+                        if keep > remaining:
+                            if selected_lines:
+                                # The page is full: leave this line whole for the next page.
+                                handle.seek(line_start)
+                                break
+                            keep = remaining
+                        prefix = chunk[:keep]
+                        if keep < len(chunk):
+                            # The line is cut here; keep only whole characters.
                             while prefix:
                                 try:
                                     prefix.decode("utf-8")
@@ -852,15 +920,16 @@ def register_file_tools(
                                     if exc.reason != "unexpected end of data":
                                         raise
                                     prefix = prefix[:exc.start]
+                            line_truncated = True
                             next_byte_offset = line_start + len(prefix)
+                            while chunk and not chunk.endswith(b"\n"):
+                                chunk = handle.readline(max_line_bytes + 1)
                         selected_raw.extend(prefix)
                         selected_lines += 1
                         if line_truncated or len(selected_raw) >= max_page_bytes:
                             break
                     if handle.tell() >= file_stat.st_size:
                         reached_eof = True
-                    if not reached_eof and next_byte_offset is None:
-                        next_byte_offset = handle.tell()
 
             content = bytes(selected_raw).decode("utf-8")
         except UnicodeDecodeError as exc:
@@ -881,24 +950,37 @@ def register_file_tools(
             )
 
         actual_line_offset = scanned_lines if byte_offset is None else 0
-        truncated = not reached_eof or line_truncated or actual_line_offset > 0 or start_byte > 0
-        if not truncated and not include_metadata:
+        # truncated means more of the file remains after this page.
+        truncated = not reached_eof or line_truncated
+        if not truncated and not include_metadata and not actual_line_offset and not start_byte:
             return content
         digest = ""
-        if include_metadata:
+        total_lines = actual_line_offset + selected_lines if reached_eof and byte_offset is None else None
+        if include_metadata or (
+            total_lines is None and file_stat.st_size <= read_file_count_lines_max_bytes
+        ):
             hasher = hashlib.sha256()
+            newline_count = 0
+            final_byte = b""
             try:
                 with full.open("rb") as handle:
                     for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                        hasher.update(chunk)
-                digest = hasher.hexdigest()
+                        if include_metadata:
+                            hasher.update(chunk)
+                        newline_count += chunk.count(b"\n")
+                        final_byte = chunk[-1:]
             except OSError as exc:
-                return ToolFailure(
-                    code="file_read_failed",
-                    message=f"Could not hash file: {full}",
-                    retryable=True,
-                    details={"path": str(full), "error": str(exc)},
-                )
+                if include_metadata:
+                    return ToolFailure(
+                        code="file_read_failed",
+                        message=f"Could not hash file: {full}",
+                        retryable=True,
+                        details={"path": str(full), "error": str(exc)},
+                    )
+            else:
+                if include_metadata:
+                    digest = hasher.hexdigest()
+                total_lines = newline_count + (1 if final_byte not in {b"", b"\n"} else 0)
         metadata = {
             "path": str(full),
             "bytes": file_stat.st_size,
@@ -906,18 +988,24 @@ def register_file_tools(
             "line_offset": actual_line_offset if byte_offset is None else None,
             "line_start": actual_line_offset + 1 if byte_offset is None and content else None,
             "line_end": actual_line_offset + selected_lines if byte_offset is None else None,
-            "total_lines": actual_line_offset + selected_lines if reached_eof and byte_offset is None else None,
-            "byte_offset": start_byte,
+            "total_lines": total_lines,
+            "next_offset": (
+                actual_line_offset + selected_lines
+                if byte_offset is None and not reached_eof
+                else None
+            ),
+            "byte_offset": start_byte if byte_offset is not None else None,
             "next_byte_offset": next_byte_offset,
             "line_truncated": line_truncated,
             "truncated": truncated,
         }
         if digest:
             metadata["sha256"] = digest
-        return (
+        text = (
             f"[File metadata: {json.dumps(metadata, ensure_ascii=False)}]\n"
             f"{content}"
         )
+        return PartialResult(text) if truncated else text
 
     async def _stat_file(path: str, preview_lines: int = 3) -> str | ToolFailure:
         full = access.resolve(path)
@@ -1118,7 +1206,8 @@ def register_file_tools(
             expected = str(args.get("content") or "")
             if not full.is_file():
                 return False, f"written file does not exist: {full}"
-            if full.read_text(encoding="utf-8") != expected:
+            # Compare bytes: reading as text would translate "\r\n" and "\r".
+            if full.read_bytes() != expected.encode("utf-8"):
                 return False, f"written file content does not match: {full}"
         except (OSError, ValueError) as exc:
             return False, f"could not verify written file: {exc}"
@@ -1163,12 +1252,16 @@ def register_file_tools(
                 return (
                     f"No files matching '{pattern}' found in {search}\n"
                     "Did you mean one of these files?\n"
-                    + "\n".join(f"- {name}" for name in suggestions)
+                    + "\n".join(f"- {_tool_path(search / name)}" for name in suggestions)
                 )
             return f"No files matching '{pattern}' found in {search}"
-        lines = [str(match.relative_to(search)) for match in matches[:100]]
+        lines = [_tool_path(match) for match in matches[:100]]
         if len(matches) > 100:
-            lines.append(f"... and {len(matches) - 100} more")
+            lines.append(
+                f"... and {len(matches) - 100} more not listed; "
+                "narrow the pattern or path to see them"
+            )
+            return PartialResult("\n".join(lines))
         return "\n".join(lines)
 
     async def _search_text(
@@ -1177,38 +1270,53 @@ def register_file_tools(
         glob: str = "*",
         max_results: int = 50,
         include_ignored: bool = False,
-    ) -> str:
+    ) -> str | ToolFailure:
         """Grep file contents with a regex pattern under an allowed directory.
 
         Skips the same noise directories as search_files by default. The *glob*
-        parameter restricts by filename (e.g. ``"*.py"``), and *max_results*
-        caps the total match count. Files larger than 1 MiB and binary files
-        (null byte in first 8 KiB) are silently skipped.
+        parameter restricts by filename (e.g. ``"*.py"``) or, when it contains
+        ``/``, by path relative to the search directory. *max_results* caps the
+        total match count. Files larger than 1 MiB and binary files (null byte
+        in first 8 KiB) are silently skipped.
 
         Set *include_ignored* to True to also search dependency, cache, and
         build directories, including .sandbox_* files and directories.
         """
-        import fnmatch as _fnmatch
         import re as _re
 
         _MAX_FILE_BYTES = 1_048_576   # 1 MiB
         _MAX_PATTERN_LEN = 500
 
         if len(pattern) > _MAX_PATTERN_LEN:
-            return f"Error: pattern too long ({len(pattern)} > {_MAX_PATTERN_LEN})"
+            return ToolFailure(
+                "invalid_arguments",
+                f"pattern too long ({len(pattern)} > {_MAX_PATTERN_LEN})",
+                True,
+                f"Use a regex of at most {_MAX_PATTERN_LEN} characters.",
+            )
 
         search = access.resolve(path)
         if not search.exists():
-            return f"Error: Path not found: {search}"
+            return ToolFailure("file_not_found", f"Path not found: {search}", False,
+                               "List the parent directory and use an existing path; do not repeat this path unchanged.", details={"path": str(search)})
         if not search.is_dir():
-            return f"Error: Not a directory: {search}"
+            return ToolFailure("not_a_directory", f"Not a directory: {search}", False,
+                               "Use a directory path for search_text; to search one file, pass its directory as path and its name as glob.", details={"path": str(search)})
         try:
             compiled = _re.compile(pattern)
         except _re.error as exc:
-            return f"Error: Invalid regex pattern: {exc}"
+            return ToolFailure(
+                "invalid_arguments",
+                f"Invalid regex pattern: {exc}",
+                True,
+                "Correct the regex; escape characters such as ( [ . * with a backslash to match them literally.",
+            )
 
+        max_results = max(1, max_results)
         results: list[str] = []
-        seen = 0
+        capped = False
+        candidate_files = 0
+        glob_files = 0
 
         for dirpath_str, dirnames, filenames in os.walk(str(search)):
             # Prune noise directories in-place so we don't descend into them.
@@ -1217,12 +1325,15 @@ def register_file_tools(
                     d for d in dirnames
                     if not _is_search_noise(d)
                 ]
+            relative_dir = Path(dirpath_str).relative_to(search).parts
 
             for fname in filenames:
                 if not include_ignored and _is_search_noise(fname):
                     continue
-                if not _fnmatch.fnmatch(fname, glob):
+                candidate_files += 1
+                if not _search_glob_matches((*relative_dir, fname), glob):
                     continue
+                glob_files += 1
                 fp = Path(dirpath_str) / fname
                 # Check size before reading
                 try:
@@ -1239,19 +1350,26 @@ def register_file_tools(
                 if b"\x00" in raw[:8192]:
                     continue
                 text = raw.decode("utf-8", errors="replace")
-                relative = fp.relative_to(search)
+                shown = _tool_path(fp)
                 for lineno, line in enumerate(text.splitlines(), 1):
                     if compiled.search(line):
-                        results.append(f"{relative}:{lineno}: {line.rstrip()}")
-                        seen += 1
-                        if seen >= max_results:
+                        if len(results) >= max_results:
+                            # One more match exists, so the list really is cut short.
+                            capped = True
                             break
-                if seen >= max_results:
+                        results.append(f"{shown}:{lineno}: {line.rstrip()}")
+                if capped:
                     break
-            if seen >= max_results:
+            if capped:
                 break
 
         if not results:
+            if candidate_files and not glob_files:
+                return (
+                    f"No files in {search} match glob '{glob}', so no file contents were searched. "
+                    "A glob without '/' is matched against file names; a glob with '/' is matched "
+                    "against the path relative to the search directory, where '**/' spans directories."
+                )
             content_suggestions = _content_near_miss_suggestions(
                 search, pattern, include_ignored=include_ignored, glob_filter=glob
             )
@@ -1265,16 +1383,18 @@ def register_file_tools(
                 lines = [f"No lines matching '{pattern}' found in {search}"]
                 if suggestions:
                     lines.append("Did you mean one of these files?")
-                    lines.extend(f"- {name}" for name in suggestions)
+                    lines.extend(f"- {_tool_path(search / name)}" for name in suggestions)
                 if content_only:
                     lines.append("Content near-miss in:")
-                    lines.extend(f"- {name}" for name in content_only)
+                    lines.extend(f"- {_tool_path(search / name)}" for name in content_only)
                 return "\n".join(lines)
             return f"No lines matching '{pattern}' found in {search}"
-        header = f"{len(results)} match(es)"
-        if seen >= max_results:
-            header += f" (capped at {max_results})"
-        return f"{header}:\n" + "\n".join(results)
+        if capped:
+            return PartialResult(
+                f"{len(results)} match(es) (capped at {max_results}); more exist, so raise "
+                "max_results or narrow the pattern, path or glob:\n" + "\n".join(results)
+            )
+        return f"{len(results)} match(es):\n" + "\n".join(results)
 
     async def _edit_file(
         path: str,
@@ -1325,12 +1445,19 @@ def register_file_tools(
             match_old = old.replace("\r\n", "\n")
             replacement = new.replace("\r\n", "\n")
             count = content.count(match_old)
+        fuzzy_span: tuple[int, int] | None = None
         if count == 0:
             # Fuzzy fallback: find closest whitespace-normalized match
             lines = content.splitlines(keepends=True)
             old_lines = [line.rstrip() for line in old.split("\n")]
+            # A line break at the end of old belongs to its last line; it is
+            # not one more (blank) line to match.
+            through_line_end = len(old_lines) > 1 and old.endswith("\n")
+            if through_line_end:
+                old_lines.pop()
             best_line = -1
             best_score = 0
+            perfect_lines: list[int] = []
             for i in range(len(lines)):
                 remaining = lines[i:]
                 matched = 0
@@ -1344,21 +1471,39 @@ def register_file_tools(
                 if matched > best_score:
                     best_score = matched
                     best_line = i
+                if matched == len(old_lines) and any(old_lines):
+                    perfect_lines.append(i)
+            if len(perfect_lines) > 1:
+                return ToolFailure(
+                    code="edit_match_ambiguous",
+                    message=(
+                        f"Edit text matched {len(perfect_lines)} places in {full} "
+                        "when trailing whitespace is ignored"
+                    ),
+                    retryable=True,
+                    recovery_hint="Include more surrounding context so old matches exactly once.",
+                    details={"path": str(full), "matches": len(perfect_lines)},
+                )
             # If fuzzy matcher found a perfect match (all lines equal
             # after rstrip), use the actual file text for replacement
             # instead of failing.  This handles trailing-whitespace drift.
-            if best_line >= 0 and best_score == len(old_lines):
-                actual_old = "".join(lines[best_line:best_line + len(old_lines)])
+            if perfect_lines:
+                first_line = perfect_lines[0]
+                matched_lines = "".join(lines[first_line:first_line + len(old_lines)])
+                start = sum(len(line) for line in lines[:first_line])
+                end = start + len(matched_lines)
+                if not through_line_end:
+                    # old stops before the line break, so the last line keeps
+                    # its line ending and any trailing whitespace.
+                    last_line = lines[first_line + len(old_lines) - 1]
+                    end -= len(last_line) - len(last_line.rstrip())
                 # Preserve the file's line-ending style in replacement.
-                if "\r\n" in actual_old:
-                    replacement = new.replace("\n", "\r\n")
-                else:
-                    replacement = new.replace("\r\n", "\n")
-                updated = (
-                    content[:sum(len(line) for line in lines[:best_line])]
-                    + replacement
-                    + content[sum(len(line) for line in lines[:best_line + len(old_lines)]):]
-                )
+                replacement = new.replace("\r\n", "\n")
+                if "\r\n" in matched_lines or ("\n" not in matched_lines and "\r\n" in content):
+                    replacement = replacement.replace("\n", "\r\n")
+                # Report and replace the text that is really in the file.
+                match_old = content[start:end]
+                fuzzy_span = (start, end)
             else:
                 context = ""
                 if best_line >= 0 and best_score > 0:
@@ -1385,7 +1530,10 @@ def register_file_tools(
                 recovery_hint="Include more surrounding context so old matches exactly once.",
                 details={"path": str(full), "matches": count},
             )
-        updated = content.replace(match_old, replacement, 1)
+        if fuzzy_span is not None:
+            updated = content[:fuzzy_span[0]] + replacement + content[fuzzy_span[1]:]
+        else:
+            updated = content.replace(match_old, replacement, 1)
         encoded = updated.encode("utf-8")
         if has_bom:
             encoded = b"\xef\xbb\xbf" + encoded
@@ -1463,10 +1611,10 @@ def register_file_tools(
         limit = _minimal_editor_max_chars()
         if len(content) <= limit:
             return content
-        return content[:limit] + (
+        return PartialResult(content[:limit] + (
             "<response clipped><NOTE>Retry after viewing or searching the relevant range "
             "to keep the next response within the context budget.</NOTE>"
-        )
+        ))
 
     def _minimal_editor_file_view(full: Path, view_range: list[int] | None) -> str:
         try:
@@ -1534,11 +1682,13 @@ def register_file_tools(
 
         visit(full, 1)
         rows.sort(key=lambda row: row.split("\t", 1)[-1])
-        return (
+        listing = _minimal_editor_clip("\n".join(rows) + "\n")
+        text = (
             f"Here're the files and directories up to 2 levels deep in {full}, "
             "excluding hidden items, node_modules, and Python cache directories:\n"
-            + _minimal_editor_clip("\n".join(rows) + "\n")
+            + listing
         )
+        return PartialResult(text) if isinstance(listing, PartialResult) else text
 
     def _minimal_editor_permission_check(args: dict) -> dict | None:
         command = str(args.get("command") or "")
@@ -1593,6 +1743,19 @@ def register_file_tools(
         if command == "create":
             if file_text is None:
                 raise ValueError("Parameter file_text is required for command: create")
+            existing = access.resolve(path, write=True)
+            if existing.exists():
+                # write_file's own refusal points at tools this editor's caller may not have.
+                return ToolFailure(
+                    code="existing_file_requires_edit",
+                    message=f"File already exists at: {existing}. The create command does not overwrite files.",
+                    retryable=True,
+                    recovery_hint=(
+                        "Use the view command to read the file, then change it with "
+                        "str_replace or insert."
+                    ),
+                    details={"path": str(existing)},
+                )
             result = await _write_file(path, file_text, False, "", _task_id)
             if isinstance(result, ToolFailure):
                 return result
@@ -1663,12 +1826,23 @@ def register_file_tools(
         path: str,
         overwrite: bool = False,
         expected_size: int | None = None,
-    ) -> str:
+    ) -> str | ToolFailure:
         target = access.resolve(path, write=True)
         if expected_size is not None and expected_size < 0:
-            return "Error: expected_size must be zero or greater"
+            return ToolFailure(
+                code="invalid_arguments",
+                message="expected_size must be zero or greater",
+                retryable=True,
+                recovery_hint="Omit expected_size or pass the final UTF-8 byte count.",
+            )
         if target.exists() and not overwrite:
-            return f"Error: target already exists and overwrite is false: {target}"
+            return ToolFailure(
+                code="target_exists",
+                message=f"Target already exists and overwrite is false: {target}",
+                retryable=True,
+                recovery_hint="Pass overwrite=true to replace the whole file, or choose another path.",
+                details={"path": str(target)},
+            )
         transaction_dir.mkdir(parents=True, exist_ok=True)
         write_id = uuid.uuid4().hex
         temp_path = transaction_dir / f"{write_id}.part"
@@ -1696,6 +1870,18 @@ def register_file_tools(
             "status": "open",
         }, ensure_ascii=False)
 
+    def unknown_write_id(write_id: str) -> ToolFailure:
+        return ToolFailure(
+            code="unknown_write_id",
+            message=f"Unknown or closed write_id: {write_id}",
+            retryable=False,
+            recovery_hint=(
+                "This transaction was already committed, aborted or discarded. To write "
+                "the file, call begin_file_write again and send every chunk from sequence 0."
+            ),
+            details={"write_id": write_id},
+        )
+
     async def _write_file_chunk(
         write_id: str,
         sequence: int,
@@ -1703,11 +1889,24 @@ def register_file_tools(
     ) -> str | ToolFailure:
         transaction = transactions.get(write_id)
         if transaction is None:
-            return f"Error: unknown or closed write_id: {write_id}"
+            return unknown_write_id(write_id)
         if sequence != transaction.next_sequence:
-            return (
-                f"Error: out-of-order chunk for {write_id}; "
-                f"expected sequence {transaction.next_sequence}, received {sequence}"
+            return ToolFailure(
+                code="chunk_out_of_order",
+                message=(
+                    f"out-of-order chunk for {write_id}; "
+                    f"expected sequence {transaction.next_sequence}, received {sequence}"
+                ),
+                retryable=True,
+                recovery_hint=(
+                    f"Send the chunk with sequence {transaction.next_sequence} next. "
+                    "Chunks already accepted are kept; this one was not written."
+                ),
+                details={
+                    "write_id": write_id,
+                    "expected_sequence": transaction.next_sequence,
+                    "received_sequence": sequence,
+                },
             )
         if len(content) > chunk_char_limit:
             return ToolFailure(
@@ -1781,15 +1980,37 @@ def register_file_tools(
     ) -> str | ToolFailure:
         transaction = transactions.get(write_id)
         if transaction is None:
-            return f"Error: unknown or closed write_id: {write_id}"
+            return unknown_write_id(write_id)
         try:
             current_target = access._candidate(transaction.requested_path)
         except (OSError, ValueError) as exc:
-            return f"Error: could not re-resolve transaction target: {exc}"
+            return ToolFailure(
+                code="transaction_target_unavailable",
+                message=f"Could not re-resolve transaction target: {exc}",
+                retryable=True,
+                recovery_hint=(
+                    "The target was not modified and the transaction is still open. "
+                    "Commit again once the path is reachable, or abort it."
+                ),
+                details={"write_id": write_id, "path": str(transaction.target)},
+            )
         if os.path.normcase(str(current_target)) != os.path.normcase(str(transaction.target)):
-            return (
-                "Error: transaction target changed after approval; "
-                f"was {transaction.target}, now {current_target}"
+            return ToolFailure(
+                code="transaction_target_changed",
+                message=(
+                    "Transaction target changed after approval; "
+                    f"was {transaction.target}, now {current_target}"
+                ),
+                retryable=False,
+                recovery_hint=(
+                    "The target was not modified. Abort this transaction and begin a new "
+                    "one for the intended path."
+                ),
+                details={
+                    "write_id": write_id,
+                    "path": str(transaction.target),
+                    "current_path": str(current_target),
+                },
             )
 
         payload = transaction.temp_path.read_bytes()
@@ -1876,7 +2097,17 @@ def register_file_tools(
             )
         target = transaction.target
         if target.exists() and not transaction.overwrite:
-            return f"Error: target already exists and overwrite is false: {target}"
+            return ToolFailure(
+                code="target_exists",
+                message=f"Target already exists and overwrite is false: {target}",
+                retryable=False,
+                recovery_hint=(
+                    "The file appeared after this transaction began and was not modified. "
+                    "Abort this transaction, then begin a new one with overwrite=true or "
+                    "another path."
+                ),
+                details={"write_id": write_id, "path": str(target)},
+            )
         previous_text = ""
         target_existed = target.exists()
         if target_existed:
@@ -1904,7 +2135,16 @@ def register_file_tools(
             sibling_temp = None
             checkpoint_id = _finalize_checkpoint(checkpoint)
         except Exception as exc:
-            return f"Error committing file transaction: {exc}"
+            return ToolFailure(
+                code="transaction_commit_failed",
+                message=f"Could not commit file transaction: {exc}",
+                retryable=True,
+                recovery_hint=(
+                    "The target was not replaced and the transaction is still open. "
+                    "Check the target directory, then commit again or abort it."
+                ),
+                details={"write_id": write_id, "path": str(target)},
+            )
         finally:
             if sibling_temp is not None:
                 try:
@@ -1944,10 +2184,10 @@ def register_file_tools(
             "checkpoint_id": checkpoint_id,
         }, ensure_ascii=False)
 
-    async def _abort_file_write(write_id: str) -> str:
+    async def _abort_file_write(write_id: str) -> str | ToolFailure:
         transaction = transactions.pop(write_id, None)
         if transaction is None:
-            return f"Error: unknown or closed write_id: {write_id}"
+            return unknown_write_id(write_id)
         transaction.temp_path.unlink(missing_ok=True)
         transaction.manifest_path.unlink(missing_ok=True)
         audit_transaction("aborted", transaction, reason="tool_call")
@@ -1991,6 +2231,22 @@ def register_file_tools(
                     result = json.dumps(result_payload, ensure_ascii=False)
             return result
         except PatchError as exc:
+            if isinstance(exc, PatchFormatError):
+                recovery_hint = (
+                    "Correct the patch text and resend it; no file was changed. The first "
+                    "line is *** Begin Patch and the last is *** End Patch, with no "
+                    "indentation or code fence. Each file has one *** Update File:, "
+                    "*** Add File: or *** Delete File: section. In an Update File section "
+                    "every hunk starts with an @@ line and needs at least one context or "
+                    "removed line; each hunk line starts with +, - or one space, and a "
+                    "blank context line is a single space. Add File lines start with +."
+                )
+            else:
+                recovery_hint = (
+                    f"Use paths relative to workspace root {access.workspace}; then read the "
+                    "current target region and retry one smaller, complete patch with enough "
+                    "unique context."
+                )
             return ToolFailure(
                 code="patch_precondition_failed",
                 message=(
@@ -1998,11 +2254,7 @@ def register_file_tools(
                     f"Workspace root: {access.workspace}"
                 ),
                 retryable=True,
-                recovery_hint=(
-                    f"Use paths relative to workspace root {access.workspace}; then read the "
-                    "current target region and retry one smaller, complete patch with enough "
-                    "unique context."
-                ),
+                recovery_hint=recovery_hint,
                 details={
                     "dry_run": dry_run,
                     "workspace_root": str(access.workspace),
@@ -2019,9 +2271,14 @@ def register_file_tools(
     registry.register(ToolDef(
         name="read_file",
         description=(
-            "Read a UTF-8 regular file with bounded memory. Use line offset/limit for normal paging; "
-            "when metadata reports next_byte_offset (for example on a huge single line), continue "
-            "with byte_offset. Set include_metadata=true when a stable SHA-256 is needed."
+            "Read a UTF-8 regular file with bounded memory. A read returns up to limit lines "
+            f"(default {read_file_limits()[2]}) starting at line offset, or fewer when the page "
+            "size cap is reached. A result that is not the whole file begins with a "
+            "[File metadata: {...}] line: truncated=true means more of the file remains after "
+            "this page, and next_offset is the offset to pass for the next page. Use "
+            "byte_offset only when line_truncated=true, which means one line was too long and "
+            "was cut: byte_offset=next_byte_offset continues inside that line. "
+            "Set include_metadata=true when a stable SHA-256 is needed."
         ),
         parameters={
             "type": "object",
@@ -2031,22 +2288,35 @@ def register_file_tools(
                     "type": "integer",
                     "minimum": 0,
                     "default": 0,
-                    "description": "Zero-based starting line",
+                    "description": "Zero-based starting line; pass a previous next_offset to read the next page",
                 },
                 "limit": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Maximum lines to return",
+                    "description": (
+                        f"Maximum lines to return (default {read_file_limits()[2]}); "
+                        "it also applies to byte_offset reads"
+                    ),
                 },
                 "byte_offset": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "Raw byte cursor from a previous next_byte_offset; cannot be combined with non-zero offset",
+                    "description": (
+                        "Byte position from a previous next_byte_offset, for continuing a line "
+                        "that was cut (line_truncated=true). The read continues from there for "
+                        "up to limit lines, so limit=1 stops at the end of that line; line "
+                        "numbers are not reported. Cannot be combined with non-zero offset"
+                    ),
                 },
                 "include_metadata": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Include path, SHA-256, total lines, and truncation metadata",
+                    "description": (
+                        "Always include the metadata line and add the file's SHA-256. "
+                        "total_lines is then counted for any file; otherwise it may be null "
+                        "for a file larger than "
+                        f"{read_file_count_lines_max_bytes // (1024 * 1024)} MiB"
+                    ),
                 },
                 **approval_justification_schema(),
             },
@@ -2215,7 +2485,9 @@ def register_file_tools(
         description=(
             "Search an allowed host directory using a glob pattern. Common dependency, "
             "runtime-state, cache, and build directories are skipped by default; an explicit "
-            "search rooted inside one of those directories still works."
+            "search rooted inside one of those directories still works. Returns one path per "
+            "line, relative to the workspace root (absolute outside it), ready to pass to the "
+            "other file tools; at most 100 paths are listed."
         ),
         parameters={
             "type": "object",
@@ -2240,16 +2512,28 @@ def register_file_tools(
         name="search_text",
         description=(
             "Search file contents with a regex pattern inside an allowed directory. "
-            "Common dependency, runtime-state, cache, and build directories are skipped "
-            "by default. Use *glob* to filter by filename (e.g. \"*.py\") and "
-            "*max_results* to cap matches. Returns file:line: text for each hit."
+            "The regex is applied to each line separately, so it cannot match across lines. "
+            "Files larger than 1 MiB and binary files (a NUL byte in the first 8 KiB) are "
+            "skipped. Common dependency, runtime-state, cache, and build directories are skipped "
+            "by default. Use *glob* to filter files (e.g. \"*.py\" or \"src/**/*.py\") and "
+            "*max_results* to cap matches. Returns path:line: text for each hit; paths are "
+            "relative to the workspace root (absolute outside it), ready to pass to read_file."
         ),
         parameters={
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "description": "Regex pattern to search for in file contents"},
+                "pattern": {"type": "string", "description": "Regex pattern to search for in file contents; applied per line"},
                 "path": {"type": "string", "description": "Search directory (default: workspace root)", "default": "."},
-                "glob": {"type": "string", "description": "Filename glob filter (e.g. \"*.py\")", "default": "*"},
+                "glob": {
+                    "type": "string",
+                    "description": (
+                        "File filter. Without '/' it is matched against the file name at any "
+                        "depth (e.g. \"*.py\"); with '/' it is matched against the path relative "
+                        "to the search directory, where '**/' spans directories "
+                        "(e.g. \"src/**/*.py\")"
+                    ),
+                    "default": "*",
+                },
                 "max_results": {"type": "integer", "description": "Maximum total matches (default: 50)", "default": 50, "minimum": 1, "maximum": 200},
                 "include_ignored": {"type": "boolean", "description": "Include all ignored dependency, runtime-state, cache, and build paths, including .sandbox_*.", "default": False},
                 **approval_justification_schema(),
@@ -2315,7 +2599,11 @@ def register_file_tools(
                 },
                 "insert_line": {
                     "anyOf": [{"type": "integer"}, {"type": "null"}],
-                    "description": "Required for insert; omit or use null for other commands.",
+                    "description": (
+                        "Required for insert: new_str is inserted after this line number, "
+                        "as numbered by view; 0 inserts at the top of the file. "
+                        "Omit or use null for other commands."
+                    ),
                 },
                 "new_str": {
                     "anyOf": [{"type": "string"}, {"type": "null"}],
@@ -2353,26 +2641,31 @@ def register_file_tools(
             "Apply a validated multi-file patch. "
             f"Every path must be relative to workspace root {access.workspace}; absolute "
             "paths and '..' are rejected. Prefer this for existing code instead of resending "
-            "whole files.\\n\\n"
-            "=== FORMAT (not standard unified diff!) ===\\n"
-            "The document must use `*** Begin Patch` / `*** End Patch` delimiters.\\n"
-            "Supported directives (replace the unified-diff ---/+++ headers):\\n"
-            "  `*** Update File: <relpath>` — modify existing file with hunks\\n"
-            "  `*** Add File: <relpath>` — create new file (lines prefixed with +)\\n"
-            "  `*** Delete File: <relpath>` — remove file\\n"
-            "\\n"
-            "Hunks use standard @@ lines. Prefix: + (add), - (remove), space (context).\\n"
-            "Do NOT include --- a/ or +++ b/ unified-diff headers.\\n"
-            "\\n"
-            "Example:\\n"
-            "  *** Begin Patch\\n"
-            "  *** Update File: src/main.py\\n"
-            "  @@ -10,3 +10,4 @@\\n"
-            "   def hello():\\n"
-            "  -    print(\\\"old\\\")\\n"
-            "  +    print(\\\"new\\\")\\n"
-            "  +    print(\\\"extra\\\")\\n"
-            "  *** End Patch"
+            "whole files.\n\n"
+            "Format (not standard unified diff):\n"
+            "The first line is `*** Begin Patch` and the last line is `*** End Patch`. "
+            "Write every line of the patch without extra indentation.\n"
+            "Each file has one section that starts with a directive line (these replace the "
+            "unified-diff ---/+++ headers):\n"
+            "`*** Update File: <relpath>` modifies an existing file with hunks\n"
+            "`*** Add File: <relpath>` creates a new file; every content line is prefixed with +\n"
+            "`*** Delete File: <relpath>` removes a file; no content lines\n"
+            "\n"
+            "Each hunk starts with a line beginning with @@. Line numbers after @@ are "
+            "ignored: a hunk is located by its context and removed lines, which together "
+            "must match exactly one place in the file. Hunk line prefixes: + (add), "
+            "- (remove), one space (context); a blank context line is a single space.\n"
+            "Do not include --- a/ or +++ b/ unified-diff headers.\n"
+            "\n"
+            "Example:\n"
+            "*** Begin Patch\n"
+            "*** Update File: src/main.py\n"
+            "@@\n"
+            " def hello():\n"
+            "-    print(\"old\")\n"
+            "+    print(\"new\")\n"
+            "+    print(\"extra\")\n"
+            "*** End Patch"
         ),
         parameters={
             "type": "object",
@@ -2380,15 +2673,16 @@ def register_file_tools(
                 "patch": {
                     "type": "string",
                     "description": (
-                        "Complete *** Begin Patch ... *** End Patch document.\\n"
-                        f"Paths relative to {access.workspace}\\n"
-                        "\\n"
-                        "Directives:\\n"
-                        "  *** Update File: <relpath> — hunks (standard @@ lines, no ---/+++ headers)\\n"
-                        "  *** Add File: <relpath> — lines prefixed with +\\n"
-                        "  *** Delete File: <relpath> — no content needed\\n"
-                        "\\n"
-                        "See tool description for a full example."
+                        "Complete patch text, from the line *** Begin Patch to the line "
+                        "*** End Patch.\n"
+                        f"Paths are relative to {access.workspace}\n"
+                        "\n"
+                        "Directives:\n"
+                        "*** Update File: <relpath>, then hunks (each starts with @@; no ---/+++ headers)\n"
+                        "*** Add File: <relpath>, then lines prefixed with +\n"
+                        "*** Delete File: <relpath>, no content needed\n"
+                        "\n"
+                        "See the tool description for a full example."
                     ),
                 },
                 "dry_run": {

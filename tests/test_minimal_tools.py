@@ -80,6 +80,96 @@ def test_str_replace_editor_exposes_dsh_schema_and_file_commands(tmp_path: Path)
     assert target.read_text(encoding="utf-8") == "one\nbetween\nTWO\n"
 
 
+def test_str_replace_editor_create_refusal_names_only_editor_commands(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    register_file_tools(registry, str(tmp_path))
+    target = tmp_path / "existing.txt"
+    target.write_text("keep\n", encoding="utf-8")
+
+    refused = run(registry.execute("str_replace_editor", {
+        "command": "create",
+        "path": str(target),
+        "file_text": "replacement\n",
+    }))
+
+    assert refused["code"] == "existing_file_requires_edit"
+    assert refused["output"] == ""
+    assert target.read_text(encoding="utf-8") == "keep\n"
+    guidance = refused["error"] + " " + refused["recovery_hint"]
+    assert "str_replace" in guidance and "insert" in guidance
+    # Minimal Mode has no other file tool to fall back on.
+    other_file_tools = set(registry.tool_names) - {"str_replace_editor"}
+    assert {"write_file", "edit_file", "apply_patch"} <= other_file_tools
+    assert not [name for name in other_file_tools if name in guidance]
+
+
+def test_str_replace_editor_insert_line_text_matches_where_the_text_lands(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    register_file_tools(registry, str(tmp_path))
+    schema = registry.to_openai_tools(names={"str_replace_editor"})[0]["function"]
+    described = schema["parameters"]["properties"]["insert_line"]["description"]
+    assert "after this line" in described
+    assert "0 inserts at the top" in described
+
+    target = tmp_path / "lines.txt"
+    target.write_text("one\ntwo\n", encoding="utf-8")
+    for insert_line, text in ((0, "top"), (2, "after-one")):
+        result = run(registry.execute("str_replace_editor", {
+            "command": "insert",
+            "path": str(target),
+            "insert_line": insert_line,
+            "new_str": text,
+        }))
+        assert "edited successfully" in result["output"]
+    assert target.read_text(encoding="utf-8") == "top\none\nafter-one\ntwo\n"
+
+
+def test_str_replace_editor_str_replace_writes_a_trailing_whitespace_match(tmp_path: Path) -> None:
+    registry = ToolRegistry()
+    register_file_tools(registry, str(tmp_path))
+    target = tmp_path / "drift.txt"
+    target.write_bytes(b"alpha  \nbeta\n")
+
+    replaced = run(registry.execute("str_replace_editor", {
+        "command": "str_replace",
+        "path": str(target),
+        "old_str": "alpha\nbeta",
+        "new_str": "ALPHA\nbeta",
+    }))
+
+    assert "edited successfully" in replaced["output"]
+    assert target.read_bytes() == b"ALPHA\nbeta\n"
+
+
+def test_str_replace_editor_marks_only_clipped_views_partial(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("MINIMAL_EDITOR_MAX_OUTPUT_CHARS", "400")
+    registry = ToolRegistry()
+    register_file_tools(registry, str(tmp_path))
+    target = tmp_path / "long.txt"
+    target.write_text("".join(f"row {index}\n" for index in range(200)), encoding="utf-8")
+    for index in range(40):
+        (tmp_path / f"file-{index:02d}.txt").write_text("", encoding="utf-8")
+
+    clipped_file = run(registry.execute("str_replace_editor", {
+        "command": "view", "path": str(target),
+    }))
+    assert "<response clipped>" in clipped_file["output"]
+    assert clipped_file["partial"] is True
+
+    ranged = run(registry.execute("str_replace_editor", {
+        "command": "view", "path": str(target), "view_range": [1, 3],
+    }))
+    assert "<response clipped>" not in ranged["output"]
+    assert "     3  row 2" in ranged["output"]
+    assert not ranged.get("partial")
+
+    clipped_directory = run(registry.execute("str_replace_editor", {
+        "command": "view", "path": str(tmp_path),
+    }))
+    assert "<response clipped>" in clipped_directory["output"]
+    assert clipped_directory["partial"] is True
+
+
 class _WslSidecar:
     workdir = "."
     current = object()

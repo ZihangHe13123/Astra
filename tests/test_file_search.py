@@ -71,7 +71,9 @@ def test_search_files_skips_noise_but_allows_explicit_search(tmp_path):
         )
     )
     assert explicit["error"] == ""
-    assert explicit["output"] == "hidden.py"
+    # Printed relative to the workspace root, so it can be passed to read_file.
+    assert explicit["output"] == os.path.join(".astra", "hidden.py")
+    assert run(registry.execute("read_file", {"path": explicit["output"]}))["error"] == ""
 
 
 def test_search_files_can_include_ignored_directories(tmp_path):
@@ -145,3 +147,43 @@ def test_search_files_no_match_no_suggestion_when_unrelated(tmp_path):
     assert result["error"] == ""
     assert "No files matching" in result["output"]
     assert "Did you mean" not in result["output"]
+
+
+def test_search_files_paths_under_a_subdirectory_can_be_passed_back(tmp_path):
+    (tmp_path / "pkg" / "sub").mkdir(parents=True)
+    (tmp_path / "pkg" / "sub" / "m.py").write_text("value = 1\n", encoding="utf-8")
+
+    registry = ToolRegistry()
+    register_file_tools(registry, str(tmp_path))
+
+    result = run(registry.execute("search_files", {"pattern": "*.py", "path": "pkg"}))
+    assert result["error"] == ""
+    assert result["output"] == os.path.join("pkg", "sub", "m.py")
+    assert not result.get("partial")
+    read = run(registry.execute("read_file", {"path": result["output"]}))
+    assert read["output"] == "value = 1\n"
+
+    (tmp_path / "pkg" / "sub" / "configure.py").write_text("", encoding="utf-8")
+    near_miss = run(registry.execute("search_files", {"pattern": "configre.py", "path": "pkg"}))
+    suggested = [line[2:] for line in near_miss["output"].split("\n") if line.startswith("- ")]
+    assert suggested == [os.path.join("pkg", "sub", "configure.py")]
+    assert run(registry.execute("read_file", {"path": suggested[0]}))["error"] == ""
+
+
+def test_search_files_marks_a_capped_listing_partial(tmp_path):
+    for index in range(103):
+        (tmp_path / f"f{index:03d}.txt").write_text("", encoding="utf-8")
+
+    registry = ToolRegistry()
+    register_file_tools(registry, str(tmp_path))
+
+    capped = run(registry.execute("search_files", {"pattern": "*.txt"}))
+    assert capped["error"] == ""
+    lines = capped["output"].split("\n")
+    assert lines[:100] == [f"f{index:03d}.txt" for index in range(100)]
+    assert "3 more" in lines[100]
+    assert capped["partial"] is True
+
+    complete = run(registry.execute("search_files", {"pattern": "f00*.txt"}))
+    assert complete["output"].split("\n") == [f"f{index:03d}.txt" for index in range(10)]
+    assert not complete.get("partial")

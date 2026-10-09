@@ -5257,6 +5257,25 @@ def test_write_file_verifies_persisted_content(tmp_path):
     run(scenario())
 
 
+@pytest.mark.parametrize("content", ["a\r\nb\r\n", "a\rb\r", "mixed\r\nlines\nhere\r"])
+def test_write_file_verifies_carriage_returns_byte_for_byte(tmp_path, content):
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "endings.txt"
+
+        result = await registry.execute(
+            "write_file",
+            {"path": str(target), "content": content},
+        )
+
+        assert result["error"] == ""
+        assert result["verified"] is True
+        assert target.read_bytes() == content.encode("utf-8")
+
+    run(scenario())
+
+
 def test_transactional_file_write_commits_complete_content_atomically(tmp_path):
     async def scenario():
         registry = ToolRegistry()
@@ -5343,6 +5362,71 @@ def test_transactional_file_write_rejects_bad_sequence_and_hash_without_target(t
         assert aborted["error"] == ""
         assert json.loads(aborted["output"])["status"] == "aborted"
         assert not target.exists()
+
+    run(scenario())
+
+
+def test_transactional_file_write_failures_carry_a_code_and_recovery(tmp_path):
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        existing = tmp_path / "existing.txt"
+        existing.write_text("keep", encoding="utf-8")
+
+        refused = await registry.execute("begin_file_write", {"path": str(existing)})
+        assert refused["code"] == "target_exists"
+        assert refused["output"] == ""
+        assert "overwrite=true" in refused["recovery_hint"]
+        assert refused["details"]["path"] == str(existing)
+
+        negative = await registry.execute(
+            "begin_file_write",
+            {"path": str(tmp_path / "sized.txt"), "expected_size": -1},
+        )
+        assert negative["code"] == "invalid_arguments"
+        assert negative["recovery_hint"]
+
+        target = tmp_path / "ordered.txt"
+        started = await registry.execute("begin_file_write", {"path": str(target)})
+        write_id = json.loads(started["output"])["write_id"]
+
+        out_of_order = await registry.execute(
+            "write_file_chunk",
+            {"write_id": write_id, "sequence": 2, "content": "late"},
+        )
+        assert out_of_order["code"] == "chunk_out_of_order"
+        assert out_of_order["retryable"] is True
+        assert out_of_order["details"]["expected_sequence"] == 0
+        assert out_of_order["details"]["received_sequence"] == 2
+        assert "sequence 0" in out_of_order["recovery_hint"]
+
+        # The refused chunk was not written, so the stated sequence is accepted.
+        accepted = await registry.execute(
+            "write_file_chunk",
+            {"write_id": write_id, "sequence": 0, "content": "first"},
+        )
+        assert accepted["error"] == ""
+
+        # The target appears while the transaction is open.
+        target.write_text("someone else", encoding="utf-8")
+        blocked = await registry.execute("commit_file_write", {"write_id": write_id})
+        assert blocked["code"] == "target_exists"
+        assert blocked["recovery_hint"]
+        assert target.read_text(encoding="utf-8") == "someone else"
+
+        aborted = await registry.execute("abort_file_write", {"write_id": write_id})
+        assert aborted["error"] == ""
+
+        for tool, arguments in (
+            ("write_file_chunk", {"write_id": write_id, "sequence": 1, "content": "x"}),
+            ("commit_file_write", {"write_id": write_id}),
+            ("abort_file_write", {"write_id": write_id}),
+        ):
+            closed = await registry.execute(tool, arguments)
+            assert closed["code"] == "unknown_write_id", tool
+            assert closed["retryable"] is False
+            assert "begin_file_write" in closed["recovery_hint"]
+            assert closed["details"]["write_id"] == write_id
 
     run(scenario())
 
@@ -5467,6 +5551,106 @@ def test_edit_file_preserves_utf8_bom_and_crlf_and_checks_version(tmp_path):
         )
         assert stale["code"] == "file_changed"
         assert b"delta" not in target.read_bytes()
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    "original,old,new,expected,removed,added",
+    [
+        # old stops before the line break: the last line keeps its own ending.
+        (
+            b"def f():  \n    return 1\t\nprint(f())\n",
+            "def f():\n    return 1",
+            "def f():\n    return 2",
+            b"def f():\n    return 2\t\nprint(f())\n",
+            "def f():  \n    return 1",
+            "def f():\n    return 2",
+        ),
+        # old ends with a line break: whole lines are replaced, nothing after them.
+        (
+            b"alpha  \nbeta\ngamma\n",
+            "alpha\nbeta\n",
+            "ALPHA\nBETA\n",
+            b"ALPHA\nBETA\ngamma\n",
+            "alpha  \nbeta\n",
+            "ALPHA\nBETA\n",
+        ),
+        # CRLF file, LF arguments.
+        (
+            b"alpha  \r\nbeta\r\ngamma\r\n",
+            "alpha\nbeta",
+            "ALPHA\nBETA\nextra",
+            b"ALPHA\r\nBETA\r\nextra\r\ngamma\r\n",
+            "alpha  \r\nbeta",
+            "ALPHA\r\nBETA\r\nextra",
+        ),
+        # CRLF file, CRLF arguments: line endings are not doubled.
+        (
+            b"alpha  \r\nbeta\r\ngamma\r\n",
+            "alpha\r\nbeta\r\n",
+            "ALPHA\r\nBETA\r\n",
+            b"ALPHA\r\nBETA\r\ngamma\r\n",
+            "alpha  \r\nbeta\r\n",
+            "ALPHA\r\nBETA\r\n",
+        ),
+        # LF file, CRLF arguments.
+        (
+            b"alpha  \nbeta\ngamma\n",
+            "alpha\r\nbeta",
+            "ALPHA\r\nBETA",
+            b"ALPHA\nBETA\ngamma\n",
+            "alpha  \nbeta",
+            "ALPHA\nBETA",
+        ),
+    ],
+)
+def test_edit_file_writes_the_trailing_whitespace_tolerant_match(
+    tmp_path, original, old, new, expected, removed, added
+):
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "drift.txt"
+        target.write_bytes(original)
+
+        result = await registry.execute(
+            "edit_file",
+            {"path": str(target), "old": old, "new": new},
+        )
+
+        assert result["error"] == ""
+        metadata = json.loads(result["output"])
+        landed = target.read_bytes()
+        assert landed == expected
+        assert metadata["replacements"] == 1
+        assert metadata["before_sha256"] == hashlib.sha256(original).hexdigest()
+        assert metadata["after_sha256"] == hashlib.sha256(landed).hexdigest()
+        assert metadata["before_sha256"] != metadata["after_sha256"]
+        # The counts describe the text really removed from and written to the file.
+        assert metadata["removed_chars"] == len(removed)
+        assert metadata["added_chars"] == len(added)
+        assert original.replace(removed.encode("utf-8"), added.encode("utf-8"), 1) == landed
+
+    run(scenario())
+
+
+def test_edit_file_rejects_an_ambiguous_trailing_whitespace_match(tmp_path):
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "twice.txt"
+        original = b"x = 1  \ny = 2\n\nx = 1\t\ny = 2\n"
+        target.write_bytes(original)
+
+        result = await registry.execute(
+            "edit_file",
+            {"path": str(target), "old": "x = 1\ny = 2", "new": "x = 3\ny = 2"},
+        )
+
+        assert result["code"] == "edit_match_ambiguous"
+        assert result["details"]["matches"] == 2
+        assert target.read_bytes() == original
 
     run(scenario())
 
@@ -5618,6 +5802,175 @@ def test_read_file_streams_huge_lines_with_a_bounded_byte_cursor(tmp_path, monke
         )
         assert continued["error"] == ""
         assert continued["output"].endswith("a" * 1024)
+
+    run(scenario())
+
+
+def _read_file_page(result: dict) -> tuple[dict, str]:
+    assert result["error"] == ""
+    header, payload = result["output"].split("\n", 1)
+    return json.loads(header.removeprefix("[File metadata: ").removesuffix("]")), payload
+
+
+def test_read_file_line_paging_reports_what_remains_after_each_page(tmp_path):
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "paged.txt"
+        text = "".join(f"line{index}\n" for index in range(10))
+        target.write_text(text, encoding="utf-8")
+
+        pages = []
+        offset = 0
+        while offset is not None:
+            result = await registry.execute(
+                "read_file",
+                {"path": str(target), "offset": offset, "limit": 4},
+            )
+            metadata, payload = _read_file_page(result)
+            pages.append(payload)
+            # Line paging never hands out a byte cursor, and the file size in
+            # lines is known from the first page on.
+            assert metadata["next_byte_offset"] is None
+            assert metadata["line_truncated"] is False
+            assert metadata["total_lines"] == 10
+            assert metadata["truncated"] is (metadata["next_offset"] is not None)
+            assert bool(result.get("partial")) is metadata["truncated"]
+            offset = metadata["next_offset"]
+
+        assert pages == ["".join(f"line{index}\n" for index in range(start, min(start + 4, 10)))
+                         for start in (0, 4, 8)]
+        assert metadata["line_start"] == 9
+        assert metadata["line_end"] == 10
+
+        whole = await registry.execute("read_file", {"path": str(target)})
+        assert whole["output"] == text
+        assert not whole.get("partial")
+
+    run(scenario())
+
+
+def test_read_file_states_the_default_line_limit_it_applies(tmp_path, monkeypatch):
+    monkeypatch.setenv("READ_FILE_DEFAULT_LINES", "3")
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "default.txt"
+        target.write_text("".join(f"{index}\n" for index in range(8)), encoding="utf-8")
+
+        metadata, payload = _read_file_page(
+            await registry.execute("read_file", {"path": str(target)})
+        )
+        assert payload == "0\n1\n2\n"
+        assert metadata["next_offset"] == 3
+
+        schema = registry.to_openai_tools(names={"read_file"})[0]["function"]
+        assert "default 3" in schema["description"]
+        assert "default 3" in schema["parameters"]["properties"]["limit"]["description"]
+
+    run(scenario())
+
+
+def test_read_file_page_size_cap_ends_the_page_between_lines(tmp_path, monkeypatch):
+    monkeypatch.setenv("READ_FILE_MAX_PAGE_BYTES", "1024")
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "wide.txt"
+        text = "".join(f"{index}" * 299 + "\n" for index in range(7))
+        target.write_text(text, encoding="utf-8")
+
+        pages = []
+        offset = 0
+        while offset is not None:
+            metadata, payload = _read_file_page(
+                await registry.execute("read_file", {"path": str(target), "offset": offset})
+            )
+            # An ordinary line is never split, so no byte cursor is needed.
+            assert payload.endswith("\n")
+            assert metadata["line_truncated"] is False
+            assert metadata["next_byte_offset"] is None
+            pages.append(payload)
+            offset = metadata["next_offset"]
+
+        assert len(pages) > 1
+        assert "".join(pages) == text
+
+    run(scenario())
+
+
+def test_read_file_byte_offset_finishes_a_cut_line_and_honours_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("READ_FILE_MAX_PAGE_BYTES", "1024")
+    monkeypatch.setenv("READ_FILE_MAX_LINE_BYTES", "1024")
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "long-line.txt"
+        target.write_text("a" * 1500 + "\nsecond\nthird\n", encoding="utf-8")
+
+        first = await registry.execute("read_file", {"path": str(target)})
+        metadata, payload = _read_file_page(first)
+        assert payload == "a" * 1024
+        assert metadata["line_truncated"] is True
+        assert metadata["truncated"] is True
+        assert metadata["next_byte_offset"] == 1024
+        # The line after the cut one is where line paging resumes.
+        assert metadata["next_offset"] == 1
+        assert first["partial"] is True
+
+        rest = await registry.execute(
+            "read_file",
+            {"path": str(target), "byte_offset": metadata["next_byte_offset"], "limit": 1},
+        )
+        rest_metadata, rest_payload = _read_file_page(rest)
+        assert rest_payload == "a" * 476 + "\n"
+        assert rest_metadata["line_truncated"] is False
+        assert rest_metadata["truncated"] is True
+        assert rest_metadata["next_byte_offset"] == 1501
+        assert rest["partial"] is True
+
+        resumed = await registry.execute(
+            "read_file",
+            {"path": str(target), "offset": metadata["next_offset"]},
+        )
+        resumed_metadata, resumed_payload = _read_file_page(resumed)
+        assert resumed_payload == "second\nthird\n"
+        assert resumed_metadata["truncated"] is False
+        assert resumed_metadata["next_offset"] is None
+        assert not resumed.get("partial")
+
+    run(scenario())
+
+
+def test_read_file_cuts_an_over_long_multibyte_line_between_characters(tmp_path, monkeypatch):
+    monkeypatch.setenv("READ_FILE_MAX_PAGE_BYTES", "1024")
+    monkeypatch.setenv("READ_FILE_MAX_LINE_BYTES", "1024")
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "wide-characters.txt"
+        text = "中" * 1000 + "\n"
+        target.write_text(text, encoding="utf-8")
+
+        metadata, payload = _read_file_page(
+            await registry.execute("read_file", {"path": str(target)})
+        )
+        assert metadata["line_truncated"] is True
+        assert payload == "中" * 341
+        assert metadata["next_byte_offset"] == 341 * 3
+
+        pieces = [payload]
+        while metadata["truncated"]:
+            metadata, payload = _read_file_page(await registry.execute(
+                "read_file",
+                {"path": str(target), "byte_offset": metadata["next_byte_offset"]},
+            ))
+            pieces.append(payload)
+        assert "".join(pieces) == text
 
     run(scenario())
 
@@ -5963,6 +6316,79 @@ def test_apply_patch_rejects_standard_unified_diff_without_side_effects(tmp_path
 
         assert "not standard unified diff" in result["error"]
         assert target.read_text(encoding="utf-8") == "before\n"
+
+    run(scenario())
+
+
+def test_apply_patch_accepts_the_example_from_its_own_description(tmp_path):
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        schema = registry.to_openai_tools(names={"apply_patch"})[0]["function"]
+        description = schema["description"]
+        patch_text = schema["parameters"]["properties"]["patch"]["description"]
+        # The model reads these strings as written: no escaped newlines or quotes.
+        workspace = str(registry.filesystem_policy.workspace)
+        for text in (description, patch_text):
+            assert workspace in text
+            assert "\\" not in text.replace(workspace, "")
+
+        example = description.split("Example:\n", 1)[1]
+        target = tmp_path / "src" / "main.py"
+        target.parent.mkdir()
+        target.write_text('def hello():\n    print("old")\n', encoding="utf-8")
+
+        result = await registry.execute("apply_patch", {"patch": example})
+
+        assert result["error"] == ""
+        assert json.loads(result["output"])["status"] == "applied"
+        assert target.read_text(encoding="utf-8") == (
+            'def hello():\n    print("new")\n    print("extra")\n'
+        )
+
+    run(scenario())
+
+
+def test_apply_patch_format_error_gets_a_format_hint(tmp_path):
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "notes.txt"
+        target.write_text("alpha\n\nbeta\n", encoding="utf-8")
+        # The blank context line is missing its leading space.
+        malformed = "\n".join([
+            "*** Begin Patch",
+            "*** Update File: notes.txt",
+            "@@",
+            " alpha",
+            "",
+            "-beta",
+            "+gamma",
+            "*** End Patch",
+        ])
+
+        result = await registry.execute("apply_patch", {"patch": malformed})
+
+        assert result["code"] == "patch_precondition_failed"
+        assert "invalid hunk line" in result["error"]
+        assert "blank context line is a single space" in result["recovery_hint"]
+        assert "unique context" not in result["recovery_hint"]
+        assert target.read_text(encoding="utf-8") == "alpha\n\nbeta\n"
+
+        # A well-formed patch that does not match still gets the context hint.
+        stale = malformed.replace("\n\n-beta", "\n \n-stale")
+        mismatch = await registry.execute("apply_patch", {"patch": stale})
+        assert "did not match" in mismatch["error"]
+        assert "unique context" in mismatch["recovery_hint"]
+        assert "single space" not in mismatch["recovery_hint"]
+
+        # With the leading space restored the same patch applies.
+        fixed = await registry.execute(
+            "apply_patch",
+            {"patch": malformed.replace("\n\n-beta", "\n \n-beta")},
+        )
+        assert fixed["error"] == ""
+        assert target.read_text(encoding="utf-8") == "alpha\n\ngamma\n"
 
     run(scenario())
 

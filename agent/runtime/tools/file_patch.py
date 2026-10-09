@@ -16,6 +16,10 @@ class PatchError(ValueError):
     pass
 
 
+class PatchFormatError(PatchError):
+    """The patch text itself is malformed; no file was consulted."""
+
+
 @dataclass(frozen=True)
 class PatchHunk:
     lines: tuple[str, ...]
@@ -47,7 +51,7 @@ def _normalize_patch_format(patch: str) -> str:
     """
     if patch.startswith("*** Begin Patch"):
         return patch
-    raise PatchError(
+    raise PatchFormatError(
         "apply_patch accepts the Codex-style '*** Begin Patch' protocol, "
         "not standard unified diff; convert ---/+++ headers to "
         "*** Add File, *** Update File, or *** Delete File directives"
@@ -58,11 +62,11 @@ def parse_patch(patch: str) -> list[PatchOperation]:
     patch = _normalize_patch_format(patch)
     lines = patch.replace("\r\n", "\n").split("\n")
     if not lines or lines[0] != "*** Begin Patch":
-        raise PatchError("patch must start with '*** Begin Patch'")
+        raise PatchFormatError("patch must start with '*** Begin Patch'")
     if lines[-1] == "":
         lines.pop()
     if not lines or lines[-1] != "*** End Patch":
-        raise PatchError("patch must end with '*** End Patch'")
+        raise PatchFormatError("patch must end with '*** End Patch'")
 
     operations: list[PatchOperation] = []
     index = 1
@@ -75,7 +79,7 @@ def parse_patch(patch: str) -> list[PatchOperation]:
             while index < len(lines) - 1 and not lines[index].startswith("*** "):
                 line = lines[index]
                 if not line.startswith("+"):
-                    raise PatchError(f"add-file lines must start with '+': {path}")
+                    raise PatchFormatError(f"add-file lines must start with '+': {path}")
                 added.append(line[1:])
                 index += 1
             operations.append(PatchOperation("add", path, "\n".join(added) + "\n"))
@@ -99,26 +103,26 @@ def parse_patch(patch: str) -> list[PatchOperation]:
                 elif line == r"\ No newline at end of file":
                     pass
                 elif current is None:
-                    raise PatchError(f"update-file content must start with '@@': {path}")
+                    raise PatchFormatError(f"update-file content must start with '@@': {path}")
                 elif line[:1] in {" ", "+", "-"}:
                     current.append(line)
                 else:
-                    raise PatchError(f"invalid hunk line for {path}: {line}")
+                    raise PatchFormatError(f"invalid hunk line for {path}: {line}")
                 index += 1
             if current is not None:
                 hunks.append(PatchHunk(tuple(current)))
             if not hunks:
-                raise PatchError(f"update file has no hunks: {path}")
+                raise PatchFormatError(f"update file has no hunks: {path}")
             operations.append(PatchOperation("update", path, hunks=tuple(hunks)))
             continue
 
-        raise PatchError(f"unknown patch directive: {header}")
+        raise PatchFormatError(f"unknown patch directive: {header}")
 
     if not operations:
-        raise PatchError("patch contains no operations")
+        raise PatchFormatError("patch contains no operations")
     paths = [operation.path for operation in operations]
     if len(paths) != len(set(paths)):
-        raise PatchError("each path may appear only once per patch")
+        raise PatchFormatError("each path may appear only once per patch")
     return operations
 
 
@@ -199,7 +203,7 @@ def _apply_hunks(path: Path, content: str, hunks: tuple[PatchHunk, ...]) -> str:
         old_block = "\n".join(old_lines)
         new_block = "\n".join(new_lines)
         if not old_block:
-            raise PatchError(f"hunk {number} has no context or removed text: {path}")
+            raise PatchFormatError(f"hunk {number} has no context or removed text: {path}")
         updated = _find_and_replace(updated, old_block, new_block, number)
     return updated
 
