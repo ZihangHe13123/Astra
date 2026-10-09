@@ -3055,6 +3055,70 @@ async def _main(startup_started: float):
             _send({"type": "done"})
 
 
+    async def _undo_or_retry_command(c: str) -> None:
+        """/undo, /retry: remove the last reply or exchanges, or take back the last request and send it again."""
+        command_name = "retry" if c == "/retry" else "undo"
+        if _reply_done and active_task is not None:
+            with suppress(asyncio.CancelledError, Exception):
+                await active_task
+        if active_task is not None and not active_task.done():
+            _send({"type": "tool_result", "name": command_name, "output": "", "error": "Finish or cancel the current reply before editing history.", "code": ""})
+            if _reply_done:
+                _send({"type": "done"})
+            return
+        resend_text = ""
+        refresh_history = False
+        if command_name == "retry":
+            ok, message, retry_text = conversation_edits.take_last_request(agent.context)
+            if ok:
+                refresh_history = True
+                snippet = retry_text if len(retry_text) <= 40 else f"{retry_text[:40]}…"
+                output, error = f'Retrying the last request: "{snippet}"', ""
+                resend_text = retry_text
+            else:
+                output, error = "", message
+        elif c == "/undo":
+            ok, message = conversation_edits.undo_last_reply(agent.context)
+            if ok:
+                refresh_history = True
+                output, error = message, ""
+            else:
+                output, error = "", message
+        else:
+            count_text = c[len("/undo "):].strip()
+            try:
+                count = int(count_text)
+            except ValueError:
+                count = 0
+            if 1 <= count <= 50:
+                ok, message = conversation_edits.undo_last_exchanges(agent.context, count)
+                if ok:
+                    refresh_history = True
+                    output, error = message, ""
+                else:
+                    output, error = "", message
+            else:
+                output, error = "", "Usage: /undo [count] · count must be an integer between 1 and 50."
+        if refresh_history:
+            await _send_history()
+            if minimal_mode.active:
+                _send_minimal_session_list()
+            elif local_mode.active:
+                _send_local_mode_info()
+            else:
+                _send_session_info()
+                _send_session_list()
+        _send({"type": "tool_result", "name": command_name, "output": output, "error": error, "code": ""})
+        if resend_text:
+            retry_msg = Msg(sender="user", role="user", content=build_user_message_content(resend_text))
+            launched = await _launch_message(retry_msg, resend_text)
+            if not launched:
+                _send({"type": "tool_result", "name": "retry", "output": "", "error": "Retry could not start; resend the request manually.", "code": ""})
+                _send({"type": "done"})
+        else:
+            _send({"type": "done"})
+
+
     async def _goal_command(c: str) -> None:
         """/goal: show, set, pause, resume or clear the session goal."""
         goal_start_text = ""
@@ -3109,6 +3173,277 @@ async def _main(startup_started: float):
             goal_msg = Msg(sender="user", role="user", content=build_user_message_content(goal_start_text))
             goal_msg.metadata["goal_round"] = True
             await _launch_message(goal_msg, goal_start_text)
+
+
+    async def _cancel_command(c: str) -> None:
+        """/cancel: stop a skill review, the reply being spoken, the running task, or a stored task by id."""
+        target_id = c.split(maxsplit=1)[1].strip() if " " in c else active_task_id
+        was_speaking = c == "/cancel" and voice.speaking
+        if was_speaking:
+            voice.stop()
+        if c == "/cancel" and any(not task.done() for task in manual_reviews):
+            await _cancel_manual_reviews()
+            output, error = "Skill review cancelled.", ""
+        elif was_speaking and (active_task is None or active_task.done() or _reply_done):
+            # The reply itself is complete; only its audio was still running.
+            output, error, target_id = "Stopped speaking.", "", ""
+        elif not target_id:
+            output, error = "", "No active task. Usage: /cancel [task-id]"
+        elif active_task is not None and not active_task.done() and target_id == active_task_id:
+            question_broker.close("The task was cancelled.")
+            active_task.cancel()
+            # The owning turn records cancellation during cleanup.
+            # Keep this command free to accept the next live control
+            # even while a previous task-store write is settling.
+            output, error = f"Cancellation requested for task {target_id}.", ""
+        elif task_store is None:
+            output, error = "", "Task persistence is disabled; see backend logs."
+        else:
+            task = await durable_io(task_store.get_task, target_id)
+            if task is None:
+                output, error = "", f"Unknown task: {target_id}"
+            elif task["status"] in {"completed", "failed", "cancelled"}:
+                output, error = "", f"Task {target_id} is already {task['status']}."
+            else:
+                await durable_io(task_store.request_cancel, target_id)
+                await durable_io(task_store.finish_run, target_id, "cancelled", "Cancelled while not active")
+                output, error = f"Task {target_id} marked cancelled.", ""
+        _send({"type": "tool_result", "name": "cancel", "output": output, "error": error, "code": ""})
+        if not (active_task is not None and not active_task.done() and target_id == active_task_id):
+            _send({"type": "done"})
+
+
+    async def _resume_command(c: str) -> None:
+        """/resume: continue a stored task of this session from its checkpoint."""
+        parts = c.split(maxsplit=1)
+        if len(parts) < 2:
+            _send({"type": "tool_result", "name": "resume", "output": "", "error": "Usage: /resume <task-id>", "code": ""})
+            _send({"type": "done"})
+        elif task_store is None:
+            _send({"type": "tool_result", "name": "resume", "output": "", "error": "Task persistence is disabled; see backend logs.", "code": ""})
+            _send({"type": "done"})
+        elif active_task is not None and not active_task.done():
+            _send({"type": "tool_result", "name": "resume", "output": "", "error": f"Task {active_task_id} is still running.", "code": ""})
+            _send({"type": "done"})
+        else:
+            task_id = parts[1].strip()
+            task = await durable_io(task_store.get_task, task_id)
+            current_session = agent.context.session_scope
+            if task is None:
+                _send({"type": "tool_result", "name": "resume", "output": "", "error": f"Unknown task: {task_id}", "code": ""})
+                _send({"type": "done"})
+            elif task.get("session_id") and task["session_id"] != current_session:
+                _send({"type": "tool_result", "name": "resume", "output": "", "error": f"Task belongs to session '{task['session_id']}'. Switch to it before resuming.", "code": ""})
+                _send({"type": "done"})
+            else:
+                try:
+                    resumed = await durable_io(task_store.prepare_resume, task_id)
+                    from agent.runtime.task_resume import resume_prompt
+                    prompt = resume_prompt(resumed)
+                    msg = Msg(sender="user", role="user", content=build_user_message_content(prompt))
+                    msg.metadata["request_id"] = resumed["request_id"]
+                    _send({"type": "tool_result", "name": "resume", "output": f"Resuming task {task_id} from checkpoint.", "error": "", "code": ""})
+                    await _launch_message(msg, resumed["input_text"], resume_task=resumed)
+                except (KeyError, ValueError) as exc:
+                    _send({"type": "tool_result", "name": "resume", "output": "", "error": str(exc), "code": ""})
+                    _send({"type": "done"})
+
+
+    async def _maintenance_command(c: str) -> None:
+        """/maintenance: preview or apply the cleanup of generated files, or checkpoint the databases."""
+        try:
+            maintenance_parts = shlex.split(c)[1:]
+            maintenance_action = maintenance_parts[0].lower() if maintenance_parts else "preview"
+            maintenance_days = int(maintenance_parts[1]) if len(maintenance_parts) > 1 else 30
+            if len(maintenance_parts) > 2:
+                raise ValueError("too many arguments")
+            database_paths = [
+                path for owner in (
+                    task_store,
+                    approval_inbox,
+                    _runtime_event_stream,
+                    memory_store,
+                    learning_store,
+                )
+                if owner is not None and (path := getattr(owner, "path", None)) is not None
+            ]
+            maintenance = RuntimeMaintenance(
+                PROJECT_ROOT,
+                artifact_dirs=[agent.tools.artifact_dir],
+                database_paths=database_paths,
+            )
+            output = format_maintenance_report(
+                maintenance,
+                action=maintenance_action,
+                artifact_days=maintenance_days,
+            )
+            error = ""
+        except (TypeError, ValueError) as exc:
+            output = ""
+            error = f"Invalid maintenance command: {exc}. Usage: /maintenance [preview [days]|apply [days]|checkpoint]"
+        _send({
+            "type": "tool_result",
+            "name": "maintenance",
+            "output": output,
+            "error": error,
+            "code": "",
+        })
+        _send({"type": "done"})
+
+
+    async def _model_command(c: str, cmd: dict) -> None:
+        """/model: list the models, or switch to one and save it as the startup default."""
+        nonlocal catalog, current_model_key
+        arg = parse_model_command_argument(c)
+        # Desktop selections have their own correlated receipt. A
+        # late receipt must never settle another model selection.
+        selection_id = cmd.get("request_id")
+        if not isinstance(selection_id, str):
+            selection_id = ""
+        if active_task is not None and not active_task.done():
+            _send_model_result({"type": "tool_result", "name": "model", "output": "",
+                   "error": "Wait for the current reply or cancel it before switching models.", "code": "busy"}, selection_id)
+            return
+        if arg:
+            # An explicit provider::model also supports unlisted/custom IDs.
+            # Resolve from current metadata without refreshing other providers.
+            entry = catalog.resolve(arg) or catalog.resolve_persisted(arg)
+            if entry is not None:
+                try:
+                    settings_path = switch_to_profile(
+                        agent,
+                        entry.key,
+                        entry.profile,
+                        valid_models=set(catalog.profiles) | {entry.key},
+                    )
+                except (ValueError, OSError) as exc:
+                    _send_model_result({
+                        "type": "tool_result",
+                        "name": "model",
+                        "output": "",
+                        "error": f"Model switch rejected; current model unchanged: {exc}",
+                        "code": "provider_not_configured",
+                    }, selection_id)
+                else:
+                    current_model_key = entry.key
+                    if not catalog.resolve(entry.key):
+                        catalog = ModelCatalog((*catalog.entries, entry), catalog.errors, catalog.statuses)
+                    _send_model_result({"type": "tool_result", "name": "model",
+                           "output": f"Model connection switched to: {entry.model_id}\n"
+                                     f"Provider: {entry.provider_label} @ {entry.base_url}\n"
+                                     f"Saved as startup default in {settings_path}.\n"
+                                     "Model access and tool support are checked when used.",
+                           "error": "", "code": ""}, selection_id)
+            else:
+                lines = [f"Unknown model: {arg}. Available:"]
+                for provider in dict.fromkeys(item.provider_label for item in catalog.entries):
+                    lines.append(f"  [{provider}]")
+                    for item in catalog.entries:
+                        if item.provider_label == provider:
+                            marker = "*" if item.key == current_model_key else " "
+                            lines.append(f"    {marker} {item.model_id} ({item.key})")
+                _send_model_result({"type": "tool_result", "name": "model",
+                       "output": "\n".join(lines),
+                       "error": f"Unknown model: {arg}. Current model unchanged." if selection_id else "",
+                       "code": "unknown_model" if selection_id else ""}, selection_id)
+        else:
+            served = _served_model()
+            serving = f" (serving {served})" if served else ""
+            lines = [f"Current model: {agent.llm.config.model}{serving} @ {agent.llm.config.base_url}", "Available:"]
+            for provider in dict.fromkeys(item.provider_label for item in catalog.entries):
+                lines.append(f"  [{provider}]")
+                for item in catalog.entries:
+                    if item.provider_label == provider:
+                        marker = "*" if item.key == current_model_key else " "
+                        lines.append(f"    {marker} {item.model_id} ({item.key})")
+            for provider_id, error in catalog.errors.items():
+                lines.append(f"  [{provider_id}] unavailable: {error}")
+            _send_model_result({"type": "tool_result", "name": "model",
+                   "output": "\n".join(lines), "error": "", "code": ""}, selection_id)
+        _send({"type": "done"})
+        # update status bar with new model name
+        await _send_model_info()
+
+
+    async def _reload_command(c: str) -> None:
+        """/reload: reload code, persona, skills or the model configuration without a restart."""
+        nonlocal catalog, current_model_key
+        import importlib
+        t0 = time.perf_counter()
+        parts = c.split(maxsplit=1)
+        target = parts[1].strip().lower() if len(parts) > 1 else "all"
+        if target in {"all", "skills"} and await guidance_command_busy(active_task, _reply_done, manual_reviews, apply_now=True):
+            _send({"type": "tool_result", "name": "reload", "output": "", "error": "Finish or cancel the active task before applying guidance.", "code": ""})
+            return
+        results: dict[str, str] = {}
+        # --- code: reload core Python modules + swap agent class ---
+        if target in ("all", "code"):
+            agent.end_session("reload")
+            await agent.context.save_async()
+            _reload_targets = [
+                "agent.runtime.tool_failure",
+                "agent.runtime.context_compressor",
+                "agent.runtime.prompts",
+                "agent.runtime.react",
+            ]
+            reloaded: list[str] = []
+            for _mod_name in _reload_targets:
+                _mod = sys.modules.get(_mod_name)
+                if _mod is not None:
+                    try:
+                        importlib.reload(_mod)
+                        reloaded.append(_mod_name.rsplit(".", 1)[-1])
+                    except Exception as exc:
+                        logger.warning("reload failed for %s: %s", _mod_name, exc)
+            from agent.runtime.react import ReActAgent as _FreshReAct
+            agent.__class__ = _FreshReAct
+            agent.invalidate_tool_schema_cache()
+            agent.begin_session()
+            results["code"] = f"reloaded {', '.join(reloaded) or 'nothing'}"
+        if target in ("all", "persona"):
+            _, new_prompt, new_state = startup_persona(os.getenv("AGENT_PERSONA"))
+            agent.set_persona(new_state, new_prompt)
+            results["persona"] = f"→ {new_state.persona_id}"
+        if target in ("all", "skills"):
+            agent.refresh_session_guidance()
+            await agent.context.save_async(allow_empty=True)
+            results["skills"] = f"{len(agent._available_skill_names)} skills"
+        if target in ("all", "model"):
+            new_catalog = configured_model_catalog()
+            new_selected = read_selected_model()
+            new_entry = (
+                new_catalog.resolve_persisted(new_selected)
+                or new_catalog.resolve(os.getenv("LLM_MODEL", ""))
+                or (new_catalog.entries[0] if new_catalog.entries else None)
+            )
+            if new_entry is not None:
+                new_profile = new_entry.profile
+                new_api_key = new_profile.api_key()
+                if not new_api_key and (is_local_url(new_entry.base_url) or not new_profile.api_key_env):
+                    new_api_key = "local"
+                if new_api_key:
+                    _apply_reloaded_model_profile(
+                        agent,
+                        new_entry,
+                        new_api_key,
+                    )
+                    catalog = new_catalog
+                    current_model_key = new_entry.key
+                    results["model"] = f"→ {new_entry.model_id}"
+                else:
+                    results["model"] = f"skipped (no API key for {new_entry.model_id})"
+            else:
+                results["model"] = "skipped (no configured model)"
+        if target not in ("all", "code", "persona", "skills", "model"):
+            results["error"] = f"Unknown target: {target}. Available: all, code, persona, skills, model"
+        elapsed = time.perf_counter() - t0
+        lines = [f"/reload {target} ({elapsed:.2f}s):"]
+        for k, v in results.items():
+            lines.append(f"  {k}: {v}")
+        _send({"type": "tool_result", "name": "reload",
+               "output": "\n".join(lines), "error": "", "code": ""})
+        _send({"type": "done"})
+        await _send_model_info()
 
 
     async def _session_command(c: str) -> None:
@@ -3567,66 +3902,7 @@ async def _main(startup_started: float):
                     _send({"type": "tool_result", "name": "changes", "output": output, "error": error, "code": ""})
                     _send({"type": "done"})
                 elif c == "/undo" or c.startswith("/undo ") or c == "/retry":
-                    command_name = "retry" if c == "/retry" else "undo"
-                    if _reply_done and active_task is not None:
-                        with suppress(asyncio.CancelledError, Exception):
-                            await active_task
-                    if active_task is not None and not active_task.done():
-                        _send({"type": "tool_result", "name": command_name, "output": "", "error": "Finish or cancel the current reply before editing history.", "code": ""})
-                        if _reply_done:
-                            _send({"type": "done"})
-                        continue
-                    resend_text = ""
-                    refresh_history = False
-                    if command_name == "retry":
-                        ok, message, retry_text = conversation_edits.take_last_request(agent.context)
-                        if ok:
-                            refresh_history = True
-                            snippet = retry_text if len(retry_text) <= 40 else f"{retry_text[:40]}…"
-                            output, error = f'Retrying the last request: "{snippet}"', ""
-                            resend_text = retry_text
-                        else:
-                            output, error = "", message
-                    elif c == "/undo":
-                        ok, message = conversation_edits.undo_last_reply(agent.context)
-                        if ok:
-                            refresh_history = True
-                            output, error = message, ""
-                        else:
-                            output, error = "", message
-                    else:
-                        count_text = c[len("/undo "):].strip()
-                        try:
-                            count = int(count_text)
-                        except ValueError:
-                            count = 0
-                        if 1 <= count <= 50:
-                            ok, message = conversation_edits.undo_last_exchanges(agent.context, count)
-                            if ok:
-                                refresh_history = True
-                                output, error = message, ""
-                            else:
-                                output, error = "", message
-                        else:
-                            output, error = "", "Usage: /undo [count] · count must be an integer between 1 and 50."
-                    if refresh_history:
-                        await _send_history()
-                        if minimal_mode.active:
-                            _send_minimal_session_list()
-                        elif local_mode.active:
-                            _send_local_mode_info()
-                        else:
-                            _send_session_info()
-                            _send_session_list()
-                    _send({"type": "tool_result", "name": command_name, "output": output, "error": error, "code": ""})
-                    if resend_text:
-                        retry_msg = Msg(sender="user", role="user", content=build_user_message_content(resend_text))
-                        launched = await _launch_message(retry_msg, resend_text)
-                        if not launched:
-                            _send({"type": "tool_result", "name": "retry", "output": "", "error": "Retry could not start; resend the request manually.", "code": ""})
-                            _send({"type": "done"})
-                    else:
-                        _send({"type": "done"})
+                    await _undo_or_retry_command(c)
                 elif c == "/reset" and minimal_mode.active:
                     minimal_mode.reset()
                     await _send_history()
@@ -3678,73 +3954,9 @@ async def _main(startup_started: float):
                     _send({"type": "tool_result", "name": "today", "output": output, "error": error, "code": ""})
                     _send({"type": "done"})
                 elif c == "/cancel" or c.startswith("/cancel "):
-                    target_id = c.split(maxsplit=1)[1].strip() if " " in c else active_task_id
-                    was_speaking = c == "/cancel" and voice.speaking
-                    if was_speaking:
-                        voice.stop()
-                    if c == "/cancel" and any(not task.done() for task in manual_reviews):
-                        await _cancel_manual_reviews()
-                        output, error = "Skill review cancelled.", ""
-                    elif was_speaking and (active_task is None or active_task.done() or _reply_done):
-                        # The reply itself is complete; only its audio was still running.
-                        output, error, target_id = "Stopped speaking.", "", ""
-                    elif not target_id:
-                        output, error = "", "No active task. Usage: /cancel [task-id]"
-                    elif active_task is not None and not active_task.done() and target_id == active_task_id:
-                        question_broker.close("The task was cancelled.")
-                        active_task.cancel()
-                        # The owning turn records cancellation during cleanup.
-                        # Keep this command free to accept the next live control
-                        # even while a previous task-store write is settling.
-                        output, error = f"Cancellation requested for task {target_id}.", ""
-                    elif task_store is None:
-                        output, error = "", "Task persistence is disabled; see backend logs."
-                    else:
-                        task = await durable_io(task_store.get_task, target_id)
-                        if task is None:
-                            output, error = "", f"Unknown task: {target_id}"
-                        elif task["status"] in {"completed", "failed", "cancelled"}:
-                            output, error = "", f"Task {target_id} is already {task['status']}."
-                        else:
-                            await durable_io(task_store.request_cancel, target_id)
-                            await durable_io(task_store.finish_run, target_id, "cancelled", "Cancelled while not active")
-                            output, error = f"Task {target_id} marked cancelled.", ""
-                    _send({"type": "tool_result", "name": "cancel", "output": output, "error": error, "code": ""})
-                    if not (active_task is not None and not active_task.done() and target_id == active_task_id):
-                        _send({"type": "done"})
+                    await _cancel_command(c)
                 elif c.startswith("/resume"):
-                    parts = c.split(maxsplit=1)
-                    if len(parts) < 2:
-                        _send({"type": "tool_result", "name": "resume", "output": "", "error": "Usage: /resume <task-id>", "code": ""})
-                        _send({"type": "done"})
-                    elif task_store is None:
-                        _send({"type": "tool_result", "name": "resume", "output": "", "error": "Task persistence is disabled; see backend logs.", "code": ""})
-                        _send({"type": "done"})
-                    elif active_task is not None and not active_task.done():
-                        _send({"type": "tool_result", "name": "resume", "output": "", "error": f"Task {active_task_id} is still running.", "code": ""})
-                        _send({"type": "done"})
-                    else:
-                        task_id = parts[1].strip()
-                        task = await durable_io(task_store.get_task, task_id)
-                        current_session = agent.context.session_scope
-                        if task is None:
-                            _send({"type": "tool_result", "name": "resume", "output": "", "error": f"Unknown task: {task_id}", "code": ""})
-                            _send({"type": "done"})
-                        elif task.get("session_id") and task["session_id"] != current_session:
-                            _send({"type": "tool_result", "name": "resume", "output": "", "error": f"Task belongs to session '{task['session_id']}'. Switch to it before resuming.", "code": ""})
-                            _send({"type": "done"})
-                        else:
-                            try:
-                                resumed = await durable_io(task_store.prepare_resume, task_id)
-                                from agent.runtime.task_resume import resume_prompt
-                                prompt = resume_prompt(resumed)
-                                msg = Msg(sender="user", role="user", content=build_user_message_content(prompt))
-                                msg.metadata["request_id"] = resumed["request_id"]
-                                _send({"type": "tool_result", "name": "resume", "output": f"Resuming task {task_id} from checkpoint.", "error": "", "code": ""})
-                                await _launch_message(msg, resumed["input_text"], resume_task=resumed)
-                            except (KeyError, ValueError) as exc:
-                                _send({"type": "tool_result", "name": "resume", "output": "", "error": str(exc), "code": ""})
-                                _send({"type": "done"})
+                    await _resume_command(c)
                 elif c == "/reset":
                     question_broker.supersede("Question expired because the conversation was reset.")
                     question_followups.clear()
@@ -3919,44 +4131,7 @@ async def _main(startup_started: float):
                     })
                     _send({"type": "done"})
                 elif c == "/maintenance" or c.startswith("/maintenance "):
-                    try:
-                        maintenance_parts = shlex.split(c)[1:]
-                        maintenance_action = maintenance_parts[0].lower() if maintenance_parts else "preview"
-                        maintenance_days = int(maintenance_parts[1]) if len(maintenance_parts) > 1 else 30
-                        if len(maintenance_parts) > 2:
-                            raise ValueError("too many arguments")
-                        database_paths = [
-                            path for owner in (
-                                task_store,
-                                approval_inbox,
-                                _runtime_event_stream,
-                                memory_store,
-                                learning_store,
-                            )
-                            if owner is not None and (path := getattr(owner, "path", None)) is not None
-                        ]
-                        maintenance = RuntimeMaintenance(
-                            PROJECT_ROOT,
-                            artifact_dirs=[agent.tools.artifact_dir],
-                            database_paths=database_paths,
-                        )
-                        output = format_maintenance_report(
-                            maintenance,
-                            action=maintenance_action,
-                            artifact_days=maintenance_days,
-                        )
-                        error = ""
-                    except (TypeError, ValueError) as exc:
-                        output = ""
-                        error = f"Invalid maintenance command: {exc}. Usage: /maintenance [preview [days]|apply [days]|checkpoint]"
-                    _send({
-                        "type": "tool_result",
-                        "name": "maintenance",
-                        "output": output,
-                        "error": error,
-                        "code": "",
-                    })
-                    _send({"type": "done"})
+                    await _maintenance_command(c)
                 elif c == "/sandbox" or c.startswith("/sandbox "):
                     try:
                         sandbox_parts = shlex.split(c)[1:]
@@ -4059,75 +4234,7 @@ async def _main(startup_started: float):
                     _send({"type": "done"})
                     await _send_model_info()
                 elif c.startswith("/model"):
-                    arg = parse_model_command_argument(c)
-                    # Desktop selections have their own correlated receipt. A
-                    # late receipt must never settle another model selection.
-                    selection_id = cmd.get("request_id")
-                    if not isinstance(selection_id, str):
-                        selection_id = ""
-                    if active_task is not None and not active_task.done():
-                        _send_model_result({"type": "tool_result", "name": "model", "output": "",
-                               "error": "Wait for the current reply or cancel it before switching models.", "code": "busy"}, selection_id)
-                        continue
-                    if arg:
-                        # An explicit provider::model also supports unlisted/custom IDs.
-                        # Resolve from current metadata without refreshing other providers.
-                        entry = catalog.resolve(arg) or catalog.resolve_persisted(arg)
-                        if entry is not None:
-                            try:
-                                settings_path = switch_to_profile(
-                                    agent,
-                                    entry.key,
-                                    entry.profile,
-                                    valid_models=set(catalog.profiles) | {entry.key},
-                                )
-                            except (ValueError, OSError) as exc:
-                                _send_model_result({
-                                    "type": "tool_result",
-                                    "name": "model",
-                                    "output": "",
-                                    "error": f"Model switch rejected; current model unchanged: {exc}",
-                                    "code": "provider_not_configured",
-                                }, selection_id)
-                            else:
-                                current_model_key = entry.key
-                                if not catalog.resolve(entry.key):
-                                    catalog = ModelCatalog((*catalog.entries, entry), catalog.errors, catalog.statuses)
-                                _send_model_result({"type": "tool_result", "name": "model",
-                                       "output": f"Model connection switched to: {entry.model_id}\n"
-                                                 f"Provider: {entry.provider_label} @ {entry.base_url}\n"
-                                                 f"Saved as startup default in {settings_path}.\n"
-                                                 "Model access and tool support are checked when used.",
-                                       "error": "", "code": ""}, selection_id)
-                        else:
-                            lines = [f"Unknown model: {arg}. Available:"]
-                            for provider in dict.fromkeys(item.provider_label for item in catalog.entries):
-                                lines.append(f"  [{provider}]")
-                                for item in catalog.entries:
-                                    if item.provider_label == provider:
-                                        marker = "*" if item.key == current_model_key else " "
-                                        lines.append(f"    {marker} {item.model_id} ({item.key})")
-                            _send_model_result({"type": "tool_result", "name": "model",
-                                   "output": "\n".join(lines),
-                                   "error": f"Unknown model: {arg}. Current model unchanged." if selection_id else "",
-                                   "code": "unknown_model" if selection_id else ""}, selection_id)
-                    else:
-                        served = _served_model()
-                        serving = f" (serving {served})" if served else ""
-                        lines = [f"Current model: {agent.llm.config.model}{serving} @ {agent.llm.config.base_url}", "Available:"]
-                        for provider in dict.fromkeys(item.provider_label for item in catalog.entries):
-                            lines.append(f"  [{provider}]")
-                            for item in catalog.entries:
-                                if item.provider_label == provider:
-                                    marker = "*" if item.key == current_model_key else " "
-                                    lines.append(f"    {marker} {item.model_id} ({item.key})")
-                        for provider_id, error in catalog.errors.items():
-                            lines.append(f"  [{provider_id}] unavailable: {error}")
-                        _send_model_result({"type": "tool_result", "name": "model",
-                               "output": "\n".join(lines), "error": "", "code": ""}, selection_id)
-                    _send({"type": "done"})
-                    # update status bar with new model name
-                    await _send_model_info()
+                    await _model_command(c, cmd)
                 elif c == "/mode" or c.startswith("/mode "):
                     argument = c[len("/mode"):].strip().lower()
                     if not argument:
@@ -4196,82 +4303,7 @@ async def _main(startup_started: float):
                     _send({"type": "done"})
                     await _send_model_info()
                 elif c == "/reload" or c.startswith("/reload "):
-                    import importlib
-                    t0 = time.perf_counter()
-                    parts = c.split(maxsplit=1)
-                    target = parts[1].strip().lower() if len(parts) > 1 else "all"
-                    if target in {"all", "skills"} and await guidance_command_busy(active_task, _reply_done, manual_reviews, apply_now=True):
-                        _send({"type": "tool_result", "name": "reload", "output": "", "error": "Finish or cancel the active task before applying guidance.", "code": ""})
-                        continue
-                    results: dict[str, str] = {}
-                    # --- code: reload core Python modules + swap agent class ---
-                    if target in ("all", "code"):
-                        agent.end_session("reload")
-                        await agent.context.save_async()
-                        _reload_targets = [
-                            "agent.runtime.tool_failure",
-                            "agent.runtime.context_compressor",
-                            "agent.runtime.prompts",
-                            "agent.runtime.react",
-                        ]
-                        reloaded: list[str] = []
-                        for _mod_name in _reload_targets:
-                            _mod = sys.modules.get(_mod_name)
-                            if _mod is not None:
-                                try:
-                                    importlib.reload(_mod)
-                                    reloaded.append(_mod_name.rsplit(".", 1)[-1])
-                                except Exception as exc:
-                                    logger.warning("reload failed for %s: %s", _mod_name, exc)
-                        from agent.runtime.react import ReActAgent as _FreshReAct
-                        agent.__class__ = _FreshReAct
-                        agent.invalidate_tool_schema_cache()
-                        agent.begin_session()
-                        results["code"] = f"reloaded {', '.join(reloaded) or 'nothing'}"
-                    if target in ("all", "persona"):
-                        _, new_prompt, new_state = startup_persona(os.getenv("AGENT_PERSONA"))
-                        agent.set_persona(new_state, new_prompt)
-                        results["persona"] = f"→ {new_state.persona_id}"
-                    if target in ("all", "skills"):
-                        agent.refresh_session_guidance()
-                        await agent.context.save_async(allow_empty=True)
-                        results["skills"] = f"{len(agent._available_skill_names)} skills"
-                    if target in ("all", "model"):
-                        new_catalog = configured_model_catalog()
-                        new_selected = read_selected_model()
-                        new_entry = (
-                            new_catalog.resolve_persisted(new_selected)
-                            or new_catalog.resolve(os.getenv("LLM_MODEL", ""))
-                            or (new_catalog.entries[0] if new_catalog.entries else None)
-                        )
-                        if new_entry is not None:
-                            new_profile = new_entry.profile
-                            new_api_key = new_profile.api_key()
-                            if not new_api_key and (is_local_url(new_entry.base_url) or not new_profile.api_key_env):
-                                new_api_key = "local"
-                            if new_api_key:
-                                _apply_reloaded_model_profile(
-                                    agent,
-                                    new_entry,
-                                    new_api_key,
-                                )
-                                catalog = new_catalog
-                                current_model_key = new_entry.key
-                                results["model"] = f"→ {new_entry.model_id}"
-                            else:
-                                results["model"] = f"skipped (no API key for {new_entry.model_id})"
-                        else:
-                            results["model"] = "skipped (no configured model)"
-                    if target not in ("all", "code", "persona", "skills", "model"):
-                        results["error"] = f"Unknown target: {target}. Available: all, code, persona, skills, model"
-                    elapsed = time.perf_counter() - t0
-                    lines = [f"/reload {target} ({elapsed:.2f}s):"]
-                    for k, v in results.items():
-                        lines.append(f"  {k}: {v}")
-                    _send({"type": "tool_result", "name": "reload",
-                           "output": "\n".join(lines), "error": "", "code": ""})
-                    _send({"type": "done"})
-                    await _send_model_info()
+                    await _reload_command(c)
                 elif c.startswith("/session"):
                     await _session_command(c)
 
