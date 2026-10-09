@@ -1,3 +1,5 @@
+import asyncio
+import json
 import os
 import sqlite3
 import subprocess
@@ -368,3 +370,116 @@ def test_session_search_tool_exposes_and_forwards_source_filter(monkeypatch):
     assert calls == [("needle", 3, 3, None, "api")]
     assert '"source_type": "api"' in payload
     assert source_schema["enum"] == ["", "astra", "hermes", "api", "learning"]
+
+
+def _search_tool(monkeypatch, tmp_path):
+    """The real session_search tool over a real archive in a temporary directory."""
+    recall = SessionRecall(tmp_path / "tool.db")
+    recall.init_db()
+    monkeypatch.setattr(session_recall_tool, "_SR", recall)
+    registry = ToolRegistry()
+    session_recall_tool.register_session_recall_tools(registry)
+
+    def call(**arguments):
+        result = asyncio.run(registry.execute("session_search", {"source_type": "astra", **arguments}))
+        return result, (json.loads(result["output"]) if result["output"] else {})
+
+    return recall, call
+
+
+def test_cut_messages_are_marked_and_a_scroll_returns_its_anchor_whole(monkeypatch, tmp_path):
+    recall, call = _search_tool(monkeypatch, tmp_path)
+    sid = recall.get_or_create_session("session_long", title="long")
+    first = recall.log_message(sid, "user", "short opening question")
+    long_text = "a" * 1500 + " needleword " + "b" * 1488
+    long_id = recall.log_message(sid, "assistant", long_text)
+    neighbour = recall.log_message(sid, "user", "c" * 700)
+
+    result, found = call(query="needleword")
+    row = found["results"][0]
+    assert row["message_id"] == long_id
+    assert row["truncated"] is True and row["content_chars"] == len(long_text)
+    assert result["partial"] is True and "around_message_id" in found["partial"]
+    cut_context = [item for item in row["window_context"] if item["id"] in {long_id, neighbour}]
+    assert [(item["truncated"], item["content_chars"]) for item in cut_context] == [(True, 3000), (True, 700)]
+
+    result, scrolled = call(session_id=sid, around_message_id=long_id)
+    by_id = {item["id"]: item for item in scrolled["window"]}
+    assert by_id[long_id]["content"] == long_text and "truncated" not in by_id[long_id]
+    assert len(by_id[neighbour]["content"]) == 500
+    assert by_id[neighbour]["truncated"] is True and by_id[neighbour]["content_chars"] == 700
+    assert "truncated" not in by_id[first]
+    assert result["partial"] is True and "around_message_id" in scrolled["partial"]
+
+    # The cut neighbour becomes readable by anchoring on it; nothing short is called partial.
+    _, reread = call(session_id=sid, around_message_id=neighbour, scroll_window=1)
+    assert {item["id"]: item["content"] for item in reread["window"]}[neighbour] == "c" * 700
+    other = recall.get_or_create_session("session_short", title="short")
+    only = recall.log_message(other, "user", "nothing long here")
+    result, short = call(session_id=other, around_message_id=only)
+    assert "partial" not in short and not result.get("partial")
+
+
+def test_a_browsed_session_can_be_opened_with_its_first_or_last_message_id(monkeypatch, tmp_path):
+    recall, call = _search_tool(monkeypatch, tmp_path)
+    sid = recall.get_or_create_session("session_browse", title="browse")
+    ids = [recall.log_message(sid, "user" if index % 2 == 0 else "assistant", f"turn {index}") for index in range(4)]
+
+    _, browsed = call()
+    row = next(item for item in browsed["sessions"] if item["session_id"] == sid)
+    assert (row["first_message_id"], row["last_message_id"]) == (ids[0], ids[-1])
+
+    _, opened = call(session_id=sid, around_message_id=row["first_message_id"])
+    assert [item["content"] for item in opened["window"]] == [f"turn {index}" for index in range(4)]
+    _, tail = call(session_id=sid, around_message_id=row["last_message_id"], scroll_window=1)
+    assert [item["id"] for item in tail["window"]] == ids[-2:]
+
+
+def test_scroll_with_an_anchor_outside_the_session_fails_and_names_its_session(monkeypatch, tmp_path):
+    recall, call = _search_tool(monkeypatch, tmp_path)
+    one = recall.get_or_create_session("session_one", title="one")
+    two = recall.get_or_create_session("session_two", title="two")
+    recall.log_message(one, "user", "in the first session")
+    foreign = recall.log_message(two, "user", "in the second session")
+
+    result, _ = call(session_id=one, around_message_id=foreign)
+    assert result["code"] == "message_not_found"
+    assert f"not found in session {one}" in result["error"] and two in result["error"]
+    assert "same search result" in result["recovery_hint"]
+
+    missing, _ = call(session_id=one, around_message_id=foreign + 1000)
+    assert missing["code"] == "message_not_found" and two not in missing["error"]
+
+
+def test_short_terms_match_as_substrings_and_keep_not_or_sort_and_window(monkeypatch, tmp_path):
+    recall, call = _search_tool(monkeypatch, tmp_path)
+    sid = recall.get_or_create_session("session_cjk", title="cjk")
+    rollback = recall.log_message(sid, "user", "部署 之后 需要 回滚 方案")
+    shipped = recall.log_message(sid, "assistant", "部署 已经 上线")
+    weather = recall.log_message(sid, "user", "今天 天气 不错")
+    conn = recall._get_conn()
+    for offset, message_id in enumerate((rollback, shipped, weather)):
+        conn.execute("UPDATE messages SET timestamp = ? WHERE id = ?", (1_000 + offset, message_id))
+    conn.commit()
+
+    def ids(**arguments):
+        return [row["message_id"] for row in call(**arguments)[1]["results"]]
+
+    # An excluded term stays excluded; it used to be required, which returned only the rollback message.
+    assert ids(query="部署 NOT 回滚") == [shipped]
+    assert set(ids(query="回滚 OR 天气")) == {rollback, weather}
+    assert ids(query="部署") == [shipped, rollback]
+    assert ids(query="部署", sort="oldest") == [rollback, shipped]
+
+    _, found = call(query="部署 NOT 回滚", window=1)
+    assert found["matching"] == "substring"
+    assert "shorter than 3 characters" in found["matching_note"] and "relevance" in found["matching_note"]
+    assert [item["id"] for item in found["results"][0]["window_context"]] == [rollback, shipped, weather]
+
+    _, either = call(query="回滚 天气")
+    assert {row["message_id"] for row in either["results"]} == {rollback, weather}
+    assert "any one of them" in either["matching_note"]
+
+    recall.log_message(sid, "user", "a fulltext indexed sentence")
+    _, indexed = call(query="fulltext")
+    assert indexed["total"] == 1 and "matching" not in indexed

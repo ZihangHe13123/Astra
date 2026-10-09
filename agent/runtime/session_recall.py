@@ -69,6 +69,54 @@ def _fmt_ts(ts: Optional[float]) -> str:
         return str(ts)
 
 
+# A scroll returns its anchor message whole up to this bound, so one long
+# message can be read; its neighbours and all other views are short excerpts.
+SCROLL_ANCHOR_CHARS = 20_000
+_SCROLL_NEIGHBOUR_CHARS = 500
+_WINDOW_CHARS = 200
+_LIKE_SNIPPET_CHARS = 200
+_LIKE_TOKEN = re.compile(r'"([^"]*)"|(\S+)')
+
+
+def _mark_cut(item: Dict[str, Any], shown: str, full: Optional[str]) -> Dict[str, Any]:
+    """Flag an item whose text is only part of the stored message."""
+    full = full or ""
+    if shown != full:
+        item["truncated"] = True
+        item["content_chars"] = len(full)
+    return item
+
+
+class SearchResults(List[Dict[str, Any]]):
+    """Search rows plus how the query was matched.
+
+    ``matching`` is "fts" for the full-text index and "substring" when the
+    query fell back to LIKE; ``note`` then says why and what that changes.
+    """
+
+    matching = "fts"
+    note = ""
+
+
+def _like_alternatives(query: str) -> List[tuple[List[str], List[str]]]:
+    """Read an FTS-style query as OR-alternatives of (required, excluded) substrings."""
+    alternatives: List[tuple[List[str], List[str]]] = [([], [])]
+    negate = False
+    for phrase, word in _LIKE_TOKEN.findall(query):
+        if word == "OR":
+            alternatives.append(([], []))
+            negate = False
+        elif word == "NOT":
+            negate = True
+        elif word != "AND":
+            term = (phrase or word).replace("*", "").strip('"').strip()
+            if term:
+                alternatives[-1][1 if negate else 0].append(term)
+            negate = False
+    # An alternative with nothing required would match almost every message.
+    return [item for item in alternatives if item[0]]
+
+
 def configured_session_recall_path() -> Path:
     configured = os.getenv(SESSION_RECALL_DB_ENV, "").strip()
     return Path(configured).expanduser() if configured else Path(DB_PATH).expanduser()
@@ -448,8 +496,14 @@ class SessionRecall:
         if not query or not query.strip():
             return []
         source_filter = self._source_filter_sql(source_type)
+
+        def like(reason: str) -> List[Dict[str, Any]]:
+            return self._search_like(
+                query.strip(), limit, source_type=source_type, window=window, sort=sort, reason=reason,
+            )
+
         if self._fts_stale:
-            return self._search_like(query.strip(), limit, source_type=source_type)
+            return like("the full-text index is unavailable")
 
         # Trigram tokenizer requires >= 3 chars per *search term* for MATCH.
         # Strip FTS5 boolean operators (OR / NOT / AND) and quoted phrases
@@ -460,10 +514,7 @@ class SessionRecall:
         _no_ops = _no_ops.replace('*', '')
         actual_terms = _no_ops.split()
         if any(len(t) < 3 for t in actual_terms):
-            # LIKE fallback — strip operators so they aren't matched as text
-            like_q = re.sub(r'\b(?:OR|NOT|AND)\b', '', clean)
-            like_q = like_q.replace('*', '').strip()
-            return self._search_like(like_q, limit, source_type=source_type)
+            return like("a query term is shorter than 3 characters, which the full-text index cannot match")
         # Strip FTS5 prefix operators that trigram doesn't support.
         query = query.replace("*", "")
 
@@ -492,28 +543,19 @@ class SessionRecall:
         try:
             rows = conn.execute(sql, (query, limit)).fetchall()
         except sqlite3.DatabaseError:
-            # FTS5 syntax error — fall back to LIKE search
-            like_q = f"%{query}%"
-            rows = conn.execute(
-                "SELECT m.id, m.session_id, m.role, m.content AS snippet, "
-                "m.content, m.timestamp, s.title AS session_title, s.started_at "
-                "FROM messages m JOIN sessions s ON s.id = m.session_id "
-                f"WHERE m.content LIKE ? AND {source_filter} "
-                "AND m.role IN ('user','assistant') "
-                "ORDER BY m.timestamp DESC LIMIT ?",
-                (like_q, limit),
-            ).fetchall()
+            return like("the full-text index rejected the query syntax")
 
-        results = []
+        results = SearchResults()
         for row in rows:
-            r = {
+            snippet = row["snippet"] or (row["content"][:120] if row["content"] else "")
+            r = _mark_cut({
                 "message_id": row["id"],
                 "session_id": row["session_id"],
                 "role": row["role"],
-                "snippet": row["snippet"] or (row["content"][:120] if row["content"] else ""),
+                "snippet": snippet,
                 "timestamp": _fmt_ts(row["timestamp"]),
                 "session_title": row["session_title"],
-            }
+            }, snippet.replace(">>>", "").replace("<<<", ""), row["content"])
             r["window_context"] = self._get_window(
                 row["session_id"], row["id"], window
             )
@@ -527,43 +569,74 @@ class SessionRecall:
         limit: int,
         *,
         source_type: str = "",
+        window: int = 3,
+        sort: Optional[str] = None,
+        reason: str = "",
     ) -> List[Dict[str, Any]]:
-        """LIKE fallback for queries too short for trigram MATCH.
+        """Substring fallback for queries the trigram index cannot answer.
 
-        Multi-word queries try AND first, then fall back to OR.
+        Terms are AND-ed, ``OR`` separates alternatives and ``NOT`` excludes.
+        When no message holds every term of a plain multi-word query, messages
+        holding any one of them are returned instead.
         """
         conn = self._get_conn()
         source_filter = self._source_filter_sql(source_type)
-        terms = query.split()
-        params = [f"%{t}%" for t in terms]
+        alternatives = _like_alternatives(query)
+        order = "ASC" if sort == "oldest" else "DESC"
 
-        def _run(joiner: str) -> list:
-            where = joiner.join("m.content LIKE ?" for _ in terms)
+        def _run(choices: List[tuple[List[str], List[str]]]) -> list:
+            where = " OR ".join(
+                "(" + " AND ".join(
+                    ["m.content LIKE ?"] * len(required) + ["m.content NOT LIKE ?"] * len(excluded)
+                ) + ")"
+                for required, excluded in choices
+            )
+            params = [f"%{term}%" for required, excluded in choices for term in (*required, *excluded)]
             return conn.execute(
                 "SELECT m.id, m.session_id, m.role, m.content AS snippet, "
                 "m.content, m.timestamp, s.title AS session_title, s.started_at "
                 "FROM messages m JOIN sessions s ON s.id = m.session_id "
                 f"WHERE ({where}) AND {source_filter} "
                 "AND m.role IN ('user','assistant') "
-                "ORDER BY m.timestamp DESC LIMIT ?",
+                f"ORDER BY m.timestamp {order} LIMIT ?",
                 (*params, limit),
             ).fetchall()
 
-        rows = _run(" AND ") if len(terms) > 1 else _run("")
-        if not rows and len(terms) > 1:
-            rows = _run(" OR ")
-        return [
-            {
+        rows = _run(alternatives) if alternatives else []
+        any_term = False
+        if not rows and len(alternatives) == 1 and len(alternatives[0][0]) > 1:
+            required, excluded = alternatives[0]
+            rows = _run([([term], excluded) for term in required])
+            any_term = bool(rows)
+
+        results = SearchResults()
+        results.matching = "substring"
+        results.note = (
+            f"Substring matching was used because {reason or 'the full-text index could not be used'}. "
+            "Every term must appear as a substring of the message, OR separates alternatives and NOT excludes; "
+            "relevance ranking does not apply, so results are newest first unless sort is 'oldest'."
+            + (" No message contained all the terms, so messages containing any one of them are listed."
+               if any_term else "")
+        )
+        terms = [term.lower() for required, _excluded in alternatives for term in required]
+        for row in rows:
+            content = row["content"] or ""
+            # Show the neighbourhood of a matched term, not an unrelated opening.
+            lowered = content.lower()
+            hit = min((position for position in map(lowered.find, terms) if position >= 0), default=0)
+            begin = max(0, hit - _LIKE_SNIPPET_CHARS // 4)
+            snippet = content[begin:begin + _LIKE_SNIPPET_CHARS]
+            item = _mark_cut({
                 "message_id": row["id"],
                 "session_id": row["session_id"],
                 "role": row["role"],
-                "snippet": (row["content"] or "")[:200],
+                "snippet": snippet,
                 "timestamp": _fmt_ts(row["timestamp"]),
                 "session_title": row["session_title"],
-                "window_context": [],
-            }
-            for row in rows
-        ]
+            }, snippet, content)
+            item["window_context"] = self._get_window(row["session_id"], row["id"], window)
+            results.append(item)
+        return results
 
     # ── browse ────────────────────────────────────────────────
 
@@ -579,7 +652,9 @@ class SessionRecall:
         rows = conn.execute(
             "SELECT s.id, s.title, s.started_at, s.ended_at, s.message_count, "
             "  (SELECT content FROM messages WHERE session_id = s.id "
-            "   AND role = 'user' ORDER BY msg_index ASC LIMIT 1) AS first_msg "
+            "   AND role = 'user' ORDER BY msg_index ASC LIMIT 1) AS first_msg, "
+            "  (SELECT MIN(id) FROM messages WHERE session_id = s.id) AS first_id, "
+            "  (SELECT MAX(id) FROM messages WHERE session_id = s.id) AS last_id "
             f"FROM sessions s WHERE {source_filter} "
             "ORDER BY s.started_at DESC LIMIT ?",
             (limit,),
@@ -594,6 +669,9 @@ class SessionRecall:
                 "started": _fmt_ts(row["started_at"]),
                 "ended": _fmt_ts(row["ended_at"]),
                 "messages": row["message_count"],
+                # What a scroll needs to open this session from either end.
+                "first_message_id": row["first_id"],
+                "last_message_id": row["last_id"],
                 "preview": preview,
             })
         return results
@@ -603,7 +681,10 @@ class SessionRecall:
     def scroll(self, session_id: str, around_msg_id: int, window: int = 5) -> Dict[str, Any]:
         """Scroll within a session around a specific message id.
 
-        Returns dict with window, messages_before, messages_after.
+        Returns dict with window, messages_before, messages_after. The anchor
+        message is returned whole up to SCROLL_ANCHOR_CHARS; its neighbours are
+        cut short and marked. An empty window means the anchor is not in that
+        session; ``anchor_session_id`` then names the session that holds it.
         """
         conn = self._get_conn()
         # check anchor exists
@@ -612,7 +693,13 @@ class SessionRecall:
             (around_msg_id, session_id),
         ).fetchone()
         if not anchor:
-            return {"window": [], "messages_before": 0, "messages_after": 0}
+            elsewhere = conn.execute(
+                "SELECT session_id FROM messages WHERE id = ? LIMIT 1", (around_msg_id,),
+            ).fetchone()
+            return {
+                "window": [], "messages_before": 0, "messages_after": 0,
+                "anchor_session_id": elsewhere["session_id"] if elsewhere else "",
+            }
 
         before = conn.execute(
             "SELECT id, role, content, tool_name, timestamp FROM messages "
@@ -626,13 +713,17 @@ class SessionRecall:
         ).fetchall()
 
         combined = list(reversed(before)) + list(after)
-        msgs = [{
-            "id": m["id"],
-            "role": m["role"],
-            "content": (m["content"] or "")[:500],
-            "tool_name": m["tool_name"],
-            "timestamp": _fmt_ts(m["timestamp"]),
-        } for m in combined]
+        msgs = []
+        for m in combined:
+            limit = SCROLL_ANCHOR_CHARS if m["id"] == around_msg_id else _SCROLL_NEIGHBOUR_CHARS
+            shown = (m["content"] or "")[:limit]
+            msgs.append(_mark_cut({
+                "id": m["id"],
+                "role": m["role"],
+                "content": shown,
+                "tool_name": m["tool_name"],
+                "timestamp": _fmt_ts(m["timestamp"]),
+            }, shown, m["content"]))
 
         msgs_before = max(0, len(before) - 1)
         msgs_after = len(after)
@@ -667,11 +758,11 @@ class SessionRecall:
 
         combined = list(reversed(before)) + list(after)
         return [
-            {
+            _mark_cut({
                 "id": m["id"],
                 "role": m["role"],
-                "content": (m["content"] or "")[:200],
-            }
+                "content": (m["content"] or "")[:_WINDOW_CHARS],
+            }, (m["content"] or "")[:_WINDOW_CHARS], m["content"])
             for m in combined
         ]
 
