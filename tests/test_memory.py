@@ -410,7 +410,8 @@ def test_memory_tool_and_slash_commands_share_the_store(tmp_path):
             "action": "core_remove",
             "memory_id": memory_id,
         })
-        assert "not found or is not a unique match" in missing["output"]
+        assert missing["code"] == "memory_not_found"
+        assert "not found or is not a unique match" in missing["error"]
 
         await registry.execute("memory", {
             "action": "core_add",
@@ -436,6 +437,47 @@ def test_memory_tool_and_slash_commands_share_the_store(tmp_path):
     )
     assert error == ""
     assert "USER.md" in output
+
+
+def test_memory_tool_says_which_field_an_action_reads_and_offers_only_fields_shown_again(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db")
+    registry = ToolRegistry()
+    register_memory_tools(registry, store, session_id=lambda: "session-a")
+
+    def call(**arguments):
+        return asyncio.run(registry.execute("memory", arguments))
+
+    # Text in the wrong field used to fail with "Memory content cannot be empty".
+    wrong_field = call(action="core_add", value="User prefers concise answers")
+    assert wrong_field["code"] == "invalid_arguments"
+    assert "content" in wrong_field["error"] and "working_update" in wrong_field["error"]
+    assert store.list_core("memory") == []
+
+    assert call(action="core_remove")["code"] == "invalid_arguments"
+    missing = call(action="core_remove", memory_id="deadbeef")
+    assert missing["output"] == "" and missing["code"] == "memory_not_found"
+    assert "action=status" in missing["recovery_hint"]
+
+    empty = call(action="working_update", field="turn_notes")
+    assert empty["code"] == "invalid_arguments" and "value" in empty["error"]
+
+    call(action="working_update", field="turn_notes", value="first note")
+    call(action="working_update", field="turn_notes", value="second note")
+    assert store.get_working("session-a")["turn_notes"] == "second note"
+
+    schema = registry.get("memory").parameters["properties"]
+    assert all(schema[name].get("description") for name in schema)
+    assert "replaces" in schema["value"]["description"]
+    # Every field the tool offers is one the model is shown again in later turns.
+    for field in schema["field"]["enum"]:
+        assert call(action="working_update", field=field, value=f"text for {field}")["error"] == ""
+        assert f"{field}: text for {field}" in store.format_working_prompt("session-a")
+
+    # A legacy field is still stored for old clients, and the result says it will not be shown.
+    legacy = call(action="working_update", field="progress", value="Storage implemented")
+    assert legacy["error"] == "" and "not shown to you in later turns" in legacy["output"]
+    assert store.get_working("session-a")["progress"] == "Storage implemented"
+    assert "Storage implemented" not in store.format_working_prompt("session-a")
 
 
 def test_memory_timeline_command_shows_lifecycle_and_supersession(tmp_path):
