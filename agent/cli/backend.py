@@ -885,7 +885,8 @@ async def _main(startup_started: float):
     delegate_statuses: dict[str, dict] = {}
 
     def _delegate_store(scope: str) -> SessionStore:
-        ctx = agent_holder.get("agent").context if agent_holder.get("agent") else None
+        held = agent_holder.get("agent")
+        ctx = held.context if held else None
         if re.fullmatch(r"branch_[0-9a-f]{16}_[0-9a-f]{32}", scope):
             branch = scope.rsplit("_", 1)[-1]
             if ctx is None or branch_scope(ctx.session_path, branch) != scope:
@@ -2551,11 +2552,11 @@ async def _main(startup_started: float):
             return
         payload = json.dumps(command, sort_keys=True)
         if request_id in response_receipts:
-            previous, receipt = response_receipts[request_id]
+            previous, stored = response_receipts[request_id]
             if previous != payload:
                 _send({"type": "response_operation_result", "request_id": request_id, "error": "Request identity was reused"})
-            elif receipt is not None:
-                _send(receipt)
+            elif stored is not None:
+                _send(stored)
             return
         response_receipts[request_id] = (payload, None)
 
@@ -2645,6 +2646,7 @@ async def _main(startup_started: float):
     async def _peer_tick() -> None:
         """Claim mail only for the same idle branch observed before the read."""
         assert peer_link is not None
+        link = peer_link  # the nested functions below do not inherit the assert's narrowing
         async with peer_lock:
             session = agent.context.session_scope
             now = time.monotonic()
@@ -2653,7 +2655,7 @@ async def _main(startup_started: float):
 
             def current_idle() -> bool:
                 return (agent.context.session_scope == session
-                        and peer_link.peer_id == f"{peer_link.site}:{session}"
+                        and link.peer_id == f"{link.site}:{session}"
                         and not (_turn_busy() or _response_regenerating or restart.draining
                                  or active_channel.get() or bar_mode.active or minimal_mode.active
                                  or local_mode.active or agent.llm.config.connection_required))
@@ -2678,7 +2680,7 @@ async def _main(startup_started: float):
                 def claim() -> None:
                     # Keep the claimed batch even if cancellation arrives while
                     # the durable database operation finishes in its worker.
-                    messages.extend(peer_link.claim_inbox())
+                    messages.extend(link.claim_inbox())
 
                 await durable_io(claim)
                 if not messages or not current_idle():
@@ -2702,6 +2704,484 @@ async def _main(startup_started: float):
                     # peer_lock prevents join/leave from changing release's
                     # recipient filter while this old branch batch is owned.
                     await durable_io(peer_link.release, messages)
+
+    # Slash commands with many branches run in their own coroutines, which keeps the
+    # command loop below within the type checker's per-function complexity limit (past
+    # it, pyright stops checking the function at all). They are called last in a loop
+    # pass, so a `return` here is that loop's `continue`.
+    async def _bar_command(c: str) -> None:
+        """/bar: open, leave or switch the night bar, sip, or set its output mode."""
+        if minimal_mode.active:
+            _send({"type": "tool_result", "name": "bar", "output": "", "error": "Minimal mode is open. Use /minimal leave first.", "code": ""})
+            _send({"type": "done"})
+            return
+        if local_mode.active:
+            _send({"type": "tool_result", "name": "bar", "output": "", "error": f"{local_mode.label} mode is open. Use {local_mode.command} leave first.", "code": ""})
+            _send({"type": "done"})
+            return
+        if active_task is not None and not active_task.done():
+            _send({"type": "tool_result", "name": "bar", "output": "", "error": "Finish or cancel the current reply before changing bar mode.", "code": ""})
+            _send({"type": "done"})
+            return
+        argument = c.split(maxsplit=1)[1].strip() if " " in c else "enter"
+        action = argument.lower()
+        refresh_history = False
+        await _cancel_manual_reviews()
+        if action in {"enter", "open"}:
+            available = list_bar_sessions()
+            name = available[0] if available else create_bar_session_name()
+            if bar_mode.enter(bar_session_path(name)):
+                refresh_history = True
+                output, error = (
+                    f"Night bar opened: {name}. Work context is parked; memory, work tools, tasks, and learning are off.\n"
+                    "This bar session is saved separately. Use /bar leave to return or /bar new for another shift.",
+                    "",
+                )
+            else:
+                output, error = "Night bar is already open. Use /bar leave to return to work.", ""
+        elif action in {"leave", "close", "exit"}:
+            if bar_mode.leave():
+                refresh_history = True
+                output, error = "Night bar closed. Restored the untouched work context.", ""
+            else:
+                output, error = "", "Night bar is not open. Use /bar to enter."
+        elif action in {"new", "reset"}:
+            name = create_bar_session_name()
+            if bar_mode.active:
+                bar_mode.switch(bar_session_path(name))
+            else:
+                bar_mode.enter(bar_session_path(name))
+            refresh_history = True
+            output, error = f"Started a new saved bar session: {name}.", ""
+        elif action in {"sip", "drink"}:
+            if bar_mode.active:
+                _, output = bar_mode.sip()
+                error = ""
+            else:
+                output, error = "", "Night bar is not open. Use /bar to enter."
+        elif action == "status":
+            output, error = (
+                f"Night bar: open · session {bar_mode.session_name} · output {bar_mode.output_mode} · saved separately · memory off · work tools off · scene actions on · learning off"
+                if bar_mode.active
+                else f"Night bar: closed · output {bar_mode.output_mode} · work context active",
+                "",
+            )
+        elif action == "output" or action.startswith("output "):
+            output_args = action.split()
+            if len(output_args) == 1 or output_args[1] == "status":
+                output, error = (
+                    f"Bar output mode: {bar_mode.output_mode}. Use /bar output atomic or /bar output stream.",
+                    "",
+                )
+            elif len(output_args) == 2 and output_args[1] in {"atomic", "stream"}:
+                selected_mode = output_args[1]
+                bar_mode.set_output_mode(selected_mode)
+                save_bar_output_mode(selected_mode)
+                explanation = (
+                    "Replies wait for one validated bar_turn, keeping text and glass state atomic."
+                    if selected_mode == "atomic"
+                    else "Replies stream immediately; individual scene tools update the bar as they complete."
+                )
+                output, error = f"Bar output mode set to {selected_mode}. {explanation}", ""
+            else:
+                output, error = "", "Usage: /bar output [atomic|stream|status]"
+        else:
+            name = argument
+            try:
+                target = bar_session_path(name)
+                existed = bar_session_exists(name)
+                if bar_mode.active:
+                    bar_mode.switch(target)
+                else:
+                    bar_mode.enter(target)
+                refresh_history = True
+                output, error = (
+                    f"Switched to saved bar session: {name}."
+                    if existed else f"Opened new saved bar session: {name}.",
+                    "",
+                )
+            except SessionNameError as exc:
+                output, error = "", str(exc)
+        await _send_model_info()
+        _send_session_info()
+        _send_session_list()
+        _send_working_memory()
+        _send_mode_info()
+        # Set the frontend mode before restoring history so its
+        # renderer cannot format a private-mode transcript with
+        # the previous mode's role prefixes.
+        if refresh_history:
+            await _send_history()
+        _send_bar_session_list()
+        _send_bar_state(output if action in {"sip", "drink"} and not error else "")
+        if error or action not in {"sip", "drink"}:
+            _send({"type": "tool_result", "name": "bar", "output": output, "error": error, "code": ""})
+        _send({"type": "done"})
+
+
+    async def _minimal_command(c: str) -> None:
+        """/minimal: open, leave, switch or list Minimal mode sessions."""
+        if bar_mode.active:
+            _send({"type": "tool_result", "name": "minimal", "output": "", "error": "Night bar is open. Use /bar leave first.", "code": ""})
+            _send({"type": "done"})
+            return
+        if local_mode.active:
+            _send({"type": "tool_result", "name": "minimal", "output": "", "error": f"{local_mode.label} mode is open. Use {local_mode.command} leave first.", "code": ""})
+            _send({"type": "done"})
+            return
+        if active_task is not None and not active_task.done():
+            _send({"type": "tool_result", "name": "minimal", "output": "", "error": "Finish or cancel the current reply before changing minimal mode.", "code": ""})
+            _send({"type": "done"})
+            return
+        argument = c.split(maxsplit=1)[1].strip() if " " in c else "enter"
+        action = argument.lower()
+        refresh_history = False
+        await _cancel_manual_reviews()
+        if action in {"enter", "open"}:
+            available = list_minimal_sessions()
+            name = available[0] if available else create_minimal_session_name()
+            try:
+                entered = minimal_mode.enter(minimal_session_path(name))
+            except Exception as exc:
+                entered = False
+                output, error = "", f"Minimal mode could not open: {exc}"
+            if entered:
+                refresh_history = True
+                output, error = (
+                    f"Minimal mode opened: {name}. Work context is parked; memory, skills, tasks, and work tools are off.\n"
+                    "PTC sandbox is forced ON for this isolated session; read-only web tools are available. Use /minimal leave to return.",
+                    "",
+                )
+            elif minimal_mode.active:
+                output, error = "Minimal mode is already open. Use /minimal leave to return.", ""
+            else:
+                output, error = "", "Minimal mode could not open."
+        elif action in {"new", "reset"}:
+            name = create_minimal_session_name()
+            try:
+                if minimal_mode.active:
+                    minimal_mode.switch(minimal_session_path(name))
+                else:
+                    minimal_mode.enter(minimal_session_path(name))
+                refresh_history = True
+                output, error = f"Started a new saved Minimal session: {name}.", ""
+            except (SessionNameError, OSError, RuntimeError) as exc:
+                output, error = "", f"Minimal session could not start: {exc}"
+        elif action in {"leave", "close", "exit"}:
+            if minimal_mode.leave():
+                refresh_history = True
+                output, error = "Minimal mode closed. Restored the untouched work context.", ""
+            else:
+                output, error = "", "Minimal mode is not open. Use /minimal to enter."
+        elif action == "status":
+            output, error = (
+                MINIMAL_STATUS_OPEN_TEMPLATE.format(session=minimal_mode.session_name)
+                if minimal_mode.active
+                else "Minimal mode: closed · work context active",
+                "",
+            )
+        elif action == "sessions":
+            names = list_minimal_sessions()
+            output = "Minimal sessions:\n" + "\n".join(
+                f"  {'*' if name == minimal_mode.session_name else ' '} {name} ({minimal_session_msg_count(name)} msgs)"
+                for name in names
+            ) if names else "Minimal sessions: none"
+            error = ""
+        else:
+            try:
+                target = minimal_session_path(argument)
+                existed = minimal_session_exists(argument)
+                if minimal_mode.active:
+                    minimal_mode.switch(target)
+                else:
+                    minimal_mode.enter(target)
+                refresh_history = True
+                output, error = (
+                    f"Switched to saved Minimal session: {argument}."
+                    if existed else f"Opened new saved Minimal session: {argument}.",
+                    "",
+                )
+            except (SessionNameError, OSError, RuntimeError) as exc:
+                output, error = "", str(exc)
+        await _send_model_info()
+        _send_session_info()
+        _send_session_list()
+        _send_working_memory()
+        _send_mode_info()
+        _send({"type": "yolo_status", "yolo": agent.tools.yolo})
+        if refresh_history:
+            await _send_history()
+        _send_minimal_session_list()
+        _send({"type": "tool_result", "name": "minimal", "output": output, "error": error, "code": ""})
+        _send({"type": "done"})
+
+
+    async def _local_command(c: str) -> None:
+        """The local mode command: open, leave, switch or list its sessions; undo or retry the last reply."""
+        if bar_mode.active:
+            _send({"type": "tool_result", "name": local_mode.tool_name, "output": "", "error": "Night bar is open. Use /bar leave first.", "code": ""})
+            _send({"type": "done"})
+            return
+        if minimal_mode.active:
+            _send({"type": "tool_result", "name": local_mode.tool_name, "output": "", "error": "Minimal mode is open. Use /minimal leave first.", "code": ""})
+            _send({"type": "done"})
+            return
+        if _reply_done and active_task is not None:
+            with suppress(asyncio.CancelledError, Exception):
+                await active_task
+        if active_task is not None and not active_task.done():
+            _send({"type": "tool_result", "name": local_mode.tool_name, "output": "", "error": f"Finish or cancel the current reply before changing {local_mode.label.lower()} mode.", "code": ""})
+            if _reply_done:
+                _send({"type": "done"})
+            return
+        argument = c.split(maxsplit=1)[1].strip() if " " in c else "enter"
+        action = argument.lower()
+        refresh_history = False
+        resend_text = ""
+        await _cancel_manual_reviews()
+        if action in {"enter", "open"}:
+            available = local_mode.list_sessions()
+            name = available[0] if available else local_mode.new_session_name()
+            try:
+                entered = local_mode.enter(local_mode.session_path(name))
+            except Exception as exc:
+                entered = False
+                output, error = "", f"{local_mode.label} mode could not open: {exc}"
+            if entered:
+                refresh_history = True
+                output, error = (
+                    f"{local_mode.label} mode opened: {name}. Work context is parked; memory, skills, tasks, and work tools are off.\n"
+                    f"This {local_mode.label.lower()} session is saved separately. Use {local_mode.command} leave to return to work.",
+                    "",
+                )
+            elif local_mode.active:
+                output, error = f"{local_mode.label} mode is already open. Use {local_mode.command} leave to return.", ""
+            else:
+                output, error = "", f"{local_mode.label} mode could not open."
+        elif action in {"new", "reset"}:
+            name = local_mode.new_session_name()
+            try:
+                if local_mode.active:
+                    local_mode.switch(local_mode.session_path(name))
+                else:
+                    local_mode.enter(local_mode.session_path(name))
+                refresh_history = True
+                output, error = f"Started a new saved {local_mode.label.lower()} session: {name}.", ""
+            except (SessionNameError, OSError, RuntimeError) as exc:
+                output, error = "", f"{local_mode.label} session could not start: {exc}"
+        elif action in {"leave", "close", "exit"}:
+            try:
+                if local_mode.leave():
+                    refresh_history = True
+                    output, error = f"{local_mode.label} mode closed. Restored the untouched work context.", ""
+                else:
+                    output, error = "", f"{local_mode.label} mode is not open. Use {local_mode.command} to enter."
+            except (OSError, RuntimeError) as exc:
+                output, error = "", f"{local_mode.label} mode could not close: {exc}"
+        elif action == "status":
+            output, error = (
+                local_mode.status_template.format(session=local_mode.session_name)
+                if local_mode.active
+                else f"{local_mode.label} mode: closed · work context active",
+                "",
+            )
+        elif action == "undo" or action.startswith("undo "):
+            if action == "undo":
+                ok, message = local_mode.undo_last_reply()
+            else:
+                count_text = action[5:].strip()
+                try:
+                    count = int(count_text)
+                except ValueError:
+                    count = 0
+                if 1 <= count <= 50:
+                    ok, message = local_mode.undo_last_exchanges(count)
+                else:
+                    ok, message = False, f"Usage: {local_mode.command} undo [count] · count must be an integer between 1 and 50."
+            if ok:
+                refresh_history = True
+                output, error = message, ""
+            else:
+                output, error = "", message
+        elif action == "retry":
+            ok, message, retry_text = local_mode.take_last_request()
+            if ok:
+                refresh_history = True
+                snippet = retry_text if len(retry_text) <= 40 else f"{retry_text[:40]}…"
+                output, error = f'Retrying the last request: "{snippet}"', ""
+                resend_text = retry_text
+            else:
+                output, error = "", message
+        elif action == "sessions":
+            names = local_mode.list_sessions()
+            output = f"{local_mode.label} sessions:\n" + "\n".join(
+                f"  {'*' if name == local_mode.session_name else ' '} {name} ({local_mode.session_msg_count(name)} msgs)"
+                for name in names
+            ) if names else f"{local_mode.label} sessions: none"
+            error = ""
+        else:
+            try:
+                target = local_mode.session_path(argument)
+                existed = local_mode.session_exists(argument)
+                if local_mode.active:
+                    local_mode.switch(target)
+                else:
+                    local_mode.enter(target)
+                refresh_history = True
+                output, error = (
+                    f"Switched to saved {local_mode.label.lower()} session: {argument}."
+                    if existed else f"Opened new saved {local_mode.label.lower()} session: {argument}.",
+                    "",
+                )
+            except (SessionNameError, OSError, RuntimeError) as exc:
+                output, error = "", str(exc)
+        await _send_model_info()
+        _send_session_info()
+        _send_session_list()
+        _send_working_memory()
+        _send_mode_info()
+        _send({"type": "yolo_status", "yolo": agent.tools.yolo})
+        if refresh_history:
+            await _send_history()
+        _send_local_mode_info()
+        _send({"type": "tool_result", "name": local_mode.tool_name, "output": output, "error": error, "code": ""})
+        if resend_text:
+            retry_msg = Msg(sender="user", role="user", content=build_user_message_content(resend_text))
+            launched = await _launch_message(retry_msg, resend_text)
+            if not launched:
+                _send({"type": "tool_result", "name": local_mode.tool_name, "output": "", "error": "Retry could not start; resend the request manually.", "code": ""})
+                _send({"type": "done"})
+        else:
+            _send({"type": "done"})
+
+
+    async def _goal_command(c: str) -> None:
+        """/goal: show, set, pause, resume or clear the session goal."""
+        goal_start_text = ""
+        if task_store is None:
+            output, error = "", "Task persistence is disabled; see backend logs."
+        else:
+            argument = c.split(maxsplit=1)[1].strip() if " " in c else ""
+            goal_session = _current_memory_session()
+            lowered = argument.lower()
+            goal = None
+            try:
+                if not argument:
+                    output, error = (await durable_io(task_store.format_goal_status, goal_session)), ""
+                elif lowered == "pause":
+                    goal = await durable_io(task_store.pause_goal, goal_session)
+                    output, error = (
+                        (f"Goal paused at round {goal['round']}/{goal['max_rounds']}. Use /goal resume to continue.", "")
+                        if goal else ("", "No active goal to pause.")
+                    )
+                elif lowered == "resume":
+                    goal = await durable_io(task_store.resume_goal, goal_session)
+                    if goal is None:
+                        current = await durable_io(task_store.active_goal_for_session, goal_session)
+                        goal = current if current and current.get("status") == "active" else None
+                    if goal is not None:
+                        output, error = f"Goal resumed: {goal['objective']}", ""
+                        goal_start_text = build_goal_resume_message(goal)
+                    else:
+                        output, error = "", "No paused or active goal to resume."
+                elif lowered == "clear":
+                    goal = await durable_io(task_store.clear_goal, goal_session)
+                    output, error = (f"Goal cleared: {goal['objective']}", "") if goal else ("", "No live goal to clear.")
+                else:
+                    objective = argument.split(maxsplit=1)[1].strip() if lowered.startswith("replace ") else argument
+                    goal = await durable_io(task_store.set_goal, goal_session, objective)
+                    output, error = (
+                        f"Goal set (round 0/{goal['max_rounds']}): {goal['objective']}\n"
+                        "Every completed turn is now checked by an independent verifier against real "
+                        "evidence; unmet rounds continue automatically. /goal pause | clear to stop.",
+                        "",
+                    )
+                    goal_start_text = build_goal_start_message(goal)
+            except ValueError as exc:
+                output, error = "", str(exc)
+            if goal is not None:
+                _send({"type": "goal_status", "goal": goal})
+        _send({"type": "tool_result", "name": "goal", "output": output, "error": error, "code": ""})
+        _send({"type": "done"})
+        if goal_start_text:
+            # ZCode semantics: setting a goal starts the work, not
+            # just records it. Launch the first goal round now.
+            goal_msg = Msg(sender="user", role="user", content=build_user_message_content(goal_start_text))
+            goal_msg.metadata["goal_round"] = True
+            await _launch_message(goal_msg, goal_start_text)
+
+
+    async def _session_command(c: str) -> None:
+        """/session: list, export, rename, delete or switch saved sessions."""
+        sessions = list_sessions()
+        current = agent.context.session_path
+        if c == "/session":
+            lines = [f"Sessions ({len(sessions)}):"]
+            for s in sessions:
+                sp = session_path(s)
+                marker = "*" if str(sp.resolve()) == str(Path(current).resolve()) else " "
+                count = session_msg_count(s)
+                lines.append(f"  {marker} {s} ({count} msgs)")
+            _send({"type": "tool_result", "name": "session",
+                   "output": "\n".join(lines), "error": "", "code": ""})
+            _send({"type": "done"})
+        elif c.startswith("/session "):
+            parts = c.split()
+            try:
+                if len(parts) >= 3 and parts[1] == "export":
+                    name = parts[2]
+                    out = export_session_markdown(name)
+                    _send({"type": "tool_result", "name": "session",
+                           "output": f"Exported session '{name}' to {out}", "error": "", "code": ""})
+                elif len(parts) >= 4 and parts[1] == "rename":
+                    old_name, new_name = parts[2], parts[3]
+                    old_path = session_path(old_name)
+                    new_path = session_path(new_name)
+                    rename_lease = claim_session(new_path)
+                    try:
+                        rename_session(old_name, new_name)
+                        memory_store.rename_working(old_name, new_name)
+                        if Path(agent.context.session_path).resolve() == old_path.resolve():
+                            agent.context.set_session(str(new_path))
+                    finally:
+                        del rename_lease
+                    _send_session_info()
+                    _send_session_list()
+                    _send_working_memory()
+                    _send({"type": "tool_result", "name": "session",
+                           "output": f"Renamed session '{old_name}' to '{new_name}'", "error": "", "code": ""})
+                elif len(parts) >= 3 and parts[1] == "delete":
+                    name = parts[2]
+                    if Path(agent.context.session_path).resolve() == session_path(name).resolve():
+                        raise SessionNameError("Switch to another session before deleting the active session.")
+                    delete_session(name)
+                    memory_store.clear_working(name)
+                    _send_session_list()
+                    _send_working_memory()
+                    _send({"type": "tool_result", "name": "session",
+                           "output": f"Deleted session '{name}'", "error": "", "code": ""})
+                else:
+                    name = parts[1]
+                    target = session_path(name)
+                    await agent.context.save_async()
+                    candidate = agent.context.stage_session(str(target))
+                    agent.end_session("session_switch")
+                    agent.reset_conversation()
+                    agent.context.adopt_session(candidate)
+                    agent.begin_session()
+                    if not session_exists(name):
+                        await agent.context.save_async()
+                    await _send_history()
+                    await _send_model_info(refresh=True)
+                    _send_session_info()
+                    _send_session_list()
+                    _send_working_memory()
+                    _send({"type": "tool_result", "name": "session",
+                           "output": f"Switched to session '{name}'", "error": "", "code": ""})
+            except (SessionNameError, OSError, AppshotMediaError) as e:
+                _send({"type": "tool_result", "name": "session",
+                       "output": "", "error": str(e), "code": ""})
+            _send({"type": "done"})
 
     lifecycle_task = asyncio.create_task(_lifecycle_tick(), name="session-lifecycle")
 
@@ -3051,342 +3531,11 @@ async def _main(startup_started: float):
                         message, error = "", f"Invalid voice command: {exc}"
                     voice.report(force=True, message=message, error=error)
                 elif c == "/bar" or c.startswith("/bar "):
-                    if minimal_mode.active:
-                        _send({"type": "tool_result", "name": "bar", "output": "", "error": "Minimal mode is open. Use /minimal leave first.", "code": ""})
-                        _send({"type": "done"})
-                        continue
-                    if local_mode.active:
-                        _send({"type": "tool_result", "name": "bar", "output": "", "error": f"{local_mode.label} mode is open. Use {local_mode.command} leave first.", "code": ""})
-                        _send({"type": "done"})
-                        continue
-                    if active_task is not None and not active_task.done():
-                        _send({"type": "tool_result", "name": "bar", "output": "", "error": "Finish or cancel the current reply before changing bar mode.", "code": ""})
-                        _send({"type": "done"})
-                        continue
-                    argument = c.split(maxsplit=1)[1].strip() if " " in c else "enter"
-                    action = argument.lower()
-                    refresh_history = False
-                    await _cancel_manual_reviews()
-                    if action in {"enter", "open"}:
-                        available = list_bar_sessions()
-                        name = available[0] if available else create_bar_session_name()
-                        if bar_mode.enter(bar_session_path(name)):
-                            refresh_history = True
-                            output, error = (
-                                f"Night bar opened: {name}. Work context is parked; memory, work tools, tasks, and learning are off.\n"
-                                "This bar session is saved separately. Use /bar leave to return or /bar new for another shift.",
-                                "",
-                            )
-                        else:
-                            output, error = "Night bar is already open. Use /bar leave to return to work.", ""
-                    elif action in {"leave", "close", "exit"}:
-                        if bar_mode.leave():
-                            refresh_history = True
-                            output, error = "Night bar closed. Restored the untouched work context.", ""
-                        else:
-                            output, error = "", "Night bar is not open. Use /bar to enter."
-                    elif action in {"new", "reset"}:
-                        name = create_bar_session_name()
-                        if bar_mode.active:
-                            bar_mode.switch(bar_session_path(name))
-                        else:
-                            bar_mode.enter(bar_session_path(name))
-                        refresh_history = True
-                        output, error = f"Started a new saved bar session: {name}.", ""
-                    elif action in {"sip", "drink"}:
-                        if bar_mode.active:
-                            _, output = bar_mode.sip()
-                            error = ""
-                        else:
-                            output, error = "", "Night bar is not open. Use /bar to enter."
-                    elif action == "status":
-                        output, error = (
-                            f"Night bar: open · session {bar_mode.session_name} · output {bar_mode.output_mode} · saved separately · memory off · work tools off · scene actions on · learning off"
-                            if bar_mode.active
-                            else f"Night bar: closed · output {bar_mode.output_mode} · work context active",
-                            "",
-                        )
-                    elif action == "output" or action.startswith("output "):
-                        output_args = action.split()
-                        if len(output_args) == 1 or output_args[1] == "status":
-                            output, error = (
-                                f"Bar output mode: {bar_mode.output_mode}. Use /bar output atomic or /bar output stream.",
-                                "",
-                            )
-                        elif len(output_args) == 2 and output_args[1] in {"atomic", "stream"}:
-                            selected_mode = output_args[1]
-                            bar_mode.set_output_mode(selected_mode)
-                            save_bar_output_mode(selected_mode)
-                            explanation = (
-                                "Replies wait for one validated bar_turn, keeping text and glass state atomic."
-                                if selected_mode == "atomic"
-                                else "Replies stream immediately; individual scene tools update the bar as they complete."
-                            )
-                            output, error = f"Bar output mode set to {selected_mode}. {explanation}", ""
-                        else:
-                            output, error = "", "Usage: /bar output [atomic|stream|status]"
-                    else:
-                        name = argument
-                        try:
-                            target = bar_session_path(name)
-                            existed = bar_session_exists(name)
-                            if bar_mode.active:
-                                bar_mode.switch(target)
-                            else:
-                                bar_mode.enter(target)
-                            refresh_history = True
-                            output, error = (
-                                f"Switched to saved bar session: {name}."
-                                if existed else f"Opened new saved bar session: {name}.",
-                                "",
-                            )
-                        except SessionNameError as exc:
-                            output, error = "", str(exc)
-                    await _send_model_info()
-                    _send_session_info()
-                    _send_session_list()
-                    _send_working_memory()
-                    _send_mode_info()
-                    # Set the frontend mode before restoring history so its
-                    # renderer cannot format a private-mode transcript with
-                    # the previous mode's role prefixes.
-                    if refresh_history:
-                        await _send_history()
-                    _send_bar_session_list()
-                    _send_bar_state(output if action in {"sip", "drink"} and not error else "")
-                    if error or action not in {"sip", "drink"}:
-                        _send({"type": "tool_result", "name": "bar", "output": output, "error": error, "code": ""})
-                    _send({"type": "done"})
+                    await _bar_command(c)
                 elif c == "/minimal" or c.startswith("/minimal "):
-                    if bar_mode.active:
-                        _send({"type": "tool_result", "name": "minimal", "output": "", "error": "Night bar is open. Use /bar leave first.", "code": ""})
-                        _send({"type": "done"})
-                        continue
-                    if local_mode.active:
-                        _send({"type": "tool_result", "name": "minimal", "output": "", "error": f"{local_mode.label} mode is open. Use {local_mode.command} leave first.", "code": ""})
-                        _send({"type": "done"})
-                        continue
-                    if active_task is not None and not active_task.done():
-                        _send({"type": "tool_result", "name": "minimal", "output": "", "error": "Finish or cancel the current reply before changing minimal mode.", "code": ""})
-                        _send({"type": "done"})
-                        continue
-                    argument = c.split(maxsplit=1)[1].strip() if " " in c else "enter"
-                    action = argument.lower()
-                    refresh_history = False
-                    await _cancel_manual_reviews()
-                    if action in {"enter", "open"}:
-                        available = list_minimal_sessions()
-                        name = available[0] if available else create_minimal_session_name()
-                        try:
-                            entered = minimal_mode.enter(minimal_session_path(name))
-                        except Exception as exc:
-                            entered = False
-                            output, error = "", f"Minimal mode could not open: {exc}"
-                        if entered:
-                            refresh_history = True
-                            output, error = (
-                                f"Minimal mode opened: {name}. Work context is parked; memory, skills, tasks, and work tools are off.\n"
-                                "PTC sandbox is forced ON for this isolated session; read-only web tools are available. Use /minimal leave to return.",
-                                "",
-                            )
-                        elif minimal_mode.active:
-                            output, error = "Minimal mode is already open. Use /minimal leave to return.", ""
-                        else:
-                            output, error = "", "Minimal mode could not open."
-                    elif action in {"new", "reset"}:
-                        name = create_minimal_session_name()
-                        try:
-                            if minimal_mode.active:
-                                minimal_mode.switch(minimal_session_path(name))
-                            else:
-                                minimal_mode.enter(minimal_session_path(name))
-                            refresh_history = True
-                            output, error = f"Started a new saved Minimal session: {name}.", ""
-                        except (SessionNameError, OSError, RuntimeError) as exc:
-                            output, error = "", f"Minimal session could not start: {exc}"
-                    elif action in {"leave", "close", "exit"}:
-                        if minimal_mode.leave():
-                            refresh_history = True
-                            output, error = "Minimal mode closed. Restored the untouched work context.", ""
-                        else:
-                            output, error = "", "Minimal mode is not open. Use /minimal to enter."
-                    elif action == "status":
-                        output, error = (
-                            MINIMAL_STATUS_OPEN_TEMPLATE.format(session=minimal_mode.session_name)
-                            if minimal_mode.active
-                            else "Minimal mode: closed · work context active",
-                            "",
-                        )
-                    elif action == "sessions":
-                        names = list_minimal_sessions()
-                        output = "Minimal sessions:\n" + "\n".join(
-                            f"  {'*' if name == minimal_mode.session_name else ' '} {name} ({minimal_session_msg_count(name)} msgs)"
-                            for name in names
-                        ) if names else "Minimal sessions: none"
-                        error = ""
-                    else:
-                        try:
-                            target = minimal_session_path(argument)
-                            existed = minimal_session_exists(argument)
-                            if minimal_mode.active:
-                                minimal_mode.switch(target)
-                            else:
-                                minimal_mode.enter(target)
-                            refresh_history = True
-                            output, error = (
-                                f"Switched to saved Minimal session: {argument}."
-                                if existed else f"Opened new saved Minimal session: {argument}.",
-                                "",
-                            )
-                        except (SessionNameError, OSError, RuntimeError) as exc:
-                            output, error = "", str(exc)
-                    await _send_model_info()
-                    _send_session_info()
-                    _send_session_list()
-                    _send_working_memory()
-                    _send_mode_info()
-                    _send({"type": "yolo_status", "yolo": agent.tools.yolo})
-                    if refresh_history:
-                        await _send_history()
-                    _send_minimal_session_list()
-                    _send({"type": "tool_result", "name": "minimal", "output": output, "error": error, "code": ""})
-                    _send({"type": "done"})
+                    await _minimal_command(c)
                 elif local_mode.matches(c):
-                    if bar_mode.active:
-                        _send({"type": "tool_result", "name": local_mode.tool_name, "output": "", "error": "Night bar is open. Use /bar leave first.", "code": ""})
-                        _send({"type": "done"})
-                        continue
-                    if minimal_mode.active:
-                        _send({"type": "tool_result", "name": local_mode.tool_name, "output": "", "error": "Minimal mode is open. Use /minimal leave first.", "code": ""})
-                        _send({"type": "done"})
-                        continue
-                    if _reply_done and active_task is not None:
-                        with suppress(asyncio.CancelledError, Exception):
-                            await active_task
-                    if active_task is not None and not active_task.done():
-                        _send({"type": "tool_result", "name": local_mode.tool_name, "output": "", "error": f"Finish or cancel the current reply before changing {local_mode.label.lower()} mode.", "code": ""})
-                        if _reply_done:
-                            _send({"type": "done"})
-                        continue
-                    argument = c.split(maxsplit=1)[1].strip() if " " in c else "enter"
-                    action = argument.lower()
-                    refresh_history = False
-                    resend_text = ""
-                    await _cancel_manual_reviews()
-                    if action in {"enter", "open"}:
-                        available = local_mode.list_sessions()
-                        name = available[0] if available else local_mode.new_session_name()
-                        try:
-                            entered = local_mode.enter(local_mode.session_path(name))
-                        except Exception as exc:
-                            entered = False
-                            output, error = "", f"{local_mode.label} mode could not open: {exc}"
-                        if entered:
-                            refresh_history = True
-                            output, error = (
-                                f"{local_mode.label} mode opened: {name}. Work context is parked; memory, skills, tasks, and work tools are off.\n"
-                                f"This {local_mode.label.lower()} session is saved separately. Use {local_mode.command} leave to return to work.",
-                                "",
-                            )
-                        elif local_mode.active:
-                            output, error = f"{local_mode.label} mode is already open. Use {local_mode.command} leave to return.", ""
-                        else:
-                            output, error = "", f"{local_mode.label} mode could not open."
-                    elif action in {"new", "reset"}:
-                        name = local_mode.new_session_name()
-                        try:
-                            if local_mode.active:
-                                local_mode.switch(local_mode.session_path(name))
-                            else:
-                                local_mode.enter(local_mode.session_path(name))
-                            refresh_history = True
-                            output, error = f"Started a new saved {local_mode.label.lower()} session: {name}.", ""
-                        except (SessionNameError, OSError, RuntimeError) as exc:
-                            output, error = "", f"{local_mode.label} session could not start: {exc}"
-                    elif action in {"leave", "close", "exit"}:
-                        try:
-                            if local_mode.leave():
-                                refresh_history = True
-                                output, error = f"{local_mode.label} mode closed. Restored the untouched work context.", ""
-                            else:
-                                output, error = "", f"{local_mode.label} mode is not open. Use {local_mode.command} to enter."
-                        except (OSError, RuntimeError) as exc:
-                            output, error = "", f"{local_mode.label} mode could not close: {exc}"
-                    elif action == "status":
-                        output, error = (
-                            local_mode.status_template.format(session=local_mode.session_name)
-                            if local_mode.active
-                            else f"{local_mode.label} mode: closed · work context active",
-                            "",
-                        )
-                    elif action == "undo" or action.startswith("undo "):
-                        if action == "undo":
-                            ok, message = local_mode.undo_last_reply()
-                        else:
-                            count_text = action[5:].strip()
-                            try:
-                                count = int(count_text)
-                            except ValueError:
-                                count = 0
-                            if 1 <= count <= 50:
-                                ok, message = local_mode.undo_last_exchanges(count)
-                            else:
-                                ok, message = False, f"Usage: {local_mode.command} undo [count] · count must be an integer between 1 and 50."
-                        if ok:
-                            refresh_history = True
-                            output, error = message, ""
-                        else:
-                            output, error = "", message
-                    elif action == "retry":
-                        ok, message, retry_text = local_mode.take_last_request()
-                        if ok:
-                            refresh_history = True
-                            snippet = retry_text if len(retry_text) <= 40 else f"{retry_text[:40]}…"
-                            output, error = f'Retrying the last request: "{snippet}"', ""
-                            resend_text = retry_text
-                        else:
-                            output, error = "", message
-                    elif action == "sessions":
-                        names = local_mode.list_sessions()
-                        output = f"{local_mode.label} sessions:\n" + "\n".join(
-                            f"  {'*' if name == local_mode.session_name else ' '} {name} ({local_mode.session_msg_count(name)} msgs)"
-                            for name in names
-                        ) if names else f"{local_mode.label} sessions: none"
-                        error = ""
-                    else:
-                        try:
-                            target = local_mode.session_path(argument)
-                            existed = local_mode.session_exists(argument)
-                            if local_mode.active:
-                                local_mode.switch(target)
-                            else:
-                                local_mode.enter(target)
-                            refresh_history = True
-                            output, error = (
-                                f"Switched to saved {local_mode.label.lower()} session: {argument}."
-                                if existed else f"Opened new saved {local_mode.label.lower()} session: {argument}.",
-                                "",
-                            )
-                        except (SessionNameError, OSError, RuntimeError) as exc:
-                            output, error = "", str(exc)
-                    await _send_model_info()
-                    _send_session_info()
-                    _send_session_list()
-                    _send_working_memory()
-                    _send_mode_info()
-                    _send({"type": "yolo_status", "yolo": agent.tools.yolo})
-                    if refresh_history:
-                        await _send_history()
-                    _send_local_mode_info()
-                    _send({"type": "tool_result", "name": local_mode.tool_name, "output": output, "error": error, "code": ""})
-                    if resend_text:
-                        retry_msg = Msg(sender="user", role="user", content=build_user_message_content(resend_text))
-                        launched = await _launch_message(retry_msg, resend_text)
-                        if not launched:
-                            _send({"type": "tool_result", "name": local_mode.tool_name, "output": "", "error": "Retry could not start; resend the request manually.", "code": ""})
-                            _send({"type": "done"})
-                    else:
-                        _send({"type": "done"})
+                    await _local_command(c)
                 elif c == "/sip":
                     if active_task is not None and not active_task.done():
                         _send({"type": "tool_result", "name": "sip", "output": "", "error": "Finish or cancel the current reply before drinking.", "code": ""})
@@ -3520,58 +3669,7 @@ async def _main(startup_started: float):
                     _send({"type": "tool_result", "name": "tasks", "output": output, "error": error, "code": ""})
                     _send({"type": "done"})
                 elif c == "/goal" or c.startswith("/goal "):
-                    goal_start_text = ""
-                    if task_store is None:
-                        output, error = "", "Task persistence is disabled; see backend logs."
-                    else:
-                        argument = c.split(maxsplit=1)[1].strip() if " " in c else ""
-                        goal_session = _current_memory_session()
-                        lowered = argument.lower()
-                        goal = None
-                        try:
-                            if not argument:
-                                output, error = (await durable_io(task_store.format_goal_status, goal_session)), ""
-                            elif lowered == "pause":
-                                goal = await durable_io(task_store.pause_goal, goal_session)
-                                output, error = (
-                                    (f"Goal paused at round {goal['round']}/{goal['max_rounds']}. Use /goal resume to continue.", "")
-                                    if goal else ("", "No active goal to pause.")
-                                )
-                            elif lowered == "resume":
-                                goal = await durable_io(task_store.resume_goal, goal_session)
-                                if goal is None:
-                                    current = await durable_io(task_store.active_goal_for_session, goal_session)
-                                    goal = current if current and current.get("status") == "active" else None
-                                if goal is not None:
-                                    output, error = f"Goal resumed: {goal['objective']}", ""
-                                    goal_start_text = build_goal_resume_message(goal)
-                                else:
-                                    output, error = "", "No paused or active goal to resume."
-                            elif lowered == "clear":
-                                goal = await durable_io(task_store.clear_goal, goal_session)
-                                output, error = (f"Goal cleared: {goal['objective']}", "") if goal else ("", "No live goal to clear.")
-                            else:
-                                objective = argument.split(maxsplit=1)[1].strip() if lowered.startswith("replace ") else argument
-                                goal = await durable_io(task_store.set_goal, goal_session, objective)
-                                output, error = (
-                                    f"Goal set (round 0/{goal['max_rounds']}): {goal['objective']}\n"
-                                    "Every completed turn is now checked by an independent verifier against real "
-                                    "evidence; unmet rounds continue automatically. /goal pause | clear to stop.",
-                                    "",
-                                )
-                                goal_start_text = build_goal_start_message(goal)
-                        except ValueError as exc:
-                            output, error = "", str(exc)
-                        if goal is not None:
-                            _send({"type": "goal_status", "goal": goal})
-                    _send({"type": "tool_result", "name": "goal", "output": output, "error": error, "code": ""})
-                    _send({"type": "done"})
-                    if goal_start_text:
-                        # ZCode semantics: setting a goal starts the work, not
-                        # just records it. Launch the first goal round now.
-                        goal_msg = Msg(sender="user", role="user", content=build_user_message_content(goal_start_text))
-                        goal_msg.metadata["goal_round"] = True
-                        await _launch_message(goal_msg, goal_start_text)
+                    await _goal_command(c)
                 elif c == "/today":
                     if task_store is None:
                         output, error = "", "Task persistence is disabled; see backend logs."
@@ -4175,75 +4273,7 @@ async def _main(startup_started: float):
                     _send({"type": "done"})
                     await _send_model_info()
                 elif c.startswith("/session"):
-                    sessions = list_sessions()
-                    current = agent.context.session_path
-                    if c == "/session":
-                        lines = [f"Sessions ({len(sessions)}):"]
-                        for s in sessions:
-                            sp = session_path(s)
-                            marker = "*" if str(sp.resolve()) == str(Path(current).resolve()) else " "
-                            count = session_msg_count(s)
-                            lines.append(f"  {marker} {s} ({count} msgs)")
-                        _send({"type": "tool_result", "name": "session",
-                               "output": "\n".join(lines), "error": "", "code": ""})
-                        _send({"type": "done"})
-                    elif c.startswith("/session "):
-                        parts = c.split()
-                        try:
-                            if len(parts) >= 3 and parts[1] == "export":
-                                name = parts[2]
-                                out = export_session_markdown(name)
-                                _send({"type": "tool_result", "name": "session",
-                                       "output": f"Exported session '{name}' to {out}", "error": "", "code": ""})
-                            elif len(parts) >= 4 and parts[1] == "rename":
-                                old_name, new_name = parts[2], parts[3]
-                                old_path = session_path(old_name)
-                                new_path = session_path(new_name)
-                                rename_lease = claim_session(new_path)
-                                try:
-                                    rename_session(old_name, new_name)
-                                    memory_store.rename_working(old_name, new_name)
-                                    if Path(agent.context.session_path).resolve() == old_path.resolve():
-                                        agent.context.set_session(str(new_path))
-                                finally:
-                                    del rename_lease
-                                _send_session_info()
-                                _send_session_list()
-                                _send_working_memory()
-                                _send({"type": "tool_result", "name": "session",
-                                       "output": f"Renamed session '{old_name}' to '{new_name}'", "error": "", "code": ""})
-                            elif len(parts) >= 3 and parts[1] == "delete":
-                                name = parts[2]
-                                if Path(agent.context.session_path).resolve() == session_path(name).resolve():
-                                    raise SessionNameError("Switch to another session before deleting the active session.")
-                                delete_session(name)
-                                memory_store.clear_working(name)
-                                _send_session_list()
-                                _send_working_memory()
-                                _send({"type": "tool_result", "name": "session",
-                                       "output": f"Deleted session '{name}'", "error": "", "code": ""})
-                            else:
-                                name = parts[1]
-                                target = session_path(name)
-                                await agent.context.save_async()
-                                candidate = agent.context.stage_session(str(target))
-                                agent.end_session("session_switch")
-                                agent.reset_conversation()
-                                agent.context.adopt_session(candidate)
-                                agent.begin_session()
-                                if not session_exists(name):
-                                    await agent.context.save_async()
-                                await _send_history()
-                                await _send_model_info(refresh=True)
-                                _send_session_info()
-                                _send_session_list()
-                                _send_working_memory()
-                                _send({"type": "tool_result", "name": "session",
-                                       "output": f"Switched to session '{name}'", "error": "", "code": ""})
-                        except (SessionNameError, OSError, AppshotMediaError) as e:
-                            _send({"type": "tool_result", "name": "session",
-                                   "output": "", "error": str(e), "code": ""})
-                        _send({"type": "done"})
+                    await _session_command(c)
 
                 elif c.startswith("/conclave"):
                     await _handle_conclave(c, _send, agent)

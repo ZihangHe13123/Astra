@@ -2055,9 +2055,12 @@ class ComputerSessionManager:
             return None
         identities: set[str] = set()
         for application in catalog.apps:
-            if not isinstance(application, Mapping) or not isinstance(application.get("windows"), list):
+            if not isinstance(application, Mapping):
                 return None
-            for window in application["windows"]:
+            windows = application.get("windows")
+            if not isinstance(windows, list):
+                return None
+            for window in windows:
                 if not isinstance(window, Mapping):
                     return None
                 identity = window.get("window_identity_ref")

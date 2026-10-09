@@ -5,10 +5,13 @@ import os
 HOST_NAME = 'com.astra.browser_control'
 KEYS = {'edge': 'Software\\Microsoft\\Edge\\NativeMessagingHosts\\' + HOST_NAME,
         'chrome': 'Software\\Google\\Chrome\\NativeMessagingHosts\\' + HOST_NAME}
+_WINDOWS_ONLY = 'The native-host registry requires native Windows'
 
 
 def require_user_registry():
     """Do not mistake a process-private registry for the ordinary browser's HKCU."""
+    if os.name != 'nt':
+        raise RuntimeError(_WINDOWS_ONLY)
     import ctypes
     from ctypes import wintypes
     # Agent-launched children may have a virtualized registry even when
@@ -27,7 +30,9 @@ def require_user_registry():
         )
 
 
-def entries(browser):
+def entries(browser) -> list[tuple[str, int, str]]:
+    if os.name != 'nt':
+        raise RuntimeError(_WINDOWS_ONLY)
     import winreg
     found = []
     for hive_name, hive in [('HKCU', winreg.HKEY_CURRENT_USER), ('HKLM', winreg.HKEY_LOCAL_MACHINE)]:
@@ -56,6 +61,8 @@ def matches(browser, manifest):
 
 
 def publish(browser, manifest):
+    if os.name != 'nt':
+        raise RuntimeError(_WINDOWS_ONLY)
     import winreg
     require_user_registry()
     found = entries(browser)
@@ -83,6 +90,8 @@ def publish(browser, manifest):
 
 
 def remove(browser, manifest):
+    if os.name != 'nt':
+        raise RuntimeError(_WINDOWS_ONLY)
     import winreg
     require_user_registry()
     if not entries(browser):

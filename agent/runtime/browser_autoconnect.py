@@ -21,6 +21,8 @@ def _registered(browser: str, home: Path, repo: Path) -> bool:
 
 
 def windows_browser_executable(browser, *, home=None):
+    if os.name != 'nt':
+        raise RuntimeError('Registry browser discovery requires native Windows')
     import winreg
     executable = 'msedge.exe' if browser == 'edge' else 'chrome.exe'
     candidates = []
