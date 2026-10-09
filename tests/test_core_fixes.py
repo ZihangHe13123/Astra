@@ -42,6 +42,7 @@ from agent.runtime.llm import (
     OpenAICompatibleProvider,
     _messages_for_capabilities,
 )
+from agent.runtime.message_source import message_source_ref
 from agent.runtime.react import ReActAgent
 from agent.runtime.session_store import SessionStore
 from agent.runtime.task_store import TaskStore
@@ -8430,7 +8431,19 @@ def test_duplicate_full_tile_selection_is_not_cached_and_task_step_hides_paths(t
         }
         for step in stored_task["steps"]
     ], ensure_ascii=False)
-    event_text = json.dumps(events, ensure_ascii=False)
+    # A message_source event names a saved canonical message by position and
+    # content digest. Only a digest verified against that saved message is
+    # left out; tile cache keys and tile byte hashes must still never reach a
+    # task step or an event.
+    saved_messages = SessionStore(session_path).load()["messages"]
+    scanned_events = []
+    for event in events:
+        if event.get("type") == "message_source":
+            reference = event["source_ref"]
+            assert reference == message_source_ref(saved_messages[reference["index"]], reference["index"])
+            event = {**event, "source_ref": {"index": reference["index"]}}
+        scanned_events.append(event)
+    event_text = json.dumps(scanned_events, ensure_ascii=False)
     source_path = str(source.resolve())
     for serialized in (task_text, event_text):
         normalized = serialized.replace("\\\\", "/")
