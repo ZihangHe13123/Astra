@@ -7795,7 +7795,7 @@ def test_current_time_tool_uses_runtime_clock(monkeypatch):
         register_time_tools(registry)
         result = await registry.execute("current_time", {})
 
-        assert result["output"] == "2026-05-20 周三 17:08:09 UTC+08:00"
+        assert result["output"] == "2026-05-20 周三 17:08:09 UTC+08:00 (Asia/Shanghai)"
 
     run(scenario())
 
