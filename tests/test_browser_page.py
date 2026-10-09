@@ -167,3 +167,29 @@ def test_cdp_wait_uses_ref_preserving_probe():
         assert 'stale_snapshot' in await conn.wait_for(selector='ref:old',timeout_ms=300)
         conn.page_operation.assert_awaited_once()
     asyncio.run(check())
+
+
+def test_cdp_read_passes_the_offset_with_the_bound_origin():
+    async def check():
+        backend = CdpBrowserBackend(chrome_path='/fake')
+        conn = AsyncMock(); conn.is_connected = True
+        conn.page_operation.return_value = {'status':'observed','value':'rest','valueTruncated':False,'valueOffset':12000}
+        backend._connections['t'] = conn
+        result = await backend.interactive_read('#content',tab_id='t',url='https://example.org/long',offset=12000)
+        assert json.loads(result)['valueOffset'] == 12000
+        conn.page_operation.assert_awaited_once_with('read', {
+            'selector':'#content','offset':12000,'expectedOrigin':'https://example.org'})
+        await backend.interactive_read('#content',tab_id='t',url='https://example.org/long')
+        conn.page_operation.assert_awaited_with('read', {'selector':'#content','expectedOrigin':'https://example.org'})
+    asyncio.run(check())
+
+
+def test_cdp_wait_timeout_reports_the_time_actually_waited_and_no_observation():
+    async def check():
+        conn = CdpConnection('', page_ws_url='ws://test')
+        conn.page_operation = AsyncMock(return_value={'matched':False})
+        # Requests are held to 100..30000 ms; the receipt names the time used, not the time asked for.
+        result = json.loads(await conn.wait_for(text='never',timeout_ms=5))
+        assert result['status'] == 'timeout' and 'after 100 ms' in result['message']
+        assert 'after' not in result
+    asyncio.run(check())

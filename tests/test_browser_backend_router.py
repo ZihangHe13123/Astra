@@ -172,3 +172,32 @@ def test_snapshot_text_options_follow_each_bound_transport():
         ext.interactive_snapshot.assert_awaited_once_with(tab_id='new',include_text=False)
         primary.interactive_snapshot.assert_awaited_once_with(tab_id='old',include_text=True)
     asyncio.run(scenario())
+
+
+def test_cdp_never_stands_in_for_a_named_extension_tab():
+    async def scenario():
+        primary,ext=Backend('cdp'),Backend('extension')
+        connected=[]
+        async def connect(**kw): connected.append(kw);return 'Connected cdp'
+        primary.connect_existing=connect
+        router=BrowserBackendRouter(primary,lambda:ext)
+        with pytest.raises(ValueError,match='transport=extension'):
+            await router.connect_existing(transport='cdp',tab_id='new',target_tab_id='7')
+        # Not attached to some other page, and the logical tab is left unbound.
+        assert connected==[] and 'new' not in router.bindings
+        await router.connect_existing(transport='cdp',tab_id='new')
+        assert connected==[{'tab_id':'new','port':0,'host':''}]
+    asyncio.run(scenario())
+
+
+def test_close_outcome_comes_back_from_the_bound_transport():
+    async def scenario():
+        primary,ext=Backend('cdp'),Backend('extension')
+        async def close(tab_id=''): return 'detached'
+        ext.close_connection=close
+        router=BrowserBackendRouter(primary,lambda:ext)
+        await router.interactive_state(tab_id='managed')
+        await router.connect_existing(transport='extension',tab_id='granted')
+        assert await router.close_connection('granted')=='detached'
+        assert await router.close_connection('managed') is None and primary.closed==['managed']
+    asyncio.run(scenario())

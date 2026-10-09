@@ -39,6 +39,7 @@ from ..browser_session import (
     format_session,
     sanitize_snapshot,
 )
+from ..tool_execution import PartialResult
 from ..tool_failure import ToolFailure
 from ..browser_lifecycle import BrowserLifecycle
 from .approval import ScopedApprovalStore, normalized_origin
@@ -47,11 +48,50 @@ from .registry import ToolDef, ToolRegistry, _set_tool_timeout_failure
 logger = logging.getLogger(__name__)
 
 
+# The page script returns at most this many characters of page text, and of one read value.
+_PAGE_TEXT_LIMIT = 12000
+_MOVED_ORIGIN_HINT = (
+    "Call browser_open with the reported address to work on that page; "
+    "this tab stays bound to the origin it was opened on."
+)
+
+
 async def _await_backend_result(result: object) -> object:
     """Narrow optional transport hooks without weakening the core protocol."""
     if not inspect.isawaitable(result):
         raise TypeError("browser backend operation must be awaitable")
     return await result
+
+
+class _OriginMoved(PermissionError):
+    """The live page is on another origin than the one this tab is bound to."""
+
+
+def _shown_url(url: object) -> str:
+    return sanitize_snapshot(" ".join(str(url).split())[:2000]) or "an unreadable address"
+
+
+def _page_text_note(observation: object) -> str:
+    """Say when a structured snapshot's page text stopped at the page script's limit."""
+    if isinstance(observation, str):
+        try:
+            observation = json.loads(observation)
+        except (ValueError, RecursionError):
+            return ""
+    if not isinstance(observation, dict) or observation.get("textIncluded") is False:
+        return ""
+    text = observation.get("text")
+    if not isinstance(text, str):
+        return ""
+    cut = observation.get("textTruncated")
+    rest = ("To read the rest, call browser_read on a content container (CSS such as main, article or body) "
+            "and continue with its offset.")
+    if cut is True:
+        return f"Note: page text is cut after {len(text)} characters (limit {_PAGE_TEXT_LIMIT}). {rest}"
+    # A page script from before this flag does not report it; a full window is the only sign.
+    if cut is None and len(text) >= _PAGE_TEXT_LIMIT:
+        return f"Note: page text fills the {_PAGE_TEXT_LIMIT}-character limit, so later text may be missing. {rest}"
+    return ""
 
 
 def register_browser_tools(
@@ -256,7 +296,9 @@ def register_browser_tools(
             return manager.get_tab(tab_id)
         url, title, snapshot = await backend.interactive_state(tab_id=tab_id)
         if expected_origin and normalized_origin(url) != expected_origin:
-            raise PermissionError("Cross-origin redirect blocked; open or attach the new page explicitly")
+            raise _OriginMoved(
+                f"Cross-origin redirect blocked: the page went to {_shown_url(url)}, outside {expected_origin}. "
+                "Call browser_open with that address to use it")
         return manager.update_page_state(
             tab_id, url=url, title=title, snapshot=snapshot[:65536]
         )
@@ -300,13 +342,32 @@ def register_browser_tools(
                          "owner_pid": exc.owner_pid})
         return _failure(f"{operation} failed: {exc}")
 
-    async def _finish_action(tab_id: str, result: str, *, expected_text: str | None = None) -> str | ToolFailure:
+    async def _finish_action(tab_id: str, result: str, *, expected_text: str | None = None,
+                             read_offset: int | None = None) -> str | ToolFailure:
         # Re-observing would invalidate the element refs in the action's own
         # postcondition snapshot. Persist and return that exact observation.
         try:
             payload = json.loads(result)
         except (ValueError, TypeError):
             payload = None
+        read_cut = False
+        if isinstance(payload, dict) and read_offset is not None and isinstance(payload.get("value"), str):
+            # A page script from before offsets ignores the argument and returns the start again.
+            if read_offset and payload.get("valueOffset") != read_offset:
+                return _failure(
+                    "browser_read offset is not supported by the page script in use; nothing was read from that offset",
+                    "browser_unsupported_operation",
+                    recovery_hint="Read a smaller element instead, or ask the user to reload the Browser Control extension and observe again.")
+            if payload.get("valueTruncated") is True:
+                read_cut = True
+                end = read_offset + len(payload["value"])
+                total = payload.get("valueLength")
+                payload["value_note"] = (
+                    f"value holds characters {read_offset} to {end}"
+                    + (f" of {total}" if type(total) is int else "")
+                    + f" (limit {_PAGE_TEXT_LIMIT} per read). "
+                    + (f"Call browser_read again with offset={end} for the rest." if "valueOffset" in payload
+                       else "This page script cannot continue from an offset; read a smaller element for the rest."))
         if isinstance(payload, dict) and expected_text is not None and isinstance(payload.get("value"), str):
             actual = payload["value"]
             expected = expected_text.replace("\r\n", "\n").replace("\r", "\n")
@@ -331,6 +392,9 @@ def register_browser_tools(
         if updated is None:
             return _failure("Active tab disappeared. Call browser_open.")
         if isinstance(payload, dict):
+            after_note = _page_text_note(after)
+            if after_note:
+                payload["after_text_note"] = after_note
             # Existing structured fields stay intact for older callers. Give
             # models an explicit continuation rather than a vague status marker.
             value_verified = payload.get("verified") is True and payload.get("status") not in _failed_statuses | {"no_observed_change"}
@@ -359,8 +423,16 @@ def register_browser_tools(
                 payload["continuation"] = {"next_step": "fresh_snapshot", "repeat_input": False,
                     "instruction": "This reference is expired. Observe once and use new refs; refreshing refs does not restore unsupported operations."}
             elif payload.get("status") == "timeout":
-                payload["continuation"] = {"next_step": "inspect_after", "repeat_input": False,
-                    "instruction": "The requested wait condition was not observed. Inspect the current after URL/text for the task result before waiting again; do not repeat the preceding input."}
+                # Not every backend returns an observation with a timeout.
+                payload["continuation"] = {"next_step": "inspect_after" if isinstance(after, dict) else "observe", "repeat_input": False,
+                    "instruction": "The requested wait condition was not observed. "
+                        + ("Inspect the current after URL/text for the task result" if isinstance(after, dict)
+                           else "This result has no after; call browser_snapshot with refresh=true to see the current page")
+                        + " before waiting again; do not repeat the preceding input."}
+            elif payload.get("status") == "error" and isinstance(payload.get("options"), list):
+                payload["continuation"] = {"next_step": "choose_listed_option", "repeat_input": False,
+                    "instruction": "Nothing was selected. Call browser_select again with a value or the exact visible label from options"
+                        + (" (only the first ones are listed)." if payload.get("optionsTruncated") else ".")}
             result = json.dumps(payload, ensure_ascii=False,
                 separators=(",", ":") if isinstance(after, dict) and after.get("scope") == "form" else None)
         message = f"[Browser] tab {tab_id} ({updated.url}): {sanitize_snapshot(result)}"
@@ -370,7 +442,7 @@ def register_browser_tools(
                 or (payload.get("dispatch_state") != "not_dispatched" and payload["status"] in {"unknown_outcome", "verification_failed"}),
                 recovery_hint=str(payload["continuation"]["instruction"]),
                 details={key:payload[key] for key in ("dispatch_state", "operation", "wait") if key in payload})
-        return message
+        return PartialResult(message) if read_cut else message
 
     # ── fallback extraction ladder ─────────────────────────────────
 
@@ -526,9 +598,14 @@ def register_browser_tools(
                 with suppress(Exception):
                     await backend.close_connection(tab.tab_id)
                 manager.close_tab(tab.tab_id)
-                return f"[Browser Error] open failed: {exc}"
-            return (f"Opened tab {tab.tab_id} at {tab.url} (live browser)" +
-                    (f"\n{tab.last_snapshot}" if extract else ""))
+                return f"[Browser Error] open failed: {sanitize_snapshot(str(exc))}"
+            opened = f"Opened tab {tab.tab_id} at {tab.url} (live browser)"
+            if not extract:
+                return opened
+            note = _page_text_note(tab.last_snapshot)
+            if note:
+                return PartialResult(f"{opened}\n{note}\n{tab.last_snapshot}")
+            return f"{opened}\n{tab.last_snapshot}"
         lines = [f"Opened tab {tab.tab_id} at {url} (mode: {tab.mode.value})"]
         if extract:
             content, rung = await _fallback_extract(url, tab_id=tab.tab_id)
@@ -584,7 +661,10 @@ def register_browser_tools(
                 if payload.get("status") in _failed_statuses:
                     return _failure(str(result), "browser_" + payload["status"])
                 if normalized_origin(payload["url"]) != normalized_origin(tab.url):
-                    return _failure("Page origin changed; attach the new page explicitly")
+                    return _failure(
+                        f"Page origin changed: the page is now at {_shown_url(payload['url'])}. "
+                        "Call browser_open with that address to work on it",
+                        recovery_hint=_MOVED_ORIGIN_HINT)
                 if scope == "form":
                     result = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
                 tab = manager.update_page_state(tab.tab_id, url=payload["url"],
@@ -598,7 +678,8 @@ def register_browser_tools(
                     tab = await _sync_interactive_state(tab.tab_id,
                         expected_origin=normalized_origin(tab.url) if registry.approval_handler is not None else "")
                 except Exception as exc:
-                    return _failure(f"Live snapshot unavailable: {exc}")
+                    return _failure(f"Live snapshot unavailable: {exc}",
+                        recovery_hint=_MOVED_ORIGIN_HINT if isinstance(exc, _OriginMoved) else "")
             else:
                 content, rung = await _fallback_extract(tab.url, tab_id=tab.tab_id)
                 if rung != "error":
@@ -611,6 +692,9 @@ def register_browser_tools(
                 "Call browser_snapshot with refresh=true or browser_open with extract."
             )
         header = f"Snapshot of {tab.url} (tab {tab.tab_id}, mode {tab.mode.value}):"
+        note = _page_text_note(tab.last_snapshot)
+        if note:
+            return PartialResult(f"{header}\n{note}\n{tab.last_snapshot}")
         return f"{header}\n{tab.last_snapshot}"
 
     # ── browser_extract (explicit read-only fetch) ──────────────────
@@ -713,15 +797,20 @@ def register_browser_tools(
             dispatched = True
             _record_mutation_timeout(operation, dispatched=True)
             result = await _await_backend_result(hook(selector, tab_id=tab.tab_id, url=tab.url, **args))
-            return await _finish_action(tab.tab_id, str(result), expected_text=args.get("text") if operation == "fill" else None)
+            return await _finish_action(tab.tab_id, str(result),
+                expected_text=args.get("text") if operation == "fill" else None,
+                read_offset=args.get("offset", 0) if operation == "read" else None)
         except Exception as exc:
             return _interaction_failure(operation, f"{operation} failed: {exc}", dispatched=dispatched)
 
     async def _browser_fill(selector: str, text: str, tab_id: str = "") -> str | ToolFailure:
         return await _target_tool("fill", selector, tab_id, text=text)
 
-    async def _browser_read(selector: str, tab_id: str = "") -> str | ToolFailure:
-        return await _target_tool("read", selector, tab_id)
+    async def _browser_read(selector: str, tab_id: str = "", offset: int = 0) -> str | ToolFailure:
+        if type(offset) is not int or offset < 0:
+            return _failure("offset must be a non-negative integer", "invalid_arguments")
+        # Sent only when used, so a backend without the argument still reads from the start.
+        return await _target_tool("read", selector, tab_id, **({"offset": offset} if offset else {}))
 
     async def _browser_check(selector: str = "", checked: bool = True,
         checks: list[dict[str, object]] | None = None, tab_id: str = "") -> str | ToolFailure:
@@ -761,6 +850,13 @@ def register_browser_tools(
         timeout_ms: int = 10000,
         tab_id: str = "",
     ) -> str | ToolFailure:
+        if not (selector or text or url_contains):
+            # Backends disagree here (one sleeps and reports a match, one raises), so decide before dispatch.
+            return _failure(
+                "browser_wait needs at least one of selector, text or url_contains; nothing was waited for",
+                "invalid_arguments",
+                recovery_hint="Give a condition seen on the page or known for certain. "
+                              "To look at the page now, call browser_snapshot with refresh=true.")
         tab, err = _resolve_tab(tab_id)
         if err:
             return err
@@ -802,7 +898,7 @@ def register_browser_tools(
                 "image_paths": [path],
                 "detail": "high",
                 "question": f"Inspect the screenshot of {tab.url}.",
-                "message": f"Browser screenshot saved: {path}",
+                "message": f"Browser screenshot saved: {path}. The image is attached in the following message.",
             }, ensure_ascii=False)
         except Exception as exc:
             return f"[Browser Error] screenshot failed: {exc}"
@@ -833,9 +929,17 @@ def register_browser_tools(
         except Exception as exc:
             return _connection_failure("Tab discovery", exc)
 
-    async def _browser_connect(port: int = 0, host: str = "", transport: str = "cdp", target_tab_id: str = "") -> str | ToolFailure:
-        if transport not in {"cdp", "extension"}:
+    async def _browser_connect(port: int = 0, host: str = "", transport: str = "", target_tab_id: str = "") -> str | ToolFailure:
+        if transport not in {"", "cdp", "extension"}:
             return "[Browser Error] transport must be cdp or extension"
+        if transport == "cdp" and target_tab_id:
+            return _failure(
+                "target_tab_id names a tab granted in the control extension and cannot be used with transport=cdp; "
+                "CDP attaches to the first non-blank page of a browser started with a debug port",
+                "invalid_arguments",
+                recovery_hint="To connect that tab, omit transport or use transport=extension. For CDP, omit target_tab_id.")
+        # An id from browser_tabs exists only on the extension transport.
+        transport = transport or ("extension" if target_tab_id else "cdp")
         backend = manager.backend
         connect_existing = cast(
             Callable[..., Awaitable[str]] | None,
@@ -878,10 +982,17 @@ def register_browser_tools(
         if err:
             return err
         try:
+            outcome: object = None
             if manager.backend is not None:
-                await manager.backend.close_connection(tab.tab_id)
+                # The extension says whether it closed its own tab or only let go of the user's.
+                outcome = await _await_backend_result(manager.backend.close_connection(tab.tab_id))
             manager.close_tab(tab.tab_id)
-            return f"Closed browser tab {tab.tab_id}."
+            if outcome == "closed":
+                return f"Closed browser tab {tab.tab_id}."
+            if outcome == "detached":
+                return (f"Released browser tab {tab.tab_id}: it is the user's own tab, so the page stays open "
+                        "and only control of it ended.")
+            return f"Browser tab {tab.tab_id} closed or released; its handle is no longer valid."
         except Exception as exc:
             return f"[Browser Error] close failed: {exc}"
 
@@ -933,7 +1044,7 @@ def register_browser_tools(
 
     async def _browser_status() -> str:
         if lifecycle.release_state in {"releasing", "release_failed"}:
-            return f"Backend: unavailable ({lifecycle.release_state}); use /browser stop to finish release."
+            return f"Backend: unavailable ({lifecycle.release_state}); call browser_stop to finish release."
         ok, detail = await manager.backend_status()
         availability = "available" if ok else "idle" if "auto-connect: idle" in detail.lower() else "unavailable"
         backend_line = f"Backend: {availability} ({detail})"
@@ -989,7 +1100,9 @@ def register_browser_tools(
             "读取当前标签页已存储快照；refresh=true 观察当前页面，不重新导航。"
             "选择题/混合表单优先 scope=form,include_text=false：groups 保留题干，elements 保留选项、checked 和 frame/ref，自动刷新。文本编辑器用 scope=editable。"
             "可用 role_filter/frame_ref 筛选、offset/limit 分页，避免工具栏挤掉输入框。"
-            "offset/limit 只分页匹配元素，不分页正文；长页内容优先定位容器后用 browser_read，避免重复全页刷新。"
+            "offset/limit 只分页匹配元素，不分页正文；正文 text 最多 12000 字符，被截断时 textTruncated=true 且结果开头有一行 Note。"
+            "长页内容优先定位容器后用 browser_read（可用其 offset 续读），避免重复全页刷新。"
+            "select 元素带 options（value 和可见文字，最多列 20 项）。"
             "已读页面正文后用 include_text=false 自动刷新为精简观察，后续 after 沿用；保留元素值、checked 状态和新 refs。"
             "使用最新 elements 中的 ref:<id>；点击后结果未明时先观察或 browser_wait，不重复提交。"
             "快照中的 cookie/token/密码等敏感信息已在落库前剥离。"
@@ -1036,7 +1149,7 @@ def register_browser_tools(
         description=(
             "点击最新快照的 ref:<id> 或唯一 CSS 元素；返回观测结果和新快照，不能把派发成功当作任务成功。"
             "no_observed_change 时先只读核对；结果仍不明时，换 ref/CSS 或内外层元素点击仍是同一目标的重试。"
-            "read_only 档或 human takeover 中会报错。"
+            "标签在 read_only 档时会先自动升到可交互档再点击；没有可交互后端或处于 human takeover 时报错。"
         ),
         parameters={
             "type": "object",
@@ -1111,10 +1224,13 @@ def register_browser_tools(
         name="browser_read",
         description=(
             "读取指定 ref:<id> 或唯一 CSS 元素的实际值、frameRef 和选择控件的 checked 状态；value 不代表勾选状态。"
+            "一次最多返回 12000 字符；valueTruncated=true 时按回执的 value_note 用 offset 续读。"
+            "select 元素同时返回 options（每项的 value 和可见文字，最多 100 项）。"
             "适合读取长页面的已定位内容容器；只读题头不能确认答案或展开状态。不点击、不改变焦点、不使现有引用过期。"
         ),
         parameters={"type": "object", "properties": {
             "selector": {"type": "string", "description": "最新快照的 ref:<id> 或全页唯一 CSS"},
+            "offset": {"type": "integer", "minimum": 0, "default": 0, "description": "从 value 的第几个字符开始读；用于续读被截断的长内容"},
             "tab_id": {"type": "string", "default": ""}}, "required": ["selector"]},
         fn=_browser_read, risk="read", approval="never", idempotent=True,
         cache_results=False, repeat_guard=False, max_calls_per_turn=30,
@@ -1144,12 +1260,15 @@ def register_browser_tools(
 
     register(ToolDef(
         name="browser_select",
-        description="在当前标签页的原生 select 元素中按 value 选择选项。",
+        description=(
+            "在当前标签页的原生 select 元素中选择一个选项。先按 option 的 value 精确匹配；没有时按可见文字精确匹配，且只有一项相同才选。"
+            "可选项见快照里该元素的 options，或对它调用 browser_read；匹配不到时错误里列出 options（最多 100 项），不会改动页面。"
+        ),
         parameters={
             "type": "object",
             "properties": {
-                "selector": {"type": "string", "description": "CSS selector"},
-                "value": {"type": "string", "description": "option value"},
+                "selector": {"type": "string", "description": "最新快照的 ref:<id>，或唯一 CSS 选择器"},
+                "value": {"type": "string", "description": "option 的 value，或它的可见文字"},
                 "tab_id": {"type": "string", "default": ""},
             },
             "required": ["selector", "value"],
@@ -1163,7 +1282,14 @@ def register_browser_tools(
 
     register(ToolDef(
         name="browser_wait",
-        description="等待已观察到或明确已知的 selector、页面文本或 URL 条件；多个条件需同时满足，不猜通用成功文案。timeout 只说明条件未满足，先检查 after 的当前结果；extension 最多等待 10000ms，回执包含实际时间上限。",
+        description=(
+            "等待已观察到或明确已知的 selector、页面文本或 URL 条件；至少给一个条件，多个条件需同时满足，不猜通用成功文案。"
+            "selector（ref:<id> 或 CSS）要恰好匹配一个可见元素才算满足：还没有匹配时继续等，匹配到多个则以 ambiguous_target 失败。"
+            "text 只在页面正文前 12000 字符内查找。"
+            "timeout_ms 上限：extension 10000，CDP 30000，超出按上限执行。timeout 只说明条件未满足。"
+            "extension 的回执带 after 和实际时间上限，先检查 after；CDP 成功只返回 Wait condition satisfied（此前的 ref 随之失效），"
+            "超时也不带 after，需要页面内容时调用 browser_snapshot。"
+        ),
         parameters={
             "type": "object",
             "properties": {
@@ -1182,7 +1308,10 @@ def register_browser_tools(
 
     register(ToolDef(
         name="browser_screenshot",
-        description="CDP 后端截取已绑定标签页并返回 PNG 路径；extension 后端不支持截图。",
+        description=(
+            "CDP 后端截取已绑定标签页并存为 PNG；图片会在下一条消息里作为附件直接给你查看，结果里同时给出文件路径。"
+            "extension 后端不支持截图。"
+        ),
         parameters={
             "type": "object",
             "properties": {
@@ -1190,7 +1319,8 @@ def register_browser_tools(
                 "output_path": {"type": "string", "default": ""},
             },
         },
-        fn=_browser_screenshot, risk="write", approval="on_risk", idempotent=False,
+        # An observation: taking the same screenshot again is how the model sees a changed page.
+        fn=_browser_screenshot, risk="write", approval="on_risk", idempotent=False, repeat_guard=False,
         postcondition=_verify_browser_screenshot,
         trace_context=_browser_trace_context,
         group="browser",
@@ -1248,7 +1378,10 @@ def register_browser_tools(
 
     register(ToolDef(
         name="browser_close",
-        description="关闭当前或指定的真实浏览器标签页，并清理其 CDP 进程。",
+        description=(
+            "结束对当前或指定标签页的控制，其 tab_id 随即失效。本会话打开的标签会被关闭；"
+            "用户授权接入的已有标签只解除控制，页面保留。返回结果说明是哪一种，后端分不清时写 closed or released。"
+        ),
         parameters={
             "type": "object",
             "properties": {"tab_id": {"type": "string", "default": ""}},
@@ -1261,15 +1394,19 @@ def register_browser_tools(
     register(ToolDef(
         name="browser_connect",
         description=(
-            "连接现有浏览器：transport=extension 使用独立控制扩展授权的 Edge/Chrome 标签，"
-            "先 browser_tabs 查看 target_tab_id；cdp 保留调试端口连接。"
+            "连接现有浏览器。extension：连接独立控制扩展里已授权的 Edge/Chrome 标签，"
+            "先调 browser_tabs，把目标标签的 id 填入 target_tab_id；只填 target_tab_id 不写 transport 即走 extension。"
+            "cdp：连接以调试端口启动的浏览器，附加到第一个非空白页面，不能指定标签，也不接受 target_tab_id。"
+            "成功后返回的 Tracked as browser tab <tab_id> 才是其他浏览器工具使用的 tab_id，它和 target_tab_id 不是同一个编号。"
             "用于用户指定或任务依赖原页面状态的已有标签；普通资料调研可直接 browser_open 新建任务标签。"
         ),
         parameters={
             "type": "object",
             "properties": {
-                "transport": {"type": "string", "enum": ["cdp", "extension"], "default": "cdp"},
-                "target_tab_id": {"type": "string", "description": "扩展已授权的真实标签 ID；为空时必须仅有一个可选标签", "default": ""},
+                "transport": {"type": "string", "enum": ["cdp", "extension"],
+                              "description": "缺省时：填了 target_tab_id 为 extension，否则为 cdp"},
+                "target_tab_id": {"type": "string", "description": "browser_tabs 返回的 id（写成字符串），不是其他工具的 tab_id；"
+                                  "transport=extension 且留空时必须仅有一个已授权标签；不能与 transport=cdp 同用", "default": ""},
                 "port": {"type": "integer", "description": "DevTools 调试端口，0=自动扫描", "default": 0},
                 "host": {"type": "string", "description": "Chrome 所在主机，默认 127.0.0.1", "default": ""},
             },
@@ -1284,6 +1421,7 @@ def register_browser_tools(
         name="browser_tabs",
         description=(
             "发现用户指定或任务所需的已有标签，只列出独立控制扩展明确授权的标签，不枚举未授权的日常标签。"
+            "每项的 id 用于 browser_connect 的 target_tab_id（写成字符串）；它不是其他浏览器工具的 tab_id，后者由 browser_connect/browser_open 返回。"
             "普通资料调研无需将此作为 browser_open 的前置；空列表只表示无已授权标签，仍可新建任务标签。"
             "连接不可用时返回安装/连接提示。"
         ),
