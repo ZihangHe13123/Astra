@@ -17,6 +17,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
+from agent.runtime.context import AgentContext
 from agent.runtime.hooks import HookRegistry, HookReject, ToolDecision
 from agent.runtime.react import ReActAgent
 from agent.runtime.tools.policy import ToolPolicy
@@ -45,15 +46,17 @@ def test_react_end_session_dispatches_once_until_session_changes(tmp_path):
     hooks = HookRegistry()
     hooks.on_session_end(lambda session_id, reason: events.append((session_id, reason)))
     agent = object.__new__(ReActAgent)
-    agent.context = SimpleNamespace(session_path=str(tmp_path / "alpha.jsonl"))
+    # The real context: the lifecycle identity is the session store's scope.
+    agent.context = AgentContext()
+    agent.context.set_session(str(tmp_path / "alpha.jsonl"))
     agent.tools = SimpleNamespace(hooks=hooks)
     agent._last_ended_session = None
 
     agent.end_session("shutdown")
     agent.end_session("shutdown")
-    agent.context.session_path = str(tmp_path / "beta.jsonl")
+    agent.context.set_session(str(tmp_path / "beta.jsonl"))
     agent.end_session("session_switch")
-    agent.context.session_path = str(tmp_path / "alpha.jsonl")
+    agent.context.set_session(str(tmp_path / "alpha.jsonl"))
     agent.end_session("shutdown")
     agent.begin_session()
     agent.end_session("reset")
