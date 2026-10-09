@@ -25,6 +25,12 @@ regex-based, session-sticky chat/work prompt projection.
   boolean and no automatic tool-dispatch gate.
 - Keep other skills' existing refresh behavior, project trust, custom prompts,
   Minimal mode and restricted tool surfaces intact.
+- A second built-in skill, `interactive-cards` (`agent/runtime/interactive_cards.md`),
+  teaches the card format of the desktop. The catalog lists it only when the backend
+  was started by the desktop (`ASTRA_UI_SURFACE=gui`), since no other client shows
+  cards. It follows the ordinary rules: its name is reserved everywhere, it stays
+  readable wherever a conversation that lists it is continued, and the catalog a
+  conversation started with changes only at an explicit refresh.
 - `ASTRA_CORE_RULES_MODE=skill` is the default. `full` restores the original
   complete core identity without changing persona text. The retired
   `ASTRA_LAZY_WORK_RULES` setting has no effect. Configuration changes take effect

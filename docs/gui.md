@@ -152,8 +152,13 @@ What a card can and cannot do:
   of view, switching to the source, or reopening the conversation starts it again.
 - A block over 200,000 characters is shown as source.
 
-Models do not know about cards unless told. Put the format above in a skill or in your
-project instructions, and say that cards are for the desktop.
+The model learns the format from the built-in `interactive-cards` skill. Only a conversation
+started in the desktop lists it, because only the desktop shows cards; the model reads it when
+it decides a card would help, or when you ask for one. The skill catalog is applied per
+conversation: a conversation started before this skill existed, or in the terminal, gets it
+after `/guidance refresh --now` in the desktop, and a desktop conversation continued in the
+terminal keeps it.
+`/skills show interactive-cards` displays the text.
 
 ## Command help while typing
 

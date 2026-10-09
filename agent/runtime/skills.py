@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .card_skill import CARD_SKILL_NAME, card_skill_content, card_skill_listed, card_skill_metadata
 from .core_rules import CORE_SKILL_NAME, core_skill_content, core_skill_metadata
 from .project_trust import ProjectTrust
 from .learning_scope import learning_scope, scope_key
@@ -60,6 +61,8 @@ class SkillStore:
         skill_name = self._validate_name(name)
         if skill_name == CORE_SKILL_NAME:
             raise ValueError("astra-core is a read-only built-in Skill; edit the packaged astra.md through development")
+        if skill_name == CARD_SKILL_NAME:
+            raise ValueError("interactive-cards is a read-only built-in Skill")
         candidates = [self.root / skill_name]
         candidates.extend(sorted(self.root.glob(f"*/{skill_name}")))
         existing = [path for path in candidates if (path / "SKILL.md").is_file()]
@@ -122,6 +125,8 @@ class SkillStore:
 
     def list(self) -> list[dict[str, Any]]:
         items = [core_skill_metadata()]
+        if card_skill_listed():
+            items.append(card_skill_metadata())
         if not self.read_allowed:
             return items
         current_scope = scope_key(learning_scope())
@@ -129,7 +134,8 @@ class SkillStore:
             automatic = set(automatic_names(read_learning_state(self.root)))
         except (OSError, ValueError):
             automatic = set()
-        seen_names: set[str] = {CORE_SKILL_NAME}
+        # A built-in name is taken everywhere, also where the built-in itself is not listed.
+        seen_names: set[str] = {CORE_SKILL_NAME, CARD_SKILL_NAME}
         for path in self._iter_skill_paths():
             try:
                 content = path.read_text(encoding="utf-8")
@@ -179,6 +185,11 @@ class SkillStore:
             if file_path not in {"SKILL.md", "astra.md"}:
                 raise ValueError("astra-core only exposes SKILL.md (alias: astra.md)")
             return core_skill_content()
+        if self._validate_name(name) == CARD_SKILL_NAME:
+            # Readable wherever a conversation that lists it is continued.
+            if file_path != "SKILL.md":
+                raise ValueError("interactive-cards only exposes SKILL.md")
+            return card_skill_content()
         if not self.read_allowed:
             raise PermissionError("Project-local skills are disabled until the project is trusted")
         target = self._target(name, file_path)
