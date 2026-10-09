@@ -8,6 +8,7 @@ import threading
 import time
 from pathlib import Path
 from ..process_env import hidden_process_creationflags
+from ..tool_failure import ToolFailure
 from .approval import ScopedApprovalStore
 from .registry import ToolRegistry, ToolDef
 
@@ -91,6 +92,7 @@ def _run_git_blocking(
             )
             deadline = time.monotonic() + timeout
             terminal_error = ""
+            timed_out = False
             while proc.poll() is None:
                 if cancel_event is not None:
                     cancelled = cancel_event.wait(timeout=0.05)
@@ -103,6 +105,7 @@ def _run_git_blocking(
                     break
                 if time.monotonic() >= deadline:
                     terminal_error = f"[Timeout] git command exceeded {timeout}s"
+                    timed_out = True
                     _terminate_process_tree(proc)
                     break
 
@@ -113,7 +116,15 @@ def _run_git_blocking(
             output = stdout_file.read().decode("utf-8", errors="replace").strip()
             error = stderr_file.read().decode("utf-8", errors="replace").strip()
             if terminal_error:
-                return {"output": output, "error": terminal_error, "exit_code": -1}
+                return {
+                    "output": output,
+                    "error": terminal_error,
+                    "exit_code": -1,
+                    "exited": False,
+                    # What git wrote before it was stopped; "error" holds the marker.
+                    "stderr": error,
+                    "timed_out": timed_out,
+                }
             return {
                 "output": output,
                 "error": error,
@@ -126,6 +137,7 @@ def _run_git_blocking(
             "output": "",
             "error": f"[GitExecutionError] {type(exc).__name__}: {exc}",
             "exit_code": -1,
+            "exited": False,
         }
 
 
@@ -144,6 +156,40 @@ async def _run_git(*args, cwd: str = ".") -> dict:
     except asyncio.CancelledError:
         cancel_event.set()
         raise
+
+
+def _git_result(r: dict, empty: str, *, readonly: bool = False) -> str | ToolFailure:
+    """Return git's output, or a failure when git exited non-zero or was stopped.
+
+    Git writes progress and warnings to stderr even when it succeeds, so both
+    streams are always carried.
+    """
+    if r["exit_code"] == 0:
+        return "\n".join(part for part in (r["output"], r["error"]) if part) or empty
+    if r.get("timed_out"):
+        partial = "\n".join(part for part in (r["output"], r.get("stderr", "")) if part)
+        return ToolFailure(
+            code="git_timeout",
+            message=r["error"] + " and was stopped. " + (
+                f"Its output is partial:\n{partial}" if partial else "It printed nothing."
+            ),
+            retryable=readonly,
+            recovery_hint="" if readonly else (
+                "The command may have taken effect. Check the repository state "
+                "before running it again."
+            ),
+            partial=bool(partial),
+        )
+    text = "\n".join(part for part in (r["error"], r["output"]) if part)
+    if not r.get("exited", True):
+        # Git never returned an exit code (it could not be started, or was cancelled).
+        return ToolFailure(code="git_failed", message=text, retryable=False)
+    return ToolFailure(
+        code="git_failed",
+        message=f"git exited with code {r['exit_code']}." + (f"\n{text}" if text else ""),
+        retryable=False,
+        details={"exit_code": r["exit_code"]},
+    )
 
 
 def register_git_tools(
@@ -174,12 +220,17 @@ def register_git_tools(
         target = _safe_path(path)
         return f"git-write:{operation}:{os.path.normcase(target)}", target
 
+    # The model cannot set the backend's environment, so the text says who can act.
+    git_write_requirement = (
+        "A Git write needs the user's approval for this repository, or the user "
+        "starting Astra with AGENT_ALLOW_GIT_WRITE=1. Without that, the agent "
+        "should tell the user and not retry."
+    )
+
     def _require_git_write_enabled(operation: str, path: str = "."):
         scope, _target = _git_scope(operation, path)
         if os.getenv("AGENT_ALLOW_GIT_WRITE") != "1" and scope not in approvals.approved_scopes:
-            raise PermissionError(
-                f"{operation} modifies git state. Set AGENT_ALLOW_GIT_WRITE=1 to enable git write tools."
-            )
+            raise PermissionError(f"{operation} was not run. {git_write_requirement}")
 
     def _git_permission_check(operation: str):
         def check(args: dict) -> dict | None:
@@ -192,10 +243,7 @@ def register_git_tools(
                 operation=operation,
                 target=target,
                 reason=f"{operation} wants to modify Git state",
-                detail=(
-                    f"{operation} modifies git state. "
-                    "Set AGENT_ALLOW_GIT_WRITE=1 to enable git write tools."
-                ),
+                detail=git_write_requirement,
             )
         return check
 
@@ -203,69 +251,76 @@ def register_git_tools(
         return approvals.grant(args, request, decision)
 
     # ── 只读 ──
-    async def _git_status(path: str = ".") -> str:
+    async def _git_status(path: str = ".") -> str | ToolFailure:
         r = await _run_git("status", cwd=_safe_path(path))
-        return r["output"] or r["error"] or "(empty status)"
+        return _git_result(r, "(empty status)", readonly=True)
 
-    async def _git_log(path: str = ".", max_count: int = 10) -> str:
+    async def _git_log(path: str = ".", max_count: int = 10) -> str | ToolFailure:
         r = await _run_git("log", f"--max-count={max_count}", "--oneline", "--graph", cwd=_safe_path(path))
-        return r["output"] or r["error"] or "(no commits)"
+        return _git_result(r, "(no commits)", readonly=True)
 
-    async def _git_diff(path: str = ".", target: str = "HEAD", files: list[str] | None = None) -> str:
+    async def _git_diff(
+        path: str = ".", target: str = "HEAD", files: list[str] | None = None,
+    ) -> str | ToolFailure:
         args = ["diff", target]
         if files:
             args.extend(["--", *files])
         r = await _run_git(*args, cwd=_safe_path(path))
-        return r["output"] or r["error"] or "(no diff)"
+        return _git_result(r, "(no diff)", readonly=True)
 
-    async def _git_show(commit: str = "HEAD", path: str = ".") -> str:
-        r = await _run_git("show", commit, "--stat", "--no-patch", cwd=_safe_path(path))
-        return r["output"] or r["error"] or "(no output)"
+    async def _git_show(commit: str = "HEAD", path: str = ".") -> str | ToolFailure:
+        # --stat alone replaces the patch with the changed-file summary;
+        # adding --no-patch would drop that summary too.
+        r = await _run_git("show", "--stat", commit, cwd=_safe_path(path))
+        return _git_result(r, "(no output)", readonly=True)
 
-    async def _git_branch(path: str = ".") -> str:
+    async def _git_branch(path: str = ".") -> str | ToolFailure:
         r = await _run_git("branch", "-a", cwd=_safe_path(path))
-        return r["output"] or "(no branches)"
+        return _git_result(r, "(no branches)", readonly=True)
 
     # ── 写入（安全） ──
-    async def _git_add(path: str = ".", files: str = ".") -> str:
+    async def _git_add(path: str = ".", files: str = ".") -> str | ToolFailure:
         _require_git_write_enabled("git_add", path)
         r = await _run_git("add", *files.split(), cwd=_safe_path(path))
-        return f"Staged: {files}" + (f"\n{r['error']}" if r["error"] else "")
+        result = _git_result(r, "")
+        if isinstance(result, ToolFailure):
+            return result
+        return f"Staged: {files}" + (f"\n{result}" if result else "")
 
-    async def _git_commit(path: str = ".", message: str = "") -> str:
+    async def _git_commit(path: str = ".", message: str = "") -> str | ToolFailure:
         _require_git_write_enabled("git_commit", path)
         if not message:
-            return "Error: commit message is required"
+            return ToolFailure("invalid_arguments", "commit message is required", False)
         r = await _run_git("commit", "-m", message, cwd=_safe_path(path))
-        return r["output"] or r["error"] or "(commit done)"
+        return _git_result(r, "(commit done)")
 
-    async def _git_push(path: str = ".", remote: str = "origin", branch: str = "") -> str:
+    async def _git_push(path: str = ".", remote: str = "origin", branch: str = "") -> str | ToolFailure:
         _require_git_write_enabled("git_push", path)
         args = ["push", remote]
         if branch:
             args.append(branch)
         r = await _run_git(*args, cwd=_safe_path(path))
-        return r["output"] or r["error"] or "(pushed)"
+        return _git_result(r, "(pushed)")
 
-    async def _git_pull(path: str = ".", remote: str = "origin", branch: str = "") -> str:
+    async def _git_pull(path: str = ".", remote: str = "origin", branch: str = "") -> str | ToolFailure:
         _require_git_write_enabled("git_pull", path)
         args = ["pull", remote]
         if branch:
             args.append(branch)
         r = await _run_git(*args, cwd=_safe_path(path))
-        return r["output"] or r["error"] or "(pulled)"
+        return _git_result(r, "(pulled)")
 
-    async def _git_clone(url: str, path: str = ".", branch: str = "") -> str:
+    async def _git_clone(url: str, path: str = ".", branch: str = "") -> str | ToolFailure:
         _require_git_write_enabled("git_clone", path)
         args = ["clone", url]
         if branch:
             args.extend(["-b", branch])
         args.append(_safe_path(path))
         r = await _run_git(*args, cwd=str(root))
-        return r["output"] or r["error"] or f"Cloned {url}"
+        return _git_result(r, f"Cloned {url}")
 
     # ── 危险（改错代码时救回） ──
-    async def _git_checkout(path: str = ".", target: str = "", files: str = "") -> str:
+    async def _git_checkout(path: str = ".", target: str = "", files: str = "") -> str | ToolFailure:
         """撤销文件修改或切换分支。files='.' 恢复所有文件"""
         _require_git_write_enabled("git_checkout", path)
         args = ["checkout"]
@@ -274,29 +329,33 @@ def register_git_tools(
         if files:
             args.extend(files.split())
         r = await _run_git(*args, cwd=_safe_path(path))
-        return r["output"] or r["error"] or "(checkout done)"
+        return _git_result(r, "(checkout done)")
 
-    async def _git_revert(path: str = ".", commit: str = "") -> str:
+    async def _git_revert(path: str = ".", commit: str = "") -> str | ToolFailure:
         """安全撤销一个 commit（创建反向 commit）"""
         _require_git_write_enabled("git_revert", path)
         if not commit:
-            return "Error: commit hash is required"
+            return ToolFailure("invalid_arguments", "commit hash is required", False)
         r = await _run_git("revert", "--no-edit", commit, cwd=_safe_path(path))
-        return r["output"] or r["error"] or f"Reverted {commit}"
+        return _git_result(r, f"Reverted {commit}")
 
-    async def _git_reset(path: str = ".", target: str = "HEAD", mode: str = "mixed") -> str:
+    async def _git_reset(path: str = ".", target: str = "HEAD", mode: str = "mixed") -> str | ToolFailure:
         """重置 HEAD: soft(保留修改), mixed(取消暂存), hard(丢弃修改!)"""
         _require_git_write_enabled("git_reset", path)
         if mode not in ("soft", "mixed", "hard"):
-            return f"Error: invalid mode '{mode}'. Use soft/mixed/hard"
+            return ToolFailure(
+                "invalid_arguments", f"invalid mode '{mode}'. Use soft/mixed/hard", False,
+            )
         r = await _run_git("reset", f"--{mode}", target, cwd=_safe_path(path))
-        return r["output"] or r["error"] or f"Reset {mode} to {target}"
+        return _git_result(r, f"Reset {mode} to {target}")
 
     # 注册
+    # Only arguments the function cannot default are required.
+    required_args = {"git_commit": ["message"], "git_clone": ["url"], "git_revert": ["commit"]}
     for name, fn, desc, extra_props in [
         ("git_status", _git_status, "Show working tree status", {}),
-        ("git_log", _git_log, "Show commit history graph", {"max_count": {"type": "integer", "description": "Max commits"}}),
-        ("git_show", _git_show, "Show details of a commit", {"commit": {"type": "string", "description": "Commit hash or ref (default: HEAD)"}}),
+        ("git_log", _git_log, "Show commit history graph", {"max_count": {"type": "integer", "description": "Max commits (default: 10)"}}),
+        ("git_show", _git_show, "Show one commit: author, date, message and the changed-file summary. It prints no patch.", {"commit": {"type": "string", "description": "Commit hash or ref (default: HEAD)"}}),
         ("git_branch", _git_branch, "List branches", {}),
         ("git_add", _git_add, "Stage file(s) for commit. Use '.' to stage all.", {"files": {"type": "string", "description": "Files to stage (default: '.')"}}),
         ("git_commit", _git_commit, "Commit staged changes with a message", {"message": {"type": "string", "description": "Commit message"}}),
@@ -305,14 +364,14 @@ def register_git_tools(
         ("git_clone", _git_clone, "Clone a repository", {"url": {"type": "string", "description": "Repository URL"}, "branch": {"type": "string", "description": "Branch (optional)"}}),
         ("git_checkout", _git_checkout, "⚠️ 撤销文件修改或切换分支. 改错代码时最常用的救回工具", {"target": {"type": "string", "description": "Branch/commit, or '--' for file restore"}, "files": {"type": "string", "description": "Files to restore"}}),
         ("git_revert", _git_revert, "⚠️ 创建一个新提交来撤销指定 commit 的更改（安全救回方式）", {"commit": {"type": "string", "description": "Commit hash to revert"}}),
-        ("git_reset", _git_reset, "⚠️ 重置 HEAD. mode=soft(保留) mixed(取消暂存) hard(丢弃!)", {"target": {"type": "string", "description": "Ref to reset to (default: HEAD)"}, "mode": {"type": "string", "description": "soft/mixed/hard"}}),
+        ("git_reset", _git_reset, "⚠️ 重置 HEAD. mode=soft(保留) mixed(取消暂存) hard(丢弃!)", {"target": {"type": "string", "description": "Ref to reset to (default: HEAD)"}, "mode": {"type": "string", "description": "soft/mixed/hard (default: mixed)"}}),
     ]:
         props = {"path": {"type": "string", "description": "Git repo path (default: current dir)"}}
         props.update(extra_props)
         readonly = name in {"git_status", "git_log", "git_diff", "git_show", "git_branch"}
         registry.register(ToolDef(
             name=name, description=desc,
-            parameters={"type": "object", "properties": props, "required": [k for k in props if k != "path"]},
+            parameters={"type": "object", "properties": props, "required": required_args.get(name, [])},
             fn=fn, sandboxed=False,
             # _run_git owns the command-specific hard deadline and terminates
             # the whole process tree. Do not add a competing Registry timeout.
@@ -327,16 +386,18 @@ def register_git_tools(
             permission_grant=None if readonly else _git_permission_grant,
         ))
 
-    # git_diff with optional scoped files — registered outside the loop because
-    # *files* must not appear in required (the loop auto-requires every extra_prop).
+    # git_diff with optional scoped files.
     registry.register(ToolDef(
         name="git_diff",
-        description="Show unstaged changes or diff against a ref",
+        description=(
+            "Diff the working tree against a Git ref. The default target is HEAD, which "
+            "shows staged and unstaged changes together; untracked files are not included."
+        ),
         parameters={
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Git repo path (default: current dir)"},
-                "target": {"type": "string", "description": "Git ref (default: HEAD)"},
+                "target": {"type": "string", "description": "Git ref to compare the working tree with (default: HEAD)"},
                 "files": {"type": "array", "items": {"type": "string"}, "description": "Optional file paths to scope the diff"},
             },
             "required": [],

@@ -2424,9 +2424,202 @@ def test_git_write_tools_require_explicit_environment_opt_in(tmp_path, monkeypat
 
         result = await registry.execute("git_reset", {"mode": "hard", "target": "HEAD"})
 
-        assert "Set AGENT_ALLOW_GIT_WRITE=1" in result["error"]
+        # The model cannot set the backend's environment: the text names the
+        # user's approval and tells it not to retry.
+        assert result["code"] == "approval_required"
+        assert "needs the user's approval for this repository" in result["error"]
+        assert "AGENT_ALLOW_GIT_WRITE=1" in result["error"]
+        assert "not retry" in result["error"]
+        assert "to enable git write tools" not in result["error"]
+
+        # YOLO skips this tool's permission prompt, so nothing grants the
+        # scope: the write is still refused, with the same explanation.
+        registry.yolo = True
+        refused = await registry.execute("git_reset", {"mode": "hard", "target": "HEAD"})
+        assert "git_reset was not run" in refused["error"]
+        assert "needs the user's approval for this repository" in refused["error"]
+        assert "not retry" in refused["error"]
 
     monkeypatch.delenv("AGENT_ALLOW_GIT_WRITE", raising=False)
+    run(scenario())
+
+
+def _committed_git_repo(tmp_path, monkeypatch) -> Path:
+    """A one-commit repository whose Git runs ignore the developer's own config."""
+    import subprocess
+
+    empty_config = tmp_path / "empty.gitconfig"
+    empty_config.write_text("", encoding="utf-8")
+    for name, value in {
+        "GIT_CONFIG_GLOBAL": str(empty_config),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "test",
+        "GIT_AUTHOR_EMAIL": "test@example.invalid",
+        "GIT_COMMITTER_NAME": "test",
+        "GIT_COMMITTER_EMAIL": "test@example.invalid",
+        "LC_ALL": "C",
+    }.items():
+        monkeypatch.setenv(name, value)
+    root = tmp_path / "repo"
+    root.mkdir()
+    for args in (
+        ["init", "-q"],
+        ["checkout", "-q", "-b", "trunk"],
+    ):
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+    (root / "first.txt").write_text("one\n", encoding="utf-8")
+    for args in (["add", "first.txt"], ["commit", "-q", "-m", "first commit"]):
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+    return root
+
+
+def test_git_tools_fail_when_git_exits_nonzero(tmp_path, monkeypatch):
+    root = _committed_git_repo(tmp_path, monkeypatch)
+    monkeypatch.setenv("AGENT_ALLOW_GIT_WRITE", "1")
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_git_tools(registry, str(root))
+
+        missing = await registry.execute("git_add", {"files": "missing.txt"})
+        assert missing["output"] == ""
+        assert missing["code"] == "git_failed"
+        assert "missing.txt" in missing["error"]
+        assert "Staged" not in missing["error"]
+        assert missing["details"]["exit_code"] != 0
+
+        for name, args in (
+            ("git_show", {"commit": "no-such-ref"}),
+            ("git_diff", {"target": "no-such-ref"}),
+            ("git_checkout", {"target": "no-such-ref"}),
+        ):
+            failed = await registry.execute(name, args)
+            assert failed["output"] == "", name
+            assert failed["code"] == "git_failed", name
+            assert "no-such-ref" in failed["error"], name
+
+        # Git never started here, so there is no branch list to report.
+        no_repo = await registry.execute("git_branch", {"path": "missing-dir"})
+        assert no_repo["output"] == ""
+        assert no_repo["code"] == "git_failed"
+        assert no_repo["error"]
+
+        # A failure that git explains on stdout keeps that explanation.
+        nothing = await registry.execute("git_commit", {"message": "nothing staged"})
+        assert nothing["output"] == ""
+        assert nothing["code"] == "git_failed"
+        assert "nothing to commit" in nothing["error"]
+
+        for name, args in (
+            ("git_commit", {"message": ""}),
+            ("git_reset", {"mode": "sideways"}),
+        ):
+            rejected = await registry.execute(name, args)
+            assert rejected["output"] == "", name
+            assert rejected["code"] == "invalid_arguments", name
+
+        (root / "second.txt").write_text("two\n", encoding="utf-8")
+        staged = await registry.execute("git_add", {"files": "second.txt"})
+        assert staged["error"] == ""
+        assert staged["output"].startswith("Staged: second.txt")
+        committed = await registry.execute("git_commit", {"message": "second commit"})
+        assert committed["error"] == ""
+        log = await registry.execute("git_log", {})
+        assert log["error"] == ""
+        assert "second commit" in log["output"] and "first commit" in log["output"]
+
+    run(scenario())
+
+
+def test_git_timeout_is_a_failure_that_marks_partial_output(tmp_path, monkeypatch):
+    from agent.runtime.tools import git as git_tools
+
+    class HangingGit:
+        pid = 789
+        returncode = None
+
+        def __init__(self, args, **kwargs):
+            kwargs["stdout"].write(b"* 1234567 newest commit\n")
+            kwargs["stderr"].write(b"warning: still walking history\n")
+
+        def poll(self):
+            return self.returncode
+
+    def terminate(proc):
+        proc.returncode = -9
+
+    monkeypatch.setattr(git_tools.subprocess, "Popen", HangingGit)
+    monkeypatch.setattr(git_tools, "_terminate_process_tree", terminate)
+    monkeypatch.setattr(git_tools, "_git_timeout", lambda args: 0)
+    monkeypatch.setenv("AGENT_ALLOW_GIT_WRITE", "1")
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_git_tools(registry, str(tmp_path))
+
+        read = await registry.execute("git_log", {"max_count": 5})
+        assert read["output"] == ""
+        assert read["code"] == "git_timeout"
+        assert "[Timeout] git command exceeded 0s" in read["error"]
+        assert "partial" in read["error"]
+        assert "* 1234567 newest commit" in read["error"]
+        assert "warning: still walking history" in read["error"]
+        assert read["partial"] is True
+        assert read["retryable"] is True
+
+        # A stopped write may have taken effect, so it is not offered for retry.
+        write = await registry.execute("git_push", {"remote": "origin", "branch": "trunk"})
+        assert write["code"] == "git_timeout"
+        assert write["retryable"] is False
+        assert "repository state" in write["recovery_hint"]
+
+    run(scenario())
+
+
+def test_git_tools_require_only_arguments_without_a_default(tmp_path, monkeypatch):
+    root = _committed_git_repo(tmp_path, monkeypatch)
+    monkeypatch.setenv("AGENT_ALLOW_GIT_WRITE", "1")
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_git_tools(registry, str(root))
+
+        # No remote is configured, so these reach git and fail there instead of
+        # being rejected for arguments their descriptions call optional.
+        for name in ("git_push", "git_pull"):
+            result = await registry.execute(name, {})
+            assert result["code"] == "git_failed", (name, result)
+
+        for name in ("git_log", "git_show", "git_add", "git_checkout", "git_reset"):
+            result = await registry.execute(name, {})
+            assert result["error"] == "", (name, result)
+
+        for name, argument in (
+            ("git_commit", "message"),
+            ("git_clone", "url"),
+            ("git_revert", "commit"),
+        ):
+            result = await registry.execute(name, {})
+            assert result["code"] == "invalid_arguments", (name, result)
+            assert argument in result["error"], name
+
+    run(scenario())
+
+
+def test_git_show_lists_changed_files_without_the_patch(tmp_path, monkeypatch):
+    root = _committed_git_repo(tmp_path, monkeypatch)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_git_tools(registry, str(root))
+
+        shown = await registry.execute("git_show", {"commit": "HEAD"})
+
+        assert shown["error"] == ""
+        assert "first commit" in shown["output"]
+        assert "first.txt" in shown["output"]
+        assert "+one" not in shown["output"]
+
     run(scenario())
 
 
