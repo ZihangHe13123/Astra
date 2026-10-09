@@ -61,7 +61,7 @@ YOLO 可跳过 Astra 的普通操作审批，不会替扩展授予网站权限�
 | 浏览器重启或扩展重载 | 已有标签需要重新授权；新任务标签可继续使用持久网站权限 |
 | 用户点 Stop and revoke all tabs | 自动连接和授权已撤销，重启也保持停止。等待用户重新启用，不自动恢复或换通道绕过 |
 
-`browser_connect` 默认 transport 是 **cdp**；扩展连接必须显式传 `transport="extension"`。
+`browser_connect` 不写 transport 时：填了 `target_tab_id` 走 **extension**，否则走 **cdp**。`target_tab_id` 用 `browser_tabs` 返回的 `id`（写成字符串），不能和 `transport="cdp"` 同用。
 
 ### 多实例诊断
 

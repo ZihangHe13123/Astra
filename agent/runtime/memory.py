@@ -62,14 +62,16 @@ def default_memory_path() -> Path:
     return state_path("memory.db")
 
 
-def _safe_state_text(value: str, *, max_chars: int, allow_empty: bool = False) -> str:
+def _safe_state_text(
+    value: str, *, max_chars: int, allow_empty: bool = False, noun: str = "Memory content",
+) -> str:
     text = " ".join(str(value).strip().split())
     if not text and not allow_empty:
-        raise ValueError("Memory content cannot be empty")
+        raise ValueError(f"{noun} cannot be empty")
     if len(text) > max_chars:
-        raise ValueError(f"Memory content is too long (max {max_chars} characters)")
+        raise ValueError(f"{noun} is too long (max {max_chars} characters)")
     if any(pattern.search(text) for pattern in _SECRET_PATTERNS):
-        raise ValueError("Memory content looks like a secret or credential and was not stored")
+        raise ValueError(f"{noun} looks like a secret or credential and was not stored")
     return text
 
 
@@ -82,7 +84,7 @@ def _safe_memory_text(value: str, *, max_chars: int, allow_empty: bool = False) 
 
 def _safe_plan_text(value: str, *, max_chars: int, allow_empty: bool = False) -> str:
     # Plans are stored as JSON, not delimiter-separated Core Memory entries.
-    return _safe_state_text(value, max_chars=max_chars, allow_empty=allow_empty)
+    return _safe_state_text(value, max_chars=max_chars, allow_empty=allow_empty, noun="Plan text")
 
 
 class MemoryStore:
