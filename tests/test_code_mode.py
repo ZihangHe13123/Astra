@@ -710,3 +710,63 @@ def test_run_code_tool_budget_is_raised_and_env_overrideable(monkeypatch):
     overridden = ToolRegistry()
     register_run_code_tool(overridden, lambda: None)
     assert overridden.get("run_code").max_calls_per_turn == 24
+
+
+def test_registered_run_code_reports_a_failed_program_as_a_failure():
+    registry = _registry()
+    agent = ExecutingAgent(registry)
+    register_run_code_tool(registry, lambda: agent)
+
+    def run(code: str) -> dict:
+        return asyncio.run(registry.execute("run_code", {"code": code, "description": "probe"}))
+
+    ok = run("return await tools.echo(message='hi')")
+    assert ok["error"] == "" and "echo:hi" in ok["output"]
+
+    # A failed run used to come back as ordinary output, which the model was shown as a success.
+    failed = run("print('step one done')\nawait tools.broken()")
+    assert failed["output"] == "" and failed["code"] == "run_code_tool_call_failed"
+    assert failed["error"].index("step one done") < failed["error"].index("[run_code] tool call failed:")
+    assert "not undone" in failed["recovery_hint"]
+
+    assert run("raise ValueError('nope')")["code"] == "run_code_exception"
+    assert run("return asyncio")["code"] == "run_code_invalid_output"
+
+    # The failure keeps the start of the program output and its end, where the reason is.
+    big = run("print('head-marker' + 'x' * 40000)\nreturn 1")
+    assert big["code"] == "run_code_output_limit"
+    assert big["error"].startswith("head-marker") and len(big["error"]) < 13_000
+    assert "characters of program output omitted" in big["error"]
+    assert big["error"].rstrip().endswith("run_code output exceeded 32000 characters")
+
+
+def test_a_tool_recovery_hint_reaches_the_program_and_the_failed_run():
+    from agent.runtime.react import ReActAgent
+    from agent.runtime.tool_failure import ToolFailure
+
+    registry = ToolRegistry()
+    registry.register(ToolDef(
+        "guided", "fails with a hint", {"type": "object", "properties": {}},
+        lambda: ToolFailure(code="stale", message="hash is stale", retryable=True,
+                            recovery_hint="Read the outline again."),
+        group="core",
+    ))
+    agent = ReActAgent("test", SimpleNamespace(), registry, code_mode="code")
+    register_run_code_tool(registry, agent_getter=lambda: agent)
+
+    def run(code: str) -> dict:
+        async def scenario():
+            event, = await agent._execute_tool_calls([{
+                "id": "call-1", "name": "run_code",
+                "arguments": json.dumps({"code": code, "description": "probe"}),
+            }])
+            return event
+        return asyncio.run(scenario())
+
+    caught = run("try:\n    await tools.guided()\nexcept ToolCallError as e:\n    return str(e)")
+    assert not caught["error"]
+    assert "hash is stale" in caught["output"] and "Read the outline again." in caught["output"]
+
+    uncaught = run("await tools.guided()")
+    assert uncaught["code"] == "run_code_tool_call_failed"
+    assert "hash is stale" in uncaught["error"] and "Read the outline again." in uncaught["error"]
