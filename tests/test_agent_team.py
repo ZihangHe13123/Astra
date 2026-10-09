@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from agent.runtime.agent_team import AgentTeamRuntime, AgentTeamStore, team_execution_context
+from agent.runtime.agent_team import (
+    TEAM_INBOX_PAGE_SIZE,
+    AgentTeamRuntime,
+    AgentTeamStore,
+    team_execution_context,
+)
 from agent.runtime.session_store import SessionStore
 from agent.runtime.task_store import TaskStore
 from agent.runtime.tools import delegate
@@ -1270,10 +1275,8 @@ def test_team_spawn_validates_before_registering_agent(tmp_path: Path, monkeypat
         assert spawn_schema["max_turns"]["maximum"] == 50
         assert spawn_schema["max_turns"]["default"] == 50
         assert spawn_schema["timeout"]["maximum"] == 1800
-        assert spawn_schema["keep_alive"] == {
-            "type": "boolean",
-            "default": False,
-        }
+        assert spawn_schema["keep_alive"]["type"] == "boolean"
+        assert spawn_schema["keep_alive"]["default"] is False
         assert spawn_schema["workspace_root"]["default"] == ""
         description = registry.get("team_spawn").description
         assert "keep_alive" in description
@@ -1748,6 +1751,252 @@ def test_team_restart_accepts_completed_member(tmp_path: Path, monkeypatch):
         prompt_text = json.dumps(llm.prompts, ensure_ascii=False)
         assert "CHECKPOINT RESTART" in prompt_text
         assert "Recheck the finding with fresh evidence" in prompt_text
+
+    asyncio.run(scenario())
+
+
+def _team_tools(tmp_path: Path, monkeypatch, llm, *, session_store: SessionStore | None = None):
+    """A real registry with the delegate/Team tools and one running parent task."""
+
+    manager = ProcessManager(artifact_dir=tmp_path / "processes")
+    monkeypatch.setattr(delegate, "_sub_processes", manager)
+    store = TaskStore(tmp_path / "tasks.db")
+    parent_task = store.start_run("request-a", "team tools", session_id="session-a")
+    registry = ToolRegistry()
+    register_delegate_tools(
+        registry,
+        llm_getter=lambda: llm,
+        session_id_getter=lambda: "session-a",
+        task_store=store,
+        on_session_event=(
+            (lambda _session_id, event: session_store.append_subagent_event(event))
+            if session_store is not None
+            else None
+        ),
+    )
+
+    async def run(tool: str, /, **args) -> dict:
+        return await registry.execute(tool, args, task_id=parent_task["id"])
+
+    async def call(tool: str, /, **args) -> dict:
+        result = await run(tool, **args)
+        assert result["error"] == "", result["error"]
+        return json.loads(result["output"])
+
+    return manager, AgentTeamStore(store.path), run, call
+
+
+def test_team_wait_reports_a_change_made_between_waits(tmp_path: Path, monkeypatch):
+    async def scenario():
+        _, team_store, _, call = _team_tools(tmp_path, monkeypatch, ImmediateTeamLLM())
+        loop = asyncio.get_running_loop()
+        team = await call("team", action="create", name="waiters", goal="observe")
+        # A retained idle teammate keeps polling the same Team signal.
+        retained = await call(
+            "team_spawn", team_id=team["id"], name="retained", goal="stay available",
+            max_turns=4, timeout=10, keep_alive=True,
+        )
+        await _wait_for_agent_status(team_store, retained["agent"]["id"], "idle")
+        await call("team_wait", team_id=team["id"])
+
+        finisher = await call(
+            "team_spawn", team_id=team["id"], name="finisher", goal="finish quickly",
+            max_turns=2, timeout=10,
+        )
+        await _wait_for_agent_status(team_store, finisher["agent"]["id"], "completed")
+        await asyncio.sleep(0.3)  # the lead is busy elsewhere while the change sits there
+
+        started = loop.time()
+        state = await call("team_wait", team_id=team["id"], timeout_ms=5000)
+        waited = loop.time() - started
+
+        assert waited < 2.0
+        by_name = {agent["name"]: agent for agent in state["agents"]}
+        assert by_name["finisher"]["status"] == "completed"
+
+        # That change is now reported; the lead's own action is not news to it.
+        await call("team_task", action="create", team_id=team["id"], title="own change")
+        started = loop.time()
+        await call("team_wait", team_id=team["id"], timeout_ms=400)
+        assert loop.time() - started >= 0.3
+
+        started = loop.time()
+        await call("team_wait", team_id=team["id"])
+        assert loop.time() - started < 0.3
+        await call("team", action="stop", team_id=team["id"])
+
+    asyncio.run(scenario())
+
+
+def test_team_spawn_rejects_context_over_limit_before_registering_agent(
+    tmp_path: Path, monkeypatch,
+):
+    async def scenario():
+        manager, team_store, run, call = _team_tools(tmp_path, monkeypatch, ImmediateTeamLLM())
+        team = await call("team", action="create", name="briefing", goal="inspect")
+        long_context = "x" * (delegate._DEFAULT_CONTEXT_CHARS + 1)
+
+        rejected = await run(
+            "team_spawn", team_id=team["id"], name="researcher", goal="report one finding",
+            context=long_context,
+        )
+
+        assert f"context is {len(long_context)} characters" in rejected["error"]
+        assert f"limit is {delegate._DEFAULT_CONTEXT_CHARS}" in rejected["error"]
+        assert [agent["name"] for agent in team_store.get_team(team["id"])["agents"]] == ["lead"]
+        assert manager.list() == []
+
+    asyncio.run(scenario())
+
+
+def test_team_restart_checkpoint_delivers_instruction_and_context_whole(
+    tmp_path: Path, monkeypatch,
+):
+    async def scenario():
+        llm = CapturingTeamLLM()
+        session_store = SessionStore(tmp_path / "session.json")
+        _, team_store, run, call = _team_tools(
+            tmp_path, monkeypatch, llm, session_store=session_store,
+        )
+        team = await call("team", action="create", name="restart", goal="inspect")
+        original_context = "ORIGINAL-START " + "c" * 2000 + " ORIGINAL-END"
+        spawned = await call(
+            "team_spawn", team_id=team["id"], name="researcher", goal="report one finding",
+            context=original_context, max_turns=2, timeout=5,
+        )
+        agent_id = spawned["agent"]["id"]
+        first_process_id = spawned["process"]["process_id"]
+        await call("delegate_poll", process_id=first_process_id, wait_ms=5000)
+        # A long prior transcript used to push the new instruction out of the seed.
+        for index in range(12):
+            session_store.append_subagent_event({
+                "process_id": first_process_id, "type": "tool", "turn": index + 1,
+                "output": f"evidence-{index} " + "t" * 1100,
+            })
+        team_store.set_agent_status(agent_id, "interrupted")
+        instruction = "INSTRUCTION-START " + "i" * 2500 + " INSTRUCTION-END"
+
+        restarted = await call(
+            "team_restart", team_id=team["id"], agent="researcher", instruction=instruction,
+            max_turns=3, timeout=5,
+        )
+        assert restarted["restart_kind"] == "checkpoint_restart"
+        await call("delegate_poll", process_id=restarted["process"]["process_id"], wait_ms=5000)
+
+        seed = llm.prompts[-1][1]["content"]
+        assert instruction in seed
+        assert original_context in seed
+        # The transcript gives way instead: its end is kept, its beginning is not.
+        assert "evidence-11 " in seed
+        assert "evidence-0 " not in seed
+
+        # An instruction with no room in the checkpoint is refused, not cut.
+        await _wait_for_agent_status(team_store, agent_id, "completed")
+        too_long = "i" * delegate._DEFAULT_CONTEXT_CHARS
+        prompts_before = len(llm.prompts)
+        rejected = await run(
+            "team_restart", team_id=team["id"], agent="researcher", instruction=too_long,
+        )
+        assert f"instruction is {len(too_long)} characters" in rejected["error"]
+        after = team_store.get_agent(agent_id)
+        assert after["status"] == "completed"
+        assert after["restart_count"] == 1
+        assert len(llm.prompts) == prompts_before
+
+    asyncio.run(scenario())
+
+
+def test_team_send_to_ended_teammate_names_team_restart(tmp_path: Path, monkeypatch):
+    async def scenario():
+        _, team_store, run, call = _team_tools(tmp_path, monkeypatch, ImmediateTeamLLM())
+        team = await call("team", action="create", name="recall", goal="inspect")
+        spawned = await call(
+            "team_spawn", team_id=team["id"], name="researcher", goal="report one finding",
+            max_turns=2, timeout=5,
+        )
+        await _wait_for_agent_status(team_store, spawned["agent"]["id"], "completed")
+
+        refused = await run(
+            "team_send", team_id=team["id"], to="researcher", message="one more question",
+        )
+
+        assert "researcher is completed" in refused["error"]
+        assert "team_restart" in refused["error"]
+        # The named next step is one the runtime accepts for this teammate.
+        restarted = await call(
+            "team_restart", team_id=team["id"], agent="researcher",
+            instruction="one more question", timeout=5,
+        )
+        await call("delegate_poll", process_id=restarted["process"]["process_id"], wait_ms=5000)
+
+    asyncio.run(scenario())
+
+
+def test_team_inbox_says_when_more_messages_remain(tmp_path: Path, monkeypatch):
+    async def scenario():
+        _, team_store, run, call = _team_tools(tmp_path, monkeypatch, ImmediateTeamLLM())
+        team = await call("team", action="create", name="mail", goal="inspect")
+        helper = _agent(team_store, team, "helper")
+
+        def send(count: int, label: str) -> None:
+            for index in range(count):
+                team_store.send_message(
+                    team["id"], helper["id"], team["lead_agent_id"], body=f"{label}-{index}"
+                )
+
+        send(TEAM_INBOX_PAGE_SIZE, "old")
+        first = await run("team_inbox", team_id=team["id"])
+        first_page = json.loads(first["output"])
+        assert first_page["count"] == TEAM_INBOX_PAGE_SIZE
+        assert first_page["has_more"] is False
+        assert not first.get("partial")
+
+        send(3, "new")
+        again = await run("team_inbox", team_id=team["id"])
+        again_page = json.loads(again["output"])
+        # The default starts from the oldest message, so this page is the old one again.
+        assert again_page["messages"][0]["message"] == "old-0"
+        assert again_page["has_more"] is True
+        assert again["partial"] is True
+        assert f"after_seq={again_page['next_seq']}" in again_page["note"]
+
+        rest = await run("team_inbox", team_id=team["id"], after_seq=again_page["next_seq"])
+        rest_page = json.loads(rest["output"])
+        assert [item["message"] for item in rest_page["messages"]] == ["new-0", "new-1", "new-2"]
+        assert rest_page["has_more"] is False
+        assert not rest.get("partial")
+
+    asyncio.run(scenario())
+
+
+def test_team_task_update_keeps_result_unless_given_and_names_what_is_missing(
+    tmp_path: Path, monkeypatch,
+):
+    async def scenario():
+        _, team_store, run, call = _team_tools(tmp_path, monkeypatch, ImmediateTeamLLM())
+        team = await call("team", action="create", name="board", goal="inspect")
+        task = await call("team_task", action="create", team_id=team["id"], title="collect evidence")
+
+        async def update(**args) -> dict:
+            return await call(
+                "team_task", action="update", team_id=team["id"], team_task_id=task["id"], **args
+            )
+
+        await call("team_task", action="claim", team_id=team["id"], team_task_id=task["id"])
+        assert (await update(status="completed", result="three findings"))["result"] == "three findings"
+        # A status-only update no longer blanks what was stored.
+        assert (await update(status="pending"))["result"] == "three findings"
+        assert (await update(status="completed", result="four findings"))["result"] == "four findings"
+        assert (await update(status="completed", result=""))["result"] == ""
+
+        no_status = await run(
+            "team_task", action="update", team_id=team["id"], team_task_id=task["id"],
+            result="late note",
+        )
+        assert "update requires status" in no_status["error"]
+        no_id = await run("team_task", action="claim", team_id=team["id"])
+        assert "claim requires team_task_id" in no_id["error"]
+        assert team_store.get_task(task["id"])["result"] == ""
 
     asyncio.run(scenario())
 

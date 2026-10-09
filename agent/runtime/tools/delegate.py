@@ -36,12 +36,21 @@ from ..subagent_resume import (
 from ..llm import LLMClient
 from ..agent_team import (
     EPISODE_KINDS,
+    TEAM_INBOX_PAGE_SIZE,
+    TEAM_TASK_DESCRIPTION_CHARS,
+    TEAM_TASK_LEASE_MAX_SECONDS,
+    TEAM_TASK_LEASE_MIN_SECONDS,
+    TEAM_TASK_RESULT_CHARS,
+    TEAM_TASK_TITLE_CHARS,
+    TEAM_UNREAD_MESSAGE_LIMIT,
     AgentTeamOwnershipError,
     AgentTeamRuntime,
     current_team_agent_id,
     team_execution_context,
+    team_worker_context,
 )
 from ..team_budget import TeamBudgetTracker
+from ..tool_execution import PartialResult
 from ..worker_lifecycle import WorkerLifecycle
 from ..process_env import hidden_process_creationflags
 from ..turn_change_store import turn_store_scope
@@ -185,6 +194,10 @@ _DEFAULT_CONTEXT_CHARS = 6000
 _DEFAULT_FORK_TURNS = "2"
 _MAX_BATCH_TASKS = 5
 _MAILBOX_RESULT_CHARS = 6000
+_BACKGROUND_RESULT_TEXT = (
+    "Its result is delivered to you automatically when it finishes; "
+    "use delegate_poll/delegate_read only for interim progress."
+)
 
 
 class DelegateMailboxStore:
@@ -676,7 +689,11 @@ def _context_snapshot(
     explicit_context: str = "",
     max_chars: int = _DEFAULT_CONTEXT_CHARS,
 ) -> str:
-    """Return a bounded, model-visible parent context without tool traces."""
+    """Return a bounded, model-visible parent context without tool traces.
+
+    The parent's own context is never cut: it must fit max_chars whole. The
+    inherited conversation takes the room that is left and keeps its end.
+    """
     policy = str(fork_turns or _DEFAULT_FORK_TURNS).strip().lower()
     if policy not in {"none", "all"}:
         try:
@@ -687,6 +704,12 @@ def _context_snapshot(
             raise ValueError("fork_turns must be 'none', 'all', or a positive integer")
     else:
         count = 0
+    provided = explicit_context.strip()
+    if len(provided) > max_chars:
+        raise ValueError(
+            f"context is {len(provided)} characters; the limit is {max_chars}. "
+            "Shorten it, or write the details to a file and give the worker its path."
+        )
 
     clean: list[tuple[str, str]] = []
     for message in messages or []:
@@ -706,14 +729,17 @@ def _context_snapshot(
         if len(user_positions) > count:
             clean = clean[user_positions[-count]:]
 
-    sections = [f"{role.title()}: {content}" for role, content in clean]
-    if explicit_context.strip():
-        sections.append(f"Parent-provided context: {explicit_context.strip()}")
-    rendered = "\n\n".join(sections).strip() or "(No parent context was provided.)"
-    if len(rendered) > max_chars:
+    conversation = "\n\n".join(f"{role.title()}: {content}" for role, content in clean).strip()
+    room = max_chars - len(provided)
+    if len(conversation) > room:
         marker = "[Earlier context truncated]\n"
-        rendered = marker + rendered[-max(0, max_chars - len(marker)):]
-    return rendered
+        conversation = (
+            marker + conversation[-(room - len(marker)):] if room > len(marker) else marker.strip()
+        )
+    sections = [conversation] if conversation else []
+    if provided:
+        sections.append(f"Parent-provided context: {provided}")
+    return "\n\n".join(sections) or "(No parent context was provided.)"
 
 
 def _is_local_endpoint(base_url: str) -> bool:
@@ -1405,6 +1431,12 @@ def register_delegate_tools(
     child_slots = DelegateConcurrencyGate(
         global_child_limit,
         _delegate_owner_concurrency(global_child_limit),
+    )
+    # One wording for the tool description and the queue-timeout error.
+    slot_limit_text = (
+        f"Subagents running at once: at most {child_slots.owner_limit} per parent task, "
+        f"{child_slots.global_limit} across all tasks; the rest wait for a free slot, "
+        "and that wait counts toward their timeout."
     )
     team_runtime_holder: dict[str, AgentTeamRuntime] = {}
 
@@ -2441,6 +2473,7 @@ def register_delegate_tools(
         parent_agent_id: str = "",
         agent_name: str = "",
         keep_alive: bool = False,
+        context_chars: int = _DEFAULT_CONTEXT_CHARS,
     ) -> tuple[str, str, ToolRegistry, WorkerSpec]:
         """Validate one delegate request without creating durable state."""
 
@@ -2477,6 +2510,7 @@ def register_delegate_tools(
             parent_messages,
             fork_turns=fork_turns,
             explicit_context=context,
+            max_chars=context_chars,
         )
         sub_registry = _build_subagent_registry(registry, normalized_mode)
         resolved_tools = _expand_requested_tools(tools, sub_registry)
@@ -2537,6 +2571,7 @@ def register_delegate_tools(
         _agent_name: str = "",
         _keep_alive: bool = False,
         _resume_conversation: SubagentConversation | None = None,
+        _context_chars: int = _DEFAULT_CONTEXT_CHARS,
     ) -> str:
         """Spawn a read-only subagent.
 
@@ -2592,7 +2627,9 @@ def register_delegate_tools(
                         f"tools are not available to subagents: {', '.join(unknown)}"
                     )
                 item_fork = str(item.get("fork_turns") or fork_turns)
-                _context_snapshot([], fork_turns=item_fork)
+                _context_snapshot(
+                    [], fork_turns=item_fork, explicit_context=str(item.get("context") or context),
+                )
                 item_turns = int(item.get("max_turns") or max_turns)
                 item_timeout = int(item.get("timeout") or timeout)
                 item_model = _resolve_model(str(item.get("model") or model))
@@ -2661,6 +2698,7 @@ def register_delegate_tools(
             parent_agent_id=_parent_agent_id,
             agent_name=_agent_name,
             keep_alive=_keep_alive,
+            context_chars=_context_chars,
         )
         from agent.ui.delegates import sanitize_delegate_event
 
@@ -2851,6 +2889,7 @@ def register_delegate_tools(
             lifecycle.transition("active")
             deadline = loop.time() + spec.timeout_seconds
             acquired = False
+            waiting_for_slot = False
             owner_id = spec.task_id or (f"session:{run_session_id}" if run_session_id else "anonymous")
             slot_lease = (
                 _DelegateSlotLease(child_slots, owner_id)
@@ -2886,6 +2925,7 @@ def register_delegate_tools(
                         raise ConversationCorrupt("a new worker cannot overwrite an existing conversation")
                 # Queueing for a child slot is part of the caller's total
                 # deadline, not free extra time before the worker starts.
+                waiting_for_slot = True
                 if slot_lease is not None:
                     assert active_budget is not None
                     await slot_lease.acquire(
@@ -2894,6 +2934,7 @@ def register_delegate_tools(
                 else:
                     await child_slots.acquire(owner_id, deadline)
                     acquired = True
+                waiting_for_slot = False
                 _delegate_event("running")
                 # The inner loop owns the authoritative deadline so it can
                 # preserve collected evidence instead of being cancelled and
@@ -2924,7 +2965,12 @@ def register_delegate_tools(
                     "max_turns": spec.max_turns,
                     "turns_remaining": spec.max_turns,
                     "result": "(no result — subagent did not produce output)",
-                    "error": f"Subagent exceeded {spec.timeout_seconds}s time limit",
+                    "error": (
+                        f"Subagent never started: it waited its whole {spec.timeout_seconds}s time limit "
+                        f"for a free slot. {slot_limit_text} Run fewer at once or raise timeout."
+                        if waiting_for_slot
+                        else f"Subagent exceeded {spec.timeout_seconds}s time limit"
+                    ),
                     "error_code": "timed_out",
                     "worker_status": WorkerStatus.TIMED_OUT.value,
                 }
@@ -3055,7 +3101,7 @@ def register_delegate_tools(
             # Ownership of root/session/request stays fixed with the parent
             # turn; children never hold a binding
             # (review R3).
-            with turn_store_scope(None):
+            with turn_store_scope(None), team_worker_context(spec.team_agent_id):
                 return await _factory_body(on_output)
 
         def _started(process) -> None:
@@ -3123,10 +3169,7 @@ def register_delegate_tools(
                     process,
                     {
                         **_sub_processes.describe(process),
-                        "message": (
-                            "Subagent running in background; "
-                            "use delegate_poll/delegate_read."
-                        ),
+                        "message": "Subagent running in background. " + _BACKGROUND_RESULT_TEXT,
                     },
                 )
             )
@@ -3159,10 +3202,7 @@ def register_delegate_tools(
                     process,
                     {
                         **_sub_processes.describe(process),
-                        "message": (
-                            "Subagent continues in background; "
-                            "use delegate_poll/delegate_read."
-                        ),
+                        "message": "Subagent continues in background. " + _BACKGROUND_RESULT_TEXT,
                     },
                 )
             )
@@ -3218,11 +3258,16 @@ def register_delegate_tools(
     async def _delegate_read(
         process_id: str,
         offset: int | None = None,
+        byte_offset: int | None = None,
         max_chars: int = 12000,
         stream: str = "combined",
         _task_id: str = "",
     ) -> str:
         """Read incremental output from a running subagent."""
+        if offset is not None and byte_offset is not None:
+            raise ValueError("offset and byte_offset cannot be combined")
+        if byte_offset is not None and byte_offset < 0:
+            raise ValueError("byte_offset must be zero or greater")
         if max_chars < 1 or max_chars > 100_000:
             raise ValueError("max_chars must be 1-100000")
         process = _owned_process(process_id, _task_id)
@@ -3236,6 +3281,7 @@ def register_delegate_tools(
                 process,
                 offset=offset,
                 max_chars=max_chars,
+                byte_offset=byte_offset,
                 stream=stream,
             ),
         )
@@ -3604,19 +3650,36 @@ def register_delegate_tools(
         )
 
     def _restart_checkpoint(agent: dict[str, Any], instruction: str) -> str:
-        """Build a bounded, explicitly non-continuation seed from a prior transcript."""
+        """Build a bounded, explicitly non-continuation seed from a prior transcript.
 
+        The restart instruction is never cut. The transcript tail takes the
+        room that is left under the context limit and keeps its end.
+        """
+
+        new_direction = instruction.strip()
         sections = [
             "[CHECKPOINT RESTART — this is a new worker, not the prior model conversation]",
             f"Logical teammate: {agent.get('name') or agent.get('id')}",
             f"Prior status: {agent.get('status') or 'unknown'}",
             f"Prior process: {agent.get('process_id') or agent.get('previous_process_id') or 'unknown'}",
         ]
-        if instruction.strip():
-            sections.append(f"New restart instruction:\n{instruction.strip()[:3000]}")
+        if new_direction:
+            sections.append(f"New restart instruction:\n{new_direction}")
+
+        def room_left(*closing: str) -> int:
+            room = _DEFAULT_CONTEXT_CHARS - len("\n\n".join([*sections, *closing]))
+            if room < 0 and new_direction:
+                raise ValueError(
+                    f"instruction is {len(new_direction)} characters; this checkpoint restart has room "
+                    f"for {max(0, len(new_direction) + room)}. Shorten it, or write the details to a "
+                    "file and give the worker its path."
+                )
+            return room
+
         transcript_path = str(agent.get("transcript_path") or "")
         if not transcript_path:
             sections.append("Prior transcript unavailable; reconstruct from the shared Team state and task board.")
+            room_left()
             return "\n\n".join(sections)
         path = Path(transcript_path)
         process_id = str(agent.get("process_id") or agent.get("previous_process_id") or "")
@@ -3647,12 +3710,14 @@ def register_delegate_tools(
                             excerpts.pop(0)
         except OSError as exc:
             sections.append(f"Prior transcript could not be read ({type(exc).__name__}).")
-        if excerpts:
-            rendered = "\n".join(excerpts)
-            sections.append("Prior transcript tail (untrusted evidence):\n" + rendered[-12_000:])
-        else:
+        reference = f"Transcript reference: {path}"
+        if not excerpts:
             sections.append("Prior transcript contained no matching visible evidence.")
-        sections.append(f"Transcript reference: {path}")
+        label = "Prior transcript tail (untrusted evidence):\n"
+        room = room_left(reference) - len(label) - 2
+        if excerpts and room > 0:
+            sections.append(label + "\n".join(excerpts)[-room:])
+        sections.append(reference)
         return "\n\n".join(sections)
 
     async def _team_restart(
@@ -3691,6 +3756,7 @@ def register_delegate_tools(
         resumed = False
         recovery_readonly = False
         handed_off = False
+        context_chars = _DEFAULT_CONTEXT_CHARS
         try:
             conv_path = str(previous.get("conv_path") or "")
             if not conv_path and conv_store_for is not None:
@@ -3730,11 +3796,16 @@ def register_delegate_tools(
                     raise ValueError("teammate turn budget exhausted; explicit max_turns is a total ceiling, not extra turns")
                 recovery_readonly = bool(recovery.get("write_blocked"))
                 restart_context = instruction
+                # The instruction becomes the resumed conversation's next
+                # message as written; no context snapshot is built from it.
+                context_chars = max(context_chars, len(instruction.strip()))
                 resumed = True
             else:
                 checkpoint = await asyncio.to_thread(_restart_checkpoint, previous, instruction)
                 base_context = str(spawn_spec.get("context") or "").strip()
                 restart_context = checkpoint if not base_context else base_context + "\n\n" + checkpoint
+                # The checkpoint bounds itself; the original context rides whole beside it.
+                context_chars = len(restart_context) - len(checkpoint) + _DEFAULT_CONTEXT_CHARS
             normalized_mode, normalized_isolation, _, validated_spec = _validated_delegate_spec(
                 goal=str(spawn_spec["goal"]),
                 context=restart_context,
@@ -3748,6 +3819,7 @@ def register_delegate_tools(
                 isolation=str(spawn_spec.get("isolation") or "shared"),
                 workspace_root=resolved_workspace_root if not resumed or sandbox is not None else "",
                 task_id=_task_id,
+                context_chars=context_chars,
             )
             restarted = await durable_io(
                 runtime.store.prepare_agent_restart, str(team["id"]), str(previous["id"])
@@ -3781,6 +3853,7 @@ def register_delegate_tools(
                     _agent_name=str(restarted["name"]),
                     _keep_alive=keep_alive,
                     _resume_conversation=resume_conversation,
+                    _context_chars=context_chars,
                 )
                 process = _json.loads(raw)
                 handed_off = True
@@ -3859,8 +3932,11 @@ def register_delegate_tools(
             runtime.store.read_messages,
             recipient,
             after_seq=max(0, int(after_seq)),
-            limit=50,
+            limit=TEAM_INBOX_PAGE_SIZE,
         )
+        has_more = len(messages) >= TEAM_INBOX_PAGE_SIZE and bool(await asyncio.to_thread(
+            runtime.store.read_messages, recipient, after_seq=int(messages[-1]["seq"]), limit=1,
+        ))
         ids = [str(item["id"]) for item in messages]
         if ids:
             await asyncio.to_thread(
@@ -3886,15 +3962,20 @@ def register_delegate_tools(
             }
             for item in messages
         ]
-        return _sub_processes.dumps(
+        next_seq = int(messages[-1]["seq"]) if messages else max(0, int(after_seq))
+        inbox = _sub_processes.dumps(
             {
                 "team_id": str(team["id"]),
                 "agent_id": recipient,
                 "messages": safe_messages,
                 "count": len(safe_messages),
-                "next_seq": int(messages[-1]["seq"]) if messages else max(0, int(after_seq)),
+                "next_seq": next_seq,
+                "has_more": has_more,
+                **({"note": f"More messages remain; call team_inbox again with after_seq={next_seq}."}
+                   if has_more else {}),
             }
         )
+        return PartialResult(inbox) if has_more else inbox
 
     async def _team_task(
         action: str,
@@ -3905,13 +3986,17 @@ def register_delegate_tools(
         blocked_by: list[str] | None = None,
         agent: str = "",
         status: str = "",
-        result: str = "",
+        result: str | None = None,
         lease_seconds: int = 300,
         _task_id: str = "",
     ) -> str:
         """Create, list, atomically claim, or update a shared Team task."""
 
         normalized = str(action or "").strip().lower()
+        if normalized in {"claim", "update"} and not str(team_task_id or "").strip():
+            raise ValueError(f"{normalized} requires team_task_id: the id of a task from create or list")
+        if normalized == "update" and not str(status or "").strip():
+            raise ValueError("update requires status: pending, running, completed, failed or cancelled")
         runtime, team = await _accessible_team(team_id, _task_id, read_only=action == "list")
         actor = await asyncio.to_thread(runtime.sender_for, team)
         if normalized == "create":
@@ -3979,11 +4064,23 @@ def register_delegate_tools(
 
     # ── Tool registrations ────────────────────────────────────────────
 
+    context_text = (
+        "Optional task-specific context, passed on whole. At most "
+        f"{_DEFAULT_CONTEXT_CHARS} characters; a longer one is rejected, so shorten it or "
+        "name a file the subagent can read. Recent visible conversation is added "
+        "automatically in the room that is left."
+    )
+    fork_turns_text = (
+        "Recent conversation to add: none, all, or a number of recent user turns (default 2). "
+        f"It shares the {_DEFAULT_CONTEXT_CHARS}-character limit with context; when it does "
+        "not fit, its beginning is dropped and its end is kept."
+    )
+
     registry.register(ToolDef(
         name="delegate_task",
         description=(
             "Delegate concrete, bounded, independent work. Use mode=explorer for read-only "
-            "web research, code exploration, log analysis, or review; use mode=worker for an "
+            "web research, code exploration, log analysis, or review; use mode=worker for "
             "workspace edits/tests; pass isolation=worktree to give a worker a detached Git worktree. "
             "Parallel worker tasks must own disjoint files. Proactively use it "
             "when parallel work will materially speed up a long task, but do not duplicate "
@@ -3997,15 +4094,15 @@ def register_delegate_tools(
             "type": "object",
             "properties": {
                 "goal": {"type": "string", "description": "One-sentence goal for the subagent."},
-                "context": {"type": "string", "description": "Optional task-specific context. Recent visible conversation is added automatically."},
+                "context": {"type": "string", "description": context_text},
                 "tasks": {
                     "type": "array", "minItems": 1, "maxItems": _MAX_BATCH_TASKS,
-                    "description": "Optional parallel task batch; use instead of goal.",
+                    "description": "Optional parallel task batch; use instead of goal. " + slot_limit_text,
                     "items": {
                         "type": "object",
                         "properties": {
                             "goal": {"type": "string"},
-                            "context": {"type": "string"},
+                            "context": {"type": "string", "description": "Context for this task, with the same limit as the top-level context; defaults to it."},
                             "mode": {"type": "string", "enum": ["explorer", "worker"]},
                             "isolation": {"type": "string", "enum": ["shared", "worktree"]},
                             "fork_turns": {"type": "string"},
@@ -4026,12 +4123,12 @@ def register_delegate_tools(
                     "default": "explorer",
                 },
                 "isolation": {"type": "string", "enum": ["shared", "worktree"], "description": "shared uses the current workspace; worktree creates a detached Git worktree for one worker and retains it only if changed.", "default": "shared"},
-                "fork_turns": {"type": "string", "description": "Parent context: none, all, or recent user-turn count (default 2).", "default": "2"},
+                "fork_turns": {"type": "string", "description": fork_turns_text, "default": "2"},
                 "tools": {"type": "array", "items": {"type": "string"}, "description": "Optional capability subset using concrete names or file/terminal/code/git/web/codegraph/workspace aliases. Default: every tool allowed by the selected mode."},
                 "model": {"type": "string", "description": "Optional worker model. Empty follows the main agent; flash/fast select deepseek-flash.", "default": ""},
                 "reasoning_effort": {"type": "string", "enum": list(REASONING_EFFORTS), "description": "Optional override for remote DeepSeek workers; empty leaves the model/config setting unchanged."},
                 "max_turns": {"type": "integer", "minimum": 1, "maximum": _DELEGATE_MAX_TURNS, "description": "Maximum LLM turns including one reserved final-report turn (default 12).", "default": 12},
-                "timeout": {"type": "integer", "minimum": 1, "maximum": WORKER_TIMEOUT_MAX_SECONDS, "description": "Maximum total seconds (default 120).", "default": 120},
+                "timeout": {"type": "integer", "minimum": 1, "maximum": WORKER_TIMEOUT_MAX_SECONDS, "description": "Maximum total seconds, including any wait for a free slot (default 120).", "default": 120},
                 "foreground_yield_ms": {"type": "integer", "minimum": 0, "maximum": DELEGATE_FOREGROUND_MAX_MS, "description": "Run this long before returning process_id (0=wait for completion).", "default": 0},
                 "background": {"type": "boolean", "description": "Start subagent in background immediately.", "default": False},
             },
@@ -4085,6 +4182,14 @@ def register_delegate_tools(
                         "last read position (cursor advances); 0 reads from the start."
                     ),
                     "default": None,
+                },
+                "byte_offset": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": (
+                        "Byte position to read from: pass next_byte_offset from an earlier "
+                        "result. Cannot be combined with offset."
+                    ),
                 },
                 "max_chars": {"type": "integer", "description": "Max chars to return (default 12000).", "default": 12000},
                 "stream": {"type": "string", "enum": ["combined", "stdout", "stderr"], "description": "Which stream to read.", "default": "combined"},
@@ -4190,15 +4295,22 @@ def register_delegate_tools(
                 "goal": {"type": "string"},
                 "role": {"type": "string"},
                 "mode": {"type": "string", "enum": ["explorer", "worker"], "default": "explorer"},
-                "context": {"type": "string"},
-                "fork_turns": {"type": "string", "default": "2"},
+                "context": {"type": "string", "description": context_text},
+                "fork_turns": {"type": "string", "description": fork_turns_text, "default": "2"},
                 "tools": {"type": "array", "items": {"type": "string"}},
                 "model": {"type": "string", "description": "Optional teammate model. Empty follows the main agent; flash/fast select deepseek-flash.", "default": ""},
                 "max_turns": {"type": "integer", "minimum": 1, "maximum": _DELEGATE_MAX_TURNS, "default": MAX_WORKER_TURNS,
                               "description": "Cumulative member turn budget across episodes; default and maximum 50, including one reserved final-report turn."},
                 "timeout": {"type": "integer", "minimum": 1, "maximum": WORKER_TIMEOUT_MAX_SECONDS, "default": 300},
                 "isolation": {"type": "string", "enum": ["shared", "worktree"], "default": "shared"},
-                "keep_alive": {"type": "boolean", "default": False},
+                "keep_alive": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "true: after each report the teammate stays idle and resumes on the "
+                        "next team_send instead of ending; false: it ends with its first report."
+                    ),
+                },
                 "workspace_root": {
                     "type": "string",
                     "description": (
@@ -4236,15 +4348,33 @@ def register_delegate_tools(
                 "agent": {"type": "string", "description": "Terminal teammate name or id."},
                 "instruction": {
                     "type": "string",
-                    "description": "Optional new direction appended to the recovered conversation or legacy checkpoint.",
+                    "description": (
+                        "Optional new direction, delivered whole: the next message of a recovered "
+                        "conversation, or part of a legacy checkpoint ahead of the transcript tail. "
+                        f"A checkpoint holds {_DEFAULT_CONTEXT_CHARS} characters in all; an instruction "
+                        "that does not fit is rejected, not cut."
+                    ),
                     "default": "",
                 },
                 "max_turns": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": _DELEGATE_MAX_TURNS,
+                    "description": (
+                        "Turn limit after the restart. A recovered conversation keeps the turns it "
+                        "already used, so this is a ceiling on the total, not extra turns, and must "
+                        "be above the turns used; a legacy checkpoint worker counts from zero. "
+                        "Default: the limit it had."
+                    ),
                 },
-                "timeout": {"type": "integer", "minimum": 1, "maximum": WORKER_TIMEOUT_MAX_SECONDS},
+                "timeout": {
+                    "type": "integer", "minimum": 1, "maximum": WORKER_TIMEOUT_MAX_SECONDS,
+                    "description": (
+                        "Seconds of active time for the restarted worker, counted from zero: time "
+                        "used before the restart is not carried over. Default: the timeout it was "
+                        "spawned with."
+                    ),
+                },
             },
             "required": ["team_id", "agent"],
         },
@@ -4298,12 +4428,19 @@ def register_delegate_tools(
 
     registry.register(ToolDef(
         name="team_wait",
-        description="Wait for the next Team change and return compact status. Same-session reads need no resume; detail=true includes full context and task text.",
+        description=(
+            "Return compact Team status. timeout_ms=0 (the default) returns the current status "
+            "at once. A positive timeout_ms waits up to that long for a change made by another "
+            "agent that no earlier team_wait has returned to you; if one is already pending it "
+            "returns at once. Your own actions do not end the wait. Same-session reads need "
+            "no resume; detail=true includes full context and task text."
+        ),
         parameters={
             "type": "object",
             "properties": {
                 "team_id": {"type": "string"},
-                "timeout_ms": {"type": "integer", "minimum": 0, "maximum": POLL_MAX_MS, "default": 0},
+                "timeout_ms": {"type": "integer", "minimum": 0, "maximum": POLL_MAX_MS, "default": 0,
+                               "description": "0 returns now; a positive value is the longest time to wait for a change."},
                 "detail": {"type": "boolean", "default": False},
             },
             "required": ["team_id"],
@@ -4321,14 +4458,32 @@ def register_delegate_tools(
         description=(
             "Read durable messages addressed to the current authenticated Agent. "
             "The lead uses this to inspect teammate updates; teammates normally receive "
-            "messages automatically between model turns. Use next_seq for incremental reads."
+            "messages automatically between model turns. Use next_seq for incremental reads. "
+            f"One call returns at most {TEAM_INBOX_PAGE_SIZE} messages, oldest first; "
+            "has_more=true means more remain."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "team_id": {"type": "string"},
-                "after_seq": {"type": "integer", "default": 0},
-                "acknowledge": {"type": "boolean", "default": True},
+                "after_seq": {
+                    "type": "integer",
+                    "default": 0,
+                    "description": (
+                        "Return only messages with seq above this. The default 0 starts from the "
+                        "oldest message, including ones already read; pass next_seq from the "
+                        "previous result to get only newer ones."
+                    ),
+                },
+                "acknowledge": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": (
+                        "true marks the returned messages read: they leave unread_count and free "
+                        f"room in the mailbox, which holds at most {TEAM_UNREAD_MESSAGE_LIMIT} unread "
+                        "messages before senders are refused. false leaves them unread."
+                    ),
+                },
             },
             "required": ["team_id"],
         },
@@ -4352,14 +4507,16 @@ def register_delegate_tools(
             "properties": {
                 "action": {"type": "string", "enum": ["create", "list", "claim", "update"]},
                 "team_id": {"type": "string"},
-                "team_task_id": {"type": "string"},
-                "title": {"type": "string"},
-                "description": {"type": "string"},
-                "blocked_by": {"type": "array", "items": {"type": "string"}},
-                "agent": {"type": "string", "description": "Lead-only claim target by agent id/name."},
-                "status": {"type": "string", "enum": ["pending", "running", "completed", "failed", "cancelled"]},
-                "result": {"type": "string"},
-                "lease_seconds": {"type": "integer", "default": 300},
+                "team_task_id": {"type": "string", "description": "claim and update: required. The id field of a task returned by create or list."},
+                "title": {"type": "string", "description": f"create: required. Whitespace is collapsed and text beyond {TEAM_TASK_TITLE_CHARS} characters is cut."},
+                "description": {"type": "string", "description": f"create: optional details; text beyond {TEAM_TASK_DESCRIPTION_CHARS} characters is cut."},
+                "blocked_by": {"type": "array", "items": {"type": "string"}, "description": "create: ids of tasks in this team that must be completed before this one can be claimed."},
+                "agent": {"type": "string", "description": "claim: lead only, the teammate (id or name) to claim for. Omit to claim for yourself."},
+                "status": {"type": "string", "enum": ["pending", "running", "completed", "failed", "cancelled"],
+                           "description": "update: required. running renews the lease; pending releases the task so anyone can claim it; completed, failed and cancelled close it."},
+                "result": {"type": "string", "description": f"update: text stored with the task; beyond {TEAM_TASK_RESULT_CHARS} characters it is cut. Omit to keep the stored result."},
+                "lease_seconds": {"type": "integer", "default": 300,
+                                  "description": f"claim, and update with status=running: how long the task stays with its owner before another agent may claim it. Values outside {TEAM_TASK_LEASE_MIN_SECONDS}-{TEAM_TASK_LEASE_MAX_SECONDS} are clamped."},
             },
             "required": ["action", "team_id"],
         },
