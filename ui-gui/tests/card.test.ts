@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { Markdown } from "../src/renderer/markdown.js";
-import { CARD_FRAME_URL, MAX_CARD_HEIGHT, MAX_CARD_SOURCE, MIN_CARD_HEIGHT, cardHeight, cardMessage, cardSourceKey, cardTheme, isCardLanguage, rememberCardHeight, rememberedCardHeight } from "../src/renderer/card-state.js";
+import { readFileSync } from "node:fs";
+import { CARD_FRAME_URL, CARD_THEME_COLORS, MAX_CARD_HEIGHT, MAX_CARD_SOURCE, MIN_CARD_HEIGHT, cardHeight, cardMessage, cardSourceKey, cardTheme, isCardLanguage, rememberCardHeight, rememberedCardHeight } from "../src/renderer/card-state.js";
 import { CARD_FRAME_POLICY, CARD_FRAME_URL as SERVED_URL, cardFrameResponse, isCardFrameAddress } from "../src/main/card-frame.js";
 
 const render = (text: string) => renderToStaticMarkup(React.createElement(Markdown, { text, fail: () => {} }));
@@ -102,4 +103,21 @@ test("only the card document is a card frame address", () => {
   assert.equal(isCardFrameAddress("astra://card/frame.html?dark"), true);
   for (const url of ["astra://card/frame.html?dark=1&x=https://example.com", "astra://card/frame.html#x", "astra://card/other.html", "astra://app/index.html", "https://example.com/", "about:blank", "data:text/html,x"])
     assert.equal(isCardFrameAddress(url), false, url);
+});
+
+test("what the built-in skill and the guides tell the model is what the desktop provides", () => {
+  const provided = new Set<string>(CARD_THEME_COLORS);
+  // The skill is all about cards; each guide has one section about them.
+  for (const [path, heading] of [["../../agent/runtime/interactive_cards.md", "# 可交互卡片"], ["../../docs/gui.md", "## Interactive cards"], ["../../docs/zh-CN/gui.md", "## 可交互卡片"]]) {
+    const whole = readFileSync(new URL(path, import.meta.url), "utf8");
+    const start = whole.indexOf(`${heading}\n`), next = whole.indexOf("\n## ", start + heading.length);
+    assert.notEqual(start, -1, path);
+    const text = heading.startsWith("## ") ? whole.slice(start, next === -1 ? undefined : next) : whole.slice(start);
+    const named = [...text.matchAll(/`(--[a-z-]+)`/g)].map(match => match[1]);
+    assert.ok(named.length >= provided.size, path);
+    for (const name of named) assert.equal(provided.has(name), true, `${path} names ${name}`);
+    // Each example is a finished card block, so it runs where it is shown.
+    const example = /```card\n[\s\S]*?\n```/.exec(text)?.[0] || "";
+    assert.match(render(example), /<iframe/, path);
+  }
 });

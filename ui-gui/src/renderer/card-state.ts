@@ -25,12 +25,12 @@ export function cardMessage(data: unknown): CardMessage | undefined {
   return undefined;
 }
 
-const THEME_COLORS = ["--bg", "--panel", "--soft", "--hover", "--line", "--text", "--muted", "--accent", "--on-accent", "--error"] as const;
+export const CARD_THEME_COLORS = ["--bg", "--panel", "--soft", "--hover", "--line", "--text", "--muted", "--accent", "--on-accent", "--error"] as const;
 export type CardTheme = { dark: boolean; colors: Record<string, string> };
 /** The colours a card may use so that it reads as part of the reply, in whichever theme is active. */
 export function cardTheme(style: { getPropertyValue(name: string): string; colorScheme?: string }): CardTheme {
   const colors: Record<string, string> = {};
-  for (const name of THEME_COLORS) { const value = style.getPropertyValue(name).trim(); if (value) colors[name] = value; }
+  for (const name of CARD_THEME_COLORS) { const value = style.getPropertyValue(name).trim(); if (value) colors[name] = value; }
   return { dark: String(style.colorScheme || "").includes("dark"), colors };
 }
 

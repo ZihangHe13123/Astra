@@ -95,12 +95,15 @@ const escape = `<p id="state">probing</p><pre id="result"></pre>
 </script>`;
 // The example in the guide, exactly as a reader would copy it.
 const documented = /```card\n([\s\S]*?)\n```/.exec(readFileSync(join(root, 'docs/gui.md'), 'utf8'))[1];
+// And the example the model itself is given when it reads the built-in skill.
+const taught = /```card\n([\s\S]*?)\n```/.exec(readFileSync(join(root, 'agent/runtime/interactive_cards.md'), 'utf8'))[1];
 const broken = `<p>before</p><script>throw new Error('CARD_FIXTURE_FAILURE');</script>`;
 const fence = (language, body) => '```' + language + '\n' + body + '\n```';
 const replies = {
   计数: `这是一个计数器。\n\n${fence('card', counterCard)}\n\n卡片后面的文字。`,
   逃逸: `试试能不能出去。\n\n${fence('card', escape)}`,
   文档: `文档里的例子。\n\n${fence('card', documented)}`,
+  技能: `技能里的例子。\n\n${fence('card', taught)}`,
   报错: `这张会出错。\n\n${fence('card', broken)}`,
   网页: `这只是代码。\n\n${fence('html', '<button id="plain">not run</button><script>document.title = "RAN"</script>')}`,
 };
@@ -174,7 +177,7 @@ try {
   const send = async text => { await composer.fill(text); await page.getByRole('button', { name: '发送', exact: true }).click(); };
   // The list mounts only the rows near the viewport, so each card is found through its own reply.
   const reply = text => page.locator('.message.assistant').filter({ hasText: text });
-  const counter = reply('这是一个计数器。'), hostile = reply('试试能不能出去。'), failing = reply('这张会出错。'), plain = reply('这只是代码。'), example = reply('文档里的例子。');
+  const counter = reply('这是一个计数器。'), hostile = reply('试试能不能出去。'), failing = reply('这张会出错。'), plain = reply('这只是代码。'), example = reply('文档里的例子。'), lesson = reply('技能里的例子。');
   const frame = message => message.locator('iframe.card-frame');
   const inside = message => frame(message).contentFrame();
   const scroller = page.locator('.messages-scroll');
@@ -260,7 +263,17 @@ try {
   await inside(example).locator('#years').fill('1');
   await expect(inside(example).locator('#total')).toHaveText('1,050');
   await page.screenshot({ path: join(output, 'card-example.png') });
-  passed('a failing card reports its error beside what it did render, an html block stays code, and the guide\'s example runs as written');
+  await send('技能');
+  await idle();
+  await expect(inside(lesson).locator('#total')).toHaveText('2,653');
+  await expect(inside(lesson).locator('#shown')).toHaveText('20');
+  await inside(lesson).locator('#years').fill('40');
+  await expect(inside(lesson).locator('#total')).toHaveText('7,040');
+  // The desktop's backend offers the model that skill by name; the text is sent only when the model reads it.
+  const offered = JSON.stringify(requests[0].messages.filter(message => message.role === 'system'));
+  assert.equal(offered.includes('- interactive-cards: '), true);
+  assert.equal(JSON.stringify(requests).includes('## 怎么写'), false);
+  passed('a failing card reports its error beside what it did render, an html block stays code, the examples of the guide and of the skill run as written, and the desktop offers the skill');
 
   // Scrolled out of the mounted rows and back, and reopened from saved history, the card runs again.
   await reveal(counter);
@@ -283,7 +296,7 @@ try {
   await new Promise(done => setTimeout(done, 1500));
   assert.deepEqual(reached, [], 'the reopened hostile card reached nothing either');
   assert.deepEqual(answered, []);
-  assert.equal(requests.length, 5, 'showing cards asks the model for nothing');
+  assert.equal(requests.length, 6, 'showing cards asks the model for nothing');
   passed('cards run again after scrolling away and from saved history, fit the smallest window, and still reach nothing');
   // The failing card's own exception is the only one, once per time it ran.
   assert.deepEqual([...new Set(errors)], ['CARD_FIXTURE_FAILURE']);
