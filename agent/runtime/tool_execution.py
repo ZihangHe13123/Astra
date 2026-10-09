@@ -36,3 +36,14 @@ class ExecutionFailure(RuntimeError):
     def __init__(self, text: str, result: dict[str, Any]):
         super().__init__(text)
         self.execution = execution_metadata(result)
+
+
+class PartialResult(str):
+    """Successful text that the tool itself cut short.
+
+    Use it when a tool returns one bounded page, a capped list or a clipped
+    view and its text already says how to get the rest. The result envelope
+    then stops describing the result as complete.
+    """
+
+    partial = True
