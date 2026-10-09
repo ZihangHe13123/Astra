@@ -180,6 +180,30 @@ def test_partial_result_is_not_described_as_complete():
     assert "Result completeness: complete" in whole
 
 
+def test_failure_that_left_partial_output_is_not_described_as_complete():
+    from agent.runtime.tool_failure import ToolFailure
+
+    async def scan() -> ToolFailure:
+        return ToolFailure(
+            code="scan_timeout",
+            message="scan stopped after 2 of 9 folders:\nfolder-1\nfolder-2",
+            retryable=True,
+            partial=True,
+        )
+
+    registry = ToolRegistry()
+    registry.register(ToolDef("scan", "scan folders", {"type": "object"}, scan))
+    agent = ReActAgent("agent", _ScriptedLLM([("scan", "{}")]), registry, max_iterations=4)
+
+    _turn(agent, None)
+
+    (message,) = _tool_messages(agent)
+    assert "status: error" in message
+    assert "folder-2" in message
+    assert "Result completeness: partial" in message
+    assert "Result completeness: complete" not in message
+
+
 def test_failed_postcondition_shows_its_reason_next_to_the_kept_output():
     async def save(path: str) -> str:
         return f"saved {path}"

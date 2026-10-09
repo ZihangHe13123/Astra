@@ -3394,8 +3394,11 @@ class ReActAgent(AgentBase):
                     "This is a bounded preview. If omitted details are needed, "
                     f"inspect the complete result at: {artifact_path}"
                 )
-        elif event.get("partial") and not error:
+        elif event.get("partial"):
             lines.append(
+                "Result completeness: partial. The tool stopped before finishing; "
+                "what it produced until then is above."
+                if error else
                 "Result completeness: partial. The tool returned a bounded part; "
                 "its own fields above say what was left out and how to continue."
             )
