@@ -7,6 +7,8 @@ from collections import defaultdict, deque
 
 _RESULT_HEADER = re.compile(r"^\[Tool result: ([^\n|]+) \| status: (success|error)\]\n")
 _RESULT_END = "\n[End tool result. Continue the current user request from this result; do not restart from assumptions made before the tool call.]"
+# Model-facing notices the result envelope may add after the tool's own text.
+_RESULT_NOTICES = re.compile(r"(?:\n(?:Repeated call|Repeat limit|Result completeness): [^\n]*)+\Z")
 
 
 def history_tool_results(messages: list[dict], saved_results: list[dict], limit: int = 100) -> list[dict]:
@@ -42,7 +44,7 @@ def history_tool_results(messages: list[dict], saved_results: list[dict], limit:
             if saved.get("output_truncated"):
                 result["output_truncated"] = True
         elif header:
-            body = content[header.end():].removesuffix(_RESULT_END).removesuffix("\nResult completeness: complete.")
+            body = _RESULT_NOTICES.sub("", content[header.end():].removesuffix(_RESULT_END))
             failed = header[2] == "error"
             result = {"name": header[1], "output": "" if failed else body, "error": body if failed else ""}
         elif content == "[Atomic interaction committed successfully.]" and calls.get(call_id):
