@@ -894,10 +894,14 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             searxng_only.append(f"page={page}")
         if engine:
             searxng_only.append(f"engine={engine}")
-        if language != "auto":
-            searxng_only.append(f"language={language}")
         if category and category not in {"general", "science", "news"}:
             searxng_only.append(f"category={category}")
+        # These three change which results come back, so auto must honour them.
+        needs_searxng = bool(searxng_only)
+        # A language preference or inline content is not worth leaving Exa
+        # for; an Exa answer only says that it did not apply them.
+        if language != "auto":
+            searxng_only.append(f"language={language}")
         if include_content:
             searxng_only.append("include_content")
 
@@ -915,7 +919,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             language = "zh" if _is_chinese(query) else "en"
 
         selected_provider, allow_fallback = _select_search_provider(query, category, provider)
-        if selected_provider == "exa" and allow_fallback and searxng_only:
+        if selected_provider == "exa" and allow_fallback and needs_searxng:
             # auto must not pick the route that would drop what was asked for.
             selected_provider = "searxng"
         if selected_provider == "exa":
@@ -1339,7 +1343,10 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
 
     def _extract_provider_chain(requested: str) -> list[str]:
         order = ["tavily", "exa", "parallel", "firecrawl", "http"]
-        requested = (requested or configured_extract_provider or "auto").strip().lower()
+        requested = (requested or "auto").strip().lower()
+        if requested not in order:
+            # "auto" (the tool's default) means the configured first backend.
+            requested = configured_extract_provider
         if requested not in {"auto", *order}:
             requested = "auto"
         availability = {
@@ -1783,8 +1790,8 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         description=(
             "通过 Exa 或 SearXNG 搜索网页并返回轻量候选链接（标题、URL、摘要）。"
             "provider=auto 会让新闻、论文、新模型和研究查询优先使用 Exa，并在 Exa/SearXNG 间故障回退；"
-            "page、engine、language、include_content 及 science/news 以外的 category 只在 SearXNG 生效："
-            "auto 下设置它们会改走 SearXNG，由 Exa 返回的结果会注明未生效的参数。"
+            "page、engine 及 science/news 以外的 category 只在 SearXNG 生效，auto 下设置它们会改走 SearXNG；"
+            "language、include_content 在 Exa 上不生效。由 Exa 返回的结果会注明未生效的参数。"
             "多个独立查询可同轮并行。摘要足以回答时直接引用；仅在摘要不足或需要核实原文时使用 web_extract。"
             "若仍缺关键证据，可主动使用浏览器访问原站或交互搜索补查，按信息需要自主选择，无需用户点名浏览器。"
         ),

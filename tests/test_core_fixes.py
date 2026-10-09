@@ -7292,9 +7292,7 @@ def _searxng_query(url):
 @pytest.mark.parametrize("extra,sent", [
     ({"page": 2}, {"pageno": "2"}),
     ({"engine": "google"}, {"engines": "google"}),
-    ({"language": "ja"}, {"language": "ja"}),
     ({"category": "it"}, {"categories": "it"}),
-    ({"include_content": True}, {}),
 ])
 def test_search_web_auto_keeps_searxng_only_parameters_off_exa(monkeypatch, extra, sent):
     def searxng(url):
@@ -7331,8 +7329,29 @@ def test_search_web_auto_keeps_searxng_only_parameters_off_exa(monkeypatch, extr
         assert _searxng_query(search_urls[0]).items() >= sent.items()
         assert f"SearXNG page {extra.get('page', 1)}" in result["output"]
         assert "Exa first page" not in result["output"]
-        if extra.get("include_content"):
-            assert "Inline page body" in result["output"]
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("extra,named", [
+    ({"language": "ja"}, "language=ja"),
+    ({"include_content": True}, "include_content"),
+])
+def test_search_web_auto_stays_on_exa_for_a_preference_and_names_it(monkeypatch, extra, named):
+    monkeypatch.setenv("EXA_API_KEY", "test-exa-key")
+    monkeypatch.setenv("WEB_SEARCH_PROVIDER", "auto")
+    calls = _fake_web_transport(monkeypatch, get=lambda url: {"results": []}, post=_exa_first_page)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+
+        result = await registry.execute("search_web", {"query": "latest model report", **extra})
+
+        assert result["error"] == ""
+        assert calls == [("post", "https://api.exa.ai/search")]
+        assert "Exa first page" in result["output"]
+        assert f"Not applied on the Exa route: {named}" in result["output"]
 
     run(scenario())
 
@@ -7671,6 +7690,41 @@ def test_web_extract_lists_urls_left_out_by_the_five_url_limit(monkeypatch):
         within_limit = await registry.execute("web_extract", {"urls": urls[:5], "provider": "http"})
         assert "not_processed" not in json.loads(within_limit["output"])
         assert not within_limit.get("partial")
+
+    run(scenario())
+
+
+def test_web_extract_starts_at_the_configured_provider_unless_the_call_names_one(monkeypatch):
+    import agent.runtime.tools.web as web_module
+
+    async def safe_url(url):
+        return True
+
+    def page(url):
+        return f"<html><body><main><p>Body of {url} with enough words to count as real content.</p></main></body></html>"
+
+    # Exa comes before plain HTTP in the built-in order; the setting moves the start.
+    monkeypatch.setenv("EXA_API_KEY", "test-exa-key")
+    monkeypatch.setenv("WEB_EXTRACT_PROVIDER", "http")
+    calls = _fake_web_transport(monkeypatch, get=page)
+    monkeypatch.setattr(web_module, "_is_safe_public_url", safe_url)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+
+        configured = json.loads((await registry.execute(
+            "web_extract", {"urls": ["https://example.test/a"]},
+        ))["output"])
+        assert configured["provider_chain"] == ["http"]
+        assert configured["results"][0]["backend"] == "http"
+        assert ("get", "https://example.test/a") in calls
+        assert not any(kind == "post" for kind, _ in calls)
+
+        named = json.loads((await registry.execute(
+            "web_extract", {"urls": ["https://example.test/b"], "provider": "exa"},
+        ))["output"])
+        assert named["provider_chain"][0] == "exa"
 
     run(scenario())
 
