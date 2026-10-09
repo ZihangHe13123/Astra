@@ -3,7 +3,7 @@ import type { Element, Root as HastRoot, RootContent } from "hast";
 import rehypeHighlight from "rehype-highlight";
 
 export const MAX_HIGHLIGHT_CHARS = 32_768;
-const highlight = rehypeHighlight({ detect: false, plainText: ["mermaid", "math", "text", "txt", "plaintext"] });
+const highlight = rehypeHighlight({ detect: false, plainText: ["mermaid", "card", "math", "text", "txt", "plaintext"] });
 
 /** Reuse registered language grammars across streamed Markdown revisions. */
 export function rehypeCodeHighlight() { return highlight; }
@@ -39,7 +39,7 @@ export function rehypeCodeBudget() {
     const walk = (node: HastRoot | RootContent) => {
       if (node.type === "element" && node.tagName === "code") {
         const classes = Array.isArray(node.properties.className) ? node.properties.className : [];
-        if (classes.includes("language-mermaid") || codeText(node).length > MAX_HIGHLIGHT_CHARS) {
+        if (classes.includes("language-mermaid") || classes.includes("language-card") || codeText(node).length > MAX_HIGHLIGHT_CHARS) {
           node.properties.className = [...classes, "no-highlight"];
         }
       }

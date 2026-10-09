@@ -17,6 +17,7 @@ import { configurePackagedRuntime, acquirePackagedLease } from "./packaged-runti
 import { ClipboardFiles } from "./clipboard-files.js";
 import { DesktopAppshot } from "./appshot.js";
 import { checkedCommand, checkedPreferences, checkedString, externalURL, inside } from "./validation.js";
+import { cardFrameResponse, guardCardFrames } from "./card-frame.js";
 
 const packaged = configurePackagedRuntime({ isPackaged: app.isPackaged, resourcesPath: process.resourcesPath,
   appData: app.getPath("appData"), platform: process.platform, arch: process.arch });
@@ -291,9 +292,11 @@ function showWindow() {
   if (window && !window.isDestroyed()) { window.show(); window.focus(); return; }
   window = new BrowserWindow({ title: "Astra", width: 1320, height: 900, minWidth: 850, minHeight: 600,
     backgroundColor: "#f8f8f7", ...(process.platform === "darwin" ? { titleBarStyle: "hiddenInset" as const, trafficLightPosition: { x: 18, y: 18 } } : {}),
-    webPreferences: { preload: join(__dirname, "preload.cjs"), contextIsolation: true, sandbox: true, nodeIntegration: false } });
+    // The preload also runs in card frames, only to strip what a policy cannot (see src/preload); it exposes the bridge to the window alone.
+    webPreferences: { preload: join(__dirname, "preload.cjs"), contextIsolation: true, sandbox: true, nodeIntegration: false, nodeIntegrationInSubFrames: true } });
   window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   window.webContents.on("will-navigate", event => event.preventDefault());
+  guardCardFrames(window.webContents);
   window.webContents.session.setPermissionRequestHandler((_contents, _permission, callback) => callback(false));
   window.on("focus", () => { if (process.env.ASTRA_GUI_DISABLE_APPSHOT !== "1") appshot.activity(); });
   window.webContents.on("before-input-event", (_event, input) => {
@@ -327,6 +330,7 @@ else {
     const staticRoot = realpathSync(join(__dirname, "renderer"));
     protocol.handle("astra", request => {
       const url = new URL(request.url);
+      if (url.hostname === "card") return cardFrameResponse(url.pathname);
       if (url.hostname !== "app") return new Response("Not found", { status: 404 });
       const path = resolve(staticRoot, `.${decodeURIComponent(url.pathname)}`);
       if (!inside(staticRoot, path) || !existsSync(path) || !inside(staticRoot, realpathSync(path))) return new Response("Not found", { status: 404 });

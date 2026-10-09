@@ -8,6 +8,8 @@ import { CopyButton } from "./copy-button.js";
 import { codeText, rehypeCodeBudget, rehypeCodeHighlight, remarkCodeMetadata } from "./code-markdown.js";
 import { normalizeMathMarkdown, remarkMathOptions, rehypeSafeKatex } from "./math-markdown.js";
 import { MermaidBlock } from "./mermaid-block.js";
+import { CardBlock } from "./card-block.js";
+import { isCardLanguage } from "./card-state.js";
 
 function InlineImage({ src, alt, runtime, base }: { src?: string; alt?: string; runtime?: string; base?: string }) {
   const [url, setURL] = useState<string>();
@@ -26,6 +28,7 @@ function CodeBlock({ children, node, fail }: { children?: React.ReactNode; node?
   const language = String(classes.find(name => String(name).startsWith("language-")) || "").slice(9);
   const source = code ? codeText(code) : "";
   if (language.toLowerCase() === "mermaid") return <MermaidBlock source={source} complete={code?.properties["data-fence-complete"] === "true"} fail={fail}/>;
+  if (isCardLanguage(language)) return <CardBlock source={source} complete={code?.properties["data-fence-complete"] === "true"} fail={fail}/>;
   return <div className="code-block"><div className="code-toolbar"><span className="code-language">{language || "代码"}</span><CopyButton label="复制代码" text={source} fail={fail}/></div><pre>{children}</pre></div>;
 }
 
