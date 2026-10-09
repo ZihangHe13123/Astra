@@ -2210,7 +2210,8 @@ class ReActAgent(AgentBase):
         question = str(payload.get("question") or "").strip()
         intro = "系统提示：工具刚附加了以下图片。请直接查看图片内容并基于实际画面回答，不要只根据 prompt、文件名或路径猜测。"
         if question:
-            intro += f"\n用户想检查的问题：{question}"
+            # The model wrote this when it called the tool; it is not the user's wording.
+            intro += f"\n调用工具时注明要检查的内容：{question}"
         detail = str(payload.get("detail") or "auto")
         if detail not in {"auto", "low", "high", "original"}:
             detail = "auto"
