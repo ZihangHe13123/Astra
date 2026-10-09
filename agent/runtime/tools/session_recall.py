@@ -188,7 +188,7 @@ def register_session_recall_tools(registry: ToolRegistry):
                 },
                 "around_message_id": {
                     "type": "integer",
-                    "description": "Scroll mode. Message id to anchor the scroll window on: a message_id from a discovery result, an id from a window, or a browse row's first_message_id / last_message_id. This message is returned in full.",
+                    "description": "Scroll mode. Message id to anchor the scroll window on: a message_id from a discovery result, an id from a window, or a browse row's first_message_id / last_message_id. This message is returned whole; only a very long one is cut and marked truncated.",
                     "default": 0,
                 },
                 "scroll_window": {

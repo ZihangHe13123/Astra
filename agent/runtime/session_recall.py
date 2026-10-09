@@ -543,7 +543,7 @@ class SessionRecall:
         try:
             rows = conn.execute(sql, (query, limit)).fetchall()
         except sqlite3.DatabaseError:
-            return like("the full-text index rejected the query syntax")
+            return like("the full-text index could not run this query")
 
         results = SearchResults()
         for row in rows:
@@ -613,8 +613,9 @@ class SessionRecall:
         results.matching = "substring"
         results.note = (
             f"Substring matching was used because {reason or 'the full-text index could not be used'}. "
-            "Every term must appear as a substring of the message, OR separates alternatives and NOT excludes; "
-            "relevance ranking does not apply, so results are newest first unless sort is 'oldest'."
+            "Every term must appear as a substring of a user or assistant message (tool output is not "
+            "searched), OR separates alternatives and NOT excludes; relevance ranking does not apply, so "
+            "results are newest first unless sort is 'oldest'."
             + (" No message contained all the terms, so messages containing any one of them are listed."
                if any_term else "")
         )
