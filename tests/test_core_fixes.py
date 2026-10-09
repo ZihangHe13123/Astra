@@ -2427,9 +2427,8 @@ def test_git_write_tools_require_explicit_environment_opt_in(tmp_path, monkeypat
         # The model cannot set the backend's environment: the text names the
         # user's approval and tells it not to retry.
         assert result["code"] == "approval_required"
-        assert "needs the user's approval for this repository" in result["error"]
+        assert "need the user's approval for this repository" in result["error"]
         assert "AGENT_ALLOW_GIT_WRITE=1" in result["error"]
-        assert "not retry" in result["error"]
         assert "to enable git write tools" not in result["error"]
 
         # YOLO skips this tool's permission prompt, so nothing grants the
@@ -2437,7 +2436,7 @@ def test_git_write_tools_require_explicit_environment_opt_in(tmp_path, monkeypat
         registry.yolo = True
         refused = await registry.execute("git_reset", {"mode": "hard", "target": "HEAD"})
         assert "git_reset was not run" in refused["error"]
-        assert "needs the user's approval for this repository" in refused["error"]
+        assert "need the user's approval for this repository" in refused["error"]
         assert "not retry" in refused["error"]
 
     monkeypatch.delenv("AGENT_ALLOW_GIT_WRITE", raising=False)

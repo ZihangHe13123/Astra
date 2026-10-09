@@ -220,17 +220,19 @@ def register_git_tools(
         target = _safe_path(path)
         return f"git-write:{operation}:{os.path.normcase(target)}", target
 
-    # The model cannot set the backend's environment, so the text says who can act.
+    # The model cannot set the backend's environment, so the text says who can
+    # act. The same sentence is shown on the user's approval card.
     git_write_requirement = (
-        "A Git write needs the user's approval for this repository, or the user "
-        "starting Astra with AGENT_ALLOW_GIT_WRITE=1. Without that, the agent "
-        "should tell the user and not retry."
+        "Git writes need the user's approval for this repository, or Astra "
+        "started with AGENT_ALLOW_GIT_WRITE=1."
     )
 
     def _require_git_write_enabled(operation: str, path: str = "."):
         scope, _target = _git_scope(operation, path)
         if os.getenv("AGENT_ALLOW_GIT_WRITE") != "1" and scope not in approvals.approved_scopes:
-            raise PermissionError(f"{operation} was not run. {git_write_requirement}")
+            raise PermissionError(
+                f"{operation} was not run. {git_write_requirement} Tell the user and do not retry."
+            )
 
     def _git_permission_check(operation: str):
         def check(args: dict) -> dict | None:
@@ -243,7 +245,7 @@ def register_git_tools(
                 operation=operation,
                 target=target,
                 reason=f"{operation} wants to modify Git state",
-                detail=git_write_requirement,
+                detail=f"{operation} changes Git state. {git_write_requirement}",
             )
         return check
 
