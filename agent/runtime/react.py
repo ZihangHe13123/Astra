@@ -2745,6 +2745,13 @@ class ReActAgent(AgentBase):
                     invocation_id = uuid.uuid4().hex
                 elif tool is None or tool.idempotent:
                     invocation_id = None
+                    if tool is not None:
+                        # A repeatable observation may answer a later identical
+                        # call only while nothing else has run in between: any
+                        # other step may have changed what it describes.
+                        changes = await durable_io(self._steps_that_may_change_state, task_id)
+                        if changes:
+                            invocation_id = f"after-step:{changes}"
                 else:
                     invocation_id = str(tc.get("id") or "")
                 claim = await durable_io(
@@ -2760,6 +2767,10 @@ class ReActAgent(AgentBase):
                     # protection for the same call id.
                     invocation_id=invocation_id,
                     replay=tool.replay if tool is not None else "never",
+                    # A failed observation is safe to run again; answering a
+                    # retry with the old failure would make a transient error
+                    # permanent for the rest of the task.
+                    rerun_failed=bool(tool is not None and tool.idempotent and tool.cache_results),
                 )
                 step_id = claim.step_id
                 if claim.action == "cached" and claim.output is not None:
@@ -3046,6 +3057,16 @@ class ReActAgent(AgentBase):
             except Exception:
                 logger.exception("task store tool finish failed task_id=%s name=%s", task_id, name)
         return event
+
+    def _steps_that_may_change_state(self, task_id: str) -> int:
+        """Count this task's recorded steps that were not repeatable observations."""
+        assert self.task_store is not None
+        count = 0
+        for step_name in self.task_store.tool_step_names(task_id):
+            step_tool = self.tools.get(step_name)
+            if step_tool is None or not step_tool.idempotent:
+                count += 1
+        return count
 
     async def _execute_tool_calls(
         self,

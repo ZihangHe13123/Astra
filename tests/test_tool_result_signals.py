@@ -1,0 +1,287 @@
+"""What the model is told about a tool result: fresh or replayed, whole or partial."""
+
+import asyncio
+from pathlib import Path
+
+import pytest
+
+from agent.core.msg import ContentBlock, Msg
+from agent.runtime.react import ReActAgent
+from agent.runtime.task_store import TaskStore
+from agent.runtime.tool_execution import PartialResult
+from agent.runtime.tools.registry import ToolDef, ToolRegistry
+
+
+class _ScriptedLLM:
+    """Issue one scripted tool call per request, then finish."""
+
+    class _Config:
+        model = "test-model"
+        capabilities = frozenset()
+
+    config = _Config()
+
+    def __init__(self, calls: list[tuple[str, str]]):
+        self._calls = list(calls)
+        self.requests = 0
+
+    async def chat_stream(self, messages, tools):
+        index = self.requests
+        self.requests += 1
+        if index < len(self._calls):
+            name, arguments = self._calls[index]
+            yield {
+                "type": "tool_calls",
+                "calls": [{"id": f"call-{index + 1}", "name": name, "arguments": arguments}],
+                "content": "",
+                "reasoning_content": "",
+                "usage": None,
+            }
+            yield {"type": "done", "content": "", "usage": None}
+        else:
+            yield {"type": "done", "content": "done", "usage": None}
+
+
+class _World:
+    """A value one tool reports and another tool changes."""
+
+    def __init__(self):
+        self.value = "before"
+        self.reads = 0
+
+    def register(self, registry: ToolRegistry) -> None:
+        async def status() -> str:
+            self.reads += 1
+            return f"value is {self.value}"
+
+        async def change(to: str) -> str:
+            self.value = to
+            return "changed"
+
+        registry.register(ToolDef("status", "report the value", {"type": "object"}, status, idempotent=True))
+        registry.register(ToolDef(
+            "change", "change the value",
+            {"type": "object", "properties": {"to": {"type": "string"}}, "required": ["to"]},
+            change, risk="write",
+        ))
+
+
+def _tool_messages(agent: ReActAgent) -> list[str]:
+    return [str(message.get("content") or "") for message in agent.context.messages if message.get("role") == "tool"]
+
+
+def _turn(agent: ReActAgent, store: TaskStore | None) -> list[dict]:
+    metadata = {}
+    if store is not None:
+        metadata["task_id"] = store.start_run("req-1", "check the value", session_id="default")["id"]
+
+    async def scenario() -> list[dict]:
+        message = Msg(content=[ContentBlock.text("check the value")], metadata=metadata)
+        return [event async for event in agent.reply_stream(message)]
+
+    return asyncio.run(scenario())
+
+
+@pytest.fixture(params=["memory", "durable"])
+def store(request, tmp_path: Path) -> TaskStore | None:
+    return TaskStore(tmp_path / "tasks.db") if request.param == "durable" else None
+
+
+def test_observation_runs_again_after_something_changed(store):
+    world = _World()
+    registry = ToolRegistry()
+    world.register(registry)
+    llm = _ScriptedLLM([("status", "{}"), ("change", '{"to": "after"}'), ("status", "{}")])
+    agent = ReActAgent("agent", llm, registry, max_iterations=6, task_store=store)
+
+    _turn(agent, store)
+
+    first, _, second = _tool_messages(agent)
+    assert world.reads == 2
+    assert "value is before" in first
+    assert "value is after" in second
+    assert "not run again" not in second
+
+
+def test_repeated_observation_says_it_is_a_replay_and_that_one_more_ends_the_turn(store):
+    world = _World()
+    registry = ToolRegistry()
+    world.register(registry)
+    llm = _ScriptedLLM([("status", "{}"), ("status", "{}")])
+    agent = ReActAgent("agent", llm, registry, max_iterations=6, task_store=store)
+
+    _turn(agent, store)
+
+    first, second = _tool_messages(agent)
+    assert world.reads == 1
+    assert "not run again" not in first
+    assert "identical call" not in first
+    assert "value is before" in second
+    assert "not run again" in second
+    assert "one more identical call" in second
+
+
+def test_failed_observation_is_tried_again_on_retry(tmp_path: Path):
+    attempts = 0
+
+    async def fetch(url: str) -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError("upstream timed out")
+        return f"body of {url}"
+
+    registry = ToolRegistry()
+    registry.register(ToolDef(
+        "fetch", "fetch a page",
+        {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+        fetch, risk="network", idempotent=True,
+    ))
+    store = TaskStore(tmp_path / "tasks.db")
+    run = store.start_run("req-1", "fetch the page", session_id="default")
+    agent = ReActAgent("agent", _ScriptedLLM([]), registry, task_store=store)
+    call = {"id": "call-1", "name": "fetch", "arguments": '{"url": "https://example.invalid/a"}'}
+
+    async def scenario() -> tuple[dict, dict]:
+        failed = await agent._execute_tool_call(call, task_id=run["id"])
+        retried = await agent._execute_tool_call({**call, "id": "call-2"}, task_id=run["id"])
+        return failed, retried
+
+    failed, retried = asyncio.run(scenario())
+
+    assert failed["error"]
+    assert attempts == 2
+    assert retried["output"] == "body of https://example.invalid/a"
+    assert not retried.get("error")
+    assert not retried.get("cached")
+
+
+def test_partial_result_is_not_described_as_complete():
+    async def page(full: bool) -> str:
+        if full:
+            return "lines 1-3 of 3"
+        return PartialResult("lines 1-3 of 900; continue with offset=3")
+
+    registry = ToolRegistry()
+    registry.register(ToolDef(
+        "page", "read a page",
+        {"type": "object", "properties": {"full": {"type": "boolean"}}, "required": ["full"]},
+        page,
+    ))
+    llm = _ScriptedLLM([("page", '{"full": false}'), ("page", '{"full": true}')])
+    agent = ReActAgent("agent", llm, registry, max_iterations=6)
+
+    _turn(agent, None)
+
+    partial, whole = _tool_messages(agent)
+    assert "continue with offset=3" in partial
+    assert "Result completeness: partial" in partial
+    assert "Result completeness: complete" not in partial
+    assert "Result completeness: complete" in whole
+
+
+def test_failed_postcondition_shows_its_reason_next_to_the_kept_output():
+    async def save(path: str) -> str:
+        return f"saved {path}"
+
+    registry = ToolRegistry()
+    registry.register(ToolDef(
+        "save", "save a file",
+        {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+        save, risk="write",
+        postcondition=lambda args, result: (False, "the file on disk differs from what was sent"),
+    ))
+    agent = ReActAgent("agent", _ScriptedLLM([("save", '{"path": "a.txt"}')]), registry, max_iterations=4)
+
+    _turn(agent, None)
+
+    (message,) = _tool_messages(agent)
+    assert "status: error" in message
+    assert "saved a.txt" in message
+    assert "the file on disk differs from what was sent" in message
+
+
+_SHAPES = {
+    "type": "object",
+    "properties": {
+        "steps": {
+            "type": "array",
+            "items": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "properties": {"kind": {"type": "string", "const": "press"}, "name": {"type": "string"}},
+                        "required": ["kind", "name"],
+                        "additionalProperties": False,
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "const": "press"},
+                            "x": {"type": "number"},
+                            "y": {"type": "number"},
+                        },
+                        "required": ["kind", "x", "y"],
+                        "additionalProperties": False,
+                    },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "kind": {"type": "string", "const": "pause"},
+                            "ms": {"type": "integer", "maximum": 1000},
+                        },
+                        "required": ["kind", "ms"],
+                        "additionalProperties": False,
+                    },
+                ]
+            },
+        }
+    },
+    "required": ["steps"],
+}
+
+
+@pytest.mark.parametrize(
+    ("step", "expected", "unexpected"),
+    [
+        # Two forms of the same kind mixed together: name the stray field and the forms.
+        ({"kind": "press", "name": "ok", "x": 1, "y": 2}, ["is not allowed", "name | x + y"], ["pause"]),
+        # A kind that does not exist: list the kinds that do.
+        ({"kind": "tap", "name": "ok"}, ["$.steps[0].kind must be one of pause, press"], ["is required"]),
+        # The right form with one bad value: report that value, not the other forms.
+        ({"kind": "pause", "ms": 5000}, ["$.steps[0].ms must be at most 1000"], ["name", "is not allowed"]),
+    ],
+)
+def test_one_of_error_names_the_problem_in_the_form_the_caller_meant(step, expected, unexpected):
+    ran = False
+
+    async def act(steps: list) -> str:
+        nonlocal ran
+        ran = True
+        return "ok"
+
+    registry = ToolRegistry()
+    registry.register(ToolDef("act", "run steps", _SHAPES, act, strict_schema=True))
+
+    result = asyncio.run(registry.execute("act", {"steps": [step]}))
+
+    assert not ran
+    assert result["code"] == "invalid_arguments"
+    assert "$.steps[0] does not match oneOf" in result["error"]
+    for text in expected:
+        assert text in result["error"]
+    for text in unexpected:
+        assert text not in result["error"].split("does not match oneOf", 1)[1]
+
+
+def test_valid_one_of_value_still_runs():
+    async def act(steps: list) -> str:
+        return f"ran {len(steps)}"
+
+    registry = ToolRegistry()
+    registry.register(ToolDef("act", "run steps", _SHAPES, act, strict_schema=True))
+
+    result = asyncio.run(registry.execute("act", {"steps": [{"kind": "press", "x": 1, "y": 2}, {"kind": "pause", "ms": 10}]}))
+
+    assert result["output"] == "ran 2"
+    assert not result["error"]
