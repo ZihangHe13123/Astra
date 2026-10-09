@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from agent.core.msg import ContentBlock, Msg
+from agent.runtime.activity_store import ActivityEvent, ActivityStore, ActivitySummary, SourceCursor
 from agent.runtime.activity_sync import SourceDiscoveryError, SyncReport
 from agent.runtime.context import AgentContext
 from agent.runtime.react import ReActAgent
@@ -610,3 +611,84 @@ def test_activity_warning_and_description_forbid_instruction_authority():
 
     assert guidance in tool.description
     assert json.loads(tool.fn())["warning"] == guidance
+
+
+def _real_activity_tool(tmp_path: Path, events, summaries):
+    """The real activity_search tool over a real store in a temporary directory."""
+    path = tmp_path / "activity.sqlite3"
+    with ActivityStore(path) as store:
+        store.add_event_batch(events, SourceCursor("/events", "events", "1:2", 1, 1, 1, "now", ""))
+        for summary in summaries:
+            store.upsert_summary(summary)
+    registry = ToolRegistry()
+    register_activity_tools(registry, store_factory=lambda: ActivityStore(path), sync_runner=successful_sync)
+
+    def call(**arguments):
+        result = asyncio.run(registry.execute("activity_search", arguments))
+        return result, (json.loads(result["fresh_output"]) if not result["error"] else {})
+
+    return call
+
+
+def _event(event_id: int, occurred_at: str, app: str, text: str = "archive work") -> ActivityEvent:
+    return ActivityEvent(
+        segment_id="2026-08-26T06-00-00Z", event_id=event_id, occurred_at=occurred_at, kind="selection",
+        app_name=app, bundle_id="bundle." + app, window_title=f"{app} window", url="https://example.com/page",
+        selection_text=text, searchable_text=f"{app} {text}", raw_json="{}", imported_at="now",
+    )
+
+
+def _summary(summary_id: str, start: str, end: str, content: str) -> ActivitySummary:
+    return ActivitySummary(summary_id, f"/summaries/{summary_id}.md", "10min", start, end, content, summary_id, 1, "now")
+
+
+def test_browse_applies_the_time_window_and_echoes_only_applied_filters(tmp_path: Path):
+    long_id = "f" * 64  # the real id format; it must survive next to a preview far over the item budget
+    call = _real_activity_tool(tmp_path, [
+        _event(1, "2026-08-26T06:05:00Z", "Safari"),
+        _event(2, "2026-08-26T07:05:00Z", "Xcode"),
+        _event(3, "2026-08-26T08:05:00Z", "Safari"),
+    ], [
+        _summary(long_id, "2026-08-26T07:40:00Z", "2026-08-26T07:50:00Z", "Reviewed the archive. " + "x" * 5_000),
+        _summary("summary-late", "2026-08-26T08:10:00Z", "2026-08-26T08:20:00Z", "Late work."),
+    ])
+
+    _, everything = call()
+    assert [row["bucket_start"][11:13] for row in everything["results"]] == ["08", "07", "06"]
+
+    # 15:00-15:59 at +08:00 is the 07:00 UTC hour: only that bucket, not the most recent ones.
+    window = {"start": "2026-08-26T15:00:00+08:00", "end": "2026-08-26T15:59:00+08:00"}
+    _, browsed = call(app="Safari", **window)
+    assert browsed["mode"] == "browse"
+    assert [row["bucket_start"] for row in browsed["results"]] == ["2026-08-26T07:00:00+00:00"]
+    assert browsed["filters"] == {**window, "limit": 5}
+    assert browsed["filters_not_applied"] == ["app"]
+
+    # A browse row carries what expand needs, whole.
+    row = browsed["results"][0]
+    assert row["summary_ids"] == [long_id] and len(row["summary_previews"]) == 1
+    _, expanded = call(summary_id=row["summary_ids"][0], start=window["start"])
+    assert expanded["mode"] == "expand" and expanded["results"][0]["summary_id"] == long_id
+    assert expanded["filters"] == {} and expanded["filters_not_applied"] == ["start"]
+
+    invalid, _ = call(start="2026-08-26T15:00:00")
+    assert "timezone" in invalid["error"]
+
+
+def test_app_filter_ignores_case_and_summaries_leave_room_for_matching_events(tmp_path: Path):
+    call = _real_activity_tool(tmp_path, [
+        _event(1, "2026-08-26T06:05:00Z", "Safari"),
+        _event(2, "2026-08-26T06:06:00Z", "Firefox"),
+    ], [
+        _summary(f"summary-{index}", "2026-08-26T06:00:00Z", "2026-08-26T06:10:00Z", f"archive summary {index}")
+        for index in range(3)
+    ])
+
+    _, found = call(query="archive", app="safari", limit=2)
+    kinds = [row["evidence_type"] for row in found["results"]]
+    assert kinds == ["summary", "raw_event"]
+    assert found["results"][1]["app"] == "Safari"
+    assert found["filters"]["app"] == "safari" and "filters_not_applied" not in found
+
+    _, unfiltered = call(query="archive", limit=2)
+    assert [row["evidence_type"] for row in unfiltered["results"]] == ["summary", "summary"]

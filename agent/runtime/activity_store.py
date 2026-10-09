@@ -313,6 +313,22 @@ def _bounded_payload(value: dict[str, Any], maximum: int = _MAX_ITEM_CHARS) -> d
     return payload
 
 
+def _bounded_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Bound one result, copying its expand locators whole: a shortened id cannot be expanded."""
+    bounded = _bounded_payload({key: value for key, value in item.items() if key != "summary_ids"})
+    if "summary_ids" in item:
+        bounded["summary_ids"] = list(item["summary_ids"])
+    return bounded
+
+
+def _time_window(start: str, end: str) -> tuple[str, str]:
+    start_utc = _utc_timestamp(start)[1] if start else ""
+    end_utc = _utc_timestamp(end)[1] if end else ""
+    if start_utc and end_utc and _utc_timestamp(start_utc)[0] > _utc_timestamp(end_utc)[0]:
+        raise ValueError("start must not be after end")
+    return start_utc, end_utc
+
+
 class ActivityStore:
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path).expanduser() if path is not None else default_activity_db_path()
@@ -695,25 +711,43 @@ class ActivityStore:
         """Search bounded, sanitized local evidence. Summaries precede raw events."""
         terms = _search_terms(query)
         if not terms:
-            return self.browse(limit=limit)
-        start_utc = _utc_timestamp(start)[1] if start else ""
-        end_utc = _utc_timestamp(end)[1] if end else ""
-        if start_utc and end_utc and _utc_timestamp(start_utc)[0] > _utc_timestamp(end_utc)[0]:
-            raise ValueError("start must not be after end")
+            return self.browse(limit=limit, start=start, end=end)
+        start_utc, end_utc = _time_window(start, end)
         bounded_limit = _clamp(limit, 1, _MAX_RESULTS)
         summaries = self._query_summaries(terms, start_utc, end_utc, bounded_limit)
         events = self._query_events(terms, start_utc, end_utc, app, domain, bounded_limit)
+        if app or domain:
+            # Summaries carry no app or domain, so they cannot be filtered by one.
+            # They stay first but only take the room the matching events leave.
+            summaries = summaries[:max(0, bounded_limit - len(events))]
         return self._bound_results([*summaries, *events], bounded_limit)
 
-    def browse(self, limit: int = 5) -> list[dict[str, Any]]:
+    def browse(self, limit: int = 5, *, start: str = "", end: str = "") -> list[dict[str, Any]]:
+        """Hour buckets of recent activity, newest first, inside ``start``/``end`` when given."""
         bounded_limit = _clamp(limit, 1, _MAX_RESULTS)
+        start_utc, end_utc = _time_window(start, end)
+        summary_clauses: list[str] = []
+        event_clauses: list[str] = []
+        window: list[str] = []
+        if start_utc:
+            summary_clauses.append("activity_timestamp_us(period_end) >= activity_timestamp_us(?)")
+            event_clauses.append("activity_timestamp_us(occurred_at) >= activity_timestamp_us(?)")
+            window.append(start_utc)
+        if end_utc:
+            summary_clauses.append("activity_timestamp_us(period_start) <= activity_timestamp_us(?)")
+            event_clauses.append("activity_timestamp_us(occurred_at) <= activity_timestamp_us(?)")
+            window.append(end_utc)
         summary_rows = self.connection.execute(
-            "SELECT * FROM activity_summaries ORDER BY period_end_us DESC, rowid DESC LIMIT ?",
-            (bounded_limit * 4,),
+            "SELECT * FROM activity_summaries "
+            + (f"WHERE {' AND '.join(summary_clauses)} " if summary_clauses else "")
+            + "ORDER BY period_end_us DESC, rowid DESC LIMIT ?",
+            (*window, bounded_limit * 4),
         ).fetchall()
         event_rows = self.connection.execute(
-            "SELECT * FROM activity_events ORDER BY activity_timestamp_us(occurred_at) DESC, rowid DESC LIMIT ?",
-            (bounded_limit * 40,),
+            "SELECT * FROM activity_events "
+            + (f"WHERE {' AND '.join(event_clauses)} " if event_clauses else "")
+            + "ORDER BY activity_timestamp_us(occurred_at) DESC, rowid DESC LIMIT ?",
+            (*window, bounded_limit * 40),
         ).fetchall()
         buckets: dict[str, dict[str, Any]] = {}
 
@@ -734,6 +768,7 @@ class ActivityStore:
                     "bucket_end": (start + timedelta(hours=1)).isoformat(),
                     "principal_apps": Counter(),
                     "summary_previews": [],
+                    "summary_ids": [],
                 },
             )
 
@@ -741,6 +776,8 @@ class ActivityStore:
             bucket = bucket_for(str(row["period_start"]))
             if bucket is not None and len(bucket["summary_previews"]) < 3:
                 bucket["summary_previews"].append(str(row["content"]))
+                # Same order as the previews: what expand needs to read one in full.
+                bucket["summary_ids"].append(str(row["summary_id"]))
         for row in event_rows:
             bucket = bucket_for(str(row["occurred_at"]))
             app_name = str(row["app_name"] or "")
@@ -764,7 +801,7 @@ class ActivityStore:
                 if principal_apps
                 else "Recent activity"
             )
-            output.append(_bounded_payload({
+            output.append(_bounded_item({
                 **bucket,
                 "principal_apps": principal_apps,
                 "summary_previews": previews,
@@ -878,7 +915,7 @@ class ActivityStore:
             clauses.append("activity_timestamp_us(activity_events.occurred_at) <= activity_timestamp_us(?)")
             parameters.append(end)
         if app:
-            clauses.append("activity_events.app_name = ?")
+            clauses.append("activity_events.app_name = ? COLLATE NOCASE")
             parameters.append(app)
         if domain:
             normalized_domain = _domain_host(domain)
@@ -928,7 +965,7 @@ class ActivityStore:
                 continue
             if dedupe_key:
                 seen.add(dedupe_key)
-            bounded = _bounded_payload(item)
+            bounded = _bounded_item(item)
             candidate = [*results, bounded]
             if len(json.dumps(candidate, ensure_ascii=False)) > _MAX_TOTAL_CHARS:
                 break
