@@ -419,10 +419,11 @@ test('select lists its options, accepts one exact visible label, and changes not
   // Results come from the page's realm; compare them as plain data.
   const call=async(...args)=>JSON.parse(JSON.stringify(await w.__astraBrowserPage(...args)));
   let events=0;el.addEventListener('change',()=>events++);
-  const listed=(await call('snapshot',{})).elements.find(e=>e.id==='s');
+  // Snapshots carry only the current value, so a form with many selects keeps its element budget.
+  assert.equal((await call('snapshot',{})).elements.find(e=>e.id==='s').options,undefined);
+  const listed=await call('read',{selector:'#s'});
   assert.deepEqual(listed.options.slice(0,3),[{value:'',label:'Choose',selected:true},{value:'sg',label:'Singapore'},{value:'my',label:'Malaysia'}]);
   assert.deepEqual(listed.options[5],{value:'no',label:'Norway',disabled:true});
-  assert.deepEqual((await call('read',{selector:'#s'})).options,listed.options);
   // No value and no label: the failure carries the choices and the page is untouched.
   let r=await call('select',{selector:'#s',value:'Japan'});
   assert.equal(r.status,'error');assert.deepEqual(r.options,listed.options);assert.equal(el.value,'');assert.equal(events,0);
@@ -432,7 +433,7 @@ test('select lists its options, accepts one exact visible label, and changes not
   // One option with this visible label.
   r=await call('select',{selector:'#s',value:'Malaysia'});
   assert.equal(r.status,'observed');assert.equal(el.value,'my');assert.deepEqual(r.option,{value:'my',label:'Malaysia',matchedBy:'label'});
-  assert.equal(r.after.elements.find(e=>e.id==='s').options[2].selected,true);
+  assert.equal((await call('read',{selector:'#s'})).options[2].selected,true);
   // A value match is preferred to a label shared by two other options.
   r=await call('select',{selector:'#s',value:'Other'});
   assert.equal(r.status,'observed');assert.equal(el.value,'Other');assert.equal(r.option.matchedBy,'value');
@@ -452,13 +453,11 @@ test('select keeps the matched option when another option shares its value',asyn
   assert.equal(r.status,'observed');assert.equal(w.document.querySelector('select').selectedIndex,2);
 });
 
-test('option lists are bounded in snapshots, reads and failures',async t=>{
+test('option lists are bounded in reads and failures',async t=>{
   const w=fixture('<select id=s>'+Array.from({length:130},(_,i)=>`<option value="v${i}">${'Label '+i+' '+'x'.repeat(200)}</option>`).join('')+'</select>');
   t.after(()=>w.close());const call=w.__astraBrowserPage;
-  const listed=(await call('snapshot',{})).elements.find(e=>e.id==='s');
-  assert.equal(listed.options.length,20);assert.equal(listed.optionsTruncated,true);assert.equal(listed.optionCount,130);
-  assert.ok(listed.options.every(o=>o.label.length<=120));
   for(const r of [await call('read',{selector:'#s'}),await call('select',{selector:'#s',value:'missing'})]) {
     assert.equal(r.options.length,100);assert.equal(r.optionsTruncated,true);assert.equal(r.optionCount,130);
+    assert.ok(r.options.every(o=>o.label.length<=120));
   }
 });

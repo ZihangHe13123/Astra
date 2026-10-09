@@ -255,7 +255,7 @@
           info.group=groups.get(group);
         } else if(context(target.el)) info.context=context(target.el);
       }
-      if(editable(target.el) || target.el.tagName==='SELECT') {const text=value(target.el);info.value=text.slice(0,12000);info.valueTruncated=text.length>12000;Object.assign(info,selectOptions(target.el,20));}
+      if(editable(target.el) || target.el.tagName==='SELECT') {const text=value(target.el);info.value=text.slice(0,12000);info.valueTruncated=text.length>12000;}
       result.elements.push(info);
     }
     if(location.href.length>4096) result.limitations.push('URL truncated at 4096 characters.');

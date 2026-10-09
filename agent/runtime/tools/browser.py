@@ -1102,7 +1102,6 @@ def register_browser_tools(
             "可用 role_filter/frame_ref 筛选、offset/limit 分页，避免工具栏挤掉输入框。"
             "offset/limit 只分页匹配元素，不分页正文；正文 text 最多 12000 字符，被截断时 textTruncated=true 且结果开头有一行 Note。"
             "长页内容优先定位容器后用 browser_read（可用其 offset 续读），避免重复全页刷新。"
-            "select 元素带 options（value 和可见文字，最多列 20 项）。"
             "已读页面正文后用 include_text=false 自动刷新为精简观察，后续 after 沿用；保留元素值、checked 状态和新 refs。"
             "使用最新 elements 中的 ref:<id>；点击后结果未明时先观察或 browser_wait，不重复提交。"
             "快照中的 cookie/token/密码等敏感信息已在落库前剥离。"
@@ -1262,7 +1261,7 @@ def register_browser_tools(
         name="browser_select",
         description=(
             "在当前标签页的原生 select 元素中选择一个选项。先按 option 的 value 精确匹配；没有时按可见文字精确匹配，且只有一项相同才选。"
-            "可选项见快照里该元素的 options，或对它调用 browser_read；匹配不到时错误里列出 options（最多 100 项），不会改动页面。"
+            "可选项用 browser_read 读该元素得到；匹配不到时错误里列出 options（最多 100 项），不会改动页面。"
         ),
         parameters={
             "type": "object",
