@@ -213,14 +213,30 @@ def _linked_node(workflow: dict[str, Any], link: Any) -> dict[str, Any]:
     return {}
 
 
+def _prompt_text(node: dict[str, Any], previous: tuple[str, bool]) -> tuple[str, bool]:
+    """Return ``(text, linked)`` for a prompt node, or ``previous`` without a text input.
+
+    A linked ``text`` input holds a node reference such as ``["12", 0]``. The
+    linked node may be a template, wildcard or translation step whose output is
+    not its own text, so the prompt is reported as not extracted.
+    """
+    inputs = node.get("inputs", {})
+    if not isinstance(inputs, dict) or "text" not in inputs:
+        return previous
+    text = inputs["text"]
+    if isinstance(text, list):
+        return "", True
+    return str(text), False
+
+
 def _summarize_comfyui_workflow(workflow: dict[str, Any]) -> dict[str, Any]:
     models: list[dict[str, Any]] = []
     loras: list[dict[str, Any]] = []
     samplers: list[dict[str, Any]] = []
     latent: list[dict[str, Any]] = []
     outputs: list[str] = []
-    positive_prompt = ""
-    negative_prompt = ""
+    positive: tuple[str, bool] = ("", False)
+    negative: tuple[str, bool] = ("", False)
     for node_id, node in workflow.items():
         if not isinstance(node, dict):
             continue
@@ -247,29 +263,35 @@ def _summarize_comfyui_workflow(workflow: dict[str, Any]) -> dict[str, Any]:
             )
             sampler = {"node": str(node_id), **{key: inputs[key] for key in fields if key in inputs}}
             samplers.append(sampler)
-            positive_node = _linked_node(workflow, inputs.get("positive"))
-            negative_node = _linked_node(workflow, inputs.get("negative"))
-            positive_prompt = str(positive_node.get("inputs", {}).get("text", positive_prompt))
-            negative_prompt = str(negative_node.get("inputs", {}).get("text", negative_prompt))
+            positive = _prompt_text(_linked_node(workflow, inputs.get("positive")), positive)
+            negative = _prompt_text(_linked_node(workflow, inputs.get("negative")), negative)
         elif class_type in {"EmptyLatentImage", "EmptySD3LatentImage"}:
             latent.append({"node": str(node_id), **{
                 key: inputs[key] for key in ("width", "height", "batch_size") if key in inputs
             }})
         elif class_type in {"SaveImage", "PreviewImage"} and inputs.get("filename_prefix"):
             outputs.append(str(inputs["filename_prefix"]))
-    return {
+    summary: dict[str, Any] = {
         "format": "comfyui",
         "node_count": len(workflow),
         # Prompts are intentionally first: small local models often stop
         # attending before the end of a long model/LoRA/sampler inventory.
-        "positive_prompt": positive_prompt,
-        "negative_prompt": negative_prompt,
+        "positive_prompt": positive[0],
+        "negative_prompt": negative[0],
         "models": models,
         "loras": loras,
         "samplers": samplers,
         "latent_images": latent,
         "filename_prefixes": outputs,
     }
+    not_extracted = [
+        name
+        for name, (_text, linked) in (("positive_prompt", positive), ("negative_prompt", negative))
+        if linked
+    ]
+    if not_extracted:
+        summary["prompts_not_extracted"] = not_extracted
+    return summary
 
 
 def _inspect_image_metadata(path: Path, include_raw: bool = False) -> dict[str, Any]:
@@ -295,16 +317,33 @@ def _inspect_image_metadata(path: Path, include_raw: bool = False) -> dict[str, 
         except json.JSONDecodeError:
             plain_prompt = prompt
     parameters = metadata.get("parameters", "")
-    prompt_extracted = bool(
-        plain_prompt
-        or parameters
-        or (generation and (generation.get("positive_prompt") or generation.get("negative_prompt")))
-    )
+    # Name only fields this result carries: ComfyUI prompts sit under
+    # generation, an A1111 chunk or a plain prompt string is top-level.
+    prompt_fields = [
+        f"generation.{key}"
+        for key in ("positive_prompt", "negative_prompt")
+        if generation and generation.get(key)
+    ]
+    if plain_prompt:
+        prompt_fields.append("prompt")
+    if parameters:
+        prompt_fields.append("parameters")
+    not_extracted = [
+        f"generation.{key}" for key in (generation or {}).get("prompts_not_extracted", [])
+    ]
+    prompt_extracted = bool(prompt_fields) and not not_extracted
     raw_needed = bool(metadata) and not prompt_extracted
     if prompt_extracted:
         guidance = (
-            "The exact prompt is available in generation.positive_prompt and generation.negative_prompt. "
-            "Continue the user's task now using those fields. No additional metadata extraction is required."
+            f"The exact prompt is available in {' and '.join(prompt_fields)}. "
+            f"Continue the user's task now using {'that field' if len(prompt_fields) == 1 else 'those fields'}. "
+            "No additional metadata extraction is required."
+        )
+    elif not_extracted:
+        guidance = (
+            f"Not extracted: {' and '.join(not_extracted)} (the text comes from another workflow node). "
+            + (f"Available: {' and '.join(prompt_fields)}. " if prompt_fields else "")
+            + "Retry with include_raw=true if the missing prompt text is required."
         )
     elif raw_needed:
         guidance = "Known prompt fields were not found; retry with include_raw=true only if the raw workflow is required."
@@ -526,10 +565,10 @@ def register_image_tools(
         name="inspect_image_metadata",
         description=(
             "Extract exact generation settings from an existing PNG before guessing from pixels. "
-            "The default result already contains complete parsed positive/negative prompts plus models, LoRAs, "
-            "seed, sampler, CFG, steps, resolution, and output prefix. When prompt_extracted=true, the current "
-            "result is authoritative: continue the user task using generation.positive_prompt and "
-            "generation.negative_prompt. "
+            "For a ComfyUI PNG the default result contains the parsed positive/negative prompts plus models, "
+            "LoRAs, seed, sampler, CFG, steps, resolution, and output prefix under generation; an A1111 PNG "
+            "returns its settings text as parameters. When prompt_extracted=true, the current result is "
+            "authoritative: continue the user task from the fields its guidance names. "
             "Use read_image separately for visual quality."
         ),
         parameters={
@@ -552,12 +591,15 @@ def register_image_tools(
         sandboxed=False, timeout=30,
     ))
     if select_tiles is not None:
+        tile_calls_per_turn = 2
         registry.register(ToolDef(
             name="read_image_tiles",
             description=(
                 "Attach bounded original-pixel detail tiles from the current request's opaque tile set. "
                 "Use only tile_set_id and tile_ids listed in the annotated overview manifest. "
-                "This tool accepts no file paths and reports unserved IDs and remaining request budgets."
+                "This tool accepts no file paths and reports unserved IDs and remaining request budgets. "
+                f"Limit: {tile_calls_per_turn} calls per turn, one tile_set_id per call; ask for all the "
+                "tiles you need within those calls. A further call is not run and ends the turn."
             ),
             parameters={
                 "type": "object",
@@ -584,7 +626,7 @@ def register_image_tools(
             idempotent=False,
             cache_results=False,
             group="image",
-            max_calls_per_turn=2,
+            max_calls_per_turn=tile_calls_per_turn,
             sandboxed=False,
             timeout=30,
         ))
