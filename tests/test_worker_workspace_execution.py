@@ -26,6 +26,14 @@ def _print_working_directory() -> str:
     return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
 
 
+def _names(text: str, path) -> bool:
+    """Whether a tool result names the path. A result is JSON, where a Windows
+    path has its backslashes doubled once for each level of nesting."""
+    while "\\\\" in text:
+        text = text.replace("\\\\", "\\")
+    return str(path) in text
+
+
 def git(root, *args):
     return subprocess.run(["git", "-C", str(root), *args], text=True, capture_output=True, check=True).stdout.strip()
 
@@ -121,10 +129,10 @@ def test_spawn_and_restart_execute_in_selected_worktree(tmp_path, monkeypatch, e
             assert (child / f"shell-{phase}.txt").read_text().strip() == "shell"
             assert not (root / f"patch-{phase}.txt").exists()
             assert not (root / f"shell-{phase}.txt").exists()
-            assert str(child.resolve()) in llm.results[4]
+            assert _names(llm.results[4], child.resolve())
             assert f"patch-{phase}.txt" in llm.results[5]
             assert "MAIN MUST STAY" not in llm.results[0]
-            assert str(child.resolve()) in llm.results[1]
+            assert _names(llm.results[1], child.resolve())
             assert f"Native workspace root: {child.resolve()}" in llm.prompts[0]
     asyncio.run(scenario())
 
