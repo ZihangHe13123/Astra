@@ -232,6 +232,31 @@ def test_auto_engine_prefers_pandoc_with_safe_arguments(tmp_path, monkeypatch):
     assert "@astra" not in record["input"]
 
 
+def test_exported_file_is_flushed_through_a_handle_windows_accepts(tmp_path, monkeypatch):
+    """Windows flushes only a handle that may write: every export there ended in
+    "OSError: [Errno 9] Bad file descriptor" after the engine had produced the file."""
+    if os.name != "nt":
+        # Give the flush the Windows rule, so the same failure shows on this platform.
+        import fcntl
+
+        real_fsync = os.fsync
+
+        def fsync_as_windows(descriptor):
+            if fcntl.fcntl(descriptor, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDONLY:
+                raise OSError(9, "Bad file descriptor")
+            real_fsync(descriptor)
+
+        monkeypatch.setattr(os, "fsync", fsync_as_windows)
+    monkeypatch.setenv("ASTRA_PANDOC", str(fake_pandoc(tmp_path)))
+    output = tmp_path / "out.docx"
+
+    result = export_document("# T\n\nText\n", base_dir=tmp_path, output=output, fmt="docx", resolve_image=inside(tmp_path))
+
+    assert result.engine == "pandoc"
+    assert output.read_bytes() == b"fake docx"
+    assert [path.name for path in tmp_path.iterdir() if path.name.endswith(".tmp")] == []
+
+
 def test_pandoc_takes_the_title_only_from_a_document_that_opens_with_it(tmp_path, monkeypatch):
     monkeypatch.setenv("ASTRA_PANDOC", str(fake_pandoc(tmp_path)))
     log = tmp_path / "pandoc-args.json"

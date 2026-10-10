@@ -16,7 +16,7 @@ Pytest 会隔离继承的 Astra 安装、工作区和模型设置，使代理内
 仓库提交了 `uv.lock` 以及 `ui-core`、`ui-tui`、`ui-gui` 的 npm 锁文件。安装 Python 3.11+、Node.js 18+ 和 [uv（英文文档）](https://docs.astral.sh/uv/) 后，在仓库根目录运行：
 
 ```text
-uv sync --locked --python 3.11 --extra dev --extra mcp --extra tracing --extra server --extra notebook
+uv sync --locked --python 3.11 --extra dev --extra mcp --extra tracing --extra server --extra notebook --extra documents --extra voice
 npm --prefix ui-core ci
 npm --prefix ui-core run build
 npm --prefix ui-tui ci
@@ -68,7 +68,7 @@ python -m agent.evals.replay --case legacy-work-session-migrates --json
 先安装上述锁定的开发依赖。发布检查包括 Ruff、Pyright、全部 TUI 测试、TUI 类型检查/构建和 Python 测试。Ruff 使用 `pyproject.toml` 中偏重正确性的规则集，格式规则不是发布要求。可选验收项另行启用：
 
 ```text
-uv run --locked --extra dev --extra mcp --extra tracing --extra server --extra notebook python scripts/phase_t_gate.py --wheel-smoke
+uv run --locked --extra dev --extra mcp --extra tracing --extra server --extra notebook --extra documents --extra voice python scripts/phase_t_gate.py --wheel-smoke
 ```
 
 开发中先运行相关检查，最终云端验收前完成本机 macOS 检查：

@@ -212,7 +212,7 @@ def test_omnibox_hover_types_by_shortcut_and_passes_only_with_strip_evidence():
         runner = runner_for_omnibox(typed, "127.0.0.1:8771/text?step=omnibox-hover&nonce=nonce123")
         moves = []
         runner.locate_pointer = lambda: (700.0, 5.0)
-        runner.move_pointer = lambda x, y: moves.append((x, y))
+        runner.move_pointer = lambda x, y, moves=moves: moves.append((x, y))
         runner.hover_fixture_link = AsyncMock(return_value=(125, 240))
         runner.diagnostics_offset = lambda: 0
         runner.diagnostics_since = lambda _offset, seen=strip: (

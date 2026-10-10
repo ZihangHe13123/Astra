@@ -163,7 +163,8 @@ def _atomic_move(source: Path, target: Path) -> None:
     temporary = target.with_name(f".{target.name}.agent-{os.getpid()}.tmp")
     try:
         shutil.copyfile(source, temporary)
-        with open(temporary, "rb") as handle:
+        # Opened for writing too: Windows refuses to flush a read-only handle.
+        with open(temporary, "rb+") as handle:
             os.fsync(handle.fileno())
         os.replace(temporary, target)
     finally:
