@@ -1,6 +1,9 @@
 import asyncio
 import json
+import os
+import shlex
 import subprocess
+import sys
 
 import pytest
 
@@ -15,6 +18,12 @@ from agent.runtime.tools.processes import ProcessManager
 from agent.runtime.tools.registry import ToolRegistry
 from agent.sandbox.docker import DockerSandbox
 from agent.sandbox.local import LocalSandbox
+
+
+def _print_working_directory() -> str:
+    """A command cmd.exe and bash both run; on Windows `pwd` would be sent to WSL."""
+    argv = [sys.executable, "-c", "import os; print(os.getcwd())"]
+    return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
 
 
 def git(root, *args):
@@ -37,7 +46,8 @@ class WorkspaceLLM:
             ("stat_file", {"path": "marker.txt"}),
             ("edit_file", {"path": "marker.txt", "old": f"child-{suffix}", "new": f"edited-{suffix}"}),
             ("apply_patch", {"patch": f"*** Begin Patch\n*** Add File: patch-{suffix}.txt\n+patch\n*** End Patch"}),
-            ("execute_shell", {"command": f"pwd && git rev-parse --show-toplevel && echo shell > shell-{suffix}.txt",
+            ("execute_shell", {"command": f"{_print_working_directory()} && git rev-parse --show-toplevel"
+                                          f" && echo shell > shell-{suffix}.txt",
                                "foreground_yield_ms": 5000}),
             ("git_status", {}),
         ]
