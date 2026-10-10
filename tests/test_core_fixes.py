@@ -2432,15 +2432,34 @@ def test_git_write_tools_require_explicit_environment_opt_in(tmp_path, monkeypat
         assert "AGENT_ALLOW_GIT_WRITE=1" in result["error"]
         assert "to enable git write tools" not in result["error"]
 
-        # YOLO skips this tool's permission prompt, so nothing grants the
-        # scope: the write is still refused, with the same explanation.
-        registry.yolo = True
-        refused = await registry.execute("git_reset", {"mode": "hard", "target": "HEAD"})
-        assert "git_reset was not run" in refused["error"]
-        assert "need the user's approval for this repository" in refused["error"]
-        assert "not retry" in refused["error"]
-
     monkeypatch.delenv("AGENT_ALLOW_GIT_WRITE", raising=False)
+    run(scenario())
+
+
+def test_yolo_is_the_standing_approval_for_git_writes(tmp_path, monkeypatch):
+    root = _committed_git_repo(tmp_path, monkeypatch)
+    monkeypatch.delenv("AGENT_ALLOW_GIT_WRITE", raising=False)
+    (root / "second.txt").write_text("two\n", encoding="utf-8")
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_git_tools(registry, str(root))
+
+        registry.yolo = True
+        staged = await registry.execute("git_add", {"files": "second.txt"})
+        assert staged["error"] == ""
+        committed = await registry.execute("git_commit", {"message": "second commit"})
+        assert committed["error"] == ""
+        log = await registry.execute("git_log", {})
+        assert "second commit" in log["output"]
+
+        # Leaving YOLO withdraws it: with nobody to ask, the write is refused again.
+        registry.yolo = False
+        (root / "third.txt").write_text("three\n", encoding="utf-8")
+        refused = await registry.execute("git_add", {"files": "third.txt"})
+        assert refused["code"] == "approval_required"
+        assert "need the user's approval for this repository" in refused["error"]
+
     run(scenario())
 
 
@@ -2527,6 +2546,51 @@ def test_git_tools_fail_when_git_exits_nonzero(tmp_path, monkeypatch):
         log = await registry.execute("git_log", {})
         assert log["error"] == ""
         assert "second commit" in log["output"] and "first commit" in log["output"]
+
+    run(scenario())
+
+
+def test_git_tools_stage_quoted_paths_and_refuse_option_like_refs(tmp_path, monkeypatch):
+    root = _committed_git_repo(tmp_path, monkeypatch)
+    monkeypatch.setenv("AGENT_ALLOW_GIT_WRITE", "1")
+    (root / "release notes.txt").write_text("notes\n", encoding="utf-8")
+    (root / "-dash.txt").write_text("dash\n", encoding="utf-8")
+    (root / "plain.txt").write_text("plain\n", encoding="utf-8")
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_git_tools(registry, str(root))
+
+        staged = await registry.execute("git_add", {"files": '"release notes.txt" -dash.txt'})
+        assert staged["error"] == ""
+        only_staged = await registry.execute("git_diff", {"target": "--staged"})
+        assert "release notes.txt" in only_staged["output"]
+        assert "-dash.txt" in only_staged["output"]
+        assert "plain.txt" not in only_staged["output"]
+
+        everything = await registry.execute("git_add", {"files": "-A"})
+        assert everything["error"] == ""
+        assert "plain.txt" in (await registry.execute("git_diff", {"target": "--staged"}))["output"]
+
+        # A value git would read as an option never reaches git.
+        for name, args in (
+            ("git_show", {"commit": "--output=leak.txt"}),
+            ("git_diff", {"target": "--output=leak.txt"}),
+            ("git_reset", {"target": "--hard"}),
+            ("git_checkout", {"target": "-f"}),
+            ("git_push", {"remote": "--receive-pack=evil"}),
+            ("git_clone", {"url": "--upload-pack=evil", "path": "copy"}),
+        ):
+            refused = await registry.execute(name, args)
+            assert refused["code"] == "invalid_arguments", name
+            assert "must not start with '-'" in refused["error"], name
+        assert not (root / "leak.txt").exists()
+        assert not (root / "copy").exists()
+
+        (root / "plain.txt").write_text("changed\n", encoding="utf-8")
+        restored = await registry.execute("git_checkout", {"target": "--", "files": "plain.txt"})
+        assert restored["error"] == ""
+        assert (root / "plain.txt").read_text(encoding="utf-8") == "plain\n"
 
     run(scenario())
 
