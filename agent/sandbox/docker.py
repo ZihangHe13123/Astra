@@ -72,9 +72,10 @@ class DockerSandbox(Sandbox):
                     await proc.wait()
             raise
 
-    def _build_args(self, command: str) -> list[str]:
+    def _build_args(self, command: str, name: str = "") -> list[str]:
         return [
             self.docker_cmd, "run", "--rm", "-i",
+            *(["--name", name] if name else []),
             "--workdir", "/workspace",
             "-v", f"{self.workdir}:/workspace",
             "--memory", self.memory_limit,
@@ -133,11 +134,27 @@ class DockerSandbox(Sandbox):
                 on_output(stream, tail)
         return b"".join(chunks)
 
+    async def _remove_container(self, name: str) -> None:
+        """Remove a container whose client was stopped, and with it everything it runs."""
+        try:
+            cleanup = await asyncio.create_subprocess_exec(
+                self.docker_cmd, "rm", "-f", name,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                creationflags=hidden_process_creationflags(),
+            )
+            await asyncio.wait_for(cleanup.communicate(), timeout=5)
+        except (asyncio.TimeoutError, OSError):
+            pass
+
     async def _exec_args(
         self,
         args: list[str],
         on_output: OutputCallback | None = None,
+        *,
+        container: str = "",
     ) -> dict:
+        """Run one docker command. ``container`` names a one-shot container to remove when the run is stopped."""
         proc = None
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -153,6 +170,9 @@ class DockerSandbox(Sandbox):
                 if proc.returncode is None:
                     proc.kill()
                     await proc.wait()
+                # Killing the client does not stop the container it started.
+                if container:
+                    await self._remove_container(container)
                 # Keep what the run wrote before it was stopped.
                 collected = await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
                 stdout, stderr = (item if isinstance(item, bytes) else b"" for item in collected)
@@ -168,6 +188,8 @@ class DockerSandbox(Sandbox):
                 if proc.returncode is None:
                     proc.kill()
                     await proc.wait()
+                if container:
+                    await self._remove_container(container)
                 await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
                 raise
             return {
@@ -208,7 +230,11 @@ class DockerSandbox(Sandbox):
         if self.reuse_container:
             await self._ensure_container()
             return await self._exec_args(self._build_exec_args(command), on_output=on_output)
-        return await self._exec_args(self._build_args(command), on_output=on_output)
+        # Named, so that a run stopped at the limit or cancelled can be removed.
+        name = f"agent-sandbox-run-{uuid.uuid4().hex[:12]}"
+        return await self._exec_args(
+            self._build_args(command, name), on_output=on_output, container=name,
+        )
 
     async def execute_python(self, code: str) -> dict:
         return await self.execute_python_stream(code)
