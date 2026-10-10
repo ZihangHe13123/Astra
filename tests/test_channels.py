@@ -19,6 +19,7 @@ from agent.channels.router import (
 )
 from agent.channels.tools import register_channel_tools
 from agent.runtime.context import AgentContext
+from agent.runtime.tools.policy import ToolPolicy
 from agent.runtime.tools.registry import ToolRegistry
 
 
@@ -547,6 +548,53 @@ def test_channel_send_file_tool_is_scoped_to_trusted_sender_and_root(tmp_path):
 
     asyncio.run(scenario())
 
+
+def test_channel_send_file_reports_an_unconfirmed_upload_and_the_path_it_could_not_find(tmp_path):
+    class SilentAdapter(FakeAdapter):
+        name = "qq"
+
+        async def send_file(self, message, path, name):
+            raise TimeoutError  # how the adapter's wait for the channel's confirmation ends
+
+    async def scenario():
+        async def handler(message, reply_sink=None):
+            return message.text
+
+        config = ChannelsConfig(onebot=OneBotConfig(
+            send_files_enabled=True,
+            file_allow_users=("10001",),
+            send_file_roots=(str(tmp_path),),
+        ))
+        manager = ChannelManager(config, handler, adapters=[SilentAdapter(handler)])
+        registry = ToolRegistry(ToolPolicy(mode="permissive"))
+        register_channel_tools(registry, lambda: manager)
+        source = tmp_path / "report.txt"
+        source.write_text("report", encoding="utf-8")
+        missing = tmp_path / "gone" / "report.txt"
+        token = active_channel_message.set(ChannelMessage("qq", "10001", "10001", "把报告发给我"))
+        try:
+            return (await registry.execute("channel_send_file", {"path": str(source)}),
+                    await registry.execute("channel_send_file", {"path": str(missing)}), missing)
+        finally:
+            active_channel_message.reset(token)
+
+    unconfirmed, not_found, missing = asyncio.run(scenario())
+
+    # Not the registry's own "[ToolTimeout] ... exceeded 45s", which is neither the time
+    # that passed nor a statement about the file.
+    assert unconfirmed["code"] == "channel_send_unconfirmed"
+    assert "may or may not have reached the user" in unconfirmed["error"]
+    assert "exceeded" not in unconfirmed["error"]
+    assert unconfirmed["retryable"] is False and "Do not send it again" in unconfirmed["recovery_hint"]
+    # The whole path that was asked for, not its first missing directory.
+    assert str(missing) in not_found["error"]
+
+
+def test_channel_send_file_states_its_turn_limit():
+    registry = ToolRegistry()
+    register_channel_tools(registry, lambda: None)
+    tool = registry.get("channel_send_file")
+    assert f"At most {tool.max_calls_per_turn} calls per turn" in tool.description
 
 
 def test_is_address_in_use_detects_common_errnos():
