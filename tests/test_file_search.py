@@ -151,7 +151,7 @@ def test_search_files_no_match_no_suggestion_when_unrelated(tmp_path):
 
 def test_search_files_paths_under_a_subdirectory_can_be_passed_back(tmp_path):
     (tmp_path / "pkg" / "sub").mkdir(parents=True)
-    (tmp_path / "pkg" / "sub" / "m.py").write_text("value = 1\n", encoding="utf-8")
+    (tmp_path / "pkg" / "sub" / "m.py").write_text("value = 1\n", encoding="utf-8", newline="\n")
 
     registry = ToolRegistry()
     register_file_tools(registry, str(tmp_path))

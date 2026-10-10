@@ -135,7 +135,9 @@ def test_python_run_stopped_at_the_sandbox_limit_is_marked_partial(tmp_path):
             # A shell run reports the stop as a failure; that failure is partial too.
             shell = await registry.execute(
                 "execute_shell",
-                {"command": "echo shell-before; sleep 8", "foreground_yield_ms": 0},
+                {"command": _python_command(
+                    "import time; print('shell-before', flush=True); time.sleep(8)"
+                ), "foreground_yield_ms": 0},
             )
             assert shell["partial"] is True
             shell_context = ReActAgent._tool_result_context(

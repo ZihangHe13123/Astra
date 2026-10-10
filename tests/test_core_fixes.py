@@ -5988,7 +5988,7 @@ def test_read_file_line_paging_reports_what_remains_after_each_page(tmp_path):
         register_file_tools(registry, str(tmp_path))
         target = tmp_path / "paged.txt"
         text = "".join(f"line{index}\n" for index in range(10))
-        target.write_text(text, encoding="utf-8")
+        target.write_text(text, encoding="utf-8", newline="\n")
 
         pages = []
         offset = 0
@@ -6027,7 +6027,7 @@ def test_read_file_states_the_default_line_limit_it_applies(tmp_path, monkeypatc
         registry = ToolRegistry()
         register_file_tools(registry, str(tmp_path))
         target = tmp_path / "default.txt"
-        target.write_text("".join(f"{index}\n" for index in range(8)), encoding="utf-8")
+        target.write_text("".join(f"{index}\n" for index in range(8)), encoding="utf-8", newline="\n")
 
         metadata, payload = _read_file_page(
             await registry.execute("read_file", {"path": str(target)})
@@ -6050,7 +6050,7 @@ def test_read_file_page_size_cap_ends_the_page_between_lines(tmp_path, monkeypat
         register_file_tools(registry, str(tmp_path))
         target = tmp_path / "wide.txt"
         text = "".join(f"{index}" * 299 + "\n" for index in range(7))
-        target.write_text(text, encoding="utf-8")
+        target.write_text(text, encoding="utf-8", newline="\n")
 
         pages = []
         offset = 0
@@ -6079,7 +6079,7 @@ def test_read_file_byte_offset_finishes_a_cut_line_and_honours_limit(tmp_path, m
         registry = ToolRegistry()
         register_file_tools(registry, str(tmp_path))
         target = tmp_path / "long-line.txt"
-        target.write_text("a" * 1500 + "\nsecond\nthird\n", encoding="utf-8")
+        target.write_text("a" * 1500 + "\nsecond\nthird\n", encoding="utf-8", newline="\n")
 
         first = await registry.execute("read_file", {"path": str(target)})
         metadata, payload = _read_file_page(first)
@@ -6124,7 +6124,7 @@ def test_read_file_cuts_an_over_long_multibyte_line_between_characters(tmp_path,
         register_file_tools(registry, str(tmp_path))
         target = tmp_path / "wide-characters.txt"
         text = "中" * 1000 + "\n"
-        target.write_text(text, encoding="utf-8")
+        target.write_text(text, encoding="utf-8", newline="\n")
 
         metadata, payload = _read_file_page(
             await registry.execute("read_file", {"path": str(target)})
