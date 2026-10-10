@@ -1,6 +1,9 @@
 import asyncio
 import json
+import os
+import shlex
 import subprocess
+import sys
 
 import pytest
 
@@ -15,6 +18,20 @@ from agent.runtime.tools.processes import ProcessManager
 from agent.runtime.tools.registry import ToolRegistry
 from agent.sandbox.docker import DockerSandbox
 from agent.sandbox.local import LocalSandbox
+
+
+def _print_working_directory() -> str:
+    """A command cmd.exe and bash both run; on Windows `pwd` would be sent to WSL."""
+    argv = [sys.executable, "-c", "import os; print(os.getcwd())"]
+    return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+
+
+def _names(text: str, path) -> bool:
+    """Whether a tool result names the path. A result is JSON, where a Windows
+    path has its backslashes doubled once for each level of nesting."""
+    while "\\\\" in text:
+        text = text.replace("\\\\", "\\")
+    return str(path) in text
 
 
 def git(root, *args):
@@ -37,7 +54,8 @@ class WorkspaceLLM:
             ("stat_file", {"path": "marker.txt"}),
             ("edit_file", {"path": "marker.txt", "old": f"child-{suffix}", "new": f"edited-{suffix}"}),
             ("apply_patch", {"patch": f"*** Begin Patch\n*** Add File: patch-{suffix}.txt\n+patch\n*** End Patch"}),
-            ("execute_shell", {"command": f"pwd && git rev-parse --show-toplevel && echo shell > shell-{suffix}.txt",
+            ("execute_shell", {"command": f"{_print_working_directory()} && git rev-parse --show-toplevel"
+                                          f" && echo shell > shell-{suffix}.txt",
                                "foreground_yield_ms": 5000}),
             ("git_status", {}),
         ]
@@ -111,10 +129,10 @@ def test_spawn_and_restart_execute_in_selected_worktree(tmp_path, monkeypatch, e
             assert (child / f"shell-{phase}.txt").read_text().strip() == "shell"
             assert not (root / f"patch-{phase}.txt").exists()
             assert not (root / f"shell-{phase}.txt").exists()
-            assert str(child.resolve()) in llm.results[4]
+            assert _names(llm.results[4], child.resolve())
             assert f"patch-{phase}.txt" in llm.results[5]
             assert "MAIN MUST STAY" not in llm.results[0]
-            assert str(child.resolve()) in llm.results[1]
+            assert _names(llm.results[1], child.resolve())
             assert f"Native workspace root: {child.resolve()}" in llm.prompts[0]
     asyncio.run(scenario())
 

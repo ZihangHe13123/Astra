@@ -217,6 +217,10 @@ def test_cache_reuses_unchanged_file_but_append_and_atomic_replacement_refresh(t
     assert len(reads) == 3
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="Windows reports a file's creation time, not its change time: this rewrite leaves no trace in os.stat",
+)
 def test_same_size_rewrite_with_restored_mtime_refreshes(tmp_path):
     store = SessionStore(tmp_path / "test.json")
     _write(store, _record("terminal", status="completed", result="old"))

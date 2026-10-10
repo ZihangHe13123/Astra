@@ -309,6 +309,52 @@ def test_added_and_deleted_use_the_absent_side_for_counts(tmp_path: Path) -> Non
     ]
 
 
+def test_after_side_is_the_files_bytes_where_files_open_in_text_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows opens a file in text mode unless asked otherwise: the after side lost its
+    carriage returns and ended at the first 0x1A byte, so a "\r\n" file that a turn left
+    as it was came out as changed."""
+    monkeypatch.setattr(store, "_HANDLE_IO_OK", False)  # the path-based reads Windows uses
+    if os.name != "nt":
+        # Give this platform the same rule, so the failure shows here too.
+        binary = 0x8000
+        text_mode: set[int] = set()
+        real_open, real_read, real_close = os.open, os.read, os.close
+
+        def open_as_windows(path, flags, *args, **kwargs):
+            descriptor = real_open(path, flags & ~binary, *args, **kwargs)
+            (text_mode.discard if flags & binary else text_mode.add)(descriptor)
+            return descriptor
+
+        def read_as_windows(descriptor, count):
+            data = real_read(descriptor, count)
+            if descriptor in text_mode:
+                data = data.split(b"\x1a")[0].replace(b"\r\n", b"\n")
+            return data
+
+        def close_as_windows(descriptor):
+            text_mode.discard(descriptor)
+            real_close(descriptor)
+
+        monkeypatch.setattr(os, "O_BINARY", binary, raising=False)
+        monkeypatch.setattr(os, "open", open_as_windows)
+        monkeypatch.setattr(os, "read", read_as_windows)
+        monkeypatch.setattr(os, "close", close_as_windows)
+    data = b"one\r\ntwo\x1athree\r\n"
+    (tmp_path / "note.txt").write_bytes(data)
+    subject = make_store(tmp_path)
+
+    subject.begin_turn("changed")
+    subject.note_capture("note.txt", b"earlier\r\n")
+    assert subject.seal() is not None
+    assert subject.load_sides(0, "note.txt").after == data
+
+    subject.begin_turn("left as it was")
+    subject.note_capture("note.txt", data)
+    assert subject.seal() is None
+
+
 def test_unchanged_paths_are_never_reported(tmp_path: Path) -> None:
     (tmp_path / "same.txt").write_bytes(b"same\n")
     subject = make_store(tmp_path)
@@ -1288,10 +1334,10 @@ def test_external_cancel_is_processed_during_cooperative_seal(
     async def scenario():
         task = asyncio.current_task()
         assert task is not None
-        start = time.monotonic()
+        start = time.perf_counter()
 
         def request_cancel() -> None:
-            observed["cancel_callback_ms"] = (time.monotonic() - start) * 1000.0
+            observed["cancel_callback_ms"] = (time.perf_counter() - start) * 1000.0
             task.cancel()
 
         asyncio.get_running_loop().call_later(0.01, request_cancel)
@@ -1300,7 +1346,7 @@ def test_external_cancel_is_processed_during_cooperative_seal(
         except asyncio.CancelledError:
             # 收尾完成后取消语义继续传播（review G2）
             observed["cancel_propagated"] = True
-        observed["seal_return_ms"] = (time.monotonic() - start) * 1000.0
+        observed["seal_return_ms"] = (time.perf_counter() - start) * 1000.0
         await asyncio.sleep(0)
         return subject.take_stopped_manifest()
 
@@ -1318,6 +1364,7 @@ def test_external_cancel_is_processed_during_cooperative_seal(
     assert all(change.after_state == store.SIDE_UNCAPTURED for change in manifest.unknown)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory-handle semantics")
 def test_after_read_refuses_a_parent_swap_between_check_and_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1358,6 +1405,7 @@ def test_after_read_refuses_a_parent_swap_between_check_and_open(
     assert subject.load_sides(0, "sub/note.txt").after is None
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory-handle semantics")
 def test_snapshot_write_refuses_a_storage_swap_between_check_and_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2070,12 +2118,17 @@ def test_locked_turn_eviction_stops_instead_of_looping(tmp_path: Path) -> None:
         root = Path(sys.argv[1])
         calls = 0
 
-        def failing_remove(parent_fd, name):
+        def failing_remove(*_args, **_kwargs):
             global calls
             calls += 1
             raise PermissionError("simulated locked snapshot directory")
 
-        tcs._remove_tree_at = failing_remove
+        # A turn area is removed through a directory handle where the platform
+        # has them and by path elsewhere: fail the one this platform uses.
+        if tcs._HANDLE_IO_OK:
+            tcs._remove_tree_at = failing_remove
+        else:
+            tcs.shutil.rmtree = failing_remove
 
         store = tcs.TurnChangeStore(
             root, "review", root=root / "ledger",

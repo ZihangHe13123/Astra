@@ -106,7 +106,7 @@ def test_capture_reads_the_file_tool_target_when_roots_differ(tmp_path):
     sandbox = tmp_path / "sandbox"
     workspace.mkdir()
     sandbox.mkdir()
-    (workspace / "note.txt").write_text("before\n", encoding="utf-8")
+    (workspace / "note.txt").write_text("before\n", encoding="utf-8", newline="\n")
     (sandbox / "note.txt").write_text("UNRELATED-SANDBOX-CONTENT\n", encoding="utf-8")
     registry = ToolRegistry()
     register_file_tools(registry, workdir=str(workspace))
@@ -716,7 +716,7 @@ def test_non_streaming_reply_records_without_events(tmp_path, monkeypatch):
 
 def test_previous_turn_snapshots_are_immutable(tmp_path, monkeypatch):
     """Later edits must not rewrite a previous turn's ledger snapshots."""
-    (tmp_path / "hist.txt").write_text("a\n", encoding="utf-8")
+    (tmp_path / "hist.txt").write_text("a\n", encoding="utf-8", newline="\n")
     agent, stores = make_turn_agent(tmp_path, [
         call("edit_file", {"path": "hist.txt", "old": "a", "new": "b"}, call_id="h1"),
         DONE,
