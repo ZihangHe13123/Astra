@@ -763,7 +763,7 @@ class ContextIndexBroker:
             return ""
         if self._open_calls.get(request_id, 0) >= OPEN_MAX_CALLS:
             next_step = (
-                "No context_open call is left this turn (a further call is not run and ends the turn); "
+                "No context_open call is left this turn (a further call is not run); "
                 "use its recommendation text."
             )
         elif OPEN_TOKEN_BUDGET - self._open_tokens.get(request_id, 0) < _OPEN_MIN_REMAINING_TOKENS:
@@ -771,7 +771,7 @@ class ContextIndexBroker:
         else:
             next_step = (
                 "If this was your first context_open call this turn, one more call with only this handle "
-                "and window 0 needs the least room; a third call is not run and ends the turn."
+                "and window 0 needs the least room; a third call is not run."
             )
         lines = [f"Not opened ({len(skipped)} of {len(statuses)} requested handles):"]
         for handle, status in skipped:

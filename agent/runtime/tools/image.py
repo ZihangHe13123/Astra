@@ -599,7 +599,7 @@ def register_image_tools(
                 "Use only tile_set_id and tile_ids listed in the annotated overview manifest. "
                 "This tool accepts no file paths and reports unserved IDs and remaining request budgets. "
                 f"Limit: {tile_calls_per_turn} calls per turn, one tile_set_id per call; ask for all the "
-                "tiles you need within those calls. A further call is not run and ends the turn."
+                "tiles you need within those calls. A further call is not run."
             ),
             parameters={
                 "type": "object",

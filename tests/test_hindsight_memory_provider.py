@@ -369,7 +369,7 @@ def test_hindsight_descriptions_state_the_per_turn_limit_and_what_tags_do():
     for name in ("hindsight_retain", "hindsight_recall", "hindsight_reflect"):
         tool = tools.get(name)
         assert f"At most {tool.max_calls_per_turn} calls per turn" in tool.description
-        assert "ends the turn" in tool.description
+        assert "is not run" in tool.description
     properties = tools.get("hindsight_retain").parameters["properties"]
     assert "cannot filter by tag" in properties["tags"]["description"]
     assert properties["context"]["description"] and properties["content"]["description"]

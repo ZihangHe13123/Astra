@@ -189,7 +189,7 @@ def test_tool_contract_and_persistence_flags() -> None:
     # The model is told the limits it will hit and that the result is kept for one step only.
     for name in ("context_open", "context_inspect"):
         description = registry.get(name).description
-        assert "At most 2 calls per turn" in description and "ends the turn" in description
+        assert "At most 2 calls per turn" in description and "is not run" in description
         assert "next step only" in description
 
 
@@ -444,7 +444,7 @@ def test_open_says_how_to_retry_a_budget_omission_while_a_call_is_left() -> None
     assert "evidence budget" in skipped[session_handle]
     assert "only this handle" in skipped[session_handle] and "window 0" in skipped[session_handle]
     assert "first context_open call this turn" in skipped[session_handle]
-    assert "ends the turn" in skipped[session_handle]
+    assert "is not run" in skipped[session_handle]
 
     # Following the note works: alone, the handle gets the room the other two no longer share.
     retried = _open_through_registry(broker, [session_handle], 0)

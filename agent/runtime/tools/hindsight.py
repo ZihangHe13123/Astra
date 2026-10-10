@@ -9,7 +9,7 @@ from ..tool_failure import ToolFailure
 from .registry import ToolDef, ToolRegistry
 
 _CALLS_PER_TURN = 2
-_TURN_LIMIT = f"At most {_CALLS_PER_TURN} calls per turn: a further call is not run and ends the turn"
+_TURN_LIMIT = f"At most {_CALLS_PER_TURN} calls per turn: a further call is not run"
 
 
 def _failure(operation: str, exc: Exception) -> ToolFailure:
