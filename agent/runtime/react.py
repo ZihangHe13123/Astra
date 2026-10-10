@@ -3068,6 +3068,119 @@ class ReActAgent(AgentBase):
                 logger.exception("task store tool finish failed task_id=%s name=%s", task_id, name)
         return event
 
+    # The two methods below hold the per-message bookkeeping of the turn's
+    # repeat and per-tool limits. They live outside the reply loop on purpose:
+    # that loop is one very large function, and branches added to it make its
+    # type analysis many times slower.
+    def _admit_tool_calls(
+        self,
+        tool_calls: list[dict],
+        *,
+        tool_signature_counts: dict[str, int],
+        tool_name_counts: dict[str, int],
+        failed_tool_signatures: set[str],
+        budget_warned: set[str],
+        repeated_tool_limit: int,
+    ) -> tuple[str | None, tuple[str, int] | None, set[str], dict[str, tuple[str, bool]]]:
+        """Count one assistant message's tool calls against the turn's limits.
+
+        Returns ``(repeated, exhausted, repeat_notice_ids, refusals)``: the
+        signature of a call that repeats too often; the tool, with its limit,
+        that went past its per-turn limit a second time; the ids of calls that
+        just used up the identical-call allowance; and, when a tool's limit is
+        passed for the first time, why each call of this message is not run
+        and whether it may be sent again. The count dictionaries and
+        ``budget_warned`` are updated in place.
+        """
+        repeated: str | None = None
+        exhausted: tuple[str, int] | None = None
+        repeat_notice_ids: set[str] = set()
+        over_limit: dict[str, int] = {}
+        counts_before = (dict(tool_signature_counts), dict(tool_name_counts))
+        for tc in tool_calls:
+            name = tc.get("name", "")
+            tool_def = self.tools.get(name)
+            signature = self._tool_signature(tc)
+            if signature in failed_tool_signatures:
+                repeated = signature
+                break
+            if tool_def is None or tool_def.repeat_guard:
+                tool_signature_counts[signature] = tool_signature_counts.get(signature, 0) + 1
+                if tool_signature_counts[signature] > repeated_tool_limit:
+                    repeated = signature
+                    break
+                if tool_signature_counts[signature] == repeated_tool_limit:
+                    repeat_notice_ids.add(str(tc.get("id") or ""))
+            tool_name_counts[name] = tool_name_counts.get(name, 0) + 1
+            limit = tool_def.max_calls_per_turn if tool_def is not None else None
+            if limit is not None and tool_name_counts[name] > limit:
+                if name in budget_warned:
+                    exhausted = (name, limit)
+                    break
+                over_limit.setdefault(name, limit)
+        refusals: dict[str, tuple[str, bool]] = {}
+        if repeated is not None or exhausted is not None or not over_limit:
+            return repeated, exhausted, repeat_notice_ids, refusals
+        # Refuse the whole message once instead of ending the turn: its calls
+        # may depend on each other, so none is run, and none counts, which
+        # leaves the model its remaining calls.
+        asked = {
+            name: sum(1 for tc in tool_calls if tc.get("name", "") == name)
+            for name in over_limit
+        }
+        tool_signature_counts.clear()
+        tool_signature_counts.update(counts_before[0])
+        tool_name_counts.clear()
+        tool_name_counts.update(counts_before[1])
+        budget_warned.update(over_limit)
+        blamed = ", ".join(sorted(over_limit))
+        for tc in tool_calls:
+            name = tc.get("name", "")
+            if name in over_limit:
+                limit = over_limit[name]
+                left = max(0, limit - tool_name_counts.get(name, 0))
+                refusal = (
+                    f"[ToolBudgetExhausted] {name} was not run: this message asked for "
+                    f"{asked[name]} calls and {left} of its {limit} per turn are left, so none "
+                    f"of them ran. Send at most {left} (put several items into one call); "
+                    "asking for more again ends the turn."
+                    if left else
+                    f"[ToolBudgetExhausted] {name} was not run: its limit of {limit} calls per "
+                    f"turn is used up. Go on without it; another {name} call in this turn "
+                    "ends the turn."
+                )
+            else:
+                left = 1  # not over any limit of its own: it may simply be sent again
+                refusal = (
+                    f"[ToolBudgetExhausted] {name} was not run because {blamed} in the same "
+                    "message went over its per-turn limit. Send this call again."
+                )
+            refusals[str(tc.get("id") or "")] = (refusal, left > 0)
+        return None, None, set(), refusals
+
+    @staticmethod
+    def _settle_tool_counts(
+        tool_events: list[dict],
+        call_signatures: dict[str, str],
+        refusals: dict[str, tuple[str, bool]],
+        tool_signature_counts: dict[str, int],
+        tool_name_counts: dict[str, int],
+    ) -> None:
+        """Correct the turn's counts for calls that did not run or that changed state."""
+        for event in tool_events:
+            call_id = str(event.get("id") or "")
+            if event.get("not_executed") and call_id not in refusals:
+                # Refused before the tool's code ran (for example a missing
+                # argument): the corrected call must still fit the tool's
+                # per-turn limit.
+                refused_name = str(event.get("name") or "")
+                if tool_name_counts.get(refused_name, 0) > 0:
+                    tool_name_counts[refused_name] -= 1
+            if event.get("state_changed") and not event.get("error"):
+                # The call changed what it acts on, so sending it again is a
+                # new action rather than a repeat.
+                tool_signature_counts.pop(call_signatures.get(call_id, ""), None)
+
     def _steps_that_may_change_state(self, task_id: str) -> int:
         """Count this task's recorded steps that were not repeatable observations."""
         assert self.task_store is not None
@@ -4234,32 +4347,14 @@ class ReActAgent(AgentBase):
                 last_text = full_content
 
             if tool_calls:
-                repeated = None
-                exhausted = None
-                repeat_notice_ids: set[str] = set()
-                over_limit: dict[str, int] = {}
-                counts_before = (dict(tool_signature_counts), dict(tool_name_counts))
-                for tc in tool_calls:
-                    name = tc.get("name", "")
-                    tool_def = self.tools.get(name)
-                    signature = self._tool_signature(tc)
-                    if signature in failed_tool_signatures:
-                        repeated = signature
-                        break
-                    if tool_def is None or tool_def.repeat_guard:
-                        tool_signature_counts[signature] = tool_signature_counts.get(signature, 0) + 1
-                        if tool_signature_counts[signature] > repeated_tool_limit:
-                            repeated = signature
-                            break
-                        if tool_signature_counts[signature] == repeated_tool_limit:
-                            repeat_notice_ids.add(str(tc.get("id") or ""))
-                    tool_name_counts[name] = tool_name_counts.get(name, 0) + 1
-                    limit = tool_def.max_calls_per_turn if tool_def is not None else None
-                    if limit is not None and tool_name_counts[name] > limit:
-                        if name in budget_warned:
-                            exhausted = (name, limit)
-                            break
-                        over_limit.setdefault(name, limit)
+                repeated, exhausted, repeat_notice_ids, refusals = self._admit_tool_calls(
+                    tool_calls,
+                    tool_signature_counts=tool_signature_counts,
+                    tool_name_counts=tool_name_counts,
+                    failed_tool_signatures=failed_tool_signatures,
+                    budget_warned=budget_warned,
+                    repeated_tool_limit=repeated_tool_limit,
+                )
                 if repeated:
                     runtime_metrics.increment("repeated_payload_count")
                     repeated_label = self._persistent_tool_signature_label(repeated)
@@ -4283,45 +4378,6 @@ class ReActAgent(AgentBase):
                         "recoverable": True,
                     })
                     break
-                refusals: dict[str, tuple[str, bool]] = {}
-                if over_limit:
-                    # Refuse the whole message once instead of ending the turn:
-                    # its calls may depend on each other, so none is run, and
-                    # none counts, which leaves the model its remaining calls.
-                    asked = {
-                        name: sum(1 for tc in tool_calls if tc.get("name", "") == name)
-                        for name in over_limit
-                    }
-                    tool_signature_counts.clear()
-                    tool_signature_counts.update(counts_before[0])
-                    tool_name_counts.clear()
-                    tool_name_counts.update(counts_before[1])
-                    budget_warned.update(over_limit)
-                    repeat_notice_ids = set()
-                    blamed = ", ".join(sorted(over_limit))
-                    for tc in tool_calls:
-                        name = tc.get("name", "")
-                        if name in over_limit:
-                            limit = over_limit[name]
-                            left = max(0, limit - tool_name_counts.get(name, 0))
-                            refusal = (
-                                f"[ToolBudgetExhausted] {name} was not run: this message asked for "
-                                f"{asked[name]} calls and {left} of its {limit} per turn are left, so none "
-                                f"of them ran. Send at most {left} (put several items into one call); "
-                                "asking for more again ends the turn."
-                                if left else
-                                f"[ToolBudgetExhausted] {name} was not run: its limit of {limit} calls per "
-                                f"turn is used up. Go on without it; another {name} call in this turn "
-                                "ends the turn."
-                            )
-                        else:
-                            left = 1  # not over any limit of its own: it may simply be sent again
-                            refusal = (
-                                f"[ToolBudgetExhausted] {name} was not run because {blamed} in the same "
-                                "message went over its per-turn limit. Send this call again."
-                            )
-                        refusals[str(tc.get("id") or "")] = (refusal, left > 0)
-
                 # 通知前端：当前轮结束，finalize 本轮推理/内容
                 if emit_events:
                     yield with_request({
@@ -4403,18 +4459,9 @@ class ReActAgent(AgentBase):
                     for event in tool_events
                     if not event.get("error")
                 )
-                for event in tool_events:
-                    if event.get("not_executed") and str(event.get("id") or "") not in refusals:
-                        # Refused before the tool's code ran (for example a
-                        # missing argument): the corrected call must still fit
-                        # the tool's per-turn limit.
-                        refused_name = str(event.get("name") or "")
-                        if tool_name_counts.get(refused_name, 0) > 0:
-                            tool_name_counts[refused_name] -= 1
-                    if event.get("state_changed") and not event.get("error"):
-                        # The call changed what it acts on, so sending it
-                        # again is a new action rather than a repeat.
-                        tool_signature_counts.pop(call_signatures.get(str(event.get("id") or ""), ""), None)
+                self._settle_tool_counts(
+                    tool_events, call_signatures, refusals, tool_signature_counts, tool_name_counts,
+                )
                 if any(event.get("coding_change_journal") for event in tool_events):
                     # A successful source mutation changes the world in which
                     # earlier checks ran. Re-running the same check is a new
