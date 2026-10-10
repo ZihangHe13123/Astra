@@ -158,6 +158,12 @@ Edge or sending global keys to compensate for approval.
   each per turn (or per code-mode program). Connect and write tools retain their
   repeated-call guards. This prevents cached refs from being presented as a live
   refresh without allowing unbounded observation loops or automatic write replay.
+- A `browser_click` whose result reports an observed page change may be sent
+  again unchanged (the next "load more" or pager click); an identical click that
+  changed nothing still counts toward the guard.
+- A message that takes a tool past its per-turn limit is refused once with an
+  explanation and the turn continues; going past the same limit again ends the
+  turn.
 - `browser_select` takes an option's `value` or its exact visible label (when
   one option has it). A miss changes nothing and lists the options; `browser_read`
   on the select lists them too.

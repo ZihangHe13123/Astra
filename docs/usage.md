@@ -261,7 +261,8 @@ YOLO can be changed while a reply is streaming or tools are running:
 approval panels, questions, and tool details without submitting the input draft.
 The input bar displays `YOLO` while enabled. Turning it on releases pending
 approvals that support YOLO with a one-time decision; mandatory permission
-boundaries still apply. Turning it off restores approval checks at subsequent
+boundaries still apply. The Git write tools (`git_add`, `git_commit`, `git_push`
+and the others) run without asking while YOLO is on. Turning it off restores approval checks at subsequent
 tool boundaries, including running Team members. It does not cancel a tool
 that has already been authorized or erase separately granted session permissions.
 YOLO is available in Work and Minimal modes. Commands that cannot run during a
