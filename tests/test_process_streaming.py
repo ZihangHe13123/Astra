@@ -138,6 +138,72 @@ def test_result_only_output_pages_by_byte_cursor(tmp_path):
     assert second["eof"] is True
 
 
+def test_byte_offset_past_the_end_is_reported_from_the_real_end(tmp_path):
+    text = "ab你好cd"
+    total = len(text.encode("utf-8"))
+    manager, process = _managed(tmp_path, text)
+
+    result = manager.read(process, offset=None, byte_offset=total + 500, max_chars=10)
+
+    assert result["content"] == ""
+    assert result["byte_offset"] == result["next_byte_offset"] == result["total_bytes"] == total
+    assert result["eof"] is True
+    assert str(total + 500) in result["offset_past_end"] and str(total) in result["offset_past_end"]
+    assert result["output_reader"]["arguments"]["byte_offset"] == total
+    # A position that exists, including the end itself, carries no such note.
+    for valid in (0, total):
+        assert "offset_past_end" not in manager.read(process, offset=None, byte_offset=valid, max_chars=10)
+
+
+def test_byte_offset_past_the_end_of_a_running_process_does_not_become_the_next_position(tmp_path):
+    manager, process = _managed(tmp_path, "")
+    for path in (process.output_path, process.stdout_path, process.stderr_path):
+        path.unlink()
+    process.recovered_status = "running"
+
+    early = manager.read(process, offset=None, byte_offset=500, max_chars=10)
+
+    assert early["eof"] is False
+    assert early["byte_offset"] == early["next_byte_offset"] == early["total_bytes"] == 0
+    assert "so far" in early["offset_past_end"]
+    # Output that arrives later is read from its start, not from byte 500.
+    process.output_path.write_text("late output", encoding="utf-8")
+    arguments = dict(early["output_reader"]["arguments"])
+    assert arguments.pop("process_id") == process.process_id
+    assert manager.read(process, offset=None, **arguments)["content"] == "late output"
+
+
+def test_character_offset_past_the_end_does_not_inflate_the_total(tmp_path):
+    text = "a你好bc"
+    manager, process = _managed(tmp_path, text)
+
+    result = manager.read(process, offset=500, max_chars=10)
+
+    assert result["content"] == ""
+    assert result["offset"] == result["next_offset"] == result["total_chars"] == len(text)
+    assert result["byte_offset"] == result["total_bytes"] == len(text.encode("utf-8"))
+    assert "500" in result["offset_past_end"] and str(len(text)) in result["offset_past_end"]
+    assert result["output_reader"]["arguments"]["offset"] == len(text)
+    assert "offset_past_end" not in manager.read(process, offset=len(text), max_chars=10)
+
+
+def test_result_only_output_reports_positions_past_the_end_from_the_real_end(tmp_path):
+    manager, process = _managed(tmp_path, "")
+    for path in (process.output_path, process.stdout_path, process.stderr_path):
+        path.unlink()
+    process.result = {"output": "你好cd", "error": "", "exit_code": 0}
+    total = len("你好cd".encode("utf-8"))
+
+    by_byte = manager.read(process, offset=None, byte_offset=total + 9, max_chars=10)
+    by_char = manager.read(process, offset=40, max_chars=10)
+
+    assert by_byte["byte_offset"] == by_byte["next_byte_offset"] == by_byte["total_bytes"] == total
+    assert by_char["offset"] == by_char["next_offset"] == by_char["total_chars"] == 4
+    for result in (by_byte, by_char):
+        assert result["content"] == "" and result["eof"] is True
+        assert "past the end" in result["offset_past_end"]
+
+
 def test_external_refresh_uses_manifest_counters_without_scanning_logs(tmp_path, monkeypatch):
     manager, process = _managed(tmp_path, "large output", external=True)
     process.manifest_path.write_text(

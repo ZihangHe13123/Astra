@@ -104,3 +104,26 @@ def test_explicit_byte_read_keeps_the_cursor_and_reports_no_character_positions(
         finally:
             await sandbox.close()
     asyncio.run(scenario())
+
+
+def test_process_read_past_the_end_says_so_and_reports_the_real_end(tmp_path):
+    async def scenario():
+        registry = ToolRegistry(artifact_dir=tmp_path / "artifacts")
+        sandbox = LocalSandbox(workdir=str(tmp_path))
+        register_code_tools(registry, sandbox)
+        try:
+            process_id, _description = await _finished_background_process(registry)
+            result = await registry.execute(
+                "process_read", {"process_id": process_id, "byte_offset": len(_LINES) + 1000}
+            )
+            assert not result["error"], result
+            beyond = json.loads(result["output"])
+            assert beyond["content"] == ""
+            assert beyond["eof"] is True
+            # The requested position is not echoed as if output existed there.
+            assert beyond["byte_offset"] == beyond["next_byte_offset"] == beyond["total_bytes"] == len(_LINES)
+            assert str(len(_LINES) + 1000) in beyond["offset_past_end"]
+            assert beyond["output_reader"]["arguments"]["byte_offset"] == len(_LINES)
+        finally:
+            await sandbox.close()
+    asyncio.run(scenario())
