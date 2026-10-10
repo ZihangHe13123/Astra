@@ -1,6 +1,7 @@
 """What the model is told about a tool result: fresh or replayed, whole or partial."""
 
 import asyncio
+import time
 from pathlib import Path
 
 import pytest
@@ -342,6 +343,33 @@ def test_a_timeout_inside_a_tool_is_not_reported_as_the_tools_own_limit(tool_tim
     if inner_message:
         assert inner_message in inner["error"]
     assert "exceeded 0.05s" in own["error"]
+
+
+def test_the_tools_own_limit_is_named_when_the_loop_clock_is_coarse(monkeypatch):
+    """On Windows the event loop's clock ticks every 15.6 ms and a timer runs up to a tick early,
+    so a 30 ms limit that ended after 20 ms was reported as a wait inside the tool."""
+    real_clock_info = time.get_clock_info
+
+    def coarse_clock_info(name):
+        info = real_clock_info(name)
+        if name == "monotonic":
+            info.resolution = 0.015625
+        return info
+
+    monkeypatch.setattr(time, "get_clock_info", coarse_clock_info)
+
+    async def too_slow() -> str:
+        await asyncio.sleep(0.02)  # wakes the loop inside the tick before the limit
+        await asyncio.sleep(5)
+        return "late"
+
+    registry = ToolRegistry()
+    registry.register(ToolDef("too_slow", "wait", {"type": "object"}, too_slow, timeout=0.03))
+
+    own = asyncio.run(registry.execute("too_slow", {}))
+
+    assert "exceeded 0.03s" in own["error"]
+    assert "already exhausted its tool timeout" in own["recovery_hint"]
 
 
 def test_partial_result_is_not_described_as_complete():
