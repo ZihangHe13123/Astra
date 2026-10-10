@@ -35,7 +35,13 @@ def _store(root, mode, name="样例"):
 
 
 def _files(root):
-    return {p.relative_to(root): (p.stat().st_mtime_ns, p.read_bytes())
+    def content(path):
+        try:
+            return path.read_bytes()
+        except PermissionError:
+            return None  # Windows does not let a held writer lock be read
+
+    return {p.relative_to(root): (p.stat().st_mtime_ns, content(p))
             for p in root.rglob("*") if p.is_file()}
 
 
@@ -91,11 +97,14 @@ def test_delete_removes_related_files_and_media_only_in_target_namespace(data_ro
         if not related.exists():
             related.write_text("{}\n")
     media = target.appshot_media.path
-    media.mkdir(mode=0o700)
-    media.chmod(0o700)
-    asset = media / ("a" * 32 + ".png")
-    asset.write_bytes(b"opaque session-owned file")
-    asset.chmod(0o600)
+    if sys.platform != "win32":
+        # Windows keeps and removes session media through its native library,
+        # which test_appshot_windows_media.py covers; a hand-made directory is refused there.
+        media.mkdir(mode=0o700)
+        media.chmod(0o700)
+        asset = media / ("a" * 32 + ".png")
+        asset.write_bytes(b"opaque session-owned file")
+        asset.chmod(0o600)
     other_before = {other: store.markdown("样例") for other, store in stores.items() if other != mode}
     result = _cli({"action": "delete", "name": "样例", "mode": mode})
     assert result == {"ok": True, "result": {"name": "样例", "mode": mode, "deleted": True}}
