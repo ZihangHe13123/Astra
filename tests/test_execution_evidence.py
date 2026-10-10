@@ -11,6 +11,7 @@ import time
 
 import pytest
 
+from agent.core.msg import ContentBlock, Msg
 from agent.runtime.coding_contracts import append_check, new_contract
 from agent.runtime.react import ReActAgent
 from agent.runtime.task_store import TaskStore, format_task_detail
@@ -324,6 +325,94 @@ def test_stopped_run_returns_without_waiting_for_a_process_that_left_its_group(t
 
 
 @_POSIX_GROUPS
+@pytest.mark.parametrize("foreground_yield_ms", [0, 20_000])
+def test_cancelling_a_foreground_call_stops_its_run_and_what_it_started(
+    foreground_yield_ms, tmp_path, monkeypatch,
+):
+    """0 runs in this process, a positive yield under a detached supervisor: neither outlives the call."""
+    # Only an upper bound: the wait ends as soon as the run has stopped.
+    monkeypatch.setattr(
+        "agent.runtime.tools.processes._ABANDONED_STOP_WAIT_SECONDS", 15.0, raising=False,
+    )
+
+    async def run():
+        registry = ToolRegistry()
+        sandbox = LocalSandbox(timeout=30, workdir=str(tmp_path))
+        register_code_tools(registry, sandbox)
+        started, late = tmp_path / "started", tmp_path / "late"
+        child = _late_writer(started, late, delay=1.0)
+        call = asyncio.create_task(registry.execute("execute_shell", {
+            "command": f"echo shell-before; {_python_command(child)}; echo shell-after",
+            "foreground_yield_ms": foreground_yield_ms,
+        }))
+        try:
+            began = await _child_started(started)
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+            await _until(began + 1.0 + 0.6)
+            assert not late.exists()
+            # Nothing is left behind, listed or not.
+            assert json.loads((await registry.execute("process_list", {}))["output"]) == []
+            assert not list((tmp_path / ".astra" / "processes").glob("*.json"))
+        finally:
+            call.cancel()
+            await sandbox.close()
+    asyncio.run(run())
+
+
+@_POSIX_GROUPS
+def test_stopping_the_turn_stops_the_foreground_run_of_its_tool_call(tmp_path, monkeypatch):
+    """The same through the agent loop: the model's call is waiting on its run when the turn is stopped."""
+    monkeypatch.setattr(
+        "agent.runtime.tools.processes._ABANDONED_STOP_WAIT_SECONDS", 15.0, raising=False,
+    )
+    started, late = tmp_path / "started", tmp_path / "late"
+    command = f"echo shell-before; {_python_command(_late_writer(started, late, delay=1.0))}; echo shell-after"
+
+    class OneShellCall:
+        class config:
+            model = "test-model"
+            capabilities = frozenset()
+
+        async def chat_stream(self, messages, tools):
+            yield {
+                "type": "tool_calls",
+                "calls": [{
+                    "id": "call-1",
+                    "name": "execute_shell",
+                    "arguments": json.dumps({"command": command, "foreground_yield_ms": 20_000}),
+                }],
+                "content": "", "reasoning_content": "", "finish_reason": "tool_calls", "usage": None,
+            }
+
+    async def run():
+        registry = ToolRegistry()
+        sandbox = LocalSandbox(timeout=30, workdir=str(tmp_path))
+        register_code_tools(registry, sandbox)
+        agent = ReActAgent("agent", OneShellCall(), registry, max_iterations=1)
+        events = []
+
+        async def consume():
+            async for event in agent.reply_stream(Msg(content=[ContentBlock.text("start")])):
+                events.append(event)
+
+        turn = asyncio.create_task(consume())
+        try:
+            began = await _child_started(started)
+            turn.cancel()
+            await asyncio.wait_for(turn, timeout=30)
+            assert sum(event.get("code") == "cancelled" for event in events) == 1
+            await _until(began + 1.0 + 0.6)
+            assert not late.exists()
+            assert json.loads((await registry.execute("process_list", {}))["output"]) == []
+        finally:
+            turn.cancel()
+            await sandbox.close()
+    asyncio.run(run())
+
+
+@_POSIX_GROUPS
 def test_process_cancel_stops_what_a_background_run_started(tmp_path):
     async def run():
         registry = ToolRegistry()
@@ -345,6 +434,56 @@ def test_process_cancel_stops_what_a_background_run_started(tmp_path):
         finally:
             await manager.cancel(manager.get(pid))
             await sandbox.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stop_wait,cancel_again", [(0.05, False), (60.0, True)])
+def test_cancelled_foreground_run_that_does_not_stop_in_time_stays_listed(
+    stop_wait, cancel_again, tmp_path, monkeypatch,
+):
+    """The wait for the stop ends at its bound, or at once when the call is cancelled a second time."""
+    monkeypatch.setattr(
+        "agent.runtime.tools.processes._ABANDONED_STOP_WAIT_SECONDS", stop_wait, raising=False,
+    )
+
+    async def run():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        class StubbornSandbox:
+            workdir = str(tmp_path)
+
+            async def execute_python_stream(self, code, on_output):
+                entered.set()
+                while not release.is_set():
+                    try:
+                        await release.wait()
+                    except asyncio.CancelledError:
+                        pass  # does not stop when asked
+                return {"output": "", "error": "", "exit_code": 0}
+
+        registry = ToolRegistry()
+        register_code_tools(registry, StubbornSandbox())
+        call = asyncio.create_task(
+            registry.execute("execute_python", {"code": "stubborn", "foreground_yield_ms": 0})
+        )
+        try:
+            await entered.wait()
+            call.cancel()
+            if cancel_again:
+                await asyncio.sleep(0.05)
+                assert not call.done()
+                call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(call, timeout=10)
+            listed = json.loads((await registry.execute("process_list", {}))["output"])
+            assert [item["status"] for item in listed] == ["running"]
+            release.set()
+            polled = await registry.execute(
+                "process_poll", {"process_id": listed[0]["process_id"], "wait_ms": 2000}
+            )
+            assert json.loads(polled["output"])["status"] == "completed"
+        finally:
+            release.set()
     asyncio.run(run())
 
 

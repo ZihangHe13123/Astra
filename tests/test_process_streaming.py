@@ -4,6 +4,8 @@ import os
 import subprocess
 import time
 
+import pytest
+
 from agent.runtime.tools.processes import ManagedProcess, ProcessManager
 
 
@@ -308,6 +310,40 @@ def test_supervised_startup_poll_yields_to_event_loop(tmp_path, monkeypatch):
         assert not flags & subprocess.DETACHED_PROCESS
     else:
         assert popen_kwargs["start_new_session"] is True
+
+
+def test_cancelling_a_supervised_start_asks_the_owner_to_stop_and_keeps_it_listed(tmp_path, monkeypatch):
+    """The supervisor is already running when the start is cancelled, and nobody holds its process_id yet."""
+    manager = ProcessManager(artifact_dir=tmp_path / "processes")
+
+    class NeverPublishes:
+        pid = 12345
+
+        @staticmethod
+        def poll():
+            return None
+
+    monkeypatch.setattr(
+        "agent.runtime.tools.processes.subprocess.Popen", lambda *_args, **_kwargs: NeverPublishes()
+    )
+    # The stand-in's pid is not a real process: never probe it.
+    monkeypatch.setattr(manager, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(
+        "agent.runtime.tools.processes._ABANDONED_STOP_WAIT_SECONDS", 0.05, raising=False,
+    )
+
+    async def scenario():
+        start = asyncio.create_task(manager.start_supervised(
+            {"sandbox": {"type": "local"}, "command": "demo"}, kind="shell", label="demo",
+        ))
+        await asyncio.sleep(0.05)
+        start.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await start
+
+    asyncio.run(scenario())
+    assert [item["status"] for item in manager.list()] == ["running"]
+    assert len(list(manager.artifact_dir.glob("*.cancel"))) == 1
 
 
 def test_compacted_read_stamp_replays_same_utf8_page_after_cursor_advanced(tmp_path):

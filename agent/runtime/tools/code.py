@@ -1,5 +1,6 @@
 """code tools — execute_python, execute_shell"""
 
+import asyncio
 import hashlib
 import json
 import os
@@ -551,7 +552,13 @@ def register_code_tools(
         if background:
             processes.expose(process)
             return None, process
-        completed = await processes.wait(process, foreground_yield_ms)
+        try:
+            completed = await processes.wait(process, foreground_yield_ms)
+        except asyncio.CancelledError:
+            # The call was cancelled before it returned a result or a
+            # process_id, so nothing else could stop this run afterwards.
+            await processes.stop_abandoned(process)
+            raise
         if completed:
             processes.describe(process)
             result = process.result

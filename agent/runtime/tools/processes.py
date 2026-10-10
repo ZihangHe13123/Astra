@@ -22,6 +22,10 @@ OutputCallback = Callable[[str, str], None]
 ProcessFactory = Callable[[OutputCallback], Coroutine[Any, Any, dict]]
 ProcessEventCallback = Callable[[dict[str, Any]], None]
 
+# How long a cancelled caller waits for the run it started to stop. A run that
+# is still alive after that is listed instead of being left behind unseen.
+_ABANDONED_STOP_WAIT_SECONDS = 3.0
+
 
 @dataclass
 class ManagedProcess:
@@ -506,19 +510,24 @@ class ProcessManager:
         # the small restart window where a new backend could see a starting
         # manifest without a live owner and incorrectly mark it interrupted.
         deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            try:
-                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                payload = {}
-            status = str(payload.get("status") or "")
-            if payload.get("supervisor_pid") or status in {
-                "completed", "failed", "cancelled",
-            }:
-                break
-            if child.poll() is not None:
-                break
-            await asyncio.sleep(0.01)
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    payload = {}
+                status = str(payload.get("status") or "")
+                if payload.get("supervisor_pid") or status in {
+                    "completed", "failed", "cancelled",
+                }:
+                    break
+                if child.poll() is not None:
+                    break
+                await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            # The caller never receives this process, so it could not stop it later.
+            await self.stop_abandoned(process)
+            raise
         self._refresh_external(process)
         if process.recovered_status == "interrupted":
             diagnostic = self._read_text(supervisor_log_path).strip()
@@ -561,6 +570,36 @@ class ProcessManager:
             return
         self._processes.pop(process.process_id, None)
         self._delete_transient_files(process)
+
+    async def stop_abandoned(self, process: ManagedProcess) -> None:
+        """Stop a run whose caller was cancelled before it got a result or a process_id.
+
+        The run is asked to stop the way ``cancel`` asks, and the wait for it is
+        bounded. A run that has stopped is discarded like any foreground run
+        that returned. One that is still alive, also when this wait is itself
+        cancelled, becomes visible so process_list and process_cancel reach it.
+        """
+        try:
+            if process.external:
+                if process.cancel_path is not None and self.status(process) == "running":
+                    try:
+                        process.cancel_path.touch()
+                    except OSError:
+                        pass
+                deadline = time.monotonic() + _ABANDONED_STOP_WAIT_SECONDS
+                while self.status(process) == "running" and time.monotonic() < deadline:
+                    await asyncio.sleep(0.05)
+            elif process.task is not None and not process.task.done():
+                process.task.cancel()
+                await asyncio.wait({process.task}, timeout=_ABANDONED_STOP_WAIT_SECONDS)
+        finally:
+            try:
+                if self.status(process) == "running":
+                    self.expose(process)
+                else:
+                    self.discard_unexposed(process)
+            except OSError:
+                pass
 
     def observe(self, process: ManagedProcess) -> None:
         """Publish detached output/terminal transitions seen by this backend."""
