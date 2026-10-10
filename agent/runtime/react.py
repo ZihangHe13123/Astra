@@ -2123,8 +2123,16 @@ class ReActAgent(AgentBase):
         if not request_local_attachment:
             payload = event.get("_vision_tile_attachment")
         if not isinstance(payload, dict):
+            raw = event.get("output", "")
+            if event.get("output_truncated") and event.get("artifact_path"):
+                # A long result reaches here as a preview; the attachment it
+                # describes is in the full text the registry saved.
+                try:
+                    raw = Path(str(event["artifact_path"])).read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    return None
             try:
-                payload = json.loads(event.get("output", ""))
+                payload = json.loads(raw)
             except (TypeError, json.JSONDecodeError):
                 return None
         if not isinstance(payload, dict):
