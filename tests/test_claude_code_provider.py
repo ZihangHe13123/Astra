@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import re
 import sys
@@ -68,8 +69,13 @@ if scenario == "hang":
     time.sleep(60)
 emit({"type": "assistant", "message": {"content": [{"type": "thinking", "thinking": "Need the file."}]}})
 denied = {"type": "user", "message": {"content": [{"type": "tool_result", "is_error": True, "content": "denied"}]}}
-if scenario in {"tools", "foreign"}:
-    name = "mcp__astra__read_file" if scenario == "tools" else "execute_shell"
+if scenario in {"tools", "foreign", "listed"}:
+    # "listed": the first tool of the list Claude was given, under the name that list shows.
+    name = ({"tools": "mcp__astra__read_file", "foreign": "execute_shell"}.get(scenario)
+            or "mcp__astra__" + record["tools"][0]["name"])
+    if scenario == "listed":
+        emit({"type": "stream_event", "event": {"type": "content_block_start", "index": 1,
+                                                 "content_block": {"type": "tool_use", "id": "toolu_1", "name": name}}})
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "Reading it."}]}})
     emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_1", "name": name,
                                                         "input": {"path": "a.txt"}}]}})
@@ -97,6 +103,8 @@ def fresh_provider_state(tmp_path, monkeypatch):
     monkeypatch.setattr(ClaudeCodeProvider, "replay", True)
     monkeypatch.setattr(ClaudeCodeProvider, "cache_marker", True)
     monkeypatch.setattr(ClaudeCodeProvider, "thinking_display", True)
+    # What the bridge has already logged in this process; each test starts with nothing logged.
+    monkeypatch.setattr(ccp, "_reported", set(), raising=False)
     workdir = tmp_path / "claude-code"
     workdir.mkdir()
     monkeypatch.setattr(ccp, "workspace", lambda: str(workdir))
@@ -205,7 +213,10 @@ def test_cli_runs_isolated_and_bills_only_the_signed_in_subscription(fake_cli, m
 
 def test_bridge_lists_astras_tools_and_never_runs_them(tmp_path):
     tools = ccp.bridge_tools([READ_FILE, {"type": "function", "function": {"name": "bad name!", "parameters": {}}}])
-    assert [t["name"] for t in tools] == ["read_file"]
+    plain, aliased = tools
+    assert plain["name"] == "read_file"
+    # A name with characters Claude does not accept is listed under one it does, not left out.
+    assert aliased["name"].startswith("bad_name_") and ccp.TOOL_NAME.fullmatch(aliased["name"])
     path = tmp_path / "tools.json"
     path.write_text(json.dumps(tools))
     requests = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
@@ -636,4 +647,111 @@ def test_a_failed_result_with_an_image_keeps_both_and_stays_unmarked():
     block = replayed_result([{"type": "text", "text": ReActAgent._tool_result_context(FAILED_READ)},
                              {"type": "image_url", "image_url": {"url": png}}])
     assert [b["type"] for b in block["content"]] == ["text", "image"] and "is_error" not in block
+
+
+LONG_NAME = "mcp__design-review-workspace-server__export_annotated_screenshots"
+LONG_TOOL = {"type": "function", "function": {
+    "name": LONG_NAME, "description": "Export screenshots.",
+    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}
+
+
+def test_a_tool_name_claude_cannot_accept_is_offered_and_called_under_a_stable_alias(fake_cli, monkeypatch):
+    """A third-party MCP tool is `mcp__<server>__<tool>` in Astra and gets the bridge's own prefix
+    on top. Past 64 characters it was left out of Claude's tool list without a word. It is now
+    listed under an alias made from its name alone: Claude's call comes back as the real tool, and
+    a replayed call shows the alias the list shows, the same on every request."""
+    command, record = fake_cli
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "listed")
+    events = collect(provider(command).chat_stream(MESSAGES, [LONG_TOOL, READ_FILE]))
+    aliased, plain = json.loads(record.read_text())["tools"]
+    alias = aliased["name"]
+    assert plain["name"] == "read_file"
+    assert alias != LONG_NAME and ccp.TOOL_NAME.fullmatch(alias) and len(ccp.TOOL_PREFIX + alias) <= 64
+    assert (aliased["description"], aliased["inputSchema"]) == ("Export screenshots.", LONG_TOOL["function"]["parameters"])
+    # Claude calls the alias; Astra gets its own tool's name, while the call streams and at the end.
+    assert [c["name"] for c in events[-1]["calls"]] == [LONG_NAME, LONG_NAME]
+    previewed = {c["name"] for e in events if e["type"] == "tool_preparing" for c in e["calls"]}
+    assert previewed == {LONG_NAME}
+
+    history = [
+        *MESSAGES,
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "toolu_1", "type": "function", "function": {"name": LONG_NAME, "arguments": '{"path": "a.txt"}'}}]},
+        {"role": "tool", "tool_call_id": "toolu_1", "content": "exported"},
+        {"role": "assistant", "content": "Done."},
+        {"role": "user", "content": "Again?"},
+    ]
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "text")
+
+    def sent() -> tuple[list[dict], list[dict]]:
+        collect(provider(command).chat_stream(history, [LONG_TOOL, READ_FILE]))
+        seen = json.loads(record.read_text())
+        return seen["tools"], seen["frames"]
+
+    tools, frames = sent()
+    assert tools[0]["name"] == alias
+    assert frames[1]["message"]["content"] == [
+        {"type": "tool_use", "id": "toolu_1", "name": ccp.TOOL_PREFIX + alias, "input": {"path": "a.txt"}}]
+    assert frames[2]["message"]["content"][0]["tool_use_id"] == "toolu_1"
+    assert sent() == (tools, frames)
+    # The one-turn fallback and a forced choice name the tool the same way.
+    assert any(f'"name": "{ccp.TOOL_PREFIX + alias}"' in b.get("text", "") for b in ccp.transcript(history))
+    assert ccp.tool_choice_note({"type": "function", "function": {"name": LONG_NAME}}) == f"You must call `{alias}` now."
+    assert ccp.tool_choice_note({"type": "function", "function": {"name": "read_file"}}) == "You must call `read_file` now."
+
+
+def function_tool(name, description="", **extra):
+    return {"type": "function", "function": {"name": name, "description": description, **extra}}
+
+
+def warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == ccp.logger.name and r.levelno >= logging.WARNING]
+
+
+def test_names_that_differ_only_where_an_alias_is_cut_stay_apart():
+    first, second = ("a" * 40 + middle + "b" * 40 for middle in ("1", "2"))
+    one, two = (t["name"] for t in ccp.bridge_tools([function_tool(first), function_tool(second)]))
+    assert one != two and ccp.TOOL_NAME.fullmatch(one) and ccp.TOOL_NAME.fullmatch(two)
+    assert ccp.ClaudeCodeProvider._call({"id": "t", "name": ccp.TOOL_PREFIX + two, "input": {}},
+                                        {one: first, two: second})["name"] == second
+
+
+def test_a_tool_that_cannot_be_listed_is_reported_by_name(caplog):
+    """An alias that is already another tool's name would make one name mean two tools, and a
+    tool without a name cannot be called at all: neither is listed, and the log says which."""
+    alias = ccp.bridge_name(LONG_NAME)
+    tools = [LONG_TOOL, function_tool(alias, "Holds the alias as its own name."),
+             {"type": "function", "function": {"description": "No name."}}]
+    with caplog.at_level(logging.WARNING, logger=ccp.logger.name):
+        listed = ccp.bridge_tools(tools)
+        ccp.bridge_tools(tools)
+    assert [(t["name"], t["description"]) for t in listed] == [(alias, "Holds the alias as its own name.")]
+    # Once per process, however often the same tools are bridged.
+    taken, unnamed = sorted(warnings(caplog), key=lambda message: LONG_NAME not in message)
+    assert LONG_NAME in taken and alias in taken and "not shown" in taken
+    assert "without a name" in unnamed
+
+
+def test_parameters_that_are_not_an_object_schema_are_not_shown_as_no_parameters(caplog):
+    """Claude takes only an object schema. One that is an object schema in all but the missing
+    `type` gets it. Any other was replaced by an empty one, which told Claude the tool takes no
+    arguments; the description now says the parameters are not listed and carries the schema."""
+    properties = {"properties": {"key": {"type": "string"}}, "required": ["key"]}
+    union = {"anyOf": [{"type": "object", "properties": {"celsius": {"type": "number"}}},
+                       {"type": "object", "properties": {"kelvin": {"type": "number"}}}]}
+    tools = [function_tool("lookup", "Look up.", parameters=properties),
+             function_tool("convert", "Convert a temperature.", parameters=union),
+             function_tool("ping", "Ping.")]
+    with caplog.at_level(logging.WARNING, logger=ccp.logger.name):
+        lookup, convert, ping = ccp.bridge_tools(tools)
+    assert lookup == {"name": "lookup", "description": "Look up.", "inputSchema": {"type": "object", **properties}}
+    assert convert["inputSchema"] == {"type": "object", "properties": {}}
+    assert convert["description"].startswith("Convert a temperature.\n\n")
+    assert "not listed" in convert["description"]
+    assert json.dumps(union, sort_keys=True) in convert["description"]
+    # A tool that declares no parameters has none: nothing to say.
+    assert ping == {"name": "ping", "description": "Ping.", "inputSchema": {"type": "object", "properties": {}}}
+    [warning] = warnings(caplog)
+    assert "'convert'" in warning and "object schema" in warning
+    assert ccp.bridge_tools(tools) == [lookup, convert, ping]
 
