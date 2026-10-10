@@ -14,14 +14,17 @@ import sys
 def respond(message_id, result=None, error=None) -> None:
     payload = {"jsonrpc": "2.0", "id": message_id}
     payload.update({"error": error} if error is not None else {"result": result})
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    # ASCII with \u escapes parses to the same text whatever encoding this process was given for
+    # stdout (Windows pipes default to the ANSI code page, where a Chinese description either
+    # cannot be written at all or arrives as bytes the CLI does not read as UTF-8).
+    sys.stdout.write(json.dumps(payload) + "\n")
     sys.stdout.flush()
 
 
 def main(tools_path: str) -> None:
     with open(tools_path, encoding="utf-8") as handle:
         tools = json.load(handle)
-    for line in sys.stdin:
+    for line in sys.stdin.buffer:  # bytes: JSON-RPC is UTF-8, the locale's stdin decoding may not be
         try:
             message = json.loads(line)
         except ValueError:

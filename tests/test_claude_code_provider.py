@@ -224,6 +224,38 @@ def test_bridge_lists_astras_tools_and_never_runs_them(tmp_path):
     assert replies[2]["result"]["isError"] is True
 
 
+@pytest.mark.parametrize("stdio_encoding", ["cp1252", "gbk"])
+def test_bridge_passes_descriptions_unchanged_whatever_its_stdio_encoding(tmp_path, stdio_encoding):
+    """Windows gives a piped Python process the ANSI code page: cp1252 cannot write Chinese at
+    all, and GBK writes bytes the CLI does not read as UTF-8."""
+    described = {"type": "function", "function": {
+        "name": "apply_patch",
+        "description": "应用补丁。\nSecond line — with a dash → and an arrow.\n  *** Begin Patch",
+        "parameters": {"type": "object", "properties": {
+            "patch": {"type": "string", "description": "多行\n补丁文本"}}, "required": ["patch"]},
+    }}
+    tools = ccp.bridge_tools([described])
+    path = tmp_path / "tools.json"
+    path.write_text(json.dumps(tools, ensure_ascii=False), encoding="utf-8")
+    requests = [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                 "params": {"name": "apply_patch", "arguments": {"patch": "补丁"}}}]
+
+    async def run():
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, ccp.BRIDGE, str(path), env={**os.environ, "PYTHONIOENCODING": stdio_encoding},
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await process.communicate(
+            "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in requests).encode("utf-8"))
+        return [json.loads(line) for line in out.decode("utf-8").splitlines()]
+
+    replies = asyncio.run(run())
+    assert [r["id"] for r in replies] == [1, 2]
+    assert replies[0]["result"]["tools"] == tools
+    assert replies[0]["result"]["tools"][0]["description"] == described["function"]["description"]
+    assert replies[1]["result"]["isError"] is True
+
+
 def test_plain_answer_without_tools_starts_no_bridge(fake_cli, monkeypatch):
     command, record = fake_cli
     monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "text")
