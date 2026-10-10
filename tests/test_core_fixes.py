@@ -3899,6 +3899,35 @@ def test_bar_stream_scene_tools_called_in_one_step_all_commit(tmp_path):
         assert reopened.leave() is True
 
 
+def test_bar_turn_too_long_reply_error_states_the_limit(tmp_path):
+    from agent.runtime.bar_mode import BarModeController
+    from agent.runtime.tools.bar import register_bar_tools
+
+    limit = 6000
+    agent = ReActAgent("agent", Mock(), ToolRegistry())
+    mode = BarModeController(agent)
+    register_bar_tools(agent.tools, mode)
+    assert mode.enter(tmp_path / "bar_reply_limit.jsonl") is True
+
+    too_long = asyncio.run(agent.tools.execute("bar_turn", {
+        "reply": "x" * (limit + 7),
+        "actions": [{"type": "pour_lyra_drink", "name": "Side Glass"}],
+    }))
+    assert str(limit) in too_long["error"]
+    assert str(limit + 7) in too_long["error"]
+    assert mode.lyra_glass.active is False
+
+    at_limit = asyncio.run(agent.tools.execute("bar_turn", {
+        "reply": "x" * limit,
+        "actions": [],
+    }))
+    assert at_limit.get("error", "") == ""
+    assert at_limit["output"] == "x" * limit
+
+    reply_schema = agent.tools.get("bar_turn").parameters["properties"]["reply"]
+    assert str(limit) in reply_schema["description"]
+
+
 def test_atomic_turn_omits_tool_choice_for_thinking_provider(tmp_path):
     from agent.runtime.bar_mode import BarModeController
     from agent.runtime.tools.bar import register_bar_tools
