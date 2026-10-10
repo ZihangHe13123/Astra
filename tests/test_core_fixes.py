@@ -3824,6 +3824,81 @@ def test_bar_turn_rolls_back_all_scene_actions_when_one_is_invalid(tmp_path):
     assert mode.drink.temperature == "cold"
 
 
+def test_bar_stream_scene_tools_called_in_one_step_all_commit(tmp_path):
+    from agent.runtime.bar_mode import BarModeController
+    from agent.runtime.tools.bar import register_bar_tools
+
+    class SceneStepLLM:
+        def __init__(self):
+            self.calls = 0
+
+        async def chat_stream(
+            self, messages, tools, tool_choice=None, generation_overrides=None,
+        ):
+            self.calls += 1
+            if self.calls == 1:
+                yield {
+                    "type": "tool_calls",
+                    "calls": [
+                        {"id": "serve", "name": "serve_drink", "arguments": json.dumps({
+                            "name": "Test Cup",
+                            "note": "plain water",
+                            "tone": "clear",
+                            "temperature": "cold",
+                        })},
+                        {"id": "ambiance", "name": "set_ambiance", "arguments": json.dumps({
+                            "weather": "downpour",
+                        })},
+                        {"id": "pour", "name": "pour_lyra_drink", "arguments": json.dumps({
+                            "name": "Side Glass",
+                        })},
+                        {"id": "sip", "name": "sip_lyra_drink", "arguments": "{}"},
+                    ],
+                    "content": "",
+                    "reasoning_content": "",
+                    "usage": None,
+                }
+                return
+            yield {"type": "chunk", "content": "done"}
+            yield {"type": "message_end", "content": "done", "reasoning_content": "", "usage": None}
+
+    for round_index in range(3):
+        agent = ReActAgent("agent", SceneStepLLM(), ToolRegistry(), max_iterations=3)
+        mode = BarModeController(agent, "stream")
+        register_bar_tools(agent.tools, mode)
+        session = tmp_path / f"bar_one_step_{round_index}.jsonl"
+        assert mode.enter(session) is True
+
+        events = asyncio.run(_collect_stream(agent.reply_stream(
+            Msg(content=[ContentBlock.text("one step")]),
+        )))
+
+        results = {event["id"]: event for event in events if event["type"] == "tool_result"}
+        assert sorted(results) == ["ambiance", "pour", "serve", "sip"]
+        assert {call_id: event.get("error", "") for call_id, event in results.items()} == {
+            "ambiance": "", "pour": "", "serve": "", "sip": "",
+        }
+        # Each result reports the scene as its own call left it.
+        assert json.loads(results["pour"]["output"])["fill"] == 3
+        assert json.loads(results["sip"]["output"])["fill"] == 2
+        assert not [event for event in events if event["type"] == "error"]
+        assert mode.drink.name == "Test Cup"
+        assert mode.ambiance.weather == "downpour"
+        assert mode.lyra_glass.fill == 2
+        assert mode.leave() is True
+
+        # The saved scene is the one the calls reported.
+        reopened_agent = ReActAgent("agent", Mock(), ToolRegistry())
+        reopened = BarModeController(reopened_agent, "stream")
+        assert reopened.enter(session) is True
+        assert reopened.drink.name == "Test Cup"
+        assert reopened.drink.fill == 3
+        assert reopened.ambiance.weather == "downpour"
+        assert reopened.lyra_glass.name == "Side Glass"
+        assert reopened.lyra_glass.fill == 2
+        assert reopened.leave() is True
+
+
 def test_atomic_turn_omits_tool_choice_for_thinking_provider(tmp_path):
     from agent.runtime.bar_mode import BarModeController
     from agent.runtime.tools.bar import register_bar_tools

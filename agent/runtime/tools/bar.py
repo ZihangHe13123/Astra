@@ -13,10 +13,14 @@ from .registry import ToolDef, ToolRegistry
 
 
 def register_bar_tools(registry: ToolRegistry, controller: BarModeController) -> None:
-    def bar_turn(reply: str, actions: list[dict] | None = None) -> str:
+    # Coroutine functions on purpose. The registry runs a plain function in a
+    # worker thread, and these tools are read-risk, so several scene calls in
+    # one step would overlap: they share one scene state and one state file.
+    # On the event loop each call applies, saves and reports before the next.
+    async def bar_turn(reply: str, actions: list[dict] | None = None) -> str:
         return controller.commit_turn(reply, actions)
 
-    def serve_drink(
+    async def serve_drink(
         name: str = "",
         note: str = "",
         tone: str = "clear",
@@ -25,15 +29,15 @@ def register_bar_tools(registry: ToolRegistry, controller: BarModeController) ->
         drink = controller.serve_drink(name, note, tone, temperature)
         return json.dumps(drink.to_event(), ensure_ascii=False)
 
-    def refill_drink() -> str:
+    async def refill_drink() -> str:
         drink = controller.refill_drink()
         return json.dumps(drink.to_event(), ensure_ascii=False)
 
-    def rename_drink(name: str) -> str:
+    async def rename_drink(name: str) -> str:
         drink = controller.rename_drink(name)
         return json.dumps(drink.to_event(), ensure_ascii=False)
 
-    def set_ambiance(
+    async def set_ambiance(
         weather: str | None = None,
         power: str | None = None,
         music: str | None = None,
@@ -42,11 +46,11 @@ def register_bar_tools(registry: ToolRegistry, controller: BarModeController) ->
         ambiance = controller.set_ambiance(weather, power, music, radio)
         return json.dumps(ambiance.to_event(), ensure_ascii=False)
 
-    def pour_lyra_drink(name: str, note: str = "") -> str:
+    async def pour_lyra_drink(name: str, note: str = "") -> str:
         glass = controller.pour_lyra_drink(name, note)
         return json.dumps(glass.to_event(), ensure_ascii=False)
 
-    def sip_lyra_drink() -> str:
+    async def sip_lyra_drink() -> str:
         glass = controller.sip_lyra_drink()
         return json.dumps(glass.to_event(), ensure_ascii=False)
 
