@@ -320,6 +320,30 @@ def test_a_long_failure_text_is_bounded_and_kept_whole_on_disk(tmp_path: Path):
     assert len(message) < 15_000
 
 
+@pytest.mark.parametrize(("tool_timeout", "inner_message"), [(None, ""), (30, "no reply from the service")])
+def test_a_timeout_inside_a_tool_is_not_reported_as_the_tools_own_limit(tool_timeout, inner_message):
+    async def ask_service() -> str:
+        raise TimeoutError(inner_message)
+
+    async def too_slow() -> str:
+        await asyncio.sleep(5)
+        return "late"
+
+    registry = ToolRegistry()
+    registry.register(ToolDef("ask_service", "ask", {"type": "object"}, ask_service, timeout=tool_timeout))
+    registry.register(ToolDef("too_slow", "wait", {"type": "object"}, too_slow, timeout=0.05))
+
+    inner = asyncio.run(registry.execute("ask_service", {}))
+    own = asyncio.run(registry.execute("too_slow", {}))
+
+    assert inner["code"] == "overall_timeout"
+    assert "a wait inside the tool timed out" in inner["error"]
+    assert "exceeded" not in inner["error"] and "None" not in inner["error"]
+    if inner_message:
+        assert inner_message in inner["error"]
+    assert "exceeded 0.05s" in own["error"]
+
+
 def test_partial_result_is_not_described_as_complete():
     async def page(full: bool) -> str:
         if full:

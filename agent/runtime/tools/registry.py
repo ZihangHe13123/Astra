@@ -1070,6 +1070,9 @@ class ToolRegistry:
         # True once the tool's own function has been entered. A failure before
         # that point is a refusal: nothing the tool does can have happened.
         handler_started = False
+        # When the current timed attempt began, to tell this registry's own
+        # deadline from a TimeoutError raised by a shorter wait inside the tool.
+        timed_attempt_started: float | None = None
 
         async def finalize(result: dict) -> dict:
             if result.get("error") and not handler_started:
@@ -1403,6 +1406,7 @@ class ToolRegistry:
                             if tool.timeout is None:
                                 result = await task
                             else:
+                                timed_attempt_started = time.perf_counter()
                                 result = await asyncio.wait_for(task, timeout=tool.timeout)
                             private_result = private_slot.retrieve()
                         finally:
@@ -1524,10 +1528,22 @@ class ToolRegistry:
                         logger.warning("tool retry name=%s attempt=%s", name, attempt + 1)
                     await asyncio.sleep(tool.retry_delay)
                 return await finalize({"output": "", "error": f"[ToolError] {name}: retry loop exhausted"})
-        except TimeoutError:
+        except TimeoutError as timeout_error:
             logger.warning("tool timeout name=%s timeout=%s", name, tool.timeout)
-            report("timed_out", status="failed", message=f"exceeded {tool.timeout}s")
-            error_msg = f"[ToolTimeout] {name}: exceeded {tool.timeout}s"
+            own_deadline = (
+                tool.timeout is not None
+                and timed_attempt_started is not None
+                and time.perf_counter() - timed_attempt_started >= float(tool.timeout) * 0.98
+            )
+            if own_deadline:
+                waited = f"exceeded {tool.timeout}s"
+            else:
+                # The tool has no limit of its own here, or it gave up on a
+                # shorter wait: naming this registry's limit would be wrong.
+                inner = str(timeout_error).strip()
+                waited = "a wait inside the tool timed out" + (f" ({inner})" if inner else "")
+            report("timed_out", status="failed", message=waited)
+            error_msg = f"[ToolTimeout] {name}: {waited}"
             timeout_failure = timeout_slot.failure if timeout_slot is not None else None
             if timeout_failure is not None:
                 # String-only consumers (including Code Mode RPC) must retain
@@ -1544,9 +1560,12 @@ class ToolRegistry:
                 "recoverable": bool(tool.idempotent),
                 "retryable": False,
                 "recovery_hint": (
-                    "This exact invocation already exhausted its tool timeout. Do not repeat it "
-                    "unchanged in the same turn; inspect the service or inputs, change approach, "
-                    "or ask the user before retrying."
+                    (
+                        "This exact invocation already exhausted its tool timeout."
+                        if own_deadline else "A wait inside this tool ran out before it finished."
+                    )
+                    + " Do not repeat it unchanged in the same turn; inspect the service or inputs, "
+                    "change approach, or ask the user before retrying."
                 ),
             }
             if timeout_failure is not None:
