@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from ..tool_failure import ToolFailure
 from .registry import ToolDef, ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -88,7 +89,7 @@ def register_conclave_tools(
         question: str,
         discussion: bool | None = None,
         _progress=None,
-    ) -> str:
+    ) -> str | ToolFailure:
         """Run the Conclave multi-expert research panel.
 
         Gathers findings from multiple search engines (Google, Bing, GitHub, arXiv,
@@ -126,6 +127,7 @@ def register_conclave_tools(
             if active_llm is not None
             else None
         )
+        search_errors: list[str] = []
 
         async def search_with_runtime_provider(expert, query: str, limit: int):
             name, engine, category, guidance = expert
@@ -153,6 +155,7 @@ def register_conclave_tools(
                 },
             )
             if response.get("error"):
+                search_errors.append(str(response["error"]))
                 raise RuntimeError(str(response["error"]))
             findings = _parse_search_results(str(response.get("output") or ""))
             if not findings:
@@ -227,11 +230,30 @@ def register_conclave_tools(
 
         intent_label = INTENT_ROUTES.get(result.intent, ("全面调研", []))[0]
         total_sources = unique_source_count(result.findings)
+        searches = int(result.stats.get("search_calls", 0))
+        failed_searches = int(result.stats.get("search_failures", 0))
+        if searches and failed_searches == searches and not total_sources:
+            # A synthesis written from no evidence at all is not a research result.
+            return ToolFailure(
+                code="conclave_search_failed",
+                message=(
+                    f"Conclave found no sources: all {searches} searches failed"
+                    + (f" (last error: {search_errors[-1][:300]})" if search_errors else "")
+                    + "."
+                ),
+                retryable=False,
+                recovery_hint=(
+                    "Call search_web once with the question to see whether web search works. If it does "
+                    "not, answer from other evidence and say that the panel could not search."
+                ),
+            )
         lines = [result.synthesis.rstrip(), "", "---"]
         lines.append(
             f"*{intent_label} · {len(result.experts_selected)} 位专家 · "
             f"{total_sources} 条来源 · "
-            f"{result.stats.get('search_calls', 0)} 次检索 · "
+            f"{searches} 次检索"
+            + (f"（其中 {failed_searches} 次失败）" if failed_searches else "")
+            + " · "
             f"{sum(result.stats.get(key, 0) for key in ('expert_llm_calls', 'discussion_llm_calls', 'chairperson_llm_calls'))} 次模型调用 · "
             f"{'含专家交叉讨论' if cross_discussion else '专家报告后主席总结'} · "
             f"{result.duration_ms/1000:.1f}s*"
@@ -244,15 +266,18 @@ def register_conclave_tools(
         name="conclave",
         description=(
             "Run a multi-expert research panel (Conclave) to investigate a question. "
-            "The panel dynamically selects 3-8 experts from a pool covering Google, Bing, "
+            "The panel picks 3 to 5 experts from keywords in the question (or uses the user's "
+            "configured list of up to 8) from a pool covering Google, Bing, "
             "GitHub, arXiv, academic papers, Chinese sources (知乎/百度/B站), Wikipedia, "
             "news, StackOverflow, and Reddit. Each expert runs at least two distinct searches "
             "through the configured web provider, deduplicates evidence, and writes an independent "
             "report before the chairperson synthesizes all reports. "
-            "Use when you need thorough, multi-angle research. Set discussion=true only "
-            "when conflicting evidence, competing designs, trade-offs, or important "
-            "omissions need ordered expert rebuttals and supplements; leave it false or "
-            "omit it for straightforward research to reduce latency and cost."
+            "Use when you need thorough, multi-angle research. discussion=true adds an ordered "
+            "round of expert rebuttals and supplements (one more model call per expert): set it only "
+            "when conflicting evidence, competing designs, trade-offs, or important omissions need "
+            "it. discussion=false skips that round. Omitting discussion uses the user's saved "
+            "Conclave setting, which may be on; pass false for straightforward research to reduce "
+            "latency and cost. A run can take several minutes and is stopped after 10."
         ),
         parameters={
             "type": "object",
@@ -264,9 +289,10 @@ def register_conclave_tools(
                 "discussion": {
                     "type": "boolean",
                     "description": (
-                        "是否在搜索后增加一次主席主持的交叉讨论。仅当问题存在重要分歧、"
-                        "需要比较冲突证据或审视遗漏时设为 true；普通事实调研设为 false "
-                        "或省略以沿用全局配置。开启会增加一次主席模型调用和延迟。"
+                        "是否在专家报告之后增加一轮按顺序进行的专家交叉讨论。仅当问题存在重要分歧、"
+                        "需要比较冲突证据或审视遗漏时设为 true；设为 false 则不讨论；省略时沿用用户"
+                        "保存的 Conclave 配置（可能是开启），普通事实调研请明确传 false。"
+                        "开启后每位专家各多一次模型调用，延迟随之增加。"
                     ),
                 },
             },

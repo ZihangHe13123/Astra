@@ -342,6 +342,66 @@ def test_conclave_tool_reuses_runtime_search_and_has_research_timeout(monkeypatc
     assert any(item["stage"] == "sources_collected" for item in progress)
 
 
+def _conclave_with_search(monkeypatch, search):
+    registry = ToolRegistry()
+    registry.register(ToolDef(
+        name="search_web",
+        description="fake search",
+        parameters={"type": "object", "properties": {}},
+        fn=search,
+        risk="network",
+        approval="never",
+    ))
+
+    class ActiveLlm:
+        config = type("Config", (), {"model": "active-model"})()
+
+        async def chat_limited(self, messages, **kwargs):
+            return {"content": "# 主席总结陈词\n\nwritten by the chairperson"}
+
+    monkeypatch.setattr(
+        config_module.ConclaveConfig,
+        "load",
+        classmethod(lambda cls: cls(chairperson_model="active", experts="GitHub专家", cross_discussion=False)),
+    )
+    register_conclave_tools(registry, llm_getter=ActiveLlm)
+    return registry
+
+
+def test_conclave_tool_fails_when_every_search_failed(monkeypatch):
+    async def broken_search(query: str, **kwargs):
+        raise RuntimeError("search backend is down")
+
+    registry = _conclave_with_search(monkeypatch, broken_search)
+
+    result = run(registry.execute("conclave", {"question": "compare agent runtimes"}))
+
+    # The chairperson still wrote something, but from no evidence: that is not a result.
+    assert result["output"] == ""
+    assert result["code"] == "conclave_search_failed"
+    assert "searches failed" in result["error"]
+    assert "search backend is down" in result["error"]
+    assert "search_web" in result["recovery_hint"]
+
+
+def test_conclave_tool_counts_failed_searches_next_to_the_sources(monkeypatch):
+    calls = []
+
+    async def flaky_search(query: str, **kwargs):
+        calls.append(query)
+        if len(calls) == 1:
+            raise RuntimeError("rate limited")
+        return "[1] Runtime provider result\n    URL: https://example.com/runtime\n    Snippet: provider evidence\n"
+
+    registry = _conclave_with_search(monkeypatch, flaky_search)
+
+    result = run(registry.execute("conclave", {"question": "compare agent runtimes"}))
+
+    assert result["error"] == ""
+    assert "1 条来源" in result["output"]
+    assert "次检索（其中 1 次失败）" in result["output"]
+
+
 def test_conclave_tool_discussion_argument_overrides_saved_default(monkeypatch):
     registry = ToolRegistry()
     observed = []
