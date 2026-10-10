@@ -3078,12 +3078,27 @@ class ReActAgent(AgentBase):
         trace_ctx: TraceContext | None = None,
         result_callback: Callable[[dict], None] | None = None,
         repeat_notice_ids: frozenset[str] = frozenset(),
+        refusals: dict[str, tuple[str, bool]] | None = None,
     ) -> list[dict]:
+        """Run one assistant message's tool calls and record their results.
+
+        ``refusals`` maps a call id to why that call is not run and whether it
+        may be sent again; such a call gets an error result without reaching
+        the registry.
+        """
         semaphore = asyncio.Semaphore(self.tool_concurrency)
         turn_tool_cache = turn_tool_cache if turn_tool_cache is not None else {}
 
         async def run_one(tc: dict) -> dict:
             check_work_budget()
+            refusal = (refusals or {}).get(str(tc.get("id") or ""))
+            if refusal is not None:
+                reason, may_resend = refusal
+                return {
+                    "type": "tool_result", "id": tc["id"], "name": str(tc.get("name") or "tool"),
+                    "args": {}, "output": "", "error": reason, "code": "tool_budget_exhausted",
+                    "tool_output": reason, "duration_ms": 0, "retryable": may_resend,
+                }
             if progress_callback is not None:
                 progress_callback({
                     "type": "tool_progress",
@@ -3579,6 +3594,10 @@ class ReActAgent(AgentBase):
         user_text = msg.get_text()
         tool_signature_counts: dict[str, int] = {}
         tool_name_counts: dict[str, int] = {}
+        # Tools whose per-turn limit a message has already gone past once.
+        # The first time, that message is refused and the turn goes on; the
+        # second time the turn stops.
+        budget_warned: set[str] = set()
         turn_tool_cache: dict[str, dict] = {}
         completed_tool_events: list[dict] = []
         auto_image_messages: list[tuple[int, object]] = []
@@ -4208,6 +4227,8 @@ class ReActAgent(AgentBase):
                 repeated = None
                 exhausted = None
                 repeat_notice_ids: set[str] = set()
+                over_limit: dict[str, int] = {}
+                counts_before = (dict(tool_signature_counts), dict(tool_name_counts))
                 for tc in tool_calls:
                     name = tc.get("name", "")
                     tool_def = self.tools.get(name)
@@ -4225,8 +4246,10 @@ class ReActAgent(AgentBase):
                     tool_name_counts[name] = tool_name_counts.get(name, 0) + 1
                     limit = tool_def.max_calls_per_turn if tool_def is not None else None
                     if limit is not None and tool_name_counts[name] > limit:
-                        exhausted = (name, limit)
-                        break
+                        if name in budget_warned:
+                            exhausted = (name, limit)
+                            break
+                        over_limit.setdefault(name, limit)
                 if repeated:
                     runtime_metrics.increment("repeated_payload_count")
                     repeated_label = self._persistent_tool_signature_label(repeated)
@@ -4250,6 +4273,44 @@ class ReActAgent(AgentBase):
                         "recoverable": True,
                     })
                     break
+                refusals: dict[str, tuple[str, bool]] = {}
+                if over_limit:
+                    # Refuse the whole message once instead of ending the turn:
+                    # its calls may depend on each other, so none is run, and
+                    # none counts, which leaves the model its remaining calls.
+                    asked = {
+                        name: sum(1 for tc in tool_calls if tc.get("name", "") == name)
+                        for name in over_limit
+                    }
+                    tool_signature_counts.clear()
+                    tool_signature_counts.update(counts_before[0])
+                    tool_name_counts.clear()
+                    tool_name_counts.update(counts_before[1])
+                    budget_warned.update(over_limit)
+                    repeat_notice_ids = set()
+                    blamed = ", ".join(sorted(over_limit))
+                    for tc in tool_calls:
+                        name = tc.get("name", "")
+                        if name in over_limit:
+                            limit = over_limit[name]
+                            left = max(0, limit - tool_name_counts.get(name, 0))
+                            refusal = (
+                                f"[ToolBudgetExhausted] {name} was not run: this message asked for "
+                                f"{asked[name]} calls and {left} of its {limit} per turn are left, so none "
+                                f"of them ran. Send at most {left} (put several items into one call); "
+                                "asking for more again ends the turn."
+                                if left else
+                                f"[ToolBudgetExhausted] {name} was not run: its limit of {limit} calls per "
+                                f"turn is used up. Go on without it; another {name} call in this turn "
+                                "ends the turn."
+                            )
+                        else:
+                            left = 1  # not over any limit of its own: it may simply be sent again
+                            refusal = (
+                                f"[ToolBudgetExhausted] {name} was not run because {blamed} in the same "
+                                "message went over its per-turn limit. Send this call again."
+                            )
+                        refusals[str(tc.get("id") or "")] = (refusal, left > 0)
 
                 # 通知前端：当前轮结束，finalize 本轮推理/内容
                 if emit_events:
@@ -4285,6 +4346,7 @@ class ReActAgent(AgentBase):
                         trace_ctx=trace_ctx,
                         result_callback=enqueue_progress,
                         repeat_notice_ids=frozenset(repeat_notice_ids),
+                        refusals=refusals,
                     ))
                     next_progress: asyncio.Task | None = None
                     try:
@@ -4320,6 +4382,7 @@ class ReActAgent(AgentBase):
                         active_groups=active_groups,
                         trace_ctx=trace_ctx,
                         repeat_notice_ids=frozenset(repeat_notice_ids),
+                        refusals=refusals,
                     )
                 call_signatures = {
                     str(tc.get("id") or ""): self._tool_signature(tc)
@@ -4373,6 +4436,9 @@ class ReActAgent(AgentBase):
                     error = str(event.get("error") or "")
                     if not error:
                         failure_state.pop(name, None)
+                        continue
+                    if str(event.get("id") or "") in refusals:
+                        # The call never ran, and the model may be told to send it again.
                         continue
                     signature = call_signatures.get(str(event.get("id") or ""))
                     if signature and self._is_deterministic_tool_error(error, event):

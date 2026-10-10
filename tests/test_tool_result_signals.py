@@ -156,6 +156,109 @@ def test_failed_observation_is_tried_again_on_retry(tmp_path: Path):
     assert not retried.get("cached")
 
 
+class _BatchLLM:
+    """Issue scripted batches of tool calls, one batch per request, then finish."""
+
+    config = _ScriptedLLM.config
+
+    def __init__(self, batches: list[list[tuple[str, str]]]):
+        self._batches = list(batches)
+        self.requests = 0
+
+    async def chat_stream(self, messages, tools):
+        index = self.requests
+        self.requests += 1
+        if index < len(self._batches):
+            yield {
+                "type": "tool_calls",
+                "calls": [
+                    {"id": f"call-{index + 1}-{position}", "name": name, "arguments": arguments}
+                    for position, (name, arguments) in enumerate(self._batches[index])
+                ],
+                "content": "", "reasoning_content": "", "usage": None,
+            }
+            yield {"type": "done", "content": "", "usage": None}
+        else:
+            yield {"type": "done", "content": "done", "usage": None}
+
+
+def _limited_registry(saved: list[str], looked_up: list[str]) -> ToolRegistry:
+    async def save(fact: str) -> str:
+        saved.append(fact)
+        return f"saved {fact}"
+
+    async def look(topic: str) -> str:
+        looked_up.append(topic)
+        return f"about {topic}"
+
+    registry = ToolRegistry()
+    registry.register(ToolDef(
+        "save", "save a fact",
+        {"type": "object", "properties": {"fact": {"type": "string"}}, "required": ["fact"]},
+        save, risk="write", max_calls_per_turn=2,
+    ))
+    registry.register(ToolDef(
+        "look", "look something up",
+        {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]},
+        look,
+    ))
+    return registry
+
+
+def test_a_message_over_a_per_turn_limit_is_refused_once_and_the_turn_goes_on():
+    saved: list[str] = []
+    looked_up: list[str] = []
+    llm = _BatchLLM([
+        [("look", '{"topic": "a"}'), ("save", '{"fact": "1"}'), ("save", '{"fact": "2"}'), ("save", '{"fact": "3"}')],
+        [("look", '{"topic": "a"}'), ("save", '{"fact": "1 and 2"}'), ("save", '{"fact": "3"}')],
+    ])
+    agent = ReActAgent("agent", llm, _limited_registry(saved, looked_up), max_iterations=6)
+
+    events = _turn(agent, None)
+
+    refused = _tool_messages(agent)[:4]
+    # Nothing in the over-limit message ran or counted, so the resend fits.
+    assert all("status: error" in message and "was not run" in message for message in refused)
+    assert "Send this call again" in refused[0]
+    assert all("asked for 3 calls and 2 of its 2 per turn are left" in message for message in refused[1:])
+    assert saved == ["1 and 2", "3"]
+    assert looked_up == ["a"]
+    assert not any(str(event.get("message", "")).startswith("Stopping") for event in events)
+    assert agent.context.messages[-1]["content"] == "done"
+
+
+def test_going_over_the_same_limit_again_ends_the_turn():
+    saved: list[str] = []
+    over = [("save", '{"fact": "1"}'), ("save", '{"fact": "2"}'), ("save", '{"fact": "3"}')]
+    llm = _BatchLLM([over, [(name, arguments.replace('"}', ' again"}')) for name, arguments in over]])
+    agent = ReActAgent("agent", llm, _limited_registry(saved, []), max_iterations=6)
+
+    events = _turn(agent, None)
+
+    assert saved == []
+    assert any("per-turn tool budget exhausted (save, limit=2)" in str(event.get("message", "")) for event in events)
+
+
+def test_a_used_up_limit_refuses_one_more_call_and_says_the_next_ends_the_turn():
+    saved: list[str] = []
+    llm = _BatchLLM([
+        [("save", '{"fact": "1"}')], [("save", '{"fact": "2"}')], [("save", '{"fact": "3"}')],
+    ])
+    registry = _limited_registry(saved, [])
+    agent = ReActAgent("agent", llm, registry, max_iterations=6)
+    # Keep the tool offered so the test reaches the execution limit itself.
+    agent._available_tool_schemas = lambda *_args: registry.to_openai_tools()
+
+    events = _turn(agent, None)
+
+    assert saved == ["1", "2"]
+    third = _tool_messages(agent)[2]
+    assert "its limit of 2 calls per turn is used up" in third
+    assert "ends the turn" in third
+    assert not any(str(event.get("message", "")).startswith("Stopping") for event in events)
+    assert agent.context.messages[-1]["content"] == "done"
+
+
 def test_partial_result_is_not_described_as_complete():
     async def page(full: bool) -> str:
         if full:
