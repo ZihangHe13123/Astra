@@ -46,6 +46,18 @@ def test_history_without_task_database_preserves_known_outcomes_without_inventin
     assert history_tool_results([{"role": "tool", "content": "unknown legacy outcome"}], []) == []
 
 
+def test_history_without_task_database_leaves_out_the_notices_written_for_the_model():
+    replayed = {**_event("a", "git_status"), "cached": True, "_repeat_limit_reached": True}
+    partial = {**_event("b", "read_file"), "partial": True}
+
+    restored = history_tool_results([_message(replayed), _message(partial)], [])
+
+    assert restored == [
+        {"name": "git_status", "call_id": "a", "output": "saved output", "error": ""},
+        {"name": "read_file", "call_id": "b", "output": "saved output", "error": ""},
+    ]
+
+
 def test_history_retains_result_artifacts_but_omits_internal_args():
     event = _event("a", "read_file") | {"artifact_path": "/tmp/saved.txt", "output_truncated": True, "args": {"internal": True}}
     restored = history_tool_results([_message(event)], [event])[0]

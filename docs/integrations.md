@@ -117,8 +117,11 @@ cannot dispatch on a replacement connection.
 `search_web` supports `provider=auto|exa|searxng`. Use `/search` to inspect the
 default and `/search auto|exa|searxng` to switch it persistently. In `auto`
 mode, news, research, model-release and benchmark queries prefer Exa; ordinary
-queries start with SearXNG. Empty results or provider failures fall back between
-Exa and SearXNG inside the same tool call. Search has no fixed per-turn call
+queries start with SearXNG. A page above 1, an `engine` or a category other than
+science/news is only honoured by SearXNG, so `auto` sends such a call there; an
+Exa answer names any parameter it did not apply. SearXNG lists at most two
+results per site unless the query contains `site:`. Empty results or provider
+failures fall back between Exa and SearXNG inside the same tool call. Search has no fixed per-turn call
 limit; the general repeated-call and ReAct iteration guards still prevent true
 infinite loops. DuckDuckGo is not used.
 

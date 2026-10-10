@@ -336,11 +336,17 @@ GET_APP_STATE_SCHEMA = {
             "type": "string",
             "enum": ["target_window", "display"],
             "default": "target_window",
+            "description": (
+                "target_window observes the bound window and can be acted on. display captures the "
+                "whole screen for looking only: it needs approval for each call, cannot be acted on, and "
+                "replaces the current actionable snapshot."
+            ),
         },
         "text_detail": {
             "type": "string",
             "enum": ["off", "on"],
             "default": "off",
+            "description": "on also returns the window's detailed text (a summary and a detail file) and needs approval for each call; off needs none.",
         },
     },
     "required": ["app_ref", "window_ref"],
@@ -355,11 +361,17 @@ SNAPSHOT_SCHEMA = _object_schema({
         "type": "string",
         "enum": ["target_window", "display"],
         "default": "target_window",
+        "description": (
+            "target_window observes the bound window and can be acted on. display captures the "
+            "whole screen for looking only: it needs approval for each call, cannot be acted on, and "
+            "replaces the current actionable snapshot."
+        ),
     },
     "text_detail": {
         "type": "string",
         "enum": ["off", "on"],
         "default": "off",
+        "description": "on also returns the window's detailed text (a summary and a detail file) and needs approval for each call; off needs none.",
     },
     "subtree_ref": {
         "type": "string",
@@ -399,7 +411,7 @@ ACT_SCHEMA = _object_schema(
         "opens_dialog": {
             "type": "boolean",
             "default": False,
-            "description": "Set true on the FIRST action that opens a native file picker, save panel or modal dialog. With auto, activate the target before input even if AX exposes an ordinary button. Never replay an already-dispatched click to add this flag.",
+            "description": "Set true on this call when its first action opens a native file picker, save panel or modal dialog. With auto, activate the target before input even if AX exposes an ordinary button. Never replay an already-dispatched click to add this flag.",
         },
     },
     required=("snapshot_id", "actions"),
@@ -474,10 +486,26 @@ def _failure(code: str, message: str, *, retryable: bool = False, recovery_hint:
 def _session_failure(exc: ComputerSessionError) -> ToolFailure:
     retryable = exc.code in {"stale_snapshot", "target_required", "handoff_active"}
     recovery_hint = ""
-    if exc.code in {"catalog_required", "stale_target", "target_gone"}:
+    if exc.code == "stale_target" and "subtree_ref" in str(exc):
+        # The target is still bound; only the element reference is out of date.
+        recovery_hint = (
+            "Call computer_snapshot without subtree_ref, then use an element_ref from that "
+            "new snapshot."
+        )
+    elif exc.code in {"catalog_required", "stale_target", "target_gone"}:
         recovery_hint = (
             "Call computer_apps, then choose the exact app_ref and window_ref from "
             "its fresh catalog before calling computer_get_app_state."
+        )
+    elif exc.code == "target_required":
+        recovery_hint = (
+            "No target is bound (computer_apps clears it). Call computer_get_app_state with an "
+            "app_ref and window_ref from the latest computer_apps list; the same call again "
+            "without binding will fail the same way."
+        )
+    elif exc.code == "stale_snapshot":
+        recovery_hint = (
+            "Take a new computer_snapshot of the bound target window and use its snapshot_id and refs."
         )
     return _failure(exc.code, str(exc), retryable=retryable, recovery_hint=recovery_hint)
 
@@ -1960,7 +1988,18 @@ def _public_snapshot_payload(
                 "max_actions": MAX_ACTIONS,
             }
         payload["coordinate_space"] = "window_logical" if scope == "target_window" else "display_logical_observation_only"
-        payload["message"] = "Use current form_controls element_index/ref for fields, including deep web content. Batch independent choices with click + checked; verify receipts. Coordinates are window-local logical units, not screenshot pixels or old Appshot coordinates."
+        payload["message"] = (
+            "Use current form_controls element_index/ref for fields, including deep web content. "
+            "Batch independent choices with click + checked; verify receipts. "
+            + (
+                "Frames and sizes in this result are window-local logical units. To point at something "
+                "seen in the attached image, send its pixel position with coordinate_space=image_pixels; "
+                "do not send image pixels as window_logical."
+                if scope == "target_window"
+                else "This display observation is for looking only: it cannot be acted on. Take a "
+                "target-window snapshot before acting."
+            )
+        )
     if "has_default_button" in snapshot.payload:
         payload["has_default_button"] = snapshot.payload["has_default_button"]
     default_button_ref = snapshot.payload.get("default_button_element_ref")
@@ -4280,7 +4319,9 @@ def register_computer_tools(
     registry.register(ToolDef("computer_status", "Report macOS Computer Use support and session state.", STATUS_SCHEMA, computer_status, risk="read", replay="safe", **common))
     registry.register(ToolDef(
         "computer_apps",
-        "List bounded running GUI applications and eligible windows.",
+        "List bounded running GUI applications and eligible windows. Refreshing the list clears the "
+        "bound target and the current snapshot, so bind again with computer_get_app_state afterwards. "
+        "At most 8 calls per turn.",
         APPS_SCHEMA,
         computer_apps,
         completion_finalizer=complete_observation, permission_finalizer=finalize_observation,
@@ -4292,7 +4333,8 @@ def register_computer_tools(
     ))
     registry.register(ToolDef(
         "computer_get_app_state",
-        "Bind one exact target from the latest application catalog without activating it. Its returned target-window snapshot_id and element refs can feed the next computer_act directly while current; no extra focus or snapshot is required.",
+        "Bind one exact target from the latest application catalog without activating it. Its returned target-window snapshot_id and element refs can feed the next computer_act directly while current; no extra focus or snapshot is required."
+        " The result is shown once, for your next step only: use its snapshot_id and refs then, and observe again after any other step.",
         GET_APP_STATE_SCHEMA,
         computer_get_app_state,
         risk="read",
@@ -4309,7 +4351,8 @@ def register_computer_tools(
     ))
     registry.register(ToolDef("computer_focus", "Lock Computer Use to one opaque application and window reference.", FOCUS_SCHEMA, computer_focus, risk="write", approval="on_risk", replay="safe", **common))
     registry.register(ToolDef(
-        "computer_snapshot", "Observe the locked macOS target. After an acknowledged click with pending effect, use settle_ms=300 for a bounded read; do not click again to wait. Two inconclusive reads are enough to report unconfirmed.", SNAPSHOT_SCHEMA, computer_snapshot,
+        "computer_snapshot", "Observe the locked macOS target. After an acknowledged click with pending effect, use settle_ms=300 for a bounded read; do not click again to wait. Two inconclusive reads are enough to report unconfirmed."
+        " The result is shown once, for your next step only: use its snapshot_id and refs then, and observe again after any other step.", SNAPSHOT_SCHEMA, computer_snapshot,
         risk="read", approval="never", replay="safe", result_persistence="request_local",
         completion_finalizer=complete_observation, permission_finalizer=finalize_observation,
         permission_check=display_permission_check, permission_grant=display_permission_grant,

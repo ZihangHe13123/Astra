@@ -1,6 +1,8 @@
 const MAX_BYTES = 1024 * 1024;
 const OPERATIONS = new Set(['upload_prepare','upload_chunk','upload_commit','upload_abort','tabs','attach','open','snapshot','click','type','fill','check','read','select','wait','screenshot','handoff','resume','close']);
 const bytes = value => new TextEncoder().encode(JSON.stringify(value)).length;
+// Errors are capped at 500 characters; an address too long to quote whole is given as its origin.
+const shown = url => url.length<=300 ? url : new URL(url).origin;
 function origin(tab) {
   if (!tab || tab.incognito || !Number.isInteger(tab.id)) throw new Error('Private or missing tab');
   const url = new URL(tab.url);
@@ -9,7 +11,7 @@ function origin(tab) {
 }
 export function createControl(api, {openTimeoutMs=10000}={}) {
   let enabled = false, epoch = 0, grantSequence = 0;
-  const grants = new Map(), seen = new Set(), revisions = new Map(), queues = new Map(), uploads = new Map();
+  const grants = new Map(), seen = new Set(), revisions = new Map(), queues = new Map(), uploads = new Map(), moved = new Map();
   const revision=id=>revisions.get(id)||0;
   const changed=id=>revisions.set(id,revision(id)+1);
   const session = crypto.randomUUID();
@@ -24,19 +26,22 @@ export function createControl(api, {openTimeoutMs=10000}={}) {
       // tabs.create resolves before the initial navigation commits. Do not
       // expose a grant or inject into that transient empty/about:blank page.
       const pending=!tab.url || tab.url==='about:blank';
-      if(!pending && origin(tab)!==expected) throw new Error('Origin changed while opening; grant this tab explicitly');
+      if(!pending && origin(tab)!==expected) throw new Error(`Origin changed while opening: the page went to ${shown(tab.url)} and this tab was closed. Open that address instead`);
       if(!pending && tab.status==='complete') return tab;
-      if(performance.now()>=deadline) throw new Error('New tab navigation timed out; no page control was granted');
+      if(performance.now()>=deadline) throw new Error(pending
+        ? 'New tab navigation timed out before the page address could be read (a slow page, or a redirect to a site without website permission); no page control was granted'
+        : 'New tab navigation timed out; no page control was granted');
       await new Promise(resolve=>setTimeout(resolve,Math.min(50,Math.max(0,deadline-performance.now()))));
     }
   }
   async function target(id, token) {
     check(token);
-    if (!Number.isInteger(id) || !grants.has(id)) throw new Error('Tab requires explicit popup grant');
+    if (!Number.isInteger(id) || !grants.has(id)) throw new Error(moved.get(id) || 'Tab requires explicit popup grant');
     const grant = grants.get(id), tab = await api.tabs.get(id);
     check(token);
-    try { if (origin(tab) !== grant.origin) throw new Error('Origin changed; grant this tab again'); }
-    catch (error) { revoke(id); throw error; }
+    let current;
+    try { current = origin(tab); } catch (error) { revoke(id); throw error; }
+    if (current !== grant.origin) throw left(id, grant, tab.url);
     if (grants.get(id) !== grant) throw new Error('Tab grant revoked');
     return {tab,grant};
   }
@@ -119,8 +124,18 @@ export function createControl(api, {openTimeoutMs=10000}={}) {
       if(globalThis.__astraBrowserGrantToken===token) return globalThis.__astraBrowserPage?.('invalidate',{});
     },args:[grantToken]}).catch(()=>{});
   }
-  function revoke(id) { discardUpload(id);changed(id); grants.delete(id); }
-  function stop() { for(const id of grants.keys()) discardUpload(id);enabled=false;epoch++;grants.clear(); /* IDs survive reconnect: never replay. */ }
+  function revoke(id) { discardUpload(id);changed(id); grants.delete(id);moved.delete(id); }
+  // The grant ends either way. Only a tab the agent opened says where it went, so later
+  // requests can name the address; a user's own tab is not described after it leaves its grant.
+  function left(id, grant, url) {
+    const error=new Error(grant.owned
+      ? `Origin changed: this tab went to ${shown(url)} and is no longer controlled. Open that address as a new tab`
+      : 'Origin changed; this tab is no longer granted. The user can grant it again in the extension popup');
+    revoke(id);
+    if(grant.owned) {moved.set(id,error.message);if(moved.size>50) moved.delete(moved.keys().next().value);}
+    return error;
+  }
+  function stop() { for(const id of grants.keys()) discardUpload(id);enabled=false;epoch++;grants.clear();moved.clear(); /* IDs survive reconnect: never replay. */ }
   return {
     enable(){enabled=true;},stop,revoke,
     capabilities(){return {version:1,controllerVersion:3,extensionVersion:api.runtime?.getManifest?.().version || '',
@@ -142,13 +157,13 @@ export function createControl(api, {openTimeoutMs=10000}={}) {
       for(const [id,version,g] of restored) if(revision(id)===version) grants.set(id,g);
       return true;
     },
-    navigation(id,url){ discardUpload(id);changed(id); const grant=grants.get(id);if(grant){try{if(new URL(url).origin!==grant.origin) revoke(id);else grant.token=`${session}:${++grantSequence}`;}catch{revoke(id);}} },
+    navigation(id,url){ discardUpload(id);changed(id); const grant=grants.get(id);if(grant){try{if(new URL(url).origin!==grant.origin) left(id,grant,url);else grant.token=`${session}:${++grantSequence}`;}catch{revoke(id);}} },
     state(){return {enabled,grantedTabIds:[...grants.keys()]};},
     async grant(id) {
       discardUpload(id);const token=epoch, version=revision(id);check(token);const tab=await api.tabs.get(id);check(token);
       const bound=origin(tab);
       if (!await api.permissions.contains({origins:[bound+'/*']})) throw new Error('Page permission not granted');
-      check(token);if(revision(id)!==version)throw new Error('Tab changed while granting');grants.set(id,{origin:bound,owned:grants.get(id)?.owned || false,paused:false,token:`${session}:${++grantSequence}`});
+      check(token);if(revision(id)!==version)throw new Error('Tab changed while granting');grants.set(id,{origin:bound,owned:grants.get(id)?.owned || false,paused:false,token:`${session}:${++grantSequence}`});moved.delete(id);
       return {tabId:id,url:tab.url,title:tab.title || ''};
     },
     async handle(request) {
@@ -167,7 +182,7 @@ export function createControl(api, {openTimeoutMs=10000}={}) {
         if (operation==='tabs') {
           const tabs=[];
           for (const tid of [...grants.keys()]) {
-            try {const {tab,grant}=await target(tid,token);tabs.push({id:tid,url:tab.url,title:tab.title||'',owned:grant.owned});}catch {revoke(tid);}
+            try {const {tab,grant}=await target(tid,token);tabs.push({id:tid,url:tab.url,title:tab.title||'',owned:grant.owned});}catch {if(grants.has(tid)) revoke(tid);}
           }
           check(token);result={tabs};
         } else if(operation==='open') {

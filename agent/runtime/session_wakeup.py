@@ -31,7 +31,11 @@ class SessionWakeups:
         if (delay_seconds < self.MIN_DELAY or interval_seconds < 0
                 or 0 < interval_seconds < self.MIN_DELAY
                 or not delay_seconds < lifetime_seconds <= self.MAX_LIFETIME):
-            raise ValueError("Delay/interval must be at least 60s; expiry must be after the first wakeup and within 12 hours.")
+            raise ValueError(
+                f"delay_seconds must be at least {self.MIN_DELAY}; interval_seconds must be 0 or at least "
+                f"{self.MIN_DELAY}; lifetime_seconds must be greater than delay_seconds and at most "
+                f"{self.MAX_LIFETIME} (12 hours)."
+            )
         if (not session or not prompt.strip() or not original_request.strip()
                 or len(prompt) > 4000 or len(original_request) > 8000):
             raise ValueError("A wakeup needs a session, a bounded prompt and the original user request.")

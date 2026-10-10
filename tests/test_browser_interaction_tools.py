@@ -357,8 +357,9 @@ def test_react_browser_wait_and_connection_status_are_fresh(tmp_path):
         agent=ReActAgent('test',object(),reg)
         for name in ('browser_wait','browser_tabs','browser_status','browser_connect'):
             cache={}; outputs=[]
+            arguments='{"text":"ready"}' if name=='browser_wait' else '{}'
             for i in range(2):
-                events=await agent._execute_tool_calls([{'id':f'{name}-{i}','name':name,'arguments':'{}'}],turn_tool_cache=cache)
+                events=await agent._execute_tool_calls([{'id':f'{name}-{i}','name':name,'arguments':arguments}],turn_tool_cache=cache)
                 outputs.append(events[0]['output'])
             assert counts.get(name)==2, name
             assert outputs[0]!=outputs[1], name
@@ -457,4 +458,401 @@ def test_compact_snapshot_option_and_checked_evidence_survive_tool_and_session(t
         assert len(calls) == 2 and calls[1]['include_text'] is True
         assert b.reads == 0 and b.navigations == 0
 
+    asyncio.run(scenario())
+
+
+# ── what the model is told about limits, moved pages and refused calls ──
+
+def setup_isolated(tmp_path):
+    """Like setup(), with oversized results kept under tmp_path instead of the working directory."""
+    backend = Backend()
+    manager = BrowserSessionManager(path=tmp_path / 'browser.db')
+    reg = ToolRegistry(artifact_dir=tmp_path / 'tool-results')
+    register_browser_tools(reg, manager=manager, backend=backend)
+    return reg, backend, manager
+
+
+def shown(result):
+    """The text the next model request receives: the complete result when the stored one is a preview."""
+    return result.get('fresh_output') or result['output']
+
+
+def observation(length, flag):
+    return {'url':'https://example.com/form','title':'Form','snapshotId':'s1','text':'x'*length,'textIncluded':True,
+            **({} if flag is None else {'textTruncated':flag}),'elements':[]}
+
+
+@pytest.mark.parametrize('flag,length,note', [
+    (True, 12000, 'page text is cut after 12000 characters (limit 12000)'),
+    (True, 6000, 'page text is cut after 6000 characters (limit 12000)'),
+    (False, 12000, ''),
+    # A page script from before the flag: a full window is the only sign.
+    (None, 12000, 'page text fills the 12000-character limit'),
+    (None, 300, ''),
+])
+def test_cut_page_text_is_announced_on_open_snapshot_and_action_results(tmp_path, flag, length, note):
+    async def scenario():
+        reg, b, _ = setup_isolated(tmp_path)
+        b.structured_snapshots = True
+
+        async def state(**kw):
+            return 'https://example.com/form', 'Form', json.dumps(observation(length, flag))
+
+        async def click(*args, **kw):
+            return json.dumps({'status':'observed','after':observation(length, flag)})
+
+        b.interactive_state = state
+        b.interactive_click = click
+        opened = await reg.execute('browser_open', {'url':'https://example.com/form'})
+        refreshed = await reg.execute('browser_snapshot', {'refresh':True})
+        for result in (opened, refreshed):
+            assert not result['error']
+            assert ('Note: page text' in shown(result)) is bool(note)
+            assert bool(result.get('partial')) is bool(note)
+            if note:
+                # Ahead of the long JSON, so a bounded preview keeps it.
+                assert note in result['output'] and 'browser_read' in result['output']
+        clicked = await reg.execute('browser_click', {'selector':'#next'})
+        assert not clicked['error']
+        assert ('after_text_note' in shown(clicked)) is bool(note) and note in shown(clicked)
+        # The click itself is complete; only its observation is bounded.
+        assert not clicked.get('partial')
+    asyncio.run(scenario())
+
+
+def test_read_reports_a_cut_value_and_continues_from_the_offset(tmp_path):
+    body = ''.join(str(i % 10) for i in range(30000))
+
+    async def scenario():
+        reg, b, _ = setup_isolated(tmp_path)
+        await reg.execute('browser_open', {'url':'https://example.com/form','extract':False})
+        offsets = []
+
+        async def read(selector, *, tab_id, url, offset=0):
+            offsets.append(offset)
+            return json.dumps({'status':'observed','target':{'role':'main'},'value':body[offset:offset+12000],
+                'valueTruncated':len(body) > offset+12000,'valueOffset':offset,'valueLength':len(body)})
+
+        b.interactive_read = read
+        first = await reg.execute('browser_read', {'selector':'#content'})
+        assert not first['error'] and first['partial'] is True
+        assert 'characters 0 to 12000 of 30000' in shown(first) and 'offset=12000' in shown(first)
+        last = await reg.execute('browser_read', {'selector':'#content','offset':24000})
+        assert offsets == [0, 24000] and body[24000:] in shown(last)
+        assert not last.get('partial') and 'value_note' not in shown(last)
+        refused = await reg.execute('browser_read', {'selector':'#content','offset':-1})
+        assert refused['error'] and offsets == [0, 24000]
+    asyncio.run(scenario())
+
+
+def test_read_offset_fails_clearly_when_the_page_script_ignores_it(tmp_path):
+    async def scenario():
+        reg, b, _ = setup_isolated(tmp_path)
+        await reg.execute('browser_open', {'url':'https://example.com/form','extract':False})
+
+        async def read(selector, **kw):
+            # An extension not yet reloaded: always the start of the value, and no valueOffset.
+            return json.dumps({'status':'observed','target':{'role':'main'},'value':'a'*12000,'valueTruncated':True})
+
+        b.interactive_read = read
+        first = await reg.execute('browser_read', {'selector':'#content'})
+        assert first['partial'] is True and 'cannot continue from an offset' in shown(first)
+        assert 'offset=' not in shown(first)
+        again = await reg.execute('browser_read', {'selector':'#content','offset':12000})
+        assert again['code'] == 'browser_unsupported_operation'
+        # The repeated start of the value is never presented as the next part.
+        assert 'aaaa' not in again['error'] and not again['output']
+        assert 'reload' in again['recovery_hint']
+    asyncio.run(scenario())
+
+
+async def approve_once(_request):
+    return 'once'
+
+
+def test_open_redirect_names_the_destination_and_leaves_no_tab(tmp_path):
+    async def scenario():
+        reg, b, manager = setup(tmp_path)
+        b.structured_snapshots = True
+        reg.set_approval_handler(approve_once)
+        closed = []
+
+        async def close(tab_id=''):
+            closed.append(tab_id)
+
+        async def state(**kw):
+            return 'https://www.example.com/form?step=2', 'Form', json.dumps({'text':'OTHER-ORIGIN-CONTENT','elements':[]})
+
+        b.close_connection = close
+        b.interactive_state = state
+        result = await reg.execute('browser_open', {'url':'http://example.com/form?step=2'})
+        text = result['output'] + result['error']
+        assert 'Cross-origin redirect blocked' in text
+        assert 'https://www.example.com/form?step=2' in text and 'browser_open' in text
+        # The rule is unchanged: nothing from the other origin is shown, and no tab is left to "attach".
+        assert 'OTHER-ORIGIN-CONTENT' not in text and 'attach' not in text
+        assert len(closed) == 1
+        after = await reg.execute('browser_snapshot', {})
+        assert 'No active tab' in after['output'] + after['error']
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('arguments', [{'refresh':True}, {'include_text':False}])
+def test_page_that_left_its_origin_is_named_when_observed(tmp_path, arguments):
+    async def scenario():
+        reg, b, manager = setup(tmp_path)
+        reg.set_approval_handler(approve_once)
+        await reg.execute('browser_open', {'url':'https://example.com/form','extract':False})
+        moved = {'url':'https://elsewhere.example/landing','title':'Else','text':'OTHER-ORIGIN-CONTENT','elements':[]}
+
+        async def state(**kw):
+            return moved['url'], moved['title'], json.dumps(moved)
+
+        async def snapshot(**kw):
+            return json.dumps(moved)
+
+        b.interactive_state = state
+        b.interactive_snapshot = snapshot
+        result = await reg.execute('browser_snapshot', arguments)
+        assert result['error'] and 'https://elsewhere.example/landing' in result['error']
+        assert 'OTHER-ORIGIN-CONTENT' not in result['error'] + result['output']
+        assert 'browser_open' in result['recovery_hint']
+        assert 'browser_snapshot/browser_read' not in result['recovery_hint']
+        # The tab stays bound to the origin it was opened on.
+        session = manager.list_sessions()[0]
+        assert session.tabs[session.current_tab_id].url == 'https://example.com/form'
+    asyncio.run(scenario())
+
+
+def test_connect_with_a_tab_id_uses_the_extension_and_refuses_cdp(tmp_path):
+    from agent.runtime.browser_backend_router import BrowserBackendRouter
+
+    calls = []
+
+    class Side:
+        capabilities = BackendCapabilities(True, True, True)
+
+        def __init__(self, name):
+            self.name = name
+
+        async def status(self):
+            return True, self.name
+
+        async def connect_existing(self, **kw):
+            calls.append((self.name, kw))
+            return 'Connected ' + self.name
+
+        async def interactive_state(self, **kw):
+            return 'https://example.com/form', self.name, '{}'
+
+        async def close_connection(self, tab_id=''):
+            return None
+
+    async def scenario():
+        manager = BrowserSessionManager(path=tmp_path / 'browser.db')
+        reg = ToolRegistry()
+        register_browser_tools(reg, manager=manager, backend=BrowserBackendRouter(Side('cdp'), lambda: Side('extension')))
+        # The id copied from browser_tabs, with no transport named.
+        result = await reg.execute('browser_connect', {'target_tab_id':'7'})
+        assert 'Connected extension' in result['output']
+        assert [(name, kw.get('target_tab_id')) for name, kw in calls] == [('extension', '7')]
+        tabs = len(manager.list_sessions()[0].tabs)
+
+        refused = await reg.execute('browser_connect', {'transport':'cdp','target_tab_id':'7'})
+        assert refused['code'] == 'invalid_arguments' and 'transport=extension' in refused['recovery_hint']
+        # Nothing was attached in its place, and no placeholder tab is left behind.
+        assert len(calls) == 1 and len(manager.list_sessions()[0].tabs) == tabs
+
+        plain = await reg.execute('browser_connect', {})
+        assert 'Connected cdp' in plain['output']
+        assert calls[-1][0] == 'cdp' and 'target_tab_id' not in calls[-1][1]
+    asyncio.run(scenario())
+
+
+class ControlTransport:
+    """Stands in for the extension controller behind ExtensionBrowserBackend."""
+    connected = True
+    generation = 1
+
+    def __init__(self):
+        self.calls = []
+
+    async def start(self):
+        pass
+
+    async def close(self):
+        self.connected = False
+
+    async def request(self, operation, *, tab_id=None, args=None):
+        self.calls.append(operation)
+        page = {'url':'https://example.com/a','title':'A','snapshotId':'s1','text':'Hello','elements':[]}
+        if operation == 'open':
+            return {'tabId':7,'url':page['url'],'title':page['title']}
+        if operation == 'snapshot':
+            return page
+        if operation == 'wait':
+            # With no condition the real controller sleeps, then answers like this.
+            return {'status':'observed','after':page}
+        raise AssertionError(operation)
+
+
+def test_wait_without_a_condition_fails_the_same_way_on_both_backends(tmp_path):
+    from unittest import mock
+    from agent.runtime.cdp_backend import CdpBrowserBackend
+    from agent.runtime.extension_browser_backend import ExtensionBrowserBackend
+
+    async def scenario():
+        transport = ControlTransport()
+        extension = ExtensionBrowserBackend(transport=transport)
+
+        # The CDP backend with its page connection replaced; no browser is started.
+        cdp = CdpBrowserBackend('/fake/chrome', timeout=1)
+        page = {'url':'https://example.com/a','title':'A','snapshotId':'s1','text':'Hello','elements':[]}
+        connection = mock.Mock(is_connected=True)
+        connection.navigate = mock.AsyncMock()
+        connection.evaluate = mock.AsyncMock(return_value='A')
+        connection.get_url = mock.AsyncMock(return_value=page['url'])
+        connection.page_operation = mock.AsyncMock(return_value=page)
+        connection.wait_for = mock.AsyncMock(return_value='Wait condition satisfied')
+
+        async def connection_for(tab_id, **kwargs):
+            cdp._connections[tab_id] = connection
+            return connection
+
+        cdp.ensure_connection = mock.AsyncMock(side_effect=connection_for)
+
+        dispatched = {'extension': lambda: transport.calls.count('wait'), 'cdp': lambda: connection.wait_for.await_count}
+        failures = []
+        for name, backend in (('extension', extension), ('cdp', cdp)):
+            reg = ToolRegistry()
+            register_browser_tools(reg, manager=BrowserSessionManager(path=tmp_path / f'{name}.db'), backend=backend)
+            opened = await reg.execute('browser_open', {'url':'https://example.com/a','extract':False})
+            assert 'live browser' in opened['output'], opened
+            for arguments in ({}, {'timeout_ms':500}, {'selector':'','text':'','url_contains':''}):
+                result = await reg.execute('browser_wait', arguments)
+                assert result['code'] == 'invalid_arguments' and not result['output']
+                failures.append((result['error'], result['recovery_hint']))
+            # Nothing reached this backend.
+            assert dispatched[name]() == 0
+            # A real condition still does.
+            waited = await reg.execute('browser_wait', {'text':'Hello'})
+            assert not waited['error'], waited
+            assert dispatched[name]() == 1
+        assert len(set(failures)) == 1
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('with_after', [False, True])
+def test_wait_timeout_hint_matches_what_the_result_contains(tmp_path, with_after):
+    async def scenario():
+        reg, b, _ = setup(tmp_path)
+        await reg.execute('browser_open', {'url':'https://example.com/form','extract':False})
+
+        async def wait(**kw):
+            result = {'status':'timeout','message':'Wait condition timed out after 100 ms'}
+            if with_after:
+                result['after'] = {'url':'https://example.com/form','text':'still loading','elements':[]}
+            return json.dumps(result)
+
+        b.interactive_wait = wait
+        result = await reg.execute('browser_wait', {'text':'Saved','timeout_ms':100})
+        assert result['code'] == 'browser_timeout'
+        assert ('after URL/text' in result['recovery_hint']) is with_after
+        assert ('browser_snapshot' in result['recovery_hint']) is not with_after
+        assert 'do not repeat the preceding input' in result['recovery_hint']
+    asyncio.run(scenario())
+
+
+def test_select_miss_returns_the_choices_and_how_to_use_them(tmp_path):
+    async def scenario():
+        reg, b, _ = setup(tmp_path)
+        await reg.execute('browser_open', {'url':'https://example.com/form','extract':False})
+
+        async def select(selector, value, **kw):
+            # The page script's answer when neither a value nor a label matches.
+            return json.dumps({'status':'error',
+                'message':'Selectable option not found: no option has this value or exact label. Choose from options.',
+                'options':[{'value':'sg','label':'Singapore'},{'value':'my','label':'Malaysia'}]})
+
+        b.interactive_select = select
+        result = await reg.execute('browser_select', {'selector':'ref:s1:3','value':'Japan'})
+        assert result['code'] == 'browser_error'
+        assert 'Singapore' in result['error'] and '"value": "my"' in result['error']
+        assert 'browser_select again' in result['recovery_hint']
+        # There is no after in this result to inspect.
+        assert 'Inspect after' not in result['recovery_hint'] and 'inspect_after' not in result['error']
+        assert b.reads == 0 and result['partial'] is False
+    asyncio.run(scenario())
+
+
+PNG = bytes.fromhex(
+    '89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489'
+    '0000000d49444154789c6360000002000001e221bc330000000049454e44ae426082')
+
+
+def test_screenshot_says_the_image_is_attached_and_can_be_repeated_in_a_turn(tmp_path):
+    from agent.core.msg import ContentBlock, Msg
+    from agent.runtime.react import ReActAgent
+
+    class LLM:
+        def __init__(self):
+            self.calls = 0
+
+        async def chat_stream(self, messages, tools):
+            self.calls += 1
+            if self.calls <= 3:
+                yield {'type':'tool_calls','calls':[{'id':f'shot-{self.calls}',
+                    'name':'browser_screenshot','arguments':'{}'}],
+                    'content':'','reasoning_content':'','usage':None}
+                yield {'type':'done','content':'','usage':None}
+            else:
+                yield {'type':'done','content':'The page finished loading.','usage':None}
+
+    async def scenario():
+        reg, b, _ = setup(tmp_path)
+        shots = []
+
+        async def screenshot(*, tab_id, url, output_path=''):
+            path = tmp_path / f'shot-{len(shots)}.png'
+            path.write_bytes(PNG)
+            shots.append(path)
+            return str(path)
+
+        b.interactive_screenshot = screenshot
+        await reg.execute('browser_open', {'url':'https://example.com/form','extract':False})
+        direct = await reg.execute('browser_screenshot', {})
+        payload = json.loads(direct['output'])
+        assert payload['image_paths'] == [str(shots[0])]
+        assert 'attached in the following message' in payload['message']
+
+        # Watching a page change: the same argument-less call three times in one turn.
+        shots.clear()
+        llm = LLM()
+        agent = ReActAgent('test', llm, reg, max_iterations=10)
+        events = [e async for e in agent.reply_stream(Msg(content=[ContentBlock.text('Watch the page load')]))]
+        assert len(shots) == 3 and llm.calls == 4
+        assert not any('repeated tool call' in e.get('message','') for e in events)
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize('outcome,expected', [
+    ('closed', 'Closed browser tab'),
+    ('detached', 'Released browser tab'),
+    (None, 'closed or released'),
+])
+def test_close_says_whether_the_tab_was_closed_or_only_released(tmp_path, outcome, expected):
+    async def scenario():
+        reg, b, _ = setup(tmp_path)
+
+        async def close(tab_id=''):
+            return outcome
+
+        b.close_connection = close
+        await reg.execute('browser_open', {'url':'https://example.com/form','extract':False})
+        result = await reg.execute('browser_close', {})
+        assert not result['error'] and expected in result['output']
+        if outcome == 'detached':
+            assert 'stays open' in result['output'] and 'Closed' not in result['output']
+        gone = await reg.execute('browser_snapshot', {})
+        assert 'No active tab' in gone['output'] + gone['error']
     asyncio.run(scenario())

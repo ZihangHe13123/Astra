@@ -231,6 +231,102 @@ def test_hindsight_tool_labels_results_as_non_authoritative():
     assert "A historical preference" in result["output"]
 
 
+def test_hindsight_recall_shows_a_memory_date_only_when_hindsight_has_one():
+    def memory(identifier, text, occurred):
+        return SimpleNamespace(id=identifier, text=text, type="observation", occurred_start=occurred,
+                               mentioned_at=None, document_id="doc", metadata={}, tags=[])
+
+    client = FakeRecallClient([
+        memory("dated", "Moved the NAS to the new rack", "2026-03-04T09:30:00Z"),
+        memory("undated", "Prefers short summaries", None),
+    ])
+    provider = HindsightMemoryProvider(base_url="http://127.0.0.1:8888", bank_id="main-v2", client=client)
+    tools = ToolRegistry()
+    register_hindsight_tools(tools, provider)
+
+    result = asyncio.run(tools.execute("hindsight_recall", {"query": "setup"}))
+
+    dated, undated = result["output"].splitlines()[1:]
+    assert dated == "1. [observation] (2026-03-04) Moved the NAS to the new rack"
+    # The provider stamps an undated memory with the time of the recall; that is not its date.
+    assert undated == "2. [observation] Prefers short summaries"
+
+
+def test_hindsight_failures_are_real_failures_and_a_retry_is_not_served_from_cache():
+    class DownClient(FakeRecallClient):
+        down = True
+
+        async def arecall(self, **kwargs):
+            if self.down:
+                raise ConnectionError("connection refused")
+            return await super().arecall(**kwargs)
+
+        async def areflect(self, **kwargs):
+            raise TimeoutError()
+
+        async def aretain(self, **kwargs):
+            raise ConnectionError("connection reset")
+
+    client = DownClient([SimpleNamespace(
+        id="m", text="Back again", type="observation", occurred_start=None, mentioned_at=None,
+        document_id="doc", metadata={}, tags=[],
+    )])
+    provider = HindsightMemoryProvider(base_url="http://127.0.0.1:8888", bank_id="main-v2", client=client)
+    tools = ToolRegistry()
+    register_hindsight_tools(tools, provider)
+
+    def call(name, **arguments):
+        return asyncio.run(tools.execute(name, arguments))
+
+    recall = call("hindsight_recall", query="anything")
+    assert recall["output"] == "" and recall["code"] == "hindsight_error"
+    assert "connection refused" in recall["error"] and "session_search" in recall["recovery_hint"]
+
+    reflect = call("hindsight_reflect", query="anything")
+    assert reflect["code"] == "hindsight_timeout" and "did not answer in time" in reflect["error"]
+
+    retain = call("hindsight_retain", content="A fact")
+    assert retain["code"] == "hindsight_error"
+    assert "may not have been stored" in retain["recovery_hint"]
+    blank = call("hindsight_retain", content="   ")
+    assert blank["code"] == "invalid_arguments" and "non-empty content" in blank["error"]
+
+    # In a turn, an identical recall after the service is back runs again: a returned
+    # error string used to be cached as a result and replayed.
+    client.down = True
+    agent = ReActAgent("test", SimpleNamespace(), tools)
+    turn_cache: dict[str, dict] = {}
+
+    def recall_in_turn(call_id):
+        async def scenario():
+            event, = await agent._execute_tool_calls([{
+                "id": call_id, "name": "hindsight_recall", "arguments": json.dumps({"query": "anything"}),
+            }], turn_cache)
+            return event
+        return asyncio.run(scenario())
+
+    assert recall_in_turn("first")["code"] == "hindsight_error"
+    client.down = False
+    again = recall_in_turn("second")
+    assert not again["error"] and not again.get("cached") and "Back again" in again["output"]
+
+
+def test_hindsight_descriptions_state_the_per_turn_limit_and_what_tags_do():
+    provider = HindsightMemoryProvider(
+        base_url="http://127.0.0.1:8888", bank_id="main-v2", client=FakeRecallClient(),
+    )
+    tools = ToolRegistry()
+    register_hindsight_tools(tools, provider)
+
+    for name in ("hindsight_retain", "hindsight_recall", "hindsight_reflect"):
+        tool = tools.get(name)
+        assert f"At most {tool.max_calls_per_turn} calls per turn" in tool.description
+        assert "ends the turn" in tool.description
+    properties = tools.get("hindsight_retain").parameters["properties"]
+    assert "cannot filter by tag" in properties["tags"]["description"]
+    assert properties["context"]["description"] and properties["content"]["description"]
+
+
 def test_hindsight_registers_native_retain_recall_and_reflect_tools():
     client = FakeRecallClient()
     provider = HindsightMemoryProvider(

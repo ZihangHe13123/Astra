@@ -2745,6 +2745,13 @@ class ReActAgent(AgentBase):
                     invocation_id = uuid.uuid4().hex
                 elif tool is None or tool.idempotent:
                     invocation_id = None
+                    if tool is not None:
+                        # A repeatable observation may answer a later identical
+                        # call only while nothing else has run in between: any
+                        # other step may have changed what it describes.
+                        changes = await durable_io(self._steps_that_may_change_state, task_id)
+                        if changes:
+                            invocation_id = f"after-step:{changes}"
                 else:
                     invocation_id = str(tc.get("id") or "")
                 claim = await durable_io(
@@ -2760,6 +2767,10 @@ class ReActAgent(AgentBase):
                     # protection for the same call id.
                     invocation_id=invocation_id,
                     replay=tool.replay if tool is not None else "never",
+                    # A failed observation is safe to run again; answering a
+                    # retry with the old failure would make a transient error
+                    # permanent for the rest of the task.
+                    rerun_failed=bool(tool is not None and tool.idempotent and tool.cache_results),
                 )
                 step_id = claim.step_id
                 if claim.action == "cached" and claim.output is not None:
@@ -2982,6 +2993,10 @@ class ReActAgent(AgentBase):
         error = result.get("error", "")
         code = result.get("code") or args.get("code", args.get("command", ""))
         tool_output = output or error or "(tool returned empty)"
+        if output and error:
+            # A failed postcondition keeps the raw output for audit. Without
+            # the reason the model sees a normal result labelled as an error.
+            tool_output = f"{output}\n{error}"
         event = {
             "type": "tool_result",
             "id": tc["id"],
@@ -3043,6 +3058,16 @@ class ReActAgent(AgentBase):
                 logger.exception("task store tool finish failed task_id=%s name=%s", task_id, name)
         return event
 
+    def _steps_that_may_change_state(self, task_id: str) -> int:
+        """Count this task's recorded steps that were not repeatable observations."""
+        assert self.task_store is not None
+        count = 0
+        for step_name in self.task_store.tool_step_names(task_id):
+            step_tool = self.tools.get(step_name)
+            if step_tool is None or not step_tool.idempotent:
+                count += 1
+        return count
+
     async def _execute_tool_calls(
         self,
         tool_calls: list[dict],
@@ -3052,6 +3077,7 @@ class ReActAgent(AgentBase):
         progress_callback: Callable[[dict], None] | None = None,
         trace_ctx: TraceContext | None = None,
         result_callback: Callable[[dict], None] | None = None,
+        repeat_notice_ids: frozenset[str] = frozenset(),
     ) -> list[dict]:
         semaphore = asyncio.Semaphore(self.tool_concurrency)
         turn_tool_cache = turn_tool_cache if turn_tool_cache is not None else {}
@@ -3152,6 +3178,12 @@ class ReActAgent(AgentBase):
                 )
                 if cacheable and not event.get("error"):
                     turn_tool_cache[signature] = dict(event)
+                elif tool is None or not tool.idempotent:
+                    # Only repeatable observations are cached. Any other call
+                    # may have changed what they describe (a written file, a
+                    # commit, a started process, a delegated worker), so an
+                    # identical later observation must run again.
+                    turn_tool_cache.clear()
                 return event
 
         profiler = current_profiler()
@@ -3188,6 +3220,8 @@ class ReActAgent(AgentBase):
             if tool_def is not None and tool_def.return_direct and not event.get("error"):
                 context_result = "[Atomic interaction committed successfully.]"
             else:
+                if str(tc.get("id") or "") in repeat_notice_ids:
+                    event["_repeat_limit_reached"] = True
                 context_result = self._tool_result_context(event)
             self.context.add_tool(tc["id"], context_result)
             fresh_output = event.pop("_fresh_output", None)
@@ -3341,6 +3375,16 @@ class ReActAgent(AgentBase):
                 if len(details_text) > 1600:
                     details_text = details_text[:1597] + "..."
                 lines.append(f"Details: {details_text}")
+        if event.get("cached"):
+            lines.append(
+                "Repeated call: this exact call already ran earlier in this task, so its "
+                "earlier result is shown and the tool was not run again."
+            )
+        if event.get("_repeat_limit_reached"):
+            lines.append(
+                "Repeat limit: one more identical call in this turn will not run and will "
+                "end the turn. Change the arguments or take a different step."
+            )
         if event.get("request_local_placeholder"):
             lines.append("Result lifecycle: request-local content is no longer retained.")
         elif event.get("output_truncated"):
@@ -3350,6 +3394,14 @@ class ReActAgent(AgentBase):
                     "This is a bounded preview. If omitted details are needed, "
                     f"inspect the complete result at: {artifact_path}"
                 )
+        elif event.get("partial"):
+            lines.append(
+                "Result completeness: partial. The tool stopped before finishing; "
+                "what it produced until then is above."
+                if error else
+                "Result completeness: partial. The tool returned a bounded part; "
+                "its own fields above say what was left out and how to continue."
+            )
         else:
             # Give weaker local models an unambiguous positive signal. Avoid
             # mentioning UI folding here: negated wording about truncation can
@@ -4155,6 +4207,7 @@ class ReActAgent(AgentBase):
             if tool_calls:
                 repeated = None
                 exhausted = None
+                repeat_notice_ids: set[str] = set()
                 for tc in tool_calls:
                     name = tc.get("name", "")
                     tool_def = self.tools.get(name)
@@ -4167,6 +4220,8 @@ class ReActAgent(AgentBase):
                         if tool_signature_counts[signature] > repeated_tool_limit:
                             repeated = signature
                             break
+                        if tool_signature_counts[signature] == repeated_tool_limit:
+                            repeat_notice_ids.add(str(tc.get("id") or ""))
                     tool_name_counts[name] = tool_name_counts.get(name, 0) + 1
                     limit = tool_def.max_calls_per_turn if tool_def is not None else None
                     if limit is not None and tool_name_counts[name] > limit:
@@ -4229,6 +4284,7 @@ class ReActAgent(AgentBase):
                         progress_callback=enqueue_progress,
                         trace_ctx=trace_ctx,
                         result_callback=enqueue_progress,
+                        repeat_notice_ids=frozenset(repeat_notice_ids),
                     ))
                     next_progress: asyncio.Task | None = None
                     try:
@@ -4263,6 +4319,7 @@ class ReActAgent(AgentBase):
                         task_id=task_id,
                         active_groups=active_groups,
                         trace_ctx=trace_ctx,
+                        repeat_notice_ids=frozenset(repeat_notice_ids),
                     )
                 call_signatures = {
                     str(tc.get("id") or ""): self._tool_signature(tc)

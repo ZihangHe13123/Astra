@@ -230,9 +230,10 @@ def test_bad_handles_fail_before_opening_evidence(handle):
     if len(handle) != 10:
         assert result["code"] == "invalid_arguments"
     else:
-        output = json.loads(result["fresh_output"])
-        assert output["status"] == "invalid_or_expired_handle"
-        assert "context_inspect" in output["hint"] and "does not establish expiry" in output["hint"]
+        # A refusal is a real failure, kept in history, not a one-step result shown as a success.
+        assert result["code"] == "invalid_or_expired_handle" and result["error"]
+        assert "fresh_output" not in result
+        assert "context_inspect" in result["recovery_hint"] and "does not establish expiry" in result["recovery_hint"]
 
 
 def test_inspection_tool_request_local_and_no_argument_data_leak():

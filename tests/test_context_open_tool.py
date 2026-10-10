@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from datetime import UTC, datetime
 from typing import Any
 
@@ -17,6 +16,7 @@ from agent.runtime.context_index.models import (
 )
 from agent.runtime.context_index.workspace import WorkspaceIdentity
 from agent.runtime.react import ReActAgent
+from agent.runtime.tool_failure import ToolFailure
 from agent.runtime.tools.context_index import register_context_index_tools
 from agent.runtime.tools.registry import ToolRegistry
 
@@ -139,7 +139,13 @@ def test_tool_contract_and_persistence_flags() -> None:
     assert tool.argument_redactor is None
     assert tool.memory_evidence is None
     assert tool.strict_schema is True
-    assert tool.parameters == {
+    properties = tool.parameters["properties"]
+    assert "each side" in properties["window"]["description"]
+    assert "context_inspect" in properties["handles"]["description"]
+    assert {**tool.parameters, "properties": {
+        name: {key: value for key, value in schema.items() if key != "description"}
+        for name, schema in properties.items()
+    }} == {
         "type": "object",
         "required": ["handles"],
         "properties": {
@@ -158,6 +164,11 @@ def test_tool_contract_and_persistence_flags() -> None:
         },
         "additionalProperties": False,
     }
+    # The model is told the limits it will hit and that the result is kept for one step only.
+    for name in ("context_open", "context_inspect"):
+        description = registry.get(name).description
+        assert "At most 2 calls per turn" in description and "ends the turn" in description
+        assert "next step only" in description
 
 
 def test_direct_tool_call_clamps_window_before_delegating() -> None:
@@ -176,7 +187,9 @@ def test_direct_tool_call_without_handles_returns_stable_error() -> None:
     tool = registry.get("context_open")
     assert tool is not None
 
-    assert tool.fn() == "invalid_request"
+    failure = tool.fn()
+    assert isinstance(failure, ToolFailure) and failure.code == "invalid_request"
+    assert "1 to 3 distinct handles" in failure.message and "context_inspect" in failure.recovery_hint
     assert broker.calls == []
 
 
@@ -203,7 +216,7 @@ def test_direct_tool_call_rejects_malformed_values_without_delegating(
     tool = registry.get("context_open")
     assert tool is not None
 
-    assert tool.fn(handles=handles, window=window) == "invalid_request"
+    assert tool.fn(handles=handles, window=window).code == "invalid_request"
     assert broker.calls == []
 
 
@@ -254,20 +267,51 @@ def test_invalid_duplicate_expired_and_foreign_handles_never_open_or_research() 
     assert tool is not None
     baseline_recommend = session.recommend_calls + activity.recommend_calls
 
-    assert tool.fn(handles=[handles[0], handles[0]], window=2) == "invalid_request"
-    assert json.loads(tool.fn(handles=["ctx:s:dead"], window=2))["status"] == "invalid_or_expired_handle"
+    assert tool.fn(handles=[handles[0], handles[0]], window=2).code == "invalid_request"
+    assert tool.fn(handles=["ctx:s:dead"], window=2).code == "invalid_or_expired_handle"
 
     foreign_pack = asyncio.run(
         broker.build("new turn", "req-foreign", "session-current", WORKSPACE, NOW, frozenset())
     )
     assert foreign_pack.rows
-    assert json.loads(tool.fn(handles=[handles[0]], window=2))["status"] == "invalid_or_expired_handle"
+    assert tool.fn(handles=[handles[0]], window=2).code == "invalid_or_expired_handle"
     foreign_handle = foreign_pack.rows[0].handle
     broker.complete_request("req-foreign")
-    assert json.loads(tool.fn(handles=[foreign_handle], window=2))["status"] == "invalid_or_expired_handle"
+    assert tool.fn(handles=[foreign_handle], window=2).code == "invalid_or_expired_handle"
 
     assert session.open_calls == activity.open_calls == 0
     assert session.recommend_calls + activity.recommend_calls == baseline_recommend + 2
+
+
+@pytest.mark.parametrize("token", [
+    "invalid_request", "invalid_or_expired_handle", "open_limit_reached",
+    "open_budget_reached", "evidence_unavailable",
+])
+def test_every_broker_refusal_is_a_failure_that_says_what_to_do_next(token: str) -> None:
+    registry, _broker = _registered_spy(token)
+
+    result = asyncio.run(registry.execute("context_open", {"handles": ["ctx:s:beef"], "window": 2}))
+
+    # The bare token used to be returned as a successful one-step result.
+    assert result["code"] == token
+    assert result["error"] and result["error"] != token
+    assert result["recovery_hint"]
+    assert result["output"] == "" and "fresh_output" not in result
+
+
+def test_a_real_broker_refusal_reaches_the_caller_as_a_failure() -> None:
+    broker, _session, _activity, handles = _live_broker()
+    registry = ToolRegistry()
+    register_context_index_tools(registry, broker)
+
+    def open_evidence(**arguments: object) -> dict:
+        return asyncio.run(registry.execute("context_open", arguments))
+
+    assert "safe evidence" in open_evidence(handles=handles, window=2)["fresh_output"]
+    assert "safe evidence" in open_evidence(handles=[handles[0]], window=0)["fresh_output"]
+    spent = open_evidence(handles=[handles[0]], window=0)
+    assert spent["code"] == "open_budget_reached" and "evidence budget" in spent["error"]
+    assert "already opened" in spent["recovery_hint"]
 
 
 def test_persistence_keeps_literal_handles_but_not_expanded_evidence() -> None:

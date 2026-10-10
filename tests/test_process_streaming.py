@@ -75,6 +75,69 @@ def test_process_read_legacy_character_offset_scans_without_materializing(tmp_pa
     assert result["next_offset"] == 4
 
 
+def test_explicit_byte_read_leaves_cursor_and_character_fields_alone(tmp_path):
+    manager, process = _managed(tmp_path, "ab你好cd")
+
+    first = manager.read(process, offset=None, max_chars=3)
+    peek = manager.read(
+        process,
+        offset=None,
+        byte_offset=len("ab你好".encode("utf-8")),
+        max_chars=10,
+    )
+    second = manager.read(process, offset=None, max_chars=10)
+
+    assert first["content"] == "ab你"
+    assert peek["content"] == "cd"
+    assert peek["eof"] is True
+    # Counting the characters before a byte position would mean scanning the log.
+    assert not {"offset", "next_offset", "total_chars"} & set(peek)
+    assert peek["output_reader"]["arguments"]["byte_offset"] == peek["next_byte_offset"]
+    assert second["content"] == "好cd"
+    assert second["offset"] == 3
+    assert second["total_chars"] == len("ab你好cd")
+
+
+def test_reader_arguments_continue_after_each_kind_of_read(tmp_path):
+    manager, process = _managed(tmp_path, "a你好bcdef")
+
+    def reread(result):
+        arguments = dict(result["output_reader"]["arguments"])
+        assert arguments.pop("process_id") == process.process_id
+        arguments["max_chars"] = 2
+        return manager.read(process, offset=arguments.pop("offset", None), **arguments)
+
+    # Before any read the suggestion starts at the beginning.
+    assert "offset" not in manager.describe(process)["output_reader"]["arguments"]
+    cursor_first = manager.read(process, offset=None, max_chars=2)
+    cursor_second = reread(cursor_first)
+    explicit = manager.read(process, offset=1, max_chars=2)
+    explicit_next = reread(explicit)
+
+    assert (cursor_first["content"], cursor_second["content"]) == ("a你", "好b")
+    assert (explicit["content"], explicit_next["content"]) == ("你好", "bc")
+    # The explicit reads did not move the cursor.
+    assert manager.read(process, offset=None, max_chars=2)["content"] == "cd"
+
+
+def test_result_only_output_pages_by_byte_cursor(tmp_path):
+    manager, process = _managed(tmp_path, "")
+    for path in (process.output_path, process.stdout_path, process.stderr_path):
+        path.unlink()
+    process.result = {"output": "你好cd", "error": "", "exit_code": 0}
+
+    first = manager.read(process, offset=None, byte_offset=0, max_chars=2)
+    arguments = dict(first["output_reader"]["arguments"])
+    arguments.pop("process_id")
+    second = manager.read(process, offset=None, **arguments)
+
+    assert first["content"] == "你好"
+    assert first["next_byte_offset"] == len("你好".encode("utf-8"))
+    assert first["eof"] is False
+    assert second["content"] == "cd"
+    assert second["eof"] is True
+
+
 def test_external_refresh_uses_manifest_counters_without_scanning_logs(tmp_path, monkeypatch):
     manager, process = _managed(tmp_path, "large output", external=True)
     process.manifest_path.write_text(

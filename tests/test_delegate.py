@@ -515,6 +515,86 @@ def test_context_snapshot_none_and_bounded_all():
         _context_snapshot(messages, fork_turns="0")
 
 
+def test_context_snapshot_keeps_parent_context_whole_and_trims_conversation():
+    messages = [
+        {"role": "user", "content": "oldest " + "o" * 400},
+        {"role": "assistant", "content": "newest answer"},
+    ]
+    context = "start-of-brief " + "c" * 300 + " end-of-brief"
+
+    snapshot = _context_snapshot(
+        messages, fork_turns="all", explicit_context=context, max_chars=400
+    )
+
+    assert snapshot.endswith(f"Parent-provided context: {context}")
+    assert snapshot.startswith("[Earlier context truncated]")
+    assert "newest answer" in snapshot
+    assert "oldest" not in snapshot
+    with pytest.raises(ValueError, match="context is 401 characters; the limit is 400"):
+        _context_snapshot(messages, explicit_context="c" * 401, max_chars=400)
+
+
+def test_delegate_rejects_context_over_limit_before_starting(process_manager):
+    async def scenario():
+        registry = ToolRegistry()
+        llm = SequenceLLM([{"content": "should not run", "tool_calls": []}])
+        register_delegate_tools(registry, llm_getter=lambda: llm)
+        limit = delegate._DEFAULT_CONTEXT_CHARS
+        long_context = "BRIEF-START " + "x" * limit
+
+        single = await registry.execute(
+            "delegate_task", {"goal": "inspect", "context": long_context}
+        )
+        batch = await registry.execute(
+            "delegate_task",
+            {"tasks": [{"goal": "fits"}, {"goal": "too long", "context": long_context}]},
+        )
+
+        for result in (single, batch):
+            assert f"context is {len(long_context)} characters" in result["error"]
+            assert f"limit is {limit}" in result["error"]
+            assert "file" in result["error"]
+        # Nothing ran on a cut brief, including the batch item that did fit.
+        assert process_manager.list() == []
+        assert len(llm.responses) == 1
+
+    asyncio.run(scenario())
+
+
+def test_delegate_passes_context_whole_and_trims_only_conversation(process_manager):
+    class CapturingLLM:
+        def __init__(self):
+            self.prompts = []
+
+        async def chat(self, **kwargs):
+            self.prompts.append(list(kwargs.get("messages") or []))
+            return {"content": "report", "tool_calls": []}
+
+    async def scenario():
+        registry = ToolRegistry()
+        llm = CapturingLLM()
+        limit = delegate._DEFAULT_CONTEXT_CHARS
+        context = "BRIEF-START " + "b" * (limit - 200) + " BRIEF-END"
+        history = [
+            {"role": "user", "content": "HISTORY-START " + "h" * limit + " HISTORY-END"}
+        ]
+        register_delegate_tools(
+            registry, llm_getter=lambda: llm, context_getter=lambda: history
+        )
+
+        result = await registry.execute(
+            "delegate_task", {"goal": "inspect", "context": context, "timeout": 5}
+        )
+
+        assert result["error"] == ""
+        task_message = llm.prompts[0][1]["content"]
+        assert context in task_message
+        assert "HISTORY-END" in task_message
+        assert "HISTORY-START" not in task_message
+
+    asyncio.run(scenario())
+
+
 def test_remote_worker_uses_independent_bounded_client(monkeypatch):
     class Provider:
         def __init__(self):
@@ -1998,6 +2078,45 @@ def test_delegate_queue_time_counts_toward_total_timeout(
     asyncio.run(scenario())
 
 
+def test_delegate_queue_timeout_says_the_subagent_never_started(
+    process_manager, monkeypatch
+):
+    class HoldingLLM:
+        async def chat(self, **kwargs):
+            del kwargs
+            await asyncio.sleep(1.6)
+            return {"content": "held the only slot", "tool_calls": []}
+
+    async def scenario():
+        monkeypatch.setenv("ASTRA_DELEGATE_CONCURRENCY", "1")
+        registry = ToolRegistry()
+        register_delegate_tools(registry, llm_getter=HoldingLLM)
+
+        result = await registry.execute(
+            "delegate_task",
+            {
+                "tasks": [
+                    {"goal": "runs", "timeout": 10},
+                    {"goal": "queued", "timeout": 1},
+                ]
+            },
+        )
+        runs, queued = json.loads(result["output"])["results"]
+
+        assert runs["worker_status"] == "completed"
+        assert queued["worker_status"] == "timed_out"
+        assert queued["turns_used"] == 0
+        # A worker that ran out of time and one that never got a slot differ.
+        assert "never started" in queued["error"]
+        assert "free slot" in queued["error"]
+        assert "exceeded" not in queued["error"]
+        assert "counts toward" in registry.get("delegate_task").parameters[
+            "properties"
+        ]["tasks"]["description"]
+
+    asyncio.run(scenario())
+
+
 def test_delegate_batch_runs_five_children_concurrently(process_manager, monkeypatch):
     class ConcurrentLLM:
         def __init__(self):
@@ -2151,6 +2270,77 @@ def test_delegate_read_returns_json_incrementally(process_manager):
         assert payload["worker"]["run_id"] == process_id
         assert payload["worker"]["status"] == "running"
         await registry.execute("delegate_cancel", {"process_id": process_id})
+
+    asyncio.run(scenario())
+
+
+def test_delegate_read_accepts_the_byte_cursor_its_results_return(process_manager):
+    async def scenario():
+        registry = ToolRegistry()
+        _register_read_tool(registry)
+        llm = SequenceLLM([
+            {
+                "content": "",
+                "tool_calls": [{
+                    "id": "call-1",
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": "README.md"}),
+                }],
+            },
+            {"content": "报告完成", "tool_calls": []},
+        ])
+        register_delegate_tools(registry, llm_getter=lambda: llm)
+        started = await registry.execute(
+            "delegate_task", {"goal": "调查问题", "timeout": 5, "background": True}
+        )
+        pid = json.loads(started["output"])["process_id"]
+        await registry.execute("delegate_poll", {"process_id": pid, "wait_ms": 3000})
+
+        async def read(**args):
+            return await registry.execute("delegate_read", {"process_id": pid, **args})
+
+        whole = json.loads((await read(offset=0, max_chars=100_000))["output"])["content"]
+        first = json.loads((await read(offset=0, max_chars=24))["output"])
+        second_result = await read(byte_offset=first["next_byte_offset"], max_chars=24)
+
+        assert second_result["error"] == ""
+        second = json.loads(second_result["output"])
+        # The first page ends inside the non-ASCII goal, so bytes and characters differ.
+        assert first["next_byte_offset"] > len(first["content"])
+        assert second["byte_offset"] == first["next_byte_offset"]
+        assert first["content"] + second["content"] == whole[:len(first["content"] + second["content"])]
+        assert second["content"]
+        combined = await read(offset=0, byte_offset=0)
+        assert "cannot be combined" in combined["error"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("start", [{"background": True}, {"foreground_yield_ms": 20}])
+def test_background_start_message_matches_automatic_delivery(process_manager, start):
+    class BriefLLM:
+        async def chat(self, **kwargs):
+            del kwargs
+            await asyncio.sleep(0.2)
+            return {"content": "evidence from worker", "tool_calls": []}
+
+    async def scenario():
+        registry = ToolRegistry()
+        mailbox = register_delegate_tools(registry, llm_getter=BriefLLM)
+
+        started = json.loads((await registry.execute(
+            "delegate_task",
+            {"goal": "research branch", "timeout": 5, **start},
+            task_id="mail-task",
+        ))["output"])
+
+        # The start result and the tool description give the same instruction,
+        assert "delivered to you automatically" in started["message"]
+        assert "only for interim progress" in started["message"]
+        # and it is true: the result arrives without a poll or a read.
+        envelopes = await mailbox.wait_and_drain("mail-task", timeout=2)
+        assert len(envelopes) == 1
+        assert "evidence from worker" in envelopes[0]
 
     asyncio.run(scenario())
 

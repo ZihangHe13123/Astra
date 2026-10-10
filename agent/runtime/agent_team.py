@@ -48,6 +48,14 @@ MESSAGE_KINDS = frozenset(
     }
 )
 EPISODE_KINDS = ("assignment", "implementation", "review", "revision", "readiness", "coordination")
+# Limits the Team tools state in their parameter descriptions.
+TEAM_TASK_TITLE_CHARS = 160
+TEAM_TASK_DESCRIPTION_CHARS = 4000
+TEAM_TASK_RESULT_CHARS = 6000
+TEAM_TASK_LEASE_MIN_SECONDS = 30
+TEAM_TASK_LEASE_MAX_SECONDS = 3600
+TEAM_UNREAD_MESSAGE_LIMIT = 50
+TEAM_INBOX_PAGE_SIZE = 50
 
 
 def _assignment_metadata(kind: str, value: dict[str, Any] | None) -> dict[str, Any]:
@@ -98,6 +106,32 @@ def team_execution_context(agent_id: str, turn: int) -> Iterator[None]:
     finally:
         _CURRENT_AGENT_TURN.reset(turn_token)
         _CURRENT_AGENT_ID.reset(agent_token)
+
+
+_CURRENT_WORKER_ID: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "astra_team_worker_id", default=""
+)
+
+
+@contextmanager
+def team_worker_context(agent_id: str) -> Iterator[None]:
+    """Mark the running task as one teammate's worker.
+
+    Unlike team_execution_context this binds no tool identity. It only lets
+    the runtime tell a teammate's own Team changes and waits from the lead's.
+    """
+
+    token = _CURRENT_WORKER_ID.set(str(agent_id or ""))
+    try:
+        yield
+    finally:
+        _CURRENT_WORKER_ID.reset(token)
+
+
+def _change_observer() -> str:
+    """Who is making or awaiting a Team change: a teammate id, or "" for the lead."""
+
+    return _CURRENT_AGENT_ID.get() or _CURRENT_WORKER_ID.get()
 
 
 def current_team_agent_id() -> str:
@@ -804,9 +838,14 @@ class AgentTeamStore:
                 ).fetchall()
         direct = clean not in {"team", "all", "lead", "siblings", "children"}
         if direct and rows and str(rows[0]["status"]) not in ACTIVE_AGENT_STATUSES:
-            raise ValueError(
-                f"message recipient {rows[0]['name']} is {rows[0]['status']}"
-            )
+            ended = f"message recipient {rows[0]['name']} is {rows[0]['status']}"
+            if str(rows[0]["parent_agent_id"] or ""):
+                # Every inactive status is terminal, which team_restart accepts.
+                ended += (
+                    " and no longer receives messages; the team lead can bring it back "
+                    "with team_restart, passing the message as its instruction"
+                )
+            raise ValueError(ended)
         recipients = [
             dict(row)
             for row in rows
@@ -855,8 +894,10 @@ class AgentTeamStore:
                     (recipient_id,),
                 ).fetchone()[0]
             )
-            if count >= 50:
-                raise ValueError("recipient mailbox is full (50 unacknowledged messages)")
+            if count >= TEAM_UNREAD_MESSAGE_LIMIT:
+                raise ValueError(
+                    f"recipient mailbox is full ({TEAM_UNREAD_MESSAGE_LIMIT} unacknowledged messages)"
+                )
             db.execute(
                 """INSERT OR IGNORE INTO agent_messages
                    (id, team_id, sender_agent_id, recipient_agent_id, kind, body, dedupe_key, created_at, assignment_json)
@@ -881,7 +922,7 @@ class AgentTeamStore:
             ).fetchone() is not None
 
     def read_messages(self, agent_id: str, *, after_seq: int = 0, limit: int = 20) -> list[dict[str, Any]]:
-        bounded = max(1, min(int(limit), 50))
+        bounded = max(1, min(int(limit), TEAM_INBOX_PAGE_SIZE))
         with self._lock, self._connection() as db:
             rows = db.execute(
                 """SELECT m.*, sender.name AS sender_name
@@ -919,7 +960,7 @@ class AgentTeamStore:
         description: str = "",
         blocked_by: list[str] | None = None,
     ) -> dict[str, Any]:
-        clean_title = " ".join(str(title or "").split())[:160]
+        clean_title = " ".join(str(title or "").split())[:TEAM_TASK_TITLE_CHARS]
         if not clean_title:
             raise ValueError("task title is required")
         blockers = list(dict.fromkeys(str(item) for item in (blocked_by or []) if str(item)))
@@ -944,7 +985,10 @@ class AgentTeamStore:
                 """INSERT INTO team_tasks
                    (id, team_id, title, description, blocked_by_json, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (task_id, team_id, clean_title, str(description)[:4000], json.dumps(blockers), now, now),
+                (
+                    task_id, team_id, clean_title, str(description)[:TEAM_TASK_DESCRIPTION_CHARS],
+                    json.dumps(blockers), now, now,
+                ),
             )
         return self.get_task(task_id) or {}
 
@@ -967,7 +1011,7 @@ class AgentTeamStore:
         return self._with_task_usage(rows, episodes)
 
     def claim_task(self, team_id: str, task_id: str, agent_id: str, *, lease_seconds: int) -> dict[str, Any]:
-        lease = max(30, min(int(lease_seconds), 3600))
+        lease = max(TEAM_TASK_LEASE_MIN_SECONDS, min(int(lease_seconds), TEAM_TASK_LEASE_MAX_SECONDS))
         now = time.time()
         with self._lock, self._connection() as db:
             db.execute("BEGIN IMMEDIATE")
@@ -1013,9 +1057,11 @@ class AgentTeamStore:
         actor_agent_id: str,
         *,
         status: str,
-        result: str = "",
+        result: str | None = None,
         lease_seconds: int = 300,
     ) -> dict[str, Any]:
+        """Set a task's status. result=None keeps the stored result."""
+
         normalized = str(status).lower()
         if normalized not in {"pending", "running", "completed", "failed", "cancelled"}:
             raise ValueError(f"invalid task status: {status}")
@@ -1032,12 +1078,14 @@ class AgentTeamStore:
             if actor_agent_id not in {owner, str(team["lead_agent_id"])}:
                 raise ValueError("only the task owner or team lead may update this task")
             finished = now if normalized in TERMINAL_TEAM_TASK_STATUSES else None
-            lease_until = now + max(30, min(int(lease_seconds), 3600)) if normalized == "running" else None
+            lease = max(TEAM_TASK_LEASE_MIN_SECONDS, min(int(lease_seconds), TEAM_TASK_LEASE_MAX_SECONDS))
+            lease_until = now + lease if normalized == "running" else None
             next_owner = "" if normalized == "pending" else owner
+            next_result = None if result is None else str(result)[:TEAM_TASK_RESULT_CHARS]
             db.execute(
-                """UPDATE team_tasks SET status=?, owner_agent_id=?, result=?, lease_until=?, heartbeat_at=?,
-                   version=version+1, updated_at=?, finished_at=? WHERE id=?""",
-                (normalized, next_owner, str(result)[:6000], lease_until, now, now, finished, task_id),
+                """UPDATE team_tasks SET status=?, owner_agent_id=?, result=COALESCE(?, result),
+                   lease_until=?, heartbeat_at=?, version=version+1, updated_at=?, finished_at=? WHERE id=?""",
+                (normalized, next_owner, next_result, lease_until, now, now, finished, task_id),
             )
         return self.get_task(task_id) or {}
 
@@ -1173,10 +1221,21 @@ class AgentTeamRuntime:
         self.store.recover_interrupted()
         self.on_event = on_event
         self._events: dict[str, asyncio.Event] = {}
+        # Changes signalled per team, and how many each waiter has been shown.
+        self._changes: dict[str, int] = {}
+        self._seen: dict[tuple[str, str], int] = {}
         self._send_counts: dict[tuple[str, int], int] = {}
 
     def _signal(self, team_id: str) -> None:
-        self._events.setdefault(str(team_id), asyncio.Event()).set()
+        team_id = str(team_id)
+        count = self._changes.get(team_id, 0) + 1
+        self._changes[team_id] = count
+        # Whoever made the change already knows it. Everyone else keeps it
+        # pending until their own next wait returns.
+        observer = (team_id, _change_observer())
+        if self._seen.get(observer, 0) == count - 1:
+            self._seen[observer] = count
+        self._events.setdefault(team_id, asyncio.Event()).set()
 
     def emit(self, event: str, **payload: Any) -> None:
         team_id = str(payload.get("team_id") or "")
@@ -1351,11 +1410,29 @@ class AgentTeamRuntime:
         await asyncio.to_thread(self.acknowledge, message_ids)
 
     async def wait(self, team_id: str, timeout_ms: int) -> dict[str, Any]:
-        event = self._events.setdefault(str(team_id), asyncio.Event())
-        event.clear()
+        """Return the Team once it changed since this caller's previous wait.
+
+        The lead and each teammate's worker keep their own cursor. A change
+        that lands between two waits is therefore reported by the next one
+        instead of being cleared, and one caller's wait cannot use up another
+        caller's change. A caller's own changes do not end its wait.
+        timeout_ms=0 never blocks.
+        """
+
+        team_id = str(team_id)
+        observer = (team_id, _change_observer())
+        event = self._events.setdefault(team_id, asyncio.Event())
         if timeout_ms > 0:
-            try:
-                await asyncio.wait_for(event.wait(), timeout=timeout_ms / 1000)
-            except asyncio.TimeoutError:
-                pass
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + timeout_ms / 1000
+            while self._changes.get(team_id, 0) == self._seen.get(observer, 0):
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    break
+                event.clear()
+                try:
+                    await asyncio.wait_for(event.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break
+        self._seen[observer] = self._changes.get(team_id, 0)
         return await asyncio.to_thread(self.store.get_team, team_id) or {}

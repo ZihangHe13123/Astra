@@ -1257,9 +1257,12 @@ async def _main(startup_started: float):
         description="Only when the user explicitly asks to check back later or monitor something, schedule one bounded check in THIS session. Zero interval is one-shot; positive interval repeats until completion, failure, cancellation or expiry. Replaces the current plan. Closing/switching/restarting Astra stops it. Include what to inspect and the stop condition in prompt. Does not grant permission for new actions.",
         parameters={"type": "object", "properties": {
             "prompt": {"type": "string", "maxLength": 4000},
-            "delay_seconds": {"type": "number", "minimum": 60, "default": 300},
-            "interval_seconds": {"type": "number", "minimum": 0, "default": 0},
-            "lifetime_seconds": {"type": "number", "minimum": 60, "maximum": 43200, "default": 3600},
+            "delay_seconds": {"type": "number", "minimum": 60, "default": 300,
+                              "description": "Seconds until the first check; at least 60 and less than lifetime_seconds."},
+            "interval_seconds": {"type": "number", "minimum": 0, "default": 0,
+                                 "description": "0 for one check, or at least 60: seconds from the end of one check to the next."},
+            "lifetime_seconds": {"type": "number", "minimum": 60, "maximum": 43200, "default": 3600,
+                                 "description": "Seconds from now until the plan expires; must be greater than delay_seconds (raise it for a delay of an hour or more) and at most 43200."},
         }, "required": ["prompt"]}, fn=_schedule_wakeup, risk="write", cache_results=False,
     ))
     for name, description, fn in (

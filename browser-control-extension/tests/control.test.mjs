@@ -136,3 +136,56 @@ test('uncertain file commit is not retried',async()=>{
  const result=await f.req('upload_commit',1,{transferId:'t'});
  assert.equal(result.result.status,'unknown_outcome');assert.equal(count,1);
 });
+
+test('open redirect to another origin names where the page went',async()=>{
+ const f=fixture();f.c.enable();
+ f.api.tabs.create=async()=>{const t={id:3,url:'https://www.example.com/a?x=1',status:'complete'};f.tabs.set(3,t);return t;};
+ const r=await f.req('open',undefined,{url:'http://example.com/a?x=1'});
+ assert.equal(r.ok,false);assert.ok(r.error.includes('https://www.example.com/a?x=1'),r.error);
+ // The tab is gone, so the advice is to open the address, not to grant the tab.
+ assert.deepEqual(f.removed,[3]);assert.match(r.error,/open that address/i);assert.doesNotMatch(r.error,/grant this tab/i);
+ // An address too long for the 500-character error is reduced to its origin.
+ f.api.tabs.create=async()=>{const t={id:4,url:'https://www.example.com/'+'p'.repeat(400),status:'complete'};f.tabs.set(4,t);return t;};
+ const long=await f.req('open',undefined,{url:'http://example.com/'});
+ assert.ok(long.error.includes('went to https://www.example.com and'),long.error);
+});
+test('open timeout says when the tab address never became readable',async()=>{
+ const f=fixture();const c=createControl(f.api,{openTimeoutMs:0});c.enable();
+ f.api.tabs.create=async()=>{const t={id:3,url:'',status:'loading'};f.tabs.set(3,t);return t;};
+ const hidden=await c.handle({id:'hidden',operation:'open',args:{url:'https://example.com/'}});
+ assert.match(hidden.error,/timed out/i);assert.match(hidden.error,/before the page address could be read/);
+ f.api.tabs.create=async()=>{const t={id:4,url:'https://example.com/',status:'loading'};f.tabs.set(4,t);return t;};
+ const slow=await c.handle({id:'slow',operation:'open',args:{url:'https://example.com/'}});
+ assert.match(slow.error,/timed out/i);assert.doesNotMatch(slow.error,/before the page address could be read/);
+ assert.deepEqual(f.removed,[3,4]);
+});
+for(const how of ['request','event']) test('an agent-opened tab that leaves its origin reports the new address ('+how+')',async()=>{
+ const f=fixture();f.c.enable();
+ assert.equal((await f.req('open',undefined,{url:'https://example.com/start'})).ok,true);
+ f.tabs.get(3).url='https://other.test/next';
+ if(how==='event') f.c.navigation(3,'https://other.test/next');
+ const args={expectedOrigin:'https://example.com'};
+ const first=await f.c.handle({id:'first',operation:'snapshot',tabId:3,args});
+ assert.equal(first.ok,false);assert.ok(first.error.includes('https://other.test/next'),first.error);
+ // Still no control of it, and no script was injected into the other site.
+ assert.deepEqual(f.c.state().grantedTabIds,[]);assert.equal(f.scripts.length,0);
+ const again=await f.c.handle({id:'again',operation:'click',tabId:3,args:{...args,selector:'#go'}});
+ assert.equal(again.ok,false);assert.ok(again.error.includes('https://other.test/next'),again.error);
+ assert.deepEqual((await f.req('tabs')).result.tabs,[]);
+ // Closing the tab forgets it.
+ f.c.revoke(3);
+ assert.match((await f.c.handle({id:'closed',operation:'snapshot',tabId:3,args})).error,/explicit popup grant/);
+});
+test('a user-granted tab that leaves its origin is not described',async()=>{
+ const f=fixture();f.c.enable();await f.c.grant(1);
+ f.tabs.get(1).url='https://private.test/account';
+ const args={expectedOrigin:'https://example.com'};
+ for(const id of ['first','again']) {
+  const r=await f.c.handle({id,operation:'snapshot',tabId:1,args});
+  assert.equal(r.ok,false);assert.doesNotMatch(r.error,/private\.test/);
+ }
+ await f.c.grant(2);f.c.navigation(2,'https://private.test/other');
+ const r=await f.c.handle({id:'event',operation:'snapshot',tabId:2,args:{expectedOrigin:'https://other.test'}});
+ assert.equal(r.ok,false);assert.doesNotMatch(r.error,/private\.test/);
+ assert.deepEqual(f.c.state().grantedTabIds,[]);
+});

@@ -175,6 +175,30 @@ def test_final_report_is_durable_before_idle_and_restart_instruction_reaches_mod
     asyncio.run(scenario())
 
 
+def test_resumed_conversation_takes_an_instruction_longer_than_the_context_limit(tmp_path, monkeypatch):
+    async def scenario():
+        llm = RecordingLLM()
+        harness = Harness(tmp_path, monkeypatch, llm)
+        team, spawned = await harness.spawn()
+        await harness.wait(spawned["process"]["process_id"])
+        # The limit bounds a new worker's seed. A resumed conversation receives
+        # the instruction as its next message, so nothing is cut or refused.
+        instruction = "LONG-START " + "n" * delegate._DEFAULT_CONTEXT_CHARS + " LONG-END"
+
+        restarted = await harness.call(
+            "team_restart", team_id=team["id"], agent="worker", instruction=instruction,
+        )
+
+        assert restarted["restart_kind"] == "conversation_resume"
+        await harness.wait(restarted["process"]["process_id"])
+        assert any(
+            m.get("role") == "user" and m.get("content") == instruction
+            for m in llm.requests[-1]
+        )
+
+    asyncio.run(scenario())
+
+
 def test_batch_delegates_with_same_parent_have_distinct_canonical_histories(tmp_path, monkeypatch):
     async def scenario():
         harness = Harness(tmp_path, monkeypatch, RecordingLLM())

@@ -1,7 +1,7 @@
 /* Inject only into an isolated world. No page-supplied code is evaluated. */
 (() => {
   'use strict';
-  const VERSION = 10;
+  const VERSION = 11;
   if (globalThis.__astraBrowserPageVersion === VERSION) return;
   globalThis.__astraBrowserPage?.('invalidate', {});
   globalThis.__astraBrowserPageVersion = VERSION;
@@ -28,6 +28,15 @@
     return (el.value ?? el.innerText ?? el.textContent ?? '').replace(/\r\n?/g,'\n');
   }
   const failure = (status, message) => Object.assign(new Error(message), {status});
+  const optionLabel = option => (option.label || option.textContent || '').replace(/\s+/g,' ').trim();
+  const optionUsable = option => !option.disabled && !option.parentElement?.disabled;
+  function selectOptions(el, limit) {
+    if(el.tagName!=='SELECT') return {};
+    const all=[...el.options];
+    return {options:all.slice(0,limit).map(o=>({value:o.value.slice(0,120),label:optionLabel(o).slice(0,120),
+      ...(o.selected ? {selected:true} : {}),...(optionUsable(o) ? {} : {disabled:true})})),
+      ...(all.length>limit ? {optionsTruncated:true,optionCount:all.length} : {})};
+  }
   const opaqueSandbox = el => el.hasAttribute('sandbox') && !el.getAttribute('sandbox').split(/\s+/).includes('allow-same-origin');
   function allowedDocument(doc) {
     // DOM access alone is insufficient on pages that relax document.domain.
@@ -111,7 +120,7 @@
   }
   function scan() {
     const elements=[], allFrames=[], roots=[], chunks=[], limitations=['Only open shadow roots and accessible same-origin frames are inspected.'];
-    let count=0, length=0;
+    let count=0, length=0, textTruncated=false;
     function addDocument(doc, owner=null, enclosing=null, depth=0) {
       if (allFrames.length>=32 || depth>8) {limitations.push('Frame traversal limit reached (32 frames, depth 8).');return;}
       let identity=documentIds.get(doc);
@@ -126,9 +135,14 @@
     function walk(node, frame, depth) {
       if (!node || ++count>20000) return;
       if (node.nodeType===3) {
-        if(length<12000 && node.parentElement && visible(node.parentElement)) {
-          const text=node.textContent.replace(/\s+/g,' ').trim().slice(0,12000-length);
-          if(text){chunks.push(text);length+=text.length+1;}
+        // After the limit, look only far enough to learn whether visible text was left out.
+        if(!textTruncated && node.parentElement) {
+          const full=node.textContent.replace(/\s+/g,' ').trim();
+          if(full && visible(node.parentElement)) {
+            const text=full.slice(0,Math.max(0,12000-length));
+            if(text){chunks.push(text);length+=text.length+1;}
+            if(text.length<full.length) textTruncated=true;
+          }
         }
         return;
       }
@@ -152,7 +166,7 @@
     }
     addDocument(document);
     if(count>=20000) limitations.push('DOM traversal truncated at 20000 nodes.');
-    return {elements,frames:allFrames,roots,text:chunks.join('\n').slice(0,12000),limitations:[...new Set(limitations)]};
+    return {elements,frames:allFrames,roots,text:chunks.join('\n').slice(0,12000),textTruncated,limitations:[...new Set(limitations)]};
   }
   function frameInfo(frame) {
     return {frameRef:frame.frameRef,parentFrameRef:frame.parent?.frameRef || '',url:frame.url.slice(0,4096),
@@ -215,7 +229,7 @@
     observer.disconnect();refs=new Map();
     for(const root of data.roots) observer.observe(root,{childList:true,subtree:true});
     lastOptions={scope,role_filter,frame_ref,offset,limit,include_text};
-    const result={url:location.href.slice(0,4096),title:document.title.slice(0,1000),snapshotId,text:include_text?data.text:'',textIncluded:include_text,
+    const result={url:location.href.slice(0,4096),title:document.title.slice(0,1000),snapshotId,text:include_text?data.text:'',textIncluded:include_text,...(include_text ? {textTruncated:data.textTruncated} : {}),
       capabilities:{check:true,checkBatchLimit:20,checkViaClick:true,pageVersion:VERSION,formSnapshot:true,upload:typeof globalThis.__astraCreateFileUpload==='function' && typeof DataTransfer==='function'},frames:data.frames.map(frameInfo),scope,offset,totalMatches:selected.length,nextOffset:null,elements:[],limitations:data.limitations};
     const groups=new Map();
     if(scope==='form') result.groups=[];
@@ -259,7 +273,7 @@
     updatePagination();
     if(overBudget()) {
       result.limitations.push(scope==='form' ? 'Form observation limited to 10K characters; use nextOffset or frame_ref.' : 'Snapshot truncated to fit the 64 KiB transport budget; use frame_ref or pagination.');
-      while(result.text.length && overBudget()) result.text=result.text.slice(0,Math.floor(result.text.length*0.5));
+      while(result.text.length && overBudget()) {result.text=result.text.slice(0,Math.floor(result.text.length*0.5));result.textTruncated=true;}
       while(result.elements.length && overBudget()) {refs.delete(result.elements.pop().ref);pruneGroups();updatePagination();}
       // Frame metadata itself can exceed the transport budget on long URLs.
       if(overBudget()) for(const f of result.frames) f.url=f.url.slice(0,200);
@@ -340,7 +354,12 @@
       if(!visible(el)) throw new Error('Target is not visible');
       for(let f=frame; f.owner; f=f.parent) if(!visible(f.owner)) throw new Error('Containing frame is not visible');
       if(secret(el)) throw new Error('Password, file and hidden inputs are not supported');
-      if(operation==='read') {const text=value(el);return {status:'observed',target:targetInfo(target),value:text.slice(0,12000),valueTruncated:text.length>12000};}
+      if(operation==='read') {
+        const text=value(el), offset=args.offset ?? 0;
+        if(!Number.isInteger(offset) || offset<0) throw new Error('offset must be a non-negative integer');
+        return {status:'observed',target:targetInfo(target),value:text.slice(offset,offset+12000),valueTruncated:text.length>offset+12000,
+          valueOffset:offset,valueLength:text.length,...selectOptions(el,100)};
+      }
       if(disabled(el)) throw new Error('Target is disabled');
       const filling=['type','fill'].includes(operation);
       if(filling) {
@@ -348,10 +367,21 @@
         if(el.readOnly || el.getAttribute('aria-readonly')==='true') throw new Error('Target is readonly');
         if(!editable(el)) throw new Error('Target is not editable');
       }
+      let option, matchedBy='value';
       if(operation==='select') {
         if(el.tagName!=='SELECT') throw new Error('Target is not a select');
-        const option=[...el.options].find(x=>x.value===args.value);
-        if(!option || option.disabled || option.parentElement?.disabled) throw new Error('Selectable option not found');
+        const all=[...el.options];
+        option=all.find(x=>x.value===args.value);
+        let labelled=0;
+        if(!option && typeof args.value==='string') {
+          // A visible label selects only when exactly one option carries it.
+          const wanted=args.value.replace(/\s+/g,' ').trim(), matches=wanted ? all.filter(x=>optionLabel(x)===wanted) : [];
+          labelled=matches.length;
+          if(labelled===1) {option=matches[0];matchedBy='label';}
+        }
+        if(!option || !optionUsable(option)) return {status:'error',message:'Selectable option not found: '+
+          (option ? 'that option is disabled' : labelled>1 ? 'several options share this label; use a value' : 'no option has this value or exact label')+
+          '. Choose from options.',...selectOptions(el,100)};
       }
       const before=signature(), beforeValue=filling ? value(el) : '', identity=targetInfo(target);
       // No replay is safe after this boundary, including event-handler exceptions.
@@ -374,7 +404,9 @@
         el.blur();
       } else {
         const proto=operation==='select'?view.HTMLSelectElement.prototype:el.tagName==='TEXTAREA'?view.HTMLTextAreaElement.prototype:view.HTMLInputElement.prototype;
-        Object.getOwnPropertyDescriptor(proto,'value').set.call(el,filling?args.text:args.value);
+        Object.getOwnPropertyDescriptor(proto,'value').set.call(el,filling?args.text:option.value);
+        // Options can share a value; keep the one that was matched.
+        if(!filling && el.selectedIndex!==option.index) Object.getOwnPropertyDescriptor(proto,'selectedIndex').set.call(el,option.index);
         el.dispatchEvent(new view.Event('input',{bubbles:true,composed:true}));
         el.dispatchEvent(new view.Event('change',{bubbles:true,composed:true}));
       }
@@ -388,7 +420,8 @@
           message:verified?'Target value read back and matched; application save must be checked separately':'Target value did not match; inspect before deciding next action',after:afterSnapshot()};
       }
       const changed=signature()!==before;
-      return {status:changed?'observed':'no_observed_change',message:changed?'Page change observed; task success is not implied':'Action dispatched once; no page change observed',after:afterSnapshot()};
+      return {status:changed?'observed':'no_observed_change',message:changed?'Page change observed; task success is not implied':'Action dispatched once; no page change observed',
+        ...(option ? {option:{value:option.value.slice(0,120),label:optionLabel(option).slice(0,120),matchedBy}} : {}),after:afterSnapshot()};
     } catch(error) {
       return {status:dispatched?'unknown_outcome':error.status || 'error',message:dispatched?'Action may have executed; inspect target before deciding next action; do not replay automatically':String(error.message || error)};
     }

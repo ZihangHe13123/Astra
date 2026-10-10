@@ -3,6 +3,7 @@ import asyncio
 import base64
 import json
 import os
+import re
 import struct
 import subprocess
 import sys
@@ -430,6 +431,92 @@ def test_inspect_image_metadata_summarizes_comfyui_prompt_graph(tmp_path):
     assert raw_result["raw_metadata_included"] is True
     assert raw_result["raw_metadata_needed_for_prompt"] is False
     assert "prompt" in raw_result["raw_metadata"]
+
+
+def _write_text_png(path, chunks):
+    ihdr = struct.pack(">IIBBBBB", 512, 512, 8, 2, 0, 0, 0)
+    path.write_bytes(
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk(b"IHDR", ihdr)
+        + b"".join(
+            _png_chunk(b"tEXt", key.encode("latin-1") + b"\x00" + value.encode("latin-1"))
+            for key, value in chunks.items()
+        )
+        + _png_chunk(b"IEND", b"")
+    )
+
+
+def _inspect_metadata_tool(tmp_path, image, **arguments):
+    registry = ToolRegistry()
+    register_image_tools(registry, workdir=str(tmp_path))
+    result = run(registry.execute("inspect_image_metadata", {"path": str(image), **arguments}))
+    assert result["error"] == ""
+    return json.loads(result["output"])
+
+
+def _lookup(payload, dotted):
+    value = payload
+    for part in dotted.split("."):
+        value = value[part]
+    return value
+
+
+@pytest.mark.parametrize("chunks,fields", [
+    (
+        {"parameters": "a red fox, forest\nNegative prompt: blurry\nSteps: 20, Sampler: Euler a"},
+        ["parameters"],
+    ),
+    ({"prompt": "a red fox in a forest"}, ["prompt"]),
+    (
+        {"prompt": json.dumps({
+            "4": {"class_type": "CLIPTextEncode", "inputs": {"text": "a red fox"}},
+            "5": {"class_type": "CLIPTextEncode", "inputs": {"text": ""}},
+            "7": {"class_type": "KSampler", "inputs": {"positive": ["4", 0], "negative": ["5", 0]}},
+        })},
+        ["generation.positive_prompt"],
+    ),
+])
+def test_inspect_image_metadata_guidance_names_fields_the_result_contains(tmp_path, chunks, fields):
+    image = tmp_path / "generated.png"
+    _write_text_png(image, chunks)
+
+    payload = _inspect_metadata_tool(tmp_path, image)
+
+    guidance = payload["guidance"]
+    assert payload["prompt_extracted"] is True
+    assert f"available in {' and '.join(fields)}." in guidance
+    for field in [*fields, *re.findall(r"generation\.\w+", guidance)]:
+        assert _lookup(payload, field)
+    assert "No additional metadata extraction is required" in guidance
+
+
+def test_inspect_image_metadata_does_not_present_a_node_link_as_the_prompt(tmp_path):
+    image = tmp_path / "generated.png"
+    workflow = {
+        "4": {"class_type": "CLIPTextEncode", "inputs": {"text": ["12", 0]}},
+        "5": {"class_type": "CLIPTextEncode", "inputs": {"text": "blurry, low quality"}},
+        "7": {"class_type": "KSampler", "inputs": {"positive": ["4", 0], "negative": ["5", 0], "seed": 7}},
+        "12": {"class_type": "WildcardPrompt", "inputs": {"text": "a {red|blue} fox", "seed": 3}},
+    }
+    _write_comfy_png(image, workflow)
+
+    payload = _inspect_metadata_tool(tmp_path, image)
+    generation = payload["generation"]
+
+    assert generation["positive_prompt"] == ""
+    assert generation["negative_prompt"] == "blurry, low quality"
+    assert generation["prompts_not_extracted"] == ["positive_prompt"]
+    assert "'12'" not in json.dumps(generation)
+    # The linked text is not the prompt, so the raw workflow must stay reachable.
+    assert payload["prompt_extracted"] is False
+    assert payload["raw_metadata_needed_for_prompt"] is True
+    assert "generation.positive_prompt" in payload["guidance"]
+    assert "generation.negative_prompt" in payload["guidance"]
+    assert "include_raw=true" in payload["guidance"]
+    assert "No additional metadata extraction is required" not in payload["guidance"]
+
+    raw = _inspect_metadata_tool(tmp_path, image, include_raw=True)
+    assert json.loads(raw["raw_metadata"]["prompt"])["12"]["inputs"]["text"] == "a {red|blue} fox"
 
 
 def test_inspect_image_metadata_tool_is_exposed(tmp_path):

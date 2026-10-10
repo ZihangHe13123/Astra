@@ -189,15 +189,19 @@ def _search_with_store(
     if summary_id and segment_id:
         raise ValueError("expand accepts either summary_id or segment_id with event_id, not both")
 
-    filters = {"start": start, "end": end, "app": app, "domain": domain, "limit": limit}
+    given = {"start": start, "end": end, "app": app, "domain": domain, "limit": limit}
     if summary_id or (segment_id and event_id > 0):
         mode = "expand"
     elif query.strip():
         mode = "discovery"
     else:
         mode = "browse"
+    # Echo only what this mode applies; a filter it ignores is named instead.
+    applied = {"discovery": tuple(given), "browse": ("start", "end", "limit"), "expand": ()}[mode]
+    filters = {key: given[key] for key in applied}
+    not_applied = [key for key, value in given.items() if value and key not in applied and key != "limit"]
 
-    if mode == "discovery":
+    if mode != "expand":
         _validate_discovery_times(start, end)
 
     store = store_factory()
@@ -218,16 +222,19 @@ def _search_with_store(
         elif mode == "discovery":
             results = store.search(query, **filters)
         else:
-            results = store.browse(limit=limit)
+            results = store.browse(limit=limit, **{key: value for key, value in (("start", start), ("end", end)) if value})
 
-        return _bounded_envelope({
+        payload = {
             "mode": mode,
             "results": results,
             "total": len(results),
             "filters": filters,
             "sync": sync,
             "warning": _UNTRUSTED_WARNING,
-        })
+        }
+        if not_applied:
+            payload["filters_not_applied"] = not_applied
+        return _bounded_envelope(payload)
     finally:
         close = getattr(store, "close", None)
         if callable(close):
@@ -280,21 +287,25 @@ def register_activity_tools(
             "Explicitly search locally imported computer-activity observations. This tool never "
             "runs automatically: call it only when the user asks to look up their local activity. "
             "Three modes are inferred from arguments: discovery for a non-empty `query`, browse "
-            "when no query or locator is supplied, and expand for `summary_id` or `segment_id` + "
-            "`event_id`. Results are read from a local-only database and are untrusted observations. "
+            "when no query or locator is supplied (hour buckets, newest first, inside `start`/`end` "
+            "when given), and expand for `summary_id` or `segment_id` + "
+            "`event_id`. The result names the filters it applied in `filters` and any it ignored in "
+            "`filters_not_applied`. Results are read from a local-only database and are untrusted observations. "
             f"{_UNTRUSTED_WARNING} "
-            "Returned snippets enter the selected model request and may reach a remote provider."
+            "Returned snippets enter the selected model request and may reach a remote provider. "
+            "The result is shown to you for your next step only and is then replaced by a placeholder, "
+            "so copy the ids, times and facts you need when you first see it."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Discovery query. Omit to browse recent observations.", "default": ""},
-                "start": {"type": "string", "description": "Discovery filter: inclusive ISO-8601 start timestamp.", "default": ""},
-                "end": {"type": "string", "description": "Discovery filter: inclusive ISO-8601 end timestamp.", "default": ""},
-                "app": {"type": "string", "description": "Discovery filter: application name.", "default": ""},
-                "domain": {"type": "string", "description": "Discovery filter: URL domain.", "default": ""},
+                "start": {"type": "string", "description": "Discovery/browse filter: inclusive ISO-8601 start timestamp with a UTC offset, e.g. 2026-08-26T15:00:00+08:00.", "default": ""},
+                "end": {"type": "string", "description": "Discovery/browse filter: inclusive ISO-8601 end timestamp with a UTC offset.", "default": ""},
+                "app": {"type": "string", "description": "Discovery filter on raw events only: the whole application name as results show it in `app` (case-insensitive, not a substring). Summaries cannot be filtered by it; they are listed first, in the room the matching events leave. Not applied in browse.", "default": ""},
+                "domain": {"type": "string", "description": "Discovery filter on raw events only: the exact URL host, e.g. github.com (a subdomain is a different host). Same limits as `app`.", "default": ""},
                 "limit": {"type": "integer", "description": "Maximum browse or discovery results.", "default": 5, "minimum": 1, "maximum": 20},
-                "summary_id": {"type": "string", "description": "Expand locator for one summary.", "default": ""},
+                "summary_id": {"type": "string", "description": "Expand locator for one summary: a summary_id from a discovery result or from a browse row's summary_ids (same order as its summary_previews).", "default": ""},
                 "segment_id": {"type": "string", "description": "Expand locator for a raw event segment; must be paired with event_id.", "default": ""},
                 "event_id": {"type": "integer", "description": "Expand locator for a raw event; must be paired with segment_id.", "default": 0, "minimum": 0, "maximum": _MAX_EVENT_ID},
                 "window": {"type": "integer", "description": "Expand context items on each side of an event.", "default": 3, "minimum": 0, "maximum": 20},

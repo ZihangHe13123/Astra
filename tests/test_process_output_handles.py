@@ -26,3 +26,81 @@ def test_truncated_foreground_output_has_usable_process_reader(tmp_path, foregro
         assert not readback["error"], readback
         assert "begin-" + "x" * 200 + "-end" in json.loads(readback["output"])["content"]
     asyncio.run(scenario())
+
+
+# No newlines: a Windows child would write them as two bytes.
+_LINES = "".join(f"line {index:04d};" for index in range(300))
+_PRINT_LINES = "import sys\nfor index in range(300):\n    sys.stdout.write(f'line {index:04d};')\n"
+
+
+async def _finished_background_process(registry) -> tuple[str, dict]:
+    started = await registry.execute("execute_python", {"code": _PRINT_LINES, "background": True})
+    assert not started["error"], started
+    process_id = json.loads(started["output"])["process_id"]
+    polled = await registry.execute("process_poll", {"process_id": process_id, "wait_ms": 20_000})
+    description = json.loads(polled["output"])
+    assert description["status"] == "completed", description
+    return process_id, description
+
+
+def test_suggested_reader_arguments_page_through_the_output_once(tmp_path):
+    async def scenario():
+        registry = ToolRegistry(artifact_dir=tmp_path / "artifacts")
+        sandbox = LocalSandbox(workdir=str(tmp_path))
+        register_code_tools(registry, sandbox)
+        try:
+            _process_id, description = await _finished_background_process(registry)
+            reader = description["output_reader"]
+            pages = []
+            for _ in range(8):
+                assert reader["tool"] == "process_read"
+                read = await registry.execute(reader["tool"], {**reader["arguments"], "max_chars": 1000})
+                assert not read["error"], read
+                page = json.loads(read["output"])
+                pages.append(page["content"])
+                if page["eof"]:
+                    break
+                # Reusing the arguments each result suggests must move forward.
+                reader = page["output_reader"]
+            assert pages == [_LINES[:1000], _LINES[1000:2000], _LINES[2000:]]
+        finally:
+            await sandbox.close()
+    asyncio.run(scenario())
+
+
+def test_explicit_byte_read_keeps_the_cursor_and_reports_no_character_positions(tmp_path):
+    async def scenario():
+        registry = ToolRegistry(artifact_dir=tmp_path / "artifacts")
+        sandbox = LocalSandbox(workdir=str(tmp_path))
+        register_code_tools(registry, sandbox)
+
+        async def read(**arguments):
+            result = await registry.execute("process_read", arguments)
+            assert not result["error"], result
+            return json.loads(result["output"])
+
+        try:
+            process_id, _description = await _finished_background_process(registry)
+            first = await read(process_id=process_id, max_chars=1000)
+            assert first["content"] == _LINES[:1000]
+
+            tail = await read(process_id=process_id, byte_offset=2900, max_chars=1000)
+            assert tail["content"] == _LINES[2900:]
+            assert tail["eof"] is True
+            assert tail["next_byte_offset"] == tail["total_bytes"] == len(_LINES)
+            # A byte position does not say how many characters precede it.
+            assert not {"offset", "next_offset", "total_chars"} & set(tail)
+
+            # Looking at the tail did not lose the place of the cursor read.
+            second = await read(process_id=process_id, max_chars=1000)
+            assert second["content"] == _LINES[1000:2000]
+            assert second["offset"] == 1000
+
+            # An explicit page suggests the byte cursor where it stopped.
+            page = await read(process_id=process_id, byte_offset=0, max_chars=1500)
+            following = await read(**page["output_reader"]["arguments"])
+            assert page["content"] + following["content"] == _LINES
+            assert following["eof"] is True
+        finally:
+            await sandbox.close()
+    asyncio.run(scenario())

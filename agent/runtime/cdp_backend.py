@@ -1033,7 +1033,8 @@ class CdpConnection:
         """Poll page state until all supplied conditions are true."""
         if not any((selector, text, url_contains)):
             raise ValueError("selector, text, or url_contains is required")
-        deadline = asyncio.get_running_loop().time() + max(0.1, min(timeout_ms, 30000) / 1000)
+        waited = max(0.1, min(timeout_ms, 30000) / 1000)
+        deadline = asyncio.get_running_loop().time() + waited
         while asyncio.get_running_loop().time() < deadline:
             probe = await self.page_operation("probe", {
                 "selector": selector, "text": text, "urlContains": url_contains,
@@ -1043,7 +1044,7 @@ class CdpConnection:
             if probe.get("matched") is True:
                 return "Wait condition satisfied"
             await asyncio.sleep(0.2)
-        return json.dumps({"status": "timeout", "message": "Wait condition timed out"})
+        return json.dumps({"status": "timeout", "message": f"Wait condition timed out after {round(waited * 1000)} ms"})
 
     async def screenshot(self, *, output_path: str = "") -> str:
         """Capture a screenshot of the current page via CDP."""
@@ -1514,8 +1515,9 @@ class CdpBrowserBackend:
     async def interactive_fill(self, selector: str, text: str, *, tab_id: str = "default", url: str = "") -> str:
         return await self._target_operation("fill", tab_id=tab_id, url=url, selector=selector, text=text)
 
-    async def interactive_read(self, selector: str, *, tab_id: str = "default", url: str = "") -> str:
-        return await self._target_operation("read", tab_id=tab_id, url=url, selector=selector)
+    async def interactive_read(self, selector: str, *, tab_id: str = "default", url: str = "", offset: int = 0) -> str:
+        return await self._target_operation("read", tab_id=tab_id, url=url, selector=selector,
+                                            **({"offset": offset} if offset else {}))
 
     async def interactive_check(self, selector: str = "", *, checked: bool = True,
         checks: list[dict[str, object]] | None = None, tab_id: str = "default", url: str = "") -> str:

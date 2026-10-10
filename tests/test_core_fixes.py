@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -2424,9 +2425,201 @@ def test_git_write_tools_require_explicit_environment_opt_in(tmp_path, monkeypat
 
         result = await registry.execute("git_reset", {"mode": "hard", "target": "HEAD"})
 
-        assert "Set AGENT_ALLOW_GIT_WRITE=1" in result["error"]
+        # The model cannot set the backend's environment: the text names the
+        # user's approval and tells it not to retry.
+        assert result["code"] == "approval_required"
+        assert "need the user's approval for this repository" in result["error"]
+        assert "AGENT_ALLOW_GIT_WRITE=1" in result["error"]
+        assert "to enable git write tools" not in result["error"]
+
+        # YOLO skips this tool's permission prompt, so nothing grants the
+        # scope: the write is still refused, with the same explanation.
+        registry.yolo = True
+        refused = await registry.execute("git_reset", {"mode": "hard", "target": "HEAD"})
+        assert "git_reset was not run" in refused["error"]
+        assert "need the user's approval for this repository" in refused["error"]
+        assert "not retry" in refused["error"]
 
     monkeypatch.delenv("AGENT_ALLOW_GIT_WRITE", raising=False)
+    run(scenario())
+
+
+def _committed_git_repo(tmp_path, monkeypatch) -> Path:
+    """A one-commit repository whose Git runs ignore the developer's own config."""
+    import subprocess
+
+    empty_config = tmp_path / "empty.gitconfig"
+    empty_config.write_text("", encoding="utf-8")
+    for name, value in {
+        "GIT_CONFIG_GLOBAL": str(empty_config),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "test",
+        "GIT_AUTHOR_EMAIL": "test@example.invalid",
+        "GIT_COMMITTER_NAME": "test",
+        "GIT_COMMITTER_EMAIL": "test@example.invalid",
+        "LC_ALL": "C",
+    }.items():
+        monkeypatch.setenv(name, value)
+    root = tmp_path / "repo"
+    root.mkdir()
+    for args in (
+        ["init", "-q"],
+        ["checkout", "-q", "-b", "trunk"],
+    ):
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+    (root / "first.txt").write_text("one\n", encoding="utf-8")
+    for args in (["add", "first.txt"], ["commit", "-q", "-m", "first commit"]):
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+    return root
+
+
+def test_git_tools_fail_when_git_exits_nonzero(tmp_path, monkeypatch):
+    root = _committed_git_repo(tmp_path, monkeypatch)
+    monkeypatch.setenv("AGENT_ALLOW_GIT_WRITE", "1")
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_git_tools(registry, str(root))
+
+        missing = await registry.execute("git_add", {"files": "missing.txt"})
+        assert missing["output"] == ""
+        assert missing["code"] == "git_failed"
+        assert "missing.txt" in missing["error"]
+        assert "Staged" not in missing["error"]
+        assert missing["details"]["exit_code"] != 0
+
+        for name, args in (
+            ("git_show", {"commit": "no-such-ref"}),
+            ("git_diff", {"target": "no-such-ref"}),
+            ("git_checkout", {"target": "no-such-ref"}),
+        ):
+            failed = await registry.execute(name, args)
+            assert failed["output"] == "", name
+            assert failed["code"] == "git_failed", name
+            assert "no-such-ref" in failed["error"], name
+
+        # Git never started here, so there is no branch list to report.
+        no_repo = await registry.execute("git_branch", {"path": "missing-dir"})
+        assert no_repo["output"] == ""
+        assert no_repo["code"] == "git_failed"
+        assert no_repo["error"]
+
+        # A failure that git explains on stdout keeps that explanation.
+        nothing = await registry.execute("git_commit", {"message": "nothing staged"})
+        assert nothing["output"] == ""
+        assert nothing["code"] == "git_failed"
+        assert "nothing to commit" in nothing["error"]
+
+        for name, args in (
+            ("git_commit", {"message": ""}),
+            ("git_reset", {"mode": "sideways"}),
+        ):
+            rejected = await registry.execute(name, args)
+            assert rejected["output"] == "", name
+            assert rejected["code"] == "invalid_arguments", name
+
+        (root / "second.txt").write_text("two\n", encoding="utf-8")
+        staged = await registry.execute("git_add", {"files": "second.txt"})
+        assert staged["error"] == ""
+        assert staged["output"].startswith("Staged: second.txt")
+        committed = await registry.execute("git_commit", {"message": "second commit"})
+        assert committed["error"] == ""
+        log = await registry.execute("git_log", {})
+        assert log["error"] == ""
+        assert "second commit" in log["output"] and "first commit" in log["output"]
+
+    run(scenario())
+
+
+def test_git_timeout_is_a_failure_that_marks_partial_output(tmp_path, monkeypatch):
+    from agent.runtime.tools import git as git_tools
+
+    class HangingGit:
+        pid = 789
+        returncode = None
+
+        def __init__(self, args, **kwargs):
+            kwargs["stdout"].write(b"* 1234567 newest commit\n")
+            kwargs["stderr"].write(b"warning: still walking history\n")
+
+        def poll(self):
+            return self.returncode
+
+    def terminate(proc):
+        proc.returncode = -9
+
+    monkeypatch.setattr(git_tools.subprocess, "Popen", HangingGit)
+    monkeypatch.setattr(git_tools, "_terminate_process_tree", terminate)
+    monkeypatch.setattr(git_tools, "_git_timeout", lambda args: 0)
+    monkeypatch.setenv("AGENT_ALLOW_GIT_WRITE", "1")
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_git_tools(registry, str(tmp_path))
+
+        read = await registry.execute("git_log", {"max_count": 5})
+        assert read["output"] == ""
+        assert read["code"] == "git_timeout"
+        assert "[Timeout] git command exceeded 0s" in read["error"]
+        assert "partial" in read["error"]
+        assert "* 1234567 newest commit" in read["error"]
+        assert "warning: still walking history" in read["error"]
+        assert read["partial"] is True
+        assert read["retryable"] is True
+
+        # A stopped write may have taken effect, so it is not offered for retry.
+        write = await registry.execute("git_push", {"remote": "origin", "branch": "trunk"})
+        assert write["code"] == "git_timeout"
+        assert write["retryable"] is False
+        assert "repository state" in write["recovery_hint"]
+
+    run(scenario())
+
+
+def test_git_tools_require_only_arguments_without_a_default(tmp_path, monkeypatch):
+    root = _committed_git_repo(tmp_path, monkeypatch)
+    monkeypatch.setenv("AGENT_ALLOW_GIT_WRITE", "1")
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_git_tools(registry, str(root))
+
+        # No remote is configured, so these reach git and fail there instead of
+        # being rejected for arguments their descriptions call optional.
+        for name in ("git_push", "git_pull"):
+            result = await registry.execute(name, {})
+            assert result["code"] == "git_failed", (name, result)
+
+        for name in ("git_log", "git_show", "git_add", "git_checkout", "git_reset"):
+            result = await registry.execute(name, {})
+            assert result["error"] == "", (name, result)
+
+        for name, argument in (
+            ("git_commit", "message"),
+            ("git_clone", "url"),
+            ("git_revert", "commit"),
+        ):
+            result = await registry.execute(name, {})
+            assert result["code"] == "invalid_arguments", (name, result)
+            assert argument in result["error"], name
+
+    run(scenario())
+
+
+def test_git_show_lists_changed_files_without_the_patch(tmp_path, monkeypatch):
+    root = _committed_git_repo(tmp_path, monkeypatch)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_git_tools(registry, str(root))
+
+        shown = await registry.execute("git_show", {"commit": "HEAD"})
+
+        assert shown["error"] == ""
+        assert "first commit" in shown["output"]
+        assert "first.txt" in shown["output"]
+        assert "+one" not in shown["output"]
+
     run(scenario())
 
 
@@ -5064,6 +5257,25 @@ def test_write_file_verifies_persisted_content(tmp_path):
     run(scenario())
 
 
+@pytest.mark.parametrize("content", ["a\r\nb\r\n", "a\rb\r", "mixed\r\nlines\nhere\r"])
+def test_write_file_verifies_carriage_returns_byte_for_byte(tmp_path, content):
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "endings.txt"
+
+        result = await registry.execute(
+            "write_file",
+            {"path": str(target), "content": content},
+        )
+
+        assert result["error"] == ""
+        assert result["verified"] is True
+        assert target.read_bytes() == content.encode("utf-8")
+
+    run(scenario())
+
+
 def test_transactional_file_write_commits_complete_content_atomically(tmp_path):
     async def scenario():
         registry = ToolRegistry()
@@ -5150,6 +5362,71 @@ def test_transactional_file_write_rejects_bad_sequence_and_hash_without_target(t
         assert aborted["error"] == ""
         assert json.loads(aborted["output"])["status"] == "aborted"
         assert not target.exists()
+
+    run(scenario())
+
+
+def test_transactional_file_write_failures_carry_a_code_and_recovery(tmp_path):
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        existing = tmp_path / "existing.txt"
+        existing.write_text("keep", encoding="utf-8")
+
+        refused = await registry.execute("begin_file_write", {"path": str(existing)})
+        assert refused["code"] == "target_exists"
+        assert refused["output"] == ""
+        assert "overwrite=true" in refused["recovery_hint"]
+        assert refused["details"]["path"] == str(existing)
+
+        negative = await registry.execute(
+            "begin_file_write",
+            {"path": str(tmp_path / "sized.txt"), "expected_size": -1},
+        )
+        assert negative["code"] == "invalid_arguments"
+        assert negative["recovery_hint"]
+
+        target = tmp_path / "ordered.txt"
+        started = await registry.execute("begin_file_write", {"path": str(target)})
+        write_id = json.loads(started["output"])["write_id"]
+
+        out_of_order = await registry.execute(
+            "write_file_chunk",
+            {"write_id": write_id, "sequence": 2, "content": "late"},
+        )
+        assert out_of_order["code"] == "chunk_out_of_order"
+        assert out_of_order["retryable"] is True
+        assert out_of_order["details"]["expected_sequence"] == 0
+        assert out_of_order["details"]["received_sequence"] == 2
+        assert "sequence 0" in out_of_order["recovery_hint"]
+
+        # The refused chunk was not written, so the stated sequence is accepted.
+        accepted = await registry.execute(
+            "write_file_chunk",
+            {"write_id": write_id, "sequence": 0, "content": "first"},
+        )
+        assert accepted["error"] == ""
+
+        # The target appears while the transaction is open.
+        target.write_text("someone else", encoding="utf-8")
+        blocked = await registry.execute("commit_file_write", {"write_id": write_id})
+        assert blocked["code"] == "target_exists"
+        assert blocked["recovery_hint"]
+        assert target.read_text(encoding="utf-8") == "someone else"
+
+        aborted = await registry.execute("abort_file_write", {"write_id": write_id})
+        assert aborted["error"] == ""
+
+        for tool, arguments in (
+            ("write_file_chunk", {"write_id": write_id, "sequence": 1, "content": "x"}),
+            ("commit_file_write", {"write_id": write_id}),
+            ("abort_file_write", {"write_id": write_id}),
+        ):
+            closed = await registry.execute(tool, arguments)
+            assert closed["code"] == "unknown_write_id", tool
+            assert closed["retryable"] is False
+            assert "begin_file_write" in closed["recovery_hint"]
+            assert closed["details"]["write_id"] == write_id
 
     run(scenario())
 
@@ -5274,6 +5551,106 @@ def test_edit_file_preserves_utf8_bom_and_crlf_and_checks_version(tmp_path):
         )
         assert stale["code"] == "file_changed"
         assert b"delta" not in target.read_bytes()
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    "original,old,new,expected,removed,added",
+    [
+        # old stops before the line break: the last line keeps its own ending.
+        (
+            b"def f():  \n    return 1\t\nprint(f())\n",
+            "def f():\n    return 1",
+            "def f():\n    return 2",
+            b"def f():\n    return 2\t\nprint(f())\n",
+            "def f():  \n    return 1",
+            "def f():\n    return 2",
+        ),
+        # old ends with a line break: whole lines are replaced, nothing after them.
+        (
+            b"alpha  \nbeta\ngamma\n",
+            "alpha\nbeta\n",
+            "ALPHA\nBETA\n",
+            b"ALPHA\nBETA\ngamma\n",
+            "alpha  \nbeta\n",
+            "ALPHA\nBETA\n",
+        ),
+        # CRLF file, LF arguments.
+        (
+            b"alpha  \r\nbeta\r\ngamma\r\n",
+            "alpha\nbeta",
+            "ALPHA\nBETA\nextra",
+            b"ALPHA\r\nBETA\r\nextra\r\ngamma\r\n",
+            "alpha  \r\nbeta",
+            "ALPHA\r\nBETA\r\nextra",
+        ),
+        # CRLF file, CRLF arguments: line endings are not doubled.
+        (
+            b"alpha  \r\nbeta\r\ngamma\r\n",
+            "alpha\r\nbeta\r\n",
+            "ALPHA\r\nBETA\r\n",
+            b"ALPHA\r\nBETA\r\ngamma\r\n",
+            "alpha  \r\nbeta\r\n",
+            "ALPHA\r\nBETA\r\n",
+        ),
+        # LF file, CRLF arguments.
+        (
+            b"alpha  \nbeta\ngamma\n",
+            "alpha\r\nbeta",
+            "ALPHA\r\nBETA",
+            b"ALPHA\nBETA\ngamma\n",
+            "alpha  \nbeta",
+            "ALPHA\nBETA",
+        ),
+    ],
+)
+def test_edit_file_writes_the_trailing_whitespace_tolerant_match(
+    tmp_path, original, old, new, expected, removed, added
+):
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "drift.txt"
+        target.write_bytes(original)
+
+        result = await registry.execute(
+            "edit_file",
+            {"path": str(target), "old": old, "new": new},
+        )
+
+        assert result["error"] == ""
+        metadata = json.loads(result["output"])
+        landed = target.read_bytes()
+        assert landed == expected
+        assert metadata["replacements"] == 1
+        assert metadata["before_sha256"] == hashlib.sha256(original).hexdigest()
+        assert metadata["after_sha256"] == hashlib.sha256(landed).hexdigest()
+        assert metadata["before_sha256"] != metadata["after_sha256"]
+        # The counts describe the text really removed from and written to the file.
+        assert metadata["removed_chars"] == len(removed)
+        assert metadata["added_chars"] == len(added)
+        assert original.replace(removed.encode("utf-8"), added.encode("utf-8"), 1) == landed
+
+    run(scenario())
+
+
+def test_edit_file_rejects_an_ambiguous_trailing_whitespace_match(tmp_path):
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "twice.txt"
+        original = b"x = 1  \ny = 2\n\nx = 1\t\ny = 2\n"
+        target.write_bytes(original)
+
+        result = await registry.execute(
+            "edit_file",
+            {"path": str(target), "old": "x = 1\ny = 2", "new": "x = 3\ny = 2"},
+        )
+
+        assert result["code"] == "edit_match_ambiguous"
+        assert result["details"]["matches"] == 2
+        assert target.read_bytes() == original
 
     run(scenario())
 
@@ -5425,6 +5802,175 @@ def test_read_file_streams_huge_lines_with_a_bounded_byte_cursor(tmp_path, monke
         )
         assert continued["error"] == ""
         assert continued["output"].endswith("a" * 1024)
+
+    run(scenario())
+
+
+def _read_file_page(result: dict) -> tuple[dict, str]:
+    assert result["error"] == ""
+    header, payload = result["output"].split("\n", 1)
+    return json.loads(header.removeprefix("[File metadata: ").removesuffix("]")), payload
+
+
+def test_read_file_line_paging_reports_what_remains_after_each_page(tmp_path):
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "paged.txt"
+        text = "".join(f"line{index}\n" for index in range(10))
+        target.write_text(text, encoding="utf-8")
+
+        pages = []
+        offset = 0
+        while offset is not None:
+            result = await registry.execute(
+                "read_file",
+                {"path": str(target), "offset": offset, "limit": 4},
+            )
+            metadata, payload = _read_file_page(result)
+            pages.append(payload)
+            # Line paging never hands out a byte cursor, and the file size in
+            # lines is known from the first page on.
+            assert metadata["next_byte_offset"] is None
+            assert metadata["line_truncated"] is False
+            assert metadata["total_lines"] == 10
+            assert metadata["truncated"] is (metadata["next_offset"] is not None)
+            assert bool(result.get("partial")) is metadata["truncated"]
+            offset = metadata["next_offset"]
+
+        assert pages == ["".join(f"line{index}\n" for index in range(start, min(start + 4, 10)))
+                         for start in (0, 4, 8)]
+        assert metadata["line_start"] == 9
+        assert metadata["line_end"] == 10
+
+        whole = await registry.execute("read_file", {"path": str(target)})
+        assert whole["output"] == text
+        assert not whole.get("partial")
+
+    run(scenario())
+
+
+def test_read_file_states_the_default_line_limit_it_applies(tmp_path, monkeypatch):
+    monkeypatch.setenv("READ_FILE_DEFAULT_LINES", "3")
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "default.txt"
+        target.write_text("".join(f"{index}\n" for index in range(8)), encoding="utf-8")
+
+        metadata, payload = _read_file_page(
+            await registry.execute("read_file", {"path": str(target)})
+        )
+        assert payload == "0\n1\n2\n"
+        assert metadata["next_offset"] == 3
+
+        schema = registry.to_openai_tools(names={"read_file"})[0]["function"]
+        assert "default 3" in schema["description"]
+        assert "default 3" in schema["parameters"]["properties"]["limit"]["description"]
+
+    run(scenario())
+
+
+def test_read_file_page_size_cap_ends_the_page_between_lines(tmp_path, monkeypatch):
+    monkeypatch.setenv("READ_FILE_MAX_PAGE_BYTES", "1024")
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "wide.txt"
+        text = "".join(f"{index}" * 299 + "\n" for index in range(7))
+        target.write_text(text, encoding="utf-8")
+
+        pages = []
+        offset = 0
+        while offset is not None:
+            metadata, payload = _read_file_page(
+                await registry.execute("read_file", {"path": str(target), "offset": offset})
+            )
+            # An ordinary line is never split, so no byte cursor is needed.
+            assert payload.endswith("\n")
+            assert metadata["line_truncated"] is False
+            assert metadata["next_byte_offset"] is None
+            pages.append(payload)
+            offset = metadata["next_offset"]
+
+        assert len(pages) > 1
+        assert "".join(pages) == text
+
+    run(scenario())
+
+
+def test_read_file_byte_offset_finishes_a_cut_line_and_honours_limit(tmp_path, monkeypatch):
+    monkeypatch.setenv("READ_FILE_MAX_PAGE_BYTES", "1024")
+    monkeypatch.setenv("READ_FILE_MAX_LINE_BYTES", "1024")
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "long-line.txt"
+        target.write_text("a" * 1500 + "\nsecond\nthird\n", encoding="utf-8")
+
+        first = await registry.execute("read_file", {"path": str(target)})
+        metadata, payload = _read_file_page(first)
+        assert payload == "a" * 1024
+        assert metadata["line_truncated"] is True
+        assert metadata["truncated"] is True
+        assert metadata["next_byte_offset"] == 1024
+        # The line after the cut one is where line paging resumes.
+        assert metadata["next_offset"] == 1
+        assert first["partial"] is True
+
+        rest = await registry.execute(
+            "read_file",
+            {"path": str(target), "byte_offset": metadata["next_byte_offset"], "limit": 1},
+        )
+        rest_metadata, rest_payload = _read_file_page(rest)
+        assert rest_payload == "a" * 476 + "\n"
+        assert rest_metadata["line_truncated"] is False
+        assert rest_metadata["truncated"] is True
+        assert rest_metadata["next_byte_offset"] == 1501
+        assert rest["partial"] is True
+
+        resumed = await registry.execute(
+            "read_file",
+            {"path": str(target), "offset": metadata["next_offset"]},
+        )
+        resumed_metadata, resumed_payload = _read_file_page(resumed)
+        assert resumed_payload == "second\nthird\n"
+        assert resumed_metadata["truncated"] is False
+        assert resumed_metadata["next_offset"] is None
+        assert not resumed.get("partial")
+
+    run(scenario())
+
+
+def test_read_file_cuts_an_over_long_multibyte_line_between_characters(tmp_path, monkeypatch):
+    monkeypatch.setenv("READ_FILE_MAX_PAGE_BYTES", "1024")
+    monkeypatch.setenv("READ_FILE_MAX_LINE_BYTES", "1024")
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "wide-characters.txt"
+        text = "中" * 1000 + "\n"
+        target.write_text(text, encoding="utf-8")
+
+        metadata, payload = _read_file_page(
+            await registry.execute("read_file", {"path": str(target)})
+        )
+        assert metadata["line_truncated"] is True
+        assert payload == "中" * 341
+        assert metadata["next_byte_offset"] == 341 * 3
+
+        pieces = [payload]
+        while metadata["truncated"]:
+            metadata, payload = _read_file_page(await registry.execute(
+                "read_file",
+                {"path": str(target), "byte_offset": metadata["next_byte_offset"]},
+            ))
+            pieces.append(payload)
+        assert "".join(pieces) == text
 
     run(scenario())
 
@@ -5770,6 +6316,111 @@ def test_apply_patch_rejects_standard_unified_diff_without_side_effects(tmp_path
 
         assert "not standard unified diff" in result["error"]
         assert target.read_text(encoding="utf-8") == "before\n"
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    "original,expected",
+    [
+        (b"keep\na  \nb\n", b"keep\na\nB\n"),        # hunk at the end: final newline stays
+        (b"\na  \nb\nrest\n", b"\na\nB\nrest\n"),  # hunk after a leading blank line
+        (b"a  \nb", b"a\nB"),                           # no final newline before, none after
+    ],
+)
+def test_apply_patch_whitespace_tolerant_match_keeps_the_other_lines(tmp_path, original, expected):
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "drift.txt"
+        target.write_bytes(original)
+        patch = "\n".join([
+            "*** Begin Patch",
+            "*** Update File: drift.txt",
+            "@@",
+            " a",
+            "-b",
+            "+B",
+            "*** End Patch",
+        ])
+
+        result = await registry.execute("apply_patch", {"patch": patch})
+
+        assert result["error"] == ""
+        assert target.read_bytes() == expected
+
+    run(scenario())
+
+
+def test_apply_patch_accepts_the_example_from_its_own_description(tmp_path):
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        schema = registry.to_openai_tools(names={"apply_patch"})[0]["function"]
+        description = schema["description"]
+        patch_text = schema["parameters"]["properties"]["patch"]["description"]
+        # The model reads these strings as written: no escaped newlines or quotes.
+        workspace = str(registry.filesystem_policy.workspace)
+        for text in (description, patch_text):
+            assert workspace in text
+            assert "\\" not in text.replace(workspace, "")
+
+        example = description.split("Example:\n", 1)[1]
+        target = tmp_path / "src" / "main.py"
+        target.parent.mkdir()
+        target.write_text('def hello():\n    print("old")\n', encoding="utf-8")
+
+        result = await registry.execute("apply_patch", {"patch": example})
+
+        assert result["error"] == ""
+        assert json.loads(result["output"])["status"] == "applied"
+        assert target.read_text(encoding="utf-8") == (
+            'def hello():\n    print("new")\n    print("extra")\n'
+        )
+
+    run(scenario())
+
+
+def test_apply_patch_format_error_gets_a_format_hint(tmp_path):
+    async def scenario():
+        registry = ToolRegistry()
+        register_file_tools(registry, str(tmp_path))
+        target = tmp_path / "notes.txt"
+        target.write_text("alpha\n\nbeta\n", encoding="utf-8")
+        # The blank context line is missing its leading space.
+        malformed = "\n".join([
+            "*** Begin Patch",
+            "*** Update File: notes.txt",
+            "@@",
+            " alpha",
+            "",
+            "-beta",
+            "+gamma",
+            "*** End Patch",
+        ])
+
+        result = await registry.execute("apply_patch", {"patch": malformed})
+
+        assert result["code"] == "patch_precondition_failed"
+        assert "invalid hunk line" in result["error"]
+        assert "blank context line is a single space" in result["recovery_hint"]
+        assert "unique context" not in result["recovery_hint"]
+        assert target.read_text(encoding="utf-8") == "alpha\n\nbeta\n"
+
+        # A well-formed patch that does not match still gets the context hint.
+        stale = malformed.replace("\n\n-beta", "\n \n-stale")
+        mismatch = await registry.execute("apply_patch", {"patch": stale})
+        assert "did not match" in mismatch["error"]
+        assert "unique context" in mismatch["recovery_hint"]
+        assert "single space" not in mismatch["recovery_hint"]
+
+        # With the leading space restored the same patch applies.
+        fixed = await registry.execute(
+            "apply_patch",
+            {"patch": malformed.replace("\n\n-beta", "\n \n-beta")},
+        )
+        assert fixed["error"] == ""
+        assert target.read_text(encoding="utf-8") == "alpha\n\ngamma\n"
 
     run(scenario())
 
@@ -7040,6 +7691,502 @@ def test_fetch_url_prefers_beautifulsoup_article_text(monkeypatch):
     run(scenario())
 
 
+def _fake_web_transport(monkeypatch, *, get=None, post=None):
+    """Answer every web tool request from memory and record it.
+
+    The tools swallow transport exceptions, so tests assert on the returned
+    call list instead of relying on a handler that raises.
+    """
+    import agent.runtime.tools.web as web_module
+
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, payload, url):
+            self.text = payload if isinstance(payload, str) else json.dumps(payload)
+            self.url = url
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return json.loads(self.text)
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def get(self, url, **kwargs):
+            calls.append(("get", url))
+            if get is None:
+                raise RuntimeError(f"no GET handler: {url}")
+            return FakeResponse(get(url), url)
+
+        async def post(self, url, **kwargs):
+            calls.append(("post", url))
+            if post is None:
+                raise RuntimeError(f"no POST handler: {url}")
+            return FakeResponse(post(url, kwargs.get("json")), url)
+
+    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    return calls
+
+
+def _exa_first_page(_url, _payload):
+    return {
+        "resolvedSearchType": "auto",
+        "results": [{
+            "title": "Exa first page",
+            "url": "https://exa.example.test/one",
+            "highlights": ["Exa highlight."],
+        }],
+    }
+
+
+def _searxng_query(url):
+    return dict(urllib.parse.parse_qsl(urllib.parse.urlsplit(url).query))
+
+
+@pytest.mark.parametrize("extra,sent", [
+    ({"page": 2}, {"pageno": "2"}),
+    ({"engine": "google"}, {"engines": "google"}),
+    ({"category": "it"}, {"categories": "it"}),
+])
+def test_search_web_auto_keeps_searxng_only_parameters_off_exa(monkeypatch, extra, sent):
+    def searxng(url):
+        if "/search?" not in url:
+            return "<html><body>Inline page body with enough words to be kept as content.</body></html>"
+        return {
+            "query": "latest model report",
+            "number_of_results": 40,
+            "results": [{
+                "title": f"SearXNG page {_searxng_query(url)['pageno']}",
+                "url": "https://searx.example.test/hit",
+                "content": "snippet",
+            }],
+        }
+
+    monkeypatch.setenv("EXA_API_KEY", "test-exa-key")
+    monkeypatch.setenv("WEB_SEARCH_PROVIDER", "auto")
+    calls = _fake_web_transport(monkeypatch, get=searxng, post=_exa_first_page)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        # Without the extra parameter this query is one that auto sends to Exa.
+        plain = await registry.execute("search_web", {"query": "latest model report"})
+        assert "Exa first page" in plain["output"]
+        assert calls == [("post", "https://api.exa.ai/search")]
+
+        result = await registry.execute("search_web", {"query": "latest model report", **extra})
+
+        assert result["error"] == ""
+        assert [kind for kind, _ in calls].count("post") == 1
+        search_urls = [url for kind, url in calls if kind == "get" and "/search?" in url]
+        assert len(search_urls) == 1
+        assert _searxng_query(search_urls[0]).items() >= sent.items()
+        assert f"SearXNG page {extra.get('page', 1)}" in result["output"]
+        assert "Exa first page" not in result["output"]
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("extra,named", [
+    ({"language": "ja"}, "language=ja"),
+    ({"include_content": True}, "include_content"),
+])
+def test_search_web_auto_stays_on_exa_for_a_preference_and_names_it(monkeypatch, extra, named):
+    monkeypatch.setenv("EXA_API_KEY", "test-exa-key")
+    monkeypatch.setenv("WEB_SEARCH_PROVIDER", "auto")
+    calls = _fake_web_transport(monkeypatch, get=lambda url: {"results": []}, post=_exa_first_page)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+
+        result = await registry.execute("search_web", {"query": "latest model report", **extra})
+
+        assert result["error"] == ""
+        assert calls == [("post", "https://api.exa.ai/search")]
+        assert "Exa first page" in result["output"]
+        assert f"Not applied on the Exa route: {named}" in result["output"]
+
+    run(scenario())
+
+
+def test_search_web_forced_exa_names_the_parameters_it_did_not_apply(monkeypatch):
+    monkeypatch.setenv("EXA_API_KEY", "test-exa-key")
+    calls = _fake_web_transport(monkeypatch, post=_exa_first_page)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        first = await registry.execute("search_web", {"query": "agent runtimes", "provider": "exa"})
+        second = await registry.execute("search_web", {
+            "query": "agent runtimes",
+            "provider": "exa",
+            "page": 2,
+            "engine": "google",
+            "language": "ja",
+        })
+
+        assert "Exa first page" in first["output"]
+        assert "Not applied" not in first["output"]
+        # Exa has no second page: the same hits must not read as a new page.
+        assert "Exa first page" in second["output"]
+        note = next((line for line in second["output"].splitlines() if line.startswith("Not applied")), "")
+        assert "page=2" in note
+        assert "engine=google" in note
+        assert "language=ja" in note
+        assert "first results" in note
+        assert all(kind == "post" for kind, _ in calls)
+
+    run(scenario())
+
+
+def test_search_web_exa_fallback_names_the_parameters_it_did_not_apply(monkeypatch):
+    def searxng_down(url):
+        raise RuntimeError("searxng down")
+
+    monkeypatch.setenv("EXA_API_KEY", "test-exa-key")
+    monkeypatch.setenv("WEB_SEARCH_PROVIDER", "auto")
+    calls = _fake_web_transport(monkeypatch, get=searxng_down, post=_exa_first_page)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        result = await registry.execute("search_web", {"query": "obscure named thing", "page": 3})
+
+        assert [kind for kind, _ in calls] == ["get", "post"]
+        assert "Exa first page" in result["output"]
+        note = next((line for line in result["output"].splitlines() if line.startswith("Not applied")), "")
+        assert "page=3" in note
+
+    run(scenario())
+
+
+def _one_site_results(url):
+    hits = [
+        {"title": f"Docs {index}", "url": f"https://docs.example.test/page-{index}", "content": "doc"}
+        for index in range(1, 7)
+    ]
+    hits.insert(2, {"title": "Other site", "url": "https://other.example.test/a", "content": "other"})
+    return {"query": _searxng_query(url)["q"], "number_of_results": 900, "results": hits}
+
+
+def test_search_web_site_query_is_not_capped_per_domain(monkeypatch):
+    _fake_web_transport(monkeypatch, get=_one_site_results)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        result = await registry.execute("search_web", {
+            "query": "site:docs.example.test asyncio",
+            "provider": "searxng",
+            "max_results": 6,
+        })
+
+        listed = re.findall(r"URL: (\S+)", result["output"])
+        assert [url for url in listed if "docs.example.test" in url] == [
+            f"https://docs.example.test/page-{index}" for index in range(1, 6)
+        ]
+        assert len(listed) == 6
+        assert "per site" not in result["output"]
+        assert not result.get("partial")
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("query", ["asyncio docs", "asyncio docs -site:spam.example.test"])
+def test_search_web_says_when_the_per_domain_cap_left_results_out(monkeypatch, query):
+    _fake_web_transport(monkeypatch, get=_one_site_results)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        result = await registry.execute("search_web", {
+            "query": query,
+            "provider": "searxng",
+            "max_results": 6,
+        })
+
+        listed = re.findall(r"URL: (\S+)", result["output"])
+        assert listed == [
+            "https://docs.example.test/page-1",
+            "https://docs.example.test/page-2",
+            "https://other.example.test/a",
+        ]
+        note = next((line for line in result["output"].splitlines() if line.startswith("Shown:")), "")
+        assert note.startswith(f"Shown: {len(listed)} results,")
+        assert "at most 2 per site" in note
+        assert "4 more" in note
+        assert "site:" in note
+        assert result["partial"] is True
+
+    run(scenario())
+
+
+_LISTING_PAGE = (
+    "<html><body><nav>Navigation noise</nav><main><h1>Thread title</h1>"
+    "<article><p>First post says the launch moved to Tuesday.</p></article>"
+    "<article><p>Second post corrects it to Wednesday.</p></article>"
+    "<article><p>Third post confirms Wednesday at noon.</p></article>"
+    "</main><footer>Footer noise</footer></body></html>"
+)
+
+
+def test_fetch_url_and_web_extract_keep_every_article_of_a_listing_page(monkeypatch):
+    import agent.runtime.tools.web as web_module
+
+    async def safe_url(url):
+        return True
+
+    _fake_web_transport(monkeypatch, get=lambda url: _LISTING_PAGE)
+    monkeypatch.setattr(web_module, "_is_safe_public_url", safe_url)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        fetched = await registry.execute("fetch_url", {"url": "https://example.test/thread"})
+        extracted = await registry.execute("web_extract", {
+            "urls": ["https://example.test/thread"],
+            "provider": "http",
+        })
+        page = json.loads(extracted["output"])["results"][0]
+
+        for text in (fetched["output"], page["content"]):
+            assert "Thread title" in text
+            assert "moved to Tuesday" in text
+            assert "corrects it to Wednesday" in text
+            assert "Wednesday at noon" in text
+            assert "Navigation noise" not in text
+            assert "Footer noise" not in text
+
+    run(scenario())
+
+
+def test_fetch_url_returns_a_short_non_html_body_as_it_is(monkeypatch):
+    bodies = {
+        "https://example.test/health": '{"status": "ok"}',
+        "https://example.test/ping": "pong\n",
+        "https://example.test/app": (
+            '<!doctype html><html><head><script src="/app.js"></script></head>'
+            '<body><div id="root"></div></body></html>'
+        ),
+    }
+    _fake_web_transport(monkeypatch, get=bodies.__getitem__)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        health = await registry.execute("fetch_url", {"url": "https://example.test/health"})
+        ping = await registry.execute("fetch_url", {"url": "https://example.test/ping"})
+        shell = await registry.execute("fetch_url", {"url": "https://example.test/app"})
+
+        assert health["output"].endswith('{"status": "ok"}')
+        assert ping["output"].endswith("pong")
+        for result in (health, ping):
+            assert "Empty/minimal" not in result["output"]
+            assert "JavaScript" not in result["output"]
+        # An HTML page that yields no text still gets the rendering hint.
+        assert "Empty/minimal content" in shell["output"]
+        assert "web_extract" in shell["output"]
+
+    run(scenario())
+
+
+def test_fetch_url_truncation_states_the_full_length_and_how_to_get_more(monkeypatch):
+    pages = {
+        "https://example.test/long": f"<html><body><p>{'word ' * 600}</p></body></html>",
+        "https://example.test/huge": f"<html><body><p>{'word ' * 12000}</p></body></html>",
+    }
+    _fake_web_transport(monkeypatch, get=pages.__getitem__)
+
+    async def scenario():
+        # Keep the registry's own inline preview out of the way of the longest page.
+        registry = ToolRegistry(max_inline_chars=100_000)
+        register_web_tools(registry, None)
+        clipped = await registry.execute("fetch_url", {"url": "https://example.test/long", "max_length": 500})
+        whole = await registry.execute("fetch_url", {"url": "https://example.test/long", "max_length": 5000})
+        maxed = await registry.execute("fetch_url", {"url": "https://example.test/huge", "max_length": 50000})
+
+        assert "first 500 of 2999 characters" in clipped["output"]
+        assert "max_length" in clipped["output"]
+        assert "web_extract" in clipped["output"]
+        assert clipped["partial"] is True
+
+        assert "truncated" not in whole["output"]
+        assert not whole.get("partial")
+
+        # At the largest max_length the only way to more is another tool.
+        tail = maxed["output"][-400:]
+        assert "first 50000 of 59999 characters" in tail
+        assert "web_extract" in tail
+        assert "larger max_length" not in tail
+        assert maxed["partial"] is True
+
+    run(scenario())
+
+
+def test_web_extract_tells_unresolved_hosts_and_bad_schemes_from_private_addresses(monkeypatch):
+    import socket
+
+    import agent.runtime.tools.web as web_module
+
+    lookups = []
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        lookups.append(host)
+        if host == "intranet.example.test":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", port))]
+        raise socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided, or not known")
+
+    calls = _fake_web_transport(monkeypatch)
+    monkeypatch.setattr(web_module.socket, "getaddrinfo", fake_getaddrinfo)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        result = await registry.execute("web_extract", {
+            "urls": [
+                "https://mistyped.example.test/page",
+                "ftp://files.example.test/report.txt",
+                "http://intranet.example.test/admin",
+                "http://127.0.0.1/private",
+            ],
+            "provider": "http",
+        })
+        payload = json.loads(result["output"])
+        unresolved, scheme, private_name, private_ip = payload["results"]
+
+        assert "could not resolve the host name" in unresolved["error"]
+        assert "http://" in scheme["error"] and "https://" in scheme["error"]
+        for entry in (unresolved, scheme):
+            assert "Blocked" not in entry["error"]
+            assert "private" not in entry["error"]
+            assert entry["backend"] != "blocked"
+        # The security block itself is unchanged for real private targets.
+        for entry in (private_name, private_ip):
+            assert entry["error"] == "Blocked: URL targets localhost, credentials, or a private/internal address"
+            assert entry["backend"] == "blocked"
+        assert payload["success"] is False
+        assert all(not entry["content"] for entry in payload["results"])
+        assert calls == []
+        assert set(lookups) == {"mistyped.example.test", "intranet.example.test"}
+
+    run(scenario())
+
+
+def test_public_url_check_rejects_the_same_targets_whatever_the_wording(monkeypatch):
+    import socket
+
+    import agent.runtime.tools.web as web_module
+
+    resolved = {
+        "public.example.test": ["93.184.216.34"],
+        "intranet.example.test": ["10.0.0.5"],
+        "mixed.example.test": ["93.184.216.34", "10.0.0.5"],
+    }
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        if host not in resolved:
+            raise socket.gaierror(socket.EAI_NONAME, "not known")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (address, port)) for address in resolved[host]]
+
+    monkeypatch.setattr(web_module.socket, "getaddrinfo", fake_getaddrinfo)
+    rejected = [
+        "http://127.0.0.1/x",
+        "http://[::1]/x",
+        "http://10.1.2.3/",
+        "http://169.254.169.254/latest/meta-data",
+        "http://localhost:8080/",
+        "http://printer.local/",
+        "http://service.internal/",
+        "http://user:secret@public.example.test/",
+        "ftp://public.example.test/file",
+        "public.example.test/no-scheme",
+        "https://mistyped.example.test/",
+        "https://intranet.example.test/",
+        "https://mixed.example.test/",
+    ]
+    accepted = ["https://public.example.test/page", "https://8.8.8.8/"]
+
+    async def scenario():
+        for url in rejected:
+            assert await web_module._is_safe_public_url(url) is False, url
+        for url in accepted:
+            assert await web_module._is_safe_public_url(url) is True, url
+
+    run(scenario())
+
+
+def test_web_extract_lists_urls_left_out_by_the_five_url_limit(monkeypatch):
+    import agent.runtime.tools.web as web_module
+
+    async def safe_url(url):
+        return True
+
+    def page(url):
+        return f"<html><body><main><p>Body of {url} with enough words to count as real content.</p></main></body></html>"
+
+    calls = _fake_web_transport(monkeypatch, get=page)
+    monkeypatch.setattr(web_module, "_is_safe_public_url", safe_url)
+    urls = [f"https://example.test/page-{index}" for index in range(1, 8)]
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        result = await registry.execute("web_extract", {"urls": urls, "provider": "http"})
+        payload = json.loads(result["output"])
+
+        assert [entry["url"] for entry in payload["results"]] == urls[:5]
+        assert payload["not_processed"]["urls"] == urls[5:]
+        assert "5" in payload["not_processed"]["reason"]
+        assert sorted(url for _, url in calls) == urls[:5]
+        assert result["partial"] is True
+
+        within_limit = await registry.execute("web_extract", {"urls": urls[:5], "provider": "http"})
+        assert "not_processed" not in json.loads(within_limit["output"])
+        assert not within_limit.get("partial")
+
+    run(scenario())
+
+
+def test_web_extract_starts_at_the_configured_provider_unless_the_call_names_one(monkeypatch):
+    import agent.runtime.tools.web as web_module
+
+    async def safe_url(url):
+        return True
+
+    def page(url):
+        return f"<html><body><main><p>Body of {url} with enough words to count as real content.</p></main></body></html>"
+
+    # Exa comes before plain HTTP in the built-in order; the setting moves the start.
+    monkeypatch.setenv("EXA_API_KEY", "test-exa-key")
+    monkeypatch.setenv("WEB_EXTRACT_PROVIDER", "http")
+    calls = _fake_web_transport(monkeypatch, get=page)
+    monkeypatch.setattr(web_module, "_is_safe_public_url", safe_url)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+
+        configured = json.loads((await registry.execute(
+            "web_extract", {"urls": ["https://example.test/a"]},
+        ))["output"])
+        assert configured["provider_chain"] == ["http"]
+        assert configured["results"][0]["backend"] == "http"
+        assert ("get", "https://example.test/a") in calls
+        assert not any(kind == "post" for kind, _ in calls)
+
+        named = json.loads((await registry.execute(
+            "web_extract", {"urls": ["https://example.test/b"], "provider": "exa"},
+        ))["output"])
+        assert named["provider_chain"][0] == "exa"
+
+    run(scenario())
+
+
 def test_search_status_reports_searxng_and_browser(monkeypatch):
     import agent.runtime.tools.web as web_module
 
@@ -7160,7 +8307,7 @@ def test_current_time_tool_uses_runtime_clock(monkeypatch):
         register_time_tools(registry)
         result = await registry.execute("current_time", {})
 
-        assert result["output"] == "2026-05-20 周三 17:08:09 UTC+08:00"
+        assert result["output"] == "2026-05-20 周三 17:08:09 UTC+08:00 (Asia/Shanghai)"
 
     run(scenario())
 

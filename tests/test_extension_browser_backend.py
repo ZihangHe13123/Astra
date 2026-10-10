@@ -208,3 +208,49 @@ def test_wait_receipt_reports_actual_limit_and_changed_url_without_claiming_matc
         assert result['wait']['timeoutMs']==10000 and result['wait']['requestedTimeoutMs']==15000
         assert result['wait']['urlChanged'] is True and result['after']['text']=='10 of 10'
     asyncio.run(run())
+
+
+def test_read_offset_reaches_the_page_script_only_when_used():
+    async def run():
+        t=Transport();b=ExtensionBrowserBackend(transport=t)
+        await b.connect_existing(target_tab_id='7')
+        await b.interactive_read('ref:s1:e1',offset=12000)
+        assert t.calls[-1]==('read',7,{'ref':'s1:e1','offset':12000,'expectedOrigin':'https://example.com'})
+        # A first read is sent exactly as before, so an extension not yet reloaded sees nothing new.
+        await b.interactive_read('ref:s1:e1')
+        assert t.calls[-1]==('read',7,{'ref':'s1:e1','expectedOrigin':'https://example.com'})
+    asyncio.run(run())
+
+
+def test_close_message_tells_an_opened_tab_from_a_users_tab(tmp_path):
+    from agent.runtime.browser_session import BrowserSessionManager
+    from agent.runtime.tools.browser import register_browser_tools
+    from agent.runtime.tools.registry import ToolRegistry
+
+    class ControllerTransport(Transport):
+        """Answers close the way the controller does: its own tab is closed, a granted one detached."""
+        def __init__(self): super().__init__(); self.owned=set()
+        async def request(self,operation,*,tab_id=None,args=None):
+            if operation=='close':
+                self.calls.append((operation,tab_id,args))
+                return {'status':'closed' if tab_id in self.owned else 'detached','tabId':tab_id}
+            result=await super().request(operation,tab_id=tab_id,args=args)
+            if operation=='open': self.owned.add(result['tabId'])
+            return result
+
+    async def run():
+        for opened,expected in ((True,'Closed browser tab'),(False,'Released browser tab')):
+            transport=ControllerTransport()
+            registry=ToolRegistry()
+            register_browser_tools(registry,manager=BrowserSessionManager(path=tmp_path/f'{opened}.db'),
+                backend=ExtensionBrowserBackend(transport=transport))
+            if opened:
+                result=await registry.execute('browser_open',{'url':'https://example.com/a','extract':False})
+            else:
+                result=await registry.execute('browser_connect',{'target_tab_id':'7'})
+            assert not result['error'] and '[Browser Error]' not in result['output'],result
+            closed=await registry.execute('browser_close',{})
+            assert expected in closed['output'],closed
+            assert transport.calls[-1][0]=='close'
+            if not opened: assert 'stays open' in closed['output']
+    asyncio.run(run())

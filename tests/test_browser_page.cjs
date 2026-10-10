@@ -380,3 +380,84 @@ test('verification yields without background-throttled page timers',async()=>{
  const r=await w.__astraBrowserPage('fill',{selector:'input',text:'wanted'});
  assert.equal(r.status,'verification_failed');assert.equal(r.value,'app rejected');w.close();
 });
+
+test('snapshot says whether visible page text went past the 12000-character limit',async t=>{
+  const long=fixture('<p>'+'a'.repeat(11990)+'</p><p>tail that does not fit</p>');t.after(()=>long.close());
+  let s=await long.__astraBrowserPage('snapshot',{});
+  assert.equal(s.textTruncated,true);assert.equal(s.text.length,12000);assert.ok(!s.text.includes('does not fit'));
+  // Without page text there is nothing to cut, so the flag is left out.
+  s=await long.__astraBrowserPage('snapshot',{include_text:false});
+  assert.equal(s.text,'');assert.ok(!('textTruncated' in s));
+  // The wait probe searches the same window.
+  assert.equal((await long.__astraBrowserPage('probe',{text:'does not fit'})).matched,false);
+  const short=fixture('<p>'+'a'.repeat(11990)+'</p><p hidden>hidden text is not page text</p>');t.after(()=>short.close());
+  s=await short.__astraBrowserPage('snapshot',{});
+  assert.equal(s.textTruncated,false);assert.equal(s.text.length,11990);
+});
+
+test('read continues a long value from an offset without touching refs',async t=>{
+  const body='0123456789'.repeat(3000);
+  const w=fixture('<button>Go</button><div id=c>'+body+'</div>');t.after(()=>w.close());const call=w.__astraBrowserPage;
+  const s=await call('snapshot',{});
+  let r=await call('read',{selector:'#c'});
+  assert.equal(r.value,body.slice(0,12000));assert.equal(r.valueTruncated,true);
+  assert.equal(r.valueOffset,0);assert.equal(r.valueLength,30000);
+  r=await call('read',{selector:'#c',offset:12000});
+  assert.equal(r.value,body.slice(12000,24000));assert.equal(r.valueTruncated,true);assert.equal(r.valueOffset,12000);
+  r=await call('read',{selector:'#c',offset:24000});
+  assert.equal(r.value,body.slice(24000));assert.equal(r.valueTruncated,false);
+  r=await call('read',{selector:'#c',offset:30000});
+  assert.equal(r.value,'');assert.equal(r.valueTruncated,false);
+  for(const offset of [-1,1.5,'12000']) assert.equal((await call('read',{selector:'#c',offset})).status,'error');
+  assert.equal((await call('click',{ref:s.elements[0].ref})).status,'no_observed_change');
+});
+
+test('select lists its options, accepts one exact visible label, and changes nothing on a miss',async t=>{
+  const w=fixture('<select id=s><option value="">Choose</option><option value=sg>Singapore</option><option value=my>  Malaysia\n</option>'+
+    '<option value=x1>Other</option><option value=x2>Other</option><option value=no disabled>Norway</option><option value=Other>Value wins</option></select>');
+  t.after(()=>w.close());const el=w.document.querySelector('select');
+  // Results come from the page's realm; compare them as plain data.
+  const call=async(...args)=>JSON.parse(JSON.stringify(await w.__astraBrowserPage(...args)));
+  let events=0;el.addEventListener('change',()=>events++);
+  // Snapshots carry only the current value, so a form with many selects keeps its element budget.
+  assert.equal((await call('snapshot',{})).elements.find(e=>e.id==='s').options,undefined);
+  const listed=await call('read',{selector:'#s'});
+  assert.deepEqual(listed.options.slice(0,3),[{value:'',label:'Choose',selected:true},{value:'sg',label:'Singapore'},{value:'my',label:'Malaysia'}]);
+  assert.deepEqual(listed.options[5],{value:'no',label:'Norway',disabled:true});
+  // No value and no label: the failure carries the choices and the page is untouched.
+  let r=await call('select',{selector:'#s',value:'Japan'});
+  assert.equal(r.status,'error');assert.deepEqual(r.options,listed.options);assert.equal(el.value,'');assert.equal(events,0);
+  // A disabled option stays unselectable by value or by label.
+  for(const value of ['no','Norway']) {r=await call('select',{selector:'#s',value});assert.equal(r.status,'error');assert.ok(r.options.length);}
+  assert.equal(el.value,'');assert.equal(events,0);
+  // One option with this visible label.
+  r=await call('select',{selector:'#s',value:'Malaysia'});
+  assert.equal(r.status,'observed');assert.equal(el.value,'my');assert.deepEqual(r.option,{value:'my',label:'Malaysia',matchedBy:'label'});
+  assert.equal((await call('read',{selector:'#s'})).options[2].selected,true);
+  // A value match is preferred to a label shared by two other options.
+  r=await call('select',{selector:'#s',value:'Other'});
+  assert.equal(r.status,'observed');assert.equal(el.value,'Other');assert.equal(r.option.matchedBy,'value');
+  assert.equal(events,2);
+  w.document.querySelector('option[value=Other]').remove();
+  r=await call('select',{selector:'#s',value:'Other'});
+  assert.equal(r.status,'error');assert.match(r.message,/several options share this label/);assert.equal(events,2);
+  // Refs work as selectors too.
+  const fresh=(await call('snapshot',{})).elements.find(e=>e.id==='s');
+  assert.equal((await call('select',{selector:'ref:'+fresh.ref,value:'sg'})).status,'observed');assert.equal(el.value,'sg');
+});
+
+test('select keeps the matched option when another option shares its value',async t=>{
+  const w=fixture('<select id=s><option value="">Choose</option><option value=dup>First</option><option value=dup>Second</option></select>');
+  t.after(()=>w.close());
+  const r=await w.__astraBrowserPage('select',{selector:'#s',value:'Second'});
+  assert.equal(r.status,'observed');assert.equal(w.document.querySelector('select').selectedIndex,2);
+});
+
+test('option lists are bounded in reads and failures',async t=>{
+  const w=fixture('<select id=s>'+Array.from({length:130},(_,i)=>`<option value="v${i}">${'Label '+i+' '+'x'.repeat(200)}</option>`).join('')+'</select>');
+  t.after(()=>w.close());const call=w.__astraBrowserPage;
+  for(const r of [await call('read',{selector:'#s'}),await call('select',{selector:'#s',value:'missing'})]) {
+    assert.equal(r.options.length,100);assert.equal(r.optionsTruncated,true);assert.equal(r.optionCount,130);
+    assert.ok(r.options.every(o=>o.label.length<=120));
+  }
+});

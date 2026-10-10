@@ -158,7 +158,11 @@ Edge or sending global keys to compensate for approval.
   each per turn (or per code-mode program). Connect and write tools retain their
   repeated-call guards. This prevents cached refs from being presented as a live
   refresh without allowing unbounded observation loops or automatic write replay.
-- `browser_wait` can wait for an element, text or URL substring. A timeout is an
+- `browser_select` takes an option's `value` or its exact visible label (when
+  one option has it). A miss changes nothing and lists the options; `browser_read`
+  on the select lists them too.
+- `browser_wait` needs at least one condition: an element (exactly one visible
+  match), text or a URL substring. A timeout is an
   unmet condition, not a successful wait. Use observed or explicitly known
   conditions; multiple conditions must all match. Extension receipts report
   the requested and actual timeout (up to 10 seconds), conditions and whether
@@ -202,7 +206,9 @@ snapshot/read on an unbound tab, even if a generic recovery hint suggests them.
 ## Current limits
 
 Page snapshots are bounded to 150 interactive elements, 12,000 text characters
-and a total serialization budget below 64 KiB. Password and hidden-text inputs
+and a total serialization budget below 64 KiB. A snapshot whose text was cut
+says so (`textTruncated` and a note line); `browser_read` returns up to 12,000
+characters of one element and continues a longer value with `offset`. Password and hidden-text inputs
 are excluded. File inputs expose metadata only, including when visually hidden;
 arbitrary page text may still contain sensitive information. Open
 shadow roots and accessible same-origin child frames are supported. Cross-origin

@@ -51,8 +51,20 @@ def register_notebook_tools(registry, execute_python, permission_check, permissi
             "skip_cells": {"type": "array", "items": {"type": "integer", "minimum": 1}, "default": []},
             "cell_timeout": {"type": "integer", "minimum": 1, "maximum": 86400, "default": 600},
             "kernel_name": {"type": "string", "default": ""},
-            "foreground_yield_ms": {"type": "integer", "minimum": 0, "maximum": 90000, "default": 10000},
-            "background": {"type": "boolean", "default": False},
+            "foreground_yield_ms": {
+                "type": "integer", "minimum": 0, "maximum": 90000, "default": 10000,
+                "description": (
+                    "How long to wait for the run, in milliseconds, before returning a process_id "
+                    "and letting it continue. 0 does not yield: the run stays in the foreground "
+                    "and is stopped at the sandbox time limit. On the host sandbox a positive "
+                    "value or background=true runs without that limit; the Docker sandbox "
+                    "applies it to every run."
+                ),
+            },
+            "background": {
+                "type": "boolean", "default": False,
+                "description": "Return immediately with a process_id.",
+            },
             **approval_justification_schema(),
         }, "required": ["path"]},
         fn=execute, sandboxed=True, risk="execute", approval="on_risk", group="code",

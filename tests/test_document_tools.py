@@ -440,3 +440,42 @@ def test_a_parent_with_sub_sections_refuses_headings_and_guards_its_subtree(tmp_
     removed = call(registry, "doc_edit", {"path": "nested.md", "action": "remove", "section_id": "2-candidates",
                                           "expected_hash": fresh["2-candidates"]["hash"]})
     assert removed["action"] == "remove" and statuses(registry) == [("3-budget", "pending")]
+
+
+def test_a_sub_section_edit_hands_back_the_parent_hash_and_a_stale_one_is_explained(tmp_path):
+    registry = make_registry(tmp_path)
+    create_nested(registry)
+
+    def hashes() -> dict[str, str]:
+        return {item["id"]: item["hash"] for item in call(registry, "doc_outline", {"path": "nested.md"})["sections"]}
+
+    parent = call(registry, "doc_edit", {"path": "nested.md", "action": "write", "section_id": "2-candidates",
+                                         "content": "Three places."})
+    assert "parent_hashes" not in parent
+    child = call(registry, "doc_edit", {"path": "nested.md", "action": "write", "section_id": "2-1-scoring",
+                                        "content": "Points."})
+    # The parent's hash covers the child, so the child's write result carries the parent's new hash.
+    assert child["parent_hashes"] == [{"id": "2-candidates", "hash": hashes()["2-candidates"]}]
+    assert child["parent_hashes"][0]["hash"] != parent["section"]["hash"]
+
+    stale = call(registry, "doc_edit", {"path": "nested.md", "action": "write", "section_id": "2-candidates",
+                                        "content": "Four places.", "expected_hash": parent["section"]["hash"]})
+    assert stale["code"] == "section_changed"
+    assert "one of its sub-sections" in stale["error"]
+    assert "sub-section" in stale["recovery_hint"] and "Someone" not in stale["recovery_hint"]
+    assert stale["details"]["current_hash"] == child["parent_hashes"][0]["hash"]
+
+    rewritten = call(registry, "doc_edit", {"path": "nested.md", "action": "write", "section_id": "2-candidates",
+                                            "content": "Four places.",
+                                            "expected_hash": child["parent_hashes"][0]["hash"]})
+    assert rewritten["status"] == "written"
+
+    added = call(registry, "doc_edit", {"path": "nested.md", "action": "add", "heading": "2.2 Costs",
+                                        "after": "2-1-scoring", "content": "Cheap."})
+    assert added["parent_hashes"] == [{"id": "2-candidates", "hash": hashes()["2-candidates"]}]
+    assert added["parent_hashes"][0]["hash"] != rewritten["section"]["hash"]
+    removed = call(registry, "doc_edit", {"path": "nested.md", "action": "remove",
+                                          "section_id": added["section"]["id"],
+                                          "expected_hash": added["section"]["hash"]})
+    assert removed["parent_hashes"] == [{"id": "2-candidates", "hash": hashes()["2-candidates"]}]
+    assert removed["parent_hashes"][0]["hash"] != added["parent_hashes"][0]["hash"]

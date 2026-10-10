@@ -177,8 +177,8 @@ class ExtensionBrowserBackend:
     async def interactive_fill(self, selector, text, *, tab_id='default', url=''):
         return await self._action('fill', tab_id, url, {**self._target(selector), 'text':text})
 
-    async def interactive_read(self, selector, *, tab_id='default', url=''):
-        return await self._action('read', tab_id, url, self._target(selector))
+    async def interactive_read(self, selector, *, tab_id='default', url='', offset=0):
+        return await self._action('read', tab_id, url, {**self._target(selector), **({'offset':offset} if offset else {})})
 
     async def interactive_upload(self, selector, files, *, tab_id, url, frame_ref=''):
         from .browser_upload import upload
@@ -238,7 +238,8 @@ class ExtensionBrowserBackend:
             entry = self._tabs.pop(tab_id, None)
             self._page_capabilities.pop(tab_id, None)
             if entry is not None and self.transport.connected and entry[1] == self.transport.generation:
-                await self.transport.request('close', tab_id=entry[0])
+                # 'closed' for a tab this runtime opened, 'detached' for a user's tab that stays open.
+                return (await self.transport.request('close', tab_id=entry[0])).get('status')
         else:
             self._tabs.clear()
             self._page_capabilities.clear()

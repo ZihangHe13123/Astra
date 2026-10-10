@@ -91,3 +91,61 @@ def test_tool_requires_explicit_origin_and_cannot_change_it(tmp_path, monkeypatc
                           "old_string": "\nCheck", "new_string": "\nSkip"}))
     assert "origins are fixed" in changed["error"]
     assert store.raw_file("sample", "SKILL.md").count("Check") == 2
+
+
+def test_an_origin_refusal_names_the_origin_that_works_for_that_skill(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    store = SkillStore(tmp_path / "skills")
+    registry = ToolRegistry()
+    register_skill_tools(registry, store)
+
+    def manage(**arguments):
+        return asyncio.run(registry.execute("skill_manage", arguments))
+
+    assert not manage(action="create", origin="user", name="manual", content=skill("manual"))["error"]
+    assert not manage(action="create", origin="auto", name="automatic", content=skill("automatic"))["error"]
+    edit = {"action": "patch", "old_string": "\nCheck", "new_string": "\nVerify"}
+
+    # Automatic learning still cannot change a user-owned skill; the refusal now says what can.
+    refused = manage(origin="auto", name="manual", **edit)
+    assert "user-owned" in refused["error"] and "origin=user" in refused["error"]
+    assert "\nVerify" not in store.view("manual")
+    assert not manage(origin="user", name="manual", **edit)["error"]
+    assert "\nVerify" in store.view("manual")
+
+    refused = manage(origin="user", name="automatic", **edit)
+    assert "origins are fixed" in refused["error"] and "origin=auto" in refused["error"]
+    assert "\nVerify" not in store.view("automatic")
+    assert not manage(origin="auto", name="automatic", **edit)["error"]
+    assert "\nVerify" in store.view("automatic")
+
+    # Neither edit moved a skill to the other owner, and no origin can change a built-in skill.
+    assert {item["name"]: item["origin"] for item in store.list()} == {
+        "astra-core": "builtin", "automatic": "auto", "manual": "user",
+    }
+    for origin in ("auto", "user"):
+        assert "built-in" in manage(origin=origin, name="astra-core", **edit)["error"]
+    assert "Skill not found: nowhere" in manage(origin="auto", name="nowhere", **edit)["error"]
+
+
+def test_a_learned_skill_patch_reports_how_often_the_text_matched(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    store = SkillStore(tmp_path / "skills")
+    registry = ToolRegistry()
+    register_skill_tools(registry, store)
+
+    def patch(old_string, file_path="SKILL.md"):
+        return asyncio.run(registry.execute("skill_manage", {
+            "action": "patch", "origin": "auto", "name": "automatic", "file_path": file_path,
+            "old_string": old_string, "new_string": "replacement",
+        }))["error"]
+
+    created = asyncio.run(registry.execute("skill_manage", {
+        "action": "create", "origin": "auto", "name": "automatic", "content": skill("automatic"),
+    }))
+    assert not created["error"]
+    # The text is in the description and in the body; the old message hid whether it was 0 or several.
+    assert "found 2" in patch("actual output")
+    assert "found 0" in patch("text that is not there")
+    assert "Skill file not found: automatic/references/notes.md" in patch("anything", "references/notes.md")
+    assert "references/, templates/, scripts/ or assets/" in patch("anything", "notes.md")

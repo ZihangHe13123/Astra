@@ -40,6 +40,7 @@ except ImportError:  # pragma: no cover - optional dependency
     markdownify_html = None
 
 from ..network import active_proxy_for_url
+from ..tool_execution import PartialResult
 from .approval import normalized_origin
 from .registry import ToolDef, ToolRegistry
 from .image_search import register_image_search
@@ -425,20 +426,25 @@ def exa_configuration_status() -> tuple[bool, str]:
     return bool(key), source
 
 
-async def _is_safe_public_url(url: str) -> bool:
-    """Reject credentials, localhost, and private/internal network targets."""
+async def _public_url_problem(url: str) -> str:
+    """Return "" for a safe public URL, otherwise why it is rejected.
+
+    "scheme": not a full http(s) URL. "unresolved": the host name did not
+    resolve. "private": credentials, localhost, or a private/internal target.
+    Every non-empty answer is a rejection; the names only pick the wording.
+    """
     try:
         parsed = urllib.parse.urlparse(url)
     except ValueError:
-        return False
+        return "scheme"
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        return False
+        return "scheme"
     if parsed.username or parsed.password:
-        return False
+        return "private"
 
     host = parsed.hostname.rstrip(".").lower()
     if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
-        return False
+        return "private"
 
     try:
         addresses = [ipaddress.ip_address(host)]
@@ -448,15 +454,22 @@ async def _is_safe_public_url(url: str) -> bool:
                 socket.getaddrinfo, host, parsed.port or (443 if parsed.scheme == "https" else 80)
             )
         except (OSError, socket.gaierror):
-            return False
+            return "unresolved"
         addresses = []
         for info in infos:
             try:
                 addresses.append(ipaddress.ip_address(info[4][0]))
             except ValueError:
-                return False
+                return "private"
+        if not addresses:
+            return "unresolved"
 
-    return bool(addresses) and all(address.is_global for address in addresses)
+    return "" if all(address.is_global for address in addresses) else "private"
+
+
+async def _is_safe_public_url(url: str) -> bool:
+    """Reject credentials, localhost, and private/internal network targets."""
+    return not await _public_url_problem(url)
 
 
 class SearchProviderState:
@@ -619,13 +632,21 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         except Exception as exc:
             return None, str(exc)
 
+    def _main_region(soup):
+        # Feeds, threads and listings use one <article> per item, so only a
+        # lone <article> stands for the whole page.
+        articles = soup.find_all("article", limit=2)
+        if len(articles) == 1:
+            return articles[0]
+        return soup.find("main") or soup.body or soup
+
     def _html_to_text(body: str) -> str:
         if BeautifulSoup is not None:
             try:
                 soup = BeautifulSoup(body, "html.parser")
                 for node in soup(["script", "style", "noscript", "nav", "footer", "header", "aside"]):
                     node.decompose()
-                main = soup.find("article") or soup.find("main") or soup.body or soup
+                main = _main_region(soup)
                 return re.sub(r"\s+", " ", main.get_text(" ", strip=True)).strip()
             except Exception:
                 pass
@@ -644,7 +665,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             soup = BeautifulSoup(body, "html.parser")
             for node in soup(["script", "style", "noscript", "nav", "footer", "header", "aside"]):
                 node.decompose()
-            main = soup.find("article") or soup.find("main") or soup.body or soup
+            main = _main_region(soup)
             markdown = markdownify_html(
                 str(main),
                 heading_style="ATX",
@@ -692,9 +713,18 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         return body, err
 
     def _format_content(url: str, text: str, max_length: int) -> str:
-        if len(text) > max_length:
-            text = text[:max_length] + "\n\n... (truncated)"
-        return f"Content from: {url}\n{'=' * 50}\n\n{text}"
+        header = f"Content from: {url}\n{'=' * 50}\n\n"
+        if len(text) <= max_length:
+            return f"{header}{text}"
+        more = (
+            "call again with a larger max_length (up to 50000) or use web_extract"
+            if max_length < 50000
+            else "use web_extract, which saves the full text of a long page to a file"
+        )
+        return PartialResult(
+            f"{header}{text[:max_length]}\n\n... (truncated: the first {max_length} of "
+            f"{len(text)} characters are shown. For more, {more}.)"
+        )
 
     def _fetched_label() -> str:
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -857,10 +887,41 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         content_results = min(max(content_results, 0), max_results)
         content_max_length = min(max(content_max_length, 200), 5000)
 
+        # Exa takes a query, a count and a science/news category. Everything
+        # else the caller set is honoured by the SearXNG route only.
+        searxng_only = []
+        if page > 1:
+            searxng_only.append(f"page={page}")
+        if engine:
+            searxng_only.append(f"engine={engine}")
+        if category and category not in {"general", "science", "news"}:
+            searxng_only.append(f"category={category}")
+        # These three change which results come back, so auto must honour them.
+        needs_searxng = bool(searxng_only)
+        # A language preference or inline content is not worth leaving Exa
+        # for; an Exa answer only says that it did not apply them.
+        if language != "auto":
+            searxng_only.append(f"language={language}")
+        if include_content:
+            searxng_only.append("include_content")
+
+        def _exa_reply(output: str) -> str:
+            if not searxng_only:
+                return output
+            head, separator, rest = output.partition("\n\n")
+            return (
+                f"{head}\nNot applied on the Exa route: {', '.join(searxng_only)}. "
+                "Exa returns only its first results for a query; use provider=searxng for those options."
+                f"{separator}{rest}"
+            )
+
         if language == "auto":
             language = "zh" if _is_chinese(query) else "en"
 
         selected_provider, allow_fallback = _select_search_provider(query, category, provider)
+        if selected_provider == "exa" and allow_fallback and needs_searxng:
+            # auto must not pick the route that would drop what was asked for.
+            selected_provider = "searxng"
         if selected_provider == "exa":
             exa_cache_key = json.dumps(
                 {
@@ -875,12 +936,12 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             )
             cached = _cache_get(search_cache, exa_cache_key, search_cache_ttl)
             if cached is not None:
-                return cached
+                return _exa_reply(cached)
             exa_output, exa_error = await _search_exa(query, max_results, category)
             if exa_output is not None:
                 if not (allow_fallback and exa_output.startswith("No Exa results")):
                     _cache_set(search_cache, exa_cache_key, exa_output, search_cache_ttl)
-                    return exa_output
+                    return _exa_reply(exa_output)
             if not allow_fallback:
                 return f"[Exa Error] {exa_error}"
 
@@ -917,7 +978,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             if allow_fallback:
                 exa_output, exa_error = await _search_exa(query, max_results, category)
                 if exa_output is not None:
-                    return exa_output
+                    return _exa_reply(exa_output)
                 return f"[Search Error] SearXNG unavailable ({err or 'empty response'}); Exa: {exa_error}"
             return f"[Network Error] Cannot reach SearXNG ({searxng_url}): {err or 'empty response'}"
 
@@ -939,13 +1000,16 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             if allow_fallback:
                 exa_output, exa_error = await _search_exa(query, max_results, category)
                 if exa_output is not None:
-                    return exa_output
+                    return _exa_reply(exa_output)
                 return f"No SearXNG results for '{query}'; Exa: {exa_error}."
             return f"No results for '{query}' (lang={language}, category={category}, page={page})."
 
+        # A query that names its site wants many results from that one site.
+        site_restricted = bool(re.search(r"(?<![\w-])site:\S", query, re.IGNORECASE))
         readable_results = []
         seen_urls = set()
         domain_counts = {}
+        domain_capped = 0
         for res in results:
             title = res.get("title", "").strip()
             content = res.get("content", "").strip()
@@ -964,9 +1028,12 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
                 domain = (parsed.hostname or "").lower()
             except ValueError:
                 continue
-            if normalized_url in seen_urls or domain_counts.get(domain, 0) >= 2:
+            if normalized_url in seen_urls:
                 continue
             seen_urls.add(normalized_url)
+            if not site_restricted and domain_counts.get(domain, 0) >= 2:
+                domain_capped += 1
+                continue
             domain_counts[domain] = domain_counts.get(domain, 0) + 1
             readable_results.append(res)
             if len(readable_results) >= max_results:
@@ -992,6 +1059,11 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             )
         if total:
             lines.append(f"Total: {total} | Page {page} | {language}")
+        if domain_capped:
+            lines.append(
+                f"Shown: {len(readable_results)} results, at most 2 per site ({domain_capped} more from "
+                "sites already listed left out). Add site:<domain> to the query for more from one site."
+            )
         lines.append("")
 
         for ans in answers[:3]:
@@ -1041,6 +1113,8 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             lines.append("")
 
         output = "\n".join(lines).strip()
+        if domain_capped:
+            output = PartialResult(output)
         _cache_set(search_cache, cache_key, output, search_cache_ttl)
         return output
 
@@ -1269,7 +1343,10 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
 
     def _extract_provider_chain(requested: str) -> list[str]:
         order = ["tavily", "exa", "parallel", "firecrawl", "http"]
-        requested = (requested or configured_extract_provider or "auto").strip().lower()
+        requested = (requested or "auto").strip().lower()
+        if requested not in order:
+            # "auto" (the tool's default) means the configured first backend.
+            requested = configured_extract_provider
         if requested not in {"auto", *order}:
             requested = "auto"
         availability = {
@@ -1437,7 +1514,8 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
                 {"success": False, "error": "urls must be a non-empty list"},
                 ensure_ascii=False,
             )
-        urls = [str(url).strip() for url in urls[:5] if str(url).strip()]
+        urls = [str(url).strip() for url in urls if str(url).strip()]
+        urls, not_processed = urls[:5], urls[5:]
         max_chars = min(max(int(max_chars), 500), 50000)
         results: list[dict | None] = [None] * len(urls)
         initial_candidates: dict[int, str] = {}
@@ -1445,12 +1523,21 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             if await _is_safe_public_url(url):
                 initial_candidates[index] = url
                 continue
+            # The check above decides; this second look only picks the wording,
+            # so a mistyped host or scheme is not reported as a private address.
+            problem = await _public_url_problem(url)
+            if problem == "scheme":
+                backend, error = "none", "Not fetched: only full http:// or https:// URLs are supported"
+            elif problem == "unresolved":
+                backend, error = "none", "Not fetched: could not resolve the host name; check the URL"
+            else:
+                backend, error = "blocked", "Blocked: URL targets localhost, credentials, or a private/internal address"
             results[index] = {
                 "url": url,
                 "title": "",
                 "content": "",
-                "backend": "blocked",
-                "error": "Blocked: URL targets localhost, credentials, or a private/internal address",
+                "backend": backend,
+                "error": error,
             }
 
         chain = _extract_provider_chain(provider)
@@ -1528,15 +1615,18 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             not result.get("error") and result.get("content")
             for result in completed_results
         )
-        return json.dumps(
-            {
-                "success": success,
-                "provider_chain": chain,
-                "results": completed_results,
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+        payload: dict = {
+            "success": success,
+            "provider_chain": chain,
+            "results": completed_results,
+        }
+        if not_processed:
+            payload["not_processed"] = {
+                "reason": "web_extract reads at most 5 URLs per call; call it again with these URLs",
+                "urls": not_processed,
+            }
+        output = json.dumps(payload, ensure_ascii=False, indent=2)
+        return PartialResult(output) if not_processed else output
 
     # ── fetch_url ───────────────────────────────────────────────────
 
@@ -1601,6 +1691,11 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
 
         text = _html_to_text(body)
         if not text or len(text) < 50:
+            # A short JSON or plain-text body is the whole response; only
+            # markup that yields almost no text points at JavaScript or a block.
+            raw = body.strip()
+            if raw and not re.search(r"<[a-zA-Z!/][^<>]*>", raw):
+                return _format_content(url, raw, max_length)
             return (f"(Empty/minimal content — page may require JavaScript or is behind anti-bot protection. "
                     f"Try web_extract, or browser_open and browser_snapshot. URL: {url})")
 
@@ -1695,6 +1790,8 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         description=(
             "通过 Exa 或 SearXNG 搜索网页并返回轻量候选链接（标题、URL、摘要）。"
             "provider=auto 会让新闻、论文、新模型和研究查询优先使用 Exa，并在 Exa/SearXNG 间故障回退；"
+            "page、engine 及 science/news 以外的 category 只在 SearXNG 生效，auto 下设置它们会改走 SearXNG；"
+            "language、include_content 在 Exa 上不生效。由 Exa 返回的结果会注明未生效的参数。"
             "多个独立查询可同轮并行。摘要足以回答时直接引用；仅在摘要不足或需要核实原文时使用 web_extract。"
             "若仍缺关键证据，可主动使用浏览器访问原站或交互搜索补查，按信息需要自主选择，无需用户点名浏览器。"
         ),
@@ -1702,7 +1799,11 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "搜索关键词"},
-                "max_results": {"type": "integer", "description": "返回条数 1-50，默认 5", "default": 5},
+                "max_results": {
+                    "type": "integer",
+                    "description": "最多返回条数 1-50，默认 5；SearXNG 每个站点最多 2 条，查询含 site: 时不限",
+                    "default": 5,
+                },
                 "provider": {
                     "type": "string",
                     "enum": ["auto", "exa", "searxng"],
@@ -1712,19 +1813,22 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
                 "language": {
                     "type": "string",
                     "enum": ["auto", "zh", "en", "ja", "all"],
-                    "description": "语言：auto(自动检测), zh, en, all",
+                    "description": "语言：auto(自动检测), zh, en, all；仅 SearXNG 生效",
                     "default": "auto",
                 },
                 "category": {
                     "type": "string",
                     "enum": ["general", "science", "news", "it", "images", "social media"],
-                    "description": "类别：general, science(学术), news(新闻)",
+                    "description": "类别：general, science(学术), news(新闻)；其余类别仅 SearXNG 生效",
                 },
-                "engine": {"type": "string", "description": "指定引擎：google, baidu, bing, arxiv, wikipedia 等"},
-                "page": {"type": "integer", "description": "翻页 1-5，默认 1", "default": 1},
+                "engine": {
+                    "type": "string",
+                    "description": "指定引擎：google, baidu, bing, arxiv, wikipedia 等；仅 SearXNG 生效",
+                },
+                "page": {"type": "integer", "description": "翻页 1-5，默认 1；仅 SearXNG 生效", "default": 1},
                 "include_content": {
                     "type": "boolean",
-                    "description": "兼容选项：是否内联少量正文，默认 false；推荐使用 web_extract",
+                    "description": "兼容选项：是否内联少量正文，默认 false；仅 SearXNG 生效，推荐使用 web_extract",
                     "default": False,
                 },
                 "content_results": {
@@ -1749,7 +1853,8 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         description=(
             "通过可配置后端瀑布流读取网页并返回干净 Markdown。auto 按 Tavily、Exa、Parallel、"
             "Firecrawl、直接 HTTP 的顺序选择并逐 URL 故障回退；整条链失败时会从搜索结果中"
-            "有界重试最多 2 个公开候选，并在结果中标明恢复来源。一次最多 5 个公开 URL。"
+            "有界重试最多 2 个公开候选，并在结果中标明恢复来源。一次最多 5 个公开 URL，"
+            "超出的不会读取，并列在结果的 not_processed 中。"
             "提取成功不代表问题已回答；遇到折叠 FAQ、动态内容或需站内搜索等信息缺口，可主动用浏览器交互补查。"
         ),
         parameters={
@@ -1769,7 +1874,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
                 "provider": {
                     "type": "string",
                     "enum": ["auto", "tavily", "exa", "parallel", "firecrawl", "http"],
-                    "description": "首选提取后端；默认 auto，也可通过 WEB_EXTRACT_PROVIDER 配置",
+                    "description": "首选提取后端；默认 auto",
                     "default": "auto",
                 },
             },
@@ -1791,7 +1896,11 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             "type": "object",
             "properties": {
                 "url": {"type": "string", "description": "完整 URL（需 http/https 开头）"},
-                "max_length": {"type": "integer", "description": "返回最大字符数 500-50000，默认 8000", "default": 8000},
+                "max_length": {
+                    "type": "integer",
+                    "description": "返回最大字符数 500-50000，默认 8000；超出时截断并注明全文长度",
+                    "default": 8000,
+                },
             },
             "required": ["url"],
         },

@@ -19,7 +19,7 @@ from typing import Any
 from ..hooks import HookRegistry, HookReject
 from ..metrics import runtime_metrics
 from ..tool_failure import ToolFailure
-from ..tool_execution import ExecutionFailure, ExecutionResult
+from ..tool_execution import ExecutionFailure, ExecutionResult, PartialResult
 from ..tracing import trace_span
 from .policy import VALID_RISKS, ToolPolicy
 
@@ -491,6 +491,86 @@ class ToolRegistry:
         return tool
 
     @classmethod
+    def _fixed_property(cls, schema: Any, key: str) -> tuple[bool, Any]:
+        """Return the ``const`` an alternative pins ``key`` to, looking through allOf."""
+        if not isinstance(schema, dict):
+            return False, None
+        properties = schema.get("properties")
+        if isinstance(properties, dict) and isinstance(properties.get(key), dict) and "const" in properties[key]:
+            return True, properties[key]["const"]
+        members = schema.get("allOf")
+        for member in members if isinstance(members, list) else []:
+            found, fixed = cls._fixed_property(member, key)
+            if found:
+                return True, fixed
+        return False, None
+
+    @classmethod
+    def _required_names(cls, schema: Any) -> list[str]:
+        if not isinstance(schema, dict):
+            return []
+        required = schema.get("required")
+        names = [str(item) for item in required] if isinstance(required, list) else []
+        members = schema.get("allOf")
+        for member in members if isinstance(members, list) else []:
+            if isinstance(member, dict) and "properties" in member:
+                names.extend(name for name in cls._required_names(member) if name not in names)
+        return names
+
+    @classmethod
+    def _alternative_hint(
+        cls,
+        variants: list[Any],
+        value: Any,
+        path: str,
+        matches: int,
+        *,
+        strict: bool,
+    ) -> str:
+        """Explain a failed anyOf/oneOf with the nearest alternative's own errors."""
+        if matches > 1:
+            return f": it fits {matches} alternatives at once; remove the fields that belong to another form"
+        candidates = [variant for variant in variants if isinstance(variant, dict)]
+        if candidates and all(set(variant) <= {"type", "required"} for variant in candidates):
+            groups = [" + ".join(cls._required_names(variant)) for variant in candidates]
+            if all(groups):
+                return f": {path} needs one of: {' | '.join(groups)}"
+        forms = ""
+        if isinstance(value, dict):
+            # A property every alternative pins with ``const`` names the form
+            # the caller meant, so only those alternatives are worth explaining.
+            for key in value:
+                fixed = [cls._fixed_property(variant, key) for variant in candidates]
+                if not fixed or not all(found for found, _ in fixed):
+                    continue
+                chosen = [
+                    variant for variant, (_, pinned) in zip(candidates, fixed)
+                    if pinned == value[key]
+                ]
+                if not chosen:
+                    allowed = sorted({str(pinned) for _, pinned in fixed})
+                    return f": {path}.{key} must be one of {', '.join(allowed)}"
+                candidates = chosen
+                if len(chosen) > 1:
+                    groups = []
+                    for variant in chosen:
+                        names = [name for name in cls._required_names(variant) if name != key]
+                        group = " + ".join(names) if names else "no other field"
+                        if group not in groups:
+                            groups.append(group)
+                    if len(groups) > 1:
+                        forms = f" ({key}={value[key]!r} takes exactly one of: {' | '.join(groups)})"
+                break
+        nearest: list[str] | None = None
+        for variant in candidates:
+            errors = cls._schema_errors(variant, value, path, strict=strict)
+            if errors and (nearest is None or len(errors) < len(nearest)):
+                nearest = errors
+        if not nearest:
+            return forms
+        return ": " + "; ".join(nearest[:3]) + forms
+
+    @classmethod
     def _schema_errors(
         cls,
         schema: dict[str, Any] | None,
@@ -519,7 +599,10 @@ class ToolRegistry:
                     for variant in variants
                 )
                 if (keyword == "anyOf" and matches < 1) or (keyword == "oneOf" and matches != 1):
-                    return [f"{path} does not match {keyword}"]
+                    return [
+                        f"{path} does not match {keyword}"
+                        + cls._alternative_hint(variants, value, path, matches, strict=strict)
+                    ]
 
         expected = schema.get("type")
         expected_types = [expected] if isinstance(expected, str) else expected
@@ -1347,6 +1430,8 @@ class ToolRegistry:
                         success_result = {**shaped, "error": "", "duration_ms": duration_ms, "risk": tool.risk}
                         if isinstance(result, ExecutionResult):
                             success_result["execution"] = dict(result.execution)
+                        if isinstance(result, PartialResult):
+                            success_result["partial"] = True
                         # ── postcondition verifier ──
                         if tool.postcondition is not None:
                             runtime_metrics.increment("postcondition_check_count")

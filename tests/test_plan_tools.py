@@ -55,6 +55,20 @@ def test_plan_section_symbols_round_trip_without_relaxing_core_memory(tmp_path):
         _safe_memory_text("Core § entry", max_chars=600)
 
 
+def test_plan_step_that_is_too_long_is_reported_as_plan_text(tmp_path: Path):
+    _, registry = setup_plan(tmp_path)
+    result = asyncio.run(registry.execute("plan_update", {
+        "goal": "Ship structured clarification",
+        "steps": [
+            {"text": "Add broker " + "x" * 300, "status": "in_progress"},
+            {"text": "Add TUI", "status": "pending"},
+        ],
+    }))
+
+    assert "Plan text is too long (max 240 characters)" in result["error"]
+    assert "Memory content" not in result["error"]
+
+
 def test_plan_update_rejects_ambiguous_active_state(tmp_path: Path):
     _, registry = setup_plan(tmp_path)
     result = asyncio.run(registry.execute("plan_update", {

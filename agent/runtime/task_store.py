@@ -282,7 +282,14 @@ class TaskStore:
         risk: str,
         invocation_id: str | None = None,
         replay: str = "never",
+        rerun_failed: bool = False,
     ) -> ToolClaim:
+        """Claim one tool step.
+
+        ``rerun_failed`` is for repeatable observations: a failed earlier
+        attempt with the same key is run again instead of being answered with
+        the old failure, so a transient error can be retried.
+        """
         if replay not in {"never", "safe"}:
             raise ValueError(f"invalid tool replay policy: {replay}")
         payload = _json(args)
@@ -305,7 +312,9 @@ class TaskStore:
                 step = self._step_dict(existing)
                 if step["status"] == "completed":
                     return ToolClaim("cached", step["id"], step.get("output"))
-                if step["status"] == "unknown" and replay == "safe":
+                if (step["status"] == "unknown" and replay == "safe") or (
+                    rerun_failed and step["status"] == "failed"
+                ):
                     now = _now()
                     db.execute(
                         """UPDATE steps SET status='running', attempt=attempt+1,
@@ -347,6 +356,14 @@ class TaskStore:
             "replay": replay,
         }, step_id=step_id)
         return ToolClaim("execute", step_id)
+
+    def tool_step_names(self, run_id: str) -> list[str]:
+        """Names of every tool step recorded for a run, in order."""
+        with self._lock, self._connection() as db:
+            rows = db.execute(
+                "SELECT name FROM steps WHERE run_id=? AND kind='tool' ORDER BY ordinal", (run_id,)
+            ).fetchall()
+        return [str(row["name"] or "") for row in rows]
 
     def finish_step(
         self,

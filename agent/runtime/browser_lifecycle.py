@@ -121,7 +121,7 @@ class BrowserLifecycle:
                     await asyncio.shield(release)
                 except Exception:
                     return ToolFailure("browser_release_failed", "Browser cleanup failed; control remains unavailable.",
-                                       False, "Use /browser stop to retry cleanup before connecting again.")
+                                       False, "Call browser_stop to retry cleanup before connecting again.")
             async with self._operation_lock:
                 if generation != self._generation or self._release_pending:
                     return ToolFailure("browser_session_ended", "Browser session ended before this call could run.",

@@ -31,6 +31,7 @@ from typing import Any, Callable
 import uuid
 
 from agent.runtime.process_env import hidden_process_creationflags
+from agent.runtime.tool_failure import ToolFailure
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
 from agent.sandbox.docker import DockerSandbox
 
@@ -47,6 +48,65 @@ class CodeRunFailed(Exception):
         self.kind = kind
         self.message = message
         self.logs = logs
+
+
+class RunFailure(str):
+    """Text of a failed program run; ``kind`` is its stable classification.
+
+    It stays a string for callers that only render it. The registered tool
+    turns it into a ``ToolFailure`` so the model is not told the run succeeded.
+    """
+
+    kind: str
+
+    def __new__(cls, kind: str, text: str):
+        value = super().__new__(cls, text)
+        value.kind = kind
+        return value
+
+
+# kind -> (the same program may be run again as it is, what to do next)
+_RUN_FAILURE_RECOVERY: dict[str, tuple[bool, str]] = {
+    "invalid_description": (False, "Pass a short non-empty description of what the program does."),
+    "tool_call_failed": (
+        False,
+        "The program stopped at this tool call; calls it completed earlier were not undone. Fix the "
+        "failing call or catch ToolCallError in the program, and do not repeat writes that already succeeded.",
+    ),
+    "exception": (
+        False,
+        "Fix the program. Tool calls it completed before the exception were not undone, so do not "
+        "repeat writes that already succeeded.",
+    ),
+    "invalid_output": (False, "Return a JSON-serializable value (string, number, list or dict) or print the text."),
+    "output_limit": (
+        False,
+        "The tool calls ran, but the returned value was dropped. Print or return less: filter or "
+        "summarize in the program, and do not repeat writes that already succeeded.",
+    ),
+    "timeout": (
+        False,
+        "Tool calls the program completed were not undone, and a call that was still running may or may "
+        "not have taken effect. Check the current state before running anything again, then split the "
+        "work into shorter programs.",
+    ),
+    "sandbox": (False, "run_code cannot start in this environment. Call the tools directly instead."),
+    "unavailable": (False, "run_code cannot run in this session. Call the tools directly instead."),
+}
+
+
+def _run_tool_failure(failure: RunFailure, max_chars: int) -> ToolFailure:
+    """Report a failed run as a failure, keeping the start and the end of its output."""
+    text = str(failure)
+    if len(text) > max_chars:
+        head = max_chars // 3
+        tail = max_chars - head
+        text = (
+            f"{text[:head]}\n[... {len(text) - max_chars} characters of program output omitted ...]\n"
+            f"{text[-tail:]}"
+        )
+    retryable, hint = _RUN_FAILURE_RECOVERY.get(failure.kind, _RUN_FAILURE_RECOVERY["exception"])
+    return ToolFailure(code=f"run_code_{failure.kind}", message=text, retryable=retryable, recovery_hint=hint)
 
 
 # These tools must remain first-class model calls so their provenance and
@@ -383,9 +443,15 @@ async def _handle_tool_request(
         raise
     except Exception as exc:  # noqa: BLE001
         event = {"output": "", "error": f"{type(exc).__name__}: {exc}"}
+    error = str(event.get("error") or "")
+    hint = str(event.get("recovery_hint") or "").strip()
+    if error and hint and hint not in error:
+        # The program only receives text; without this a tool's structured
+        # recovery hint would never reach the model that wrote the program.
+        error = f"{error} Recovery: {hint}"
     await reply(
         str(event.get("output") or event.get("tool_output") or ""),
-        str(event.get("error") or ""),
+        error,
     )
 
 
@@ -399,7 +465,7 @@ async def execute_run_code(
 ) -> str:
     """Execute a model-written program in a subprocess against the tool registry."""
     if not description.strip():
-        return "[run_code] invalid description: expected a non-empty string"
+        return RunFailure("invalid_description", "[run_code] invalid description: expected a non-empty string")
 
     effective_timeout = timeout if timeout is not None else _positive_env(
         "RUN_CODE_TIMEOUT_SECONDS", 120
@@ -436,7 +502,7 @@ async def execute_run_code(
         done_received = False
         stderr = proc.stderr
         if stderr is None:
-            return "[run_code] exception: subprocess stderr unavailable"
+            return RunFailure("exception", "[run_code] exception: subprocess stderr unavailable")
 
         async def drain_tool_tasks() -> None:
             tasks = tuple(read_tasks)
@@ -495,32 +561,34 @@ async def execute_run_code(
 
         if not done_received:
             detail = final["logs"].strip() or f"subprocess exited with code {proc.returncode}"
-            return _logs_then(
+            return RunFailure("exception", _logs_then(
                 "[run_code] exception: subprocess exited without a done message",
                 detail,
-            )
+            ))
 
         if final["error"]:
             error_text = final["error"]
             prefix = "ToolCallError:"
             if error_text.startswith(prefix):
-                return _logs_then(
+                return RunFailure("tool_call_failed", _logs_then(
                     f"[run_code] tool call failed: {error_text[len(prefix):].strip()}",
                     final["logs"],
-                )
+                ))
             if "not JSON serializable" in error_text:
-                return _logs_then(f"[run_code] invalid_output: {error_text}", final["logs"])
-            return _logs_then(f"[run_code] exception: {error_text}", final["logs"])
+                return RunFailure(
+                    "invalid_output", _logs_then(f"[run_code] invalid_output: {error_text}", final["logs"]),
+                )
+            return RunFailure("exception", _logs_then(f"[run_code] exception: {error_text}", final["logs"]))
         return _render_success(final["logs"], final["result"], True)
     except CodeRunFailed as exc:
-        return _logs_then(f"[run_code] {exc.kind}: {exc.message}", exc.logs)
+        return RunFailure(exc.kind, _logs_then(f"[run_code] {exc.kind}: {exc.message}", exc.logs))
     except asyncio.TimeoutError:
-        return f"[run_code] timeout: program exceeded {effective_timeout}s"
+        return RunFailure("timeout", f"[run_code] timeout: program exceeded {effective_timeout}s")
     except asyncio.CancelledError:
         raise
     except Exception as exc:  # noqa: BLE001
         detail = "".join(traceback.format_exception_only(type(exc), exc)).strip()
-        return f"[run_code] exception: {detail}"
+        return RunFailure("exception", f"[run_code] exception: {detail}")
     finally:
         await cancel_tool_tasks()
         if proc is not None and not proc_reaped:
@@ -531,29 +599,41 @@ async def execute_run_code(
 def register_run_code_tool(registry: ToolRegistry, agent_getter: Callable[[], Any]) -> None:
     """Register the run_code transport bound to a lazily-resolved agent."""
 
-    async def _run_code(code: str, description: str, _task_id: str = "") -> str:
+    async def _run_code(code: str, description: str, _task_id: str = "") -> str | ToolFailure:
         agent = agent_getter()
         if agent is None:
-            return "[run_code] agent is not available"
-        return await execute_run_code(agent, code, description, task_id=_task_id)
+            return _run_tool_failure(
+                RunFailure("unavailable", "[run_code] agent is not available"), registry.max_inline_chars,
+            )
+        text = await execute_run_code(agent, code, description, task_id=_task_id)
+        if isinstance(text, RunFailure):
+            return _run_tool_failure(text, registry.max_inline_chars)
+        return text
+
+    program_seconds = min(120, _positive_env("RUN_CODE_TIMEOUT_SECONDS", 120))
 
     registry.register(ToolDef(
         name="run_code",
         description=(
             "Execute a Docker-sandboxed Python program that orchestrates multiple tool calls in one "
-            "step. Takes two required arguments: `code` — the body of an async Python "
-            "function (top-level `await` and `return` both work) — and `description`, a "
-            "short summary of what the program does. Inside the program call tools as "
-            "`await tools.<name>(<keyword args>)`; the names `tools`, `ToolCallError`, "
-            "and `asyncio` are bound. Use `await tools.gather(tools.a(), tools.b())` or "
+            "step. `code` is the body of an async Python function (top-level `await` and `return` both "
+            "work); `description` is a short summary of what the program does. The names `tools`, "
+            "`ToolCallError`, and `asyncio` are bound. `await tools.<name>(<keyword args>)` always "
+            "returns the tool's text output as a string, so parse JSON yourself with `json.loads`; an "
+            f"output over {registry.max_inline_chars:,} characters arrives as a shortened preview with "
+            "the middle omitted. A failing call raises `ToolCallError` with the tool's error text, which "
+            "you may catch. Use `await tools.gather(tools.a(), tools.b())` or "
             "`await asyncio.gather(*coros)` to fan out independent reads; side-effecting "
-            "calls should stay sequential. A tool that needs interactive approval "
-            "pauses the program until you decide (the prompt looks like a native "
-            "call); a denied, cancelled, or unanswerable decision surfaces to the "
-            "program as a `ToolCallError` starting with `[ToolApproval...]`. "
+            f"calls should stay sequential. Limits: at most {_max_tool_calls()} tool calls per program; a "
+            "third identical call (same tool, same arguments) is rejected; the whole program has "
+            f"{program_seconds} seconds, and that clock keeps running while a call waits for approval. "
+            "A tool that needs interactive approval pauses the program until the user decides (the user "
+            "sees the same prompt as for a native call); a denied, cancelled, or unanswerable decision "
+            "surfaces to the program as a `ToolCallError` starting with `[ToolApproval...]`. "
             "Answer with `print(...)` and/or `return <value>`: only prints and the "
-            "returned JSON value come back, so curate the result. A failing tool call "
-            "raises `ToolCallError`, which you may catch. Use this for multi-step "
+            "returned JSON value come back, so curate the result; together they may hold at most "
+            f"{_max_output_chars():,} characters, beyond which the run fails and the returned value is "
+            "lost. Use this for multi-step "
             "read/edit/test work instead of one round-trip per tool. The Docker runtime "
             "contains Python's standard library only and does not inherit the host "
             "project virtualenv; use an available shell tool (Minimal's `bash` for WSL) "

@@ -48,6 +48,23 @@ def _bounded_python_preview(code: str, limit: int = 240) -> str:
     return _bounded_text_preview(code, label="代码", limit=limit)
 
 
+_FOREGROUND_YIELD_DESCRIPTION = (
+    "How long to wait for the run, in milliseconds, before returning a process_id and "
+    "letting it continue. 0 does not yield: the run stays in the foreground and is "
+    "stopped at the sandbox time limit. On the host sandbox a positive value or "
+    "background=true runs without that limit; the Docker sandbox applies it to every run."
+)
+_BACKGROUND_DESCRIPTION = "Return immediately with a process_id."
+
+
+def _hit_sandbox_time_limit(result: dict) -> bool:
+    """Sandboxes report their own time limit as exit code -1 and a [Timeout] error."""
+    return (
+        result.get("exit_code") == -1
+        and str(result.get("error") or "").startswith("[Timeout]")
+    )
+
+
 def _compound_commands(command: str) -> list[str]:
     """Split common POSIX/PowerShell/cmd separators without misreading quotes.
 
@@ -528,6 +545,25 @@ def register_code_tools(
         if completed:
             processes.describe(process)
             result = process.result
+            if result and _hit_sandbox_time_limit(result):
+                # The receipt must not call a stopped run completed.
+                result = {**result, "status": "timed_out"}
+                unlimited_when_supervised = (
+                    supervisor_spec is not None
+                    and supervisor_spec["sandbox"].get("timeout") is None
+                )
+                if not use_supervisor and unlimited_when_supervised:
+                    result["error"] = (
+                        f"{result['error']}. The run was in the foreground "
+                        "(foreground_yield_ms=0), where the sandbox time limit applies, so it "
+                        "was stopped. A positive foreground_yield_ms or background=true runs "
+                        "without that limit; follow it with process_poll/process_read."
+                    )
+                    if kind == "shell":
+                        # The agent loop forces tracked source-mutating commands to 0.
+                        result["error"] += (
+                            " Formatter and code-generator commands always run in the foreground."
+                        )
             if result and result.get("artifact_path"):
                 processes.expose(process)
                 result["output_reader"] = processes.describe(process)["output_reader"]
@@ -664,7 +700,13 @@ def register_code_tools(
             stream=stream,
         )
         processes.observe(process)
-        return _process_result({**result, **processes.describe(process)})
+        # describe() refreshes the status; the reader arguments of this read say
+        # where the next one continues.
+        return _process_result({
+            **result,
+            **processes.describe(process),
+            "output_reader": result["output_reader"],
+        })
 
     async def _process_cancel(process_id: str) -> str:
         process = processes.get(process_id)
@@ -686,8 +728,11 @@ def register_code_tools(
             "code": {"type": "string", "description": "Python code"},
             "foreground_yield_ms": {
                 "type": "integer", "minimum": 0, "maximum": COMMAND_FOREGROUND_MAX_MS, "default": 10000,
+                "description": _FOREGROUND_YIELD_DESCRIPTION,
             },
-            "background": {"type": "boolean", "default": False},
+            "background": {
+                "type": "boolean", "default": False, "description": _BACKGROUND_DESCRIPTION,
+            },
             **approval_justification_schema(),
         }, "required": ["code"]},
         fn=_execute_python, sandboxed=True, risk="execute", approval="on_risk", group="code",
@@ -752,12 +797,12 @@ def register_code_tools(
                 "minimum": 0,
                 "maximum": COMMAND_FOREGROUND_MAX_MS,
                 "default": 10000,
-                "description": "Wait this long before returning a background process_id; 0 waits until completion.",
+                "description": _FOREGROUND_YIELD_DESCRIPTION,
             },
             "background": {
                 "type": "boolean",
                 "default": False,
-                "description": "Return immediately with a process_id.",
+                "description": _BACKGROUND_DESCRIPTION,
             },
             **approval_justification_schema(),
         }, "required": ["command"]},
@@ -822,7 +867,12 @@ def register_code_tools(
     ))
     registry.register(ToolDef(
         name="process_read",
-        description="Read live or completed output incrementally from a background sandbox process.",
+        description=(
+            "Read live or completed output incrementally from a background sandbox process. "
+            "Without offset or byte_offset, each call continues after the previous such call "
+            "(one cursor per stream). A call with offset or byte_offset reads from that "
+            "position and does not move the cursor."
+        ),
         parameters={
             "type": "object",
             "properties": {
@@ -853,7 +903,7 @@ def register_code_tools(
         },
         fn=_process_read,
         risk="read",
-        # Omitting offset advances the per-process cursor.
+        # Omitting offset and byte_offset advances the per-stream cursor.
         idempotent=False,
         repeat_guard=False,
         group="code",

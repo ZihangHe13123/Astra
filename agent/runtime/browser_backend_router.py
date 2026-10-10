@@ -161,6 +161,9 @@ class BrowserBackendRouter:
         return await method()
 
     async def connect_existing(self, *, transport='cdp', tab_id='', target_tab_id='', port=0, host=''):
+        if transport == 'cdp' and target_tab_id:
+            # Never fall through to "first page of the debug-port browser" for a named tab.
+            raise ValueError('target_tab_id names an extension tab; use transport=extension')
         if transport == 'extension' and self.auto_connect:
             await self._ensure_extension_ready()
         backend = self._transport(transport)
@@ -186,7 +189,7 @@ class BrowserBackendRouter:
         if tab_id:
             backend = self.bindings.pop(tab_id, None)
             if backend is not None:
-                await backend.close_connection(tab_id)
+                return await backend.close_connection(tab_id)
             return
         # Close both transports, even if one cleanup raises.
         self._closed = True

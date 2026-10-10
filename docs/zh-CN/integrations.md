@@ -81,7 +81,7 @@ MCP 派发后的失败会区分读取与动作：可能有副作用的调用在�
 
 ## 网页搜索
 
-`search_web` 支持 `provider=auto|exa|searxng`。`/search` 查看默认值，`/search auto|exa|searxng` 持久切换。auto 对新闻、研究、模型发布和基准问题优先 Exa，普通问题先用 SearXNG；结果为空或失败时，同一次工具调用内相互回退。不设固定每轮搜索次数，但重复调用和 ReAct 上限仍防止无限循环。不使用 DuckDuckGo。
+`search_web` 支持 `provider=auto|exa|searxng`。`/search` 查看默认值，`/search auto|exa|searxng` 持久切换。auto 对新闻、研究、模型发布和基准问题优先 Exa，普通问题先用 SearXNG；翻页（page 大于 1）、指定 `engine`、science/news 以外的类别只有 SearXNG 支持，auto 会把这类调用交给 SearXNG，由 Exa 返回的结果会注明未生效的参数。SearXNG 每个站点最多列 2 条，查询含 `site:` 时不限。结果为空或失败时，同一次工具调用内相互回退。不设固定每轮搜索次数，但重复调用和 ReAct 上限仍防止无限循环。不使用 DuckDuckGo。
 
 直接配置 `EXA_API_KEY`，或用 `EXA_ENV_FILE` 指向另一份包含该 Key 的 dotenv，以复用凭据而不复制。`/doctor` 只报告是否配置和来源，不打印密钥。
 
