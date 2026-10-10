@@ -2235,7 +2235,10 @@ class ReActAgent(AgentBase):
         tiling_required = self._vision_tile_tool_enabled()
         max_bytes = int(os.getenv("MAX_AUTO_TOOL_IMAGE_BYTES", str(10 * 1024 * 1024)))
         blocks = [ContentBlock.text(intro)]
+        # Images the result names but the model will not be shown, with the reason.
+        not_attached: list[str] = []
         for raw_path, label in zip(paths, labels):
+            shown_name = Path(str(raw_path)).name or str(raw_path)
             try:
                 path = Path(str(raw_path)).expanduser()
                 if not path.is_absolute():
@@ -2248,18 +2251,21 @@ class ReActAgent(AgentBase):
                     raise self._tool_image_preprocess_error(
                         "Unable to access a tool-produced local image"
                     ) from exc
+                not_attached.append(f"{shown_name}（无法访问）")
                 continue
             if not is_file:
                 if tiling_required:
                     raise self._tool_image_preprocess_error(
                         "A tool-produced local image is not a regular file"
                     )
+                not_attached.append(f"{shown_name}（文件不存在或不是普通文件）")
                 continue
             if file_size > max_bytes:
                 if tiling_required:
                     raise self._tool_image_preprocess_error(
                         "A tool-produced local image exceeded the safe materialization limit"
                     )
+                not_attached.append(f"{shown_name}（{file_size} 字节，超过 {max_bytes} 字节的上限）")
                 continue
             mime, _ = mimetypes.guess_type(str(path))
             if mime == "image/jpg":
@@ -2269,6 +2275,7 @@ class ReActAgent(AgentBase):
                     raise self._tool_image_preprocess_error(
                         "A tool-produced local image has an unsupported format"
                     )
+                not_attached.append(f"{shown_name}（不支持的格式）")
                 continue
             try:
                 encoded = base64.b64encode(path.read_bytes()).decode("ascii")
@@ -2277,12 +2284,21 @@ class ReActAgent(AgentBase):
                     raise self._tool_image_preprocess_error(
                         "Unable to read a tool-produced local image"
                     ) from exc
+                not_attached.append(f"{shown_name}（读取失败）")
                 continue
             if label.strip():
                 blocks.append(ContentBlock.text(label.strip()))
             blocks.append(ContentBlock.image_url(f"data:{mime};base64,{encoded}", detail=detail, source_path=str(path)))
 
-        if len(blocks) == 1:
+        if not_attached:
+            # The tool result says its images are attached; say which are not,
+            # so the model does not describe a picture it was never shown.
+            note = "以下图片没有附加，你看不到它们的内容：" + "；".join(not_attached)
+            if len(blocks) == 1:
+                blocks = [ContentBlock.text("系统提示：工具结果提到了图片，但" + note)]
+            else:
+                blocks.append(ContentBlock.text(note))
+        elif len(blocks) == 1:
             return None
         source_msg = Msg(sender="tool", role="user", content=blocks)
         chat_content = source_msg.to_chat_content()
