@@ -38,6 +38,17 @@ class ExecutionFailure(RuntimeError):
         self.execution = execution_metadata(result)
 
 
+class StateChanged(str):
+    """Successful text of a call that visibly changed what it acts on.
+
+    The same call sent again is then a new action on a new state (the next
+    click on "load more"), not a stuck repeat, so it does not count toward
+    the identical-call limit. A call that changed nothing still counts.
+    """
+
+    state_changed = True
+
+
 class PartialResult(str):
     """Successful text that the tool itself cut short.
 

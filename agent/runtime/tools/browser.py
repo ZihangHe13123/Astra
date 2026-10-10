@@ -39,7 +39,7 @@ from ..browser_session import (
     format_session,
     sanitize_snapshot,
 )
-from ..tool_execution import PartialResult
+from ..tool_execution import PartialResult, StateChanged
 from ..tool_failure import ToolFailure
 from ..browser_lifecycle import BrowserLifecycle
 from .approval import ScopedApprovalStore, normalized_origin
@@ -343,7 +343,8 @@ def register_browser_tools(
         return _failure(f"{operation} failed: {exc}")
 
     async def _finish_action(tab_id: str, result: str, *, expected_text: str | None = None,
-                             read_offset: int | None = None) -> str | ToolFailure:
+                             read_offset: int | None = None,
+                             change_makes_a_new_action: bool = False) -> str | ToolFailure:
         # Re-observing would invalidate the element refs in the action's own
         # postcondition snapshot. Persist and return that exact observation.
         try:
@@ -442,6 +443,10 @@ def register_browser_tools(
                 or (payload.get("dispatch_state") != "not_dispatched" and payload["status"] in {"unknown_outcome", "verification_failed"}),
                 recovery_hint=str(payload["continuation"]["instruction"]),
                 details={key:payload[key] for key in ("dispatch_state", "operation", "wait") if key in payload})
+        if change_makes_a_new_action and isinstance(payload, dict) and payload.get("status") == "observed":
+            # The page changed, so the same click again (next page, load more)
+            # acts on a new page and is not a stuck repeat.
+            return StateChanged(message)
         return PartialResult(message) if read_cut else message
 
     # ── fallback extraction ladder ─────────────────────────────────
@@ -754,7 +759,7 @@ def register_browser_tools(
                 dispatched = True
                 _record_mutation_timeout("click", dispatched=True)
                 result = await _await_backend_result(hook(selector, tab_id=tab.tab_id, url=tab.url))
-                return await _finish_action(tab.tab_id, str(result))
+                return await _finish_action(tab.tab_id, str(result), change_makes_a_new_action=True)
             except Exception as e:
                 return _interaction_failure("click", f"Click failed: {e}", dispatched=dispatched)
         return _interaction_failure("click", "[Browser Error] Interactive backend not available.")
@@ -1148,6 +1153,7 @@ def register_browser_tools(
         description=(
             "点击最新快照的 ref:<id> 或唯一 CSS 元素；返回观测结果和新快照，不能把派发成功当作任务成功。"
             "no_observed_change 时先只读核对；结果仍不明时，换 ref/CSS 或内外层元素点击仍是同一目标的重试。"
+            "点击后页面有变化（status=observed）时可以再发同一个点击，例如连续点“加载更多”或翻页；没有观察到变化的相同点击仍计入重复调用限制。"
             "标签在 read_only 档时会先自动升到可交互档再点击；没有可交互后端或处于 human takeover 时报错。"
         ),
         parameters={

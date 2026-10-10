@@ -790,6 +790,49 @@ PNG = bytes.fromhex(
     '0000000d49444154789c6360000002000001e221bc330000000049454e44ae426082')
 
 
+@pytest.mark.parametrize(('status', 'clicks_run', 'stopped'), [
+    ('observed', 5, False),            # each click changed the page: "load more" five times
+    ('no_observed_change', 2, True),   # nothing happened: the third identical click is a stuck repeat
+])
+def test_the_same_click_may_repeat_only_while_it_changes_the_page(tmp_path, status, clicks_run, stopped):
+    from agent.core.msg import ContentBlock, Msg
+    from agent.runtime.react import ReActAgent
+
+    class LLM:
+        def __init__(self):
+            self.calls = 0
+
+        async def chat_stream(self, messages, tools):
+            self.calls += 1
+            if self.calls <= 5:
+                yield {'type':'tool_calls','calls':[{'id':f'more-{self.calls}','name':'browser_click',
+                    'arguments':'{"selector":"button.load-more"}'}],
+                    'content':'','reasoning_content':'','usage':None}
+                yield {'type':'done','content':'','usage':None}
+            else:
+                yield {'type':'done','content':'All items are loaded.','usage':None}
+
+    async def scenario():
+        reg, b, _ = setup(tmp_path)
+        clicks = []
+
+        async def click(selector, **kw):
+            clicks.append(selector)
+            return json.dumps({'status':status,'message':'clicked','after':{
+                'url':'https://example.com/form','title':'Form','snapshotId':f'after-{len(clicks)}',
+                'text':f'{len(clicks) * 10} items','elements':[]}})
+
+        b.interactive_click = click
+        await reg.execute('browser_open', {'url':'https://example.com/form','extract':False})
+        agent = ReActAgent('test', LLM(), reg, max_iterations=10)
+        events = [e async for e in agent.reply_stream(Msg(content=[ContentBlock.text('Load every item')]))]
+
+        assert len(clicks) == clicks_run
+        assert any('repeated tool call' in e.get('message', '') for e in events) is stopped
+
+    asyncio.run(scenario())
+
+
 def test_screenshot_says_the_image_is_attached_and_can_be_repeated_in_a_turn(tmp_path):
     from agent.core.msg import ContentBlock, Msg
     from agent.runtime.react import ReActAgent

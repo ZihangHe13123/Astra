@@ -3028,6 +3028,7 @@ class ReActAgent(AgentBase):
             "retryable",
             "recovery_hint",
             "partial",
+            "state_changed",
             "details",
             "artifact_ref",
             "mutation_tracking_warning",
@@ -4393,6 +4394,11 @@ class ReActAgent(AgentBase):
                     for event in tool_events
                     if not event.get("error")
                 )
+                for event in tool_events:
+                    if event.get("state_changed") and not event.get("error"):
+                        # The call changed what it acts on, so sending it
+                        # again is a new action rather than a repeat.
+                        tool_signature_counts.pop(call_signatures.get(str(event.get("id") or ""), ""), None)
                 if any(event.get("coding_change_journal") for event in tool_events):
                     # A successful source mutation changes the world in which
                     # earlier checks ran. Re-running the same check is a new

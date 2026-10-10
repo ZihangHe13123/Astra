@@ -19,7 +19,7 @@ from typing import Any
 from ..hooks import HookRegistry, HookReject
 from ..metrics import runtime_metrics
 from ..tool_failure import ToolFailure
-from ..tool_execution import ExecutionFailure, ExecutionResult, PartialResult
+from ..tool_execution import ExecutionFailure, ExecutionResult, PartialResult, StateChanged
 from ..tracing import trace_span
 from .policy import VALID_RISKS, ToolPolicy
 
@@ -1442,6 +1442,8 @@ class ToolRegistry:
                             success_result["execution"] = dict(result.execution)
                         if isinstance(result, PartialResult):
                             success_result["partial"] = True
+                        if isinstance(result, StateChanged):
+                            success_result["state_changed"] = True
                         # ── postcondition verifier ──
                         if tool.postcondition is not None:
                             runtime_metrics.increment("postcondition_check_count")
