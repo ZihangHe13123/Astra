@@ -309,6 +309,52 @@ def test_added_and_deleted_use_the_absent_side_for_counts(tmp_path: Path) -> Non
     ]
 
 
+def test_after_side_is_the_files_bytes_where_files_open_in_text_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows opens a file in text mode unless asked otherwise: the after side lost its
+    carriage returns and ended at the first 0x1A byte, so a "\r\n" file that a turn left
+    as it was came out as changed."""
+    monkeypatch.setattr(store, "_HANDLE_IO_OK", False)  # the path-based reads Windows uses
+    if os.name != "nt":
+        # Give this platform the same rule, so the failure shows here too.
+        binary = 0x8000
+        text_mode: set[int] = set()
+        real_open, real_read, real_close = os.open, os.read, os.close
+
+        def open_as_windows(path, flags, *args, **kwargs):
+            descriptor = real_open(path, flags & ~binary, *args, **kwargs)
+            (text_mode.discard if flags & binary else text_mode.add)(descriptor)
+            return descriptor
+
+        def read_as_windows(descriptor, count):
+            data = real_read(descriptor, count)
+            if descriptor in text_mode:
+                data = data.split(b"\x1a")[0].replace(b"\r\n", b"\n")
+            return data
+
+        def close_as_windows(descriptor):
+            text_mode.discard(descriptor)
+            real_close(descriptor)
+
+        monkeypatch.setattr(os, "O_BINARY", binary, raising=False)
+        monkeypatch.setattr(os, "open", open_as_windows)
+        monkeypatch.setattr(os, "read", read_as_windows)
+        monkeypatch.setattr(os, "close", close_as_windows)
+    data = b"one\r\ntwo\x1athree\r\n"
+    (tmp_path / "note.txt").write_bytes(data)
+    subject = make_store(tmp_path)
+
+    subject.begin_turn("changed")
+    subject.note_capture("note.txt", b"earlier\r\n")
+    assert subject.seal() is not None
+    assert subject.load_sides(0, "note.txt").after == data
+
+    subject.begin_turn("left as it was")
+    subject.note_capture("note.txt", data)
+    assert subject.seal() is None
+
+
 def test_unchanged_paths_are_never_reported(tmp_path: Path) -> None:
     (tmp_path / "same.txt").write_bytes(b"same\n")
     subject = make_store(tmp_path)

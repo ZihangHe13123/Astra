@@ -2217,7 +2217,9 @@ def _read_bounded_fd(fd: int, limit: int) -> bytes:
 
 def _read_bounded_path(path: Path, limit: int) -> bytes:
     """Path-based bounded read used where directory handles are unavailable."""
-    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    # Windows opens in text mode unless asked otherwise: "\r\n" would be read
+    # as "\n" and the read would end at the first 0x1A byte.
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
     try:
         return _read_bounded_fd(fd, limit)
     finally:
