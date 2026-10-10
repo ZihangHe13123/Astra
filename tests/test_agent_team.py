@@ -2010,9 +2010,19 @@ def test_team_inbox_says_when_more_messages_remain(tmp_path: Path, monkeypatch):
         assert not first.get("partial")
 
         send(3, "new")
-        again = await run("team_inbox", team_id=team["id"])
+        unread = await run("team_inbox", team_id=team["id"])
+        unread_page = json.loads(unread["output"])
+        # The first page was acknowledged, so the default read does not return it again.
+        assert [item["message"] for item in unread_page["messages"]] == ["new-0", "new-1", "new-2"]
+        assert unread_page["has_more"] is False
+        assert not unread.get("partial")
+
+        empty = json.loads((await run("team_inbox", team_id=team["id"]))["output"])
+        assert empty["count"] == 0 and empty["next_seq"] == unread_page["next_seq"]
+
+        # An explicit cursor reads acknowledged messages again, one page at a time.
+        again = await run("team_inbox", team_id=team["id"], after_seq=0)
         again_page = json.loads(again["output"])
-        # The default starts from the oldest message, so this page is the old one again.
         assert again_page["messages"][0]["message"] == "old-0"
         assert again_page["has_more"] is True
         assert again["partial"] is True
@@ -2023,6 +2033,12 @@ def test_team_inbox_says_when_more_messages_remain(tmp_path: Path, monkeypatch):
         assert [item["message"] for item in rest_page["messages"]] == ["new-0", "new-1", "new-2"]
         assert rest_page["has_more"] is False
         assert not rest.get("partial")
+
+        # Unacknowledged reads stay unread and come back on the next default read.
+        send(1, "kept")
+        for _ in range(2):
+            kept = json.loads((await run("team_inbox", team_id=team["id"], acknowledge=False))["output"])
+            assert [item["message"] for item in kept["messages"]] == ["kept-0"]
 
     asyncio.run(scenario())
 

@@ -3920,7 +3920,7 @@ def register_delegate_tools(
 
     async def _team_inbox(
         team_id: str,
-        after_seq: int = 0,
+        after_seq: int | None = None,
         acknowledge: bool = True,
         _task_id: str = "",
     ) -> str:
@@ -3928,14 +3928,17 @@ def register_delegate_tools(
 
         runtime, team = await _accessible_team(team_id, _task_id)
         recipient = await asyncio.to_thread(runtime.sender_for, team)
+        # No cursor: only unread messages. A cursor: everything above it, read or not.
+        cursor = None if after_seq is None else max(0, int(after_seq))
         messages = await asyncio.to_thread(
             runtime.store.read_messages,
             recipient,
-            after_seq=max(0, int(after_seq)),
+            after_seq=cursor,
             limit=TEAM_INBOX_PAGE_SIZE,
         )
         has_more = len(messages) >= TEAM_INBOX_PAGE_SIZE and bool(await asyncio.to_thread(
             runtime.store.read_messages, recipient, after_seq=int(messages[-1]["seq"]), limit=1,
+            unread_only=cursor is None,
         ))
         ids = [str(item["id"]) for item in messages]
         if ids:
@@ -3962,7 +3965,12 @@ def register_delegate_tools(
             }
             for item in messages
         ]
-        next_seq = int(messages[-1]["seq"]) if messages else max(0, int(after_seq))
+        if messages:
+            next_seq = int(messages[-1]["seq"])
+        elif cursor is not None:
+            next_seq = cursor
+        else:
+            next_seq = await asyncio.to_thread(runtime.store.last_message_seq, recipient)
         inbox = _sub_processes.dumps(
             {
                 "team_id": str(team["id"]),
@@ -4458,7 +4466,8 @@ def register_delegate_tools(
         description=(
             "Read durable messages addressed to the current authenticated Agent. "
             "The lead uses this to inspect teammate updates; teammates normally receive "
-            "messages automatically between model turns. Use next_seq for incremental reads. "
+            "messages automatically between model turns. Without after_seq a call returns only "
+            "unread messages, so repeated calls do not return a message twice. "
             f"One call returns at most {TEAM_INBOX_PAGE_SIZE} messages, oldest first; "
             "has_more=true means more remain."
         ),
@@ -4468,18 +4477,19 @@ def register_delegate_tools(
                 "team_id": {"type": "string"},
                 "after_seq": {
                     "type": "integer",
-                    "default": 0,
+                    "minimum": 0,
                     "description": (
-                        "Return only messages with seq above this. The default 0 starts from the "
-                        "oldest message, including ones already read; pass next_seq from the "
-                        "previous result to get only newer ones."
+                        "Omit to get only unread messages. Pass a seq to get every message above "
+                        "it, read or not: 0 reads again from the oldest message, and next_seq from "
+                        "a previous result continues after that result."
                     ),
                 },
                 "acknowledge": {
                     "type": "boolean",
                     "default": True,
                     "description": (
-                        "true marks the returned messages read: they leave unread_count and free "
+                        "true marks the returned messages read: they leave unread_count, are not "
+                        "returned again by a call without after_seq, and free "
                         f"room in the mailbox, which holds at most {TEAM_UNREAD_MESSAGE_LIMIT} unread "
                         "messages before senders are refused. false leaves them unread."
                     ),
