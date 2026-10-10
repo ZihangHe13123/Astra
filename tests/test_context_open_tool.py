@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
 from typing import Any
 
@@ -103,12 +104,33 @@ class EvidenceSource:
         )
 
 
-def _live_broker() -> tuple[ContextIndexBroker, EvidenceSource, EvidenceSource, list[str]]:
-    session = EvidenceSource(
+class ScriptedEvidenceSource(EvidenceSource):
+    """Evidence chosen per locator kind: a (title, items) pair, or None for an unreadable record."""
+
+    scripted: dict[str, tuple[str, tuple[str, ...]] | None] = {}
+
+    def open(self, locator: SourceLocator, window: int, plan=None) -> EvidenceResult:
+        if locator.kind not in self.scripted:
+            return super().open(locator, window, plan)
+        self.open_calls += 1
+        script = self.scripted[locator.kind]
+        title, items = script if script is not None else ("gone", ())
+        return EvidenceResult(
+            source="session" if self.source == "session" else "activity",
+            trust_label="historical_context" if self.source == "session" else "untrusted_observation",
+            title=title,
+            items=items,
+        )
+
+
+def _live_broker(
+    source_type: type[EvidenceSource] = EvidenceSource,
+) -> tuple[ContextIndexBroker, EvidenceSource, EvidenceSource, list[str]]:
+    session = source_type(
         "session",
         SourceResult("available", relevance=(_candidate("session", "session"),)),
     )
-    activity = EvidenceSource(
+    activity = source_type(
         "activity",
         SourceResult(
             "available",
@@ -312,6 +334,204 @@ def test_a_real_broker_refusal_reaches_the_caller_as_a_failure() -> None:
     spent = open_evidence(handles=[handles[0]], window=0)
     assert spent["code"] == "open_budget_reached" and "evidence budget" in spent["error"]
     assert "already opened" in spent["recovery_hint"]
+
+
+def _open_through_registry(broker: ContextIndexBroker, handles: list[str], window: int) -> dict:
+    registry = ToolRegistry()
+    register_context_index_tools(registry, broker)
+    return asyncio.run(registry.execute("context_open", {"handles": handles, "window": window}))
+
+
+def _not_opened_lines(fresh_output: str) -> dict[str, str]:
+    """The lines after the evidence block, keyed by the handle each one names."""
+    _evidence, _closing, note = fresh_output.partition("</context-evidence>")
+    return {
+        line[2:12]: line
+        for line in note.splitlines()
+        if line.startswith("- ctx:")
+    }
+
+
+def test_open_names_the_handle_whose_record_could_not_be_read() -> None:
+    class ActivityRecordGone(ScriptedEvidenceSource):
+        scripted = {"activity_event": None}
+
+    broker, _session, _activity, handles = _live_broker(ActivityRecordGone)
+    session_handle, activity_handle, habit_handle = handles
+
+    result = _open_through_registry(broker, handles, 2)
+
+    fresh = result["fresh_output"]
+    opened = {handle for handle in handles if f'<evidence handle="{handle}"' in fresh}
+    assert opened == {session_handle, habit_handle}
+    # Two of three opened used to look exactly like a complete answer.
+    skipped = _not_opened_lines(fresh)
+    assert set(skipped) == {activity_handle}
+    assert "unavailable" in skipped[activity_handle] and "Do not retry" in skipped[activity_handle]
+    assert "1 of 3 requested handles" in fresh
+    assert result["partial"] is True
+    assert result["error"] == ""
+    # The note is request-local like the evidence: the durable output stays the placeholder.
+    assert activity_handle not in result["output"] and result["request_local_placeholder"] is True
+    assert broker.last_trace is not None
+    assert broker.last_trace.opened == [
+        (session_handle, "opened"), (activity_handle, "evidence_unavailable"), (habit_handle, "opened"),
+    ]
+
+
+def test_open_with_every_handle_opened_adds_no_note_and_is_complete() -> None:
+    broker, _session, _activity, handles = _live_broker()
+
+    result = _open_through_registry(broker, handles, 2)
+
+    assert result["fresh_output"].endswith("</context-evidence>")
+    assert "Not opened" not in result["fresh_output"]
+    assert "partial" not in result
+
+
+def test_open_names_a_handle_left_out_for_budget_on_the_last_call() -> None:
+    class NearlyFullThenTwoMore(ScriptedEvidenceSource):
+        # One CJK character is estimated as one token, so the session evidence takes most of the
+        # 2000-token turn budget and leaves room for one more short section, not two.
+        scripted = {
+            "session_message": ("first", ("证" * 1_800,)),
+            "activity_event": ("long title " * 21, ("activity evidence",)),
+            "habit": ("habit", ("habit evidence",)),
+        }
+
+    broker, _session, _activity, handles = _live_broker(NearlyFullThenTwoMore)
+    session_handle, activity_handle, habit_handle = handles
+
+    first = _open_through_registry(broker, [session_handle], 0)
+    assert first["fresh_output"].endswith("</context-evidence>") and "partial" not in first
+    assert broker.last_trace is not None
+    assert 64 <= 2_000 - broker.last_trace.opened_tokens < 200
+
+    second = _open_through_registry(broker, [activity_handle, habit_handle], 0)
+
+    fresh = second["fresh_output"]
+    assert f'<evidence handle="{habit_handle}"' in fresh and "habit evidence" in fresh
+    assert f'<evidence handle="{activity_handle}"' not in fresh
+    skipped = _not_opened_lines(fresh)
+    assert set(skipped) == {activity_handle}
+    assert "evidence budget" in skipped[activity_handle]
+    # This was the second of two calls: the text must not suggest a retry that would end the turn.
+    assert "No context_open call is left this turn" in skipped[activity_handle]
+    assert "one more call" not in fresh
+    assert second["partial"] is True
+    assert broker.last_trace.opened[-2:] == [(activity_handle, "budget_omitted"), (habit_handle, "opened")]
+
+
+def test_open_says_how_to_retry_a_budget_omission_while_a_call_is_left() -> None:
+    class OversizedFirstTitle(ScriptedEvidenceSource):
+        # Each of these invisible characters is escaped to nine characters, so the title alone
+        # is larger than a third of the output room; the other two handles still fit.
+        scripted = {
+            "session_message": ("\U000e0001" * 240, ("session evidence",)),
+            "activity_event": ("activity", ("activity evidence",)),
+            "habit": ("habit", ("habit evidence",)),
+        }
+
+    broker, _session, _activity, handles = _live_broker(OversizedFirstTitle)
+    session_handle, activity_handle, habit_handle = handles
+
+    result = _open_through_registry(broker, handles, 0)
+
+    fresh = result["fresh_output"]
+    assert f'<evidence handle="{activity_handle}"' in fresh and f'<evidence handle="{habit_handle}"' in fresh
+    skipped = _not_opened_lines(fresh)
+    assert set(skipped) == {session_handle}
+    assert "evidence budget" in skipped[session_handle]
+    assert "only this handle" in skipped[session_handle] and "window 0" in skipped[session_handle]
+    assert "first context_open call this turn" in skipped[session_handle]
+    assert "ends the turn" in skipped[session_handle]
+
+    # Following the note works: alone, the handle gets the room the other two no longer share.
+    retried = _open_through_registry(broker, [session_handle], 0)
+    assert f'<evidence handle="{session_handle}"' in retried["fresh_output"]
+    assert "session evidence" in retried["fresh_output"]
+
+
+def test_open_does_not_suggest_a_retry_once_the_evidence_budget_is_spent() -> None:
+    class OversizedTitleThenFullBudget(ScriptedEvidenceSource):
+        scripted = {
+            "session_message": ("\U000e0001" * 240, ("session evidence",)),
+            "activity_event": ("activity", ("证" * 3_000,)),
+            "habit": ("habit", ("据" * 3_000,)),
+        }
+
+    broker, _session, _activity, handles = _live_broker(OversizedTitleThenFullBudget)
+    session_handle = handles[0]
+
+    result = _open_through_registry(broker, handles, 0)
+
+    skipped = _not_opened_lines(result["fresh_output"])
+    assert set(skipped) == {session_handle}
+    assert "budget is now used up" in skipped[session_handle]
+    assert "one more call" not in result["fresh_output"]
+    # The statement is true: the broker refuses the next call for lack of room.
+    assert _open_through_registry(broker, [session_handle], 0)["code"] == "open_budget_reached"
+
+
+def test_react_shows_the_not_opened_note_once_and_keeps_it_out_of_history() -> None:
+    class ActivityRecordGone(ScriptedEvidenceSource):
+        scripted = {"activity_event": None}
+
+    broker, _session, _activity, handles = _live_broker(ActivityRecordGone)
+    activity_handle = handles[1]
+
+    class OpenOnceLLM:
+        class Config:
+            model = "test-model"
+            capabilities = frozenset()
+
+        config = Config()
+
+        def __init__(self) -> None:
+            self.seen_results: list[str] = []
+
+        async def chat_stream(self, messages: list[dict], tools: list[dict], **_kwargs: object):
+            del tools
+            results = [str(m.get("content")) for m in messages if m.get("role") == "tool"]
+            self.seen_results.extend(results)
+            if results:
+                yield {"type": "done", "content": "answered", "usage": None}
+                return
+            yield {
+                "type": "tool_calls",
+                "calls": [{
+                    "id": "open-1",
+                    "name": "context_open",
+                    "arguments": json.dumps({"handles": handles, "window": 2}),
+                }],
+                "content": "",
+                "reasoning_content": "",
+                "usage": None,
+            }
+
+    registry = ToolRegistry()
+    register_context_index_tools(registry, broker)
+    llm = OpenOnceLLM()
+    agent = ReActAgent(
+        "agent", llm, registry, max_iterations=4,  # type: ignore[arg-type]
+        progressive_tools=False, timing_log_enabled=False,
+    )
+
+    async def collect() -> list[dict[str, Any]]:
+        return [
+            event
+            async for event in agent.reply_stream(Msg(content=[ContentBlock.text("continue")]))
+        ]
+
+    asyncio.run(collect())
+
+    assert len(llm.seen_results) == 1
+    shown = llm.seen_results[0]
+    assert "Not opened (1 of 3 requested handles)" in shown and f"- {activity_handle}:" in shown
+    assert "Result completeness: partial." in shown
+    history = repr(agent.context.messages)
+    assert "Not opened" not in history and "safe evidence" not in history
+    assert "request-local content is no longer retained" in history
 
 
 def test_persistence_keeps_literal_handles_but_not_expanded_evidence() -> None:
