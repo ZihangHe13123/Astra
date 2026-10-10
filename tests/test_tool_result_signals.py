@@ -284,6 +284,42 @@ def test_a_call_refused_for_its_arguments_does_not_use_up_a_per_turn_limit():
     assert not any(str(event.get("message", "")).startswith("Stopping") for event in events)
 
 
+def test_a_long_failure_text_is_bounded_and_kept_whole_on_disk(tmp_path: Path):
+    from agent.runtime.tool_failure import ToolFailure
+
+    lines = [f"test_case_{number} FAILED: expected {number}" for number in range(4000)]
+    full = "\n".join(["collected 4000 items", *lines, "== 4000 failed in 12.3s =="])
+
+    async def run_tests(how: str) -> ToolFailure:
+        if how == "raise":
+            raise RuntimeError(full)
+        return ToolFailure("tests_failed", full, False)
+
+    registry = ToolRegistry(artifact_dir=str(tmp_path / "tool-results"))
+    registry.register(ToolDef(
+        "run_tests", "run the tests",
+        {"type": "object", "properties": {"how": {"type": "string"}}, "required": ["how"]},
+        run_tests, risk="execute",
+    ))
+
+    for how in ("raise", "report"):
+        result = asyncio.run(registry.execute("run_tests", {"how": how}))
+
+        assert len(result["error"]) < 14_000 < len(full)
+        # The beginning and, above all, the summary at the end survive.
+        assert "collected 4000 items" in result["error"]
+        assert "== 4000 failed in 12.3s ==" in result["error"]
+        assert result["output_truncated"] is True
+        assert full in Path(result["artifact_path"]).read_text(encoding="utf-8")
+
+    agent = ReActAgent("agent", _ScriptedLLM([("run_tests", '{"how": "report"}')]), registry, max_iterations=4)
+    _turn(agent, None)
+    (message,) = _tool_messages(agent)
+    assert "status: error" in message
+    assert "inspect the complete result at" in message
+    assert len(message) < 15_000
+
+
 def test_partial_result_is_not_described_as_complete():
     async def page(full: bool) -> str:
         if full:

@@ -129,6 +129,22 @@ def test_python_run_stopped_at_the_sandbox_limit_is_marked_partial(tmp_path):
                 "execute_python", {"code": "print('done')", "foreground_yield_ms": 0}
             )
             assert "partial" not in finished
+
+            # A shell run reports the stop as a failure; that failure is partial too.
+            shell = await registry.execute(
+                "execute_shell",
+                {"command": "echo shell-before; sleep 8", "foreground_yield_ms": 0},
+            )
+            assert shell["partial"] is True
+            shell_context = ReActAgent._tool_result_context(
+                {**shell, "name": "execute_shell", "tool_output": shell["error"]}
+            )
+            assert "shell-before" in shell_context
+            assert "Result completeness: partial" in shell_context
+            failed = await registry.execute(
+                "execute_shell", {"command": "exit 3", "foreground_yield_ms": 0}
+            )
+            assert failed["error"] and not failed.get("partial")
         finally:
             await sandbox.close()
     asyncio.run(run())
