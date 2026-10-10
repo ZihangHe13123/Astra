@@ -46,6 +46,10 @@ BRIDGE_NAME = "astra"
 TOOL_PREFIX = f"mcp__{BRIDGE_NAME}__"
 # Claude accepts tool names up to 64 characters, and the bridge prefix counts.
 TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,%d}" % (64 - len(TOOL_PREFIX)))
+# The first line ReActAgent puts on each tool result it stores: the tool and how the call went.
+RESULT_HEADER = re.compile(r"\[Tool result: [^\n|]+ \| status: ([a-z_]+)\]\n")
+# What the runtime stores, without that line, for a call it refused to run before ending the turn.
+NOT_RUN = ("[ToolCircuitOpen] ", "[ToolBudgetExhausted] ")
 # Dropped from the CLI's environment: anything that would move billing, routing or model aliases
 # away from the signed-in subscription (a provider switcher sets ANTHROPIC_DEFAULT_*_MODEL[_NAME]),
 # and whatever a parent Claude Code session or the user's shell set for their own sessions
@@ -257,6 +261,28 @@ def _tool_use_id(raw, used: set[str]) -> str:
     return candidate
 
 
+def _is_error(content) -> bool:
+    """Whether a stored tool result is a failed call. Read from its text alone, so a replay marks
+    it the same way every time. Of the statuses on the first line Astra writes, only `error` is a
+    failed call: `failed` (a command that exited non-zero), `timed_out`, `cancelled`, `running`
+    and the like are what a call that worked reports about a process, and they stay in the text.
+    A result without that line is a failure when it is a call the runtime refused to run, or a
+    worker's result (the registry's JSON) whose `error` is not empty."""
+    text = _text(content)
+    header = RESULT_HEADER.match(text)
+    if header:
+        return header[1] == "error"
+    if text.startswith(NOT_RUN):
+        return True
+    if not text.startswith("{"):
+        return False
+    try:
+        value, _ = json.JSONDecoder().raw_decode(text)
+    except ValueError:
+        return False
+    return isinstance(value, dict) and isinstance(value.get("error"), str) and bool(value["error"].strip())
+
+
 def conversation(messages: list[dict], names: frozenset[str]) -> list[tuple[str, list[dict]]] | None:
     """The conversation after the system prompt as alternating native turns, starting and ending
     with a user turn: tool results first in each user turn, then text, images and later system
@@ -301,7 +327,11 @@ def conversation(messages: list[dict], names: frozenset[str]) -> list[tuple[str,
             content = _content_blocks(message.get("content")) or [{"type": "text", "text": "(no output)"}]
             native = pending.pop(call_id, None)
             if native is not None:
-                results.append({"type": "tool_result", "tool_use_id": native, "content": content})
+                # Marked only when the result is all text: whether Claude's API takes an image
+                # inside an error result is not established, and a refused request loses the step.
+                failed = _is_error(message.get("content")) and all(b["type"] == "text" for b in content)
+                results.append({"type": "tool_result", "tool_use_id": native,
+                                **({"is_error": True} if failed else {}), "content": content})
             else:
                 blocks.extend([{"type": "text", "text": f"[tool result for call {call_id}]"}, *content])
         elif role in {"system", "developer"}:

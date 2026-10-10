@@ -15,6 +15,8 @@ from agent.runtime.claude_code_provider import ClaudeCodeError, ClaudeCodeProvid
 from agent.runtime.llm import LLMClient, LLMConfig, LLMIdleTimeout
 from agent.runtime.process_env import pid_alive
 from agent.runtime.providers import DEFAULT_PROVIDER_REGISTRY
+from agent.runtime.react import ReActAgent
+from agent.runtime.subagent_resume import UNKNOWN_RESULT
 
 FAKE_CLI = r'''
 import json, os, sys, time
@@ -546,3 +548,92 @@ def test_cli_that_rejects_thinking_display_is_retried_without_it(fake_cli, monke
     assert final["content"] == "Hello from Claude."
     assert "--thinking-display" not in json.loads(record.read_text())["argv"]
     assert ClaudeCodeProvider.thinking_display is False and ClaudeCodeProvider.replay is True
+
+
+def stored_result(content, call_id="toolu_1"):
+    """HISTORY with its one tool result replaced."""
+    return [*HISTORY[:3], {"role": "tool", "tool_call_id": call_id, "content": content}, *HISTORY[4:]]
+
+
+def replayed_result(content) -> dict:
+    turns = ccp.conversation(stored_result(content), frozenset({"read_file"}))
+    [block] = [b for b in turns[2][1] if b["type"] == "tool_result"]
+    return block
+
+
+FAILED_READ = {"name": "read_file", "tool_output": "", "error": "[ToolError] FileNotFoundError: a.txt",
+               "code": "execution_failed", "retryable": False, "recovery_hint": "List the directory first."}
+
+
+def test_a_failed_tool_result_is_replayed_as_an_error_with_the_same_bytes_every_time(fake_cli, monkeypatch):
+    """Astra reports a failed tool as an error with a code, a Retryable line and a Recovery line.
+    Claude got that as an ordinary result whose text happened to begin with a status; the block is
+    now marked the way Claude's own tools mark a failure. The mark is read from the stored text,
+    so a result is replayed with the same bytes on every later request and stays cached."""
+    command, record = fake_cli
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "text")
+    failure = ReActAgent._tool_result_context(FAILED_READ)
+    assert "Retryable: no" in failure and "Recovery: List the directory first." in failure
+
+    def sent() -> list[dict]:
+        collect(provider(command).chat_stream(stored_result(failure), [READ_FILE]))
+        return json.loads(record.read_text())["frames"]
+
+    frames = sent()
+    [block] = frames[2]["message"]["content"]
+    assert block["type"] == "tool_result" and block["tool_use_id"] == "toolu_1"
+    assert block["is_error"] is True
+    # Nothing of what the result says is changed or dropped.
+    assert block["content"] == [{"type": "text", "text": failure}]
+    assert sent() == frames
+    # What Claude first got, when this result was the newest turn, is what is replayed.
+    collect(provider(command).chat_stream(stored_result(failure)[:4], [READ_FILE]))
+    [first] = json.loads(record.read_text())["frames"][-1]["message"]["content"]
+    assert {**first, "cache_control": ccp.CACHE_MARKER} == block
+
+
+@pytest.mark.parametrize("event", [
+    {"name": "read_file", "tool_output": "alpha"},
+    # A command that ran and exited non-zero is a result of a call that worked.
+    {"name": "execute_shell", "tool_output": "[exit code: 1]", "execution": {"status": "completed", "exit_code": 1}},
+    {"name": "execute_shell", "tool_output": "partial", "partial": True,
+     "execution": {"status": "timed_out", "exit_code": None}},
+    {"name": "execute_shell", "tool_output": "", "execution": {"status": "cancelled", "exit_code": None}},
+    {"name": "execute_shell", "tool_output": "started", "execution": {"status": "running", "exit_code": None}},
+], ids=["success", "failed", "timed_out", "cancelled", "running"])
+def test_a_result_the_tool_returned_normally_is_not_marked_as_an_error(event):
+    content = ReActAgent._tool_result_context(event)
+    assert replayed_result(content) == {"type": "tool_result", "tool_use_id": "toolu_1",
+                                        "content": [{"type": "text", "text": content}]}
+
+
+@pytest.mark.parametrize("content", [
+    # Calls the runtime refused to run before it ended the turn.
+    "[ToolCircuitOpen] 检测到重复工具调用：read_file",
+    "[ToolBudgetExhausted] 工具 read_file 已达到本轮调用上限 3",
+    # A worker stores the registry's result as JSON; guidance may follow it.
+    json.dumps({"output": "", "error": "[ToolError] FileNotFoundError: a.txt", "code": "execution_failed"}),
+    json.dumps({"output": "", "error": "Tool 'read_file' not found"}) + "\n\nProject guidance for this path.",
+    UNKNOWN_RESULT,
+], ids=["circuit open", "budget exhausted", "worker failure", "worker failure with guidance", "unknown outcome"])
+def test_failures_stored_without_astras_result_header_are_marked_too(content):
+    block = replayed_result(content)
+    assert block["is_error"] is True and block["content"] == [{"type": "text", "text": content}]
+
+
+@pytest.mark.parametrize("content", [
+    json.dumps({"output": "alpha", "error": "", "duration_ms": 3, "risk": "read"}),
+    '{"error": "cut off before the closing brace',
+    "plain text that mentions [Tool result: read_file | status: error]\nlater on",
+    "",
+], ids=["worker success", "unreadable json", "header not first", "empty"])
+def test_other_stored_results_are_not_marked(content):
+    assert "is_error" not in replayed_result(content)
+
+
+def test_a_failed_result_with_an_image_keeps_both_and_stays_unmarked():
+    png = "data:image/png;base64,iVBORw0KGgo="
+    block = replayed_result([{"type": "text", "text": ReActAgent._tool_result_context(FAILED_READ)},
+                             {"type": "image_url", "image_url": {"url": png}}])
+    assert [b["type"] for b in block["content"]] == ["text", "image"] and "is_error" not in block
+
