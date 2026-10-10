@@ -2,8 +2,10 @@ import asyncio
 import base64
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import httpx
@@ -766,6 +768,390 @@ def test_mcp_config_validates_tool_filters():
 
     assert "servers.demo.include_tools must be a list of non-empty tool names" in warnings
     assert "servers.demo.exclude_tools must be a list of non-empty tool names" in warnings
+
+
+# What OpenAI-compatible and Anthropic endpoints accept as a function name; one name
+# outside it fails every model request of the session.
+_VALID_TOOL_NAME = re.compile(r"[a-zA-Z0-9_-]{1,64}")
+_LONG_REMOTE_TOOL = "repos/owner/repo/pulls/pull_number/comments/comment_id/replies.post"
+
+
+class _ListedSession:
+    """A connected server: it lists its tools and records which one each call reached."""
+
+    def __init__(self, tools=()):
+        self.tools = list(tools)
+        self.calls = []
+
+    async def initialize(self):
+        return None
+
+    async def list_tools(self, cursor=None):
+        return SimpleNamespace(tools=self.tools, nextCursor=None)
+
+    async def call_tool(self, name, arguments):
+        self.calls.append(name)
+        return SimpleNamespace(content=[SimpleNamespace(text=f"ran {name}")], structuredContent=None, isError=False)
+
+
+def _mcp_listing(tmp_path, server, tools, *, manager=None, registry=None, config=None):
+    """List, register and publish the status the way a server's tool-list change does."""
+    registry = registry or ToolRegistry(ToolPolicy(mode="permissive"), artifact_dir=tmp_path)
+    manager = manager or MCPManager(tmp_path / "mcp.json")
+    session = _ListedSession(tools)
+    manager._registry = registry
+    manager._sessions[server] = session
+    manager._server_configs[server] = config or {}
+    run(manager._refresh_server_tools(server))
+    return manager, registry, session
+
+
+def _reached(registry, session, names=None):
+    """The registered name of each remote tool, found by calling every registered tool."""
+    reached = {}
+    for local in names if names is not None else registry.tool_names:
+        before = len(session.calls)
+        result = run(registry.execute(local, {"query": "hello"}))
+        assert result["error"] == "" and len(session.calls) == before + 1, result
+        reached[session.calls[-1]] = local
+    return reached
+
+
+@pytest.mark.parametrize("server,tool,name", [
+    ("demo server", "lookup/item", "mcp__demo_server__lookup_item"),
+    ("qwen-mm-plugins", "vision_chat", "mcp__qwen-mm-plugins__vision_chat"),
+    ("codegraph", "explore", "mcp__codegraph__explore"),
+    ("github", "create_pull_request_review_comment", "mcp__github__create_pull_request_review_comment"),
+    ("_files_", "__read  file__", "mcp__files__read_file"),
+    ("a.b", "get.user", "mcp__a_b__get_user"),
+    ("???", "搜索", "mcp__server__tool"),
+    # Exactly 64 characters: the longest name that needs no change.
+    ("sequential-thinking", "t" * 38, "mcp__sequential-thinking__" + "t" * 38),
+])
+def test_mcp_ordinary_tool_names_stay_as_they_were(tmp_path, server, tool, name):
+    # Saved conversations and user allowlists hold these names. This holds before and
+    # after names became bounded: nothing about an ordinary tool changed.
+    manager, registry, session = _mcp_listing(tmp_path, server, [FakeRemoteTool(name=tool)])
+
+    assert registry.tool_names == [name]
+    assert mcp_tool_name(server, tool) == name
+    assert _reached(registry, session) == {tool: name}
+    assert registry.get(name).description == "look up an item"
+    assert manager.report().splitlines()[1:] == [f"  {server}: ready (1 tools)"]
+
+
+def test_mcp_long_tool_name_is_shortened_to_the_same_valid_name_every_time(tmp_path):
+    sibling = _LONG_REMOTE_TOOL + ".v2"
+    tools = [FakeRemoteTool(name=_LONG_REMOTE_TOOL), FakeRemoteTool(name=sibling), FakeRemoteTool(name="ping")]
+
+    manager, registry, session = _mcp_listing(tmp_path / "one", "github-enterprise", tools)
+    reached = _reached(registry, session)
+
+    assert set(reached) == {_LONG_REMOTE_TOOL, sibling, "ping"}
+    assert all(_VALID_TOOL_NAME.fullmatch(name) for name in registry.tool_names)
+    local = reached[_LONG_REMOTE_TOOL]
+    # A name in a saved conversation must mean the same tool in the next session: it
+    # is made from the two original names only, and this is that name.
+    assert local == "mcp__github-enterpris__repos_owner_repo_pu_e315009e"
+    assert reached[sibling].startswith("mcp__github-enterpris__repos_owner_repo_pu_") and reached[sibling] != local
+    assert reached["ping"] == "mcp__github-enterprise__ping"
+    # It also fits behind the prefix the Claude Code bridge adds to every tool name.
+    assert len("mcp__astra__" + local) <= 64
+
+    # The model and the user can both see which of the server's tools it is.
+    assert registry.get(local).description == (
+        f'look up an item\n[Tool "{_LONG_REMOTE_TOOL}" of MCP server "github-enterprise"]'
+    )
+    assert registry.get(reached["ping"]).description == "look up an item"
+    report = manager.report()
+    assert f'"{_LONG_REMOTE_TOOL}" is registered as {local}: its full name would be 91 characters' in report
+    assert not any("ping" in note for note in manager.statuses[0].notes)
+
+    # Another session, and the server listing its tools in another order.
+    _, later_registry, later_session = _mcp_listing(tmp_path / "two", "github-enterprise", tools[::-1])
+    assert _reached(later_registry, later_session) == reached
+
+
+def test_mcp_error_from_a_shortened_tool_names_the_registered_tool(tmp_path):
+    registry = ToolRegistry(ToolPolicy(mode="permissive"), artifact_dir=tmp_path)
+    manager = MCPManager(tmp_path / "mcp.json")
+    failing = _OneResultSession([type("ErrorText", (), {"text": "No such thread"})()], is_error=True)
+    manager._register_tools(
+        registry, "github-enterprise", failing, [FakeRemoteTool(name=_LONG_REMOTE_TOOL)], {"risk": "read"},
+    )
+    [local] = registry.tool_names
+
+    result = run(registry.execute(local, {"query": "hello"}))
+
+    # The message names what the model can call; the details keep the server's own name.
+    assert _VALID_TOOL_NAME.fullmatch(local)
+    assert result["error"] == f"[MCPToolError] {local}: No such thread"
+    assert result["details"]["mcp_server"] == "github-enterprise"
+    assert result["details"]["mcp_tool"] == _LONG_REMOTE_TOOL
+
+
+@pytest.mark.parametrize("server", ["codegraph", "qwen-mm-plugins"])
+def test_mcp_shortened_name_keeps_an_ordinary_server_name_whole(tmp_path, server):
+    # Delegation and image routing find these servers' tools by `mcp__<server>__` and by group.
+    _, registry, _ = _mcp_listing(tmp_path, server, [FakeRemoteTool(name=_LONG_REMOTE_TOOL)])
+
+    [local] = registry.tool_names
+    assert _VALID_TOOL_NAME.fullmatch(local) and local.startswith(f"mcp__{server}__")
+    assert registry.get(local).group == f"mcp:{server}"
+
+
+def test_mcp_long_server_name_keeps_the_tool_name_readable(tmp_path):
+    server = "a-very-long-server-name-from-a-config-file-that-keeps-going-on"
+
+    _, registry, session = _mcp_listing(tmp_path, server, [FakeRemoteTool(name="ping")])
+
+    [local] = registry.tool_names
+    assert _VALID_TOOL_NAME.fullmatch(local) and local.startswith("mcp__a-very-long-server-name") and "__ping_" in local
+    assert _reached(registry, session) == {"ping": local}
+
+
+def test_mcp_tools_whose_names_collide_are_all_registered(tmp_path):
+    tools = [
+        FakeRemoteTool(name="get.user", description="one user by id"),
+        FakeRemoteTool(name="get_user", description="one user by name"),
+        FakeRemoteTool(name="get user", description="one user by mail"),
+        FakeRemoteTool(name="other"),
+    ]
+
+    manager, registry, session = _mcp_listing(tmp_path / "one", "demo", tools)
+    reached = _reached(registry, session)
+
+    # Every tool is there and reaches its own remote tool; this used to fail the server.
+    assert set(reached) == {"get.user", "get_user", "get user", "other"}
+    assert manager.statuses[0].state == "ready" and manager.statuses[0].tools == 4
+    assert manager.statuses[0].error == ""
+    assert reached["other"] == "mcp__demo__other"
+    colliding = [reached["get.user"], reached["get_user"], reached["get user"]]
+    assert len(set(colliding)) == 3
+    assert all(_VALID_TOOL_NAME.fullmatch(name) and name.startswith("mcp__demo__get_user_") for name in colliding)
+    # The shared name itself is given to none of them, so it cannot come to mean another tool.
+    assert registry.get("mcp__demo__get_user") is None
+
+    # The model reads which remote tool each name stands for, the user reads it in /mcp.
+    assert registry.get(reached["get.user"]).description == 'one user by id\n[Tool "get.user" of MCP server "demo"]'
+    assert registry.get(reached["get_user"]).description == 'one user by name\n[Tool "get_user" of MCP server "demo"]'
+    assert registry.get(reached["other"]).description == "look up an item"
+    report = manager.report()
+    for remote in ("get.user", "get_user", "get user"):
+        assert (
+            f'"{remote}" is registered as {reached[remote]}: 3 tools of this server would be named mcp__demo__get_user'
+        ) in report
+    assert not any("other" in note for note in manager.statuses[0].notes)
+
+    # The same names in another session whatever order the server lists them in, and
+    # after the same connection lists them again.
+    _, later_registry, later_session = _mcp_listing(tmp_path / "two", "demo", tools[::-1])
+    assert _reached(later_registry, later_session) == reached
+    _, _, again = _mcp_listing(tmp_path / "one", "demo", tools[::-1], manager=manager, registry=registry)
+    assert _reached(registry, again) == reached
+    assert sorted(registry.tool_names) == sorted(reached.values())
+
+
+def test_mcp_names_without_usable_characters_do_not_collide(tmp_path):
+    manager, registry, session = _mcp_listing(
+        tmp_path, "demo", [FakeRemoteTool(name="搜索"), FakeRemoteTool(name="翻译")],
+    )
+
+    reached = _reached(registry, session)
+    assert set(reached) == {"搜索", "翻译"}
+    assert all(_VALID_TOOL_NAME.fullmatch(name) for name in reached.values())
+    assert registry.get(reached["搜索"]).description.endswith('[Tool "搜索" of MCP server "demo"]')
+    assert f'"翻译" is registered as {reached["翻译"]}' in manager.report()
+
+
+def test_mcp_shortened_names_that_coincide_are_told_apart(tmp_path):
+    # Found by search: shortened alone, both get the same name, hash characters included.
+    pair = [
+        "export_report_for_account_and_region_with_all_details_28360",
+        "export_report_for_account_and_region_with_all_details_140453",
+    ]
+    assert mcp_tool_name("demo", pair[0]) == mcp_tool_name("demo", pair[1])
+
+    _, registry, session = _mcp_listing(tmp_path / "one", "demo", [FakeRemoteTool(name=name) for name in pair])
+    reached = _reached(registry, session)
+
+    assert set(reached) == set(pair) and len(set(reached.values())) == 2
+    assert all(_VALID_TOOL_NAME.fullmatch(name) for name in reached.values())
+    assert mcp_tool_name("demo", pair[0]) not in reached.values()
+    _, later_registry, later_session = _mcp_listing(
+        tmp_path / "two", "demo", [FakeRemoteTool(name=name) for name in pair[::-1]],
+    )
+    assert _reached(later_registry, later_session) == reached
+
+
+def test_mcp_text_added_for_an_altered_name_can_be_sent_to_a_model(tmp_path):
+    # JSON can carry a lone surrogate in a name; UTF-8, which a model request is sent in, cannot.
+    manager, registry, session = _mcp_listing(
+        tmp_path, "demo", [FakeRemoteTool(name="\ud800"), FakeRemoteTool(name="tool")],
+    )
+
+    assert set(_reached(registry, session)) == {"\ud800", "tool"}
+    assert json.dumps(registry.to_openai_tools(), ensure_ascii=False).encode("utf-8")
+    assert "\\\\ud800" in manager.report() and manager.report().encode("utf-8")
+
+
+def test_mcp_approval_of_one_colliding_tool_does_not_cover_the_other(tmp_path):
+    registry = ToolRegistry()
+    manager = MCPManager(tmp_path / "mcp.json")
+    session = _ListedSession()
+    manager._register_tools(
+        registry, "demo", session, [FakeRemoteTool(name="send.note"), FakeRemoteTool(name="send_note")],
+        {"risk": "write"},
+    )
+    requests = []
+
+    async def decide(request):
+        requests.append(request)
+        return "session"
+
+    registry.set_approval_handler(decide)
+    reached = _reached(registry, session)
+
+    # Approval is asked and remembered per server tool, not per registered name.
+    assert sorted(request["target"] for request in requests) == ["demo/send.note", "demo/send_note"]
+    assert len({request["scope"] for request in requests}) == 2
+    assert _reached(registry, session) == reached and len(requests) == 2
+
+
+def test_mcp_tool_name_held_by_another_server_gets_its_own_name(tmp_path):
+    manager, registry, first = _mcp_listing(tmp_path, "a.b", [FakeRemoteTool(name="x")])
+    _, _, second = _mcp_listing(
+        tmp_path, "a_b", [FakeRemoteTool(name="x"), FakeRemoteTool(name="y")], manager=manager, registry=registry,
+    )
+
+    # The second server used to lose all its tools to "already registered by another owner".
+    assert [(status.name, status.state, status.tools) for status in manager.statuses] == [
+        ("a.b", "ready", 1), ("a_b", "ready", 2),
+    ]
+    assert _reached(registry, first, ["mcp__a_b__x"]) == {"x": "mcp__a_b__x"}
+    theirs = _reached(registry, second, [name for name in registry.tool_names if name != "mcp__a_b__x"])
+    assert theirs["y"] == "mcp__a_b__y"
+    assert _VALID_TOOL_NAME.fullmatch(theirs["x"]) and theirs["x"].startswith("mcp__a_b__x_")
+    assert registry.get(theirs["x"]).description.endswith('[Tool "x" of MCP server "a_b"]')
+    assert (
+        f'"x" is registered as {theirs["x"]}: mcp__a_b__x is already registered by another server or tool'
+    ) in manager.report()
+
+    # Each server keeps its names when it lists its tools again.
+    _, _, first_again = _mcp_listing(tmp_path, "a.b", [FakeRemoteTool(name="x")], manager=manager, registry=registry)
+    _, _, second_again = _mcp_listing(
+        tmp_path, "a_b", [FakeRemoteTool(name="y"), FakeRemoteTool(name="x")], manager=manager, registry=registry,
+    )
+    assert _reached(registry, first_again, ["mcp__a_b__x"]) == {"x": "mcp__a_b__x"}
+    assert _reached(registry, second_again, list(theirs.values())) == theirs
+
+
+def test_mcp_startup_and_reconnect_keep_a_server_with_flawed_tool_names(tmp_path):
+    pytest.importorskip("mcp")
+    offered = {"plain": ["read"], "odd": ["get.user", "get_user", "", _LONG_REMOTE_TOOL]}
+    sessions = {}
+
+    class FakeServers(MCPManager):
+        async def _enter_server_session(self, name, raw, stack):
+            sessions[name] = _ListedSession([FakeRemoteTool(name=tool) for tool in offered[name]])
+            return sessions[name]
+
+    config = tmp_path / "mcp.json"
+    config.write_text(json.dumps({"servers": {name: {"command": "demo"} for name in offered}}), encoding="utf-8")
+    manager = FakeServers(config)
+    registry = ToolRegistry(ToolPolicy(mode="permissive"), artifact_dir=tmp_path)
+
+    run(manager.load(registry))
+
+    # The colliding pair or the nameless tool alone used to leave "odd" in the error
+    # state with no tools, to be started again every reconnect interval.
+    assert [(status.name, status.state, status.tools, status.error) for status in manager.statuses] == [
+        ("plain", "ready", 1, ""), ("odd", "ready", 3, ""),
+    ]
+    assert _reached(registry, sessions["plain"], ["mcp__plain__read"]) == {"read": "mcp__plain__read"}
+    odd_names = [name for name in registry.tool_names if name != "mcp__plain__read"]
+    reached = _reached(registry, sessions["odd"], odd_names)
+    assert set(reached) == {"get.user", "get_user", _LONG_REMOTE_TOOL}
+    assert all(_VALID_TOOL_NAME.fullmatch(name) for name in registry.tool_names)
+    report = manager.report()
+    assert "  odd: ready (3 tools)" in report and "a tool was skipped: its name is empty" in report
+    assert f'"get.user" is registered as {reached["get.user"]}' in report
+
+    # A reconnection gives every tool the name it had, on the new connection.
+    before = sessions["odd"]
+    run(manager._reconnect_server("odd"))
+    assert sessions["odd"] is not before
+    assert _reached(registry, sessions["odd"], odd_names) == reached
+    assert sorted(registry.tool_names) == sorted(["mcp__plain__read", *odd_names])
+    assert manager.report() == report
+
+
+def _tool_with_schema(name, schema):
+    return SimpleNamespace(name=name, description=f"does {name}", inputSchema=schema)
+
+
+def test_mcp_unusable_tool_is_left_out_and_the_rest_of_the_server_stays(tmp_path):
+    takes_query = {"properties": {"query": {"type": "string"}}}
+    tools = [
+        FakeRemoteTool(name="good"),
+        _tool_with_schema("", {"type": "object", "properties": {}}),
+        _tool_with_schema(None, {"type": "object", "properties": {}}),
+        _tool_with_schema("good", {"type": "object", "properties": {}}),
+        _tool_with_schema("text_schema", "string"),
+        _tool_with_schema("list_schema", [{"type": "object"}]),
+        _tool_with_schema("string_tool", {"type": "string"}),
+        _tool_with_schema("typeless", takes_query),
+    ]
+
+    manager, registry, session = _mcp_listing(tmp_path, "demo", tools)
+
+    assert manager.statuses[0].state == "ready" and manager.statuses[0].error == ""
+    assert _reached(registry, session) == {"good": "mcp__demo__good", "typeless": "mcp__demo__typeless"}
+    assert manager.statuses[0].tools == 2
+    # The first "good" is the registered one.
+    assert registry.get("mcp__demo__good").description == "look up an item"
+    # Every schema sent to the model is an object schema; the server's own dict is not changed.
+    for schema in registry.to_openai_tools():
+        assert schema["function"]["parameters"]["type"] == "object"
+    assert registry.get("mcp__demo__typeless").parameters["properties"] == takes_query["properties"]
+    assert "type" not in takes_query
+
+    # /mcp names each tool that is missing and says why.
+    report = manager.report()
+    assert "  demo: ready (2 tools)" in report
+    assert "a tool was skipped: its name is empty" in report
+    assert "a tool was skipped: its name is not text (NoneType)" in report
+    assert 'a repeated "good" was skipped: the server lists this name more than once' in report
+    assert '"text_schema" was skipped: its input schema is not a JSON object (str)' in report
+    assert '"list_schema" was skipped: its input schema is not a JSON object (list)' in report
+    assert '"string_tool" was skipped: its input schema has type "string"' in report
+
+
+def test_mcp_excluded_tool_is_not_reported_as_skipped(tmp_path):
+    tools = [FakeRemoteTool(name="get.user"), FakeRemoteTool(name="get_user"), _tool_with_schema("broken", "string")]
+
+    manager, registry, _ = _mcp_listing(
+        tmp_path, "demo", tools, config={"exclude_tools": ["get.user", "broken"]},
+    )
+
+    # What the user's configuration leaves out neither collides nor needs a note, as
+    # before: excluding one of two colliding tools is how a user picks the plain name.
+    assert registry.tool_names == ["mcp__demo__get_user"]
+    assert manager.report().splitlines()[1:] == ["  demo: ready (1 tools)"]
+
+
+def test_mcp_report_bounds_the_list_of_renamed_and_skipped_tools(tmp_path):
+    tools = [_tool_with_schema(f"broken_{index}", "string") for index in range(60)]
+
+    manager, _, _ = _mcp_listing(tmp_path, "demo", [FakeRemoteTool(name="good"), *tools])
+
+    lines = manager.report().splitlines()
+    shown = [line for line in lines if "was skipped" in line]
+    assert shown and '"broken_0" was skipped' in shown[0]
+    assert len(shown) < 60
+    assert lines[-1].strip() == f"... and {60 - len(shown)} more renamed or skipped tools"
+    # The status object itself holds every note.
+    assert len(manager.statuses[0].notes) == 60
 
 
 def test_mcp_image_from_a_tool_with_a_long_name_is_saved(tmp_path):
