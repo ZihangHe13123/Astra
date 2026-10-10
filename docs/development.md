@@ -19,7 +19,7 @@ live acceptance may opt into inherited settings with the
 on any supported platform:
 
 ```text
-uv sync --locked --python 3.11 --extra dev --extra mcp --extra tracing --extra server --extra notebook
+uv sync --locked --python 3.11 --extra dev --extra mcp --extra tracing --extra server --extra notebook --extra documents --extra voice
 npm --prefix ui-core ci
 npm --prefix ui-core run build
 npm --prefix ui-tui ci
@@ -90,7 +90,7 @@ an explicit correctness-focused rule set in `pyproject.toml`; formatting rules
 are not a release requirement. Optional acceptance gates are separate:
 
 ```text
-uv run --locked --extra dev --extra mcp --extra tracing --extra server --extra notebook python scripts/phase_t_gate.py --wheel-smoke
+uv run --locked --extra dev --extra mcp --extra tracing --extra server --extra notebook --extra documents --extra voice python scripts/phase_t_gate.py --wheel-smoke
 ```
 
 During development, run focused checks locally. Before the final cloud run,
