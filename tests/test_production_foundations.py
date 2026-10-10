@@ -611,6 +611,130 @@ def test_mcp_image_content_becomes_astra_image_attachment(tmp_path):
     assert image_path.read_bytes() == b"small-png-payload"
 
 
+class _OneResultSession:
+    def __init__(self, content, *, structured=None, is_error=False):
+        self.result = type("Result", (), {
+            "content": content, "structuredContent": structured, "isError": is_error,
+        })()
+
+    async def call_tool(self, name, arguments):
+        return self.result
+
+
+def _mcp_call(tmp_path, content, **result):
+    registry = ToolRegistry(ToolPolicy(mode="permissive"), artifact_dir=tmp_path)
+    manager = MCPManager(tmp_path / "mcp.json", max_output_chars=1000)
+    manager._register_tools(
+        registry, "demo server", _OneResultSession(content, **result), [FakeRemoteTool()], {"risk": "read"},
+    )
+    return run(registry.execute("mcp__demo_server__lookup_item", {"query": "hello"}))
+
+
+class _Uri:
+    """Stands in for the SDK's URL type: it prints as the address and is not JSON-serializable."""
+
+    def __init__(self, value):
+        self.value = value
+
+    def __str__(self):
+        return self.value
+
+
+class _Block:
+    def __init__(self, **fields):
+        self.__dict__.update(fields)
+
+    def model_dump(self, **_options):
+        return dict(self.__dict__)
+
+
+def test_mcp_resource_blocks_reach_the_model_as_text(tmp_path):
+    link = _Block(type="resource_link", uri=_Uri("file:///reports/q3.csv"), name="Q3 report",
+                  description=None, mimeType="text/csv")
+    embedded = _Block(type="resource", resource=_Block(
+        uri=_Uri("file:///notes.md"), mimeType="text/markdown", text="first line\nsecond line"))
+
+    result = _mcp_call(tmp_path, [FakeText(), link, embedded])
+
+    # A URL object used to stop the whole result with "not JSON serializable".
+    assert result["error"] == ""
+    assert result["output"].startswith("result\n")
+    assert "file:///reports/q3.csv" in result["output"] and "Q3 report" in result["output"]
+    assert "file:///notes.md" in result["output"]
+    assert "first line\nsecond line" in result["output"]
+    assert not result.get("partial")
+
+
+def test_mcp_resource_blocks_from_the_sdk_types(tmp_path):
+    types = pytest.importorskip("mcp.types")
+    link = types.ResourceLink(type="resource_link", uri="file:///reports/q3.csv", name="Q3 report")
+    embedded = types.EmbeddedResource(type="resource", resource=types.TextResourceContents(
+        uri="file:///notes.md", mimeType="text/markdown", text="first line"))
+
+    result = _mcp_call(tmp_path, [link, embedded])
+
+    assert result["error"] == ""
+    assert "file:///reports/q3.csv" in result["output"]
+    assert "file:///notes.md" in result["output"] and "first line" in result["output"]
+
+
+def test_mcp_binary_content_is_named_instead_of_pasted(tmp_path):
+    payload = base64.b64encode(b"x" * 600).decode("ascii")
+    audio = _Block(type="audio", mimeType="audio/wav", data=payload)
+    drawing = _Block(type="image", mimeType="image/svg+xml", data=payload)
+    blob = _Block(type="resource", resource=_Block(
+        uri=_Uri("file:///scan.pdf"), mimeType="application/pdf", blob=payload))
+
+    result = _mcp_call(tmp_path, [FakeText(), audio, drawing, blob])
+
+    output = result["output"]
+    assert payload not in output
+    assert "audio/wav" in output and "image/svg+xml" in output and "file:///scan.pdf" in output
+    assert output.count("not shown") == 3
+    # The bridge left content out, so the result may not be called complete.
+    assert result["partial"] is True
+
+
+def test_mcp_image_that_cannot_be_attached_is_reported(tmp_path):
+    broken = _Block(type="image", mimeType="image/png", data="!!! not base64 !!!")
+
+    result = _mcp_call(tmp_path, [FakeText(), broken])
+
+    assert result["output"].startswith("result\n")
+    assert "1 image(s) from this result not shown" in result["output"]
+    assert result["partial"] is True
+    assert not (tmp_path / "mcp-images").exists()
+
+    kept = _mcp_call(tmp_path, [FakeImage(), broken])
+    payload = json.loads(kept["output"])
+    assert len(payload["image_paths"]) == 1
+    assert "1 image(s) from this result not shown" in payload["text"]
+    assert kept["partial"] is True
+
+
+def test_mcp_structured_result_keeps_the_other_content(tmp_path):
+    link = _Block(type="resource_link", uri=_Uri("https://example.test/export/7"), name="export",
+                  description=None, mimeType=None)
+
+    result = _mcp_call(tmp_path, [FakeText(), link], structured={"rows": 3})
+
+    assert result["output"].startswith('{"rows": 3}')
+    assert "https://example.test/export/7" in result["output"]
+
+
+def test_mcp_error_names_the_tool_the_model_can_call(tmp_path):
+    long_message = "No such table: orders. " + "x" * 2000
+
+    result = _mcp_call(tmp_path, [type("ErrorText", (), {"text": long_message})(), FakeImage()], is_error=True)
+
+    assert result["error"].startswith("[MCPToolError] mcp__demo_server__lookup_item: No such table: orders.")
+    assert "demo server/lookup/item" not in result["error"]
+    # max_output_chars is 1000 here; what was cut and the dropped image are both named.
+    assert "more characters of the server's message not shown" in result["error"]
+    assert result["error"].endswith("[1 image(s) in this error result not shown]")
+    assert not (tmp_path / "mcp-images").exists()
+
+
 def test_mcp_include_and_exclude_tools_limit_registration():
     registry = ToolRegistry(ToolPolicy(mode="permissive"))
     manager = MCPManager()
