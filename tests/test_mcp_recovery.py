@@ -153,7 +153,7 @@ def test_call_to_a_disconnected_server_reports_its_state(tmp_path):
     assert session.calls == 1
     assert result["code"] == "mcp_unavailable"
     assert result["details"]["dispatch_state"] == "not_dispatched"
-    assert "state: error: ConnectionError: reply lost" in result["error"]
+    assert "is not connected (state: error)" in result["error"]
     # No tool lists tools again, and nothing reconnects when no lifecycle task runs.
     assert "rediscover" not in result["recovery_hint"]
     assert "Nothing is reconnecting" in result["recovery_hint"]

@@ -950,8 +950,8 @@ class MCPManager:
                 details=details,
             )
         status = next((item for item in self.statuses if item.name == server), None)
+        # The state only: the stored error can quote the server's URL, and the user reads it with /mcp.
         state = status.state if status is not None else "unknown"
-        reason = f": {status.error[:300]}" if status is not None and status.error else ""
         lifecycle = self._background_task
         if state == "auth_required":
             hint = "The server needs the user to sign in again; tell the user."
@@ -964,10 +964,7 @@ class MCPManager:
             hint = "Nothing is reconnecting this server now; tell the user it is unavailable."
         return ToolFailure(
             code="mcp_unavailable",
-            message=(
-                f"MCP server {server} is not connected (state: {state}{reason}); "
-                "this call was not dispatched."
-            ),
+            message=f"MCP server {server} is not connected (state: {state}); this call was not dispatched.",
             retryable=True,
             recovery_hint=hint + afterwards,
             tool_name=local_name,
