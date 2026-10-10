@@ -64,6 +64,64 @@ def test_store_persists_agent_tree_mailbox_and_ack(tmp_path: Path):
     assert by_name["worker"]["unread_count"] == 0
 
 
+def test_default_read_returns_unacknowledged_messages_and_after_seq_rereads(tmp_path: Path):
+    store = AgentTeamStore(tmp_path / "tasks.db")
+    team = _team(store)
+    worker = _agent(store, team)
+    lead = team["lead_agent_id"]
+    sent = [store.send_message(team["id"], lead, worker["id"], body=f"note {index}") for index in range(4)]
+
+    def bodies(**arguments) -> list[str]:
+        return [item["body"] for item in store.read_messages(worker["id"], **arguments)]
+
+    assert bodies() == ["note 0", "note 1", "note 2", "note 3"]
+    # Acknowledged out of order, and one message only delivered: it is still unread.
+    store.mark_messages([sent[0]["id"], sent[2]["id"]], acknowledged=True)
+    store.mark_messages([sent[1]["id"]], acknowledged=False)
+
+    # The default used to start from the oldest message again, acknowledged or not.
+    assert bodies() == ["note 1", "note 3"]
+    unread_counts = {item["name"]: item["unread_count"] for item in store.get_team(team["id"])["agents"]}
+    assert unread_counts["worker"] == len(bodies())
+    # An explicit cursor is how acknowledged messages are read again.
+    assert bodies(after_seq=0) == ["note 0", "note 1", "note 2", "note 3"]
+    assert bodies(after_seq=sent[1]["seq"]) == ["note 2", "note 3"]
+    assert bodies(after_seq=sent[1]["seq"], unread_only=True) == ["note 3"]
+    assert bodies(unread_only=False) == bodies(after_seq=0)
+
+    store.mark_messages([item["id"] for item in sent], acknowledged=True)
+    assert bodies() == []
+    # With nothing unread, this is the cursor that returns only what arrives later.
+    cursor = store.last_message_seq(worker["id"])
+    assert cursor == sent[-1]["seq"] and bodies(after_seq=cursor) == []
+    assert store.last_message_seq(lead) == 0
+    store.send_message(team["id"], lead, worker["id"], body="note 4")
+    assert bodies() == bodies(after_seq=cursor) == ["note 4"]
+
+
+def test_default_reads_page_through_a_mailbox_without_a_cursor(tmp_path: Path):
+    store = AgentTeamStore(tmp_path / "tasks.db")
+    team = _team(store)
+    worker = _agent(store, team)
+    for index in range(5):
+        store.send_message(team["id"], team["lead_agent_id"], worker["id"], body=f"note {index}")
+
+    pages = []
+    follow_ups = []
+    while page := store.read_messages(worker["id"], limit=2):
+        pages.append([item["body"] for item in page])
+        follow_ups.append(bool(
+            store.read_messages(worker["id"], after_seq=page[-1]["seq"], limit=1, unread_only=True)
+        ))
+        store.mark_messages([item["id"] for item in page], acknowledged=True)
+
+    # Each default read continues after what was acknowledged instead of repeating the first page.
+    assert pages == [["note 0", "note 1"], ["note 2", "note 3"], ["note 4"]]
+    assert follow_ups == [True, True, False]
+    # The acknowledged messages are still there for an explicit cursor.
+    assert len(store.read_messages(worker["id"], after_seq=0)) == 5
+
+
 def test_runtime_exposes_structured_shutdown_delivery_and_legacy_envelope(tmp_path: Path):
     runtime = AgentTeamRuntime(tmp_path / "tasks.db")
     team = _team(runtime.store)
