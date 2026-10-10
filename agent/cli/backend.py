@@ -1374,7 +1374,7 @@ async def _main(startup_started: float):
                      "question. Replies can only arrive after this turn ends, so after sending, finish the turn and tell "
                      "the user what you asked; do not wait, sleep or poll for the reply. Use it when another session's "
                      "work or context helps the user's request; never for thanks or acknowledgements. "
-                     "Limits: at most 8 calls per turn (a further call is not run and ends the turn), 20 messages "
+                     "Limits: at most 8 calls per turn (a further call is not run), 20 messages "
                      "per task counting both directions, and 20 new tasks per hour from this session."),
         parameters={"type": "object", "properties": {
             "text": {"type": "string", "maxLength": 20000,
@@ -1391,7 +1391,7 @@ async def _main(startup_started: float):
                      "input-required (text is your question), completed (text is the result), failed (text is the reason) "
                      "or rejected (it should not be done; text says why). The session that asked may set canceled to "
                      "withdraw it. completed, failed, rejected and canceled close the task. "
-                     "Limits: at most 8 calls per turn (a further call is not run and ends the turn), and each "
+                     "Limits: at most 8 calls per turn (a further call is not run), and each "
                      "update counts toward the task's 20 messages."),
         parameters={"type": "object", "properties": {
             "task_id": {"type": "string", "maxLength": 200,

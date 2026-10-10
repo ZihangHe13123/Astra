@@ -102,7 +102,7 @@ def register_channel_tools(
             "Works only in a turn that came from a messaging channel. "
             "Use only when that user explicitly asks to receive a file. The path must be inside "
             "configured send_file_roots; credential files are always blocked. "
-            "At most 3 calls per turn: a further call is not run and ends the turn."
+            "At most 3 calls per turn: a further call is not run."
         ),
         parameters={
             "type": "object",

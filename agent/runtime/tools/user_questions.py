@@ -231,7 +231,7 @@ def register_user_question_tools(
             "pending and you may continue independent work while the question remains answerable. "
             "Required answers and authorization must remain blocking. Unanswered never means approval. "
             "This must be the only tool call in its assistant step; it may be repeated, at most "
-            f"{_CALLS_PER_TURN} calls per turn (a further call is not run and ends the turn). "
+            f"{_CALLS_PER_TURN} calls per turn (a further call is not run). "
             "Only one question request can be open at a time: while a timed-out optional question is still "
             "pending, another call fails. It stops blocking when the user answers or dismisses it, or when a "
             "new task, a session change or a backend restart expires it. "

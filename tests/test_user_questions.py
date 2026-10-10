@@ -390,7 +390,7 @@ def test_question_tool_definition_has_interactive_contract():
     assert "only tool call" in description
     assert "may be repeated" in description
     assert "does not grant" in description
-    # A call beyond the limit is not run and ends the turn, so the limit is stated.
+    # A call beyond the limit is not run, so the limit is stated.
     assert f"at most {definition.max_calls_per_turn} calls per turn" in description
 
 

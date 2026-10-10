@@ -179,7 +179,7 @@ def register_conversation_tools(agent: Any, *, sandbox=None, mcp_manager=None,
     def register(name: str, description: str, fn, properties: dict, required=(), *, risk="read", max_calls=4):
         agent.tools.register(ToolDef(
             name=name,
-            description=f"{description} At most {max_calls} calls per turn: a further call is not run and ends the turn.",
+            description=f"{description} At most {max_calls} calls per turn: a further call is not run.",
             parameters={"type": "object", "properties": properties, "required": list(required), "additionalProperties": False},
             fn=fn, risk=risk, approval="never" if risk == "read" else "on_risk",
             group="skills" if name.startswith("skill_") else "core", cache_results=False,
