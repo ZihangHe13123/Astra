@@ -62,8 +62,11 @@ def test_failure_empty_results_and_safe_html(tmp_path):
             return True
         registry = ToolRegistry(artifact_dir=tmp_path)
         register_image_search(registry, unavailable, public)
-        failure = json.loads((await registry.execute("search_images", {"query": "garden"}))["output"])
-        assert failure["success"] is False and "EXA_API_KEY" in failure["error"]
+        failure = await registry.execute("search_images", {"query": "garden"})
+        assert failure["output"] == "" and failure["code"] == "image_search_failed"
+        assert "EXA_API_KEY" in failure["error"] and "search_web" in failure["recovery_hint"]
+        blank = await registry.execute("search_images", {"query": "   "})
+        assert blank["output"] == "" and blank["code"] == "invalid_arguments"
         async def empty(query, limit):
             return {"results": []}, None
         registry = ToolRegistry(artifact_dir=tmp_path)
@@ -162,9 +165,18 @@ def test_selected_image_loading_partial_failures_cache_and_unknown_ids(tmp_path)
         candidates = await call("search_images", {"query": "red object"})
         ids = [item["id"] for item in candidates["images"]]
         assert candidates["visual_status"] == "not_inspected" and not downloads
-        for invalid in [["https://arbitrary.example/image.png"], [ids[0], ids[0]], ids * 3, []]:
-            failed = await call("read_search_images", {"image_ids": invalid})
-            assert failed["success"] is False
+        for invalid, code in [
+            (["https://arbitrary.example/image.png"], "unknown_image_id"),
+            ([ids[0], ids[0]], "invalid_arguments"),
+            (ids * 3, "invalid_arguments"),
+            ([], "invalid_arguments"),
+        ]:
+            failed = await registry.execute("read_search_images", {"image_ids": invalid})
+            assert failed["output"] == "" and failed["code"] == code
+            assert failed["retryable"] is False and "search_images" in failed["recovery_hint"]
+        assert "https://arbitrary.example/image.png" in (await registry.execute(
+            "read_search_images", {"image_ids": [ids[0], "https://arbitrary.example/image.png"]},
+        ))["error"]
         assert not downloads
         loaded = await call("read_search_images", {"image_ids": ids, "question": "Is the object red?"})
         assert loaded["type"] == "image_attachment" and loaded["success"]
@@ -179,6 +191,124 @@ def test_selected_image_loading_partial_failures_cache_and_unknown_ids(tmp_path)
         regenerated = await call("read_search_images", {"image_ids": [ids[0]]})
         assert Path(regenerated["image_paths"][0]).is_file() and len(downloads) == 3
         assert (await call("search_images", {"query": "red object"}))["visual_status"] == "not_inspected"
+
+    asyncio.run(scenario())
+
+
+def test_read_search_images_fails_when_no_selected_image_loads(tmp_path):
+    async def scenario():
+        reasons = {}
+        async def search(query, limit):
+            return {"results": [
+                {"url": "https://source.example/a", "image": "https://cdn.example/a.png"},
+                {"url": "https://source.example/b", "image": "https://cdn.example/b.png"},
+            ]}, None
+        async def public(url): return True
+        async def load(url):
+            raise reasons[url.rsplit("/", 1)[1]]
+        registry = ToolRegistry(artifact_dir=tmp_path)
+        register_image_search(registry, search, public, load_image=load)
+        found = json.loads((await registry.execute("search_images", {"query": "red object"}))["output"])
+        ids = [item["id"] for item in found["images"]]
+
+        reasons.update({
+            "a.png": SearchImageError("Image download returned HTTP 403."),
+            "b.png": SearchImageError("Image download timed out; try another candidate.", retryable=True),
+        })
+        failed = await registry.execute("read_search_images", {"image_ids": ids})
+        # No pixels were attached, so nothing may read as images awaiting inspection.
+        assert failed["output"] == "" and failed["code"] == "image_load_failed"
+        assert failed["error"].splitlines()[1:] == [
+            f"- {ids[0]}: Image download returned HTTP 403.",
+            f"- {ids[1]}: Image download timed out; try another candidate.",
+        ]
+        assert failed["retryable"] is True and "retry" in failed["recovery_hint"]
+
+        reasons["b.png"] = RuntimeError("internal token must not be exposed")
+        settled = await registry.execute("read_search_images", {"image_ids": ids})
+        assert settled["code"] == "image_load_failed" and settled["retryable"] is False
+        assert "retry" not in settled["recovery_hint"] and "internal token" not in json.dumps(settled)
+
+        unloadable = ToolRegistry(artifact_dir=tmp_path)
+        register_image_search(unloadable, search, public)
+        found = json.loads((await unloadable.execute("search_images", {"query": "red object"}))["output"])
+        missing = await unloadable.execute("read_search_images", {"image_ids": [found["images"][0]["id"]]})
+        assert missing["output"] == "" and missing["code"] == "image_loading_unavailable"
+
+    asyncio.run(scenario())
+
+
+def test_search_images_without_an_exa_key_is_a_failure_that_names_what_to_use(monkeypatch, tmp_path):
+    import agent.runtime.tools.web as web
+    requests = []
+    class Client:
+        def __init__(self, **kwargs): pass
+        async def post(self, url, **kwargs):
+            requests.append(url)
+            raise AssertionError("no request may be sent without a key")
+    monkeypatch.delenv("EXA_API_KEY", raising=False)
+    monkeypatch.delenv("EXA_ENV_FILE", raising=False)
+    monkeypatch.setattr(web.httpx, "AsyncClient", Client)
+    registry = ToolRegistry(artifact_dir=tmp_path)
+    register_web_tools(registry, None)
+    result = asyncio.run(registry.execute("search_images", {"query": "garden"}))
+    assert result["output"] == "" and result["code"] == "exa_not_configured"
+    assert "EXA_API_KEY is not configured" in result["error"] and "unavailable" in result["error"]
+    assert result["retryable"] is False
+    assert "do not retry" in result["recovery_hint"] and "search_web" in result["recovery_hint"]
+    assert not requests and not list(tmp_path.rglob("*.html"))
+
+
+def test_search_images_and_image_loading_say_whether_a_retry_can_help(monkeypatch, tmp_path):
+    import httpx
+    import agent.runtime.tools.web as web
+    actual_client = httpx.AsyncClient
+    answers = {"POST": 503, "GET": 503}
+    clients = []
+
+    def respond(request):
+        if request.method == "POST":
+            if answers["POST"] != 200:
+                return httpx.Response(answers["POST"])
+            return httpx.Response(200, json={"results": [{"url": "https://source.example/",
+                                                        "image": "https://cdn.example/a.png"}]})
+        if request.method == "HEAD":
+            return httpx.Response(200, headers={"content-type": "image/png", "content-length": "4096"})
+        if answers["GET"] == "refused":
+            raise httpx.ConnectError("All connection attempts failed")
+        return httpx.Response(answers["GET"])
+
+    def make_client(**kwargs):
+        clients.append(actual_client(transport=httpx.MockTransport(respond)))
+        return clients[-1]
+
+    async def public(url): return True
+    monkeypatch.setenv("EXA_API_KEY", "test-only-key")
+    monkeypatch.setenv("EXA_API_URL", "https://exa.example")
+    monkeypatch.setattr(web.httpx, "AsyncClient", make_client)
+    monkeypatch.setattr(web, "_is_safe_public_url", public)
+    monkeypatch.setattr(web, "active_proxy_for_url", lambda _: None)
+
+    async def scenario():
+        registry = ToolRegistry(artifact_dir=tmp_path)
+        register_web_tools(registry, None, "exa")
+        for status, retryable in ((503, True), (401, False)):
+            answers["POST"] = status
+            failed = await registry.execute("search_images", {"query": "red"})
+            assert failed["output"] == "" and failed["code"] == "image_search_failed"
+            assert failed["retryable"] is retryable
+            assert ("Retry later" in failed["recovery_hint"]) is retryable
+            assert "search_web" in failed["recovery_hint"] and "test-only-key" not in json.dumps(failed)
+        answers["POST"] = 200
+        found = json.loads((await registry.execute("search_images", {"query": "red"}))["output"])
+        ids = [found["images"][0]["id"]]
+        for answer, retryable in ((503, True), ("refused", True), (404, False)):
+            answers["GET"] = answer
+            failed = await registry.execute("read_search_images", {"image_ids": ids})
+            assert failed["output"] == "" and failed["code"] == "image_load_failed"
+            assert failed["retryable"] is retryable
+        for client in clients:
+            await client.aclose()
 
     asyncio.run(scenario())
 

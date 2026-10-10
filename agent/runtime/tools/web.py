@@ -11,10 +11,12 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from collections import OrderedDict
@@ -41,6 +43,7 @@ except ImportError:  # pragma: no cover - optional dependency
 
 from ..network import active_proxy_for_url
 from ..tool_execution import PartialResult
+from ..tool_failure import ToolFailure
 from .approval import normalized_origin
 from .registry import ToolDef, ToolRegistry
 from .image_search import register_image_search
@@ -68,6 +71,12 @@ _WINDOWS_LEGACY_UNSUPPORTED_URL_CHARS = frozenset({'"', "\r", "\n", "\0"})
 _WINDOWS_LEGACY_CMD_PREFIX = ("cmd.exe", "/D", "/V:OFF", "/S", "/C")
 _WEB_EXTRACT_RECOVERY_CANDIDATES = 2
 _SEARCH_RESULT_URL_RE = re.compile(r"(?im)^\s*URL:\s*(https?://\S+)\s*$")
+_MARKUP_RE = re.compile(r"<[a-zA-Z!/][^<>]*>")
+_BROWSER_EXTRACT_TIMEOUT = "[Browser Error] Browser extractor timed out (60s)"
+_NO_MATCH_NOTE = "No match is not proof that nothing exists; try other words, another provider or a known source."
+_RETRYABLE_HTTP_STATUS = frozenset({408, 425, 429})
+# A host name that does not resolve and a rejected certificate fail the same way again.
+_LASTING_CONNECT_CAUSES = (socket.gaierror, ssl.SSLCertVerificationError)
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +327,7 @@ def create_browser_extract_fn(command: str | None = None):
                 text = text[:max_length] + "\n…[truncated]"
             return text
         except asyncio.TimeoutError:
-            return "[Browser Error] Browser extractor timed out (60s)"
+            return _BROWSER_EXTRACT_TIMEOUT
         except Exception as e:
             return f"[Browser Error] Browser extractor failed: {e}"
         finally:
@@ -472,6 +481,47 @@ async def _is_safe_public_url(url: str) -> bool:
     return not await _public_url_problem(url)
 
 
+class _TransportError(str):
+    """A request error message that also records whether trying again can help."""
+
+    retryable: bool = False
+
+
+def _is_transient_error(exc: BaseException) -> bool:
+    """True for a timeout, a refused or dropped connection, and a 5xx/408/425/429 answer."""
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status is None and isinstance(exc, urllib.error.HTTPError):
+        status = exc.code
+    if isinstance(status, int):
+        return status >= 500 or status in _RETRYABLE_HTTP_STATUS
+    cause: BaseException | None = exc
+    seen: set[int] = set()
+    while cause is not None and id(cause) not in seen:
+        if isinstance(cause, _LASTING_CONNECT_CAUSES):
+            return False
+        seen.add(id(cause))
+        cause = cause.__cause__ or cause.__context__
+    if httpx is not None:
+        if isinstance(exc, (httpx.UnsupportedProtocol, httpx.LocalProtocolError)):
+            return False
+        if isinstance(exc, httpx.TransportError):
+            return True
+    if isinstance(exc, urllib.error.URLError):
+        return isinstance(exc.reason, OSError) and not isinstance(exc.reason, _LASTING_CONNECT_CAUSES)
+    return isinstance(exc, (TimeoutError, ConnectionError))
+
+
+def _transport_error(exc: BaseException) -> _TransportError:
+    # httpx timeouts carry no text; name the exception instead of losing the cause.
+    error = _TransportError(str(exc) or type(exc).__name__)
+    error.retryable = _is_transient_error(exc)
+    return error
+
+
+def _retryable(error: object) -> bool:
+    return bool(getattr(error, "retryable", False))
+
+
 class SearchProviderState:
     """Mutable process-local default controlled by the /search command."""
 
@@ -497,6 +547,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         configured_firecrawl_url
         or ("https://api.firecrawl.dev" if firecrawl_api_key else "http://localhost:3002")
     ).rstrip("/")
+    firecrawl_configured = bool(firecrawl_api_key or configured_firecrawl_url)
     browser_extract_fn = create_browser_extract_fn()
     browser_status_fn = create_browser_status_fn()
     search_cache_ttl = _positive_int_env("WEB_SEARCH_CACHE_TTL", 600)
@@ -593,7 +644,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
                     return None, f"Cross-origin redirect blocked: {url} -> {final_url or '(unknown)'}"
             return resp.text, None
         except Exception as e:
-            return None, str(e)
+            return None, _transport_error(e)
 
     async def _http_post_json(
         url: str,
@@ -613,7 +664,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
                 )
                 return data, None
             except Exception as exc:
-                return None, str(exc)
+                return None, _transport_error(exc)
         try:
             proxy_url = active_proxy_for_url(url)
             client_key = proxy_url or "direct"
@@ -630,7 +681,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             response.raise_for_status()
             return response.json(), None
         except Exception as exc:
-            return None, str(exc)
+            return None, _transport_error(exc)
 
     def _main_region(soup):
         # Feeds, threads and listings use one <article> per item, so only a
@@ -694,6 +745,11 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             "captcha",
         )
         return any(signal in lower for signal in signals) and len(text) < 1000
+
+    def _plain_body(body: str) -> str:
+        """Return a plain-text or JSON response as it is, "" for markup."""
+        raw = body.strip()
+        return raw if raw and not _MARKUP_RE.search(raw) else ""
 
     async def _cached_url_text(url: str, timeout: int | None = None) -> tuple[str | None, str | None]:
         require_same_origin = registry.approval_handler is not None
@@ -863,8 +919,47 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             if count >= max_results:
                 break
         if count == 0:
-            return f"No Exa results for '{query}'.", None
+            return f"No Exa results for '{query}'. {_NO_MATCH_NOTE}", None
         return "\n".join(lines).strip(), None
+
+    def _other_search_route_hint(retryable: bool, *, exa_tried: bool) -> str:
+        if not exa_tried and resolve_exa_api_key()[0]:
+            return ("Retry later, or call" if retryable else "Call") + (
+                " search_web with provider=exa to use the other route."
+            )
+        return (
+            "No other search route is available. "
+            + ("Retry later; if it keeps failing, tell" if retryable else "Tell")
+            + " the user that web search is unavailable. A known URL can still be read directly."
+        )
+
+    def _exa_only_failure(error: str | None) -> ToolFailure:
+        if not resolve_exa_api_key()[0]:
+            return ToolFailure(
+                code="exa_not_configured",
+                message="Exa search is unavailable: EXA_API_KEY is not configured",
+                retryable=False,
+                recovery_hint=(
+                    "This setup has no Exa API key, so the Exa route cannot work. "
+                    "Call search_web with provider=searxng."
+                ),
+            )
+        retryable = _retryable(error)
+        return ToolFailure(
+            code="search_failed",
+            message=f"Exa search failed: {error}",
+            retryable=retryable,
+            recovery_hint=("Retry later, or call" if retryable else "Call")
+            + " search_web with provider=searxng to use the other route.",
+        )
+
+    def _searxng_response_failure(detail: str, *, exa_tried: bool) -> ToolFailure:
+        return ToolFailure(
+            code="search_response_invalid",
+            message=f"SearXNG ({searxng_url}) did not return search results: {detail}",
+            retryable=False,
+            recovery_hint=_other_search_route_hint(False, exa_tried=exa_tried),
+        )
 
     async def _search_web(
         query: str,
@@ -877,10 +972,15 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         content_results: int = 2,
         content_max_length: int = 1200,
         provider: str = "auto",
-    ) -> str:
+    ) -> str | ToolFailure:
         """Return lightweight candidates from Exa or SearXNG."""
         if not query.strip():
-            return "[Error] Empty query"
+            return ToolFailure(
+                code="invalid_arguments",
+                message="query is empty",
+                retryable=False,
+                recovery_hint="Pass the search words in query.",
+            )
 
         max_results = min(max(max_results, 1), 50)
         page = min(max(page, 1), 5)
@@ -922,6 +1022,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         if selected_provider == "exa" and allow_fallback and needs_searxng:
             # auto must not pick the route that would drop what was asked for.
             selected_provider = "searxng"
+        exa_tried = selected_provider == "exa"
         if selected_provider == "exa":
             exa_cache_key = json.dumps(
                 {
@@ -943,7 +1044,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
                     _cache_set(search_cache, exa_cache_key, exa_output, search_cache_ttl)
                     return _exa_reply(exa_output)
             if not allow_fallback:
-                return f"[Exa Error] {exa_error}"
+                return _exa_only_failure(exa_error)
 
         params = {
             "q": query,
@@ -979,15 +1080,27 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
                 exa_output, exa_error = await _search_exa(query, max_results, category)
                 if exa_output is not None:
                     return _exa_reply(exa_output)
-                return f"[Search Error] SearXNG unavailable ({err or 'empty response'}); Exa: {exa_error}"
-            return f"[Network Error] Cannot reach SearXNG ({searxng_url}): {err or 'empty response'}"
+                # Only here has every route of this call failed.
+                retryable = _retryable(err) or _retryable(exa_error)
+                return ToolFailure(
+                    code="search_failed",
+                    message=f"SearXNG unavailable ({err or 'empty response'}); Exa: {exa_error}",
+                    retryable=retryable,
+                    recovery_hint=_other_search_route_hint(retryable, exa_tried=True),
+                )
+            return ToolFailure(
+                code="search_failed",
+                message=f"Cannot reach SearXNG ({searxng_url}): {err or 'empty response'}",
+                retryable=_retryable(err),
+                recovery_hint=_other_search_route_hint(_retryable(err), exa_tried=False),
+            )
 
         try:
             data = json.loads(body)
         except json.JSONDecodeError:
-            return "[Parse Error] Invalid JSON from SearXNG"
+            return _searxng_response_failure("the response is not valid JSON", exa_tried=exa_tried)
         except Exception as e:
-            return f"[Error] {type(e).__name__}: {e}"
+            return _searxng_response_failure(f"{type(e).__name__}: {e}", exa_tried=exa_tried)
 
         results = data.get("results", [])
         suggestions = data.get("suggestions", [])
@@ -1001,8 +1114,8 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
                 exa_output, exa_error = await _search_exa(query, max_results, category)
                 if exa_output is not None:
                     return _exa_reply(exa_output)
-                return f"No SearXNG results for '{query}'; Exa: {exa_error}."
-            return f"No results for '{query}' (lang={language}, category={category}, page={page})."
+                return f"No SearXNG results for '{query}'; Exa: {exa_error}. {_NO_MATCH_NOTE}"
+            return f"No results for '{query}' (lang={language}, category={category}, page={page}). {_NO_MATCH_NOTE}"
 
         # A query that names its site wants many results from that one site.
         site_restricted = bool(re.search(r"(?<![\w-])site:\S", query, re.IGNORECASE))
@@ -1320,11 +1433,18 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
                 )
             content = _html_to_markdown(body)
             if len(content) < 50 or _looks_like_spa_or_antibot(body, content):
-                return _extract_result(
+                result = _extract_result(
                     requested_url=url,
                     backend="http",
                     error="Static HTTP content is empty/minimal or requires JavaScript",
                 )
+                # A short JSON or plain-text body is the whole response. It is
+                # still an error for the waterfall; web_extract returns it only
+                # when nothing else read the URL.
+                plain_body = _plain_body(body)
+                if plain_body:
+                    result["plain_body"] = plain_body
+                return result
             return _extract_result(
                 requested_url=url,
                 backend="http",
@@ -1405,12 +1525,17 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         candidates: dict[int, str],
         chain: list[str],
         max_chars: int,
-    ) -> tuple[dict[int, dict], dict[int, str], dict[int, list[str]]]:
-        """Run one bounded provider waterfall for one candidate per result slot."""
+    ) -> tuple[dict[int, dict], dict[int, str], dict[int, list[str]], dict[int, dict]]:
+        """Run one bounded provider waterfall for one candidate per result slot.
+
+        The last value notes, per slot, whether a failure can pass on a retry
+        and the short plain body the last backend received, if any.
+        """
 
         completed: dict[int, dict] = {}
         pending = dict(candidates)
         errors = {index: [] for index in candidates}
+        notes: dict[int, dict] = {index: {} for index in candidates}
         for backend in chain:
             if not pending:
                 break
@@ -1426,13 +1551,25 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
                     errors[index].append(
                         f"{backend}: {detail[:500]}"
                     )
+                    # A Firecrawl nobody configured is tried at its default local
+                    # address; that none runs there is not changed by a retry.
+                    if _retryable(result.get("error")) and (backend != "firecrawl" or firecrawl_configured):
+                        notes[index]["retryable"] = True
+                    notes[index]["plain_body"] = result.get("plain_body") or ""
                     continue
 
                 final_url = str(result.get("url") or pending[index])
                 if not await _is_safe_public_url(final_url):
-                    errors[index].append(
-                        f"{backend}: redirected to an unsafe/private URL"
-                    )
+                    # The check above decides; this second look only picks the
+                    # wording, as for the requested URLs in web_extract.
+                    problem = await _public_url_problem(final_url)
+                    if problem == "unresolved":
+                        reason = f"could not resolve the host name of the final URL {final_url[:200]}"
+                    elif problem == "scheme":
+                        reason = f"the final URL is not a full http:// or https:// URL: {final_url[:200]}"
+                    else:
+                        reason = "redirected to an unsafe/private URL"
+                    errors[index].append(f"{backend}: {reason}")
                     continue
 
                 final_content, stored_path = _truncate_and_store(
@@ -1448,7 +1585,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
                     result["full_content_path"] = stored_path
                 completed[index] = result
                 pending.pop(index, None)
-        return completed, pending, errors
+        return completed, pending, errors, notes
 
     def _fallback_labels(errors: list[str]) -> list[str]:
         labels = []
@@ -1480,6 +1617,8 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             include_content=False,
             provider="auto",
         )
+        if not isinstance(search_output, str):
+            return []
         original = urllib.parse.urldefrag(url)[0]
         original_host = (urllib.parse.urlparse(url).hostname or "").lower()
         guarded_origin = (
@@ -1504,17 +1643,60 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
                 break
         return candidates
 
+    def _extract_failure(
+        failed: list[dict],
+        chain: list[str],
+        not_processed: list[str],
+        retryable: bool,
+    ) -> ToolFailure:
+        """No URL of a web_extract call was read: name each one with its reason."""
+        lines = []
+        for result in failed:
+            reason = " ".join(str(result.get("error") or "no content").split())
+            if len(reason) > 500:
+                reason = reason[:500] + "..."
+            lines.append(f"- {str(result.get('url') or '')[:200]}: {reason}")
+        count = len(failed)
+        subject = "the URL" if count == 1 else f"any of the {count} URLs"
+        message = f"web_extract could not read {subject}:\n" + "\n".join(lines)
+        if not_processed:
+            message += f"\n{len(not_processed)} more URLs were not tried (at most 5 per call)."
+        rejected = [result for result in failed if result.get("backend") in {"blocked", "none"}]
+        hints = []
+        if retryable:
+            hints.append("A timeout or server error may pass on a retry.")
+        if len(rejected) < count:
+            hints.append(
+                "A page that needs JavaScript or a login can be opened with the browser tools; "
+                "search_web may find another source."
+            )
+        if rejected:
+            hints.append("Only full public http:// or https:// URLs are read; correct or drop the others.")
+        details: dict = {"provider_chain": chain}
+        if not_processed:
+            details["not_processed"] = not_processed
+        return ToolFailure(
+            code="extract_failed",
+            message=message,
+            retryable=retryable,
+            recovery_hint=" ".join(hints),
+            details=details,
+        )
+
     async def _web_extract(
         urls: list[str],
         max_chars: int = 15000,
         provider: str = "auto",
-    ) -> str:
+    ) -> str | ToolFailure:
+        if isinstance(urls, list):
+            urls = [str(url).strip() for url in urls if str(url).strip()]
         if not isinstance(urls, list) or not urls:
-            return json.dumps(
-                {"success": False, "error": "urls must be a non-empty list"},
-                ensure_ascii=False,
+            return ToolFailure(
+                code="invalid_arguments",
+                message="urls must be a non-empty list of URLs",
+                retryable=False,
+                recovery_hint="Pass urls as a list of one to five full http:// or https:// URLs.",
             )
-        urls = [str(url).strip() for url in urls if str(url).strip()]
         urls, not_processed = urls[:5], urls[5:]
         max_chars = min(max(int(max_chars), 500), 50000)
         results: list[dict | None] = [None] * len(urls)
@@ -1541,7 +1723,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             }
 
         chain = _extract_provider_chain(provider)
-        completed, pending, fallback_errors = await _attempt_extract_candidates(
+        completed, pending, fallback_errors, extract_notes = await _attempt_extract_candidates(
             initial_candidates,
             chain,
             max_chars,
@@ -1565,7 +1747,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
                 }
                 if not round_candidates:
                     continue
-                recovered, _, recovery_errors = await _attempt_extract_candidates(
+                recovered, _, recovery_errors, _ = await _attempt_extract_candidates(
                     round_candidates,
                     chain,
                     max_chars,
@@ -1600,7 +1782,29 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
                         "search recovery: no safe alternative URLs found"
                     )
 
+        retryable = False
         for index, url in pending.items():
+            note = extract_notes.get(index, {})
+            plain_body = str(note.get("plain_body") or "")
+            if plain_body and await _is_safe_public_url(url):
+                # Nothing else read the URL, and what the http backend received
+                # is a whole short answer, not a page that needs rendering.
+                content, stored_path = _truncate_and_store(url, plain_body, max_chars)
+                plain_result = {
+                    "url": url,
+                    "title": "",
+                    "content": content,
+                    "backend": "http",
+                    "error": None,
+                    "fallback_from": [
+                        label for label in _fallback_labels(fallback_errors[index]) if label != "http"
+                    ],
+                }
+                if stored_path:
+                    plain_result["full_content_path"] = stored_path
+                results[index] = plain_result
+                continue
+            retryable = retryable or bool(note.get("retryable"))
             results[index] = {
                 "url": url,
                 "title": "",
@@ -1615,6 +1819,9 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             not result.get("error") and result.get("content")
             for result in completed_results
         )
+        if not success:
+            # Errors of single URLs stay in the result when another URL was read.
+            return _extract_failure(completed_results, chain, not_processed, retryable)
         payload: dict = {
             "success": success,
             "provider_chain": chain,
@@ -1679,25 +1886,72 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             lines.append(f"Browser extractor: error ({browser_detail})")
         return "\n".join(lines)
 
-    async def _fetch_url(url: str, max_length: int = 8000) -> str:
+    def _invalid_url_failure() -> ToolFailure:
+        return ToolFailure(
+            code="invalid_url",
+            message="URL must start with http:// or https://",
+            retryable=False,
+            recovery_hint="Pass the full URL with its scheme, for example https://example.com/page.",
+        )
+
+    def _fetch_failure(url: str, err: str | None) -> ToolFailure:
+        if not err:
+            return ToolFailure(
+                code="empty_response",
+                message=f"Empty content: {url} answered with an empty body",
+                retryable=False,
+                recovery_hint="Check the URL. If the page shows content in a browser, try web_extract or the browser tools.",
+            )
+        if err.startswith("Cross-origin redirect blocked"):
+            return ToolFailure(
+                code="redirect_blocked",
+                message=err,
+                retryable=False,
+                recovery_hint=(
+                    "The URL redirects to another site, which was not read. "
+                    "Call fetch_url with the destination URL if that site is the one to read."
+                ),
+            )
+        retryable = _retryable(err)
+        return ToolFailure(
+            code="fetch_failed",
+            message=f"Could not fetch {url}: {err}",
+            retryable=retryable,
+            recovery_hint=(
+                "The request timed out, was refused or got a server error. Retry later; "
+                "if it keeps failing, try web_extract or the browser tools."
+                if retryable else
+                "Check the URL. A page that blocks plain requests may still open with web_extract or the browser tools."
+            ),
+        )
+
+    async def _fetch_url(url: str, max_length: int = 8000) -> str | ToolFailure:
         """Fetch and extract text from a URL (static HTML only)."""
         if not url.startswith(("http://", "https://")):
-            return "[Error] URL must start with http:// or https://"
+            return _invalid_url_failure()
 
         max_length = min(max(max_length, 500), 50000)
         body, err = await _cached_url_text(url)
         if err or not body:
-            return f"[Error] {err}" if err else "(Empty content)"
+            return _fetch_failure(url, err)
 
         text = _html_to_text(body)
         if not text or len(text) < 50:
             # A short JSON or plain-text body is the whole response; only
             # markup that yields almost no text points at JavaScript or a block.
-            raw = body.strip()
-            if raw and not re.search(r"<[a-zA-Z!/][^<>]*>", raw):
+            raw = _plain_body(body)
+            if raw:
                 return _format_content(url, raw, max_length)
-            return (f"(Empty/minimal content — page may require JavaScript or is behind anti-bot protection. "
-                    f"Try web_extract, or browser_open and browser_snapshot. URL: {url})")
+            found = f'only this text: "{text}"' if text else "no text"
+            return ToolFailure(
+                code="no_static_text",
+                message=(
+                    f"Empty/minimal content: the static HTML of {url} has {found}. "
+                    "The page may require JavaScript or is behind anti-bot protection."
+                ),
+                retryable=False,
+                recovery_hint="Try web_extract, or browser_open and browser_snapshot.",
+            )
 
         return _format_content(url, text, max_length)
 
@@ -1708,31 +1962,55 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         max_length: int = 12000,
         browser_first: bool = False,
         min_static_chars: int = 500,
-    ) -> str:
+    ) -> str | ToolFailure:
         """Extract content with browser fallback for JS/anti-bot pages."""
         if not url.startswith(("http://", "https://")):
-            return "[Error] URL must start with http:// or https://"
+            return _invalid_url_failure()
 
         max_length = min(max(max_length, 500), 50000)
         min_static_chars = min(max(min_static_chars, 50), 5000)
 
+        static_problem = ""
+        static_retryable = False
         if not browser_first:
             body, err = await _cached_url_text(url)
             if body:
                 text = _html_to_text(body)
                 if len(text) >= min_static_chars and not _looks_like_spa_or_antibot(body, text):
                     return _format_content(url, text, max_length)
-            elif err:
-                pass
+                static_problem = f"found too little text ({len(text)} characters)"
+            else:
+                static_problem = f"failed ({err or 'empty response'})"
+                static_retryable = _retryable(err)
 
-        return await _browser_extract(url, max_length)
+        extracted = await _browser_extract(url, max_length)
+        if extracted.startswith(("[Browser Error]", "[Extract Error]")):
+            # The extractor reports failures as text, which the browser tools read.
+            reason = extracted.split("]", 1)[1].strip().rstrip(".")
+            return ToolFailure(
+                code="browser_extract_failed",
+                message=f"Could not extract {url}: {reason}."
+                + (f" The static attempt before it {static_problem}." if static_problem else ""),
+                retryable=static_retryable or extracted == _BROWSER_EXTRACT_TIMEOUT,
+                recovery_hint="Use web_extract to read the page, or browser_open to render it.",
+            )
+        return extracted
 
     # ── Register all tools ──────────────────────────────────────────
 
-    async def _image_pages(query: str, limit: int) -> tuple[dict | None, str | None]:
+    async def _image_pages(query: str, limit: int) -> tuple[dict | None, str | ToolFailure | None]:
         key, _ = resolve_exa_api_key()
         if not key:
-            return None, "EXA_API_KEY is not configured"
+            return None, ToolFailure(
+                code="exa_not_configured",
+                message="search_images is unavailable in this setup: EXA_API_KEY is not configured",
+                retryable=False,
+                recovery_hint=(
+                    "Image search works only with an Exa API key, which this setup does not have, so "
+                    "every call fails the same way; do not retry. Use search_web to find pages that "
+                    "show such images, and tell the user that search_images needs EXA_API_KEY."
+                ),
+            )
         data, error = await _http_post_json(
             f"{exa_api_url}/search",
             {"query": query, "numResults": max(10, limit), "type": exa_search_type,
@@ -1740,7 +2018,18 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             {"x-api-key": key, "Content-Type": "application/json"},
             exa_timeout,
         )
-        return data, "Exa image search failed; check connectivity and Exa configuration." if error else None
+        if not error:
+            return data, None
+        retryable = _retryable(error)
+        return data, ToolFailure(
+            code="image_search_failed",
+            message="Exa image search failed; check connectivity and Exa configuration.",
+            retryable=retryable,
+            recovery_hint=(
+                ("The request timed out, was refused or got a server error. Retry later, or use" if retryable else "Use")
+                + " search_web to find pages that show such images."
+            ),
+        )
 
     async def _image_preview_available(url: str) -> bool:
         # Check headers only. Never download image bodies into the tool context.
@@ -1780,6 +2069,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             raise ValueError("Image loading requires httpx.")
         return await load_search_image(
             url, registry.artifact_dir / "search-images", _is_safe_public_url, _image_client,
+            _is_transient_error,
         )
 
     register_image_search(registry, _image_pages, _is_safe_public_url, search_cache_ttl,
@@ -2005,7 +2295,7 @@ def _http_get_urllib(
                     return None, f"Cross-origin redirect blocked: {url} -> {final_url or '(unknown)'}"
             return resp.read().decode("utf-8", errors="replace"), None
     except Exception as e:
-        return None, str(e)
+        return None, _transport_error(e)
 
 
 def _http_post_json_urllib(

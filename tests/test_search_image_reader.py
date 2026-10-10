@@ -101,3 +101,32 @@ def test_invalid_oversized_and_failed_downloads_leave_no_artifacts(tmp_path, mon
             assert len(sent) == 1
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("answer,retryable", [
+    (403, False), (404, False), (429, True), (503, True), ("timeout", True), ("refused", False),
+])
+def test_download_failure_records_whether_a_retry_can_help(tmp_path, answer, retryable):
+    def respond(request):
+        if answer == "timeout":
+            raise TimeoutError("slow origin")
+        if answer == "refused":
+            raise httpx.ConnectError("All connection attempts failed")
+        return httpx.Response(answer)
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            with pytest.raises(reader.SearchImageError) as failure:
+                await reader.load_search_image("https://images.example/image", tmp_path, public, lambda _: client)
+            assert failure.value.retryable is retryable
+            if answer == "refused":
+                # Only the caller's transport knows which of its errors are transient.
+                with pytest.raises(reader.SearchImageError) as classified:
+                    await reader.load_search_image(
+                        "https://images.example/image", tmp_path, public, lambda _: client,
+                        lambda exc: isinstance(exc, httpx.ConnectError),
+                    )
+                assert classified.value.retryable is True
+                assert str(classified.value) == str(failure.value)
+
+    asyncio.run(scenario())

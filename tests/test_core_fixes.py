@@ -4,8 +4,10 @@ import hashlib
 import json
 import os
 import re
+import socket
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 from pathlib import Path
 from types import SimpleNamespace
@@ -7133,7 +7135,10 @@ def test_fetch_url_does_not_reuse_unguarded_cache_after_approval_is_enabled(monk
 
         registry.set_approval_handler(approve)
         guarded = await registry.execute("fetch_url", {"url": "https://example.test/page"})
-        assert "Cross-origin redirect blocked" in guarded["output"]
+        assert guarded["output"] == ""
+        assert guarded["code"] == "redirect_blocked"
+        assert "Cross-origin redirect blocked" in guarded["error"]
+        assert "https://evil.test/redirected" in guarded["error"]
         assert calls == ["https://example.test/page", "https://example.test/page"]
 
     run(scenario())
@@ -7716,9 +7721,10 @@ def test_web_extract_blocks_private_urls_before_firecrawl(monkeypatch):
         registry = ToolRegistry()
         register_web_tools(registry, None)
         result = await registry.execute("web_extract", {"urls": ["http://127.0.0.1/private"]})
-        payload = json.loads(result["output"])
 
-        assert "Blocked" in payload["results"][0]["error"]
+        assert result["output"] == ""
+        assert result["code"] == "extract_failed"
+        assert "http://127.0.0.1/private: Blocked" in result["error"]
 
     run(scenario())
 
@@ -7898,6 +7904,14 @@ def _fake_web_transport(monkeypatch, *, get=None, post=None):
 
     monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
     return calls
+
+
+# Long enough for web_extract's http backend, which rejects pages under 120 characters.
+_READABLE_PAGE = (
+    "<html><body><main><h1>Readable page body</h1><p>"
+    + "This paragraph carries enough plain words for a static reader to accept the page as real content. " * 2
+    + "</p></main></body></html>"
+)
 
 
 def _exa_first_page(_url, _payload):
@@ -8156,9 +8170,13 @@ def test_fetch_url_returns_a_short_non_html_body_as_it_is(monkeypatch):
         for result in (health, ping):
             assert "Empty/minimal" not in result["output"]
             assert "JavaScript" not in result["output"]
-        # An HTML page that yields no text still gets the rendering hint.
-        assert "Empty/minimal content" in shell["output"]
-        assert "web_extract" in shell["output"]
+        # An HTML page that yields no text is a failure that keeps the rendering hint.
+        assert shell["output"] == ""
+        assert shell["code"] == "no_static_text"
+        assert shell["retryable"] is False
+        assert "Empty/minimal content" in shell["error"]
+        assert "https://example.test/app" in shell["error"]
+        assert "web_extract" in shell["recovery_hint"]
 
     run(scenario())
 
@@ -8207,25 +8225,28 @@ def test_web_extract_tells_unresolved_hosts_and_bad_schemes_from_private_address
         lookups.append(host)
         if host == "intranet.example.test":
             return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", port))]
+        if host == "public.example.test":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
         raise socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided, or not known")
 
-    calls = _fake_web_transport(monkeypatch)
+    calls = _fake_web_transport(monkeypatch, get=lambda url: _READABLE_PAGE)
     monkeypatch.setattr(web_module.socket, "getaddrinfo", fake_getaddrinfo)
+    rejected_urls = [
+        "https://mistyped.example.test/page",
+        "ftp://files.example.test/report.txt",
+        "http://intranet.example.test/admin",
+        "http://127.0.0.1/private",
+    ]
 
     async def scenario():
         registry = ToolRegistry()
         register_web_tools(registry, None)
         result = await registry.execute("web_extract", {
-            "urls": [
-                "https://mistyped.example.test/page",
-                "ftp://files.example.test/report.txt",
-                "http://intranet.example.test/admin",
-                "http://127.0.0.1/private",
-            ],
+            "urls": [*rejected_urls, "https://public.example.test/page"],
             "provider": "http",
         })
         payload = json.loads(result["output"])
-        unresolved, scheme, private_name, private_ip = payload["results"]
+        unresolved, scheme, private_name, private_ip, readable = payload["results"]
 
         assert "could not resolve the host name" in unresolved["error"]
         assert "http://" in scheme["error"] and "https://" in scheme["error"]
@@ -8237,10 +8258,25 @@ def test_web_extract_tells_unresolved_hosts_and_bad_schemes_from_private_address
         for entry in (private_name, private_ip):
             assert entry["error"] == "Blocked: URL targets localhost, credentials, or a private/internal address"
             assert entry["backend"] == "blocked"
-        assert payload["success"] is False
-        assert all(not entry["content"] for entry in payload["results"])
-        assert calls == []
-        assert set(lookups) == {"mistyped.example.test", "intranet.example.test"}
+        # The reasons stay next to the URL that was read; nothing rejected was fetched.
+        assert result["error"] == ""
+        assert payload["success"] is True
+        assert "Readable page body" in readable["content"]
+        assert all(not entry["content"] for entry in (unresolved, scheme, private_name, private_ip))
+        assert calls == [("get", "https://public.example.test/page")]
+        assert set(lookups) == {"mistyped.example.test", "intranet.example.test", "public.example.test"}
+
+        # With no URL read, the same reasons are the failure of the call.
+        alone = await registry.execute("web_extract", {"urls": rejected_urls, "provider": "http"})
+        assert alone["output"] == ""
+        assert alone["code"] == "extract_failed"
+        assert alone["retryable"] is False
+        reasons = dict(line[2:].split(": ", 1) for line in alone["error"].splitlines()[1:])
+        assert list(reasons) == rejected_urls
+        assert reasons[rejected_urls[0]] == unresolved["error"]
+        assert reasons[rejected_urls[1]] == scheme["error"]
+        assert reasons[rejected_urls[2]] == reasons[rejected_urls[3]] == private_ip["error"]
+        assert len(calls) == 1
 
     run(scenario())
 
@@ -8295,7 +8331,7 @@ def test_web_extract_lists_urls_left_out_by_the_five_url_limit(monkeypatch):
         return True
 
     def page(url):
-        return f"<html><body><main><p>Body of {url} with enough words to count as real content.</p></main></body></html>"
+        return _READABLE_PAGE.replace("Readable page body", f"Body of {url}")
 
     calls = _fake_web_transport(monkeypatch, get=page)
     monkeypatch.setattr(web_module, "_is_safe_public_url", safe_url)
@@ -8307,7 +8343,9 @@ def test_web_extract_lists_urls_left_out_by_the_five_url_limit(monkeypatch):
         result = await registry.execute("web_extract", {"urls": urls, "provider": "http"})
         payload = json.loads(result["output"])
 
+        assert payload["success"] is True
         assert [entry["url"] for entry in payload["results"]] == urls[:5]
+        assert all(f"Body of {entry['url']}" in entry["content"] for entry in payload["results"])
         assert payload["not_processed"]["urls"] == urls[5:]
         assert "5" in payload["not_processed"]["reason"]
         assert sorted(url for _, url in calls) == urls[:5]
@@ -8327,7 +8365,7 @@ def test_web_extract_starts_at_the_configured_provider_unless_the_call_names_one
         return True
 
     def page(url):
-        return f"<html><body><main><p>Body of {url} with enough words to count as real content.</p></main></body></html>"
+        return _READABLE_PAGE.replace("Readable page body", f"Body of {url}")
 
     # Exa comes before plain HTTP in the built-in order; the setting moves the start.
     monkeypatch.setenv("EXA_API_KEY", "test-exa-key")
@@ -8344,6 +8382,7 @@ def test_web_extract_starts_at_the_configured_provider_unless_the_call_names_one
         ))["output"])
         assert configured["provider_chain"] == ["http"]
         assert configured["results"][0]["backend"] == "http"
+        assert "Body of https://example.test/a" in configured["results"][0]["content"]
         assert ("get", "https://example.test/a") in calls
         assert not any(kind == "post" for kind, _ in calls)
 
@@ -8351,6 +8390,536 @@ def test_web_extract_starts_at_the_configured_provider_unless_the_call_names_one
             "web_extract", {"urls": ["https://example.test/b"], "provider": "exa"},
         ))["output"])
         assert named["provider_chain"][0] == "exa"
+
+    run(scenario())
+
+
+def _without_web_keys(monkeypatch):
+    for name in (
+        "EXA_API_KEY", "EXA_ENV_FILE", "TAVILY_API_KEY", "PARALLEL_API_KEY", "FIRECRAWL_API_KEY",
+        "FIRECRAWL_URL", "SEARXNG_URL", "WEB_SEARCH_PROVIDER", "WEB_EXTRACT_PROVIDER",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+def _web_status_error(url, status):
+    import httpx
+
+    request = httpx.Request("GET", url)
+    return httpx.HTTPStatusError(
+        f"HTTP {status} for {url}",
+        request=request,
+        response=httpx.Response(status, request=request),
+    )
+
+
+def _web_answers_with(status):
+    def handler(url, *_):
+        raise _web_status_error(url, status)
+
+    return handler
+
+
+def _web_times_out(url, *_):
+    import httpx
+
+    # httpx timeouts really do carry an empty message.
+    raise httpx.ReadTimeout("")
+
+
+def _web_refuses(url, *_):
+    import httpx
+
+    raise httpx.ConnectError("All connection attempts failed")
+
+
+def _web_host_unknown(url, *_):
+    import httpx
+
+    try:
+        raise socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided, or not known")
+    except socket.gaierror as cause:
+        raise httpx.ConnectError(str(cause)) from cause
+
+
+def _web_certificate_rejected(url, *_):
+    import ssl
+
+    import httpx
+
+    try:
+        raise ssl.SSLCertVerificationError(1, "certificate verify failed: self-signed certificate")
+    except ssl.SSLCertVerificationError as cause:
+        raise httpx.ConnectError(str(cause)) from cause
+
+
+@pytest.mark.parametrize("exa_key,provider,get,post,code,retryable,in_error,in_hint,not_in_hint", [
+    pytest.param(
+        False, "exa", None, None, "exa_not_configured", False,
+        ["EXA_API_KEY is not configured"], ["provider=searxng"], ["Retry"], id="exa-without-key",
+    ),
+    pytest.param(
+        True, "exa", None, _web_times_out, "search_failed", True,
+        ["Exa search failed", "ReadTimeout"], ["Retry later", "provider=searxng"], [], id="exa-timeout",
+    ),
+    pytest.param(
+        True, "exa", None, _web_answers_with(401), "search_failed", False,
+        ["Exa search failed", "401"], ["provider=searxng"], ["Retry"], id="exa-rejected",
+    ),
+    pytest.param(
+        False, "searxng", _web_refuses, None, "search_failed", True,
+        ["Cannot reach SearXNG", "All connection attempts failed"],
+        ["Retry later", "No other search route"], ["provider=exa"], id="searxng-refused-no-exa",
+    ),
+    pytest.param(
+        True, "searxng", _web_answers_with(403), None, "search_failed", False,
+        ["Cannot reach SearXNG", "403"], ["provider=exa"], ["Retry"], id="searxng-forbidden-exa-ready",
+    ),
+    pytest.param(
+        False, "auto", _web_answers_with(503), None, "search_failed", True,
+        ["SearXNG unavailable", "503", "Exa: EXA_API_KEY is not configured"],
+        ["Retry later", "No other search route"], ["provider=exa"], id="auto-every-route-failed",
+    ),
+    pytest.param(
+        True, "auto", _web_answers_with(404), _web_answers_with(401), "search_failed", False,
+        ["SearXNG unavailable", "404", "Exa: ", "401"],
+        ["No other search route"], ["Retry", "provider=exa"], id="auto-both-rejected",
+    ),
+    pytest.param(
+        False, "searxng", lambda url: "<html><body>Sign in to this network</body></html>", None,
+        "search_response_invalid", False, ["SearXNG", "not valid JSON"],
+        ["No other search route"], ["Retry"], id="searxng-not-json",
+    ),
+])
+def test_search_web_reports_a_call_with_no_working_route_as_a_failure(
+    monkeypatch, exa_key, provider, get, post, code, retryable, in_error, in_hint, not_in_hint,
+):
+    _without_web_keys(monkeypatch)
+    if exa_key:
+        monkeypatch.setenv("EXA_API_KEY", "test-exa-key")
+    _fake_web_transport(monkeypatch, get=get, post=post)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        result = await registry.execute("search_web", {"query": "obscure named thing", "provider": provider})
+
+        # Nothing is left in the output for the model to read as a result.
+        assert result["output"] == ""
+        assert result["code"] == code
+        assert result["retryable"] is retryable
+        for text in in_error:
+            assert text in result["error"]
+        for text in in_hint:
+            assert text in result["recovery_hint"]
+        for text in not_in_hint:
+            assert text not in result["recovery_hint"]
+
+    run(scenario())
+
+
+def test_search_web_runs_again_after_a_failure_and_answers_no_match_as_a_result(monkeypatch):
+    import httpx
+
+    service = {"down": True}
+
+    def searxng(url):
+        if service["down"]:
+            raise httpx.ConnectError("All connection attempts failed")
+        query = _searxng_query(url)["q"]
+        if query == "nothing here":
+            return {"query": query, "results": []}
+        return {"query": query, "results": [{
+            "title": "Back again", "url": "https://example.test/back", "content": "snippet",
+        }]}
+
+    _without_web_keys(monkeypatch)
+    calls = _fake_web_transport(monkeypatch, get=searxng)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        arguments = {"query": "service notes", "provider": "searxng"}
+        failed = await registry.execute("search_web", arguments)
+        assert failed["output"] == "" and failed["retryable"] is True
+
+        service["down"] = False
+        again = await registry.execute("search_web", arguments)
+        assert again["error"] == ""
+        assert "Back again" in again["output"]
+        assert len(calls) == 2
+
+        for chosen in ("searxng", "auto"):
+            empty = await registry.execute("search_web", {"query": "nothing here", "provider": chosen})
+            assert empty["error"] == ""
+            assert empty["output"].startswith("No ")
+            assert "'nothing here'" in empty["output"]
+            assert "not proof" in empty["output"]
+        # SearXNG answered, so the call worked; the Exa route it could not ask is named.
+        assert "Exa: EXA_API_KEY is not configured" in empty["output"]
+
+        blank = await registry.execute("search_web", {"query": "   "})
+        assert blank["output"] == "" and blank["code"] == "invalid_arguments"
+
+    run(scenario())
+
+
+def test_search_web_exa_without_hits_is_an_answer(monkeypatch):
+    _without_web_keys(monkeypatch)
+    monkeypatch.setenv("EXA_API_KEY", "test-exa-key")
+    _fake_web_transport(monkeypatch, post=lambda url, payload: {"results": []})
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        result = await registry.execute("search_web", {"query": "nothing here", "provider": "exa"})
+
+        assert result["error"] == ""
+        assert result["output"].startswith("No Exa results for 'nothing here'")
+        assert "not proof" in result["output"]
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("handler,code,retryable,in_error", [
+    pytest.param(_web_times_out, "fetch_failed", True, "ReadTimeout", id="timeout"),
+    pytest.param(_web_refuses, "fetch_failed", True, "All connection attempts failed", id="refused"),
+    pytest.param(_web_answers_with(503), "fetch_failed", True, "503", id="server-error"),
+    pytest.param(_web_answers_with(404), "fetch_failed", False, "404", id="not-found"),
+    pytest.param(_web_host_unknown, "fetch_failed", False, "nodename nor servname", id="unknown-host"),
+    pytest.param(_web_certificate_rejected, "fetch_failed", False, "certificate verify failed", id="bad-certificate"),
+    pytest.param(lambda url: "", "empty_response", False, "empty body", id="empty-body"),
+])
+def test_fetch_url_reports_a_page_it_could_not_get_as_a_failure(monkeypatch, handler, code, retryable, in_error):
+    calls = _fake_web_transport(monkeypatch, get=handler)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        url = "https://example.test/report"
+        result = await registry.execute("fetch_url", {"url": url})
+
+        assert result["output"] == ""
+        assert result["code"] == code
+        assert result["retryable"] is retryable
+        assert url in result["error"]
+        assert in_error in result["error"]
+        # The hint only proposes a retry when one can help.
+        assert ("Retry later" in result["recovery_hint"]) is retryable
+        assert "web_extract" in result["recovery_hint"]
+        assert calls == [("get", url)]
+
+        scheme = await registry.execute("fetch_url", {"url": "ftp://example.test/report"})
+        assert scheme["output"] == "" and scheme["code"] == "invalid_url"
+        assert scheme["retryable"] is False
+        assert len(calls) == 1
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("failure,retryable", [
+    pytest.param(lambda url: urllib.error.HTTPError(url, 503, "Service Unavailable", None, None), True, id="server-error"),
+    pytest.param(lambda url: urllib.error.HTTPError(url, 404, "Not Found", None, None), False, id="not-found"),
+    pytest.param(lambda url: urllib.error.URLError(ConnectionRefusedError(61, "Connection refused")), True, id="refused"),
+    pytest.param(lambda url: urllib.error.URLError(socket.gaierror(8, "nodename nor servname provided")), False, id="unknown-host"),
+    pytest.param(lambda url: TimeoutError("timed out"), True, id="timeout"),
+    pytest.param(lambda url: ValueError("unknown url type"), False, id="bad-url"),
+])
+def test_fetch_url_keeps_the_retry_flag_when_httpx_is_missing(monkeypatch, failure, retryable):
+    import agent.runtime.tools.web as web_module
+
+    opened = []
+
+    class Opener:
+        def open(self, request, timeout=None):
+            opened.append(request.full_url)
+            raise failure(request.full_url)
+
+    for name in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(web_module, "httpx", None)
+    monkeypatch.setattr(web_module.urllib.request, "build_opener", lambda *handlers: Opener())
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        result = await registry.execute("fetch_url", {"url": "https://example.test/page"})
+
+        assert opened == ["https://example.test/page"]
+        assert result["output"] == ""
+        assert result["code"] == "fetch_failed"
+        assert result["retryable"] is retryable
+
+    run(scenario())
+
+
+def test_web_extract_fails_the_call_only_when_no_url_was_read(monkeypatch):
+    import agent.runtime.tools.web as web_module
+
+    good = "https://docs.example.test/guide"
+    missing = "https://docs.example.test/gone"
+    slow = "https://slow.example.test/report"
+    private = "http://127.0.0.1/admin"
+
+    def page(url):
+        if url == good:
+            return _READABLE_PAGE
+        if url == slow:
+            return _web_times_out(url)
+        raise _web_status_error(url, 404)
+
+    def public_dns(host, port, *args, **kwargs):
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+
+    _without_web_keys(monkeypatch)
+    calls = _fake_web_transport(monkeypatch, get=page)
+    monkeypatch.setattr(web_module.socket, "getaddrinfo", public_dns)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+
+        # One URL read: the other URL's error stays inside the result.
+        mixed = await registry.execute("web_extract", {"urls": [good, missing], "provider": "http"})
+        payload = json.loads(mixed["output"])
+        assert mixed["error"] == ""
+        assert payload["success"] is True
+        assert "Readable page body" in payload["results"][0]["content"]
+        assert "404" in payload["results"][1]["error"]
+
+        failed = await registry.execute("web_extract", {"urls": [missing, slow, private], "provider": "http"})
+        assert failed["output"] == ""
+        assert failed["code"] == "extract_failed"
+        reasons = dict(line[2:].split(": ", 1) for line in failed["error"].splitlines()[1:])
+        assert list(reasons) == [missing, slow, private]
+        assert "404" in reasons[missing]
+        assert "ReadTimeout" in reasons[slow]
+        assert reasons[private].startswith("Blocked")
+        # The timeout is the one cause that a retry can change.
+        assert failed["retryable"] is True
+        assert "retry" in failed["recovery_hint"]
+        assert failed["details"]["provider_chain"] == ["http"]
+
+        settled = await registry.execute("web_extract", {"urls": [missing, private], "provider": "http"})
+        assert settled["code"] == "extract_failed"
+        assert settled["retryable"] is False
+        assert "retry" not in settled["recovery_hint"]
+
+        gone = [f"https://docs.example.test/gone-{index}" for index in range(1, 8)]
+        many = await registry.execute("web_extract", {"urls": gone, "provider": "http"})
+        assert many["code"] == "extract_failed"
+        assert [url for url in gone if url in many["error"]] == gone[:5]
+        assert "2 more URLs were not tried" in many["error"]
+        assert many["details"]["not_processed"] == gone[5:]
+
+        requests_before = len(calls)
+        for nothing in ([], ["  "]):
+            empty = await registry.execute("web_extract", {"urls": nothing})
+            assert empty["output"] == "" and empty["code"] == "invalid_arguments"
+        assert len(calls) == requests_before
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("configured,retryable", [(False, False), (True, True)])
+def test_web_extract_does_not_take_an_absent_default_firecrawl_as_a_reason_to_retry(
+    monkeypatch, configured, retryable,
+):
+    import agent.runtime.tools.web as web_module
+
+    async def safe_url(url):
+        return True
+
+    _without_web_keys(monkeypatch)
+    if configured:
+        monkeypatch.setenv("FIRECRAWL_URL", "http://firecrawl.example.test:3002")
+    # Nothing answers on the Firecrawl address; the page itself is gone.
+    _fake_web_transport(monkeypatch, get=_web_answers_with(404), post=_web_refuses)
+    monkeypatch.setattr(web_module, "_is_safe_public_url", safe_url)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        result = await registry.execute("web_extract", {
+            "urls": ["https://docs.example.test/gone"],
+            "provider": "firecrawl",
+        })
+
+        assert result["code"] == "extract_failed"
+        assert "firecrawl: All connection attempts failed" in result["error"]
+        assert "http: HTTP 404" in result["error"]
+        assert result["retryable"] is retryable
+
+    run(scenario())
+
+
+def test_web_extract_returns_a_short_plain_body_when_nothing_else_read_the_url(monkeypatch):
+    import agent.runtime.tools.web as web_module
+
+    health = "https://api.example.test/health"
+    ping = "https://api.example.test/ping"
+    shell = "https://api.example.test/app"
+    bodies = {
+        health: '{"status": "ok"}',
+        ping: "pong\n",
+        shell: (
+            '<!doctype html><html><head><script src="/app.js"></script></head>'
+            '<body><div id="root"></div></body></html>'
+        ),
+    }
+
+    def get(url):
+        if "/search?" in url:
+            return {"query": "health", "results": []}
+        return bodies[url]
+
+    async def safe_url(url):
+        return True
+
+    _without_web_keys(monkeypatch)
+    # No POST handler: the Firecrawl backend in front of plain HTTP cannot be reached.
+    calls = _fake_web_transport(monkeypatch, get=get)
+    monkeypatch.setattr(web_module, "_is_safe_public_url", safe_url)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        direct = await registry.execute("web_extract", {"urls": [health, ping, shell], "provider": "http"})
+        payload = json.loads(direct["output"])
+        health_entry, ping_entry, shell_entry = payload["results"]
+
+        assert direct["error"] == ""
+        assert payload["success"] is True
+        assert health_entry["content"] == '{"status": "ok"}'
+        assert health_entry["error"] is None
+        assert health_entry["backend"] == "http"
+        assert ping_entry["content"] == "pong"
+        # Markup that yields no text is still the page that may need rendering.
+        assert shell_entry["content"] == ""
+        assert "JavaScript" in shell_entry["error"]
+
+        alone = await registry.execute("web_extract", {"urls": [shell], "provider": "http"})
+        assert alone["output"] == "" and alone["code"] == "extract_failed"
+        assert shell in alone["error"] and "JavaScript" in alone["error"]
+
+        # Under auto the backends in front and the search for a moved page still run first.
+        calls.clear()
+        auto = await registry.execute("web_extract", {"urls": [health]})
+        entry = json.loads(auto["output"])["results"][0]
+        assert auto["error"] == ""
+        assert entry["content"] == '{"status": "ok"}'
+        assert entry["error"] is None
+        assert entry["fallback_from"] == ["firecrawl", "search"]
+        assert ("get", health) in calls
+        assert any(kind == "post" for kind, _ in calls)
+        assert any(kind == "get" and "/search?" in url for kind, url in calls)
+
+    run(scenario())
+
+
+def test_web_extract_names_a_final_url_that_does_not_resolve_without_calling_it_private(monkeypatch):
+    import agent.runtime.tools.web as web_module
+
+    moved, internal, read = (f"https://docs.example.test/{name}" for name in ("moved", "internal", "read"))
+    finals = {
+        moved: "https://relocated.example.test/moved",
+        internal: "http://intranet.example.test/internal",
+        read: read,
+    }
+
+    def dns(host, port, *args, **kwargs):
+        if host == "docs.example.test":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
+        if host == "intranet.example.test":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", port))]
+        raise socket.gaierror(socket.EAI_NONAME, "nodename nor servname provided, or not known")
+
+    def post(url, payload):
+        if url.endswith("/contents"):
+            return {"results": [
+                {"url": finals[item], "title": "Page", "text": f"PROVIDER-TEXT for {item} " + "words " * 40}
+                for item in payload["urls"]
+            ]}
+        return {"success": False, "error": "scrape failed"}
+
+    _without_web_keys(monkeypatch)
+    monkeypatch.setenv("EXA_API_KEY", "test-exa-key")
+    _fake_web_transport(monkeypatch, get=_web_answers_with(404), post=post)
+    monkeypatch.setattr(web_module.socket, "getaddrinfo", dns)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+        result = await registry.execute("web_extract", {"urls": [moved, internal, read], "provider": "exa"})
+        payload = json.loads(result["output"])
+        moved_entry, internal_entry, read_entry = payload["results"]
+
+        assert read_entry["backend"] == "exa"
+        assert read_entry["content"].startswith(f"PROVIDER-TEXT for {read}")
+        exa_reason = moved_entry["error"].split("; ")[0]
+        assert exa_reason == (
+            "exa: could not resolve the host name of the final URL https://relocated.example.test/moved"
+        )
+        assert internal_entry["error"].split("; ")[0] == "exa: redirected to an unsafe/private URL"
+        # Whatever the wording, neither final URL's text is handed over.
+        for entry in (moved_entry, internal_entry):
+            assert entry["content"] == ""
+            assert "PROVIDER-TEXT" not in json.dumps(entry)
+
+    run(scenario())
+
+
+def test_extract_url_reports_a_failed_extraction_as_a_failure(monkeypatch):
+    import agent.runtime.tools.web as web_module
+
+    slow = "https://example.test/slow"
+    shell = "https://example.test/app"
+
+    class FailedProcess:
+        returncode = 3
+
+        async def communicate(self):
+            return b"", b"renderer crashed"
+
+    async def fake_subprocess_exec(*cmd, **kwargs):
+        return FailedProcess()
+
+    def get(url):
+        if url == slow:
+            return _web_times_out(url)
+        return '<html><body><div id="root"></div></body></html>'
+
+    monkeypatch.setenv("BROWSER_EXTRACT_ARGV", '["browser-extract"]')
+    monkeypatch.delenv("BROWSER_EXTRACT_CMD", raising=False)
+    monkeypatch.delenv("WSL_EXTRACT_CMD", raising=False)
+    _fake_web_transport(monkeypatch, get=get)
+    monkeypatch.setattr(web_module.asyncio, "create_subprocess_exec", fake_subprocess_exec)
+
+    async def scenario():
+        registry = ToolRegistry()
+        register_web_tools(registry, None)
+
+        timed_out = await registry.execute("extract_url", {"url": slow})
+        assert timed_out["output"] == ""
+        assert timed_out["code"] == "browser_extract_failed"
+        assert slow in timed_out["error"]
+        assert "exit 3" in timed_out["error"] and "renderer crashed" in timed_out["error"]
+        # The static attempt that came first is no longer dropped.
+        assert "static attempt before it failed (ReadTimeout)" in timed_out["error"]
+        assert timed_out["retryable"] is True
+        assert "web_extract" in timed_out["recovery_hint"]
+
+        no_text = await registry.execute("extract_url", {"url": shell})
+        assert no_text["code"] == "browser_extract_failed"
+        assert "too little text" in no_text["error"]
+        assert no_text["retryable"] is False
+
+        scheme = await registry.execute("extract_url", {"url": "file:///etc/hosts"})
+        assert scheme["output"] == "" and scheme["code"] == "invalid_url"
+
+        # The browser tools read the extractor's own text and still get it.
+        direct = await web_module.create_browser_extract_fn()(shell)
+        assert direct.startswith("[Browser Error]") and "exit 3" in direct
 
     run(scenario())
 

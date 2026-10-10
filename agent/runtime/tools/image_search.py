@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 from urllib.parse import unquote, urlsplit
 
+from ..tool_failure import ToolFailure
 from .registry import ToolDef, ToolRegistry
 from .search_image_reader import SearchImageError
 
@@ -107,7 +108,7 @@ img{display:block;width:100%;height:230px;object-fit:contain;background:#e9ede7}
 
 def register_image_search(
     registry: ToolRegistry,
-    search_pages: Callable[[str, int], Awaitable[tuple[dict | None, str | None]]],
+    search_pages: Callable[[str, int], Awaitable[tuple[dict | None, str | ToolFailure | None]]],
     is_public_url: Callable[[str], Awaitable[bool]],
     cache_ttl: int = 600,
     preview_available: Callable[[str], Awaitable[bool]] | None = None,
@@ -125,10 +126,15 @@ def register_image_search(
             old_id, _ = known_images.popitem(last=False)
             local_images.pop(old_id, None)
 
-    async def search_images(query: str, max_results: int = 6) -> str:
+    async def search_images(query: str, max_results: int = 6) -> str | ToolFailure:
         query = query.strip()
         if not query or len(query) > 1000:
-            return json.dumps({"type": "image_search", "success": False, "error": "query must contain 1–1000 characters"})
+            return ToolFailure(
+                code="invalid_arguments",
+                message="query must contain 1–1000 characters",
+                retryable=False,
+                recovery_hint="Pass a short description of the image subject in query.",
+            )
         limit = min(10, max(1, int(max_results)))
         key = (query, limit)
         cached = cache.get(key)
@@ -137,8 +143,16 @@ def register_image_search(
             remember(cached[1]["images"])
             return json.dumps(cached[1], ensure_ascii=False)
         data, error = await search_pages(query, limit)
+        if isinstance(error, ToolFailure):
+            # The search backend knows why it failed and what to do instead.
+            return error
         if error or not isinstance(data, dict):
-            return json.dumps({"type": "image_search", "success": False, "error": error or "Image search unavailable"}, ensure_ascii=False)
+            return ToolFailure(
+                code="image_search_failed",
+                message=error or "Image search unavailable",
+                retryable=False,
+                recovery_hint="Image search did not answer. Use search_web to find pages that show such images.",
+            )
         candidates = image_candidates(data, limit * 3)
         urls = list(dict.fromkeys(url for item in candidates for url in (item["source_url"], item["image_url"])))
         semaphore = asyncio.Semaphore(8)
@@ -199,23 +213,38 @@ def register_image_search(
             result["message"] = "No public image links found. Try a more specific subject or another query."
         return json.dumps(result, ensure_ascii=False)
 
-    async def read_search_images(image_ids: list[str], question: str = "") -> str:
-        def failure(message: str) -> str:
-            return json.dumps({"success": False, "type": "image_attachment", "error": message}, ensure_ascii=False)
+    async def read_search_images(image_ids: list[str], question: str = "") -> str | ToolFailure:
+        def failure(code: str, message: str, hint: str, retryable: bool = False) -> ToolFailure:
+            return ToolFailure(code=code, message=message, retryable=retryable, recovery_hint=hint)
 
         if (not isinstance(image_ids, list) or not 1 <= len(image_ids) <= 4
                 or any(not isinstance(item, str) or not item for item in image_ids)
                 or len(set(image_ids)) != len(image_ids)):
-            return failure("Choose one to four unique image IDs returned by search_images.")
-        if any(item not in known_images for item in image_ids):
-            return failure("Unknown or expired image ID. Run search_images again and use its returned IDs.")
+            return failure(
+                "invalid_arguments",
+                "Choose one to four unique image IDs returned by search_images.",
+                "Pass image_ids as a list of 1-4 different ids taken from the images of a search_images result.",
+            )
+        unknown = [item for item in image_ids if item not in known_images]
+        if unknown:
+            return failure(
+                "unknown_image_id",
+                "Unknown or expired image ID: " + ", ".join(item[:80] for item in unknown),
+                "IDs are valid only for recent search_images results of this run. "
+                "Run search_images again and use the IDs it returns.",
+            )
         if load_image is None:
-            return failure("Image loading is unavailable in this runtime.")
+            return failure(
+                "image_loading_unavailable",
+                "Image loading is unavailable in this runtime.",
+                "The pixels cannot be inspected here. Use the image and source URLs from search_images, "
+                "and say that the images were not visually checked.",
+            )
         loader = load_image
         candidates = {image_id: known_images[image_id].copy() for image_id in image_ids}
         semaphore = asyncio.Semaphore(4)
 
-        async def read(image_id: str) -> tuple[str, Path | None, str]:
+        async def read(image_id: str) -> tuple[str, Path | None, str, bool]:
             async with semaphore:
                 try:
                     path = local_images.get(image_id)
@@ -224,20 +253,34 @@ def register_image_search(
                         local_images[image_id] = path
                         while len(local_images) > 512:
                             local_images.popitem(last=False)
-                    return image_id, path, ""
+                    return image_id, path, "", False
                 except SearchImageError as exc:
-                    return image_id, None, str(exc)
-                except Exception:
-                    return image_id, None, "Could not load this candidate for visual inspection; try another image."
+                    return image_id, None, str(exc), exc.retryable
+                except Exception as exc:
+                    return (image_id, None, "Could not load this candidate for visual inspection; try another image.",
+                            isinstance(exc, TimeoutError))
 
         loaded = await asyncio.gather(*(read(image_id) for image_id in image_ids))
-        images = [{**candidates[image_id], "local_path": str(path)} for image_id, path, _ in loaded if path]
+        images = [{**candidates[image_id], "local_path": str(path)} for image_id, path, _, _ in loaded if path]
+        failures = [{"id": image_id, "error": error} for image_id, path, error, _ in loaded if path is None]
+        if not images:
+            # Nothing was attached: a result here would read as images to inspect.
+            retryable = any(transient for _, path, _, transient in loaded if path is None)
+            return failure(
+                "image_load_failed",
+                "None of the selected images could be loaded:\n"
+                + "\n".join(f"- {item['id']}: {item['error']}" for item in failures),
+                ("A timeout or server error may pass on a retry. " if retryable else "")
+                + "Choose other image IDs from the search_images result. "
+                "Do not describe an image that was not loaded.",
+                retryable,
+            )
         return json.dumps({
             "success": bool(images), "type": "image_attachment", "provider": "exa",
             "image_paths": [item["local_path"] for item in images],
             "image_labels": [f"Image ID: {item['id']} | Source (untrusted): {item['source_url']}" for item in images],
             "images": images,
-            "failures": [{"id": image_id, "error": error} for image_id, path, error in loaded if path is None],
+            "failures": failures,
             "question": str(question)[:1000], "detail": "original",
             "visual_status": "awaiting_model_inspection" if images else "unavailable",
             "message": (
