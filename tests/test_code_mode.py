@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -735,9 +736,12 @@ def test_registered_run_code_reports_a_failed_program_as_a_failure():
     # The failure keeps the start of the program output and its end, where the reason is.
     big = run("print('head-marker' + 'x' * 40000)\nreturn 1")
     assert big["code"] == "run_code_output_limit"
-    assert big["error"].startswith("head-marker") and len(big["error"]) < 13_000
-    assert "characters of program output omitted" in big["error"]
+    assert "head-marker" in big["error"] and len(big["error"]) < 13_000
+    assert big["output_truncated"] is True
     assert big["error"].rstrip().endswith("run_code output exceeded 32000 characters")
+    # What the failed run reported is kept whole on disk; the error shows a shortened copy.
+    saved = Path(big["artifact_path"]).read_text(encoding="utf-8")
+    assert saved.startswith("head-marker") and len(saved) > 2 * len(big["error"])
 
 
 def test_a_tool_recovery_hint_reaches_the_program_and_the_failed_run():
