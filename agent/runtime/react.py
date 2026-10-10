@@ -3029,6 +3029,7 @@ class ReActAgent(AgentBase):
             "recovery_hint",
             "partial",
             "state_changed",
+            "not_executed",
             "details",
             "artifact_ref",
             "mutation_tracking_warning",
@@ -4395,6 +4396,13 @@ class ReActAgent(AgentBase):
                     if not event.get("error")
                 )
                 for event in tool_events:
+                    if event.get("not_executed") and str(event.get("id") or "") not in refusals:
+                        # Refused before the tool's code ran (for example a
+                        # missing argument): the corrected call must still fit
+                        # the tool's per-turn limit.
+                        refused_name = str(event.get("name") or "")
+                        if tool_name_counts.get(refused_name, 0) > 0:
+                            tool_name_counts[refused_name] -= 1
                     if event.get("state_changed") and not event.get("error"):
                         # The call changed what it acts on, so sending it
                         # again is a new action rather than a repeat.

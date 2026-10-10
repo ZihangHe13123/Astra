@@ -259,6 +259,31 @@ def test_a_used_up_limit_refuses_one_more_call_and_says_the_next_ends_the_turn()
     assert agent.context.messages[-1]["content"] == "done"
 
 
+def test_a_call_refused_for_its_arguments_does_not_use_up_a_per_turn_limit():
+    served: list[str] = []
+
+    async def serve(name: str) -> str:
+        served.append(name)
+        return f"served {name}"
+
+    registry = ToolRegistry()
+    registry.register(ToolDef(
+        "serve", "serve one drink",
+        {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]},
+        serve, risk="write", max_calls_per_turn=1,
+    ))
+    llm = _BatchLLM([[("serve", "{}")], [("serve", '{"name": "tea"}')]])
+    agent = ReActAgent("agent", llm, registry, max_iterations=6)
+
+    events = _turn(agent, None)
+
+    first, second = _tool_messages(agent)
+    assert "status: error" in first and "name" in first
+    assert "served tea" in second
+    assert served == ["tea"]
+    assert not any(str(event.get("message", "")).startswith("Stopping") for event in events)
+
+
 def test_partial_result_is_not_described_as_complete():
     async def page(full: bool) -> str:
         if full:

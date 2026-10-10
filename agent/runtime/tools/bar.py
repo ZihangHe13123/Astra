@@ -13,8 +13,8 @@ from .registry import ToolDef, ToolRegistry
 
 _BAR_TURN_CALLS_PER_TURN = 3
 _ONE_CALL_PER_TURN = (
-    "At most one call per turn, and a failed call counts. A second call, in the same step or a later one, "
-    "is not run, and nothing else in that step runs either."
+    "At most one call per turn; a call that ran and failed counts, one rejected for its arguments does not. "
+    "A second call, in the same step or a later one, is not run, and nothing else in that step runs either."
 )
 
 
