@@ -1063,7 +1063,8 @@ class MCPManager:
             if not payload or len(payload) > max_bytes:
                 continue
             output_dir.mkdir(parents=True, exist_ok=True)
-            prefix = _SAFE_NAME.sub("_", f"{server}_{tool}").strip("_") or "mcp_image"
+            # Bounded: the server chooses the tool name, and a file name has a length limit.
+            prefix = _SAFE_NAME.sub("_", f"{server}_{tool}").strip("_")[:80] or "mcp_image"
             path = output_dir / f"{prefix}_{uuid.uuid4().hex}{_MCP_IMAGE_EXTENSIONS[mime]}"
             path.write_bytes(payload)
             paths.append(str(path.resolve()))

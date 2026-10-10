@@ -766,3 +766,18 @@ def test_mcp_config_validates_tool_filters():
 
     assert "servers.demo.include_tools must be a list of non-empty tool names" in warnings
     assert "servers.demo.exclude_tools must be a list of non-empty tool names" in warnings
+
+
+def test_mcp_image_from_a_tool_with_a_long_name_is_saved(tmp_path):
+    name = "render/" + "chart." * 60
+    registry = ToolRegistry(ToolPolicy(mode="permissive"), artifact_dir=tmp_path)
+    manager = MCPManager(tmp_path / "mcp.json")
+    manager._register_tools(registry, "demo", FakeImageSession(), [FakeRemoteTool(name=name)], {})
+
+    # The image file used to be named after the whole tool name, here longer than a file name may be.
+    result = run(registry.execute(registry.tool_names[0], {"query": "hello"}))
+
+    assert result["error"] == ""
+    payload = json.loads(result["output"])
+    assert Path(payload["image_paths"][0]).read_bytes() == b"small-png-payload"
+    assert payload["source"] == f"mcp:demo/{name}"
