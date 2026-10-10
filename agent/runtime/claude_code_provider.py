@@ -51,6 +51,9 @@ TOOL_PREFIX = f"mcp__{BRIDGE_NAME}__"
 # Claude accepts tool names up to 64 characters, and the bridge prefix counts.
 NAME_LIMIT = 64 - len(TOOL_PREFIX)
 TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,%d}" % NAME_LIMIT)
+# Claude Code shortens an MCP tool description longer than this before Claude reads it (2,048
+# characters as reported for current CLIs, more in newer ones). Astra sends descriptions whole.
+DESCRIPTION_LIMIT = 2048
 # The first line ReActAgent puts on each tool result it stores: the tool and how the call went.
 RESULT_HEADER = re.compile(r"\[Tool result: [^\n|]+ \| status: ([a-z_]+)\]\n")
 # What the runtime stores, without that line, for a call it refused to run before ending the turn.
@@ -435,6 +438,9 @@ def _bridged(tools: list[dict]) -> list[tuple[str, dict]]:
                 "object schema. The declared schema: "
                 + json.dumps(schema, ensure_ascii=False, sort_keys=True, default=str) + "]")
             schema = {"type": "object", "properties": {}}
+        if len(description) > DESCRIPTION_LIMIT:
+            _report("description", name, "Claude Code bridge: the description of tool %r is %d characters; "
+                    "Claude Code may cut what is past %d", name, len(description), DESCRIPTION_LIMIT)
         listed.append((name, {"name": shown, "description": description, "inputSchema": schema}))
     return listed
 

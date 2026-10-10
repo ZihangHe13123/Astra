@@ -755,3 +755,113 @@ def test_parameters_that_are_not_an_object_schema_are_not_shown_as_no_parameters
     assert "'convert'" in warning and "object schema" in warning
     assert ccp.bridge_tools(tools) == [lookup, convert, ping]
 
+
+BUILTIN_DESCRIPTION_LIMIT = 2000
+
+
+def over_long_descriptions(tools: list[dict], limit: int = BUILTIN_DESCRIPTION_LIMIT) -> dict[str, int]:
+    return {t["name"]: len(t["description"]) for t in ccp.bridge_tools(tools) if len(t["description"]) > limit}
+
+
+def test_an_over_long_description_reaches_claude_code_whole_and_is_reported(caplog):
+    """Claude Code cuts an MCP tool description past its own cap. Astra cannot see that happen,
+    so it sends the text whole and logs which tool is over, with its length."""
+    long = "Describes a third-party tool. " + "x" * ccp.DESCRIPTION_LIMIT
+    tools = [function_tool("verbose_tool", long), READ_FILE,
+             function_tool("exact_tool", "y" * ccp.DESCRIPTION_LIMIT)]
+    with caplog.at_level(logging.WARNING, logger=ccp.logger.name):
+        listed = ccp.bridge_tools(tools)
+    assert [t["description"] for t in listed] == [long, "Read a file.", "y" * ccp.DESCRIPTION_LIMIT]
+    [warning] = warnings(caplog)
+    assert "'verbose_tool'" in warning and str(len(long)) in warning
+    assert over_long_descriptions(tools) == {"verbose_tool": len(long), "exact_tool": ccp.DESCRIPTION_LIMIT}
+
+
+def builtin_tools(root: Path) -> list[dict]:
+    """Astra's own tools as the model is offered them, from the real registration functions."""
+    from types import SimpleNamespace
+
+    from agent.channels.tools import register_channel_tools
+    from agent.cli.conversation_commands import register_conversation_tools
+    from agent.runtime.code_mode import register_run_code_tool
+    from agent.runtime.hindsight_provider import HindsightMemoryProvider
+    from agent.runtime.memory import MemoryStore
+    from agent.runtime.skills import SkillStore
+    from agent.runtime.task_store import TaskStore
+    from agent.runtime.tools.activity import register_activity_tools
+    from agent.runtime.tools.bar import register_bar_tools
+    from agent.runtime.tools.browser import register_browser_tools
+    from agent.runtime.tools.computer import register_local_computer_runtime
+    from agent.runtime.tools.conclave import register_conclave_tools
+    from agent.runtime.tools.context_index import register_context_index_tools
+    from agent.runtime.tools.delegate import register_delegate_tools
+    from agent.runtime.tools.goals import register_goal_tools
+    from agent.runtime.tools.hindsight import register_hindsight_tools
+    from agent.runtime.tools.image import register_image_tools
+    from agent.runtime.tools.memory import register_memory_tools
+    from agent.runtime.tools.plans import register_plan_tools
+    from agent.runtime.tools.registry import ToolRegistry
+    from agent.runtime.tools.session_recall import register_session_recall_tools
+    from agent.runtime.tools.skills import register_skill_tools
+    from agent.runtime.tools.user_questions import register_user_question_tools
+    from agent.runtime.tools.web import register_web_tools
+    from agent.runtime.tools.workspace import register_workspace_tools
+    from agent.runtime.tools.workspace_dependencies import register_workspace_dependency_tools
+    from agent.sandbox.local import LocalSandbox
+
+    async def ask(questions, mode="blocking", **_):
+        return {}
+
+    registry = ToolRegistry()
+    sandbox = LocalSandbox(timeout=5, workdir=str(root))
+    memory, skills = MemoryStore(root / "memory.db"), SkillStore(root / "skills")
+    register_workspace_tools(registry, sandbox, workdir=str(root))
+    register_user_question_tools(registry, ask)
+    register_channel_tools(registry, lambda: None)
+    register_memory_tools(registry, memory, session_id=lambda: "default")
+    register_goal_tools(registry, TaskStore(root / "tasks.db"), session_id=lambda: "default")
+    register_plan_tools(registry, memory, session_id=lambda: "default")
+    register_skill_tools(registry, skills)
+    register_workspace_dependency_tools(registry)
+    register_session_recall_tools(registry)
+    register_activity_tools(registry)
+    register_context_index_tools(registry, SimpleNamespace(inspect=lambda: ""))
+    register_conclave_tools(registry, llm_getter=lambda: None)
+    register_delegate_tools(registry, llm_getter=lambda: None, sandbox=sandbox)
+    register_web_tools(registry, sandbox)
+    register_image_tools(registry, workdir=str(root))
+    register_local_computer_runtime(registry, cache_root=root / "computer")  # macOS only
+    register_browser_tools(registry, workdir=str(root))
+    register_hindsight_tools(registry, HindsightMemoryProvider(
+        base_url="http://127.0.0.1:8888", bank_id="test", client=SimpleNamespace()))
+    register_run_code_tool(registry, agent_getter=lambda: None)
+    register_bar_tools(registry, None)
+    register_conversation_tools(SimpleNamespace(
+        tools=registry, skill_store=skills, memory_store=memory, task_store=None,
+        llm=SimpleNamespace(config=SimpleNamespace(model="test")),
+        context=SimpleNamespace(session_path=str(root / "session.json"), persona_id="", messages=[]),
+        _refresh_skill_catalog=lambda **_: None))
+    # The group activation tool is offered too; its description lists every group's tool names.
+    activation = registry.activation_tool_schema()
+    return registry.to_openai_tools(names=set(registry.tool_names)) + ([activation] if activation else [])
+
+
+def test_builtin_tools_reach_claude_unchanged_and_under_the_description_cap(tmp_path, monkeypatch):
+    """Claude Code cuts an MCP tool description past its cap (2,048 characters as reported), and
+    every Astra tool reaches Claude as an MCP tool. A built-in description that grows past 2,000
+    fails here, where its author sees it, and not in a prompt that was cut without notice. Shorten
+    the description, or move detail into parameter descriptions or a skill."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ASTRA_HOME", str(tmp_path / "home"))
+    tools = builtin_tools(tmp_path)
+    functions = [tool["function"] for tool in tools]
+    assert {"run_code", "session_search", "memory", "execute_shell", "apply_patch", "read_file", "delegate_task",
+            "search_web", "browser_open", "ask_user_question", "skill_manage",
+            "activate_tool_group"} <= {f["name"] for f in functions}
+    assert over_long_descriptions(tools) == {}
+    # The same check does see a description one character over.
+    assert over_long_descriptions([function_tool("grown", "x" * (BUILTIN_DESCRIPTION_LIMIT + 1))]) == {
+        "grown": BUILTIN_DESCRIPTION_LIMIT + 1}
+    # No built-in needs an alias or has parameters Claude cannot take: each is listed as it is.
+    assert ccp.bridge_tools(tools) == [
+        {"name": f["name"], "description": f["description"], "inputSchema": f["parameters"]} for f in functions]
