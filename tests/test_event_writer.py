@@ -171,16 +171,22 @@ def test_close_still_bounds_stalled_output_with_a_longer_total_budget():
 
 def test_delivery_progress_cannot_extend_the_absolute_close_deadline():
     async def scenario():
-        release = threading.Event()
+        release, progressing = threading.Event(), threading.Event()
         output = []
 
         def write(event):
             release.wait(0.02)
             output.append(event)
+            if len(output) == 2:
+                progressing.set()
 
         writer = OrderedEventWriter(None, write)
         for index in range(100):
             writer.send({"type": "done", "index": index})
+        # The close is timed once output is being delivered. A writer thread
+        # that is slow to start would end the close by its stall bound, with
+        # one event written, which is not the case this test is about.
+        assert await asyncio.to_thread(progressing.wait, 5)
         began = time.monotonic()
         try:
             with pytest.raises(TimeoutError, match="did not drain"):
