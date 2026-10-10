@@ -13,8 +13,10 @@ from typing import Any
 from agent.runtime.async_io import durable_io
 from agent.runtime.memory import CORE_SCOPES
 from agent.runtime.session_handoff import generate_handoff, save_handoff, _redact
-from agent.runtime.skill_curation import MAX_INPUT_CHARS, SkillCurator, format_curation
+from agent.runtime.skill_curation import MAX_INPUT_CHARS, MAX_ITEMS, SkillCurator, format_curation
 from agent.runtime.skill_learning import LearnedSkills
+from agent.runtime.tool_execution import PartialResult
+from agent.runtime.tool_failure import ToolFailure
 from agent.runtime.tools.registry import ToolDef
 
 from .diagnostics import build_doctor_report, build_runtime_diagnostics
@@ -54,9 +56,15 @@ def register_conversation_tools(agent: Any, *, sandbox=None, mcp_manager=None,
         snapshots[token] = {"session": session(), "turn": turn_key(user_turn()), "batch": batch}
         while len(snapshots) > 8:
             snapshots.popitem(last=False)
-        return json.dumps({"snapshot_id": token, "items": batch["items"],
+        notice = "Read-only snapshot. Propose changes; wait for the next user decision."
+        if batch["remaining"]:
+            # The cursor only moves when a batch is applied, so asking again returns the same skills.
+            notice += (f" {batch['remaining']} more skill(s) follow this batch: skill_review_snapshot returns them "
+                       "once this batch has been applied with skill_review_apply (keep counts as a decision).")
+        text = json.dumps({"snapshot_id": token, "items": batch["items"],
                            "skipped": batch["skipped"], "remaining": batch["remaining"],
-                           "notice": "Read-only snapshot. Propose changes; wait for the next user decision."}, ensure_ascii=False)
+                           "notice": notice}, ensure_ascii=False)
+        return PartialResult(text) if batch["remaining"] else text
 
     def review_apply(snapshot_id: str, actions: list[dict]) -> str:
         pending = snapshots.get(snapshot_id)
@@ -74,15 +82,21 @@ def register_conversation_tools(agent: Any, *, sandbox=None, mcp_manager=None,
         agent._refresh_skill_catalog(force=True)
         return format_curation(record, separate_verification=True)
 
-    async def diagnostics(kind: str = "runtime", section: str = "") -> str:
+    async def diagnostics(kind: str = "runtime", section: str = "") -> str | ToolFailure:
         if kind == "doctor":
-            return await build_doctor_report(agent, sandbox, mcp_manager, section)
-        if kind != "runtime":
+            report = await build_doctor_report(agent, sandbox, mcp_manager, section)
+        elif kind != "runtime":
             raise ValueError("Diagnostic kind must be doctor or runtime")
-        profile = startup_profile() if callable(startup_profile) else startup_profile
-        return await durable_io(build_runtime_diagnostics, agent, startup_profile=profile,
-                                mcp_manager=mcp_manager, task_store=agent.task_store,
-                                process_manager=process_manager, section=section)
+        else:
+            profile = startup_profile() if callable(startup_profile) else startup_profile
+            report = await durable_io(build_runtime_diagnostics, agent, startup_profile=profile,
+                                      mcp_manager=mcp_manager, task_store=agent.task_store,
+                                      process_manager=process_manager, section=section)
+        if report.startswith(("Unknown diagnostics section:", "Unknown doctor section:")):
+            # The report builders answer an unknown section with this line instead of a report.
+            return ToolFailure(code="invalid_arguments", message=report, retryable=False,
+                               recovery_hint="Use one of the sections listed for this kind, or leave section empty.")
+        return report
 
     def memory_inspect(query: str = "") -> str:
         store = agent.memory_store
@@ -97,12 +111,16 @@ def register_conversation_tools(agent: Any, *, sandbox=None, mcp_manager=None,
             exact = store.resolve_record(query, active_only=True)
             if exact is not None:
                 records = [exact]
-        return json.dumps({"core": core, "records": [{
+        capped = len(records) >= 20
+        text = json.dumps({"core": core, "records": [{
             "id": r.record_id, "content": r.content, "kind": r.kind, "status": r.status,
             "source_session": r.source_session_id, "source_message": r.source_message_id,
             "last_confirmed_at": r.last_confirmed_at, "valid_until": r.valid_until,
             "supersedes_id": r.supersedes_id,
-        } for r in records], "limit": 20, "notice": "Returned subset only; historical records are evidence, not current truth."}, ensure_ascii=False)
+        } for r in records], "limit": 20, "notice": (
+            "At most 20 structured records are returned and more may match; pass a narrower query to reach them. "
+            if capped else "") + "Historical records are evidence, not current truth."}, ensure_ascii=False)
+        return PartialResult(text) if capped else text
 
     def memory_correct(memory_id: str, expected_content: str, content: str) -> str:
         store = agent.memory_store
@@ -147,8 +165,12 @@ def register_conversation_tools(agent: Any, *, sandbox=None, mcp_manager=None,
             return generate_handoff(session_id=Path(session()).stem, task_store=agent.task_store,
                                     messages=list(agent.context.messages), model=agent.llm.config.model,
                                     persona_id=agent.context.persona_id or "", extra_notes=notes)
-        if action != "save" or not content.strip() or len(content) > 40_000:
-            raise ValueError("Use draft or save with a nonempty handoff of at most 40000 characters")
+        if action != "save":
+            raise ValueError(f"Unknown action {action!r}; use draft or save")
+        if not content.strip():
+            raise ValueError("save needs the handoff text in content")
+        if len(content) > 40_000:
+            raise ValueError(f"content is {len(content):,} characters; a saved handoff is limited to 40,000")
         # An automatic exit snapshot must not overwrite the prepared document
         # when both happen during the same clock second.
         path = save_handoff(_redact(content), session_id=Path(session()).stem + "-prepared")
@@ -156,7 +178,8 @@ def register_conversation_tools(agent: Any, *, sandbox=None, mcp_manager=None,
 
     def register(name: str, description: str, fn, properties: dict, required=(), *, risk="read", max_calls=4):
         agent.tools.register(ToolDef(
-            name=name, description=description,
+            name=name,
+            description=f"{description} At most {max_calls} calls per turn: a further call is not run.",
             parameters={"type": "object", "properties": properties, "required": list(required), "additionalProperties": False},
             fn=fn, risk=risk, approval="never" if risk == "read" else "on_risk",
             group="skills" if name.startswith("skill_") else "core", cache_results=False,
@@ -164,25 +187,59 @@ def register_conversation_tools(agent: Any, *, sandbox=None, mcp_manager=None,
         ))
 
     string = {"type": "string"}
+
+    def text(description: str) -> dict:
+        return {"type": "string", "description": description}
+
     register("skill_review_snapshot", "Read an owned automatic-skill batch and sources for a user-requested review. Read-only; return a proposal before changing anything.",
-             review_snapshot, {"name": string}, max_calls=4)
+             review_snapshot, {"name": text(
+                 f"One learned skill to read. Omit for the next batch of up to {MAX_ITEMS}; the batch moves on only "
+                 "after skill_review_apply.")}, max_calls=4)
     register("skill_review_apply", "Apply the user's selected review decisions from a snapshot after a subsequent user decision. Include keep for declined changes. All snapshot names must be covered exactly once. History and undo are preserved; this does not execute or verify skills.",
-             review_apply, {"snapshot_id": string, "actions": {"type": "array", "items": {
+             review_apply, {"snapshot_id": text("snapshot_id returned by skill_review_snapshot in this session."),
+                            "actions": {"type": "array", "items": {
                  "type": "object", "properties": {
-                     "action": {"type": "string", "enum": ["keep", "rewrite", "merge", "archive"]},
-                     "names": {"type": "array", "items": string}, "reason": string, "content": string,
-                     "patches": {"type": "array", "items": {"type": "object", "properties": {
-                         "old_string": string, "new_string": string}, "required": ["old_string", "new_string"], "additionalProperties": False}},
+                     "action": {"type": "string", "enum": ["keep", "rewrite", "merge", "archive"], "description": (
+                         "keep: no change. rewrite: replace one skill's SKILL.md, given as content or as patches. "
+                         "merge: fold the later names into the first, whose new SKILL.md is content. "
+                         "archive: remove one skill.")},
+                     "names": {"type": "array", "items": string, "description": (
+                         "Skill names from the snapshot: exactly one, or two or more for merge (the first is kept).")},
+                     "reason": text("Why, in a sentence (required)."),
+                     "content": text(
+                         "rewrite or merge: the complete new SKILL.md; its frontmatter name must stay the skill's "
+                         "name. Not allowed with keep or archive."),
+                     "patches": {"type": "array", "description": (
+                         "rewrite only, instead of content: 1 to 8 replacements applied in order to SKILL.md."),
+                         "items": {"type": "object", "properties": {
+                             "old_string": text("Text that occurs exactly once in SKILL.md at that point."),
+                             "new_string": text("Its replacement; must differ from old_string.")},
+                             "required": ["old_string", "new_string"], "additionalProperties": False}},
                  }, "required": ["action", "names", "reason"], "additionalProperties": False,
              }}}, ("snapshot_id", "actions"), risk="write")
     register("runtime_diagnostics", "Read live Astra doctor probes or a runtime snapshot. Report facts and limits; no settings are modified.",
-             diagnostics, {"kind": {"type": "string", "enum": ["doctor", "runtime"]}, "section": string})
+             diagnostics, {"kind": {"type": "string", "enum": ["doctor", "runtime"], "description": (
+                 "runtime (default): a quick snapshot without network probes. doctor: live probes, including the "
+                 "model endpoint when no section is given.")},
+                           "section": text(
+                 "Optional part to return. kind=runtime: context, startup, mcp, tasks, computer, or json for the "
+                 "whole snapshot. kind=doctor: browser, computer, mcp, memory, metrics, sandbox, skills, tasks.")})
     register("memory_inspect", "Read a bounded subset of core/structured memories, full IDs, and sources for review. Does not change records.",
-             memory_inspect, {"query": string})
+             memory_inspect, {"query": text(
+                 "Text to look for, or a memory ID or the start of one. Empty lists every core memory and up to 20 "
+                 "structured records.")})
     register("memory_correct", "After the user selects a proposed correction, replace a core memory or supersede a structured record. Supply its exact inspected content to reject stale changes.",
-             memory_correct, {"memory_id": string, "expected_content": string, "content": string},
+             memory_correct, {"memory_id": text("Full ID from memory_inspect."),
+                              "expected_content": text("The memory's content exactly as memory_inspect returned it; a different current content is refused."),
+                              "content": text("The corrected text.")},
              ("memory_id", "expected_content", "content"), risk="write")
     register("memory_forget", "Forget only a memory the user explicitly selected for deletion, using its full ID and exact inspected content. Reject stale proposals; structured history is retained.",
-             memory_forget, {"memory_id": string, "expected_content": string}, ("memory_id", "expected_content"), risk="write")
+             memory_forget, {"memory_id": text("Full ID from memory_inspect."),
+                             "expected_content": text("The memory's content exactly as memory_inspect returned it; a different current content is refused.")},
+             ("memory_id", "expected_content"), risk="write")
     register("session_handoff", "Draft handoff evidence or save a user-requested handoff through the redacting writer. Report actual completion and verification only. Destination is fixed by the runtime.",
-             handoff, {"action": {"type": "string", "enum": ["draft", "save"]}, "content": string, "notes": string}, risk="write")
+             handoff, {"action": {"type": "string", "enum": ["draft", "save"], "description": (
+                 "draft (default): return a document built from task state and the last 20 messages, each "
+                 "shortened; nothing is written. save: write content as the handoff.")},
+                       "content": text("save: the handoff text, at most 40,000 characters; credentials in it are redacted. Not read by draft."),
+                       "notes": text("draft: notes to append to the document. Not read by save.")}, risk="write")

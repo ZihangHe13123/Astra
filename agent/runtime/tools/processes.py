@@ -717,10 +717,14 @@ class ProcessManager:
             return ""
 
     @staticmethod
-    def _byte_offset_for_char(path: Path, char_offset: int) -> int:
-        """Map a legacy character cursor with bounded memory."""
+    def _byte_offset_for_char(path: Path, char_offset: int) -> tuple[int, int]:
+        """Map a legacy character cursor with bounded memory.
+
+        Returns the byte position and the character position it stands for;
+        the latter is smaller than ``char_offset`` when the file ends first.
+        """
         if char_offset <= 0:
-            return 0
+            return 0, 0
         remaining = char_offset
         try:
             # newline=None preserves the historical read_text() behavior:
@@ -731,9 +735,9 @@ class ProcessManager:
                     if not text:
                         break
                     remaining -= len(text)
-                return handle.tell()
+                return handle.tell(), char_offset - remaining
         except OSError:
-            return 0
+            return 0, 0
 
     @staticmethod
     def _read_file_chunk(
@@ -808,10 +812,12 @@ class ProcessManager:
             if offset is None
             else max(0, offset)
         )
+        # Characters that really precede the start when a legacy offset is given.
+        legacy_reached = legacy_start
         if byte_offset is not None:
             start_byte = max(0, byte_offset)
         elif offset is not None:
-            start_byte = self._byte_offset_for_char(path, legacy_start)
+            start_byte, legacy_reached = self._byte_offset_for_char(path, legacy_start)
         else:
             start_byte = process.read_byte_offsets.get(stream, 0)
 
@@ -840,6 +846,17 @@ class ProcessManager:
             content = fallback_content[legacy_start:legacy_start + max(1, max_chars)]
             next_byte = len(fallback_content[:legacy_start + len(content)].encode("utf-8"))
             total_bytes = len(fallback_content.encode("utf-8"))
+            legacy_reached = min(legacy_start, len(fallback_content))
+
+        # A position past the end is not echoed back as if output existed
+        # there: the read is reported from the real end, and says so.
+        past_end: tuple[str, int, int, str] | None = None
+        if byte_offset is not None and start_byte > total_bytes:
+            past_end = ("byte_offset", start_byte, total_bytes, "bytes")
+            start_byte = next_byte = total_bytes
+        elif offset is not None and legacy_start > legacy_reached:
+            past_end = ("offset", legacy_start, legacy_reached, "characters")
+            legacy_start = legacy_reached
 
         next_legacy = legacy_start + len(content)
         # Only a read without an explicit position uses and advances the cursor,
@@ -880,6 +897,13 @@ class ProcessManager:
             ),
             "total_bytes": total_bytes,
         }
+        if past_end is not None:
+            name, requested, end, unit = past_end
+            so_far = " so far" if status == "running" else ""
+            result["offset_past_end"] = (
+                f"{name} {requested} is past the end of this output ({end} {unit}{so_far}); "
+                "this read starts at that end."
+            )
         if byte_offset is not None:
             # A byte position does not say how many characters precede it.
             for key in ("offset", "next_offset", "offset_unit", "total_chars"):

@@ -482,4 +482,82 @@ def test_short_terms_match_as_substrings_and_keep_not_or_sort_and_window(monkeyp
 
     recall.log_message(sid, "user", "a fulltext indexed sentence")
     _, indexed = call(query="fulltext")
-    assert indexed["total"] == 1 and "matching" not in indexed
+    assert indexed["total_matches"] == 1 and "matching" not in indexed
+
+
+def test_search_counts_the_matches_that_exist_not_the_rows_it_returned(monkeypatch, tmp_path):
+    recall, call = _search_tool(monkeypatch, tmp_path)
+    sid = recall.get_or_create_session("session_count", title="count")
+    for index in range(5):
+        recall.log_message(sid, "user" if index % 2 == 0 else "assistant", f"needleword {index} 部署")
+    recall.log_message(sid, "tool", "部署 tool output")
+    recall.log_message(sid, "user", "nothing relevant")
+    other_source = recall.get_or_create_session("hermes:elsewhere", title="other source")
+    recall.log_message(other_source, "user", "needleword 部署 from another source")
+
+    # limit=3 used to answer "total": 3 for both queries, which reads as "three matches exist".
+    result, indexed = call(query="needleword", limit=3)
+    assert len(indexed["results"]) == indexed["returned"] == 3
+    assert indexed["total_matches"] == 5 and "total" not in indexed
+    assert result["partial"] is True
+    assert "total_matches" in indexed["partial"] and "limit" in indexed["partial"]
+
+    result, substring = call(query="部署", limit=2)
+    assert substring["matching"] == "substring"
+    assert substring["returned"] == 2 and substring["total_matches"] == 5
+    assert result["partial"] is True
+
+    # Asking for as many as exist lists them all, and that result is complete.
+    result, everything = call(query="needleword", limit=indexed["total_matches"])
+    assert everything["returned"] == everything["total_matches"] == 5
+    assert "partial" not in everything and not result.get("partial")
+    result, everything = call(query="部署", limit=5)
+    assert everything["returned"] == everything["total_matches"] == 5
+    assert "partial" not in everything and not result.get("partial")
+
+    _, none = call(query="absentword")
+    assert none["returned"] == none["total_matches"] == 0
+
+    # Without a message holding both terms, messages holding either are listed and counted.
+    recall.log_message(sid, "user", "回滚 方案")
+    _, either = call(query="回滚 部署", limit=2)
+    assert "any one of them" in either["matching_note"]
+    assert either["returned"] == 2 and either["total_matches"] == 6
+
+
+def test_search_says_at_least_when_it_stops_counting(monkeypatch, tmp_path):
+    recall, call = _search_tool(monkeypatch, tmp_path)
+    sid = recall.get_or_create_session("session_many", title="many")
+    cap = recall_module.MATCH_COUNT_CAP
+    conn = recall._get_conn()
+    conn.executemany(
+        "INSERT INTO messages(session_id, role, content, tool_name, timestamp, msg_index) VALUES(?, 'user', ?, '', ?, ?)",
+        [(sid, f"needleword {index} 部署", 1_000 + index, index) for index in range(cap + 5)],
+    )
+    conn.commit()
+
+    for query in ("needleword", "部署"):
+        result, found = call(query=query, limit=20, window=0)
+        assert found["returned"] == 20
+        # More than the cap match: the number is a floor and is named as one.
+        assert found["total_matches_at_least"] == cap and "total_matches" not in found
+        assert result["partial"] is True
+        assert "total_matches_at_least" in found["partial"] and "narrower query" in found["partial"]
+        assert "Raise `limit`" not in found["partial"]
+
+
+def test_browse_reports_how_many_sessions_exist(monkeypatch, tmp_path):
+    recall, call = _search_tool(monkeypatch, tmp_path)
+    for index in range(5):
+        sid = recall.get_or_create_session(f"session_browse_{index}", title=f"browse {index}")
+        recall.log_message(sid, "user", f"opening {index}")
+    recall.log_message(recall.get_or_create_session("hermes:elsewhere", title="other source"), "user", "elsewhere")
+
+    result, page = call(limit=2)
+    assert len(page["sessions"]) == page["returned"] == 2
+    assert page["total_sessions"] == 5 and "total" not in page
+    assert result["partial"] is True and "search with a query" in page["partial"]
+
+    result, everything = call(limit=20)
+    assert everything["returned"] == everything["total_sessions"] == 5
+    assert "partial" not in everything and not result.get("partial")

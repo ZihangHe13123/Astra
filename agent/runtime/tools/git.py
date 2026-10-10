@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -192,6 +193,28 @@ def _git_result(r: dict, empty: str, *, readonly: bool = False) -> str | ToolFai
     )
 
 
+_PATH_TOKEN = re.compile(r"\"([^\"]*)\"|'([^']*)'|(\S+)")
+_ADD_FLAGS = frozenset({"-A", "--all", "-u", "--update"})
+
+
+def _path_tokens(files: str) -> list[str]:
+    """Split a files argument on whitespace; a quoted path may contain spaces."""
+    return [double or single or bare for double, single, bare in _PATH_TOKEN.findall(files)]
+
+
+def _not_an_option(**named: str) -> ToolFailure | None:
+    """Refuse a ref, remote or URL that git would read as one of its options."""
+    for name, value in named.items():
+        if str(value).startswith("-"):
+            return ToolFailure(
+                "invalid_arguments",
+                f"{name} must not start with '-': {value!r}",
+                False,
+                f"Pass a real {name}; git options are not accepted here.",
+            )
+    return None
+
+
 def register_git_tools(
     registry: ToolRegistry,
     workdir: str = ".",
@@ -229,10 +252,13 @@ def register_git_tools(
 
     def _require_git_write_enabled(operation: str, path: str = "."):
         scope, _target = _git_scope(operation, path)
-        if os.getenv("AGENT_ALLOW_GIT_WRITE") != "1" and scope not in approvals.approved_scopes:
-            raise PermissionError(
-                f"{operation} was not run. {git_write_requirement} Tell the user and do not retry."
-            )
+        # YOLO is the user's standing approval. The registry skips this tool's
+        # prompt in that mode, so no prompt would ever grant the scope.
+        if registry.yolo or os.getenv("AGENT_ALLOW_GIT_WRITE") == "1" or scope in approvals.approved_scopes:
+            return
+        raise PermissionError(
+            f"{operation} was not run. {git_write_requirement} Tell the user and do not retry."
+        )
 
     def _git_permission_check(operation: str):
         def check(args: dict) -> dict | None:
@@ -264,7 +290,11 @@ def register_git_tools(
     async def _git_diff(
         path: str = ".", target: str = "HEAD", files: list[str] | None = None,
     ) -> str | ToolFailure:
-        args = ["diff", target]
+        staged_only = target in {"--staged", "--cached"}
+        refused = None if staged_only else _not_an_option(target=target)
+        if refused:
+            return refused
+        args = ["diff", "--cached" if staged_only else target]
         if files:
             args.extend(["--", *files])
         r = await _run_git(*args, cwd=_safe_path(path))
@@ -273,6 +303,9 @@ def register_git_tools(
     async def _git_show(commit: str = "HEAD", path: str = ".") -> str | ToolFailure:
         # --stat alone replaces the patch with the changed-file summary;
         # adding --no-patch would drop that summary too.
+        refused = _not_an_option(commit=commit)
+        if refused:
+            return refused
         r = await _run_git("show", "--stat", commit, cwd=_safe_path(path))
         return _git_result(r, "(no output)", readonly=True)
 
@@ -283,7 +316,11 @@ def register_git_tools(
     # ── 写入（安全） ──
     async def _git_add(path: str = ".", files: str = ".") -> str | ToolFailure:
         _require_git_write_enabled("git_add", path)
-        r = await _run_git("add", *files.split(), cwd=_safe_path(path))
+        tokens = _path_tokens(files)
+        flags = [token for token in tokens if token in _ADD_FLAGS]
+        paths = [token for token in tokens if token not in _ADD_FLAGS]
+        # Everything after "--" is a path, so a name such as "-notes.txt" is staged, not parsed.
+        r = await _run_git("add", *flags, "--", *paths, cwd=_safe_path(path))
         result = _git_result(r, "")
         if isinstance(result, ToolFailure):
             return result
@@ -298,6 +335,9 @@ def register_git_tools(
 
     async def _git_push(path: str = ".", remote: str = "origin", branch: str = "") -> str | ToolFailure:
         _require_git_write_enabled("git_push", path)
+        refused = _not_an_option(remote=remote, branch=branch)
+        if refused:
+            return refused
         args = ["push", remote]
         if branch:
             args.append(branch)
@@ -306,6 +346,9 @@ def register_git_tools(
 
     async def _git_pull(path: str = ".", remote: str = "origin", branch: str = "") -> str | ToolFailure:
         _require_git_write_enabled("git_pull", path)
+        refused = _not_an_option(remote=remote, branch=branch)
+        if refused:
+            return refused
         args = ["pull", remote]
         if branch:
             args.append(branch)
@@ -314,10 +357,13 @@ def register_git_tools(
 
     async def _git_clone(url: str, path: str = ".", branch: str = "") -> str | ToolFailure:
         _require_git_write_enabled("git_clone", path)
-        args = ["clone", url]
+        refused = _not_an_option(url=url, branch=branch)
+        if refused:
+            return refused
+        args = ["clone"]
         if branch:
             args.extend(["-b", branch])
-        args.append(_safe_path(path))
+        args.extend(["--", url, _safe_path(path)])
         r = await _run_git(*args, cwd=str(root))
         return _git_result(r, f"Cloned {url}")
 
@@ -325,11 +371,16 @@ def register_git_tools(
     async def _git_checkout(path: str = ".", target: str = "", files: str = "") -> str | ToolFailure:
         """撤销文件修改或切换分支。files='.' 恢复所有文件"""
         _require_git_write_enabled("git_checkout", path)
+        refused = None if target == "--" else _not_an_option(target=target)
+        if refused:
+            return refused
         args = ["checkout"]
-        if target:
+        if target and target != "--":
             args.append(target)
-        if files:
-            args.extend(files.split())
+        paths = _path_tokens(files)
+        if paths or target == "--":
+            # Paths go after "--" so a file is never taken for a branch or an option.
+            args.extend(["--", *paths])
         r = await _run_git(*args, cwd=_safe_path(path))
         return _git_result(r, "(checkout done)")
 
@@ -338,6 +389,9 @@ def register_git_tools(
         _require_git_write_enabled("git_revert", path)
         if not commit:
             return ToolFailure("invalid_arguments", "commit hash is required", False)
+        refused = _not_an_option(commit=commit)
+        if refused:
+            return refused
         r = await _run_git("revert", "--no-edit", commit, cwd=_safe_path(path))
         return _git_result(r, f"Reverted {commit}")
 
@@ -348,6 +402,9 @@ def register_git_tools(
             return ToolFailure(
                 "invalid_arguments", f"invalid mode '{mode}'. Use soft/mixed/hard", False,
             )
+        refused = _not_an_option(target=target)
+        if refused:
+            return refused
         r = await _run_git("reset", f"--{mode}", target, cwd=_safe_path(path))
         return _git_result(r, f"Reset {mode} to {target}")
 
@@ -359,7 +416,7 @@ def register_git_tools(
         ("git_log", _git_log, "Show commit history graph", {"max_count": {"type": "integer", "description": "Max commits (default: 10)"}}),
         ("git_show", _git_show, "Show one commit: author, date, message and the changed-file summary. It prints no patch.", {"commit": {"type": "string", "description": "Commit hash or ref (default: HEAD)"}}),
         ("git_branch", _git_branch, "List branches", {}),
-        ("git_add", _git_add, "Stage file(s) for commit. Use '.' to stage all.", {"files": {"type": "string", "description": "Files to stage (default: '.')"}}),
+        ("git_add", _git_add, "Stage file(s) for commit. Use '.' to stage all.", {"files": {"type": "string", "description": "Files to stage, separated by spaces (default: '.'); put a path that contains spaces in quotes. -A and -u are accepted"}}),
         ("git_commit", _git_commit, "Commit staged changes with a message", {"message": {"type": "string", "description": "Commit message"}}),
         ("git_push", _git_push, "Push commits to remote", {"remote": {"type": "string", "description": "Remote name (default: origin)"}, "branch": {"type": "string", "description": "Branch (default: current)"}}),
         ("git_pull", _git_pull, "Pull from remote", {"remote": {"type": "string", "description": "Remote name (default: origin)"}, "branch": {"type": "string", "description": "Branch (default: current)"}}),
@@ -399,7 +456,7 @@ def register_git_tools(
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "Git repo path (default: current dir)"},
-                "target": {"type": "string", "description": "Git ref to compare the working tree with (default: HEAD)"},
+                "target": {"type": "string", "description": "Git ref to compare the working tree with (default: HEAD), or --staged for the staged changes only"},
                 "files": {"type": "array", "items": {"type": "string"}, "description": "Optional file paths to scope the diff"},
             },
             "required": [],

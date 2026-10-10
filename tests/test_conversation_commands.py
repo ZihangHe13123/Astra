@@ -308,3 +308,74 @@ def test_concurrent_memory_proposals_cannot_create_two_active_replacements(servi
     assert sum(result is not None for result in results) == 1
     records = service.memory_store.recall_records(limit=20)
     assert len([r for r in records if r.supersedes_id == item.record_id]) == 1
+
+
+def test_snapshot_says_how_to_reach_the_skills_after_its_batch(service):
+    for i in range(6):
+        save_skill(service, f"example-{i}")
+
+    first = call(service, "skill_review_snapshot")
+    batch = json.loads(first["output"])
+
+    assert batch["remaining"] == 6 - len(batch["items"]) > 0
+    # Asking again returns the same skills, so the way forward has to be stated.
+    assert "skill_review_apply" in batch["notice"] and str(batch["remaining"]) in batch["notice"]
+    assert first["partial"] is True
+    assert set(json.loads(call(service, "skill_review_snapshot")["output"])["items"]) == set(batch["items"])
+
+    service.context.messages.append({"role": "user", "content": "Keep these."})
+    applied = call(service, "skill_review_apply", snapshot_id=batch["snapshot_id"], actions=[
+        {"action": "keep", "names": [name], "reason": "Still useful."} for name in batch["items"]
+    ])
+    assert not applied["error"], applied
+    rest = call(service, "skill_review_snapshot")
+    assert set(json.loads(rest["output"])["items"]).isdisjoint(batch["items"])
+    assert json.loads(rest["output"])["remaining"] == 0 and not rest.get("partial")
+
+
+def test_memory_inspect_says_when_the_record_list_is_capped(service):
+    for index in range(3):
+        service.memory_store.add_record(kind="observation", content=f"Deployment note {index}")
+    few = call(service, "memory_inspect")
+    assert len(json.loads(few["output"])["records"]) == 3
+    assert "more may match" not in json.loads(few["output"])["notice"] and not few.get("partial")
+
+    for index in range(3, 24):
+        service.memory_store.add_record(kind="observation", content=f"Deployment note {index}")
+    capped = call(service, "memory_inspect")
+    payload = json.loads(capped["output"])
+    assert len(payload["records"]) == payload["limit"] < 24
+    assert "narrower query" in payload["notice"]
+    assert capped["partial"] is True
+
+
+def test_handoff_save_refusals_name_the_actual_problem(service):
+    empty = call(service, "session_handoff", action="save", content="  ")
+    assert "save needs the handoff text in content" in empty["error"]
+    too_long = call(service, "session_handoff", action="save", content="x" * 40_001)
+    assert "content is 40,001 characters" in too_long["error"] and "40,000" in too_long["error"]
+    unknown = call(service, "session_handoff", action="send", content="# Handoff")
+    assert "'send'" in unknown["error"] and "draft or save" in unknown["error"]
+    assert not Path(".astra/handoffs").exists()
+
+
+def test_unknown_diagnostics_section_is_a_failure_that_lists_the_sections():
+    from test_runtime_diagnostics import _agent
+    agent = _agent()
+    agent.task_store = None
+    register_conversation_tools(agent)
+
+    runtime = call(agent, "runtime_diagnostics", section="memory")
+    doctor = call(agent, "runtime_diagnostics", kind="doctor", section="nonsense")
+
+    for result in (runtime, doctor):
+        assert result["output"] == "" and result["code"] == "invalid_arguments"
+        assert "Available:" in result["error"]
+    assert "context" in runtime["error"] and "sandbox" in doctor["error"]
+
+
+def test_conversation_tools_state_their_turn_limit(service):
+    for name in ("skill_review_snapshot", "skill_review_apply", "runtime_diagnostics", "memory_inspect",
+                 "memory_correct", "memory_forget", "session_handoff"):
+        tool = service.tools.get(name)
+        assert f"At most {tool.max_calls_per_turn} calls per turn" in tool.description, name

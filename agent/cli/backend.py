@@ -1373,11 +1373,16 @@ async def _main(startup_started: float):
                      "arrive here as a new turn. With task_id it sends a follow-up or answers the task's input-required "
                      "question. Replies can only arrive after this turn ends, so after sending, finish the turn and tell "
                      "the user what you asked; do not wait, sleep or poll for the reply. Use it when another session's "
-                     "work or context helps the user's request; never for thanks or acknowledgements."),
+                     "work or context helps the user's request; never for thanks or acknowledgements. "
+                     "Limits: at most 8 calls per turn (a further call is not run), 20 messages "
+                     "per task counting both directions, and 20 new tasks per hour from this session."),
         parameters={"type": "object", "properties": {
-            "text": {"type": "string", "maxLength": 20000},
-            "to": {"type": "string", "maxLength": 200},
-            "task_id": {"type": "string", "maxLength": 200},
+            "text": {"type": "string", "maxLength": 20000,
+                     "description": "The request, follow-up or answer; at most 20000 characters. Its first line becomes a new task's title."},
+            "to": {"type": "string", "maxLength": 200,
+                   "description": "Name or peer_id of an open session from peer_list. Needed to open a task; not read when task_id is given."},
+            "task_id": {"type": "string", "maxLength": 200,
+                        "description": "An open task between this session and another, to continue it. Omit to open a new task."},
         }, "required": ["text"]}, fn=_peer_send, risk="write", cache_results=False, max_calls_per_turn=8,
     ))
     tools.register(ToolDef(
@@ -1385,11 +1390,16 @@ async def _main(startup_started: float):
         description=("Report on a task another Astra session gave this session: working (started, will take a while), "
                      "input-required (text is your question), completed (text is the result), failed (text is the reason) "
                      "or rejected (it should not be done; text says why). The session that asked may set canceled to "
-                     "withdraw it. completed, failed, rejected and canceled close the task."),
+                     "withdraw it. completed, failed, rejected and canceled close the task. "
+                     "Limits: at most 8 calls per turn (a further call is not run), and each "
+                     "update counts toward the task's 20 messages."),
         parameters={"type": "object", "properties": {
-            "task_id": {"type": "string", "maxLength": 200},
-            "state": {"type": "string", "enum": ["working", "input-required", "completed", "failed", "rejected", "canceled"]},
-            "text": {"type": "string", "maxLength": 20000},
+            "task_id": {"type": "string", "maxLength": 200,
+                        "description": "The task's id, from the message that gave it or from peer_list."},
+            "state": {"type": "string", "enum": ["working", "input-required", "completed", "failed", "rejected", "canceled"],
+                      "description": "canceled can be set only by the session that asked; every other state only by the session given the task."},
+            "text": {"type": "string", "maxLength": 20000,
+                     "description": "Required for input-required, completed, failed and rejected; optional for working and canceled. At most 20000 characters."},
         }, "required": ["task_id", "state"]}, fn=_peer_task_update, risk="write", cache_results=False, max_calls_per_turn=8,
     ))
 

@@ -39,6 +39,12 @@ Process receipts contain `output_reader` with a callable `process_read` (or
 process handle. Use it to page the full output without adding artifact directories
 to the file tool's allowed roots.
 
+A foreground run that is stopped at the sandbox time limit returns what it wrote
+before the stop, marked as a partial result, together with how to rerun it past
+the limit. A failure whose text is longer than the inline limit (a failing test
+run, for example) is shortened to its start and end, and the full text is saved
+with its path in the result.
+
 [Minimal Bash environment](#minimal-bash-environment) · [Host filesystem access](#host-filesystem-access) · [Tool policy and tracing](#tool-policy-and-tracing)
 
 ## Minimal Bash environment

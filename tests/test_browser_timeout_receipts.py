@@ -222,7 +222,14 @@ def test_preflight_timeout_has_initialized_generic_fallback(tmp_path):
         registry.get("browser_fill").permission_check = permission_check
         result = await registry.execute("browser_fill", arguments("fill"))
         assert backend.writes == 1
-        assert_generic_timeout(result)
+        # The tool's own time limit was not reached: the text says what timed out.
+        assert result["code"] == "overall_timeout", result
+        assert result["retryable"] is False
+        assert "partial" not in result and "details" not in result
+        assert result["error"].startswith("[ToolTimeout]")
+        assert "permission preflight timed out" in result["error"]
+        assert "exceeded" not in result["error"]
+        assert "Do not repeat it unchanged" in result["recovery_hint"]
     asyncio.run(scenario())
 
 

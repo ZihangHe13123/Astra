@@ -15,7 +15,7 @@ from test_backend_task_protocol import (
 )
 from test_session_lifecycle_protocol import send
 
-from agent.runtime.peer_link import PeerLink
+from agent.runtime.peer_link import MAX_NEW_TASKS_PER_HOUR, MAX_TASK_MESSAGES, PeerLink
 
 
 def _tool_call(name: str, arguments: dict, call_id: str) -> tuple[dict, str]:
@@ -109,6 +109,15 @@ def test_two_backends_hand_a_task_over_and_back(tmp_path, model):
         time.sleep(2.5)  # nothing further: the closed task starts no more turns
         # A: peer_list, peer_send, its reply; B: the answer; A: reading the result.
         assert len(requests) == 5
+        # What the model was shown: the mailbox's own limits, and a meaning for every argument.
+        offered = {tool["function"]["name"]: tool["function"] for tool in requests[0]["tools"]}
+        assert f"{MAX_TASK_MESSAGES} messages per task" in offered["peer_send"]["description"]
+        assert f"{MAX_NEW_TASKS_PER_HOUR} new tasks per hour" in offered["peer_send"]["description"]
+        assert f"{MAX_TASK_MESSAGES} messages" in offered["peer_task_update"]["description"]
+        for name in ("peer_send", "peer_task_update"):
+            assert "calls per turn" in offered[name]["description"]
+            for argument, schema in offered[name]["parameters"]["properties"].items():
+                assert schema.get("description"), (name, argument)
 
         send(a, {"type": "command", "cmd": "/peers"})
         overview = wait_a(lambda e: e.get("type") == "tool_result" and e.get("name") == "peers")

@@ -26,7 +26,7 @@ _OPEN_FAILURES = {
     "open_limit_reached": (
         f"The {OPEN_MAX_CALLS} evidence openings for this turn are used up.",
         "Work from the evidence already opened. Do not call context_open again in this turn: "
-        "a further call is not run and ends the turn.",
+        "a further call is not run.",
     ),
     "open_budget_reached": (
         f"This turn's evidence budget (about {OPEN_TOKEN_BUDGET} tokens) has no room left for this request.",
@@ -64,7 +64,7 @@ def register_context_index_tools(
             "current handles. Reads existing state only: does not rerun retrieval, encode "
             "a query or change recommendations. Previous-turn metadata is labeled "
             "separately; core MD memory is not included. "
-            f"At most {_INSPECT_MAX_CALLS} calls per turn: a further call is not run and ends the turn. "
+            f"At most {_INSPECT_MAX_CALLS} calls per turn: a further call is not run. "
             f"{_ONE_STEP_RESULT}"
         ),
         parameters={"type": "object", "properties": {}, "additionalProperties": False},
@@ -98,7 +98,7 @@ def register_context_index_tools(
                 "Context Index. Copy handles exactly; do not invent or extend them. "
                 "Use context_inspect for current handles and diagnostics. Three handles is "
                 "the per-call opening limit, not the recommendation limit. "
-                f"At most {OPEN_MAX_CALLS} calls per turn (a further call is not run and ends the turn), "
+                f"At most {OPEN_MAX_CALLS} calls per turn (a further call is not run), "
                 f"so open up to {OPEN_MAX_HANDLES} handles in one call. {_ONE_STEP_RESULT}"
             ),
             parameters={

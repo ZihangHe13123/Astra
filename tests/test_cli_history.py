@@ -58,6 +58,20 @@ def test_history_without_task_database_leaves_out_the_notices_written_for_the_mo
     ]
 
 
+def test_history_without_task_database_restores_runs_that_did_not_succeed():
+    failed = {**_event("a", "execute_python"), "execution": {"status": "completed", "exit_code": 1}}
+    stopped = {**_event("b", "execute_python"), "execution": {"status": "timed_out", "exit_code": -1}}
+    started = {**_event("c", "execute_shell"), "execution": {"status": "running", "exit_code": None}}
+
+    restored = history_tool_results([_message(failed), _message(stopped), _message(started)], [])
+
+    assert [(item["name"], item["call_id"], item["output"], item["error"]) for item in restored] == [
+        ("execute_python", "a", "saved output", ""),
+        ("execute_python", "b", "saved output", ""),
+        ("execute_shell", "c", "saved output", ""),
+    ]
+
+
 def test_history_retains_result_artifacts_but_omits_internal_args():
     event = _event("a", "read_file") | {"artifact_path": "/tmp/saved.txt", "output_truncated": True, "args": {"internal": True}}
     restored = history_tool_results([_message(event)], [event])[0]

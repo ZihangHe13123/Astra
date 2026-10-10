@@ -11,7 +11,7 @@ from pathlib import Path
 from agent.sandbox.docker import DockerSandbox
 from agent.sandbox.local import LocalSandbox
 from ..hook_config import install_project_hooks
-from ..tool_execution import ExecutionFailure, ExecutionResult
+from ..tool_execution import ExecutionFailure, ExecutionResult, PartialResult
 from ..execution_limits import COMMAND_FOREGROUND_MAX_MS, POLL_MAX_MS, validate_wait_ms
 
 from .approval import ScopedApprovalStore
@@ -58,11 +58,19 @@ _BACKGROUND_DESCRIPTION = "Return immediately with a process_id."
 
 
 def _hit_sandbox_time_limit(result: dict) -> bool:
-    """Sandboxes report their own time limit as exit code -1 and a [Timeout] error."""
-    return (
-        result.get("exit_code") == -1
-        and str(result.get("error") or "").startswith("[Timeout]")
+    """Sandboxes report their own time limit as exit code -1 and a [Timeout] error.
+
+    One that keeps the stderr written before the stop puts it ahead of that
+    notice and sets ``timed_out`` instead.
+    """
+    return result.get("exit_code") == -1 and (
+        result.get("timed_out") is True
+        or str(result.get("error") or "").startswith("[Timeout]")
     )
+
+
+class _StoppedExecutionResult(ExecutionResult, PartialResult):
+    """Result of a run stopped at the time limit: only what it wrote until then."""
 
 
 def _compound_commands(command: str) -> list[str]:
@@ -506,6 +514,8 @@ def register_code_tools(
             and not result.get("shell_reset")
         ):
             parts.append(f"[exit code: {result['exit_code']}]")
+        if result.get("status") == "timed_out":
+            return _StoppedExecutionResult("\n".join(parts), result)
         return ExecutionResult("\n".join(parts), result)
 
     async def _run_or_background(

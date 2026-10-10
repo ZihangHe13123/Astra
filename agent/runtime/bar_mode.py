@@ -70,6 +70,7 @@ BAR_POWER_STATES = {"stable", "flicker", "brownout"}
 BAR_MUSIC_STATES = {"silent", "low_synth", "old_radio", "jukebox"}
 BAR_RADIO_STATES = {"static", "local_news", "weather", "emergency"}
 BAR_TURN_TOOL_NAME = "bar_turn"
+BAR_TURN_REPLY_MAX_CHARS = 6000
 BAR_OUTPUT_MODES = frozenset({"atomic", "stream"})
 BAR_SCENE_TOOL_NAMES = frozenset({
     BAR_TURN_TOOL_NAME,
@@ -538,8 +539,11 @@ class BarModeController:
         clean_reply = str(reply).strip()
         if not clean_reply:
             raise ValueError("Bar turn reply cannot be empty")
-        if len(clean_reply) > 6000:
-            raise ValueError("Bar turn reply is too long")
+        if len(clean_reply) > BAR_TURN_REPLY_MAX_CHARS:
+            raise ValueError(
+                f"Bar turn reply is too long: {len(clean_reply)} characters, "
+                f"the limit is {BAR_TURN_REPLY_MAX_CHARS}"
+            )
         if actions is None:
             actions = []
         if not isinstance(actions, list):

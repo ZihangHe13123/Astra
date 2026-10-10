@@ -218,11 +218,9 @@ class HindsightMemoryProvider(MemoryProvider):
             return None
         metadata = dict(_field(item, "metadata", {}) or {})
         document_id = _text(_field(item, "document_id"))
-        occurred = (
-            _text(_field(item, "occurred_start"))
-            or _text(_field(item, "mentioned_at"))
-            or _now()
-        )
+        # A memory Hindsight gives no date for keeps empty date fields: the time
+        # of this recall is not when it happened.
+        occurred = _text(_field(item, "occurred_start")) or _text(_field(item, "mentioned_at"))
         raw_kind = _text(_field(item, "type")).lower()
         kind = raw_kind if raw_kind in MEMORY_KINDS else "observation"
         tags = tuple(dict.fromkeys([

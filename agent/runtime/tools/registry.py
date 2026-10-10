@@ -19,7 +19,7 @@ from typing import Any
 from ..hooks import HookRegistry, HookReject
 from ..metrics import runtime_metrics
 from ..tool_failure import ToolFailure
-from ..tool_execution import ExecutionFailure, ExecutionResult, PartialResult
+from ..tool_execution import ExecutionFailure, ExecutionResult, PartialResult, StateChanged
 from ..tracing import trace_span
 from .policy import VALID_RISKS, ToolPolicy
 
@@ -1036,6 +1036,7 @@ class ToolRegistry:
                 "error": f"Tool '{name}' not found",
                 "code": "invalid_arguments",
                 "error_type": "invalid_input",
+                "not_executed": True,
                 "recoverable": True,
                 "retryable": False,
                 "recovery_hint": (
@@ -1062,10 +1063,20 @@ class ToolRegistry:
                 "risk": tool.risk,
                 "code": "invalid_arguments",
                 "error_type": "invalid_input",
+                "not_executed": True,
                 "recoverable": True,
             }
 
+        # True once the tool's own function has been entered. A failure before
+        # that point is a refusal: nothing the tool does can have happened.
+        handler_started = False
+        # When the current timed attempt began, to tell this registry's own
+        # deadline from a TimeoutError raised by a shorter wait inside the tool.
+        timed_attempt_started: float | None = None
+
         async def finalize(result: dict) -> dict:
+            if result.get("error") and not handler_started:
+                result["not_executed"] = True
             if tool.completion_finalizer is not None:
                 try:
                     completion = tool.completion_finalizer(
@@ -1369,7 +1380,9 @@ class ToolRegistry:
                         if "_task_id" in params:
                             call_args["_task_id"] = task_id
                         async def invoke_tool(bound_call_args: dict[str, Any] = call_args) -> Any:
+                            nonlocal handler_started
                             check_work_budget()
+                            handler_started = True
                             if asyncio.iscoroutinefunction(tool.fn):
                                 raw_result = await tool.fn(**bound_call_args)
                             else:
@@ -1393,6 +1406,7 @@ class ToolRegistry:
                             if tool.timeout is None:
                                 result = await task
                             else:
+                                timed_attempt_started = time.perf_counter()
                                 result = await asyncio.wait_for(task, timeout=tool.timeout)
                             private_result = private_slot.retrieve()
                         finally:
@@ -1416,6 +1430,7 @@ class ToolRegistry:
                             }
                             if result.artifact_ref:
                                 failure_result["artifact_ref"] = result.artifact_ref
+                            failure_result.update(self._shape_error(name, result.message, tool))
                             report("failed", status="failed", message=result.message)
                             self.hooks.dispatch_tool_error(
                                 name, self.persistence_safe_args(tool, args), result.message, tool
@@ -1432,6 +1447,8 @@ class ToolRegistry:
                             success_result["execution"] = dict(result.execution)
                         if isinstance(result, PartialResult):
                             success_result["partial"] = True
+                        if isinstance(result, StateChanged):
+                            success_result["state_changed"] = True
                         # ── postcondition verifier ──
                         if tool.postcondition is not None:
                             runtime_metrics.increment("postcondition_check_count")
@@ -1511,10 +1528,22 @@ class ToolRegistry:
                         logger.warning("tool retry name=%s attempt=%s", name, attempt + 1)
                     await asyncio.sleep(tool.retry_delay)
                 return await finalize({"output": "", "error": f"[ToolError] {name}: retry loop exhausted"})
-        except TimeoutError:
+        except TimeoutError as timeout_error:
             logger.warning("tool timeout name=%s timeout=%s", name, tool.timeout)
-            report("timed_out", status="failed", message=f"exceeded {tool.timeout}s")
-            error_msg = f"[ToolTimeout] {name}: exceeded {tool.timeout}s"
+            own_deadline = (
+                tool.timeout is not None
+                and timed_attempt_started is not None
+                and time.perf_counter() - timed_attempt_started >= float(tool.timeout) * 0.98
+            )
+            if own_deadline:
+                waited = f"exceeded {tool.timeout}s"
+            else:
+                # The tool has no limit of its own here, or it gave up on a
+                # shorter wait: naming this registry's limit would be wrong.
+                inner = str(timeout_error).strip()
+                waited = "a wait inside the tool timed out" + (f" ({inner})" if inner else "")
+            report("timed_out", status="failed", message=waited)
+            error_msg = f"[ToolTimeout] {name}: {waited}"
             timeout_failure = timeout_slot.failure if timeout_slot is not None else None
             if timeout_failure is not None:
                 # String-only consumers (including Code Mode RPC) must retain
@@ -1531,9 +1560,12 @@ class ToolRegistry:
                 "recoverable": bool(tool.idempotent),
                 "retryable": False,
                 "recovery_hint": (
-                    "This exact invocation already exhausted its tool timeout. Do not repeat it "
-                    "unchanged in the same turn; inspect the service or inputs, change approach, "
-                    "or ask the user before retrying."
+                    (
+                        "This exact invocation already exhausted its tool timeout."
+                        if own_deadline else "A wait inside this tool ran out before it finished."
+                    )
+                    + " Do not repeat it unchanged in the same turn; inspect the service or inputs, "
+                    "change approach, or ask the user before retrying."
                 ),
             }
             if timeout_failure is not None:
@@ -1560,6 +1592,13 @@ class ToolRegistry:
                 "error_type": "execution_failed",
                 "recoverable": isinstance(e, (ValueError, OSError, ConnectionError)),
                 **({"execution": dict(e.execution)} if isinstance(e, ExecutionFailure) else {}),
+                # A run stopped at its time limit failed with only part of its output.
+                **(
+                    {"partial": True}
+                    if isinstance(e, ExecutionFailure) and e.execution.get("status") == "timed_out"
+                    else {}
+                ),
+                **self._shape_error(name, error_msg, tool),
             })
         finally:
             if permission_cleanup is not None:
@@ -1572,6 +1611,38 @@ class ToolRegistry:
                     tool.permission_finalizer(permission_args)
                 except Exception:
                     logger.exception("permission finalizer failed name=%s", name)
+
+    def _shape_error(self, tool_name: str, error: str, tool: ToolDef) -> dict:
+        """Bound a long error text like a long output, keeping the full text on disk.
+
+        A failed command carries its whole output in the error. Left as it is,
+        one failing test run can put a hundred thousand characters into the
+        context. The end is weighted, since that is where a summary sits.
+        """
+        limit = tool.max_inline_chars or self.max_inline_chars
+        if len(error) <= limit or tool.result_persistence == "request_local":
+            return {}
+        safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", tool_name).strip("._") or "tool"
+        try:
+            artifact_path = self._write_private_artifact(safe_name, error)
+        except OSError as exc:
+            logger.warning(
+                "tool error artifact write failed name=%s dir=%s error=%s",
+                tool_name, self.artifact_dir, type(exc).__name__,
+            )
+            return {}
+        size_bytes = len(error.encode("utf-8"))
+        notice = (
+            f"[Tool error text truncated: {len(error)} chars / {size_bytes} bytes. "
+            f"Full text saved to {artifact_path}]\n"
+        )
+        return {
+            "error": notice + _bounded_head_tail(error, limit, head_ratio=0.3),
+            "output_truncated": True,
+            "artifact_path": str(artifact_path),
+            "artifact_chars": len(error),
+            "artifact_bytes": size_bytes,
+        }
 
     def _shape_output(
         self,

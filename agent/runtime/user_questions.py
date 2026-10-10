@@ -77,7 +77,10 @@ class UserQuestionBroker:
         if not self._available():
             raise UserQuestionUnavailable("Human interaction is unavailable on this channel.")
         if self._pending is not None:
-            raise UserQuestionUnavailable("Another question request is already pending. Continue independent work or wait for its answer.")
+            raise UserQuestionUnavailable(
+                "Another question request is already pending, and only one can be open at a time. It closes when "
+                "the user answers or dismisses it, or when a new task, a session change or a backend restart "
+                "expires it. Continue independent work or wait for its answer.")
         identity = dict(self._identity())
         if call_id:
             identity["call_id"] = call_id
@@ -104,7 +107,8 @@ class UserQuestionBroker:
                         return {"state": "pending", "request_id": pending.request_id, **identity,
                                 "message": "No answer received. This is not approval. Continue only independent work; "
                                 "the answer will arrive with the original question and IDs. "
-                                "This question expires on backend restart, session change, or a new task."}
+                                "This question expires on backend restart, session change, or a new task. "
+                                "Until it is answered, dismissed or expired, another ask_user_question call fails."}
                     await asyncio.wait({pending.future}, timeout=min(remaining, 0.25))
             answer = await pending.future
             pending.state = "answered"

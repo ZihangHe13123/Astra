@@ -32,6 +32,11 @@ DANGEROUS_PATTERNS = [
 _DEFAULT_PERSISTENT_BASH_TIMEOUT = 300
 _DEFAULT_PERSISTENT_WSL_TIMEOUT = _DEFAULT_PERSISTENT_BASH_TIMEOUT
 
+# Killing a timed-out process normally closes its pipes at once. A descendant
+# that survives the kill can keep them open, so the wait for the last bytes is
+# bounded instead of lasting until that descendant exits.
+_STOPPED_OUTPUT_WAIT_SECONDS = 1.0
+
 SHELL_ENVIRONMENTS = {"auto", "windows", "wsl", "posix"}
 WSL_COMMANDS = {
     "awk", "bash", "cat", "chmod", "chown", "cp", "df", "du", "find",
@@ -42,6 +47,28 @@ WSL_COMMANDS = {
 
 class SandboxError(Exception):
     pass
+
+
+class _TimeLimitExceeded(asyncio.TimeoutError):
+    """The time limit expired; holds what the process wrote before it was stopped."""
+
+    def __init__(self, stdout: bytes, stderr: bytes):
+        super().__init__()
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+# Strong references: the event loop keeps only weak ones to running tasks.
+_DISCARDING: set[asyncio.Task] = set()
+
+
+async def _discard_stream(reader: asyncio.StreamReader) -> None:
+    """Read a pipe to its end and keep nothing."""
+    try:
+        while await reader.read(65536):
+            pass
+    except Exception:
+        return
 
 
 class LocalSandbox(Sandbox):
@@ -227,6 +254,26 @@ class LocalSandbox(Sandbox):
         artifact.write_text("\n".join(sections), encoding="utf-8")
         return str(artifact.resolve())
 
+    def _time_limit_result(self, exc: BaseException) -> dict:
+        """Report a run stopped at the time limit with the output it had written.
+
+        The output is bounded and preserved like that of a finished run. The
+        notice stays last in ``error`` so text appended to it reads as part of it.
+        """
+        stdout = getattr(exc, "stdout", b"")
+        stderr = getattr(exc, "stderr", b"")
+        artifact_path = self._preserve_output_artifact(stdout, stderr)
+        output, error = self._decode_limited(stdout, stderr)
+        if error and not error.endswith("\n"):
+            error += "\n"
+        return {
+            "output": output,
+            "error": f"{error}[Timeout] Execution exceeded {self.timeout}s",
+            "exit_code": -1,
+            "timed_out": True,
+            "artifact_path": artifact_path,
+        }
+
     def check_host_processes(self, command: str, environment: str = "auto") -> None:
         resolved = self.resolve_shell_environment(command, environment)
         self.process_guard.check_shell(command, foreign_namespace=resolved == "wsl")
@@ -260,10 +307,13 @@ class LocalSandbox(Sandbox):
         reader: asyncio.StreamReader | None,
         stream: str,
         on_output: OutputCallback | None,
+        chunks: list[bytes] | None = None,
     ) -> bytes:
+        """Read one pipe to its end. A caller-owned ``chunks`` keeps what was read if this is cancelled."""
         if reader is None:
             return b""
-        chunks: list[bytes] = []
+        if chunks is None:
+            chunks = []
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         while True:
             chunk = await reader.read(4096)
@@ -287,8 +337,14 @@ class LocalSandbox(Sandbox):
         input_data: bytes | None = None,
         on_output: OutputCallback | None = None,
     ) -> tuple[bytes, bytes]:
-        stdout_task = asyncio.create_task(self._collect_stream(proc.stdout, "stdout", on_output))
-        stderr_task = asyncio.create_task(self._collect_stream(proc.stderr, "stderr", on_output))
+        stdout_chunks: list[bytes] = []
+        stderr_chunks: list[bytes] = []
+        stdout_task = asyncio.create_task(
+            self._collect_stream(proc.stdout, "stdout", on_output, stdout_chunks)
+        )
+        stderr_task = asyncio.create_task(
+            self._collect_stream(proc.stderr, "stderr", on_output, stderr_chunks)
+        )
         try:
             if input_data is not None and proc.stdin is not None:
                 proc.stdin.write(input_data)
@@ -303,12 +359,46 @@ class LocalSandbox(Sandbox):
             else:
                 await asyncio.wait_for(proc.wait(), timeout=self.timeout)
             return await asyncio.gather(stdout_task, stderr_task)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+        except asyncio.TimeoutError:
+            if proc.returncode is None:
+                proc.kill()
+            await self._settle_stopped(proc, stdout_task, stderr_task)
+            raise _TimeLimitExceeded(b"".join(stdout_chunks), b"".join(stderr_chunks)) from None
+        except asyncio.CancelledError:
             if proc.returncode is None:
                 proc.kill()
                 await proc.wait()
             await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
             raise
+
+    @staticmethod
+    async def _settle_stopped(
+        proc: asyncio.subprocess.Process,
+        *collectors: asyncio.Task,
+    ) -> None:
+        """Wait for a killed process and its output, but not for a descendant.
+
+        ``proc.wait()`` and the collectors finish only when the pipes close. A
+        killed process closes them at once unless a descendant still holds
+        them. That descendant is left running, as it always was; its pipes stay
+        drained so it never blocks on a full one, but nothing more is kept or
+        forwarded.
+        """
+        waiting = [asyncio.ensure_future(proc.wait()), *collectors]
+        try:
+            await asyncio.wait(waiting, timeout=_STOPPED_OUTPUT_WAIT_SECONDS)
+        finally:
+            unfinished = [task for task in waiting if not task.done()]
+            for task in unfinished:
+                task.cancel()
+        if not unfinished:
+            return
+        await asyncio.gather(*unfinished, return_exceptions=True)
+        for reader in (proc.stdout, proc.stderr):
+            if reader is not None and not reader.at_eof():
+                task = asyncio.create_task(_discard_stream(reader))
+                _DISCARDING.add(task)
+                task.add_done_callback(_DISCARDING.discard)
 
     @staticmethod
     def resolve_shell_environment(command: str, environment: str = "auto") -> str:
@@ -405,11 +495,11 @@ class LocalSandbox(Sandbox):
                 "exit_code": proc.returncode or 0,
                 "artifact_path": artifact_path,
             }
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             if proc and proc.returncode is None:
                 proc.kill()
                 await proc.wait()
-            return {"output": "", "error": f"[Timeout] Execution exceeded {self.timeout}s", "exit_code": -1}
+            return self._time_limit_result(exc)
         except asyncio.CancelledError:
             if proc and proc.returncode is None:
                 proc.kill()
@@ -473,11 +563,11 @@ class LocalSandbox(Sandbox):
                 "environment": resolved_environment,
                 "artifact_path": artifact_path,
             }
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as exc:
             if proc and proc.returncode is None:
                 proc.kill()
                 await proc.wait()
-            return {"output": "", "error": f"[Timeout] Execution exceeded {self.timeout}s", "exit_code": -1, "environment": resolved_environment}
+            return {**self._time_limit_result(exc), "environment": resolved_environment}
         except asyncio.CancelledError:
             if proc and proc.returncode is None:
                 proc.kill()

@@ -1,5 +1,6 @@
 """On-demand history must retrieve evidence without changing its authority."""
 
+import asyncio
 import hashlib
 import json
 import os
@@ -174,7 +175,8 @@ def test_learning_only_and_expansion_do_not_open_session_archive(archive, monkey
     monkeypatch.setattr(tool, "_get_sr", lambda: pytest.fail("must not open sessions"))
     result = json.loads(tool._search("pip", source_type="learning"))
     assert result["observations"]["total"] == 1
-    assert "results" not in result and "total" not in result  # conversations were not queried
+    # conversations were not queried
+    assert "results" not in result and "returned" not in result and "total_matches" not in result
     assert json.loads(tool._search(record_id=record_id))["observations"]["total"] == 1
     assert not Path(os.environ["ASTRA_SESSION_RECALL_DB"]).exists()
 
@@ -190,7 +192,7 @@ def test_session_search_browse_scroll_and_filters_keep_existing_meaning(archive,
     try:
         discovered = json.loads(tool._search("needle"))
         assert discovered["results"][0]["session_id"] == sid
-        assert discovered["total"] == 1
+        assert discovered["returned"] == discovered["total_matches"] == 1
         assert discovered["observations"]["total"] == 1
         assert json.loads(tool._search())["sessions"][0]["session_id"] == sid
         scrolled = json.loads(tool._search(session_id=sid, around_message_id=mid))
@@ -199,9 +201,34 @@ def test_session_search_browse_scroll_and_filters_keep_existing_meaning(archive,
         for source in ("astra", "api", "hermes"):
             filtered = json.loads(tool._search("needle", source_type=source))
             assert "observations" not in filtered
-            assert filtered["total"] == (1 if source == "astra" else 0)
+            assert filtered["total_matches"] == (1 if source == "astra" else 0)
     finally:
         sr.close()
+
+
+def test_more_observations_than_listed_make_the_result_partial(archive, monkeypatch):
+    _, add = archive
+    for index in range(4):
+        add(f"note{index}", f"needle observation {index}")
+    monkeypatch.setattr(tool, "_get_sr", lambda: pytest.fail("must not open sessions"))
+    registry = ToolRegistry()
+    tool.register_session_recall_tools(registry)
+
+    def search(limit):
+        result = asyncio.run(registry.execute(
+            "session_search", {"query": "needle", "limit": limit, "source_type": "learning"},
+        ))
+        return result, json.loads(result["output"])
+
+    result, page = search(2)
+    assert page["observations"]["has_more"] is True and len(page["observations"]["results"]) == 2
+    # A full page of a longer list used to be labelled a complete result.
+    assert result["partial"] is True
+    assert "has_more" in page["partial"] and "limit" in page["partial"]
+
+    result, everything = search(4)
+    assert everything["observations"]["has_more"] is False
+    assert "partial" not in everything and not result.get("partial")
 
 
 def test_one_archive_failure_does_not_mask_the_other(archive, monkeypatch):

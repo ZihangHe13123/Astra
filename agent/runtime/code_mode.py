@@ -95,18 +95,12 @@ _RUN_FAILURE_RECOVERY: dict[str, tuple[bool, str]] = {
 }
 
 
-def _run_tool_failure(failure: RunFailure, max_chars: int) -> ToolFailure:
-    """Report a failed run as a failure, keeping the start and the end of its output."""
-    text = str(failure)
-    if len(text) > max_chars:
-        head = max_chars // 3
-        tail = max_chars - head
-        text = (
-            f"{text[:head]}\n[... {len(text) - max_chars} characters of program output omitted ...]\n"
-            f"{text[-tail:]}"
-        )
+def _run_tool_failure(failure: RunFailure) -> ToolFailure:
+    """Report a failed run as a failure. The registry shortens a long text and saves it whole."""
     retryable, hint = _RUN_FAILURE_RECOVERY.get(failure.kind, _RUN_FAILURE_RECOVERY["exception"])
-    return ToolFailure(code=f"run_code_{failure.kind}", message=text, retryable=retryable, recovery_hint=hint)
+    return ToolFailure(
+        code=f"run_code_{failure.kind}", message=str(failure), retryable=retryable, recovery_hint=hint,
+    )
 
 
 # These tools must remain first-class model calls so their provenance and
@@ -602,12 +596,10 @@ def register_run_code_tool(registry: ToolRegistry, agent_getter: Callable[[], An
     async def _run_code(code: str, description: str, _task_id: str = "") -> str | ToolFailure:
         agent = agent_getter()
         if agent is None:
-            return _run_tool_failure(
-                RunFailure("unavailable", "[run_code] agent is not available"), registry.max_inline_chars,
-            )
+            return _run_tool_failure(RunFailure("unavailable", "[run_code] agent is not available"))
         text = await execute_run_code(agent, code, description, task_id=_task_id)
         if isinstance(text, RunFailure):
-            return _run_tool_failure(text, registry.max_inline_chars)
+            return _run_tool_failure(text)
         return text
 
     program_seconds = min(120, _positive_env("RUN_CODE_TIMEOUT_SECONDS", 120))

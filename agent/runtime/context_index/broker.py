@@ -34,6 +34,7 @@ from .record_source import RecordSource
 from .session_source import _public_summary
 from .feedback import FeedbackStore, item_key, scope_key, OUTCOMES
 from ..token_estimator import estimate_value_tokens
+from ..tool_execution import PartialResult
 from .workspace import WorkspaceIdentity
 from .semantic_reader import SemanticReader
 from .query_embedding import QueryEmbedding, current_embedding
@@ -47,6 +48,7 @@ _OPEN_OUTPUT_LIMIT = 6_000
 OPEN_MAX_HANDLES = 3
 OPEN_MAX_CALLS = 2
 OPEN_TOKEN_BUDGET = 2_000
+_OPEN_MIN_REMAINING_TOKENS = 64
 _TRACE_OUTPUT_LIMIT = 4_000
 _ERROR_CATEGORIES = ERROR_CATEGORIES
 _SAFE_REASONS = frozenset(
@@ -671,7 +673,7 @@ class ContextIndexBroker:
             or self._request_tokens.get(request_id) != request_token
         ):
             return "invalid_or_expired_handle"
-        if OPEN_TOKEN_BUDGET - self._open_tokens.get(request_id, 0) < 64:
+        if OPEN_TOKEN_BUDGET - self._open_tokens.get(request_id, 0) < _OPEN_MIN_REMAINING_TOKENS:
             return "open_budget_reached"
         if self._open_calls.get(request_id, 0) >= OPEN_MAX_CALLS:
             return "open_limit_reached"
@@ -718,7 +720,10 @@ class ContextIndexBroker:
             statuses.append((handle, "opened"))
 
         result = self._format_evidence(sections, token_budget=OPEN_TOKEN_BUDGET - self._open_tokens.get(request_id, 0)) if sections else "evidence_unavailable"
-        statuses = [(handle, "budget_omitted" if status == "opened" and handle not in result else status) for handle, status in statuses]
+        statuses = [
+            (handle, "budget_omitted" if status == "opened" and f'<evidence handle="{handle}"' not in result else status)
+            for handle, status in statuses
+        ]
         if result.startswith("<context-evidence>"):
             self._open_tokens[request_id] = self._open_tokens.get(request_id, 0) + estimate_value_tokens(result)
         trace = self._traces.get(request_id)
@@ -743,7 +748,42 @@ class ContextIndexBroker:
                 for handle, status in statuses[:3]
             ],
         })
+        if result.startswith("<context-evidence>"):
+            not_opened = self._not_opened_note(statuses, request_id)
+            if not_opened:
+                # The note is a statement about this call, not historical evidence: it
+                # follows the evidence block and is not charged to the evidence budget.
+                return PartialResult(f"{result}\n{not_opened}")
         return result
+
+    def _not_opened_note(self, statuses: Sequence[tuple[str, str]], request_id: str) -> str:
+        """Name each requested handle the evidence block leaves out, why, and what to do."""
+        skipped = [(handle, status) for handle, status in statuses if status != "opened"]
+        if not skipped:
+            return ""
+        if self._open_calls.get(request_id, 0) >= OPEN_MAX_CALLS:
+            next_step = (
+                "No context_open call is left this turn (a further call is not run); "
+                "use its recommendation text."
+            )
+        elif OPEN_TOKEN_BUDGET - self._open_tokens.get(request_id, 0) < _OPEN_MIN_REMAINING_TOKENS:
+            next_step = "That budget is now used up; use its recommendation text."
+        else:
+            next_step = (
+                "If this was your first context_open call this turn, one more call with only this handle "
+                "and window 0 needs the least room; a third call is not run."
+            )
+        lines = [f"Not opened ({len(skipped)} of {len(statuses)} requested handles):"]
+        for handle, status in skipped:
+            if status == "budget_omitted":
+                reason = f"left out to fit this turn's evidence budget (about {OPEN_TOKEN_BUDGET} tokens). {next_step}"
+            else:
+                reason = (
+                    "its source record is unavailable or has changed. Do not retry it in this turn; use its "
+                    "recommendation text. This is not proof that the recorded event did not happen."
+                )
+            lines.append(f"- {_safe_handle(handle)}: {reason}")
+        return "\n".join(lines)
 
     @staticmethod
     def _format_evidence(

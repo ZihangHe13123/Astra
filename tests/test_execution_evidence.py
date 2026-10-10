@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shlex
+import signal
 import subprocess
 import sys
 
@@ -15,6 +16,7 @@ from agent.runtime.task_store import TaskStore, format_task_detail
 from agent.runtime.tool_execution import ExecutionResult
 from agent.runtime.tools.code import register_code_tools
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
+from agent.sandbox.docker import DockerSandbox
 from agent.sandbox.local import LocalSandbox
 
 
@@ -67,6 +69,171 @@ def test_foreground_run_stopped_at_the_sandbox_limit_is_timed_out_and_says_how_t
             assert "status: success" not in context
         finally:
             await sandbox.close()
+    asyncio.run(run())
+
+
+# One line, so the same text is valid as execute_python code and as a `python -c` argument.
+_PRINT_THEN_HANG = (
+    "import sys, time; print('printed-before-0'); print('printed-before-1'); "
+    "print('warned-before', file=sys.stderr); sys.stdout.flush(); sys.stderr.flush(); "
+    "time.sleep(8); print('printed-after')"
+)
+# These runs must have printed before the limit, so it leaves room for a slow interpreter start.
+_LIMIT = 2
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("execute_python", {"code": _PRINT_THEN_HANG}),
+    ("execute_shell", {"command": _python_command(_PRINT_THEN_HANG)}),
+])
+def test_foreground_run_stopped_at_the_sandbox_limit_keeps_what_it_had_written(tool, args, tmp_path):
+    async def run():
+        registry = ToolRegistry()
+        sandbox = LocalSandbox(timeout=_LIMIT, workdir=str(tmp_path))
+        register_code_tools(registry, sandbox)
+        try:
+            result = await registry.execute(tool, {**args, "foreground_yield_ms": 0})
+            assert result["execution"] == {"status": "timed_out", "exit_code": -1}
+            text = result["output"] + result["error"]
+            for expected in ("printed-before-0", "printed-before-1", "warned-before"):
+                assert expected in text, expected
+            assert "printed-after" not in text
+            # The output comes first, then the stop and how to rerun.
+            assert (
+                text.index("printed-before-1")
+                < text.index(f"[Timeout] Execution exceeded {_LIMIT}s")
+                < text.index("background=true")
+            )
+        finally:
+            await sandbox.close()
+    asyncio.run(run())
+
+
+def test_python_run_stopped_at_the_sandbox_limit_is_marked_partial(tmp_path):
+    async def run():
+        registry = ToolRegistry()
+        sandbox = LocalSandbox(timeout=_LIMIT, workdir=str(tmp_path))
+        register_code_tools(registry, sandbox)
+        try:
+            stopped = await registry.execute(
+                "execute_python", {"code": _PRINT_THEN_HANG, "foreground_yield_ms": 0}
+            )
+            assert stopped["partial"] is True
+            context = ReActAgent._tool_result_context(
+                {**stopped, "name": "execute_python", "tool_output": stopped["output"]}
+            )
+            assert "printed-before-1" in context
+            assert "Result completeness: partial" in context
+            assert "Result completeness: complete" not in context
+            finished = await registry.execute(
+                "execute_python", {"code": "print('done')", "foreground_yield_ms": 0}
+            )
+            assert "partial" not in finished
+
+            # A shell run reports the stop as a failure; that failure is partial too.
+            shell = await registry.execute(
+                "execute_shell",
+                {"command": "echo shell-before; sleep 8", "foreground_yield_ms": 0},
+            )
+            assert shell["partial"] is True
+            shell_context = ReActAgent._tool_result_context(
+                {**shell, "name": "execute_shell", "tool_output": shell["error"]}
+            )
+            assert "shell-before" in shell_context
+            assert "Result completeness: partial" in shell_context
+            failed = await registry.execute(
+                "execute_shell", {"command": "exit 3", "foreground_yield_ms": 0}
+            )
+            assert failed["error"] and not failed.get("partial")
+        finally:
+            await sandbox.close()
+    asyncio.run(run())
+
+
+def test_stopped_run_output_is_bounded_and_readable_like_a_finished_one(tmp_path):
+    async def run():
+        registry = ToolRegistry(artifact_dir=tmp_path / "artifacts")
+        sandbox = LocalSandbox(timeout=_LIMIT, workdir=str(tmp_path), max_output_bytes=64)
+        register_code_tools(registry, sandbox)
+        code = "import time\nprint('begin-' + 'x' * 200 + '-end', flush=True)\ntime.sleep(8)"
+        try:
+            result = await registry.execute("execute_python", {"code": code, "foreground_yield_ms": 0})
+            assert result["execution"]["status"] == "timed_out"
+            assert "begin-" in result["output"] and "x" * 200 not in result["output"]
+            assert "[Output truncated: stdout exceeded 64 bytes]" in result["output"]
+            assert f"[Timeout] Execution exceeded {_LIMIT}s" in result["output"]
+            handle = json.loads(result["output"].split("[Read full output: ")[1].split("]")[0])
+            readback = await registry.execute(handle["tool"], handle["arguments"])
+            assert not readback["error"], readback
+            assert "begin-" + "x" * 200 + "-end" in json.loads(readback["output"])["content"]
+        finally:
+            await sandbox.close()
+    asyncio.run(run())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="native Bash integration")
+def test_stopped_run_returns_without_waiting_for_a_descendant_that_keeps_the_pipes(tmp_path):
+    """Only the shell is killed at the limit; a child it started may live on and hold stdout."""
+    async def run():
+        sandbox = LocalSandbox(timeout=1, workdir=str(tmp_path))
+        child = (
+            "import os, time; print('child-before', flush=True); "
+            "open('child.pid', 'w').write(str(os.getpid())); time.sleep(12)"
+        )
+        streamed: list[str] = []
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        try:
+            result = await sandbox.execute_shell_stream(
+                f"echo shell-before; {_python_command(child)}; echo shell-after",
+                on_output=lambda _stream, text: streamed.append(text),
+            )
+            elapsed = loop.time() - started
+            assert result["exit_code"] == -1 and result["timed_out"] is True
+            assert result["error"] == "[Timeout] Execution exceeded 1s"
+            assert "shell-before" in result["output"] and "child-before" in result["output"]
+            assert "shell-after" not in result["output"]
+            assert "".join(streamed) == result["output"]
+            # The child sleeps for 12s; waiting for its pipes to close would take that long.
+            assert elapsed < 6, elapsed
+        finally:
+            pid_file = tmp_path / "child.pid"
+            if pid_file.exists():
+                try:
+                    os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                except (OSError, ValueError):
+                    pass
+            # Let the closed pipes be seen before the loop goes away.
+            await asyncio.sleep(0.2)
+            await sandbox.close()
+    asyncio.run(run())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the stand-in CLI is a POSIX script")
+def test_docker_run_stopped_at_the_limit_keeps_what_it_had_written(tmp_path):
+    """DockerSandbox's own execution path, with a script standing in for the docker CLI.
+
+    The script runs the command locally, so this covers how the sandbox handles
+    its child process and not Docker itself.
+    """
+    cli = tmp_path / "docker-stand-in"
+    cli.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1 $2" = "image inspect" ]; then exit 0; fi\n'
+        "for command; do :; done\n"  # the last argument of `run ... sh -c <command>`
+        'exec sh -c "$command"\n',
+        encoding="utf-8",
+    )
+    cli.chmod(0o755)
+
+    async def run():
+        sandbox = DockerSandbox(timeout=_LIMIT, workdir=str(tmp_path), docker_cmd=str(cli))
+        result = await sandbox.execute_shell_stream("exec " + _python_command(_PRINT_THEN_HANG))
+        assert result["exit_code"] == -1 and result["timed_out"] is True
+        assert result["output"].split() == ["printed-before-0", "printed-before-1"]
+        assert result["error"].splitlines() == [
+            "warned-before", f"[Timeout] Docker execution exceeded {_LIMIT}s",
+        ]
     asyncio.run(run())
 
 

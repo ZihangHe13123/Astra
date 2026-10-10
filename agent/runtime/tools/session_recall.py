@@ -30,11 +30,14 @@ def _was_cut(value: Any) -> bool:
     return isinstance(value, list) and any(_was_cut(item) for item in value)
 
 
-def _render(payload: dict[str, Any], how_to_read_more: str) -> str:
-    """Serialize a result; one that holds cut items says so and is marked partial."""
-    if not _was_cut(payload):
+def _render(payload: dict[str, Any], how_to_read_more: str, more_exist: str = "") -> str:
+    """Serialize a result; one that holds cut items or lists only some rows says so and is marked partial."""
+    notes = [more_exist] if more_exist else []
+    if _was_cut(payload):
+        notes.append(how_to_read_more)
+    if not notes:
         return json.dumps(payload, indent=2, ensure_ascii=False)
-    return PartialResult(json.dumps({**payload, "partial": how_to_read_more}, indent=2, ensure_ascii=False))
+    return PartialResult(json.dumps({**payload, "partial": " ".join(notes)}, indent=2, ensure_ascii=False))
 
 
 def _search(query: str = "", limit: int = 3, window: int = 3,
@@ -95,28 +98,51 @@ def _search(query: str = "", limit: int = 3, window: int = 3,
         payload["query"] = query
     if source_type in {"", "learning"}:
         payload["observations"] = LearningArchive().lookup(query, limit=limit, sort=sort)
+    more: list[str] = []
+    if isinstance(payload.get("observations"), dict) and payload["observations"].get("has_more"):
+        more.append("observations (`has_more`)")
     if source_type != "learning":
         payload["sessions" if browse else "results"] = []
-        payload["total"] = 0
+        payload["returned"] = 0
         try:
             sr = _get_sr()
-            results = sr.browse(limit=limit, source_type=source_type) if browse else sr.search(
-                query, limit=limit, window=window,
-                sort=sort if sort in {"newest", "oldest"} else None,
-                source_type=source_type,
-            )
+            if browse:
+                results = sr.browse(limit=limit, source_type=source_type)
+                count_key, total = "total_sessions", sr.count_sessions(source_type=source_type)
+            else:
+                results = sr.search(
+                    query, limit=limit, window=window,
+                    sort=sort if sort in {"newest", "oldest"} else None,
+                    source_type=source_type,
+                )
+                at_least = bool(getattr(results, "total_is_lower_bound", False))
+                count_key = "total_matches_at_least" if at_least else "total_matches"
+                total = int(getattr(results, "total", 0))
             payload["sessions" if browse else "results"] = results
-            payload["total"] = len(results)
+            # `returned` is the rows listed here; the count after it is how many exist.
+            payload["returned"] = len(results)
+            payload[count_key] = max(total, len(results))
+            if total > len(results):
+                more.insert(0, f"conversations (`returned` is below `{count_key}`)")
             if getattr(results, "matching", "") == "substring":
                 payload["matching"] = "substring"
                 payload["matching_note"] = getattr(results, "note", "")
         except (OSError, sqlite3.Error):
             payload["sessions_status"] = "unavailable"
             payload["sessions_error"] = "Conversation archive could not be read; this is not a zero-match result."
+    more_exist = ""
+    if more:
+        more_exist = (
+            f"More exist than are listed for {' and '.join(more)}. "
+            + ("Raise `limit` (maximum 20) to list more; there is no paging, so past that "
+               if limit < 20 else "`limit` is at its maximum and there is no paging, so ")
+            + ("search with a query." if browse else "use a narrower query or another `sort`.")
+        )
     return _render(
         payload,
         "Items marked truncated are excerpts; content_chars is a message's full length. Read a message with "
         "session_id + around_message_id (its message_id or id), and an observation with its record_id.",
+        more_exist,
     )
 
 
@@ -154,7 +180,12 @@ def register_session_recall_tools(registry: ToolRegistry):
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "Discovery/Browse mode. Maximum results per archive (default 3). Each archive has its own returned count.",
+                    "description": (
+                        "Discovery/Browse mode. Maximum results listed per archive (default 3); there is no paging. "
+                        "Conversations report `returned` (rows listed) beside how many exist: `total_matches`, "
+                        "`total_matches_at_least` when counting stopped at its cap, or `total_sessions` "
+                        "when browsing. Observations report `has_more`."
+                    ),
                     "default": 3,
                     "minimum": 1,
                     "maximum": 20,

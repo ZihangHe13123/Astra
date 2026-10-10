@@ -1087,7 +1087,9 @@ def test_react_enforces_computer_apps_budget_after_eight_catalog_refreshes(
     assert llm.tool_calls == 9
     assert sum(name == "apps" for name, _value in backend.calls) == 8
     assert any("ToolBudgetExhausted" in message["content"] for message in agent.context.messages)
-    assert any("per-turn tool budget exhausted" in event.get("message", "") for event in events)
+    # The ninth call is refused once and the turn goes on to its answer.
+    assert not any("per-turn tool budget exhausted" in event.get("message", "") for event in events)
+    assert agent.context.messages[-1]["content"] == "catalog refresh stopped"
 
 
 def test_react_rejects_entire_computer_apps_batch_that_exceeds_budget(
@@ -1146,7 +1148,13 @@ def test_react_rejects_entire_computer_apps_batch_that_exceeds_budget(
         "ToolBudgetExhausted" in message["content"]
         for message in agent.context.messages
     ) == 2
-    assert any("per-turn tool budget exhausted" in event.get("message", "") for event in events)
+    # Neither call of the over-limit message ran or counted: one refresh is still allowed.
+    assert all(
+        "1 of its 8 per turn are left" in message["content"]
+        for message in agent.context.messages if "ToolBudgetExhausted" in str(message.get("content"))
+    )
+    assert not any("per-turn tool budget exhausted" in event.get("message", "") for event in events)
+    assert agent.context.messages[-1]["content"] == "catalog refresh stopped"
 
 
 def test_computer_resume_holds_catalog_authority_through_registry_postcondition(

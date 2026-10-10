@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
+from agent.runtime.tool_failure import ToolFailure
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
 
 from .manager import ChannelManager
@@ -32,7 +33,7 @@ def register_channel_tools(
     registry: ToolRegistry,
     manager_getter: Callable[[], ChannelManager | None],
 ) -> None:
-    async def channel_send_file(path: str, name: str = "") -> dict[str, object]:
+    async def channel_send_file(path: str, name: str = "") -> dict[str, object] | ToolFailure:
         message = active_channel_message.get()
         if message is None:
             raise RuntimeError("channel_send_file is only available during a messaging-channel turn")
@@ -46,7 +47,11 @@ def register_channel_tools(
         if not allowed_users or message.sender_id not in allowed_users:
             raise PermissionError("sender is not allowed to receive local files")
 
-        source = Path(path).expanduser().resolve(strict=True)
+        try:
+            source = Path(path).expanduser().resolve(strict=True)
+        except FileNotFoundError:
+            # The OS error names the first missing directory, not the path that was asked for.
+            raise FileNotFoundError(f"file not found: {path}") from None
         if not source.is_file():
             raise ValueError(f"not a file: {source}")
         roots = [Path(item).expanduser().resolve() for item in config.send_file_roots]
@@ -66,7 +71,23 @@ def register_channel_tools(
                 f"file is too large: {size} bytes > {config.max_send_file_bytes} bytes"
             )
         upload_name = Path(name).name if name.strip() else source.name
-        await manager.send_file(message, str(source), upload_name)
+        try:
+            await manager.send_file(message, str(source), upload_name)
+        except TimeoutError:
+            # The upload was handed to the channel and no confirmation came back.
+            return ToolFailure(
+                code="channel_send_unconfirmed",
+                message=(
+                    f"The {message.channel} channel did not confirm the upload of {upload_name}; "
+                    "the file may or may not have reached the user."
+                ),
+                retryable=False,
+                recovery_hint=(
+                    "Do not send it again on your own. Tell the user the upload was not confirmed "
+                    "and ask whether the file arrived."
+                ),
+                partial=True,
+            )
         return {
             "status": "sent",
             "channel": message.channel,
@@ -78,8 +99,10 @@ def register_channel_tools(
         name="channel_send_file",
         description=(
             "Send an existing local file to the user in the active QQ/channel conversation. "
+            "Works only in a turn that came from a messaging channel. "
             "Use only when that user explicitly asks to receive a file. The path must be inside "
-            "configured send_file_roots; credential files are always blocked."
+            "configured send_file_roots; credential files are always blocked. "
+            "At most 3 calls per turn: a further call is not run."
         ),
         parameters={
             "type": "object",

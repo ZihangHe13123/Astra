@@ -435,6 +435,56 @@ def test_interrupted_read_allows_later_authorized_write(tmp_path, monkeypatch):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(
+    ("first_write", "later_write_runs"),
+    [
+        # The tool reported what happened, or never ran: the worker knows the outcome.
+        ("reported_failure", True),
+        ("refused_arguments", True),
+        # The call was cut off: nobody knows what it left behind.
+        ("raised_midway", False),
+        ("stopped_with_partial_output", False),
+    ],
+)
+def test_only_a_cut_off_write_blocks_the_workers_later_writes(tmp_path, monkeypatch, first_write, later_write_runs):
+    from agent.runtime.tool_failure import ToolFailure
+
+    async def scenario():
+        writes = []
+
+        def edit():
+            if first_write == "reported_failure":
+                return ToolFailure("edit_match_not_found", "Exact edit text was not found", True)
+            if first_write == "stopped_with_partial_output":
+                return ToolFailure("edit_timeout", "stopped after writing part of the file", False, partial=True)
+            raise RuntimeError("connection lost while writing")
+
+        registry = ToolRegistry()
+        registry.register(ToolDef(
+            name="edit_file", description="Recovery acceptance probe",
+            parameters={
+                "type": "object", "properties": {"path": {"type": "string"}},
+                "required": ["path"] if first_write == "refused_arguments" else [],
+            },
+            fn=lambda path="": edit(), risk="write",
+        ))
+        _register_tool(registry, "write_file", lambda: writes.append("done") or "saved", "write")
+        llm = RecordingLLM([
+            _calls("edit_file"), _calls("write_file"), {"content": "Reported", "tool_calls": []},
+        ])
+        harness = Harness(tmp_path, monkeypatch, llm, registry=registry)
+        _team, spawned = await harness.spawn(mode="worker")
+        await harness.wait(spawned["process"]["process_id"])
+
+        assert writes == (["done"] if later_write_runs else [])
+        seen_by_worker = json.dumps(llm.requests[-1])
+        assert ("recovery_write_blocked" in seen_by_worker) is not later_write_runs
+        agent = harness.teams.get_agent(spawned["agent"]["id"])
+        assert _load_closed(agent["conv_path"])["state"]["write_blocked"] is not later_write_runs
+
+    asyncio.run(scenario())
+
+
 def test_canonical_history_redacts_request_local_arguments_without_mutating_active_call(tmp_path, monkeypatch):
     async def scenario():
         registry = ToolRegistry()

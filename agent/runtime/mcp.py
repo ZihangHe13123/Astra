@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from .tool_execution import PartialResult
 from .tool_failure import ToolFailure
 from .process_env import mark_agent_environment
 from .tools.approval import ScopedApprovalStore
@@ -38,6 +39,10 @@ _MCP_RETRYABLE_ERROR = re.compile(
     r"\b(?:408|425|429|500|502|503|504)\b|connection|rate.?limit|temporar|timed?\s*out|timeout",
     re.IGNORECASE,
 )
+# JSON-RPC's own error codes: the server read the request and answered it, so the
+# connection works and no result was lost. Codes an SDK makes up for a closed
+# connection or its own timeout (-32000, -32001, 408) are not in this set.
+_MCP_REPLY_ERROR_CODES = frozenset({-32700, -32600, -32601, -32602, -32603})
 _MCP_SERVER_KEYS = {
     "enabled",
     "transport",
@@ -739,13 +744,8 @@ class MCPManager:
             ):
                 current_session = self._sessions.get(_server)
                 if current_session is None or current_session is not _session:
-                    return ToolFailure(
-                        code="mcp_stale_connection" if current_session is not None else "mcp_unavailable",
-                        message=f"MCP connection for {_server} changed or is unavailable; this call was not dispatched.",
-                        retryable=True,
-                        recovery_hint="Wait for reconnection, rediscover tools and obtain fresh observations/references. Do not replay an earlier uncertain action.",
-                        tool_name=_local_name,
-                        details={"mcp_server": _server, "mcp_tool": _remote_name, "dispatch_state": "not_dispatched"},
+                    return self._not_dispatched(
+                        _server, _remote_name, _local_name, replaced=current_session is not None,
                     )
 
                 def disconnected(error: str) -> str:
@@ -758,57 +758,16 @@ class MCPManager:
                         self._reconnect_event.set()
                     return state
 
-                try:
-                    # Own the deadline so an expired mutating call cannot become
-                    # a generic timeout that suggests repeating the operation.
-                    async with asyncio.timeout(_timeout):
-                        result = await current_session.call_tool(_remote_name, arguments=kwargs)
-                except asyncio.CancelledError:
-                    disconnected("MCP call cancelled after dispatch")
-                    raise
-                except Exception as exc:
-                    error = f"{type(exc).__name__}: {exc}"
-                    state = disconnected(error)
-                    return ToolFailure(
-                        code=("mcp_auth_required" if state == "auth_required" else "mcp_unavailable") if _read_only else "mcp_unknown_outcome",
-                        message=f"MCP server {_server} lost the call result: {error}" + ("" if _read_only else " The action may already have happened."),
-                        retryable=_read_only,
-                        recovery_hint=("Retry the read after reconnection; re-authenticate first if required. Obtain fresh references."
-                                       if _read_only else "Do not repeat this action. After reconnection, observe the target to establish what happened before deciding the next step. Cancellation or timeout does not roll back remote effects."),
-                        tool_name=_local_name,
-                        partial=not _read_only,
-                        details={"mcp_server": _server, "mcp_tool": _remote_name, "dispatch_state": "unknown"},
-                    )
-                content = list(getattr(result, "content", []) or [])
-                structured = getattr(result, "structuredContent", None)
-                if structured is None:
-                    structured = getattr(result, "structured_content", None)
-                if structured is not None:
-                    text = json.dumps(structured, ensure_ascii=False)
-                else:
-                    parts = []
-                    for block in content:
-                        if self._image_block(block) is not None:
-                            continue
-                        value = getattr(block, "text", None)
-                        if value is None and hasattr(block, "model_dump"):
-                            value = json.dumps(block.model_dump(), ensure_ascii=False)
-                        parts.append(str(value if value is not None else block))
-                    text = "\n".join(parts)
-                is_error = bool(
-                    getattr(result, "isError", False)
-                    or getattr(result, "is_error", False)
-                )
-                if is_error:
-                    detail = text.strip() or "MCP server returned isError=true without an error message"
-                    detail = detail[: self.max_output_chars]
+                def server_error(detail: str, note: str = "") -> ToolFailure:
+                    detail = self._bounded(detail, "of the server's message") + note
                     return ToolFailure(
                         code="mcp_tool_error",
-                        message=f"[MCPToolError] {_server}/{_remote_name}: {detail}",
+                        message=f"[MCPToolError] {_local_name}: {detail}",
                         retryable=_read_only and bool(_MCP_RETRYABLE_ERROR.search(detail)),
                         recovery_hint=(
-                            "Check the MCP server configuration and logs. Retry only for a transient "
-                            "network, timeout, rate-limit, or server error." if _read_only else
+                            "If the server's message names an argument problem, correct the arguments and call "
+                            "again. Retry unchanged only for a transient network, timeout, rate-limit, or "
+                            "server error." if _read_only else
                             "The server reported an error, which does not prove the action had no effect. Observe the target before deciding the next step; do not repeat automatically."
                         ),
                         tool_name=_local_name,
@@ -818,12 +777,97 @@ class MCPManager:
                             "remote_output": detail,
                         },
                     )
+
+                # Own the deadline so an expired mutating call cannot become
+                # a generic timeout that suggests repeating the operation.
+                deadline = asyncio.timeout(_timeout)
+                try:
+                    async with deadline:
+                        result = await current_session.call_tool(_remote_name, arguments=kwargs)
+                except asyncio.CancelledError:
+                    disconnected("MCP call cancelled after dispatch")
+                    raise
+                except Exception as exc:
+                    reply_code = getattr(getattr(exc, "error", None), "code", None)
+                    if type(reply_code) is int and reply_code in _MCP_REPLY_ERROR_CODES:
+                        # A JSON-RPC error is the server's answer, not a lost one:
+                        # the connection stays and the model gets the message.
+                        return server_error(
+                            f"{str(exc).strip() or 'no error message'} (JSON-RPC error {reply_code})"
+                        )
+                    timed_out = isinstance(exc, TimeoutError) and deadline.expired()
+                    error = f"no reply within {_timeout:g}s" if timed_out else f"{type(exc).__name__}: {exc}"
+                    state = disconnected(error)
+                    details: dict[str, Any] = {
+                        "mcp_server": _server, "mcp_tool": _remote_name, "dispatch_state": "unknown",
+                    }
+                    if timed_out:
+                        details["timeout_seconds"] = _timeout
+                    return ToolFailure(
+                        code=("mcp_auth_required" if state == "auth_required" else "mcp_unavailable") if _read_only else "mcp_unknown_outcome",
+                        message=(
+                            f"MCP server {_server} did not answer {_local_name} within {_timeout:g}s (the "
+                            "server's configured call timeout); Astra stopped waiting and dropped the connection."
+                            if timed_out else f"MCP server {_server} lost the call result: {error}"
+                        ) + ("" if _read_only else " The action may already have happened."),
+                        retryable=_read_only,
+                        recovery_hint=("Retry the read after reconnection; re-authenticate first if required. Obtain fresh references."
+                                       if _read_only else "Do not repeat this action. After reconnection, observe the target to establish what happened before deciding the next step. Cancellation or timeout does not roll back remote effects."),
+                        tool_name=_local_name,
+                        partial=not _read_only,
+                        details=details,
+                    )
+                content = list(getattr(result, "content", []) or [])
+                structured = getattr(result, "structuredContent", None)
+                if structured is None:
+                    structured = getattr(result, "structured_content", None)
+                # (is a text block, what the model reads) in the server's order.
+                rendered: list[tuple[bool, str]] = []
+                attachable = 0
+                omitted = 0
+                for block in content:
+                    if self._image_block(block) is not None:
+                        attachable += 1
+                        continue
+                    value = getattr(block, "text", None)
+                    if value is not None:
+                        rendered.append((True, str(value)))
+                        continue
+                    described, complete = self._describe_block(block)
+                    if not complete:
+                        omitted += 1
+                    rendered.append((False, described))
+                if structured is not None:
+                    # MCP has a server repeat its structured result in a text
+                    # block, so the structured form stands for the text blocks;
+                    # anything else the server sent is still shown.
+                    parts = [json.dumps(structured, ensure_ascii=False)]
+                    parts.extend(value for is_text, value in rendered if not is_text)
+                else:
+                    parts = [value for _is_text, value in rendered]
+                text = "\n".join(parts)
+                is_error = bool(
+                    getattr(result, "isError", False)
+                    or getattr(result, "is_error", False)
+                )
+                if is_error:
+                    return server_error(
+                        text.strip() or "MCP server returned isError=true without an error message",
+                        f"\n[{attachable} image(s) in this error result not shown]" if attachable else "",
+                    )
                 image_paths = self._persist_image_blocks(
                     content,
                     artifact_dir=_artifact_dir,
                     server=_server,
                     tool=_remote_name,
                 )
+                unattached = attachable - len(image_paths)
+                if unattached:
+                    omitted += unattached
+                    text = (text + "\n" if text else "") + (
+                        f"[{unattached} image(s) from this result not shown: empty, not valid base64, "
+                        f"or larger than {self._max_image_bytes()} bytes]"
+                    )
                 if image_paths:
                     question = str(
                         kwargs.get("question")
@@ -831,17 +875,19 @@ class MCPManager:
                         or kwargs.get("instruction")
                         or ""
                     ).strip()
-                    return json.dumps(
+                    shown = self._bounded(text, "of text")
+                    attachment = json.dumps(
                         {
                             "type": "image_attachment",
                             "image_paths": image_paths,
                             "question": question,
-                            "text": text[: self.max_output_chars],
+                            "text": shown,
                             "source": f"mcp:{_server}/{_remote_name}",
                         },
                         ensure_ascii=False,
                     )
-                return text
+                    return PartialResult(attachment) if omitted or shown != text else attachment
+                return PartialResult(text) if omitted else text
 
             def permission_check(
                 args: dict,
@@ -887,6 +933,97 @@ class MCPManager:
         self._sessions[server] = session
         return len(definitions)
 
+    def _not_dispatched(self, server: str, remote_name: str, local_name: str, *, replaced: bool) -> ToolFailure:
+        """A call that never left Astra: say why and what brings the tool back."""
+        details = {"mcp_server": server, "mcp_tool": remote_name, "dispatch_state": "not_dispatched"}
+        afterwards = (
+            " References from before the reconnection may no longer be valid: obtain fresh "
+            "observations, and do not replay an earlier uncertain action."
+        )
+        if replaced:
+            return ToolFailure(
+                code="mcp_stale_connection",
+                message=f"MCP server {server} reconnected after this call was prepared; this call was not dispatched.",
+                retryable=True,
+                recovery_hint=f"Call {local_name} again; it now uses the new connection." + afterwards,
+                tool_name=local_name,
+                details=details,
+            )
+        status = next((item for item in self.statuses if item.name == server), None)
+        # The state only: the stored error can quote the server's URL, and the user reads it with /mcp.
+        state = status.state if status is not None else "unknown"
+        lifecycle = self._background_task
+        if state == "auth_required":
+            hint = "The server needs the user to sign in again; tell the user."
+        elif lifecycle is not None and not lifecycle.done():
+            hint = (
+                f"Astra retries the connection in the background and {local_name} keeps its name: "
+                "continue with other work and call it again later; tell the user if it stays unavailable."
+            )
+        else:
+            hint = "Nothing is reconnecting this server now; tell the user it is unavailable."
+        return ToolFailure(
+            code="mcp_unavailable",
+            message=f"MCP server {server} is not connected (state: {state}); this call was not dispatched.",
+            retryable=True,
+            recovery_hint=hint + afterwards,
+            tool_name=local_name,
+            details=details,
+        )
+
+    def _bounded(self, text: str, what: str) -> str:
+        """Clip to max_output_chars and say how much was cut."""
+        if len(text) <= self.max_output_chars:
+            return text
+        cut = len(text) - self.max_output_chars
+        return text[: self.max_output_chars] + f"\n[... {cut} more characters {what} not shown]"
+
+    @staticmethod
+    def _describe_block(block: Any) -> tuple[str, bool]:
+        """Text that stands for a non-text content block, and whether it is all of it.
+
+        Base64 payloads are opaque to a text model, so they are named with their
+        type and size instead of being pasted into the result.
+        """
+        kind = str(getattr(block, "type", "") or "").lower()
+        mime = str(getattr(block, "mimeType", None) or getattr(block, "mime_type", None) or "")
+
+        def encoded_size(data: Any) -> str:
+            return f", about {len(data) * 3 // 4} bytes" if isinstance(data, str) else ""
+
+        if kind == "resource":
+            resource = getattr(block, "resource", None)
+            mime = str(getattr(resource, "mimeType", None) or getattr(resource, "mime_type", None) or "")
+            label = f"[MCP resource {getattr(resource, 'uri', '') or '(no uri)'}" + (f" ({mime})" if mime else "")
+            text = getattr(resource, "text", None)
+            if isinstance(text, str):
+                return f"{label}]\n{text}", True
+            return f"{label}: binary content{encoded_size(getattr(resource, 'blob', None))}, not shown]", False
+        if kind == "resource_link":
+            label = f"[MCP resource link {getattr(block, 'uri', '') or '(no uri)'}" + (f" ({mime})" if mime else "")
+            extra = "; ".join(
+                str(value).strip()
+                for value in (getattr(block, "name", None), getattr(block, "description", None))
+                if value and str(value).strip()
+            )
+            return label + (f": {extra}" if extra else "") + "; the server sent the link, not the content]", True
+        if kind in {"image", "audio"}:
+            return (
+                f"[MCP {kind} content ({mime or 'no media type'}{encoded_size(getattr(block, 'data', None))}) "
+                "not shown: Astra cannot pass this format to the model]"
+            ), False
+        dump = getattr(block, "model_dump", None)
+        if callable(dump):
+            try:
+                return json.dumps(dump(mode="json", exclude_none=True), ensure_ascii=False), True
+            except Exception:  # an unknown block must not lose the rest of the result
+                logger.debug("MCP content block could not be serialized", exc_info=True)
+        return str(block), True
+
+    @staticmethod
+    def _max_image_bytes() -> int:
+        return int(os.getenv("MAX_AUTO_TOOL_IMAGE_BYTES", str(10 * 1024 * 1024)))
+
     @staticmethod
     def _image_block(block: Any) -> tuple[str, str] | None:
         block_type = str(getattr(block, "type", "") or "").lower()
@@ -909,7 +1046,7 @@ class MCPManager:
         server: str,
         tool: str,
     ) -> list[str]:
-        max_bytes = int(os.getenv("MAX_AUTO_TOOL_IMAGE_BYTES", str(10 * 1024 * 1024)))
+        max_bytes = cls._max_image_bytes()
         output_dir = artifact_dir / "mcp-images"
         paths: list[str] = []
         for block in content:

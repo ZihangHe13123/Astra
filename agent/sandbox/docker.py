@@ -149,7 +149,22 @@ class DockerSandbox(Sandbox):
             try:
                 await asyncio.wait_for(proc.wait(), timeout=self.timeout)
                 stdout, stderr = await asyncio.gather(stdout_task, stderr_task)
-            except (asyncio.TimeoutError, asyncio.CancelledError):
+            except asyncio.TimeoutError:
+                if proc.returncode is None:
+                    proc.kill()
+                    await proc.wait()
+                # Keep what the run wrote before it was stopped.
+                collected = await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+                stdout, stderr = (item if isinstance(item, bytes) else b"" for item in collected)
+                error = stderr.decode("utf-8", errors="replace").strip()
+                notice = f"[Timeout] Docker execution exceeded {self.timeout}s"
+                return {
+                    "output": stdout.decode("utf-8", errors="replace").strip(),
+                    "error": f"{error}\n{notice}" if error else notice,
+                    "exit_code": -1,
+                    "timed_out": True,
+                }
+            except asyncio.CancelledError:
                 if proc.returncode is None:
                     proc.kill()
                     await proc.wait()

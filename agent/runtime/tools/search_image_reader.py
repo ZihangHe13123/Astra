@@ -19,7 +19,15 @@ MAX_IMAGE_PIXELS = 16_000_000
 
 
 class SearchImageError(ValueError):
-    """A user-facing download failure that does not expose transport secrets."""
+    """A user-facing download failure that does not expose transport secrets.
+
+    ``retryable`` is true when the same download can succeed later (a timeout,
+    a dropped connection or a server error).
+    """
+
+    def __init__(self, message: str, *, retryable: bool = False):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 def _save_raster(data: bytes, directory: Path) -> Path:
@@ -61,6 +69,7 @@ async def load_search_image(
     directory: Path,
     is_public_url: Callable[[str], Awaitable[bool]],
     client_for_url: Callable[[str], "httpx.AsyncClient"],
+    is_transient: Callable[[BaseException], bool] | None = None,
 ) -> Path:
     """Follow at most three checked redirects and never fetch an unbounded body."""
     try:
@@ -77,7 +86,10 @@ async def load_search_image(
                         url = urljoin(url, location)
                         continue
                     if response.status_code != 200:
-                        raise SearchImageError(f"Image download returned HTTP {response.status_code}.")
+                        raise SearchImageError(
+                            f"Image download returned HTTP {response.status_code}.",
+                            retryable=response.status_code >= 500 or response.status_code in {408, 425, 429},
+                        )
                     length = response.headers.get("content-length", "")
                     if length.isdigit() and int(length) > MAX_IMAGE_BYTES:
                         raise SearchImageError("Image exceeds the 8 MiB inspection limit.")
@@ -91,6 +103,9 @@ async def load_search_image(
     except SearchImageError:
         raise
     except TimeoutError as exc:
-        raise SearchImageError("Image download timed out; try another candidate.") from exc
+        raise SearchImageError("Image download timed out; try another candidate.", retryable=True) from exc
     except Exception as exc:
-        raise SearchImageError("Could not load this image; try another candidate.") from exc
+        raise SearchImageError(
+            "Could not load this image; try another candidate.",
+            retryable=bool(is_transient and is_transient(exc)),
+        ) from exc

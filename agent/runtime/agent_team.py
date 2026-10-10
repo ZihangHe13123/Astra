@@ -921,17 +921,45 @@ class AgentTeamStore:
                 (str(agent_id), time.time()),
             ).fetchone() is not None
 
-    def read_messages(self, agent_id: str, *, after_seq: int = 0, limit: int = 20) -> list[dict[str, Any]]:
+    def read_messages(
+        self,
+        agent_id: str,
+        *,
+        after_seq: int | None = None,
+        limit: int = 20,
+        unread_only: bool | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return one page of the messages addressed to ``agent_id``, oldest first.
+
+        Without ``after_seq`` only messages not yet acknowledged are returned,
+        so a reader that acknowledges what it reads is not handed the same
+        message again. An explicit ``after_seq`` returns every message above
+        that seq, acknowledged or not, which is how older ones are read again
+        (0 starts from the oldest). ``unread_only`` overrides that choice, for
+        example to ask whether unread messages follow a page.
+        """
+        if unread_only is None:
+            unread_only = after_seq is None
         bounded = max(1, min(int(limit), TEAM_INBOX_PAGE_SIZE))
+        unread = "AND m.acknowledged_at IS NULL" if unread_only else ""
         with self._lock, self._connection() as db:
             rows = db.execute(
-                """SELECT m.*, sender.name AS sender_name
+                f"""SELECT m.*, sender.name AS sender_name
                    FROM agent_messages m JOIN team_agents sender ON sender.id=m.sender_agent_id
-                   WHERE m.recipient_agent_id=? AND m.seq>? AND (m.expires_at IS NULL OR m.expires_at>?)
+                   WHERE m.recipient_agent_id=? AND m.seq>? {unread}
+                     AND (m.expires_at IS NULL OR m.expires_at>?)
                    ORDER BY m.seq LIMIT ?""",
-                (str(agent_id), max(0, int(after_seq)), time.time(), bounded),
+                (str(agent_id), max(0, int(after_seq or 0)), time.time(), bounded),
             ).fetchall()
         return [self._row(row) or {} for row in rows]
+
+    def last_message_seq(self, agent_id: str) -> int:
+        """Highest seq addressed to ``agent_id``, or 0: a cursor after which only newer messages come."""
+        with self._lock, self._connection() as db:
+            row = db.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM agent_messages WHERE recipient_agent_id=?", (str(agent_id),)
+            ).fetchone()
+        return int(row[0])
 
     def mark_messages(self, message_ids: list[str], *, acknowledged: bool) -> None:
         if not message_ids:

@@ -75,6 +75,10 @@ SCROLL_ANCHOR_CHARS = 20_000
 _SCROLL_NEIGHBOUR_CHARS = 500
 _WINDOW_CHARS = 200
 _LIKE_SNIPPET_CHARS = 200
+# Matches beyond the rows returned are counted exactly up to this many. Past it
+# the count is a lower bound, which keeps a broad substring query from reading
+# the whole archive only to count.
+MATCH_COUNT_CAP = 1_000
 _LIKE_TOKEN = re.compile(r'"([^"]*)"|(\S+)')
 
 
@@ -88,14 +92,40 @@ def _mark_cut(item: Dict[str, Any], shown: str, full: Optional[str]) -> Dict[str
 
 
 class SearchResults(List[Dict[str, Any]]):
-    """Search rows plus how the query was matched.
+    """Search rows plus how the query was matched and how many messages match.
 
     ``matching`` is "fts" for the full-text index and "substring" when the
     query fell back to LIKE; ``note`` then says why and what that changes.
+    ``total`` counts the matching messages, which can be more than the rows
+    listed; with ``total_is_lower_bound`` set, at least that many match.
     """
 
     matching = "fts"
     note = ""
+    total = 0
+    total_is_lower_bound = False
+
+
+def _count_matches(
+    conn: sqlite3.Connection, fetched: int, limit: int, from_where: str, params: tuple,
+) -> tuple[int, bool]:
+    """Count a query's matches after ``limit + 1`` of its rows were fetched.
+
+    Returns ``(count, is_lower_bound)``. A fetch that did not fill the extra
+    row already saw every match, so nothing more is read. Otherwise the
+    matches are counted up to MATCH_COUNT_CAP.
+    """
+    if fetched <= limit:
+        return fetched, False
+    try:
+        counted = conn.execute(
+            f"SELECT COUNT(*) FROM (SELECT 1 {from_where} LIMIT ?)", (*params, MATCH_COUNT_CAP + 1),
+        ).fetchone()[0]
+    except sqlite3.DatabaseError:
+        return fetched, True
+    if counted > MATCH_COUNT_CAP:
+        return MATCH_COUNT_CAP, True
+    return max(counted, fetched), False
 
 
 def _like_alternatives(query: str) -> List[tuple[List[str], List[str]]]:
@@ -526,6 +556,12 @@ class SessionRecall:
         elif sort == "oldest":
             order_sql = "ORDER BY m.timestamp ASC, rank"
 
+        from_where = f"""
+            FROM messages_fts
+            JOIN messages m ON m.rowid = messages_fts.rowid
+            JOIN sessions s ON s.id = m.session_id
+            WHERE messages_fts MATCH ? AND {source_filter}
+        """
         sql = f"""
             SELECT
                 m.id, m.session_id, m.role,
@@ -533,20 +569,19 @@ class SessionRecall:
                 m.content, m.timestamp,
                 s.title AS session_title,
                 s.started_at
-            FROM messages_fts
-            JOIN messages m ON m.rowid = messages_fts.rowid
-            JOIN sessions s ON s.id = m.session_id
-            WHERE messages_fts MATCH ? AND {source_filter}
+            {from_where}
             {order_sql}
             LIMIT ?
         """
         try:
-            rows = conn.execute(sql, (query, limit)).fetchall()
+            # One extra row tells a full page from a complete result set.
+            rows = conn.execute(sql, (query, limit + 1)).fetchall()
         except sqlite3.DatabaseError:
             return like("the full-text index could not run this query")
 
         results = SearchResults()
-        for row in rows:
+        results.total, results.total_is_lower_bound = _count_matches(conn, len(rows), limit, from_where, (query,))
+        for row in rows[:limit]:
             snippet = row["snippet"] or (row["content"][:120] if row["content"] else "")
             r = _mark_cut({
                 "message_id": row["id"],
@@ -584,32 +619,37 @@ class SessionRecall:
         alternatives = _like_alternatives(query)
         order = "ASC" if sort == "oldest" else "DESC"
 
-        def _run(choices: List[tuple[List[str], List[str]]]) -> list:
+        def _run(choices: List[tuple[List[str], List[str]]]) -> tuple[list, tuple[int, bool]]:
             where = " OR ".join(
                 "(" + " AND ".join(
                     ["m.content LIKE ?"] * len(required) + ["m.content NOT LIKE ?"] * len(excluded)
                 ) + ")"
                 for required, excluded in choices
             )
-            params = [f"%{term}%" for required, excluded in choices for term in (*required, *excluded)]
-            return conn.execute(
-                "SELECT m.id, m.session_id, m.role, m.content AS snippet, "
-                "m.content, m.timestamp, s.title AS session_title, s.started_at "
+            params = tuple(f"%{term}%" for required, excluded in choices for term in (*required, *excluded))
+            from_where = (
                 "FROM messages m JOIN sessions s ON s.id = m.session_id "
                 f"WHERE ({where}) AND {source_filter} "
-                "AND m.role IN ('user','assistant') "
-                f"ORDER BY m.timestamp {order} LIMIT ?",
-                (*params, limit),
+                "AND m.role IN ('user','assistant')"
+            )
+            # One extra row tells a full page from a complete result set.
+            found = conn.execute(
+                "SELECT m.id, m.session_id, m.role, m.content AS snippet, "
+                "m.content, m.timestamp, s.title AS session_title, s.started_at "
+                f"{from_where} ORDER BY m.timestamp {order} LIMIT ?",
+                (*params, limit + 1),
             ).fetchall()
+            return found[:limit], _count_matches(conn, len(found), limit, from_where, params)
 
-        rows = _run(alternatives) if alternatives else []
+        rows, total = _run(alternatives) if alternatives else ([], (0, False))
         any_term = False
         if not rows and len(alternatives) == 1 and len(alternatives[0][0]) > 1:
             required, excluded = alternatives[0]
-            rows = _run([([term], excluded) for term in required])
+            rows, total = _run([([term], excluded) for term in required])
             any_term = bool(rows)
 
         results = SearchResults()
+        results.total, results.total_is_lower_bound = total
         results.matching = "substring"
         results.note = (
             f"Substring matching was used because {reason or 'the full-text index could not be used'}. "
@@ -676,6 +716,13 @@ class SessionRecall:
                 "preview": preview,
             })
         return results
+
+    def count_sessions(self, *, source_type: str = "") -> int:
+        """Number of sessions ``browse`` can list for one source category."""
+        row = self._get_conn().execute(
+            f"SELECT COUNT(*) FROM sessions s WHERE {self._source_filter_sql(source_type)}"
+        ).fetchone()
+        return int(row[0])
 
     # ── scroll ────────────────────────────────────────────────
 

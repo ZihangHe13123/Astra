@@ -5,7 +5,9 @@ import re
 from collections import defaultdict, deque
 
 
-_RESULT_HEADER = re.compile(r"^\[Tool result: ([^\n|]+) \| status: (success|error)\]\n")
+# Any status other than "error" belongs to a call that returned its text
+# normally: success, or an execution state such as failed, timed_out or running.
+_RESULT_HEADER = re.compile(r"^\[Tool result: ([^\n|]+) \| status: ([a-z_]+)\]\n")
 _RESULT_END = "\n[End tool result. Continue the current user request from this result; do not restart from assumptions made before the tool call.]"
 # Model-facing notices the result envelope may add after the tool's own text.
 _RESULT_NOTICES = re.compile(r"(?:\n(?:Repeated call|Repeat limit|Result completeness): [^\n]*)+\Z")
