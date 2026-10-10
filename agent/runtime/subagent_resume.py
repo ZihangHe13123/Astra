@@ -91,14 +91,39 @@ def provider_messages(messages: list[dict], *, include_recovery_metadata: bool =
     ]
 
 
+# The tool ran, and what it left behind was not reported back: it was cut
+# off, it raised midway, or a check on its result failed.
+_UNREPORTED_OUTCOME_CODES = frozenset({
+    "overall_timeout", "execution_failed", "postcondition_failed", "sandbox_denied",
+})
+
+
 def tool_outcome_unknown(result: Any) -> bool:
-    """An error/timeout cannot prove a mutating operation had no effect."""
+    """Whether a mutating call may have taken effect without saying so.
+
+    A call that was cut off (timeout, crash, lost connection) or that marks
+    its own outcome unknown cannot prove it had no effect. A refusal before
+    the tool's code ran, a failure the tool itself reported, and a command
+    that ran to its own exit are known outcomes: the worker has the report
+    and can go on.
+    """
     if not isinstance(result, dict):
         return False
-    if result.get("error"):
-        return True
     encoded = json.dumps(result, default=str)
-    return "unknown_outcome" in encoded or "outcome_unknown" in encoded
+    if "unknown_outcome" in encoded or "outcome_unknown" in encoded:
+        return True
+    if not result.get("error"):
+        return False
+    if result.get("not_executed"):
+        return False
+    if result.get("partial"):
+        return True
+    execution = result.get("execution")
+    if isinstance(execution, dict):
+        return not (execution.get("status") == "completed" and type(execution.get("exit_code")) is int)
+    code = str(result.get("code") or result.get("error_type") or "")
+    # An error with no code never went through a tool's own failure report.
+    return not code or code in _UNREPORTED_OUTCOME_CODES or code.endswith(("timeout", "timed_out"))
 
 
 def restore_conversation(data: dict, identity: dict) -> tuple[list[dict], dict]:

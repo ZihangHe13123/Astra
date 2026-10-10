@@ -1036,6 +1036,7 @@ class ToolRegistry:
                 "error": f"Tool '{name}' not found",
                 "code": "invalid_arguments",
                 "error_type": "invalid_input",
+                "not_executed": True,
                 "recoverable": True,
                 "retryable": False,
                 "recovery_hint": (
@@ -1062,10 +1063,17 @@ class ToolRegistry:
                 "risk": tool.risk,
                 "code": "invalid_arguments",
                 "error_type": "invalid_input",
+                "not_executed": True,
                 "recoverable": True,
             }
 
+        # True once the tool's own function has been entered. A failure before
+        # that point is a refusal: nothing the tool does can have happened.
+        handler_started = False
+
         async def finalize(result: dict) -> dict:
+            if result.get("error") and not handler_started:
+                result["not_executed"] = True
             if tool.completion_finalizer is not None:
                 try:
                     completion = tool.completion_finalizer(
@@ -1369,7 +1377,9 @@ class ToolRegistry:
                         if "_task_id" in params:
                             call_args["_task_id"] = task_id
                         async def invoke_tool(bound_call_args: dict[str, Any] = call_args) -> Any:
+                            nonlocal handler_started
                             check_work_budget()
+                            handler_started = True
                             if asyncio.iscoroutinefunction(tool.fn):
                                 raw_result = await tool.fn(**bound_call_args)
                             else:
