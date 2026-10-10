@@ -8802,17 +8802,18 @@ def test_web_extract_returns_a_short_plain_body_when_nothing_else_read_the_url(m
         assert alone["output"] == "" and alone["code"] == "extract_failed"
         assert shell in alone["error"] and "JavaScript" in alone["error"]
 
-        # Under auto the backends in front and the search for a moved page still run first.
+        # Under auto the backends in front still run first, but a whole short
+        # answer is returned as it is: no search for another page replaces it.
         calls.clear()
         auto = await registry.execute("web_extract", {"urls": [health]})
         entry = json.loads(auto["output"])["results"][0]
         assert auto["error"] == ""
         assert entry["content"] == '{"status": "ok"}'
         assert entry["error"] is None
-        assert entry["fallback_from"] == ["firecrawl", "search"]
+        assert entry["fallback_from"] == ["firecrawl"]
         assert ("get", health) in calls
         assert any(kind == "post" for kind, _ in calls)
-        assert any(kind == "get" and "/search?" in url for kind, url in calls)
+        assert not any(kind == "get" and "/search?" in url for kind, url in calls)
 
     run(scenario())
 

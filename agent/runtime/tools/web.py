@@ -1731,6 +1731,29 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         for index, result in completed.items():
             results[index] = result
 
+        for index in list(pending):
+            url = pending[index]
+            plain_body = str(extract_notes.get(index, {}).get("plain_body") or "")
+            if plain_body and await _is_safe_public_url(url):
+                # What the http backend received is a whole short answer (JSON
+                # or plain text), not a page that needs rendering. Return it
+                # before search recovery could swap it for another page.
+                content, stored_path = _truncate_and_store(url, plain_body, max_chars)
+                plain_result = {
+                    "url": url,
+                    "title": "",
+                    "content": content,
+                    "backend": "http",
+                    "error": None,
+                    "fallback_from": [
+                        label for label in _fallback_labels(fallback_errors[index]) if label != "http"
+                    ],
+                }
+                if stored_path:
+                    plain_result["full_content_path"] = stored_path
+                results[index] = plain_result
+                del pending[index]
+
         # An automatic extraction may fail because a search result points at a
         # moved or stale page. Recover only after the complete provider chain
         # fails, and keep both the retry count and candidate provenance visible.
@@ -1785,25 +1808,6 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         retryable = False
         for index, url in pending.items():
             note = extract_notes.get(index, {})
-            plain_body = str(note.get("plain_body") or "")
-            if plain_body and await _is_safe_public_url(url):
-                # Nothing else read the URL, and what the http backend received
-                # is a whole short answer, not a page that needs rendering.
-                content, stored_path = _truncate_and_store(url, plain_body, max_chars)
-                plain_result = {
-                    "url": url,
-                    "title": "",
-                    "content": content,
-                    "backend": "http",
-                    "error": None,
-                    "fallback_from": [
-                        label for label in _fallback_labels(fallback_errors[index]) if label != "http"
-                    ],
-                }
-                if stored_path:
-                    plain_result["full_content_path"] = stored_path
-                results[index] = plain_result
-                continue
             retryable = retryable or bool(note.get("retryable"))
             results[index] = {
                 "url": url,
