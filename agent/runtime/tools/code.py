@@ -543,8 +543,20 @@ def register_code_tools(
                 task_id=task_id,
             )
         else:
+            async def keeping_output(on_output) -> dict:
+                try:
+                    return await factory(on_output)
+                except Exception as exc:
+                    # The sandbox failed after the run had written something:
+                    # the failure is reported after that output, not instead of it.
+                    if not process.output_chars:
+                        raise
+                    return processes.unfinished_result(
+                        process, f"[ExecutionFailed] {type(exc).__name__}: {exc}"
+                    )
+
             process = processes.start(
-                factory,
+                keeping_output,
                 kind=kind,
                 label=label[:240],
                 task_id=task_id,

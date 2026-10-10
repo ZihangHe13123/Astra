@@ -487,6 +487,150 @@ def test_cancelled_foreground_run_that_does_not_stop_in_time_stays_listed(
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("foreground_yield_ms", [0, 5_000])
+def test_sandbox_failure_after_output_keeps_what_the_run_had_written(foreground_yield_ms, tmp_path):
+    class FailingSandbox:
+        workdir = str(tmp_path)
+
+        async def execute_python_stream(self, code, on_output):
+            if code == "fails at once":
+                raise RuntimeError("did not start")
+            on_output("stdout", "partial-out\n")
+            on_output("stderr", "partial-err\n")
+            raise RuntimeError("sandbox broke")
+
+    async def run():
+        registry = ToolRegistry()
+        register_code_tools(registry, FailingSandbox())
+        result = await registry.execute(
+            "execute_python", {"code": "fails late", "foreground_yield_ms": foreground_yield_ms}
+        )
+        text = result["output"] + result["error"]
+        for expected in ("partial-out", "partial-err", "[ExecutionFailed] RuntimeError: sandbox broke"):
+            assert expected in text, expected
+        assert text.index("partial-err") < text.index("[ExecutionFailed]")
+        assert result["execution"] == {"status": "completed", "exit_code": -1}
+        context = ReActAgent._tool_result_context(
+            {**result, "name": "execute_python", "tool_output": result["output"]}
+        )
+        assert "status: success" not in context
+        # A failure before anything was written is reported as it was.
+        at_once = await registry.execute(
+            "execute_python", {"code": "fails at once", "foreground_yield_ms": foreground_yield_ms}
+        )
+        assert at_once["error"] == "[ToolError] RuntimeError: did not start"
+        assert json.loads((await registry.execute("process_list", {}))["output"]) == []
+    asyncio.run(run())
+
+
+def test_long_output_before_a_sandbox_failure_is_bounded_and_stays_readable(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent.runtime.tools.processes._UNFINISHED_OUTPUT_CHARS", 64, raising=False)
+
+    class FailingSandbox:
+        workdir = str(tmp_path)
+
+        async def execute_python_stream(self, code, on_output):
+            on_output("stdout", "begin-" + "x" * 200 + "-end")
+            raise RuntimeError("sandbox broke")
+
+    async def run():
+        registry = ToolRegistry(artifact_dir=tmp_path / "artifacts")
+        register_code_tools(registry, FailingSandbox())
+        result = await registry.execute("execute_python", {"code": "long", "foreground_yield_ms": 0})
+        text = result["output"]
+        assert "begin-" in text and "x" * 200 not in text
+        assert "[Output truncated: stdout exceeded 64 characters]" in text
+        assert "[ExecutionFailed] RuntimeError: sandbox broke" in text
+        handle = json.loads(text.split("[Read full output: ")[1].split("]")[0])
+        readback = await registry.execute(handle["tool"], handle["arguments"])
+        assert not readback["error"], readback
+        assert json.loads(readback["output"])["content"] == "begin-" + "x" * 200 + "-end"
+    asyncio.run(run())
+
+
+def test_supervisor_keeps_what_the_run_had_written_before_the_sandbox_failed(tmp_path, monkeypatch):
+    from agent.runtime import process_supervisor
+
+    class FailingSandbox:
+        async def execute_shell_stream(self, command, environment="auto", on_output=None):
+            on_output("stdout", "partial-out\n")
+            on_output("stderr", "partial-err\n")
+            raise RuntimeError("sandbox broke")
+
+    monkeypatch.setattr(process_supervisor, "_sandbox_from_spec", lambda _spec: FailingSandbox())
+    paths = {
+        name: str(tmp_path / f"run.{suffix}")
+        for name, suffix in (
+            ("manifest_path", "json"), ("output_path", "log"), ("stdout_path", "stdout.log"),
+            ("stderr_path", "stderr.log"), ("cancel_path", "cancel"),
+        )
+    }
+    spec_path = tmp_path / "run.spec.json"
+    spec_path.write_text(json.dumps({"kind": "shell", "command": "x", **paths}), encoding="utf-8")
+
+    assert asyncio.run(process_supervisor._run(spec_path)) == 1
+    with open(paths["manifest_path"], encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    assert manifest["status"] == "failed"
+    assert manifest["result"] == {
+        "output": "partial-out\n",
+        "exit_code": -1,
+        "error": "partial-err\n[ExecutionFailed] RuntimeError: sandbox broke",
+    }
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="kills the supervisor with a POSIX signal")
+def test_foreground_run_whose_supervisor_dies_returns_then_with_its_output(tmp_path):
+    """A dead supervisor that had not been reaped counted as alive until the yield expired."""
+    async def run():
+        registry = ToolRegistry()
+        sandbox = LocalSandbox(timeout=30, workdir=str(tmp_path))
+        register_code_tools(registry, sandbox)
+        code = (
+            "import os, time\n"
+            "open('run.pid', 'w').write(str(os.getpid()))\n"
+            "print('printed-before', flush=True)\n"
+            "time.sleep(20)\n"
+        )
+        call = asyncio.create_task(
+            registry.execute("execute_python", {"code": code, "foreground_yield_ms": 60_000})
+        )
+        loop = asyncio.get_running_loop()
+        try:
+            supervisor_pid = 0
+            deadline = loop.time() + 15
+            while not supervisor_pid and loop.time() < deadline:
+                await asyncio.sleep(0.05)
+                for path in (tmp_path / ".astra" / "processes").glob("*.json"):
+                    try:
+                        manifest = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        continue
+                    if manifest.get("stdout_chars"):
+                        supervisor_pid = int(manifest["supervisor_pid"])
+            assert supervisor_pid, "the supervised run did not publish its output"
+            # The supervisor was started by this test's own tool call.
+            os.kill(supervisor_pid, signal.SIGKILL)
+            killed = loop.time()
+            result = await asyncio.wait_for(call, timeout=10)
+            assert loop.time() - killed < 10
+            text = result["output"] + result["error"]
+            assert "printed-before" in text
+            assert "[Interrupted] Detached process owner exited" in text
+            assert result["execution"] == {"status": "interrupted", "exit_code": -1}
+        finally:
+            call.cancel()
+            pid_file = tmp_path / "run.pid"
+            if pid_file.exists():
+                # Its supervisor is gone, so nothing else stops this run.
+                try:
+                    os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                except (OSError, ValueError):
+                    pass
+            await sandbox.close()
+    asyncio.run(run())
+
+
 @pytest.mark.skipif(sys.platform == "win32", reason="the stand-in CLI is a POSIX script")
 def test_docker_run_stopped_at_the_limit_keeps_what_it_had_written(tmp_path):
     """DockerSandbox's own execution path, with a script standing in for the docker CLI.

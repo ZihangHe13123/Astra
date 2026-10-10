@@ -16,6 +16,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from agent.runtime.tools.processes import unfinished_result
 from agent.sandbox.docker import DockerSandbox
 from agent.sandbox.local import LocalSandbox
 
@@ -176,11 +177,13 @@ async def _run(spec_path: Path) -> int:
             }
             status = "cancelled"
         except Exception as exc:
-            result = {
-                "output": "",
-                "error": f"[ExecutionFailed] {type(exc).__name__}: {exc}",
-                "exit_code": -1,
-            }
+            # Keep what the run had written before the sandbox failed.
+            result = unfinished_result(
+                stdout_path,
+                stderr_path,
+                output_path,
+                f"[ExecutionFailed] {type(exc).__name__}: {exc}",
+            )
             status = "failed"
         else:
             status = (
