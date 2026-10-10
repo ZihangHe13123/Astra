@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from agent.runtime.hindsight_provider import HindsightMemoryProvider
@@ -248,8 +249,55 @@ def test_hindsight_recall_shows_a_memory_date_only_when_hindsight_has_one():
 
     dated, undated = result["output"].splitlines()[1:]
     assert dated == "1. [observation] (2026-03-04) Moved the NAS to the new rack"
-    # The provider stamps an undated memory with the time of the recall; that is not its date.
     assert undated == "2. [observation] Prefers short summaries"
+
+
+def test_hindsight_provider_keeps_an_undated_memory_undated():
+    def memory(identifier, occurred, mentioned):
+        return SimpleNamespace(id=identifier, text=f"memory {identifier}", type="observation",
+                               occurred_start=occurred, mentioned_at=mentioned, document_id="doc",
+                               metadata={}, tags=[])
+
+    client = FakeRecallClient([
+        memory("occurred", "2026-03-04T09:30:00Z", "2026-04-01T00:00:00Z"),
+        memory("mentioned", None, "2026-05-06T00:00:00+00:00"),
+        memory("undated", None, None),
+    ])
+    provider = HindsightMemoryProvider(base_url="http://127.0.0.1:8888", bank_id="main-v2", client=client)
+
+    records = {record.source_message_id: record for record in asyncio.run(provider.recall("setup"))}
+
+    def dates(record):
+        return {record.created_at, record.last_confirmed_at, record.valid_from}
+
+    assert dates(records["occurred"]) == {"2026-03-04T09:30:00Z"}
+    assert dates(records["mentioned"]) == {"2026-05-06T00:00:00+00:00"}
+    # The time of the recall used to be written here, which made every undated memory look new.
+    assert dates(records["undated"]) == {""}
+    assert records["undated"].to_dict()["created_at"] == ""
+
+
+def test_hindsight_recall_keeps_the_date_of_a_memory_dated_during_the_call():
+    class JustRecordedClient(FakeRecallClient):
+        stamp = ""
+
+        async def arecall(self, **kwargs):
+            self.stamp = datetime.now(timezone.utc).isoformat()
+            self.results = [SimpleNamespace(
+                id="fresh", text="Deployed build 41", type="observation", occurred_start=self.stamp,
+                mentioned_at=None, document_id="doc", metadata={}, tags=[],
+            )]
+            return await super().arecall(**kwargs)
+
+    client = JustRecordedClient()
+    provider = HindsightMemoryProvider(base_url="http://127.0.0.1:8888", bank_id="main-v2", client=client)
+    tools = ToolRegistry()
+    register_hindsight_tools(tools, provider)
+
+    result = asyncio.run(tools.execute("hindsight_recall", {"query": "deploy"}))
+
+    # A date inside the call's own start and end used to be taken for a missing one and dropped.
+    assert result["output"].splitlines()[1] == f"1. [observation] ({client.stamp[:10]}) Deployed build 41"
 
 
 def test_hindsight_failures_are_real_failures_and_a_retry_is_not_served_from_cache():

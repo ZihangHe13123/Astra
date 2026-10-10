@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 
 from ..hindsight_provider import HindsightMemoryProvider
 from ..tool_failure import ToolFailure
@@ -36,19 +36,12 @@ def _failure(operation: str, exc: Exception) -> ToolFailure:
     )
 
 
-def _record_date(created_at: str, started: datetime, finished: datetime) -> str:
-    """The record's own date, or "" when Hindsight had none.
-
-    The provider stamps a record without a date with the time of the recall
-    itself, so a timestamp inside this call is a placeholder, not a date.
-    """
+def _record_date(created_at: str) -> str:
+    """The record's own date, or "" when Hindsight had none or it cannot be read."""
     try:
-        moment = datetime.fromisoformat(str(created_at).strip().replace("Z", "+00:00"))
+        return datetime.fromisoformat(str(created_at).strip().replace("Z", "+00:00")).date().isoformat()
     except ValueError:
         return ""
-    if moment.tzinfo is not None and started <= moment <= finished:
-        return ""
-    return moment.date().isoformat()
 
 
 def register_hindsight_tools(
@@ -77,19 +70,17 @@ def register_hindsight_tools(
         return f"Hindsight stored non-authoritative memory in {record.metadata['document_id']}."
 
     async def hindsight_recall(query: str, limit: int = 5) -> str | ToolFailure:
-        started = datetime.now(timezone.utc)
         try:
             records = await provider.recall(query, limit=limit)
         except Exception as exc:
             return _failure("recall", exc)
-        finished = datetime.now(timezone.utc)
         if not records:
             return "No relevant Hindsight memories found."
         lines = [
             "Hindsight results (historical, non-authoritative; builtin current facts override conflicts):"
         ]
         for index, record in enumerate(records, 1):
-            date = _record_date(record.created_at, started, finished)
+            date = _record_date(record.created_at)
             lines.append(f"{index}. [{record.kind}]{f' ({date})' if date else ''} {record.content}")
         return "\n".join(lines)
 
