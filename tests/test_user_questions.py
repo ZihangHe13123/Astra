@@ -390,6 +390,8 @@ def test_question_tool_definition_has_interactive_contract():
     assert "only tool call" in description
     assert "may be repeated" in description
     assert "does not grant" in description
+    # A call beyond the limit is not run and ends the turn, so the limit is stated.
+    assert f"at most {definition.max_calls_per_turn} calls per turn" in description
 
 
 def test_broker_waits_for_matching_response():
@@ -733,6 +735,58 @@ def test_timed_question_refuses_required_input_and_tool_retains_pending_contract
         assert json.loads(result["output"])["state"] == "pending"
         broker.close("shutdown")
     asyncio.run(scenario())
+
+
+def test_pending_optional_question_blocks_the_next_call_and_says_when_that_ends():
+    async def scenario():
+        events = []
+        broker = UserQuestionBroker(events.append, available=lambda: True)
+        registry = ToolRegistry()
+        register_user_question_tools(registry, broker.ask)
+        ask = {"questions": sample_questions()}
+        pending = await registry.execute("ask_user_question", {**ask, "mode": "timed", "optional": True,
+                                                              "timeout_seconds": 0.01})
+        assert "another ask_user_question call fails" in json.loads(pending["output"])["message"]
+
+        blocked = await registry.execute("ask_user_question", ask)
+        assert blocked["code"] == "user_question_unavailable" and blocked["output"] == ""
+        assert "only one can be open at a time" in blocked["error"]
+        assert "answers or dismisses it" in blocked["error"]
+
+        # Dismissing the pending request is one of the ways it stops blocking.
+        request_id = json.loads(pending["output"])["request_id"]
+        assert broker.cancel(request_id, "dismissed") == (True, "")
+        answered = asyncio.create_task(registry.execute("ask_user_question", ask))
+        await asyncio.sleep(0.01)
+        current = [event for event in events if event["type"] == "user_question_request"][-1]["request_id"]
+        assert current != request_id
+        assert broker.resolve(current, {"answers": [{"id": "storage", "selected": ["Markdown"]}]})[0] is True
+        assert (await answered)["error"] == ""
+    asyncio.run(scenario())
+
+
+def test_question_text_over_its_limit_is_refused_instead_of_shown_cut():
+    asked = []
+
+    async def ask(questions):
+        asked.append(questions)
+        return {"answers": [{"id": "x", "selected": []}]}
+
+    registry = ToolRegistry()
+    register_user_question_tools(registry, ask)
+
+    def call(question):
+        return asyncio.run(registry.execute("ask_user_question", {"questions": [question]}))
+
+    # 1,000 characters, a space, then more: the cut used to fall on the space and pass unnoticed.
+    too_long = call({"id": "x", "question": "a" * 1000 + " and the part the user never saw"})
+    assert "question 1 text is 1,032 characters; the limit is 1,000" in too_long["error"]
+    long_label = call({"id": "x", "question": "Pick one", "options": [{"label": "b" * 121}, {"label": "c"}]})
+    assert "question 1 option 1 label is 121 characters; the limit is 120" in long_label["error"]
+    assert asked == []
+
+    exact = call({"id": "x", "question": "a" * 1000})
+    assert exact["error"] == "" and asked[0][0]["question"] == "a" * 1000
 
 
 def test_editing_holds_timed_question_and_answer_before_deadline_stays_synchronous():
