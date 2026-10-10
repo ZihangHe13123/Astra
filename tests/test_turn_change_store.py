@@ -1334,10 +1334,10 @@ def test_external_cancel_is_processed_during_cooperative_seal(
     async def scenario():
         task = asyncio.current_task()
         assert task is not None
-        start = time.monotonic()
+        start = time.perf_counter()
 
         def request_cancel() -> None:
-            observed["cancel_callback_ms"] = (time.monotonic() - start) * 1000.0
+            observed["cancel_callback_ms"] = (time.perf_counter() - start) * 1000.0
             task.cancel()
 
         asyncio.get_running_loop().call_later(0.01, request_cancel)
@@ -1346,7 +1346,7 @@ def test_external_cancel_is_processed_during_cooperative_seal(
         except asyncio.CancelledError:
             # 收尾完成后取消语义继续传播（review G2）
             observed["cancel_propagated"] = True
-        observed["seal_return_ms"] = (time.monotonic() - start) * 1000.0
+        observed["seal_return_ms"] = (time.perf_counter() - start) * 1000.0
         await asyncio.sleep(0)
         return subject.take_stopped_manifest()
 
@@ -1364,6 +1364,7 @@ def test_external_cancel_is_processed_during_cooperative_seal(
     assert all(change.after_state == store.SIDE_UNCAPTURED for change in manifest.unknown)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory-handle semantics")
 def test_after_read_refuses_a_parent_swap_between_check_and_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1404,6 +1405,7 @@ def test_after_read_refuses_a_parent_swap_between_check_and_open(
     assert subject.load_sides(0, "sub/note.txt").after is None
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory-handle semantics")
 def test_snapshot_write_refuses_a_storage_swap_between_check_and_write(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2116,12 +2118,17 @@ def test_locked_turn_eviction_stops_instead_of_looping(tmp_path: Path) -> None:
         root = Path(sys.argv[1])
         calls = 0
 
-        def failing_remove(parent_fd, name):
+        def failing_remove(*_args, **_kwargs):
             global calls
             calls += 1
             raise PermissionError("simulated locked snapshot directory")
 
-        tcs._remove_tree_at = failing_remove
+        # A turn area is removed through a directory handle where the platform
+        # has them and by path elsewhere: fail the one this platform uses.
+        if tcs._HANDLE_IO_OK:
+            tcs._remove_tree_at = failing_remove
+        else:
+            tcs.shutil.rmtree = failing_remove
 
         store = tcs.TurnChangeStore(
             root, "review", root=root / "ledger",
