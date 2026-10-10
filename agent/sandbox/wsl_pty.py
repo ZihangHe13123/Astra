@@ -18,6 +18,12 @@ _SHELL_RESET_MESSAGE = (
     "The persistent bash shell was reset; the next bash call starts from "
     "the workspace with a fresh current directory and environment."
 )
+_CANCEL_RESET_MESSAGE = (
+    "[An earlier bash command was cancelled and the persistent bash shell was "
+    "reset with it: this command ran from the workspace with a fresh current "
+    "directory and environment.]"
+)
+_STARTUP_TIMEOUT_SECONDS = 10
 
 
 class PersistentWslShell:
@@ -48,6 +54,8 @@ class PersistentWslShell:
         self._lock = asyncio.Lock()
         self._closed = False
         self._output_truncated = False
+        # A cancelled call returns nothing, so the next result reports its reset.
+        self._cancel_reset_unreported = False
 
     def _creation_kwargs(self) -> dict:
         if sys.platform == "win32":
@@ -76,7 +84,14 @@ class PersistentWslShell:
         )
         try:
             startup = self._read_until_marker(marker)
-            _, status = await asyncio.wait_for(startup, timeout=10)
+            _, status = await asyncio.wait_for(startup, timeout=_STARTUP_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            await self._terminate_locked()
+            # Not the command's time limit: the command was never sent.
+            raise RuntimeError(
+                f"persistent bash shell did not start within {_STARTUP_TIMEOUT_SECONDS}s; "
+                "the command was not run"
+            ) from None
         except BaseException:
             await self._terminate_locked()
             raise
@@ -101,13 +116,20 @@ class PersistentWslShell:
         process.stdin.write(script.encode("utf-8"))
         await process.stdin.drain()
 
-    async def _read_until_marker(self, marker: str) -> tuple[bytes, int]:
+    async def _read_until_marker(
+        self,
+        marker: str,
+        unfinished: list[bytearray] | None = None,
+    ) -> tuple[bytes, int]:
+        """Read up to the marker line. A caller-owned ``unfinished`` keeps what was read if this is cancelled."""
         process = self._process
         if process is None or process.stdout is None:
             raise RuntimeError("persistent bash shell is not running")
         marker_bytes = marker.encode("ascii")
         pending = bytearray(self._pending)
         output = bytearray()
+        if unfinished is not None:
+            unfinished[:] = [output, pending]
         while True:
             search_start = 0
             while True:
@@ -146,6 +168,20 @@ class PersistentWslShell:
                 output.extend(pending[:overflow])
                 del pending[:overflow]
 
+    def _render_output(self, raw: bytes) -> str:
+        """Clean what a command wrote; say when it was cut at the output limit or ran after a cancel's reset."""
+        output = self._clean_output(raw)
+        if self._output_truncated:
+            suffix = (
+                f"[Output truncated: persistent bash output exceeded "
+                f"{self._max_output_bytes} bytes]"
+            )
+            output = f"{output}\n{suffix}" if output else suffix
+        if self._cancel_reset_unreported:
+            self._cancel_reset_unreported = False
+            output = f"{_CANCEL_RESET_MESSAGE}\n{output}" if output else _CANCEL_RESET_MESSAGE
+        return output
+
     async def _terminate_locked(self) -> None:
         process = self._process
         self._process = None
@@ -177,6 +213,8 @@ class PersistentWslShell:
         process = self._process
         self._process = None
         self._pending = b""
+        # This reset is the caller's own; an earlier cancelled command no longer matters.
+        self._cancel_reset_unreported = False
         if process is None:
             return
         if process.stdin is not None:
@@ -208,29 +246,24 @@ class PersistentWslShell:
         if not command.strip():
             raise ValueError("command must be a non-empty string")
         async with self._lock:
+            unfinished: list[bytearray] = []
+            marker = self._marker()
             try:
                 if self._process is None or self._process.returncode is not None:
                     await self._spawn()
                 self._output_truncated = False
-                marker = self._marker()
                 encoded = base64.b64encode(command.encode("utf-8")).decode("ascii")
                 await self._write(
                     f"__astra_cmd=$(printf %s {encoded} | base64 -d); "
                     f"eval \"$__astra_cmd\"; __astra_status=$?; "
                     f"printf '\\n{marker}%s\\n' \"$__astra_status\"\n"
                 )
-                reader = self._read_until_marker(marker)
+                reader = self._read_until_marker(marker, unfinished)
                 if self._timeout is None:
                     raw_output, exit_code = await reader
                 else:
                     raw_output, exit_code = await asyncio.wait_for(reader, timeout=self._timeout)
-                output = self._clean_output(raw_output)
-                if self._output_truncated:
-                    suffix = (
-                        f"[Output truncated: persistent bash output exceeded "
-                        f"{self._max_output_bytes} bytes]"
-                    )
-                    output = f"{output}\n{suffix}" if output else suffix
+                output = self._render_output(raw_output)
                 if on_output is not None and output:
                     on_output("stdout", output)
                 return {
@@ -242,20 +275,36 @@ class PersistentWslShell:
                 }
             except asyncio.TimeoutError:
                 await self._terminate_locked()
+                # Keep what the command wrote before the limit, cleaned and bounded like a finished one.
+                raw_output = b"".join(unfinished).split(marker.encode("ascii"), 1)[0]
+                if len(raw_output) > self._max_output_bytes:
+                    self._output_truncated = True
+                    raw_output = raw_output[:self._max_output_bytes]
+                output = self._render_output(raw_output)
+                if on_output is not None and output:
+                    on_output("stdout", output)
+                notice = f"[Timeout] Execution exceeded {self._timeout}s; persistent bash shell was reset"
+                if self._environment != "wsl":
+                    # Killing the PTY owner hangs up the shell and its jobs.
+                    notice += " and its command hung up (a process that ignores the hangup keeps running)"
                 return {
-                    "output": "",
-                    "error": f"[Timeout] Execution exceeded {self._timeout}s; persistent bash shell was reset",
+                    "output": output,
+                    "error": notice,
                     "exit_code": -1,
+                    "timed_out": True,
                     "environment": self._environment,
                     "persistent": True,
                     "shell_reset": True,
                 }
             except asyncio.CancelledError:
+                self._cancel_reset_unreported = True
                 await self._terminate_locked()
                 raise
             except RuntimeError as exc:
                 await self._terminate_locked()
                 if "exited before returning its result marker" in str(exc):
+                    # This result announces a reset itself.
+                    self._cancel_reset_unreported = False
                     return {
                         "output": f"{exc}\n{_SHELL_RESET_MESSAGE}",
                         "error": "",

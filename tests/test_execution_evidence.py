@@ -7,9 +7,11 @@ import shlex
 import signal
 import subprocess
 import sys
+import time
 
 import pytest
 
+from agent.core.msg import ContentBlock, Msg
 from agent.runtime.coding_contracts import append_check, new_contract
 from agent.runtime.react import ReActAgent
 from agent.runtime.task_store import TaskStore, format_task_detail
@@ -133,7 +135,9 @@ def test_python_run_stopped_at_the_sandbox_limit_is_marked_partial(tmp_path):
             # A shell run reports the stop as a failure; that failure is partial too.
             shell = await registry.execute(
                 "execute_shell",
-                {"command": "echo shell-before; sleep 8", "foreground_yield_ms": 0},
+                {"command": _python_command(
+                    "import time; print('shell-before', flush=True); time.sleep(8)"
+                ), "foreground_yield_ms": 0},
             )
             assert shell["partial"] is True
             shell_context = ReActAgent._tool_result_context(
@@ -171,31 +175,144 @@ def test_stopped_run_output_is_bounded_and_readable_like_a_finished_one(tmp_path
     asyncio.run(run())
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="native Bash integration")
-def test_stopped_run_returns_without_waiting_for_a_descendant_that_keeps_the_pipes(tmp_path):
-    """Only the shell is killed at the limit; a child it started may live on and hold stdout."""
+def _late_writer(started, late, delay: float) -> str:
+    """Python source of a child that records when it started and, unless it is stopped first, writes a file later."""
+    return (
+        "import time; "
+        f"open({str(started)!r}, 'w').write(str(time.time())); "
+        "print('child-before', flush=True); "
+        f"time.sleep({delay}); open({str(late)!r}, 'w').write('late')"
+    )
+
+
+async def _child_started(started, within: float = 15.0) -> float:
+    """Wait for the child of ``_late_writer`` and return the time it started at."""
+    deadline = time.monotonic() + within
+    while time.monotonic() < deadline:
+        try:
+            return float(started.read_text())
+        except (OSError, ValueError):
+            await asyncio.sleep(0.02)
+    raise AssertionError("the child process did not start")
+
+
+async def _until(moment: float) -> None:
+    await asyncio.sleep(max(0.0, moment - time.time()))
+
+
+_POSIX_GROUPS = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="POSIX process groups; the Windows tree kill is not exercised by this test",
+)
+
+
+@_POSIX_GROUPS
+@pytest.mark.parametrize("tool", ["execute_shell", "execute_python"])
+def test_run_stopped_at_the_sandbox_limit_stops_the_processes_it_started(tool, tmp_path):
+    """The limit used to kill only the run's own process: a child lived on and kept writing."""
     async def run():
-        sandbox = LocalSandbox(timeout=1, workdir=str(tmp_path))
+        registry = ToolRegistry()
+        sandbox = LocalSandbox(timeout=_LIMIT, workdir=str(tmp_path))
+        register_code_tools(registry, sandbox)
+        started, late = tmp_path / "started", tmp_path / "late"
+        # Later than the limit, so only a child that outlived the stop writes it.
+        delay = _LIMIT + 0.6
+        child = _late_writer(started, late, delay)
+        if tool == "execute_shell":
+            args = {"command": f"echo shell-before; {_python_command(child)}; echo shell-after"}
+        else:
+            args = {"code": (
+                "import subprocess, sys, time\n"
+                f"subprocess.Popen([sys.executable, '-c', {child!r}])\n"
+                "time.sleep(30)"
+            )}
+        try:
+            result = await registry.execute(tool, {**args, "foreground_yield_ms": 0})
+            assert result["execution"] == {"status": "timed_out", "exit_code": -1}
+            text = result["output"] + result["error"]
+            assert "child-before" in text and "shell-after" not in text
+            assert "still holds its output" not in text
+            began = float(started.read_text())
+            await _until(began + delay + 0.6)
+            assert not late.exists()
+        finally:
+            await sandbox.close()
+    asyncio.run(run())
+
+
+def test_only_a_process_the_sandbox_really_spawned_has_its_tree_signalled(monkeypatch):
+    """The pid of a stand-in (as tests pass in) names nothing the sandbox created: only the object is killed."""
+    killed, signalled = [], []
+
+    class StandIn:
+        pid = 4242
+        returncode = None
+        stdin = None
+
+        def __init__(self):
+            self.stdout, self.stderr = asyncio.StreamReader(), asyncio.StreamReader()
+            self._ended = asyncio.Event()
+
+        def kill(self):
+            killed.append(self.pid)
+            self.returncode = -9
+            self.stdout.feed_eof()
+            self.stderr.feed_eof()
+            self._ended.set()
+
+        async def wait(self):
+            await self._ended.wait()
+            return self.returncode
+
+    async def spawn(*_args, **_kwargs):
+        return StandIn()
+
+    monkeypatch.setattr("agent.sandbox.local.asyncio.create_subprocess_exec", spawn)
+    monkeypatch.setattr("agent.sandbox.local.asyncio.create_subprocess_shell", spawn)
+    if hasattr(os, "killpg"):
+        # Would the group be signalled, it would look like one the pid leads.
+        monkeypatch.setattr("agent.sandbox.local.os.getpgid", lambda pid: pid)
+        monkeypatch.setattr("agent.sandbox.local.os.killpg", lambda pid, _signal: signalled.append(pid))
+
+    result = asyncio.run(LocalSandbox(timeout=0.05).execute_shell_stream("sleep 5"))
+
+    assert result["timed_out"] is True
+    assert killed == [4242]
+    assert signalled == []
+
+
+@_POSIX_GROUPS
+def test_stopped_run_returns_without_waiting_for_a_process_that_left_its_group(tmp_path):
+    """A process in a session of its own is out of the stop's reach and may hold stdout; the result says so."""
+    async def run():
+        sandbox = LocalSandbox(timeout=_LIMIT, workdir=str(tmp_path))
         child = (
             "import os, time; print('child-before', flush=True); "
             "open('child.pid', 'w').write(str(os.getpid())); time.sleep(12)"
+        )
+        launcher = (
+            "import subprocess, sys; "
+            f"subprocess.Popen([sys.executable, '-c', {child!r}], start_new_session=True)"
         )
         streamed: list[str] = []
         loop = asyncio.get_running_loop()
         started = loop.time()
         try:
             result = await sandbox.execute_shell_stream(
-                f"echo shell-before; {_python_command(child)}; echo shell-after",
+                f"echo shell-before; {_python_command(launcher)}; sleep 12; echo shell-after",
                 on_output=lambda _stream, text: streamed.append(text),
             )
             elapsed = loop.time() - started
             assert result["exit_code"] == -1 and result["timed_out"] is True
-            assert result["error"] == "[Timeout] Execution exceeded 1s"
+            assert result["error"] == (
+                f"[Timeout] Execution exceeded {_LIMIT}s; a process the run started still holds "
+                "its output and may still be running"
+            )
             assert "shell-before" in result["output"] and "child-before" in result["output"]
             assert "shell-after" not in result["output"]
             assert "".join(streamed) == result["output"]
             # The child sleeps for 12s; waiting for its pipes to close would take that long.
-            assert elapsed < 6, elapsed
+            assert elapsed < _LIMIT + 5, elapsed
         finally:
             pid_file = tmp_path / "child.pid"
             if pid_file.exists():
@@ -205,6 +322,313 @@ def test_stopped_run_returns_without_waiting_for_a_descendant_that_keeps_the_pip
                     pass
             # Let the closed pipes be seen before the loop goes away.
             await asyncio.sleep(0.2)
+            await sandbox.close()
+    asyncio.run(run())
+
+
+@_POSIX_GROUPS
+@pytest.mark.parametrize("foreground_yield_ms", [0, 20_000])
+def test_cancelling_a_foreground_call_stops_its_run_and_what_it_started(
+    foreground_yield_ms, tmp_path, monkeypatch,
+):
+    """0 runs in this process, a positive yield under a detached supervisor: neither outlives the call."""
+    # Only an upper bound: the wait ends as soon as the run has stopped.
+    monkeypatch.setattr(
+        "agent.runtime.tools.processes._ABANDONED_STOP_WAIT_SECONDS", 15.0, raising=False,
+    )
+
+    async def run():
+        registry = ToolRegistry()
+        sandbox = LocalSandbox(timeout=30, workdir=str(tmp_path))
+        register_code_tools(registry, sandbox)
+        started, late = tmp_path / "started", tmp_path / "late"
+        child = _late_writer(started, late, delay=1.0)
+        call = asyncio.create_task(registry.execute("execute_shell", {
+            "command": f"echo shell-before; {_python_command(child)}; echo shell-after",
+            "foreground_yield_ms": foreground_yield_ms,
+        }))
+        try:
+            began = await _child_started(started)
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+            await _until(began + 1.0 + 0.6)
+            assert not late.exists()
+            # Nothing is left behind, listed or not.
+            assert json.loads((await registry.execute("process_list", {}))["output"]) == []
+            assert not list((tmp_path / ".astra" / "processes").glob("*.json"))
+        finally:
+            call.cancel()
+            await sandbox.close()
+    asyncio.run(run())
+
+
+@_POSIX_GROUPS
+def test_stopping_the_turn_stops_the_foreground_run_of_its_tool_call(tmp_path, monkeypatch):
+    """The same through the agent loop: the model's call is waiting on its run when the turn is stopped."""
+    monkeypatch.setattr(
+        "agent.runtime.tools.processes._ABANDONED_STOP_WAIT_SECONDS", 15.0, raising=False,
+    )
+    started, late = tmp_path / "started", tmp_path / "late"
+    command = f"echo shell-before; {_python_command(_late_writer(started, late, delay=1.0))}; echo shell-after"
+
+    class OneShellCall:
+        class config:
+            model = "test-model"
+            capabilities = frozenset()
+
+        async def chat_stream(self, messages, tools):
+            yield {
+                "type": "tool_calls",
+                "calls": [{
+                    "id": "call-1",
+                    "name": "execute_shell",
+                    "arguments": json.dumps({"command": command, "foreground_yield_ms": 20_000}),
+                }],
+                "content": "", "reasoning_content": "", "finish_reason": "tool_calls", "usage": None,
+            }
+
+    async def run():
+        registry = ToolRegistry()
+        sandbox = LocalSandbox(timeout=30, workdir=str(tmp_path))
+        register_code_tools(registry, sandbox)
+        agent = ReActAgent("agent", OneShellCall(), registry, max_iterations=1)
+        events = []
+
+        async def consume():
+            async for event in agent.reply_stream(Msg(content=[ContentBlock.text("start")])):
+                events.append(event)
+
+        turn = asyncio.create_task(consume())
+        try:
+            began = await _child_started(started)
+            turn.cancel()
+            await asyncio.wait_for(turn, timeout=30)
+            assert sum(event.get("code") == "cancelled" for event in events) == 1
+            await _until(began + 1.0 + 0.6)
+            assert not late.exists()
+            assert json.loads((await registry.execute("process_list", {}))["output"]) == []
+        finally:
+            turn.cancel()
+            await sandbox.close()
+    asyncio.run(run())
+
+
+@_POSIX_GROUPS
+def test_process_cancel_stops_what_a_background_run_started(tmp_path):
+    async def run():
+        registry = ToolRegistry()
+        sandbox = LocalSandbox(timeout=30, workdir=str(tmp_path))
+        manager = register_code_tools(registry, sandbox)
+        started, late = tmp_path / "started", tmp_path / "late"
+        child = _late_writer(started, late, delay=1.0)
+        launched = await registry.execute("execute_shell", {
+            "command": f"echo shell-before; {_python_command(child)}; echo shell-after",
+            "background": True,
+        })
+        pid = launched["execution"]["process_id"]
+        try:
+            began = await _child_started(started)
+            cancelled = await registry.execute("process_cancel", {"process_id": pid})
+            assert cancelled["execution"]["status"] == "cancelled"
+            await _until(began + 1.0 + 0.6)
+            assert not late.exists()
+        finally:
+            await manager.cancel(manager.get(pid))
+            await sandbox.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("stop_wait,cancel_again", [(0.05, False), (60.0, True)])
+def test_cancelled_foreground_run_that_does_not_stop_in_time_stays_listed(
+    stop_wait, cancel_again, tmp_path, monkeypatch,
+):
+    """The wait for the stop ends at its bound, or at once when the call is cancelled a second time."""
+    monkeypatch.setattr(
+        "agent.runtime.tools.processes._ABANDONED_STOP_WAIT_SECONDS", stop_wait, raising=False,
+    )
+
+    async def run():
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        class StubbornSandbox:
+            workdir = str(tmp_path)
+
+            async def execute_python_stream(self, code, on_output):
+                entered.set()
+                while not release.is_set():
+                    try:
+                        await release.wait()
+                    except asyncio.CancelledError:
+                        pass  # does not stop when asked
+                return {"output": "", "error": "", "exit_code": 0}
+
+        registry = ToolRegistry()
+        register_code_tools(registry, StubbornSandbox())
+        call = asyncio.create_task(
+            registry.execute("execute_python", {"code": "stubborn", "foreground_yield_ms": 0})
+        )
+        try:
+            await entered.wait()
+            call.cancel()
+            if cancel_again:
+                await asyncio.sleep(0.05)
+                assert not call.done()
+                call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(call, timeout=10)
+            listed = json.loads((await registry.execute("process_list", {}))["output"])
+            assert [item["status"] for item in listed] == ["running"]
+            release.set()
+            polled = await registry.execute(
+                "process_poll", {"process_id": listed[0]["process_id"], "wait_ms": 2000}
+            )
+            assert json.loads(polled["output"])["status"] == "completed"
+        finally:
+            release.set()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("foreground_yield_ms", [0, 5_000])
+def test_sandbox_failure_after_output_keeps_what_the_run_had_written(foreground_yield_ms, tmp_path):
+    class FailingSandbox:
+        workdir = str(tmp_path)
+
+        async def execute_python_stream(self, code, on_output):
+            if code == "fails at once":
+                raise RuntimeError("did not start")
+            on_output("stdout", "partial-out\n")
+            on_output("stderr", "partial-err\n")
+            raise RuntimeError("sandbox broke")
+
+    async def run():
+        registry = ToolRegistry()
+        register_code_tools(registry, FailingSandbox())
+        result = await registry.execute(
+            "execute_python", {"code": "fails late", "foreground_yield_ms": foreground_yield_ms}
+        )
+        text = result["output"] + result["error"]
+        for expected in ("partial-out", "partial-err", "[ExecutionFailed] RuntimeError: sandbox broke"):
+            assert expected in text, expected
+        assert text.index("partial-err") < text.index("[ExecutionFailed]")
+        assert result["execution"] == {"status": "completed", "exit_code": -1}
+        context = ReActAgent._tool_result_context(
+            {**result, "name": "execute_python", "tool_output": result["output"]}
+        )
+        assert "status: success" not in context
+        # A failure before anything was written is reported as it was.
+        at_once = await registry.execute(
+            "execute_python", {"code": "fails at once", "foreground_yield_ms": foreground_yield_ms}
+        )
+        assert at_once["error"] == "[ToolError] RuntimeError: did not start"
+        assert json.loads((await registry.execute("process_list", {}))["output"]) == []
+    asyncio.run(run())
+
+
+def test_long_output_before_a_sandbox_failure_is_bounded_and_stays_readable(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent.runtime.tools.processes._UNFINISHED_OUTPUT_CHARS", 64, raising=False)
+
+    class FailingSandbox:
+        workdir = str(tmp_path)
+
+        async def execute_python_stream(self, code, on_output):
+            on_output("stdout", "begin-" + "x" * 200 + "-end")
+            raise RuntimeError("sandbox broke")
+
+    async def run():
+        registry = ToolRegistry(artifact_dir=tmp_path / "artifacts")
+        register_code_tools(registry, FailingSandbox())
+        result = await registry.execute("execute_python", {"code": "long", "foreground_yield_ms": 0})
+        text = result["output"]
+        assert "begin-" in text and "x" * 200 not in text
+        assert "[Output truncated: stdout exceeded 64 characters]" in text
+        assert "[ExecutionFailed] RuntimeError: sandbox broke" in text
+        handle = json.loads(text.split("[Read full output: ")[1].split("]")[0])
+        readback = await registry.execute(handle["tool"], handle["arguments"])
+        assert not readback["error"], readback
+        assert json.loads(readback["output"])["content"] == "begin-" + "x" * 200 + "-end"
+    asyncio.run(run())
+
+
+def test_supervisor_keeps_what_the_run_had_written_before_the_sandbox_failed(tmp_path, monkeypatch):
+    from agent.runtime import process_supervisor
+
+    class FailingSandbox:
+        async def execute_shell_stream(self, command, environment="auto", on_output=None):
+            on_output("stdout", "partial-out\n")
+            on_output("stderr", "partial-err\n")
+            raise RuntimeError("sandbox broke")
+
+    monkeypatch.setattr(process_supervisor, "_sandbox_from_spec", lambda _spec: FailingSandbox())
+    paths = {
+        name: str(tmp_path / f"run.{suffix}")
+        for name, suffix in (
+            ("manifest_path", "json"), ("output_path", "log"), ("stdout_path", "stdout.log"),
+            ("stderr_path", "stderr.log"), ("cancel_path", "cancel"),
+        )
+    }
+    spec_path = tmp_path / "run.spec.json"
+    spec_path.write_text(json.dumps({"kind": "shell", "command": "x", **paths}), encoding="utf-8")
+
+    assert asyncio.run(process_supervisor._run(spec_path)) == 1
+    with open(paths["manifest_path"], encoding="utf-8") as handle:
+        manifest = json.load(handle)
+    assert manifest["status"] == "failed"
+    assert manifest["result"] == {
+        "output": "partial-out\n",
+        "exit_code": -1,
+        "error": "partial-err\n[ExecutionFailed] RuntimeError: sandbox broke",
+    }
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="kills the supervisor with a POSIX signal")
+def test_foreground_run_whose_supervisor_dies_returns_then_with_its_output(tmp_path):
+    """A dead supervisor that had not been reaped counted as alive until the yield expired."""
+    async def run():
+        registry = ToolRegistry()
+        sandbox = LocalSandbox(timeout=30, workdir=str(tmp_path))
+        register_code_tools(registry, sandbox)
+        code = (
+            "import os, time\n"
+            "open('run.pid', 'w').write(str(os.getpid()))\n"
+            "print('printed-before', flush=True)\n"
+            "time.sleep(20)\n"
+        )
+        call = asyncio.create_task(
+            registry.execute("execute_python", {"code": code, "foreground_yield_ms": 60_000})
+        )
+        loop = asyncio.get_running_loop()
+        try:
+            supervisor_pid = 0
+            deadline = loop.time() + 15
+            while not supervisor_pid and loop.time() < deadline:
+                await asyncio.sleep(0.05)
+                for path in (tmp_path / ".astra" / "processes").glob("*.json"):
+                    try:
+                        manifest = json.loads(path.read_text(encoding="utf-8"))
+                    except (OSError, ValueError):
+                        continue
+                    if manifest.get("stdout_chars"):
+                        supervisor_pid = int(manifest["supervisor_pid"])
+            assert supervisor_pid, "the supervised run did not publish its output"
+            # The supervisor was started by this test's own tool call.
+            os.kill(supervisor_pid, signal.SIGKILL)
+            killed = loop.time()
+            result = await asyncio.wait_for(call, timeout=10)
+            assert loop.time() - killed < 10
+            text = result["output"] + result["error"]
+            assert "printed-before" in text
+            assert "[Interrupted] Detached process owner exited" in text
+            assert result["execution"] == {"status": "interrupted", "exit_code": -1}
+        finally:
+            call.cancel()
+            pid_file = tmp_path / "run.pid"
+            if pid_file.exists():
+                # Its supervisor is gone, so nothing else stops this run.
+                try:
+                    os.kill(int(pid_file.read_text()), signal.SIGKILL)
+                except (OSError, ValueError):
+                    pass
             await sandbox.close()
     asyncio.run(run())
 
@@ -234,6 +658,48 @@ def test_docker_run_stopped_at_the_limit_keeps_what_it_had_written(tmp_path):
         assert result["error"].splitlines() == [
             "warned-before", f"[Timeout] Docker execution exceeded {_LIMIT}s",
         ]
+    asyncio.run(run())
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the stand-in CLI is a POSIX script")
+@pytest.mark.parametrize("stop", ["limit", "cancel"])
+def test_docker_one_shot_container_is_removed_when_its_run_is_stopped(stop, tmp_path):
+    """Killing the docker client leaves its container running. The stand-in records what it was asked to do."""
+    cli = tmp_path / "docker-stand-in"
+    log = tmp_path / "docker.log"
+    cli.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1 $2" = "image inspect" ]; then exit 0; fi\n'
+        f'if [ "$1 $2" = "rm -f" ]; then echo "rm $3" >> {shlex.quote(str(log))}; exit 0; fi\n'
+        'name=""; previous=""\n'
+        'for argument; do\n'
+        '  if [ "$previous" = "--name" ]; then name="$argument"; fi\n'
+        '  previous="$argument"\n'
+        "done\n"
+        f'echo "run $name" >> {shlex.quote(str(log))}\n'
+        'exec sh -c "$previous"\n',  # the last argument of `run ... sh -c <command>`
+        encoding="utf-8",
+    )
+    cli.chmod(0o755)
+
+    async def run():
+        sandbox = DockerSandbox(
+            timeout=1 if stop == "limit" else 30, workdir=str(tmp_path), docker_cmd=str(cli),
+        )
+        ready = asyncio.Event()
+        call = asyncio.create_task(sandbox.execute_shell_stream(
+            "echo ready; exec sleep 20", on_output=lambda _stream, _text: ready.set(),
+        ))
+        if stop == "limit":
+            assert (await call)["timed_out"] is True
+        else:
+            await asyncio.wait_for(ready.wait(), timeout=15)
+            call.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await call
+        started, removed = log.read_text(encoding="utf-8").split("\n")[:2]
+        assert started.startswith("run agent-sandbox-run-")
+        assert removed == "rm " + started.removeprefix("run ")
     asyncio.run(run())
 
 

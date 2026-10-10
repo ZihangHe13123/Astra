@@ -19,7 +19,9 @@ the whole conversation again (live 2026-09-24: one tool round written per step i
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -34,6 +36,8 @@ from .llm import LLMIdleTimeout, LLMResponseError, _messages_for_capabilities
 from .token_estimator import estimate_messages_tokens
 from .tool_preparation import with_tool_preparation
 
+logger = logging.getLogger(__name__)
+
 BASE_URL = "claude-code://local"
 COMMAND_ENV = "ASTRA_CLAUDE_CODE_COMMAND"
 # Aliases the CLI resolves to the newest model the signed-in account can use, with their context
@@ -45,7 +49,15 @@ BRIDGE = str(Path(__file__).with_name("claude_code_tool_bridge.py"))
 BRIDGE_NAME = "astra"
 TOOL_PREFIX = f"mcp__{BRIDGE_NAME}__"
 # Claude accepts tool names up to 64 characters, and the bridge prefix counts.
-TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,%d}" % (64 - len(TOOL_PREFIX)))
+NAME_LIMIT = 64 - len(TOOL_PREFIX)
+TOOL_NAME = re.compile(r"[A-Za-z0-9_-]{1,%d}" % NAME_LIMIT)
+# Claude Code shortens an MCP tool description longer than this before Claude reads it (2,048
+# characters as reported for current CLIs, more in newer ones). Astra sends descriptions whole.
+DESCRIPTION_LIMIT = 2048
+# The first line ReActAgent puts on each tool result it stores: the tool and how the call went.
+RESULT_HEADER = re.compile(r"\[Tool result: [^\n|]+ \| status: ([a-z_]+)\]\n")
+# What the runtime stores, without that line, for a call it refused to run before ending the turn.
+NOT_RUN = ("[ToolCircuitOpen] ", "[ToolBudgetExhausted] ")
 # Dropped from the CLI's environment: anything that would move billing, routing or model aliases
 # away from the signed-in subscription (a provider switcher sets ANTHROPIC_DEFAULT_*_MODEL[_NAME]),
 # and whatever a parent Claude Code session or the user's shell set for their own sessions
@@ -214,8 +226,31 @@ def system_prompt(messages: list[dict], tools: list[dict] | None) -> str:
     return "\n\n".join(s for s in sections if s.strip())
 
 
+def bridge_name(name: str) -> str:
+    """The name Claude knows an Astra tool by, without the bridge prefix. A name Claude cannot
+    accept (too long once prefixed, or with other characters) gets an alias made from the name
+    alone, so the tool list and every replay of a call show the same one: the name's start and
+    end around a digest of all of it."""
+    if TOOL_NAME.fullmatch(name):
+        return name
+    digest = hashlib.sha256(name.encode("utf-8", "surrogatepass")).hexdigest()[:8]
+    clean = re.sub(r"[^A-Za-z0-9_-]", "_", name)
+    room = NAME_LIMIT - len(digest) - 1
+    if len(clean) <= room:
+        return f"{clean}_{digest}"
+    head = (room - 1) // 2
+    return f"{clean[:head]}_{digest}_{clean[len(clean) - (room - 1 - head):]}"
+
+
+def _astra_name(raw: str, aliases: dict[str, str] | None) -> str:
+    """Astra's name for a tool as Claude called it: the bridge prefix removed and an alias undone."""
+    name = raw[len(TOOL_PREFIX):] if raw.startswith(TOOL_PREFIX) else raw
+    return (aliases or {}).get(name, name)
+
+
 def tool_choice_note(tool_choice) -> str:
     forced = tool_choice.get("function", {}).get("name") if isinstance(tool_choice, dict) else None
+    forced = bridge_name(forced) if isinstance(forced, str) and forced else forced
     return (f"You must call `{forced}` now." if forced else
             "Do not call any tool now." if tool_choice == "none" else
             "You must call at least one tool now." if tool_choice == "required" else "")
@@ -229,7 +264,7 @@ def _call_text(call: dict) -> dict:
     function = call.get("function") or {}
     name = str(function.get("name", ""))
     # The same name Claude sees in its tool list, so it does not copy a different form.
-    native = TOOL_PREFIX + name if TOOL_NAME.fullmatch(name) else name
+    native = TOOL_PREFIX + bridge_name(name) if name else name
     return {"type": "text", "text": "[tool call " + json.dumps(
         {"id": call.get("id", ""), "name": native, "arguments": function.get("arguments", "{}")},
         ensure_ascii=False) + "]"}
@@ -257,6 +292,28 @@ def _tool_use_id(raw, used: set[str]) -> str:
     return candidate
 
 
+def _is_error(content) -> bool:
+    """Whether a stored tool result is a failed call. Read from its text alone, so a replay marks
+    it the same way every time. Of the statuses on the first line Astra writes, only `error` is a
+    failed call: `failed` (a command that exited non-zero), `timed_out`, `cancelled`, `running`
+    and the like are what a call that worked reports about a process, and they stay in the text.
+    A result without that line is a failure when it is a call the runtime refused to run, or a
+    worker's result (the registry's JSON) whose `error` is not empty."""
+    text = _text(content)
+    header = RESULT_HEADER.match(text)
+    if header:
+        return header[1] == "error"
+    if text.startswith(NOT_RUN):
+        return True
+    if not text.startswith("{"):
+        return False
+    try:
+        value, _ = json.JSONDecoder().raw_decode(text)
+    except ValueError:
+        return False
+    return isinstance(value, dict) and isinstance(value.get("error"), str) and bool(value["error"].strip())
+
+
 def conversation(messages: list[dict], names: frozenset[str]) -> list[tuple[str, list[dict]]] | None:
     """The conversation after the system prompt as alternating native turns, starting and ending
     with a user turn: tool results first in each user turn, then text, images and later system
@@ -277,10 +334,10 @@ def conversation(messages: list[dict], names: frozenset[str]) -> list[tuple[str,
             for call in message.get("tool_calls") or []:
                 function = call.get("function") or {}
                 name = str(function.get("name") or "")
-                if name in names and TOOL_NAME.fullmatch(name):
+                if name and name in names:
                     native = _tool_use_id(call.get("id"), used)
                     calls[str(call.get("id") or "")] = native
-                    blocks.append({"type": "tool_use", "id": native, "name": TOOL_PREFIX + name,
+                    blocks.append({"type": "tool_use", "id": native, "name": TOOL_PREFIX + bridge_name(name),
                                    "input": _tool_input(function.get("arguments"))})
                 else:
                     blocks.append(_call_text(call))
@@ -301,7 +358,11 @@ def conversation(messages: list[dict], names: frozenset[str]) -> list[tuple[str,
             content = _content_blocks(message.get("content")) or [{"type": "text", "text": "(no output)"}]
             native = pending.pop(call_id, None)
             if native is not None:
-                results.append({"type": "tool_result", "tool_use_id": native, "content": content})
+                # Marked only when the result is all text: whether Claude's API takes an image
+                # inside an error result is not established, and a refused request loses the step.
+                failed = _is_error(message.get("content")) and all(b["type"] == "text" for b in content)
+                results.append({"type": "tool_result", "tool_use_id": native,
+                                **({"is_error": True} if failed else {}), "content": content})
             else:
                 blocks.extend([{"type": "text", "text": f"[tool result for call {call_id}]"}, *content])
         elif role in {"system", "developer"}:
@@ -327,21 +388,66 @@ def conversation(messages: list[dict], names: frozenset[str]) -> list[tuple[str,
             if role == "user" else (role, blocks) for role, results, blocks in turns]
 
 
-def bridge_tools(tools: list[dict]) -> list[dict]:
-    """Astra's function tools as MCP tool definitions; names Claude cannot accept are left out."""
-    listed = []
-    for tool in tools:
-        function = tool.get("function") if isinstance(tool, dict) else None
-        if not isinstance(function, dict):
-            continue
+_reported: set[tuple[str, str]] = set()
+
+
+def _report(kind: str, name: str, message: str, *args, level: int = logging.WARNING) -> None:
+    """Log something about a bridged tool once per process: the same tools are bridged again on
+    every model call."""
+    if (kind, name) not in _reported:
+        _reported.add((kind, name))
+        logger.log(level, message, *args)
+
+
+def _bridged(tools: list[dict]) -> list[tuple[str, dict]]:
+    """Astra's function tools, each with its own name and its MCP definition, in the order given.
+
+    A name Claude cannot accept is shown under its alias. Parameters that are an object schema in
+    all but the missing `type` get it; any other schema that is not an object schema cannot be
+    listed as parameters, so the description says so and carries it as text. Nothing is shortened.
+    """
+    functions = [t["function"] for t in tools if isinstance(t, dict) and isinstance(t.get("function"), dict)]
+    plain = {f["name"] for f in functions if isinstance(f.get("name"), str) and TOOL_NAME.fullmatch(f["name"])}
+    aliased: set[str] = set()
+    listed: list[tuple[str, dict]] = []
+    for function in functions:
         name = function.get("name")
-        if not isinstance(name, str) or not TOOL_NAME.fullmatch(name):
+        if not isinstance(name, str) or not name:
+            _report("unnamed", "", "Claude Code bridge: a tool without a name is not shown to Claude")
             continue
+        shown = bridge_name(name)
+        if shown != name:
+            if shown in plain or shown in aliased:
+                _report("alias taken", name, "Claude Code bridge: tool %r is not shown to Claude: its name is not "
+                        "one Claude accepts and its alias %r is already another tool's name", name, shown)
+                continue
+            aliased.add(shown)
+            _report("alias", name, "Claude Code bridge: tool %r is shown to Claude as %r (Claude accepts "
+                    "letters, digits, _ and - up to %d characters)", name, shown, NAME_LIMIT, level=logging.INFO)
+        description = str(function.get("description") or "")
         schema = function.get("parameters")
-        if not isinstance(schema, dict) or schema.get("type") != "object":
+        if schema is None or schema == {}:
             schema = {"type": "object", "properties": {}}
-        listed.append({"name": name, "description": str(function.get("description") or ""), "inputSchema": schema})
+        elif isinstance(schema, dict) and "type" not in schema and isinstance(schema.get("properties"), dict):
+            schema = {"type": "object", **schema}
+        elif not isinstance(schema, dict) or schema.get("type") != "object":
+            _report("schema", name, "Claude Code bridge: the parameters of tool %r are not an object schema; "
+                    "Claude gets them as text in the description instead of as parameters", name)
+            description += ("\n\n" if description else "") + (
+                "[Astra: this tool's parameters are not listed here because their schema is not a JSON "
+                "object schema. The declared schema: "
+                + json.dumps(schema, ensure_ascii=False, sort_keys=True, default=str) + "]")
+            schema = {"type": "object", "properties": {}}
+        if len(description) > DESCRIPTION_LIMIT:
+            _report("description", name, "Claude Code bridge: the description of tool %r is %d characters; "
+                    "Claude Code may cut what is past %d", name, len(description), DESCRIPTION_LIMIT)
+        listed.append((name, {"name": shown, "description": description, "inputSchema": schema}))
     return listed
+
+
+def bridge_tools(tools: list[dict]) -> list[dict]:
+    """Astra's function tools as the MCP tool definitions Claude is shown."""
+    return [definition for _, definition in _bridged(tools)]
 
 
 def transcript(messages: list[dict]) -> list[dict]:
@@ -482,8 +588,11 @@ class ClaudeCodeProvider:
         command = self.command or claude_command()
         if command is None:
             raise ClaudeCodeError("Claude Code CLI not found. " + LOGIN_HINT)
-        listed = bridge_tools([t for t in tools or [] if isinstance(t, dict)])
-        names = frozenset(t["name"] for t in listed)
+        bridged = _bridged([t for t in tools or [] if isinstance(t, dict)])
+        listed = [definition for _, definition in bridged]
+        names = frozenset(name for name, _ in bridged)
+        # What Claude calls a tool whose own name it cannot accept, back to that name.
+        aliases = {definition["name"]: name for name, definition in bridged if definition["name"] != name}
         prepared = _messages_for_capabilities(messages, self.config.capabilities, names, self.config.vision_detail)
         turns, marked = self._turns(prepared, names, tool_choice_note(tool_choice) if listed else "")
         with tempfile.TemporaryDirectory(prefix="astra-claude-code-") as files:
@@ -501,7 +610,7 @@ class ClaudeCodeProvider:
                 await self._replay(process, lines, turns[:-1])
                 await self._send(process, lines, {"type": "user", "message": {"role": "user", "content": turns[-1][1]}})
                 process.stdin.close()
-                async for event in self._events(lines, marked):
+                async for event in self._events(lines, marked, aliases):
                     yield event
             finally:
                 _terminate(process)
@@ -565,7 +674,8 @@ class ClaudeCodeProvider:
             if MODEL_ID.fullmatch(model):
                 self.served_model = model
 
-    async def _events(self, lines: _Lines, marked: bool = False) -> AsyncGenerator[dict, None]:
+    async def _events(self, lines: _Lines, marked: bool = False,
+                      aliases: dict[str, str] | None = None) -> AsyncGenerator[dict, None]:
         loop = asyncio.get_running_loop()
         idle = float(getattr(self.config, "idle_timeout", 0) or 0) or 300.0
         overall = getattr(self.config, "overall_timeout", None)
@@ -598,9 +708,8 @@ class ClaudeCodeProvider:
                     block_index = partial.get("index")
                     if block.get("type") == "tool_use" and isinstance(block_index, int) and not isinstance(block_index, bool):
                         call_id = str(block.get("id") or "")
-                        raw_name = str(block.get("name") or "")
-                        name = raw_name[len(TOOL_PREFIX):] if raw_name.startswith(TOOL_PREFIX) else raw_name
-                        preview = {"index": next_preview_index, "call_id": call_id, "name": name}
+                        preview = {"index": next_preview_index, "call_id": call_id,
+                                   "name": _astra_name(str(block.get("name") or ""), aliases)}
                         next_preview_index += 1
                         preview_blocks[block_index] = preview
                         if call_id:
@@ -634,7 +743,7 @@ class ClaudeCodeProvider:
                     elif block.get("type") == "text" and block.get("text"):
                         content += str(block["text"])
                     elif block.get("type") == "tool_use":
-                        call = self._call(block)
+                        call = self._call(block, aliases)
                         calls.append(call)
                         index = preview_ids.get(call["id"])
                         if index is None:
@@ -655,7 +764,7 @@ class ClaudeCodeProvider:
                 return
 
     @staticmethod
-    def _call(block: dict) -> dict:
+    def _call(block: dict, aliases: dict[str, str] | None = None) -> dict:
         """A native call as Astra's call. Claude sometimes repeats the plain name it read in the
         transcript (live: execute_shell for mcp__astra__execute_shell); Astra's registry decides
         whether a name exists and answers an unknown one with a recoverable error, as for any model."""
@@ -664,7 +773,8 @@ class ClaudeCodeProvider:
         arguments = block.get("input")
         if not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", name) or not isinstance(arguments, dict) or not block.get("id"):
             raise LLMResponseError("invalid_tool_arguments", "Claude Code returned a malformed tool call.")
-        return {"id": str(block["id"]), "name": name, "arguments": json.dumps(arguments, ensure_ascii=False)}
+        return {"id": str(block["id"]), "name": (aliases or {}).get(name, name),
+                "arguments": json.dumps(arguments, ensure_ascii=False)}
 
     def _final(self, result: dict, content: str, calls: list[dict], reasoning: str, marked: bool = False) -> dict:
         # With tools the CLI stops at its one-turn limit right after the calls; that is the answer.

@@ -72,7 +72,7 @@ QQ 图片经公开 URL 检查与大小限制后下载，再作为原生多模态
 }
 ```
 
-工具名为 `mcp__<server>__<tool>`。`/mcp` 查看服务，`/doctor` 排查连接错误。支持 stdio 和 streamable HTTP，可分别停用服务；`${ENV_NAME}` 从环境解析凭据，避免将密钥存入 JSON。见[完整配置示例](../../config/mcp.example.json)。
+工具名为 `mcp__<server>__<tool>`；超过 64 个字符或会与别的工具重名时，改为以一段短哈希结尾。名字为空或参数 schema 不是对象的工具会被单独略过，服务器的其余工具照常可用。`/mcp` 查看服务并列出每个被改名或略过的工具及原因，`/doctor` 排查连接错误。支持 stdio 和 streamable HTTP，可分别停用服务；`${ENV_NAME}` 从环境解析凭据，避免将密钥存入 JSON。见[完整配置示例](../../config/mcp.example.json)。
 
 <a id="web-search"></a>
 

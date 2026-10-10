@@ -79,7 +79,7 @@ def test_search_text_missing_path_and_file_path_are_failures(tmp_path):
 def test_search_text_hits_can_be_passed_back_to_read_file(tmp_path):
     """Hits under a search subdirectory are printed relative to the workspace."""
     (tmp_path / "pkg" / "sub").mkdir(parents=True)
-    (tmp_path / "pkg" / "sub" / "m.py").write_text("needle = 1\n", encoding="utf-8")
+    (tmp_path / "pkg" / "sub" / "m.py").write_text("needle = 1\n", encoding="utf-8", newline="\n")
 
     reg = ToolRegistry()
     register_file_tools(reg, str(tmp_path))

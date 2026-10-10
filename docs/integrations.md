@@ -96,8 +96,11 @@ Install the `mcp` extra and create `.astra/mcp.json`:
 }
 ```
 
-MCP tools are exposed as `mcp__<server>__<tool>`. Use `/mcp` to inspect loaded
-servers and `/doctor` for connection failures.
+MCP tools are exposed as `mcp__<server>__<tool>`. A name over 64 characters, or
+one that several tools would share, ends in a short hash instead. A tool with an
+empty name or a schema that is not an object is left out while the server keeps
+its other tools. `/mcp` lists every renamed or skipped tool with the reason; use
+`/doctor` for connection failures.
 
 Both stdio and streamable HTTP transports are supported; servers can be disabled
 individually. `${ENV_NAME}` placeholders resolve environment variables without

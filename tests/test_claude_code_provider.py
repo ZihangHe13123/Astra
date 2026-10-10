@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import os
 import re
 import sys
@@ -15,6 +16,8 @@ from agent.runtime.claude_code_provider import ClaudeCodeError, ClaudeCodeProvid
 from agent.runtime.llm import LLMClient, LLMConfig, LLMIdleTimeout
 from agent.runtime.process_env import pid_alive
 from agent.runtime.providers import DEFAULT_PROVIDER_REGISTRY
+from agent.runtime.react import ReActAgent
+from agent.runtime.subagent_resume import UNKNOWN_RESULT
 
 FAKE_CLI = r'''
 import json, os, sys, time
@@ -66,8 +69,13 @@ if scenario == "hang":
     time.sleep(60)
 emit({"type": "assistant", "message": {"content": [{"type": "thinking", "thinking": "Need the file."}]}})
 denied = {"type": "user", "message": {"content": [{"type": "tool_result", "is_error": True, "content": "denied"}]}}
-if scenario in {"tools", "foreign"}:
-    name = "mcp__astra__read_file" if scenario == "tools" else "execute_shell"
+if scenario in {"tools", "foreign", "listed"}:
+    # "listed": the first tool of the list Claude was given, under the name that list shows.
+    name = ({"tools": "mcp__astra__read_file", "foreign": "execute_shell"}.get(scenario)
+            or "mcp__astra__" + record["tools"][0]["name"])
+    if scenario == "listed":
+        emit({"type": "stream_event", "event": {"type": "content_block_start", "index": 1,
+                                                 "content_block": {"type": "tool_use", "id": "toolu_1", "name": name}}})
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "Reading it."}]}})
     emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "toolu_1", "name": name,
                                                         "input": {"path": "a.txt"}}]}})
@@ -95,6 +103,8 @@ def fresh_provider_state(tmp_path, monkeypatch):
     monkeypatch.setattr(ClaudeCodeProvider, "replay", True)
     monkeypatch.setattr(ClaudeCodeProvider, "cache_marker", True)
     monkeypatch.setattr(ClaudeCodeProvider, "thinking_display", True)
+    # What the bridge has already logged in this process; each test starts with nothing logged.
+    monkeypatch.setattr(ccp, "_reported", set(), raising=False)
     workdir = tmp_path / "claude-code"
     workdir.mkdir()
     monkeypatch.setattr(ccp, "workspace", lambda: str(workdir))
@@ -203,7 +213,10 @@ def test_cli_runs_isolated_and_bills_only_the_signed_in_subscription(fake_cli, m
 
 def test_bridge_lists_astras_tools_and_never_runs_them(tmp_path):
     tools = ccp.bridge_tools([READ_FILE, {"type": "function", "function": {"name": "bad name!", "parameters": {}}}])
-    assert [t["name"] for t in tools] == ["read_file"]
+    plain, aliased = tools
+    assert plain["name"] == "read_file"
+    # A name with characters Claude does not accept is listed under one it does, not left out.
+    assert aliased["name"].startswith("bad_name_") and ccp.TOOL_NAME.fullmatch(aliased["name"])
     path = tmp_path / "tools.json"
     path.write_text(json.dumps(tools))
     requests = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2025-06-18"}},
@@ -546,3 +559,309 @@ def test_cli_that_rejects_thinking_display_is_retried_without_it(fake_cli, monke
     assert final["content"] == "Hello from Claude."
     assert "--thinking-display" not in json.loads(record.read_text())["argv"]
     assert ClaudeCodeProvider.thinking_display is False and ClaudeCodeProvider.replay is True
+
+
+def stored_result(content, call_id="toolu_1"):
+    """HISTORY with its one tool result replaced."""
+    return [*HISTORY[:3], {"role": "tool", "tool_call_id": call_id, "content": content}, *HISTORY[4:]]
+
+
+def replayed_result(content) -> dict:
+    turns = ccp.conversation(stored_result(content), frozenset({"read_file"}))
+    [block] = [b for b in turns[2][1] if b["type"] == "tool_result"]
+    return block
+
+
+FAILED_READ = {"name": "read_file", "tool_output": "", "error": "[ToolError] FileNotFoundError: a.txt",
+               "code": "execution_failed", "retryable": False, "recovery_hint": "List the directory first."}
+
+
+def test_a_failed_tool_result_is_replayed_as_an_error_with_the_same_bytes_every_time(fake_cli, monkeypatch):
+    """Astra reports a failed tool as an error with a code, a Retryable line and a Recovery line.
+    Claude got that as an ordinary result whose text happened to begin with a status; the block is
+    now marked the way Claude's own tools mark a failure. The mark is read from the stored text,
+    so a result is replayed with the same bytes on every later request and stays cached."""
+    command, record = fake_cli
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "text")
+    failure = ReActAgent._tool_result_context(FAILED_READ)
+    assert "Retryable: no" in failure and "Recovery: List the directory first." in failure
+
+    def sent() -> list[dict]:
+        collect(provider(command).chat_stream(stored_result(failure), [READ_FILE]))
+        return json.loads(record.read_text())["frames"]
+
+    frames = sent()
+    [block] = frames[2]["message"]["content"]
+    assert block["type"] == "tool_result" and block["tool_use_id"] == "toolu_1"
+    assert block["is_error"] is True
+    # Nothing of what the result says is changed or dropped.
+    assert block["content"] == [{"type": "text", "text": failure}]
+    assert sent() == frames
+    # What Claude first got, when this result was the newest turn, is what is replayed.
+    collect(provider(command).chat_stream(stored_result(failure)[:4], [READ_FILE]))
+    [first] = json.loads(record.read_text())["frames"][-1]["message"]["content"]
+    assert {**first, "cache_control": ccp.CACHE_MARKER} == block
+
+
+@pytest.mark.parametrize("event", [
+    {"name": "read_file", "tool_output": "alpha"},
+    # A command that ran and exited non-zero is a result of a call that worked.
+    {"name": "execute_shell", "tool_output": "[exit code: 1]", "execution": {"status": "completed", "exit_code": 1}},
+    {"name": "execute_shell", "tool_output": "partial", "partial": True,
+     "execution": {"status": "timed_out", "exit_code": None}},
+    {"name": "execute_shell", "tool_output": "", "execution": {"status": "cancelled", "exit_code": None}},
+    {"name": "execute_shell", "tool_output": "started", "execution": {"status": "running", "exit_code": None}},
+], ids=["success", "failed", "timed_out", "cancelled", "running"])
+def test_a_result_the_tool_returned_normally_is_not_marked_as_an_error(event):
+    content = ReActAgent._tool_result_context(event)
+    assert replayed_result(content) == {"type": "tool_result", "tool_use_id": "toolu_1",
+                                        "content": [{"type": "text", "text": content}]}
+
+
+@pytest.mark.parametrize("content", [
+    # Calls the runtime refused to run before it ended the turn.
+    "[ToolCircuitOpen] 检测到重复工具调用：read_file",
+    "[ToolBudgetExhausted] 工具 read_file 已达到本轮调用上限 3",
+    # A worker stores the registry's result as JSON; guidance may follow it.
+    json.dumps({"output": "", "error": "[ToolError] FileNotFoundError: a.txt", "code": "execution_failed"}),
+    json.dumps({"output": "", "error": "Tool 'read_file' not found"}) + "\n\nProject guidance for this path.",
+    UNKNOWN_RESULT,
+], ids=["circuit open", "budget exhausted", "worker failure", "worker failure with guidance", "unknown outcome"])
+def test_failures_stored_without_astras_result_header_are_marked_too(content):
+    block = replayed_result(content)
+    assert block["is_error"] is True and block["content"] == [{"type": "text", "text": content}]
+
+
+@pytest.mark.parametrize("content", [
+    json.dumps({"output": "alpha", "error": "", "duration_ms": 3, "risk": "read"}),
+    '{"error": "cut off before the closing brace',
+    "plain text that mentions [Tool result: read_file | status: error]\nlater on",
+    "",
+], ids=["worker success", "unreadable json", "header not first", "empty"])
+def test_other_stored_results_are_not_marked(content):
+    assert "is_error" not in replayed_result(content)
+
+
+def test_a_failed_result_with_an_image_keeps_both_and_stays_unmarked():
+    png = "data:image/png;base64,iVBORw0KGgo="
+    block = replayed_result([{"type": "text", "text": ReActAgent._tool_result_context(FAILED_READ)},
+                             {"type": "image_url", "image_url": {"url": png}}])
+    assert [b["type"] for b in block["content"]] == ["text", "image"] and "is_error" not in block
+
+
+LONG_NAME = "mcp__design-review-workspace-server__export_annotated_screenshots"
+LONG_TOOL = {"type": "function", "function": {
+    "name": LONG_NAME, "description": "Export screenshots.",
+    "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}
+
+
+def test_a_tool_name_claude_cannot_accept_is_offered_and_called_under_a_stable_alias(fake_cli, monkeypatch):
+    """A third-party MCP tool is `mcp__<server>__<tool>` in Astra and gets the bridge's own prefix
+    on top. Past 64 characters it was left out of Claude's tool list without a word. It is now
+    listed under an alias made from its name alone: Claude's call comes back as the real tool, and
+    a replayed call shows the alias the list shows, the same on every request."""
+    command, record = fake_cli
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "listed")
+    events = collect(provider(command).chat_stream(MESSAGES, [LONG_TOOL, READ_FILE]))
+    aliased, plain = json.loads(record.read_text())["tools"]
+    alias = aliased["name"]
+    assert plain["name"] == "read_file"
+    assert alias != LONG_NAME and ccp.TOOL_NAME.fullmatch(alias) and len(ccp.TOOL_PREFIX + alias) <= 64
+    assert (aliased["description"], aliased["inputSchema"]) == ("Export screenshots.", LONG_TOOL["function"]["parameters"])
+    # Claude calls the alias; Astra gets its own tool's name, while the call streams and at the end.
+    assert [c["name"] for c in events[-1]["calls"]] == [LONG_NAME, LONG_NAME]
+    previewed = {c["name"] for e in events if e["type"] == "tool_preparing" for c in e["calls"]}
+    assert previewed == {LONG_NAME}
+
+    history = [
+        *MESSAGES,
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "toolu_1", "type": "function", "function": {"name": LONG_NAME, "arguments": '{"path": "a.txt"}'}}]},
+        {"role": "tool", "tool_call_id": "toolu_1", "content": "exported"},
+        {"role": "assistant", "content": "Done."},
+        {"role": "user", "content": "Again?"},
+    ]
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "text")
+
+    def sent() -> tuple[list[dict], list[dict]]:
+        collect(provider(command).chat_stream(history, [LONG_TOOL, READ_FILE]))
+        seen = json.loads(record.read_text())
+        return seen["tools"], seen["frames"]
+
+    tools, frames = sent()
+    assert tools[0]["name"] == alias
+    assert frames[1]["message"]["content"] == [
+        {"type": "tool_use", "id": "toolu_1", "name": ccp.TOOL_PREFIX + alias, "input": {"path": "a.txt"}}]
+    assert frames[2]["message"]["content"][0]["tool_use_id"] == "toolu_1"
+    assert sent() == (tools, frames)
+    # The one-turn fallback and a forced choice name the tool the same way.
+    assert any(f'"name": "{ccp.TOOL_PREFIX + alias}"' in b.get("text", "") for b in ccp.transcript(history))
+    assert ccp.tool_choice_note({"type": "function", "function": {"name": LONG_NAME}}) == f"You must call `{alias}` now."
+    assert ccp.tool_choice_note({"type": "function", "function": {"name": "read_file"}}) == "You must call `read_file` now."
+
+
+def function_tool(name, description="", **extra):
+    return {"type": "function", "function": {"name": name, "description": description, **extra}}
+
+
+def warnings(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == ccp.logger.name and r.levelno >= logging.WARNING]
+
+
+def test_names_that_differ_only_where_an_alias_is_cut_stay_apart():
+    first, second = ("a" * 40 + middle + "b" * 40 for middle in ("1", "2"))
+    one, two = (t["name"] for t in ccp.bridge_tools([function_tool(first), function_tool(second)]))
+    assert one != two and ccp.TOOL_NAME.fullmatch(one) and ccp.TOOL_NAME.fullmatch(two)
+    assert ccp.ClaudeCodeProvider._call({"id": "t", "name": ccp.TOOL_PREFIX + two, "input": {}},
+                                        {one: first, two: second})["name"] == second
+
+
+def test_a_tool_that_cannot_be_listed_is_reported_by_name(caplog):
+    """An alias that is already another tool's name would make one name mean two tools, and a
+    tool without a name cannot be called at all: neither is listed, and the log says which."""
+    alias = ccp.bridge_name(LONG_NAME)
+    tools = [LONG_TOOL, function_tool(alias, "Holds the alias as its own name."),
+             {"type": "function", "function": {"description": "No name."}}]
+    with caplog.at_level(logging.WARNING, logger=ccp.logger.name):
+        listed = ccp.bridge_tools(tools)
+        ccp.bridge_tools(tools)
+    assert [(t["name"], t["description"]) for t in listed] == [(alias, "Holds the alias as its own name.")]
+    # Once per process, however often the same tools are bridged.
+    taken, unnamed = sorted(warnings(caplog), key=lambda message: LONG_NAME not in message)
+    assert LONG_NAME in taken and alias in taken and "not shown" in taken
+    assert "without a name" in unnamed
+
+
+def test_parameters_that_are_not_an_object_schema_are_not_shown_as_no_parameters(caplog):
+    """Claude takes only an object schema. One that is an object schema in all but the missing
+    `type` gets it. Any other was replaced by an empty one, which told Claude the tool takes no
+    arguments; the description now says the parameters are not listed and carries the schema."""
+    properties = {"properties": {"key": {"type": "string"}}, "required": ["key"]}
+    union = {"anyOf": [{"type": "object", "properties": {"celsius": {"type": "number"}}},
+                       {"type": "object", "properties": {"kelvin": {"type": "number"}}}]}
+    tools = [function_tool("lookup", "Look up.", parameters=properties),
+             function_tool("convert", "Convert a temperature.", parameters=union),
+             function_tool("ping", "Ping.")]
+    with caplog.at_level(logging.WARNING, logger=ccp.logger.name):
+        lookup, convert, ping = ccp.bridge_tools(tools)
+    assert lookup == {"name": "lookup", "description": "Look up.", "inputSchema": {"type": "object", **properties}}
+    assert convert["inputSchema"] == {"type": "object", "properties": {}}
+    assert convert["description"].startswith("Convert a temperature.\n\n")
+    assert "not listed" in convert["description"]
+    assert json.dumps(union, sort_keys=True) in convert["description"]
+    # A tool that declares no parameters has none: nothing to say.
+    assert ping == {"name": "ping", "description": "Ping.", "inputSchema": {"type": "object", "properties": {}}}
+    [warning] = warnings(caplog)
+    assert "'convert'" in warning and "object schema" in warning
+    assert ccp.bridge_tools(tools) == [lookup, convert, ping]
+
+
+BUILTIN_DESCRIPTION_LIMIT = 2000
+
+
+def over_long_descriptions(tools: list[dict], limit: int = BUILTIN_DESCRIPTION_LIMIT) -> dict[str, int]:
+    return {t["name"]: len(t["description"]) for t in ccp.bridge_tools(tools) if len(t["description"]) > limit}
+
+
+def test_an_over_long_description_reaches_claude_code_whole_and_is_reported(caplog):
+    """Claude Code cuts an MCP tool description past its own cap. Astra cannot see that happen,
+    so it sends the text whole and logs which tool is over, with its length."""
+    long = "Describes a third-party tool. " + "x" * ccp.DESCRIPTION_LIMIT
+    tools = [function_tool("verbose_tool", long), READ_FILE,
+             function_tool("exact_tool", "y" * ccp.DESCRIPTION_LIMIT)]
+    with caplog.at_level(logging.WARNING, logger=ccp.logger.name):
+        listed = ccp.bridge_tools(tools)
+    assert [t["description"] for t in listed] == [long, "Read a file.", "y" * ccp.DESCRIPTION_LIMIT]
+    [warning] = warnings(caplog)
+    assert "'verbose_tool'" in warning and str(len(long)) in warning
+    assert over_long_descriptions(tools) == {"verbose_tool": len(long), "exact_tool": ccp.DESCRIPTION_LIMIT}
+
+
+def builtin_tools(root: Path) -> list[dict]:
+    """Astra's own tools as the model is offered them, from the real registration functions."""
+    from types import SimpleNamespace
+
+    from agent.channels.tools import register_channel_tools
+    from agent.cli.conversation_commands import register_conversation_tools
+    from agent.runtime.code_mode import register_run_code_tool
+    from agent.runtime.hindsight_provider import HindsightMemoryProvider
+    from agent.runtime.memory import MemoryStore
+    from agent.runtime.skills import SkillStore
+    from agent.runtime.task_store import TaskStore
+    from agent.runtime.tools.activity import register_activity_tools
+    from agent.runtime.tools.bar import register_bar_tools
+    from agent.runtime.tools.browser import register_browser_tools
+    from agent.runtime.tools.computer import register_local_computer_runtime
+    from agent.runtime.tools.conclave import register_conclave_tools
+    from agent.runtime.tools.context_index import register_context_index_tools
+    from agent.runtime.tools.delegate import register_delegate_tools
+    from agent.runtime.tools.goals import register_goal_tools
+    from agent.runtime.tools.hindsight import register_hindsight_tools
+    from agent.runtime.tools.image import register_image_tools
+    from agent.runtime.tools.memory import register_memory_tools
+    from agent.runtime.tools.plans import register_plan_tools
+    from agent.runtime.tools.registry import ToolRegistry
+    from agent.runtime.tools.session_recall import register_session_recall_tools
+    from agent.runtime.tools.skills import register_skill_tools
+    from agent.runtime.tools.user_questions import register_user_question_tools
+    from agent.runtime.tools.web import register_web_tools
+    from agent.runtime.tools.workspace import register_workspace_tools
+    from agent.runtime.tools.workspace_dependencies import register_workspace_dependency_tools
+    from agent.sandbox.local import LocalSandbox
+
+    async def ask(questions, mode="blocking", **_):
+        return {}
+
+    registry = ToolRegistry()
+    sandbox = LocalSandbox(timeout=5, workdir=str(root))
+    memory, skills = MemoryStore(root / "memory.db"), SkillStore(root / "skills")
+    register_workspace_tools(registry, sandbox, workdir=str(root))
+    register_user_question_tools(registry, ask)
+    register_channel_tools(registry, lambda: None)
+    register_memory_tools(registry, memory, session_id=lambda: "default")
+    register_goal_tools(registry, TaskStore(root / "tasks.db"), session_id=lambda: "default")
+    register_plan_tools(registry, memory, session_id=lambda: "default")
+    register_skill_tools(registry, skills)
+    register_workspace_dependency_tools(registry)
+    register_session_recall_tools(registry)
+    register_activity_tools(registry)
+    register_context_index_tools(registry, SimpleNamespace(inspect=lambda: ""))
+    register_conclave_tools(registry, llm_getter=lambda: None)
+    register_delegate_tools(registry, llm_getter=lambda: None, sandbox=sandbox)
+    register_web_tools(registry, sandbox)
+    register_image_tools(registry, workdir=str(root))
+    register_local_computer_runtime(registry, cache_root=root / "computer")  # macOS only
+    register_browser_tools(registry, workdir=str(root))
+    register_hindsight_tools(registry, HindsightMemoryProvider(
+        base_url="http://127.0.0.1:8888", bank_id="test", client=SimpleNamespace()))
+    register_run_code_tool(registry, agent_getter=lambda: None)
+    register_bar_tools(registry, None)
+    register_conversation_tools(SimpleNamespace(
+        tools=registry, skill_store=skills, memory_store=memory, task_store=None,
+        llm=SimpleNamespace(config=SimpleNamespace(model="test")),
+        context=SimpleNamespace(session_path=str(root / "session.json"), persona_id="", messages=[]),
+        _refresh_skill_catalog=lambda **_: None))
+    # The group activation tool is offered too; its description lists every group's tool names.
+    activation = registry.activation_tool_schema()
+    return registry.to_openai_tools(names=set(registry.tool_names)) + ([activation] if activation else [])
+
+
+def test_builtin_tools_reach_claude_unchanged_and_under_the_description_cap(tmp_path, monkeypatch):
+    """Claude Code cuts an MCP tool description past its cap (2,048 characters as reported), and
+    every Astra tool reaches Claude as an MCP tool. A built-in description that grows past 2,000
+    fails here, where its author sees it, and not in a prompt that was cut without notice. Shorten
+    the description, or move detail into parameter descriptions or a skill."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ASTRA_HOME", str(tmp_path / "home"))
+    tools = builtin_tools(tmp_path)
+    functions = [tool["function"] for tool in tools]
+    assert {"run_code", "session_search", "memory", "execute_shell", "apply_patch", "read_file", "delegate_task",
+            "search_web", "browser_open", "ask_user_question", "skill_manage",
+            "activate_tool_group"} <= {f["name"] for f in functions}
+    assert over_long_descriptions(tools) == {}
+    # The same check does see a description one character over.
+    assert over_long_descriptions([function_tool("grown", "x" * (BUILTIN_DESCRIPTION_LIMIT + 1))]) == {
+        "grown": BUILTIN_DESCRIPTION_LIMIT + 1}
+    # No built-in needs an alias or has parameters Claude cannot take: each is listed as it is.
+    assert ccp.bridge_tools(tools) == [
+        {"name": f["name"], "description": f["description"], "inputSchema": f["parameters"]} for f in functions]

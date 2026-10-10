@@ -9,6 +9,7 @@ import signal
 import shlex
 import sys
 import uuid
+from contextlib import suppress
 from pathlib import Path
 
 from ..runtime.process_env import hidden_process_creationflags
@@ -32,10 +33,11 @@ DANGEROUS_PATTERNS = [
 _DEFAULT_PERSISTENT_BASH_TIMEOUT = 300
 _DEFAULT_PERSISTENT_WSL_TIMEOUT = _DEFAULT_PERSISTENT_BASH_TIMEOUT
 
-# Killing a timed-out process normally closes its pipes at once. A descendant
-# that survives the kill can keep them open, so the wait for the last bytes is
-# bounded instead of lasting until that descendant exits.
+# Stopping a run normally closes its pipes at once. A descendant the stop could
+# not reach can keep them open, so the wait for the last bytes is bounded
+# instead of lasting until that descendant exits.
 _STOPPED_OUTPUT_WAIT_SECONDS = 1.0
+_TREE_KILL_WAIT_SECONDS = 5.0
 
 SHELL_ENVIRONMENTS = {"auto", "windows", "wsl", "posix"}
 WSL_COMMANDS = {
@@ -52,10 +54,12 @@ class SandboxError(Exception):
 class _TimeLimitExceeded(asyncio.TimeoutError):
     """The time limit expired; holds what the process wrote before it was stopped."""
 
-    def __init__(self, stdout: bytes, stderr: bytes):
+    def __init__(self, stdout: bytes, stderr: bytes, *, output_still_held: bool = False):
         super().__init__()
         self.stdout = stdout
         self.stderr = stderr
+        # Something the run started outlived the stop and keeps its pipes open.
+        self.output_still_held = output_still_held
 
 
 # Strong references: the event loop keeps only weak ones to running tasks.
@@ -69,6 +73,46 @@ async def _discard_stream(reader: asyncio.StreamReader) -> None:
             pass
     except Exception:
         return
+
+
+async def _stop_process_tree(proc: asyncio.subprocess.Process | None) -> None:
+    """Kill a run and the processes it started, without waiting for its pipes.
+
+    POSIX: the run was started as the leader of its own session, so the process
+    group named by its pid holds only what the run started. The group is
+    signalled only while that leader still exists and leads it: its id cannot
+    then belong to anything else. A descendant that moved to another group or
+    session is not reached.
+    Windows: ``taskkill /T`` walks the tree from the root while it is running.
+    For ``wsl.exe`` that tree is the Windows side only.
+    Only a process asyncio really spawned is treated this way: the pid of any
+    other object does not name a tree this sandbox created.
+    """
+    if proc is None or proc.returncode is not None:
+        return
+    try:
+        if not isinstance(proc, asyncio.subprocess.Process):
+            pass
+        elif sys.platform == "win32":
+            killer = await asyncio.create_subprocess_exec(
+                "taskkill.exe", "/PID", str(proc.pid), "/T", "/F",
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                creationflags=hidden_process_creationflags(),
+            )
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(killer.communicate(), timeout=_TREE_KILL_WAIT_SECONDS)
+        else:
+            pid = proc.pid
+            if os.getpgid(pid) == pid and pid != os.getpgrp():
+                os.killpg(pid, signal.SIGKILL)
+    except OSError:
+        pass
+    finally:
+        if proc.returncode is None:
+            with suppress(OSError):
+                proc.kill()
 
 
 class LocalSandbox(Sandbox):
@@ -150,8 +194,11 @@ class LocalSandbox(Sandbox):
             # The backend itself runs windowless; without CREATE_NO_WINDOW each
             # spawned python.exe/wsl.exe/cmd.exe would flash a console window.
             return {"creationflags": hidden_process_creationflags()}
+        # Its own session: the run leads a process group that holds only what
+        # it started, so stopping it reaches those processes and nothing else.
+        kwargs: dict = {"start_new_session": True}
         if self.max_memory_mb is None and self.max_cpu_seconds is None:
-            return {}
+            return kwargs
 
         def apply_limits():
             try:
@@ -165,7 +212,8 @@ class LocalSandbox(Sandbox):
             except Exception:
                 os.kill(os.getpid(), signal.SIGKILL)
 
-        return {"preexec_fn": apply_limits}
+        kwargs["preexec_fn"] = apply_limits
+        return kwargs
 
     @staticmethod
     def _decode_output(data: bytes) -> str:
@@ -266,9 +314,12 @@ class LocalSandbox(Sandbox):
         output, error = self._decode_limited(stdout, stderr)
         if error and not error.endswith("\n"):
             error += "\n"
+        notice = f"[Timeout] Execution exceeded {self.timeout}s"
+        if getattr(exc, "output_still_held", False):
+            notice += "; a process the run started still holds its output and may still be running"
         return {
             "output": output,
-            "error": f"{error}[Timeout] Execution exceeded {self.timeout}s",
+            "error": f"{error}{notice}",
             "exit_code": -1,
             "timed_out": True,
             "artifact_path": artifact_path,
@@ -360,29 +411,31 @@ class LocalSandbox(Sandbox):
                 await asyncio.wait_for(proc.wait(), timeout=self.timeout)
             return await asyncio.gather(stdout_task, stderr_task)
         except asyncio.TimeoutError:
-            if proc.returncode is None:
-                proc.kill()
-            await self._settle_stopped(proc, stdout_task, stderr_task)
-            raise _TimeLimitExceeded(b"".join(stdout_chunks), b"".join(stderr_chunks)) from None
+            await _stop_process_tree(proc)
+            closed = await self._settle_stopped(proc, stdout_task, stderr_task)
+            raise _TimeLimitExceeded(
+                b"".join(stdout_chunks),
+                b"".join(stderr_chunks),
+                output_still_held=not closed,
+            ) from None
         except asyncio.CancelledError:
-            if proc.returncode is None:
-                proc.kill()
-                await proc.wait()
-            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            await _stop_process_tree(proc)
+            await self._settle_stopped(proc, stdout_task, stderr_task)
             raise
 
     @staticmethod
     async def _settle_stopped(
         proc: asyncio.subprocess.Process,
         *collectors: asyncio.Task,
-    ) -> None:
-        """Wait for a killed process and its output, but not for a descendant.
+    ) -> bool:
+        """Wait for a stopped run and its output, but not for a process the stop missed.
 
-        ``proc.wait()`` and the collectors finish only when the pipes close. A
-        killed process closes them at once unless a descendant still holds
-        them. That descendant is left running, as it always was; its pipes stay
-        drained so it never blocks on a full one, but nothing more is kept or
-        forwarded.
+        ``proc.wait()`` and the collectors finish only when the pipes close.
+        Stopping the run closes them at once unless something it started was
+        out of reach (it left the run's process group, or the run's own process
+        had already exited) and still holds them. That process is left running;
+        its pipes stay drained so it never blocks on a full one, but nothing
+        more is kept or forwarded. Returns whether the pipes closed.
         """
         waiting = [asyncio.ensure_future(proc.wait()), *collectors]
         try:
@@ -392,13 +445,14 @@ class LocalSandbox(Sandbox):
             for task in unfinished:
                 task.cancel()
         if not unfinished:
-            return
+            return True
         await asyncio.gather(*unfinished, return_exceptions=True)
         for reader in (proc.stdout, proc.stderr):
             if reader is not None and not reader.at_eof():
                 task = asyncio.create_task(_discard_stream(reader))
                 _DISCARDING.add(task)
                 task.add_done_callback(_DISCARDING.discard)
+        return False
 
     @staticmethod
     def resolve_shell_environment(command: str, environment: str = "auto") -> str:
@@ -496,14 +550,10 @@ class LocalSandbox(Sandbox):
                 "artifact_path": artifact_path,
             }
         except asyncio.TimeoutError as exc:
-            if proc and proc.returncode is None:
-                proc.kill()
-                await proc.wait()
+            await _stop_process_tree(proc)
             return self._time_limit_result(exc)
         except asyncio.CancelledError:
-            if proc and proc.returncode is None:
-                proc.kill()
-                await proc.wait()
+            await _stop_process_tree(proc)
             raise
         finally:
             if job is not None:
@@ -564,14 +614,10 @@ class LocalSandbox(Sandbox):
                 "artifact_path": artifact_path,
             }
         except asyncio.TimeoutError as exc:
-            if proc and proc.returncode is None:
-                proc.kill()
-                await proc.wait()
+            await _stop_process_tree(proc)
             return {**self._time_limit_result(exc), "environment": resolved_environment}
         except asyncio.CancelledError:
-            if proc and proc.returncode is None:
-                proc.kill()
-                await proc.wait()
+            await _stop_process_tree(proc)
             raise
         finally:
             if job is not None:

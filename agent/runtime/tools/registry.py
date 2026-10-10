@@ -1530,10 +1530,14 @@ class ToolRegistry:
                 return await finalize({"output": "", "error": f"[ToolError] {name}: retry loop exhausted"})
         except TimeoutError as timeout_error:
             logger.warning("tool timeout name=%s timeout=%s", name, tool.timeout)
+            # The event loop reads its clock in ticks (15.6 ms on Windows) and
+            # runs a timer up to one tick before it is due, so its deadline
+            # can arrive up to two ticks early by this finer clock.
+            early = 2 * time.get_clock_info("monotonic").resolution
             own_deadline = (
                 tool.timeout is not None
                 and timed_attempt_started is not None
-                and time.perf_counter() - timed_attempt_started >= float(tool.timeout) * 0.98
+                and time.perf_counter() - timed_attempt_started >= float(tool.timeout) * 0.98 - early
             )
             if own_deadline:
                 waited = f"exceeded {tool.timeout}s"

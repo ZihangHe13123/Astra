@@ -22,6 +22,13 @@ OutputCallback = Callable[[str, str], None]
 ProcessFactory = Callable[[OutputCallback], Coroutine[Any, Any, dict]]
 ProcessEventCallback = Callable[[dict[str, Any]], None]
 
+# How long a cancelled caller waits for the run it started to stop. A run that
+# is still alive after that is listed instead of being left behind unseen.
+_ABANDONED_STOP_WAIT_SECONDS = 3.0
+# What a run that ended without a result of its own keeps of each stream in
+# its result (one process_read page); the logs hold the rest.
+_UNFINISHED_OUTPUT_CHARS = 12_000
+
 
 @dataclass
 class ManagedProcess:
@@ -52,6 +59,8 @@ class ManagedProcess:
     terminal_emitted: bool = False
     external: bool = False
     supervisor_pid: int | None = None
+    # Set by the backend that started the supervisor; a recovered one has none.
+    supervisor_handle: subprocess.Popen | None = None
     spec_path: Path | None = None
     cancel_path: Path | None = None
     # Small, JSON-serializable runtime metadata. Callers must not place
@@ -104,6 +113,25 @@ class ProcessManager:
         if not pid or pid <= 0:
             return False
         return pid_alive(pid)
+
+    def _owner_alive(self, process: ManagedProcess) -> bool:
+        """Whether the detached owner of a supervised run is still running.
+
+        A supervisor this backend started stays in the process table after it
+        dies until it is reaped, and a pid probe counts that as alive. Asking
+        its handle reaps it. A recovered supervisor is not a child: it is probed.
+        """
+        handle = process.supervisor_handle
+        if handle is not None and handle.pid == process.supervisor_pid:
+            return handle.poll() is None
+        return self._pid_alive(process.supervisor_pid)
+
+    @staticmethod
+    def unfinished_result(process: ManagedProcess, notice: str) -> dict:
+        """Result for a run that ended without one: what it had streamed, then ``notice``."""
+        return unfinished_result(
+            process.stdout_path, process.stderr_path, process.output_path, notice,
+        )
 
     def _load_manifests(self) -> None:
         for manifest_path in sorted(self.artifact_dir.glob("*.json")):
@@ -502,23 +530,29 @@ class ProcessManager:
             self._delete_transient_files(process)
             raise
         process.supervisor_pid = child.pid
+        process.supervisor_handle = child
         # Wait for the detached owner to publish its PID/state. This closes
         # the small restart window where a new backend could see a starting
         # manifest without a live owner and incorrectly mark it interrupted.
         deadline = time.monotonic() + 2.0
-        while time.monotonic() < deadline:
-            try:
-                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                payload = {}
-            status = str(payload.get("status") or "")
-            if payload.get("supervisor_pid") or status in {
-                "completed", "failed", "cancelled",
-            }:
-                break
-            if child.poll() is not None:
-                break
-            await asyncio.sleep(0.01)
+        try:
+            while time.monotonic() < deadline:
+                try:
+                    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    payload = {}
+                status = str(payload.get("status") or "")
+                if payload.get("supervisor_pid") or status in {
+                    "completed", "failed", "cancelled",
+                }:
+                    break
+                if child.poll() is not None:
+                    break
+                await asyncio.sleep(0.01)
+        except asyncio.CancelledError:
+            # The caller never receives this process, so it could not stop it later.
+            await self.stop_abandoned(process)
+            raise
         self._refresh_external(process)
         if process.recovered_status == "interrupted":
             diagnostic = self._read_text(supervisor_log_path).strip()
@@ -561,6 +595,36 @@ class ProcessManager:
             return
         self._processes.pop(process.process_id, None)
         self._delete_transient_files(process)
+
+    async def stop_abandoned(self, process: ManagedProcess) -> None:
+        """Stop a run whose caller was cancelled before it got a result or a process_id.
+
+        The run is asked to stop the way ``cancel`` asks, and the wait for it is
+        bounded. A run that has stopped is discarded like any foreground run
+        that returned. One that is still alive, also when this wait is itself
+        cancelled, becomes visible so process_list and process_cancel reach it.
+        """
+        try:
+            if process.external:
+                if process.cancel_path is not None and self.status(process) == "running":
+                    try:
+                        process.cancel_path.touch()
+                    except OSError:
+                        pass
+                deadline = time.monotonic() + _ABANDONED_STOP_WAIT_SECONDS
+                while self.status(process) == "running" and time.monotonic() < deadline:
+                    await asyncio.sleep(0.05)
+            elif process.task is not None and not process.task.done():
+                process.task.cancel()
+                await asyncio.wait({process.task}, timeout=_ABANDONED_STOP_WAIT_SECONDS)
+        finally:
+            try:
+                if self.status(process) == "running":
+                    self.expose(process)
+                else:
+                    self.discard_unexposed(process)
+            except OSError:
+                pass
 
     def observe(self, process: ManagedProcess) -> None:
         """Publish detached output/terminal transitions seen by this backend."""
@@ -642,15 +706,26 @@ class ProcessManager:
             }
 
     def _refresh_external(self, process: ManagedProcess) -> None:
-        try:
-            payload = json.loads(process.manifest_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            payload = {}
+        def manifest() -> dict:
+            try:
+                payload = json.loads(process.manifest_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return {}
+            return payload if isinstance(payload, dict) else {}
+
+        payload = manifest()
         status = str(payload.get("status") or process.recovered_status or "running")
         process.supervisor_pid = (
             int(payload.get("supervisor_pid") or process.supervisor_pid or 0)
             or None
         )
+        owner_gone = False
+        if status in {"starting", "running"} and not self._owner_alive(process):
+            # The owner may have published its result between that read and its
+            # exit; what it left is final now, so look once more.
+            payload = manifest() or payload
+            status = str(payload.get("status") or status)
+            owner_gone = status in {"starting", "running"}
         # The detached supervisor publishes these counters while appending.
         # Trust them instead of re-reading every artifact on every status poll.
         process.output_chars = int(payload.get("output_chars") or process.output_chars)
@@ -660,13 +735,15 @@ class ProcessManager:
             process.result = payload["result"]
         if payload.get("completed_at"):
             process.completed_at = float(payload["completed_at"])
-        if status in {"starting", "running"} and not self._pid_alive(process.supervisor_pid):
+        if owner_gone:
             status = "interrupted"
             process.completed_at = process.completed_at or time.time()
             process.result = process.result or {
-                "output": "",
-                "error": "[Interrupted] Detached process owner exited without a terminal result",
-                "exit_code": -1,
+                **self.unfinished_result(
+                    process,
+                    "[Interrupted] Detached process owner exited without a terminal result",
+                ),
+                "status": "interrupted",
             }
             process.recovered_status = status
             self._persist(process)
@@ -948,3 +1025,32 @@ class ProcessManager:
     @staticmethod
     def dumps(payload: Any) -> str:
         return json.dumps(payload, ensure_ascii=False)
+
+
+def unfinished_result(
+    stdout_path: Path,
+    stderr_path: Path,
+    output_path: Path,
+    notice: str,
+) -> dict[str, Any]:
+    """Result of a run that ended without one: what it had streamed, then why it ended.
+
+    Each stream is bounded. When one is longer, ``artifact_path`` names the
+    combined log, which makes the caller keep the process readable.
+    """
+    limit = _UNFINISHED_OUTPUT_CHARS
+    output, read_out, total_out = ProcessManager._read_file_chunk(stdout_path, 0, limit)
+    error, read_err, total_err = ProcessManager._read_file_chunk(stderr_path, 0, limit)
+    result: dict[str, Any] = {"output": output, "exit_code": -1}
+    if error and not error.endswith("\n"):
+        error += "\n"
+    cut = [
+        name
+        for name, read, total in (("stdout", read_out, total_out), ("stderr", read_err, total_err))
+        if read < total
+    ]
+    if cut:
+        error += f"[Output truncated: {', '.join(cut)} exceeded {limit} characters]\n"
+        result["artifact_path"] = str(output_path)
+    result["error"] = error + notice
+    return result

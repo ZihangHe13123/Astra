@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import json
 import logging
 import os
@@ -60,6 +61,18 @@ _MCP_SERVER_KEYS = {
 }
 _DEFAULT_MCP_STARTUP_CONCURRENCY = 4
 _MAX_MCP_STARTUP_CONCURRENCY = 8
+# OpenAI-compatible and Anthropic endpoints refuse a whole request when one function
+# name is longer than this (or holds a character _SAFE_NAME replaces).
+_MAX_TOOL_NAME = 64
+# A name that has to change anyway is made this short: the Claude Code bridge puts
+# its own `mcp__astra__` in front of every tool name, and that must fit in 64 as well.
+_ALTERED_TOOL_NAME = 51
+_NAME_HASH_CHARS = 8
+# An altered name keeps at least this much of the server name, so ordinary server
+# names stay whole and `mcp__<server>__` still matches policy patterns and groups.
+_ALTERED_SERVER_CHARS = 16
+# /mcp shows this many renamed or skipped tools of one server and counts the rest.
+_MAX_REPORTED_TOOL_NOTES = 20
 
 
 def _expand_env(value: Any) -> Any:
@@ -72,10 +85,85 @@ def _expand_env(value: Any) -> Any:
     return value
 
 
+def _clean_names(server: str, tool: str) -> tuple[str, str]:
+    return (
+        _SAFE_NAME.sub("_", server).strip("_") or "server",
+        _SAFE_NAME.sub("_", tool).strip("_") or "tool",
+    )
+
+
+def _hashed_tool_name(server: str, tool: str, attempt: int = 0) -> str:
+    """A name of at most _ALTERED_TOOL_NAME characters ending in a hash of the original pair.
+
+    Nothing but the two original names goes into it, so a server's tool gets the same
+    name in every session and after every reconnect.
+    """
+    clean_server, clean_tool = _clean_names(server, tool)
+    digest = hashlib.sha256(f"{server}\0{tool}".encode("utf-8", "surrogatepass")).hexdigest()
+    suffix = digest[attempt * _NAME_HASH_CHARS:(attempt + 1) * _NAME_HASH_CHARS]
+    room = _ALTERED_TOOL_NAME - len("mcp__") - len("__") - len("_") - len(suffix)
+    if len(clean_server) + len(clean_tool) > room:
+        keep = min(len(clean_server), max(_ALTERED_SERVER_CHARS, room - len(clean_tool)))
+        clean_server = clean_server[:keep].rstrip("_-") or clean_server[:keep]
+        keep = room - len(clean_server)
+        clean_tool = clean_tool[:keep].rstrip("_-") or clean_tool[:keep]
+    return f"mcp__{clean_server}__{clean_tool}_{suffix}"
+
+
 def mcp_tool_name(server: str, tool: str) -> str:
-    clean_server = _SAFE_NAME.sub("_", server).strip("_") or "server"
-    clean_tool = _SAFE_NAME.sub("_", tool).strip("_") or "tool"
-    return f"mcp__{clean_server}__{clean_tool}"
+    """The registered name of a remote tool that shares its name with no other tool."""
+    name = "mcp__{}__{}".format(*_clean_names(server, tool))
+    return name if len(name) <= _MAX_TOOL_NAME else _hashed_tool_name(server, tool)
+
+
+def mcp_tool_names(
+    server: str,
+    tools: list[str],
+    taken: Callable[[str], bool] = lambda _name: False,
+) -> dict[str, tuple[str, str]]:
+    """For each remote tool of one server: its registered name and why that was altered.
+
+    The reason is "" for the plain ``mcp__<server>__<tool>``, which a tool keeps unless
+    it is too long, several of the server's tools would get it (then none of them
+    does, so the name cannot come to mean another tool), or ``taken`` says something
+    else holds it. An altered name ends in a hash of the original names. The result
+    does not depend on the order of ``tools``. The name is "" when none was free.
+    """
+    plain = {tool: mcp_tool_name(server, tool) for tool in tools}
+    sharing: dict[str, int] = {}
+    for name in plain.values():
+        sharing[name] = sharing.get(name, 0) + 1
+    names: dict[str, tuple[str, str]] = {}
+    used: set[str] = set()
+    for tool, name in plain.items():
+        if sharing[name] > 1 or taken(name):
+            continue
+        full = len("mcp__{}__{}".format(*_clean_names(server, tool)))
+        why = "" if full <= _MAX_TOOL_NAME else (
+            f"its full name would be {full} characters, over the limit of {_MAX_TOOL_NAME}"
+        )
+        names[tool] = (name, why)
+        used.add(name)
+    used.update(name for name, count in sharing.items() if count > 1)
+    for tool in sorted(tool for tool in plain if tool not in names):
+        name = plain[tool]
+        why = (
+            f"{sharing[name]} tools of this server would be named {name}" if sharing[name] > 1
+            else f"{name} is already registered by another server or tool"
+        )
+        candidates = (_hashed_tool_name(server, tool, attempt) for attempt in range(64 // _NAME_HASH_CHARS))
+        chosen = next((item for item in candidates if item not in used and not taken(item)), "")
+        names[tool] = (chosen, why)
+        used.add(chosen)
+    return names
+
+
+def _quoted(name: str, limit: int = 80) -> str:
+    """A server's own name for something, safe to show: quoted, escaped and bounded."""
+    if len(name) > limit:
+        name = f"{name[:limit]}... ({len(name)} characters)"
+    # A lone surrogate cannot be encoded, and this text goes into model requests.
+    return json.dumps(name.encode("utf-8", "backslashreplace").decode("utf-8"), ensure_ascii=False)
 
 
 def _exception_summary(exc: BaseException) -> str:
@@ -101,6 +189,8 @@ class MCPServerStatus:
     state: str
     tools: int = 0
     error: str = ""
+    # One line for each tool registered under an altered name or left out, with the reason.
+    notes: tuple[str, ...] = ()
 
 
 @dataclass
@@ -120,19 +210,15 @@ class MCPManager:
         """Finish pagination before publishing a new registry generation."""
         gathered: list[Any] = []
         seen_cursors: set[str] = set()
-        seen_names: set[str] = set()
         cursor = None
         for _ in range(100):
             page = await session.list_tools() if cursor is None else await session.list_tools(cursor=cursor)
             remote_tools = getattr(page, "tools", None)
             if not isinstance(remote_tools, (list, tuple)):
                 raise ValueError("MCP tool page must contain a tools array")
-            for tool in remote_tools:
-                name = getattr(tool, "name", None)
-                if not isinstance(name, str) or not name.strip() or name in seen_names:
-                    raise ValueError("MCP tool list contains an empty or duplicate name")
-                seen_names.add(name)
-                gathered.append(tool)
+            # _register_tools leaves out a tool it cannot use and says why; one such
+            # tool does not cost the server the rest of its list.
+            gathered.extend(remote_tools)
             cursor = getattr(page, "nextCursor", None)
             if cursor is None:
                 cursor = getattr(page, "next_cursor", None)
@@ -186,6 +272,8 @@ class MCPManager:
         self._server_stacks: dict[str, AsyncExitStack] = {}
         self._sessions: dict[str, Any] = {}
         self._server_configs: dict[str, dict] = {}
+        self._tool_names: dict[str, frozenset[str]] = {}
+        self._tool_notes: dict[str, tuple[str, ...]] = {}
         self._registry: ToolRegistry | None = None
         self._background_task: asyncio.Task | None = None
         self._reconnect_event = asyncio.Event()
@@ -548,7 +636,9 @@ class MCPManager:
                              error=f"Tool refresh failed; retaining previous tools: {error}")
 
     def _set_status(self, name: str, state: str, *, tools: int = 0, error: str = "") -> None:
-        replacement = MCPServerStatus(name, state, tools=tools, error=error)
+        replacement = MCPServerStatus(
+            name, state, tools=tools, error=error, notes=self._tool_notes.get(name, ()),
+        )
         for index, status in enumerate(self.statuses):
             if status.name == name:
                 self.statuses[index] = replacement
@@ -717,14 +807,58 @@ class MCPManager:
             enabled=lambda: registry.approval_handler is not None,
             approved_scopes=registry.approved_permission_scopes,
         )
-        definitions: list[ToolDef] = []
+        # One unusable tool is left out with a note; the server keeps its other tools.
+        notes: list[str] = []
+        usable: dict[str, tuple[Any, dict]] = {}
         for remote in tools:
-            remote_name = str(getattr(remote, "name", ""))
+            remote_name = getattr(remote, "name", None)
+            if not isinstance(remote_name, str) or not remote_name.strip():
+                notes.append("a tool was skipped: " + (
+                    "its name is empty" if isinstance(remote_name, str)
+                    else f"its name is not text ({type(remote_name).__name__})"
+                ))
+                continue
             if (include_tools is not None and remote_name not in include_tools) or remote_name in exclude_tools:
                 continue
-            local_name = mcp_tool_name(server, remote_name)
+            if remote_name in usable:
+                notes.append(
+                    f"a repeated {_quoted(remote_name)} was skipped: the server lists this name more than once"
+                )
+                continue
             schema = getattr(remote, "inputSchema", None) or {"type": "object", "properties": {}}
+            if not isinstance(schema, dict):
+                notes.append(
+                    f"{_quoted(remote_name)} was skipped: its input schema is not a JSON object "
+                    f"({type(schema).__name__})"
+                )
+                continue
+            if "type" not in schema:
+                # MCP input schemas describe an object; model APIs refuse one that does not say so.
+                schema = {"type": "object", **schema}
+            elif schema["type"] != "object":
+                notes.append(
+                    f"{_quoted(remote_name)} was skipped: its input schema has type "
+                    f"{_quoted(str(schema['type']))}, and a tool's arguments must be an object"
+                )
+                continue
+            usable[remote_name] = (remote, schema)
+        own_names = self._tool_names.get(server, frozenset())
+        local_names = mcp_tool_names(
+            server,
+            list(usable),
+            taken=lambda name: name not in own_names and registry.get(name) is not None,
+        )
+        definitions: list[ToolDef] = []
+        for remote_name, (remote, schema) in usable.items():
+            local_name, altered = local_names[remote_name]
+            if not local_name:
+                notes.append(f"{_quoted(remote_name)} was skipped: no free tool name was found ({altered})")
+                continue
             description = str(getattr(remote, "description", "") or f"MCP tool {remote_name} from {server}")
+            if altered:
+                # The registered name no longer shows which of the server's tools this is.
+                description += f"\n[Tool {_quoted(remote_name, 200)} of MCP server {_quoted(server)}]"
+                notes.append(f"{_quoted(remote_name)} is registered as {local_name}: {altered}")
             risk = str(risk_overrides.get(remote_name, default_risk)) if isinstance(risk_overrides, dict) else default_risk
             annotations = getattr(remote, "annotations", None)
             read_hint = (annotations.get("readOnlyHint") if isinstance(annotations, dict)
@@ -930,6 +1064,8 @@ class MCPManager:
                 permission_grant=side_effect_approvals.grant,
             ))
         registry.replace_owned_tools(f"mcp:{server}", definitions)
+        self._tool_names[server] = frozenset(definition.name for definition in definitions)
+        self._tool_notes[server] = tuple(notes)
         self._sessions[server] = session
         return len(definitions)
 
@@ -1063,7 +1199,8 @@ class MCPManager:
             if not payload or len(payload) > max_bytes:
                 continue
             output_dir.mkdir(parents=True, exist_ok=True)
-            prefix = _SAFE_NAME.sub("_", f"{server}_{tool}").strip("_") or "mcp_image"
+            # Bounded: the server chooses the tool name, and a file name has a length limit.
+            prefix = _SAFE_NAME.sub("_", f"{server}_{tool}").strip("_")[:80] or "mcp_image"
             path = output_dir / f"{prefix}_{uuid.uuid4().hex}{_MCP_IMAGE_EXTENSIONS[mime]}"
             path.write_bytes(payload)
             paths.append(str(path.resolve()))
@@ -1077,6 +1214,11 @@ class MCPManager:
             if status.error:
                 detail += f" — {status.error}"
             lines.append(f"  {status.name}: {status.state}{detail}")
+            lines.extend(f"    {note}" for note in status.notes[:_MAX_REPORTED_TOOL_NOTES])
+            if len(status.notes) > _MAX_REPORTED_TOOL_NOTES:
+                lines.append(
+                    f"    ... and {len(status.notes) - _MAX_REPORTED_TOOL_NOTES} more renamed or skipped tools"
+                )
         return "\n".join(lines)
 
     async def close(self) -> None:

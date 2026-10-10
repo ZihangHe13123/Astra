@@ -41,7 +41,13 @@ to the file tool's allowed roots.
 
 A foreground run that is stopped at the sandbox time limit returns what it wrote
 before the stop, marked as a partial result, together with how to rerun it past
-the limit. A failure whose text is longer than the inline limit (a failing test
+the limit. A run stopped at the limit, by `process_cancel` or by stopping the
+turn is stopped together with the processes it started (its process group on
+macOS and Linux, its process tree on Windows). A process that moved to its own
+session is not reached, and a timeout result says when one still holds the run's
+output. A Minimal `bash` command that exceeds its limit returns what it printed;
+the shell is reset, as it is when a `bash` call is cancelled, and the next result
+says so. A failure whose text is longer than the inline limit (a failing test
 run, for example) is shortened to its start and end, and the full text is saved
 with its path in the result.
 
