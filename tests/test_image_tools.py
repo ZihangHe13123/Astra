@@ -15,6 +15,7 @@ import pytest
 import agent.runtime.tools.image as image_module
 from agent.core.msg import ContentBlock, Msg
 from agent.runtime.hooks import HookRegistry
+from agent.runtime.page_snapshot import MAX_PAGE_BYTES, PageSnapshot, PageSnapshotError
 from agent.runtime.react import ReActAgent
 from agent.runtime.tools.image import (
     _inspect_image_metadata,
@@ -76,6 +77,136 @@ def test_read_image_tool_returns_attachable_image_payload(tmp_path):
         assert payload["detail"] == "original"
 
     run(scenario())
+
+
+def _read_image_schema(registry):
+    return next(
+        tool["function"] for tool in registry.to_openai_tools()
+        if tool["function"]["name"] == "read_image"
+    )
+
+
+def test_read_image_shows_a_page_as_the_picture_its_renderer_returns(tmp_path):
+    page = tmp_path / "report.page.html"
+    page.write_text("<h1>Report</h1>", encoding="utf-8")
+    picture = tmp_path / "elsewhere" / "report.png"
+    picture.parent.mkdir()
+    _write_png(picture)
+    asked = []
+
+    async def render_page(path):
+        asked.append(path)
+        return PageSnapshot(image_path=picture, height=700, page_height=700)
+
+    registry = ToolRegistry()
+    register_image_tools(registry, workdir=str(tmp_path), render_page=render_page)
+
+    result = run(registry.execute("read_image", {"path": "report.page.html", "question": "is it readable"}))
+    payload = json.loads(result["output"])
+
+    assert result["error"] == ""
+    assert asked == [page.resolve()]
+    assert payload["type"] == "image_attachment"
+    assert payload["image_paths"] == [str(picture)]
+    assert payload["page"] == str(page.resolve())
+    assert payload["question"] == "is it readable"
+    assert "page_height" not in payload and "page_script_error" not in payload
+
+
+def test_read_image_says_what_a_page_picture_leaves_out(tmp_path):
+    page = tmp_path / "long.page.html"
+    page.write_text("<h1>Long</h1>", encoding="utf-8")
+    picture = tmp_path / "long.png"
+    _write_png(picture)
+
+    async def render_page(path):
+        return PageSnapshot(image_path=picture, height=2100, page_height=5400, script_error="chart is not defined")
+
+    registry = ToolRegistry()
+    register_image_tools(registry, workdir=str(tmp_path), render_page=render_page)
+
+    payload = json.loads(run(registry.execute("read_image", {"path": "long.page.html"}))["output"])
+
+    assert (payload["shown_height"], payload["page_height"]) == (2100, 5400)
+    assert "5400px" in payload["message"] and "2100px" in payload["message"]
+    assert payload["page_script_error"] == "chart is not defined"
+    assert "chart is not defined" in payload["message"]
+
+
+def test_read_image_offers_pages_only_where_something_renders_them(tmp_path):
+    page = tmp_path / "report.html"
+    page.write_text("<h1>Report</h1>", encoding="utf-8")
+
+    async def render_page(path):
+        raise AssertionError("not asked in this test")
+
+    plain = ToolRegistry()
+    register_image_tools(plain, workdir=str(tmp_path))
+    rendering = ToolRegistry()
+    register_image_tools(rendering, workdir=str(tmp_path), render_page=render_page)
+
+    refused = run(plain.execute("read_image", {"path": "report.html"}))
+
+    assert refused["code"] == "page_rendering_unavailable"
+    assert refused["retryable"] is False
+    assert ".html" not in json.dumps(_read_image_schema(plain))
+    assert ".html" in _read_image_schema(rendering)["description"]
+    assert ".html" in _read_image_schema(rendering)["parameters"]["properties"]["path"]["description"]
+
+
+def test_read_image_reports_a_page_its_renderer_could_not_draw(tmp_path):
+    page = tmp_path / "report.html"
+    page.write_text("<h1>Report</h1>", encoding="utf-8")
+
+    async def render_page(path):
+        raise PageSnapshotError("The page left its frame.")
+
+    registry = ToolRegistry()
+    register_image_tools(registry, workdir=str(tmp_path), render_page=render_page)
+
+    result = run(registry.execute("read_image", {"path": "report.html"}))
+
+    assert result["code"] == "page_rendering_failed"
+    assert result["retryable"] is False
+    assert "left its frame" in result["error"]
+
+
+def test_read_image_asks_for_no_picture_of_a_page_it_cannot_accept(tmp_path):
+    oversized = tmp_path / "huge.html"
+    oversized.write_bytes(b"x" * (MAX_PAGE_BYTES + 1))
+    asked = []
+
+    async def render_page(path):
+        asked.append(path)
+        return PageSnapshot(image_path=tmp_path / "never.png")
+
+    registry = ToolRegistry()
+    register_image_tools(registry, workdir=str(tmp_path), render_page=render_page)
+
+    missing = run(registry.execute("read_image", {"path": "absent.html"}))
+    too_large = run(registry.execute("read_image", {"path": "huge.html"}))
+
+    assert "not found" in missing["error"]
+    assert "too large" in too_large["error"]
+    assert asked == []
+
+
+def test_read_image_rejects_a_page_picture_that_is_not_an_image(tmp_path):
+    page = tmp_path / "report.html"
+    page.write_text("<h1>Report</h1>", encoding="utf-8")
+    not_a_picture = tmp_path / "report.txt"
+    not_a_picture.write_text("no pixels", encoding="utf-8")
+
+    async def render_page(path):
+        return PageSnapshot(image_path=not_a_picture)
+
+    registry = ToolRegistry()
+    register_image_tools(registry, workdir=str(tmp_path), render_page=render_page)
+
+    result = run(registry.execute("read_image", {"path": "report.html"}))
+
+    assert result["error"]
+    assert "image_attachment" not in str(result.get("output") or "")
 
 
 def test_read_image_tiles_uses_injected_bounded_selector(tmp_path):

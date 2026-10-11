@@ -11,10 +11,12 @@ import struct
 import subprocess
 import sys
 import zlib
-from collections.abc import Callable
+import asyncio
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+from ..page_snapshot import MAX_PAGE_BYTES, PageSnapshot, PageSnapshotError, is_page_path
 from ..process_env import hidden_process_creationflags
 from ..tool_failure import ToolFailure
 from ..vision_preprocessor import VisionTileSelectionError
@@ -125,6 +127,16 @@ def _prepare_image_path(path: str, root: Path, max_bytes: int) -> Path:
     image_path = _materialize_wsl_image(path, root, max_bytes)
     _validate_image_path(image_path, max_bytes)
     return image_path
+
+
+def _validate_page_path(path: Path) -> None:
+    if not path.exists():
+        raise FileNotFoundError(f"Page not found: {path}")
+    if not path.is_file():
+        raise ValueError(f"Not a file: {path}")
+    size = path.stat().st_size
+    if size > MAX_PAGE_BYTES:
+        raise ValueError(f"Page is too large to render: {size} bytes > {MAX_PAGE_BYTES} bytes")
 
 
 def _validate_image_path(path: Path, max_bytes: int) -> None:
@@ -402,21 +414,59 @@ def register_image_tools(
     workdir: str = ".",
     *,
     select_tiles: Callable[[str, list[str]], dict] | None = None,
+    render_page: Callable[[Path], Awaitable[PageSnapshot]] | None = None,
 ):
     root = Path(workdir).resolve()
 
-    def _read_image(path: str, question: str = "", detail: str = "auto") -> str:
-        """Attach a local image to the next multimodal model call."""
+    async def _read_image(path: str, question: str = "", detail: str = "auto") -> str | ToolFailure:
+        """Attach a local image, or a picture of a page as the desktop shows it, to the next multimodal model call."""
         max_bytes = _positive_int_env("MAX_IMAGE_UPLOAD_BYTES", 10 * 1024 * 1024)
-        image_path = _prepare_image_path(path, root, max_bytes)
-        payload = {
-            "success": True,
-            "type": "image_attachment",
+        payload: dict[str, Any] = {"success": True, "type": "image_attachment"}
+        if is_page_path(path):
+            # Only the client that shows pages can draw one; without it there is nothing to look at.
+            if render_page is None:
+                return ToolFailure(
+                    code="page_rendering_unavailable",
+                    message=(
+                        "An HTML page can be looked at only while the desktop app is showing this "
+                        "conversation: the desktop is what renders it. Read the file as text instead."
+                    ),
+                    retryable=False,
+                )
+            page_path = _resolve_image_path(path, root)
+            _validate_page_path(page_path)
+            try:
+                snapshot = await render_page(page_path)
+            except PageSnapshotError as exc:
+                # What stops a page from being drawn is nearly always the page; asking again draws it the same.
+                return ToolFailure(code="page_rendering_failed", message=str(exc), retryable=False)
+            image_path = snapshot.image_path
+            await asyncio.to_thread(_validate_image_path, image_path, max_bytes)
+            payload["page"] = str(page_path)
+            message = (
+                "The page was rendered as the desktop shows it and its picture attached for the next "
+                "model turn. Inspect the actual pixels before answering."
+            )
+            # What the picture does not show is said, so the page is not judged by its first screen alone.
+            if snapshot.page_height > snapshot.height > 0:
+                payload["shown_height"] = snapshot.height
+                payload["page_height"] = snapshot.page_height
+                message += (
+                    f" The page is {snapshot.page_height}px tall; the picture shows its first "
+                    f"{snapshot.height}px."
+                )
+            if snapshot.script_error:
+                payload["page_script_error"] = snapshot.script_error
+                message += f" A script on the page raised an error while it was drawn: {snapshot.script_error}"
+        else:
+            image_path = await asyncio.to_thread(_prepare_image_path, path, root, max_bytes)
+            message = "Image attached for the next model turn. Inspect the actual pixels before answering."
+        payload.update({
             "image_paths": [str(image_path)],
             "question": question,
             "detail": detail,
-            "message": "Image attached for the next model turn. Inspect the actual pixels before answering.",
-        }
+            "message": message,
+        })
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
     def _inspect_metadata(path: str, include_raw: bool = False) -> str:
@@ -526,19 +576,28 @@ def register_image_tools(
             private={"image_data_urls": list(data_urls)},
         )
 
+    # Only a client that renders pages is offered them, so every other surface keeps the tool it had.
+    read_image_description = (
+        "Attach a local image file to the next vision-capable model turn for inspection. "
+        "Use this when the user asks you to look at, judge, compare, OCR, debug, or describe a local image path."
+    )
+    read_image_path = "Local image path (.png, .jpg, .jpeg, .webp, .gif). "
+    if render_page is not None:
+        read_image_description += (
+            " It also takes an HTML page (.html): the page is rendered as the desktop shows it and "
+            "its picture attached, so what was written can be checked by eye."
+        )
+        read_image_path = "Local image path (.png, .jpg, .jpeg, .webp, .gif), or an HTML page (.html) to render. "
     registry.register(ToolDef(
         name="read_image",
-        description=(
-            "Attach a local image file to the next vision-capable model turn for inspection. "
-            "Use this when the user asks you to look at, judge, compare, OCR, debug, or describe a local image path."
-        ),
+        description=read_image_description,
         parameters={
             "type": "object",
             "properties": {
                 "path": {
                     "type": "string",
                     "description": (
-                        "Local image path (.png, .jpg, .jpeg, .webp, .gif). Windows paths, WSL UNC paths, "
+                        f"{read_image_path}Windows paths, WSL UNC paths, "
                         "and WSL Linux paths such as /home/user/image.png are supported. Relative paths resolve "
                         "from the agent workdir."
                     ),
