@@ -5,7 +5,7 @@ import stringWidth from "string-width";
 import stripAnsi from "strip-ansi";
 import { ActivityDock } from "./components/activity-dock.js";
 import { AppHeader } from "./components/app-header.js";
-import { BarHeader, BarStatusDock } from "./components/bar-chrome.js";
+import { BarStatusDock } from "./components/bar-chrome.js";
 import { BarShelf } from "./components/bar-shelf.js";
 import { ThemeProvider, useTheme } from "./theme-context.js";
 import { THEMES, type ThemeName } from "./theme.js";
@@ -81,7 +81,6 @@ function Fixture({ columns, active = true }: { columns: number; active?: boolean
 function BarFixture({ columns }: { columns: number }) {
   return (
     <Box flexDirection="column" width={columns}>
-      <BarHeader columns={columns} />
       <Text color="#D8D4C8">LYRA › The rain has settled in. Your glass is waiting under the neon.</Text>
       <BarStatusDock
         session="bar_20260717_230700"

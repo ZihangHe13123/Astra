@@ -43,7 +43,7 @@ import { WelcomeScreen } from "./components/welcome-screen.js";
 import { ToolApprovalPanel } from "./components/tool-approval-panel.js";
 import { QuestionCard } from "./components/question-card.js";
 import { BarShelf } from "./components/bar-shelf.js";
-import { BarHeader, BarStatusDock, isQuietBarAction } from "./components/bar-chrome.js";
+import { BarStatusDock, isQuietBarAction } from "./components/bar-chrome.js";
 import { MinimalStatusDock } from "./components/minimal-chrome.js";
 import { LocalStatusDock } from "./components/local-chrome.js";
 import { StreamingControlLayout } from "./components/streaming-control-layout.js";
@@ -459,7 +459,6 @@ export const MessageLine = memo(function MessageLine({ line, runtimeMode = "work
 const InputBarMemo = memo(InputBar);
 const ActivityDockMemo = memo(ActivityDock);
 const AppHeaderMemo = memo(AppHeader);
-const BarHeaderMemo = memo(BarHeader);
 const BarStatusDockMemo = memo(BarStatusDock);
 const StartupScreenMemo = memo(StartupScreen);
 const WelcomeScreenMemo = memo(WelcomeScreen);
@@ -2192,9 +2191,10 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         dynamic={compactQuestion ? null : visibleDynamicDisplayLines(displayState, Math.max(1, rows - 2)).map((line) => (
           <MessageLine key={line.key} line={line} runtimeMode={runtimeMode} />
         ))}
-        // In work mode the status line is the header too; the other modes keep the header they have.
-        header={compactQuestion || runtimeMode === "work" ? null : runtimeMode === "bar"
-          ? <BarHeaderMemo columns={columns} />
+        // In work mode the status line is the header too, and the bar's sign carries its status;
+        // local and minimal mode keep the header they have.
+        header={compactQuestion || runtimeMode === "work" || runtimeMode === "bar"
+          ? null
           : <AppHeaderMemo columns={columns} busy={busy} mode={runtimeMode} localMode={localMode} />}
         status={compactQuestion ? null : runtimeMode === "work" ? <ActivityDockMemo
           expanded={activityExpanded}
@@ -2284,7 +2284,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
               if (send(request)) setConnectionPending(true);
               else setConnectionError("Backend disconnected. Reconnect before saving.");
             }} /></Box>}
-          {!interactionActive && runtimeMode === "bar" && <BarShelf drink={barDrink} columns={columns} />}
+          {!interactionActive && runtimeMode === "bar" && <BarShelf drink={barDrink} columns={columns} rows={rows} />}
 
           {approvalRequests[0] && (
             <ToolApprovalPanel

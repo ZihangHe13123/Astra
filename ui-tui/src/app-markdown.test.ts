@@ -299,7 +299,7 @@ assert.ok(
     && auxiliaryIndex > statusIndex
     && inputIndex > auxiliaryIndex,
 );
-assert.equal((appSource.match(/<BarHeaderMemo\b/g) ?? []).length, 1);
+assert.equal((appSource.match(/<BarStatusDockMemo\b/g) ?? []).length, 1);
 assert.equal((appSource.match(/<AppHeaderMemo\b/g) ?? []).length, 1);
 const completeTurnSource = appSource.slice(
   appSource.indexOf("const completeTurn"),
