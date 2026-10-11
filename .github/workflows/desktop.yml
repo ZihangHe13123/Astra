@@ -69,3 +69,5 @@ jobs:
           node ui-gui/tests/inspector-smoke.mjs
           node ui-gui/tests/markdown-smoke.mjs
           node ui-gui/tests/response-versions-smoke.mjs
+          node ui-gui/tests/card-smoke.mjs
+          node ui-gui/tests/page-smoke.mjs
