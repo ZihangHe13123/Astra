@@ -378,7 +378,7 @@ const recoverableErrorCase = appSource.slice(
   appSource.indexOf("if (event.recoverable)"),
   appSource.indexOf("finishTurn();", appSource.indexOf("if (event.recoverable)")),
 );
-assert.match(recoverableErrorCase, /addMessage\("tool"/u);
+assert.match(recoverableErrorCase, /addMessage\("system", `⚠ /u);
 assert.doesNotMatch(recoverableErrorCase, /toolCompletion/u);
 assert.match(appSource, /case "user_question_request"/);
 assert.match(appSource, /case "user_question_resolved"/);

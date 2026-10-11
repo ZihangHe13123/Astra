@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { gapLine, TranscriptFlow, type FlowItem } from "./transcript-flow.js";
+import { gapLine, noticeItem, TranscriptFlow, type FlowItem } from "./transcript-flow.js";
 
 const gaps = (flow: TranscriptFlow, items: FlowItem[]) => items.map((item) => flow.before(item));
 
@@ -12,8 +12,8 @@ test("inside a turn the rail runs between pieces, and a run of tool calls has no
   );
 });
 
-test("a new question starts on a clear line, whatever the turn before it ended with", () => {
-  for (const last of ["assistant", "tool", "changes", "user"] as const) {
+test("a new question starts on a clear line, whatever came before it", () => {
+  for (const last of ["assistant", "tool", "changes", "user", "note", "block"] as const) {
     const flow = new TranscriptFlow();
     gaps(flow, ["user", last]);
     assert.equal(flow.before("user"), "blank", last);
@@ -21,15 +21,21 @@ test("a new question starts on a clear line, whatever the turn before it ended w
   }
 });
 
-test("a notice ends with its own blank line, so nothing is owed after it", () => {
+test("a one-line notice is a row among rows, and stands off from what is said", () => {
   const flow = new TranscriptFlow();
-  assert.equal(flow.before("other"), "none");
-  assert.equal(flow.before("assistant"), "none");
-  // Inside a turn a notice is set off by a clear line and leaves the next piece nothing to add.
-  assert.equal(flow.before("other"), "blank");
-  assert.equal(flow.previous, null);
-  assert.equal(flow.before("tool"), "none");
-  assert.equal(flow.before("user"), "blank");
+  // Between tool calls it takes one line and no more.
+  assert.deepEqual(gaps(flow, ["user", "tool", "note", "tool", "note", "note"]), ["none", "rail", "none", "none", "none", "none"]);
+  // The rail runs between a notice and what is said before or after it.
+  assert.deepEqual(gaps(flow, ["assistant", "note", "assistant"]), ["rail", "rail", "rail"]);
+  // A command and its answer are one exchange.
+  const command = new TranscriptFlow();
+  assert.deepEqual(gaps(command, ["user", "note", "user", "block", "note"]), ["none", "rail", "blank", "rail", "rail"]);
+});
+
+test("a message that is not part of the talk is a notice when it is one line, a block otherwise", () => {
+  assert.equal(noticeItem("YOLO mode ON"), "note");
+  assert.equal(noticeItem("  trailing newline does not make a block\n"), "note");
+  assert.equal(noticeItem("Current theme: a\nAvailable: a, b"), "block");
 });
 
 test("a reset forgets what was owed", () => {

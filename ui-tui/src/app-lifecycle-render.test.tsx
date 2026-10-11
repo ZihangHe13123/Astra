@@ -562,7 +562,8 @@ test("model download stderr progress is hidden while real stderr stays error",as
   const output=h.stdout.chunks.map(stripAnsi).join("\n");
   assert.doesNotMatch(output,/Fetching 9 files/);
   h.child.stderr.write("OSError: model weights could not be opened\n");await settle();
-  assert.match(h.stdout.chunks.map(stripAnsi).join("\n"),/err\s+\[backend\] OSError/);
+  // Shown under the theme's own label for errors, beside the time rail.
+  assert.match(h.stdout.chunks.map(stripAnsi).join("\n"),/ERR\S*\s+\[backend\] OSError/);
  }finally{h.app.unmount();}
 });
 

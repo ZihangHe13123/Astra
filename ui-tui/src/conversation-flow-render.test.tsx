@@ -95,9 +95,9 @@ test("a turn reads as one piece: tool calls as rows, and the rail unbroken from 
     const text = lines.join("\n");
 
     // One row per call: what was done, to what, what came of it, how long, how it ended, its number.
-    assert.match(text, /\S READ\s+agent\/runtime\/turn_change_store\.py\s+61 lines\s+0\.1s ✓\s+#1$/m, text);
-    assert.match(text, /\S SEARCH\s+os\.open\(  in agent\/runtime\s+14 lines\s+0\.3s ✓\s+#2$/m, text);
-    assert.match(text, /\S RUN\s+pytest tests\/test_turn_change_store\.py -q\s+18 passed in 4\.21s\s+4\.2s ✓\s+#3$/m, text);
+    assert.match(text, /\S READ\s+agent\/runtime\/turn_change_store\.py ·+ 61 lines\s+0\.1s ✓\s+#1$/m, text);
+    assert.match(text, /\S SEARCH\s+os\.open\(  in agent\/runtime ·+ 14 lines\s+0\.3s ✓\s+#2$/m, text);
+    assert.match(text, /\S RUN\s+pytest tests\/test_turn_change_store\.py -q ·+ 18 passed in 4\.21s\s+4\.2s ✓\s+#3$/m, text);
     // The output itself stays out of the conversation.
     assert.doesNotMatch(text, /collected 18 items|collapsed/);
     // A run of calls is one block: the speaker's label on its first row only, no line between
@@ -150,7 +150,7 @@ test("a failed call says why under its row, and the next question starts a new b
     const lines = conversation(h.frame());
     const text = lines.join("\n");
 
-    assert.match(text, /\S RUN\s+pytest tests -q -x\s+1 failed, 212 passed\s+1:38 ✕\s+#1$/m, text);
+    assert.match(text, /\S RUN\s+pytest tests -q -x ·+ 1 failed, 212 passed\s+1:38 ✕\s+#1$/m, text);
     const row = lines.findIndex((line) => /\S RUN /.test(line));
     // Only the first line of the reason, right under the row and under the rail.
     assert.match(lines[row + 1], /^ {5}\S\s+Command exited with code 1$/, text);
@@ -187,8 +187,8 @@ test("with the timeline off the same pieces stand without a rail", async () => {
     const text = lines.join("\n");
     const rows = lines.filter((line) => /\S READ /.test(line));
     assert.equal(rows.length, 2, text);
-    assert.match(rows[0], /^tool \S READ\s+README\.md\s+2 lines\s+12ms ✓\s+#1$/, text);
-    assert.match(rows[1], /^ {5}\S READ\s+docs\/usage\.md\s+3 lines\s+30ms ✓\s+#2$/, text);
+    assert.match(rows[0], /^tool \S READ\s+README\.md ·+ 2 lines\s+12ms ✓\s+#1$/, text);
+    assert.match(rows[1], /^ {5}\S READ\s+docs\/usage\.md ·+ 3 lines\s+30ms ✓\s+#2$/, text);
     assert.equal(lines.indexOf(rows[1]) - lines.indexOf(rows[0]), 1);
     // One clear line before the run and one after it, as between any two pieces.
     assert.equal(lines[lines.indexOf(rows[0]) - 1].trim(), "");
@@ -198,7 +198,7 @@ test("with the timeline off the same pieces stand without a rail", async () => {
   } finally { h.app.unmount(); }
 });
 
-test("a command and its answer stand apart from the question that follows, one clear line each", async () => {
+test("a command and its answer are one exchange on the rail, apart from the question that follows", async () => {
   const h = await setup(120);
   try {
     await h.events({ type: "session_info", name: "sess-a", messages: 1 });
@@ -212,10 +212,82 @@ test("a command and its answer stand apart from the question that follows, one c
     const hello = lines.findIndex((line) => line.includes("hello"));
     const reply = lines.findIndex((line) => line.includes("Hi."));
     assert.deepEqual([answer - echo, hello - answer, reply - hello], [2, 2, 2], text);
-    assert.equal(lines[echo + 1].trim(), "", text);
+    // The rail joins the command to its answer and the question to its reply; a clear line
+    // parts the two exchanges.
+    assert.match(lines[echo + 1], /^ {5}\S$/, text);
+    assert.match(lines[answer], RAIL, text);
     assert.equal(lines[answer + 1].trim(), "", text);
-    // The rail joins the question to its reply, and nothing else here.
     assert.match(lines[hello + 1], /^ {5}\S$/, text);
+    // The answer stands under a label of its own, in the column everything is said in.
+    assert.match(lines[answer].slice(6), /^\S+\s+Timeline display: ON$/, text);
+    assert.equal(lines[answer].indexOf("Timeline display"), lines[hello].indexOf("hello"), text);
+  } finally { h.app.unmount(); }
+});
+
+test("notices are rows among the tool calls: one line each, on the rail, said once", async () => {
+  const h = await setup(140);
+  try {
+    await h.events({ type: "session_info", name: "sess-a", messages: 1 });
+    await h.submit("go on");
+    await h.events({ type: "tool_calls", calls: [{ id: "c1", name: "read_file", arguments: JSON.stringify({ path: "a.md" }) }] });
+    await h.events({ type: "tool_result", call_id: "c1", name: "read_file", output: "only", error: "", duration_ms: 6 });
+    await h.events({ type: "yolo_status", yolo: true });
+    await h.events({ type: "tool_calls", calls: [{ id: "c2", name: "execute_shell", arguments: JSON.stringify({ command: "python3 - <<'PY'\nimport json\nprint(1)\nPY" }) }] });
+    await h.events({ type: "tool_result", call_id: "c2", name: "execute_shell", output: "1", error: "", duration_ms: 200 });
+    const ended = { type: "process_status", process_id: "2540283a99ff", kind: "shell", status: "completed", label: "npm run build", started_at: 1, output_chars: 336_743, duration_ms: 34_533 };
+    await h.events(ended, ended);
+    await h.events({ type: "error", recoverable: true, code: "tool_budget_exceeded", tool_name: "execute_shell", message: "stopped\nafter the limit" });
+    await h.events({ type: "chunk", content: "Done." }, { type: "done" });
+    const lines = conversation(h.frame());
+    const text = lines.join("\n");
+    const at = (needle: string | RegExp) => lines.findIndex((line) => typeof needle === "string" ? line.includes(needle) : needle.test(line));
+
+    // From the first call to the last notice every piece is one line under the one before it.
+    const order = [at(/\S READ /), at("YOLO mode ON"), at(/\S RUN\s+python3/), at("background shell"), at("TOOL BUDGET EXCEEDED")];
+    assert.deepEqual(order.map((index) => index - order[0]), [0, 1, 2, 3, 4], text);
+    for (const index of order) assert.match(lines[index], RAIL, text);
+    // One line of output is "1 line"; a script is told past its first line.
+    assert.match(lines[order[0]], /\S READ\s+a\.md ·+ 1 line\s+6ms ✓\s+#1$/, text);
+    assert.match(lines[order[2]], /\S RUN\s+python3 - <<'PY' ↵ import json ↵ print\(1\) ↵ PY ·+ 1\s+0\.2s ✓\s+#2$/, text);
+    // A process that ended is said to have ended once, however often its status is told.
+    assert.match(lines[order[3]], /\S RUN\s+background shell · npm run build ·+ 336,743 chars\s+35s ✓$/, text);
+    assert.equal(lines.filter((line) => line.includes("background shell")).length, 1, text);
+    // A notice stands under its own label, in the column everything is said in, on one line.
+    assert.match(lines[order[1]].slice(6), /^\S+\s+YOLO mode ON — eligible approvals bypassed · Ctrl\+Y to switch off$/, text);
+    assert.match(lines[order[4]].slice(6), /^\S+\s+⚠ TOOL BUDGET EXCEEDED · execute_shell — stopped after the limit$/, text);
+    assert.equal(lines[order[1]].indexOf("YOLO"), lines[at("go on")].indexOf("go on"), text);
+    // The rail then runs on to the reply.
+    assert.match(lines[order[4] + 1], /^ {5}\S$/, text);
+    assert.match(lines[order[4] + 2], /Done\./, text);
+  } finally { h.app.unmount(); }
+});
+
+test("an error and a command's listing stand on the rail under their own labels", async () => {
+  const h = await setup(150, 60);
+  try {
+    await h.events({ type: "session_info", name: "sess-a", messages: 1 });
+    await h.submit("/help");
+    await h.submit("/theme no-such-theme");
+    const lines = conversation(h.frame());
+    const text = lines.join("\n");
+    const display = lines.findIndex((line) => /DISPLAY\s+\/theme\s+\/timeline/.test(line));
+    const system = lines.findIndex((line) => /SYSTEM\s+\/health/.test(line));
+    const unknown = lines.findIndex((line) => line.includes("Unknown theme: no-such-theme"));
+    assert.ok(display >= 0 && system > display && unknown > system, text);
+    // A listing keeps its lines together in the column everything is said in, under one label
+    // on its first line; an error has a label of its own.
+    const said = lines[lines.findIndex((line) => line.includes("/help"))].indexOf("/help");
+    assert.equal(lines[display].search(/DISPLAY/), said, text);
+    assert.equal(lines[system].search(/SYSTEM/), said, text);
+    assert.equal(lines[unknown].indexOf("Unknown theme"), said, text);
+    const label = (index: number) => lines[index].slice(6, said).trim();
+    const first = lines.findIndex((line, index) => index > 0 && RAIL.test(line) && label(index) !== "" && index > lines.findIndex((item) => item.includes("/help")));
+    assert.ok(first >= 0 && first <= display, text);
+    for (let index = first + 1; index <= system; index += 1) assert.equal(label(index), "", `a listing has one label\n${text}`);
+    assert.notEqual(label(unknown), "");
+    assert.notEqual(label(unknown), label(first));
+    for (let index = first; index <= system; index += 1) assert.match(lines[index], RAIL, text);
+    assert.match(lines[unknown], RAIL, text);
   } finally { h.app.unmount(); }
 });
 
