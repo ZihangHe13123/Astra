@@ -1,4 +1,5 @@
 import React from "react";
+import { describeTool } from "@astra/ui-core/tool-activity";
 import stringWidth from "string-width";
 import { Box, Text } from "ink";
 import type { GenerationStats, ToolCallInfo, ToolProgressInfo, WorkingMemory } from "../types.js";
@@ -245,12 +246,6 @@ export function fitActivitySummary(segments: string[], columns: number, model: s
   return parts.map((part) => part.text);
 }
 
-function argumentsPreview(raw = "", maxChars = 90): string {
-  const compact = raw.replace(/\s+/g, " ").trim();
-  if (!compact || compact === "{}") return "";
-  return compact.length <= maxChars ? compact : `${compact.slice(0, maxChars - 1)}…`;
-}
-
 function requestDuration(seconds: number): string {
   if (seconds < 0.001) return "<1ms";
   return seconds < 1 ? `${Math.round(seconds * 1000)}ms` : `${seconds.toFixed(1)}s`;
@@ -281,6 +276,8 @@ export function ActivityDock({
   pendingApproval,
   queuedApprovalCallIds = [],
   computer,
+  brand,
+  action = "exit",
 }: {
   expanded: boolean;
   tools: ActiveTool[];
@@ -306,17 +303,31 @@ export function ActivityDock({
   pendingApproval?: PendingApprovalSummary;
   queuedApprovalCallIds?: readonly (string | undefined)[];
   computer?: ComputerUiState;
+  /** With a brand, this line is also the header: the brand leads it, the keys end it, and one rule
+   * above replaces the two frames a separate header and dock would draw. */
+  brand?: string;
+  /** What Ctrl+C does now, for the key hints of a line that carries the brand. */
+  action?: string;
 }) {
   const theme = useTheme();
   const chrome = theme.chrome;
   const mode = responsiveMode(columns);
   const visibleTools = filterQueuedApprovalTools(tools, queuedApprovalCallIds);
   const separator = chrome?.separator ?? " · ";
-  const hint = mode === "compact" ? " ^L" : expanded ? "  ^L collapse" : "  ^L expand";
+  const merged = brand !== undefined;
+  const toggle = expanded ? "collapse" : "expand";
+  const keys = mode === "compact" ? "^L" : !merged ? `^L ${toggle}` : mode === "standard" ? `^L ${toggle}  ^C ${action}` : `^L ${toggle}  ^O tools  ^C ${action}`;
+  const lead = merged && mode !== "compact" ? brand : "";
+  const leadWidth = lead ? stringWidth(lead) + stringWidth(separator) : 0;
+  const gap = mode === "compact" ? 1 : 2;
+  // A line that is also the header has no side frames, so it is two cells wider inside.
   const summary = fitActivitySummary(buildActivitySummary({
     status, tools: visibleTools, now, memory, contextPct, lastTool, columns, model, showReasoning, reasoningEffort, codeMode, teams, pendingApproval, computer,
     expanded, tokensPerSecond: generationStats?.tokens_per_second,
-  }), columns, model, separator, hint);
+  }), columns - leadWidth + (merged ? 2 : 0), model, separator, `${" ".repeat(gap)}${keys}`);
+  // The keys sit at the right edge of a header line, and straight after the summary otherwise.
+  const used = leadWidth + 2 + stringWidth(summary.join(separator));
+  const hint = `${" ".repeat(merged ? Math.max(gap, columns - 2 - used - stringWidth(keys)) : gap)}${keys}`;
   const statusParts = buildStatusParts({
     columns: Math.max(30, columns - 10),
     model,
@@ -353,11 +364,13 @@ export function ActivityDock({
       : theme.border;
 
   return (
-    <Box flexDirection="column" borderStyle={chrome?.activityFrameStyle ?? chrome?.frameStyle ?? "single"} borderColor={borderColor} paddingX={1}>
+    <Box flexDirection="column" borderStyle={merged ? "single" : chrome?.activityFrameStyle ?? chrome?.frameStyle ?? "single"} borderColor={borderColor} paddingX={1}
+      borderBottom={!merged} borderLeft={!merged} borderRight={!merged}>
       {/* Stretch the text to the row so asynchronously inserted fields do not
           retain Ink's previous, shorter text measurement. */}
       <Box flexDirection="column" overflow="hidden">
         <Text wrap="truncate-end">
+          {lead && <><Text bold={theme.prefixBold} color={theme.name === "classic" ? theme.header : theme.accent}>{lead}</Text><Text color={theme.subtle}>{separator}</Text></>}
           <Text bold color={indicatorColor}>{indicator} </Text>
           {summary.map((item, index) => (
             <React.Fragment key={item}>
@@ -375,15 +388,23 @@ export function ActivityDock({
             <Text bold={theme.prefixBold} color={theme.warning}>{chrome?.activeToolsTitle ?? "LIVE TOOLS"}</Text>
           )}
           {visibleTools.map((tool) => {
-            const preview = argumentsPreview(tool.arguments, Math.max(20, Math.min(90, columns - 30)));
+            // One line per tool, in columns: its kind, what it is done to, its progress, its time.
+            // The target is the one argument that says what the call is about, not the raw arguments.
+            const step = describeTool({ name: tool.name, arguments: tool.arguments, status: "running" });
+            const label = (tool.arguments ?? "").trim();
+            const what = step.target === tool.name && label && !label.startsWith("{") ? `${tool.name}  ${label.replace(/\s+/g, " ")}` : step.target;
             const progress = formatToolProgress(tool.progress);
             const progressColor = tool.progress?.status === "failed" ? theme.danger : theme.warning;
+            const time = formatToolElapsed(tool.startedAt, now);
+            const room = Math.max(8, columns - (merged ? 2 : 4) - 2 - 8 - (progress ? stringWidth(progress) + 2 : 0) - stringWidth(time) - 2);
+            const target = shorten(what, room);
             return (
-              <Text key={tool.id} color={theme.text}>
+              <Text key={tool.id} color={theme.text} wrap="truncate-end">
                 <Text color={theme.warning}>{chrome?.activeToolIcon ?? "◌"} </Text>
-                <Text bold={theme.prefixBold}>{formatToolName(tool.name)}</Text>
+                <Text bold={theme.prefixBold} color={theme.accentAlt}>{step.verb.padEnd(8)}</Text>
+                {target}{" ".repeat(Math.max(0, room - stringWidth(target)))}
                 {progress && <Text color={progressColor}>  {progress}</Text>}
-                <Text color={theme.muted}>  {formatToolElapsed(tool.startedAt, now)}{preview ? `  ${preview}` : ""}</Text>
+                <Text color={theme.muted}>  {time}</Text>
               </Text>
             );
           })}

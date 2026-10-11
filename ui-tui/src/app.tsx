@@ -2192,7 +2192,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         dynamic={compactQuestion ? null : visibleDynamicDisplayLines(displayState, Math.max(1, rows - 2)).map((line) => (
           <MessageLine key={line.key} line={line} runtimeMode={runtimeMode} />
         ))}
-        header={compactQuestion ? null : runtimeMode === "bar"
+        // In work mode the status line is the header too; the other modes keep the header they have.
+        header={compactQuestion || runtimeMode === "work" ? null : runtimeMode === "bar"
           ? <BarHeaderMemo columns={columns} />
           : <AppHeaderMemo columns={columns} busy={busy} mode={runtimeMode} localMode={localMode} />}
         status={compactQuestion ? null : runtimeMode === "work" ? <ActivityDockMemo
@@ -2230,6 +2231,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           pendingApproval={pendingApprovalSummary}
           queuedApprovalCallIds={queuedApprovalCallIds}
           computer={computer}
+          brand={(theme.chrome?.brand ?? "Agent System").split(" // ")[0]}
+          action={busy ? "cancel" : theme.chrome?.exitLabel ?? "exit"}
         /> : runtimeMode === "bar" ? <BarStatusDockMemo
           session={barSessionName}
           busy={busy}
