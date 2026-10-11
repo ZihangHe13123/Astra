@@ -81,6 +81,7 @@ from agent.runtime.peer_link import (HEARTBEAT_SECONDS, PeerError, PeerLink, def
 from agent.runtime.tools.web import register_web_tools, create_browser_extract_fn, create_browser_status_fn
 from agent.runtime.tools.workspace import register_workspace_tools
 from agent.runtime.tools.image import register_image_tools, select_vision_tiles_from_holder
+from agent.runtime.page_snapshot import PageSnapshotBroker
 from agent.runtime.tools.computer import register_local_computer_runtime
 from agent.runtime.tools.browser import register_browser_tools
 from agent.runtime.cdp_backend import CdpBrowserBackend, find_chrome
@@ -941,6 +942,8 @@ async def _main(startup_started: float):
     search_provider_state = register_web_tools(
         tools, sandbox, default_provider=resolve_startup_search_provider()
     )
+    # Pages are drawn by the desktop alone, so only its backend offers to look at one.
+    page_snapshots = PageSnapshotBroker(_send)
     register_image_tools(
         tools,
         workdir=os.getcwd(),
@@ -949,6 +952,7 @@ async def _main(startup_started: float):
             tile_set_id,
             tile_ids,
         ),
+        render_page=page_snapshots.request if os.getenv("ASTRA_UI_SURFACE") == "gui" else None,
     )
     computer_runtime = register_local_computer_runtime(
         tools,
@@ -3651,6 +3655,9 @@ async def _main(startup_started: float):
                         "reason": reason,
                         "retryable": retryable,
                     })
+
+            elif cmd.get("type") == "page_snapshot_response":
+                page_snapshots.resolve(cmd)
 
             elif cmd.get("type") == "user_question_editing":
                 editing = cmd.get("editing")

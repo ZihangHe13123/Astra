@@ -104,7 +104,8 @@ const pageDocument = `<!doctype html><html lang="zh-CN"><head><meta charset="utf
       if (event.source !== host || !data || data.astraPage !== true) return;
       if (data.type === "theme") paint(data.theme);
       // The host asks after every load whether this is still the page; a document that replaced it cannot answer.
-      if (data.type === "ping") tell({ type: "pong", id: data.id });
+      // The answer says how tall the page is and whether it has finished loading, for a host that takes its picture.
+      if (data.type === "ping") tell({ type: "pong", id: data.id, height: Math.max(root.scrollHeight, document.body ? document.body.scrollHeight : 0), settled: document.readyState === "complete" });
     });
     // A link inside the page scrolls to its place. Any other would replace the page with a refused one.
     addEventListener("click", event => {
@@ -132,6 +133,85 @@ const pageDocument = `<!doctype html><html lang="zh-CN"><head><meta charset="utf
   host.postMessage({ astraPage: true, type: "ready" }, "*");
 })();
 </script></head><body></body></html>`;
+
+/**
+ * The document that holds a page while its picture is taken, in a window nobody sees. It is the
+ * page's host there as the app's window is its host on screen: the page runs in the same frame,
+ * under the same policy, and this document only hands it its source, waits until it has settled,
+ * and says how tall it is. It is ours alone; nothing but the page frame loads in it.
+ */
+export const CAPTURE_HOST_URL = "astra://capture/host.html";
+export const CAPTURE_HOST_POLICY = [
+  "default-src 'none'", "script-src 'unsafe-inline'", "style-src 'unsafe-inline'", "frame-src astra://card",
+  "form-action 'none'", "base-uri 'none'",
+].join("; ");
+const captureDocument = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><style>html, body { margin: 0; overflow: hidden; background: #fff; } iframe { display: block; border: 0; }</style><script>
+(() => {
+  const loadTimeout = 5000, answerTimeout = 3000, settleTime = 400, drawTimeout = 8000;
+  let frame, asks = 0, problem = "", ready;
+  const waiting = new Map();
+  const becameReady = new Promise(resolve => { ready = resolve; });
+  const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
+  // Two frames, so that what was laid out has also been drawn; a window that draws nothing must not hold the picture up.
+  const painted = () => Promise.race([new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))), pause(300)]);
+  addEventListener("message", event => {
+    const data = event.data;
+    if (!frame || event.source !== frame.contentWindow || !data || data.astraPage !== true) return;
+    if (data.type === "ready") ready();
+    else if (data.type === "pong" && waiting.has(data.id)) { const answer = waiting.get(data.id); waiting.delete(data.id); answer(data); }
+    else if (data.type === "error" && typeof data.message === "string" && !problem) problem = data.message.slice(0, 300);
+  });
+  // The page answers only while it is still the page and its script is not stuck.
+  const ask = () => new Promise((resolve, reject) => {
+    const id = ++asks;
+    const timer = setTimeout(() => { waiting.delete(id); reject(new Error("页面没有应答：它离开了自己的框，或脚本一直占着不放。")); }, answerTimeout);
+    waiting.set(id, data => { clearTimeout(timer); resolve(data); });
+    frame.contentWindow.postMessage({ astraPage: true, type: "ping", id }, "*");
+  });
+  // The page says how tall it is; the host believes it only as a number within bounds.
+  const tall = data => { const value = Number(data.height); return Number.isFinite(value) ? Math.min(100000, Math.max(0, Math.ceil(value))) : 0; };
+  window.astraCapture = {
+    async open({ html, theme, address, width, height }) {
+      frame = document.createElement("iframe");
+      frame.setAttribute("sandbox", "allow-scripts"); frame.referrerPolicy = "no-referrer";
+      frame.style.width = width + "px"; frame.style.height = height + "px";
+      frame.src = address; document.body.append(frame);
+      await Promise.race([becameReady, pause(loadTimeout).then(() => { throw new Error("页面没有载入。"); })]);
+      frame.contentWindow.postMessage({ astraPage: true, type: "render", html, theme }, "*");
+      // Loaded, and the same height twice running: what the page lays out as it loads has been laid out.
+      const started = Date.now(); let last = 0, settledAt = 0;
+      for (;;) {
+        await pause(100);
+        const data = await ask(), now = tall(data);
+        if (data.settled === true && now > 0) {
+          settledAt = settledAt || Date.now();
+          if (now === last && Date.now() - settledAt >= settleTime) break;
+          last = now;
+        }
+        if (Date.now() - started > drawTimeout) { if (last > 0) break; throw new Error("页面在限定时间内没有画完。"); }
+      }
+      await painted();
+      return last;
+    },
+    async fit(height) {
+      frame.style.height = height + "px";
+      await painted(); await pause(120);
+      const now = tall(await ask());
+      await painted();
+      return now;
+    },
+    problem: () => problem,
+  };
+})();
+</script></head><body></body></html>`;
+
+export function captureHostResponse(pathname: string): Response {
+  if (pathname !== "/host.html") return new Response("Not found", { status: 404 });
+  return new Response(captureDocument, { headers: {
+    "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": CAPTURE_HOST_POLICY,
+    "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store",
+  } });
+}
 
 export function cardFrameResponse(pathname: string): Response {
   const body = pathname === "/frame.html" ? frameDocument : pathname === "/page.html" ? pageDocument : undefined;

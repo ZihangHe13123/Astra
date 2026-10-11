@@ -184,6 +184,14 @@ any `.html` file can be previewed as a page from the Files panel.
   `--astra-line`, `--astra-text`, `--astra-muted`, `--astra-accent`, `--astra-on-accent` and
   `--astra-error`.
 - A file over 1 MiB is shown as source.
+- The model can look at a page as well as write it. When it reads the page file with its image
+  tool, the desktop draws the page out of sight, in the same isolated frame, and hands the model
+  the picture: 1000 px wide, from the top, up to three screens. A longer page is reported with
+  its full height, and an error raised by the page's script is reported with it. The picture is
+  of the page as it loads; the model cannot click in it.
+- **发给 Astra 看** attaches that same picture to the message you are writing, for when you want
+  the model to look at what you are looking at. Pictures are kept in the desktop's own data
+  folder (`gui/page-snapshots`), the newest forty.
 
 Pages are a desktop feature. The model learns of them from the same `interactive-cards` skill as
 cards, so the same notes on the skill catalog apply.

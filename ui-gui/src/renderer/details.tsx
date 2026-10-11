@@ -11,7 +11,7 @@ import { ToolPreparation } from "./tool-preparation.js";
 import { FilePreviewPanel } from "./file-preview-panel.js";
 
 export type Panel = "tools" | "changes" | "files" | "context" | "team" | "logs";
-export function Details({ state, panel, setPanel, selection, width, onWidth, close, fail, doc, onDocDismiss, openLog, wide, onWide }: { wide?: boolean; onWide?: (wide: boolean) => void; state: SessionState; panel: Panel; setPanel: (p: Panel) => void; selection: { index?: number; serial: number }; width: number; onWidth: (width: number) => void; close: () => void; fail: (e: unknown) => void; doc?: { path: string; serial: number }; onDocDismiss?: () => void; openLog?: (callId: string) => void }) {
+export function Details({ state, panel, setPanel, selection, width, onWidth, close, fail, doc, onDocDismiss, openLog, wide, onWide, onAttach }: { wide?: boolean; onWide?: (wide: boolean) => void; onAttach?: (paths: string[]) => void; state: SessionState; panel: Panel; setPanel: (p: Panel) => void; selection: { index?: number; serial: number }; width: number; onWidth: (width: number) => void; close: () => void; fail: (e: unknown) => void; doc?: { path: string; serial: number }; onDocDismiss?: () => void; openLog?: (callId: string) => void }) {
   const content = useRef<HTMLDivElement>(null);
   const previewRequest = useRef(0);
   const locatedSelection = useRef("");
@@ -61,7 +61,7 @@ export function Details({ state, panel, setPanel, selection, width, onWidth, clo
       onPointerCancel={() => { drag.current = undefined; if (panelRef.current) panelRef.current.style.width = `${width}px`; }}/>
     <div className="panel-tabs" role="tablist">{tabs.filter(t => t.id !== "logs" || openLog).map(t => <button key={t.id} role="tab" aria-selected={panel === t.id} onClick={() => { previewRequest.current++; setPreview(undefined); setPanel(t.id); }}><t.icon size={15}/>{t.label}</button>)}<button className="icon" onClick={close} aria-label="关闭详情"><X size={15}/></button></div>
     <div className="panel-content" ref={content}>
-      {preview ? <FilePreviewPanel runtime={state.id} path={preview.path} serial={preview.serial} fail={fail} wide={wide} onWide={onWide} dismiss={() => { if (doc && preview.path === doc.path) onDocDismiss?.(); onWide?.(false); setPreview(undefined); }}/> : panel === "tools" ? <>
+      {preview ? <FilePreviewPanel runtime={state.id} path={preview.path} serial={preview.serial} fail={fail} wide={wide} onWide={onWide} onAttach={onAttach} dismiss={() => { if (doc && preview.path === doc.path) onDocDismiss?.(); onWide?.(false); setPreview(undefined); }}/> : panel === "tools" ? <>
         <ToolPreparation preparation={state.preparation}/>
         <DelegateCards delegates={state.delegates} runtime={state.id} fail={fail} openFile={openFile}/>
         <h3>工具与进程 <span className="count">{state.tools.length}</span></h3>
