@@ -30,15 +30,6 @@ export function toolResultBody(result: ToolResultRecord): string {
   return imageSearchSummary(result) ?? (result.output || result.error || "(done)");
 }
 
-export function shouldCollapseToolResult(
-  content: string,
-  maxChars = 700,
-  maxLines = 6,
-): boolean {
-  if (content.length > maxChars) return true;
-  return content.split(/\r?\n/).length > maxLines;
-}
-
 export function summarizeToolResult(content: string, maxChars = 120): string {
   const firstUsefulLine = content
     .replace(ANSI_PATTERN, "")

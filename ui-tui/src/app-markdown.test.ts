@@ -253,7 +253,7 @@ assert.match(appSource, /useState\(loadTimelineDisplay\)/u);
 assert.match(appSource, /resolveTimelineCommand\(text, timelineVisibleRef\.current\)/u);
 assert.match(appSource, /saveTimelineDisplay\(timelineCommand\.enabled\)/u);
 assert.match(appSource, /DISPLAY  \/theme  \/timeline/u);
-assert.match(appSource, /toolCompletion: true, timestamp: completedAt/u);
+assert.match(appSource, /nextTimeRail\("tool", completedAt\)/u);
 assert.match(appSource, /const completedAt = Date\.now\(\)/u);
 assert.match(appSource, /timeRailCursorRef\.current\.reset\(\)/);
 assert.match(appSource, /theme\.chrome\?\.separator/);
@@ -361,11 +361,11 @@ const toolResultCase = appSource.slice(
   appSource.indexOf('case "tool_result"'),
   appSource.indexOf('case "done"'),
 );
-assert.match(toolResultCase, /toolCompletion: true/u);
+assert.match(toolResultCase, /shouldMessageUseTimeline\("tool", timelineVisibleRef\.current, true\)/u);
 assert.equal(callCount(toolResultCase, assistantFlush), 1);
 const toolCompletedAt = toolResultCase.indexOf("const completedAt = Date.now()");
 const toolAssistantFlush = toolResultCase.indexOf(assistantFlush);
-const toolOutputAllocation = toolResultCase.indexOf('addMessage(\n            "tool"');
+const toolOutputAllocation = toolResultCase.indexOf('appendFlow(\n          "tool"');
 assert.ok(toolCompletedAt >= 0 && toolCompletedAt < toolAssistantFlush);
 assert.ok(toolAssistantFlush < toolOutputAllocation);
 const ctrlCBranch = appSource.slice(

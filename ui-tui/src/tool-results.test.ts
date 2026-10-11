@@ -4,16 +4,9 @@ import stringWidth from "string-width";
 
 import {
   clampToolDetailOffset,
-  shouldCollapseToolResult,
   summarizeToolResult,
   wrapToolResult,
 } from "./tool-results.js";
-
-test("long or multi-line tool results collapse by default", () => {
-  assert.equal(shouldCollapseToolResult("x".repeat(701)), true);
-  assert.equal(shouldCollapseToolResult("1\n2\n3\n4\n5\n6\n7"), true);
-  assert.equal(shouldCollapseToolResult("short\nresult"), false);
-});
 
 test("tool result summary uses the first meaningful line", () => {
   assert.equal(summarizeToolResult("\n  Search results: 5\nsecond"), "Search results: 5");
