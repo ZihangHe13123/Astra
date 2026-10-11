@@ -7,6 +7,8 @@ import { inspectOffice, spreadsheetPreview } from './office-inspection.js';
 import { convertOffice, type OfficeConversion } from './office-converter.js';
 
 export const TEXT_PREVIEW_LIMIT = 256 * 1024;
+/** A page is rendered whole or not at all: half an HTML document is not a smaller page. */
+export const PAGE_PREVIEW_LIMIT = 1024 * 1024;
 export const DOCUMENT_PREVIEW_LIMIT = 32 * 1024 * 1024;
 const IMAGE_PREVIEW_LIMIT = 10 * 1024 * 1024;
 const imageTypes: Record<string, string> = { '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif' };
@@ -68,7 +70,7 @@ export class DocumentPreviewService {
     try {
       checkSignal(signal); authorize();
       const file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-      let content: Buffer, initialVersion: string, truncated: boolean;
+      let content: Buffer, initialVersion: string, truncated: boolean, page = false;
       try {
         authorize(); checkSignal(signal);
         const info = await file.stat(); if (!info.isFile()) throw new Error('只能预览普通文件。');
@@ -82,7 +84,8 @@ export class DocumentPreviewService {
         }
         const document = office || extension === '.pdf' || extension === '.xlsx';
         const mime = imageTypes[extension];
-        const limit = document ? this.options.maxInputBytes ?? DOCUMENT_PREVIEW_LIMIT : mime ? IMAGE_PREVIEW_LIMIT : TEXT_PREVIEW_LIMIT;
+        page = (extension === '.html' || extension === '.htm') && info.size <= PAGE_PREVIEW_LIMIT;
+        const limit = document ? this.options.maxInputBytes ?? DOCUMENT_PREVIEW_LIMIT : mime ? IMAGE_PREVIEW_LIMIT : page ? PAGE_PREVIEW_LIMIT : TEXT_PREVIEW_LIMIT;
         if ((document || mime) && info.size > limit) throw new Error(`文件超过预览大小限制（${Math.round(limit / 1024 / 1024)} MiB），请使用系统打开。`);
         const length = Math.min(info.size, limit); const buffer = Buffer.alloc(length); let read = 0;
         while (read < length) { checkSignal(signal); const {bytesRead} = await file.read(buffer, read, length-read, read); if (!bytesRead) break; read += bytesRead; }
@@ -109,7 +112,10 @@ export class DocumentPreviewService {
       if (extension === '.xlsx') return {...base, kind:'spreadsheet', ...spreadsheetPreview(content)};
       const mime = imageTypes[extension]; if (mime) return {...base, kind:'image', data:`data:${mime};base64,${content.toString('base64')}`};
       if (content.subarray(0, 8192).includes(0)) throw new Error('二进制文件请使用系统打开。');
-      return {...base, kind:'text', text:new TextDecoder().decode(content, {stream:truncated}), truncated};
+      const text = new TextDecoder().decode(content, {stream:truncated});
+      if (page && !truncated) return {...base, kind:'page', text};
+      const oversized = extension === '.html' || extension === '.htm' ? {warnings:[`页面超过 ${PAGE_PREVIEW_LIMIT / 1024 / 1024} MiB，只显示源码。`]} : {};
+      return {...base, kind:'text', text, truncated, ...oversized};
     } finally { release?.(); }
   }
   private remember(key: string, result: FilePreview) {

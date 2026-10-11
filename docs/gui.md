@@ -160,6 +160,34 @@ after `/guidance refresh --now` in the desktop, and a desktop conversation conti
 terminal keeps it.
 `/skills show interactive-cards` displays the text.
 
+## Pages
+
+A card is a small display inside a reply. For something to look at as a whole (a design draft, a
+prototype, a report, a long interactive walk-through) the model writes a page: a complete HTML
+document saved in the workspace under a name ending in `.page.html`. When the write finishes the
+Files panel opens on it beside the conversation, and each later change to that file shows the
+new version. An ordinary HTML file of a project being worked on is not opened this way, though
+any `.html` file can be previewed as a page from the Files panel.
+
+- **源码** / **预览** switch between the page and its source. **放大** gives the page the
+  conversation's room as well; **还原** or Escape gives it back.
+- Once you close the page or leave the Files panel, later writes to that same file stay out of
+  your way; a different page the model writes opens again. Every page written in the
+  conversation stays listed under Files.
+- A page runs under the same rules as a card: a frame of its own with no access to Astra, and no
+  network. Scripts, styles, fonts and images must be inline; requests, WebSockets, WebRTC,
+  storage, forms, pop-ups and navigation are refused. A link to a place inside the page scrolls
+  there; any other link does not open. A page that navigates its frame is stopped.
+- Unlike a card, a page is a document of its own: its doctype, head, body and styles are what it
+  wrote, and nothing of the app's is laid over it. The app's colours are available to a page
+  that wants them as `--astra-bg`, `--astra-panel`, `--astra-soft`, `--astra-hover`,
+  `--astra-line`, `--astra-text`, `--astra-muted`, `--astra-accent`, `--astra-on-accent` and
+  `--astra-error`.
+- A file over 1 MiB is shown as source.
+
+Pages are a desktop feature. The model learns of them from the same `interactive-cards` skill as
+cards, so the same notes on the skill catalog apply.
+
 ## Command help while typing
 
 The composer starts at one line, grows with its content, and scrolls internally

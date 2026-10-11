@@ -1,14 +1,15 @@
 import React, { lazy, Suspense, useEffect, useRef, useState } from 'react';
-import { ExternalLink, FolderOpen, FileCode, Eye } from 'lucide-react';
+import { ExternalLink, FolderOpen, FileCode, Eye, Maximize2, Minimize2 } from 'lucide-react';
 import type { FilePreview } from '../file-preview-types.js';
 import { dirname, isMarkdownPath, openComments } from './doc-preview.js';
 import { Markdown } from './messages.js';
+import { PageFrame } from './page-frame.js';
 
 const PDFPreview = lazy(()=>import('./pdf-preview.js'));
-type Props = {runtime:string; path:string; serial:number; dismiss:()=>void; fail:(error:unknown)=>void};
+type Props = {runtime:string; path:string; serial:number; dismiss:()=>void; fail:(error:unknown)=>void; wide?:boolean; onWide?:(wide:boolean)=>void};
 
 /** Each mounted selection owns its request. Dismissal/session changes cancel the host conversion. */
-export function FilePreviewPanel({runtime,path,serial,dismiss,fail}: Props) {
+export function FilePreviewPanel({runtime,path,serial,dismiss,fail,wide,onWide}: Props) {
   const [preview,setPreview]=useState<FilePreview>();
   const [error,setError]=useState(''); const [loading,setLoading]=useState(true);
   const [revision,setRevision]=useState(0); const [stale,setStale]=useState('');
@@ -33,10 +34,14 @@ export function FilePreviewPanel({runtime,path,serial,dismiss,fail}: Props) {
   },[runtime,path,preview?.sourceVersion]);
   const cancel=()=>{const request=pending.current;if(request){request.cancelled=true;void window.astra.cancelPreview(runtime,request.id).catch(fail);}setLoading(false);setError('文件预览已取消。');};
   const markdown=preview?.text!==undefined && isMarkdownPath(path);
+  const page=preview?.kind==='page';
+  // Only a page takes the whole window; anything else shown next gives the room back.
+  useEffect(()=>{ if(wide && preview && !page) onWide?.(false); },[wide,preview,page]);
   return <section className="file-preview-panel" aria-label="文件预览">
     <button className="text-button" onClick={dismiss}>← 返回</button><h3>{path.split(/[\\/]/).pop()}</h3>
     <div className="actions">
-      {markdown && <button onClick={()=>setDocView(docView==='rendered'?'source':'rendered')}>{docView==='rendered'?<><FileCode size={14}/> 源码</>:<><Eye size={14}/> 预览</>}</button>}
+      {(markdown || page) && <button onClick={()=>setDocView(docView==='rendered'?'source':'rendered')}>{docView==='rendered'?<><FileCode size={14}/> 源码</>:<><Eye size={14}/> 预览</>}</button>}
+      {page && onWide && <button aria-pressed={!!wide} onClick={()=>onWide(!wide)}>{wide?<><Minimize2 size={14}/> 还原</>:<><Maximize2 size={14}/> 放大</>}</button>}
       <button onClick={()=>setRevision(value=>value+1)} disabled={loading}>刷新预览</button>
       <button onClick={()=>{void window.astra.file(runtime,path,'open').catch(fail);}}><ExternalLink size={14}/> 系统打开</button>
       <button onClick={()=>{void window.astra.file(runtime,path,'reveal').catch(fail);}}><FolderOpen size={14}/> 定位</button>
@@ -58,6 +63,7 @@ export function DocumentPreviewBody({preview,runtime,fail,docView='rendered'}: {
     {preview.kind==='pdf' && preview.data ? <Suspense fallback={<p role="status">正在加载 PDF 阅读器…</p>}><PDFPreview data={preview.data}/></Suspense>
       : preview.kind==='spreadsheet' ? <SpreadsheetPreview sheets={preview.sheets||[]}/>
       : preview.data ? <img className="preview-image" src={preview.data} alt="文件预览"/>
+      : preview.kind==='page' && docView==='rendered' ? <PageFrame source={preview.text||''}/>
       : markdown && docView==='rendered' ? <>
         {comments.length>0 && <section className="summary-card doc-comments"><h4>待处理评论 <span className="count">{comments.length}</span></h4>{comments.map((comment,index)=><p key={index} className="small">{comment}</p>)}</section>}
         <div className="doc-preview"><Markdown text={preview.text||''} runtime={runtime} base={dirname(preview.path||'')} fail={fail}/></div>

@@ -6,11 +6,12 @@ import { toolEmptyOutput, toolExpanded, toolStatus } from "./tool-status.js";
 import { toolInput } from "./activity-state.js";
 import { RequestTimeline } from "./request-timeline.js";
 import { docPathFromTool } from "./doc-preview.js";
+import { pagePathFromTool } from "./page-state.js";
 import { ToolPreparation } from "./tool-preparation.js";
 import { FilePreviewPanel } from "./file-preview-panel.js";
 
 export type Panel = "tools" | "changes" | "files" | "context" | "team" | "logs";
-export function Details({ state, panel, setPanel, selection, width, onWidth, close, fail, doc, onDocDismiss, openLog }: { state: SessionState; panel: Panel; setPanel: (p: Panel) => void; selection: { index?: number; serial: number }; width: number; onWidth: (width: number) => void; close: () => void; fail: (e: unknown) => void; doc?: { path: string; serial: number }; onDocDismiss?: () => void; openLog?: (callId: string) => void }) {
+export function Details({ state, panel, setPanel, selection, width, onWidth, close, fail, doc, onDocDismiss, openLog, wide, onWide }: { wide?: boolean; onWide?: (wide: boolean) => void; state: SessionState; panel: Panel; setPanel: (p: Panel) => void; selection: { index?: number; serial: number }; width: number; onWidth: (width: number) => void; close: () => void; fail: (e: unknown) => void; doc?: { path: string; serial: number }; onDocDismiss?: () => void; openLog?: (callId: string) => void }) {
   const content = useRef<HTMLDivElement>(null);
   const previewRequest = useRef(0);
   const locatedSelection = useRef("");
@@ -39,7 +40,10 @@ export function Details({ state, panel, setPanel, selection, width, onWidth, clo
     return () => { cancelled = true; };
   }, [panel, turn, file, state.id, state.mode, state.session, state.status, state.info.turn_changes]);
   const openFile = (path: string) => { setPreview({path, serial: ++previewRequest.current}); };
-  // Follow the document the agent is writing: each new doc_* result reloads it.
+  // Another session starts with nothing open. This runs before the effect below, so that a panel
+  // opened by something the agent just wrote shows it instead of clearing it again.
+  useEffect(() => { previewRequest.current++; setFile(undefined); setTurn(1); setPreview(undefined); setChanges(undefined); }, [state.id, state.mode, state.session]);
+  // Follow the document or page the agent is writing: each new result for it reloads it.
   useEffect(() => { if (doc && panel === "files") openFile(doc.path); }, [doc?.serial, doc?.path, panel, state.id]);
   const tabs = [{ id: "tools", label: "执行", icon: Terminal }, { id: "changes", label: "改动", icon: FileDiff }, { id: "files", label: "文件", icon: FolderOpen, FileText }, { id: "context", label: "上下文", icon: Layers }, { id: "team", label: "Team", icon: Users }, { id: "logs", label: "记录", icon: FileText }] as const;
   const galleries = state.tools.flatMap((tool, index) => {
@@ -47,9 +51,8 @@ export function Details({ state, panel, setPanel, selection, width, onWidth, clo
     try { const result = JSON.parse(tool.output); return result.type === "image_search" && result.success && Array.isArray(result.images) ? [{ ...result, index: tool.result_index || index + 1 }] : []; }
     catch { return []; }
   });
-  const artifacts = [...new Set([...state.tools.flatMap(t => [t.artifact_path, docPathFromTool(t)]), ...Object.values(state.processes).map(p => p.artifact_path)].filter(Boolean))];
-  useEffect(() => { previewRequest.current++; setFile(undefined); setTurn(1); setPreview(undefined); setChanges(undefined); }, [state.id, state.mode, state.session]);
-  return <aside className="details-panel" ref={panelRef} style={{ width }} aria-label="执行详情面板">
+  const artifacts = [...new Set([...state.tools.flatMap(t => [t.artifact_path, docPathFromTool(t), pagePathFromTool(t)]), ...Object.values(state.processes).map(p => p.artifact_path)].filter(Boolean))];
+  return <aside className={`details-panel${wide ? " wide" : ""}`} ref={panelRef} style={wide ? undefined : { width }} aria-label="执行详情面板">
     <div className="panel-resizer" role="separator" tabIndex={0} aria-label="调整详情宽度" aria-orientation="vertical" aria-valuemin={260} aria-valuemax={720} aria-valuenow={Math.round(width)}
       onKeyDown={e => { if (["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) { e.preventDefault(); onWidth(e.key === "Home" ? 260 : e.key === "End" ? 720 : Math.max(260, Math.min(720, width + (e.key === "ArrowLeft" ? 20 : -20)))); } }}
       onPointerDown={e => { drag.current = { x: e.clientX, width: panelRef.current!.getBoundingClientRect().width }; e.currentTarget.setPointerCapture(e.pointerId); e.preventDefault(); }}
@@ -58,7 +61,7 @@ export function Details({ state, panel, setPanel, selection, width, onWidth, clo
       onPointerCancel={() => { drag.current = undefined; if (panelRef.current) panelRef.current.style.width = `${width}px`; }}/>
     <div className="panel-tabs" role="tablist">{tabs.filter(t => t.id !== "logs" || openLog).map(t => <button key={t.id} role="tab" aria-selected={panel === t.id} onClick={() => { previewRequest.current++; setPreview(undefined); setPanel(t.id); }}><t.icon size={15}/>{t.label}</button>)}<button className="icon" onClick={close} aria-label="关闭详情"><X size={15}/></button></div>
     <div className="panel-content" ref={content}>
-      {preview ? <FilePreviewPanel runtime={state.id} path={preview.path} serial={preview.serial} fail={fail} dismiss={() => { if (doc && preview.path === doc.path) onDocDismiss?.(); setPreview(undefined); }}/> : panel === "tools" ? <>
+      {preview ? <FilePreviewPanel runtime={state.id} path={preview.path} serial={preview.serial} fail={fail} wide={wide} onWide={onWide} dismiss={() => { if (doc && preview.path === doc.path) onDocDismiss?.(); onWide?.(false); setPreview(undefined); }}/> : panel === "tools" ? <>
         <ToolPreparation preparation={state.preparation}/>
         <DelegateCards delegates={state.delegates} runtime={state.id} fail={fail} openFile={openFile}/>
         <h3>工具与进程 <span className="count">{state.tools.length}</span></h3>

@@ -386,6 +386,12 @@ label { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sma
 .diagnostics-title { margin-top: 22px; color: var(--muted); font-weight: 500; }
 .model-picker .models { max-height: 48vh; margin: 0; padding: 8px; }
 .model-picker-footer { padding: 12px 20px; border-top: 1px solid var(--line); }
+/* A page being looked at may take the conversation's room: the same layout a narrow window gets. */
+.body.details-wide>.conversation { display: none; }
+.body.details-wide .details-panel { width: 100%!important; max-width: none; min-width: 0; flex: 1; border-left: 0; }
+.body.details-wide .panel-resizer { display: none; }
+.page-preview { display: flex; flex-direction: column; gap: 8px; }
+.page-frame { display: block; width: 100%; height: calc(100vh - 230px); min-height: 320px; border: 1px solid var(--line); border-radius: var(--r-2); background: var(--bg); color-scheme: normal; }
 @media(max-width:1100px) { .body.with-details>.conversation { display: none; } .details-panel { position: relative; inset: auto; width: 100%!important; max-width: none; min-width: 0; flex: 1; box-shadow: none; border-left: 0; } .panel-resizer { display: none; } }
 .model-picker>p { padding: 10px 20px 0; }
 .model-picker .models>p { padding: 12px; }
