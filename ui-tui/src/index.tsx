@@ -62,7 +62,7 @@ process.on("SIGHUP", () => { void lifecycle.requestExit("terminal_output_failure
 process.on("SIGTERM", () => { void lifecycle.requestExit("signal"); });
 process.on("SIGINT", () => { void lifecycle.requestExit("signal"); });
 
-instance = render(<App lifecycle={lifecycle} />, {
+instance = render(<App lifecycle={lifecycle} clearLiveOutput={() => instance?.clear()} />, {
   stdout: outputStream as any,
   stderr: outputStream as any,
   patchConsole: false,

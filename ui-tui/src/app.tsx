@@ -13,6 +13,7 @@ import { preparationLabel, reduceToolPreparation, type ToolPreparation } from "@
 import { COMPACTION_LABEL, compactionNotice } from "./context-compaction.js";
 import { TurnChangesRenderGate } from "./turn-changes.js";
 import { turnChangesCard } from "./turn-changes-card.js";
+import { describeTool } from "@astra/ui-core/tool-activity";
 import { processRowCells, toolRowCells } from "./tool-row.js";
 import { gapLine, noticeItem, TranscriptFlow, type FlowGap, type FlowItem } from "./transcript-flow.js";
 import { createBackendEventReceiver, EventDeliveryState, writeProtocolDiagnostic } from "./backend-protocol.js";
@@ -571,22 +572,30 @@ function ToolDetailsPanel({
   styles,
   pageSize,
   offset,
+  position,
+  total,
 }: {
   result: ToolResultRecord;
   lines: string[];
   styles?: DocumentLineStyle[];
   pageSize: number;
   offset: number;
+  /** Which of the kept results this is, counted from one, and how many are kept. */
+  position: number;
+  total: number;
 }) {
   const theme = useTheme();
   const chrome = theme.chrome;
   const safeOffset = clampToolDetailOffset(offset, lines.length, pageSize);
   const visible = lines.slice(safeOffset, safeOffset + pageSize);
   const end = Math.min(lines.length, safeOffset + pageSize);
+  // Said as its row in the conversation says it, so the result on screen is known while stepping.
+  const step = describeTool({ ...result, error: "", status: "completed" });
+  const what = step.target === result.name ? result.name : `${step.verb} ${step.target}`;
   return (
     <Box borderStyle={chrome?.frameStyle ?? "round"} borderColor={theme.accentAlt} paddingX={1} flexDirection="column">
-      <Text bold={theme.prefixBold} color={theme.accentAlt}>
-        {chrome?.detailTitle ? `${chrome.detailTitle} // ` : ""}Tool #{result.id} · {result.name} · lines {safeOffset + 1}-{end}/{lines.length}
+      <Text bold={theme.prefixBold} color={theme.accentAlt} wrap="truncate-end">
+        {chrome?.detailTitle ? `${chrome.detailTitle} // ` : ""}Tool #{result.id} ({position}/{total}) · lines {safeOffset + 1}-{end}/{lines.length} · {what}
       </Text>
       {visible.map((line, index) => (
         <Text key={`${result.id}-${safeOffset + index}`} {...detailLineProps(styles?.[safeOffset + index], theme, Boolean(result.error))}>
@@ -596,7 +605,7 @@ function ToolDetailsPanel({
       {result.artifactPath && (
         <Text color={theme.muted}>full result → {result.artifactPath}</Text>
       )}
-      <Text color={theme.muted}>↑/↓ scroll · PgUp/PgDn page · Esc or Ctrl+O close</Text>
+      <Text color={theme.muted} wrap="truncate-end">←/→ other results · ↑/↓ scroll · PgUp/PgDn page · Esc or Ctrl+O close</Text>
     </Box>
   );
 }
@@ -659,7 +668,13 @@ export function formatVisionPreprocessMessage(event: VisionPreprocessEvent): str
   return event.message ? `[vision] ${event.message}` : null;
 }
 
-export default function App({ appshotClientFactory, appshotManifestReader, lifecycle }: { appshotClientFactory?: (consumer:AppshotConsumer) => AppshotClient; appshotManifestReader?:AppshotManifestReader; lifecycle?: TuiLifecycle } = {}) {
+export default function App({ appshotClientFactory, appshotManifestReader, lifecycle, clearLiveOutput }: {
+  appshotClientFactory?: (consumer:AppshotConsumer) => AppshotClient;
+  appshotManifestReader?:AppshotManifestReader;
+  lifecycle?: TuiLifecycle;
+  /** Erases the frame Ink last drew and makes Ink forget it (Ink's own `clear`). */
+  clearLiveOutput?: () => void;
+} = {}) {
   const appshotInputRef = useRef<AppshotInputHandle>(null);
   const appshotStatusTimerRef = useRef<ReturnType<typeof setTimeout>>();
   const appshotClientRef = useRef<AppshotClient>();
@@ -910,13 +925,25 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     return () => clearTimeout(timer);
   }, [startupInfo, startupVisible]);
 
-  useLayoutEffect(() => {
-    if (openToolResultId === null) return;
+  // The output viewer has the alternate screen to itself. The switch is written here, in
+  // order, and not from an effect: Ink draws a frame before effects run, so an effect put the
+  // viewer's first frame on the main screen and then cleared the screen it had switched to,
+  // which was a black screen until the next key. Before each switch Ink is told to erase and
+  // forget its frame, so the frame it draws next starts clean on the screen it lands on, and
+  // the main screen is found exactly as it was left.
+  const viewerScreenRef = useRef(false);
+  const enterViewerScreen = useCallback(() => {
+    if (viewerScreenRef.current) return;
+    viewerScreenRef.current = true;
+    clearLiveOutput?.();
     stdout.write(ENTER_ALTERNATE_SCREEN);
-    return () => {
-      stdout.write(LEAVE_ALTERNATE_SCREEN);
-    };
-  }, [openToolResultId, stdout]);
+  }, [clearLiveOutput, stdout]);
+  const leaveViewerScreen = useCallback(() => {
+    if (!viewerScreenRef.current) return;
+    viewerScreenRef.current = false;
+    clearLiveOutput?.();
+    stdout.write(LEAVE_ALTERNATE_SCREEN);
+  }, [clearLiveOutput, stdout]);
 
   const addMessage = useCallback((
     role: Role,
@@ -1032,9 +1059,22 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   const closeToolDetails = useCallback(() => {
     if (!detailOpenRef.current) return;
     detailOpenRef.current = false;
+    leaveViewerScreen();
     dispatchDisplay({ type: "setToolDetailOpen", open: false });
     setOpenToolResultId(null);
     setToolDetailOffset(0);
+  }, [leaveViewerScreen]);
+
+  /** In the viewer: show the result `delta` places from the one shown, stopping at either end. */
+  const stepToolDetails = useCallback((delta: number) => {
+    const available = toolResultsRef.current;
+    setOpenToolResultId((current) => {
+      const index = available.findIndex((item) => item.id === current);
+      if (index < 0) return current;
+      const next = available[Math.max(0, Math.min(available.length - 1, index + delta))];
+      if (next.id !== current) setToolDetailOffset(0);
+      return next.id;
+    });
   }, []);
 
   const handleEvent = useCallback((event: PyEvent) => {
@@ -1538,9 +1578,12 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           const index = current.findIndex((tool) => tool.name === event.name);
           return index < 0 ? current : current.filter((_, itemIndex) => itemIndex !== index);
         });
+        const call = event.call_id ? toolCallsRef.current.get(event.call_id) : undefined;
+        if (event.call_id) toolCallsRef.current.delete(event.call_id);
         const result: ToolResultRecord = {
           id: ++toolResultIdRef.current,
           name: event.name,
+          arguments: call?.arguments,
           output: event.output,
           error: event.error,
           durationMs: event.duration_ms,
@@ -1554,15 +1597,13 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         setOpenToolResultId((current) => followDocumentView(current, toolResultsRef.current, result));
         // One row in the conversation: what was done, to what, what came of it. The output
         // itself is a keystroke away (/tool <id>, or Ctrl+O for the latest).
-        const call = event.call_id ? toolCallsRef.current.get(event.call_id) : undefined;
-        if (event.call_id) toolCallsRef.current.delete(event.call_id);
         const toolRail = shouldMessageUseTimeline("tool", timelineVisibleRef.current, true)
           ? nextTimeRail("tool", completedAt)
           : undefined;
         appendFlow(
           "tool",
           toolResultLines(
-            { ...result, arguments: call?.arguments, note: documentSummary(result) ?? imageSearchSummary(result) ?? undefined },
+            { ...result, note: documentSummary(result) ?? imageSearchSummary(result) ?? undefined },
             columns,
             runtimeMode,
             flowRef.current.previous !== "tool",
@@ -1929,10 +1970,11 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
       return;
     }
     detailOpenRef.current = true;
+    enterViewerScreen();
     dispatchDisplay({ type: "setToolDetailOpen", open: true });
     setOpenToolResultId(selected.id);
     setToolDetailOffset(0);
-  }, [addMessage]);
+  }, [addMessage, enterViewerScreen]);
 
   const submit = useCallback((submission: InputSubmission) => {
     const text = submission.text;
@@ -2121,10 +2163,9 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           timeRailCursorRef.current.reset();
           flowRef.current.reset();
           dispatchDisplay({ type: "clearHistory" });
+          closeToolDetails();
           toolResultsRef.current = [];
-          detailOpenRef.current = false;
           setToolResults([]);
-          setOpenToolResultId(null);
           addMessage("system", "Context cleared.");
           send({ type: "command", cmd: "/reset" });
         } else if (text === "/think") {
@@ -2208,6 +2249,10 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   const openToolResult = openToolResultId === null
     ? undefined
     : toolResults.find((item) => item.id === openToolResultId);
+  useEffect(() => {
+    // A result that is no longer kept cannot stay open; the viewer must not hold the screen for nothing.
+    if (openToolResultId !== null && !toolResults.some((item) => item.id === openToolResultId)) closeToolDetails();
+  }, [closeToolDetails, openToolResultId, toolResults]);
   const openToolBody = openToolResult ? toolResultBody(openToolResult) : undefined;
   const toolWrapWidth = Math.max(20, columns - 8);
   // Document results show the current file, styled per line, instead of the raw result.
@@ -2254,7 +2299,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
       if (lifecycle) void lifecycle.requestExit("user_exit");
       else {
         procRef.current?.kill();
-        if (detailOpenRef.current) stdout.write(LEAVE_ALTERNATE_SCREEN);
+        leaveViewerScreen();
         process.exit(0);
       }
     }
@@ -2305,6 +2350,10 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
       }
       if (key.pageDown) {
         setToolDetailOffset((current) => clampToolDetailOffset(current + toolDetailPageSize, openToolLineCount, toolDetailPageSize));
+        return;
+      }
+      if (key.leftArrow || key.rightArrow) {
+        stepToolDetails(key.leftArrow ? -1 : 1);
         return;
       }
       return;
@@ -2510,6 +2559,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           styles={openStyledLines?.map((line) => line.style)}
           pageSize={toolDetailPageSize}
           offset={toolDetailOffset}
+          position={toolResults.findIndex((item) => item.id === openToolResult.id) + 1}
+          total={toolResults.length}
         />
       </Box>
     )}

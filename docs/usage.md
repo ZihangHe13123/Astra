@@ -271,9 +271,10 @@ reply show an explanation; `/help` lists the available controls.
 Each finished tool call is one row in terminal history: what was done, to what,
 a short result, the time it took, how it ended, and its number. The output
 itself is not printed there. Run `/tool <id>` to open a numbered result, or
-press `Ctrl+O` for the latest result. The detail panel supports arrow keys and
-PageUp/PageDown; press Escape or `Ctrl+O` to close it. `TUI_MAX_TOOL_RESULTS`
-controls how many results are kept for that.
+press `Ctrl+O` for the latest result. In the detail panel Left and Right step
+to the result before or after the one shown, Up/Down and PageUp/PageDown
+scroll, and Escape or `Ctrl+O` closes it. `TUI_MAX_TOOL_RESULTS` controls how
+many results are kept for that.
 Slash-command suggestions use a fixed-height scrolling window so filtering does
 not leak old menu rows into terminal scrollback. `TUI_COMMAND_MENU_ROWS` defaults
 to 8; arrow keys still traverse every matching command.
