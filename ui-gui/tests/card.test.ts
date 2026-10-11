@@ -107,12 +107,13 @@ test("only the card document is a card frame address", () => {
 
 test("what the built-in skill and the guides tell the model is what the desktop provides", () => {
   const provided = new Set<string>(CARD_THEME_COLORS);
-  // The skill is all about cards; each guide has one section about them.
+  // The skill and each guide have one section about cards; it ends where the next section of its level begins.
   for (const [path, heading] of [["../../agent/runtime/interactive_cards.md", "# 可交互卡片"], ["../../docs/gui.md", "## Interactive cards"], ["../../docs/zh-CN/gui.md", "## 可交互卡片"]]) {
     const whole = readFileSync(new URL(path, import.meta.url), "utf8");
-    const start = whole.indexOf(`${heading}\n`), next = whole.indexOf("\n## ", start + heading.length);
+    const level = heading.slice(0, heading.indexOf(" ") + 1);
+    const start = whole.indexOf(`${heading}\n`), next = whole.indexOf(`\n${level}`, start + heading.length);
     assert.notEqual(start, -1, path);
-    const text = heading.startsWith("## ") ? whole.slice(start, next === -1 ? undefined : next) : whole.slice(start);
+    const text = whole.slice(start, next === -1 ? undefined : next);
     const named = [...text.matchAll(/`(--[a-z-]+)`/g)].map(match => match[1]);
     assert.ok(named.length >= provided.size, path);
     for (const name of named) assert.equal(provided.has(name), true, `${path} names ${name}`);

@@ -1,4 +1,4 @@
-"""The built-in skill that teaches the interactive card format, listed only where cards are shown."""
+"""The built-in skill that teaches interactive cards and whole pages, listed only where they are shown."""
 
 from __future__ import annotations
 
@@ -9,8 +9,9 @@ from importlib.resources import files
 CARD_SKILL_NAME = "interactive-cards"
 CARD_SKILL_BODY = files("agent.runtime").joinpath("interactive_cards.md").read_text(encoding="utf-8").rstrip("\n")
 CARD_SKILL_DESCRIPTION = (
-    "桌面端可交互卡片：讲解概念、流程、对比或带参数的计算，而一个能动手试的小展示明显比文字清楚时，"
-    "或用户要求卡片、交互演示时，先读取再写。普通回答不需要。"
+    "桌面端可交互卡片与整页画布：讲解概念、流程、对比或带参数的计算，而一个能动手试的小展示明显比文字清楚时；"
+    "要交给用户一整页东西看（设计稿、原型、报告、长的交互演示）时；"
+    "或用户要求卡片、交互演示、页面时，先读取再写。普通回答不需要。"
 )
 
 
