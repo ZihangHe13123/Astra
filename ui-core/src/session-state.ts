@@ -3,6 +3,7 @@ import type { ResponseVersions, ResponseOperation, ResponseRegeneration } from "
 import type { PyEvent } from "./types.js";
 import { delegateActive, reduceDelegateEvent, type DelegateView } from "./delegates.js";
 import { reduceToolPreparation, type ToolPreparation } from "./tool-preparation.js";
+import type { TurnChangesEventData } from "./turn-changes.js";
 
 /** Platform-independent projection. The backend remains the execution authority. */
 export type UIEvent = { type: string; [key: string]: any };
@@ -12,11 +13,15 @@ export type Message = {
   stream_id?: string; source_ref?: { index: number; digest: string };
   submissionState?: "pending" | "accepted" | "rejected" | "unknown"; submissionError?: string;
 };
+/** A turn's file changes, with the message they were reported after. */
+export type TurnChangeNote = TurnChangesEventData & { after_message: string };
 export type SessionState = {
   id: string; session: string; workspace: string; mode: string; status: string; busy: boolean; isDraft: boolean;
   messages: Message[]; tools: UIEvent[]; approvals: UIEvent[]; questions: UIEvent[];
   processes: Record<string, UIEvent>; delegates: Record<string, DelegateView>; teams: Record<string, AgentTeamView>; info: Record<string, UIEvent>;
   notices: UIEvent[]; stream: string; serial: number; revision: number;
+  /** One entry per turn that changed files, oldest first; a restored history has none. */
+  turnChanges: TurnChangeNote[];
   preparation?: ToolPreparation;
   responseVersions?: ResponseVersions; responseOperation?: ResponseOperation; regeneration?: ResponseRegeneration;
   branchId?: string;
@@ -24,7 +29,7 @@ export type SessionState = {
 export function initialSession(id: string, workspace = ""): SessionState {
   return { id, workspace, session: "", mode: "work", status: "connecting", busy: false, isDraft: false,
     messages: [], tools: [], approvals: [], questions: [], processes: {}, delegates: {}, teams: {},
-    info: {}, notices: [], stream: "", serial: 0, revision: 0 };
+    info: {}, notices: [], stream: "", serial: 0, revision: 0, turnChanges: [] };
 }
 export function textContent(value: unknown): string {
   if (typeof value === "string") return value;
@@ -51,6 +56,8 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
       ...(event.stream_id ? { stream_id: event.stream_id } : {}) }];
   };
   const notice = () => { state.notices = [...state.notices, event].slice(-200); };
+  // Where in the conversation something happened: after the message that was last at the time.
+  const place = () => state.messages[state.messages.length - 1]?.id ?? "";
   switch (event.type) {
     case "backend_hello": {
       const { restart_ready: _restart, ...info } = state.info;
@@ -142,6 +149,7 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
       }));
       state.tools = (event.tool_results || []).map((r: UIEvent, i: number) => ({ ...r, type: "tool_result", status: r.error ? "failed" : "completed", historical: true, result_index: i + 1, call_id: r.call_id || `history-tool:${i}` }));
       state.delegates = (event.delegates || []).reduce(reduceDelegateEvent, {});
+      state.turnChanges = [];
       state.session = event.session_id || state.session; state.stream = ""; break;
     case "task_started": state.busy = true; state.stream = ""; state.info = { ...state.info, task_status: event }; break;
     case "task_status":
@@ -169,7 +177,8 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
     }
     case "tool_calls":
       state.stream = "";
-      state.tools = [...state.tools, ...(event.calls || []).map((c: UIEvent) => ({ ...c, type: "tool_calls", call_id: c.id, status: "running" }))];
+      state.tools = [...state.tools, ...(event.calls || []).map((c: UIEvent) => ({ ...c, type: "tool_calls", call_id: c.id, status: "running",
+        after_message: place(), started_at: Date.now() / 1000 }))];
       state.busy = true; break;
     case "tool_progress":
       state.tools = state.tools.map(t => t.call_id === event.call_id ? { ...t, progress: event } : t); break;
@@ -178,7 +187,7 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
       const existing = event.call_id ? state.tools.find(t => t.call_id === event.call_id) : undefined;
       const result_index = existing?.result_index || state.tools.reduce((max, t) => Math.max(max, Number(t.result_index) || 0), 0) + 1;
       const result = { ...event, result_index, status: event.error ? "failed" : "completed" };
-      state.tools = match ? state.tools.map(t => t.call_id === event.call_id ? { ...t, ...result } : t) : [...state.tools, result];
+      state.tools = match ? state.tools.map(t => t.call_id === event.call_id ? { ...t, ...result } : t) : [...state.tools, { ...result, after_message: place() }];
       state.stream = "";
       if (!event.call_id) append(event.error ? "error" : "tool", plainText(event.error || event.output || ""));
       break;
@@ -211,6 +220,15 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
     // still owns the backend. Only its task status can terminate that turn.
     case "done": state.busy = ["pending", "running", "cancelling"].includes(state.info.task_status?.task?.status); state.stream = ""; break;
     case "error": append("error", event.message || "请求失败"); state.busy = ["pending", "running", "cancelling"].includes(state.info.task_status?.task?.status); state.stream = ""; notice(); break;
+    case "turn_changes": {
+      // The newest report stays where the details panel reads it; each turn's report keeps its place too.
+      state.info = { ...state.info, turn_changes: event };
+      const same = (note: TurnChangeNote) => note.request_id === event.request_id && note.turn_seq === event.turn_seq;
+      const earlier = (state.turnChanges ?? []).find(same);
+      state.turnChanges = [...(state.turnChanges ?? []).filter(note => !same(note)),
+        { ...(event as unknown as TurnChangesEventData), after_message: earlier?.after_message ?? place() }].slice(-50);
+      break;
+    }
     case "steering": break; // The submitted user message is already present.
     case "gui_notice": append("system", event.message); break;
     // Another Astra session on this computer: shown as a notice, never as the user's words.

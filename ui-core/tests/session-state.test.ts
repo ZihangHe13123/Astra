@@ -157,3 +157,30 @@ test('expired question notices survive history replacement when recovered after 
   state = projectEvent(state, {type:'user_question_resolved',request_id:'old',state:'expired',reason:'Question expired after backend restart.'});
   assert.match(state.messages.at(-1)?.content || '', /expired after backend restart/);
 });
+test("tool calls and a turn's file changes remember where in the conversation they happened", () => {
+  let state = initialSession("a");
+  state = projectEvent(state, { type: "gui_user", text: "改一下", submission_id: "u1" });
+  state = projectEvent(state, { type: "tool_calls", calls: [{ id: "c1", name: "read_file" }, { id: "c2", name: "edit_file" }] });
+  state = projectEvent(state, { type: "chunk", content: "好了。" });
+  const answer = state.messages[state.messages.length - 1].id;
+  state = projectEvent(state, { type: "tool_calls", calls: [{ id: "c3", name: "execute_shell" }] });
+  state = projectEvent(state, { type: "tool_result", call_id: "c3", output: "ok", error: "" });
+  assert.deepEqual(state.tools.map(t => [t.call_id, t.after_message]), [["c1", "u1"], ["c2", "u1"], ["c3", answer]]);
+  assert.ok(state.tools.every(t => typeof t.started_at === "number"));
+  // A result keeps the place its call had.
+  assert.equal(state.tools[2].status, "completed");
+
+  const report = { type: "turn_changes", session_id: "s", request_id: "r1", turn_seq: 1, files: [{ path: "a.py", state: "modified", added: 3, removed: 1, compare: "full", reason: "" }], unknown_count: 0, totals: { files: 1, added: 3, removed: 1 } };
+  state = projectEvent(state, report);
+  state = projectEvent(state, { type: "gui_user", text: "再改", submission_id: "u2" });
+  // The same report delivered again stays where it was, once.
+  state = projectEvent(state, report);
+  state = projectEvent(state, { ...report, request_id: "r2", turn_seq: 2 });
+  assert.deepEqual(state.turnChanges.map(note => [note.request_id, note.after_message]), [["r1", answer], ["r2", "u2"]]);
+  assert.equal(state.info.turn_changes.request_id, "r2");
+
+  // A restored history has no places to give: its tool results are listed, its turn reports are not.
+  state = projectEvent(state, { type: "history", session_id: "s", messages: [{ role: "user", content: "改一下" }], tool_results: [{ name: "read_file", output: "x", error: "" }] });
+  assert.deepEqual(state.turnChanges, []);
+  assert.equal(state.tools[0].after_message, undefined);
+});
