@@ -185,6 +185,15 @@ export function buildActivitySummary(input: ActivitySummaryInput): string[] {
   return segments;
 }
 
+const CONTEXT_BAR_WIDTH = 8;
+
+/** How full the context is, as a line: the heavy part is what is used. Anything in use shows. */
+export function contextBar(percent: number, width = CONTEXT_BAR_WIDTH): { used: string; free: string } {
+  const share = Number.isFinite(percent) ? Math.max(0, Math.min(100, percent)) / 100 : 0;
+  const cells = share > 0 ? Math.max(1, Math.round(share * width)) : 0;
+  return { used: "━".repeat(cells), free: "─".repeat(width - cells) };
+}
+
 // Budget the shortcut and important fields before Ink truncates the row.
 export function fitActivitySummary(segments: string[], columns: number, model: string, separator: string, hint: string): string[] {
   const available = Math.max(1, columns - 6 - stringWidth(hint));
@@ -327,7 +336,11 @@ export function ActivityDock({
   }), columns - leadWidth + (merged ? 2 : 0), model, separator, `${" ".repeat(gap)}${keys}`);
   // The keys sit at the right edge of a header line, and straight after the summary otherwise.
   const used = leadWidth + 2 + stringWidth(summary.join(separator));
-  const hint = `${" ".repeat(merged ? Math.max(gap, columns - 2 - used - stringWidth(keys)) : gap)}${keys}`;
+  // Where the line has room to spare, the context share is drawn as well as told.
+  const spare = merged ? columns - 2 - used - stringWidth(keys) - gap : 0;
+  const bar = spare > CONTEXT_BAR_WIDTH && summary.some((item) => /^CTX \d+%$/.test(item)) ? contextBar(contextPct) : null;
+  const barWidth = bar ? CONTEXT_BAR_WIDTH + 1 : 0;
+  const hint = `${" ".repeat(merged ? Math.max(gap, columns - 2 - used - barWidth - stringWidth(keys)) : gap)}${keys}`;
   const statusParts = buildStatusParts({
     columns: Math.max(30, columns - 10),
     model,
@@ -375,7 +388,14 @@ export function ActivityDock({
           {summary.map((item, index) => (
             <React.Fragment key={item}>
               {index > 0 && <Text color={theme.subtle}>{chrome?.separator ?? " · "}</Text>}
-              <Text color={index === 0 ? theme.accent : index === 1 ? theme.accentAlt : theme.muted}>{item}</Text>
+              {bar && /^CTX \d+%$/.test(item) ? (
+                <Text color={theme.muted}>
+                  {item} <Text color={contextPct >= 95 ? theme.danger : contextPct >= 80 ? theme.warning : theme.accentAlt}>{bar.used}</Text>
+                  <Text color={theme.subtle}>{bar.free}</Text>
+                </Text>
+              ) : (
+                <Text color={index === 0 ? theme.accent : index === 1 ? theme.accentAlt : theme.muted}>{item}</Text>
+              )}
             </React.Fragment>
           ))}
           <Text color={theme.muted}>{hint}</Text>
