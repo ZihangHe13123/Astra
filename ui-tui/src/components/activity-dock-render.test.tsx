@@ -224,6 +224,12 @@ for (const columns of [60, 92, 124, 180]) {
       assert.doesNotMatch(lines[1], /GLITCH CITY|close shift/);
     }
     assert.equal(/\^O tools/.test(lines[1]), columns > 110);
+    // Where the line has room to spare, the context share is drawn after its figure; the keys
+    // still end at the right edge, and a line with no room keeps the figure alone.
+    assert.match(lines[1], /C(?:TX )?38%/);
+    if (columns === 180) assert.match(lines[1], /CTX 38% ━━━───── │/, lines[1]);
+    if (columns === 60) assert.doesNotMatch(lines[1], /[━]/, lines[1]);
+    // Drawn or not, the bar never pushes the keys off the edge (checked above for every width).
   }
 }
 

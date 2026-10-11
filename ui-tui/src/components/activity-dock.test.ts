@@ -6,7 +6,7 @@ import stripAnsi from "strip-ansi";
 import stringWidth from "string-width";
 import { THEMES } from "../theme.js";
 import { ThemeProvider } from "../theme-context.js";
-import { ActivityDock, activityVisualState, buildActivitySummary, formatToolElapsed, formatToolName, formatToolProgress } from "./activity-dock.js";
+import { ActivityDock, activityVisualState, buildActivitySummary, contextBar, formatToolElapsed, formatToolName, formatToolProgress } from "./activity-dock.js";
 
 // --- helpers (unchanged) ---
 
@@ -226,3 +226,16 @@ function assertNoModeTag(segments: string[]) {
 assertNoModeTag(buildActivitySummary({ ...base, columns: 130, reasoningEffort: undefined }));
 assertNoModeTag(buildActivitySummary({ ...base, columns: 90, reasoningEffort: undefined }));
 assertNoModeTag(buildActivitySummary({ ...base, columns: 60, reasoningEffort: undefined }));
+
+// The context share as a line: the heavy part is what is used. Anything in use shows at least
+// one cell, a full context fills the line, and a figure that is no number draws nothing.
+assert.deepEqual(contextBar(0), { used: "", free: "────────" });
+assert.deepEqual(contextBar(0.4), { used: "━", free: "───────" });
+assert.deepEqual(contextBar(38), { used: "━━━", free: "─────" });
+assert.deepEqual(contextBar(100), { used: "━━━━━━━━", free: "" });
+assert.deepEqual(contextBar(250), { used: "━━━━━━━━", free: "" });
+assert.deepEqual(contextBar(Number.NaN), { used: "", free: "────────" });
+for (const percent of [0, 1, 12, 50, 99, 100]) {
+  const bar = contextBar(percent);
+  assert.equal([...bar.used, ...bar.free].length, 8);
+}

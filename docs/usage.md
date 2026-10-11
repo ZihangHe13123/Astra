@@ -268,11 +268,12 @@ that has already been authorized or erase separately granted session permissions
 YOLO is available in Work and Minimal modes. Commands that cannot run during a
 reply show an explanation; `/help` lists the available controls.
 
-Verbose tool output is collapsed in terminal history by default. Run
-`/tool <id>` to open a numbered result, or press `Ctrl+O` for the latest result.
-The detail panel supports arrow keys and PageUp/PageDown; press Escape or
-`Ctrl+O` to close it. `TUI_TOOL_COLLAPSE_CHARS`, `TUI_TOOL_COLLAPSE_LINES`, and
-`TUI_MAX_TOOL_RESULTS` control the thresholds and retained detail records.
+Each finished tool call is one row in terminal history: what was done, to what,
+a short result, the time it took, how it ended, and its number. The output
+itself is not printed there. Run `/tool <id>` to open a numbered result, or
+press `Ctrl+O` for the latest result. The detail panel supports arrow keys and
+PageUp/PageDown; press Escape or `Ctrl+O` to close it. `TUI_MAX_TOOL_RESULTS`
+controls how many results are kept for that.
 Slash-command suggestions use a fixed-height scrolling window so filtering does
 not leak old menu rows into terminal scrollback. `TUI_COMMAND_MENU_ROWS` defaults
 to 8; arrow keys still traverse every matching command.

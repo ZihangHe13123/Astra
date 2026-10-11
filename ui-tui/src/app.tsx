@@ -3,15 +3,18 @@ import { workspaceLabel } from "./workspace-label.js";
 import { modelDisplayName } from "./model-label.js";
 import { ConnectionPanel } from "./components/connection-panel.js";
 import { appshotRejectionNotice } from "./appshot-rejection.js";
-import { openImageGallery } from "./image-gallery.js";
-import { documentDetail, findDocumentResult, followDocumentView, openDocument, type DocumentLineStyle } from "./document-view.js";
+import { imageSearchSummary, openImageGallery } from "./image-gallery.js";
+import { documentDetail, documentSummary, findDocumentResult, followDocumentView, openDocument, type DocumentLineStyle } from "./document-view.js";
 import type { AppshotConsumer, AppshotDraftState } from "./appshot-client.js";
 import type { AppshotManifestReader } from "./appshot-input.js";
 import type { GenerationProgress, GenerationStats, InputSubmission, LocalModeDefinition } from "./types.js";
 import { generationProgressLabel } from "./generation-progress.js";
 import { preparationLabel, reduceToolPreparation, type ToolPreparation } from "@astra/ui-core/tool-preparation";
 import { COMPACTION_LABEL, compactionNotice } from "./context-compaction.js";
-import { formatTurnChangesSummary, TurnChangesRenderGate } from "./turn-changes.js";
+import { TurnChangesRenderGate } from "./turn-changes.js";
+import { turnChangesCard } from "./turn-changes-card.js";
+import { toolRowCells } from "./tool-row.js";
+import { gapLine, TranscriptFlow, type FlowGap, type FlowItem } from "./transcript-flow.js";
 import { createBackendEventReceiver, EventDeliveryState, writeProtocolDiagnostic } from "./backend-protocol.js";
 import { RuntimeTiming } from "./runtime-timing.js";
 import { ControlledBackendRestart } from "./controlled-restart.js";
@@ -101,8 +104,6 @@ import { reduceQuestionProtocolState } from "./question-protocol-state.js";
 import { restoreRecentHistory } from "./static-history.js";
 import {
   clampToolDetailOffset,
-  shouldCollapseToolResult,
-  summarizeToolResult,
   toolResultBody,
   wrapStyledLines,
   wrapToolResult,
@@ -126,7 +127,6 @@ import {
 type Role = ChatMessage["role"];
 
 type AddMessageOptions = {
-  toolCompletion?: boolean;
   timestamp?: number;
 };
 
@@ -186,6 +186,15 @@ function isRoleStartPrefix(role: Role, prefix: string): boolean {
   return prefix === rolePrefix[role] || prefix === minimalRolePrefix[role];
 }
 
+/** The cells a theme's widest speaker label takes beside the time rail. */
+function railLabelWidth(theme: Pick<ReturnType<typeof useTheme>, "chrome">): number {
+  return Math.max(...CONVERSATION_ROLES.map((role) => stringWidth(compactRolePrefix(
+    theme.chrome?.rolePrefixes?.[role] ?? rolePrefix[role],
+  ))));
+}
+
+// Beside the time rail every speaker's text starts in one column, whichever theme draws it:
+// the room kept for a label is the widest label any theme has.
 export function messageRolePrefixWidth(role: Role, runtimeMode: RuntimeMode): number {
   if (runtimeMode === "minimal") {
     return stringWidth(compactRolePrefix(minimalRoleLabel[role]));
@@ -193,9 +202,13 @@ export function messageRolePrefixWidth(role: Role, runtimeMode: RuntimeMode): nu
   if (!CONVERSATION_ROLES.includes(role)) {
     return stringWidth(rolePrefixForMode(role, runtimeMode));
   }
-  return Math.max(...THEME_NAMES.map((name) => stringWidth(compactRolePrefix(
-    THEMES[name].chrome?.rolePrefixes?.[role] ?? rolePrefix[role],
-  ))));
+  return Math.max(...THEME_NAMES.map((name) => railLabelWidth(THEMES[name])));
+}
+
+/** The cells a laid-out row (a tool call, a changed file) may take at this terminal width. */
+export function messageCellsWidth(columns: number, rail: TimeRailLayout | undefined, runtimeMode: RuntimeMode): number {
+  const lead = rail ? rail.width + rail.prefixWidth : stringWidth(rolePrefixForMode("tool", runtimeMode));
+  return Math.max(20, Math.max(30, columns - 8) - lead);
 }
 
 // Keep session restore bounded, but never trim the live array passed to Ink
@@ -205,8 +218,6 @@ const MAX_RESTORED_RENDER_LINES = Math.max(
   200,
   Number(process.env.TUI_MAX_RESTORED_LINES ?? process.env.TUI_MAX_RENDER_LINES ?? "2500") || 2500,
 );
-const TOOL_COLLAPSE_CHARS = Math.max(120, Number(process.env.TUI_TOOL_COLLAPSE_CHARS ?? "700") || 700);
-const TOOL_COLLAPSE_LINES = Math.max(2, Number(process.env.TUI_TOOL_COLLAPSE_LINES ?? "6") || 6);
 const MAX_TOOL_RESULTS = Math.max(10, Number(process.env.TUI_MAX_TOOL_RESULTS ?? "100") || 100);
 const ENTER_ALTERNATE_SCREEN = "\x1b[?1049h\x1b[2J\x1b[H";
 const LEAVE_ALTERNATE_SCREEN = "\x1b[?1049l";
@@ -273,6 +284,7 @@ export function messageToLines(
   showReasoning: boolean,
   runtimeMode: RuntimeMode = "work",
   timeRail?: TimeRail,
+  trailingGap = true,
 ): RenderLine[] {
   if (msg.role === "reasoning" && !showReasoning) return [];
   const content = msg.role === "assistant"
@@ -287,17 +299,48 @@ export function messageToLines(
     continuationPrefix: "    ",
     timeRail,
   });
-  return [
-    ...result.lines,
-    {
-      key: `${msg.id ?? msg.timestamp}-gap`,
-      role: "system",
-      prefix: "    ",
-      text: " ",
-      kind: "text",
-      spans: [],
-    },
-  ];
+  return trailingGap ? [...result.lines, gapLine(`${msg.id ?? msg.timestamp}-gap`)] : result.lines;
+}
+
+/** The rows of a finished tool call, ready for the transcript. */
+export function toolResultLines(
+  tool: Parameters<typeof toolRowCells>[0],
+  columns: number,
+  runtimeMode: RuntimeMode,
+  first: boolean,
+  timeRail?: TimeRail,
+): RenderLine[] {
+  const label = rolePrefixForMode("tool", runtimeMode);
+  return toolRowCells(tool, messageCellsWidth(columns, timeRail, runtimeMode)).map((cells, index) => ({
+    key: `tool-${tool.id}-${index}`,
+    role: "tool" as const,
+    prefix: index === 0 && first ? label : " ".repeat(stringWidth(label)),
+    text: cells.map((cell) => cell.text).join(""),
+    kind: "cells" as const,
+    cells,
+    timeRail: timeRail ? { ...timeRail, label: index === 0 ? timeRail.label : "" } : undefined,
+  }));
+}
+
+/** The rows of a turn's change report, ready for the transcript; none when there is nothing to report. */
+export function turnChangesLines(
+  event: Parameters<typeof turnChangesCard>[0],
+  columns: number,
+  runtimeMode: RuntimeMode,
+  rail?: TimeRailLayout,
+): RenderLine[] {
+  const card = turnChangesCard(event, messageCellsWidth(columns, rail, runtimeMode));
+  if (!card) return [];
+  const indent = " ".repeat(stringWidth(rolePrefixForMode("tool", runtimeMode)));
+  return card.map((cells, index) => ({
+    key: `changes-${event.request_id}-${event.turn_seq}-${index}`,
+    role: "system" as const,
+    prefix: indent,
+    text: cells.map((cell) => cell.text).join(""),
+    kind: "cells" as const,
+    cells,
+    timeRail: rail ? { ...rail, label: "", kind: "relative" as const } : undefined,
+  }));
 }
 
 export function streamingUpdateToRenderLines(
@@ -352,42 +395,62 @@ export const MessageLine = memo(function MessageLine({ line, runtimeMode = "work
     ? minimalRoleLabel[line.role]
     : theme.chrome?.rolePrefixes?.[line.role] ?? rolePrefix[line.role];
   const compactConfiguredRolePrefix = compactRolePrefix(configuredRolePrefix);
-  const isConversationContinuation = Boolean(
-    line.timeRail
-    && CONVERSATION_ROLES.includes(line.role)
-    && !isRoleStart
-    && line.prefix.trim() === "",
-  );
+  // Beside the time rail every speaker's text starts in one column: a shorter label is padded
+  // to the theme's widest. Minimal mode keeps each label its own width.
+  const labelWidth = runtimeMode === "minimal" ? stringWidth(compactConfiguredRolePrefix) : railLabelWidth(theme);
+  const paddedLabel = compactConfiguredRolePrefix + " ".repeat(Math.max(0, labelWidth - stringWidth(compactConfiguredRolePrefix)));
+  const inConversation = Boolean(line.timeRail && CONVERSATION_ROLES.includes(line.role) && !isRoleStart);
+  const isConversationContinuation = inConversation && line.prefix.trim() === "";
   const displayedPrefix = line.timeRail && isRoleStart
-    ? compactConfiguredRolePrefix
+    ? paddedLabel
     : isConversationContinuation
-      ? " ".repeat(stringWidth(compactConfiguredRolePrefix))
-      : line.prefix;
+      ? " ".repeat(labelWidth + (line.hang ?? 0))
+      // A list or quote marker stands in the text column, not to the left of it.
+      : inConversation
+        ? " ".repeat(labelWidth) + line.prefix.trimStart()
+        : line.prefix;
   const displayedSeparator = compactRailSeparator(theme.chrome?.separator ?? " │ ");
   const conversationRoleColor = line.role === "user"
     ? theme.accent
     : line.role === "reasoning"
       ? theme.emphasis
       : theme.accentAlt;
+  const rail = line.timeRail ? (
+    <>
+      <Text
+        bold={line.timeRail.kind === "absolute"}
+        dimColor={line.timeRail.kind === "relative"}
+        color={theme.accentAlt}
+      >
+        {line.timeRail.label.padStart(5, " ")}
+      </Text>
+      <Text bold color={theme.border}>{displayedSeparator}</Text>
+    </>
+  ) : null;
   const lead = (
     <>
-      {line.timeRail ? (
-        <>
-          <Text
-            bold={line.timeRail.kind === "absolute"}
-            dimColor={line.timeRail.kind === "relative"}
-            color={theme.accentAlt}
-          >
-            {line.timeRail.label.padStart(5, " ")}
-          </Text>
-          <Text bold color={theme.border}>{displayedSeparator}</Text>
-        </>
-      ) : null}
+      {rail}
       {line.timeRail && isRoleStart ? (
         <Text bold color={conversationRoleColor}>{displayedPrefix}</Text>
       ) : displayedPrefix}
     </>
   );
+
+  if (line.kind === "cells") {
+    const toolMark = theme.chrome?.activeToolIcon;
+    const label = !line.timeRail ? line.prefix : isRoleStart ? paddedLabel : " ".repeat(labelWidth);
+    return (
+      <Text wrap="truncate-end">
+        {rail}
+        <Text bold color={theme.muted}>{label}</Text>
+        {(line.cells ?? []).map((cell, index) => (
+          <Text key={index} bold={cell.bold} color={cell.tone ? theme[cell.tone] : undefined}>
+            {cell.mark === "tool" && toolMark && stringWidth(toolMark) === 1 ? `${toolMark} ` : cell.text}
+          </Text>
+        ))}
+      </Text>
+    );
+  }
 
   if (line.kind === "rule") {
     return <Text dimColor color={theme.subtle}>{lead}{line.text}</Text>;
@@ -758,6 +821,10 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   const detailOpenRef = useRef(false);
   const timeRailCursorRef = useRef(new MessageTimeRailCursor());
   const timelineVisibleRef = useRef(timelineVisible);
+  const flowRef = useRef(new TranscriptFlow());
+  const streamLeadRef = useRef<Partial<Record<StreamingRole, RenderLine[]>>>({});
+  // What each running call was asked to do, kept until its result names it in the transcript.
+  const toolCallsRef = useRef(new Map<string, { name: string; arguments?: string }>());
 
   const railLayout = useCallback((role: Role): TimeRailLayout => ({
     width: MESSAGE_TIME_RAIL_WIDTH,
@@ -772,6 +839,18 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     if (!lines.length) return;
     dispatchDisplay({ type: "appendActivity", lines });
   }, []);
+
+  const flowGapLines = useCallback((gap: FlowGap, key: string): RenderLine[] => gap === "none"
+    ? []
+    : [gapLine(key, gap === "rail" && timelineVisibleRef.current ? railLayout("assistant") : undefined)], [railLayout]);
+
+  // Put one piece of the conversation into the transcript, under the space the piece before
+  // it left open. The space and the piece go in together: Ink drops a blank line that is
+  // printed on its own.
+  const appendFlow = useCallback((item: FlowItem, lines: RenderLine[], key: string) => {
+    if (!lines.length) return;
+    appendHistoryLines([...flowGapLines(flowRef.current.before(item), `${key}-lead`), ...lines]);
+  }, [appendHistoryLines, flowGapLines]);
 
   useEffect(() => {
     showReasoningRef.current = showReasoning;
@@ -827,14 +906,14 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     if (!content) return;
     const timestamp = options.timestamp ?? Date.now();
     const msg = { role, content, timestamp, id: ++msgIdRef.current } as ChatMessage;
-    const useTimeline = shouldMessageUseTimeline(
-      role,
-      timelineVisibleRef.current,
-      options.toolCompletion === true,
-    );
-    const rail = useTimeline ? nextTimeRail(role, timestamp) : undefined;
-    appendHistoryLines(messageToLines(msg, columns, showReasoningRef.current, runtimeMode, rail));
-  }, [appendHistoryLines, columns, nextTimeRail, runtimeMode]);
+    const rail = shouldMessageUseTimeline(role, timelineVisibleRef.current)
+      ? nextTimeRail(role, timestamp)
+      : undefined;
+    // What is said in a turn leaves the space under it to whatever follows; anything else
+    // (a notice, a command's answer) ends with its own blank line as before.
+    const item: FlowItem = role === "user" || role === "assistant" || role === "reasoning" ? role : "other";
+    appendFlow(item, messageToLines(msg, columns, showReasoningRef.current, runtimeMode, rail, item === "other"), `m${msg.id}`);
+  }, [appendFlow, columns, nextTimeRail, runtimeMode]);
 
   const applyStreamingUpdate = useCallback((
     role: StreamingRole,
@@ -852,11 +931,15 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     if (advanceState && committed.consumedLines > 0) {
       streamCoordinatorRef.current.advance(role, committed.consumedLines);
     }
+    // The space above a streamed reply is printed with its first line: shown with the
+    // preview until something is committed, then committed with it.
+    const lead = streamLeadRef.current[role];
+    if (lead?.length && committed.lines.length) delete streamLeadRef.current[role];
     const action = {
       type: "applyStreamUpdate" as const,
       role,
-      committed: committed.lines,
-      preview: preview.lines,
+      committed: lead?.length && committed.lines.length ? [...lead, ...committed.lines] : committed.lines,
+      preview: lead?.length && !committed.lines.length && preview.lines.length ? [...lead, ...preview.lines] : preview.lines,
     };
     if (advanceState) displayBatcher.enqueue(action);
     else dispatchDisplay(action);
@@ -869,14 +952,16 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
       const rail = shouldMessageUseTimeline(role, timelineVisibleRef.current)
         ? nextTimeRail(role, timestamp)
         : undefined;
+      streamLeadRef.current[role] = flowGapLines(flowRef.current.before(role), `stream-${role}-${timestamp}-lead`);
       streamCoordinatorRef.current.start(role, rail);
     }
     applyStreamingUpdate(role, streamCoordinatorRef.current.push(role, chunk));
-  }, [applyStreamingUpdate, nextTimeRail]);
+  }, [applyStreamingUpdate, flowGapLines, nextTimeRail]);
 
   const flushStreamRole = useCallback((role: StreamingRole) => {
     const update = streamCoordinatorRef.current.finish(role);
     applyStreamingUpdate(role, update, false);
+    delete streamLeadRef.current[role];
   }, [applyStreamingUpdate]);
 
   const completeTurn = useCallback(() => {
@@ -894,6 +979,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   const finishTurn = useCallback(() => {
     try {
       completeTurn();
+      toolCallsRef.current.clear();
     } finally {
       // Text rendering cannot own task liveness. Always unlock the composer.
       busyRef.current = false;
@@ -913,6 +999,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   const clearStreamingDisplay = useCallback(() => {
     discardPendingTextRef.current();
     streamCoordinatorRef.current.clear();
+    streamLeadRef.current = {};
     dispatchDisplay({ type: "clearStreaming" });
     assistantStartedRef.current = false;
   }, []);
@@ -1112,17 +1199,33 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
             rail,
           };
         });
+        // A restored conversation is spaced as a live one: the rail runs through a turn, and
+        // a clear line parts one turn from the next.
+        const restoredFlow = new TranscriptFlow();
+        const spaced = decoratedMessages
+          .filter(({ message }) => message.role !== "reasoning" || showReasoningRef.current)
+          .map((entry) => {
+            const item: FlowItem = entry.message.role === "system" ? "other" : entry.message.role as FlowItem;
+            return { ...entry, item, lead: restoredFlow.before(item) };
+          });
         const restored = restoreRecentHistory(
-          decoratedMessages,
+          spaced,
           MAX_RESTORED_RENDER_LINES,
-          ({ message, rail }) => messageToLines(
-            message,
-            columns,
-            showReasoningRef.current,
-            runtimeMode,
-            rail,
-          ),
+          ({ message, rail, item, lead }) => [
+            ...flowGapLines(lead, `${message.id}-lead`),
+            ...messageToLines(
+              message,
+              columns,
+              showReasoningRef.current,
+              runtimeMode,
+              rail,
+              item === "other",
+            ),
+          ],
         );
+        // The next piece follows the restored ones as it would have followed them live.
+        flowRef.current = restoredFlow;
+        toolCallsRef.current.clear();
         dispatchDisplay({ type: "replaceHistory", lines: restored });
         msgIdRef.current = event.messages.length + 1;
         break;
@@ -1233,6 +1336,9 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         assistantStartedRef.current = false;
         if (event.calls?.length) {
           const startedAt = Date.now();
+          for (const call of event.calls) {
+            if (call.id) toolCallsRef.current.set(call.id, { name: call.name, arguments: call.arguments });
+          }
           setActiveTools((current) => {
             const known = new Set(current.map((tool) => tool.id));
             return [
@@ -1386,8 +1492,6 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           const index = current.findIndex((tool) => tool.name === event.name);
           return index < 0 ? current : current.filter((_, itemIndex) => itemIndex !== index);
         });
-        const ms = event.duration_ms ? ` \x1b[90m${event.duration_ms}ms\x1b[0m` : "";
-        const status = event.error ? "\x1b[31m✗\x1b[0m" : "\x1b[32m✓\x1b[0m";
         const result: ToolResultRecord = {
           id: ++toolResultIdRef.current,
           name: event.name,
@@ -1402,30 +1506,35 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         setToolResults(nextResults);
         // An open document view follows new writes to the same document.
         setOpenToolResultId((current) => followDocumentView(current, toolResultsRef.current, result));
-        const body = toolResultBody(result);
-        if (shouldCollapseToolResult(body, TOOL_COLLAPSE_CHARS, TOOL_COLLAPSE_LINES)) {
-          const lineCount = body.split(/\r?\n/).length;
-          addMessage(
-            "tool",
-            `${status} ${event.name}${ms}  \x1b[90m${body.length} chars · ${lineCount} lines\x1b[0m\n` +
-            `  ${summarizeToolResult(body)}\n` +
-            `  \x1b[36m▸ collapsed · /tool ${result.id} or Ctrl+O for latest\x1b[0m`,
-            { toolCompletion: true, timestamp: completedAt },
-          );
-        } else {
-          const artifact = event.output_truncated && event.artifact_path
-            ? `\n  \x1b[90mfull result → ${event.artifact_path}\x1b[0m`
-            : "";
-          addMessage(
-            "tool",
-            `${status} ${event.name}${ms}\n  ${body}${artifact}`,
-            { toolCompletion: true, timestamp: completedAt },
-          );
-        }
+        // One row in the conversation: what was done, to what, what came of it. The output
+        // itself is a keystroke away (/tool <id>, or Ctrl+O for the latest).
+        const call = event.call_id ? toolCallsRef.current.get(event.call_id) : undefined;
+        if (event.call_id) toolCallsRef.current.delete(event.call_id);
+        const toolRail = shouldMessageUseTimeline("tool", timelineVisibleRef.current, true)
+          ? nextTimeRail("tool", completedAt)
+          : undefined;
+        appendFlow(
+          "tool",
+          toolResultLines(
+            { ...result, arguments: call?.arguments, note: documentSummary(result) ?? imageSearchSummary(result) ?? undefined },
+            columns,
+            runtimeMode,
+            flowRef.current.previous !== "tool",
+            toolRail,
+          ),
+          `tool-${result.id}`,
+        );
         break;
       case "turn_changes": {
-        const line = formatTurnChangesSummary(event);
-        if (line && turnChangesGateRef.current?.shouldRender(event, sessionNameRef.current)) addMessage("system", line);
+        const lines = turnChangesLines(
+          event,
+          columns,
+          runtimeMode,
+          timelineVisibleRef.current ? railLayout("assistant") : undefined,
+        );
+        if (lines.length && turnChangesGateRef.current?.shouldRender(event, sessionNameRef.current)) {
+          appendFlow("changes", lines, `changes-${event.request_id}-${event.turn_seq}`);
+        }
         break;
       }
       case "done":
@@ -1964,6 +2073,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           }
         } else if (text === "/reset") {
           timeRailCursorRef.current.reset();
+          flowRef.current.reset();
           dispatchDisplay({ type: "clearHistory" });
           toolResultsRef.current = [];
           detailOpenRef.current = false;

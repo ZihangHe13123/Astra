@@ -11,13 +11,22 @@ import {
 import type { ChatMessage } from "./types.js";
 import type { InlineSpan, MarkdownBlock } from "./terminal-markdown.js";
 
+/** The colour a cell of a laid-out row takes from the theme. */
+export type LineTone = "text" | "muted" | "accent" | "accentAlt" | "success" | "warning" | "danger";
+/** `mark: "tool"` is drawn as the theme's own tool mark where that is one cell wide. */
+export type LineCell = { text: string; tone?: LineTone; bold?: boolean; mark?: "tool" };
+
 export type RenderLine = {
   key: string;
   role: ChatMessage["role"];
   text: string;
   spans?: InlineSpan[];
   prefix: string;
-  kind: "text" | "header" | "list" | "quote" | "rule" | "code" | "table" | "math";
+  // "cells" is a row laid out in advance (a tool call, a changed file): drawn as it is, never wrapped.
+  kind: "text" | "header" | "list" | "quote" | "rule" | "code" | "table" | "math" | "cells";
+  cells?: LineCell[];
+  /** Beside the time rail: how far a wrapped list item or quote stands in from the text column. */
+  hang?: number;
   malformedMath?: boolean;
   timeRail?: TimeRail;
 };
@@ -126,18 +135,22 @@ export function markdownBlocksToLines(
   const activityPrefix = () => lines.length === 0 && startingLineIndex === 0
     ? options.firstPrefix
     : options.continuationPrefix;
-  const visiblePrefixWidth = (prefix: string) => options.timeRail
-    && (prefix === options.firstPrefix || prefix === options.continuationPrefix)
-    ? options.timeRail.prefixWidth
+  // Beside the time rail every line starts in the text column, and a list or quote marker
+  // stands in that column too, with its own text hanging after it. Without the rail a prefix
+  // takes the room it has always taken.
+  const isActivityPrefix = (prefix: string) => prefix === options.firstPrefix || prefix === options.continuationPrefix;
+  const markerWidth = (prefix: string) => options.timeRail && !isActivityPrefix(prefix) ? stringWidth(prefix.trimStart()) : 0;
+  const visiblePrefixWidth = (prefix: string, hang = 0) => options.timeRail
+    ? options.timeRail.prefixWidth + (isActivityPrefix(prefix) ? hang : markerWidth(prefix))
     : stringWidth(prefix);
-  const availableWidth = (prefix: string) => Math.max(1, options.bodyWidth - visiblePrefixWidth(prefix) - railWidth);
+  const availableWidth = (prefix: string, hang = 0) => Math.max(1, options.bodyWidth - visiblePrefixWidth(prefix, hang) - railWidth);
   const continuationWidth = () => availableWidth(options.continuationPrefix);
 
   const append = (
     prefix: string,
     text: string,
     kind: RenderLine["kind"],
-    extra: Pick<RenderLine, "spans" | "malformedMath"> = {},
+    extra: Pick<RenderLine, "spans" | "malformedMath" | "hang"> = {},
   ) => {
     const isFirstActivityLine = lines.length === 0 && startingLineIndex === 0;
     lines.push({
@@ -154,8 +167,10 @@ export function markdownBlocksToLines(
   };
 
   const emitStructured = (spans: InlineSpan[], kind: "text" | "header" | "list" | "quote", firstPrefix: string) => {
+    const hang = markerWidth(firstPrefix);
     const wrapped = wrapWithWidths(spans, (lineIndex) => availableWidth(
       lineIndex === 0 ? firstPrefix : options.continuationPrefix,
+      lineIndex === 0 ? 0 : hang,
     ));
     if (wrapped.length === 0) {
       append(firstPrefix, " ", kind, { spans: [] });
@@ -165,7 +180,7 @@ export function markdownBlocksToLines(
       index === 0 ? firstPrefix : options.continuationPrefix,
       textFor(line),
       kind,
-      { spans: line },
+      index > 0 && hang ? { spans: line, hang } : { spans: line },
     ));
   };
 
