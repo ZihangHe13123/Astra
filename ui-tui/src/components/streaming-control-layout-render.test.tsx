@@ -8,7 +8,7 @@ import { THEMES } from "../theme.js";
 import { ThemeProvider } from "../theme-context.js";
 import { ActivityDock } from "./activity-dock.js";
 import { AppHeader } from "./app-header.js";
-import { BarHeader, BarStatusDock } from "./bar-chrome.js";
+import { BarStatusDock } from "./bar-chrome.js";
 import { BarShelf } from "./bar-shelf.js";
 import { InputBar } from "./input-bar.js";
 import { MinimalStatusDock } from "./minimal-chrome.js";
@@ -89,7 +89,7 @@ function controls(mode: RuntimeMode): {
 } {
   if (mode === "bar") {
     return {
-      header: <BarHeader columns={COLUMNS} />,
+      header: null,
       status: <BarStatusDock
         session="layout_bar"
         busy

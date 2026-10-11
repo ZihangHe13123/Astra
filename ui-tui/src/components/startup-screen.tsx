@@ -98,7 +98,7 @@ export function StartupScreen({
       >
         <Box justifyContent="space-between" overflow="hidden">
           <Text bold color={theme.accent}>{consoleTheme.bootTitle}</Text>
-          {mode !== "compact" && <Text color={theme.subtle}>{consoleTheme.bootTag}</Text>}
+          {mode !== "compact" && <Text color={theme.muted}>{consoleTheme.bootTag}</Text>}
         </Box>
         <Text color={theme.subtle}>{"─".repeat(Math.max(20, panelWidth - (mode === "compact" ? 6 : 8)))}</Text>
 
@@ -115,7 +115,7 @@ export function StartupScreen({
                   </Text>
                 );
               })}
-              {!lyra && <Text dimColor color={theme.muted}>{consoleTheme.nodeLabel}</Text>}
+              {!lyra && <Text color={theme.muted}>{consoleTheme.nodeLabel}</Text>}
             </Box>
           )}
 
@@ -128,7 +128,7 @@ export function StartupScreen({
               <Text color={theme.text}>{ready ? consoleTheme.readyStatus : phase}</Text>
             </Text>
             <Text>
-              <Text color={theme.subtle}>SCAN </Text>
+              <Text color={theme.muted}>SCAN </Text>
               <Text color={theme.accentAlt}>{startupProgress(frame, progressWidth)}</Text>
             </Text>
             {info ? (
@@ -149,18 +149,18 @@ export function StartupScreen({
                   <Text color={theme.subtle}>  ·  </Text>
                   <Text color={info.learning.error ? theme.warning : theme.success}>LEARN {learningState}</Text>
                 </Text>
-                <Text dimColor color={theme.muted}>{consoleTheme.handoff}</Text>
+                <Text color={theme.muted}>{consoleTheme.handoff}</Text>
               </>
             ) : (
-              <Text dimColor color={theme.muted}>SIGNAL // {consoleTheme.waiting}</Text>
+              <Text color={theme.muted}>SIGNAL // {consoleTheme.waiting}</Text>
             )}
           </Box>
         </Box>
 
         <Text color={theme.subtle}>{"─".repeat(Math.max(20, panelWidth - (mode === "compact" ? 6 : 8)))}</Text>
         <Box justifyContent="space-between" overflow="hidden">
-          <Text dimColor color={theme.muted}>{consoleTheme.systemsLabel}</Text>
-          <Text dimColor color={theme.muted}>{info?.model ? shorten(info.model, 28) : "NEGOTIATING LINK"}</Text>
+          <Text color={theme.muted}>{consoleTheme.systemsLabel}</Text>
+          <Text color={theme.muted}>{info?.model ? shorten(info.model, 28) : "NEGOTIATING LINK"}</Text>
         </Box>
       </Box>
     </Box>

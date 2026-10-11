@@ -24,6 +24,8 @@ type CaptureOptions = {
   showReasoning?: boolean;
   generationStats?: React.ComponentProps<typeof ActivityDock>["generationStats"];
   computer?: ComputerUiState;
+  brand?: string;
+  action?: string;
 };
 
 class CaptureStream extends Writable {
@@ -67,6 +69,8 @@ async function capture(
         codeMode={options.codeMode}
         generationStats={options.generationStats}
         lastTool={options.lastTool}
+        brand={options.brand}
+        action={options.action}
         sessionName="session_test"
         columns={columns}
         computer={options.computer}
@@ -201,3 +205,42 @@ const missingIdApprovalFrame = await capture(180, false, {
   tools: queuedTools,
 });
 assert.doesNotMatch(missingIdApprovalFrame, /one-time-token-123|second-approval-secret|docs\/visible\.md/);
+
+// With a brand the status line is the header too: one rule above it, the brand first, the keys at
+// the right edge, and never wider than the terminal.
+for (const columns of [60, 92, 124, 180]) {
+  for (const expanded of [false, true]) {
+    const frame = await capture(columns, false, { brand: "GLITCH CITY", action: "close shift", memory: {}, expanded, reasoningEffort: "high", codeMode: "native" });
+    const lines = frame.split(/\r?\n/);
+    assert.match(lines[0], /^─+$/, `one rule, no frame, at ${columns} columns`);
+    assert.doesNotMatch(frame, /[│┌┐└┘╔╗╚╝](?! )|^[│║]/m, "a header line has no side frames");
+    assert.equal(lines.every((line) => stringWidth(line) <= columns), true, `overflowed at ${columns} columns`);
+    assert.match(lines[1], new RegExp(`\\^L${columns < 70 ? "" : expanded ? " collapse" : " expand"}`));
+    if (columns >= 70) {
+      assert.match(lines[1], /^ GLITCH CITY │ ● READY/);
+      assert.match(lines[1], /\^C close shift$/);
+      assert.equal(stringWidth(lines[1]), columns - 1, "the keys end at the right edge");
+    } else {
+      assert.doesNotMatch(lines[1], /GLITCH CITY|close shift/);
+    }
+    assert.equal(/\^O tools/.test(lines[1]), columns > 110);
+  }
+}
+
+// Running tools are listed in columns: kind, what it is done to, progress, time. What a call is
+// about is shown, not its raw arguments.
+const columnsFrame = await capture(124, true, {
+  brand: "GLITCH CITY", expanded: true, memory: {},
+  tools: [
+    { id: "a", name: "execute_shell", arguments: JSON.stringify({ command: "pytest tests/test_a.py", timeout: 60 }), startedAt: 1_000 },
+    { id: "b", name: "read_file", arguments: JSON.stringify({ path: "agent/runtime/x.py", limit: 5 }), startedAt: 2_000 },
+    { id: "c", name: "shell bg", arguments: "npm run dev", startedAt: 1_500 },
+  ],
+});
+const toolRows = columnsFrame.split(/\r?\n/).filter((line) => /^ ◆ /.test(line));
+assert.equal(toolRows.length, 3, columnsFrame);
+assert.match(toolRows[0], /^ ◆ RUN     pytest tests\/test_a\.py\s+1\.2s$/);
+assert.match(toolRows[1], /^ ◆ READ    agent\/runtime\/x\.py\s+0\.2s$/);
+assert.match(toolRows[2], /^ ◆ TOOL    shell bg  npm run dev\s+0\.7s$/);
+assert.equal(new Set(toolRows.map((line) => stringWidth(line))).size, 1, "every row ends in the same column");
+assert.doesNotMatch(columnsFrame, /timeout|limit|\{"/, "raw arguments are not shown");

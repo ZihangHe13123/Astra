@@ -1,4 +1,5 @@
 import type { ProviderInfo, ConnectionRoute } from "./types.js";
+import { workspaceLabel } from "./workspace-label.js";
 import { modelDisplayName } from "./model-label.js";
 import { ConnectionPanel } from "./components/connection-panel.js";
 import { appshotRejectionNotice } from "./appshot-rejection.js";
@@ -42,7 +43,7 @@ import { WelcomeScreen } from "./components/welcome-screen.js";
 import { ToolApprovalPanel } from "./components/tool-approval-panel.js";
 import { QuestionCard } from "./components/question-card.js";
 import { BarShelf } from "./components/bar-shelf.js";
-import { BarHeader, BarStatusDock, isQuietBarAction } from "./components/bar-chrome.js";
+import { BarStatusDock, isQuietBarAction } from "./components/bar-chrome.js";
 import { MinimalStatusDock } from "./components/minimal-chrome.js";
 import { LocalStatusDock } from "./components/local-chrome.js";
 import { StreamingControlLayout } from "./components/streaming-control-layout.js";
@@ -458,7 +459,6 @@ export const MessageLine = memo(function MessageLine({ line, runtimeMode = "work
 const InputBarMemo = memo(InputBar);
 const ActivityDockMemo = memo(ActivityDock);
 const AppHeaderMemo = memo(AppHeader);
-const BarHeaderMemo = memo(BarHeader);
 const BarStatusDockMemo = memo(BarStatusDock);
 const StartupScreenMemo = memo(StartupScreen);
 const WelcomeScreenMemo = memo(WelcomeScreen);
@@ -475,7 +475,7 @@ function detailLineProps(style: DocumentLineStyle | undefined, theme: UiTheme, e
   switch (style) {
     case "title": return { bold: true, color: theme.header };
     case "heading": return { bold: true, color: theme.accentAlt };
-    case "meta": return { dimColor: true, color: theme.muted };
+    case "meta": return { color: theme.muted };
     case "pending": return { dimColor: true, italic: true, color: theme.muted };
     case "comment": return { color: theme.warning };
     case "code": return { color: theme.codeBlock };
@@ -512,9 +512,9 @@ function ToolDetailsPanel({
         </Text>
       ))}
       {result.artifactPath && (
-        <Text dimColor color={theme.muted}>full result → {result.artifactPath}</Text>
+        <Text color={theme.muted}>full result → {result.artifactPath}</Text>
       )}
-      <Text dimColor color={theme.muted}>↑/↓ scroll · PgUp/PgDn page · Esc or Ctrl+O close</Text>
+      <Text color={theme.muted}>↑/↓ scroll · PgUp/PgDn page · Esc or Ctrl+O close</Text>
     </Box>
   );
 }
@@ -653,6 +653,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   // Ctrl+C reads these outside React's render cycle.
   const voiceRef = useRef({ speaking: false, error: "" });
   const [workingMemory, setWorkingMemory] = useState<WorkingMemory>({});
+  const workspaceLocation = useMemo(() => workspaceLabel(), []);
   const [toolResults, setToolResults] = useState<ToolResultRecord[]>([]);
   const [generationStats, setGenerationStats] = useState<GenerationStats | null>(null);
   const [generationProgress, setGenerationProgress] = useState<GenerationProgress | null>(null);
@@ -2179,6 +2180,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         info={startupInfo}
         model={info.model}
         sessionName={sessionName}
+        location={workspaceLocation}
       />}
 
       <HistoryOutput generation={`${themeName}:${historyGeneration}`} lines={historyLines} runtimeMode={runtimeMode} />
@@ -2189,8 +2191,10 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         dynamic={compactQuestion ? null : visibleDynamicDisplayLines(displayState, Math.max(1, rows - 2)).map((line) => (
           <MessageLine key={line.key} line={line} runtimeMode={runtimeMode} />
         ))}
-        header={compactQuestion ? null : runtimeMode === "bar"
-          ? <BarHeaderMemo columns={columns} />
+        // In work mode the status line is the header too, and the bar's sign carries its status;
+        // local and minimal mode keep the header they have.
+        header={compactQuestion || runtimeMode === "work" || runtimeMode === "bar"
+          ? null
           : <AppHeaderMemo columns={columns} busy={busy} mode={runtimeMode} localMode={localMode} />}
         status={compactQuestion ? null : runtimeMode === "work" ? <ActivityDockMemo
           expanded={activityExpanded}
@@ -2227,6 +2231,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           pendingApproval={pendingApprovalSummary}
           queuedApprovalCallIds={queuedApprovalCallIds}
           computer={computer}
+          brand={(theme.chrome?.brand ?? "Agent System").split(" // ")[0]}
+          action={busy ? "cancel" : theme.chrome?.exitLabel ?? "exit"}
         /> : runtimeMode === "bar" ? <BarStatusDockMemo
           session={barSessionName}
           busy={busy}
@@ -2278,7 +2284,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
               if (send(request)) setConnectionPending(true);
               else setConnectionError("Backend disconnected. Reconnect before saving.");
             }} /></Box>}
-          {!interactionActive && runtimeMode === "bar" && <BarShelf drink={barDrink} columns={columns} />}
+          {!interactionActive && runtimeMode === "bar" && <BarShelf drink={barDrink} columns={columns} rows={rows} />}
 
           {approvalRequests[0] && (
             <ToolApprovalPanel

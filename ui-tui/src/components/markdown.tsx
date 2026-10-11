@@ -131,7 +131,7 @@ export function MarkdownRenderer({ text, baseColor, isDim }: Props) {
         elements.push(
           <Box key={`code-${codeLineStart}`} flexDirection="column" marginLeft={1} borderStyle={theme.chrome?.frameStyle ?? "round"} borderColor={theme.border} paddingX={1}>
             {codeLang && (
-              <Text dimColor color={theme.muted}>{codeLang}</Text>
+              <Text color={theme.muted}>{codeLang}</Text>
             )}
             {codeContent.split("\n").map((cl, j) => (
               <Text key={j} color={theme.codeBlock} backgroundColor={theme.codeBlockBackground}>{cl}</Text>
