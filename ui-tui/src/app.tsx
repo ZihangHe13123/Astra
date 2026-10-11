@@ -1,4 +1,5 @@
 import type { ProviderInfo, ConnectionRoute } from "./types.js";
+import { workspaceLabel } from "./workspace-label.js";
 import { modelDisplayName } from "./model-label.js";
 import { ConnectionPanel } from "./components/connection-panel.js";
 import { appshotRejectionNotice } from "./appshot-rejection.js";
@@ -653,6 +654,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   // Ctrl+C reads these outside React's render cycle.
   const voiceRef = useRef({ speaking: false, error: "" });
   const [workingMemory, setWorkingMemory] = useState<WorkingMemory>({});
+  const workspaceLocation = useMemo(() => workspaceLabel(), []);
   const [toolResults, setToolResults] = useState<ToolResultRecord[]>([]);
   const [generationStats, setGenerationStats] = useState<GenerationStats | null>(null);
   const [generationProgress, setGenerationProgress] = useState<GenerationProgress | null>(null);
@@ -2179,6 +2181,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         info={startupInfo}
         model={info.model}
         sessionName={sessionName}
+        location={workspaceLocation}
       />}
 
       <HistoryOutput generation={`${themeName}:${historyGeneration}`} lines={historyLines} runtimeMode={runtimeMode} />
