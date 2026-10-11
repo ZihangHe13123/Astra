@@ -69,7 +69,7 @@ export function BarShelf({ drink, columns }: { drink: BarDrinkState; columns: nu
       <Box borderStyle="single" borderColor={drink.active ? toneColor : theme.border} paddingX={1} height={3} overflow="hidden">
         <Text bold color={theme.accent}>SHELF // </Text>
         <Text color={toneColor}>{layout.prefix}</Text>
-        <Text color={theme.subtle}>{layout.spacer}{layout.hint}</Text>
+        <Text color={theme.muted}>{layout.spacer}{layout.hint}</Text>
       </Box>
     );
   }
@@ -86,11 +86,11 @@ export function BarShelf({ drink, columns }: { drink: BarDrinkState; columns: nu
       <Box>
         <Text bold color={theme.accent}>BAR SHELF // </Text>
         <Text color={toneColor}>{layout.prefix}</Text>
-        <Text color={theme.subtle}>{layout.spacer}{layout.hint}</Text>
+        <Text color={theme.muted}>{layout.spacer}{layout.hint}</Text>
       </Box>
       {layout.note && (
         <Text>
-          <Text bold color={theme.subtle}>TASTING // </Text>
+          <Text bold color={theme.muted}>TASTING // </Text>
           <Text color={theme.muted}>{layout.note}</Text>
         </Text>
       )}

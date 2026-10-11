@@ -475,7 +475,7 @@ function detailLineProps(style: DocumentLineStyle | undefined, theme: UiTheme, e
   switch (style) {
     case "title": return { bold: true, color: theme.header };
     case "heading": return { bold: true, color: theme.accentAlt };
-    case "meta": return { dimColor: true, color: theme.muted };
+    case "meta": return { color: theme.muted };
     case "pending": return { dimColor: true, italic: true, color: theme.muted };
     case "comment": return { color: theme.warning };
     case "code": return { color: theme.codeBlock };
@@ -512,9 +512,9 @@ function ToolDetailsPanel({
         </Text>
       ))}
       {result.artifactPath && (
-        <Text dimColor color={theme.muted}>full result → {result.artifactPath}</Text>
+        <Text color={theme.muted}>full result → {result.artifactPath}</Text>
       )}
-      <Text dimColor color={theme.muted}>↑/↓ scroll · PgUp/PgDn page · Esc or Ctrl+O close</Text>
+      <Text color={theme.muted}>↑/↓ scroll · PgUp/PgDn page · Esc or Ctrl+O close</Text>
     </Box>
   );
 }

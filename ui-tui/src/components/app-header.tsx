@@ -53,7 +53,7 @@ export function AppHeader({ columns, busy, mode: runtimeMode = "work", localMode
         {headerTag && mode === "wide" && (
           <Text bold color={theme.accentAlt}>{`  ${headerTag}`}</Text>
         )}
-        <Text dimColor color={theme.muted}>{hints}</Text>
+        <Text color={theme.muted}>{hints}</Text>
       </Text>
     </Box>
   );

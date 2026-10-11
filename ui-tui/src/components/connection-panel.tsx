@@ -76,21 +76,21 @@ export function ConnectionPanel({ routes, pending, error, authorization, onSave,
     : stage === "key" ? "API key (saved privately on this installation)" : "Environment variable name";
   return <Box flexDirection="column" borderStyle="round" borderColor={theme.border} paddingX={1}>
     <Text bold>{pending ? "Connecting…" : title}</Text>
-    {baseUrl && stage !== "provider" && stage !== "route" && <Text dimColor>{baseUrl}</Text>}
+    {baseUrl && stage !== "provider" && stage !== "route" && <Text color={theme.muted}>{baseUrl}</Text>}
     {error && <Text color="red">{error}</Text>}
     {pending ? authorization ? <Box flexDirection="column">
         <Text>Open {authorization.verification_uri}</Text>
         <Text bold>Enter code: {authorization.user_code}</Text>
         <Text>Waiting for ChatGPT authorization…</Text>
-        <Text dimColor>If disabled, enable Codex device-code login in ChatGPT Settings → Security, then reconnect.</Text>
+        <Text color={theme.muted}>If disabled, enable Codex device-code login in ChatGPT Settings → Security, then reconnect.</Text>
       </Box> : <Text>Connecting and checking model list…</Text>
       : textEntry ? <TextInput value={value} onChange={next => setValue(singleLineFieldText(next))} onSubmit={submitText}
         mask={stage === "key" ? "*" : undefined} placeholder={stage === "url" ? "https://…/v1" : undefined} />
       : <>
-        {query && <Text dimColor>Filter: {query}</Text>}
+        {query && <Text color={theme.muted}>Filter: {query}</Text>}
         {filtered.slice(Math.max(0, selection - 4), Math.max(0, selection - 4) + 7).map(label =>
           <Text key={label} inverse={label === filtered[selection]}>{label === filtered[selection] ? "› " : "  "}{label}</Text>)}
       </>}
-    <Text dimColor>↑/↓ choose · Enter continue · Esc {pending ? "cancel connection" : "close"}</Text>
+    <Text color={theme.muted}>↑/↓ choose · Enter continue · Esc {pending ? "cancel connection" : "close"}</Text>
   </Box>;
 }

@@ -592,7 +592,7 @@ export const InputBar = forwardRef<AppshotInputHandle, Props>(function InputBar(
             const descriptionBudget = Math.max(16, columns - commandWidth - 7);
             return (
               <React.Fragment key={`${item.group ?? "command"}-${item.command}`}>
-                {showGroup && <Text bold color={theme.subtle}>{`  ${item.group}`}</Text>}
+                {showGroup && <Text bold color={theme.muted}>{`  ${item.group}`}</Text>}
                 <Text wrap="truncate-end">
                   <Text
                     color={selected ? theme.accent : item.current ? theme.success : theme.muted}
@@ -603,7 +603,6 @@ export const InputBar = forwardRef<AppshotInputHandle, Props>(function InputBar(
                   </Text>
                   {mode !== "compact" && (
                     <Text
-                      dimColor
                       color={theme.muted}
                       backgroundColor={selected ? theme.menuSelectedBackground : theme.menuBackground}
                     >
@@ -617,7 +616,7 @@ export const InputBar = forwardRef<AppshotInputHandle, Props>(function InputBar(
               </React.Fragment>
             );
           })}
-          <Text dimColor color={theme.subtle} wrap="truncate-end">  ↑↓ select  Enter run  Tab complete  Esc close</Text>
+          <Text color={theme.muted} wrap="truncate-end">  ↑↓ select  Enter run  Tab complete  Esc close</Text>
         </Box>
       )}
       <Box borderStyle={chrome?.inputFrameStyle ?? chrome?.frameStyle ?? "single"} borderColor={disabled ? theme.subtle : theme.accentAlt} paddingX={1}>
@@ -651,7 +650,7 @@ export const InputBar = forwardRef<AppshotInputHandle, Props>(function InputBar(
               {attachment.label}  {pastedTextPreview(attachment.content)}
             </Text>
           ))}
-          <Text dimColor color={theme.subtle} wrap="truncate-end">  {pastedText.length} paste(s) preserved · full text sent on Enter</Text>
+          <Text color={theme.muted} wrap="truncate-end">  {pastedText.length} paste(s) preserved · full text sent on Enter</Text>
         </Box>
       )}
     </Box>

@@ -365,7 +365,7 @@ export function ActivityDock({
               <Text color={index === 0 ? theme.accent : index === 1 ? theme.accentAlt : theme.muted}>{item}</Text>
             </React.Fragment>
           ))}
-          <Text dimColor color={theme.subtle}>{hint}</Text>
+          <Text color={theme.muted}>{hint}</Text>
         </Text>
       </Box>
 
@@ -411,7 +411,7 @@ export function ActivityDock({
                       </Text>
                     ))}
                     {team.tasks.slice(0, 6).map((task) => (
-                      <Text key={task.id} color={task.status === "failed" ? theme.danger : theme.subtle}>
+                      <Text key={task.id} color={task.status === "failed" ? theme.danger : theme.muted}>
                         <Text color={theme.accent}>  TASK </Text>{shorten(task.title, Math.max(12, columns - 38))} · {task.status}{task.ownerId ? ` · ${task.ownerId.slice(0, 8)}` : ""}
                       </Text>
                     ))}
@@ -422,7 +422,7 @@ export function ActivityDock({
           )}
           {hasMemory && <WorkingMemoryPanel memory={memory} columns={columns} embedded />}
           <Box overflow="hidden">
-            <Text color={theme.subtle}>STATUS{chrome?.separator ?? " · "}</Text>
+            <Text color={theme.muted}>STATUS</Text><Text color={theme.subtle}>{chrome?.separator ?? " · "}</Text>
             {statusParts.map((segment, index) => (
               <Text key={`${segment.text}-${index}`} color={segment.color}>{segment.text}</Text>
             ))}

@@ -131,7 +131,7 @@ export function BarStatusDock({
         <Text color={theme.accent}>{shorten(session || "UNNAMED", 15)}</Text>
         <Text color={theme.subtle}> | </Text>
         <Text bold color={outputColor}>{outputLabel}</Text>
-        <Text color={theme.subtle}> | /bar leave</Text>
+        <Text color={theme.subtle}> | </Text><Text color={theme.muted}>/bar leave</Text>
       </Box>
     );
   }
@@ -147,10 +147,10 @@ export function BarStatusDock({
           <Text bold color={theme.warning}>{phase}</Text>
           <Text color={theme.subtle}>  |  </Text>
           <Text bold color={outputColor}>{outputLabel}</Text>
-          <Text color={theme.subtle}>  |  /bar leave</Text>
+          <Text color={theme.subtle}>  |  </Text><Text color={theme.muted}>/bar leave</Text>
         </Text>
         <Text>
-          <Text bold color={theme.subtle}>ENV // </Text>
+          <Text bold color={theme.muted}>ENV // </Text>
           <Text color={notice ? theme.warning : theme.muted}>{shorten(environment, environmentBudget)}</Text>
           <Text color={theme.subtle}>  |  </Text>
           <Text color={lyraGlass.active ? theme.accentAlt : theme.muted}>{shorten(lyraCup, cupBudget)}</Text>
@@ -170,16 +170,16 @@ export function BarStatusDock({
     <Box borderStyle="single" borderColor={stateColor} paddingX={1} height={4} overflow="hidden" flexDirection="column">
       <Text>
         <Text bold color={stateColor}>{disconnected ? "X" : busy ? "*" : "o"} {state}</Text>
-        <Text color={theme.subtle}>  |  SHIFT </Text>
+        <Text color={theme.subtle}>  |  </Text><Text color={theme.muted}>SHIFT </Text>
         <Text color={theme.accent}>{shorten(session || "UNNAMED", sessionBudget)}</Text>
         <Text color={theme.subtle}>  |  </Text>
         <Text bold color={theme.warning}>{phase}</Text>
         <Text color={theme.subtle}>  |  </Text>
         <Text bold color={outputColor}>{outputLabel}</Text>
-        <Text color={theme.subtle}>  |  /bar leave</Text>
+        <Text color={theme.subtle}>  |  </Text><Text color={theme.muted}>/bar leave</Text>
       </Text>
       <Text>
-        <Text bold color={theme.subtle}>AMBIENCE // </Text>
+        <Text bold color={theme.muted}>AMBIENCE // </Text>
         <Text color={notice ? theme.warning : theme.muted}>{shorten(environment, environmentBudget)}</Text>
         <Text color={theme.subtle}>  |  </Text>
         <Text color={lyraGlass.active ? theme.accentAlt : theme.muted}>{shorten(lyraCup, lyraBudget)}</Text>

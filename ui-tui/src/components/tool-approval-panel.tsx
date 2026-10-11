@@ -132,7 +132,7 @@ export function ToolApprovalPanel({
       )}
       </Box>
       {expanded && (
-        <Text dimColor color={theme.muted} wrap="truncate-end">↑/↓ 滚动 · PgUp/PgDn 翻页 · V/Esc 折叠</Text>
+        <Text color={theme.muted} wrap="truncate-end">↑/↓ 滚动 · PgUp/PgDn 翻页 · V/Esc 折叠</Text>
       )}
       <Text color={theme.accentAlt}>
         {shortcuts}
