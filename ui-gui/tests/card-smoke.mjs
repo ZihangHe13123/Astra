@@ -194,13 +194,16 @@ try {
   holdStream(); await idle();
   await expect(frame(counter)).toHaveCount(1);
   await expect(inside(counter).getByRole('heading', { name: '计数器' })).toBeVisible();
-  await inside(counter).getByRole('button', { name: '加一', exact: true }).click();
-  await inside(counter).getByRole('button', { name: '加一', exact: true }).click();
-  await expect(inside(counter).locator('#n')).toHaveText('2');
   await expect(page.getByText('卡片后面的文字。', { exact: true })).toBeVisible();
-  // The frame is as tall as its content and takes the reply's colours.
+  // The frame is as tall as its content. It gets there a moment after the card is drawn, and the list moves with it,
+  // so the card is clicked only once it has: a click aimed while the button is still moving can land beside it.
   const fit = async () => { const box = await frame(counter).boundingBox(); const content = await inside(counter).locator('body').evaluate(body => Math.ceil(body.getBoundingClientRect().height)); return [box.height, content]; };
   await expect.poll(async () => { const [frameHeight, content] = await fit(); return frameHeight === content && content > 60; }).toBe(true);
+  await inside(counter).getByRole('button', { name: '加一', exact: true }).click();
+  await expect(inside(counter).locator('#n')).toHaveText('1');
+  await inside(counter).getByRole('button', { name: '加一', exact: true }).click();
+  await expect(inside(counter).locator('#n')).toHaveText('2');
+  // It takes the reply's colours.
   const colours = () => Promise.all([page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--text').trim()), inside(counter).locator('html').evaluate(node => getComputedStyle(node).getPropertyValue('--text').trim()), inside(counter).locator('html').evaluate(node => getComputedStyle(node).colorScheme)]);
   const [hostText, cardText, scheme] = await colours();
   assert.deepEqual([cardText, scheme], [hostText, 'light']);
