@@ -8,7 +8,15 @@ test("a tool call reads as what was done, to what, and what came of it", () => {
   assert.deepEqual(describeTool({ type: "tool_result", name: "execute_shell", status: "completed", arguments: { command: "pytest tests/test_x.py" }, output: "....\n158 passed in 4.2s\n" }),
     { verb: "RUN", target: "pytest tests/test_x.py", result: "158 passed in 4.2s", tone: "ok" });
   assert.deepEqual(describeTool({ type: "tool_calls", name: "execute_python", status: "running", arguments: { code: "\nimport time\ntime.sleep(5)" }, progress: { stage: "running", percent: 40 } }),
-    { verb: "RUN", target: "import time", result: "running · 40%", tone: "live" });
+    { verb: "RUN", target: "import time ↵ time.sleep(5)", result: "running · 40%", tone: "live" });
+  // A command or script of several lines is told on one, its lines parted by a mark, so three
+  // heredocs in a row do not read alike. One line of output is "1 line".
+  assert.equal(describeTool({ name: "execute_shell", status: "completed", arguments: { command: "python3 - <<'PY'\nimport json\n\nprint(1)\nPY" }, output: "1" }).target,
+    "python3 - <<'PY' ↵ import json ↵ print(1) ↵ PY");
+  assert.equal(describeTool({ name: "execute_shell", status: "completed", arguments: { command: "x".repeat(100) + "\n" + "y".repeat(100) }, output: "" }).target.length, 160);
+  assert.equal(describeTool({ name: "read_file", status: "completed", arguments: { path: "a.md\nignored" }, output: "only" }).target, "a.md");
+  assert.equal(describeTool({ name: "read_file", status: "completed", arguments: { path: "a.md" }, output: "only" }).result, "1 line");
+  assert.equal(describeTool({ name: "read_file", status: "completed", arguments: { path: "a.md" }, output: "" }).result, "");
   assert.deepEqual(describeTool({ type: "tool_result", name: "edit_file", arguments: { path: "a.py" }, output: "", error: "old text not found\nRecovery: read the file" }),
     { verb: "EDIT", target: "a.py", result: "old text not found", tone: "bad" });
   assert.equal(describeTool({ name: "search_text", status: "completed", arguments: { path: "agent/runtime", pattern: "os.open(" }, output: "a\nb" }).target, "os.open(  in agent/runtime");
