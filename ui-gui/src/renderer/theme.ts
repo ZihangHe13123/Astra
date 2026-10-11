@@ -19,6 +19,10 @@ export type DesktopWording = {
   promptLabel: string;
   promptPlaceholder: string;
   marker: string;
+  /** Headings of the work shown in the conversation: tools running, tools finished, files changed. */
+  liveTools: string;
+  archive: string;
+  changes: string;
   roles: { user: string; assistant: string; reasoning: string; tool: string; error: string; system: string };
 };
 export type DesktopTheme = {
@@ -124,6 +128,7 @@ function build(name: DesktopThemeName, label: string, source: {
 
 const PLAIN_WORDING: DesktopWording = {
   brand: "Astra", tag: "", promptLabel: "", promptPlaceholder: "", marker: "",
+  liveTools: "正在执行", archive: "操作记录", changes: "本回合改动",
   roles: { user: "你", assistant: "Astra", reasoning: "推理 / 摘要", tool: "工具", error: "请求未完成", system: "提示" },
 };
 const PLAIN_SHAPE = { console: false, frame: "round", inputFrame: "round", wording: PLAIN_WORDING } as const;
@@ -155,6 +160,7 @@ function fromShared(theme: UiTheme): DesktopTheme {
     wording: {
       brand: chrome.brand ?? "ASTRA", tag: chrome.headerTag ?? "", promptLabel: chrome.promptLabel ?? "",
       promptPlaceholder: chrome.promptPlaceholder ?? "", marker: chrome.menuMarker ?? "",
+      liveTools: chrome.activeToolsTitle ?? "LIVE TOOLS", archive: chrome.detailTitle ?? "TOOL RESULT", changes: "CHANGES THIS TURN",
       roles: { user: role("user"), assistant: role("assistant"), reasoning: role("reasoning"), tool: role("tool"), error: role("error"), system: role("system") },
     },
   });

@@ -18,6 +18,7 @@ import { migrateBlankDraft } from "./drafts.js";
 import { ToolPreparation } from "./tool-preparation.js";
 import { SessionLogPanel, sameSource, recordChatSource, supportsSessionLog, type LogTarget, type SessionLogRecord, type SourceRef } from "./session-log.js";
 import { MessageList } from "./messages.js";
+import { withActivity } from "./activity-state.js";
 import { DelegateHistory, DelegateSummary } from "./delegates.js";
 import { CommandInput } from "./command-input.js";
 import { commandNames, describeCommands, modeSessionTarget, type CommandMode } from "./command-help.js";
@@ -369,6 +370,8 @@ function App() {
     });
   };
   const messages: Message[] = useMemo(() => preview ? preview.messages.map((m: Message) => ({ ...m, content: textContent(m.content) })) : state?.messages || [], [preview?.messages, state?.messages]);
+  // Tool results the conversation cannot place (a restored history has only a list) keep their one-line summary.
+  const unplacedTools = useMemo(() => preview || !state ? [] : withActivity(messages, state.tools).unplaced, [preview, messages, state?.tools]);
   const openLog = (target: { source_ref?: SourceRef; call_id?: string } = {}) => {
     if (!logSession) return;
     logNavigation.current++; docFollow.current = false; setLogTarget(old => ({ ...target, serial: old.serial + 1 })); setPanel("logs");
@@ -504,9 +507,9 @@ function App() {
           {!messages.length && <section className="welcome"><div className="welcome-mark">A</div><h1>从一个想法开始。</h1><p>对话、研究、编写代码，或把手头的事情交给 Astra。</p><div className="welcome-actions"><button onClick={() => { void openModels(); }}><SlidersHorizontal size={16}/>连接或选择模型</button><button onClick={() => showCommands()}><Command size={16}/>浏览全部功能</button></div></section>}
           <EarlierResponseVersions messages={messages} controls={responseControls}/>
           {preview?.has_more && <button className="load-more" disabled={olderLoading} onClick={() => { void loadOlder(); }}>{olderLoading ? "加载中…" : "加载更早历史"}</button>}
-          <MessageList key={preview ? `preview:${preview.mode}:${preview.session_id}` : active || "blank"} messages={messages} runtime={preview ? undefined : state?.id} timeline={prefs.timeline} reasoning={model?.show_reasoning !== false} scroller={scroller} follow={follow} responses={responseControls} fail={fail} openLog={logSession ? source_ref => openLog({ source_ref }) : undefined} locate={chatLocation}/>
+          <MessageList key={preview ? `preview:${preview.mode}:${preview.session_id}` : active || "blank"} messages={messages} runtime={preview ? undefined : state?.id} timeline={prefs.timeline} reasoning={model?.show_reasoning !== false} scroller={scroller} follow={follow} responses={responseControls} fail={fail} openLog={logSession ? source_ref => openLog({ source_ref }) : undefined} locate={chatLocation} tools={preview ? undefined : state?.tools} changes={preview ? undefined : state?.turnChanges} openPanel={preview ? undefined : setPanel}/>
           {preview?.delegates?.length > 0 && <DelegateHistory key={`${preview.mode}:${preview.session_id}`} delegates={preview.delegates} fail={fail}/>}
-          {state && !preview && <><ToolPreparation preparation={state.preparation}/>{state.tools.length > 0 && <button className="execution-summary" onClick={() => setPanel("tools")}><Terminal size={15}/>{state.tools.filter(t => t.status === "running").length ? "工具正在执行" : `${state.tools.length} 项工具结果`}<ChevronRight size={15}/></button>}
+          {state && !preview && <><ToolPreparation preparation={state.preparation}/>{unplacedTools.length > 0 && <button className="execution-summary" onClick={() => setPanel("tools")}><Terminal size={15}/>{unplacedTools.some(t => t.status === "running") ? "工具正在执行" : `${unplacedTools.length} 项工具结果`}<ChevronRight size={15}/></button>}
             <DelegateSummary delegates={state.delegates} open={() => setPanel("tools")}/>
             {state.approvals.map((e, index) => <Approval key={e.request_id} event={e} send={respond} windowKeys={index === 0 && !modal && !sessionDialog}/>)}{state.questions.map(e => <Question key={e.request_id} event={e} send={respond}/>)}
             {state.busy && <div className="generating"><span className="pulse"/>Astra 正在工作<span>{state.info.generation_progress?.phase === "waiting" ? "等待模型响应" : ""}</span></div>}
