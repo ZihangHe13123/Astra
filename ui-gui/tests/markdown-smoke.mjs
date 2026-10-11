@@ -101,6 +101,12 @@ try {
     await expect.poll(() => container.locator('img[alt="Mermaid 图表"]').evaluateAll(images => images.length > 0 && images.every(image => image.complete && image.naturalWidth > 0))).toBe(true);
   };
   const submit = async text => { await page.getByRole('textbox', { name: '消息' }).fill(text); await page.getByRole('button', { name: '发送', exact: true }).click(); };
+  // While the list follows the newest message, a row whose measurement is still on its way pins it back to
+  // the bottom once, and a single scroll made in that moment is undone. The scroll is repeated until it holds.
+  const scrollToTop = () => page.waitForFunction(() => new Promise(done => {
+    const scroll = document.querySelector('.messages-scroll'); scroll.scrollTop = 0;
+    requestAnimationFrame(() => requestAnimationFrame(() => done(scroll.scrollTop === 0)));
+  }));
   const waitIdle = async () => {
     // Async IPC must be awaited by expect.poll; waitForFunction(async ...) can
     // accept a Promise before the state it represents has become true.
@@ -241,7 +247,7 @@ try {
   await expect(historyDiagram.locator('img[alt="Mermaid 图表"]')).toBeVisible();
   await waitForImage(historyDiagram);
   await assertMeasuredRows();
-  await page.locator('.messages-scroll').evaluate(el => { el.scrollTop = 0; });
+  await scrollToTop();
   await expect(historical).toHaveCount(0);
   await page.locator('.messages-scroll').evaluate(el => { el.scrollTop = el.scrollHeight; });
   await expect(historical.locator('.mermaid-block img[alt="Mermaid 图表"]')).toBeVisible();
