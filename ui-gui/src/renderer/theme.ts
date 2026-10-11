@@ -176,10 +176,30 @@ export function desktopTheme(name: string, systemDark = false): DesktopTheme {
 
 /** Puts a theme on the page. The names of the properties are what cards and stylesheets read. */
 export function applyTheme(theme: DesktopTheme, root: HTMLElement = document.documentElement): void {
-  root.dataset.theme = theme.name;
+  if (root.dataset.theme !== theme.name) root.dataset.theme = theme.name;
   root.dataset.frame = theme.frame;
   root.dataset.inputFrame = theme.inputFrame;
   root.dataset.console = String(theme.console);
   root.style.colorScheme = theme.dark ? "dark" : "light";
   for (const [property, value] of Object.entries(theme.colors)) root.style.setProperty(property, value);
+}
+
+/** Paints whichever theme the root element names in `data-theme`, now and whenever that name or the
+ * system's scheme changes. The attribute is the one switch: preferences set it, and so can a test. */
+export function followTheme(root: HTMLElement, painted: (theme: DesktopTheme) => void): () => void {
+  const system = window.matchMedia("(prefers-color-scheme: dark)");
+  let current = "";
+  const paint = () => {
+    const name = root.dataset.theme || "system", key = `${name}:${system.matches}`;
+    if (key === current) return;
+    current = key;
+    const theme = desktopTheme(name, system.matches);
+    applyTheme(theme, root);
+    painted(theme);
+  };
+  const observer = new MutationObserver(paint);
+  observer.observe(root, { attributes: true, attributeFilter: ["data-theme"] });
+  system.addEventListener("change", paint);
+  paint();
+  return () => { observer.disconnect(); system.removeEventListener("change", paint); };
 }

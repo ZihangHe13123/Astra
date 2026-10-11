@@ -25,13 +25,16 @@ import { commandNames, describeCommands, modeSessionTarget, type CommandMode } f
 import { VoiceSettings } from "./voice.js";
 import { voiceAnswer, voiceButton, voiceNotice, withVoiceOptions } from "./voice-state.js";
 import { sessionTitle, sidebarGroups } from "./sidebar.js";
-import { DESKTOP_THEME_NAMES, PLAIN_THEMES, applyTheme, desktopTheme, isDesktopThemeName } from "./theme.js";
-import { setCurrentTheme } from "./theme-context.js";
+import { DESKTOP_THEME_NAMES, PLAIN_THEMES, desktopTheme, followTheme, isDesktopThemeName } from "./theme.js";
+import { setCurrentTheme, useTheme } from "./theme-context.js";
 import { ThemeMark } from "./theme-mark.js";
 import { Welcome } from "./welcome.js";
 import "./style.css";
 import "katex/dist/katex.min.css";
 import "./rich-markdown.css";
+
+// The page is painted before anything is drawn on it, and repainted whenever the theme it names changes.
+followTheme(document.documentElement, setCurrentTheme);
 
 const defaults: Preferences = { theme: "system", drafts: {}, attachments: {}, workspaces: {}, pinned: [], projects: [], titles: {}, timeline: true };
 const builtinCommandModes: CommandMode[] = [
@@ -139,15 +142,8 @@ function App() {
     void window.astra.query("commands").then(setCatalog).catch(fail);
     return stop;
   }, []);
-  const [systemDark, setSystemDark] = useState(() => window.matchMedia("(prefers-color-scheme: dark)").matches);
-  useEffect(() => {
-    const system = window.matchMedia("(prefers-color-scheme: dark)");
-    const follow = () => setSystemDark(system.matches);
-    system.addEventListener("change", follow);
-    return () => system.removeEventListener("change", follow);
-  }, []);
-  const theme = useMemo(() => desktopTheme(prefs.theme, systemDark), [prefs.theme, systemDark]);
-  useLayoutEffect(() => { applyTheme(theme); setCurrentTheme(theme); }, [theme]);
+  useLayoutEffect(() => { document.documentElement.dataset.theme = prefs.theme; }, [prefs.theme]);
+  const theme = useTheme();
   useEffect(() => {
     if (!loaded.current) return;
     const timer = setTimeout(() => { void window.astra.preferences(prefs).catch(fail); }, 250);
