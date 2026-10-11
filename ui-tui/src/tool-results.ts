@@ -5,6 +5,8 @@ import { documentSummary, type DocumentLine } from "./document-view.js";
 export interface ToolResultRecord {
   id: number;
   name: string;
+  /** What the call was asked to do, when the call was seen (a restored result has none). */
+  arguments?: string;
   output: string;
   error: string;
   durationMs?: number;
