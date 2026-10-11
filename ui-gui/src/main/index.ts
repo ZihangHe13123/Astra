@@ -17,7 +17,9 @@ import { configurePackagedRuntime, acquirePackagedLease } from "./packaged-runti
 import { ClipboardFiles } from "./clipboard-files.js";
 import { DesktopAppshot } from "./appshot.js";
 import { checkedCommand, checkedPreferences, checkedString, externalURL, inside } from "./validation.js";
-import { cardFrameResponse, guardCardFrames } from "./card-frame.js";
+import { captureHostResponse, cardFrameResponse, guardCardFrames } from "./card-frame.js";
+import { PageSnapshots } from "./page-snapshot.js";
+import { CARD_THEME_COLORS, checkedCardTheme } from "../card-theme.js";
 
 const packaged = configurePackagedRuntime({ isPackaged: app.isPackaged, resourcesPath: process.resourcesPath,
   appData: app.getPath("appData"), platform: process.platform, arch: process.arch });
@@ -47,6 +49,10 @@ const appshot = new DesktopAppshot(() => active,
   (id, event) => runtimes.get(id)?.accept(event));
 appshot.client.on("change", () => broadcast({ appshot: { connection: appshot.client.state.connection, enabled: appshot.client.state.enabled } }));
 const selectedFiles = new Set<string>();
+// A page's picture uses the colours the window is showing now. The window is ours, so it is simply asked.
+const themeQuery = `(names => { const style = getComputedStyle(document.documentElement), colors = {}; for (const name of names) { const value = style.getPropertyValue(name).trim(); if (value) colors[name] = value; } return { dark: String(style.colorScheme || "").includes("dark"), colors }; })(${JSON.stringify(CARD_THEME_COLORS)})`;
+const snapshots = new PageSnapshots(join(gui, "page-snapshots"), join(__dirname, "preload.cjs"),
+  async () => window && !window.isDestroyed() ? checkedCardTheme(await window.webContents.executeJavaScript(themeQuery)) : undefined);
 const clipboardFiles = new ClipboardFiles();
 const preferencePath = join(gui, "preferences.json");
 let preferences: Preferences = { theme: "system", drafts: {}, attachments: {}, workspaces: {}, pinned: [], projects: [], titles: {}, timeline: true };
@@ -126,6 +132,8 @@ register("create", (options: { session?: string; mode?: string; workspace?: stri
       if (event.type === "gui_ready") appshot.update(); });
   // Special modes enter their separate namespace after the Work backend is ready.
   if (mode !== "work") rt.initialModeSession = name;
+  // The backend reads what it is allowed to on its own; the page it names is only drawn here, in isolation.
+  rt.pageSnapshot = path => snapshots.capture(path);
   rt.state.isDraft = !options.session && mode === "work";
   runtimes.set(rt.id, rt); active = rt.id; appshot.update();
   return rt.state;
@@ -234,6 +242,7 @@ register("file", async (id, value, action, requestId) => {
   if (action === "reveal") { shell.showItemInFolder(path); return { path }; }
   if (action === "open") { const error = await shell.openPath(path); if (error) throw new Error(error); return { path }; }
   if (action === "version") return { path, sourceVersion: await sourceVersion(path) };
+  if (action === "snapshot") return { path: (await snapshots.capture(path)).path, kind: "image" as const };
   if (action !== "preview") throw new Error("Unknown file action");
   const key = `${runtime(id).id}:${requestId === undefined ? randomUUID() : checkedString(requestId, "preview request", 100)}`;
   if (previewRequests.has(key)) throw new Error("Preview request is already pending");
@@ -331,6 +340,7 @@ else {
     protocol.handle("astra", request => {
       const url = new URL(request.url);
       if (url.hostname === "card") return cardFrameResponse(url.pathname);
+      if (url.hostname === "capture") return captureHostResponse(url.pathname);
       if (url.hostname !== "app") return new Response("Not found", { status: 404 });
       const path = resolve(staticRoot, `.${decodeURIComponent(url.pathname)}`);
       if (!inside(staticRoot, path) || !existsSync(path) || !inside(staticRoot, realpathSync(path))) return new Response("Not found", { status: 404 });

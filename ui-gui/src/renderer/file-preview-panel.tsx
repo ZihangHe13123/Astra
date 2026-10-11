@@ -1,19 +1,20 @@
 import React, { lazy, Suspense, useEffect, useRef, useState } from 'react';
-import { ExternalLink, FolderOpen, FileCode, Eye, Maximize2, Minimize2 } from 'lucide-react';
+import { Camera, ExternalLink, FolderOpen, FileCode, Eye, Maximize2, Minimize2 } from 'lucide-react';
 import type { FilePreview } from '../file-preview-types.js';
 import { dirname, isMarkdownPath, openComments } from './doc-preview.js';
 import { Markdown } from './messages.js';
 import { PageFrame } from './page-frame.js';
 
 const PDFPreview = lazy(()=>import('./pdf-preview.js'));
-type Props = {runtime:string; path:string; serial:number; dismiss:()=>void; fail:(error:unknown)=>void; wide?:boolean; onWide?:(wide:boolean)=>void};
+type Props = {runtime:string; path:string; serial:number; dismiss:()=>void; fail:(error:unknown)=>void; wide?:boolean; onWide?:(wide:boolean)=>void; onAttach?:(paths:string[])=>void};
 
 /** Each mounted selection owns its request. Dismissal/session changes cancel the host conversion. */
-export function FilePreviewPanel({runtime,path,serial,dismiss,fail,wide,onWide}: Props) {
+export function FilePreviewPanel({runtime,path,serial,dismiss,fail,wide,onWide,onAttach}: Props) {
   const [preview,setPreview]=useState<FilePreview>();
   const [error,setError]=useState(''); const [loading,setLoading]=useState(true);
   const [revision,setRevision]=useState(0); const [stale,setStale]=useState('');
   const [docView,setDocView]=useState<'rendered'|'source'>('rendered');
+  const [picturing,setPicturing]=useState(false);
   const pending=useRef<{id:string; cancelled:boolean}>();
   useEffect(()=>{
     let alive=true; const request={id:crypto.randomUUID(),cancelled:false}; pending.current=request;
@@ -35,6 +36,8 @@ export function FilePreviewPanel({runtime,path,serial,dismiss,fail,wide,onWide}:
   const cancel=()=>{const request=pending.current;if(request){request.cancelled=true;void window.astra.cancelPreview(runtime,request.id).catch(fail);}setLoading(false);setError('文件预览已取消。');};
   const markdown=preview?.text!==undefined && isMarkdownPath(path);
   const page=preview?.kind==='page';
+  // The picture is of the saved page, drawn afresh; it lands in the message being written, which the enlarged panel covers.
+  const picture=()=>{setPicturing(true);void window.astra.file(runtime,path,'snapshot').then(value=>{if(value.path){onAttach?.([value.path]);onWide?.(false);}}).catch(fail).finally(()=>setPicturing(false));};
   // Only a page takes the whole window; anything else shown next gives the room back.
   useEffect(()=>{ if(wide && preview && !page) onWide?.(false); },[wide,preview,page]);
   return <section className="file-preview-panel" aria-label="文件预览">
@@ -42,6 +45,7 @@ export function FilePreviewPanel({runtime,path,serial,dismiss,fail,wide,onWide}:
     <div className="actions">
       {(markdown || page) && <button onClick={()=>setDocView(docView==='rendered'?'source':'rendered')}>{docView==='rendered'?<><FileCode size={14}/> 源码</>:<><Eye size={14}/> 预览</>}</button>}
       {page && onWide && <button aria-pressed={!!wide} onClick={()=>onWide(!wide)}>{wide?<><Minimize2 size={14}/> 还原</>:<><Maximize2 size={14}/> 放大</>}</button>}
+      {page && onAttach && <button onClick={picture} disabled={picturing} title="把这个页面渲染成图片，附到正在写的消息里">{picturing?'正在截图…':<><Camera size={14}/> 发给 Astra 看</>}</button>}
       <button onClick={()=>setRevision(value=>value+1)} disabled={loading}>刷新预览</button>
       <button onClick={()=>{void window.astra.file(runtime,path,'open').catch(fail);}}><ExternalLink size={14}/> 系统打开</button>
       <button onClick={()=>{void window.astra.file(runtime,path,'reveal').catch(fail);}}><FolderOpen size={14}/> 定位</button>

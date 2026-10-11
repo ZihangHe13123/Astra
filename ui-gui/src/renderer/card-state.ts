@@ -25,14 +25,7 @@ export function cardMessage(data: unknown): CardMessage | undefined {
   return undefined;
 }
 
-export const CARD_THEME_COLORS = ["--bg", "--panel", "--soft", "--hover", "--line", "--text", "--muted", "--accent", "--on-accent", "--error"] as const;
-export type CardTheme = { dark: boolean; colors: Record<string, string> };
-/** The colours a card may use so that it reads as part of the reply, in whichever theme is active. */
-export function cardTheme(style: { getPropertyValue(name: string): string; colorScheme?: string }): CardTheme {
-  const colors: Record<string, string> = {};
-  for (const name of CARD_THEME_COLORS) { const value = style.getPropertyValue(name).trim(); if (value) colors[name] = value; }
-  return { dark: String(style.colorScheme || "").includes("dark"), colors };
-}
+export { CARD_THEME_COLORS, cardTheme, type CardTheme } from "../card-theme.js";
 
 /** Rows leave and re-enter the virtual list; a card that comes back starts at the height it had. */
 const remembered = new Map<string, number>();

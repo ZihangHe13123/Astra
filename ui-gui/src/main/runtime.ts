@@ -13,6 +13,8 @@ export class Runtime {
   readonly id = randomUUID();
   state: SessionState;
   initialModeSession = "";
+  /** Draws the page at a path and says where its picture is. Set by the host; the backend asks through it. */
+  pageSnapshot?: (path: string) => Promise<{ path: string; width: number; height: number; pageHeight: number; scriptError: string }>;
   private child?: ChildProcessWithoutNullStreams;
   private scope = `gui-${randomUUID()}`;
   private delivery = new EventDeliveryState();
@@ -66,6 +68,8 @@ export class Runtime {
         return;
       }
       if (e.type === "response_operation_result" && this.responseOperations.finish(e)) return;
+      // A request to the host, not something to show: the conversation never sees it.
+      if (e.type === "page_snapshot_request") { void this.answerPageSnapshot(e); return; }
       this.accept(e);
       if (["message_accepted", "message_rejected", "submission_status"].includes(e.type)) {
         const pending = this.submissions.get(e.submission_id);
@@ -117,6 +121,16 @@ export class Runtime {
         this.accept({ type: "gui_disconnected", message: this.closing ? "会话后端已关闭" : `后端已退出（${code ?? "信号"}）。已显示的内容保留。` });
       }
     });
+  }
+  private async answerPageSnapshot(request: UIEvent) {
+    let answer: Record<string, unknown>;
+    try {
+      if (!this.pageSnapshot || typeof request.path !== "string") throw new Error("桌面端现在不能渲染页面。");
+      const picture = await this.pageSnapshot(request.path);
+      answer = { image_path: picture.path, width: picture.width, height: picture.height, page_height: picture.pageHeight, script_error: picture.scriptError };
+    } catch (error) { answer = { error: error instanceof Error ? error.message : String(error) }; }
+    // A backend that has gone is no longer waiting for the answer.
+    try { this.write({ type: "page_snapshot_response", request_id: request.request_id, ...answer }); } catch { /* nothing waits */ }
   }
   accept(event: UIEvent) {
     if (event.type === "model_selection_result") {

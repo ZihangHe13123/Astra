@@ -1,7 +1,7 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron";
 import type { DesktopBridge, DesktopEvent } from "../bridge.js";
 
-/** The bridge belongs to the window. This script also runs in every frame below it, where it must expose nothing. */
+/** The bridge belongs to the app's window. This script also runs in every frame below it, and in the window that holds a page while its picture is taken; it exposes nothing there. */
 function exposeBridge() {
   const invoke = (method: string, ...args: unknown[]) => ipcRenderer.invoke(`astra:${method}`, ...args);
   const bridge: DesktopBridge = {
@@ -44,5 +44,5 @@ function stripPeerConnections() {
   } });
 }
 
-if (window.top === window) exposeBridge();
-else stripPeerConnections();
+if (window.top !== window) stripPeerConnections();
+else if (location.protocol === "astra:" && location.host === "app") exposeBridge();

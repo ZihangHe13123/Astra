@@ -22,7 +22,7 @@ export interface DesktopBridge {
   appshot(id: string, action: "command" | "remove", value: string): Promise<void>;
   droppedPaths(files: File[]): string[];
   openExternal(url: string): Promise<void>;
-  file(id: string, path: string, action: "preview" | "open" | "reveal" | "version", requestId?: string): Promise<FilePreview>;
+  file(id: string, path: string, action: "preview" | "open" | "reveal" | "version" | "snapshot", requestId?: string): Promise<FilePreview>;
   cancelPreview(id: string, requestId: string): Promise<void>;
   onEvents(handler: (events: DesktopEvent[]) => void): () => void;
 }

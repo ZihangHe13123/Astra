@@ -7,7 +7,7 @@ import { createServer as createTcpServer } from 'node:net';
 import { createSocket } from 'node:dgram';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -36,6 +36,7 @@ const demo = version => `<!doctype html>
   .accent { color: var(--astra-accent); }
 </style></head>
 <body class="canvas-body" data-kind="demo">
+  <div style="position: absolute; left: 0; top: 0; width: 20px; height: 20px; background: var(--astra-accent)"></div>
   <h1 id="title">CANVAS ${version}</h1>
   <p class="accent">已经点了 <strong id="n">0</strong> 次</p>
   <button id="more">加一</button> <a id="jump" href="#bottom">到底部</a>
@@ -104,6 +105,22 @@ const hostilePage = `<!doctype html><html><head><meta charset="utf-8"><title>out
 // The example the model itself is given when it reads the built-in skill.
 const taught = /```html\n([\s\S]*?)\n```/.exec(readFileSync(join(root, 'agent/runtime/interactive_cards.md'), 'utf8'))[1];
 const broken = `<!doctype html><title>broken</title><p>before</p><script>throw new Error('PAGE_FIXTURE_FAILURE');</script>`;
+// A first screen laid out against the window, then more: stretched to its whole height it would be a page nobody sees.
+const screenful = `<!doctype html><title>screen</title><body style="margin: 0"><div style="height: 100vh; background: rgb(0, 90, 160)"></div><div style="height: 900px; background: rgb(160, 90, 0)"></div></body>`;
+// Looked at rather than opened: it turns green only if it sees nothing of the host, and tries the network at once.
+const watched = `<!doctype html><title>watched</title><body style="margin: 0"><script>
+  const alone = typeof window.astra === 'undefined' && typeof RTCPeerConnection === 'undefined' && (() => { try { return !parent.document; } catch { return true; } })();
+  document.documentElement.style.background = alone ? 'rgb(0, 128, 0)' : 'rgb(200, 0, 0)';
+  fetch('${out}/watched-fetch').catch(() => {}); new Image().src = '${out}/watched-image';
+  try { navigator.sendBeacon('${out}/watched-beacon', 'x'); } catch {}
+  try { new WebSocket('ws://127.0.0.1:${probePort}/watched-websocket'); } catch {}
+  try { window.open('${out}/watched-popup'); } catch {}
+  try { top.location = '${out}/watched-top'; } catch {}
+  const sheet = document.createElement('link'); sheet.rel = 'stylesheet'; sheet.href = '${out}/watched-sheet'; document.head.append(sheet);
+  const nested = document.createElement('iframe'); nested.src = '${out}/watched-frame'; document.body.append(nested);
+</script></body>`;
+// It leaves at once, before any picture can be taken.
+const leaver = `<!doctype html><title>leaver</title><p>leaving</p><script>location.href = '${out}/leaver-navigation';</script>`;
 // What the model does when asked: one call that writes or edits a file, then a line of text.
 const writes = {
   画布: { path: 'demo.page.html', content: demo('V1') },
@@ -112,6 +129,16 @@ const writes = {
   逃逸: { path: 'hostile.page.html', content: hostilePage },
   技能: { path: 'lesson.page.html', content: taught },
   报错: { path: 'broken.page.html', content: broken },
+  一屏: { path: 'screen.page.html', content: screenful },
+  旁观: { path: 'watched.page.html', content: watched },
+  出走: { path: 'leaver.page.html', content: leaver },
+  // Looking at a page: the same tool that looks at an image, given the page's path.
+  瞧瞧画布: { tool: 'read_image', path: 'demo.page.html', question: 'layout' },
+  瞧瞧技能: { tool: 'read_image', path: 'lesson.page.html' },
+  瞧瞧报错: { tool: 'read_image', path: 'broken.page.html' },
+  瞧瞧一屏: { tool: 'read_image', path: 'screen.page.html' },
+  瞧瞧旁观: { tool: 'read_image', path: 'watched.page.html' },
+  瞧瞧出走: { tool: 'read_image', path: 'leaver.page.html' },
 };
 const requests = [];
 const model = createServer(async (req, res) => {
@@ -122,20 +149,21 @@ const model = createServer(async (req, res) => {
   const lastUser = payload.messages.findLastIndex(message => message.role === 'user');
   const text = JSON.stringify(payload.messages[lastUser]?.content ?? '');
   const answered = payload.messages.slice(lastUser + 1).some(message => message.role === 'tool');
-  const write = Object.entries(writes).find(([word]) => text.includes(word))?.[1];
+  const write = Object.entries(writes).sort(([a], [b]) => b.length - a.length).find(([word]) => text.includes(word))?.[1];
+  const sawPicture = text.includes('data:image/png;base64,');
   res.setHeader('Content-Type', 'text/event-stream');
   const chunk = (delta, finish_reason = null) => res.write('data: ' + JSON.stringify({ id: 'page-' + requests.length, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'page-test', choices: [{ index: 0, delta, finish_reason }] }) + '\n\n');
   if (write && !answered) {
     const { tool = 'write_file', ...args } = write;
     chunk({ role: 'assistant', tool_calls: [{ index: 0, id: 'page-call-' + requests.length, type: 'function', function: { name: tool, arguments: JSON.stringify(args) } }] });
     chunk({}, 'tool_calls');
-  } else { chunk({ role: 'assistant', content: write ? `WROTE ${write.path}` : 'PLAIN_REPLY' }); chunk({}, 'stop'); }
+  } else { chunk({ role: 'assistant', content: sawPicture ? 'SAW_PICTURE' : write ? `${write.tool === 'read_image' ? 'NO_PICTURE' : 'WROTE'} ${write.path}` : 'PLAIN_REPLY' }); chunk({}, 'stop'); }
   res.end('data: [DONE]\n\n');
 });
 const port = await listen(model);
 writeFileSync(join(folder, '.env'), '');
 writeFileSync(join(folder, 'settings.json'), JSON.stringify({ selected_model: 'page-test' }));
-writeFileSync(join(folder, 'models.yaml'), `version: 1\nproviders:\n  test:\n    label: Local fixture\n    provider: openai-compatible\n    base_url: http://127.0.0.1:${port}/v1\n    api_key_env: ''\n    context_limit: 131072\n    capabilities: [tools, streaming]\nmodels:\n  page-test:\n    provider: openai-compatible\n    base_url: http://127.0.0.1:${port}/v1\n    api_key_env: ''\n    context_limit: 131072\n    capabilities: [tools, streaming]\n`);
+writeFileSync(join(folder, 'models.yaml'), `version: 1\nproviders:\n  test:\n    label: Local fixture\n    provider: openai-compatible\n    base_url: http://127.0.0.1:${port}/v1\n    api_key_env: ''\n    context_limit: 131072\n    capabilities: [tools, streaming, vision]\nmodels:\n  page-test:\n    provider: openai-compatible\n    base_url: http://127.0.0.1:${port}/v1\n    api_key_env: ''\n    context_limit: 131072\n    capabilities: [tools, streaming, vision]\n`);
 const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/API_KEY|TOKEN|SECRET|^AGENT_|^ASTRA_|^LLM_|^SANDBOX_|^ELECTRON_/.test(key)));
 const env = { ...cleanEnv, ASTRA_GUI_DISABLE_APPSHOT: '1', AGENT_PROJECT_ROOT: root, AGENT_PYTHON: process.env.AGENT_PYTHON || join(root, '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python'), ASTRA_ENV_FILE: join(folder, '.env'), ASTRA_HOME: folder, AGENT_SETTINGS_PATH: join(folder, 'settings.json'), AGENT_SESSION_DIR: join(folder, 'sessions'), AGENT_TASK_DB: join(folder, 'tasks.db'), ASTRA_APPROVAL_DB: join(folder, 'approvals.db'), ASTRA_EVENT_DB: join(folder, 'events.db'), AGENT_MEMORY_PATH: join(folder, 'memory.db'), AGENT_LEARNING_PATH: join(folder, 'learning.db'), AGENT_SKILLS_PATH: join(folder, 'skills'), AGENT_MODELS_FILE: join(folder, 'models.yaml'), AGENT_USER_MODELS_FILE: join(folder, 'missing-models.yaml'), AGENT_LOG_DIR: join(folder, 'logs'), AGENT_MCP_CONFIG: join(folder, 'missing-mcp.json'), AGENT_TOOL_POLICY: 'locked', SANDBOX_DOCKER: 'false', SANDBOX_WORKDIR: workspace, ASTRA_WORKSPACE: workspace, LEARNING_REVIEW_AUTO: '0' };
 const runFile = promisify(execFile);
@@ -186,6 +214,27 @@ try {
     await expect(page.locator('.message.assistant').filter({ hasText: `WROTE ${path}` }).last()).toBeVisible();
     await idle();
   };
+  // Looking needs no leave: the model calls, and its next request holds what the tool said and any picture that came with it.
+  const look = async text => {
+    const before = requests.length;
+    await composer.fill(text); await page.getByRole('button', { name: '发送', exact: true }).click();
+    await expect.poll(() => requests.length, { timeout: 40000 }).toBeGreaterThanOrEqual(before + 2);
+    await expect(page.locator('.message.assistant').filter({ hasText: /SAW_PICTURE|NO_PICTURE/ }).last()).toBeVisible();
+    await idle();
+    const messages = requests.at(-1).messages, at = messages.findLastIndex(message => message.role === 'tool');
+    const pictures = messages.slice(at + 1).flatMap(message => Array.isArray(message.content) ? message.content : []).filter(part => part.type === 'image_url').map(part => part.image_url.url);
+    // The result reaches the model between a heading and a footer; a failure has no payload inside.
+    const said = String(messages[at].content); let result = said; try { result = JSON.parse(said.slice(said.indexOf('{'), said.lastIndexOf('}') + 1)); } catch { /* plain text */ }
+    return { result, pictures, reply: (await page.locator('.message.assistant').last().innerText()).trim().split('\n').pop() };
+  };
+  // A picture as the model received it: its size, and the colour at each point asked about.
+  const seen = (url, points) => app.evaluate(({ nativeImage }, [url, points]) => {
+    const image = nativeImage.createFromDataURL(url), { width, height } = image.getSize(), bitmap = image.toBitmap();
+    return { width, height, colours: points.map(([x, y]) => { const at = (y * width + x) * 4; return [bitmap[at + 2], bitmap[at + 1], bitmap[at]]; }) };
+  }, [url, points]);
+  const near = (actual, expected, label) => assert.ok(actual.every((value, index) => Math.abs(value - expected[index]) <= 4), `${label}: ${actual} is not ${expected}`);
+  const rgb = colour => { const hex = /^#([0-9a-f]{6})$/i.exec(colour); return hex ? [0, 2, 4].map(at => parseInt(hex[1].slice(at, at + 2), 16)) : colour.match(/\d+/g).slice(0, 3).map(Number); };
+  const pictureFolder = join(folder, 'gui', 'page-snapshots');
   const panel = page.locator('.details-panel'), preview = panel.locator('.file-preview-panel');
   const shown = () => preview.locator('h3').innerText();
   const frame = panel.locator('iframe.page-frame'), inside = frame.contentFrame();
@@ -222,6 +271,45 @@ try {
   await expect(preview.getByRole('status')).toHaveCount(0);
   await page.screenshot({ path: join(output, 'page.png') });
   passed('a page the model writes opens beside the conversation, runs as a document of its own with its own styles, can use the app colours, and scrolls to its own anchors');
+
+  // The model looks at the page it wrote. The desktop draws it out of sight, in the same frame, and the model gets the
+  // picture: the page's own ground, the app's accent where the page used it, three screens of a page that is longer.
+  const looked = await look('瞧瞧画布');
+  assert.equal(looked.reply, 'SAW_PICTURE');
+  assert.equal(looked.pictures.length, 1);
+  const demoPicture = await seen(looked.pictures[0], [[10, 10], [500, 8], [500, 2090]]);
+  assert.deepEqual([demoPicture.width, demoPicture.height], [1000, 2100]);
+  near(demoPicture.colours[0], rgb(hostAccent), 'the accent swatch');
+  near(demoPicture.colours[1], [16, 32, 48], 'the page ground');
+  near(demoPicture.colours[2], [16, 32, 48], 'the third screen');
+  assert.equal(looked.result.type, 'image_attachment');
+  assert.equal(looked.result.page.endsWith('demo.page.html'), true);
+  assert.equal(looked.result.shown_height, 2100);
+  assert.ok(looked.result.page_height > 2400 && looked.result.page_height < 3000, `page height ${looked.result.page_height}`);
+  assert.match(looked.result.message, new RegExp(`${looked.result.page_height}px tall; the picture shows its first 2100px`));
+  assert.equal('page_script_error' in looked.result, false);
+  // The picture is a file of the desktop's own, named after the page; looking changed nothing on screen.
+  assert.equal(looked.result.image_paths[0].startsWith(pictureFolder), true);
+  assert.match(looked.result.image_paths[0], /demo\.page-[0-9a-f]{10}\.png$/);
+  assert.equal(readdirSync(pictureFolder).length, 1);
+  await expect(inside.locator('#n')).toHaveText('2');
+  assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length), 1, 'the window the page was drawn in is gone');
+  // The model is told it can do this only where something can draw the page.
+  const readImage = requests.at(-1).tools.find(tool => tool.function.name === 'read_image').function;
+  assert.match(readImage.description, /HTML page \(\.html\)/);
+  passed('the model looks at its page through the image tool and receives the page as the desktop draws it, with what the picture leaves out said beside it');
+
+  // The person can send the same picture: it lands in the message being written, where the enlarged panel would hide it.
+  await preview.getByRole('button', { name: '放大', exact: true }).click();
+  await expect(page.locator('.conversation')).toBeHidden();
+  await preview.getByRole('button', { name: '发给 Astra 看' }).click();
+  await expect(page.locator('.attachment-list')).toHaveText(/demo\.page-[0-9a-f]{10}\.png/);
+  await expect(page.locator('.conversation')).toBeVisible();
+  await expect(frame).toHaveCount(1);
+  assert.equal(readdirSync(pictureFolder).length, 1, 'the same page in the same theme is the same picture');
+  await page.getByRole('button', { name: '移除附件' }).click();
+  await expect(page.locator('.attachment-list')).toHaveCount(0);
+  passed('the page preview sends its picture to the message being written');
 
   // A theme change reaches it without a restart; its source is one switch away, and it comes back fresh.
   await page.evaluate(() => { document.documentElement.dataset.theme = 'dark'; });
@@ -263,6 +351,13 @@ try {
   await expect(inside.locator('#detail')).toHaveText(/^方案 B/);
   await expect(inside.getByRole('button', { name: '方案 B' })).toHaveAttribute('aria-pressed', 'true');
   await page.screenshot({ path: join(output, 'page-lesson.png') });
+  // Looked at as the skill says to, it is one screen, and the picture is of the page as it loads: the first plan chosen.
+  const lookedLesson = await look('瞧瞧技能');
+  assert.equal(lookedLesson.reply, 'SAW_PICTURE');
+  assert.deepEqual((({ width, height }) => [width, height])(await seen(lookedLesson.pictures[0], [])), [1000, 700]);
+  assert.equal('page_height' in lookedLesson.result, false);
+  writeFileSync(join(output, 'page-lesson-seen.png'), Buffer.from(lookedLesson.pictures[0].split(',')[1], 'base64'));
+  await expect(inside.getByRole('button', { name: '方案 B' })).toHaveAttribute('aria-pressed', 'true');
   // Back in the list of files, each page is there to be opened again.
   await preview.getByRole('button', { name: '← 返回' }).click();
   await expect(panel.locator('.file-row')).toHaveText(['demo.page.html', 'lesson.page.html']);
@@ -279,6 +374,38 @@ try {
   await ask('报错', 'broken.page.html');
   await expect(preview.getByRole('status')).toHaveText(/页面脚本出错：.*PAGE_FIXTURE_FAILURE/);
   await expect(inside.getByText('before', { exact: true })).toBeVisible();
+
+  // Looked at, it is drawn all the same, and the model is told what its script said.
+  const lookedBroken = await look('瞧瞧报错');
+  assert.equal(lookedBroken.reply, 'SAW_PICTURE');
+  assert.match(lookedBroken.result.page_script_error, /PAGE_FIXTURE_FAILURE/);
+  assert.match(lookedBroken.result.message, /A script on the page raised an error while it was drawn: .*PAGE_FIXTURE_FAILURE/);
+  assert.deepEqual((({ width, height }) => [width, height])(await seen(lookedBroken.pictures[0], [])), [1000, 700]);
+  // A page laid out against its window is shown as its first screen, not stretched into one nobody sees.
+  await ask('一屏', 'screen.page.html');
+  const lookedScreen = await look('瞧瞧一屏');
+  const screenPicture = await seen(lookedScreen.pictures[0], [[500, 10], [500, 690]]);
+  assert.deepEqual([screenPicture.width, screenPicture.height], [1000, 700]);
+  near(screenPicture.colours[0], [0, 90, 160], 'the top of the first screen');
+  near(screenPicture.colours[1], [0, 90, 160], 'the bottom of the first screen');
+  assert.deepEqual([lookedScreen.result.shown_height, lookedScreen.result.page_height], [700, 1600]);
+  passed('a failing page is drawn with its error reported, and a page laid out against its window is shown as its first screen');
+
+  // Out of sight is no way out. A page being looked at sees nothing of the host and reaches nothing; one that leaves gives no picture.
+  await ask('旁观', 'watched.page.html');
+  const lookedWatched = await look('瞧瞧旁观');
+  assert.equal(lookedWatched.reply, 'SAW_PICTURE');
+  near((await seen(lookedWatched.pictures[0], [[500, 350]])).colours[0], [0, 128, 0], 'the page saw neither the bridge, nor WebRTC, nor its host');
+  await ask('出走', 'leaver.page.html');
+  const lookedLeaver = await look('瞧瞧出走');
+  console.log('LEAVER', JSON.stringify({ reply: lookedLeaver.reply, result: lookedLeaver.result, pictures: lookedLeaver.pictures.length }));
+  assert.equal(lookedLeaver.reply, 'NO_PICTURE leaver.page.html');
+  assert.equal(lookedLeaver.pictures.length, 0);
+  assert.match(JSON.stringify(lookedLeaver.result), /page_rendering_failed|页面没有应答/);
+  await new Promise(done => setTimeout(done, 1500));
+  assert.deepEqual(reached, [], 'nothing a page tried while it was looked at reached a listener');
+  assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length), 1);
+  passed('a page being looked at is as isolated as one on screen, and a page that leaves its frame gives no picture');
 
   // A page that tries every way out. It learns nothing about the host, and nothing it sends arrives anywhere.
   await ask('逃逸', 'hostile.page.html');
