@@ -27,3 +27,27 @@ export function withActivity(rows: Message[], tools: UIEvent[] = [], changes: Tu
   for (const row of rows) { result.push(row); add(row.id); }
   return { rows: result, unplaced };
 }
+
+const indent = (text: string) => text.replace(/\r\n/g, "\n").split("\n").map(line => `  ${line}`).join("\n");
+
+/**
+ * What a call was asked to do, laid out to be read: one argument to a line, and text of several
+ * lines (a script, a file's content) as a block under its name, with its line breaks as they are.
+ * Arguments that cannot be read as an object are shown as they came. Nothing for a call without any.
+ */
+export function toolInput(tool: UIEvent): string {
+  let value: unknown = tool.arguments ?? tool.args;
+  if (typeof value === "string") {
+    if (!value.trim()) return "";
+    try { value = JSON.parse(value); } catch { return value as string; }
+  }
+  if (value === null || value === undefined) return "";
+  if (typeof value === "string") return value;
+  if (typeof value !== "object" || Array.isArray(value)) return JSON.stringify(value, null, 2);
+  return Object.entries(value as Record<string, unknown>).map(([name, item]) => {
+    if (typeof item === "string") return /\r?\n/.test(item) ? `${name}:\n${indent(item)}` : `${name}: ${item}`;
+    if (item === null || typeof item !== "object") return `${name}: ${String(item)}`;
+    const compact = JSON.stringify(item);
+    return compact.length <= 72 ? `${name}: ${compact}` : `${name}:\n${indent(JSON.stringify(item, null, 2))}`;
+  }).join("\n");
+}

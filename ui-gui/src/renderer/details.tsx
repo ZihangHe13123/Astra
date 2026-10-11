@@ -3,6 +3,7 @@ import { FileDiff, Terminal, Layers, Users, X, FolderOpen, FileText } from "luci
 import type { SessionState, UIEvent } from "@astra/ui-core/session-state";
 import { DelegateCards } from "./delegates.js";
 import { toolEmptyOutput, toolExpanded, toolStatus } from "./tool-status.js";
+import { toolInput } from "./activity-state.js";
 import { RequestTimeline } from "./request-timeline.js";
 import { docPathFromTool } from "./doc-preview.js";
 import { ToolPreparation } from "./tool-preparation.js";
@@ -26,7 +27,8 @@ export function Details({ state, panel, setPanel, selection, width, onWidth, clo
     if (preview) { setPreview(undefined); return; }
     locatedSelection.current = target;
     const node = content.current?.querySelector<HTMLElement>(`[data-result-index="${selection.index}"]`);
-    if (node) { if (node instanceof HTMLDetailsElement) node.open = true; node.scrollIntoView({ block: "start" }); }
+    // The call that was asked for is shown whole: its entry open, and its arguments with it.
+    if (node) { if (node instanceof HTMLDetailsElement) { node.open = true; node.querySelectorAll<HTMLDetailsElement>("details").forEach(inner => { inner.open = true; }); } node.scrollIntoView({ block: "start" }); }
     else fail(`当前记录中没有${panel === "files" ? "图片" : "工具"}结果 ${selection.index}。`);
   }, [selection, panel, state.id, preview]);
   useEffect(() => {
@@ -63,7 +65,7 @@ export function Details({ state, panel, setPanel, selection, width, onWidth, clo
         {!state.tools.length && <p className="muted">工具运行后，结果会显示在这里。</p>}
         {[...state.tools].sort((a, b) => Number(toolStatus(b) === "running") - Number(toolStatus(a) === "running")).map((tool, i) => <details className="tool-detail" data-result-index={tool.result_index} key={`${tool.result_index || i}:${tool.call_id || "tool"}`} open={toolExpanded(tool)}><summary><span className={`status-dot ${toolStatus(tool)}`}/><strong>{tool.result_index ? `${tool.result_index}. ` : ""}{tool.name}</strong><span className="muted small">{statusLabel(toolStatus(tool))}{tool.duration_ms != null ? ` · ${tool.duration_ms >= 1000 ? `${(tool.duration_ms / 1000).toFixed(1)} 秒` : `${tool.duration_ms} ms`}` : ""}</span></summary>
           {tool.call_id && openLog && <button className="small" onClick={() => openLog(tool.call_id)}>查看会话记录</button>}
-          {tool.arguments && <details><summary>参数</summary><pre>{typeof tool.arguments === "string" ? tool.arguments : JSON.stringify(tool.arguments, null, 2)}</pre></details>}
+          {toolInput(tool) && <details className="tool-input"><summary>参数</summary><pre>{toolInput(tool)}</pre></details>}
           {tool.progress && toolStatus(tool) === "running" && <p>{tool.progress.message || tool.progress.stage}</p>}
           {tool.error && <p className="error-text">{tool.error}</p>}{(tool.output || toolEmptyOutput(tool)) && <pre>{tool.output || toolEmptyOutput(tool)}</pre>}
           {tool.artifact_path && <button onClick={() => openFile(tool.artifact_path)}>查看完整结果</button>}
