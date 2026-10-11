@@ -8,7 +8,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import React from "react";
-import { render } from "ink";
 import stripAnsi from "strip-ansi";
 
 class FakeChild extends EventEmitter {
@@ -27,6 +26,11 @@ childProcess.execFile = (() => { throw new Error("render tests must never execut
 syncBuiltinESMExports();
 process.env.TUI_STARTUP_ANIMATION = "0";
 process.env.ASTRA_HOME = mkdtempSync(join(tmpdir(), "astra-tool-viewer-"));
+// On a CI machine Ink writes no live frame at all, only static output, and these tests are
+// about the live frame. Ink reads the environment once, when it is loaded, so it is told
+// before then that this is an interactive terminal.
+process.env.CI = "false";
+const { render } = await import("ink");
 const { default: App } = await import("./app.js");
 
 class Input extends PassThrough { isTTY = true; setRawMode() {} ref() { return this; } unref() { return this; } }
