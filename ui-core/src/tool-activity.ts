@@ -39,6 +39,18 @@ const oneLine = (text: string, limit: number) => {
   return line.length > limit ? line.slice(0, limit - 1) + "…" : line;
 };
 
+const counted = (output: string) => {
+  if (!output) return "";
+  const lines = output.split(/\r?\n/).length;
+  return `${lines} ${lines === 1 ? "line" : "lines"}`;
+};
+
+/** A command or script on one line: its lines joined by a mark, so three heredocs do not read alike. */
+const flat = (text: string, limit: number) => {
+  const line = text.split(/\r?\n/).map(part => part.trim()).filter(Boolean).join(" ↵ ");
+  return line.length > limit ? line.slice(0, limit - 1) + "…" : line;
+};
+
 export function describeTool(tool: ToolLike): Step {
   const name = String(tool.name || "tool");
   const verb = VERBS.find(([pattern]) => pattern.test(name))?.[1] ?? "TOOL";
@@ -50,7 +62,10 @@ export function describeTool(tool: ToolLike): Step {
   }
   // A search is known by what it looks for, and only then by where.
   const keys = verb === "SEARCH" || verb === "WEB" ? ["pattern", "query", "url", ...TARGETS] : TARGETS;
-  for (const key of keys) { if (target) break; if (typeof args[key] === "string" && args[key]) target = oneLine(args[key] as string, 160); }
+  for (const key of keys) {
+    if (target) break;
+    if (typeof args[key] === "string" && args[key]) target = key === "command" || key === "code" ? flat(args[key] as string, 160) : oneLine(args[key] as string, 160);
+  }
   if (verb === "SEARCH" && typeof args.path === "string" && args.path && target !== args.path) target += `  in ${args.path}`;
   if (verb === "MCP") target = [name.split("__").slice(1).join(" · "), target].filter(Boolean).join("  ");
   else if (verb === "TOOL" || !target) target = [name, target].filter(Boolean).join("  ");
@@ -66,7 +81,7 @@ export function describeTool(tool: ToolLike): Step {
   // A run usually ends on its own summary line ("158 passed in 4.2s"); other output is better counted than quoted.
   const last = output.split(/\r?\n/).filter(line => line.trim()).pop()?.trim() || "";
   const result = tool.partial ? "partial" : verb === "RUN" && last && last.length <= 48 ? last
-    : verb === "READ" || verb === "SEARCH" ? (output ? `${output.split(/\r?\n/).length} lines` : "") : "";
+    : verb === "READ" || verb === "SEARCH" ? counted(output) : "";
   return { verb, target, result, tone: "ok" };
 }
 

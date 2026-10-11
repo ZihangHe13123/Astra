@@ -13,8 +13,8 @@ import { preparationLabel, reduceToolPreparation, type ToolPreparation } from "@
 import { COMPACTION_LABEL, compactionNotice } from "./context-compaction.js";
 import { TurnChangesRenderGate } from "./turn-changes.js";
 import { turnChangesCard } from "./turn-changes-card.js";
-import { toolRowCells } from "./tool-row.js";
-import { gapLine, TranscriptFlow, type FlowGap, type FlowItem } from "./transcript-flow.js";
+import { processRowCells, toolRowCells } from "./tool-row.js";
+import { gapLine, noticeItem, TranscriptFlow, type FlowGap, type FlowItem } from "./transcript-flow.js";
 import { createBackendEventReceiver, EventDeliveryState, writeProtocolDiagnostic } from "./backend-protocol.js";
 import { RuntimeTiming } from "./runtime-timing.js";
 import { ControlledBackendRestart } from "./controlled-restart.js";
@@ -84,6 +84,7 @@ import {
   INLINE_CODE_DELIMITER,
   MALFORMED_MATH_PREFIX,
   markdownBlocksToLines,
+  type LineTone,
   type RenderLine,
 } from "./markdown-render-lines.js";
 import { parseCompleteMarkdown, type InlineSpan } from "./terminal-markdown.js";
@@ -128,6 +129,8 @@ type Role = ChatMessage["role"];
 
 type AddMessageOptions = {
   timestamp?: number;
+  /** For a notice: the colour of its text, where the usual quiet one would undersell it. */
+  tone?: LineTone;
 };
 
 export type { RenderLine } from "./markdown-render-lines.js";
@@ -181,6 +184,8 @@ function rolePrefixForMode(role: Role, mode: RuntimeMode): string {
 }
 
 const CONVERSATION_ROLES: Role[] = ["user", "reasoning", "assistant", "tool"];
+// Notices and errors stand beside the rail too, under their own labels.
+const RAIL_ROLES: Role[] = [...CONVERSATION_ROLES, "system", "error"];
 
 function isRoleStartPrefix(role: Role, prefix: string): boolean {
   return prefix === rolePrefix[role] || prefix === minimalRolePrefix[role];
@@ -188,7 +193,7 @@ function isRoleStartPrefix(role: Role, prefix: string): boolean {
 
 /** The cells a theme's widest speaker label takes beside the time rail. */
 function railLabelWidth(theme: Pick<ReturnType<typeof useTheme>, "chrome">): number {
-  return Math.max(...CONVERSATION_ROLES.map((role) => stringWidth(compactRolePrefix(
+  return Math.max(...RAIL_ROLES.map((role) => stringWidth(compactRolePrefix(
     theme.chrome?.rolePrefixes?.[role] ?? rolePrefix[role],
   ))));
 }
@@ -205,10 +210,13 @@ export function messageRolePrefixWidth(role: Role, runtimeMode: RuntimeMode): nu
   return Math.max(...THEME_NAMES.map((name) => railLabelWidth(THEMES[name])));
 }
 
+/** A laid-out row is a table row: past this many cells its ends are too far apart to read together. */
+const MAX_ROW_CELLS = 110;
+
 /** The cells a laid-out row (a tool call, a changed file) may take at this terminal width. */
 export function messageCellsWidth(columns: number, rail: TimeRailLayout | undefined, runtimeMode: RuntimeMode): number {
   const lead = rail ? rail.width + rail.prefixWidth : stringWidth(rolePrefixForMode("tool", runtimeMode));
-  return Math.max(20, Math.max(30, columns - 8) - lead);
+  return Math.min(MAX_ROW_CELLS, Math.max(20, Math.max(30, columns - 8) - lead));
 }
 
 // Keep session restore bounded, but never trim the live array passed to Ink
@@ -284,7 +292,7 @@ export function messageToLines(
   showReasoning: boolean,
   runtimeMode: RuntimeMode = "work",
   timeRail?: TimeRail,
-  trailingGap = true,
+  tone?: LineTone,
 ): RenderLine[] {
   if (msg.role === "reasoning" && !showReasoning) return [];
   const content = msg.role === "assistant"
@@ -299,7 +307,14 @@ export function messageToLines(
     continuationPrefix: "    ",
     timeRail,
   });
-  return trailingGap ? [...result.lines, gapLine(`${msg.id ?? msg.timestamp}-gap`)] : result.lines;
+  // The space around a message belongs to the transcript's flow, not to the message.
+  return tone ? result.lines.map((line) => ({ ...line, tone })) : result.lines;
+}
+
+/** The colour a notice is told in: a single line is quiet, a listing reads as text. */
+export function noticeTone(role: Role, content: string, asked?: LineTone): LineTone | undefined {
+  if (role !== "system") return undefined;
+  return asked ?? (noticeItem(content) === "note" ? "muted" : "text");
 }
 
 /** The rows of a finished tool call, ready for the transcript. */
@@ -388,7 +403,7 @@ export function submitStreamLifecyclePolicy(
 
 export const MessageLine = memo(function MessageLine({ line, runtimeMode = "work" }: { line: RenderLine; runtimeMode?: RuntimeMode }) {
   const theme = useTheme();
-  const color = line.kind === "header" ? theme.header : roleColor(line.role, theme);
+  const color = line.kind === "header" ? theme.header : line.tone ? theme[line.tone] : roleColor(line.role, theme);
   const dim = line.role === "tool";
   const isRoleStart = isRoleStartPrefix(line.role, line.prefix);
   const configuredRolePrefix = runtimeMode === "minimal"
@@ -399,7 +414,7 @@ export const MessageLine = memo(function MessageLine({ line, runtimeMode = "work
   // to the theme's widest. Minimal mode keeps each label its own width.
   const labelWidth = runtimeMode === "minimal" ? stringWidth(compactConfiguredRolePrefix) : railLabelWidth(theme);
   const paddedLabel = compactConfiguredRolePrefix + " ".repeat(Math.max(0, labelWidth - stringWidth(compactConfiguredRolePrefix)));
-  const inConversation = Boolean(line.timeRail && CONVERSATION_ROLES.includes(line.role) && !isRoleStart);
+  const inConversation = Boolean(line.timeRail && !isRoleStart);
   const isConversationContinuation = inConversation && line.prefix.trim() === "";
   const displayedPrefix = line.timeRail && isRoleStart
     ? paddedLabel
@@ -414,7 +429,11 @@ export const MessageLine = memo(function MessageLine({ line, runtimeMode = "work
     ? theme.accent
     : line.role === "reasoning"
       ? theme.emphasis
-      : theme.accentAlt;
+      : line.role === "system"
+        ? theme.muted
+        : line.role === "error"
+          ? theme.danger
+          : theme.accentAlt;
   const rail = line.timeRail ? (
     <>
       <Text
@@ -825,6 +844,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   const streamLeadRef = useRef<Partial<Record<StreamingRole, RenderLine[]>>>({});
   // What each running call was asked to do, kept until its result names it in the transcript.
   const toolCallsRef = useRef(new Map<string, { name: string; arguments?: string }>());
+  const endedProcessesRef = useRef(new Set<string>());
 
   const railLayout = useCallback((role: Role): TimeRailLayout => ({
     width: MESSAGE_TIME_RAIL_WIDTH,
@@ -906,14 +926,19 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     if (!content) return;
     const timestamp = options.timestamp ?? Date.now();
     const msg = { role, content, timestamp, id: ++msgIdRef.current } as ChatMessage;
+    const spoken = role === "user" || role === "assistant" || role === "reasoning";
+    // What is said carries its time on the rail; a notice stands beside the rail without one.
     const rail = shouldMessageUseTimeline(role, timelineVisibleRef.current)
       ? nextTimeRail(role, timestamp)
-      : undefined;
-    // What is said in a turn leaves the space under it to whatever follows; anything else
-    // (a notice, a command's answer) ends with its own blank line as before.
-    const item: FlowItem = role === "user" || role === "assistant" || role === "reasoning" ? role : "other";
-    appendFlow(item, messageToLines(msg, columns, showReasoningRef.current, runtimeMode, rail, item === "other"), `m${msg.id}`);
-  }, [appendFlow, columns, nextTimeRail, runtimeMode]);
+      : !spoken && timelineVisibleRef.current
+        ? { ...railLayout("assistant"), label: "", kind: "relative" as const }
+        : undefined;
+    appendFlow(
+      spoken ? role : noticeItem(content),
+      messageToLines(msg, columns, showReasoningRef.current, runtimeMode, rail, noticeTone(role, content, options.tone)),
+      `m${msg.id}`,
+    );
+  }, [appendFlow, columns, nextTimeRail, railLayout, runtimeMode]);
 
   const applyStreamingUpdate = useCallback((
     role: StreamingRole,
@@ -1205,13 +1230,17 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         const spaced = decoratedMessages
           .filter(({ message }) => message.role !== "reasoning" || showReasoningRef.current)
           .map((entry) => {
-            const item: FlowItem = entry.message.role === "system" ? "other" : entry.message.role as FlowItem;
-            return { ...entry, item, lead: restoredFlow.before(item) };
+            const notice = entry.message.role === "system";
+            const item: FlowItem = notice ? noticeItem(entry.message.content) : entry.message.role as FlowItem;
+            const rail = notice && timelineVisibleRef.current
+              ? { ...railLayout("assistant"), label: "", kind: "relative" as const }
+              : entry.rail;
+            return { ...entry, rail, item, lead: restoredFlow.before(item) };
           });
         const restored = restoreRecentHistory(
           spaced,
           MAX_RESTORED_RENDER_LINES,
-          ({ message, rail, item, lead }) => [
+          ({ message, rail, lead }) => [
             ...flowGapLines(lead, `${message.id}-lead`),
             ...messageToLines(
               message,
@@ -1219,7 +1248,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
               showReasoningRef.current,
               runtimeMode,
               rail,
-              item === "other",
+              noticeTone(message.role, message.content),
             ),
           ],
         );
@@ -1294,7 +1323,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         if (event.error) {
           addMessage("error", event.error);
         } else if (event.yolo) {
-          addMessage("system", "YOLO mode ON — eligible approvals bypassed · Ctrl+Y to switch off");
+          addMessage("system", "YOLO mode ON — eligible approvals bypassed · Ctrl+Y to switch off", { tone: "warning" });
         } else {
           addMessage("system", "YOLO mode OFF — approvals restored");
         }
@@ -1413,12 +1442,29 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           });
         } else {
           setActiveProcesses((current) => current.filter((item) => item.id !== processTool.id));
-          const marker = event.status === "completed" ? "\x1b[32m✓\x1b[0m" : "\x1b[31m✗\x1b[0m";
-          addMessage(
-            "tool",
-            `${marker} background ${event.kind} · ${event.status} · ${event.duration_ms}ms\n` +
-            `  process ${event.process_id.slice(0, 8)} · ${event.output_chars} chars`,
-          );
+          // A process ends once, however often its last status is told.
+          const ended = `${event.process_id}:${event.status}`;
+          if (endedProcessesRef.current.has(ended)) break;
+          endedProcessesRef.current.add(ended);
+          const rail = timelineVisibleRef.current ? nextTimeRail("tool", Date.now()) : undefined;
+          const label = rolePrefixForMode("tool", runtimeMode);
+          const cells = processRowCells({
+            kind: event.kind,
+            label: event.label,
+            status: event.status,
+            durationMs: event.duration_ms,
+            outputChars: event.output_chars,
+            processId: event.process_id,
+          }, messageCellsWidth(columns, rail, runtimeMode));
+          appendFlow("tool", [{
+            key: `process-${ended}`,
+            role: "tool",
+            prefix: flowRef.current.previous === "tool" ? " ".repeat(stringWidth(label)) : label,
+            text: cells.map((cell) => cell.text).join(""),
+            kind: "cells",
+            cells,
+            timeRail: rail,
+          }], `process-${ended}`);
         }
         break;
       }
@@ -1551,7 +1597,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
             ? `${event.code.replaceAll("_", " ").toUpperCase()}${event.tool_name ? ` · ${event.tool_name}` : ""}`
             : event.message;
           const detail = event.code && event.message !== label ? ` — ${event.message}` : "";
-          addMessage("tool", `\x1b[33m⚠\x1b[0m ${label}${detail}`);
+          addMessage("system", `⚠ ${label}${detail}`.replace(/\s*\r?\n\s*/g, " "), { tone: "warning" });
           break;
         }
         try {

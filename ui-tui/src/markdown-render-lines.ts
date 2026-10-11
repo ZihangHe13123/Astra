@@ -12,7 +12,7 @@ import type { ChatMessage } from "./types.js";
 import type { InlineSpan, MarkdownBlock } from "./terminal-markdown.js";
 
 /** The colour a cell of a laid-out row takes from the theme. */
-export type LineTone = "text" | "muted" | "accent" | "accentAlt" | "success" | "warning" | "danger";
+export type LineTone = "text" | "muted" | "subtle" | "accent" | "accentAlt" | "success" | "warning" | "danger";
 /** `mark: "tool"` is drawn as the theme's own tool mark where that is one cell wide. */
 export type LineCell = { text: string; tone?: LineTone; bold?: boolean; mark?: "tool" };
 
@@ -27,6 +27,8 @@ export type RenderLine = {
   cells?: LineCell[];
   /** Beside the time rail: how far a wrapped list item or quote stands in from the text column. */
   hang?: number;
+  /** The colour of the line's plain text, where it is not the speaker's own (a quiet notice, a warning). */
+  tone?: LineTone;
   malformedMath?: boolean;
   timeRail?: TimeRail;
 };
