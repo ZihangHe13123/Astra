@@ -61,11 +61,14 @@ function App() {
   const [sessionDialog, setSessionDialog] = useState<{ action: "rename" | "delete"; entry: SessionEntry; title: string }>();
   const [toast, setToast] = useState("");
   const [selection, setSelection] = useState<{ index?: number; serial: number }>({ serial: 0 });
+  // A page being looked at may take the conversation's room as well, until Escape or its own button gives it back.
+  const [detailsWide, setDetailsWide] = useState(false);
   const [logTarget, setLogTarget] = useState<LogTarget>({ serial: 0 });
   const [chatLocation, setChatLocation] = useState<{ id: string; serial: number }>();
   const logNavigation = useRef(0);
   const [docTarget, setDocTarget] = useState<{ path: string; serial: number }>();
-  const docFollow = useRef(true);
+  // The file the user closed or walked away from: it is not opened over them again, a different one is.
+  const leftDoc = useRef<string>();
   const [historyLoading, setHistoryLoading] = useState(false);
   const [initialModelKey, setInitialModelKey] = useState<string>();
   const [olderLoading, setOlderLoading] = useState(false);
@@ -99,15 +102,18 @@ function App() {
   }, [active, state?.branchId, responseVersions?.revision]);
   const localDefinition = state?.info.local_mode_info?.definition;
   const commandModes = useMemo(() => [...builtinCommandModes, ...(localDefinition ? [{ mode: "local", ...localDefinition }] : [])], [localDefinition]);
-  // Open the Files panel on the document the agent is writing until the user closes or leaves it.
+  // Open the Files panel on the document or page the agent is writing. Once the user closes or
+  // leaves it, later writes to that same file stay out of their way; a different file is
+  // something new to show.
   const newestDoc = useMemo(() => state ? latestDoc(state.tools) : undefined, [state?.tools]);
-  useEffect(() => { docFollow.current = true; setDocTarget(undefined); }, [state?.id, state?.session]);
+  useEffect(() => { leftDoc.current = undefined; setDocTarget(undefined); }, [state?.id, state?.session]);
   useEffect(() => {
-    if (!newestDoc || !docFollow.current) return;
+    if (!newestDoc || leftDoc.current === newestDoc.path) return;
+    leftDoc.current = undefined;
     setDocTarget({ path: newestDoc.path, serial: newestDoc.index });
     setPanel("files");
   }, [newestDoc?.path, newestDoc?.index]);
-  const leaveDoc = () => { if (docTarget) docFollow.current = false; };
+  const leaveDoc = () => { if (docTarget) leftDoc.current = docTarget.path; };
   const key = preview ? `${preview.mode}:${preview.session_id}` : state && !state.isDraft ? `${state.mode}:${state.session}` : `new:${state?.workspace || workspace}`;
   const draft = prefs.drafts[key] || "";
   const files = prefs.attachments[key] || [];
@@ -160,10 +166,11 @@ function App() {
       if ((e.metaKey || e.ctrlKey) && e.key === ".") { e.preventDefault(); void send({ type: "command", cmd: "/cancel" }); }
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "o") { e.preventDefault(); setPanel("tools"); }
       if ((e.metaKey || e.ctrlKey) && e.shiftKey && e.key.toLowerCase() === "l") { e.preventDefault(); setPanel("context"); }
-      if (e.key === "Escape" && !modal) { if (panel === "files") leaveDoc(); setPanel(undefined); }
+      if (e.key === "Escape" && !modal) { if (detailsWide) setDetailsWide(false); else { if (panel === "files") leaveDoc(); setPanel(undefined); } }
     };
     window.addEventListener("keydown", listener); return () => window.removeEventListener("keydown", listener);
-  }, [active, modal, workspace, state?.isDraft, preview, panel, docTarget]);
+  }, [active, modal, workspace, state?.isDraft, preview, panel, docTarget, detailsWide]);
+  useEffect(() => { if (panel !== "files") setDetailsWide(false); }, [panel, active]);
   useEffect(() => { setFollow(!preview?.locatedFromLog); setOlderLoading(false); }, [active, preview?.session_id, preview?.mode]);
   useEffect(() => { if (follow && scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight; }, [state?.revision, active, preview, follow]);
   useEffect(() => {
@@ -263,7 +270,7 @@ function App() {
         : [...tools].reverse().map(t => docPathFromTool(t)).find(Boolean);
       if (!path) { fail(number ? `结果 ${number} 不是文档工具的结果。` : "还没有文档结果。先让 Astra 用文档工具写一份文档。"); return false; }
       if (docCommand[1]) { if (state) void window.astra.file(state.id, path, "open").catch(fail); return; }
-      docFollow.current = true; setDocTarget({ path, serial: Date.now() }); setPanel("files"); return;
+      leftDoc.current = undefined; setDocTarget({ path, serial: Date.now() }); setPanel("files"); return;
     }
     if (value === "/changes") { setPanel("changes"); return; }
     if (value.startsWith("/theme")) { const t = value.split(/\s+/)[1]; if (t) {
@@ -376,7 +383,7 @@ function App() {
   const unplacedTools = useMemo(() => preview || !state ? [] : withActivity(messages, state.tools).unplaced, [preview, messages, state?.tools]);
   const openLog = (target: { source_ref?: SourceRef; call_id?: string } = {}) => {
     if (!logSession) return;
-    logNavigation.current++; docFollow.current = false; setLogTarget(old => ({ ...target, serial: old.serial + 1 })); setPanel("logs");
+    logNavigation.current++; leaveDoc(); setLogTarget(old => ({ ...target, serial: old.serial + 1 })); setPanel("logs");
   };
   const locateLog = async (record: SessionLogRecord, revision: string, isCurrent: () => boolean) => {
     const source = recordChatSource(record);
@@ -504,7 +511,7 @@ function App() {
     </aside>
     <main className="main"><header className="topbar"><div>{!side && <button className="icon" aria-label="显示侧栏" onClick={() => setSide(true)}><PanelLeft size={18}/></button>}<Folder size={17}/><span className="title" title={currentTitle}>{currentTitle}</span>{theme.console && theme.wording.tag && <span className="topbar-tag">{theme.wording.tag}</span>}<span className="mode-badge">{preview ? "只读历史" : state?.mode && state.mode !== "work" ? state.mode : ""}</span></div>
       <div>{logSession && <button className="icon" aria-label="查看会话记录" onClick={() => openLog()}><FileText size={17}/></button>}<span className="workspace" title={state?.workspace || workspace}>{(state?.workspace || workspace).split(/[\\/]/).pop()}</span>{historyLoading || state?.status === "connecting" || state?.status === "loading" ? <LoaderCircle size={16} className="spin"/> : null}<button className="icon" aria-label="执行详情" onClick={() => { if (panel) leaveDoc(); setPanel(panel ? undefined : "tools"); }}><PanelRight size={18}/></button></div></header>
-      <div className={`body ${(panel === "logs" && logSession || panel && panel !== "logs" && state && !preview) ? "with-details" : ""}`}><div className="conversation"><div className="messages-scroll" aria-busy={historyLoading} data-history-request={preview?.request || 0} ref={scroller} onScroll={e => { const t = e.currentTarget; if (!t.clientHeight) return; setFollow(t.scrollHeight - t.scrollTop - t.clientHeight < 120); }}>
+      <div className={`body ${(panel === "logs" && logSession || panel && panel !== "logs" && state && !preview) ? "with-details" : ""}${detailsWide && panel === "files" && state && !preview ? " details-wide" : ""}`}><div className="conversation"><div className="messages-scroll" aria-busy={historyLoading} data-history-request={preview?.request || 0} ref={scroller} onScroll={e => { const t = e.currentTarget; if (!t.clientHeight) return; setFollow(t.scrollHeight - t.scrollTop - t.clientHeight < 120); }}>
         <div className="messages">
           {!messages.length && <Welcome info={preview ? undefined : state?.info.startup_banner} openModels={() => { void openModels(); }} showCommands={showCommands} run={value => { void command(value).catch(fail); }}/>}
           <EarlierResponseVersions messages={messages} controls={responseControls}/>
@@ -539,7 +546,7 @@ function App() {
           </div>}
           <div className="composer-foot"><span>{state?.status === "ready" ? state.busy ? "运行中" : "就绪" : state ? state.status === "disconnected" ? "后端已断开" : "连接后端中…" : "本地运行 · 模型自主选择工具"}</span><span>Enter 发送 · Shift Enter 换行</span></div>
         </div>
-      </div>{panel === "logs" && logSession ? <SessionLogPanel key={logScope} session={logSession.name} mode={logSession.mode} branchId={logBranch} responseRevision={logResponseRevision} target={logTarget} width={prefs.detailWidth || 420} close={() => { logNavigation.current++; setPanel(undefined); }} locate={locateLog}/> : panel && panel !== "logs" && state && !preview && <Details state={state} panel={panel} setPanel={next => { if (next === "logs") { openLog(); return; } if (next !== "files") leaveDoc(); setPanel(next); }} selection={selection} width={prefs.detailWidth || 420} onWidth={detailWidth => savePrefs({ detailWidth })} close={() => { leaveDoc(); setPanel(undefined); }} fail={fail} doc={docFollow.current ? docTarget : undefined} onDocDismiss={leaveDoc} openLog={logSession ? call_id => openLog({ call_id }) : undefined}/>}</div>
+      </div>{panel === "logs" && logSession ? <SessionLogPanel key={logScope} session={logSession.name} mode={logSession.mode} branchId={logBranch} responseRevision={logResponseRevision} target={logTarget} width={prefs.detailWidth || 420} close={() => { logNavigation.current++; setPanel(undefined); }} locate={locateLog}/> : panel && panel !== "logs" && state && !preview && <Details state={state} panel={panel} setPanel={next => { if (next === "logs") { openLog(); return; } if (next !== "files") leaveDoc(); setPanel(next); }} selection={selection} width={prefs.detailWidth || 420} onWidth={detailWidth => savePrefs({ detailWidth })} close={() => { leaveDoc(); setPanel(undefined); }} fail={fail} doc={docTarget && leftDoc.current !== docTarget.path ? docTarget : undefined} onDocDismiss={leaveDoc} openLog={logSession ? call_id => openLog({ call_id }) : undefined} wide={detailsWide} onWide={setDetailsWide}/>}</div>
     </main>
     {toast && <div className="toast" role="alert"><span>{toast}</span><button className="icon" onClick={() => setToast("")} aria-label="关闭提示"><X size={16}/></button></div>}
     {modal === "commands" && <CommandPalette commands={commands} labels={commandNames(commandModes)} initialFilter={commandQuery} close={() => setModal(undefined)} run={command}/>}

@@ -43,3 +43,56 @@
   years.addEventListener("input", show); show();
 </script>
 ```
+
+# 整页画布
+
+卡片嵌在回复里，适合小展示。要交给用户一整页东西看（设计稿、原型、报告、对比表、长的交互演示），
+就把它写成一个页面文件：桌面端会在对话旁边的面板里打开它，用户可以放大到整个窗口，文件留在工作区里。
+页面只在桌面端显示；用户明显不在桌面端时不要写。
+
+## 怎么写
+
+- 用写文件的工具，把一个完整的 HTML 文档写进工作区，文件名以 `.page.html` 结尾，例如
+  `design-draft.page.html`。写入成功后面板自动打开；之后每次修改这个文件，面板都会刷新。
+  名字不以 `.page.html` 结尾的 HTML 文件不会自动打开。
+- 页面是一份完整的文档：自己写 `<!doctype html>`、`<head>`、`<style>`、`<body>`。样式完全由你决定，
+  没有卡片的默认样式。面板大约 400–700px 宽，放大后是整个窗口，布局要能伸缩。
+- 和卡片一样完全自包含、不能联网：外部脚本、CDN、字体、图片链接、接口请求都会被拒绝，
+  `fetch`、WebSocket、`localStorage`、表单提交、页面跳转、`eval` 同样不能用。
+  图片只能用 `data:` 地址或内联 SVG。页面内的锚点链接（`href="#..."`）可以用，其他链接点不开。
+- 想跟随应用的浅色、深色主题，用这些变量：`--astra-bg` `--astra-panel` `--astra-soft`
+  `--astra-hover` `--astra-line` `--astra-text` `--astra-muted` `--astra-accent`
+  `--astra-on-accent` `--astra-error`。设计稿这类要固定配色的页面，自己写颜色。
+- 文件不超过 1 MiB。同一份东西始终改同一个文件，不要每改一版换一个文件名。
+- 回复里用一两句话说清页面里有什么、文件叫什么；不要把页面源码再贴进回复。
+
+## 例子
+
+```html
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>方案对比</title>
+<style>
+  body { margin: 0; padding: 28px; background: var(--astra-bg); color: var(--astra-text); font: 15px/1.6 system-ui, sans-serif; }
+  nav { display: flex; gap: 8px; margin: 16px 0; }
+  nav button { padding: 6px 14px; border: 1px solid var(--astra-line); border-radius: 8px; background: none; color: inherit; font: inherit; cursor: pointer; }
+  nav button[aria-pressed="true"] { background: var(--astra-accent); color: var(--astra-on-accent); border-color: transparent; }
+  section { padding: 16px; border: 1px solid var(--astra-line); border-radius: 10px; }
+</style>
+</head>
+<body>
+  <h1>方案对比</h1>
+  <nav><button data-plan="a" aria-pressed="true">方案 A</button><button data-plan="b" aria-pressed="false">方案 B</button></nav>
+  <section id="detail"></section>
+  <script>
+    const plans = { a: "方案 A：改动小，两天能上线。", b: "方案 B：要重写存储层，两周，但以后不用再改。" };
+    const detail = document.getElementById("detail"), buttons = [...document.querySelectorAll("nav button")];
+    const show = plan => { detail.textContent = plans[plan]; for (const button of buttons) button.setAttribute("aria-pressed", String(button.dataset.plan === plan)); };
+    for (const button of buttons) button.addEventListener("click", () => show(button.dataset.plan));
+    show("a");
+  </script>
+</body>
+</html>
+```

@@ -100,7 +100,10 @@ def test_the_card_skill_reads_the_same_everywhere_and_cannot_be_replaced(tmp_pat
     assert (shadow / "SKILL.md").read_text().endswith("Load a script from a CDN."), "the user's file is left alone"
     content = card_skill_content()
     assert content.startswith(f"---\nname: {CARD_SKILL_NAME}\ndescription: ")
-    assert "```card\n" in content and content.count("```") == 2, "one example block, so the text itself renders as written"
+    # One example of a card and one of a page, each a block of its own, so the text renders as written.
+    assert "```card\n" in content and "```html\n<!doctype html>" in content and content.count("```") == 4
+    # A page is asked for by its file name and taught the same limits as a card.
+    assert ".page.html" in content and "--astra-bg" in content and "不能联网" in content
 
 
 def test_a_conversation_keeps_the_entry_it_started_with(tmp_path, monkeypatch):

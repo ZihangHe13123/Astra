@@ -74,22 +74,84 @@ svg { max-width: 100%; }
 })();
 </script></body></html>`;
 
+/**
+ * The document a whole page runs in: a file the model wrote to be looked at, shown beside the
+ * conversation. It is under the same policy as a card and gets as little. Unlike a card it is a
+ * document of its own, so this one only waits for the source and then lets it replace everything:
+ * the page's doctype, head and body are its own, and no style of ours is laid over it. What the
+ * page starts with is written in front of it: the app's colours as `--astra-*` variables, which a
+ * page may use or ignore, a readable ground for a page that sets none, and the same refusals a
+ * card has (a link that leaves, a form that submits).
+ */
+export const PAGE_FRAME_URL = "astra://card/page.html";
+const pageDocument = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><script>
+(() => {
+  const host = window.parent;
+  if (location.search === "?dark") document.documentElement.style.colorScheme = "dark";
+  // Runs first in the page's own document. Listeners added before the page is written do not
+  // outlive document.open, so everything the page needs from us is set up again here.
+  const prelude = function (theme) {
+    const host = window.parent, root = document.documentElement;
+    const tell = message => host.postMessage({ astraPage: true, ...message }, "*");
+    const paint = theme => {
+      if (!theme || typeof theme !== "object") return;
+      for (const [name, value] of Object.entries(theme.colors || {})) if (/^--[a-z-]+$/.test(name) && typeof value === "string") root.style.setProperty("--astra-" + name.slice(2), value);
+      root.style.colorScheme = theme.dark ? "dark" : "light";
+    };
+    paint(theme);
+    addEventListener("message", event => {
+      const data = event.data;
+      if (event.source !== host || !data || data.astraPage !== true) return;
+      if (data.type === "theme") paint(data.theme);
+      // The host asks after every load whether this is still the page; a document that replaced it cannot answer.
+      if (data.type === "ping") tell({ type: "pong", id: data.id });
+    });
+    // A link inside the page scrolls to its place. Any other would replace the page with a refused one.
+    addEventListener("click", event => {
+      const link = event.target instanceof Element ? event.target.closest("a[href], area[href]") : null;
+      if (link && !(link.getAttribute("href") || "").startsWith("#")) event.preventDefault();
+    }, true);
+    addEventListener("submit", event => event.preventDefault(), true);
+    addEventListener("error", event => tell({ type: "error", message: String(event.message || "脚本出错").slice(0, 300) }));
+    addEventListener("unhandledrejection", event => tell({ type: "error", message: String(event.reason && event.reason.message || event.reason || "脚本出错").slice(0, 300) }));
+  };
+  const ground = "<style>html{background:var(--astra-bg,#fff);color:var(--astra-text,#282a2b);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif}</style>";
+  addEventListener("message", function receive(event) {
+    const data = event.data;
+    if (event.source !== host || !data || data.astraPage !== true) return;
+    if (data.type === "ping") host.postMessage({ astraPage: true, type: "pong", id: data.id }, "*");
+    if (data.type !== "render" || typeof data.html !== "string") return;
+    removeEventListener("message", receive);
+    const theme = JSON.stringify(data.theme || null).replace(/</g, "\\\\u003c");
+    // The doctype is written once, ahead of the script that must run first; the page's own would come too late to count.
+    const page = data.html.replace(/^\\uFEFF?\\s*<!doctype[^>]*>/i, "");
+    document.open();
+    document.write("<!doctype html><script>(" + prelude + ")(" + theme + ")</" + "script>" + ground + page);
+    document.close();
+  });
+  host.postMessage({ astraPage: true, type: "ready" }, "*");
+})();
+</script></head><body></body></html>`;
+
 export function cardFrameResponse(pathname: string): Response {
-  if (pathname !== "/frame.html") return new Response("Not found", { status: 404 });
-  return new Response(frameDocument, { headers: {
+  const body = pathname === "/frame.html" ? frameDocument : pathname === "/page.html" ? pageDocument : undefined;
+  if (body === undefined) return new Response("Not found", { status: 404 });
+  return new Response(body, { headers: {
     "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": CARD_FRAME_POLICY,
     "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store",
   } });
 }
 
-/** The card document, with or without the hint that tells it to start in the dark theme. */
-export function isCardFrameAddress(url: string): boolean { return url === CARD_FRAME_URL || url === `${CARD_FRAME_URL}?dark`; }
+/** The card document or the page document, with or without the hint that tells it to start in the dark theme. */
+export function isCardFrameAddress(url: string): boolean {
+  return [CARD_FRAME_URL, PAGE_FRAME_URL].some(address => url === address || url === `${address}?dark`);
+}
 
 /**
  * A second barrier behind two policies. The card's own policy refuses everything it could load,
  * and the window's policy (frame-src in index.html) refuses a card that navigates its frame away,
  * which the card's own policy has no say over. Should the window's policy be loosened by mistake,
- * no frame in this window navigates to anything but the card document.
+ * no frame in this window navigates to anything but the card document or the page document.
  *
  * Requests are deliberately not filtered here as well: a request filter on the window's session
  * stalled document previews, and every request a card can make is already refused by its policy.

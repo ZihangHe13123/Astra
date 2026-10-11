@@ -1,4 +1,5 @@
-// Follow saved documents that the agent writes or exports with the doc_* tools.
+// Follow saved documents that the agent writes or exports with the doc_* tools, and pages it writes to be looked at.
+import { pagePathFromTool } from "./page-state.js";
 // Tool entries from the session state; only these fields are read.
 type ToolLike = { readonly [key: string]: unknown };
 
@@ -17,12 +18,12 @@ export function docPathFromTool(tool: ToolLike): string | undefined {
   } catch { return undefined; }
 }
 
-/** The newest document written in this session; restored history is ignored. */
+/** The newest document or page written in this session; restored history is ignored. */
 export function latestDoc(tools: ToolLike[]): { path: string; index: number } | undefined {
   let latest: { path: string; index: number } | undefined;
   for (const tool of tools) {
     if (tool.historical) continue;
-    const path = docPathFromTool(tool);
+    const path = docPathFromTool(tool) ?? pagePathFromTool(tool);
     const index = Number(tool.result_index) || 0;
     if (path && (!latest || index >= latest.index)) latest = { path, index };
   }
