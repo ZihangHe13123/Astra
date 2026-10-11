@@ -194,9 +194,13 @@ try {
 
   // A request the user cannot see is not answered: the first press brings it into view.
   await ask('写入 twelve');
-  const scroller = page.locator('.messages-scroll');
   const inView = () => page.evaluate(() => { const row = document.querySelector('.approval .actions').getBoundingClientRect(), view = document.querySelector('.messages-scroll').getBoundingClientRect(); return row.top >= view.top && row.bottom <= view.bottom; });
-  await scroller.evaluate(node => { node.scrollTop = 0; });
+  // While the list follows the newest message, a row whose measurement is still on its way pins it back to
+  // the bottom once, and a single scroll made in that moment is undone. The scroll is repeated until it holds.
+  await page.waitForFunction(() => new Promise(done => {
+    const scroll = document.querySelector('.messages-scroll'); scroll.scrollTop = 0;
+    requestAnimationFrame(() => requestAnimationFrame(() => done(scroll.scrollTop === 0)));
+  }));
   await expect.poll(inView).toBe(false);
   await composer.click(); await page.keyboard.press(`${command}+Enter`);
   await expect.poll(inView).toBe(true);

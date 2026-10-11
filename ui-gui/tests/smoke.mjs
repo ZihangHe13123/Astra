@@ -153,6 +153,12 @@ try {
    throw new Error('Backend tasks did not settle');
  };
  const submit = async text => { await page.getByRole('textbox',{name:'消息'}).fill(text); await page.getByRole('button',{name:'发送',exact:true}).click(); };
+ // While the list follows the newest message, a row whose measurement is still on its way pins it back to
+ // the bottom once, and a single scroll made in that moment is undone. The scroll is repeated until it holds.
+ const scrollToTop = () => page.waitForFunction(()=>new Promise(done=>{
+   const scroll=document.querySelector('.messages-scroll'); scroll.scrollTop=0;
+   requestAnimationFrame(()=>requestAnimationFrame(()=>done(scroll.scrollTop===0)));
+ }));
  await page.getByRole('textbox',{name:'消息'}).waitFor();
  await page.evaluate(()=>{window.__events=[];window.astra.onEvents(e=>window.__events.push(...e.map(x=>({type:x.event?.type,message:x.event?.message}))));});
  await page.screenshot({path:join(output,'welcome.png')}); passed('window and sandboxed preload');
@@ -478,7 +484,7 @@ try {
  await liveReasoning.locator('summary').click();
  const reasoningId=await liveReasoning.evaluate(el=>el.closest('[data-message-id]').dataset.messageId);
  await page.waitForFunction(id=>[...document.querySelectorAll('[data-message-id]')].find(el=>el.dataset.messageId===id)?.querySelector('details')?.open,reasoningId);
- await page.locator('.messages-scroll').evaluate(el=>{el.scrollTop=0;});
+ await scrollToTop();
  await page.waitForFunction(id=>![...document.querySelectorAll('[data-message-id]')].some(el=>el.dataset.messageId===id),reasoningId);
  await page.locator('.messages-scroll').evaluate(el=>{el.scrollTop=el.scrollHeight;});
  await page.waitForFunction(id=>[...document.querySelectorAll('[data-message-id]')].find(el=>el.dataset.messageId===id)?.querySelector('details')?.open,reasoningId);
@@ -588,7 +594,7 @@ try {
  await page.screenshot({path:join(output,'long-history.png')});
  // Prepending a page keeps the current reading position and makes the added
  // messages reachable by scrolling, without increasing the mounted window.
- await page.locator('.messages-scroll').evaluate(el=>{el.scrollTop=0;});
+ await scrollToTop();
  await page.getByRole('button',{name:'加载更早历史',exact:true}).waitFor();
  await page.waitForFunction(()=>{
    const scroll=document.querySelector('.messages-scroll');
@@ -607,7 +613,7 @@ try {
    return Number(document.querySelector('.message-window')?.dataset.totalMessages)>anchor.loaded&&row&&
      Math.abs(row.getBoundingClientRect().top-scroll.getBoundingClientRect().top-anchor.top)<8;
  },historyAnchor);
- await page.locator('.messages-scroll').evaluate(el=>{el.scrollTop=0;});
+ await scrollToTop();
  await page.waitForFunction(old=>{
    const first=document.querySelector('.message[data-message-id]');
    return first&&Number(first.dataset.messageId.split(':').at(-1))<Number(old.split(':').at(-1));
@@ -618,7 +624,7 @@ try {
  // replace the loaded generation instead of prepending new rows to old text.
  writeFileSync(join(folder,'sessions',historyName+'.json'),JSON.stringify({messages:Array.from({length:3},(_,i)=>
    ({role:i%2?'assistant':'user',content:`重写后的历史 ${i}`,timestamp:1700200000+i}))}));
- await page.locator('.messages-scroll').evaluate(el=>{el.scrollTop=0;});
+ await scrollToTop();
  await page.getByRole('button',{name:'加载更早历史',exact:true}).click();
  await page.getByRole('alert').filter({hasText:'历史已在其他窗口更新，已载入最新记录。'}).waitFor();
  await page.getByText('重写后的历史 2',{exact:true}).waitFor();
