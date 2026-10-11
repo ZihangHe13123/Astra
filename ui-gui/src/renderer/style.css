@@ -180,6 +180,8 @@ summary { cursor: pointer; }
 .step-detail { margin: 0 14px 12px 42px; display: flex; flex-direction: column; align-items: flex-start; gap: 8px; animation: astra-rise var(--dur-2) var(--ease) both; }
 .step-detail pre { align-self: stretch; margin: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: var(--r-1); background: var(--sidebar); font-size: var(--fs-small); line-height: 1.6; max-height: 280px; overflow: auto; }
 .step-detail p { margin: 0; font-family: var(--font-ui); }
+.step-label { margin: 4px 0 -2px; font-size: var(--fs-micro); font-weight: 500; letter-spacing: var(--label-track); text-transform: var(--label-case); color: var(--muted); }
+.step-detail .step-input { max-height: 200px; white-space: pre-wrap; overflow-wrap: anywhere; }
 .turn-changes { margin: 0 0 26px; border: 1px solid var(--frame); border-radius: var(--r-2); overflow: hidden; font-family: var(--font-mono); }
 .turn-changes>header { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; padding: 11px 16px; font-size: var(--fs-small); letter-spacing: var(--label-track); }
 .turn-changes-title { display: inline-flex; gap: 8px; color: var(--accent); font-weight: 600; text-transform: var(--label-case); }

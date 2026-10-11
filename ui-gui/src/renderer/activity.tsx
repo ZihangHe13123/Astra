@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from "react";
 import { Check, ChevronRight, Minus, X } from "lucide-react";
 import type { TurnChangeNote, UIEvent } from "@astra/ui-core/session-state";
-import { describeTool, span } from "./activity-state.js";
+import { describeTool, span, toolInput } from "./activity-state.js";
 import { toolEmptyOutput, toolStatus } from "./tool-status.js";
 import { useTheme } from "./theme-context.js";
 
@@ -17,8 +17,25 @@ function useNow(running: boolean): number {
   return now;
 }
 
-/** The tool calls made at one point of a turn, one line each; a line opens to what the tool returned. */
-export function Activity({ tools, openDetails }: { tools: UIEvent[]; openDetails?: () => void }) {
+/** As much of a call's arguments as a row in the conversation shows; the details panel has them whole. */
+const INPUT_PREVIEW_CHARS = 4000;
+
+/** What a row opens to: what the call was asked to do, and what came back. */
+export function StepDetail({ tool, openDetails }: { tool: UIEvent; openDetails?: () => void }) {
+  const input = toolInput(tool), output = tool.output || toolEmptyOutput(tool);
+  return <div className="step-detail">
+    {input && <><h4 className="step-label">参数</h4><pre className="step-input">{input.length > INPUT_PREVIEW_CHARS ? input.slice(0, INPUT_PREVIEW_CHARS) + "\n…" : input}</pre></>}
+    {input.length > INPUT_PREVIEW_CHARS && <p className="muted small">参数较长，这里只显示开头；完整内容见执行详情。</p>}
+    {(tool.error || output) && <h4 className="step-label">输出</h4>}
+    {tool.error && <p className="error-text">{tool.error}</p>}
+    {output && <pre className="step-output">{output}</pre>}
+    {tool.output_truncated && <p className="muted small">显示内容已截断；完整输出见执行详情。</p>}
+    {openDetails && <button type="button" className="text-button small" onClick={openDetails}>在执行详情中查看<ChevronRight size={13}/></button>}
+  </div>;
+}
+
+/** The tool calls made at one point of a turn, one line each; a line opens to what the call was asked and what it returned. */
+export function Activity({ tools, openDetails }: { tools: UIEvent[]; openDetails?: (tool: UIEvent) => void }) {
   const { wording } = useTheme();
   const [open, setOpen] = useState<string>();
   const running = tools.filter(tool => toolStatus(tool) === "running");
@@ -38,12 +55,7 @@ export function Activity({ tools, openDetails }: { tools: UIEvent[]; openDetails
           <span className="step-result">{step.result}</span><span className="step-time">{time}</span>
         </button>
         {step.tone === "live" && <i className="step-sweep" aria-hidden="true"/>}
-        {expanded && <div className="step-detail">
-          {tool.error && <p className="error-text">{tool.error}</p>}
-          {(tool.output || toolEmptyOutput(tool)) && <pre>{tool.output || toolEmptyOutput(tool)}</pre>}
-          {tool.output_truncated && <p className="muted small">显示内容已截断；完整输出见执行详情。</p>}
-          {openDetails && <button type="button" className="text-button small" onClick={openDetails}>在执行详情中查看<ChevronRight size={13}/></button>}
-        </div>}
+        {expanded && <StepDetail tool={tool} openDetails={openDetails && (() => openDetails(tool))}/>}
       </div>;
     })}
   </section>;

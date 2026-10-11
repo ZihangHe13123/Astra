@@ -131,6 +131,25 @@ try {
   await page.locator('.located-message').filter({ hasText: 'INSPECTOR_DONE' }).waitFor();
   passed('live user and streamed assistant messages receive persisted source references and round-trip to raw records');
   await page.getByRole('button', { name: '关闭会话记录' }).click();
+  // The call's row in the conversation opens to what it was asked and what came back, and its
+  // link opens the details at that call, shown whole.
+  const step = page.locator('.activity .step-row').filter({ hasText: 'READ' }).first();
+  await step.scrollIntoViewIfNeeded();
+  await step.click();
+  const stepDetail = page.locator('.activity .step-detail').first();
+  assert.equal((await stepDetail.locator('.step-input').innerText()).trim(), 'path: ' + target);
+  assert.match(await stepDetail.locator('.step-output').innerText(), /READ_ONLY_FIXTURE/);
+  assert.equal(await page.locator('.details-panel').count(), 0);
+  await stepDetail.getByRole('button', { name: '在执行详情中查看' }).click();
+  const stepEntry = page.locator('.details-panel .tool-detail[data-result-index]').filter({ hasText: 'read_file' });
+  await stepEntry.waitFor();
+  await expect.poll(() => stepEntry.evaluate(el => el.open)).toBe(true);
+  await expect.poll(() => stepEntry.locator('details.tool-input').evaluate(el => el.open)).toBe(true);
+  assert.equal((await stepEntry.locator('details.tool-input pre').innerText()).trim(), 'path: ' + target);
+  await expect.poll(() => stepEntry.evaluate(el => { const box = el.getBoundingClientRect(), panel = el.closest('.panel-content').getBoundingClientRect(); return box.top >= panel.top - 1 && box.top < panel.bottom; })).toBe(true);
+  passed('a tool row opens to its arguments and output, and its link opens the execution details at that call');
+  await page.keyboard.press('Escape');
+  await expect.poll(() => page.locator('.details-panel').count()).toBe(0);
   await page.getByRole('button', { name: '执行详情', exact: true }).click();
   const toolCard = page.locator('.tool-detail').filter({ hasText: 'read_file' });
   if (!(await toolCard.evaluate(el => el.open))) await toolCard.locator('summary').first().click();

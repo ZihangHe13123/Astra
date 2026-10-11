@@ -17,7 +17,7 @@ import { modeCommand, modeChoices, localCommandEntry } from "../local-mode.js";
 import { migrateBlankDraft } from "./drafts.js";
 import { ToolPreparation } from "./tool-preparation.js";
 import { SessionLogPanel, sameSource, recordChatSource, supportsSessionLog, type LogTarget, type SessionLogRecord, type SourceRef } from "./session-log.js";
-import { MessageList } from "./messages.js";
+import { MessageList, type OpenPanel } from "./messages.js";
 import { withActivity } from "./activity-state.js";
 import { DelegateHistory, DelegateSummary } from "./delegates.js";
 import { CommandInput } from "./command-input.js";
@@ -368,6 +368,11 @@ function App() {
   };
   const messages: Message[] = useMemo(() => preview ? preview.messages.map((m: Message) => ({ ...m, content: textContent(m.content) })) : state?.messages || [], [preview?.messages, state?.messages]);
   // Tool results the conversation cannot place (a restored history has only a list) keep their one-line summary.
+  // From a row in the conversation the tools panel opens at that row's call, as `/tool <n>` does.
+  const openPanelAt = useCallback<OpenPanel>((name, resultIndex) => {
+    if (name === "tools" && resultIndex) setSelection(old => ({ index: resultIndex, serial: old.serial + 1 }));
+    setPanel(name);
+  }, []);
   const unplacedTools = useMemo(() => preview || !state ? [] : withActivity(messages, state.tools).unplaced, [preview, messages, state?.tools]);
   const openLog = (target: { source_ref?: SourceRef; call_id?: string } = {}) => {
     if (!logSession) return;
@@ -504,7 +509,7 @@ function App() {
           {!messages.length && <Welcome info={preview ? undefined : state?.info.startup_banner} openModels={() => { void openModels(); }} showCommands={showCommands} run={value => { void command(value).catch(fail); }}/>}
           <EarlierResponseVersions messages={messages} controls={responseControls}/>
           {preview?.has_more && <button className="load-more" disabled={olderLoading} onClick={() => { void loadOlder(); }}>{olderLoading ? "加载中…" : "加载更早历史"}</button>}
-          <MessageList key={preview ? `preview:${preview.mode}:${preview.session_id}` : active || "blank"} messages={messages} runtime={preview ? undefined : state?.id} timeline={prefs.timeline} reasoning={model?.show_reasoning !== false} scroller={scroller} follow={follow} responses={responseControls} fail={fail} openLog={logSession ? source_ref => openLog({ source_ref }) : undefined} locate={chatLocation} tools={preview ? undefined : state?.tools} changes={preview ? undefined : state?.turnChanges} openPanel={preview ? undefined : setPanel}/>
+          <MessageList key={preview ? `preview:${preview.mode}:${preview.session_id}` : active || "blank"} messages={messages} runtime={preview ? undefined : state?.id} timeline={prefs.timeline} reasoning={model?.show_reasoning !== false} scroller={scroller} follow={follow} responses={responseControls} fail={fail} openLog={logSession ? source_ref => openLog({ source_ref }) : undefined} locate={chatLocation} tools={preview ? undefined : state?.tools} changes={preview ? undefined : state?.turnChanges} openPanel={preview ? undefined : openPanelAt}/>
           {preview?.delegates?.length > 0 && <DelegateHistory key={`${preview.mode}:${preview.session_id}`} delegates={preview.delegates} fail={fail}/>}
           {state && !preview && <><ToolPreparation preparation={state.preparation}/>{unplacedTools.length > 0 && <button className="execution-summary" onClick={() => setPanel("tools")}><Terminal size={15}/>{unplacedTools.some(t => t.status === "running") ? "工具正在执行" : `${unplacedTools.length} 项工具结果`}<ChevronRight size={15}/></button>}
             <DelegateSummary delegates={state.delegates} open={() => setPanel("tools")}/>
