@@ -64,6 +64,37 @@ test("tool parameter preparation is visible before execution and clears on cance
   } finally { h.app.unmount(); }
 });
 
+test("stream recovery separates reasoning attempts and keeps the active turn busy", async () => {
+  const h = await setup(160, 50);
+  try {
+    h.child.event({ type: "model_info", model: "test", show_reasoning: true, total_tokens: 0, context_pct: 0 });
+    await h.submit("recover this response");
+    h.child.event({ type: "reasoning", content: "Abandoned reasoning" });
+    h.child.event({ type: "tool_preparing", attempt_id: "old", state: "preparing", calls: [
+      { index: 0, call_id: "pending", name: "write_file", summary: "unfinished.txt", argument_chars: 20 },
+    ] });
+    await settle();
+    h.child.event({ type: "tool_preparing", attempt_id: "old", state: "discarded", calls: [] });
+    h.child.event({ type: "error", recoverable: true, code: "stream_closed", message: "Retrying current response" });
+    h.child.event({ type: "reasoning", content: "Recovered reasoning" });
+    await settle();
+    const frame = h.frame();
+    assert.match(frame, /Abandoned reasoning/);
+    assert.match(frame, /STREAM CLOSED/);
+    assert.match(frame, /Recovered reasoning/);
+    assert.ok(frame.indexOf("Abandoned reasoning") < frame.indexOf("STREAM CLOSED"), frame);
+    assert.ok(frame.indexOf("STREAM CLOSED") < frame.indexOf("Recovered reasoning"), frame);
+    assert.doesNotMatch(frame, /准备 WRITE_FILE|Abandoned reasoningRecovered reasoning/);
+    assert.match(frame, /THINKING/);
+    assert.equal(h.child.commands.filter((command) => command.type === "message").length, 1);
+    h.child.event({ type: "chunk", content: "Completed answer" });
+    h.child.event({ type: "done" });
+    await settle();
+    assert.match(h.frame(), /Completed answer/);
+    assert.match(h.frame(), /READY/);
+  } finally { h.app.unmount(); }
+});
+
 test("idle teammate stops activity and a finished parent accepts a fresh turn", async () => {
   const h = await setup(143, 40);
   const dock = () => h.frame().split("\n").filter((line) => /\bCTX \d+%/.test(line)).join("\n");

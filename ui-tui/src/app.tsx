@@ -1632,8 +1632,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           setActiveTools((current) => current.filter((tool) => tool.id !== event.call_id));
         }
         if (event.recoverable) {
-          flushStreamRole("assistant");
-          assistantStartedRef.current = false;
+          completeTurn();
           const label = event.code
             ? `${event.code.replaceAll("_", " ").toUpperCase()}${event.tool_name ? ` · ${event.tool_name}` : ""}`
             : event.message;
@@ -1648,7 +1647,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         }
         break;
     }
-  }, [addMessage, appendStreamChunk, clearStreamingDisplay, closeToolDetails, columns, finishTurn, flushStreamRole, railLayout, runtimeMode, approvalRequests.length, updateActiveTask]);
+  }, [addMessage, appendStreamChunk, clearStreamingDisplay, closeToolDetails, columns, completeTurn, finishTurn, flushStreamRole, railLayout, runtimeMode, approvalRequests.length, updateActiveTask]);
 
   // ── refs to decouple backend lifecycle from React deps ──
   useLayoutEffect(() => { runtimeTimingRef.current?.commit(); });

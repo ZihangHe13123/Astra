@@ -162,7 +162,7 @@ def test_codex_preview_does_not_turn_unfinished_item_into_executable_call(tmp_pa
         {"type": "response.output_item.added", "output_index": 0, "item": item},
         {"type": "response.function_call_arguments.delta", "output_index": 0, "delta": '{"path":"x"'},
     )
-    llm = CodexProvider(config(), transport=httpx.MockTransport(lambda _: httpx.Response(200, content=events)))
+    llm = CodexProvider(config(max_retries=0), transport=httpx.MockTransport(lambda _: httpx.Response(200, content=events)))
 
     async def run():
         output = []

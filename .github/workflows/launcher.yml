@@ -5,6 +5,10 @@ on:
   push:
     paths:
       - 'agent/launcher/**'
+      - 'agent/runtime/codex_provider.py'
+      - 'agent/runtime/provider_errors.py'
+      - 'tests/test_codex*.py'
+      - 'tests/test_provider_errors.py'
       - 'agent/runtime/paths.py'
       - 'agent/runtime/session_recall.py'
       - 'agent/runtime/context_index/embedding_worker.py'
@@ -76,6 +80,10 @@ on:
   pull_request:
     paths:
       - 'agent/launcher/**'
+      - 'agent/runtime/codex_provider.py'
+      - 'agent/runtime/provider_errors.py'
+      - 'tests/test_codex*.py'
+      - 'tests/test_provider_errors.py'
       - 'agent/runtime/paths.py'
       - 'agent/runtime/session_recall.py'
       - 'agent/runtime/context_index/embedding_worker.py'
@@ -209,6 +217,7 @@ jobs:
           tests/test_browser_upload.py tests/test_backend_conversation_commands.py
           tests/test_event_writer.py tests/test_event_stream.py tests/test_backend_terminal_shutdown.py
           tests/test_tool_preparation.py tests/test_stream_inspection.py tests/test_gui_session_log.py
+          tests/test_codex_provider.py tests/test_codex_stream_recovery.py tests/test_provider_errors.py
           tests/test_file_change_time.py tests/test_gui_history_index.py
           tests/test_backend_task_protocol.py::test_backend_exposes_tasks_command_without_blocking_protocol
           tests/test_backend_task_protocol.py::test_protocol_fixture_drains_stderr_during_startup

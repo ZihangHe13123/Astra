@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import math
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import cast
 
@@ -88,6 +89,64 @@ def summarize_provider_error(exc: BaseException) -> SafeProviderError:
         status_code=status,
         request_id=_safe_request_id(exc),
     )
+
+
+def transport_error_diagnostics(exc: BaseException, *, response=None) -> dict:
+    """Keep the transport cause chain and OS codes without logging payloads.
+
+    Exception strings can contain credentials, URLs or provider text. Only
+    recognize fixed transport reasons; never copy arbitrary exception text.
+    errno works on POSIX and winerror preserves the native Windows socket code.
+    """
+    chain, seen = [], set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen and len(chain) < 6:
+        seen.add(id(current))
+        item: dict[str, object] = {"type": _safe_error_type(current)}
+        code = _safe_getattr(current, "code")
+        if type(code) is str and _SAFE_IDENTIFIER.fullmatch(code):
+            item["code"] = code
+        for field in ("errno", "winerror"):
+            value = _safe_getattr(current, field)
+            if type(value) is int and -(2**31) <= value < 2**31:
+                item[field] = value
+        try:
+            text = str(current).lower()[:2048]
+        except Exception:
+            text = ""
+        for marker, reason in (
+            ("stream ended before response.completed", "eof_before_completion"),
+            ("did not provide a completed response", "done_without_completion"),
+            ("incomplete chunked read", "incomplete_chunked_read"),
+            ("peer closed connection", "peer_closed_connection"),
+            ("server disconnected", "server_disconnected"),
+            ("connection reset", "connection_reset"),
+            ("connection refused", "connection_refused"),
+            ("certificate verify failed", "certificate_verify_failed"),
+            ("timed out", "timed_out"),
+        ):
+            if marker in text:
+                item["reason"] = reason
+                break
+        chain.append(item)
+        cause = _safe_getattr(current, "__cause__")
+        if cause is None and not _safe_getattr(current, "__suppress_context__"):
+            cause = _safe_getattr(current, "__context__")
+        current = cause if isinstance(cause, BaseException) else None
+    summary = summarize_provider_error(exc)
+    details = {"causes": chain, "status": summary.status_code, "request_id": summary.request_id}
+    if response is not None:
+        details["status"] = _status_scalar(_safe_getattr(response, "status_code"))
+        headers = _safe_getattr(response, "headers")
+        for name in ("x-request-id", "x-openai-request-id"):
+            try:
+                value = headers.get(name) if isinstance(headers, Mapping) else None
+            except Exception:
+                value = None
+            if type(value) is str and _SAFE_IDENTIFIER.fullmatch(value):
+                details["request_id"] = value
+                break
+    return details
 
 
 def _safe_attempt(value: object) -> int | None:
