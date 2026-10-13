@@ -323,14 +323,14 @@ def test_stale_opaque_state_never_replays(change):
 
 @pytest.mark.parametrize("ending", [b"", sse({"type": "response.incomplete", "response": {"status": "incomplete"}}),
     sse({"type": "response.failed"}), sse(terminal([{ "type": "function_call", "call_id": "a", "name": "tool", "arguments": '{"broken":'}]))])
-def test_incomplete_stream_never_dispatches_tools_or_retries(ending):
+def test_incomplete_stream_never_dispatches_tools_when_recovery_is_disabled(ending):
     signed_in()
     seen, emitted = [], []
     def handler(request):
         seen.append(request)
         return httpx.Response(200, content=sse({"type": "response.function_call_arguments.delta", "output_index": 0, "delta": '{"x":'}) + ending)
     async def work():
-        provider = CodexProvider(config(), transport=httpx.MockTransport(handler))
+        provider = CodexProvider(config(max_retries=0), transport=httpx.MockTransport(handler))
         with pytest.raises(LLMResponseError):
             async for e in provider.chat_stream([{"role": "user", "content": "test"}]):
                 emitted.append(e)

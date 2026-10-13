@@ -4757,6 +4757,8 @@ class ReActAgent(AgentBase):
                             elif event["type"] == "generation_recovery":
                                 final_text = final_reasoning = ""
                                 stream_phase = uuid.uuid4().hex
+                                if emit_events:
+                                    yield with_request({**event, "type": "error", "recoverable": True})
                             elif event["type"] in {"generation_stats", "generation_progress"} and emit_events:
                                 yield with_request(event)
                     finally:

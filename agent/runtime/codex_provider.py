@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import logging
+import uuid
 from collections.abc import AsyncGenerator
 from dataclasses import replace
 
@@ -12,8 +14,22 @@ from .codex_wire import OutputStream, ToolStream, completed_response, input_item
 from .llm import (LLMIdleTimeout, LLMResponseError, _RequestBudget, _RequestCapTimeout,
                   _StreamReadTiming, _messages_for_capabilities)
 from .network import active_proxy_for_url
+from .provider_errors import transport_error_diagnostics
 from .token_estimator import estimate_messages_tokens
 from .tool_preparation import with_tool_preparation
+
+logger = logging.getLogger(__name__)
+
+
+async def _close_transport(resource, *, request_key: str, component: str, response=None) -> None:
+    try:
+        await resource.aclose()
+    except Exception as exc:
+        # HTTPX close can expose raw httpcore/OSError exceptions. Cleanup must
+        # not replace a validated result or replay its tools. Cancellation and
+        # GeneratorExit remain authoritative because they are BaseExceptions.
+        logger.warning("codex %s close failed request=%s diagnostics=%s", component, request_key,
+                       json.dumps(transport_error_diagnostics(exc, response=response), sort_keys=True))
 
 
 class CodexRequestError(LLMResponseError):
@@ -88,17 +104,20 @@ class CodexProvider:
 
     async def _chat_stream(self, messages, tools=None, tool_choice=None, *, omit_tool_choice=False) -> AsyncGenerator[dict, None]:
         budget = _RequestBudget.from_policy(self.config.overall_timeout, self.config.max_retries)
-        visible = False
+        request_key = uuid.uuid4().hex[:12]
         timeout = httpx.Timeout(connect=self.config.connect_timeout, read=None, write=self.config.timeout,
                                 pool=self.config.connect_timeout)
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False, transport=self.transport,
-                proxy=active_proxy_for_url(codex_auth.BASE_URL) if self.transport is None else None) as client:
-            while budget.can_attempt():
+        client = httpx.AsyncClient(timeout=timeout, follow_redirects=False, trust_env=False, transport=self.transport,
+            proxy=active_proxy_for_url(codex_auth.BASE_URL) if self.transport is None else None)
+        try:
+            while True:
                 yield {"type": "_tool_preparation_reset"}
                 budget.begin_attempt()
                 data = await budget.run(lambda: codex_auth.credentials(client=client), cap=30)
                 body = self._body(messages, tools, tool_choice, data["account_id"], omit_tool_choice)
                 response = None
+                visible = False
+                timing = _StreamReadTiming()
                 try:
                     for auth_attempt in range(2):
                         request = client.build_request("POST", codex_auth.BASE_URL + "/responses",
@@ -106,7 +125,7 @@ class CodexProvider:
                         response = await budget.run(lambda request=request: client.send(request, stream=True), cap=self.config.connect_timeout)
                         if response.status_code != 401 or auth_attempt:
                             break
-                        await response.aclose()
+                        await _close_transport(response, request_key=request_key, component="response", response=response)
                         data = await budget.run(lambda rejected=data["access_token"]: codex_auth.credentials(client=client,
                             rejected_token=rejected), cap=30)
                         body = self._body(messages, tools, tool_choice, data["account_id"], omit_tool_choice)
@@ -114,7 +133,12 @@ class CodexProvider:
                     if response.status_code != 200:
                         status = response.status_code
                         if status in {429, 500, 502, 503, 504} and budget.can_attempt():
-                            await response.aclose()
+                            logger.warning("codex request retry request=%s attempt=%s/%s diagnostics=%s",
+                                request_key, budget.attempts, budget.max_attempts,
+                                json.dumps(transport_error_diagnostics(
+                                    httpx.HTTPStatusError("retryable HTTP status", request=response.request, response=response),
+                                    response=response), sort_keys=True))
+                            await _close_transport(response, request_key=request_key, component="response", response=response)
                             await budget.backoff(min(8, 2 ** (budget.attempts - 1)))
                             continue
                         detail = ("Run astra auth login again." if status == 401 else
@@ -123,7 +147,6 @@ class CodexProvider:
                                   "Check the selected model and account, then retry.")
                         raise codex_auth.CodexAuthError(f"Codex request failed (HTTP {status}). {detail}")
                     lines = response.aiter_lines().__aiter__()
-                    timing = _StreamReadTiming()
                     frame, content, reasoning = [], "", ""
                     summary_part = None
                     summaries = {}
@@ -176,7 +199,7 @@ class CodexProvider:
                                 yield {"type": "reasoning", "content": delta}
                         elif kind in {"response.function_call_arguments.delta", "response.output_item.done"}:
                             timing.observe("tool")
-                            visible = True  # Never retry partially generated tool arguments.
+                            visible = True
                         elif kind in {"error", "response.failed", "response.incomplete"}:
                             raise LLMResponseError("incomplete_response", "Codex reported a failed or incomplete response.")
                         elif kind == "response.completed":
@@ -204,18 +227,45 @@ class CodexProvider:
                                         yield {"type": "reasoning", "content": prefix + delta}
                             result["reasoning_content"] = reasoning
                             calls = result.pop("tool_calls")
+                            if budget.attempts > 1:
+                                logger.info("codex stream recovered request=%s attempts=%s", request_key, budget.attempts)
                             yield {"type": "tool_calls" if calls else "done", "calls": calls, **result}
                             return
-                except _RequestCapTimeout as exc:
-                    raise LLMIdleTimeout("Codex made no progress before the connection/idle timeout.") from exc
-                except httpx.RequestError as exc:
-                    if visible or not budget.can_attempt():
-                        raise LLMResponseError("stream_closed", "Codex connection failed; partial calls were discarded.") from exc
-                    yield {"type": "_tool_preparation_reset"}
-                    await budget.backoff(min(8, 2 ** (budget.attempts - 1)))
+                except (_RequestCapTimeout, httpx.RequestError, LLMResponseError) as exc:
+                    # Only the pending model request is replayed. No executable
+                    # tool call leaves this provider before response.completed
+                    # and full batch validation, even if argument previews were
+                    # already shown. Semantic/validation failures stay terminal.
+                    transient = not isinstance(exc, LLMResponseError) or exc.code == "stream_closed"
+                    retry = transient and budget.can_attempt()
+                    diagnostics = json.dumps(transport_error_diagnostics(exc, response=response), sort_keys=True)
+                    logger.log(logging.WARNING if retry else logging.ERROR,
+                        "codex stream failed request=%s attempt=%s/%s retrying=%s visible=%s "
+                        "read_wait_seconds=%.3f idle_wait_seconds=%.3f last_chunk_kind=%s diagnostics=%s",
+                        request_key, budget.attempts, budget.max_attempts, retry, visible,
+                        timing.read_wait_seconds, timing.idle_wait_seconds, timing.last_chunk_kind, diagnostics)
+                    if not retry:
+                        if isinstance(exc, _RequestCapTimeout):
+                            raise LLMIdleTimeout("Codex made no progress before the connection/idle timeout. "
+                                                 f"Diagnostics: {diagnostics}") from exc
+                        if transient:
+                            raise LLMResponseError("stream_closed", "Codex connection failed; partial calls were discarded. "
+                                                   f"Diagnostics: {diagnostics}") from exc
+                        raise
                 finally:
                     if response is not None:
-                        await response.aclose()
+                        await _close_transport(response, request_key=request_key, component="response", response=response)
+                # Close the failed socket before waiting. Backoff and subsequent
+                # reads retain the original deadline and remain cancellable on
+                # Windows and POSIX without threads, signals or process restarts.
+                yield {"type": "_tool_preparation_reset"}
+                yield {"type": "generation_recovery", "code": "stream_closed",
+                       "message": f"Model connection interrupted; retrying the current response "
+                                  f"({budget.attempts}/{budget.max_attempts - 1}). "
+                                  "Completed tools will not be replayed; unfinished output was discarded."}
+                await budget.backoff(min(8, 2 ** (budget.attempts - 1)))
+        finally:
+            await _close_transport(client, request_key=request_key, component="client")
 
     async def chat(self, messages, tools=None, tool_choice=None, max_tokens=None) -> dict:
         stream = self.chat_stream(messages, tools, tool_choice)
