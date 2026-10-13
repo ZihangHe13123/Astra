@@ -63,7 +63,10 @@ def test_interrupted_attempt_closes_and_discards_before_retry(failure, monkeypat
         return httpx.Response(200, content=sse(terminal()))
 
     async def work():
-        provider = CodexProvider(config(max_retries=1, idle_timeout=.03), transport=httpx.MockTransport(handler))
+        # Leave time for the partial frames on busy Windows runners. Only the
+        # idle fixture should expire; EOF/DONE/read faults must win their race.
+        idle_timeout = 2 if failure == "idle" else 10
+        provider = CodexProvider(config(max_retries=1, idle_timeout=idle_timeout), transport=httpx.MockTransport(handler))
         return [e async for e in provider.chat_stream([{"role": "user", "content": "write"}])]
 
     events = asyncio.run(work())
