@@ -343,8 +343,8 @@ class SessionRecommendationSource:
             with open_readonly(self._database_path, self._deadline_ms) as connection:
                 if plan is not None:
                     set_read_window(connection, plan.cutoff, plan.time_start, plan.time_end, message_id=plan.message_id)
-                deadline = time.monotonic() + self._deadline_ms / 1000
-                connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+                deadline = time.perf_counter() + self._deadline_ms / 1000
+                connection.set_progress_handler(lambda: int(time.perf_counter() >= deadline), 1000)
                 session_columns = _validate_schema(connection)
                 resolved_session_id = self._resolve_current_session_id(
                     connection,

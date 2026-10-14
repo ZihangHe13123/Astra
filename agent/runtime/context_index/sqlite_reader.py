@@ -2,7 +2,7 @@
 
 import sqlite3
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import quote
@@ -21,7 +21,7 @@ def database_error_category(exc: BaseException) -> str:
 @contextmanager
 def observe_stage(stages: list[RetrievalStage], name: str) -> Iterator[None]:
     """Record fixed stage names and categories, never exception messages."""
-    started = time.monotonic()
+    started = time.perf_counter()
     error = ""
     try:
         yield
@@ -29,7 +29,7 @@ def observe_stage(stages: list[RetrievalStage], name: str) -> Iterator[None]:
         error = database_error_category(exc)
         raise
     finally:
-        stages.append(RetrievalStage(name, max(0.0, (time.monotonic() - started) * 1000), error))
+        stages.append(RetrievalStage(name, max(0.0, (time.perf_counter() - started) * 1000), error))
 
 
 class ReadBudget:
@@ -37,26 +37,28 @@ class ReadBudget:
 
     def __init__(self, connection: sqlite3.Connection, deadline_ms: int):
         self.connection = connection
-        self.deadline = time.monotonic() + max(0, deadline_ms) / 1000
+        # Python 3.11's Windows monotonic clock advances in ~15.6 ms ticks;
+        # perf_counter is also monotonic and preserves these short budgets.
+        self.deadline = time.perf_counter() + max(0, deadline_ms) / 1000
         self.stages: list[RetrievalStage] = []
         self._set_deadline(self.deadline)
 
     def _set_deadline(self, deadline: float) -> None:
-        self.connection.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+        self.connection.set_progress_handler(lambda: int(time.perf_counter() >= deadline), 1000)
 
     @contextmanager
     def pause_for_compute(self) -> Iterator[None]:
         """No SQL in this block; retain unused read time during bounded encode wait."""
-        remaining = max(0.0, self.deadline - time.monotonic())
+        remaining = max(0.0, self.deadline - time.perf_counter())
         try:
             yield
         finally:
-            self.deadline = time.monotonic() + remaining
+            self.deadline = time.perf_counter() + remaining
             self._set_deadline(self.deadline)
 
     @contextmanager
     def stage(self, name: str, share: float = 1.0) -> Iterator[None]:
-        started = time.monotonic()
+        started = time.perf_counter()
         self._set_deadline(min(self.deadline, started + max(0, self.deadline - started) * share))
         try:
             with observe_stage(self.stages, name):
@@ -83,7 +85,7 @@ def set_read_window(
 
 @contextmanager
 def open_readonly(
-    path: Path, deadline_ms: int = 75
+    path: Path, deadline_ms: int = 75, *, cancelled: Callable[[], bool] | None = None,
 ) -> Iterator[sqlite3.Connection]:
     """Open an existing SQLite database without creating or mutating it."""
     database_path = Path(path)
@@ -101,9 +103,9 @@ def open_readonly(
         # reads beyond this limit or on platforms without mmap support.
         connection.execute("PRAGMA mmap_size=134217728")
         set_read_window(connection)
-        deadline = time.monotonic() + max(0, deadline_ms) / 1000
+        deadline = time.perf_counter() + max(0, deadline_ms) / 1000
         connection.set_progress_handler(
-            lambda: int(time.monotonic() >= deadline),
+            lambda: int((cancelled is not None and cancelled()) or time.perf_counter() >= deadline),
             1000,
         )
         try:

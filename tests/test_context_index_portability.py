@@ -106,7 +106,7 @@ def test_relevance_timeout_does_not_discard_recency(monkeypatch, tmp_path):
     connection.commit()
     connection.close()
     clock = [0.0]
-    monkeypatch.setattr(session_source, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(session_source, 'time', SimpleNamespace(perf_counter=lambda: clock[0]))
     def slow_relevance(self, connection, *args, **kwargs):
         # Advance past the total source deadline, independent of channel order
         # or host speed, then exercise SQLite's actual progress interruption.

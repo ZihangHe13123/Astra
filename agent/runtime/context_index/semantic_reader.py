@@ -108,9 +108,9 @@ class SemanticReader:
             current = reader._resolve_current_session_id(db, session_id, has_source_session_key="source_session_key" in columns) or ""
             current_id = reader._current_message_id(db, current, content_fingerprint(plan.original))
             guards, _ = reader._pool_guards()
-            until = time.monotonic() + 0.06
+            until = time.perf_counter() + 0.06
             for offset in range(0, len(hits), 64):
-                if time.monotonic() >= until:
+                if time.perf_counter() >= until:
                     break
                 batch = hits[offset:offset + 64]
                 sql = reader._base_select("0", has_workspace_key="workspace_key" in columns).format(from_clause="messages m")
@@ -138,9 +138,9 @@ class SemanticReader:
         del session_id
         candidates = []
         with open_readonly(path, deadline_ms=60) as db:
-            until = time.monotonic() + 0.06
+            until = time.perf_counter() + 0.06
             for offset in range(0, len(hits), 64):
-                if time.monotonic() >= until:
+                if time.perf_counter() >= until:
                     break
                 batch = hits[offset:offset + 64]
                 rows = db.execute("SELECT * FROM memory_records WHERE id IN (" +

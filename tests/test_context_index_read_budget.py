@@ -25,7 +25,7 @@ def _checkpoint(db):
 
 def test_phase_timeout_leaves_reserved_time_but_never_renews_total_budget(monkeypatch):
     clock = [0.0]
-    monkeypatch.setattr(sqlite_reader, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(sqlite_reader, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
     with sqlite3.connect(":memory:") as db:
         budget = ReadBudget(db, 75)
         with pytest.raises(sqlite3.OperationalError, match="interrupted"), budget.stage("summary", 0.6):
@@ -43,7 +43,7 @@ def test_phase_timeout_leaves_reserved_time_but_never_renews_total_budget(monkey
 
 def test_compute_wait_keeps_only_unspent_sql_budget(monkeypatch):
     clock = [0.0]
-    monkeypatch.setattr(sqlite_reader, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(sqlite_reader, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
     with sqlite3.connect(":memory:") as db:
         budget = ReadBudget(db, 75)
         clock[0] = 0.060
@@ -65,7 +65,7 @@ def test_activity_summary_timeout_does_not_starve_events(tmp_path, monkeypatch):
     db.commit()
     db.close()
     clock = [0.0]
-    monkeypatch.setattr(sqlite_reader, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(sqlite_reader, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
     monkeypatch.setenv("ASTRA_CONTEXT_INDEX_EMBEDDING", "off")
     reader = ActivityRecommendationReader(path)
 

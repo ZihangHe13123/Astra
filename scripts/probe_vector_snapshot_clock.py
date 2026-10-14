@@ -81,7 +81,7 @@ def main() -> None:
         "tick_samples": {name: sample_clock(getattr(time, name)) for name in ("monotonic", "perf_counter")},
         "interpretation": [
             "Only sqlite_reader.time is replaced by a local clock proxy; the standard library time module is never modified.",
-            "Both clocks have the same passive observer. Baseline delegates to production time.monotonic; precise-clock delegates to time.perf_counter. The75ms value, progress interval, query, connection setup and matrix decoding are unchanged.",
+            "Both clocks have the same passive observer. The monotonic group reproduces the historical clock; the perf_counter group uses the precise clock. The75ms value, progress interval, query, connection setup and matrix decoding are unchanged.",
             "Application snapshot cache is cleared between samples; OS pagecache is not evicted. No retries or production cache/lock changes.",
             "Serial and barrier-synchronized three-source parallel modes each contain20 measured pairs with alternating clock order and2 retained warmup pairs.",
             "Only session and memory use sqlite_reader and its75ms deadline; activity retains its original reader without that SQL deadline.",
@@ -152,7 +152,7 @@ def main() -> None:
         assert bool(np.all(matrix[:, 1:] == np.float32(.5)))
 
     try:
-        sqlite_reader.time = SimpleNamespace(monotonic=observed_clock)
+        sqlite_reader.time = SimpleNamespace(monotonic=observed_clock, perf_counter=observed_clock)
         with ThreadPoolExecutor(max_workers=3) as pool:
             for index in range(measured + warmups):
                 modes = ("serial", "parallel") if index % 2 == 0 else ("parallel", "serial")
