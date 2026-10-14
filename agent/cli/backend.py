@@ -1,11 +1,47 @@
 """Backend — 被 Ink TUI 子进程调用，stdin/stdout JSON 协议"""
 
-from agent.runtime.paths import sessions_dir, state_path
-from agent.runtime.appshot_media import AppshotMediaError
-
 import sys
 import os
 import json
+import time
+
+
+def _write_event(event: dict) -> None:
+    payload = json.dumps(event, ensure_ascii=False) + "\n"
+    try:
+        fd = sys.stdout.fileno()
+    except (AttributeError, OSError):
+        # Embedded/test streams may not have a descriptor.
+        sys.stdout.write(payload)
+        sys.stdout.flush()
+        return
+    # No TextIOWrapper lock is held by the daemon writer when a vanished TUI
+    # leaves a blocked pipe behind. Shutdown can time out its join safely.
+    data = payload.encode("utf-8")
+    while data:
+        written = os.write(fd, data)
+        if written <= 0:
+            raise BrokenPipeError("Backend event pipe made no progress")
+        data = data[written:]
+
+
+def _handshake() -> None:
+    _write_event({"type": "backend_hello", "protocol_version": 1,
+                  "capabilities": ["ui_queries", "session_ownership", "gui_ready", "response_versions"]})
+
+
+_script_startup_started: float | None = None
+if __name__ == "__main__":
+    _script_startup_started = time.perf_counter()
+    from agent.launcher.locking import protect_backend
+    protect_backend()
+    # IPC is connected after update exclusion, before optional dependencies.
+    # gui_ready still marks completion of runtime and session initialization.
+    _handshake()
+
+from agent.runtime.paths import sessions_dir, state_path
+from agent.runtime.appshot_media import AppshotMediaError
+
 import sqlite3
 import asyncio
 import contextvars
@@ -15,16 +51,11 @@ import logging
 import platform
 import re
 import shlex
-import time
 import uuid
 import urllib.error
 import urllib.request
 from contextlib import nullcontext, suppress
 from pathlib import Path
-
-if __name__ == "__main__":
-    from agent.launcher.locking import protect_backend
-    protect_backend()
 
 from agent.runtime.process_env import hidden_process_creationflags
 from agent.runtime.provider_errors import (
@@ -684,10 +715,12 @@ def _save_handoff(agent: ReActAgent, task_store: TaskStore | None, *, notes: str
 
 async def main():
     global _event_writer
-    # Establish IPC before environment/model initialization, including failures.
-    _write_event({"type": "backend_hello", "protocol_version": 1,
-                  "capabilities": ["ui_queries", "session_ownership", "gui_ready", "response_versions"]})
-    startup_started = time.perf_counter()
+    # Imported callers still establish IPC here; the script already sent it
+    # before heavy imports. Keep those imports in the startup time accounting.
+    startup_started = _script_startup_started
+    if startup_started is None:
+        _handshake()
+        startup_started = time.perf_counter()
     load_project_env(PROJECT_ROOT)
     profile = RuntimeProfiler.from_env(PROJECT_ROOT)
     with profile.activate() if profile is not None else nullcontext():
@@ -4397,25 +4430,6 @@ async def _main(startup_started: float):
             _runtime_event_stream = None
 
     return exit_code
-
-
-def _write_event(event: dict) -> None:
-    payload = json.dumps(event, ensure_ascii=False) + "\n"
-    try:
-        fd = sys.stdout.fileno()
-    except (AttributeError, OSError):
-        # Embedded/test streams may not have a descriptor.
-        sys.stdout.write(payload)
-        sys.stdout.flush()
-        return
-    # No TextIOWrapper lock is held by the daemon writer when a vanished TUI
-    # leaves a blocked pipe behind. Shutdown can time out its join safely.
-    data = payload.encode("utf-8")
-    while data:
-        written = os.write(fd, data)
-        if written <= 0:
-            raise BrokenPipeError("Backend event pipe made no progress")
-        data = data[written:]
 
 
 async def _start_channel_manager(channel_manager: ChannelManager) -> OSError | None:
