@@ -221,6 +221,10 @@ jobs:
     if: github.repository == 'ZihangHe13123/Astra' && inputs.investigation == 'windows-headless'
     runs-on: windows-2025
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        host: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
     defaults:
       run:
         shell: bash
@@ -239,17 +243,18 @@ jobs:
           download-from-astral-mirror: false
       - name: Install locked dependencies
         run: uv sync --locked --extra dev --extra mcp --extra tracing --extra server --extra notebook
-      - name: Ten independent native extraction attempts
+      - name: Cold and warm extraction on each fresh Windows host
         env:
           TMPDIR: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
-        # Each pytest process and Chrome profile is fresh. Stop on the first
-        # failure, keep its diagnostics, and retain the production 30 s limit.
+        # Compare the first and second launch on ten independent runners. Each
+        # process/profile is fresh; stop a host at its first failure and retain
+        # partial diagnostics with the production 30 s limit unchanged.
         run: |
           uv run --locked --no-sync python -c "from agent.runtime.cdp_backend import find_chrome; assert find_chrome(), 'Native Chrome missing'"
           mkdir -p "$RUNNER_TEMP/headless-diagnostics"
-          for iteration in $(seq 1 10); do
+          for iteration in 1 2; do
             uv run --locked --no-sync python -m pytest -q -s \
               --basetemp="$RUNNER_TEMP/headless-pytest-$iteration" \
               --junitxml="$RUNNER_TEMP/headless-diagnostics/attempt-$iteration.xml" \
@@ -259,6 +264,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: headless-windows-py3.12
+          name: headless-windows-py3.12-host-${{ matrix.host }}
           path: ${{ runner.temp }}/headless-diagnostics/
           retention-days: 7
