@@ -226,9 +226,6 @@ jobs:
         shell: bash
     env:
       PYTHONUTF8: '1'
-      TMPDIR: ${{ runner.temp }}
-      TEMP: ${{ runner.temp }}
-      TMP: ${{ runner.temp }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -243,6 +240,10 @@ jobs:
       - name: Install locked dependencies
         run: uv sync --locked --extra dev --extra mcp --extra tracing --extra server --extra notebook
       - name: Ten independent native extraction attempts
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
         # Each pytest process and Chrome profile is fresh. Stop on the first
         # failure, keep its diagnostics, and retain the production 30 s limit.
         run: |
