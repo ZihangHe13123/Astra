@@ -223,6 +223,7 @@ jobs:
         run: >-
           uv run --locked --no-sync python -m pytest -q
           --basetemp="${{ runner.temp }}/astra-launcher-pytest"
+          --junitxml="${{ runner.temp }}/astra-launcher-results.xml"
           tests/test_launcher.py tests/test_launcher_windows_bootstrap.py
           tests/test_launcher_prerequisites.py tests/test_launcher_private_paths.py
           tests/test_launcher_posix_bootstrap.py
@@ -260,3 +261,10 @@ jobs:
           tests/test_browser_control_management.py tests/test_capabilities.py
       - name: Exercise Browser Control extension state and permission contracts
         run: node --test browser-control-extension/tests/control.test.mjs browser-control-extension/tests/worker.test.mjs
+      - name: Preserve native launcher test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: launcher-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: ${{ runner.temp }}/astra-launcher-results.xml
+          retention-days: 7
