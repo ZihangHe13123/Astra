@@ -4668,11 +4668,9 @@ class ReActAgent(AgentBase):
                             "message": "Background subagent results joined.",
                         })
                 if envelopes:
-                    if (
-                        self.context.messages
-                        and self.context.messages[-1].get("role") == "assistant"
-                    ):
-                        self.context.messages.pop()
+                    # The draft answer gives way to one written with the results; removed
+                    # through the context, so the saved history loses it too.
+                    self.context.remove_last_message(role="assistant")
                     for envelope in envelopes:
                         self.context.add_user(envelope, provenance="delegate")
                     recovery_overlay = (
