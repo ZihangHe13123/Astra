@@ -26,7 +26,7 @@ npm --prefix ui-tui ci
 
 统一入口 `astra setup` 使用 `uv sync --locked --inexact`，记录启用的 extras 和依赖是否需要更新，执行锁定依赖安装及界面构建；仍会检查依赖冲突。上述手动命令适合开发与发布检查，之后可运行 `astra setup` 记录验证过的环境。
 
-桌面开发使用 Node.js 22.12+，运行 `astra setup --gui --extra dev`。
+桌面开发使用 Node.js 22.19+，运行 `astra setup --gui --extra dev`。
 GUI 验证命令见[桌面开发检查](gui.md#development-checks)。普通发布检查会先构建和测试 `ui-core` 再检查 TUI；GUI 验证单独启用。
 
 Python wheel 包含 Agent、内置模型配置和 Session Recall。Ink 和 Electron 界面、仓库内技能和 macOS 原生辅助程序仍需要源码安装及各自的准备步骤。

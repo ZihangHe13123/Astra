@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import tempfile
 import threading
 import time
@@ -26,6 +27,7 @@ class CapturedFile:
     existed: bool
     before: bytes
     before_sha256: str
+    before_mode: int | None = None
 
 
 @dataclass
@@ -89,7 +91,8 @@ class FileCheckpointStore:
                 continue
             seen.add(key)
             existed = path.is_file()
-            size = path.stat().st_size if existed else 0
+            info = path.stat() if existed else None
+            size = info.st_size if info is not None else 0
             if size > self.max_file_bytes or total + size > self.max_total_bytes:
                 continue
             before = path.read_bytes() if existed else b""
@@ -100,6 +103,7 @@ class FileCheckpointStore:
                 existed=existed,
                 before=before,
                 before_sha256=_sha(before) if existed else "",
+                before_mode=stat.S_IMODE(info.st_mode) if info is not None else None,
             ))
         if not files and not skipped_paths:
             return None
@@ -123,7 +127,9 @@ class FileCheckpointStore:
                 continue
             after = captured.path.read_bytes() if exists_after else b""
             after_sha = _sha(after) if exists_after else ""
-            if captured.existed == exists_after and captured.before_sha256 == after_sha:
+            after_mode = stat.S_IMODE(captured.path.stat().st_mode) if exists_after else None
+            if (captured.existed == exists_after and captured.before_sha256 == after_sha
+                    and captured.before_mode == after_mode):
                 continue
             changed.append(captured)
             entries.append({
@@ -132,6 +138,8 @@ class FileCheckpointStore:
                 "before_sha256": captured.before_sha256,
                 "exists_after": exists_after,
                 "after_sha256": after_sha,
+                "before_mode": captured.before_mode,
+                "after_mode": after_mode,
                 "backup": f"{len(changed) - 1}.before.bin" if captured.existed else "",
             })
         if not entries:
@@ -204,7 +212,9 @@ class FileCheckpointStore:
             target = self._resolve(str(entry.get("path") or ""))
             exists = target.is_file()
             current_sha = _sha(target.read_bytes()) if exists else ""
-            if exists != bool(entry.get("exists_after")) or current_sha != str(entry.get("after_sha256") or ""):
+            current_mode = stat.S_IMODE(target.stat().st_mode) if exists else None
+            if (exists != bool(entry.get("exists_after")) or current_sha != str(entry.get("after_sha256") or "")
+                    or ("after_mode" in entry and current_mode != entry["after_mode"])):
                 raise RuntimeError(
                     f"restore conflict: {entry.get('path')} changed after checkpoint; "
                     "refusing to overwrite user or later Agent edits"
@@ -215,31 +225,59 @@ class FileCheckpointStore:
                 raise RuntimeError(f"checkpoint backup hash mismatch: {entry.get('path')}")
             resolved.append((target, entry, backup))
 
-        rollback: list[tuple[Path, bool, bytes]] = []
+        rollback: list[tuple[Path, bool, bytes, int | None, bytes | None, int | None]] = []
         restored: list[str] = []
         try:
             for target, entry, backup in resolved:
                 existed = target.is_file()
                 current = target.read_bytes() if existed else b""
-                rollback.append((target, existed, current))
+                current_mode = stat.S_IMODE(target.stat().st_mode) if existed else None
+                if (existed != bool(entry.get("exists_after"))
+                        or (_sha(current) if existed else "") != str(entry.get("after_sha256") or "")
+                        or ("after_mode" in entry and current_mode != entry["after_mode"])):
+                    raise RuntimeError(f"restore conflict: {entry.get('path')} changed while preparing restore")
                 if bool(entry.get("existed_before")):
                     assert backup is not None
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as handle:
-                        temporary = Path(handle.name)
-                        handle.write(backup)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    os.replace(temporary, target)
+                    # Old manifests did not record permissions. Preserve the
+                    # current file's mode, or use private permissions if deleted.
+                    mode = entry.get("before_mode")
+                    if mode is None:
+                        mode = current_mode if current_mode is not None else 0o600
+                    _replace_bytes(target, backup, mode)
                 else:
+                    mode = None
                     target.unlink(missing_ok=True)
+                rollback.append((target, existed, current, current_mode, backup, mode))
                 restored.append(str(entry.get("path")))
         except Exception:
-            for target, existed, content in reversed(rollback):
+            for target, existed, content, mode, restored_content, restored_mode in reversed(rollback):
+                # A failed batch must not undo a user's edit made after an
+                # earlier member was restored successfully.
+                if (target.is_file() != (restored_content is not None)
+                        or (restored_content is not None and (
+                            target.read_bytes() != restored_content
+                            or stat.S_IMODE(target.stat().st_mode) != restored_mode))):
+                    continue
                 if existed:
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_bytes(content)
+                    _replace_bytes(target, content, mode if mode is not None else 0o600)
                 else:
                     target.unlink(missing_ok=True)
             raise
         return {"checkpoint_id": checkpoint_id, "restored": restored, "status": "restored"}
+
+
+def _replace_bytes(target: Path, content: bytes, mode: int) -> None:
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as handle:
+            temporary = Path(handle.name)
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary.chmod(mode)
+        os.replace(temporary, target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)

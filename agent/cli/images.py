@@ -49,10 +49,12 @@ def build_user_message_content(text: str, max_bytes: int = 10 * 1024 * 1024) -> 
     if not attachments:
         return [ContentBlock.text(text)]
 
-    prompt = _remove_spans(text, [span for _path, span in attachments]).strip()
-    prompt = re.sub(r"\s+", " ", prompt)
-    prompt = re.sub(r"^/image\b", "", prompt, flags=re.IGNORECASE).strip()
-    blocks = [ContentBlock.text(prompt)] if prompt else [ContentBlock.text("Describe this image.")]
+    prompt = _remove_spans(text, [span for _path, span in attachments])
+    # Ordinary messages keep their exact text outside attachment spans, including
+    # code indentation and line breaks. The explicit command retains its syntax.
+    if re.match(r"^/image\b", prompt, flags=re.IGNORECASE):
+        prompt = re.sub(r"^/image\b", "", prompt, flags=re.IGNORECASE).strip()
+    blocks = [ContentBlock.text(prompt)] if prompt.strip() else [ContentBlock.text("Describe this image.")]
     for path, _span in attachments:
         image_blocks = build_image_message_content(str(path), max_bytes=max_bytes)
         blocks.extend(block for block in image_blocks if block.type == "image_url")

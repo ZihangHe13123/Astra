@@ -9,6 +9,9 @@ import { createBackendEventReceiver, EventDeliveryState } from "@astra/ui-core/b
 import { modeCommand } from "../local-mode.js";
 import { createBackendHandshake } from "@astra/ui-core/backend-handshake";
 
+/** A local preflight refusal proves that no bytes for this request were written. */
+class BackendWriteRefused extends Error {}
+
 export class Runtime {
   readonly id = randomUUID();
   state: SessionState;
@@ -198,12 +201,18 @@ export class Runtime {
       this.submissions.set(sid, pending);
       this.accept({ type: "gui_user", text: command.type === "message" ? command.text : `${command.prompt}\n\n📎 ${command.path}`, submission_id: sid });
       try { this.write(command); }
-      catch (error) { clearTimeout(pending.timer); this.submissions.delete(sid); reject(error); }
+      catch (error) {
+        clearTimeout(pending.timer); this.submissions.delete(sid);
+        this.accept(error instanceof BackendWriteRefused
+          ? { type: "message_rejected", submission_id: sid, reason: error.message }
+          : { type: "submission_status", submission_id: sid, status: "unknown" });
+        reject(error);
+      }
     });
   }
   write(command: UIEvent) {
-    if (!this.child || this.child.stdin.destroyed || this.child.stdin.writableEnded) throw new Error("Backend disconnected");
-    if (this.child.stdin.writableLength > 4 * 1024 * 1024) throw new Error("Backend input is busy; request was not sent");
+    if (!this.child || this.child.stdin.destroyed || this.child.stdin.writableEnded) throw new BackendWriteRefused("Backend disconnected; request was not sent");
+    if (this.child.stdin.writableLength > 4 * 1024 * 1024) throw new BackendWriteRefused("Backend input is busy; request was not sent");
     this.child.stdin.write(JSON.stringify(command) + "\n");
   }
   query(method: string, params: Record<string, unknown>): Promise<any> {

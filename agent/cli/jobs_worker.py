@@ -5,6 +5,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import signal
+import sys
+import threading
 import time
 from pathlib import Path
 
@@ -83,6 +86,7 @@ async def run_check(store: JobStore, run: dict) -> None:
     agent.tool_allowlist = names
     agent.context.max_prompt_tokens = prompt_token_budget(
         profile.context_limit, config.max_tokens, model=config.model, provider=config.provider,
+        auto_compact_token_limit=config.auto_compact_token_limit,
     )
     agent.context.set_session(str(root / "session.json"))
     output = ""
@@ -103,6 +107,11 @@ async def run_check(store: JobStore, run: dict) -> None:
             elif event.get("type") == "error":
                 # Provider errors may embed URLs or secrets; keep the public code only.
                 error = str(event.get("code") or "scheduled_check_failed")[:120]
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            # ReAct can turn cancellation into a final error event. It is still
+            # an interrupted occurrence, not a durable failed/completed result.
+            raise asyncio.CancelledError
         await agent.context.save_async()
         if not output.strip() and not error:
             error = "scheduled_check_returned_no_result"
@@ -117,6 +126,22 @@ async def run_check(store: JobStore, run: dict) -> None:
             result = close()
             if asyncio.iscoroutine(result):
                 await result
+
+
+async def run_with_shutdown(store: JobStore, run: dict) -> None:
+    """Let provider cleanup run on POSIX TERM, including detached CLI groups."""
+    task = asyncio.current_task()
+    loop = asyncio.get_running_loop()
+    installed = sys.platform != "win32" and threading.current_thread() is threading.main_thread()
+    previous = signal.getsignal(signal.SIGTERM) if installed else None
+    if installed and task is not None and previous is not None:
+        loop.add_signal_handler(signal.SIGTERM, task.cancel)
+    try:
+        await run_check(store, run)
+    finally:
+        if installed and task is not None and previous is not None:
+            loop.remove_signal_handler(signal.SIGTERM)
+            signal.signal(signal.SIGTERM, previous)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -136,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
             if not store.start(args.run):
                 return 1
             try:
-                asyncio.run(run_check(store, store.run(args.run)))
+                asyncio.run(run_with_shutdown(store, store.run(args.run)))
             except Exception as exc:
                 store.finish(args.run, "failed", detail=f"Scheduled check failed: {type(exc).__name__}")
                 return 1

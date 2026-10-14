@@ -99,6 +99,7 @@ def _content_near_miss_suggestions(
     search: Path,
     needle: str,
     *,
+    access: FilesystemPolicy,
     include_ignored: bool = False,
     glob_filter: str = "*",
     limit: int = 3,
@@ -124,6 +125,9 @@ def _content_near_miss_suggestions(
         scanned += 1
         if scanned > max_entries:
             break
+        readable = _readable_search_path(candidate, access)
+        if readable is None:
+            continue
         if candidate.is_dir():
             continue
         relative = candidate.relative_to(search)
@@ -134,13 +138,13 @@ def _content_near_miss_suggestions(
         if not _search_glob_matches(relative.parts, glob_filter):
             continue
         try:
-            st = candidate.stat()
+            st = readable.stat()
         except OSError:
             continue
-        if st.st_size > 1024 * 1024:
+        if not stat.S_ISREG(st.st_mode) or st.st_size > 1024 * 1024:
             continue
         try:
-            with candidate.open("rb") as handle:
+            with readable.open("rb") as handle:
                 raw = handle.read(max_bytes_per_file)
         except OSError:
             continue
@@ -159,6 +163,7 @@ def _near_miss_suggestions(
     search: Path,
     needle: str,
     *,
+    access: FilesystemPolicy,
     include_ignored: bool = False,
     glob_filter: str = "*",
     dirname: str = "",
@@ -185,6 +190,8 @@ def _near_miss_suggestions(
         scanned += 1
         if scanned > max_entries:
             break
+        if _readable_search_path(candidate, access) is None:
+            continue
         if candidate.is_dir():
             continue
         relative = candidate.relative_to(search)
@@ -213,6 +220,17 @@ def _near_miss_suggestions(
         if len(suggestions) >= limit:
             break
     return suggestions[:limit]
+
+
+def _readable_search_path(candidate: Path, access: FilesystemPolicy) -> Path | None:
+    """A directory grant does not authorize a symlink's external target."""
+    try:
+        resolved = access.resolve(str(candidate))
+        if access.permission_request(str(resolved), write=False, operation="search") is not None:
+            return None
+        return resolved
+    except (OSError, ValueError, RuntimeError):
+        return None
 
 
 @dataclass(frozen=True)
@@ -1116,6 +1134,8 @@ def register_file_tools(
     ) -> str | ToolFailure:
         full = access.resolve(path, write=True)
         existed = full.exists()
+        existing_mode = stat.S_IMODE(full.stat().st_mode) if existed else None
+        normalized_expected = expected_sha256.strip().lower()
         if existed and not overwrite:
             return ToolFailure(
                 code="existing_file_requires_edit",
@@ -1128,7 +1148,6 @@ def register_file_tools(
                 details={"path": str(full)},
             )
         if existed:
-            normalized_expected = expected_sha256.strip().lower()
             if not normalized_expected:
                 return ToolFailure(
                     code="file_changed",
@@ -1175,6 +1194,18 @@ def register_file_tools(
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
+            if existing_mode is not None:
+                temporary.chmod(existing_mode)
+            if (full.exists() != existed or (existed and (
+                    hashlib.sha256(full.read_bytes()).hexdigest() != normalized_expected
+                    or stat.S_IMODE(full.stat().st_mode) != existing_mode))):
+                return ToolFailure(
+                    code="file_changed",
+                    message=f"File changed while preparing the write: {full}",
+                    retryable=True,
+                    recovery_hint="Read the current file before attempting another write.",
+                    details={"path": str(full)},
+                )
             os.replace(temporary, full)
             temporary = None
             checkpoint_id = _finalize_checkpoint(checkpoint)
@@ -1239,6 +1270,8 @@ def register_file_tools(
                                "Use a directory path for search_files; use read_file for a single file.", details={"path": str(search)})
         matches = []
         for match in search.rglob(pattern):
+            if _readable_search_path(match, access) is None:
+                continue
             relative = match.relative_to(search)
             if (
                 not include_ignored
@@ -1252,7 +1285,7 @@ def register_file_tools(
             dirname = pattern_parts[0] if len(pattern_parts) > 1 else ""
             needle = pattern_parts[-1]
             suggestions = _near_miss_suggestions(
-                search, needle, include_ignored=include_ignored, dirname=dirname
+                search, needle, access=access, include_ignored=include_ignored, dirname=dirname
             )
             if suggestions:
                 return (
@@ -1341,16 +1374,19 @@ def register_file_tools(
                     continue
                 glob_files += 1
                 fp = Path(dirpath_str) / fname
+                readable = _readable_search_path(fp, access)
+                if readable is None:
+                    continue
                 # Check size before reading
                 try:
-                    st = fp.stat()
+                    st = readable.stat()
                 except OSError:
                     continue
-                if st.st_size > _MAX_FILE_BYTES:
+                if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_FILE_BYTES:
                     continue
                 # Read once, then reject obvious binary content before decoding.
                 try:
-                    raw = fp.read_bytes()
+                    raw = readable.read_bytes()
                 except OSError:
                     continue
                 if b"\x00" in raw[:8192]:
@@ -1377,10 +1413,10 @@ def register_file_tools(
                     "against the path relative to the search directory, where '**/' spans directories."
                 )
             content_suggestions = _content_near_miss_suggestions(
-                search, pattern, include_ignored=include_ignored, glob_filter=glob
+                search, pattern, access=access, include_ignored=include_ignored, glob_filter=glob
             )
             suggestions = _near_miss_suggestions(
-                search, pattern, include_ignored=include_ignored, glob_filter=glob
+                search, pattern, access=access, include_ignored=include_ignored, glob_filter=glob
             )
             content_only = [
                 name for name in content_suggestions if name not in suggestions
@@ -1417,6 +1453,7 @@ def register_file_tools(
             return ToolFailure("invalid_arguments", "old must not be empty", False,
                                "Read the file and supply an exact non-empty old string; use write_file to create a file.")
         raw = full.read_bytes()
+        existing_mode = stat.S_IMODE(full.stat().st_mode)
         before_sha256 = hashlib.sha256(raw).hexdigest()
         normalized_expected = expected_sha256.strip().lower()
         if normalized_expected and normalized_expected != before_sha256:
@@ -1566,6 +1603,15 @@ def register_file_tools(
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
+            temporary.chmod(existing_mode)
+            if full.read_bytes() != raw or stat.S_IMODE(full.stat().st_mode) != existing_mode:
+                return ToolFailure(
+                    code="file_changed",
+                    message=f"File changed while preparing the edit: {full}",
+                    retryable=True,
+                    recovery_hint="Read the current file and regenerate the edit against its latest version.",
+                    details={"path": str(full)},
+                )
             os.replace(temporary, full)
             temporary = None
             checkpoint_id = _finalize_checkpoint(checkpoint)
@@ -2127,9 +2173,12 @@ def register_file_tools(
                 details={"write_id": write_id, "path": str(target)},
             )
         previous_text = ""
+        previous_bytes = b""
         target_existed = target.exists()
+        existing_mode = stat.S_IMODE(target.stat().st_mode) if target_existed else None
         if target_existed:
-            previous_text = target.read_text(encoding="utf-8", errors="replace")
+            previous_bytes = target.read_bytes()
+            previous_text = previous_bytes.decode("utf-8", errors="replace")
 
         target.parent.mkdir(parents=True, exist_ok=True)
         checkpoint = _capture_checkpoint(
@@ -2149,6 +2198,18 @@ def register_file_tools(
                 handle.write(payload)
                 handle.flush()
                 os.fsync(handle.fileno())
+            if existing_mode is not None:
+                sibling_temp.chmod(existing_mode)
+            if (target.exists() != target_existed or (target_existed and (
+                    target.read_bytes() != previous_bytes
+                    or stat.S_IMODE(target.stat().st_mode) != existing_mode))):
+                return ToolFailure(
+                    code="file_changed",
+                    message=f"File changed while preparing the commit: {target}",
+                    retryable=True,
+                    recovery_hint="Read the current file before committing this transaction again.",
+                    details={"write_id": write_id, "path": str(target)},
+                )
             os.replace(sibling_temp, target)
             sibling_temp = None
             checkpoint_id = _finalize_checkpoint(checkpoint)

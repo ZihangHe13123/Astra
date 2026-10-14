@@ -25,6 +25,7 @@ def token(account="test-account", exp=None):
 @pytest.fixture(autouse=True)
 def auth_home(tmp_path, monkeypatch):
     monkeypatch.setenv("ASTRA_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("AGENT_USER_MODELS_FILE", str(tmp_path / "models.yaml"))
 
 
 def signed_in(**overrides):
@@ -240,10 +241,11 @@ def test_account_catalog_normalizes_capabilities_and_scopes_cache(monkeypatch):
     async def fetch():
         def handler(request):
             assert request.headers["ChatGPT-Account-ID"] == "test-account"
-            assert request.url.params["client_version"] == "0.155.0"
+            assert tuple(map(int, request.url.params["client_version"].split("."))) >= (0, 159, 1)
             return httpx.Response(200, json={"models": [
-                {"slug": "test-codex", "context_window": 128000, "input_modalities": ["text", "image"],
-                 "supported_reasoning_levels": [{"effort": "high"}, {"effort": "xhigh"}], "supported_in_api": False},
+                {"slug": "gpt-6.1-sol", "context_window": 272000, "input_modalities": ["text", "image"],
+                 "supported_reasoning_levels": [{"effort": effort} for effort in
+                    ("low", "medium", "high", "xhigh", "max", "ultra")], "supported_in_api": False},
                 {"slug": "hidden", "visibility": "hide"}]})
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             return await real_fetch(client=client)
@@ -251,14 +253,17 @@ def test_account_catalog_normalizes_capabilities_and_scopes_cache(monkeypatch):
     provider_id, catalog = asyncio.run(connections.connect_provider("codex"))
     assert provider_id == "codex" and len(catalog.entries) == 1
     profile = catalog.entries[0].profile
+    assert catalog.entries[0].key == "codex::gpt-6.1-sol"
     assert profile.provider == "openai-codex"
-    assert profile.context_limit == 128000
+    assert profile.context_limit == 272000
     assert {"vision", "tools", "reasoning"} <= profile.capabilities
-    assert profile.reasoning_levels == ("high", "xhigh")
-    assert profile.generation_settings()["reasoning_levels"] == ("high", "xhigh")
+    assert profile.reasoning_levels == ("low", "medium", "high", "xhigh", "max", "ultra")
+    assert profile.generation_settings()["reasoning_levels"] == profile.reasoning_levels
     assert "refresh-private" not in str(provider_connections.read_connections())
-    restored = model_catalog.configured_model_catalog().resolve_persisted("codex::test-codex")
-    assert restored and restored.profile.reasoning_levels == ("high", "xhigh")
+    restored = model_catalog.configured_model_catalog().resolve_persisted("codex::gpt-6.1-sol")
+    assert restored and restored.profile.reasoning_levels == profile.reasoning_levels
+    assert restored.profile.context_limit == 272000
+    assert "vision" in restored.profile.capabilities
 
 
 def test_stream_summary_text_usage_and_replay():

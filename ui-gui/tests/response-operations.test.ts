@@ -43,3 +43,31 @@ test('runtime blocks normal text and image admission during regeneration without
   operations.finish({ type: 'response_operation_result', request_id: 'request-1' });
   await result;
 });
+
+test('definite pre-write refusals terminate only that submission; ambiguous writes remain unknown without resending', async () => {
+  const { Runtime } = await import('../src/main/runtime.js');
+  const { initialSession } = await import('@astra/ui-core/session-state');
+  const { hasOngoingWork } = await import('../src/main/ongoing-work.js');
+  const { responseControlsBusy } = await import('@astra/ui-core/response-versions');
+  for (const fault of ['backpressure', 'closed', 'ambiguous']) {
+    let writes = 0;
+    const events: any[] = [];
+    const runtime = Object.assign(Object.create(Runtime.prototype), {
+      state: { ...initialSession('test'), status: 'ready', messages: [{ id: 'saved', role: 'assistant', content: 'saved reply' }] },
+      waiters: new Set(), submissions: new Map(), responseOperations: { active: false },
+      emit(_runtime: unknown, event: unknown) { events.push(event); },
+      child: { stdin: { destroyed: fault === 'closed', writableEnded: false,
+        writableLength: fault === 'backpressure' ? 4 * 1024 * 1024 + 1 : 0,
+        write() { writes++; throw new Error('unknown write outcome'); } } },
+    });
+    await assert.rejects(runtime.send({ type: 'message', text: 'retained draft', submission_id: 'new' }));
+    assert.equal(runtime.submissions.size, 0);
+    assert.equal(runtime.state.messages[0].content, 'saved reply');
+    assert.equal(runtime.state.messages[1].content, 'retained draft');
+    assert.equal(runtime.state.messages[1].submissionState, fault === 'ambiguous' ? 'unknown' : 'rejected');
+    assert.equal(hasOngoingWork(runtime.state), fault === 'ambiguous');
+    assert.equal(responseControlsBusy(runtime.state), fault === 'ambiguous');
+    assert.equal(events.at(-1).submission_id, 'new');
+    assert.equal(writes, fault === 'ambiguous' ? 1 : 0);
+  }
+});

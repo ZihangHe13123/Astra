@@ -1,6 +1,8 @@
 """Durable canonical subagent history, separate from audit transcripts."""
 
 import json
+import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -198,23 +200,42 @@ def test_live_lease_excludes_other_handles_and_processes(tmp_path):
     other.close()
 
 
-def test_killed_process_releases_conversation_lease(tmp_path):
+@pytest.mark.parametrize("via_wrapper", [False, True])
+def test_killed_process_releases_conversation_lease(tmp_path, via_wrapper):
     path = tmp_path / "session.json"
-    script = "from agent.runtime.session_store import SessionStore; from agent.runtime.subagent_conversation import SubagentConversation; import sys, time\nc=SubagentConversation(SessionStore.for_subagent(sys.argv[1], 'agent_123')); c.acquire(); print('ready', flush=True); time.sleep(60)\n"
-    process = subprocess.Popen([sys.executable, "-c", script, str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    script = "from agent.runtime.session_store import SessionStore; from agent.runtime.subagent_conversation import SubagentConversation; import os, sys, time\nc=SubagentConversation(SessionStore.for_subagent(sys.argv[1], 'agent_123')); c.acquire(); print(os.getpid(), flush=True); time.sleep(60)\n"
+    args = [sys.executable, "-c", script, str(path)]
+    if via_wrapper:
+        # Exercise a launcher PID that differs from the lock-owning interpreter,
+        # as Windows virtual-environment redirectors can do.
+        args = [sys.executable, "-c", "import subprocess, sys; sys.exit(subprocess.call(sys.argv[1:]))", *args]
+    process = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    owner_pid = None
     try:
-        assert process.stdout.readline().strip() == "ready"
+        owner_pid = int(process.stdout.readline().strip())
+        if via_wrapper:
+            assert owner_pid != process.pid
         conv = conversation(tmp_path)
         with pytest.raises(InstanceAlreadyRunning):
             conv.acquire()
-        process.kill()
+        # Kill the process that acquired the lease, not a venv launcher waiting
+        # for it. SIGTERM is abrupt termination here; the child has no handler.
+        os.kill(owner_pid, signal.SIGTERM)
         process.wait(timeout=5)
         conv.acquire()
         conv.close()
     finally:
         if process.poll() is None:
-            process.kill()
+            if owner_pid is not None:
+                try:
+                    os.kill(owner_pid, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            else:
+                process.kill()
         process.wait(timeout=5)
+        process.stdout.close()
+        process.stderr.close()
 
 
 def test_save_does_not_reread_entire_file_and_fsyncs(tmp_path, monkeypatch):

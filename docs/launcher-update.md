@@ -11,7 +11,7 @@ or automatic stable-release download is available.
 ## First installation
 
 Install Python 3.11+, Node.js 18+ for the TUI (including npm), and Git.
-The optional desktop GUI requires **Node.js 22.12.0+**, including subsequent
+The optional desktop GUI requires **Node.js 22.19.0+**, including subsequent
 updates and repairs once the GUI is enabled. Setup/update checks this before
 installing dependencies or pausing companion services. If Node is too old,
 upgrade to a supported Node.js LTS, open a new terminal (especially on Windows),

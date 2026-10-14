@@ -76,3 +76,35 @@ def test_real_backend_cancel_restores_command_admission(tmp_path):
         assert proc.poll() is None
     finally:
         _stop_protocol_backend(proc)
+
+
+def test_real_backend_rejected_branch_rename_keeps_command_loop_alive(tmp_path):
+    from agent.runtime.conversation_branches import ConversationBranches
+    from agent.runtime.message_source import message_source_ref
+
+    proc, _, _, wait_for = start(tmp_path)
+    try:
+        wait_for(lambda event: event.get("type") == "startup_banner", timeout=30)
+        path = tmp_path / "sessions" / "branched.json"
+        messages = [{"role": "user", "content": "question"},
+                    {"role": "assistant", "content": "original answer"}]
+        SessionStore(path).save({"messages": messages})
+        branches = ConversationBranches(path)
+        ticket = branches.prepare_retry(message_source_ref(messages[-1], 1), branch_id="main", expected_revision=0)
+        alternate = ticket["seed"]
+        alternate["messages"].append({"role": "assistant", "content": "alternate answer"})
+        SessionStore(path, branch_id=ticket["candidate_branch_id"]).save(alternate)
+        branches.finish_candidate(ticket["candidate_branch_id"])
+        before = {file: file.read_bytes() for file in SessionStore(path).related_paths() if file.is_file()}
+
+        send(proc, {"type": "command", "cmd": "/session rename branched renamed"})
+        rejected = wait_for(lambda event: event.get("type") == "tool_result" and event.get("name") == "session")
+        assert "reply versions" in rejected["error"] and not rejected["output"]
+        wait_for(lambda event: event.get("type") == "done")
+        send(proc, {"type": "command", "cmd": "/tasks"})
+        wait_for(lambda event: event.get("type") == "tool_result" and event.get("name") == "tasks")
+        assert proc.poll() is None
+        assert {file: file.read_bytes() for file in before} == before
+        assert not SessionStore(path.with_name("renamed.json")).exists
+    finally:
+        _stop_protocol_backend(proc)

@@ -1151,6 +1151,7 @@ async def _main(startup_started: float):
     limit = startup_profile.context_limit or _get_context_limit(startup_model)
     agent.context.max_prompt_tokens = prompt_token_budget(
         limit, llm_config.max_tokens, model=llm_config.model, provider=llm_config.provider,
+        auto_compact_token_limit=startup_profile.auto_compact_token_limit,
     )
     agent.llm.config.context_limit = limit
     agent.context.enforce_session_ownership = True
@@ -1931,6 +1932,7 @@ async def _main(startup_started: float):
     async def _refresh_model_catalog(provider_id: str | None = None, *, force: bool = False) -> ModelCatalog:
         nonlocal catalog
         refreshed = await discover_model_catalog(provider_id=provider_id, force=force)
+        _sync_current_context_budget(agent, refreshed, current_model_key)
         if provider_id:
             entries = tuple(e for e in catalog.entries if e.provider_id != provider_id) + refreshed.entries
             errors = {k: v for k, v in catalog.errors.items() if k != provider_id}

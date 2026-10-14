@@ -541,6 +541,8 @@ class LLMConfig:
     # Resolved provider context window, separate from proactive compression.
     # None keeps legacy/custom runtimes on their existing conservative budget.
     context_limit: int | None = None
+    # Local history compaction threshold, never an API request parameter.
+    auto_compact_token_limit: int | None = None
     connection_required: bool = False
 
     def __post_init__(self) -> None:
@@ -1386,6 +1388,7 @@ class LLMClient:
         """Switch API model/endpoint without managing the external model server."""
         # A direct model switch must not inherit the previous model capacity.
         generation_settings.setdefault("context_limit", None)
+        generation_settings.setdefault("auto_compact_token_limit", None)
         generation_settings.setdefault("connection_required", False)
         if provider_name and provider_name != self.config.provider:
             generation_settings.setdefault("reasoning_levels", ())
