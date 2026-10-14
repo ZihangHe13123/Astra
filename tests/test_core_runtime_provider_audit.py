@@ -17,6 +17,7 @@ import scripts.core_runtime_audit_results as audit_results
 import scripts.core_runtime_audit_worker as audit_worker
 import scripts.core_runtime_provider_audit as audit
 from agent.runtime.llm import LLMIdleTimeout
+from agent.runtime.process_env import pid_alive
 from scripts.core_runtime_provider_audit import probes_pass, redact_error, run_audit
 
 requires_posix_audit_files = pytest.mark.skipif(
@@ -67,7 +68,7 @@ def _stubborn_worker(connection, probe_id, payload):
     del connection, probe_id
     if os.name != "nt":
         signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    Path(payload["ready_path"]).write_text("ready", encoding="utf-8")
+    Path(payload["ready_path"]).write_text(json.dumps({"ready": True, "pid": os.getpid()}), encoding="utf-8")
     while True:
         time.sleep(0.1)
 
@@ -831,25 +832,31 @@ def test_live_03_caller_cancellation_closes_and_drains_child(monkeypatch):
 
 
 def test_probe_worker_hard_deadline_kills_stubborn_child(tmp_path):
-    started = time.monotonic()
     ready_path = tmp_path / "worker-ready"
+    timeout = 10.0
 
-    # macOS spawn imports this test module before entering the worker target.
-    # Leave enough deadline budget for a cold import so this test exercises the
-    # SIGTERM-resistant target rather than timing out during process startup.
+    # Spawn imports this test module before entering the worker target. Keep
+    # that startup inside the production deadline, with enough CI headroom to
+    # reach the SIGTERM-resistant target whose cleanup this test exercises.
     result = asyncio.run(
-        audit._run_probe_worker(
-            "LIVE-03",
-            {"ready_path": str(ready_path)},
-            2.0,
-            worker_target=_stubborn_worker,
+        asyncio.wait_for(
+            audit._run_probe_worker(
+                "LIVE-03",
+                {"ready_path": str(ready_path)},
+                timeout,
+                worker_target=_stubborn_worker,
+            ),
+            timeout=20.0,
         )
     )
 
-    assert time.monotonic() - started < 4.0
-    assert ready_path.read_text(encoding="utf-8") == "ready"
+    assert ready_path.is_file(), result
+    ready = json.loads(ready_path.read_text(encoding="utf-8"))
+    assert ready["ready"] is True and ready["pid"] != os.getpid()
     assert result["status"] == "external_failure"
     assert result["error_type"] == "ProbeTimeout"
+    assert result["duration_ms"] >= timeout * 1000
+    assert not pid_alive(ready["pid"])
     assert multiprocessing.active_children() == []
 
 
