@@ -28,7 +28,8 @@ from ..runtime_identity import runtime_identity
 from ..async_io import durable_io
 from ..session_store import SessionStore
 from ..subagent_conversation import ConversationCorrupt, SubagentConversation
-from ..subagent_replay import bound_messages
+from ..context_compressor import ContextCompressor
+from ..subagent_replay import bound_messages, compact_history
 from ..subagent_resume import (
     initial_conversation, persistent_messages, provider_messages, recovery_tool_risk,
     restore_conversation, tool_outcome_unknown,
@@ -1405,11 +1406,11 @@ async def _bounded_worker_request(
     elif additions:
         request[0] = {**request[0], "content":
                       str(request[0].get("content") or "") + "\n\n" + "\n\n".join(additions)}
-    return await asyncio.wait_for(
-        bound_messages(request, registry=registry, llm=llm,
-                       generation_reserve=max_tokens, tool_schemas=schemas),
-        timeout=timeout,
-    )
+    # asyncio.timeout, not wait_for: on Python 3.11 wait_for drops a cancellation that arrives
+    # as its inner call finishes, and bounding a request that fits finishes at once.
+    async with asyncio.timeout(timeout):
+        return await bound_messages(request, registry=registry, llm=llm,
+                                    generation_reserve=max_tokens, tool_schemas=schemas)
 
 
 def register_delegate_tools(
@@ -1622,6 +1623,33 @@ def register_delegate_tools(
         finalization_retries_used: set[str] = set()
         finalization_retry_reason = ""
         latest_assignment = spec.resume_instruction or str(resume_state.get("latest_assignment") or "")
+        # One compressor for the run, as the main agent has one for its conversation: it keeps
+        # the last summary and updates it instead of writing a new one each time.
+        compressor = ContextCompressor(llm)
+
+        async def _compact_history(schemas: list[dict], remaining: float) -> None:
+            """Compact the history the way the main agent compacts its own, and keep the result."""
+            if remaining <= 0:
+                return
+            # asyncio.timeout, not wait_for: on Python 3.11 wait_for drops a cancellation that
+            # arrives as its inner call finishes, and this call usually finishes at once.
+            try:
+                async with asyncio.timeout(remaining):
+                    compacted = await compact_history(
+                        messages, registry=sub_registry, llm=llm, compressor=compressor,
+                        generation_reserve=_investigation_max_tokens(llm), tool_schemas=schemas,
+                    )
+            except TimeoutError:
+                return
+            if compacted is messages:
+                return
+            before = len(messages)
+            messages[:] = compacted
+            _log("stdout", f"[compact] history compacted from {before} to {len(messages)} messages")
+            _progress_event("context_compacted", message=f"{before} → {len(messages)} messages")
+            _transcript({"type": "compaction", "turn": turns, "before": before, "after": len(messages)})
+            await _save_conversation()
+
         budget_tracker = TeamBudgetTracker(
             team_runtime, spec,
             model=str(getattr(getattr(llm, "config", None), "model", "") or spec.model or "unknown"),
@@ -2008,6 +2036,8 @@ def register_delegate_tools(
                 )
 
                 sub_schemas_list = guidance.schemas(sub_schemas_list, finalizing=finalizing)
+                if not finalizing:
+                    await _compact_history(sub_schemas_list, remaining - finalization_reserve)
 
                 # The report is written with the same output allowance and reasoning as any other turn.
                 request_max_tokens = _investigation_max_tokens(llm)

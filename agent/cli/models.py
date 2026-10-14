@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from agent.runtime.deepseek import DEEPSEEK_FLASH, DEEPSEEK_VISION_MODELS, canonical_deepseek_model
+# Re-exported for its callers here; the rule lives with the runtime, which subagents also use.
+from agent.runtime.prompt_budget import prompt_token_budget as prompt_token_budget
 from agent.runtime.vision_policy import VisionPreprocessPolicy, parse_vision_preprocess_policy
 
 try:
@@ -273,20 +275,3 @@ def resolve_profile_key(value: str, profiles: dict[str, ModelProfile]) -> str:
     return matches[0] if len(matches) == 1 else value
 
 
-def prompt_token_budget(context_limit: int, max_tokens: int, *, model: str = "", provider: str = "") -> int:
-    """Return the token threshold at which proactive compression begins.
-
-    GPT models and the Codex provider use the model window minus the output
-    reserve, without the additional 50% proactive threshold used by other
-    models. Preserve the configured completion allowance (with an 8K minimum),
-    scaling the reserve down only when it would consume the entire window.
-    """
-    limit = max(2, int(context_limit))
-    desired_reserve = max(8_192, int(max_tokens))
-    reserve = desired_reserve if desired_reserve < limit else max(1, limit // 2)
-    completion_safe_limit = max(1, limit - reserve)
-    model_id = model.strip().lower().rsplit("::", 1)[-1].rsplit("/", 1)[-1]
-    if provider == "openai-codex" or model_id.startswith(("gpt-", "chatgpt-")):
-        return completion_safe_limit
-    compression_threshold = max(1, limit // 2)
-    return min(completion_safe_limit, compression_threshold)
