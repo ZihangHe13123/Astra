@@ -185,6 +185,19 @@ async function terminateFixture(app) {
   for (const id of [...owned].reverse()) { try { process.kill(id, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; } }
 }
 
+// Passive, bounded metadata only: never retain page HTML or message payloads.
+const loadEvents = [], frameIds = new WeakMap();
+let nextFrameId = 0, loadDiagnostics;
+const frameId = frame => { if (!frameIds.has(frame)) frameIds.set(frame, ++nextFrameId); return frameIds.get(frame); };
+const recordLoad = event => { loadEvents.push({ at: Date.now(), ...event }); if (loadEvents.length > 64) loadEvents.shift(); };
+const diagnosticAddress = value => {
+  try {
+    const url = new URL(value);
+    if (url.protocol === 'astra:') return url.hostname === 'card' && ['/page.html', '/frame.html'].includes(url.pathname) ? `astra://card${url.pathname}` : 'astra:[other]';
+    return ['about:blank', 'about:srcdoc'].includes(value) ? value : url.protocol;
+  } catch { return '[invalid URL]'; }
+};
+
 let app, failure, probed;
 const errors = [], answered = [], checks = [];
 const passed = name => { checks.push(name); console.log('PASS', name); };
@@ -198,13 +211,36 @@ try {
   app = await electron.launch({ args: [join(root, 'ui-gui')], env, timeout: 30000 });
   const page = await app.firstWindow(); page.setDefaultTimeout(30000);
   page.on('pageerror', error => errors.push(error.message));
+  for (const event of ['frameattached', 'framenavigated', 'framedetached']) page.on(event, frame => recordLoad({ event, frame: frameId(frame), address: diagnosticAddress(frame.url()) }));
+  page.on('request', request => { if (request.url().startsWith('astra:')) recordLoad({ event: 'request', address: diagnosticAddress(request.url()), resource: request.resourceType() }); });
+  page.on('response', response => { if (response.url().startsWith('astra:')) recordLoad({ event: 'response', address: diagnosticAddress(response.url()), status: response.status() }); });
+  page.on('requestfailed', request => { if (request.url().startsWith('astra:')) recordLoad({ event: 'requestfailed', address: diagnosticAddress(request.url()), code: request.failure()?.errorText?.match(/(?:net::)?ERR_[A-Z_]+/)?.[0] || '[unclassified]' }); });
+  await app.evaluate(({ BrowserWindow }) => {
+    const window = BrowserWindow.getAllWindows()[0], contents = window.webContents;
+    globalThis.__pageSmokeLoadEvents = [];
+    const record = event => { globalThis.__pageSmokeLoadEvents.push({ at: Date.now(), ...event }); if (globalThis.__pageSmokeLoadEvents.length > 64) globalThis.__pageSmokeLoadEvents.shift(); };
+    for (const event of ['did-start-loading', 'did-stop-loading']) contents.on(event, () => record({ event }));
+    contents.on('did-fail-load', (_event, code, _description, _url, isMainFrame, processId, routingId) => record({ event: 'did-fail-load', code, isMainFrame, processId, routingId }));
+    contents.on('render-process-gone', (_event, details) => record({ event: 'render-process-gone', reason: details.reason, exitCode: details.exitCode }));
+    window.on('unresponsive', () => record({ event: 'unresponsive' }));
+  });
   // A refused request is still announced; an answer or an opened socket means one got out.
   page.on('response', response => { if (/^https?:/i.test(response.url())) answered.push(response.url()); });
   page.on('websocket', socket => answered.push(socket.url()));
   const resize = async (width, height) => { await app.evaluate(({ BrowserWindow }, size) => BrowserWindow.getAllWindows()[0].setContentSize(...size), [width, height]); await page.waitForFunction(width => innerWidth === width, width); };
   await resize(1320, 900);
-  console.log('START', folder);
   const composer = page.getByRole('textbox', { name: '消息', exact: true });
+  await composer.evaluate(() => {
+    window.__pageSmokeMessages = [];
+    window.addEventListener('message', event => {
+      const data = event.data;
+      if (!data || typeof data !== 'object' || data.astraPage !== true) return;
+      const frames = [...document.querySelectorAll('iframe.page-frame')];
+      window.__pageSmokeMessages.push({ at: Date.now(), type: ['ready', 'pong', 'error'].includes(data.type) ? data.type : '[unrecognized]', id: Number.isSafeInteger(data.id) ? data.id : null, sourceMatches: frames.some(frame => event.source === frame.contentWindow), frameCount: frames.length });
+      if (window.__pageSmokeMessages.length > 64) window.__pageSmokeMessages.shift();
+    });
+  });
+  console.log('START', folder);
   const state = async () => page.evaluate(async () => { const boot = await window.astra.bootstrap(); return boot.sessions.find(item => item.id === boot.active); });
   const idle = async () => expect.poll(async () => { const current = await state(); return current?.status === 'ready' && !current.busy; }, { timeout: 30000 }).toBe(true);
   // Writing a file asks first; the person allows it, and the model then says what it wrote.
@@ -438,6 +474,25 @@ try {
   assert.deepEqual([...new Set(errors)], ['PAGE_FIXTURE_FAILURE']);
 } catch (error) {
   failure = error; console.error(error);
+  if (app) {
+    const metadata = await Promise.allSettled([
+      bounded((async () => {
+        const page = await app.firstWindow();
+        const frames = page.frames().map(frame => ({ id: frameId(frame), address: diagnosticAddress(frame.url()), detached: frame.isDetached() }));
+        const messages = await page.evaluate(() => window.__pageSmokeMessages || []);
+        return { frames, messages };
+      })(), 'Page load metadata', 2000),
+      bounded(app.evaluate(({ BrowserWindow }) => ({
+        events: globalThis.__pageSmokeLoadEvents || [],
+        windows: BrowserWindow.getAllWindows().map(window => {
+          const contents = window.webContents, destroyed = contents.isDestroyed();
+          return { id: contents.id, destroyed, ...(destroyed ? {} : { loading: contents.isLoading(), loadingMainFrame: contents.isLoadingMainFrame(), processId: contents.getOSProcessId() }) };
+        }),
+      })), 'WebContents load metadata', 2000),
+    ]);
+    loadDiagnostics = { events: loadEvents, renderer: metadata[0].status === 'fulfilled' ? metadata[0].value : '[unavailable]', main: metadata[1].status === 'fulfilled' ? metadata[1].value : '[unavailable]' };
+    console.error('PAGE_LOAD_DIAGNOSTICS', JSON.stringify(loadDiagnostics));
+  }
   if (app) await bounded((async () => {
     const page = await app.firstWindow();
     console.error((await page.locator('body').innerText()).slice(-2000));
@@ -452,6 +507,6 @@ try {
   for (const server of [model, probe, relay]) await bounded(new Promise((done, reject) => { server.close(error => error ? reject(error) : done()); server.closeAllConnections?.(); }), 'Fixture listener close', 3000).catch(error => { failure ||= error; console.error(error); });
   datagrams.close();
 }
-writeFileSync(join(output, 'page-result.json'), JSON.stringify({ checks, errors, reached, answered, probed, folder, success: !failure, ...(failure ? { failure: String(failure) } : {}) }, null, 2));
+writeFileSync(join(output, 'page-result.json'), JSON.stringify({ checks, errors, reached, answered, probed, folder, success: !failure, ...(failure ? { failure: String(failure), loadDiagnostics } : {}) }, null, 2));
 if (failure) throw failure;
 console.log(JSON.stringify({ checks: checks.length, output, folder }));
