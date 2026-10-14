@@ -93,6 +93,7 @@ def main() -> int:
                                "variant_order": list(VARIANTS), "runtime": numpy_runtime(np),
                                "baseline_semantics": "Historical full-selection copy + linalg row norm + BLAS dot; independent of current production",
                                "production_semantics": "Current unmodified vector_search and reader selection; separate from the six historical alternatives",
+                               "candidate_norm_semantics": "einsum with float64 accumulation; earlier diagnostic candidates used float32 accumulation",
                                "selection_measurement": "Historical copies occur inside the search hook after metadata selection; production uses its real selection",
                                "scope": "synthetic fixed vectors; real canonical archive and SemanticReader",
                                "acceptance_ms": 75, "production_deadlines_unchanged": True,
@@ -106,7 +107,7 @@ def main() -> int:
     def candidate(query_vec, matrix, ids, *, k, norm_einsum=False, dot_einsum=False):
         query = np.asarray(query_vec, dtype=np.float32)
         query_norm = float(np.linalg.norm(query)) or 1.0
-        norms = (np.sqrt(np.einsum("ij,ij->i", matrix, matrix)) if norm_einsum
+        norms = (np.sqrt(np.einsum("ij,ij->i", matrix, matrix, dtype=np.float64)) if norm_einsum
                  else np.linalg.norm(matrix, axis=1))
         norms = np.where(norms == 0, 1.0, norms)
         dots = np.einsum("ij,j->i", matrix, query) if dot_einsum else matrix @ query
@@ -153,7 +154,7 @@ def main() -> int:
             components = {
                 "full_advanced_index_copy": lambda: matrix[indices],
                 "row_norm_linalg": lambda: np.linalg.norm(matrix, axis=1),
-                "row_norm_einsum": lambda: np.sqrt(np.einsum("ij,ij->i", matrix, matrix)),
+                "row_norm_einsum": lambda: np.sqrt(np.einsum("ij,ij->i", matrix, matrix, dtype=np.float64)),
                 "dot_blas": lambda: matrix @ query,
                 "dot_einsum": lambda: np.einsum("ij,j->i", matrix, query),
             }

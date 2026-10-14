@@ -93,6 +93,31 @@ def test_vector_search_keeps_empty_and_invalid_dimension_behavior():
         mod.vector_search([1, 0, 0], matrix[0], ["a"], k=1)
 
 
+@pytest.mark.parametrize("target", [0.749995, 0.750005])
+@pytest.mark.parametrize("scale", [1 / 32, 1, 128])
+@pytest.mark.parametrize("direction", [-1, 1])
+def test_wide_vector_cosine_keeps_threshold_side_with_nonuniform_scales(target, scale, direction):
+    base = np.full(4096, .001, dtype=np.float32)
+    base[0] = 1
+    first = target * math.hypot(*map(float, base))
+    other = math.sqrt((1 - first * first) / 2)
+    query = np.zeros(4096, dtype=np.float32)
+    query[:3] = [first, other, -other]
+    query *= direction
+    matrix = np.stack([base * scale, -base * scale, np.zeros_like(base)])
+    matrix.flags.writeable = False
+    ids = ["positive", "negative", "zero"]
+    expected_id = "positive" if direction == 1 else "negative"
+    row = matrix[ids.index(expected_id)]
+    reference = math.fsum(float(a) * float(b) for a, b in zip(row, query)) / (
+        math.hypot(*map(float, row)) * math.hypot(*map(float, query)))
+
+    hits = mod.vector_search(query.tolist(), matrix, ids, k=len(ids))
+    assert [identity for identity, _score in hits] == [expected_id]
+    assert hits[0][1] == pytest.approx(reference, rel=2e-7, abs=2e-7)
+    assert (hits[0][1] >= .75) == (reference >= .75)
+
+
 def test_vector_search_does_not_allocate_another_float32_matrix():
     matrix = np.ones((1024, 1024), dtype=np.float32)
     matrix.flags.writeable = False

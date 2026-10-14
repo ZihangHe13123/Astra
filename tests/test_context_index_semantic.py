@@ -2,6 +2,7 @@
 import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime
+import math
 from pathlib import Path
 import sqlite3
 import threading
@@ -166,6 +167,33 @@ def test_full_semantic_selection_reuses_immutable_snapshot(archive, monkeypatch,
     monkeypatch.setattr(semantic_reader, "vector_search", search)
     assert [item.private_text for item in recommend(archive, source).relevance] == [TEXT]
     assert seen == [True]
+
+
+@pytest.mark.parametrize("target", [0.749995, 0.750005])
+def test_semantic_threshold_uses_accurate_wide_vector_cosines(archive, monkeypatch, tmp_path, target):
+    import numpy as np
+
+    vector = np.full(4096, .001, dtype=np.float32)
+    vector[0] = 1
+    first = target * math.hypot(*map(float, vector))
+    other = math.sqrt((1 - first * first) / 2)
+    query = np.zeros(4096, dtype=np.float32)
+    query[:3] = [first, other, -other]
+    reference = math.fsum(float(a) * float(b) for a, b in zip(vector, query)) / (
+        math.hypot(*map(float, vector)) * math.hypot(*map(float, query)))
+
+    class WideEncoder:
+        def encode(self, texts):
+            return [query.tolist() if text == QUERY else vector.tolist() for text in texts]
+
+    encoder = WideEncoder()
+    archive.vectors = tmp_path / "wide-vectors.db"
+    monkeypatch.setattr(embedder, "ready_embedder", lambda: encoder)
+    monkeypatch.setenv("ASTRA_CONTEXT_INDEX_MEMORY_MIN_SIMILARITY", "0.75")
+    rebuild_source(archive.session, archive.vectors, "session", backend=encoder)
+    result = recommend(archive, "session")
+    assert not result.error_category
+    assert [item.private_text for item in result.relevance] == ([TEXT] if reference >= .75 else [])
 
 
 @pytest.mark.parametrize("filter_kind", ["window", "available_at"])
