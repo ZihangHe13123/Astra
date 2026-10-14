@@ -7,7 +7,7 @@ on:
         description: 'Bounded Windows diagnostics (default runs desktop acceptance)'
         type: choice
         default: none
-        options: [none, windows-page, windows-context-performance, windows-vector-snapshot, windows-vector-read-paths]
+        options: [none, windows-page, windows-context-performance, windows-vector-snapshot, windows-vector-read-paths, windows-vector-clock]
 
 permissions:
   contents: read
@@ -141,7 +141,7 @@ jobs:
           if-no-files-found: warn
 
   context-performance:
-    if: github.repository == 'ZihangHe13123/Astra' && (inputs.investigation == 'windows-context-performance' || inputs.investigation == 'windows-vector-snapshot' || inputs.investigation == 'windows-vector-read-paths')
+    if: github.repository == 'ZihangHe13123/Astra' && (inputs.investigation == 'windows-context-performance' || inputs.investigation == 'windows-vector-snapshot' || inputs.investigation == 'windows-vector-read-paths' || inputs.investigation == 'windows-vector-clock')
     runs-on: windows-2025
     timeout-minutes: 20
     defaults:
@@ -168,7 +168,7 @@ jobs:
           mkdir -p output/context-index-windows
           git rev-parse HEAD > output/context-index-windows/source-sha.txt
       - name: Diagnose cold vector snapshots
-        if: inputs.investigation != 'windows-vector-read-paths'
+        if: inputs.investigation != 'windows-vector-read-paths' && inputs.investigation != 'windows-vector-clock'
         id: snapshot_probe
         continue-on-error: true
         run: uv run --no-sync python scripts/probe_vector_snapshot_performance.py --output=output/context-index-windows/snapshot-probe --rounds=6
@@ -177,6 +177,11 @@ jobs:
         id: read_paths_probe
         continue-on-error: true
         run: uv run --no-sync python scripts/probe_vector_snapshot_read_paths.py --output=output/context-index-windows/read-paths-probe
+      - name: Compare Windows read deadline clocks
+        if: inputs.investigation == 'windows-vector-clock'
+        id: clock_probe
+        continue-on-error: true
+        run: uv run --no-sync python scripts/probe_vector_snapshot_clock.py --output=output/context-index-windows/clock-probe
       - name: Diagnose warm vector search
         if: inputs.investigation == 'windows-context-performance'
         id: search_probe
@@ -191,7 +196,7 @@ jobs:
         run: |
           uv run --no-sync python -m pytest -q -s tests/test_context_index_performance.py --junitxml=output/context-index-windows/pytest.xml | tee output/context-index-windows/results.log
       - name: Keep diagnostic failures visible
-        if: always() && (steps.snapshot_probe.outcome == 'failure' || steps.search_probe.outcome == 'failure' || steps.read_paths_probe.outcome == 'failure')
+        if: always() && (steps.snapshot_probe.outcome == 'failure' || steps.search_probe.outcome == 'failure' || steps.read_paths_probe.outcome == 'failure' || steps.clock_probe.outcome == 'failure')
         run: exit 1
       - name: Preserve every performance observation
         if: always()
