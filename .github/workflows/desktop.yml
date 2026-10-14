@@ -71,3 +71,13 @@ jobs:
           node ui-gui/tests/response-versions-smoke.mjs
           node ui-gui/tests/card-smoke.mjs
           node ui-gui/tests/page-smoke.mjs
+      - name: Preserve failed desktop diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: desktop-diagnostics-${{ matrix.os }}
+          path: |
+            output/playwright/
+            ${{ runner.temp }}/astra-desktop-smoke-*/logs/gui-backend-*.log
+          retention-days: 7
+          if-no-files-found: warn
