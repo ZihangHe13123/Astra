@@ -46,7 +46,7 @@ class CompletingMailbox:
         del task_id
         return self.running
 
-    async def wait_and_drain(self, task_id, timeout=None):
+    async def wait_and_drain(self, task_id, timeout=None, *, session_id=""):
         self.waited = True
         assert timeout is None
         self.running = False

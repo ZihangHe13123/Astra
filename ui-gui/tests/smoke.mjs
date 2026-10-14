@@ -67,7 +67,7 @@ const server = createServer(async (req, res) => {
       content: '| 朝向 | 规则 F1 |\n| --- | --- |\n| 正对 | 0.95 |\n| 侧对 | 0.71 |\n\n**侧对**时下降明显。' }]
     : delegateGoal && !delegateRead ? ['read_file', { path: target }]
     : !answered && delegateParent ? ['delegate_task', { tasks: delegateGoals.map(goal => ({
-      goal, mode: 'explorer', fork_turns: 'none', tools: ['read_file'], max_turns: 4,
+      goal, mode: 'explorer', fork_turns: 'none', tools: ['read_file'],
     })) }]
     : !answered && text.includes('第二个测试文件') ? ['write_file', { path: laterTarget, content: 'LATER_TURN_ONLY\n' }]
     : !answered && text.includes('测试文件') ? ['write_file', { path: target, content: 'apple\norange\ngrape\n' }]

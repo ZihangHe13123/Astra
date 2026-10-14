@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.runtime.session_store import SessionStore
+from agent.runtime.prompt_budget import prompt_token_budget
 from agent.runtime.subagent_replay import (
     ReplayBudgetExceeded,
     bound_messages,
@@ -285,14 +286,24 @@ def test_mixed_tool_group_is_preserved_as_one_evidence_chain(monkeypatch):
         asyncio.run(bound_messages(messages, registry=registry(), llm=OfflineLLM(), max_prompt_tokens=3000))
 
 
-def test_budget_is_clipped_to_provider_capacity_and_compaction(monkeypatch):
-    monkeypatch.setenv("ASTRA_SUBAGENT_MAX_PROMPT_TOKENS", "64000")
+def test_budget_follows_the_main_agent_rule_and_is_lowered_by_compaction_and_cap(monkeypatch):
+    monkeypatch.delenv("ASTRA_SUBAGENT_MAX_PROMPT_TOKENS", raising=False)
     llm = OfflineLLM(context_limit=16000, auto_compact_token_limit=14000)
-    assert replay_budget(llm) == 11904
-    llm.config.auto_compact_token_limit = 9000
-    assert replay_budget(llm) == 9000
-    monkeypatch.setenv("ASTRA_SUBAGENT_MAX_PROMPT_TOKENS", "7000")
-    assert replay_budget(llm) == 7000
+    # The window less an output reserve of at least 8K, as for the main agent.
+    assert replay_budget(llm) == prompt_token_budget(16000, 4096, auto_compact_token_limit=14000) == 7808
+    llm.config.auto_compact_token_limit = 5000
+    assert replay_budget(llm) == 5000
+    monkeypatch.setenv("ASTRA_SUBAGENT_MAX_PROMPT_TOKENS", "4000")
+    assert replay_budget(llm) == 4000
+
+
+def test_a_large_window_is_used_instead_of_a_fixed_64k_cap(monkeypatch):
+    monkeypatch.delenv("ASTRA_SUBAGENT_MAX_PROMPT_TOKENS", raising=False)
+    # Half the window for most models, the window less the reserve for GPT models: the main agent's thresholds.
+    assert replay_budget(OfflineLLM(context_limit=1_000_000)) == 500_000
+    gpt = OfflineLLM(context_limit=400_000)
+    gpt.config.model = "gpt-5.5"
+    assert replay_budget(gpt) == 400_000 - 8192
 
 
 def test_explicit_budget_cannot_override_provider_capacity():
@@ -304,8 +315,8 @@ def test_explicit_budget_cannot_override_provider_capacity():
 def test_runtime_generation_reserve_uses_actual_worker_allowance():
     llm = OfflineLLM(context_limit=32000)
     assert replay_budget(llm, generation_reserve=16384) == 15616
-    # Smaller explicit output caps remain conservative about provider defaults.
-    assert replay_budget(llm, generation_reserve=2048) == 27904
+    # A smaller output cap leaves the main agent's half-window threshold in charge.
+    assert replay_budget(llm, generation_reserve=2048) == 16000
     with pytest.raises(ReplayBudgetExceeded, match="generation reserve"):
         replay_budget(llm, generation_reserve=32000)
 

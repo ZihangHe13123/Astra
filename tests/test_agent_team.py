@@ -540,7 +540,6 @@ def test_keep_alive_worker_idles_wakes_with_context_and_shutdowns_without_model_
                 "team_id": team["id"],
                 "name": "implementer",
                 "goal": "run red then green",
-                "max_turns": 4,
                 "timeout": 10,
                 "keep_alive": True,
             },
@@ -562,8 +561,7 @@ def test_keep_alive_worker_idles_wakes_with_context_and_shutdowns_without_model_
             item for item in live_team["agents"] if item["id"] == agent_id
         )
         assert live_worker["turns_used"] == 1
-        assert live_worker["max_turns"] == 4
-        assert live_worker["turns_remaining"] == 3
+        assert "max_turns" not in live_worker and "turns_remaining" not in live_worker
 
         await registry.execute(
             "team_send",
@@ -623,10 +621,16 @@ def test_keep_alive_forced_finalizer_reports_latest_task_assignment(
     class AssignmentFinalizerLLM:
         def __init__(self):
             self.finalizer_request = None
+            self.calls = 0
 
         async def chat(self, **kwargs):
             del kwargs
-            return {"content": "ready and idle", "tool_calls": []}
+            self.calls += 1
+            # Ready at first; on the assignment, a reply with neither a call nor an answer,
+            # which hands the assignment to the tool-free report.
+            if self.calls == 1:
+                return {"content": "ready and idle", "tool_calls": []}
+            return {"content": "", "tool_calls": []}
 
         async def chat_limited(self, **kwargs):
             self.finalizer_request = kwargs
@@ -658,7 +662,6 @@ def test_keep_alive_forced_finalizer_reports_latest_task_assignment(
                 "team_id": team["id"],
                 "name": "implementer",
                 "goal": "Report readiness, then wait for work",
-                "max_turns": 2,
                 "timeout": 10,
                 "keep_alive": True,
             },
@@ -685,7 +688,9 @@ def test_keep_alive_forced_finalizer_reports_latest_task_assignment(
             task_id=parent_task["id"],
         ))["output"])
 
-        assert polled["result"]["result"] == "implemented assigned slice"
+        # The report ends the assignment, not the teammate: it waits for the next one.
+        assert polled["worker"]["status"] == "idle"
+        assert polled["episode_result"]["result"] == "implemented assigned slice"
         finalizer_text = llm.finalizer_request["messages"][1]["content"]
         assert "Latest assigned task:" in finalizer_text
         assert "Implement ellipsize with RED then GREEN" in finalizer_text
@@ -701,10 +706,14 @@ def test_keep_alive_repeated_truncated_finalizer_returns_assignment_scoped_parti
     class TruncatedAssignmentFinalizerLLM:
         def __init__(self):
             self.finalizer_calls = 0
+            self.calls = 0
 
         async def chat(self, **kwargs):
             del kwargs
-            return {"content": "ready and idle", "tool_calls": []}
+            self.calls += 1
+            if self.calls == 1:
+                return {"content": "ready and idle", "tool_calls": []}
+            return {"content": "", "tool_calls": []}
 
         async def chat_limited(self, **kwargs):
             del kwargs
@@ -741,7 +750,6 @@ def test_keep_alive_repeated_truncated_finalizer_returns_assignment_scoped_parti
                 "team_id": team["id"],
                 "name": "implementer",
                 "goal": "Report readiness, then wait for work",
-                "max_turns": 2,
                 "timeout": 10,
                 "keep_alive": True,
             },
@@ -768,8 +776,10 @@ def test_keep_alive_repeated_truncated_finalizer_returns_assignment_scoped_parti
             task_id=parent_task["id"],
         ))["output"])
 
-        report = polled["result"]["result"]
-        assert polled["result"]["worker_status"] == "partial"
+        report = polled["episode_result"]["result"]
+        assert polled["worker"]["status"] == "idle"
+        assert polled["episode_result"]["partial"] is True
+        assert "truncated" in polled["episode_result"]["warning"] or "output" in polled["episode_result"]["warning"]
         assert llm.finalizer_calls == 2
         assert "Partial report" in report
         assert "Task: Implement ellipsize with RED then GREEN" in report
@@ -826,7 +836,6 @@ def test_keep_alive_worker_releases_slot_and_reacquires_on_wake(
                 "team_id": team["id"],
                 "name": "retained",
                 "goal": "retained task",
-                "max_turns": 4,
                 "timeout": 5,
                 "keep_alive": True,
             },
@@ -841,7 +850,6 @@ def test_keep_alive_worker_releases_slot_and_reacquires_on_wake(
                 "team_id": team["id"],
                 "name": "one-shot",
                 "goal": "one shot task",
-                "max_turns": 2,
                 "timeout": 1,
             },
             task_id=parent_task["id"],
@@ -924,7 +932,6 @@ def test_keep_alive_idle_preserves_active_budget_and_lifetime_cap_reclaims(
                 "team_id": team["id"],
                 "name": "retained",
                 "goal": "produce one retained report",
-                "max_turns": 4,
                 "timeout": 1,
                 "keep_alive": True,
             },
@@ -1330,16 +1337,15 @@ def test_team_spawn_validates_before_registering_agent(tmp_path: Path, monkeypat
             task_store=store,
         )
         spawn_schema = registry.get("team_spawn").parameters["properties"]
-        assert spawn_schema["max_turns"]["maximum"] == 50
-        assert spawn_schema["max_turns"]["default"] == 50
-        assert spawn_schema["timeout"]["maximum"] == 1800
+        assert "max_turns" not in spawn_schema
+        assert spawn_schema["timeout"]["maximum"] == 14400
         assert spawn_schema["keep_alive"]["type"] == "boolean"
         assert spawn_schema["keep_alive"]["default"] is False
         assert spawn_schema["workspace_root"]["default"] == ""
         description = registry.get("team_spawn").description
         assert "keep_alive" in description
         assert "pending" in description
-        assert "active time" in description
+        assert "no turn limit" in description and "idle time does not count" in description
         assert registry.get("team_spawn").max_calls_per_turn == 12
         assert registry.get("team_send").max_calls_per_turn == 48
         assert registry.get("team_restart").max_calls_per_turn == 12
@@ -1355,11 +1361,11 @@ def test_team_spawn_validates_before_registering_agent(tmp_path: Path, monkeypat
                 "team_id": team["id"],
                 "name": "researcher",
                 "goal": "report one finding",
-                "max_turns": 51,
+                "timeout": 14401,
             },
             task_id=parent_task["id"],
         )
-        assert "max_turns must be 1-50" in invalid["error"]
+        assert "timeout must be 1-14400" in invalid["error"]
         state = AgentTeamStore(store.path).get_team(team["id"])
         assert [agent["name"] for agent in state["agents"]] == ["lead"]
 
@@ -1383,7 +1389,6 @@ def test_team_spawn_validates_before_registering_agent(tmp_path: Path, monkeypat
                 "team_id": team["id"],
                 "name": "researcher",
                 "goal": "report one finding",
-                "max_turns": 2,
                 "timeout": 5,
                 "keep_alive": True,
             },
@@ -1464,7 +1469,6 @@ def test_team_spawn_persists_and_prompts_explicit_workspace_root(
                 "name": "reviewer",
                 "goal": "confirm workspace",
                 "workspace_root": str(workspace),
-                "max_turns": 2,
                 "timeout": 5,
             },
             task_id=parent_task["id"],
@@ -1529,7 +1533,6 @@ def test_team_spawn_discards_unbound_agent_after_start_failure(
                 "team_id": team["id"],
                 "name": "researcher",
                 "goal": "report one finding",
-                "max_turns": 2,
             },
             task_id=parent_task["id"],
         )
@@ -1544,7 +1547,6 @@ def test_team_spawn_discards_unbound_agent_after_start_failure(
                 "team_id": team["id"],
                 "name": "researcher",
                 "goal": "report one finding",
-                "max_turns": 2,
                 "timeout": 5,
             },
             task_id=parent_task["id"],
@@ -1593,7 +1595,6 @@ def test_team_restart_seeds_new_worker_from_durable_checkpoint(tmp_path: Path, m
                 "goal": "report one finding",
                 "context": "Original bounded context",
                 "workspace_root": str(workspace),
-                "max_turns": 2,
                 "timeout": 5,
             },
             task_id=parent_task["id"],
@@ -1618,7 +1619,6 @@ def test_team_restart_seeds_new_worker_from_durable_checkpoint(tmp_path: Path, m
                 "team_id": team["id"],
                 "agent": "researcher",
                 "instruction": "Focus on the unresolved failure path",
-                "max_turns": 3,
                 "timeout": 5,
             },
             task_id=parent_task["id"],
@@ -1674,7 +1674,6 @@ def test_team_restart_reapplies_keep_alive_for_retained_member(tmp_path: Path, m
                 "team_id": team["id"],
                 "name": "implementer",
                 "goal": "run red then green",
-                "max_turns": 4,
                 "timeout": 10,
                 "keep_alive": True,
             },
@@ -1696,7 +1695,6 @@ def test_team_restart_reapplies_keep_alive_for_retained_member(tmp_path: Path, m
                 "team_id": team["id"],
                 "agent": "implementer",
                 "instruction": "Resume the retained assignment",
-                "max_turns": 4,
                 "timeout": 10,
             },
             task_id=parent_task["id"],
@@ -1770,7 +1768,6 @@ def test_team_restart_accepts_completed_member(tmp_path: Path, monkeypatch):
                 "team_id": team["id"],
                 "name": "researcher",
                 "goal": "report one finding",
-                "max_turns": 2,
                 "timeout": 5,
             },
             task_id=parent_task["id"],
@@ -1790,7 +1787,6 @@ def test_team_restart_accepts_completed_member(tmp_path: Path, monkeypatch):
                 "team_id": team["id"],
                 "agent": "researcher",
                 "instruction": "Recheck the finding with fresh evidence",
-                "max_turns": 2,
                 "timeout": 5,
             },
             task_id=parent_task["id"],
@@ -1852,14 +1848,14 @@ def test_team_wait_reports_a_change_made_between_waits(tmp_path: Path, monkeypat
         # A retained idle teammate keeps polling the same Team signal.
         retained = await call(
             "team_spawn", team_id=team["id"], name="retained", goal="stay available",
-            max_turns=4, timeout=10, keep_alive=True,
+            timeout=10, keep_alive=True,
         )
         await _wait_for_agent_status(team_store, retained["agent"]["id"], "idle")
         await call("team_wait", team_id=team["id"])
 
         finisher = await call(
             "team_spawn", team_id=team["id"], name="finisher", goal="finish quickly",
-            max_turns=2, timeout=10,
+            timeout=10,
         )
         await _wait_for_agent_status(team_store, finisher["agent"]["id"], "completed")
         await asyncio.sleep(0.3)  # the lead is busy elsewhere while the change sits there
@@ -1920,7 +1916,7 @@ def test_team_restart_checkpoint_delivers_instruction_and_context_whole(
         original_context = "ORIGINAL-START " + "c" * 2000 + " ORIGINAL-END"
         spawned = await call(
             "team_spawn", team_id=team["id"], name="researcher", goal="report one finding",
-            context=original_context, max_turns=2, timeout=5,
+            context=original_context, timeout=5,
         )
         agent_id = spawned["agent"]["id"]
         first_process_id = spawned["process"]["process_id"]
@@ -1936,7 +1932,7 @@ def test_team_restart_checkpoint_delivers_instruction_and_context_whole(
 
         restarted = await call(
             "team_restart", team_id=team["id"], agent="researcher", instruction=instruction,
-            max_turns=3, timeout=5,
+            timeout=5,
         )
         assert restarted["restart_kind"] == "checkpoint_restart"
         await call("delegate_poll", process_id=restarted["process"]["process_id"], wait_ms=5000)
@@ -1970,7 +1966,7 @@ def test_team_send_to_ended_teammate_names_team_restart(tmp_path: Path, monkeypa
         team = await call("team", action="create", name="recall", goal="inspect")
         spawned = await call(
             "team_spawn", team_id=team["id"], name="researcher", goal="report one finding",
-            max_turns=2, timeout=5,
+            timeout=5,
         )
         await _wait_for_agent_status(team_store, spawned["agent"]["id"], "completed")
 

@@ -249,7 +249,12 @@ try {
   await assertMeasuredRows();
   await scrollToTop();
   await expect(historical).toHaveCount(0);
-  await page.locator('.messages-scroll').evaluate(el => { el.scrollTop = el.scrollHeight; });
+  // Rows coming back are measured again as they mount, so one jump to the bottom can land short
+  // of it; the jump is repeated until the message is back.
+  await expect.poll(async () => {
+    await page.locator('.messages-scroll').evaluate(el => { el.scrollTop = el.scrollHeight; });
+    return historical.locator('.mermaid-block img[alt="Mermaid 图表"]').count();
+  }).toBe(1);
   await expect(historical.locator('.mermaid-block img[alt="Mermaid 图表"]')).toBeVisible();
   await waitForImage(historical);
   await assertMeasuredRows();

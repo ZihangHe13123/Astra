@@ -38,7 +38,7 @@ class RetainedMemberProvider(_SlowOpenAIHandler):
                 if turn == 1:
                     tool, args = "team_spawn", {
                         "team_id": team_id, "name": "member", "goal": "retained member fixture",
-                        "keep_alive": True, "max_turns": 6, "timeout": 30,
+                        "keep_alive": True, "timeout": 30,
                     }
                 elif step == 1:
                     tool, args = "team", {"action": "status", "team_id": team_id}

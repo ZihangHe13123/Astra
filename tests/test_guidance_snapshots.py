@@ -318,7 +318,9 @@ def test_worker_uses_shared_loader_and_restores_frozen_project_guidance(tmp_path
         await harness.cancel(spawned["process"]["process_id"])
         saved = _load_closed(idle["conv_path"])
         assert any(item["body"] == "Root contract v1" for item in saved["state"]["project_guidance"]["records"])
-        assert saved["state"]["runtime_context_projection"]["snapshots"]
+        # The projection's state is saved; it holds no snapshot, since no runtime notice
+        # (once the turn budget) is projected into a worker's requests any more.
+        assert saved["state"]["runtime_context_projection"].get("snapshots", []) == []
         (root / "AGENTS.md").write_text("Different root after restart", encoding="utf-8")
         restarted = await harness.call("team_restart", team_id=team["id"], agent="worker")
         try:

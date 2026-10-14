@@ -1543,22 +1543,27 @@ def test_react_agent_executes_multiple_tool_calls_concurrently():
 
     async def scenario():
         registry = ToolRegistry()
+        running = {"now": 0, "peak": 0}
+
+        async def overlapping(result):
+            # Counted while it runs: two at once means the calls overlapped, however slow the machine.
+            running["now"] += 1
+            running["peak"] = max(running["peak"], running["now"])
+            await asyncio.sleep(0.06)
+            running["now"] -= 1
+            return result
 
         async def slow_one():
-            await asyncio.sleep(0.06)
-            return "one"
+            return await overlapping("one")
 
         async def slow_two():
-            await asyncio.sleep(0.06)
-            return "two"
+            return await overlapping("two")
 
         registry.register(ToolDef("slow_one", "slow one", {"type": "object"}, slow_one))
         registry.register(ToolDef("slow_two", "slow two", {"type": "object"}, slow_two))
         agent = ReActAgent("agent", FakeLLM(), registry, max_iterations=1)
 
-        start = time.perf_counter()
         events = [event async for event in agent.reply_stream(Msg(content=[ContentBlock.text("run")]))]
-        elapsed = time.perf_counter() - start
 
         started = next(event for event in events if event["type"] == "tool_calls")
         assert [(call["id"], call["name"]) for call in started["calls"]] == [
@@ -1576,7 +1581,7 @@ def test_react_agent_executes_multiple_tool_calls_concurrently():
                                 if event["type"] == "tool_result" and event["id"] == call_id)
             assert all(index < result_index for index, event in enumerate(events)
                        if event["type"] == "tool_progress" and event["id"] == call_id)
-        assert elapsed < 0.11
+        assert running["peak"] == 2
 
     run(scenario())
 
@@ -2121,7 +2126,7 @@ def test_llm_stream_idle_timeout_resets_for_each_received_chunk():
             return self
 
         async def __anext__(self):
-            await asyncio.sleep(0.005)
+            await asyncio.sleep(0.02)
             try:
                 return next(self.items)
             except StopIteration:
@@ -2132,10 +2137,13 @@ def test_llm_stream_idle_timeout_resets_for_each_received_chunk():
 
     async def scenario():
         provider = object.__new__(OpenAICompatibleProvider)
+        # The stream lasts about 0.6 s, longer than the idle limit, so only a limit that
+        # resets on each chunk lets it finish; each gap stays far below the limit, even
+        # on a loaded runner.
         provider.config = LLMConfig(
             timeout=0,
             connect_timeout=1,
-            idle_timeout=0.05,
+            idle_timeout=0.3,
             overall_timeout=0,
             max_retries=0,
         )

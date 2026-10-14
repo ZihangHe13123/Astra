@@ -67,7 +67,7 @@ class Harness:
             self.keys.append(key)
             return SessionStore.for_subagent(self.session.legacy_path, key)
 
-        register_delegate_tools(
+        self.mailbox = register_delegate_tools(
             self.registry,
             llm_getter=lambda: self.llm,
             session_id_getter=lambda: "session-a",
@@ -82,12 +82,12 @@ class Harness:
         assert not result["error"], result
         return json.loads(result["output"])
 
-    async def spawn(self, *, keep_alive=False, mode="explorer", max_turns=8):
+    async def spawn(self, *, keep_alive=False, mode="explorer"):
         team = await self.call("team", action="create", name="resume", goal="recover")
         spawned = await self.call(
             "team_spawn", team_id=team["id"], name="worker", goal="Keep the evidence",
             context="Original task context", keep_alive=keep_alive, mode=mode,
-            max_turns=max_turns, timeout=30,
+            timeout=30,
         )
         return team, spawned
 
@@ -127,19 +127,22 @@ def _register_tool(registry, name, fn, risk="read"):
     ))
 
 
-def test_explicit_total_turn_ceiling_survives_the_next_default_restart(tmp_path, monkeypatch):
+def test_restarts_carry_the_turn_count_and_never_run_out_of_turns(tmp_path, monkeypatch):
     async def scenario():
-        harness = Harness(tmp_path, monkeypatch, RecordingLLM())
-        team, spawned = await harness.spawn(max_turns=2)
+        llm = RecordingLLM()
+        harness = Harness(tmp_path, monkeypatch, llm)
+        team, spawned = await harness.spawn()
         await harness.wait(spawned["process"]["process_id"])
-        first = await harness.call("team_restart", team_id=team["id"], agent="worker", max_turns=4)
-        await harness.wait(first["process"]["process_id"])
-        second = await harness.call("team_restart", team_id=team["id"], agent="worker")
-        await harness.wait(second["process"]["process_id"])
+        # Restarted again and again, the teammate keeps counting and is never refused for its turns.
+        for _ in range(3):
+            restarted = await harness.call("team_restart", team_id=team["id"], agent="worker")
+            await harness.wait(restarted["process"]["process_id"])
         agent = harness.teams.get_agent(spawned["agent"]["id"])
         state = _load_closed(agent["conv_path"])["state"]
-        assert state["max_turns"] == 4
-        assert state["turns_used"] == 3
+        assert "max_turns" not in state
+        assert state["turns_used"] == 4
+        assert len(llm.requests) == 4
+        assert agent["restart_count"] == 3
     asyncio.run(scenario())
 
 
@@ -204,7 +207,7 @@ def test_batch_delegates_with_same_parent_have_distinct_canonical_histories(tmp_
         harness = Harness(tmp_path, monkeypatch, RecordingLLM())
         result = await harness.call(
             "delegate_task", tasks=[{"goal": "Find ALPHA"}, {"goal": "Find BETA"}],
-            max_turns=3, timeout=30,
+            timeout=30,
         )
         assert result["count"] == 2
         keys = set(harness.keys)
@@ -223,7 +226,7 @@ def test_two_restarts_count_cumulative_turns_without_replaying_mailbox(tmp_path,
     async def scenario():
         llm = RecordingLLM()
         harness = Harness(tmp_path, monkeypatch, llm)
-        team, spawned = await harness.spawn(keep_alive=True, max_turns=8)
+        team, spawned = await harness.spawn(keep_alive=True)
         agent_id = spawned["agent"]["id"]
         await harness.idle(agent_id)
         await harness.call("team_send", team_id=team["id"], to="worker",
@@ -243,26 +246,6 @@ def test_two_restarts_count_cumulative_turns_without_replaying_mailbox(tmp_path,
             assert sum("Unique assignment DELIVERY-123" in str(m.get("content"))
                        for m in llm.requests[-1]) == 1
             assert payload["state"]["team_message_cursor"] > 0
-
-    asyncio.run(scenario())
-
-
-def test_cumulative_turn_limit_refuses_another_restart(tmp_path, monkeypatch):
-    async def scenario():
-        llm = RecordingLLM()
-        harness = Harness(tmp_path, monkeypatch, llm)
-        team, spawned = await harness.spawn(max_turns=2)
-        await harness.wait(spawned["process"]["process_id"])
-        restarted = await harness.call("team_restart", team_id=team["id"], agent="worker")
-        await harness.wait(restarted["process"]["process_id"])
-        agent = harness.teams.get_agent(spawned["agent"]["id"])
-        assert _load_closed(agent["conv_path"])["state"]["turns_used"] == 2
-        refused = await harness.registry.execute(
-            "team_restart", {"team_id": team["id"], "agent": "worker"}, task_id=harness.parent,
-        )
-        assert refused["error"]
-        assert len(llm.requests) == 2
-        assert harness.teams.get_agent(agent["id"])["restart_count"] == 1
 
     asyncio.run(scenario())
 

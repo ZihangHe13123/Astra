@@ -14,9 +14,22 @@ an inactive earlier turn using the same ownership and workspace checks as explic
 Status is compact by default. `detail=true` on `team` or `team_wait` includes full
 spawn context, task text and the available episode history. `team(action="create",
 keep_alive_limit=5)` or `team(action="configure", team_id=..., keep_alive_limit=5)`
-sets this Team's idle capacity immediately and durably. Omission inherits
-`ASTRA_TEAM_KEEP_ALIVE_LIMIT` (default 2); zero disables new idle admissions.
-Reducing capacity does not evict members already idle.
+sets how many of this Team's members wait idle in memory, immediately and
+durably. Omission inherits `ASTRA_TEAM_KEEP_ALIVE_LIMIT` (default 2); zero
+disables new idle admissions. Reducing capacity does not evict members already
+idle. A member that does not fit, or that idles past
+`ASTRA_TEAM_IDLE_TIMEOUT_SECONDS` (default 1,800), stops running but keeps its
+conversation: the lead's next message to it picks it up where it left off, as
+it does after a backend restart. Members last as long as the session.
+
+Subagents have no turn limit. A run ends when its model answers without a tool
+call, when it is stopped, or when its time limit passes (`timeout`, 1,800
+seconds by default, 14,400 at most, counted while it holds a slot; for a Team
+member, per assignment). Sixteen run at once (`ASTRA_DELEGATE_CONCURRENCY`).
+A subagent's history is compacted like the main agent's. A message reaches a
+working member before its next step; what members send to `lead` arrives in
+the parent's conversation between its steps and wakes a parent waiting for
+them.
 
 Worker `lifecycle` records identify the completion reason, actual limits, last idle
 entry/deadline, active and idle monotonic seconds, and wall elapsed seconds.
@@ -24,8 +37,9 @@ entry/deadline, active and idle monotonic seconds, and wall elapsed seconds.
 at transitions. Host sleep can advance wall time without advancing monotonic time.
 After a crash, `recovered_at` is the detection time and timings remain the last
 durable observation, not an invented time of death. Reasons survive process-log
-pruning. `team_restart` clears old decisions and starts a new conversation from a
-bounded checkpoint; it does not restore the old model conversation.
+pruning. `team_restart` clears old decisions and goes on from the member's saved
+conversation, read-only when its last step's outcome is unknown; a member
+without one starts from a bounded checkpoint instead.
 
 ## Shell results and full output
 

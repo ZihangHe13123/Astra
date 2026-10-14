@@ -1,8 +1,10 @@
-"""Bound recovered worker prompts using the shared compaction pipeline.
+"""Compact a worker's history with the shared pipeline, and bound each request.
 
-Canonical history belongs to the worker's SessionStore. This module only makes
-a request copy: unavailable summaries and oversized active evidence must stop
-recovery, never silently turn it into a fresh conversation.
+A worker's history is compacted the way the main agent's is: at the same threshold, by the
+same compressor, and the result replaces the history it came from, so its summary is kept
+and updated rather than rebuilt for every request (compact_history). Each request is still
+checked against the budget on its own (bound_messages): unavailable summaries and oversized
+active evidence stop it, never silently turn it into a fresh conversation.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import os
 
 from .context import AgentContext
 from .context_compressor import ContextCompressor, _is_synthetic_user_turn
+from .prompt_budget import prompt_token_budget
 from .subagent_resume import recovery_tool_risk
 from .token_estimator import estimate_messages_tokens, estimate_value_tokens
 
@@ -38,13 +41,19 @@ def _positive_int(value, default: int = 0) -> int:
     return result if result > 0 else default
 
 
-def replay_budget(llm, *, generation_reserve: int | None = None) -> int:
-    """Respect the worker cap, model compaction setting, and output reserve.
+# The main agent's own budget when its model's window is unknown (AgentContext's default).
+_UNKNOWN_WINDOW_BUDGET = 100_000
 
-    Workers can request more output than config.max_tokens (investigation has
-    a runtime floor). The dispatch owner supplies that actual allowance here.
+
+def replay_budget(llm, *, generation_reserve: int | None = None) -> int:
+    """The prompt size at which a worker's history is compacted: the main agent's rule.
+
+    The model's window less the output the request may use, its own compaction setting,
+    and for most models half the window, exactly as prompt_token_budget decides for the main
+    agent. Workers can request more output than config.max_tokens (investigation has a
+    runtime floor); the dispatch owner supplies that actual allowance here.
+    ASTRA_SUBAGENT_MAX_PROMPT_TOKENS lowers the budget further when it is set.
     """
-    budget = _positive_int(os.getenv("ASTRA_SUBAGENT_MAX_PROMPT_TOKENS"), 64_000)
     config = getattr(llm, "config", None)
     reserve = _positive_int(getattr(config, "max_tokens", None), 4096)
     if generation_reserve is not None:
@@ -53,11 +62,20 @@ def replay_budget(llm, *, generation_reserve: int | None = None) -> int:
             raise ReplayBudgetExceeded("Subagent replay generation reserve must be positive.")
         reserve = max(reserve, requested)
     compact_limit = _positive_int(getattr(config, "auto_compact_token_limit", None))
-    if compact_limit:
-        budget = min(budget, compact_limit)
     context_limit = _positive_int(getattr(config, "context_limit", None))
+    if context_limit and reserve >= context_limit:
+        raise ReplayBudgetExceeded("Subagent replay budget is exhausted by the generation reserve.")
     if context_limit:
-        budget = min(budget, context_limit - reserve)
+        budget = prompt_token_budget(
+            context_limit, reserve,
+            model=str(getattr(config, "model", "") or ""), provider=str(getattr(config, "provider", "") or ""),
+            auto_compact_token_limit=compact_limit or None,
+        )
+    else:
+        budget = min(_UNKNOWN_WINDOW_BUDGET, compact_limit) if compact_limit else _UNKNOWN_WINDOW_BUDGET
+    cap = _positive_int(os.getenv("ASTRA_SUBAGENT_MAX_PROMPT_TOKENS"))
+    if cap:
+        budget = min(budget, cap)
     if budget <= 0:
         raise ReplayBudgetExceeded("Subagent replay budget is exhausted by the generation reserve.")
     return budget
@@ -241,3 +259,70 @@ async def bound_messages(
             f"Subagent replay remains above budget after safe compaction ({actual} > {budget} tokens)."
         )
     return _provider_messages(result)
+
+
+def _latest_request(messages: list[dict]) -> dict | None:
+    return next((
+        message for message in reversed(messages)
+        if message.get("role") == "user" and not _is_synthetic_user_turn(message)
+    ), None)
+
+
+def _recent_steps_start(messages: list[dict]) -> int:
+    """Where the last four complete protocol steps begin; the latest request when there are fewer."""
+    latest = next((
+        index for index in range(len(messages) - 1, -1, -1)
+        if messages[index].get("role") == "user" and not _is_synthetic_user_turn(messages[index])
+    ), len(messages))
+    steps = []
+    for index, message in enumerate(messages):
+        if index < latest or message.get("role") != "assistant" or not message.get("tool_calls"):
+            continue
+        ids = {call.get("id") for call in message["tool_calls"] if isinstance(call, dict)}
+        results = []
+        end = index + 1
+        while end < len(messages) and messages[end].get("role") == "tool":
+            results.append(messages[end].get("tool_call_id"))
+            end += 1
+        if ids and None not in ids and set(results) == ids and len(results) == len(ids):
+            steps.append(index)
+    return steps[-4] if len(steps) >= 4 else latest
+
+
+async def compact_history(
+    messages: list[dict], *, registry, llm, compressor: ContextCompressor,
+    generation_reserve: int | None = None, tool_schemas: list[dict] | None = None,
+) -> list[dict]:
+    """Return the history compacted to replace the worker's own, or the same list unchanged.
+
+    The threshold, the compressor and what is kept as it was are the main agent's: the
+    leading system prompt, the latest request and the last four complete steps, which also
+    hold any call still waiting for its result. Earlier completed steps are summarised,
+    writes among them, as the main agent summarises the start of a long turn; the summary
+    records what was done and which files were changed. What recovery needs is untouched:
+    a call whose outcome is unknown is in the recent steps, and the read-only lock it sets
+    is part of the saved state, not of the history. A compaction that could not keep all
+    of that is not applied; neither is one that fails: the history stays whole and the
+    request bound decides what is sent.
+    """
+    try:
+        budget = replay_budget(llm, generation_reserve=generation_reserve)
+        context, current_messages, measure, _ = _prepare_context(
+            messages, registry=registry, llm=llm, budget=budget, tool_schemas=tool_schemas,
+        )
+    except ReplayBudgetExceeded:
+        return messages
+    if measure() < budget:
+        return messages
+    recent = copy.deepcopy(context.messages[_recent_steps_start(context.messages):])
+    request = copy.deepcopy(_latest_request(context.messages))
+    context.compressor = compressor
+    await context.compress_if_needed(preserve_on_failure=True, measure_tokens=measure)
+    result = current_messages()
+    if len(result) >= len(messages):
+        return messages
+    if request is not None and request not in result:
+        return messages
+    if not _suffix_survived(result, recent):
+        return messages
+    return result
