@@ -15,6 +15,9 @@ import json
 import os
 import subprocess
 import sys
+import time
+from functools import partial
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -49,6 +52,89 @@ requires_native_chrome_interactive = pytest.mark.skipif(
 
 def run(coro):
     return asyncio.run(coro)
+
+
+async def _read_headless_output(read, process, stream, started, n=-1):
+    if n != -1:
+        return await read(n)
+    chunks = []
+    preview = bytearray()
+    try:
+        while True:
+            chunk = await read(65536)
+            if not chunk:
+                stream["eof_ms"] = (time.perf_counter() - started) * 1000
+                return b"".join(chunks)
+            stream.setdefault("first_byte_ms", (time.perf_counter() - started) * 1000)
+            stream["bytes"] += len(chunk)
+            chunks.append(chunk)
+            preview.extend(chunk[:max(0, 4096 - len(preview))])
+    except asyncio.CancelledError:
+        stream["cancelled_ms"] = (time.perf_counter() - started) * 1000
+        stream["returncode_at_cancel"] = process.returncode
+        raise
+    finally:
+        stream["preview"] = preview.decode("utf-8", errors="replace")
+
+
+@pytest.fixture
+def headless_diagnostics(monkeypatch, request):
+    """Retain output before cancellation instead of losing a cold-start failure."""
+    spawn = cdp_backend_mod.asyncio.create_subprocess_exec
+    attempts = []
+
+    async def observed_spawn(*args, **kwargs):
+        if "--dump-dom" not in args and not any(str(arg).startswith("--screenshot=") for arg in args):
+            return await spawn(*args, **kwargs)
+        started = time.perf_counter()
+        evidence = {"args": [str(arg)[:240] for arg in args], "streams": {}}
+        process = await spawn(*args, **kwargs)
+        evidence.update(pid=process.pid, spawn_ms=(time.perf_counter() - started) * 1000)
+        attempts.append((process, evidence))
+
+        def observe(reader, name):
+            stream = evidence["streams"][name] = {"bytes": 0}
+            monkeypatch.setattr(reader, "read", partial(_read_headless_output, reader.read, process, stream, started))
+
+        observe(process.stdout, "stdout")
+        observe(process.stderr, "stderr")
+        return process
+
+    monkeypatch.setattr(cdp_backend_mod.asyncio, "create_subprocess_exec", observed_spawn)
+    try:
+        yield
+    finally:
+        for process, evidence in attempts:
+            evidence["returncode_after_cleanup"] = process.returncode
+        payload = json.dumps([evidence for _, evidence in attempts], ensure_ascii=False)
+        request.node.user_properties.append(("headless_chrome_diagnostics", payload))
+        print("Headless Chrome diagnostics:", payload)
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_headless_diagnostics_preserve_output_and_cancellation(cancelled):
+    async def scenario():
+        reader = asyncio.StreamReader()
+        payload = b"partial Chrome output\n" * 300
+        reader.feed_data(payload)
+        stream = {"bytes": 0}
+        process = SimpleNamespace(returncode=None if cancelled else 0)
+        pending = asyncio.create_task(_read_headless_output(reader.read, process, stream, time.perf_counter()))
+        await asyncio.sleep(0)
+        assert stream["bytes"] == len(payload)
+        if cancelled:
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            assert "eof_ms" not in stream and stream["returncode_at_cancel"] is None
+        else:
+            reader.feed_eof()
+            assert await pending == payload
+            assert stream["eof_ms"] >= stream["first_byte_ms"]
+            assert "cancelled_ms" not in stream
+        assert stream["preview"].encode() == payload[:4096]
+
+    run(scenario())
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +320,7 @@ class TestCdpBackendExtract:
         run(scenario())
 
     @requires_native_chrome
-    def test_extract_data_url(self):
+    def test_extract_data_url(self, headless_diagnostics):
         """Extract text from a data: URL (no network needed)."""
         # Check content with the production cold-start budget. The regression
         # above checks a stuck child's short deadline without real Chrome.
@@ -246,7 +332,7 @@ class TestCdpBackendExtract:
         assert "Hello from headless Chrome" in result
 
     @requires_native_chrome
-    def test_extract_truncates(self):
+    def test_extract_truncates(self, headless_diagnostics):
         backend = CdpBrowserBackend(find_chrome())
         long_text = "A" * 500
         html = f"<html><body><p>{long_text}</p></body></html>"
@@ -256,7 +342,7 @@ class TestCdpBackendExtract:
         assert len(result) < 200
 
     @requires_native_chrome
-    def test_extract_strips_scripts(self):
+    def test_extract_strips_scripts(self, headless_diagnostics):
         backend = CdpBrowserBackend(find_chrome())
         html = '<html><body><script>var x = "should not appear";</script><p>Clean text</p></body></html>'
         data_url = f"data:text/html,{html}"
@@ -277,7 +363,7 @@ class TestCdpBackendScreenshot:
         assert "CDP Error" in result
 
     @requires_native_chrome
-    def test_screenshot_data_url(self):
+    def test_screenshot_data_url(self, headless_diagnostics):
         backend = CdpBrowserBackend(find_chrome(), timeout=15)
         html = "<html><body><h1>Screenshot Test</h1></body></html>"
         data_url = f"data:text/html,{html}"

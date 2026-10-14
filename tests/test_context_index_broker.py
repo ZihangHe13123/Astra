@@ -120,6 +120,26 @@ class ReplacementRaceSource(FakeSource):
         return self.result
 
 
+class PausedSource(FakeSource):
+    """Hold the first worker until the caller changes its generation or mode."""
+
+    def __init__(self) -> None:
+        super().__init__("session")
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+
+    def recommend(self, *args: object) -> SourceResult:
+        result = super().recommend(*args)
+        if self.calls == 1:
+            self.entered.set()
+            try:
+                assert self.release.wait(5)
+            finally:
+                self.finished.set()
+        return result
+
+
 def make_broker(
     *,
     mode: str = "all",
@@ -379,16 +399,27 @@ def test_concurrent_builds_share_one_source_generation() -> None:
 
 
 def test_cancelled_build_cannot_publish_late_handles_or_pack() -> None:
-    session = FakeSource("session", delay=0.05)
-    broker = make_broker(mode="session", session=session)
+    session = PausedSource()
+    # Cancellation ordering is the contract here; source latency has its own
+    # tests. Gates keep the first worker alive until cancellation is observed.
+    broker = make_broker(mode="session", session=session, source_deadline_seconds=5.0)
 
     async def cancel_then_retry():
         pending = asyncio.create_task(_build(broker))
-        await asyncio.sleep(0.005)
-        pending.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await pending
-        await asyncio.sleep(0.06)
+        try:
+            assert await asyncio.to_thread(session.entered.wait, 5)
+            pending.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+            assert broker.last_trace is None
+        finally:
+            session.release.set()
+        assert await asyncio.to_thread(session.finished.wait, 5)
+        # Drain the cancelled generation's worker tasks before checking that no
+        # late pack/trace was published or beginning the replacement request.
+        remaining = [task for task in asyncio.all_tasks() if task is not asyncio.current_task()]
+        await asyncio.wait_for(asyncio.gather(*remaining, return_exceptions=True), timeout=5)
+        assert broker.last_trace is None
         return await _build(broker)
 
     pack = asyncio.run(cancel_then_retry())
@@ -398,13 +429,16 @@ def test_cancelled_build_cannot_publish_late_handles_or_pack() -> None:
 
 
 def test_mode_change_during_build_returns_empty_without_stale_state() -> None:
-    session = FakeSource("session", delay=0.05)
-    broker = make_broker(mode="session", session=session)
+    session = PausedSource()
+    broker = make_broker(mode="session", session=session, source_deadline_seconds=5.0)
 
     async def change_mode():
         pending = asyncio.create_task(_build(broker))
-        await asyncio.sleep(0.005)
-        broker.set_mode("off")
+        try:
+            assert await asyncio.to_thread(session.entered.wait, 5)
+            broker.set_mode("off")
+        finally:
+            session.release.set()
         return await pending
 
     pack = asyncio.run(change_mode())
@@ -414,15 +448,17 @@ def test_mode_change_during_build_returns_empty_without_stale_state() -> None:
 
 
 def test_complete_request_during_build_cannot_publish_late_state() -> None:
-    session = FakeSource("session", delay=0.05)
-    # What is checked is the request ending during a build, not the source deadline: give a slow
-    # runner room so the retry's own 50 ms source cannot time out.
+    session = PausedSource()
+    # End the request while the worker is still held by an explicit gate.
     broker = make_broker(mode="session", session=session, source_deadline_seconds=5.0)
 
     async def complete_then_retry():
         pending = asyncio.create_task(_build(broker))
-        await asyncio.sleep(0.005)
-        broker.complete_request("req-1")
+        try:
+            assert await asyncio.to_thread(session.entered.wait, 5)
+            broker.complete_request("req-1")
+        finally:
+            session.release.set()
         first = await pending
         retry = await _build(broker)
         return first, retry
