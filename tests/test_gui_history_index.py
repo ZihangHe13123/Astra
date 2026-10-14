@@ -309,3 +309,19 @@ def test_history_includes_only_the_selected_sessions_public_delegate_reports(sto
     assert result["delegates"][0]["status"] == "completed"
     assert result["delegates"][0]["session_id"] == "demo"
     assert store.subagent_path.read_bytes() == before
+
+
+def test_turns_started_for_background_work_show_as_notices_not_user_words(store):
+    messages = [_message("start the build"), _message("started", "assistant"),
+                _message("hidden check", provenance="session_wakeup"), _message("hidden reply", "assistant"),
+                _message("[Background work ended — not a new user message] …", provenance="background_completion",
+                         display_command="后台任务完成，继续处理：npm test"),
+                _message("[SYSTEM-DELIVERED BACKGROUND RUN ENDED] …", provenance="background_run",
+                         display_command="后台命令结束：npm run lint（失败，退出码 1）"),
+                _message("the tests passed; lint failed", "assistant")]
+    _write(store.legacy_path, {"messages": messages})
+    rows = [(row["role"], row["content"]) for row in queries.history("demo")["messages"]]
+    assert rows == [("user", "start the build"), ("assistant", "started"),
+                    ("system", "后台任务完成，继续处理：npm test"),
+                    ("system", "后台命令结束：npm run lint（失败，退出码 1）"),
+                    ("assistant", "the tests passed; lint failed")]

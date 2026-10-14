@@ -72,7 +72,7 @@ def register_conversation_tools(agent: Any, *, sandbox=None, mcp_manager=None,
             raise ValueError("Review snapshot expired or belongs to another session; reread and review current files")
         current = user_turn()
         if not current or turn_key(current) == pending["turn"] or current.get("provenance") in {
-            "command_workflow", "session_wakeup", "goal_continuation",
+            "command_workflow", "session_wakeup", "goal_continuation", "background_completion",
         }:
             raise ValueError("Finish the proposal and wait for the next user decision before applying")
         learned = LearnedSkills(agent.skill_store)

@@ -325,6 +325,9 @@ class ReActAgent(AgentBase):
         # Background delegate completions are delivered at safe ReAct
         # boundaries. The concrete mailbox lives with the delegate tools.
         self.delegate_mailbox: "DelegateMailbox | None" = None
+        # Set by a host that watches this agent's background runs: the ended ones of a
+        # session as (notice, display text), each given once (runtime/background_completion.py).
+        self.background_notices: Callable[[str], list[tuple[str, str]]] | None = None
         # Local-only frontends attach the process-scoped Computer Use runtime.
         # Remote/API surfaces intentionally leave it as None.
         self._computer_runtime: Any | None = None
@@ -1744,10 +1747,12 @@ class ReActAgent(AgentBase):
             }
         canonical_content = storage_content if storage_content != chat_content else chat_content
         self.context.add_user(canonical_content, provenance=(
-            str(msg.metadata["source"]) if msg.metadata.get("source") in {"session_wakeup", "command_workflow", "peer_message"}
+            str(msg.metadata["source"]) if msg.metadata.get("source") in {
+                "session_wakeup", "command_workflow", "peer_message", "background_completion"}
             else "goal_continuation" if msg.metadata.get("goal_round") else ""
         ))
-        if msg.metadata.get("source") in {"command_workflow", "peer_message"} and msg.metadata.get("display_command"):
+        if (msg.metadata.get("source") in {"command_workflow", "peer_message", "background_completion"}
+                and msg.metadata.get("display_command")):
             self.context.messages[user_index]["display_command"] = msg.metadata["display_command"]
         if storage_content == chat_content:
             storage_content = None
@@ -3084,6 +3089,33 @@ class ReActAgent(AgentBase):
                 logger.exception("task store tool finish failed task_id=%s name=%s", task_id, name)
         return event
 
+    # Background work of the turn. Like the two methods after these three, kept out
+    # of the reply loop, whose type analysis slows with every branch added to it.
+    def _parent_woken(self, task_id) -> bool:
+        """Whether the host starts a turn for reports that arrive after this turn answers."""
+        wakes = getattr(self.delegate_mailbox, "wakes_parent", None)
+        return bool(task_id) and callable(wakes) and bool(wakes(str(task_id)))
+
+    def _running_subagents_overlay(self, task_id) -> str:
+        return (
+            "Background subagents are still running. Continue all independent "
+            "foreground analysis and tool work now; do not stop merely because "
+            "they are running. "
+            + ("When nothing else is left, answer the user with what is done and what is "
+               "still running; their results start a new turn for you when they arrive."
+               if self._parent_woken(task_id) else
+               "Their mailbox results will be joined automatically when you are "
+               "otherwise ready to give the final answer.")
+        )
+
+    def _admit_background_notices(self) -> None:
+        """Put this session's background runs that ended since the last step before the model."""
+        if self.background_notices is None:
+            return
+        for notice, display in self.background_notices(self.context.session_scope):
+            self.context.add_user(notice, provenance="background_run")
+            self.context.messages[-1]["display_command"] = display
+
     # The two methods below hold the per-message bookkeeping of the turn's
     # repeat and per-tool limits. They live outside the reply loop on purpose:
     # that loop is one very large function, and branches added to it make its
@@ -3782,6 +3814,7 @@ class ReActAgent(AgentBase):
                 background_delegates_running = self.delegate_mailbox.has_running(
                     str(task_id)
                 )
+            self._admit_background_notices()
             current_prefill = prefill_recovery
             prefill_recovery = None
             full_content = ""
@@ -3829,12 +3862,7 @@ class ReActAgent(AgentBase):
             if background_delegates_running:
                 transient_messages.append({
                     "role": "system",
-                    "content": (
-                        "Background subagents are still running. Continue all independent "
-                        "foreground analysis and tool work now; do not stop merely because "
-                        "they are running. Their mailbox results will be joined automatically "
-                        "when you are otherwise ready to give the final answer."
-                    ),
+                    "content": self._running_subagents_overlay(task_id),
                 })
             if current_prefill is not None:
                 transient_messages.extend([
@@ -4636,7 +4664,9 @@ class ReActAgent(AgentBase):
                     if callable(drain_for)
                     else self.delegate_mailbox.drain(str(task_id))
                 )
-                if not envelopes and self.delegate_mailbox.has_running(str(task_id)):
+                if (not envelopes and self.delegate_mailbox.has_running(str(task_id))
+                        # A host that starts a turn for late reports lets this one answer now.
+                        and not self._parent_woken(task_id)):
                     # Parallel work has overlapped with the root's independent
                     # ReAct steps. Only when the root is ready to finalize does
                     # the dependency become serial: keep the task alive so

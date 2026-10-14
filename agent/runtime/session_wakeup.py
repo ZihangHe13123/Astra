@@ -119,7 +119,7 @@ def visible_wakeup_history(messages: list[dict]) -> list[dict]:
     visible = []
     for message in messages:
         provenance = message.get("provenance", "")
-        if (message.get("role") == "user" and provenance in {"", "session_wakeup"}
+        if (message.get("role") == "user" and provenance in {"", "session_wakeup", "background_completion"}
                 and (message.get("_meta") or {}).get("type") != "reasoning_context"):
             hidden = provenance == "session_wakeup"
         if provenance == "wakeup_notification" or not hidden:
