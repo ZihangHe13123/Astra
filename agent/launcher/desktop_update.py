@@ -29,6 +29,15 @@ def _journal(control: Path) -> Path:
     return control / 'desktop-update.json'
 
 
+def _finish_recovery(control: Path, install) -> None:
+    # Keep the durable recovery instructions until the restored app can start.
+    # Interruption at either unlink must leave a runnable app or a journal that
+    # can finish clearing its fence on the next recover invocation.
+    if install:
+        (install.control / 'desktop-pending.json').unlink(missing_ok=True)
+    _journal(control).unlink(missing_ok=True)
+
+
 def _state(application: Path, control: Path) -> dict:
     state = read_json(_journal(control))
     if not state or state.get('application') != str(application.resolve()):
@@ -148,9 +157,7 @@ def apply(application: Path, control: Path, *, validate=None) -> dict:
                         os.replace(application, staging)
                     os.replace(backup, application)
                 shutil.rmtree(staging, ignore_errors=True)
-                _journal(control).unlink(missing_ok=True)
-                if install:
-                    (install.control / 'desktop-pending.json').unlink(missing_ok=True)
+                _finish_recovery(control, install)
                 raise LauncherError(f'Desktop update failed; previous application restored: {exc}') from exc
             state['phase'] = 'applied'
             write_json(_journal(control), state)
@@ -190,9 +197,7 @@ def _recover(application: Path, control: Path, state: dict, install) -> dict:
     elif not application.exists():
         raise LauncherError('Original desktop application is missing; recovery left all files intact.')
     shutil.rmtree(staging, ignore_errors=True)
-    _journal(control).unlink()
-    if install:
-        (install.control / 'desktop-pending.json').unlink(missing_ok=True)
+    _finish_recovery(control, install)
     return {'phase': 'restored'}
 
 def finalize(application: Path, control: Path) -> dict:

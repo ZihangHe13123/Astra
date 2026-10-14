@@ -445,3 +445,7 @@ label { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sma
 .session-log-raw { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 55vh; overflow: auto; font-size: var(--fs-small); padding: 10px; background: var(--bg); border-radius: var(--r-1); }
 .session-log-pagination { justify-content: space-between; padding-top: 14px; flex-wrap: wrap; }
 .message.user.has-source .message-actions { display: flex; justify-content: flex-end; }
+
+.approval-facts { display:grid; grid-template-columns:max-content minmax(0,1fr); gap:6px 12px; font-size:12px; }
+.approval-facts dt { color:var(--muted); }
+.approval-facts dd { margin:0; overflow-wrap:anywhere; white-space:pre-wrap; }

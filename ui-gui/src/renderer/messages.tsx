@@ -8,11 +8,12 @@ import { expandRestoredReasoning } from "./restored-reasoning.js";
 import { windowRange, messageOffsets } from "./message-window.js";
 import type { SourceRef } from "./session-log.js";
 import { CopyButton } from "./copy-button.js";
+import { changeSource, type ChangeSource } from "./change-navigation.js";
 import { responseForMessage, ResponseVersionNav, type ResponseControls } from "./response-versions.js";
 import { Markdown } from "./markdown.js";
 
 /** Open a side panel from the conversation; for the tools panel, at the call with this result number. */
-export type OpenPanel = (panel: "tools" | "changes", resultIndex?: number) => void;
+export type OpenPanel = (panel: "tools" | "changes", resultIndex?: number, source?: ChangeSource) => void;
 export { Markdown } from "./markdown.js";
 
 export const MessageRow = memo(function MessageRow({ message: m, runtime, timeline, reasoning, expanded, responses, fail, openLog, located, openPanel }: {
@@ -23,7 +24,7 @@ export const MessageRow = memo(function MessageRow({ message: m, runtime, timeli
   const toggle = (e: React.SyntheticEvent<HTMLDetailsElement>) => { expanded.set(m.id, e.currentTarget.open); setOpen(e.currentTarget.open); };
   const { roles } = useTheme().wording;
   if (m.role === "activity") return <Activity tools={m.tools || []} openDetails={openPanel && (tool => openPanel("tools", Number(tool.result_index) || undefined))}/>;
-  if (m.role === "changes") return m.changes ? <TurnChanges note={m.changes} open={openPanel && (() => openPanel("changes"))}/> : null;
+  if (m.role === "changes") return m.changes ? <TurnChanges note={m.changes} open={openPanel && (() => openPanel("changes", undefined, changeSource(m.changes!)))}/> : null;
   return <article data-message-id={m.id} data-response-group-id={response.group?.id} data-response-pending={response.pending || undefined} className={`message ${m.role}${m.source_ref && openLog ? " has-source" : ""}${located ? " located-message" : ""}`}>
     {m.role === "reasoning" ? reasoning && <details className="reasoning" open={open} onToggle={toggle}><summary>{roles.reasoning}</summary><Markdown text={m.content} runtime={runtime} fail={fail}/></details> : m.role === "tool" ? <details className="command-result" open={open} onToggle={toggle}><summary>操作结果</summary><Markdown text={m.content} runtime={runtime} fail={fail}/></details> : <>
       <div className="message-head"><span>{roles[m.role === "user" || m.role === "assistant" || m.role === "error" ? m.role : "system"]}</span>{timeline && m.timestamp && <time>{new Date(m.timestamp * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>}</div>

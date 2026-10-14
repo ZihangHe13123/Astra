@@ -253,7 +253,7 @@ def _rename_session(old_name: str, new_name: str) -> None:
     # Refuse before moving media or any source; GUI display titles remain safe.
     if (ConversationBranches(old_store.logical_path).all_related_paths()
             or ConversationBranches(new_store.logical_path).all_related_paths()):
-        raise ValueError("Conversation has reply versions and cannot be renamed on disk; change its display title instead")
+        raise SessionNameError("Conversation has reply versions and cannot be renamed on disk; change its display title instead")
     old_paths = old_store.related_paths()
     pairs = list(zip(old_store.related_paths(include_branches=False), new_store.related_paths(include_branches=False)))
     paired = {old for old, _ in pairs}

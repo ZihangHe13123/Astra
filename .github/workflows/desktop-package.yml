@@ -46,7 +46,7 @@ jobs:
           npm --prefix ui-gui run build
       - name: Distribution regression contracts
         run: |
-          uv run --no-sync python -m pytest -q tests/test_desktop_distribution.py tests/test_launcher_prerequisites.py
+          uv run --no-sync python -m pytest -q tests/test_desktop_distribution.py tests/test_desktop_packaged_backend.py tests/test_desktop_update_cleanup.py tests/test_launcher_prerequisites.py
           npm --prefix ui-gui test
       - name: Build native macOS helper
         if: runner.os == 'macOS'

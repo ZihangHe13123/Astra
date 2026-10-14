@@ -14,6 +14,7 @@ import { docPathFromTool, latestDoc } from "./doc-preview.js";
 import { modelConnection } from "./model-connection.js";
 import { SessionMenu, SessionActionDialog, type SessionAction } from "./session-actions.js";
 import { modeCommand, modeChoices, localCommandEntry } from "../local-mode.js";
+import type { ChangeTarget } from "./change-navigation.js";
 import { migrateBlankDraft } from "./drafts.js";
 import { ToolPreparation } from "./tool-preparation.js";
 import { SessionLogPanel, sameSource, recordChatSource, supportsSessionLog, type LogTarget, type SessionLogRecord, type SourceRef } from "./session-log.js";
@@ -62,6 +63,7 @@ function App() {
   const [toast, setToast] = useState("");
   const [selection, setSelection] = useState<{ index?: number; serial: number }>({ serial: 0 });
   // A page being looked at may take the conversation's room as well, until Escape or its own button gives it back.
+  const [changeTarget, setChangeTarget] = useState<ChangeTarget>();
   const [detailsWide, setDetailsWide] = useState(false);
   const [logTarget, setLogTarget] = useState<LogTarget>({ serial: 0 });
   const [chatLocation, setChatLocation] = useState<{ id: string; serial: number }>();
@@ -102,6 +104,7 @@ function App() {
   }, [active, state?.branchId, responseVersions?.revision]);
   const localDefinition = state?.info.local_mode_info?.definition;
   const commandModes = useMemo(() => [...builtinCommandModes, ...(localDefinition ? [{ mode: "local", ...localDefinition }] : [])], [localDefinition]);
+  useEffect(() => { setChangeTarget(undefined); }, [active, state?.mode, state?.session, state?.branchId]);
   // Open the Files panel on the document or page the agent is writing. Once the user closes or
   // leaves it, later writes to that same file stay out of their way; a different file is
   // something new to show.
@@ -376,8 +379,9 @@ function App() {
   const messages: Message[] = useMemo(() => preview ? preview.messages.map((m: Message) => ({ ...m, content: textContent(m.content) })) : state?.messages || [], [preview?.messages, state?.messages]);
   // Tool results the conversation cannot place (a restored history has only a list) keep their one-line summary.
   // From a row in the conversation the tools panel opens at that row's call, as `/tool <n>` does.
-  const openPanelAt = useCallback<OpenPanel>((name, resultIndex) => {
+  const openPanelAt = useCallback<OpenPanel>((name, resultIndex, source) => {
     if (name === "tools" && resultIndex) setSelection(old => ({ index: resultIndex, serial: old.serial + 1 }));
+    if (name === "changes") setChangeTarget(old => source ? { source, serial: (old?.serial || 0) + 1 } : undefined);
     setPanel(name);
   }, []);
   const unplacedTools = useMemo(() => preview || !state ? [] : withActivity(messages, state.tools).unplaced, [preview, messages, state?.tools]);
@@ -546,7 +550,7 @@ function App() {
           </div>}
           <div className="composer-foot"><span>{state?.status === "ready" ? state.busy ? "运行中" : "就绪" : state ? state.status === "disconnected" ? "后端已断开" : "连接后端中…" : "本地运行 · 模型自主选择工具"}</span><span>Enter 发送 · Shift Enter 换行</span></div>
         </div>
-      </div>{panel === "logs" && logSession ? <SessionLogPanel key={logScope} session={logSession.name} mode={logSession.mode} branchId={logBranch} responseRevision={logResponseRevision} target={logTarget} width={prefs.detailWidth || 420} close={() => { logNavigation.current++; setPanel(undefined); }} locate={locateLog}/> : panel && panel !== "logs" && state && !preview && <Details state={state} panel={panel} setPanel={next => { if (next === "logs") { openLog(); return; } if (next !== "files") leaveDoc(); setPanel(next); }} selection={selection} width={prefs.detailWidth || 420} onWidth={detailWidth => savePrefs({ detailWidth })} close={() => { leaveDoc(); setPanel(undefined); }} fail={fail} doc={docTarget && leftDoc.current !== docTarget.path ? docTarget : undefined} onDocDismiss={leaveDoc} openLog={logSession ? call_id => openLog({ call_id }) : undefined} wide={detailsWide} onWide={setDetailsWide} onAttach={attach}/>}</div>
+      </div>{panel === "logs" && logSession ? <SessionLogPanel key={logScope} session={logSession.name} mode={logSession.mode} branchId={logBranch} responseRevision={logResponseRevision} target={logTarget} width={prefs.detailWidth || 420} close={() => { logNavigation.current++; setPanel(undefined); }} locate={locateLog}/> : panel && panel !== "logs" && state && !preview && <Details key={`${state.id}:${state.mode}:${state.session}:${state.branchId || ""}`} changeTarget={changeTarget} state={state} panel={panel} setPanel={next => { if (next === "logs") { openLog(); return; } if (next !== "files") leaveDoc(); setPanel(next); }} selection={selection} width={prefs.detailWidth || 420} onWidth={detailWidth => savePrefs({ detailWidth })} close={() => { leaveDoc(); setPanel(undefined); }} fail={fail} doc={docTarget && leftDoc.current !== docTarget.path ? docTarget : undefined} onDocDismiss={leaveDoc} openLog={logSession ? call_id => openLog({ call_id }) : undefined} wide={detailsWide} onWide={setDetailsWide} onAttach={attach}/>}</div>
     </main>
     {toast && <div className="toast" role="alert"><span>{toast}</span><button className="icon" onClick={() => setToast("")} aria-label="关闭提示"><X size={16}/></button></div>}
     {modal === "commands" && <CommandPalette commands={commands} labels={commandNames(commandModes)} initialFilter={commandQuery} close={() => setModal(undefined)} run={command}/>}

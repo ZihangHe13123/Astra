@@ -67,12 +67,24 @@ saving changes. For example, a one-shot time is `--at 2026-10-06T09:00:00+08:00`
 
 `--catch-up SECONDS` sets the maximum lateness (1–86400). The default is five
 minutes for a one-shot and half the interval, capped at one hour, for repeats.
-Missed ranges are explicitly recorded as `skipped`; at most the latest eligible
-slot is executed, never a burst of past slots. A running occurrence blocks another
-occurrence of the same job; later missed slots follow the same accounting policy.
+Missed ranges are explicitly recorded as `skipped` and delivered to the local inbox;
+`list` and `show` also expose `last_outcome`, separately from the schedule state.
+A completed one-shot schedule does not mean its last occurrence succeeded. At
+most the latest eligible slot is executed, never a burst of past slots. Model-free
+reminders are serviced while a check worker is running, so a slow model request
+does not hold their delivery until that check completes. A running occurrence
+still blocks another occurrence of the same job; later missed slots follow the
+same accounting policy.
 
 `--idle SECONDS` limits inactivity, reset by actual model/tool events (default
 120 seconds); `--timeout SECONDS` is a separate hard run limit (default 900).
+
+Workers run in an owned process group on POSIX and a Windows Job on Windows.
+On interruption, the scheduler stops that group/job and checks the execution
+owner lease before recording an unknown outcome. If cleanup cannot be confirmed,
+the active occurrence remains fenced until recovery observes that the owner has
+exited; it is never automatically replayed. POSIX gives the worker a bounded
+grace period to close detached provider processes before stopping its group.
 `--iterations N` bounds the ReAct loop (default 10, maximum 50). If an execution
 owner disappears or a running worker must be terminated, the occurrence becomes
 `unknown` and is never automatically replayed. Inspect its saved session before

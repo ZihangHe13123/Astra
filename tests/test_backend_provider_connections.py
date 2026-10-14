@@ -71,7 +71,8 @@ class ModelsHandler(BaseHTTPRequestHandler):
             self.server.started.set()
             self.server.release.wait(5)
         self.server.requests.append((self.path, self.headers.get("Authorization", "")))
-        payload = json.dumps({"data": [{"id": "fresh-model", "context_length": 65536}]}).encode()
+        payload = json.dumps({"data": [{"id": self.server.model_id,
+                                       "context_length": self.server.context_length}]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
@@ -80,10 +81,12 @@ class ModelsHandler(BaseHTTPRequestHandler):
 
 
 @pytest.mark.parametrize("unconfigured", [False, True])
-def test_provider_flow_over_real_ipc(tmp_path, monkeypatch, unconfigured):
+@pytest.mark.parametrize("manual_model", [False, True])
+def test_provider_flow_over_real_ipc(tmp_path, monkeypatch, unconfigured, manual_model):
     monkeypatch.setenv("ASTRA_HOME", str(tmp_path / "state"))
     server = ThreadingHTTPServer(("127.0.0.1", 0), ModelsHandler)
     server.slow = False
+    server.model_id, server.context_length = "fresh-model", 65536
     server.started, server.release = threading.Event(), threading.Event()
     server.requests = []
     threading.Thread(target=server.serve_forever, daemon=True).start()
@@ -107,19 +110,27 @@ def test_provider_flow_over_real_ipc(tmp_path, monkeypatch, unconfigured):
         assert not connected["error"]
         assert all(e.get("model_key", original_key) == original_key for e in seen)
         provider = connected["provider_id"]
-        selector = f"{provider}::fresh-model"
+        selected_model = "gpt-6.1-sol" if manual_model else "fresh-model"
+        selector = f"{provider}::{selected_model}"
         send({"type": "command", "cmd": f"/model {selector}"})
         selected = wait(lambda e: e.get("type") == "model_info" and e.get("model_key") == selector)
         assert selected["recent_models"][0] == selector
+        assert selected["context_limit"] == (24_576 if manual_model else 32_768)
         assert json.loads((tmp_path / "settings.json").read_text())["selected_model"] == selector
         # A slow GET must not block live controls or a second provider's UI.
         server.slow = True
+        server.model_id, server.context_length = selected_model, 272_000
         send({"type": "refresh_models", "provider_id": provider, "force": True})
         assert server.started.wait(2)
         send({"type": "command", "cmd": "/yolo status"})
         wait(lambda e: e.get("type") == "yolo_status", timeout=2)
         server.release.set()
-        wait(lambda e: e.get("type") == "model_info" and e.get("model_key") == selector)
+        refreshed = wait(lambda e: e.get("type") == "model_info" and e.get("model_key") == selector)
+        assert refreshed["context_limit"] == (263_808 if manual_model else 136_000)
+        current = next(item for item in refreshed["models"] if item["current"])
+        assert current["context_limit"] == 272_000
+        assert current["source"] == "live"
+        assert refreshed["context_pct"] == round(refreshed["context_used"] / refreshed["context_limit"] * 100, 1)
         assert "PRIVATE-CONNECT-KEY" not in json.dumps(seen)
         assert any(auth == "Bearer PRIVATE-CONNECT-KEY" for _, auth in server.requests)
     finally:
@@ -165,5 +176,67 @@ def test_desktop_model_selection_receipts_are_correlated_without_changing_tui(tm
         assert "request_id" not in tui
         assert tui["error"] == ""
         assert tui["output"].startswith("Unknown model: definitely-missing")
+    finally:
+        _stop_protocol_backend(proc)
+
+
+def test_codex_context_override_survives_startup_refresh_and_reselection(tmp_path, monkeypatch):
+    monkeypatch.setenv("ASTRA_HOME", str(tmp_path / "state"))
+    overrides = tmp_path / "user-models.yaml"
+    overrides.write_text("""models:
+  gpt-6.1-sol:
+    provider: openai-codex
+    base_url: https://chatgpt.com/backend-api/codex
+    api_key_env: ''
+    catalog_provider: codex
+    context_window: 512000
+    auto_compact_token_limit: 450000
+    capabilities: [tools, reasoning, streaming, vision]
+""", encoding="utf-8")
+    bootstrap = """
+import runpy
+from agent.cli import model_cache, model_catalog, provider_connections
+from agent.runtime import codex_auth
+codex_auth._write({'access_token': 'fixture-only-token', 'account_id': 'fixture-account'})
+provider_connections.save_connection(*provider_connections.connection_record('codex'))
+items = [{'id': 'gpt-6.1-sol', 'context_length': 272000,
+          'supported_parameters': ['tools', 'reasoning'], 'input_modalities': ['text', 'image'],
+          'reasoning_levels': ['low', 'medium', 'high', 'xhigh', 'max', 'ultra']}]
+endpoint = next(e for e in model_catalog.provider_endpoints() if e.id == 'codex')
+model_cache.write_cache(endpoint, items)
+restored = model_catalog.configured_model_catalog().resolve('codex::gpt-6.1-sol')
+assert restored.profile.reasoning_levels == tuple(items[0]['reasoning_levels'])
+async def fetch_models():
+    return items
+codex_auth.fetch_models = fetch_models
+runpy.run_module('agent.cli.backend', run_name='__main__')
+"""
+    proc, _, _, wait = _start_question_protocol_backend(
+        tmp_path, 0, "codex-context-override",
+        settings_overrides={"selected_model": "codex::gpt-6.1-sol"},
+        env_overrides={"AGENT_USER_MODELS_FILE": str(overrides)}, bootstrap_code=bootstrap,
+    )
+
+    def send(payload):
+        proc.stdin.write(json.dumps(payload) + "\n")
+        proc.stdin.flush()
+
+    def assert_context(event):
+        assert event["model_key"] == "codex::gpt-6.1-sol"
+        assert event["context_limit"] == 450_000
+        assert next(item for item in event["models"] if item["current"])["context_limit"] == 512_000
+
+    try:
+        assert_context(wait(lambda e: e.get("type") == "model_info"))
+        send({"type": "refresh_models", "provider_id": "codex", "force": True})
+        refreshed = wait(lambda e: e.get("type") == "model_info")
+        assert_context(refreshed)
+        assert next(item for item in refreshed["models"] if item["current"])["source"] == "live"
+        send({"type": "command", "cmd": "/model test::Qwen3.6-35B-A3B"})
+        other = wait(lambda e: e.get("type") == "model_info")
+        assert other["model_key"] == "test::Qwen3.6-35B-A3B"
+        assert other["context_limit"] == 65_536
+        send({"type": "command", "cmd": "/model codex::gpt-6.1-sol"})
+        assert_context(wait(lambda e: e.get("type") == "model_info"))
     finally:
         _stop_protocol_backend(proc)

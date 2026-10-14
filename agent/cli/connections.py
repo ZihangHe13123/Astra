@@ -69,9 +69,11 @@ def sync_context_budget(agent, profile: ModelProfile) -> int:
     budget = prompt_token_budget(
         profile.context_limit, agent.llm.config.max_tokens,
         model=profile.model_id or getattr(agent.llm.config, "model", ""), provider=profile.provider,
+        auto_compact_token_limit=profile.auto_compact_token_limit,
     )
     agent.context.max_prompt_tokens = budget
     agent.llm.config.context_limit = profile.context_limit
+    agent.llm.config.auto_compact_token_limit = profile.auto_compact_token_limit
     return budget
 
 

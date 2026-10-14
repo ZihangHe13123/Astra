@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import stat
 import tempfile
 import uuid
 from dataclasses import dataclass, field
@@ -226,17 +227,20 @@ def apply_patch(
                 "target": target,
                 "payload": payload,
                 "before_sha256": "",
+                "before_mode": None,
             })
             continue
         if not target.exists() or not target.is_file():
             raise PatchError(f"patch target is not a file: {target}")
         content, has_bom, newline, before_sha256 = _decode_utf8(target)
+        before_mode = stat.S_IMODE(target.stat().st_mode)
         if operation.kind == "delete":
             planned.append({
                 "operation": operation,
                 "target": target,
                 "payload": None,
                 "before_sha256": before_sha256,
+                "before_mode": before_mode,
             })
             continue
         updated = _apply_hunks(target, content, operation.hunks)
@@ -250,6 +254,7 @@ def apply_patch(
             "target": target,
             "payload": payload,
             "before_sha256": before_sha256,
+            "before_mode": before_mode,
         })
 
     summary = patch_summary(operations)
@@ -264,7 +269,8 @@ def apply_patch(
                 raise PatchError(f"add target appeared after preflight: {target}")
             continue
         current_sha256 = hashlib.sha256(target.read_bytes()).hexdigest()
-        if current_sha256 != item["before_sha256"]:
+        if (current_sha256 != item["before_sha256"]
+                or stat.S_IMODE(target.stat().st_mode) != item["before_mode"]):
             raise PatchError(f"target changed after preflight: {target}")
 
     staged: list[tuple[dict, Path]] = []
@@ -289,9 +295,19 @@ def apply_patch(
                 handle.flush()
                 os.fsync(handle.fileno())
             staged.append((item, temporary))
+            if item["before_mode"] is not None:
+                temporary.chmod(item["before_mode"])
 
         for item in planned:
             target = item["target"]
+            if item["operation"].kind == "add":
+                if target.exists():
+                    raise PatchError(f"add target appeared after preflight: {target}")
+                continue
+            if (not target.is_file()
+                    or hashlib.sha256(target.read_bytes()).hexdigest() != item["before_sha256"]
+                    or stat.S_IMODE(target.stat().st_mode) != item["before_mode"]):
+                raise PatchError(f"target changed after preflight: {target}")
             if not target.exists():
                 continue
             backup = target.with_name(f".{target.name}.agent-backup-{uuid.uuid4().hex}.tmp")

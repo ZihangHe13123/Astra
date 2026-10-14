@@ -155,6 +155,52 @@ def test_guidance_survives_cold_restore_and_workspace_a_b_a(tmp_path, monkeypatc
     assert "A changed on disk" not in other_llm.requests[-1][0][0]["content"]
 
 
+def test_applied_guidance_survives_later_save_cold_restore_and_reply_branch(tmp_path, monkeypatch):
+    from agent.runtime.conversation_branches import ConversationBranches
+    from agent.runtime.message_source import message_source_ref
+    from agent.runtime.session_store import SessionStore
+
+    root = project(tmp_path)
+    agent, llm, skills = agent_for(root, monkeypatch)
+    path = tmp_path / "refreshed.json"
+    agent.context.set_session(str(path))
+    reply(agent, "first")
+    agent.context.save()
+    (root / "AGENTS.md").write_text("Root contract v2", encoding="utf-8")
+    skills.create("applied-skill", "---\nname: applied-skill\ndescription: Applied guidance\n---\nInstructions")
+    output, error = execute_guidance_command(agent, ["refresh", "--now"])
+    assert not error and "Applied saved guidance" in output
+    reply(agent, "after refresh")
+    agent.context.save()
+    applied_request = copy.deepcopy(llm.requests[-1])
+    applied_snapshot = copy.deepcopy(agent.context.guidance_snapshot)
+    assert "Root contract v2" in applied_request[0][0]["content"]
+    assert "applied-skill" in applied_request[0][0]["content"]
+
+    # Later disk changes stay pending even after a cold restore.
+    (root / "AGENTS.md").write_text("Root contract v3 pending", encoding="utf-8")
+    saved = SessionStore(path)
+    before = {file: file.read_bytes() for file in saved.related_paths() if file.is_file()}
+    restored = AgentContext(system_prompt="Shared identity")
+    restored.set_session(str(path))
+    assert restored.load(readonly=True)
+    assert restored.guidance_snapshot == applied_snapshot
+    assert {file: file.read_bytes() for file in before} == before
+    other, other_llm, _ = agent_for(root, monkeypatch, context=restored)
+    reply(other, "continue after restart")
+    assert other_llm.requests[0][0][:len(applied_request[0])] == applied_request[0]
+    assert other_llm.requests[0][1] == applied_request[1]
+    assert other.guidance_status()["pending"]["project"]
+
+    source = saved.load(readonly=True)
+    branches = ConversationBranches(path)
+    state = branches.state()
+    reference = message_source_ref(source["messages"][-1], len(source["messages"]) - 1)
+    ticket = branches.prepare_retry(reference, branch_id=state["branch_id"], expected_revision=state["revision"])
+    staged = other.context.stage_session(str(path), branch_id=ticket["candidate_branch_id"])
+    assert staged.guidance_snapshot == applied_snapshot
+
+
 def test_response_versions_inherit_guidance_and_stage_without_mutating_source(tmp_path, monkeypatch):
     from agent.runtime.conversation_branches import ConversationBranches
     from agent.runtime.message_source import message_source_ref

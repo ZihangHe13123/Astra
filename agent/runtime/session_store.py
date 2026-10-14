@@ -6,6 +6,7 @@ import re
 import sys
 import time
 import uuid
+from collections.abc import Iterable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -245,12 +246,13 @@ class SessionStore:
         replace = existing_count > append_from
 
         self._write_header(self._state_without_messages(data))
-        with open(self.jsonl_path, "a", encoding="utf-8") as f:
-            if replace:
-                f.write(json.dumps({"type": "replace", "messages": messages}, ensure_ascii=False) + "\n")
-            else:
-                for idx, msg in enumerate(messages[append_from:], start=append_from):
-                    f.write(json.dumps({"type": "message", "index": idx, "message": msg}, ensure_ascii=False) + "\n")
+        if replace:
+            self._append_jsonl([json.dumps({"type": "replace", "messages": messages}, ensure_ascii=False)])
+        else:
+            self._append_jsonl(
+                json.dumps({"type": "message", "index": idx, "message": msg}, ensure_ascii=False)
+                for idx, msg in enumerate(messages[append_from:], start=append_from)
+            )
 
         if snapshot or not self.snapshot_path.exists():
             self.save_snapshot(data)
@@ -271,27 +273,38 @@ class SessionStore:
         os.replace(temporary, self.header_path)
 
     def _append_lifecycle(self, event_type: str, **payload: Any) -> None:
-        self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
         event = {"type": event_type, "recorded_at": time.time(), **payload}
-        with open(self.jsonl_path, "a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, ensure_ascii=False, default=str) + "\n")
+        self._append_jsonl([json.dumps(event, ensure_ascii=False, default=str)])
 
-    def lifecycle_events(self) -> list[dict[str, Any]]:
-        events: list[dict[str, Any]] = []
+    def _append_jsonl(self, records: Iterable[str]) -> None:
+        """Keep every new record separate, preserving any torn tail as evidence."""
+        self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.jsonl_path, "a+b") as handle:
+            if handle.tell():
+                handle.seek(-1, os.SEEK_END)
+                if handle.read(1) != b"\n":
+                    handle.write(b"\n")
+            for record in records:
+                handle.write(record.encode("utf-8") + b"\n")
+
+    def _jsonl_events(self) -> Iterator[dict[str, Any]]:
+        """Read complete records without changing a damaged journal."""
         try:
-            with open(self.jsonl_path, "r", encoding="utf-8") as handle:
+            with open(self.jsonl_path, "rb") as handle:
                 for line in handle:
                     try:
                         event = json.loads(line)
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, UnicodeDecodeError):
                         continue
-                    if isinstance(event, dict) and event.get("type") in {
-                        "session_started", "session_ended", "session_interrupted",
-                    }:
-                        events.append(event)
+                    if isinstance(event, dict):
+                        yield event
         except OSError:
-            pass
-        return events
+            return
+
+    def lifecycle_events(self) -> list[dict[str, Any]]:
+        return [event for event in self._jsonl_events() if event.get("type") in {
+            "session_started", "session_ended", "session_interrupted",
+        }]
 
     @staticmethod
     def _process_alive(pid: int) -> bool:
@@ -403,6 +416,7 @@ class SessionStore:
             "system_prompt_migration": data.get("system_prompt_migration", {}),
             "system_prompt_projection": data.get("system_prompt_projection", {}),
             "runtime_context_projection": data.get("runtime_context_projection", {}),
+            "guidance_snapshot": data.get("guidance_snapshot", {}),
             "persona_id": data.get("persona_id", ""),
             "persona_definition_version": data.get("persona_definition_version", 0),
             "persona_state_revision": data.get("persona_state_revision", 0),
@@ -417,33 +431,22 @@ class SessionStore:
 
     def _replay_jsonl(self, data: dict[str, Any]) -> None:
         messages = list(data.get("messages", []))
-        try:
-            # Decode each record independently: a torn UTF-8 tail must not
-            # prevent inspection of earlier complete checkpoints.
-            with open(self.jsonl_path, "rb") as f:
-                for line in f:
-                    try:
-                        event = json.loads(line)
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        continue
+        for event in self._jsonl_events():
+            event_type = event.get("type")
+            if event_type == "state":
+                data.update(event.get("state", {}))
+            elif event_type == "replace":
+                messages = list(event.get("messages", []))
+            elif event_type == "message":
+                idx = event.get("index", len(messages))
+                msg = event.get("message")
+                if not isinstance(msg, dict):
+                    continue
+                if isinstance(idx, int) and idx < len(messages):
+                    continue
+                messages.append(msg)
+            elif event_type == "subagent_checkpoint":
+                from .subagent_conversation import apply_checkpoint
 
-                    event_type = event.get("type")
-                    if event_type == "state":
-                        data.update(event.get("state", {}))
-                    elif event_type == "replace":
-                        messages = list(event.get("messages", []))
-                    elif event_type == "message":
-                        idx = event.get("index", len(messages))
-                        msg = event.get("message")
-                        if not isinstance(msg, dict):
-                            continue
-                        if isinstance(idx, int) and idx < len(messages):
-                            continue
-                        messages.append(msg)
-                    elif event_type == "subagent_checkpoint":
-                        from .subagent_conversation import apply_checkpoint
-
-                        messages, data["subagent_state"] = apply_checkpoint(event, messages)
-        except OSError:
-            return
+                messages, data["subagent_state"] = apply_checkpoint(event, messages)
         data["messages"] = messages

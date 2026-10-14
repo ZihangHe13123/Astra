@@ -262,7 +262,10 @@ def configured_model_catalog() -> ModelCatalog:
         cached = model_cache.read_cache(endpoint)
         if cached:
             for entry in entries_from_items(endpoint, cached[0], source="cache", fetched_at=cached[1]):
-                entries.setdefault(entry.key, entry)
+                # Keep explicit local windows and compaction settings while
+                # restoring the account's discovered reasoning metadata.
+                if entry.key not in entries or entry.profile.context_window is not None:
+                    entries[entry.key] = entry
     return ModelCatalog(tuple(entries.values()), {})
 
 
@@ -398,7 +401,7 @@ def entries_from_items(endpoint: ProviderEndpoint, items: list[dict], *, source:
         override = next((p for name, p in static.items() if (p.model_id or name) == model_id
                          and p.base_url.rstrip("/") == endpoint.profile.base_url.rstrip("/")), None)
         template = override or endpoint.profile
-        context = model_context_limit(item) or template.context_limit
+        context = template.context_window or model_context_limit(item) or template.context_limit
         output = _positive_int(item.get("max_completion_tokens")) or template.max_tokens
         capabilities = set(template.capabilities)
         if override is None:

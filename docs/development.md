@@ -36,7 +36,7 @@ conflict checks still apply. The manual commands above remain useful for
 development and release checks; use `astra setup` afterward to record the
 verified environment.
 
-For desktop development use Node.js 22.12+ and `astra setup --gui --extra dev`.
+For desktop development use Node.js 22.19+ and `astra setup --gui --extra dev`.
 See [desktop checks](gui.md#development-checks) for the separate GUI acceptance suite.
 The normal release gate builds and tests `ui-core` before the TUI; GUI checks remain optional.
 

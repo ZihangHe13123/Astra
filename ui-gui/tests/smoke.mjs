@@ -13,6 +13,7 @@ const root = resolve(fileURLToPath(new URL('../..', import.meta.url)));
 const folder = mkdtempSync(join(tmpdir(), 'astra-desktop-smoke-'));
 const workspace = join(folder, '工作区 with spaces'); mkdirSync(workspace);
 const target = join(workspace, 'receipt.txt');
+const laterTarget = join(workspace, 'later-turn.txt');
 const report = join(workspace, 'report.md');
 const output = join(root, 'output/playwright/gui'); mkdirSync(output, { recursive: true });
 const requests = [];
@@ -68,6 +69,7 @@ const server = createServer(async (req, res) => {
     : !answered && delegateParent ? ['delegate_task', { tasks: delegateGoals.map(goal => ({
       goal, mode: 'explorer', fork_turns: 'none', tools: ['read_file'], max_turns: 4,
     })) }]
+    : !answered && text.includes('第二个测试文件') ? ['write_file', { path: laterTarget, content: 'LATER_TURN_ONLY\n' }]
     : !answered && text.includes('测试文件') ? ['write_file', { path: target, content: 'apple\norange\ngrape\n' }]
     : !answered && text.includes('追问') ? ['ask_user_question', { questions: [{ id: 'choice', question: '使用哪种格式？', multi_select: false,
       options: [{ label: 'Markdown', description: '便于阅读' }, { label: 'JSON', description: '便于处理' }] }] }] : undefined;
@@ -111,7 +113,7 @@ writeFileSync(join(folder, 'models.yaml'), `version: 1\nproviders:\n  test:\n   
 const modelsPath=join(folder,'models.yaml');
 writeFileSync(modelsPath,readFileSync(modelsPath,'utf8')+`  missing-model:\n    provider: openai-compatible\n    base_url: https://api.deepseek.com\n    api_key_env: GUI_MISSING_API_KEY\n    context_limit: 131072\n`);
 const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/API_KEY|TOKEN|SECRET|^AGENT_|^ASTRA_|^LLM_|^SANDBOX_|^ELECTRON_/.test(key)));
-const env = { ...cleanEnv, ASTRA_GUI_DISABLE_APPSHOT:'1', ASTRA_LOCAL_MODE_FILE:join(root,'tests/fixtures/local_mode.py'), AGENT_PROJECT_ROOT:root, AGENT_PYTHON:process.env.AGENT_PYTHON || join(root,'.venv',process.platform==='win32'?'Scripts/python.exe':'bin/python'),
+const env = { ...cleanEnv, ASTRA_GUI_DISABLE_APPSHOT:'1', ASTRA_DELEGATE_CONCURRENCY:'2', ASTRA_DELEGATE_OWNER_CONCURRENCY:'2', ASTRA_LOCAL_MODE_FILE:join(root,'tests/fixtures/local_mode.py'), AGENT_PROJECT_ROOT:root, AGENT_PYTHON:process.env.AGENT_PYTHON || join(root,'.venv',process.platform==='win32'?'Scripts/python.exe':'bin/python'),
  ASTRA_ENV_FILE:join(folder,'.env'), ASTRA_HOME:folder, AGENT_SETTINGS_PATH:join(folder,'settings.json'), AGENT_SESSION_DIR:join(folder,'sessions'),
  AGENT_TASK_DB:join(folder,'tasks.db'), ASTRA_APPROVAL_DB:join(folder,'approvals.db'), ASTRA_EVENT_DB:join(folder,'events.db'),
  AGENT_MEMORY_PATH:join(folder,'memory.db'), AGENT_LEARNING_PATH:join(folder,'learning.db'), AGENT_SKILLS_PATH:join(folder,'skills'),
@@ -285,6 +287,22 @@ try {
  await page.locator('.file-row').first().waitFor(); await page.locator('.file-row').first().click();
  await page.locator('.diff').waitFor(); await page.screenshot({path:join(output,'conversation-diff.png')});
  await page.getByRole('button',{name:'关闭详情',exact:true}).click(); passed('real change ledger and snapshots');
+ // A conversation card identifies its original turn even after a later turn writes another file.
+ const originalChange = await page.evaluate(async()=>{const boot=await window.astra.bootstrap();return window.astra.query('changes',{turn:1},boot.active);});
+ await submit('请写入第二个测试文件');
+ await page.getByRole('button',{name:'允许一次',exact:true}).waitFor({timeout:15000});
+ await page.getByRole('button',{name:'允许一次',exact:true}).click(); await idle();
+ assert.equal(readFileSync(laterTarget,'utf8'),'LATER_TURN_ONLY\n');
+ const olderCard=page.locator('.turn-changes').filter({hasText:'receipt.txt'}).first();
+ await olderCard.getByRole('button',{name:'查看改动',exact:true}).click();
+ await expect(page.getByRole('combobox',{name:'选择改动回合'}).locator('option:checked')).toHaveText(new RegExp(`回合 ${originalChange.record.turn_seq} ·`));
+ await expect(page.locator('.details-panel .file-row')).toHaveCount(1);
+ await expect(page.locator('.details-panel .file-row')).toContainText('receipt.txt');
+ await page.locator('.details-panel .file-row').click();
+ await expect(page.locator('.diff')).toContainText('orange');
+ await expect(page.locator('.diff')).not.toContainText('LATER_TURN_ONLY');
+ await page.getByRole('button',{name:'关闭详情',exact:true}).click();
+ passed('earlier change card and file snapshot retain exact turn identity after a newer write');
  await submit('请追问格式'); await page.getByRole('radio',{name:'Markdown 便于阅读'}).check();
  await page.getByRole('button',{name:'发送答复',exact:true}).click(); await idle(); passed('structured question and same-turn continuation');
  // Three real children read the approved file and then pause at the HTTP
@@ -294,8 +312,8 @@ try {
    window.astra.onEvents(events=>{for(const entry of events) if(entry.event?.type==='delegate_status') window.__delegateEvents.push(entry.event);});
  });
  await submit('DELEGATE_GUI_TEST');
- // The normal owner limit is two active children. Keep that contract: the
- // third must stay queued until one report releases its execution slot.
+ // Pin this fixture to two active children, independently of production defaults:
+ // the third must stay queued until one report releases its execution slot.
  // The loopback route also retains the local model's one-request limit, so
  // never require two blocked HTTP reports to arrive at the same time.
  await until(()=>[...delegateGates.values()].some(gate=>gate.reached),'A delegate did not reach its report gate');
