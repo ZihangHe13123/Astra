@@ -17,7 +17,7 @@ def test_change_source_survives_new_turns_and_never_falls_back_to_another_record
         path = workspace / name
         store.begin_turn(request_id)
         store.note_absent(path)
-        path.write_text(content)
+        path.write_bytes(content.encode("utf-8"))
         manifest = store.seal()
         assert manifest is not None
         return {"session_id": manifest.session_id, "request_id": manifest.request_id, "turn_seq": manifest.turn_seq}

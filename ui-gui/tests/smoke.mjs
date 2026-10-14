@@ -326,8 +326,8 @@ try {
    &&document.querySelectorAll('section[aria-label="委派任务"] article[data-status="queued"]').length===1);
  const delegateIds=(await delegateCards.evaluateAll(cards=>cards.map(card=>card.dataset.delegateId))).sort();
  assert.equal(new Set(delegateIds).size,3);
- const firstFinishedGoal=delegateGoals.find(goal=>goal!==delegateGoals[2]&&delegateGates.get(goal).reached);
- assert.ok(firstFinishedGoal,'the ordered fixture starts a successful reader before the intentional failure');
+ const firstFinishedGoal=delegateGoals.find(goal=>delegateGates.get(goal).reached);
+ assert.ok(firstFinishedGoal,'one reader has reached its report gate');
  await page.waitForFunction(goal=>window.__delegateEvents.some(event=>event.goal===goal&&event.current_tool==='read_file'),firstFinishedGoal);
  const delegateBounds=await app.evaluate(({BrowserWindow})=>{
    // Layout assertions measure the web contents, not native window borders.
@@ -354,16 +354,27 @@ try {
  });
  const firstFinishedCard=delegateCards.filter({has:page.locator('.delegate-goal',{hasText:firstFinishedGoal})});
  delegateGates.get(firstFinishedGoal).release();
- await page.waitForFunction(id=>document.querySelector(`article[data-delegate-id="${id}"]`)?.dataset.status==='completed',await firstFinishedCard.getAttribute('data-delegate-id'));
- await firstFinishedCard.locator('summary').filter({hasText:'查看结果'}).click();
- await firstFinishedCard.getByText(delegateReports[delegateGoals.indexOf(firstFinishedGoal)],{exact:true}).waitFor();
+ const firstFinishedStatus=firstFinishedGoal===delegateGoals[2]?'failed':'completed';
+ await page.waitForFunction(({id,status})=>document.querySelector(`article[data-delegate-id="${id}"]`)?.dataset.status===status,
+   {id:await firstFinishedCard.getAttribute('data-delegate-id'),status:firstFinishedStatus});
+ if(firstFinishedStatus==='completed') {
+   await firstFinishedCard.locator('summary').filter({hasText:'查看结果'}).click();
+   await firstFinishedCard.getByText(delegateReports[delegateGoals.indexOf(firstFinishedGoal)],{exact:true}).waitFor();
+ } else await expect(firstFinishedCard).toContainText('DELEGATE_GUI_EXPECTED_FAILURE');
  assert.match(await page.getByTestId('delegate-summary').innerText(),/2 项进行中/);
  assert.equal(await delegateCards.locator('.delegate-activity').count(),2);
- const nextFinishedGoal=delegateGoals.slice(0,2).find(goal=>goal!==firstFinishedGoal);
- await until(()=>delegateGates.get(nextFinishedGoal).reached,'Second reader did not reach its report gate');
- delegateGates.get(nextFinishedGoal).release();
- await until(()=>delegateGates.get(delegateGoals[2]).reached,'Queued delegate did not read the file after execution and model slots were released');
- await page.waitForFunction(goal=>window.__delegateEvents.some(event=>event.goal===goal&&event.current_tool==='read_file'),delegateGoals[2]);
+ // A report holds the loopback model's single request slot. Release whichever reader
+ // reaches it next; waiting for a named sibling can deadlock behind a different gated report.
+ const remainingReports=new Set(delegateGoals.filter(goal=>goal!==firstFinishedGoal));
+ while(remainingReports.size) {
+   await until(()=>[...remainingReports].some(goal=>delegateGates.get(goal).reached),'Remaining reader did not reach its report gate');
+   for(const goal of [...remainingReports]) if(delegateGates.get(goal).reached) {
+     delegateGates.get(goal).release(); remainingReports.delete(goal);
+   }
+ }
+ await page.waitForFunction(({goals,prior})=>goals.every(goal=>prior.includes(goal)
+   ||window.__delegateEvents.some(event=>event.goal===goal&&event.current_tool==='read_file')),
+   {goals:delegateGoals,prior:priorDelegateToolGoals});
  const observedDelegateToolGoals=new Set([...priorDelegateToolGoals,...await page.evaluate(()=>window.__delegateEvents.filter(event=>event.current_tool==='read_file').map(event=>event.goal))]);
  for(const goal of delegateGoals) assert.ok(observedDelegateToolGoals.has(goal),`${goal} must publish its real current_tool`);
  const childRequests=requests.filter(request=>request.messages.some(message=>message.role==='user'&&typeof message.content==='string'&&/^## Task\nDELEGATE_GUI_(ALPHA|BETA|FAILURE)\n/.test(message.content)));
@@ -372,7 +383,6 @@ try {
    const request=childRequests.findLast(request=>request.messages.some(message=>message.role==='user'&&String(message.content).startsWith(`## Task\n${goal}\n`)));
    assert.ok(request.messages.some(message=>message.role==='tool'&&String(message.content).includes('apple')),'each child must actually read the local fixture');
  }
- delegateGates.get(delegateGoals[2]).release();
  // A narrow native window shows either details or chat. Return through the
  // visible control before asserting the parent's rendered reply, then reopen
  // the cards to verify their terminal states at either window width.
