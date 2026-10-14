@@ -125,12 +125,14 @@ def make_broker(
     mode: str = "all",
     session: FakeSource | None = None,
     activity: FakeSource | None = None,
+    source_deadline_seconds: float | None = None,
 ) -> ContextIndexBroker:
     return ContextIndexBroker(
         mode=mode,
         char_budget=900,
         session_source=session or FakeSource("session"),
         activity_source=activity or FakeSource("activity"),
+        source_deadline_seconds=source_deadline_seconds,
     )
 
 
@@ -413,7 +415,9 @@ def test_mode_change_during_build_returns_empty_without_stale_state() -> None:
 
 def test_complete_request_during_build_cannot_publish_late_state() -> None:
     session = FakeSource("session", delay=0.05)
-    broker = make_broker(mode="session", session=session)
+    # What is checked is the request ending during a build, not the source deadline: give a slow
+    # runner room so the retry's own 50 ms source cannot time out.
+    broker = make_broker(mode="session", session=session, source_deadline_seconds=5.0)
 
     async def complete_then_retry():
         pending = asyncio.create_task(_build(broker))
