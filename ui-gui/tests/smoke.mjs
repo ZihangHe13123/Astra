@@ -66,7 +66,7 @@ const server = createServer(async (req, res) => {
       content: '| 朝向 | 规则 F1 |\n| --- | --- |\n| 正对 | 0.95 |\n| 侧对 | 0.71 |\n\n**侧对**时下降明显。' }]
     : delegateGoal && !delegateRead ? ['read_file', { path: target }]
     : !answered && delegateParent ? ['delegate_task', { tasks: delegateGoals.map(goal => ({
-      goal, mode: 'explorer', fork_turns: 'none', tools: ['read_file'], max_turns: 4,
+      goal, mode: 'explorer', fork_turns: 'none', tools: ['read_file'],
     })) }]
     : !answered && text.includes('测试文件') ? ['write_file', { path: target, content: 'apple\norange\ngrape\n' }]
     : !answered && text.includes('追问') ? ['ask_user_question', { questions: [{ id: 'choice', question: '使用哪种格式？', multi_select: false,
@@ -111,7 +111,8 @@ writeFileSync(join(folder, 'models.yaml'), `version: 1\nproviders:\n  test:\n   
 const modelsPath=join(folder,'models.yaml');
 writeFileSync(modelsPath,readFileSync(modelsPath,'utf8')+`  missing-model:\n    provider: openai-compatible\n    base_url: https://api.deepseek.com\n    api_key_env: GUI_MISSING_API_KEY\n    context_limit: 131072\n`);
 const cleanEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/API_KEY|TOKEN|SECRET|^AGENT_|^ASTRA_|^LLM_|^SANDBOX_|^ELECTRON_/.test(key)));
-const env = { ...cleanEnv, ASTRA_GUI_DISABLE_APPSHOT:'1', ASTRA_LOCAL_MODE_FILE:join(root,'tests/fixtures/local_mode.py'), AGENT_PROJECT_ROOT:root, AGENT_PYTHON:process.env.AGENT_PYTHON || join(root,'.venv',process.platform==='win32'?'Scripts/python.exe':'bin/python'),
+// Two subagents at once, so the third shows the queued state; by default ordinary fan-out runs together.
+const env = { ...cleanEnv, ASTRA_DELEGATE_CONCURRENCY:'2', ASTRA_GUI_DISABLE_APPSHOT:'1', ASTRA_LOCAL_MODE_FILE:join(root,'tests/fixtures/local_mode.py'), AGENT_PROJECT_ROOT:root, AGENT_PYTHON:process.env.AGENT_PYTHON || join(root,'.venv',process.platform==='win32'?'Scripts/python.exe':'bin/python'),
  ASTRA_ENV_FILE:join(folder,'.env'), ASTRA_HOME:folder, AGENT_SETTINGS_PATH:join(folder,'settings.json'), AGENT_SESSION_DIR:join(folder,'sessions'),
  AGENT_TASK_DB:join(folder,'tasks.db'), ASTRA_APPROVAL_DB:join(folder,'approvals.db'), ASTRA_EVENT_DB:join(folder,'events.db'),
  AGENT_MEMORY_PATH:join(folder,'memory.db'), AGENT_LEARNING_PATH:join(folder,'learning.db'), AGENT_SKILLS_PATH:join(folder,'skills'),
@@ -294,7 +295,7 @@ try {
    window.astra.onEvents(events=>{for(const entry of events) if(entry.event?.type==='delegate_status') window.__delegateEvents.push(entry.event);});
  });
  await submit('DELEGATE_GUI_TEST');
- // The normal owner limit is two active children. Keep that contract: the
+ // This run allows two children at once (ASTRA_DELEGATE_CONCURRENCY above): the
  // third must stay queued until one report releases its execution slot.
  // The loopback route also retains the local model's one-request limit, so
  // never require two blocked HTTP reports to arrive at the same time.
