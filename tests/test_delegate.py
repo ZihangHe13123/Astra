@@ -184,7 +184,7 @@ def test_delegate_slot_lease_releases_once_and_can_reacquire():
     asyncio.run(scenario())
 
 
-def test_active_budget_pauses_idle_time_and_counts_reacquire_time():
+def test_active_budget_pauses_idle_time_and_renews_for_each_assignment():
     now = 100.0
     budget = delegate._ActiveBudget(10.0, clock=lambda: now)
     budget.resume()
@@ -197,7 +197,13 @@ def test_active_budget_pauses_idle_time_and_counts_reacquire_time():
     now = 1005.5
     assert budget.remaining() == pytest.approx(4.5)
     assert budget.deadline() == pytest.approx(1010.0)
-    assert delegate._keep_alive_deadline(budget, 1007.0) == pytest.approx(1007.0)
+    # A new assignment has the whole limit again, counted from when it starts.
+    budget.renew()
+    assert budget.remaining() == pytest.approx(10.0)
+    now = 1008.0
+    assert budget.remaining() == pytest.approx(7.5)
+    now = 1005.5
+    budget.renew()
     assert delegate._keep_alive_remaining(
         budget,
         1007.0,
@@ -840,12 +846,18 @@ def test_invalid_delegate_concurrency_does_not_break_registration(monkeypatch):
     assert registry.get("delegate_task") is not None
 
 
-def test_delegate_concurrency_accepts_five_and_caps_higher_values(monkeypatch):
+def test_delegate_concurrency_lets_ordinary_fan_out_run_at_once_and_caps_a_runaway(monkeypatch):
+    monkeypatch.delenv("ASTRA_DELEGATE_CONCURRENCY", raising=False)
+    monkeypatch.delenv("ASTRA_DELEGATE_OWNER_CONCURRENCY", raising=False)
+    assert delegate._delegate_concurrency() == 16
+    # One parent may use all of it: a fan-out from one task is not throttled below the total.
+    assert delegate._delegate_owner_concurrency(16) == 16
+
     monkeypatch.setenv("ASTRA_DELEGATE_CONCURRENCY", "5")
     assert delegate._delegate_concurrency() == 5
 
     monkeypatch.setenv("ASTRA_DELEGATE_CONCURRENCY", "999")
-    assert delegate._delegate_concurrency() == 5
+    assert delegate._delegate_concurrency() == 64
 
 
 def test_investigation_budget_is_safe_bounded_floor(monkeypatch):
@@ -908,15 +920,13 @@ def test_delegate_runs_tool_loop_and_returns_final_answer(process_manager, tmp_p
         assert result["error"] == ""
         assert payload["result"] == "investigation complete"
         assert payload["turns_used"] == 2
-        assert payload["max_turns"] == 12
-        assert payload["turns_remaining"] == 10
+        assert "max_turns" not in payload and "turns_remaining" not in payload
         assert payload["worker_status"] == "completed"
         assert payload["error_code"] == ""
         assert payload["worker"]["status"] == "completed"
         assert payload["worker"]["worker_type"] == "explorer"
         assert payload["worker"]["turns_used"] == 2
-        assert payload["worker"]["max_turns"] == 12
-        assert payload["worker"]["turns_remaining"] == 10
+        assert "max_turns" not in payload["worker"] and "turns_remaining" not in payload["worker"]
         assert payload["session_transcript_path"].endswith("session.subagents.jsonl")
         lifecycle_events = [event[1] for event in session_events if event[1]["type"] == "lifecycle"]
         assert [event["state"] for event in lifecycle_events] == ["active", "terminal"]
@@ -1044,12 +1054,7 @@ def test_delegate_reports_progress_events(process_manager):
                 "delegate_failed",
             }
         ]
-        assert all(event["max_turns"] == 12 for event in delegate_events)
-        assert all(
-            event["turns_remaining"]
-            == max(0, event["max_turns"] - event["turns_used"])
-            for event in delegate_events
-        )
+        assert all("max_turns" not in event and "turns_remaining" not in event for event in delegate_events)
         by_stage = {event["stage"]: event for event in delegate_events}
         assert by_stage["delegate_started"]["turns_used"] == 0
         assert by_stage["tool_call"]["turns_used"] == 1
@@ -1080,7 +1085,7 @@ def test_delegate_gives_markup_and_empty_finalizers_separate_retries(process_man
 
         result = await registry.execute(
             "delegate_task",
-            {"goal": "inspect", "max_turns": 2, "timeout": 10},
+            {"goal": "inspect", "timeout": 10},
         )
         payload = json.loads(result["output"])
 
@@ -1091,7 +1096,7 @@ def test_delegate_gives_markup_and_empty_finalizers_separate_retries(process_man
     asyncio.run(scenario())
 
 
-def test_delegate_reserves_last_turn_for_tool_free_finalization(process_manager):
+def test_delegate_writes_a_tool_free_report_from_evidence_when_a_reply_has_no_answer(process_manager):
     class RecordingLLM(SequenceLLM):
         def __init__(self, responses):
             super().__init__(responses)
@@ -1115,21 +1120,23 @@ def test_delegate_reserves_last_turn_for_tool_free_finalization(process_manager)
                     "arguments": json.dumps({"path": "README.md"}),
                 }],
             },
+            {"content": "", "tool_calls": []},
             {"content": "best report from existing evidence", "tool_calls": []},
         ])
         register_delegate_tools(registry, llm_getter=lambda: llm)
 
         result = await registry.execute(
             "delegate_task",
-            {"goal": "inspect", "max_turns": 2, "timeout": 10},
+            {"goal": "inspect", "timeout": 10},
         )
         payload = json.loads(result["output"])
 
         assert payload["worker_status"] == "completed"
         assert payload["result"] == "best report from existing evidence"
-        assert llm.tool_sets[0]
-        assert llm.tool_sets[1] is None
-        final_request = llm.requests[1]
+        # Every turn of the investigation keeps its tools; only the report is written without them.
+        assert llm.tool_sets[0] and llm.tool_sets[1]
+        assert llm.tool_sets[2] is None
+        final_request = llm.requests[2]
         assert final_request["tool_choice"] == "none"
         assert [message["role"] for message in final_request["messages"]] == [
             "system",
@@ -1179,22 +1186,24 @@ def test_partial_finalizer_labels_latest_assignment_instead_of_readiness_goal():
     assert "Standing goal: Report readiness, then wait" in report
 
 
-def test_delegate_uses_limited_clean_finalizer_when_available(process_manager):
+def test_delegate_writes_its_tool_free_report_with_a_full_output_allowance(process_manager):
     class LimitedFinalizerLLM:
         def __init__(self):
             self.finalizer_request = None
             self.initial_system = ""
 
         async def chat(self, **kwargs):
-            self.initial_system = kwargs["messages"][0]["content"]
-            return {
-                "content": "",
-                "tool_calls": [{
-                    "id": "call-1",
-                    "name": "read_file",
-                    "arguments": json.dumps({"path": "README.md"}),
-                }],
-            }
+            if not self.initial_system:
+                self.initial_system = kwargs["messages"][0]["content"]
+                return {
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "call-1",
+                        "name": "read_file",
+                        "arguments": json.dumps({"path": "README.md"}),
+                    }],
+                }
+            return {"content": "", "tool_calls": []}
 
         async def chat_limited(self, **kwargs):
             self.finalizer_request = kwargs
@@ -1208,7 +1217,7 @@ def test_delegate_uses_limited_clean_finalizer_when_available(process_manager):
 
         result = await registry.execute(
             "delegate_task",
-            {"goal": "inspect", "max_turns": 2, "timeout": 10},
+            {"goal": "inspect", "timeout": 10},
         )
         payload = json.loads(result["output"])
 
@@ -1217,9 +1226,8 @@ def test_delegate_uses_limited_clean_finalizer_when_available(process_manager):
         assert "Native workspace root:" in llm.initial_system
         request = llm.finalizer_request
         assert request["tools"] is None
-        assert request["max_tokens"] == 2048
-        assert request["disable_thinking"] is True
-        assert request["reasoning_effort"] == "low"
+        assert request["max_tokens"] == delegate._investigation_max_tokens(llm)
+        assert "disable_thinking" not in request and "reasoning_effort" not in request
         assert [message["role"] for message in request["messages"]] == [
             "system",
             "user",
@@ -1258,7 +1266,7 @@ def test_delegate_recovers_reasoning_only_investigation_with_clean_finalizer(
 
         result = await registry.execute(
             "delegate_task",
-            {"goal": "reason deeply, then report", "max_turns": 4, "timeout": 10},
+            {"goal": "reason deeply, then report", "timeout": 10},
         )
         payload = json.loads(result["output"])
 
@@ -1266,8 +1274,10 @@ def test_delegate_recovers_reasoning_only_investigation_with_clean_finalizer(
         assert payload["result"] == "Recovered final report."
         assert payload["turns_used"] == 2
         assert llm.investigation_request["max_tokens"] == 16_384
-        assert llm.finalizer_request["reasoning_effort"] == "low"
-        assert llm.finalizer_request["disable_thinking"] is True
+        # The report keeps the investigation's allowance and the model's own reasoning.
+        assert llm.finalizer_request["max_tokens"] == 16_384
+        assert "reasoning_effort" not in llm.finalizer_request
+        assert "disable_thinking" not in llm.finalizer_request
 
     asyncio.run(scenario())
 
@@ -1311,7 +1321,6 @@ def test_worker_mode_executes_workspace_edit_and_reports(process_manager):
             {
                 "goal": "make focused change",
                 "mode": "worker",
-                "max_turns": 2,
                 "timeout": 10,
             },
             task_id="workspace-task",
@@ -1391,7 +1400,6 @@ def test_worker_batches_known_edit_and_verification_in_model_order(process_manag
             {
                 "goal": "write and verify sample",
                 "mode": "worker",
-                "max_turns": 2,
                 "timeout": 10,
             },
         )
@@ -1405,7 +1413,9 @@ def test_worker_batches_known_edit_and_verification_in_model_order(process_manag
         ]
         assert "executed serially in the exact order" in llm.system_prompts[0]
         assert "write implementation, write tests" in llm.system_prompts[0]
-        assert "final report writer" in llm.system_prompts[-1]
+        # With no turn limit the worker answers in its own conversation; no separate report writer.
+        assert llm.calls == 2
+        assert "final report writer" not in llm.system_prompts[-1]
 
     asyncio.run(scenario())
 
@@ -1438,7 +1448,6 @@ def test_worker_mode_edits_real_workspace_file(process_manager, tmp_path):
             {
                 "goal": "update sample value",
                 "mode": "worker",
-                "max_turns": 2,
                 "timeout": 10,
             },
             task_id="real-edit-task",
@@ -1513,7 +1522,6 @@ def test_worker_mode_preserves_main_registry_approval_boundary(process_manager):
             {
                 "goal": "make approved change",
                 "mode": "worker",
-                "max_turns": 2,
                 "timeout": 10,
             },
             task_id="approval-task",
@@ -1553,7 +1561,7 @@ def test_structured_tool_call_during_finalization_retries_as_plain_report(proces
 
         result = await registry.execute(
             "delegate_task",
-            {"goal": "inspect", "max_turns": 2, "timeout": 10},
+            {"goal": "inspect", "timeout": 10},
         )
         payload = json.loads(result["output"])
 
@@ -1593,7 +1601,7 @@ def test_output_limited_final_report_retries_as_dense_complete_report(process_ma
 
         result = await registry.execute(
             "delegate_task",
-            {"goal": "inspect", "max_turns": 2, "timeout": 10},
+            {"goal": "inspect", "timeout": 10},
         )
         payload = json.loads(result["output"])
 
@@ -1627,7 +1635,7 @@ def test_delegate_retries_unparsed_dsml_finalization(process_manager):
 
         result = await registry.execute(
             "delegate_task",
-            {"goal": "inspect", "max_turns": 2, "timeout": 10},
+            {"goal": "inspect", "timeout": 10},
         )
         payload = json.loads(result["output"])
 
@@ -1668,13 +1676,14 @@ def test_delegate_returns_partial_report_after_repeated_unparsed_dsml(process_ma
             },
             {"content": dsml, "tool_calls": []},
             {"content": dsml, "tool_calls": []},
+            {"content": dsml, "tool_calls": []},
         ])
         events = []
         register_delegate_tools(registry, llm_getter=lambda: llm, on_delegate_event=events.append)
 
         result = await registry.execute(
             "delegate_task",
-            {"goal": "inspect", "max_turns": 2, "timeout": 10},
+            {"goal": "inspect", "timeout": 10},
         )
         payload = json.loads(result["output"])
 
@@ -1718,7 +1727,7 @@ def test_delegate_retries_empty_finalization_then_completes(process_manager):
 
         result = await registry.execute(
             "delegate_task",
-            {"goal": "inspect", "max_turns": 2, "timeout": 10},
+            {"goal": "inspect", "timeout": 10},
         )
         payload = json.loads(result["output"])
 
@@ -1744,12 +1753,13 @@ def test_delegate_returns_partial_report_after_repeated_empty_finalization(proce
             },
             {"content": "", "finish_reason": "length", "tool_calls": []},
             {"content": "", "finish_reason": "length", "tool_calls": []},
+            {"content": "", "finish_reason": "length", "tool_calls": []},
         ])
         register_delegate_tools(registry, llm_getter=lambda: llm)
 
         result = await registry.execute(
             "delegate_task",
-            {"goal": "inspect", "max_turns": 2, "timeout": 10},
+            {"goal": "inspect", "timeout": 10},
         )
         payload = json.loads(result["output"])
 
@@ -1765,12 +1775,14 @@ def test_delegate_returns_partial_report_after_repeated_empty_finalization(proce
     asyncio.run(scenario())
 
 
-def test_delegate_defaults_to_twelve_bounded_turns(process_manager):
+def test_delegate_defaults_have_no_turn_limit_and_a_thirty_minute_time_limit(process_manager):
     registry = ToolRegistry()
     register_delegate_tools(registry, llm_getter=lambda: SequenceLLM([]))
 
     default_spec = WorkerSpec(worker_type="explorer", goal="inspect", context="")
-    assert default_spec.max_turns == 12
+    assert not hasattr(default_spec, "max_turns")
+    assert "max_turns" not in default_spec.public()
+    assert default_spec.timeout_seconds == 1800
     assert default_spec.model == ""
     assert default_spec.keep_alive is False
     assert default_spec.workspace_root == ""
@@ -1798,14 +1810,18 @@ def test_delegate_defaults_to_twelve_bounded_turns(process_manager):
             reasoning_effort="hihg",
         )
     schema = registry.get("delegate_task").parameters
-    assert schema["properties"]["max_turns"]["default"] == 12
-    assert schema["properties"]["max_turns"]["maximum"] == 50
-    assert schema["properties"]["timeout"]["maximum"] == 1800
+    assert "max_turns" not in schema["properties"]
+    assert schema["properties"]["timeout"]["default"] == 1800
+    assert schema["properties"]["timeout"]["maximum"] == 14400
     assert schema["properties"]["model"]["default"] == ""
     item_schema = schema["properties"]["tasks"]["items"]["properties"]
     assert "model" in item_schema
-    assert item_schema["max_turns"]["maximum"] == 50
-    assert item_schema["timeout"]["maximum"] == 1800
+    assert "max_turns" not in item_schema
+    assert item_schema["timeout"]["maximum"] == 14400
+    for name in ("team_spawn", "team_restart"):
+        assert "max_turns" not in registry.get(name).parameters["properties"], name
+    assert registry.get("team_spawn").parameters["properties"]["timeout"]["default"] == 1800
+    assert "episode_estimate" not in registry.get("team_send").parameters["properties"]
     assert registry.get("team_spawn").parameters["properties"]["model"]["default"] == ""
     workspace_schema = registry.get("team_spawn").parameters["properties"][
         "workspace_root"
@@ -1978,8 +1994,8 @@ def test_delegate_batch_item_model_overrides_top_level_default(process_manager):
         def __init__(self, model):
             self.model = model
 
-        async def chat(self, messages, tools):
-            del messages, tools
+        async def chat(self, messages, tools, *args, **kwargs):
+            del messages, tools, args, kwargs
             return {"content": self.model, "tool_calls": []}
 
     def provider_factory(config):
@@ -2000,8 +2016,8 @@ def test_delegate_batch_item_model_overrides_top_level_default(process_manager):
             {
                 "model": "research-pro",
                 "tasks": [
-                    {"goal": "inherit top-level model", "max_turns": 1},
-                    {"goal": "use fast alias", "model": "flash", "max_turns": 1},
+                    {"goal": "inherit top-level model"},
+                    {"goal": "use fast alias", "model": "flash"},
                 ],
             },
             task_id="task-model-batch",
@@ -2040,20 +2056,20 @@ def test_delegate_batch_validates_every_item_before_start(process_manager):
     asyncio.run(scenario())
 
 
-def test_delegate_queue_time_counts_toward_total_timeout(
+def test_delegate_waiting_for_a_slot_does_not_count_toward_the_time_limit(
     process_manager, monkeypatch
 ):
-    class VerySlowLLM:
+    class SteadyLLM:
         async def chat(self, **kwargs):
             del kwargs
-            await asyncio.sleep(1)
-            return {"content": "late", "tool_calls": []}
+            await asyncio.sleep(1.0)
+            return {"content": "done in time", "tool_calls": []}
 
     async def scenario():
         monkeypatch.setenv("ASTRA_DELEGATE_CONCURRENCY", "1")
         registry = ToolRegistry()
         events = []
-        register_delegate_tools(registry, llm_getter=VerySlowLLM, on_delegate_event=events.append)
+        register_delegate_tools(registry, llm_getter=SteadyLLM, on_delegate_event=events.append)
         loop = asyncio.get_running_loop()
         started = loop.time()
 
@@ -2061,56 +2077,21 @@ def test_delegate_queue_time_counts_toward_total_timeout(
             "delegate_task",
             {
                 "tasks": [
-                    {"goal": "first", "timeout": 1},
-                    {"goal": "queued", "timeout": 1},
+                    {"goal": "first", "timeout": 2},
+                    {"goal": "queued", "timeout": 2},
                 ]
             },
         )
         elapsed = loop.time() - started
-        payload = json.loads(result["output"])
+        first, queued = json.loads(result["output"])["results"]
 
-        assert elapsed < 1.5
-        assert all(item["worker_status"] == "timed_out" for item in payload["results"])
-        terminal = [event for event in events if event["status"] == "timed_out"]
-        assert {event["goal"] for event in terminal} == {"first", "queued"}
-        assert not any(event["goal"] == "queued" and event["status"] == "running" for event in events)
-
-    asyncio.run(scenario())
-
-
-def test_delegate_queue_timeout_says_the_subagent_never_started(
-    process_manager, monkeypatch
-):
-    class HoldingLLM:
-        async def chat(self, **kwargs):
-            del kwargs
-            await asyncio.sleep(1.6)
-            return {"content": "held the only slot", "tool_calls": []}
-
-    async def scenario():
-        monkeypatch.setenv("ASTRA_DELEGATE_CONCURRENCY", "1")
-        registry = ToolRegistry()
-        register_delegate_tools(registry, llm_getter=HoldingLLM)
-
-        result = await registry.execute(
-            "delegate_task",
-            {
-                "tasks": [
-                    {"goal": "runs", "timeout": 10},
-                    {"goal": "queued", "timeout": 1},
-                ]
-            },
-        )
-        runs, queued = json.loads(result["output"])["results"]
-
-        assert runs["worker_status"] == "completed"
-        assert queued["worker_status"] == "timed_out"
-        assert queued["turns_used"] == 0
-        # A worker that ran out of time and one that never got a slot differ.
-        assert "never started" in queued["error"]
-        assert "free slot" in queued["error"]
-        assert "exceeded" not in queued["error"]
-        assert "counts toward" in registry.get("delegate_task").parameters[
+        # The second waited for the only slot and then ran: longer, in all, than its limit.
+        assert elapsed > 2.0
+        assert first["worker_status"] == "completed"
+        assert queued["worker_status"] == "completed"
+        assert queued["result"] == "done in time"
+        assert any(event["goal"] == "queued" and event["status"] == "queued" for event in events)
+        assert "does not count" in registry.get("delegate_task").parameters[
             "properties"
         ]["tasks"]["description"]
 
@@ -2141,7 +2122,7 @@ def test_delegate_batch_runs_five_children_concurrently(process_manager, monkeyp
         result = await registry.execute(
             "delegate_task",
             {
-                "tasks": [{"goal": f"task-{index}", "max_turns": 1} for index in range(5)],
+                "tasks": [{"goal": f"task-{index}"} for index in range(5)],
                 "timeout": 5,
             },
         )

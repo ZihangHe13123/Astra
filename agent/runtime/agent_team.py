@@ -21,7 +21,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from .worker import MAX_WORKER_TURNS
 
 
 ACTIVE_AGENT_STATUSES = frozenset({"starting", "running", "idle", "waiting"})
@@ -66,8 +65,9 @@ def _assignment_metadata(kind: str, value: dict[str, Any] | None) -> dict[str, A
     if set(value) - {"team_task_id", "episode_estimate", "episode_kind"}:
         raise ValueError("unknown assignment metadata field")
     estimate = value.get("episode_estimate")
-    if estimate is not None and (type(estimate) is not int or not 1 <= estimate <= MAX_WORKER_TURNS):
-        raise ValueError(f"episode_estimate must be an integer in 1-{MAX_WORKER_TURNS}")
+    # Kept on the episode record for what it says about the assignment; it limits nothing.
+    if estimate is not None and (type(estimate) is not int or estimate < 1):
+        raise ValueError("episode_estimate must be a positive integer")
     episode_kind = str(value.get("episode_kind") or "assignment")
     if episode_kind not in EPISODE_KINDS:
         raise ValueError(f"invalid episode_kind: {episode_kind}")
@@ -453,7 +453,7 @@ class AgentTeamStore:
         return tasks
 
     def start_episode(
-        self, agent_id: str, *, start_turn: int, max_turns: int, model: str,
+        self, agent_id: str, *, start_turn: int, model: str,
         kind: str = "startup", message_id: str = "", assignment: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         metadata = _assignment_metadata("task_assignment", assignment)
@@ -474,7 +474,8 @@ class AgentTeamStore:
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (episode_id, agent["team_id"], agent_id, task_id, message_id or None,
                  metadata.get("episode_kind", kind), agent["role"], model,
-                 metadata.get("episode_estimate"), max_turns, start_turn, start_turn, time.time()),
+                 # The column predates the removal of turn limits; zero records that there is none.
+                 metadata.get("episode_estimate"), 0, start_turn, start_turn, time.time()),
             )
             row = db.execute("SELECT * FROM team_episodes WHERE id=?", (episode_id,)).fetchone()
         return self._row(row) or {}

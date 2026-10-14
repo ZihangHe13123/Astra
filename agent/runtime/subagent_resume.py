@@ -134,10 +134,9 @@ def restore_conversation(data: dict, identity: dict) -> tuple[list[dict], dict]:
     stored_identity = state.get("identity")
     if not isinstance(stored_identity, dict) or any(stored_identity.get(key) != value for key, value in identity.items()):
         raise ConversationCorrupt("conversation identity/workspace mismatch")
+    # A stored max_turns comes from before runs had no turn limit; it is read past, not enforced.
     if "turns_used" not in state:
-        raise ConversationCorrupt("missing cumulative turn budget")
-    if "max_turns" in state and (type(state["max_turns"]) is not int or not 1 <= state["max_turns"] <= 50):
-        raise ConversationCorrupt("invalid cumulative turn ceiling")
+        raise ConversationCorrupt("missing turn count")
     for key in ("turns_used", "team_message_cursor"):
         value = state.get(key, 0)
         if type(value) is not int or value < 0:

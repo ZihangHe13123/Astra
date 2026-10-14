@@ -15,10 +15,12 @@ from agent.runtime.tools.registry import ToolDef, ToolRegistry
 from agent.runtime.worker import WorkerSpec
 
 
-def test_worker_accepts_fifty_turns_but_rejects_fifty_one():
-    assert WorkerSpec("worker", "implement", "", max_turns=50).max_turns == 50
-    with pytest.raises(ValueError, match="1-50"):
-        WorkerSpec("worker", "implement", "", max_turns=51)
+def test_a_worker_has_a_time_limit_and_no_turn_limit():
+    spec = WorkerSpec("worker", "implement", "")
+    assert "max_turns" not in spec.public()
+    assert spec.timeout_seconds == 1800
+    with pytest.raises(ValueError, match="1-14400"):
+        WorkerSpec("worker", "implement", "", timeout_seconds=14401)
 
 
 def make_team(store):
@@ -55,7 +57,11 @@ def test_assignment_metadata_is_durable_validated_and_part_of_deduplication(tmp_
     with pytest.raises(ValueError, match="task.*team"):
         runtime.send(team, target="worker", body="bad", kind="task_assignment",
                      assignment={**assignment, "team_task_id": other_task["id"]})
-    for invalid in (0, 51, True, "12"):
+    # An estimate describes the assignment; there is no ceiling for it to stay under.
+    large = runtime.send(team, target="worker", body="large", kind="task_assignment",
+                         assignment={**assignment, "episode_estimate": 500})
+    assert large[0]["assignment"]["episode_estimate"] == 500
+    for invalid in (0, -3, True, "12"):
         with pytest.raises(ValueError, match="episode_estimate"):
             runtime.send(team, target="worker", body="bad", kind="task_assignment",
                          assignment={**assignment, "episode_estimate": invalid})
@@ -98,7 +104,7 @@ async def wait_idle(store, agent_id, *, turns, call, team_id):
     raise AssertionError(store.get_agent(agent_id))
 
 
-def test_budget_visible_each_request_and_episode_costs_survive_idle_and_reopen(tmp_path, monkeypatch):
+def test_requests_carry_no_turn_budget_and_episode_costs_survive_idle_and_reopen(tmp_path, monkeypatch):
     class LLM:
         def __init__(self):
             self.requests = []
@@ -116,26 +122,23 @@ def test_budget_visible_each_request_and_episode_costs_survive_idle_and_reopen(t
             spawned = await call("team_spawn", team_id=team["id"], name="worker", goal="report readiness",
                                  role="implementation", keep_alive=True, timeout=20)
             agent_id = spawned["agent"]["id"]
-            assert spawned["agent"]["spawn_spec"]["max_turns"] == 50
+            assert "max_turns" not in spawned["agent"]["spawn_spec"]
             await wait_idle(store, agent_id, turns=1, call=call, team_id=team["id"])
             task = await call("team_task", action="create", team_id=team["id"], title="slice")
             await call("team_send", team_id=team["id"], to="worker", message="implement slice",
-                       kind="task_assignment", team_task_id=task["id"], episode_estimate=2,
+                       kind="task_assignment", team_task_id=task["id"],
                        episode_kind="implementation")
             await wait_idle(store, agent_id, turns=3, call=call, team_id=team["id"])
             await call("team_send", team_id=team["id"], to="worker", message="check correction",
-                       kind="task_assignment", team_task_id=task["id"], episode_estimate=4,
+                       kind="task_assignment", team_task_id=task["id"],
                        episode_kind="revision")
             state = await wait_idle(store, agent_id, turns=4, call=call, team_id=team["id"])
             assert len(llm.requests) == 4
-            for index, request in enumerate(llm.requests):
-                notices = [m["content"] for m in request if "[RUNTIME TURN BUDGET]" in str(m.get("content"))]
-                assert len(notices) == 1  # stale snapshots do not grow the context
-                assert f"turns_used={index}" in notices[0]
-                assert f"turns_remaining={50 - index}" in notices[0]
-            assert "episode_estimate=2" in llm.requests[1][-1]["content"]
-            assert "episode_turns_used=1" in llm.requests[2][-1]["content"]
-            assert "Report evidence" in llm.requests[2][-1]["content"]
+            # Nothing tells the member how many turns it has left: there is no such number.
+            assert not any(
+                "TURN BUDGET" in str(message.get("content")) or "turns_remaining" in str(message.get("content"))
+                for request in llm.requests for message in request
+            )
             episodes = state["episodes"]
             assert [e["turns_used"] for e in episodes] == [1, 2, 1]
             assert [e["kind"] for e in episodes] == ["startup", "implementation", "revision"]
@@ -154,7 +157,7 @@ def test_budget_visible_each_request_and_episode_costs_survive_idle_and_reopen(t
 def test_interrupted_episode_keeps_last_observed_counter(tmp_path):
     store = AgentTeamStore(tmp_path / "team.db")
     team, agent = make_team(store)
-    episode = store.start_episode(agent["id"], start_turn=7, max_turns=50, model="test-model")
+    episode = store.start_episode(agent["id"], start_turn=7, model="test-model")
     store.update_episode(episode["id"], end_turn=10)
     store.recover_interrupted()
     record = store.get_team(team["id"])["episodes"][0]
@@ -181,15 +184,15 @@ def test_old_team_database_migrates_without_losing_mail_or_tasks(tmp_path):
     assert saved["assignment"] == {}
 
 
-def test_member_can_use_fifty_turns_and_last_turn_is_tool_free(tmp_path, monkeypatch):
+def test_member_runs_past_the_old_fifty_turn_ceiling_until_it_answers(tmp_path, monkeypatch):
     class LLM:
         def __init__(self):
             self.requests = []
 
         async def chat(self, **kwargs):
             self.requests.append(kwargs)
-            if kwargs.get("tool_choice") == "none":
-                return {"content": "Bounded final report", "tool_calls": []}
+            if len(self.requests) > 60:
+                return {"content": "Report after sixty reads", "tool_calls": []}
             return {"content": "collect evidence", "tool_calls": [
                 {"id": f"read-{len(self.requests)}", "name": "read_file", "arguments": "{}"},
             ]}
@@ -197,17 +200,16 @@ def test_member_can_use_fifty_turns_and_last_turn_is_tool_free(tmp_path, monkeyp
     async def scenario():
         llm = LLM()
         async with running_team(tmp_path, monkeypatch, llm) as (call, team, store):
-            timeout = 30
+            timeout = 60
             spawned = await call("team_spawn", team_id=team["id"], name="worker", goal="investigate", timeout=timeout)
-            # A short poll may still report running on a busy CI runner. Wait
-            # for completion within the worker's existing budget, not five seconds.
             result = await call("delegate_poll", process_id=spawned["process"]["process_id"], wait_ms=timeout * 1000)
             assert result["worker"]["status"] == "completed"
-            assert len(llm.requests) == 50
-            assert llm.requests[-1]["tools"] is None
-            assert "turns_remaining=1" in llm.requests[-1]["messages"][-1]["content"]
+            assert result["result"]["result"] == "Report after sixty reads"
+            assert len(llm.requests) == 61
+            # Every request kept its tools: no turn was set aside for a forced report.
+            assert all(request["tools"] for request in llm.requests)
             episode = store.get_team(team["id"])["episodes"][0]
-            assert episode["turns_used"] == 50
+            assert episode["turns_used"] == 61
             assert episode["outcome"] == "reported"
 
     asyncio.run(scenario())
@@ -254,7 +256,7 @@ def test_cancellation_during_episode_insert_does_not_leave_a_running_record(tmp_
             return original(*args, **kwargs)
 
         monkeypatch.setattr(runtime.store, "start_episode", slow_insert)
-        spec = WorkerSpec("worker", "test", "", max_turns=50, team_id=team["id"], team_agent_id=agent["id"])
+        spec = WorkerSpec("worker", "test", "", team_id=team["id"], team_agent_id=agent["id"])
         tracker = TeamBudgetTracker(runtime, spec, model="test")
 
         async def start_then_close():

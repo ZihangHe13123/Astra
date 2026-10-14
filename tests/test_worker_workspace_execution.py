@@ -106,7 +106,7 @@ def test_spawn_and_restart_execute_in_selected_worktree(tmp_path, monkeypatch, e
             (child / "marker.txt").write_text(f"child-{phase}\n")
             if phase == "first":
                 handle = await invoke("team_spawn", team_id=team["id"], name="worker", goal="verify",
-                                      mode="worker", workspace_root=str(child), tools=requested, max_turns=12, timeout=30)
+                                      mode="worker", workspace_root=str(child), tools=requested, timeout=30)
             else:
                 AgentTeamStore(tasks.path).set_agent_status(handle["agent"]["id"], "interrupted")
                 handle = await invoke("team_restart", team_id=team["id"], agent="worker", instruction="verify again")
@@ -194,7 +194,7 @@ def test_external_workspace_grant_revocation_stops_later_tool_calls(tmp_path, mo
         register_delegate_tools(registry, llm_getter=lambda: llm, sandbox=sandbox)
         result = await registry.execute("delegate_task", {
             "goal": "verify scoped grant", "mode": "worker", "workspace_root": str(outside),
-            "max_turns": 6, "timeout": 10,
+            "timeout": 10,
         }, task_id="owner")
         assert not result["error"]
         assert "permitted read" in llm.results[0]
@@ -247,7 +247,7 @@ def test_capability_preflight_and_static_evidence_do_not_claim_execution(tmp_pat
 
         started = await registry.execute("delegate_task", {
             "goal": "Read the prior log", "mode": "explorer", "tools": ["read_file"],
-            "max_turns": 4, "timeout": 10, "background": True,
+            "timeout": 10, "background": True,
         }, task_id="owner")
         assert not started["error"]
         process_id = json.loads(started["output"])["process_id"]

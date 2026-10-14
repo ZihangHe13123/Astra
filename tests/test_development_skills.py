@@ -129,26 +129,25 @@ def test_multi_step_execution_routes_to_team_tdd():
         assert f"`{dependency}`" in team_tdd
 
 
-def test_team_tdd_sizes_retained_member_budgets_before_spawn():
+def test_team_tdd_sizes_each_assignment_by_time_not_turns():
     content = SkillStore(SKILLS_ROOT).view("team-tdd-development")
 
     assert "team_spawn" in content
-    assert "max_turns" in content
     assert "timeout" in content
-    assert "max_turns=50" in content
-    assert "1800" in content
+    assert "1800" in content and "14400" in content
+    assert "no turn limit" in content
     assert "three worker-reviewer rounds" in content
-    assert "do not spawn" in content.lower()
+    # Nothing in the workflow asks for a turn count the runtime no longer has.
+    for retired in ("max_turns", "turns_remaining", "episode_estimate"):
+        assert retired not in content, retired
 
 
-def test_team_tdd_checks_live_turn_reserve_before_every_assignment():
+def test_team_tdd_checks_member_status_before_every_assignment():
     content = SkillStore(SKILLS_ROOT).view("team-tdd-development")
 
-    assert "turns_used" in content
-    assert "turns_remaining" in content
-    assert "episode_estimate" in content
-    assert "turns_remaining >= episode_estimate + 1" in content
+    assert "team(action=status)" in content
     assert "before every" in content.lower()
+    assert "team_task_id" in content and "episode_kind" in content
 
 
 def test_team_tdd_binds_and_verifies_the_lead_workspace_root():

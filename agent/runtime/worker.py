@@ -7,11 +7,10 @@ from enum import Enum
 from typing import Any
 
 from .tools.processes import ManagedProcess, ProcessManager
-from .execution_limits import WORKER_TIMEOUT_MAX_SECONDS
+from .execution_limits import WORKER_TIMEOUT_DEFAULT_SECONDS, WORKER_TIMEOUT_MAX_SECONDS
 
 
 REASONING_EFFORTS = ("low", "medium", "high", "max")
-MAX_WORKER_TURNS = 50
 
 
 def normalize_reasoning_effort(value: Any) -> str:
@@ -54,14 +53,17 @@ TERMINAL_WORKER_STATUSES = frozenset(
 
 @dataclass(frozen=True)
 class WorkerSpec:
-    """Immutable declaration of one bounded worker run."""
+    """Immutable declaration of one worker run: its task, tools and time limit.
+
+    A run has no turn count to stay within. It ends when the model answers without calling
+    a tool, when the parent stops it, or when its time limit passes.
+    """
 
     worker_type: str
     goal: str
     context: str
     requested_tools: tuple[str, ...] | None = None
-    max_turns: int = 12
-    timeout_seconds: int = 120
+    timeout_seconds: int = WORKER_TIMEOUT_DEFAULT_SECONDS
     model: str = ""
     reasoning_effort: str = ""
     task_id: str = ""
@@ -81,8 +83,6 @@ class WorkerSpec:
             raise ValueError("worker_type is required")
         if not goal:
             raise ValueError("goal is required")
-        if self.max_turns < 1 or self.max_turns > MAX_WORKER_TURNS:
-            raise ValueError(f"max_turns must be 1-{MAX_WORKER_TURNS}")
         if self.timeout_seconds < 1 or self.timeout_seconds > WORKER_TIMEOUT_MAX_SECONDS:
             raise ValueError(f"timeout must be 1-{WORKER_TIMEOUT_MAX_SECONDS}")
         object.__setattr__(self, "worker_type", worker_type)
@@ -117,7 +117,6 @@ class WorkerSpec:
                 if self.requested_tools is not None
                 else None
             ),
-            "max_turns": self.max_turns,
             "timeout_seconds": self.timeout_seconds,
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
@@ -157,8 +156,6 @@ class WorkerRun:
     completed_at: float | None
     duration_ms: int
     turns_used: int
-    max_turns: int
-    turns_remaining: int
     error_code: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -172,8 +169,6 @@ class WorkerRun:
             "completed_at": self.completed_at,
             "duration_ms": self.duration_ms,
             "turns_used": self.turns_used,
-            "max_turns": self.max_turns,
-            "turns_remaining": self.turns_remaining,
             "error_code": self.error_code,
         }
 
@@ -192,11 +187,6 @@ class WorkerRun:
         if raw_turns_used is None:
             raw_turns_used = process.metadata.get("turns_used")
         turns_used = int(raw_turns_used or 0)
-        max_turns = int(
-            result.get("max_turns")
-            or spec.get("max_turns")
-            or 0
-        )
         return cls(
             run_id=process.process_id,
             worker_type=str(spec.get("worker_type") or process.kind),
@@ -210,8 +200,6 @@ class WorkerRun:
             completed_at=process_info.get("completed_at"),
             duration_ms=int(process_info.get("duration_ms") or 0),
             turns_used=turns_used,
-            max_turns=max_turns,
-            turns_remaining=max(0, max_turns - turns_used),
             error_code=str(result.get("error_code") or ""),
         )
 

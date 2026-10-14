@@ -3,7 +3,10 @@
 COMMAND_FOREGROUND_MAX_MS = 90_000
 DELEGATE_FOREGROUND_MAX_MS = 120_000
 POLL_MAX_MS = 300_000
-WORKER_TIMEOUT_MAX_SECONDS = 1_800
+# One assignment's own time limit. A subagent has no turn or output budget, so this is
+# what stops one that is stuck while nobody watches; it is not shared across assignments.
+WORKER_TIMEOUT_MAX_SECONDS = 14_400
+WORKER_TIMEOUT_DEFAULT_SECONDS = 1_800
 
 
 def validate_wait_ms(value: int, *, name: str, maximum: int) -> None:

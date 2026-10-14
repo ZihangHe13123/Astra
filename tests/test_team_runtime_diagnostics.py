@@ -54,7 +54,7 @@ def test_worker_reasons_and_actual_limits_survive_process_artifacts(tmp_path, mo
         register_delegate_tools(registry, llm_getter=provider, task_store=tasks, session_id_getter=lambda: "session")
         team = await call(registry, parent, "team", action="create", keep_alive_limit=0 if reason == "idle_quota" else 4)
         handle = await call(registry, parent, "team_spawn", team_id=team["id"], name="reporter", goal="report readiness",
-                            keep_alive=reason != "reported", timeout=1 if reason in {"active_timeout", "keep_alive_lifetime"} else 10, max_turns=5)
+                            keep_alive=reason != "reported", timeout=1 if reason in {"active_timeout", "keep_alive_lifetime"} else 10)
         store = AgentTeamStore(tasks.path)
         process = manager.get(handle["process"]["process_id"])
         if reason in {"shutdown_request", "cancelled"}:
@@ -72,7 +72,7 @@ def test_worker_reasons_and_actual_limits_survive_process_artifacts(tmp_path, mo
             assert store.get_agent(handle["agent"]["id"])["status"] == "failed"
         assert persisted["completion_reason"] == reason
         assert persisted["state"] == "terminal"
-        assert persisted["limits"]["max_turns"] == 5
+        assert "max_turns" not in persisted["limits"]
         if reason in {"idle_timeout", "shutdown_request", "cancelled", "keep_alive_lifetime", "idle_quota"}:
             assert persisted["limits"]["idle_capacity"] == (0 if reason == "idle_quota" else 4)
         if reason == "idle_timeout":

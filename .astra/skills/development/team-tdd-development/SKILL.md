@@ -17,21 +17,19 @@ The lead owns scope, shared Team tasks, commits, verification, and lifecycle.
 Do not use this workflow for one bounded change or for explicitly disposable
 one-shot delegation.
 
-Before creating the Team, size each retained member's cumulative active budget
-explicitly. Estimate the worker and reviewer episodes from the number of plan
-tasks and the maximum of three worker-reviewer rounds per task, including
-readiness, investigation, tool, correction, and final-report turns. For a
-multi-step plan use the runtime maximum `max_turns=50` and `timeout=1800` unless
-a written conservative estimate proves smaller values sufficient; never
-silently accept the 300-second time default for a longer plan. Team spawn now
-defaults to 50 turns; one-shot delegates still default to 12. If the whole plan cannot
-fit within those limits, do not spawn the Team: stop and report the budget
-boundary so the plan can be split or the execution strategy approved.
+Retained members have no turn limit and keep their context across assignments, so
+one worker and one reviewer can carry the whole plan, up to three worker-reviewer
+rounds per task. What bounds a member is the time limit of each single assignment:
+`timeout` (default 1800 seconds, at most 14400), counted while it works; idle time
+and waiting for a free slot do not count. Before spawning, set `timeout` to cover
+the longest single assignment you expect, including its investigation, tools,
+corrections and report. If one assignment would need longer than the maximum,
+do not spawn for it: split that task first.
 
-Use recorded `episodes` in Team status and task-board reads to compare estimates
-with actual counter deltas. Compare the same role, model and episode kind; include
-startup and correction costs. A single 25–30-turn slice is a sample, not a fixed
-cost law. Never reset or replace a member just to renew its cumulative allowance.
+Use recorded `episodes` in Team status and task-board reads to see what each
+assignment actually took. Compare the same role, model and episode kind; include
+startup and correction costs. Keep giving related follow-up work to the member
+that already holds its context instead of replacing it.
 
 ## Create the Team
 
@@ -83,20 +81,14 @@ history. Require the worker to follow `test-driven-development` and return:
 - remaining risks or unverified behavior;
 - confirmation that the lead still owns the commit.
 
-Before every worker or reviewer assignment, read `turns_used`, `max_turns`, and
-`turns_remaining` from `team(action=status)`. Write a conservative integer
-`episode_estimate` for the pending investigation, tools, and report. Assign
-only when `turns_remaining >= episode_estimate + 1`; the added turn is reserved
-for final reporting. If the check fails, do not wake the member or consume the
-reserve. Record the boundary and follow controlled-abort cleanup.
+Before every worker or reviewer assignment, read the member's status from
+`team(action=status)`: assign only to an idle member, or send a correction to a
+working one, which it receives before its next step.
 
-Pass the board id as structured `team_task_id`, the estimate as
-`episode_estimate`, and `episode_kind=implementation`, `review` or `revision`
-on `team_send(kind=task_assignment, ...)`. These fields drive automatic runtime
-notices and durable accounting; a task id written only in prose cannot be joined
-reliably to the board. The notice reports the current lifetime and episode
-counts without another model call. Estimates are soft targets, not renewals.
-Ask for evidence and remaining work before the member consumes its reserve.
+Pass the board id as structured `team_task_id` and `episode_kind=implementation`,
+`review` or `revision` on `team_send(kind=task_assignment, ...)`. These fields
+drive durable accounting; a task id written only in prose cannot be joined
+reliably to the board.
 
 Keep message bodies at or below 3500 characters (the hard limit is 4000). Include
 exact files/line ranges and the relevant revision; place longer reference material
