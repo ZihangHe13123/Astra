@@ -103,15 +103,51 @@ def test_windows_service_helpers_use_sibling_script_and_return_failure(
 ) -> None:
     root, scripts = _installation(tmp_path, wrapper)
     program = SERVICE_PROGRAMS[Path(wrapper).name]
+    receipt = tmp_path / "service-fixture-phases.log"
     (scripts / program).write_text(
         'param([string]$Action)\n'
+        '$receipt = $env:ASTRA_WRAPPER_PHASES\n'
+        '[IO.File]::AppendAllText($receipt, "entered pid=$PID action=$Action utc=$([DateTime]::UtcNow.ToString(\'o\'))`n")\n'
         '[Console]::OutputEncoding = [Text.UTF8Encoding]::new()\n'
+        '[IO.File]::AppendAllText($receipt, "before-json-stdout`n")\n'
         '@{action=$Action; root=$PSScriptRoot; cwd=$PWD.Path} | ConvertTo-Json -Compress\n'
+        '[IO.File]::AppendAllText($receipt, "after-json-stdout`n")\n'
+        '[IO.File]::AppendAllText($receipt, "before-exit-29`n")\n'
         'exit 29\n', encoding="utf-8",
     )
-    result = subprocess.run(
-        _cmd(root / wrapper, ["status"]), cwd=tmp_path,
-        capture_output=True, text=True, encoding="utf-8", check=False, timeout=20,
-    )
+    try:
+        result = subprocess.run(
+            _cmd(root / wrapper, ["status"]), cwd=tmp_path,
+            env={**os.environ, "ASTRA_WRAPPER_PHASES": str(receipt)},
+            capture_output=True, text=True, encoding="utf-8", check=False, timeout=20,
+        )
+    except subprocess.TimeoutExpired as exc:
+        def tail(value):
+            return (value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or "")[-4000:]
+        diagnostics = {"wrapper": wrapper, "timeout_seconds": 20,
+                       "phases": receipt.read_text(encoding="utf-8") if receipt.exists() else None,
+                       "stdout_tail": tail(exc.output), "stderr_tail": tail(exc.stderr)}
+        (tmp_path / "service-wrapper-timeout.json").write_text(
+            json.dumps(diagnostics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        exc.add_note("Service fixture diagnostic: " + json.dumps(diagnostics, ensure_ascii=False))
+        raise
     assert result.returncode == 29, result.stdout + result.stderr
     assert json.loads(result.stdout) == {"action": "status", "root": str(scripts), "cwd": str(tmp_path)}
+
+
+def test_service_timeout_preserves_fixture_phases_and_partial_output(tmp_path, monkeypatch):
+    error = subprocess.TimeoutExpired("fixture command", 20, output=b"partial stdout", stderr=b"partial stderr")
+    def timeout(command, **kwargs):
+        assert kwargs["timeout"] == 20
+        Path(kwargs["env"]["ASTRA_WRAPPER_PHASES"]).write_text("entered pid=123 action=status\nbefore-json-stdout\n", encoding="utf-8")
+        raise error
+    monkeypatch.setattr(subprocess, "run", timeout)
+    with pytest.raises(subprocess.TimeoutExpired) as captured:
+        test_windows_service_helpers_use_sibling_script_and_return_failure(tmp_path, SERVICE_WRAPPERS[0])
+    assert captured.value is error
+    diagnostics = json.loads((tmp_path / "service-wrapper-timeout.json").read_text(encoding="utf-8"))
+    assert diagnostics["phases"].splitlines() == ["entered pid=123 action=status", "before-json-stdout"]
+    assert diagnostics["stdout_tail"] == "partial stdout"
+    assert diagnostics["stderr_tail"] == "partial stderr"
+    assert any("Service fixture diagnostic:" in note for note in error.__notes__)
