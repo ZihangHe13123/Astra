@@ -1120,9 +1120,14 @@ def test_empty_and_like_pool_keeps_or_fallback_and_active_exclusions(tmp_path):
 
 
 @pytest.mark.parametrize("query", ["the", "的"])
-def test_broad_relevance_terms_stay_available_under_source_deadline(tmp_path, query):
+def test_broad_relevance_terms_return_bounded_candidates(tmp_path, query, monkeypatch):
     path = _create_broad_recall_database(
         tmp_path / f"broad-{ord(query[0])}.db", rows=10_000
+    )
+    # Check complete candidate selection independently of host scheduling.
+    # Deadline degradation and wall-clock performance have separate regressions.
+    monkeypatch.setattr(
+        session_source_module, "time", SimpleNamespace(monotonic=lambda: 0.0)
     )
 
     result = SessionRecommendationSource(path, deadline_ms=75).recommend(
@@ -1130,8 +1135,9 @@ def test_broad_relevance_terms_stay_available_under_source_deadline(tmp_path, qu
     )
 
     assert result.availability == "available"
-    assert result.relevance
+    assert result.error_category == ""
     assert len(result.relevance) == 12
+    assert len(result.recency) == 12
 
 
 def test_relevance_pools_preserve_tier_before_native_rank(tmp_path):
