@@ -260,3 +260,22 @@ def test_take_last_request_without_a_request_is_a_noop(tmp_path: Path) -> None:
     assert ok is False
     assert message == "No request to retry."
     assert text == ""
+
+
+def test_a_removed_message_replaced_before_saving_is_saved_as_a_rewrite(tmp_path: Path) -> None:
+    path = tmp_path / "session.json"
+    context = _context(path)
+    context.add_user("question")
+    context.add_assistant("draft answer")
+    context.save()
+
+    # A draft gives way to a later message before anything is saved again.
+    assert context.remove_last_message(role="assistant")["content"] == "draft answer"
+    context.add_user("[SYSTEM-DELIVERED SUBAGENT RESULT] evidence")
+    context.add_assistant("final answer")
+    context.save()
+
+    stored = SessionStore(path).load()["messages"]
+    assert [message.get("content") for message in stored] == [
+        message.get("content") for message in context.messages
+    ] == ["question", "[SYSTEM-DELIVERED SUBAGENT RESULT] evidence", "final answer"]

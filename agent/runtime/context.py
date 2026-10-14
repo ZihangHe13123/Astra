@@ -693,7 +693,9 @@ class AgentContext:
         """Drop the trailing message, optionally only when it has this role.
 
         Returns the removed message, or None when nothing matched. Callers
-        persist separately (see save).
+        persist separately (see save); the removal is remembered until then,
+        so a message appended in its place is saved as a rewrite of history,
+        not mistaken for one already stored.
         """
         if not self.messages:
             return None
@@ -702,6 +704,7 @@ class AgentContext:
         removed = self.messages.pop()
         if len(self._message_token_costs) == len(self.messages) + 1:
             self._message_token_costs.pop()
+        self._saved_message_count = min(self._saved_message_count, len(self.messages))
         return removed
 
     def add_assistant(self, content: str, tool_calls: list | None = None):

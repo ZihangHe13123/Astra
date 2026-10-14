@@ -83,6 +83,32 @@ def test_react_reconciles_running_background_mailbox_before_final_answer():
     asyncio.run(scenario())
 
 
+def test_a_draft_answer_given_way_to_late_results_is_not_kept_in_the_saved_history(tmp_path):
+    from agent.runtime.session_store import SessionStore
+    from agent.runtime.task_store import TaskStore
+
+    async def scenario():
+        llm = RootLLM()
+        mailbox = CompletingMailbox()
+        agent = ReActAgent("agent", llm, ToolRegistry(), max_iterations=3)
+        agent.delegate_mailbox = mailbox
+        agent.context.set_session(str(tmp_path / "session.json"))
+        # With a task store, as in the backend, the draft is saved as soon as it is written.
+        agent.task_store = TaskStore(tmp_path / "tasks.db")
+        task = agent.task_store.start_run("request", "do the long task", session_id="session")
+        msg = Msg(content=[ContentBlock.text("do the long task")], metadata={"task_id": task["id"]})
+
+        [event async for event in agent.reply_stream(msg)]
+        await agent.context.save_async()
+
+        stored = SessionStore(tmp_path / "session.json").load()["messages"]
+        assert [m.get("content") for m in stored] == [m.get("content") for m in agent.context.messages]
+        assert not any(m.get("content") == "draft without worker" for m in stored)
+        assert stored[-1]["content"] == "final with worker evidence"
+
+    asyncio.run(scenario())
+
+
 def test_react_drains_completed_background_result_on_next_parent_turn():
     async def scenario():
         llm = RootLLM()
