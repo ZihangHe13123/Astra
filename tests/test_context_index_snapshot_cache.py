@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.cli.context_index_preferences import ContextIndexPreferences
-from agent.runtime.context_index import embedder, semantic_index, semantic_indexer
+from agent.runtime.context_index import embedder, semantic_index, semantic_indexer, sqlite_reader
 from agent.runtime.context_index.factory import create_context_index_broker
 from agent.runtime.instance_lock import InstanceLock
 from tests.test_context_index_semantic import NOW, QUERY, TEXT, WORKSPACE, archive as archive
@@ -56,29 +56,48 @@ def test_background_fills_own_cache_after_interactive_deadline(archive, monkeypa
     before = hashlib.sha256(archive.vectors.read_bytes()).hexdigest()
     original = semantic_index.open_readonly
     budgets = []
+    read_clock = threading.local()
+
+    def now():
+        # Only the snapshot worker gets a controlled SQL clock. Lexical reads,
+        # asyncio's source deadline and background maintenance keep real time.
+        return getattr(read_clock, "now", time.perf_counter())
+
+    monkeypatch.setattr(sqlite_reader, "time", SimpleNamespace(perf_counter=now))
 
     @contextmanager
-    def delayed_interactive(path, deadline_ms=75, **kwargs):
+    def expired_interactive(path, deadline_ms=75, **kwargs):
         budgets.append(deadline_ms)
         if deadline_ms == 2000 and not other_writer:
             with InstanceLock(archive.vectors.with_suffix(archive.vectors.suffix + ".memory-index.lock")):
                 pass
-        with original(path, deadline_ms=deadline_ms, **kwargs) as db:
+        if deadline_ms == 75:
+            read_clock.now = 0.0
+        try:
+            with original(path, deadline_ms=deadline_ms, **kwargs) as db:
+                if deadline_ms == 75:
+                    read_clock.now = .09
+                yield db
+        finally:
             if deadline_ms == 75:
-                time.sleep(.09)
-            yield db
+                del read_clock.now
 
-    monkeypatch.setattr(semantic_index, "open_readonly", delayed_interactive)
-    monkeypatch.delenv("ASTRA_CONTEXT_INDEX_SOURCE_MS", raising=False)
+    monkeypatch.setattr(semantic_index, "open_readonly", expired_interactive)
+    # This tests recovery from SQLite's 75 ms deadline, not the separate source
+    # budget. Leave room for thread scheduling and cold imports on CI hosts.
+    monkeypatch.setenv("ASTRA_CONTEXT_INDEX_SOURCE_MS", "2000")
     monkeypatch.delenv("ASTRA_CONTEXT_INDEX_SESSION_MS", raising=False)
     broker = create_context_index_broker(ContextIndexPreferences(mode="session", char_budget=900), Path.cwd())
-    assert broker.source_deadline_seconds == .2
+    assert broker.source_deadline_seconds == 2
     cold = asyncio.run(broker.build(QUERY, "cold", "current", WORKSPACE, NOW, frozenset()))
     assert cold.request_id == "cold"
     assert broker.last_trace is not None
     assert broker.last_trace.source_status["session"] == "available"
     assert broker.last_trace.semantic_errors == {"session": "deadline"}
     assert broker.last_trace.semantic_status == {"session": "error"}
+    assert [(stage.name, stage.error_category) for stage in broker.last_trace.semantic_stages["session"]] == [
+        ("snapshot", "deadline"),
+    ]
     assert not semantic_index._cache
     archive.encoder.calls.clear()
     monkeypatch.setattr(embedder, "get_embedder", lambda: pytest.fail("must not load a model"))

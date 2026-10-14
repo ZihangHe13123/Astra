@@ -7,7 +7,7 @@ on:
         description: 'Bounded Windows diagnostics (default runs desktop acceptance)'
         type: choice
         default: none
-        options: [none, windows-page, windows-context-performance, windows-vector-snapshot, windows-vector-read-paths, windows-vector-clock, windows-vector-contention, windows-service-wrappers]
+        options: [none, windows-page, windows-context-performance, windows-vector-snapshot, windows-vector-read-paths, windows-vector-clock, windows-vector-contention, windows-service-wrappers, windows-headless]
 
 permissions:
   contents: read
@@ -216,3 +216,48 @@ jobs:
           path: output/context-index-windows/
           retention-days: 7
           if-no-files-found: error
+
+  headless-browser:
+    if: github.repository == 'ZihangHe13123/Astra' && inputs.investigation == 'windows-headless'
+    runs-on: windows-2025
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: '1'
+      TMPDIR: ${{ runner.temp }}
+      TEMP: ${{ runner.temp }}
+      TMP: ${{ runner.temp }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          version: '0.11.27'
+          python-version: '3.12'
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          download-from-astral-mirror: false
+      - name: Install locked dependencies
+        run: uv sync --locked --extra dev --extra mcp --extra tracing --extra server --extra notebook
+      - name: Ten independent native extraction attempts
+        # Each pytest process and Chrome profile is fresh. Stop on the first
+        # failure, keep its diagnostics, and retain the production 30 s limit.
+        run: |
+          uv run --locked --no-sync python -c "from agent.runtime.cdp_backend import find_chrome; assert find_chrome(), 'Native Chrome missing'"
+          mkdir -p "$RUNNER_TEMP/headless-diagnostics"
+          for iteration in $(seq 1 10); do
+            uv run --locked --no-sync python -m pytest -q -s \
+              --basetemp="$RUNNER_TEMP/headless-pytest-$iteration" \
+              --junitxml="$RUNNER_TEMP/headless-diagnostics/attempt-$iteration.xml" \
+              tests/test_cdp_backend.py::TestCdpBackendExtract::test_extract_data_url
+          done
+      - name: Preserve every completed attempt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: headless-windows-py3.12
+          path: ${{ runner.temp }}/headless-diagnostics/
+          retention-days: 7
