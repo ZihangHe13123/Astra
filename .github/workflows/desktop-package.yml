@@ -45,6 +45,7 @@ jobs:
           npm --prefix ui-core ci
           npm --prefix ui-tui ci
           npm --prefix ui-gui ci
+          node ui-gui/node_modules/electron/install.js
           npm --prefix ui-gui run build
       - name: Distribution regression contracts
         run: |
