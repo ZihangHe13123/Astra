@@ -70,3 +70,14 @@ jobs:
           name: astra-${{ matrix.target }}-unsigned
           path: ${{ runner.temp }}/astra-${{ matrix.target }}.tar.gz
           retention-days: 7
+      - name: Upload failed packaged fixture diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: astra-${{ matrix.target }}-package-failure-diagnostics
+          path: |
+            ${{ runner.temp }}/astra-standalone-*/packaged-diagnostics.json
+            ${{ runner.temp }}/astra-standalone-*/standalone.png
+            ${{ runner.temp }}/astra-standalone-*/profile/logs/gui-backend-*.log
+          if-no-files-found: warn
+          retention-days: 7
