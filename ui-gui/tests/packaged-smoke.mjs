@@ -53,7 +53,8 @@ try{
  assert.equal(paths.python,realpathSync(python));
  assert.equal(paths.backend,backend);
  assert.equal(paths.data,data);
- assert.equal(paths.path,'');
+ // Windows can report an explicitly empty environment variable as absent.
+ if(process.platform!=='win32'||paths.path!==undefined)assert.equal(paths.path,'');
  await page.getByRole('textbox',{name:'消息'}).fill('Reply with the runtime receipt.');
  await page.getByRole('button',{name:'发送',exact:true}).click();
  await page.getByText('PACKAGED_RUNTIME_OK',{exact:true}).waitFor({timeout:45000});
