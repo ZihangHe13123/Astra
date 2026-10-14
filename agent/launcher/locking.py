@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
@@ -40,16 +41,28 @@ def active_instances(install: Installation) -> list[dict]:
 
 
 @contextmanager
-def exclusive(install: Installation, *, allow_pending: bool = False):
+def exclusive(install: Installation, *, allow_pending: bool = False, wait_seconds: float = 0):
+    lock = InstanceLock(install.control / "update.lock")
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            lock.acquire()
+            break
+        except InstanceAlreadyRunning as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise LauncherError("Another Astra startup, setup or update is running. Wait for it to finish.") from exc
+            time.sleep(min(0.05, remaining))
     try:
-        with InstanceLock(install.control / "update.lock"):
-            if not allow_pending and (install.control / "desktop-pending.json").exists():
-                raise LauncherError("A desktop update was interrupted. Run the desktop updater recover action first.")
-            if not allow_pending and any((install.control / name).exists() for name in ("pending.json", "services.json")):
-                raise LauncherError("An update was interrupted. Run astra update --recover before starting Astra.")
-            yield
-    except InstanceAlreadyRunning as exc:
-        raise LauncherError("Another Astra setup or update is running. Wait for it to finish.") from exc
+        # These checks must run after acquisition: the operation we waited for
+        # may have left a pending transaction. Never retry checks or the body.
+        if not allow_pending and (install.control / "desktop-pending.json").exists():
+            raise LauncherError("A desktop update was interrupted. Run the desktop updater recover action first.")
+        if not allow_pending and any((install.control / name).exists() for name in ("pending.json", "services.json")):
+            raise LauncherError("An update was interrupted. Run astra update --recover before starting Astra.")
+        yield
+    finally:
+        lock.release()
 
 
 class RuntimeLease:
@@ -57,7 +70,9 @@ class RuntimeLease:
         self.install = install
         self.path = install.control / "instances" / f"{uuid.uuid4().hex}.lock"
         self.lock = InstanceLock(self.path)
-        with exclusive(install):
+        # Other runtimes briefly hold update.lock while registering their
+        # independent leases. Allow those legitimate concurrent starts to drain.
+        with exclusive(install, wait_seconds=5):
             self.lock.acquire()
             try:
                 details = install.describe()

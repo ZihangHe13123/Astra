@@ -227,6 +227,110 @@ def test_direct_backend_registers_before_loading_optional_runtime(source, monkey
     assert active_instances(inst) == []
 
 
+def runtime_lease_child(inst, role):
+    script = """
+import json, sys
+from pathlib import Path
+from agent.launcher.installation import discover
+from agent.launcher.locking import RuntimeLease
+from agent.launcher.common import LauncherError
+print('ready', flush=True)
+sys.stdin.readline()
+try:
+    with RuntimeLease(discover(Path(sys.argv[1])), sys.argv[2]):
+        print(json.dumps({'outcome': 'acquired'}), flush=True)
+        sys.stdin.readline()
+except LauncherError as exc:
+    print(json.dumps({'outcome': 'rejected', 'detail': str(exc)}), flush=True)
+"""
+    child = subprocess.Popen([sys.executable, "-c", script, str(inst.root), role], cwd=ROOT,
+                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    assert child.stdout.readline().strip() == "ready"
+    return child
+
+
+def test_concurrent_runtime_registrations_wait_then_hold_independent_leases(source):
+    inst, _ = source
+    children = [runtime_lease_child(inst, f"runtime-{index}") for index in range(4)]
+    try:
+        # A short registration owns this same lock; every other runtime must
+        # wait without losing the installation's update exclusion.
+        with exclusive(inst):
+            for child in children:
+                child.stdin.write("\n")
+                child.stdin.flush()
+            for child in children:
+                with pytest.raises(subprocess.TimeoutExpired):
+                    child.wait(timeout=0.05)
+        for child in children:
+            assert json.loads(child.stdout.readline()) == {"outcome": "acquired"}
+        assert {item["role"] for item in active_instances(inst)} == {f"runtime-{i}" for i in range(4)}
+        from agent.launcher.locking import require_idle
+        with exclusive(inst), pytest.raises(LauncherError, match="Close these Astra"):
+            require_idle(inst)
+    finally:
+        for child in children:
+            output, error = child.communicate("\n", timeout=10)
+            assert child.returncode == 0, output + error
+    assert active_instances(inst) == []
+
+
+def test_runtime_wait_timeout_keeps_updater_default_immediate(source, monkeypatch):
+    from agent.launcher import locking
+    inst, _ = source
+    class Clock:
+        now = 0.0
+        def monotonic(self):
+            return self.now
+        def sleep(self, delay):
+            self.now += delay
+    clock = Clock()
+    monkeypatch.setattr(locking, "time", clock)
+    with exclusive(inst):
+        with pytest.raises(LauncherError, match="Another Astra"):
+            RuntimeLease(inst, "held updater")
+        assert clock.now == pytest.approx(5)
+        with pytest.raises(LauncherError, match="Another Astra"):
+            with exclusive(inst):
+                pytest.fail("updater must not bypass another updater")
+        assert clock.now == pytest.approx(5)
+    assert active_instances(inst) == []
+
+
+@pytest.mark.parametrize("marker", ["pending.json", "services.json", "desktop-pending.json"])
+def test_runtime_rechecks_pending_after_waiting_for_installation_lock(source, marker):
+    inst, _ = source
+    child = runtime_lease_child(inst, "waiting runtime")
+    try:
+        with exclusive(inst):
+            child.stdin.write("\n")
+            child.stdin.flush()
+            with pytest.raises(subprocess.TimeoutExpired):
+                child.wait(timeout=0.1)
+            write_json(inst.control / marker, {"schema": 1})
+        output, error = child.communicate(timeout=10)
+        assert child.returncode == 0, error
+        result = json.loads(output)
+        assert result["outcome"] == "rejected"
+        assert "interrupted" in result["detail"]
+        assert active_instances(inst) == []
+    finally:
+        if child.poll() is None:
+            child.communicate("\n", timeout=10)
+
+
+def test_waiting_exclusive_does_not_retry_business_body(source):
+    inst, _ = source
+    calls = []
+    with pytest.raises(LauncherError, match="body failed"):
+        with exclusive(inst, wait_seconds=5):
+            calls.append(True)
+            raise LauncherError("body failed")
+    assert calls == [True]
+    with exclusive(inst):
+        pass  # The lock was released even when the body failed.
+
+
 def test_update_applies_exact_commit_and_preserves_user_data(source):
     inst, seed = source
     target = advance(seed)
