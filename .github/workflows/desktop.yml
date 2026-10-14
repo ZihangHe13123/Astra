@@ -7,7 +7,7 @@ on:
         description: 'Bounded Windows diagnostics (default runs desktop acceptance)'
         type: choice
         default: none
-        options: [none, windows-page, windows-context-performance]
+        options: [none, windows-page, windows-context-performance, windows-vector-snapshot]
 
 permissions:
   contents: read
@@ -141,7 +141,7 @@ jobs:
           if-no-files-found: warn
 
   context-performance:
-    if: github.repository == 'ZihangHe13123/Astra' && inputs.investigation == 'windows-context-performance'
+    if: github.repository == 'ZihangHe13123/Astra' && (inputs.investigation == 'windows-context-performance' || inputs.investigation == 'windows-vector-snapshot')
     runs-on: windows-2025
     timeout-minutes: 20
     defaults:
@@ -163,22 +163,26 @@ jobs:
           download-from-astral-mirror: false
       - name: Prepare locked test environment
         run: uv sync --locked --extra dev
+      - name: Record tested source
+        run: |
+          mkdir -p output/context-index-windows
+          git rev-parse HEAD > output/context-index-windows/source-sha.txt
       - name: Diagnose cold vector snapshots
         id: snapshot_probe
         continue-on-error: true
         run: uv run --no-sync python scripts/probe_vector_snapshot_performance.py --output=output/context-index-windows/snapshot-probe --rounds=6
       - name: Diagnose warm vector search
+        if: inputs.investigation == 'windows-context-performance'
         id: search_probe
         continue-on-error: true
         run: uv run --no-sync python scripts/probe_vector_search_performance.py --output=output/context-index-windows/search-probe
       - name: Real Windows Context Index performance
+        if: inputs.investigation == 'windows-context-performance'
         env:
           TMPDIR: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
         run: |
-          mkdir -p output/context-index-windows
-          git rev-parse HEAD > output/context-index-windows/source-sha.txt
           uv run --no-sync python -m pytest -q -s tests/test_context_index_performance.py --junitxml=output/context-index-windows/pytest.xml | tee output/context-index-windows/results.log
       - name: Keep diagnostic failures visible
         if: always() && (steps.snapshot_probe.outcome == 'failure' || steps.search_probe.outcome == 'failure')

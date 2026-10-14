@@ -25,9 +25,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rounds", type=int, default=6)
+    parser.add_argument("--queued-rounds", type=int, default=20)
     args = parser.parse_args()
     if not 1 <= args.rounds <= 20:
         parser.error("rounds must be between 1 and 20")
+    if not 20 <= args.queued_rounds <= 40:
+        parser.error("queued-rounds must be between 20 and 40")
     if args.output.exists():
         parser.error("use a fresh output path")
     args.output.mkdir(parents=True)
@@ -76,6 +79,10 @@ def main() -> None:
               "fixture": str(folder), "counts": counts, "dim": dim,
               "payload_bytes": {source: count * dim * 4 for source, count in counts.items()},
               "metadata": metadata, "rounds": args.rounds, "warmup_rounds": 2, "experiments": [],
+              "queued_comparison": {"measured_pairs": args.queued_rounds, "warmup_pairs": 2,
+                                    "order": "original/queued then queued/original, alternating",
+                                    "lock_scope": "this fixture's vectors.db only",
+                                    "queue_timeout_ms": 200, "sql_deadline_ms": 75},
               "interpretation": "Original modes use the unchanged 75 ms reader. The 2000 ms diagnostic modes only locate work truncated by that budget; they are not acceptance passes. Instrumented modes have observer overhead and are kept separate from original modes."}
     local = threading.local()
 
@@ -193,6 +200,50 @@ def main() -> None:
             local.row = None
         return row
 
+    # Probe only: test whether serial cold loads avoid SQLite/Python contention.
+    # The queue is outside the real reader; its wait is included in total latency.
+    # A production design would also need per-DB isolation and a cache recheck.
+    load_lock = threading.Lock()
+
+    def compared_read(source, barrier, queued):
+        barrier.wait()
+        started = time.perf_counter()
+        acquired = False
+        queue_ms = 0.0
+        if queued:
+            acquired = load_lock.acquire(timeout=0.2)
+            queue_ms = (time.perf_counter() - started) * 1000
+            if not acquired:
+                return {"source": source, "phases": [], "status": "queue_timeout",
+                        "queue_ms": queue_ms, "execution_ms": 0.0, "elapsed_ms": queue_ms}
+        try:
+            row = read(source, None, False)
+        finally:
+            if acquired:
+                load_lock.release()
+        row["execution_ms"] = row["elapsed_ms"]
+        row["queue_ms"] = queue_ms
+        row["elapsed_ms"] = (time.perf_counter() - started) * 1000
+        return row
+
+    def summarize(experiment):
+        summary = {}
+        for source in counts:
+            rows = [r for sample in experiment["samples"] if not sample["warmup"]
+                    for r in sample["sources"] if r["source"] == source]
+            times = sorted(r["elapsed_ms"] for r in rows)
+            summary[source] = {"complete": sum(r["status"] == "complete" for r in rows),
+                               "deadline": sum(r["status"] == "deadline" for r in rows),
+                               "p95_elapsed_ms": times[math.ceil(len(times) * .95) - 1]}
+            if "queued" in experiment:
+                summary[source]["queue_timeout"] = sum(r["status"] == "queue_timeout" for r in rows)
+                for key in ("queue_ms", "execution_ms"):
+                    values = sorted(r[key] for r in rows)
+                    summary[source]["p95_" + key] = values[math.ceil(len(values) * .95) - 1]
+        experiment["summary"] = summary
+        print(json.dumps({"mode": experiment["name"], "summary": summary}), flush=True)
+        save()
+
     modes = [("original_serial_75ms", False, False, False), ("original_parallel_75ms", True, False, False),
              ("profile_serial_75ms", False, True, False), ("profile_parallel_75ms", True, True, False),
              ("diagnostic_serial_2000ms", False, True, True), ("diagnostic_parallel_2000ms", True, True, True)]
@@ -220,16 +271,35 @@ def main() -> None:
                         rows = [read(source, None, profiled) for source in counts]
                     experiment["samples"].append({"round": index, "warmup": index < 2, "sources": rows})
                     save()
-                summary = {}
-                for source in counts:
-                    rows = [r for sample in experiment["samples"] if not sample["warmup"] for r in sample["sources"] if r["source"] == source]
-                    times = sorted(r["elapsed_ms"] for r in rows)
-                    summary[source] = {"complete": sum(r["status"] == "complete" for r in rows),
-                                       "deadline": sum(r["status"] == "deadline" for r in rows),
-                                       "p95_elapsed_ms": times[math.ceil(len(times) * .95) - 1]}
-                experiment["summary"] = summary
-                print(json.dumps({"mode": name, "summary": summary}), flush=True)
-                save()
+                summarize(experiment)
+            # Restore every production function before the single-variable pair.
+            sqlite3.connect = original_connect
+            vector_index.matrix_from_blobs = original_matrix
+            semantic_index.matrix_from_blobs = original_matrix
+            semantic_index.open_readonly = original_open
+            semantic_index.file_version = original_version
+            semantic_index.archive_key = original_archive
+            comparisons = {
+                queued: {"name": "paired_queued_parallel_75ms" if queued else "paired_original_parallel_75ms",
+                         "parallel": True, "instrumented": False, "diagnostic_only": False,
+                         "queued": queued, "samples": []}
+                for queued in (False, True)
+            }
+            output["experiments"].extend(comparisons.values())
+            for index in range(args.queued_rounds + 2):
+                order = (False, True) if index % 2 == 0 else (True, False)
+                for position, queued in enumerate(order):
+                    with semantic_index._cache_lock:
+                        semantic_index._cache.clear()
+                    gc.collect()
+                    barrier = threading.Barrier(3)
+                    futures = [pool.submit(compared_read, source, barrier, queued) for source in counts]
+                    rows = [future.result(timeout=10) for future in futures]
+                    comparisons[queued]["samples"].append({"round": index, "warmup": index < 2,
+                                                          "position_in_pair": position, "sources": rows})
+                    save()
+            for experiment in comparisons.values():
+                summarize(experiment)
     finally:
         sqlite3.connect = original_connect
         vector_index.matrix_from_blobs = original_matrix
