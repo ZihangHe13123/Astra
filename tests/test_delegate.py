@@ -2062,7 +2062,9 @@ def test_delegate_waiting_for_a_slot_does_not_count_toward_the_time_limit(
     class SteadyLLM:
         async def chat(self, **kwargs):
             del kwargs
-            await asyncio.sleep(1.0)
+            # Two of these one after the other take clearly longer than one time limit,
+            # and one fits well inside it, even on a coarse Windows clock.
+            await asyncio.sleep(1.2)
             return {"content": "done in time", "tool_calls": []}
 
     async def scenario():

@@ -2121,7 +2121,7 @@ def test_llm_stream_idle_timeout_resets_for_each_received_chunk():
             return self
 
         async def __anext__(self):
-            await asyncio.sleep(0.005)
+            await asyncio.sleep(0.02)
             try:
                 return next(self.items)
             except StopIteration:
@@ -2132,10 +2132,13 @@ def test_llm_stream_idle_timeout_resets_for_each_received_chunk():
 
     async def scenario():
         provider = object.__new__(OpenAICompatibleProvider)
+        # The stream lasts about 0.6 s, longer than the idle limit, so only a limit that
+        # resets on each chunk lets it finish; each gap stays far below the limit, even
+        # on a loaded runner.
         provider.config = LLMConfig(
             timeout=0,
             connect_timeout=1,
-            idle_timeout=0.05,
+            idle_timeout=0.3,
             overall_timeout=0,
             max_retries=0,
         )
