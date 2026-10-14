@@ -15,8 +15,7 @@ async function bounded(promise, label, timeout) {
  try { return await Promise.race([promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error(`${label} timed out after ${timeout} ms`)),timeout);})]); }
  finally { clearTimeout(timer); }
 }
-async function terminateFixture(app) {
- const child=app.process();
+async function terminateFixture(child) {
  if(child.exitCode!==null||child.signalCode!==null)return;
  const pid=child.pid;assert.ok(Number.isSafeInteger(pid)&&pid>0,'only terminate this fixture process tree');
  if(process.platform==='win32'){await runFile('taskkill.exe',['/PID',String(pid),'/T','/F'],{timeout:5000,windowsHide:true});return;}
@@ -29,10 +28,10 @@ async function terminateFixture(app) {
 const release = resolve(process.argv[2] || '');
 const manifest = JSON.parse(readFileSync(join(release, 'release.json'), 'utf8'));
 const test = realpathSync(mkdtempSync(join(process.env.RUNNER_TEMP || tmpdir(), 'astra-standalone-')));
-let app,failure,requests=0;
+let app,fixtureProcess,failure,requests=0;
 const diagnostics={phases:[],errors:[]};
 function saveDiagnostics(){
- const child=app?.process();
+ const child=fixtureProcess;
  writeFileSync(join(test,'packaged-diagnostics.json'),JSON.stringify({...diagnostics,requests,
   fixtureProcess:child?{pid:child.pid,exitCode:child.exitCode,signalCode:child.signalCode}:null},null,2));
 }
@@ -75,6 +74,7 @@ writeFileSync(join(data,'models.yaml'),`version: 1\nmodels:\n  packaged-test:\n 
 try{
  phase('launch');
  app=await electron.launch({executablePath:join(relocated,process.platform==='darwin'?'Contents/MacOS/Astra':'Astra.exe'),env,timeout:45000});
+ fixtureProcess=app.process();
  const page=await app.firstWindow();
  const errors=[];page.on('pageerror',error=>errors.push(error.message));
  phase('runtime-paths');
@@ -109,7 +109,7 @@ try{
  if(app){
   phase('close');
   try{await bounded(app.close(),'Electron close',30000);}
-  catch(error){recordFailure(error);phase('forced-fixture-cleanup');try{await bounded(terminateFixture(app),'Fixture process cleanup',6000);}catch(cleanup){recordFailure(cleanup);}}
+  catch(error){recordFailure(error);phase('forced-fixture-cleanup');try{await bounded(terminateFixture(fixtureProcess),'Fixture process cleanup',6000);}catch(cleanup){recordFailure(cleanup);}}
  }
  phase('fixture-listener-close');
  server.closeAllConnections();await bounded(new Promise((resolve,reject)=>server.close(error=>error?reject(error):resolve())),'Fixture HTTP close',3000).catch(recordFailure);
