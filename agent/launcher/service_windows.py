@@ -22,19 +22,32 @@ def _processes() -> list[dict]:
               "@(Get-CimInstance Win32_Process -Filter \"Name = 'python.exe'\" | "
               "Select-Object ProcessId,ParentProcessId,ExecutablePath,CommandLine,CreationDate) | "
               "ConvertTo-Json -Compress")
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
+            break
+        except subprocess.TimeoutExpired:
+            # CIM can be cold during setup. Retry only this read-only query;
+            # an unreadable inventory never grants permission to stop/start.
+            if attempts == 1:
+                continue
+            raise LauncherError("Cannot inspect Windows recorder ownership: PowerShell inventory timed out after two attempts.") from None
+        except OSError:
+            raise LauncherError("Cannot inspect Windows recorder ownership: PowerShell could not start.") from None
+    if result.returncode:
+        raise LauncherError("Cannot inspect Windows recorder ownership: PowerShell exited unsuccessfully.") from None
     try:
-        result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
-                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
-        if result.returncode:
-            raise ValueError
         data = json.loads(result.stdout or "[]")
         if isinstance(data, dict):
             data = [data]
         if not isinstance(data, list) or not all(isinstance(row, dict) for row in data):
             raise ValueError
         return data
-    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
-        raise LauncherError("Cannot inspect Windows recorder ownership.") from exc
+    except ValueError:
+        raise LauncherError("Cannot inspect Windows recorder ownership: PowerShell returned invalid process data.") from None
 
 
 def _split(command: str) -> list[str]:

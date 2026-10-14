@@ -11,12 +11,13 @@ def send(proc, value):
     proc.stdin.flush()
 
 
-def start(tmp_path):
+def start(tmp_path, *, sessions_dir=None):
     return _start_question_protocol_backend(
         tmp_path, 9, "lifecycle_session", env_overrides={
             "ASTRA_TUI_RESTART": "1",
             "ASTRA_CHANNEL_CONFIG": str(tmp_path / "no-channels.json"),
             "ASTRA_CONTEXT_INDEX_EMBEDDING": "off",
+            **({"AGENT_SESSION_DIR": str(sessions_dir)} if sessions_dir is not None else {}),
         },
     )
 
@@ -82,21 +83,23 @@ def test_real_backend_rejected_branch_rename_keeps_command_loop_alive(tmp_path):
     from agent.runtime.conversation_branches import ConversationBranches
     from agent.runtime.message_source import message_source_ref
 
-    proc, _, _, wait_for = start(tmp_path)
+    # Publish fixture data before a real backend can index it. This test covers
+    # rename rejection, not concurrent external writes to the branch manifest.
+    path = tmp_path / "prepared-sessions" / "branched.json"
+    messages = [{"role": "user", "content": "question"},
+                {"role": "assistant", "content": "original answer"}]
+    SessionStore(path).save({"messages": messages})
+    branches = ConversationBranches(path)
+    ticket = branches.prepare_retry(message_source_ref(messages[-1], 1), branch_id="main", expected_revision=0)
+    alternate = ticket["seed"]
+    alternate["messages"].append({"role": "assistant", "content": "alternate answer"})
+    SessionStore(path, branch_id=ticket["candidate_branch_id"]).save(alternate)
+    branches.finish_candidate(ticket["candidate_branch_id"])
+    before = {file: file.read_bytes() for file in SessionStore(path).related_paths() if file.is_file()}
+
+    proc, _, _, wait_for = start(tmp_path, sessions_dir=path.parent)
     try:
         wait_for(lambda event: event.get("type") == "startup_banner", timeout=30)
-        path = tmp_path / "sessions" / "branched.json"
-        messages = [{"role": "user", "content": "question"},
-                    {"role": "assistant", "content": "original answer"}]
-        SessionStore(path).save({"messages": messages})
-        branches = ConversationBranches(path)
-        ticket = branches.prepare_retry(message_source_ref(messages[-1], 1), branch_id="main", expected_revision=0)
-        alternate = ticket["seed"]
-        alternate["messages"].append({"role": "assistant", "content": "alternate answer"})
-        SessionStore(path, branch_id=ticket["candidate_branch_id"]).save(alternate)
-        branches.finish_candidate(ticket["candidate_branch_id"])
-        before = {file: file.read_bytes() for file in SessionStore(path).related_paths() if file.is_file()}
-
         send(proc, {"type": "command", "cmd": "/session rename branched renamed"})
         rejected = wait_for(lambda event: event.get("type") == "tool_result" and event.get("name") == "session")
         assert "reply versions" in rejected["error"] and not rejected["output"]

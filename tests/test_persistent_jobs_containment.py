@@ -112,6 +112,7 @@ sys.exit(child.wait())
 def test_wrapper_exit_does_not_cut_off_detached_provider_finally(tmp_path, monkeypatch):
     store, run, _ = occurrence(tmp_path)
     child_lock, cleaned = tmp_path / "provider.lock", tmp_path / "cleaned"
+    ready, diagnostics = tmp_path / "provider-ready", tmp_path / "worker-stderr.log"
     script = """
 import asyncio,subprocess,sys
 from pathlib import Path
@@ -125,6 +126,7 @@ async def check(*_):
   sys.argv[3],stdout=asyncio.subprocess.PIPE,start_new_session=True)
  try:
   assert (await child.stdout.readline()).strip()==b'ready'
+  Path(sys.argv[5]).write_text('provider cancellation is ready')
   await asyncio.sleep(60)
  finally:
   await asyncio.sleep(.3)
@@ -139,9 +141,22 @@ with store.run_lock(sys.argv[2]):
     original_popen = subprocess.Popen
     wrappers = []
     def spawn(_args, **kwargs):
-        child = [sys.executable, "-c", script, str(store.home), run["id"], str(child_lock), str(cleaned)]
-        process = original_popen([sys.executable, "-c", "import subprocess,sys; sys.exit(subprocess.call(sys.argv[1:]))", *child], **kwargs)
+        child = [sys.executable, "-c", script, str(store.home), run["id"], str(child_lock), str(cleaned), str(ready)]
+        with diagnostics.open("wb") as stderr:
+            process = original_popen([sys.executable, "-c", "import subprocess,sys; sys.exit(subprocess.call(sys.argv[1:]))", *child],
+                                     **{**kwargs, "stderr": stderr})
         wrappers.append(process)
+        deadline = time.monotonic() + 10
+        while not ready.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        if not ready.exists():
+            # Startup is outside the behavior under test. Keep it bounded and
+            # clean up before reporting useful fixture diagnostics.
+            scheduler._stop_worker(process, store=store, identity=run["id"])
+            raise AssertionError(f"Provider fixture did not become ready (exit {process.returncode}): "
+                                 + diagnostics.read_text(errors="replace"))
+        # Start the production idle budget only once cancellation can exercise
+        # the provider's finally block, regardless of CI import/startup speed.
         return process
     monkeypatch.setattr(scheduler.subprocess, "Popen", spawn)
     try:

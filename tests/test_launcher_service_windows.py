@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import time
+import traceback
 from types import SimpleNamespace
 
 import pytest
@@ -156,6 +157,46 @@ def test_powershell_process_inventory_is_static_and_explicitly_utf8(monkeypatch)
     args, kwargs = calls[0]
     assert "OutputEncoding" in args[-1] and "UTF8Encoding" in args[-1]
     assert kwargs["encoding"] == "utf-8" and "shell" not in kwargs
+
+
+def test_process_inventory_retries_one_timeout_then_preserves_results(monkeypatch):
+    calls = []
+    row = {"ProcessId": 42, "CommandLine": "private process arguments"}
+    def run(args, **kwargs):
+        calls.append(kwargs["timeout"])
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(args, kwargs["timeout"], output="private output")
+        return subprocess.CompletedProcess(args, 0, json.dumps([row]), "")
+    monkeypatch.setattr(mod.subprocess, "run", run)
+    assert mod._processes() == [row]
+    assert calls == [15, 15]
+
+
+@pytest.mark.parametrize("failure,reason,attempts", [
+    ("timeout", "timed out", 2),
+    ("start", "could not start", 1),
+    ("exit", "exited unsuccessfully", 1),
+    ("json", "invalid process data", 1),
+    ("shape", "invalid process data", 1),
+])
+def test_inventory_failures_are_bounded_classified_and_do_not_expose_process_data(monkeypatch, failure, reason, attempts):
+    secret = "sensitive-command-and-inventory"
+    calls = []
+    def run(args, **kwargs):
+        calls.append(kwargs["timeout"])
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired([secret], 15, output=secret, stderr=secret)
+        if failure == "start":
+            raise OSError(secret)
+        if failure == "exit":
+            return subprocess.CompletedProcess(args, 7, secret, secret)
+        return subprocess.CompletedProcess(args, 0, secret if failure == "json" else json.dumps([secret]), "")
+    monkeypatch.setattr(mod.subprocess, "run", run)
+    with pytest.raises(LauncherError, match=reason) as caught:
+        mod._processes()
+    assert calls == [15] * attempts
+    assert secret not in str(caught.value)
+    assert secret not in "".join(traceback.format_exception(caught.value))
 
 
 @pytest.mark.skipif(os.name != "nt", reason="native Windows command-line parser")
