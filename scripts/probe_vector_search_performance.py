@@ -23,7 +23,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-VARIANTS = ("baseline", "no_copy", "norm_einsum", "dot_einsum", "no_copy_norm", "all")
+VARIANTS = ("baseline", "no_copy", "norm_einsum", "dot_einsum", "no_copy_norm", "all", "production")
 REPEATS = 30
 
 
@@ -91,6 +91,9 @@ def main() -> int:
     summary: dict[str, Any] = {"platform": platform.platform(), "python": sys.version,
                                "cpu_count": os.cpu_count(), "repeats_per_variant": REPEATS,
                                "variant_order": list(VARIANTS), "runtime": numpy_runtime(np),
+                               "baseline_semantics": "Historical full-selection copy + linalg row norm + BLAS dot; independent of current production",
+                               "production_semantics": "Current unmodified vector_search and reader selection; separate from the six historical alternatives",
+                               "selection_measurement": "Historical copies occur inside the search hook after metadata selection; production uses its real selection",
                                "scope": "synthetic fixed vectors; real canonical archive and SemanticReader",
                                "acceptance_ms": 75, "production_deadlines_unchanged": True,
                                "observations": [], "microbenchmarks": {}, "variants": {}}
@@ -168,29 +171,11 @@ def main() -> int:
             save(output / "summary.json", summary)
             reader = semantic_reader.SemanticReader(session_db, vectors)
             plan = plan_query("换一种说法寻找相关历史", fixture._NOW)
-            original_snapshot = semantic_reader.read_snapshot
+            assert all(plan.contains(row[2]) and row[3] <= plan.cutoff for row in rows)
             original_stage = semantic_reader.observe_stage
             original_search = semantic_reader.vector_search
             current: dict[str, Any] = {}
             reference: list[tuple[str, str, float, str]] | None = None
-
-            class MeasuredMatrix:
-                def __init__(self, value):
-                    self.value = value
-
-                def __getitem__(self, selected):
-                    start = time.perf_counter_ns()
-                    skip = current["variant"] in {"no_copy", "no_copy_norm", "all"}
-                    # This experiment only skips an exact ordered full selection.
-                    full = len(selected) == len(self.value) and all(i == value for i, value in enumerate(selected))
-                    result = self.value if skip and full else self.value[selected]
-                    current["selection_ms"] = (time.perf_counter_ns() - start) / 1_000_000
-                    current["selection_copied"] = result is not self.value
-                    return result
-
-            def snapshot(*args, **kwargs):
-                found_rows, found_matrix = original_snapshot(*args, **kwargs)
-                return found_rows, MeasuredMatrix(found_matrix)
 
             @contextmanager
             def stage(stages, name):
@@ -201,15 +186,25 @@ def main() -> int:
                 finally:
                     current["stages_ms"][name] = (time.perf_counter_ns() - start) / 1_000_000
 
-            def search(query_vec, matrix, ids, *, k):
+            def search(query_vec, selected_matrix, ids, *, k):
                 name = current["variant"]
-                if name in {"baseline", "no_copy"}:
-                    return original_search(query_vec, matrix, ids, k=k)
-                return candidate(query_vec, matrix, ids, k=k,
+                assert ids == [row[0] for row in rows]
+                # This fixture selects every row. Require the production
+                # no-copy fix so a hidden earlier copy cannot skew comparisons.
+                assert np.shares_memory(selected_matrix, matrix)
+                if name == "production":
+                    current["selection_ms"] = 0.0  # Included in the real search stage, not separately instrumented.
+                    current["selection_copied"] = False
+                    return original_search(query_vec, selected_matrix, ids, k=k)
+                started = time.perf_counter_ns()
+                copy = name not in {"no_copy", "no_copy_norm", "all"}
+                selected = matrix[indices] if copy else matrix
+                current["selection_ms"] = (time.perf_counter_ns() - started) / 1_000_000
+                current["selection_copied"] = copy
+                return candidate(query_vec, selected, ids, k=k,
                                  norm_einsum=name in {"norm_einsum", "no_copy_norm", "all"},
                                  dot_einsum=name in {"dot_einsum", "all"})
 
-            patch.setattr(semantic_reader, "read_snapshot", snapshot)
             patch.setattr(semantic_reader, "observe_stage", stage)
             patch.setattr(semantic_reader, "vector_search", search)
             for round_index in range(REPEATS):

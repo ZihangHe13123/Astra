@@ -73,7 +73,9 @@ class SemanticReader:
             if not indices:
                 return SourceResult("available")
             with observe_stage(stages, "search"):
-                subset = matrix[indices]
+                # The ordered filter selects every row on ordinary unbounded
+                # recall. Reuse the immutable snapshot instead of copying it.
+                subset = matrix if len(indices) == len(rows) else matrix[indices]
                 metadata = {rows[i][0]: rows[i][1] for i in indices}
                 hits = vector_search(encoded, subset, list(metadata), k=len(metadata))
             hits = [(key, score) for key, score in hits if score >= minimum_similarity()]

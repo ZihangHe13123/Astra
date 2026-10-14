@@ -55,6 +55,60 @@ def test_vector_search_ranks_by_cosine_descending() -> None:
     assert hits[1][1] == pytest.approx(0.7 / math.sqrt(0.98))
 
 
+@pytest.mark.parametrize("dtype", [np.float32, np.float64, np.int32])
+@pytest.mark.parametrize("strided", [False, True])
+def test_vector_search_preserves_raw_cosines_and_readonly_input(dtype, strided):
+    values = [[3, 4, 0], [-5, 2, 0], [0, 0, 0], [1000, -500, 20], [-2, 0, 1], [1, 2, 3]]
+    matrix = np.asarray(values, dtype=dtype)
+    if strided:
+        matrix = np.repeat(matrix, 2, axis=1)[:, ::2]
+    matrix.flags.writeable = False
+    before = matrix.tobytes()
+    query = [2.0, -1.0, 0.5]
+    ids = [str(index) for index in range(len(values))]
+    expected = []
+    for identity, row in zip(ids, values):
+        score = math.fsum(a * b for a, b in zip(row, query)) / ((math.hypot(*row) or 1) * math.hypot(*query))
+        if score > 0:
+            expected.append((identity, score))
+    expected.sort(key=lambda item: -item[1])
+
+    actual = mod.vector_search(query, matrix, ids, k=len(ids))
+    assert [identity for identity, _score in actual] == [identity for identity, _score in expected]
+    assert [score for _identity, score in actual] == pytest.approx([score for _identity, score in expected])
+    assert mod.vector_search([0, 0, 0], matrix, ids, k=len(ids)) == []
+    assert matrix.tobytes() == before and not matrix.flags.writeable
+
+
+def test_vector_search_keeps_empty_and_invalid_dimension_behavior():
+    assert mod.vector_search([], np.empty((0, 3), dtype=np.float32), [], k=3) == []
+    matrix = np.ones((2, 3), dtype=np.float32)
+    assert mod.vector_search([], matrix, [], k=3) == []
+    assert mod.vector_search([], matrix, ["a", "b"], k=0) == []
+    with pytest.raises(TypeError):
+        mod.vector_search([1, 0], [[1, 0]], ["a"], k=1)
+    with pytest.raises(ValueError):
+        mod.vector_search([1, 0], matrix, ["a", "b"], k=2)
+    with pytest.raises(ValueError):
+        mod.vector_search([1, 0, 0], matrix[0], ["a"], k=1)
+
+
+def test_vector_search_does_not_allocate_another_float32_matrix():
+    matrix = np.ones((1024, 1024), dtype=np.float32)
+    matrix.flags.writeable = False
+    query = [1.0] * matrix.shape[1]
+    ids = [str(index) for index in range(len(matrix))]
+    tracemalloc.start()
+    try:
+        hits = mod.vector_search(query, matrix, ids, k=3)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert len(hits) == 3
+    assert all(score == pytest.approx(1.0) for _identity, score in hits)
+    assert peak < matrix.nbytes, (peak, matrix.nbytes)
+
+
 def test_snapshot_preserves_float32_values_ids_and_revisions(tmp_path):
     path = tmp_path / "vectors.db"
     store = mod.VectorStore(path)
