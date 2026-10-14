@@ -75,6 +75,8 @@ class WorkerSpec:
     workspace_root: str = ""
     resume_conv_path: str = ""
     resume_instruction: str = ""
+    # Picked up for a message already in its mailbox: the saved conversation goes on as it was.
+    resume_on_message: bool = False
 
     def __post_init__(self) -> None:
         worker_type = self.worker_type.strip()
@@ -128,6 +130,7 @@ class WorkerSpec:
             "keep_alive": self.keep_alive,
             "workspace_root": self.workspace_root,
             **({"resume_conv_path": self.resume_conv_path} if self.resume_conv_path else {}),
+            **({"resume_on_message": True} if self.resume_on_message else {}),
         }
 
     def process_metadata(self) -> dict[str, Any]:

@@ -4656,6 +4656,7 @@ class ReActAgent(AgentBase):
                     envelopes = await self.delegate_mailbox.wait_and_drain(
                         str(task_id),
                         timeout=None,
+                        session_id=self.context.session_scope,
                     )
                     if emit_events:
                         yield with_request({
@@ -4681,6 +4682,14 @@ class ReActAgent(AgentBase):
                         "conclusions you cite, then give one clean final answer. Do not "
                         "repeat the dispatch acknowledgement."
                     )
+                    if any(envelope.startswith("[SYSTEM-DELIVERED TEAM MESSAGE") for envelope in envelopes):
+                        # A teammate wrote while the parent waited: a question to answer or news
+                        # to act on, not only results to reconcile.
+                        recovery_overlay = (
+                            "A teammate wrote to you while you waited. Read the message; answer or "
+                            "redirect it with team_send when it asks or needs a decision, then go on. "
+                            "Give the final answer only when the work you are waiting for is done."
+                        )
                     # Final synthesis is bookkeeping for completed parallel
                     # work, not another unit of the caller's ReAct budget.
                     mailbox_iteration_extension += 1

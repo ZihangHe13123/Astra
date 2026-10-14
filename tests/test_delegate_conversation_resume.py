@@ -67,7 +67,7 @@ class Harness:
             self.keys.append(key)
             return SessionStore.for_subagent(self.session.legacy_path, key)
 
-        register_delegate_tools(
+        self.mailbox = register_delegate_tools(
             self.registry,
             llm_getter=lambda: self.llm,
             session_id_getter=lambda: "session-a",

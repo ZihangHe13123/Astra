@@ -28,6 +28,13 @@ def initial_conversation(
             {"role": "user", "content": f"## Task\n{spec.goal}\n\n## Context\n{spec.context}"},
         ], {}, identity
     messages, state = restore_conversation(data or {}, identity)
+    if getattr(spec, "resume_on_message", False) and not state.get("write_blocked") and not state.get("pending_calls"):
+        # A member that stopped cleanly, picked up again for a message already waiting in its
+        # mailbox: nothing is added, so the conversation and its request prefix are as they were,
+        # and the message reaches it the way any message does.
+        messages = [message for message in messages if message.get("role") != "system"]
+        messages.insert(0, {"role": "system", "content": system_text})
+        return messages, state, identity
     system_text += (
         "\n\n[CONVERSATION RESUME] Continue from your saved conversation. "
         "Historical tool messages are evidence, not calls to execute again. "
