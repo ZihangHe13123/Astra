@@ -1,5 +1,5 @@
 /** Reply branches: real Electron/Python with an isolated loopback model. */
-import { _electron as electron } from 'playwright';
+import { launchElectron } from './electron-launch.mjs';
 import { expect } from '@playwright/test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
@@ -86,7 +86,7 @@ let app, failure;
 const errors = [], externalRequests = [], checks = [];
 const passed = name => { checks.push(name); console.log('PASS', name); };
 try {
-  app = await electron.launch({ args: [join(root, 'ui-gui')], env, timeout: 30000 });
+  app = await launchElectron({ args: [join(root, 'ui-gui')], env, timeout: 30000 });
   const page = await app.firstWindow(); page.setDefaultTimeout(30000);
   page.on('pageerror', error => errors.push(error.message));
   page.on('request', request => { if (/^https?:/i.test(request.url())) externalRequests.push(request.url()); });

@@ -95,45 +95,75 @@ async def collect(stream):
     return [event async for event in stream]
 
 
+@pytest.fixture
+def provider_read_clock(monkeypatch):
+    # Drive the provider's read accounting without relying on sub-100ms OS
+    # scheduling. asyncio's clock and the real stall/cancellation tests stay real.
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(llm_module, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    return clock
+
+
 @pytest.mark.parametrize("chunk", [content_chunk(""), usage_chunk()])
-def test_empty_heartbeats_do_not_reset_progress_deadline(chunk):
+def test_empty_heartbeats_do_not_reset_progress_deadline(chunk, provider_read_clock):
     class Heartbeats:
         closed = False
+        reads = 0
 
         def __aiter__(self):
             return self
 
         async def __anext__(self):
-            await asyncio.sleep(0.002)
+            self.reads += 1
+            # A broken reset must fail this test, not spin forever without
+            # yielding to the real asyncio timer used as the outer guard.
+            assert self.reads <= 10, "empty frames kept the idle budget alive"
+            provider_read_clock.now += 0.01
             return chunk
 
         async def aclose(self):
             self.closed = True
 
     stream = Heartbeats()
-    provider, _ = provider_with_streams([stream])
+    provider, created = provider_with_streams([stream])
     provider.config.idle_timeout = 0.02
     provider.config.max_retries = 0
     with pytest.raises(LLMIdleTimeout):
         run(asyncio.wait_for(collect(provider.chat_stream([])), timeout=1))
+    assert provider_read_clock.now == pytest.approx(provider.config.idle_timeout)
+    assert len(created) == 1
     assert stream.closed
 
 
 @pytest.mark.parametrize("kind", ["text", "reasoning", "tool"])
-def test_meaningful_progress_allows_stream_longer_than_idle_limit(kind):
+def test_meaningful_progress_allows_stream_longer_than_idle_limit(kind, provider_read_clock):
     chunk = {"text": content_chunk("text"), "reasoning": reasoning_chunk("think"),
              "tool": tool_call_chunk()}[kind]
     class Progress(SequenceStream):
+        closed = False
+
         async def __anext__(self):
-            await asyncio.sleep(0.01)
+            provider_read_clock.now += 0.01
             return await super().__anext__()
+
+        async def aclose(self):
+            self.closed = True
 
     # This fixture exercises idle progress; finish with an actual answer and
     # explicit provider terminal signal rather than relying on silent EOF.
-    provider, _ = provider_with_streams([Progress([chunk] * 12 + [content_chunk("answer", "stop")])])
+    stream = Progress([chunk] * 12 + [content_chunk("answer", "stop")])
+    provider, created = provider_with_streams([stream])
     provider.config.idle_timeout = 0.08
     provider.config.max_retries = 0
-    run(collect(provider.chat_stream([])))
+    events = run(collect(provider.chat_stream([])))
+    assert provider_read_clock.now > provider.config.idle_timeout
+    assert events[-1]["type"] == ("tool_calls" if kind == "tool" else "done")
+    assert events[-1]["content"] == ("text" * 12 + "answer" if kind == "text" else "answer")
+    assert events[-1]["reasoning_content"] == ("think" * 12 if kind == "reasoning" else "")
+    if kind == "tool":
+        assert events[-1]["calls"][0]["arguments"] == "{" * 12
+    assert len(created) == 1
+    assert stream.closed
 
 
 def tool_call_chunk():

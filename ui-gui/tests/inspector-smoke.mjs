@@ -1,5 +1,5 @@
 /** New inspection UI acceptance: real Electron, real Python, isolated local model. */
-import { _electron as electron } from 'playwright';
+import { launchElectron } from './electron-launch.mjs';
 import { expect } from '@playwright/test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
@@ -78,7 +78,7 @@ const errors = [];
 const checks = [];
 const passed = name => { checks.push(name); console.log('PASS', name); };
 try {
-  app = await electron.launch({ args: [join(root, 'ui-gui')], env, timeout: 30000 });
+  app = await launchElectron({ args: [join(root, 'ui-gui')], env, timeout: 30000 });
   const page = await app.firstWindow(); page.setDefaultTimeout(30000);
   // The first scenarios inspect chat and records side by side. Native launch
   // bounds may be narrower on CI; the later 1000px case tests automatic close.

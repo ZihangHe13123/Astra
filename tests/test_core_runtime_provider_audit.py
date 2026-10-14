@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import math
 import multiprocessing
 import os
 import signal
@@ -855,7 +856,8 @@ def test_probe_worker_hard_deadline_kills_stubborn_child(tmp_path):
     assert ready["ready"] is True and ready["pid"] != os.getpid()
     assert result["status"] == "external_failure"
     assert result["error_type"] == "ProbeTimeout"
-    assert result["duration_ms"] >= timeout * 1000
+    # The report truncates floating elapsed milliseconds; allow only that 1 ms.
+    assert result["duration_ms"] >= timeout * 1000 - 1
     assert not pid_alive(ready["pid"])
     assert multiprocessing.active_children() == []
 
@@ -1516,6 +1518,54 @@ def test_worker_operation_deadline_starts_after_successful_process_start(monkeyp
     assert result["error_type"] != "ProbeTimeout"
     assert now[0] == 0.05
     assert process.is_alive() is False
+
+
+def test_worker_kills_at_deadline_despite_truncated_duration(monkeypatch):
+    process = SlowStartingProcess()
+    now = [1014.004]
+    timeout = 10.0
+    deadline = now[0] + timeout
+    sleeps, killed_at, joins = [], [], []
+
+    def start():
+        process.pid = 24680
+        process.alive = True
+
+    def kill():
+        killed_at.append(now[0])
+        process.alive = False
+
+    async def advance_clock(delay):
+        assert now[0] < deadline
+        assert process.is_alive() and not killed_at
+        assert 0 < delay <= audit_worker._POLL_SECONDS
+        sleeps.append(now[0])
+        now[0] = math.nextafter(deadline, -math.inf) if len(sleeps) == 1 else deadline
+
+    monkeypatch.setattr(process, "start", start)
+    monkeypatch.setattr(process, "kill", kill)
+    monkeypatch.setattr(process, "join", lambda timeout=None: joins.append(timeout))
+    monkeypatch.setattr(audit_worker, "_make_process", lambda *args, **kwargs: process)
+    monkeypatch.setattr(audit_worker, "time", SimpleNamespace(monotonic=lambda: now[0]))
+    monkeypatch.setattr(
+        audit_worker, "asyncio",
+        SimpleNamespace(sleep=advance_clock, CancelledError=asyncio.CancelledError),
+    )
+
+    result = asyncio.run(
+        audit_worker.run_probe_worker(
+            "LIVE-03", {}, timeout, worker_target=_stubborn_worker,
+        )
+    )
+
+    assert sleeps == [1014.004, math.nextafter(deadline, -math.inf)]
+    assert killed_at == [deadline]
+    assert joins == [None]
+    assert process.is_alive() is False
+    assert result["status"] == "external_failure"
+    assert result["error_type"] == "ProbeTimeout"
+    # Exact deadline subtraction can be 9999.999999999887 ms before int().
+    assert result["duration_ms"] >= timeout * 1000 - 1
 
 
 def test_timeout_uses_immediate_hard_kill_without_sigterm_grace(monkeypatch):

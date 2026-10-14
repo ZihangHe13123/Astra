@@ -1,5 +1,5 @@
 /** Interactive cards in the desktop: real Electron/Python, a loopback model, and a card that tries to get out. */
-import { _electron as electron } from 'playwright';
+import { launchElectron } from './electron-launch.mjs';
 import { expect } from '@playwright/test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
@@ -37,6 +37,7 @@ const counterCard = `<h3>计数器</h3>
 </script>`;
 // Each attempt records what happened to it; the address it tried to reach says which one got through.
 const escape = `<p id="state">probing</p><pre id="result"></pre>
+<button id="self-navigation" type="button" disabled>尝试离开自己的框</button>
 <form id="form" action="${out}/form" method="get"><input name="q" value="secret"></form>
 <link rel="stylesheet" href="${out}/stylesheet">
 <link rel="preconnect" href="http://127.0.0.1:${relayPort}">
@@ -89,8 +90,10 @@ const escape = `<p id="state">probing</p><pre id="result"></pre>
   await attempt('linkClick', () => { const a = document.createElement('a'); a.href = '${out}/link-click'; document.body.append(a); a.click(); return 'clicked'; });
   document.getElementById('result').textContent = JSON.stringify(result);
   document.getElementById('state').textContent = 'probed';
-  // Last, because the frame does not survive it: the card tries to navigate itself away.
-  setTimeout(() => { location.href = '${out}/self-navigation?secret=1'; }, 1200);
+  // The test reads every result before explicitly allowing this destructive probe.
+  const navigate = document.getElementById('self-navigation');
+  navigate.addEventListener('click', () => { location.href = '${out}/self-navigation?secret=1'; }, { once: true });
+  navigate.disabled = false;
 })();
 </script>`;
 // The example in the guide, exactly as a reader would copy it.
@@ -162,7 +165,7 @@ try {
   await new Promise(done => setTimeout(done, 100));
   assert.deepEqual(reached.splice(0), ['http GET /control', 'udp']);
 
-  app = await electron.launch({ args: [join(root, 'ui-gui')], env, timeout: 30000 });
+  app = await launchElectron({ args: [join(root, 'ui-gui')], env, timeout: 30000 });
   const page = await app.firstWindow(); page.setDefaultTimeout(30000);
   page.on('pageerror', error => errors.push(error.message));
   // A refused request is still announced; an answer or an opened socket means one got out.
@@ -227,17 +230,21 @@ try {
   // A card that tries every way out. It learns nothing about the host, and nothing it sends arrives anywhere.
   await send('逃逸');
   await idle();
-  await expect(inside(hostile).locator('#state')).toHaveText('probed', { timeout: 20000 });
-  probed = JSON.parse(await inside(hostile).locator('#result').textContent());
-  console.log('PROBED', JSON.stringify(probed));
-  assert.equal(probed.bridge, 'undefined');
-  for (const name of ['parentDocument', 'parentBridge', 'topNavigation', 'storage', 'cookie', 'fetch', 'xhr', 'image', 'websocket', 'eventSource', 'dynamicScript', 'importModule', 'evaluate', 'blankFrameFetch', 'webrtc'])
-    assert.match(probed[name], /^blocked: /, `${name} must be refused: ${probed[name]}`);
-  assert.equal(probed.popup, 'null');
-  // Frames the card creates are no way back to them: an empty one is another origin, and one written inline starts without them.
-  assert.doesNotMatch(probed.blankFrameWebrtc, /function/);
-  assert.equal(probed.inlineFrame, 'undefined undefined undefined ReferenceError');
+  const checkHostileProbes = async () => {
+    await expect(inside(hostile).locator('#state')).toHaveText('probed', { timeout: 20000 });
+    probed = JSON.parse(await inside(hostile).locator('#result').textContent());
+    console.log('PROBED', JSON.stringify(probed));
+    assert.equal(probed.bridge, 'undefined');
+    for (const name of ['parentDocument', 'parentBridge', 'topNavigation', 'storage', 'cookie', 'fetch', 'xhr', 'image', 'websocket', 'eventSource', 'dynamicScript', 'importModule', 'evaluate', 'blankFrameFetch', 'webrtc'])
+      assert.match(probed[name], /^blocked: /, `${name} must be refused: ${probed[name]}`);
+    assert.equal(probed.popup, 'null');
+    // Frames the card creates are no way back to them: an empty one is another origin, and one written inline starts without them.
+    assert.doesNotMatch(probed.blankFrameWebrtc, /function/);
+    assert.equal(probed.inlineFrame, 'undefined undefined undefined ReferenceError');
+  };
+  await checkHostileProbes();
   // Then it navigates itself away: the host shows that it stopped, and its source instead of a refused page.
+  await inside(hostile).getByRole('button', { name: '尝试离开自己的框', exact: true }).click({ noWaitAfter: true });
   await expect(hostile.locator('.card-block').getByRole('status')).toHaveText('卡片已停止：它试图离开自己的框。');
   await expect(frame(hostile)).toHaveCount(0);
   await expect(hostile.locator('.card-block pre')).toContainText('self-navigation');
@@ -295,10 +302,15 @@ try {
   await page.screenshot({ path: join(output, 'card-narrow.png') });
   // The hostile card ran again when the history was reopened, and stopped again.
   await reveal(hostile);
+  await checkHostileProbes();
+  await inside(hostile).getByRole('button', { name: '尝试离开自己的框', exact: true }).click({ noWaitAfter: true });
   await expect(hostile.locator('.card-block').getByRole('status')).toHaveText('卡片已停止：它试图离开自己的框。', { timeout: 30000 });
+  await expect(frame(hostile)).toHaveCount(0);
+  await expect(hostile.locator('.card-block pre')).toContainText('self-navigation');
   await new Promise(done => setTimeout(done, 1500));
   assert.deepEqual(reached, [], 'the reopened hostile card reached nothing either');
   assert.deepEqual(answered, []);
+  assert.equal(await page.evaluate(() => location.href), 'astra://app/index.html');
   assert.equal(requests.length, 6, 'showing cards asks the model for nothing');
   passed('cards run again after scrolling away and from saved history, fit the smallest window, and still reach nothing');
   // The failing card's own exception is the only one, once per time it ran.

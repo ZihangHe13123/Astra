@@ -75,11 +75,12 @@ class RuntimeLease:
         with exclusive(install, wait_seconds=5):
             self.lock.acquire()
             try:
-                details = install.describe()
+                # Registration must not run Git while owning update.lock.
+                # Source diagnostics can invoke slow fsmonitor hooks; runtime
+                # ownership needs only this installation and process identity.
                 write_json(self.path.with_suffix(".json"), {
                     "pid": os.getpid(), "role": role, "root": str(install.root),
-                    "commit": details["commit"], "version": install.version,
-                    "dirty": details["dirty"],
+                    "commit": None, "version": install.version, "dirty": None,
                 })
             except BaseException:
                 self.lock.release()

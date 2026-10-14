@@ -2,18 +2,24 @@ name: Desktop preview
 
 on:
   workflow_dispatch:
+    inputs:
+      investigation:
+        description: 'Bounded Windows diagnostics (default runs desktop acceptance)'
+        type: choice
+        default: none
+        options: [none, windows-page, windows-context-performance, windows-vector-snapshot, windows-vector-read-paths, windows-vector-clock, windows-vector-contention, windows-service-wrappers]
 
 permissions:
   contents: read
 
 concurrency:
-  group: desktop-${{ github.ref }}
+  group: desktop-${{ github.ref }}${{ inputs.investigation != '' && inputs.investigation != 'none' && format('-{0}', inputs.investigation) || '' }}
   cancel-in-progress: true
 
 jobs:
   desktop:
     # Runs only in the public repository; the private dev repository skips the job.
-    if: github.repository == 'ZihangHe13123/Astra'
+    if: github.repository == 'ZihangHe13123/Astra' && (inputs.investigation == '' || inputs.investigation == 'none')
     strategy:
       fail-fast: false
       matrix:
@@ -82,3 +88,131 @@ jobs:
             ${{ runner.temp }}/astra-page-*/logs/gui-backend-*.log
           retention-days: 7
           if-no-files-found: warn
+
+  page-investigation:
+    if: github.repository == 'ZihangHe13123/Astra' && inputs.investigation == 'windows-page'
+    runs-on: windows-2025
+    timeout-minutes: 50
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: '1'
+      ASTRA_GUI_DISABLE_APPSHOT: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          version: '0.11.27'
+          python-version: '3.11.15'
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          download-from-astral-mirror: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22.23.1'
+      - name: Prepare desktop (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          uv sync --locked --extra dev
+          if errorlevel 1 exit /b %errorlevel%
+          call astra.bat setup --gui --extra dev
+      - name: Verify diagnostic process ownership boundaries
+        run: node --test ui-gui/tests/process-ownership.test.mjs
+      - name: Bounded repetitions with separate evidence per iteration
+        id: repetitions
+        run: node ui-gui/tests/stress-runner.mjs --suite=page --repeat=10 --timeout-seconds=180 --profile-imports=off --output=output/desktop-stress/windows-2025-page
+      - name: Preserve investigation evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: desktop-investigation-windows-2025-page
+          path: |
+            output/desktop-stress/**/summary.json
+            output/desktop-stress/**/stdout.log
+            output/desktop-stress/**/stderr.log
+            output/desktop-stress/**/processes.jsonl
+            output/desktop-stress/**/playwright/
+            output/desktop-stress/**/backend-logs/
+          retention-days: 7
+          if-no-files-found: warn
+
+  context-performance:
+    if: github.repository == 'ZihangHe13123/Astra' && (inputs.investigation == 'windows-context-performance' || inputs.investigation == 'windows-vector-snapshot' || inputs.investigation == 'windows-vector-read-paths' || inputs.investigation == 'windows-vector-clock' || inputs.investigation == 'windows-vector-contention' || inputs.investigation == 'windows-service-wrappers')
+    runs-on: windows-2025
+    timeout-minutes: ${{ inputs.investigation == 'windows-service-wrappers' && 30 || 20 }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      PYTHONUTF8: '1'
+      ASTRA_RUN_CONTEXT_INDEX_PERF: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
+        with:
+          version: '0.11.27'
+          python-version: '3.11.15'
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+          download-from-astral-mirror: false
+      - name: Prepare locked test environment
+        run: uv sync --locked --extra dev
+      - name: Record tested source
+        run: |
+          mkdir -p output/context-index-windows
+          git rev-parse HEAD > output/context-index-windows/source-sha.txt
+      - name: Diagnose cold vector snapshots
+        if: inputs.investigation == 'windows-context-performance' || inputs.investigation == 'windows-vector-snapshot'
+        id: snapshot_probe
+        continue-on-error: true
+        run: uv run --no-sync python scripts/probe_vector_snapshot_performance.py --output=output/context-index-windows/snapshot-probe --rounds=6
+      - name: Compare cold snapshot read paths
+        if: inputs.investigation == 'windows-vector-read-paths'
+        id: read_paths_probe
+        continue-on-error: true
+        run: uv run --no-sync python scripts/probe_vector_snapshot_read_paths.py --output=output/context-index-windows/read-paths-probe
+      - name: Compare Windows read deadline clocks
+        if: inputs.investigation == 'windows-vector-clock'
+        id: clock_probe
+        continue-on-error: true
+        run: uv run --no-sync python scripts/probe_vector_snapshot_clock.py --output=output/context-index-windows/clock-probe
+      - name: Compare vector decoder interference with small SQL reads
+        if: inputs.investigation == 'windows-vector-contention' || inputs.investigation == 'windows-context-performance'
+        id: contention_probe
+        continue-on-error: true
+        run: uv run --no-sync python scripts/probe_vector_decode_contention.py --output=output/context-index-windows/contention-probe --require-current
+      - name: Diagnose service wrapper startup and pipe completion
+        if: inputs.investigation == 'windows-service-wrappers'
+        id: wrapper_probe
+        continue-on-error: true
+        run: uv run --no-sync python scripts/probe_service_wrapper_timing.py --output=output/context-index-windows/wrapper-probe
+      - name: Diagnose warm vector search
+        if: inputs.investigation == 'windows-context-performance'
+        id: search_probe
+        continue-on-error: true
+        run: uv run --no-sync python scripts/probe_vector_search_performance.py --output=output/context-index-windows/search-probe
+      - name: Real Windows Context Index regression and performance
+        if: inputs.investigation == 'windows-context-performance'
+        env:
+          TMPDIR: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+        run: |
+          uv run --no-sync python -m pytest -q -s tests/test_context_index*.py --junitxml=output/context-index-windows/pytest.xml | tee output/context-index-windows/results.log
+      - name: Keep diagnostic failures visible
+        if: always() && (steps.snapshot_probe.outcome == 'failure' || steps.search_probe.outcome == 'failure' || steps.read_paths_probe.outcome == 'failure' || steps.clock_probe.outcome == 'failure' || steps.contention_probe.outcome == 'failure' || steps.wrapper_probe.outcome == 'failure')
+        run: exit 1
+      - name: Preserve every performance observation
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: context-index-windows
+          path: output/context-index-windows/
+          retention-days: 7
+          if-no-files-found: error

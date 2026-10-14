@@ -1,5 +1,5 @@
 /** Desktop acceptance: real Python backend, isolated data, loopback-only model. */
-import { _electron as electron } from 'playwright';
+import { launchElectron } from './electron-launch.mjs';
 import { expect } from '@playwright/test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
@@ -141,7 +141,7 @@ function terminateFixture(app) {
  }
 }
 try {
- app = await electron.launch({ args:[join(root,'ui-gui')], env, timeout:30000 });
+ app = await launchElectron({ args:[join(root,'ui-gui')], env, timeout:30000 });
  const page = await app.firstWindow();
  const errors = []; page.on('pageerror', e=>errors.push(e.message));
  const idle = async () => {
@@ -764,7 +764,7 @@ try {
  const last=await page.evaluate(async()=>{const b=await window.astra.bootstrap();return b.sessions.find(s=>s.id===b.active).session;});
  await page.getByRole('textbox',{name:'消息'}).fill('退出前的草稿');
  await app.close(); app=undefined;
- app=await electron.launch({args:[join(root,'ui-gui')],env,timeout:30000});
+ app=await launchElectron({args:[join(root,'ui-gui')],env,timeout:30000});
  const restored=await app.firstWindow(); restored.on('pageerror',e=>errors.push(e.message));
  // firstWindow can resolve before its initial navigation has committed.
  // Locator waits survive that navigation; an immediate evaluate does not.

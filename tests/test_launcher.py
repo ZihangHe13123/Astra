@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -225,6 +227,70 @@ def test_direct_backend_registers_before_loading_optional_runtime(source, monkey
         os.environ.clear()
         os.environ.update(before)
     assert active_instances(inst) == []
+
+
+def test_runtime_registration_does_not_wait_for_slow_git_and_still_blocks_updates(source, tmp_path):
+    from agent.launcher.locking import require_idle
+
+    inst, _ = source
+    entered, release = tmp_path / "hook-entered", tmp_path / "hook-release"
+    gate, hook = tmp_path / "fsmonitor-gate.py", tmp_path / "fsmonitor-hook"
+    gate.write_text(
+        "import sys,time\nfrom pathlib import Path\n"
+        "root=Path(__file__).parent\n(root/'hook-entered').write_text('entered')\n"
+        "end=time.monotonic()+45\n"
+        "while not (root/'hook-release').exists() and time.monotonic()<end: time.sleep(.02)\n"
+        "sys.stdout.buffer.write(b'fixture-token\\0')\n", encoding="utf-8",
+    )
+    # Git for Windows executes hooks through Git Bash, whose paths use '/'.
+    hook.write_text("#!/bin/sh\nexec " + shlex.quote(Path(sys.executable).as_posix()) + " "
+                    + shlex.quote(gate.as_posix()) + ' "$@"\n', encoding="utf-8", newline="\n")
+    hook.chmod(0o700)
+    git_command(inst.root, "config", "core.fsmonitor", hook.as_posix())
+    git_status = subprocess.Popen(["git", "-C", str(inst.root), "status", "--porcelain", "--untracked-files=no"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    child = None
+    receipt = tmp_path / "registered.json"
+    try:
+        deadline = time.monotonic() + 10
+        while not entered.exists() and git_status.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert entered.exists(), "real Git fsmonitor must be blocked before runtime admission"
+        script = """
+import sys
+from pathlib import Path
+from agent.launcher.installation import discover
+from agent.launcher.locking import RuntimeLease
+from agent.launcher.common import read_json, write_json
+with RuntimeLease(discover(Path(sys.argv[1])), 'git-independent startup') as lease:
+ write_json(Path(sys.argv[2]), read_json(lease.path.with_suffix('.json')))
+ sys.stdin.readline()
+"""
+        child = subprocess.Popen([sys.executable, "-c", script, str(inst.root), str(receipt)], cwd=ROOT,
+                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + 10
+        while not receipt.exists() and child.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert receipt.exists(), "runtime registration waited for an unrelated blocked Git status query"
+        assert git_status.poll() is None
+        metadata = json.loads(receipt.read_text(encoding="utf-8"))
+        assert metadata["role"] == "git-independent startup"
+        assert metadata["root"] == str(inst.root) and metadata["version"] == inst.version
+        assert {"commit", "dirty"} <= metadata.keys()
+        with exclusive(inst), pytest.raises(LauncherError, match="Close these Astra"):
+            require_idle(inst)
+    finally:
+        release.touch()
+        try:
+            git_status.communicate(timeout=10)
+            assert git_status.returncode == 0
+        finally:
+            if child is not None:
+                output, error = child.communicate("\n", timeout=10)
+                assert child.returncode == 0, output + error
+    assert active_instances(inst) == []
+    # Explicit installation diagnostics still provide full VCS information.
+    assert inst.describe()["commit"] == git_command(inst.root, "rev-parse", "HEAD")
 
 
 def runtime_lease_child(inst, role):

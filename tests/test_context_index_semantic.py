@@ -2,6 +2,7 @@
 import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime
+import math
 from pathlib import Path
 import sqlite3
 import threading
@@ -144,6 +145,95 @@ def test_window_active_context_and_named_target_filters_apply_to_vectors(archive
     assert not recommend(archive, "session", active=frozenset({content_fingerprint(TEXT)})).relevance
     assert not recommend(archive, "memory", "谢谢").relevance
     assert not recommend(archive, "session", "2+2").relevance
+
+
+@pytest.mark.parametrize("source", ["session", "memory"])
+def test_full_semantic_selection_reuses_immutable_snapshot(archive, monkeypatch, source):
+    import numpy as np
+    from agent.runtime.context_index import semantic_reader
+
+    path = archive.session if source == "session" else archive.memory.path
+    rows, matrix = read_snapshot(archive.vectors, source, path)
+    original = semantic_reader.vector_search
+    seen = []
+
+    def search(query, selected, ids, *, k):
+        seen.append(True)
+        assert ids == [row[0] for row in rows]
+        assert np.shares_memory(selected, matrix)
+        assert not selected.flags.writeable
+        return original(query, selected, ids, k=k)
+
+    monkeypatch.setattr(semantic_reader, "vector_search", search)
+    assert [item.private_text for item in recommend(archive, source).relevance] == [TEXT]
+    assert seen == [True]
+
+
+@pytest.mark.parametrize("target", [0.749995, 0.750005])
+def test_semantic_threshold_uses_accurate_wide_vector_cosines(archive, monkeypatch, tmp_path, target):
+    import numpy as np
+
+    vector = np.full(4096, .001, dtype=np.float32)
+    vector[0] = 1
+    first = target * math.hypot(*map(float, vector))
+    other = math.sqrt((1 - first * first) / 2)
+    query = np.zeros(4096, dtype=np.float32)
+    query[:3] = [first, other, -other]
+    reference = math.fsum(float(a) * float(b) for a, b in zip(vector, query)) / (
+        math.hypot(*map(float, vector)) * math.hypot(*map(float, query)))
+
+    class WideEncoder:
+        def encode(self, texts):
+            return [query.tolist() if text == QUERY else vector.tolist() for text in texts]
+
+    encoder = WideEncoder()
+    archive.vectors = tmp_path / "wide-vectors.db"
+    monkeypatch.setattr(embedder, "ready_embedder", lambda: encoder)
+    monkeypatch.setenv("ASTRA_CONTEXT_INDEX_MEMORY_MIN_SIMILARITY", "0.75")
+    rebuild_source(archive.session, archive.vectors, "session", backend=encoder)
+    result = recommend(archive, "session")
+    assert not result.error_category
+    assert [item.private_text for item in result.relevance] == ([TEXT] if reference >= .75 else [])
+
+
+@pytest.mark.parametrize("filter_kind", ["window", "available_at"])
+def test_partial_semantic_selection_keeps_vector_ids_and_time_scope(archive, monkeypatch, filter_kind):
+    from agent.runtime.context_index import semantic_reader
+
+    recent = "新近留下的联络偏好"
+    older = "很久以前的联络偏好"
+    future = "尚未发生的联络偏好"
+    with sqlite3.connect(archive.session) as db:
+        db.executemany(
+            "INSERT INTO messages(session_id, role, content, timestamp, msg_index) VALUES ('old','user',?,?,?)",
+            [(recent, NOW.timestamp() - 30, 2), (older, NOW.timestamp() - 3600, 3),
+             (future, NOW.timestamp() + 30, 4)],
+        )
+        ids_by_text = dict(db.execute("SELECT content, CAST(id AS TEXT) FROM messages"))
+    rebuild_source(archive.session, archive.vectors, "session", backend=archive.encoder)
+    plan = plan_query(QUERY, NOW)
+    if filter_kind == "window":
+        plan = replace(plan, time_start=NOW.timestamp() - 90, time_end=NOW.timestamp() - 45)
+        expected_texts = {TEXT}
+    else:
+        with sqlite3.connect(archive.vectors) as db:
+            db.execute("UPDATE context_memory_vectors SET available_at=? WHERE source='session' AND item_id=?",
+                       (NOW.timestamp() + 1, ids_by_text[recent]))
+        expected_texts = {TEXT, older}
+    expected_ids = {ids_by_text[text] for text in expected_texts}
+    original = semantic_reader.vector_search
+    seen = []
+
+    def search(query, matrix, ids, *, k):
+        seen.append(True)
+        assert set(ids) == expected_ids and matrix.shape[0] == len(expected_ids)
+        return original(query, matrix, ids, k=k)
+
+    monkeypatch.setattr(semantic_reader, "vector_search", search)
+    result = recommend(archive, "session", plan=plan)
+    assert not result.error_category
+    assert {item.private_text for item in result.relevance} == expected_texts
+    assert seen == [True]
 
 
 def test_session_self_and_same_timestamp_future_messages_are_excluded(archive):

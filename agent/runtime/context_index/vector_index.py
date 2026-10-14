@@ -161,7 +161,12 @@ def vector_search(
         return []
     query = np.asarray(query_vec, dtype=np.float32)
     query_norm = float(np.linalg.norm(query)) or 1.0
-    norms = np.linalg.norm(matrix, axis=1)
+    # Accumulate float32 storage in float64: a wide row with mixed scales can
+    # otherwise cross the similarity cutoff through reduction error. This
+    # still avoids a full matrix of squares or a full float64 conversion.
+    norms = (np.sqrt(np.einsum("ij,ij->i", matrix, matrix, dtype=np.float64))
+             if matrix.ndim == 2 and matrix.dtype == np.float32
+             else np.linalg.norm(matrix, axis=1))
     norms = np.where(norms == 0, 1.0, norms)
     scores = (matrix @ query) / (norms * query_norm)
     order = np.argsort(-scores)[:k]

@@ -120,7 +120,9 @@ for sessions and 200ms for the broker on both platforms. Activity reserves part
 of its 75ms read allowance for independent later channels, retaining completed
 results on interruption. Inspection exposes separate archive/semantic errors
 and allowlisted phase timings; a read deadline does not establish that the
-embedding backend was unavailable.
+embedding backend was unavailable. Short read deadlines and phase timings use
+`perf_counter`, whose resolution avoids early expiry from the coarse Windows
+Python 3.11 monotonic clock.
 
 Activity history is separate data. Git sync does not copy macOS activity archives,
 model weights, local settings, or vector indexes. Without an activity archive,
@@ -151,8 +153,16 @@ so copying a vector file alone does not make its evidence usable elsewhere.
 
 On startup, an enabled broker with an existing vector file warms the configured
 backend and maintains at most 16 changed entries per source every 30 seconds.
-An Astra kernel lock permits one background maintainer per vector file at a time;
+An Astra kernel lock permits one background writer per vector file at a time;
 each encoding call processes one entry before committing its progress.
+The same worker also fills this process's immutable session/record snapshot
+cache outside the writer lease. Each source gets one cooperative 2-second
+background attempt per cycle, with cancellation and version checks before
+publication; this does not change the interactive 75ms or broker 200ms budget.
+A cold query may use the text fallback until that work completes. Scheduling
+and model readiness can add a maintenance cycle, so background load latency
+is not a guarantee about time from startup to availability. The four-snapshot
+cache limit remains unchanged; changed database/WAL versions invalidate it.
 Only a ready backend is used by maintenance; a busy batch leaves queries on
 their text fallback. Restart Astra after first building the file. Set
 `ASTRA_CONTEXT_INDEX_EMBEDDING=off` for text-only operation. The session/record

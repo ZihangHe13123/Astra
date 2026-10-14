@@ -2,12 +2,18 @@ name: Maintenance
 
 on:
   workflow_dispatch:
+    inputs:
+      platform:
+        description: 'Release validation platforms (default: complete matrix)'
+        type: choice
+        default: all
+        options: [all, windows]
 
 permissions:
   contents: read
 
 concurrency:
-  group: maintenance-${{ github.workflow }}-${{ github.ref }}
+  group: maintenance-${{ github.workflow }}-${{ github.ref }}${{ inputs.platform == 'windows' && '-windows' || '' }}
   cancel-in-progress: true
 
 jobs:
@@ -20,13 +26,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-24.04
-            gate_args: --wheel-smoke
-          - os: macos-26
-            gate_args: --wheel-smoke --context-index-performance --native
-          - os: windows-2025
-            gate_args: --wheel-smoke
+        include: ${{ fromJSON(inputs.platform == 'windows' && '[{"os":"windows-2025","gate_args":"--wheel-smoke"}]' || '[{"os":"ubuntu-24.04","gate_args":"--wheel-smoke"},{"os":"macos-26","gate_args":"--wheel-smoke --context-index-performance --native"},{"os":"windows-2025","gate_args":"--wheel-smoke"}]') }}
     defaults:
       run:
         shell: bash
