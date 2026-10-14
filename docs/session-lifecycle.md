@@ -67,3 +67,38 @@ silent assistant chatter; useful notifications remain in visible history.
 Switching sessions, closing Astra or restarting the backend stops the plan.
 Restarting Astra never catches up on missed checks. These features are available
 in the local Work TUI, not isolated Bar/Minimal/local modes or remote channels.
+
+## When background work finishes
+
+In a Work session Astra is told when work it left running ends, so it carries on
+without you asking. This covers commands started with `background=true` or still
+running after `foreground_yield_ms`, waits written as a command (for example
+`until curl -fs http://localhost:3000; do sleep 2; done`), and background
+subagents and Team members.
+
+- While Astra is still working, what ended arrives before its next step.
+- Once it has answered, the backend starts a turn for it. The conversation shows
+  “后台任务完成，继续处理：…” and Astra reports the outcome. Work that ends within
+  a second is one turn.
+- A command whose end Astra has already seen through `process_poll`,
+  `process_read`, `process_list` or `process_cancel` is not reported again.
+- With subagents in the background, Astra answers at once instead of waiting for
+  them, so you can keep talking to it while they work. Their reports, and what
+  they send to it, start a turn when they arrive. `delegate_poll` with `wait_ms`
+  and `team_wait` still wait when Astra asks for them. Later turns of the session
+  can poll, read and cancel subagents that earlier turns started; Team members are
+  reached through their Team.
+
+No turn starts while a reply is running, while a question waits for you, during a
+restart, in Bar/Minimal/local modes or in channels; what ended waits until a
+turn can start, and what ends in another session waits until you return to it.
+A message you send during such a turn steers it like any other turn. After eight automatic turns in a row without a message from you
+(`ASTRA_BACKGROUND_WAKE_LIMIT`), results wait for your next message and the
+conversation says so. Stopping a turn keeps what its commands report for your
+next message without starting a turn. The notice grants no new permissions.
+
+This lives in the running backend. Restarting Astra delivers nothing it missed;
+subagent reports left from before a restart arrive with your next message. With a
+model on this computer, Astra and its subagents share that model's request slots
+(`LLM_MAX_CONCURRENT_REQUESTS`, default 1), so a reply can wait for a subagent's
+request to finish.

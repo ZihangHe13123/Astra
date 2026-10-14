@@ -55,7 +55,10 @@ _FOREGROUND_YIELD_DESCRIPTION = (
     "stopped at the sandbox time limit. On the host sandbox a positive value or "
     "background=true runs without that limit; the Docker sandbox applies it to every run."
 )
-_BACKGROUND_DESCRIPTION = "Return immediately with a process_id."
+_BACKGROUND_DESCRIPTION = (
+    "Return immediately with a process_id. Suits long builds and test runs, servers, and "
+    "waiting for a condition as one command (an until-loop) instead of polling."
+)
 
 
 def _hit_sandbox_time_limit(result: dict) -> bool:
@@ -604,7 +607,13 @@ def register_code_tools(
         return None, process
 
     def _process_result(description: dict) -> str:
+        # The caller sees this status, so a run that has ended needs no later notice.
+        processes.mark_reported(description)
         return ExecutionResult(processes.dumps(description), description)
+
+    def _background_message(process, prefix: str) -> str:
+        note = processes.background_note(process) if processes.background_note is not None else ""
+        return f"{prefix}; " + (note or "use process_poll/process_read.")
 
     async def _execute_python(
         code: str,
@@ -631,7 +640,7 @@ def register_code_tools(
         if result is None:
             return _process_result({
                 **processes.describe(process),
-                "message": "Execution continues in the background; use process_poll/process_read.",
+                "message": _background_message(process, "Execution continues in the background"),
             })
         return _render_result(result)
 
@@ -663,7 +672,7 @@ def register_code_tools(
             return _process_result({
                 **processes.describe(process),
                 "environment": environment,
-                "message": "Command continues in the background; use process_poll/process_read.",
+                "message": _background_message(process, "Command continues in the background"),
             })
         return _render_result(result, environment=environment)
 
@@ -742,7 +751,8 @@ def register_code_tools(
         return _process_result(await processes.cancel(process))
 
     async def _process_list(include_completed: bool = True) -> str:
-        return processes.dumps(processes.list(include_completed=include_completed))
+        return processes.dumps([processes.mark_reported(item)
+                                for item in processes.list(include_completed=include_completed)])
 
     registry.register(ToolDef(
         name="execute_python",

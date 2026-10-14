@@ -1736,7 +1736,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           handshake();
           if (lifecycle?.closing) { textBatcher.discard(); return; }
           textBatcher.accept(event);
-          if (event.type === "wakeup_status") {
+          if (event.type === "wakeup_status" || event.type === "background_wakeup") {
             if (event.message) addMessageRef.current("system", event.message);
           } else if (event.type === "peer_message") {
             // Another Astra session on this computer: a notice, never the user's words.

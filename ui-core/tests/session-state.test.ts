@@ -141,6 +141,14 @@ test("another Astra session's message is a notice, never the user's words", () =
   assert.equal(state.messages[0].role, "system");
 });
 
+test("a turn started for ended background work is announced as a notice", () => {
+  let state = projectEvent(initialSession("a"), { type: "background_wakeup", state: "started", message: "后台任务完成，继续处理：npm test" });
+  state = projectEvent(state, { type: "background_wakeup", state: "limited", message: "结果会在你下一条消息时交给 Astra。" });
+  assert.deepEqual(state.messages.map(m => [m.role, m.content]), [
+    ["system", "后台任务完成，继续处理：npm test"], ["system", "结果会在你下一条消息时交给 Astra。"]]);
+  assert.equal(state.busy, false);
+});
+
 test('timed questions stay answerable after completion and expire visibly on disconnect', () => {
   let state = projectEvent(initialSession('a'), {type:'user_question_request',request_id:'q',state:'waiting',mode:'timed',questions:[]});
   state = projectEvent(state, {type:'user_question_pending',request_id:'q',state:'pending'});

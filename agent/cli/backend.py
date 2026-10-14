@@ -105,6 +105,7 @@ from agent.runtime.latency import RuntimeProfiler, current_profiler, profile_req
 from agent.runtime.user_questions import UserQuestionBroker
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
 from agent.cli.session_lifecycle import ControlledRestart, RESTART_EXIT_CODE
+from agent.runtime.background_completion import BackgroundCompletions, wake_display, wake_prompt
 from agent.runtime.session_wakeup import SessionWakeups, visible_wakeup_history, wakeup_prompt
 from agent.runtime.browser_control_transport import set_owner_label_provider
 from agent.runtime.peer_link import (HEARTBEAT_SECONDS, PeerError, PeerLink, default_name, fallback_name,
@@ -870,12 +871,31 @@ async def _main(startup_started: float):
     skill_store = SkillStore()
     startup_profiler.mark("memory_and_skills")
     agent_holder = {}
+    # The Work-session turn whose background runs and subagents report back by waking the
+    # agent (agent/runtime/background_completion.py); set when such a turn starts.
+    work_turn = {"task_id": "", "session": ""}
+    completion_holder: dict[str, BackgroundCompletions] = {}
+
+    def _process_event(event: dict) -> None:
+        completions = completion_holder.get("completions")
+        if (completions is not None and event.get("event") == "process_started"
+                and work_turn["task_id"] and event.get("task_id") == work_turn["task_id"]):
+            completions.watch(str(event["process_id"]), work_turn["session"], work_turn["task_id"])
+        _send({"type": "process_status", **event})
+
     process_manager = register_workspace_tools(
         tools,
         sandbox,
         workdir=os.getcwd(),
         task_store=task_store,
-        on_process_event=lambda event: _send({"type": "process_status", **event}),
+        on_process_event=_process_event,
+    )
+    completions = BackgroundCompletions(process_manager)
+    completion_holder["completions"] = completions
+    process_manager.background_note = lambda process: (
+        "you are told when it ends, at your next step or in a new turn after you have answered, "
+        "so do not poll or sleep waiting for it; process_read shows its output meanwhile."
+        if completions.watching(process.process_id) else ""
     )
     register_memory_tools(
         tools,
@@ -1161,6 +1181,10 @@ async def _main(startup_started: float):
     agent.context.compaction_observer = _send
     agent.set_persona(persona_state, system_prompt)
     agent.delegate_mailbox = delegate_mailbox
+    delegate_mailbox.wakes_parent = lambda task_id: bool(task_id) and task_id == work_turn["task_id"]
+    agent.background_notices = lambda session: (
+        [] if bar_mode.active or minimal_mode.active or local_mode.active else completions.drain(session)
+    )
     agent_holder["agent"] = agent
     agent._computer_runtime = computer_runtime
     agent._sandbox = sandbox
@@ -1823,6 +1847,7 @@ async def _main(startup_started: float):
             agent.clear_user_question_answers()
             if task_id:
                 await delegate_mailbox.cancel_task(task_id)
+                completions.quiet_task(str(task_id))
             logger.info("stream cancelled; saving context and ending turn")
             if tick is None:
                 voice.stop()
@@ -2075,7 +2100,8 @@ async def _main(startup_started: float):
                 continue
             item = {
                 "id": f"{history_mode}:{history_session}:{position}",
-                "role": "system" if message.get("provenance") == "peer_message" else message["role"],
+                "role": "system" if message.get("provenance") in {"peer_message", "background_completion", "background_run"}
+                else message["role"],
                 "content": message_display_text(message.get("display_command", message.get("content", ""))),
             }
             if legacy_reasoning:
@@ -2421,6 +2447,8 @@ async def _main(startup_started: float):
                     msg.metadata.pop("task_id", None)
                     if not bar_mode.active and not local_mode.active:
                         msg.metadata["task_id"] = active_task_id
+                    if not (bar_mode.active or local_mode.active or minimal_mode.active):
+                        work_turn.update(task_id=active_task_id, session=agent.context.session_scope)
                     if not bar_mode.active:
                         msg.metadata["runtime_task_id"] = active_task_id
                         _send({"type": "task_started", "task": run})
@@ -2516,6 +2544,50 @@ async def _main(startup_started: float):
             if await _launch_message(msg, text):
                 question_followups.add(answer["request_id"])
 
+    background_clock = {"checked": 0.0}
+
+    async def _background_tick() -> None:
+        """Start a turn for background work that ended after the agent answered."""
+        session = agent.context.session_scope
+        if (not session or _turn_busy() or _response_regenerating or restart.draining or active_channel.get()
+                or bar_mode.active or minimal_mode.active or local_mode.active
+                or agent.llm.config.connection_required or appshot_admission.reserved
+                # A turn started now would expire a question still waiting for the user.
+                or question_broker.pending_count or question_broker.queued_request_ids):
+            # A busy turn takes what ends meanwhile at its next step; the wait restarts after it.
+            completions.ready(False)
+            return
+        now = time.monotonic()
+        if now - background_clock["checked"] < 0.5:
+            return
+        background_clock["checked"] = now
+        waiting = [*completions.pending(session), *delegate_mailbox.undelivered(session)]
+        if delegate_mailbox.lead_waiting(session):
+            waiting.append("队友来信")
+        if not completions.ready(bool(waiting)):
+            if waiting and completions.limited and not completions.limit_notified:
+                completions.limit_notified = True
+                _send({"type": "background_wakeup", "state": "limited", "message": (
+                    f"后台任务完成，但已连续自动继续 {completions.wake_limit} 次；"
+                    "结果会在你下一条消息时交给 Astra。")})
+            return
+        if not _response_head_current():
+            background_clock["checked"] = now + 30  # the error above is not repeated every tick
+            return
+        notices = [notice for notice, _ in completions.drain(session)]
+        envelopes = delegate_mailbox.drain_session(session)
+        if not notices and not envelopes:
+            return
+        display = wake_display(waiting)
+        msg = Msg(sender="scheduler", role="user", content=build_user_message_content(wake_prompt([*notices, *envelopes])),
+                  metadata={"source": "background_completion", "display_command": display})
+        if _start_message(msg, display):
+            completions.started_turn()
+            _send({"type": "background_wakeup", "state": "started", "message": display})
+        else:
+            logger.warning("background completion turn could not start; %d result(s) dropped",
+                           len(notices) + len(envelopes))
+
     async def _lifecycle_tick() -> None:
         while True:
             busy = (agent_turn_lock.locked() or appshot_admission.reserved
@@ -2545,6 +2617,7 @@ async def _main(startup_started: float):
             await _question_answer_tick()
             if peer_link is not None:
                 await _peer_tick()
+            await _background_tick()
             if browser_lifecycle is not None:
                 await _browser_handover_tick()
             await asyncio.sleep(0.25)
@@ -3720,6 +3793,7 @@ async def _main(startup_started: float):
                           else appshot_admission.status(submission_id))
 
             elif cmd.get("type") == "message":
+                completions.user_turn()
                 if isinstance(cmd.get("text"), str):
                     latest_user_request = cmd["text"][:8000]
                 if cmd.get("appshots") or ("submission_id" in cmd and os.getenv("ASTRA_UI_SURFACE") != "gui"):
@@ -3761,6 +3835,7 @@ async def _main(startup_started: float):
                     if receipt is not None:
                         _send(receipt)
                         continue
+                completions.user_turn()
                 try:
                     latest_user_request = str(cmd.get("prompt", ""))[:8000]
                     max_bytes = int(os.getenv("MAX_IMAGE_UPLOAD_BYTES", str(10 * 1024 * 1024)))
@@ -4019,6 +4094,7 @@ async def _main(startup_started: float):
                         _wakeup_event(wakeups.cancel("session_reset"), "Session wakeup stopped because the conversation was reset.")
                         await _stop_wakeup_turn()
                     latest_user_request = ""
+                    completions.forget(agent.context.session_scope)
                     current_memory_session = agent.context.session_scope
                     memory_store.clear_working(current_memory_session)
                     agent.end_session("reset")

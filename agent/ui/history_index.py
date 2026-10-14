@@ -187,7 +187,7 @@ class _Projection:
         self.db.executemany(f"INSERT INTO calls_{self.table} VALUES (?,?)",
                             ((raw_index, call) for call in dict.fromkeys(calls)))
         provenance = message.get("provenance", "")
-        if (message.get("role") == "user" and provenance in ("", "session_wakeup")
+        if (message.get("role") == "user" and provenance in ("", "session_wakeup", "background_completion")
                 and (message.get("_meta") or {}).get("type") != "reasoning_context"):
             self.hidden = provenance == "session_wakeup"
         if provenance != "wakeup_notification" and self.hidden:
@@ -200,7 +200,7 @@ class _Projection:
         if (message.get("_meta") or {}).get("type") == "reasoning_context" and not legacy_reasoning:
             return
         self.db.execute(f"UPDATE raw_{self.table} SET chat_position=? WHERE position=?", (position, raw_index))
-        payload = {"role": message["role"],
+        payload = {"role": "system" if provenance in {"background_completion", "background_run"} else message["role"],
                    "content": message_display_text(message.get("display_command", message.get("content", ""))),
                    "timestamp": message.get("timestamp"), "source_ref": reference}
         if legacy_reasoning:

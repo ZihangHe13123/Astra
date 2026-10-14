@@ -282,6 +282,7 @@ export type PyEvent =
   | { type: "restart_status"; request_id: string; state: string; message: string }
   | { type: "wakeup_status"; plan: Record<string, unknown>; message: string }
   | { type: "peer_message"; direction: "in" | "out"; peer: string; task_id: string; state: string; text: string }
+  | { type: "background_wakeup"; state: "started" | "limited"; message: string }
   | {
       type: "error";
       message: string;
