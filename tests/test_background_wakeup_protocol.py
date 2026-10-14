@@ -41,7 +41,11 @@ def _call(name: str, **arguments) -> dict:
 
 
 class Script:
-    """What the model answers, decided from the conversation it is sent."""
+    """What the model answers, decided from the conversation it is sent.
+
+    A command meant to end after the turn answered sleeps two seconds, so on a busy
+    machine it is still running when the agent takes its next step.
+    """
 
     def __init__(self):
         self.parent_requests: list[list[dict]] = []
@@ -65,14 +69,14 @@ class Script:
         if WAKE in user:
             if "chain-1" in user:
                 if not tools_run:
-                    return _call("execute_shell", command="sleep 0.5 && echo chain-2", background=True)
+                    return _call("execute_shell", command="sleep 2 && echo chain-2", background=True)
                 return "Started chain 2."
             if SUBAGENT_RESULT in user:
                 return "The survey found three notes."
             return "The check passed."
         if user == "Run the slow check in the background":
             if not tools_run:
-                return _call("execute_shell", command="sleep 1 && echo slow-check-ok", background=True)
+                return _call("execute_shell", command="sleep 2 && echo slow-check-ok", background=True)
             return "Started the check."
         if user == "Run a quick check while you work":
             if not tools_run:
@@ -82,10 +86,11 @@ class Script:
             return "Quick check done."
         if user == "Run it and wait for it yourself":
             if not tools_run:
-                return _call("execute_shell", command="echo polled-ok", background=True)
+                # Still running at the next step, so only the poll sees it end.
+                return _call("execute_shell", command="sleep 2 && echo polled-ok", background=True)
             if len(tools_run) == 1:
                 process_id = _tool_json(tools_run[0])["process_id"]
-                return _call("process_poll", process_id=process_id, wait_ms=5000)
+                return _call("process_poll", process_id=process_id, wait_ms=15000)
             return "It finished."
         if user == "Delegate the survey":
             if not tools_run:
@@ -93,7 +98,7 @@ class Script:
             return "Dispatched the survey."
         if user == "Start the chain":
             if not tools_run:
-                return _call("execute_shell", command="sleep 0.5 && echo chain-1", background=True)
+                return _call("execute_shell", command="sleep 2 && echo chain-1", background=True)
             return "Started chain 1."
         return f"Answered: {user}"
 
@@ -199,7 +204,7 @@ def test_a_background_command_that_ends_after_the_reply_starts_one_turn_with_its
         assert "you are told when it ends" in tool_outputs(started)[-1]
 
         wake = wait(lambda e: e.get("type") == "background_wakeup")
-        assert wake["state"] == "started" and "sleep 1 && echo slow-check-ok" in wake["message"]
+        assert wake["state"] == "started" and "sleep 2 && echo slow-check-ok" in wake["message"]
         chunks: list[str] = []
         wait(lambda e: (e.get("type") == "chunk" and chunks.append(e.get("content", ""))) or e.get("type") == "done")
         assert "".join(chunks) == "The check passed."

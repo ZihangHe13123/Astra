@@ -25,6 +25,10 @@ class RetainedMemberProvider(_SlowOpenAIHandler):
         message = {"role": "assistant", "content": ""}
         if not payload.get("stream"):
             server.member_requests.append(payload["messages"])
+            if len(server.member_requests) == 2:
+                # The second assignment outlasts the parent turn that gave it.
+                time.sleep(1.5)
+                server.second_report_sent = True
             message["content"] = f"retained report {len(server.member_requests)}"
         else:
             server.parent_step += 1
@@ -80,6 +84,9 @@ def test_backend_completes_turn_and_reuses_retained_member_on_next_input(tmp_pat
     threading.Thread(target=server.serve_forever, daemon=True).start()
     proc, _, seen, wait = _start_question_protocol_backend(
         tmp_path, server.server_port, "retained-backend", workdir=workspace,
+        # The fixture is on this computer, where parent and member share its request
+        # slots; with one, the parent's last request would wait out the member's.
+        env_overrides={"LLM_MAX_CONCURRENT_REQUESTS": "2"},
     )
     try:
         wait(lambda event: event.get("type") == "model_info")
@@ -105,6 +112,11 @@ def test_backend_completes_turn_and_reuses_retained_member_on_next_input(tmp_pat
         assert not any(e.get("type") == "steering" for e in seen[boundary:])
         assert teams.get_team(team_id)["owner_task_id"] != owner_id
         assert teams.get_agent(member_id)["process_id"] == process_id
+        # The parent answered without waiting; the member's report then starts a turn.
+        assert not getattr(server, "second_report_sent", False)
+        wake = wait(lambda event: event.get("type") == "background_wakeup", timeout=8)
+        assert wake["state"] == "started"
+        wait(lambda event: event.get("type") == "done", timeout=8)
         assert teams.get_agent(member_id)["status"] == "idle"
         assert len(server.member_requests) == 2
         assert "retained report 1" in str(server.member_requests[1])
