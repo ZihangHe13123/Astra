@@ -188,6 +188,13 @@ async function terminateFixture(app) {
 // Passive, bounded metadata only: never retain page HTML or message payloads.
 const loadEvents = [], frameIds = new WeakMap();
 let nextFrameId = 0, loadDiagnostics;
+const lifecycleEvents = [];
+let fixtureProcess, observedPage, contextClosed = false, stderrTail = Buffer.alloc(0);
+const recordLifecycle = event => { lifecycleEvents.push({ at: Date.now(), ...event }); if (lifecycleEvents.length > 32) lifecycleEvents.shift(); };
+const metadataResult = result => result.status === 'fulfilled' ? result.value : {
+  status: /^(?:Page load|WebContents load) metadata timed out after 2000 ms$/.test(String(result.reason?.message)) ? 'timeout' : 'rejected',
+  name: String(result.reason?.name || 'Error').slice(0, 80), message: String(result.reason?.message || result.reason).slice(0, 300),
+};
 const frameId = frame => { if (!frameIds.has(frame)) frameIds.set(frame, ++nextFrameId); return frameIds.get(frame); };
 const recordLoad = event => { loadEvents.push({ at: Date.now(), ...event }); if (loadEvents.length > 64) loadEvents.shift(); };
 const diagnosticAddress = value => {
@@ -209,7 +216,18 @@ try {
   assert.deepEqual(reached.splice(0), ['http GET /control', 'udp']);
 
   app = await electron.launch({ args: [join(root, 'ui-gui')], env, timeout: 30000 });
+  fixtureProcess = app.process();
+  recordLifecycle({ event: 'launched', pid: fixtureProcess.pid });
+  fixtureProcess.on('exit', (code, signal) => recordLifecycle({ event: 'process-exit', code, signal }));
+  fixtureProcess.on('close', (code, signal) => recordLifecycle({ event: 'process-close', code, signal }));
+  fixtureProcess.on('error', error => recordLifecycle({ event: 'process-error', name: error.name, code: error.code }));
+  fixtureProcess.stderr?.on('data', chunk => { stderrTail = Buffer.concat([stderrTail, Buffer.from(chunk)]).subarray(-64 * 1024); });
+  app.on('close', () => recordLifecycle({ event: 'app-close' }));
+  app.context().on('close', () => { contextClosed = true; recordLifecycle({ event: 'context-close' }); });
   const page = await app.firstWindow(); page.setDefaultTimeout(30000);
+  observedPage = page;
+  page.on('close', () => recordLifecycle({ event: 'page-close' }));
+  page.on('crash', () => recordLifecycle({ event: 'page-crash' }));
   page.on('pageerror', error => errors.push(error.message));
   for (const event of ['frameattached', 'framenavigated', 'framedetached']) page.on(event, frame => recordLoad({ event, frame: frameId(frame), address: diagnosticAddress(frame.url()) }));
   page.on('request', request => { if (request.url().startsWith('astra:')) recordLoad({ event: 'request', address: diagnosticAddress(request.url()), resource: request.resourceType() }); });
@@ -475,9 +493,12 @@ try {
 } catch (error) {
   failure = error; console.error(error);
   if (app) {
+    const processState = { at: Date.now(), pid: fixtureProcess?.pid, exitCode: fixtureProcess?.exitCode, signalCode: fixtureProcess?.signalCode,
+      contextClosed, pageClosed: observedPage?.isClosed() ?? null, windows: app.windows().length };
     const metadata = await Promise.allSettled([
       bounded((async () => {
-        const page = await app.firstWindow();
+        const page = observedPage;
+        if (!page || page.isClosed()) return { status: page ? 'closed' : 'not-created' };
         const frames = page.frames().map(frame => ({ id: frameId(frame), address: diagnosticAddress(frame.url()), detached: frame.isDetached() }));
         const messages = await page.evaluate(() => window.__pageSmokeMessages || []);
         return { frames, messages };
@@ -490,11 +511,12 @@ try {
         }),
       })), 'WebContents load metadata', 2000),
     ]);
-    loadDiagnostics = { events: loadEvents, renderer: metadata[0].status === 'fulfilled' ? metadata[0].value : '[unavailable]', main: metadata[1].status === 'fulfilled' ? metadata[1].value : '[unavailable]' };
+    loadDiagnostics = { events: loadEvents, lifecycle: [...lifecycleEvents], process: processState, renderer: metadataResult(metadata[0]), main: metadataResult(metadata[1]), stderrTailFile: 'electron-stderr-tail.log' };
     console.error('PAGE_LOAD_DIAGNOSTICS', JSON.stringify(loadDiagnostics));
   }
   if (app) await bounded((async () => {
-    const page = await app.firstWindow();
+    const page = observedPage;
+    if (!page || page.isClosed()) return;
     console.error((await page.locator('body').innerText()).slice(-2000));
     console.error('REACHED', JSON.stringify(reached), 'ANSWERED', JSON.stringify(answered), 'PROBED', JSON.stringify(probed), 'ERRORS', JSON.stringify(errors));
     await page.screenshot({ path: join(output, 'failure.png'), timeout: 2000 });
@@ -507,6 +529,7 @@ try {
   for (const server of [model, probe, relay]) await bounded(new Promise((done, reject) => { server.close(error => error ? reject(error) : done()); server.closeAllConnections?.(); }), 'Fixture listener close', 3000).catch(error => { failure ||= error; console.error(error); });
   datagrams.close();
 }
+if (failure) writeFileSync(join(output, 'electron-stderr-tail.log'), stderrTail.toString('utf8'));
 writeFileSync(join(output, 'page-result.json'), JSON.stringify({ checks, errors, reached, answered, probed, folder, success: !failure, ...(failure ? { failure: String(failure), loadDiagnostics } : {}) }, null, 2));
 if (failure) throw failure;
 console.log(JSON.stringify({ checks: checks.length, output, folder }));

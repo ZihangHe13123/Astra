@@ -63,7 +63,8 @@ jobs:
       - name: Relocated packaged application acceptance
         run: node ui-gui/tests/packaged-smoke.mjs "$RUNNER_TEMP/astra-release"
       - name: Archive exact application permissions and internal links
-        run: tar -czf "$RUNNER_TEMP/astra-${{ matrix.target }}.tar.gz" -C "$RUNNER_TEMP" astra-release
+        working-directory: ${{ runner.temp }}
+        run: tar -czf "astra-${{ matrix.target }}.tar.gz" astra-release
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: astra-${{ matrix.target }}-unsigned
