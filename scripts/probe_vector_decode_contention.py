@@ -22,9 +22,40 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 
+def current_acceptance(output, *, required):
+    """Keep expected historical failures, but gate the real current SQL reader."""
+    groups = {}
+    unexpected = [
+        {key: row[key] for key in ("source", "variant", "round", "warmup", "status")}
+        for row in output["samples"] if row["status"] not in {"complete", "deadline"}
+    ]
+    for source in output["counts"]:
+        for variant in ("alone", "current"):
+            rows = [row for row in output["samples"]
+                    if row["source"] == source and row["variant"] == variant and not row["warmup"]]
+            values = sorted(row["victim_elapsed_ms"] if row["status"] == "complete" else math.inf
+                            for row in rows)
+            p95 = values[math.ceil(len(values) * .95) - 1] if values else math.inf
+            groups[source + "_" + variant] = {
+                "measured_samples": len(rows), "expected_samples": output["rounds"],
+                "failed_reads": sum(row["status"] != "complete" for row in rows),
+                "p95_is_infinite": not math.isfinite(p95),
+                "p95_victim_ms": p95 if math.isfinite(p95) else None,
+                "passed": len(rows) == output["rounds"] and p95 <= 75,
+            }
+    return {
+        "required": required, "assessed": True, "limit_ms": 75,
+        "rule": "Each alone/current source has20 measured samples; failed reads count as infinity and p95 must be <=75ms. Any unexpected SQLite status fails. Historical deadline controls never affect this gate.",
+        "groups": groups, "unexpected_statuses": unexpected,
+        "passed": all(group["passed"] for group in groups.values()) and not unexpected,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--require-current", action="store_true",
+                        help="save all observations, then fail unless alone/current small SQL p95 stays within75ms")
     args = parser.parse_args()
     if args.output.exists():
         parser.error("use a fresh output path")
@@ -100,6 +131,7 @@ def main() -> None:
             "Each source has20 measured rounds and2 warmups with rotating variant order. Every decoded item and vector value is checked after both timed sections finish.",
         ],
         "samples": [], "summary": {},
+        "acceptance": {"required": args.require_current, "assessed": False},
     }
 
     def save():
@@ -189,7 +221,12 @@ def main() -> None:
                 output["summary"][source + "_" + variant] = summary
                 print(json.dumps({"source": source, "variant": variant, **summary}), flush=True)
             save()
+    output["acceptance"] = current_acceptance(output, required=args.require_current)
+    save()
+    print(json.dumps({"acceptance": output["acceptance"]}), flush=True)
     print(args.output / "results.json", flush=True)
+    if args.require_current and not output["acceptance"]["passed"]:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

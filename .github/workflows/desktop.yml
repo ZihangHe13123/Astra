@@ -183,23 +183,23 @@ jobs:
         continue-on-error: true
         run: uv run --no-sync python scripts/probe_vector_snapshot_clock.py --output=output/context-index-windows/clock-probe
       - name: Compare vector decoder interference with small SQL reads
-        if: inputs.investigation == 'windows-vector-contention'
+        if: inputs.investigation == 'windows-vector-contention' || inputs.investigation == 'windows-context-performance'
         id: contention_probe
         continue-on-error: true
-        run: uv run --no-sync python scripts/probe_vector_decode_contention.py --output=output/context-index-windows/contention-probe
+        run: uv run --no-sync python scripts/probe_vector_decode_contention.py --output=output/context-index-windows/contention-probe --require-current
       - name: Diagnose warm vector search
         if: inputs.investigation == 'windows-context-performance'
         id: search_probe
         continue-on-error: true
         run: uv run --no-sync python scripts/probe_vector_search_performance.py --output=output/context-index-windows/search-probe
-      - name: Real Windows Context Index performance
+      - name: Real Windows Context Index regression and performance
         if: inputs.investigation == 'windows-context-performance'
         env:
           TMPDIR: ${{ runner.temp }}
           TEMP: ${{ runner.temp }}
           TMP: ${{ runner.temp }}
         run: |
-          uv run --no-sync python -m pytest -q -s tests/test_context_index_performance.py --junitxml=output/context-index-windows/pytest.xml | tee output/context-index-windows/results.log
+          uv run --no-sync python -m pytest -q -s tests/test_context_index*.py --junitxml=output/context-index-windows/pytest.xml | tee output/context-index-windows/results.log
       - name: Keep diagnostic failures visible
         if: always() && (steps.snapshot_probe.outcome == 'failure' || steps.search_probe.outcome == 'failure' || steps.read_paths_probe.outcome == 'failure' || steps.clock_probe.outcome == 'failure' || steps.contention_probe.outcome == 'failure')
         run: exit 1

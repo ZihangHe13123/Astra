@@ -10,10 +10,12 @@ import hashlib
 import math
 import os
 from pathlib import Path
+import sqlite3
 import struct
 import threading
+import time
 from collections import OrderedDict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 from ..activity_store import _redact_text
 from . import embedder
@@ -175,6 +177,31 @@ def rebuild_source(path: Path, vectors_db: Path, source: str, *, backend=None,
 
 def read_snapshot(vectors_db: Path, source: str, archive_path: Path) -> tuple:
     """Cache at most four immutable archive snapshots; WAL commits invalidate it."""
+    return _read_snapshot(vectors_db, source, archive_path, deadline_ms=75)[0]
+
+
+def warm_snapshot(vectors_db: Path, source: str, archive_path: Path, *,
+                  cancelled: Callable[[], bool] = lambda: False) -> bool:
+    """Fill the cache within a cooperative 2 s budget; false means version changed."""
+    deadline = time.perf_counter() + 2.0
+
+    def stopped() -> bool:
+        return cancelled() or time.perf_counter() >= deadline
+
+    _check_cancelled(stopped)
+    if not archive_path.is_file():
+        raise FileNotFoundError(archive_path)
+    return _read_snapshot(vectors_db, source, archive_path, deadline_ms=2000, cancelled=stopped)[1]
+
+
+def _check_cancelled(cancelled: Callable[[], bool] | None) -> None:
+    if cancelled is not None and cancelled():
+        raise sqlite3.OperationalError("interrupted")
+
+
+def _read_snapshot(vectors_db: Path, source: str, archive_path: Path, *, deadline_ms: int,
+                   cancelled: Callable[[], bool] | None = None) -> tuple[tuple, bool]:
+    _check_cancelled(cancelled)
     identity = embedder.embedding_identity()
     archive = archive_key(archive_path)
     scope = (str(vectors_db.resolve()), source, archive, identity)
@@ -182,9 +209,14 @@ def read_snapshot(vectors_db: Path, source: str, archive_path: Path) -> tuple:
     with _cache_lock:
         previous = _cache.get(scope)
         if previous is not None and previous[0] == version:
+            _check_cancelled(cancelled)
             _cache.move_to_end(scope)
-            return previous[1]
-    with open_readonly(vectors_db, deadline_ms=75) as db:
+            return previous[1], True
+    _check_cancelled(cancelled)
+    reader = (open_readonly(vectors_db, deadline_ms=deadline_ms, cancelled=cancelled)
+              if cancelled is not None else open_readonly(vectors_db, deadline_ms=deadline_ms))
+    with reader as db:
+        _check_cancelled(cancelled)
         model = db.execute("SELECT identity FROM embedding_metadata LIMIT 1").fetchone()
         if model is None or model[0] != identity:
             raise ValueError("Vector model identity mismatch")
@@ -193,15 +225,22 @@ def read_snapshot(vectors_db: Path, source: str, archive_path: Path) -> tuple:
             "WHERE source=? AND archive=? AND layout=? ORDER BY timestamp DESC, item_id LIMIT ?",
             (source, archive, _LAYOUT, ARCHIVE_LIMIT),
         ).fetchall()
+    _check_cancelled(cancelled)
     if any(len(row["vec"]) > 65536 for row in rows):
         raise ValueError("Invalid vector dimensions")
     matrix = matrix_from_blobs([row["vec"] for row in rows])
     matrix.flags.writeable = False
     result = (tuple((str(row["item_id"]), str(row["revision"]), float(row["timestamp"]),
                      float(row["available_at"])) for row in rows), matrix)
+    published = False
     with _cache_lock:
-        _cache[scope] = (version, result)
-        _cache.move_to_end(scope)
-        while len(_cache) > 4:
-            _cache.popitem(last=False)
-    return result
+        _check_cancelled(cancelled)
+        # A slower read must not replace a snapshot published after a WAL
+        # commit or file replacement. Recheck while holding the publication lock.
+        if file_version(vectors_db) == version:
+            _cache[scope] = (version, result)
+            _cache.move_to_end(scope)
+            while len(_cache) > 4:
+                _cache.popitem(last=False)
+            published = True
+    return result, published

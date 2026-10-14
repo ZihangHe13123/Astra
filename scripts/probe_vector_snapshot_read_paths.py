@@ -65,7 +65,7 @@ def main() -> None:
             "Application snapshot cache is cleared; OS page cache is not evicted.",
             "Serial read-path attribution only; this is not concurrent broker acceptance.",
             "Production uses the real reader unchanged. Replicas use its readonly connection setup plus an explicit read transaction and strict final deadline check.",
-            "All replica SQL and incremental BLOB reads share one 75 ms deadline. Connection setup/close and binary matrix decode are outside that deadline, matching the production SQL budget boundary.",
+            "All replica SQL and incremental BLOB reads share one 75 ms perf_counter deadline, matching the precise production clock. Historical 6028e46f results used monotonic and remain separate evidence. Connection setup/close and binary matrix decode are outside that deadline, matching the production SQL budget boundary.",
             "selected_logical and selected_rowid first select identical metadata, then fetch the identical rowid set; only the BLOB query order changes. blobopen_rowid uses the same rowid order with incremental readonly reads.",
             "reused_row releases its transaction and resets its deadline each round. It retains both mmap and the SQLite pager cache, so it does not isolate mmap alone or demonstrate first-ever load performance.",
             "First float identifies each item; all other values are 0.5. Every completed result is checked outside timers for exact metadata, logical order, and all vector values.",
@@ -122,11 +122,11 @@ def main() -> None:
                     context = semantic_index.open_readonly(path, deadline_ms=budget_ms)
                     db = context.__enter__()
             db.row_factory = None if name == "fresh_tuple" else sqlite3.Row
-            deadline = time.monotonic() + budget_ms / 1000
-            db.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            deadline = time.perf_counter() + budget_ms / 1000
+            db.set_progress_handler(lambda: int(time.perf_counter() >= deadline), 1000)
 
             def check_deadline():
-                if time.monotonic() >= deadline:
+                if time.perf_counter() >= deadline:
                     raise TimeoutError("75 ms read deadline")
 
             with phase(sample, "sql_read_total"):

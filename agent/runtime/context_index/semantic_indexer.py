@@ -11,7 +11,7 @@ from collections.abc import Callable
 
 from ..instance_lock import InstanceAlreadyRunning, InstanceLock
 from . import embedder
-from .semantic_index import file_version, rebuild_source
+from .semantic_index import file_version, rebuild_source, warm_snapshot
 from .vector_index import default_vectors_db_path
 
 _log = logging.getLogger(__name__)
@@ -37,9 +37,14 @@ def start_background(session_path: Path, memory_path: Path, vectors_path: Path,
         def work() -> None:
             versions: dict[str, tuple] = {}
             owner = InstanceLock(vectors_path.with_suffix(vectors_path.suffix + ".memory-index.lock"))
+
+            def cancelled() -> bool:
+                return (_stop.is_set() or not enabled() or not embedder._enabled()
+                        or not vectors_path.is_file() or embedder.ready_embedder() is None)
+
             while not _stop.is_set():
                 backend = embedder.ready_embedder()
-                if backend is not None and enabled():
+                if backend is not None and not cancelled():
                     try:
                         owner.acquire()
                     except InstanceAlreadyRunning:
@@ -47,7 +52,7 @@ def start_background(session_path: Path, memory_path: Path, vectors_path: Path,
                     else:
                         try:
                             for source, path in (("memory", memory_path), ("session", session_path)):
-                                if not path.is_file() or not enabled() or _stop.is_set():
+                                if not path.is_file() or cancelled():
                                     continue
                                 version = file_version(path)
                                 if versions.get(source) == version:
@@ -60,6 +65,19 @@ def start_background(session_path: Path, memory_path: Path, vectors_path: Path,
                                     _log.warning("Memory vector maintenance deferred (%s)", type(exc).__name__)
                         finally:
                             owner.release()
+                    # Every process needs its own read cache, including when
+                    # another process owns writing or canonical inputs did not
+                    # change. Keep the bounded fill outside the writer lease.
+                    for source, path in (("memory", memory_path), ("session", session_path)):
+                        if cancelled():
+                            break
+                        if not path.is_file():
+                            continue
+                        try:
+                            warm_snapshot(vectors_path, source, path, cancelled=cancelled)
+                        except Exception as exc:
+                            if not cancelled():
+                                _log.warning("Memory vector snapshot deferred (%s)", type(exc).__name__)
                 if _stop.wait(30):
                     return
 
