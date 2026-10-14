@@ -234,6 +234,8 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
     // Another Astra session on this computer: shown as a notice, never as the user's words.
     case "peer_message":
       append("system", `${event.direction === "in" ? "来自" : "发给"} ${event.peer}（${event.state}）：${event.text}`); break;
+    // Background work ended after the reply: the turn Astra starts for it, or why it waits for the user.
+    case "background_wakeup": append("system", event.message); break;
     default: state.info = { ...state.info, [event.type]: event }; break;
   }
   return state;

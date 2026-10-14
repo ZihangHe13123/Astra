@@ -29,7 +29,8 @@ member, per assignment). Sixteen run at once (`ASTRA_DELEGATE_CONCURRENCY`).
 A subagent's history is compacted like the main agent's. A message reaches a
 working member before its next step; what members send to `lead` arrives in
 the parent's conversation between its steps and wakes a parent waiting for
-them.
+them. In a Work session the parent does not wait for them at the end of its
+turn; see [When background work finishes](session-lifecycle.md#when-background-work-finishes).
 
 Worker `lifecycle` records identify the completion reason, actual limits, last idle
 entry/deadline, active and idle monotonic seconds, and wall elapsed seconds.

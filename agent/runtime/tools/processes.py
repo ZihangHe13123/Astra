@@ -57,6 +57,8 @@ class ManagedProcess:
     last_output_event_at: float = 0.0
     output_event_recorded: bool = False
     terminal_emitted: bool = False
+    # Whether a tool result has shown the caller this run's end (see mark_reported).
+    terminal_reported: bool = False
     external: bool = False
     supervisor_pid: int | None = None
     # Set by the backend that started the supervisor; a recovered one has none.
@@ -82,6 +84,9 @@ class ProcessManager:
         self.artifact_dir.mkdir(parents=True, exist_ok=True)
         self.task_store = task_store
         self.on_event = on_event
+        # Set by a host that tells its agent when a run it started ends: the sentence
+        # a background result carries instead of the advice to poll, or "".
+        self.background_note: Callable[[ManagedProcess], str] | None = None
         self._processes: dict[str, ManagedProcess] = {}
         self._load_manifests()
 
@@ -636,6 +641,13 @@ class ProcessManager:
             process.output_event_recorded = True
             self._emit(process, "process_output")
         self._emit_terminal(process)
+
+    def mark_reported(self, description: dict) -> dict:
+        """Record that a tool result showing ``description`` told its caller the run ended."""
+        process = self._processes.get(str(description.get("process_id") or ""))
+        if process is not None and description.get("status") not in {None, "running"}:
+            process.terminal_reported = True
+        return description
 
     def get(self, process_id: str) -> ManagedProcess:
         process = self._processes.get(process_id)

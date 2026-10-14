@@ -200,6 +200,12 @@ _BACKGROUND_RESULT_TEXT = (
     "Its result is delivered to you automatically when it finishes; "
     "use delegate_poll/delegate_read only for interim progress."
 )
+# Added when the host starts a turn for a report that arrives after the parent answered.
+_BACKGROUND_WAKE_TEXT = (
+    " You need not wait for it: once you have nothing else to do, answer the user with "
+    "what is done and what is still running; a report that arrives after that starts a "
+    "new turn for you."
+)
 
 
 class DelegateMailboxStore:
@@ -327,6 +333,11 @@ class DelegateMailbox:
         )
         self._adopted_processes: set[str] = set()
         self.has_pending_messages: Callable[[Any], bool] = lambda process: False
+        # Set by a host that starts a turn for reports arriving after its parent turn
+        # answered (agent/runtime/background_completion.py). Such a turn need not wait.
+        self.wakes_parent: Callable[[str], bool] = lambda task_id: False
+        # Whether a teammate has written to a lead since this mailbox was made.
+        self._lead_written = False
         self._load_persisted()
 
     def sync_owners(self) -> None:
@@ -369,6 +380,8 @@ class DelegateMailbox:
                     }
                     row["delivered"] = False
                     self.store.upsert(owner_task_id, row)
+            # Left by an earlier backend: delivered at the next turn, never a reason to start one.
+            row["restored"] = True
             self._runs.setdefault(owner_task_id, {})[row["process_id"]] = row
 
     def _event(self, task_id: str) -> asyncio.Event:
@@ -376,6 +389,7 @@ class DelegateMailbox:
 
     def wake_all(self) -> None:
         """Wake every waiting parent; each checks for itself whether something is for it."""
+        self._lead_written = True
         for event in self._events.values():
             event.set()
 
@@ -479,6 +493,7 @@ class DelegateMailbox:
             )
             current["payload"] = self._bounded_payload(payload)
             current["status"] = final_status
+            current.pop("restored", None)
             if not same_report:
                 current["delivered"] = False
             current["transcript_path"] = str(
@@ -502,6 +517,7 @@ class DelegateMailbox:
             return
         entry["status"] = "idle" if payload is not None else "running"
         entry["delivered"] = False
+        entry.pop("restored", None)
         entry["payload"] = self._bounded_payload(payload) if payload is not None else {}
         entry["transcript_path"] = str(process.metadata.get("session_transcript_path") or "")
         if self.store is not None:
@@ -543,13 +559,14 @@ class DelegateMailbox:
         deadline = asyncio.get_running_loop().time() + wait_ms / 1000
         while True:
             self.sync_owners()
-            entry = self._runs.get(task_id, {}).get(process_id)
+            owner = self._owner_key(task_id, process_id)
+            entry = self._runs.get(owner, {}).get(process_id)
             if entry is None or not self._pending(entry):
                 return
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 return
-            event = self._event(task_id)
+            event = self._event(owner)
             event.clear()
             try:
                 await asyncio.wait_for(event.wait(), timeout=remaining)
@@ -558,7 +575,7 @@ class DelegateMailbox:
 
     def idle_report(self, task_id: str, process_id: str) -> dict[str, Any] | None:
         self.sync_owners()
-        entry = self._runs.get(task_id, {}).get(process_id)
+        entry = self._runs.get(self._owner_key(task_id, process_id), {}).get(process_id)
         if entry is not None and entry["status"] == "idle" and not self._pending(entry):
             return dict(entry["payload"])
         return None
@@ -627,13 +644,52 @@ class DelegateMailbox:
         envelopes.extend(self._lead_envelopes(task_id, session_id))
         return envelopes
 
+    def session_of(self, process_id: str) -> str:
+        """The session a tracked subagent was started in, or ""."""
+        for entries in self._runs.values():
+            if process_id in entries:
+                return str(entries[process_id].get("session_id") or "")
+        return ""
+
+    def _owner_key(self, task_id: str, process_id: str) -> str:
+        """Where a report is kept: the asking turn's, or the earlier turn in its session that owns it."""
+        task_id = str(task_id or "")
+        if process_id in self._runs.get(task_id, {}):
+            return task_id
+        return next((owner for owner, entries in self._runs.items() if process_id in entries), task_id)
+
+    def undelivered(self, session_id: str) -> list[str]:
+        """The goals of this session's reports that wait to be put before its parent."""
+        self.sync_owners()
+        return [str(entry["goal"]) for entries in self._runs.values() for entry in entries.values()
+                if entry.get("session_id") == session_id and entry["status"] != "running"
+                and not entry["delivered"] and not entry.get("restored")]
+
+    def lead_waiting(self, session_id: str) -> bool:
+        """Whether a teammate of this session has written to its parent, unread, in this backend's life."""
+        return bool(session_id) and self._lead_written and self._lead_pending("", session_id)
+
+    def drain_session(self, session_id: str) -> list[str]:
+        """Every report and teammate message waiting in a session, for a turn started to deliver them.
+
+        Only for an idle parent: no turn of the session runs, so no owner turn misses its own.
+        """
+        self.sync_owners()
+        envelopes: list[str] = []
+        for owner_id, entries in list(self._runs.items()):
+            if any(entry.get("session_id") == session_id for entry in entries.values()):
+                envelopes.extend(self.drain(owner_id))
+        envelopes.extend(self._lead_envelopes("", session_id))
+        return envelopes
+
     def acknowledge(self, task_id: str, process_id: str) -> None:
         self.sync_owners()
-        entry = self._runs.get(str(task_id or ""), {}).get(str(process_id))
+        task_id = self._owner_key(task_id, str(process_id))
+        entry = self._runs.get(task_id, {}).get(str(process_id))
         if entry is not None and entry["status"] != "running":
             entry["delivered"] = True
             if self.store is not None:
-                self.store.mark_delivered(str(task_id or ""), str(process_id))
+                self.store.mark_delivered(task_id, str(process_id))
 
     async def wait_and_drain(
         self,
@@ -3233,7 +3289,8 @@ def register_delegate_tools(
                     process,
                     {
                         **_sub_processes.describe(process),
-                        "message": "Subagent running in background. " + _BACKGROUND_RESULT_TEXT,
+                        "message": "Subagent running in background. " + _BACKGROUND_RESULT_TEXT
+                        + (_BACKGROUND_WAKE_TEXT if mailbox.wakes_parent(spec.task_id) else ""),
                     },
                 )
             )
@@ -3266,7 +3323,8 @@ def register_delegate_tools(
                     process,
                     {
                         **_sub_processes.describe(process),
-                        "message": "Subagent continues in background. " + _BACKGROUND_RESULT_TEXT,
+                        "message": "Subagent continues in background. " + _BACKGROUND_RESULT_TEXT
+                        + (_BACKGROUND_WAKE_TEXT if mailbox.wakes_parent(spec.task_id) else ""),
                     },
                 )
             )
@@ -3288,9 +3346,20 @@ def register_delegate_tools(
         _sub_processes.discard_unexposed(process)
         return _sub_processes.dumps(result)
 
+    def _in_this_session(process_id: str) -> bool:
+        # A later turn of the conversation reaches the subagents its earlier turns started.
+        # Teammates stay with their Team's owner turn; a later turn adopts the Team first.
+        session = session_id_getter() if session_id_getter else ""
+        try:
+            teammate = bool(_sub_processes.get(process_id).metadata.get("agent_team"))
+        except ValueError:
+            return False
+        return (bool(session) and not teammate and not current_team_agent_id()
+                and mailbox.session_of(process_id) == session)
+
     def _owned_process(process_id: str, task_id: str):
         process = _sub_processes.get(process_id)
-        if _process_owner(process) != task_id:
+        if _process_owner(process) != task_id and not _in_this_session(process_id):
             raise ValueError("subagent process belongs to another task")
         return process
 
@@ -3365,6 +3434,7 @@ def register_delegate_tools(
             )
             for info in _sub_processes.list(include_completed=include_completed)
             if _process_owner(_sub_processes.get(str(info["process_id"]))) == _task_id
+            or _in_this_session(str(info["process_id"]))
         ]
         return _sub_processes.dumps(procs)
 
