@@ -31,7 +31,8 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
         with:
           version: '0.11.27'
-          python-version: '3.12.14'
+          # Build host only; bundled Python is pinned separately in packaging/desktop-runtime.lock.json.
+          python-version: '3.11.15'
           enable-cache: true
           cache-dependency-glob: uv.lock
           download-from-astral-mirror: false
