@@ -23,8 +23,8 @@ CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"  # Public device-flow client identifi
 DEVICE_URL = ISSUER + "/codex/device"
 TOKEN_URL = ISSUER + "/oauth/token"
 # The account catalog omits models that need a newer client than the one reported
-# (0.0.0 hid gpt-6-sol and gpt-6-luna). Bump when a new release is missing.
-CATALOG_CLIENT_VERSION = "0.155.0"
+# (0.155.0 hid gpt-6.1-sol). Bump when a new release is missing.
+CATALOG_CLIENT_VERSION = "0.159.1"
 
 
 class CodexAuthError(ValueError):

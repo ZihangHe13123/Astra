@@ -5,7 +5,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from agent.cli.connections import sync_context_budget
-from agent.cli.models import ModelProfile, prompt_token_budget
+from agent.cli.models import (
+    ModelProfile, _load_yaml, _profile_from_data, prompt_token_budget, save_model_profile,
+)
 from agent.runtime.llm import LLMConfig
 from agent.runtime.context import AgentContext
 
@@ -63,3 +65,36 @@ def test_gpt_history_is_not_compacted_at_half_the_window(monkeypatch):
     compress.assert_not_awaited()
     asyncio.run(context.compress_if_needed(measure_tokens=lambda: 263_808))
     compress.assert_awaited_once()
+
+
+def test_explicit_window_and_compaction_round_trip_and_output_reserve(tmp_path, monkeypatch):
+    profile = _profile_from_data("gpt-6.1-sol", {
+        "base_url": "https://chatgpt.com/backend-api/codex", "provider": "openai-codex",
+        "context_window": 512_000, "auto_compact_token_limit": 450_000,
+    })
+    saved = save_model_profile("gpt-6.1-sol", profile, tmp_path / "models.yaml")
+    restored = _profile_from_data("gpt-6.1-sol", _load_yaml(saved)["models"]["gpt-6.1-sol"])
+    config = LLMConfig(model="gpt-6.1-sol", **restored.generation_settings())
+    context = AgentContext()
+    agent = SimpleNamespace(llm=SimpleNamespace(config=config), context=context)
+    assert sync_context_budget(agent, restored) == 450_000
+    assert config.context_limit == 512_000
+    assert config.auto_compact_token_limit == 450_000
+
+    compress = AsyncMock(return_value=True)
+    monkeypatch.setattr(context, "_compress_history", compress)
+    asyncio.run(context.compress_if_needed(measure_tokens=lambda: 449_999))
+    compress.assert_not_awaited()
+    asyncio.run(context.compress_if_needed(measure_tokens=lambda: 450_000))
+    compress.assert_awaited_once()
+    assert prompt_token_budget(512_000, 100_000, auto_compact_token_limit=450_000) == 412_000
+
+
+@pytest.mark.parametrize("settings", [
+    {"context_window": 0}, {"context_window": True}, {"context_window": 512_000.5},
+    {"auto_compact_token_limit": -1}, {"auto_compact_token_limit": "450000"},
+    {"context_window": 272_000, "auto_compact_token_limit": 450_000},
+])
+def test_invalid_explicit_context_settings_are_rejected(settings):
+    with pytest.raises(ValueError):
+        _profile_from_data("test", {"base_url": "https://example.test/v1", **settings})

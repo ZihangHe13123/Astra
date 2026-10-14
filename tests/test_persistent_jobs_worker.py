@@ -161,6 +161,7 @@ def test_worker_supervision_separates_idle_from_absolute_time(tmp_path, monkeypa
     original_popen = subprocess.Popen
     script = """
 import sys,time
+if sys.platform == 'win32' and sys.stdin.buffer.read(1) != b'1': sys.exit(1)
 from pathlib import Path
 from agent.runtime.jobs.store import JobStore
 store=JobStore(Path(sys.argv[1])); lock=store.run_lock(sys.argv[2]); lock.acquire()
@@ -171,7 +172,7 @@ while True:
 """
     children = []
     def spawn(_args, **kwargs):
-        child = original_popen([sys.executable, "-c", script, str(store.home), run["id"], str(progress),
+        child = original_popen([_args[0], "-c", script, str(store.home), run["id"], str(progress),
                                 "active" if active else "idle"], **kwargs)
         children.append(child)
         return child

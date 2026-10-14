@@ -64,6 +64,22 @@ token estimates are retained. Official `high`, `original` and `auto` detail all
 keep original pixels; `low` continues inline to preserve server downsampling.
 External image URLs are not downloaded by the upload cache.
 
+## Model catalog and context settings
+
+The Codex account catalog filters models by the client version Astra reports.
+Refreshing a provider updates the active model's context budget as well as its
+menu entry. An unlisted model entered manually uses the provider's conservative
+capacity until discovery supplies metadata.
+
+Per-model entries in `.astra/models.yaml` may set `context_window` to explicitly
+override the discovered default and `auto_compact_token_limit` to choose when
+history compaction starts. For example, `512000` and `450000` use a 512K window
+and compact at 450K. These settings survive catalog refreshes and apply only to
+that model; output space is always reserved. `CTX` measures occupancy against
+the compaction budget. Choose a window supported by the account/model: local
+configuration does not increase the server's maximum. Neither setting is sent
+as an API generation parameter.
+
 ## Client and MCP recovery
 
 The backend sends an IPC hello before optional initialization. A silent process

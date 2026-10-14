@@ -133,11 +133,16 @@ class JobStore:
 
     def jobs(self) -> list[dict]:
         with self.connect() as db:
-            return [self.record(row) for row in db.execute("SELECT * FROM jobs ORDER BY created_at, id")]
+            return [self.record(row) for row in db.execute(
+                "SELECT jobs.*, (SELECT state FROM runs WHERE job_id=jobs.id "
+                "ORDER BY created_at DESC,rowid DESC LIMIT 1) AS last_outcome FROM jobs ORDER BY created_at,id")]
 
     def job(self, identity: str) -> dict:
         with self.connect() as db:
-            row = db.execute("SELECT * FROM jobs WHERE id=?", (identity,)).fetchone()
+            row = db.execute(
+                "SELECT jobs.*, (SELECT state FROM runs WHERE job_id=jobs.id "
+                "ORDER BY created_at DESC,rowid DESC LIMIT 1) AS last_outcome FROM jobs WHERE id=?",
+                (identity,)).fetchone()
         if row is None:
             raise ValueError("Unknown job ID.")
         return self.record(row)
@@ -163,9 +168,12 @@ class JobStore:
         db.execute("INSERT INTO runs (id,job_id,scheduled_at,created_at,finished_at,state,spec,detail,skipped_count) "
                    "VALUES (?,?,?,?,?,?,?,?,?)", (identity, job["id"], slot, now, now if skipped else None,
                                                 state, job["spec"], detail, skipped))
+        if skipped:
+            db.execute("INSERT INTO deliveries (run_id,state) VALUES (?,'pending')", (identity,))
         return identity
 
-    def claim_due(self, *, now: float | None = None, manual_job: str = "") -> dict | None:
+    def claim_due(self, *, now: float | None = None, manual_job: str = "",
+                  reminders_only: bool = False) -> dict | None:
         now = time.time() if now is None else now
         identity = ""
         with self.transaction() as db:
@@ -182,6 +190,10 @@ class JobStore:
                                         "AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.job_id=jobs.id "
                                         "AND runs.state IN ('claimed','running')) ORDER BY next_at,id", (now,)).fetchall()
                 for job in candidates:
+                    # The supervisor can service lightweight reminders while a
+                    # check owns the worker. Do not advance other checks here.
+                    if reminders_only and json.loads(job["spec"])["kind"] != "reminder":
+                        continue
                     first = job["next_at"]
                     period = job["interval_seconds"]
                     older = int((now - first) // period) if period else 0

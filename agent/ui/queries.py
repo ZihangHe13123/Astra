@@ -60,14 +60,29 @@ def history(name: str, mode: str = "work", *, before: int | None = None, limit: 
     return {"session_id": name, "mode": mode, **result, "delegates": delegates, "response_versions": versions}
 
 
-def changes(agent, turn: int = 1, index: int | None = None) -> dict:
+def changes(agent, turn: int = 1, index: int | None = None, *, source: dict | None = None) -> dict:
+    if source is not None and (
+        not isinstance(source, dict) or set(source) != {"session_id", "request_id", "turn_seq"}
+        or not isinstance(source["session_id"], str) or not source["session_id"]
+        or not isinstance(source["request_id"], str)
+        or type(source["turn_seq"]) is not int or source["turn_seq"] < 1
+    ):
+        raise ValueError("Invalid change source")
     store = agent.turn_change_store()
+    if source is not None and (store is None or source["session_id"] != store.session_id):
+        raise ValueError("指定回合的改动记录不属于当前会话或已不可用。")
     if store is None:
         return {"turns": [], "files": [], "available": False}
     listing = store.completed_turns()
     if not listing.ok:
         raise OSError("Change index unavailable")
     records = list(listing.records)
+    if source is not None:
+        matches = [i for i, record in enumerate(records)
+                   if record.turn_seq == source["turn_seq"] and record.request_id == source["request_id"]]
+        if len(matches) != 1:
+            raise ValueError("指定回合的改动记录已变化或不可用；未切换到其他回合。")
+        turn = matches[0] + 1
     if not records:
         return {"turns": [], "files": [], "available": True}
     if turn < 1 or turn > len(records):
@@ -77,6 +92,7 @@ def changes(agent, turn: int = 1, index: int | None = None) -> dict:
     entries = [*manifest.files, *manifest.unknown] if manifest else []
     confirmed_count = len(manifest.files) if manifest else 0
     result = {"turns": [asdict(r) for r in records], "turn": turn,
+              "source": {"session_id": store.session_id, "request_id": record.request_id, "turn_seq": record.turn_seq},
               "files": [{**asdict(e), "confirmed": i < confirmed_count} for i, e in enumerate(entries)],
               "available": bool(manifest), "record": asdict(record)}
     if index is not None:
@@ -133,7 +149,7 @@ def query(request: dict, *, agent=None) -> object:
                        before=params.get("before"), limit=int(params.get("limit", 200)), source_ref=params.get("source_ref"),
                        branch_id=params.get("branch_id"))
     if method == "changes" and agent is not None:
-        return changes(agent, int(params.get("turn", 1)), params.get("index"))
+        return changes(agent, int(params.get("turn", 1)), params.get("index"), source=params.get("source"))
     raise ValueError("Unknown UI query")
 
 

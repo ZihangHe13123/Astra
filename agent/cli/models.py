@@ -55,6 +55,9 @@ class ModelProfile:
         repr=False,
         compare=False,
     )
+    # Explicit local overrides; discovery must not reset these to server defaults.
+    context_window: int | None = None
+    auto_compact_token_limit: int | None = None
 
     def generation_settings(self) -> dict:
         settings = {
@@ -70,6 +73,8 @@ class ModelProfile:
             settings["repetition_penalty_parameter"] = self.repetition_penalty_parameter
         settings["vision_detail"] = self.vision_detail
         settings["vision_preprocess"] = self.vision_preprocess
+        if self.auto_compact_token_limit is not None:
+            settings["auto_compact_token_limit"] = self.auto_compact_token_limit
         if self.provider == "openai-codex":
             settings["reasoning_levels"] = self.reasoning_levels
         return settings
@@ -109,12 +114,16 @@ def _profile_from_data(name: str, raw: dict[str, Any]) -> ModelProfile:
         base_url = os.getenv(env_name, "").strip() or base_url
     if not base_url:
         raise ValueError(f"Model '{name}' is missing base_url")
+    context_window = _positive_optional_tokens(name, raw, "context_window")
+    auto_compact_token_limit = _positive_optional_tokens(name, raw, "auto_compact_token_limit")
     try:
-        context_limit = int(raw.get("context_limit", DEFAULT_CONTEXT_LIMIT))
+        context_limit = context_window or int(raw.get("context_limit", DEFAULT_CONTEXT_LIMIT))
     except (TypeError, ValueError) as exc:
         raise ValueError(f"Model '{name}' has invalid context_limit") from exc
     if context_limit <= 0:
         raise ValueError(f"Model '{name}' context_limit must be positive")
+    if auto_compact_token_limit is not None and auto_compact_token_limit > context_limit:
+        raise ValueError(f"Model '{name}' auto_compact_token_limit exceeds its context window")
 
     capabilities = raw.get("capabilities", [])
     if not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities):
@@ -136,6 +145,8 @@ def _profile_from_data(name: str, raw: dict[str, Any]) -> ModelProfile:
     return ModelProfile(
         base_url=base_url,
         context_limit=context_limit,
+        context_window=context_window,
+        auto_compact_token_limit=auto_compact_token_limit,
         provider=str(raw.get("provider", "openai-compatible")),
         api_key_env=str(raw.get("api_key_env", "LLM_API_KEY")),
         capabilities=frozenset(capabilities),
@@ -159,6 +170,15 @@ def _profile_from_data(name: str, raw: dict[str, Any]) -> ModelProfile:
 
 def _optional_float(value: Any) -> float | None:
     return None if value is None else float(value)
+
+
+def _positive_optional_tokens(name: str, raw: dict[str, Any], key: str) -> int | None:
+    value = raw.get(key)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"Model '{name}' {key} must be a positive integer")
+    return value
 
 
 def _repetition_penalty_parameter(value: Any) -> str | None:
@@ -273,7 +293,8 @@ def resolve_profile_key(value: str, profiles: dict[str, ModelProfile]) -> str:
     return matches[0] if len(matches) == 1 else value
 
 
-def prompt_token_budget(context_limit: int, max_tokens: int, *, model: str = "", provider: str = "") -> int:
+def prompt_token_budget(context_limit: int, max_tokens: int, *, model: str = "", provider: str = "",
+                        auto_compact_token_limit: int | None = None) -> int:
     """Return the token threshold at which proactive compression begins.
 
     GPT models and the Codex provider use the model window minus the output
@@ -285,6 +306,8 @@ def prompt_token_budget(context_limit: int, max_tokens: int, *, model: str = "",
     desired_reserve = max(8_192, int(max_tokens))
     reserve = desired_reserve if desired_reserve < limit else max(1, limit // 2)
     completion_safe_limit = max(1, limit - reserve)
+    if auto_compact_token_limit is not None:
+        return min(completion_safe_limit, max(1, int(auto_compact_token_limit)))
     model_id = model.strip().lower().rsplit("::", 1)[-1].rsplit("/", 1)[-1]
     if provider == "openai-codex" or model_id.startswith(("gpt-", "chatgpt-")):
         return completion_safe_limit

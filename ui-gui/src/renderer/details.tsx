@@ -8,17 +8,20 @@ import { RequestTimeline } from "./request-timeline.js";
 import { docPathFromTool } from "./doc-preview.js";
 import { pagePathFromTool } from "./page-state.js";
 import { ToolPreparation } from "./tool-preparation.js";
+import { changeSource, type ChangeSource, type ChangeTarget } from "./change-navigation.js";
 import { FilePreviewPanel } from "./file-preview-panel.js";
 
 export type Panel = "tools" | "changes" | "files" | "context" | "team" | "logs";
-export function Details({ state, panel, setPanel, selection, width, onWidth, close, fail, doc, onDocDismiss, openLog, wide, onWide, onAttach }: { wide?: boolean; onWide?: (wide: boolean) => void; onAttach?: (paths: string[]) => void; state: SessionState; panel: Panel; setPanel: (p: Panel) => void; selection: { index?: number; serial: number }; width: number; onWidth: (width: number) => void; close: () => void; fail: (e: unknown) => void; doc?: { path: string; serial: number }; onDocDismiss?: () => void; openLog?: (callId: string) => void }) {
+export function Details({ state, changeTarget, panel, setPanel, selection, width, onWidth, close, fail, doc, onDocDismiss, openLog, wide, onWide, onAttach }: { changeTarget?: ChangeTarget; wide?: boolean; onWide?: (wide: boolean) => void; onAttach?: (paths: string[]) => void; state: SessionState; panel: Panel; setPanel: (p: Panel) => void; selection: { index?: number; serial: number }; width: number; onWidth: (width: number) => void; close: () => void; fail: (e: unknown) => void; doc?: { path: string; serial: number }; onDocDismiss?: () => void; openLog?: (callId: string) => void }) {
   const content = useRef<HTMLDivElement>(null);
   const previewRequest = useRef(0);
   const locatedSelection = useRef("");
   const panelRef = useRef<HTMLElement>(null);
   const drag = useRef<{ x: number; width: number }>();
   const [changes, setChanges] = useState<any>();
-  const [turn, setTurn] = useState(1);
+  const [chosenChange, setChosenChange] = useState<{ serial?: number; source: ChangeSource }>();
+  const source = chosenChange && chosenChange.serial === changeTarget?.serial ? chosenChange.source : changeTarget?.source;
+  const [changeError, setChangeError] = useState("");
   const [file, setFile] = useState<number>();
   const [preview, setPreview] = useState<{ path: string; serial: number }>();
   useEffect(() => {
@@ -35,14 +38,17 @@ export function Details({ state, panel, setPanel, selection, width, onWidth, clo
   useEffect(() => {
     if (panel !== "changes" || state.status !== "ready") return;
     let cancelled = false;
-    void window.astra.query("changes", { turn, ...(file === undefined ? {} : { index: file }) }, state.id)
-      .then(result => { if (!cancelled) setChanges(result); }).catch(fail);
+    setChanges(undefined); setChangeError("");
+    void window.astra.query("changes", { ...(source ? { source } : { turn: 1 }), ...(file === undefined ? {} : { index: file }) }, state.id)
+      .then(result => { if (!cancelled) setChanges(result); })
+      .catch(error => { if (!cancelled) setChangeError(error instanceof Error ? error.message : String(error)); });
     return () => { cancelled = true; };
-  }, [panel, turn, file, state.id, state.mode, state.session, state.status, state.info.turn_changes]);
+  }, [panel, source?.session_id, source?.request_id, source?.turn_seq, file, state.id, state.mode, state.session, state.status, state.info.turn_changes]);
+  useEffect(() => { setFile(undefined); }, [changeTarget?.serial]);
   const openFile = (path: string) => { setPreview({path, serial: ++previewRequest.current}); };
   // Another session starts with nothing open. This runs before the effect below, so that a panel
   // opened by something the agent just wrote shows it instead of clearing it again.
-  useEffect(() => { previewRequest.current++; setFile(undefined); setTurn(1); setPreview(undefined); setChanges(undefined); }, [state.id, state.mode, state.session]);
+  useEffect(() => { previewRequest.current++; setFile(undefined); setChosenChange(undefined); setPreview(undefined); setChanges(undefined); }, [state.id, state.mode, state.session]);
   // Follow the document or page the agent is writing: each new result for it reloads it.
   useEffect(() => { if (doc && panel === "files") openFile(doc.path); }, [doc?.serial, doc?.path, panel, state.id]);
   const tabs = [{ id: "tools", label: "执行", icon: Terminal }, { id: "changes", label: "改动", icon: FileDiff }, { id: "files", label: "文件", icon: FolderOpen, FileText }, { id: "context", label: "上下文", icon: Layers }, { id: "team", label: "Team", icon: Users }, { id: "logs", label: "记录", icon: FileText }] as const;
@@ -77,10 +83,14 @@ export function Details({ state, panel, setPanel, selection, width, onWidth, clo
         {Object.values(state.processes).filter(p => p.kind !== "subagent" || !state.delegates[p.process_id]).map((p: UIEvent) => <details key={p.process_id} className="tool-detail"><summary>{p.label} · {statusLabel(p.status)}</summary><RawDetails value={p}/>{p.artifact_path && <button onClick={() => openFile(p.artifact_path)}>查看日志</button>}</details>)}
       </> : panel === "changes" ? <>
         <h3>文件改动</h3><p className="muted small">查看已完成回合的快照差异。</p>
-        {changes?.turns?.length ? <select value={turn} onChange={e => { setTurn(Number(e.target.value)); setFile(undefined); }}>{changes.turns.map((t: UIEvent, i: number) => <option key={t.turn_seq} value={i + 1}>回合 {t.turn_seq} · {t.files} 个文件{!t.available && !t.empty ? " · 快照已淘汰" : ""}</option>)}</select> : <p className="muted">还没有可查看的回合。</p>}
+        {changeError && <p className="error-text" role="alert">{changeError}</p>}
+        {changes?.turns?.length ? <select aria-label="选择改动回合" value={changes.turn} onChange={e => {
+          const record = changes.turns[Number(e.target.value) - 1];
+          setChosenChange({ serial: changeTarget?.serial, source: changeSource({ ...record, session_id: changes.source.session_id }) }); setFile(undefined);
+        }}>{changes.turns.map((t: UIEvent, i: number) => <option key={t.turn_seq} value={i + 1}>回合 {t.turn_seq} · {t.files} 个文件{!t.available && !t.empty ? " · 快照已淘汰" : ""}</option>)}</select> : <p className="muted">还没有可查看的回合。</p>}
         {changes?.record?.empty && <p className="muted">本回合没有净改动。</p>}
         {changes?.record && !changes.available && !changes.record.empty && <p className="muted">快照不可用或已淘汰，不代表没有改动。</p>}
-        {changes?.files?.map((f: UIEvent, i: number) => <button className={`file-row ${file === i ? "selected" : ""}`} key={i} onClick={() => setFile(i)}><FileDiff size={16}/><span>{f.display || f.path}{!f.confirmed && <small>未能确认 · {f.reason}</small>}</span><small>+{f.added ?? "?"} −{f.removed ?? "?"}</small></button>)}
+        {changes?.files?.map((f: UIEvent, i: number) => <button className={`file-row ${file === i ? "selected" : ""}`} key={i} onClick={() => { setChosenChange({ serial: changeTarget?.serial, source: changes.source }); setFile(i); }}><FileDiff size={16}/><span>{f.display || f.path}{!f.confirmed && <small>未能确认 · {f.reason}</small>}</span><small>+{f.added ?? "?"} −{f.removed ?? "?"}</small></button>)}
         {changes?.sides && <><p className="small muted">{changes.files[file!]?.reason || changes.files[file!]?.compare}</p><div className="diff">
           {changes.sides.binary ? <p>二进制内容不做文本比较。</p> : changes.sides.unified != null ? <pre className="unified">{changes.sides.unified.split('\n').map((line: string, i: number) => <span key={i} className={line.startsWith('+') ? 'added' : line.startsWith('-') ? 'removed' : line.startsWith('@@') ? 'hunk' : ''}>{line}{'\n'}</span>)}</pre> : <>
           <section><h4>修改前 · {changes.sides.before_state}</h4><pre>{changes.sides.before ?? (changes.sides.before_state === "absent" ? "文件不存在" : "无可用快照")}</pre></section><section><h4>修改后 · {changes.sides.after_state}</h4><pre>{changes.sides.after ?? (changes.sides.after_state === "absent" ? "文件不存在" : "无可用快照")}</pre></section></>}

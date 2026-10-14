@@ -31,7 +31,8 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d
         with:
           version: '0.11.27'
-          python-version: '3.12.14'
+          # Build host only; bundled Python is pinned separately in packaging/desktop-runtime.lock.json.
+          python-version: '3.11.15'
           enable-cache: true
           cache-dependency-glob: uv.lock
           download-from-astral-mirror: false
@@ -46,7 +47,7 @@ jobs:
           npm --prefix ui-gui run build
       - name: Distribution regression contracts
         run: |
-          uv run --no-sync python -m pytest -q tests/test_desktop_distribution.py tests/test_launcher_prerequisites.py
+          uv run --no-sync python -m pytest -q tests/test_desktop_distribution.py tests/test_desktop_packaged_backend.py tests/test_desktop_update_cleanup.py tests/test_launcher_prerequisites.py
           npm --prefix ui-gui test
       - name: Build native macOS helper
         if: runner.os == 'macOS'

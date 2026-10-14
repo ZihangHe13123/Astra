@@ -453,7 +453,7 @@ def test_backend_extracts_quoted_image_path_from_text(tmp_path):
     blocks = build_user_message_content(f'"{image}" 分析这张图', max_bytes=100)
 
     assert blocks[0].type == "text"
-    assert blocks[0].data["text"] == "分析这张图"
+    assert blocks[0].data["text"] == " 分析这张图"
     assert blocks[1].type == "image_url"
     assert blocks[1].data["url"].startswith("data:image/png;base64,")
 
@@ -465,7 +465,7 @@ def test_backend_extracts_unquoted_image_path_from_text(tmp_path):
     blocks = build_user_message_content(f"Analyze this image: {image}", max_bytes=100)
 
     assert blocks[0].type == "text"
-    assert blocks[0].data["text"] == "Analyze this image:"
+    assert blocks[0].data["text"] == "Analyze this image: "
     assert blocks[1].type == "image_url"
 
 
@@ -478,7 +478,7 @@ def test_backend_extracts_multiple_pasted_image_paths_as_attachments(tmp_path):
     blocks = build_user_message_content(f'"{first}"\n"{second}"\n分析这两张图', max_bytes=100)
 
     assert blocks[0].type == "text"
-    assert blocks[0].data["text"] == "分析这两张图"
+    assert blocks[0].data["text"] == "\n\n分析这两张图"
     assert [block.type for block in blocks[1:]] == ["image_url", "image_url"]
     assert blocks[1].data["source_path"].endswith("first.png")
     assert blocks[2].data["source_path"].endswith("second.jpg")

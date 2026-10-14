@@ -1,6 +1,7 @@
 import { connectionFlow, filterCommands, moveSelection, opensCommandInterface } from "./control-state.js";
 import { modelConnection } from "./model-connection.js";
 import { names } from "./command-help.js";
+import { approvalPreview } from "./approval-preview.js";
 import { approvalDecision, approvalKeyHint, typingIn } from "./approval-keys.js";
 import React, { useState } from "react";
 import { X, Check, ChevronRight, ExternalLink, LoaderCircle } from "lucide-react";
@@ -215,6 +216,7 @@ export function ModelSettings({ state, send, close, initialModelKey }: {
 export function Approval({ event, send, windowKeys = false }: { event: UIEvent; send: (c: UIEvent) => Promise<void>; windowKeys?: boolean }) {
   const [pending, setPending] = useState(false);
   const choices: string[] = event.choices || ["once", "session", "deny"];
+  const preview = approvalPreview(event);
   const decide = (decision: string) => {
     if (pending) return;
     setPending(true); void send({ type: "tool_approval_response", request_id: event.request_id, decision }).catch(() => setPending(false));
@@ -240,13 +242,16 @@ export function Approval({ event, send, windowKeys = false }: { event: UIEvent; 
     window.addEventListener("keydown", listener); return () => window.removeEventListener("keydown", listener);
   }, [windowKeys]);
   const mac = typeof navigator !== "undefined" && navigator.platform.includes("Mac");
-  return <section className="approval interactive-card" tabIndex={0} aria-label={`需要你的许可：${event.approval_title || event.tool_name}`} onKeyDown={e => {
+  return <section className="approval interactive-card" tabIndex={0} aria-label={`需要你的许可：${preview.title}`} onKeyDown={e => {
     const decision = approvalDecision(e.nativeEvent, { in: "card", onButton: e.target instanceof HTMLButtonElement }, choices);
     // Stopping here keeps Escape from also closing a side panel.
     if (decision) { e.preventDefault(); e.stopPropagation(); decide(decision); }
-  }}><span className="eyebrow">需要你的许可</span><h3>{event.approval_title || event.tool_name}</h3>
-    <p>{event.approval_question || event.reason}</p><pre>{event.approval_summary || event.detail || event.target || JSON.stringify(event.arguments, null, 2)}</pre>
-    {event.scope && <p className="small muted">范围：{event.scope}</p>}
+  }}><span className="eyebrow">需要你的许可</span><h3>{preview.title}</h3>
+    <p>{preview.explanationLabel}：{preview.explanation}</p>
+    {preview.summary && <p>{preview.summary}</p>}
+    <p className="small muted">{preview.targetLabel}</p><pre>{preview.target}</pre>
+    <dl className="approval-facts">{preview.facts.map(fact => <React.Fragment key={fact.label}><dt>{fact.label}</dt><dd>{fact.value}</dd></React.Fragment>)}</dl>
+    <details><summary>查看后端提供的审批详情</summary><pre>{preview.details}</pre></details>
     <div className="actions" ref={actions}>{choices.map((decision: string) => <button key={decision} disabled={pending} className={decision === "once" ? "primary" : ""} onClick={() => decide(decision)}>{({ once: "允许一次", session: "本会话允许", deny: "拒绝" } as Record<string, string>)[decision]}</button>)}</div>
     <p className="approval-keys small muted">{approvalKeyHint(choices, windowKeys, mac)}</p>
   </section>;
