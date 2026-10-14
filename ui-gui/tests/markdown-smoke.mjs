@@ -1,5 +1,5 @@
 /** Rich Markdown acceptance: real Electron and Python, isolated local model. */
-import { _electron as electron } from 'playwright';
+import { launchElectron } from './electron-launch.mjs';
 import { expect } from '@playwright/test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
@@ -87,7 +87,7 @@ let app, failure;
 const errors = [], cspErrors = [], externalRequests = [], failedFonts = [], checks = [];
 const passed = name => { checks.push(name); console.log('PASS', name); };
 try {
-  app = await electron.launch({ args: [join(root, 'ui-gui')], env, timeout: 30000 });
+  app = await launchElectron({ args: [join(root, 'ui-gui')], env, timeout: 30000 });
   const page = await app.firstWindow(); page.setDefaultTimeout(30000);
   page.on('pageerror', error => errors.push(error.message));
   page.on('console', message => { if (/content.security.policy|violates.*directive|refused to (?:load|execute)/i.test(message.text())) cspErrors.push(message.text()); });

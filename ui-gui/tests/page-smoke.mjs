@@ -1,5 +1,5 @@
 /** Pages in the desktop: real Electron/Python, a loopback model that writes page files, and a page that tries to get out. */
-import { _electron as electron } from 'playwright';
+import { launchElectron } from './electron-launch.mjs';
 import { expect } from '@playwright/test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
@@ -215,7 +215,7 @@ try {
   await new Promise(done => setTimeout(done, 100));
   assert.deepEqual(reached.splice(0), ['http GET /control', 'udp']);
 
-  app = await electron.launch({ args: [join(root, 'ui-gui')], env, timeout: 30000 });
+  app = await launchElectron({ args: [join(root, 'ui-gui')], env, timeout: 30000 });
   fixtureProcess = app.process();
   recordLifecycle({ event: 'launched', pid: fixtureProcess.pid });
   fixtureProcess.on('exit', (code, signal) => recordLifecycle({ event: 'process-exit', code, signal }));
