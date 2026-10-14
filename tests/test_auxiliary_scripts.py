@@ -7,6 +7,8 @@ import os
 import shutil
 import subprocess
 import sys
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -107,14 +109,20 @@ def test_windows_service_helpers_use_sibling_script_and_return_failure(
     (scripts / program).write_text(
         'param([string]$Action)\n'
         '$receipt = $env:ASTRA_WRAPPER_PHASES\n'
-        '[IO.File]::AppendAllText($receipt, "entered pid=$PID action=$Action utc=$([DateTime]::UtcNow.ToString(\'o\'))`n")\n'
+        'function Mark-Phase([string]$Name) {\n'
+        '  $ticks = [Diagnostics.Stopwatch]::GetTimestamp()\n'
+        '  [IO.File]::AppendAllText($receipt, "$Name pid=$PID utc=$([DateTime]::UtcNow.ToString(\'o\')) qpc=$ticks frequency=$([Diagnostics.Stopwatch]::Frequency) highres=$([Diagnostics.Stopwatch]::IsHighResolution)`n")\n'
+        '}\n'
+        'Mark-Phase "entered action=$Action"\n'
         '[Console]::OutputEncoding = [Text.UTF8Encoding]::new()\n'
-        '[IO.File]::AppendAllText($receipt, "before-json-stdout`n")\n'
+        'Mark-Phase "before-json-stdout"\n'
         '@{action=$Action; root=$PSScriptRoot; cwd=$PWD.Path} | ConvertTo-Json -Compress\n'
-        '[IO.File]::AppendAllText($receipt, "after-json-stdout`n")\n'
-        '[IO.File]::AppendAllText($receipt, "before-exit-29`n")\n'
+        'Mark-Phase "after-json-stdout"\n'
+        'Mark-Phase "before-exit-29"\n'
         'exit 29\n', encoding="utf-8",
     )
+    started_utc = datetime.now(UTC).isoformat()
+    started_perf = time.perf_counter()
     try:
         result = subprocess.run(
             _cmd(root / wrapper, ["status"]), cwd=tmp_path,
@@ -125,6 +133,9 @@ def test_windows_service_helpers_use_sibling_script_and_return_failure(
         def tail(value):
             return (value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value or "")[-4000:]
         diagnostics = {"wrapper": wrapper, "timeout_seconds": 20,
+                       "call_started_utc": started_utc,
+                       "exception_received_utc": datetime.now(UTC).isoformat(),
+                       "call_elapsed_seconds": time.perf_counter() - started_perf,
                        "phases": receipt.read_text(encoding="utf-8") if receipt.exists() else None,
                        "stdout_tail": tail(exc.output), "stderr_tail": tail(exc.stderr)}
         (tmp_path / "service-wrapper-timeout.json").write_text(

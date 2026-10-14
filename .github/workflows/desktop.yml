@@ -7,7 +7,7 @@ on:
         description: 'Bounded Windows diagnostics (default runs desktop acceptance)'
         type: choice
         default: none
-        options: [none, windows-page, windows-context-performance, windows-vector-snapshot, windows-vector-read-paths, windows-vector-clock, windows-vector-contention]
+        options: [none, windows-page, windows-context-performance, windows-vector-snapshot, windows-vector-read-paths, windows-vector-clock, windows-vector-contention, windows-service-wrappers]
 
 permissions:
   contents: read
@@ -141,9 +141,9 @@ jobs:
           if-no-files-found: warn
 
   context-performance:
-    if: github.repository == 'ZihangHe13123/Astra' && (inputs.investigation == 'windows-context-performance' || inputs.investigation == 'windows-vector-snapshot' || inputs.investigation == 'windows-vector-read-paths' || inputs.investigation == 'windows-vector-clock' || inputs.investigation == 'windows-vector-contention')
+    if: github.repository == 'ZihangHe13123/Astra' && (inputs.investigation == 'windows-context-performance' || inputs.investigation == 'windows-vector-snapshot' || inputs.investigation == 'windows-vector-read-paths' || inputs.investigation == 'windows-vector-clock' || inputs.investigation == 'windows-vector-contention' || inputs.investigation == 'windows-service-wrappers')
     runs-on: windows-2025
-    timeout-minutes: 20
+    timeout-minutes: ${{ inputs.investigation == 'windows-service-wrappers' && 30 || 20 }}
     defaults:
       run:
         shell: bash
@@ -168,7 +168,7 @@ jobs:
           mkdir -p output/context-index-windows
           git rev-parse HEAD > output/context-index-windows/source-sha.txt
       - name: Diagnose cold vector snapshots
-        if: inputs.investigation != 'windows-vector-read-paths' && inputs.investigation != 'windows-vector-clock' && inputs.investigation != 'windows-vector-contention'
+        if: inputs.investigation == 'windows-context-performance' || inputs.investigation == 'windows-vector-snapshot'
         id: snapshot_probe
         continue-on-error: true
         run: uv run --no-sync python scripts/probe_vector_snapshot_performance.py --output=output/context-index-windows/snapshot-probe --rounds=6
@@ -187,6 +187,11 @@ jobs:
         id: contention_probe
         continue-on-error: true
         run: uv run --no-sync python scripts/probe_vector_decode_contention.py --output=output/context-index-windows/contention-probe --require-current
+      - name: Diagnose service wrapper startup and pipe completion
+        if: inputs.investigation == 'windows-service-wrappers'
+        id: wrapper_probe
+        continue-on-error: true
+        run: uv run --no-sync python scripts/probe_service_wrapper_timing.py --output=output/context-index-windows/wrapper-probe
       - name: Diagnose warm vector search
         if: inputs.investigation == 'windows-context-performance'
         id: search_probe
@@ -201,7 +206,7 @@ jobs:
         run: |
           uv run --no-sync python -m pytest -q -s tests/test_context_index*.py --junitxml=output/context-index-windows/pytest.xml | tee output/context-index-windows/results.log
       - name: Keep diagnostic failures visible
-        if: always() && (steps.snapshot_probe.outcome == 'failure' || steps.search_probe.outcome == 'failure' || steps.read_paths_probe.outcome == 'failure' || steps.clock_probe.outcome == 'failure' || steps.contention_probe.outcome == 'failure')
+        if: always() && (steps.snapshot_probe.outcome == 'failure' || steps.search_probe.outcome == 'failure' || steps.read_paths_probe.outcome == 'failure' || steps.clock_probe.outcome == 'failure' || steps.contention_probe.outcome == 'failure' || steps.wrapper_probe.outcome == 'failure')
         run: exit 1
       - name: Preserve every performance observation
         if: always()
