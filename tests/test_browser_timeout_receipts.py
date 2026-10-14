@@ -185,9 +185,13 @@ def test_consecutive_invocations_do_not_reuse_timeout_state(tmp_path):
 def test_nested_registry_calls_restore_parent_slot(tmp_path, browser_outer):
     async def scenario():
         registry, backend = await setup(tmp_path)
+        # Test nested scope restoration with room for storage and scheduling
+        # overhead between the inner and outer deadlines on slower runners.
+        inner_timeout, outer_timeout = 0.1, 2.0
+        registry.get("browser_fill").timeout = outer_timeout if browser_outer else inner_timeout
         inner_results = []
         if browser_outer:
-            register_wait(registry)
+            register_wait(registry, timeout=inner_timeout)
 
             async def action(*args, **kwargs):
                 backend.writes += 1
@@ -196,6 +200,7 @@ def test_nested_registry_calls_restore_parent_slot(tmp_path, browser_outer):
 
             backend.interactive_fill = action
             result = await registry.execute("browser_fill", arguments("fill"))
+            assert len(inner_results) == 1, "inner timeout must complete before the outer deadline"
             assert_generic_timeout(inner_results[0])
             assert_receipt(result, "fill", True)
         else:
@@ -203,8 +208,9 @@ def test_nested_registry_calls_restore_parent_slot(tmp_path, browser_outer):
                 inner_results.append(await registry.execute("browser_fill", arguments("fill")))
                 await asyncio.Event().wait()
 
-            register_wait(registry, "outer", timeout=0.3, fn=outer)
+            register_wait(registry, "outer", timeout=outer_timeout, fn=outer)
             result = await registry.execute("outer", {})
+            assert len(inner_results) == 1, "inner timeout must complete before the outer deadline"
             assert_generic_timeout(result)
             assert_receipt(inner_results[0], "fill", True)
         assert backend.writes == 1
