@@ -79,5 +79,6 @@ jobs:
           path: |
             output/playwright/
             ${{ runner.temp }}/astra-desktop-smoke-*/logs/gui-backend-*.log
+            ${{ runner.temp }}/astra-page-*/logs/gui-backend-*.log
           retention-days: 7
           if-no-files-found: warn
