@@ -967,13 +967,14 @@ def _start_question_protocol_backend(
         env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(repo_root), env.get("PYTHONPATH", "")]))
     # Startup diagnostics must be drained too: a full stderr pipe can prevent
     # a child from ever publishing model_info. Keep a bounded tail for failures.
-    diagnostic_bootstrap = (
-        "import faulthandler, runpy\n"
-        "faulthandler.dump_traceback_later(10, repeat=True)\n"
+    # A watchdog dumps stacks concurrently with imports and changes the child
+    # under test. Keep periodic tracing in explicit bootstrap_code diagnostics.
+    child_bootstrap = (
+        "import runpy\n"
         + (bootstrap_code or "runpy.run_module('agent.cli.backend', run_name='__main__')")
     )
     proc = subprocess.Popen(
-        [sys.executable, "-c", diagnostic_bootstrap],
+        [sys.executable, "-c", child_bootstrap],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -1069,6 +1070,31 @@ def test_protocol_fixture_keeps_startup_failure_diagnostics(tmp_path: Path):
             assert "fixture startup failure" in str(exc)
         else:
             raise AssertionError("The failed backend must not be considered ready")
+    finally:
+        _stop_protocol_backend(proc)
+
+
+def test_protocol_fixture_does_not_schedule_a_traceback_watchdog(tmp_path: Path):
+    hook = tmp_path / "startup-hook"
+    hook.mkdir()
+    (hook / "sitecustomize.py").write_text(
+        "import faulthandler\n"
+        "def reject_watchdog(*args, **kwargs):\n"
+        "    raise RuntimeError('unsolicited traceback watchdog')\n"
+        "faulthandler.dump_traceback_later = reject_watchdog\n",
+        encoding="utf-8",
+    )
+    bootstrap = (
+        "import json, sys\n"
+        "print(json.dumps({'type': 'model_info'}), flush=True)\n"
+        "sys.stdin.readline()\n"
+    )
+    proc, _, _, wait_for = _start_question_protocol_backend(
+        tmp_path, 9, "no-watchdog", bootstrap_code=bootstrap,
+        env_overrides={"PYTHONPATH": str(hook)},
+    )
+    try:
+        wait_for(lambda event: event.get("type") == "model_info", timeout=3)
     finally:
         _stop_protocol_backend(proc)
 
