@@ -16,7 +16,7 @@ MEMORY_USAGE = (
     "  /memory review [query]   # discuss evidence and proposed corrections\n"
     "  /memory remember <text>\n"
     "  /memory remember-user <text>\n"
-    "  /memory working <goal|plan|progress|constraints|open_items|artifacts|notes> <text>\n"
+    "  /memory working <temporary_constraints|open_questions|assumptions|turn_notes> <text>\n"
     "  /memory inspect [query|id]\n"
     "  /memory timeline <id>\n"
     "  /memory validate-core\n"

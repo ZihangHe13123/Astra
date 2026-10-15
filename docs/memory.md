@@ -10,9 +10,12 @@ Astra keeps a small core memory, searchable history and reusable skills. Each ha
 
 Core memory is global and intentionally small. `MEMORY.md` and `USER.md` are
 the direct always-injected sources of truth, not mirrors of SQLite records.
-They use fixed hard limits and are added to temporary context for the current turn;
-the persisted user message remains unchanged. Core Markdown currently has no
-project-folder scope.
+They use fixed hard limits. In Work mode they reach the model as a separate
+standing-memory copy, sent once and again only when either file changes, so
+they are not repeated in every turn's context and an edit shows on the next
+turn; restricted modes add them to the current turn's context. The persisted
+user message remains unchanged. Core Markdown currently has no project-folder
+scope.
 
 Durable execution uses `TaskRun → Step/TaskEvent` in `.astra/tasks.db`.
 Every request receives an independent TaskRun with checkpoints, tool results,
@@ -60,16 +63,19 @@ characters per turn. Project/configuration questions can match local
 observations without requiring the user to say “remember”; trivial turns,
 slash commands, and unrelated questions skip automatic recall. SQLite FTS5 is
 used when available, with deterministic substring fallback for Chinese text.
+Nothing currently adds new structured records except a correction, which
+supersedes the record it corrects; existing records stay searchable.
 
 Personal facts and corrections are written through the model's memory tools or
 explicit `/memory` commands. Astra does not turn conversation sentences into facts
 using patterns such as “I like”, “remember”, or “change to”. Optional tool-authored
 retention is off by default (`MEMORY_AUTO_RETAIN=0`); enabling it admits only tools
-that explicitly provide attributable evidence from successful calls. Diagnostics
+that explicitly provide attributable evidence from successful calls, and no current
+tool provides it, so enabling it records nothing yet. Diagnostics
 show the active runtime setting. Old `conservative` / `evolving` mode values still
 load, but both use this restricted tool-evidence policy.
 
-Background memory maintenance only expires explicit deadlines and retires exact
+Memory maintenance, run by `/compress` and when Astra exits, only expires explicit deadlines and retires exact
 observation duplicates with matching provenance, scope and lifetime. It preserves
 the original records, does not increase confidence for repetition, and does not
 promote temporary episodes into permanent facts. Existing memories are not
@@ -79,7 +85,9 @@ explicit literals and code identifiers still constrain matching results.
 
 Hindsight is an optional federated semantic-recall enhancement. When enabled,
 its results are merged with the authoritative builtin store; when disabled or
-unavailable, builtin retention and recall continue locally. Current user
+unavailable, builtin retention and recall continue locally. A slow service is
+cut off inside the interactive recall budget (`HINDSIGHT_INTERACTIVE_RECALL_TIMEOUT`,
+2.5 s) without losing the builtin results. Current user
 statements, Core Markdown, concrete TaskRun results, Goal state, and temporary
 conversation state always take precedence over recalled records.
 
@@ -114,9 +122,11 @@ cursor progress, protections and undo.
 ```
 
 The model can use the `memory` tool to maintain the same stores. Credential-like
-content is rejected. `MEMORY.md` defaults to 2,200 characters and `USER.md` to
-1,375 characters. Core additions do not require approval; model-initiated
-deletion is blocked until the user explicitly runs `/memory forget <id>`.
+content is rejected. `MEMORY.md` is limited to 2,200 characters and `USER.md` to
+1,375 characters. Core additions and removals do not require approval; the model
+is told to remove a core entry only when you ask, or when a file is full and the
+entry is obsolete, duplicated or superseded. Structured records are forgotten only
+through `/memory forget <id>` or a deletion you select in `/memory review`.
 
 ## Proactive Context Index
 
@@ -125,7 +135,9 @@ pipeline**. Query planning, reciprocal-rank fusion (RRF), diversity selection
 (MMR), evidence budgets, and feedback all run in Astra's Python components.
 It requires no external memory framework, memory server, graph database, or
 auxiliary LLM. Existing embedding backends remain optional. It is **off by
-default**, and ordinary Markdown core memory stays unchanged.
+default**, and ordinary Markdown core memory stays unchanged. In `session` and
+`all` modes it also takes over automatic recall of structured records from the
+builtin router (Hindsight's automatic merge included).
 
 ```text
 /context-index session   # Astra's local records and session history
