@@ -8,6 +8,7 @@ import pytest
 from agent.runtime import activity_store
 from agent.runtime.context_index import embedder as embedder_module
 from agent.runtime.context_index import sqlite_reader
+from agent.runtime.context_index.lexical import LexicalQuery
 from agent.runtime.context_index.activity_source import ActivityRecommendationReader
 from agent.runtime.context_index.models import SourceLocator
 from agent.runtime.context_index.workspace import WorkspaceIdentity
@@ -415,6 +416,30 @@ def test_like_fallback_rejects_single_term_overlap(tmp_path: Path) -> None:
     # "bb" 短词触发 LIKE 回退分支；仅 "ranking" 一词重叠 → 2-of-N 应拒。
     result = ActivityRecommendationReader(path).recommend("ranking bb", WORKSPACE, NOW)
     assert not any(row.locator.primary == "seg-like-one" for row in result.relevance)
+
+
+def test_one_short_term_scans_within_long_term_postings_without_losing_hits(tmp_path: Path) -> None:
+    # One short term among several cannot meet two-of-N alone, so every valid row
+    # contains a long term: the long terms' index narrows the literal scan losslessly.
+    query = "ci runner deadline"
+    assert sum(len(term) < 3 for term in LexicalQuery.from_text(query).terms) == 1
+    path = tmp_path / "short-term-prefilter.sqlite3"
+    connection = _create_activity_database(path)
+    for number, (segment, title) in enumerate((
+        ("seg-short-and-long", "ci runner logs"),
+        ("seg-two-long", "runner deadline missed"),
+        ("seg-short-only", "ci dashboard"),
+        ("seg-unrelated", "weekly planning notes"),
+    ), 1):
+        _add_event(connection, segment, number, seconds_before_now=10 * number,
+                   window_title=title, searchable_text=title)
+    connection.commit()
+    connection.close()
+
+    result = ActivityRecommendationReader(path).recommend(query, WORKSPACE, NOW)
+    identities = {row.locator.primary for row in result.relevance}
+    assert {"seg-short-and-long", "seg-two-long"} <= identities
+    assert not identities & {"seg-short-only", "seg-unrelated"}
 
 
 def test_embedding_channel_contributes_semantic_candidates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

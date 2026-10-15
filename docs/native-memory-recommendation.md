@@ -283,9 +283,12 @@ views, and the worker synchronizes and clears scratch buffers even on failure.
 is set to zero. The 6 GiB `set_memory_limit` is a scheduling guideline that MLX
 can exceed, not a hard memory guarantee.
 
-Active clients heartbeat every 30 seconds. Once all clients pause/exit, the
-worker exits after about 90 idle seconds. Lost workers recover during client
-maintenance; a current request falls back immediately if no endpoint is ready.
+Active clients check the worker every 30 seconds, but only an encode request
+counts as use: after `ASTRA_EMBEDDING_IDLE_SECONDS` (default 900, at least 60)
+without one, the worker exits and releases the model, also while Astra keeps
+running. Loading never counts as idle. The next encode request (a query, or the
+indexer after new messages) starts it again in the background; that request,
+like any request when no endpoint is ready, falls back to text immediately.
 Restart pre-update Astra sessions to release their old process-local models.
 See [platform runtime controls](context-index-platforms.md#macos) for status and
 explicit stop commands.

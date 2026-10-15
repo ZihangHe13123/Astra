@@ -10,7 +10,7 @@ from __future__ import annotations
 from .context_compressor import _is_synthetic_user_turn
 
 _NON_EVIDENCE = frozenset({
-    "context_inspect", "context_open", "session_search", "session_read",
+    "context_inspect", "context_open", "session_search",
     "session_recall", "memory", "memory_search", "memory_fetch", "activity_search",
     "activity_read", "skills_list", "skill_view", "skill_manage", "learning",
     "learning_search", "project_verifier_init", "conclave", "delegate", "skill_review_snapshot", "skill_review_apply",

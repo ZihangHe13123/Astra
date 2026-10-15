@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ from agent.runtime.memory_provider import (
     BuiltinMemoryProvider,
     FederatedMemoryProvider,
 )
+from agent.runtime.memory_router import MemoryRouter
 from agent.runtime.react import ReActAgent
 from agent.runtime.tools.hindsight import register_hindsight_tools
 from agent.runtime.tools.registry import ToolRegistry
@@ -121,6 +123,28 @@ def test_federated_provider_preserves_builtin_when_external_fails(tmp_path):
     assert "TimeoutError" in provider.last_external_error
 
 
+def test_slow_external_recall_keeps_builtin_results_within_the_interactive_budget(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db", core_dir=tmp_path / "memory")
+    expected = store.add_record(kind="preference", content="User prefers concise answers",
+                                source_session_id="session-a")
+
+    class SlowExternal(HindsightMemoryProvider):
+        async def recall(self, query, *, kinds=(), limit=8):
+            await asyncio.sleep(10)
+            return []
+
+    external = SlowExternal(base_url="http://127.0.0.1:8888", bank_id="main-v2", client=FakeRecallClient())
+    provider = FederatedMemoryProvider(BuiltinMemoryProvider(store), external, external_timeout=0.05)
+    router = MemoryRouter(provider, store, recall_timeout=0.3)
+
+    started = time.monotonic()
+    pack = asyncio.run(router.build_context("remember my preference for concise answers", session_id="s"))
+    assert time.monotonic() - started < 1
+    assert [record.record_id for record in pack.recalled] == [expected.record_id]
+    assert pack.trace.decision == "recalled"
+    assert "TimeoutError" in provider.last_external_error
+
+
 def test_federated_provider_keeps_builtin_first_and_deduplicates(tmp_path):
     store = MemoryStore(tmp_path / "memory.db", core_dir=tmp_path / "memory")
     builtin = store.add_record(
@@ -191,6 +215,7 @@ def test_react_federates_builtin_authority_with_optional_hindsight(tmp_path, mon
     assert isinstance(router.provider.authority, BuiltinMemoryProvider)
     assert agent.external_memory_provider is router.provider.external
     assert router.recall_timeout == 2.5
+    assert router.provider.external_timeout == 2.25
     assert {
         "hindsight_retain",
         "hindsight_recall",

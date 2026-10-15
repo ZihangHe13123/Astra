@@ -546,8 +546,11 @@ def test_react_prompt_reinjects_memory_after_compression_without_mutating_contex
     prompt, _ = asyncio.run(agent._prepare_prompt_for_llm("hello", FakeLLM.estimate_tokens))
     assert compressed is True
     assert compaction_estimates and all(value == FakeLLM.estimate_tokens(prompt) for value in compaction_estimates)
-    # Memory is a separate replayable snapshot, never injected into user text.
-    assert "Prefer evidence-backed answers" in prompt[-1]["content"]
+    # Memory is a separate replayable snapshot, never injected into user text: core
+    # memory in its standing-memory copy, conversation state in the turn context.
+    assert prompt[-2]["content"].startswith("[SYSTEM-SUPPLIED STANDING MEMORY")
+    assert "Prefer evidence-backed answers" in prompt[-2]["content"]
+    assert "Prefer evidence-backed answers" not in prompt[-1]["content"]
     assert "Verify prompt injection" in prompt[-1]["content"]
     assert prompt[-1]["content"].count("<agent-memory>") == 1
     assert prompt[1]["content"].endswith("hello")

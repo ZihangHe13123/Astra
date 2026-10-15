@@ -20,10 +20,12 @@ There is no extra package dependency.
 Boot warmup or explicitly enabling recommendation may start it when a vector
 file exists; explicit index preparation may start it without a vector file.
 Query encoding never spawns it or waits for model loading. Busy/unavailable
-workers return text fallback. Active clients send a heartbeat every 30 seconds;
-closing them or using `/context-index off` ends their heartbeat. After about
-90 seconds without clients or encoding, the worker exits and releases the model.
-Clients recover a lost worker in the background, outside query handling.
+workers return text fallback. Active clients check the worker every 30 seconds,
+but only encoding counts as use: after `ASTRA_EMBEDDING_IDLE_SECONDS` (default
+900, at least 60) without an encode request, the worker exits and releases the
+model, even while Astra runs. The next encode request restarts it in the
+background, outside query handling; that request uses text fallback. The first
+turn after a long pause therefore has no semantic channel.
 
 The private endpoint/token file defaults to `~/.astra/embedding-runtime`, with
 an override in `ASTRA_EMBEDDING_RUNTIME_DIR`. Using different directories creates

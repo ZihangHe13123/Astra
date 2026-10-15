@@ -17,7 +17,7 @@ from .token_estimator import estimate_value_tokens
 from .persona import PersonaState, parse_persona_metadata
 from .prompts import get_prompt_profile, is_legacy_persona_prompt, normalize_system_prompt
 from .system_prompt_projection import SystemPromptProjection
-from .runtime_context_projection import RuntimeContextProjection
+from .runtime_context_projection import RuntimeContextProjection, StandingMemoryProjection, history_anchors
 from .system_suffix import split_legacy_suffix
 from .time_utils import needs_relative_date_anchor, relative_date_anchor, relative_date_metadata, weekday_label
 
@@ -332,6 +332,8 @@ class AgentContext:
     guidance_snapshot: dict = field(default_factory=dict, init=False, repr=False)
     system_projection: SystemPromptProjection = field(default_factory=SystemPromptProjection, init=False, repr=False)
     runtime_projection: RuntimeContextProjection = field(default_factory=RuntimeContextProjection, init=False, repr=False)
+    # Core memory, sent once and again only when it changes (not inside every turn snapshot).
+    memory_projection: StandingMemoryProjection = field(default_factory=StandingMemoryProjection, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.max_prompt_tokens == 100_000:
@@ -370,6 +372,7 @@ class AgentContext:
         self.guidance_snapshot = {}
         self.system_projection.reset()
         self.runtime_projection.reset()
+        self.memory_projection.reset()
         self._session_path = path
         self._session_lease = lease
         self._session_store = store
@@ -534,6 +537,7 @@ class AgentContext:
             "system_prompt_migration": self._system_prompt_migration,
             "system_prompt_projection": self.system_projection.state,
             "runtime_context_projection": self.runtime_projection.state,
+            "standing_memory_projection": self.memory_projection.state,
             "persona_id": self.persona_id,
             "persona_definition_version": self.persona_definition_version,
             "persona_state_revision": self.persona_state_revision,
@@ -559,6 +563,7 @@ class AgentContext:
         candidate = copy.copy(self)
         candidate.system_projection = copy.deepcopy(self.system_projection)
         candidate.runtime_projection = copy.deepcopy(self.runtime_projection)
+        candidate.memory_projection = copy.deepcopy(self.memory_projection)
         candidate.messages = []
         candidate._message_token_costs = []
         candidate.compressor = None  # never reset the live compressor in preview
@@ -590,6 +595,7 @@ class AgentContext:
                 raw, validate=lambda message: hydrate_content(message.get("content"), self.session_path))
             self.system_projection = SystemPromptProjection(data.get("system_prompt_projection"))
             self.runtime_projection = RuntimeContextProjection(data.get("runtime_context_projection"))
+            self.memory_projection = StandingMemoryProjection(data.get("standing_memory_projection"))
             guidance = data.get("guidance_snapshot")
             self.guidance_snapshot = copy.deepcopy(guidance) if isinstance(guidance, dict) else {}
             migration = data.get("system_prompt_migration")
@@ -765,6 +771,7 @@ class AgentContext:
         *,
         runtime_context: str | None = None,
         include_runtime_context: bool = True,
+        standing_memory: str | None = None,
     ) -> list[dict]:
         """Build provider context with optional non-canonical message content.
 
@@ -778,7 +785,7 @@ class AgentContext:
         effective_system = self.effective_system_prompt
         if effective_system:
             result.append({"role": "system", "content": effective_system})
-        inserts = self.runtime_projection.project(self.messages, runtime_context) if include_runtime_context else {}
+        inserts = self._projection_inserts(runtime_context, standing_memory) if include_runtime_context else {}
         result.extend(inserts.get(0, []))
         for index, stored in enumerate(self.messages):
             override = _NO_OVERRIDE
@@ -789,10 +796,19 @@ class AgentContext:
             result.extend(inserts.get(index + 1, []))
         return result
 
+    def _projection_inserts(
+        self, runtime_context: str | None = None, standing_memory: str | None = None,
+    ) -> dict[int, list[dict]]:
+        """Both snapshot streams; at one anchor the standing memory comes first."""
+        anchors = history_anchors(self.messages) if self.messages else {}
+        memory = self.memory_projection.project(self.messages, standing_memory, anchors=anchors)
+        turn = self.runtime_projection.project(self.messages, runtime_context, anchors=anchors)
+        return {after: [*memory.get(after, []), *turn.get(after, [])] for after in sorted({*memory, *turn})}
+
     def _runtime_context_tokens(self) -> int:
         return sum(
             _estimate_value_tokens(message)
-            for items in self.runtime_projection.project(self.messages).values()
+            for items in self._projection_inserts().values()
             for message in items
         )
 
@@ -873,6 +889,7 @@ class AgentContext:
         self.guidance_snapshot = {}
         self.system_projection.reset()
         self.runtime_projection.reset()
+        self.memory_projection.reset()
         self.messages.clear()
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
@@ -947,6 +964,7 @@ class AgentContext:
         # Superseded runtime snapshots are useful only for prefix reuse. Retire
         # them under budget pressure before sacrificing canonical conversation.
         changed = self.runtime_projection.compact(self.messages)
+        changed = self.memory_projection.compact(self.messages) or changed
         if changed:
             report["method"] = "cleanup"
             if not force and measure_tokens() <= target_tokens:

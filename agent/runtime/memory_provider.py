@@ -83,9 +83,13 @@ class FederatedMemoryProvider(MemoryProvider):
 
     name = "federated-memory"
 
-    def __init__(self, authority: MemoryProvider, external: MemoryProvider):
+    def __init__(self, authority: MemoryProvider, external: MemoryProvider, *,
+                 external_timeout: float | None = None):
         self.authority = authority
         self.external = external
+        # A slow external service must not take the builtin results with it: it gets
+        # its own deadline inside the caller's interactive budget.
+        self.external_timeout = external_timeout
         self.capabilities = MemoryProviderCapabilities(
             recall=authority.capabilities.recall or external.capabilities.recall,
             retain=authority.capabilities.retain,
@@ -102,9 +106,12 @@ class FederatedMemoryProvider(MemoryProvider):
         kinds: Iterable[str] = (),
         limit: int = 8,
     ) -> list[MemoryRecord]:
+        external_recall = self.external.recall(query, kinds=kinds, limit=limit)
+        if self.external_timeout is not None:
+            external_recall = asyncio.wait_for(external_recall, timeout=self.external_timeout)
         authority_result, external_result = await asyncio.gather(
             self.authority.recall(query, kinds=kinds, limit=limit),
-            self.external.recall(query, kinds=kinds, limit=limit),
+            external_recall,
             return_exceptions=True,
         )
         if isinstance(authority_result, BaseException):

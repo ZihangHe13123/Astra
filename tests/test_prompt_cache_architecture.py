@@ -55,11 +55,12 @@ def test_stable_system_suffix_survives_legacy_session_restore(tmp_path: Path):
 def test_react_freezes_turn_context_and_system_prefix_across_tool_iterations():
     class FakePack:
         trace = SimpleNamespace(record_ids=())
+        core = ""
 
         def __init__(self, marker: str):
             self.marker = marker
 
-        def render(self, recall_char_limit: int):
+        def render(self, recall_char_limit: int, include_core: bool = True):
             return f"<agent-memory>{self.marker}</agent-memory>"
 
     class ChangingRouter:
@@ -151,8 +152,9 @@ def test_react_freezes_turn_context_and_system_prefix_across_tool_iterations():
 def test_context_index_coexists_with_memory_router_in_one_frozen_snapshot():
     class Pack:
         trace = SimpleNamespace(record_ids=())
+        core = ""
 
-        def render(self, recall_char_limit: int):
+        def render(self, recall_char_limit: int, include_core: bool = True):
             return "<agent-memory>remembered</agent-memory>"
 
     class Router:

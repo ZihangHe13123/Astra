@@ -95,8 +95,9 @@ class ContextPack:
     recalled: tuple[MemoryRecord, ...]
     trace: MemoryRecallTrace
 
-    def render(self, *, recall_char_limit: int = 2400) -> str:
-        blocks = [block for block in (self.core, self.working, self.task) if block]
+    def render(self, *, recall_char_limit: int = 2400, include_core: bool = True) -> str:
+        # Work mode sends core memory as its own standing-memory stream instead.
+        blocks = [block for block in (self.core if include_core else "", self.working, self.task) if block]
         if self.recalled:
             lines = [
                 "<retrieved-memory>",

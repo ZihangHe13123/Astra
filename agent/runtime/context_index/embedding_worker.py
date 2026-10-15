@@ -13,6 +13,7 @@ import time
 
 from ..instance_lock import InstanceAlreadyRunning, InstanceLock
 from .embedding_runtime import MAX_BODY, PROTOCOL, identity, runtime_directory, state_path
+from .embedding_runtime import idle_seconds as configured_idle_seconds
 
 
 class Worker:
@@ -32,6 +33,13 @@ class Worker:
             self.state = "ready"
         except Exception:
             self.state = "failed"
+        finally:
+            # Idle time counts from the end of loading (a first load may download weights).
+            self.last_use = time.monotonic()
+
+    def idle(self) -> bool:
+        return (self.state != "loading" and not self.encoding.locked()
+                and time.monotonic() - self.last_use > self.idle_seconds)
 
     def health(self) -> dict:
         stats = getattr(self.backend, "memory_stats", lambda: {})() if self.state == "ready" else {}
@@ -60,7 +68,8 @@ class Worker:
                 if not hmac.compare_digest(self.headers.get("Authorization", ""), "Bearer " + worker.token):
                     self.reply(403, {"state": "unauthorized"})
                     return False
-                worker.last_use = time.monotonic()
+                # Only an encode is use: clients check health every 30 s while they
+                # run, which would otherwise keep the model loaded indefinitely.
                 return True
 
             def do_GET(self) -> None:
@@ -120,7 +129,7 @@ class Worker:
         return Handler
 
 
-def serve(directory: Path, backend, *, idle_seconds: float = 90) -> int:
+def serve(directory: Path, backend, *, idle_seconds: float | None = None) -> int:
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = state_path(directory)
     owner = InstanceLock(path.with_suffix(".lock"))
@@ -130,7 +139,7 @@ def serve(directory: Path, backend, *, idle_seconds: float = 90) -> int:
         return 0
     server = None
     try:
-        worker = Worker(backend, idle_seconds=idle_seconds)
+        worker = Worker(backend, idle_seconds=configured_idle_seconds() if idle_seconds is None else idle_seconds)
         server = ThreadingHTTPServer(("127.0.0.1", 0), worker.handler())
         server.daemon_threads = True
         server.timeout = 1
@@ -144,7 +153,7 @@ def serve(directory: Path, backend, *, idle_seconds: float = 90) -> int:
         threading.Thread(target=worker.load, name="astra-embedding-model", daemon=True).start()
         while not worker.stop.is_set():
             server.handle_request()
-            if not worker.encoding.locked() and time.monotonic() - worker.last_use > idle_seconds:
+            if worker.idle():
                 break
         return 0
     finally:

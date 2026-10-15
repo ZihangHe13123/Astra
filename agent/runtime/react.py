@@ -272,19 +272,19 @@ class ReActAgent(AgentBase):
             from .memory_router import MemoryRouter
 
             recall_provider = builtin_memory_provider
+            recall_timeout = self._float_env("HINDSIGHT_INTERACTIVE_RECALL_TIMEOUT", 2.5)
             if self.external_memory_provider is not None:
                 recall_provider = FederatedMemoryProvider(
                     builtin_memory_provider,
                     self.external_memory_provider,
+                    # Ends before the whole recall's budget, so builtin results survive.
+                    external_timeout=max(0.05, recall_timeout - 0.25),
                 )
             self.memory_router = MemoryRouter(
                 recall_provider,
                 memory_store,
                 task_store,
-                recall_timeout=self._float_env(
-                    "HINDSIGHT_INTERACTIVE_RECALL_TIMEOUT",
-                    2.5,
-                ),
+                recall_timeout=recall_timeout,
             )
         else:
             self.memory_router = None
@@ -355,6 +355,8 @@ class ReActAgent(AgentBase):
         self._memory_turn_key = ""
         self._turn_context_key = ""
         self._turn_context_block = ""
+        # Work mode: core memory, sent by the context's standing-memory stream (see get_prompt).
+        self._standing_memory_block = ""
         self._last_ended_session: str | None = None
         append_approval_audit = self.context.append_approval_audit
 
@@ -2393,8 +2395,10 @@ class ReActAgent(AgentBase):
                 None,
             )
         cache_key = self._memory_turn_key or f"turn:{current_user_index}"
+        work_mode = self.tool_allowlist is None and not self.minimal_mode
         if cache_key != self._turn_context_key:
             blocks = []
+            standing_memory = ""
             context_index_broker = getattr(self, "context_index_broker", None)
             native_index = bool(
                 context_index_broker is not None
@@ -2425,14 +2429,22 @@ class ReActAgent(AgentBase):
                         if memory_span is not None and memory_ids:
                             memory_span.set_attribute("agent.memory_id", memory_ids)
                             memory_span.set_attribute("agent.memory.count", len(pack.trace.record_ids))
-                    memory_block = pack.render(recall_char_limit=self.memory_router.recall_char_limit)
+                    memory_block = pack.render(
+                        recall_char_limit=self.memory_router.recall_char_limit, include_core=not work_mode,
+                    )
+                    if work_mode:
+                        standing_memory = pack.core
                     if getattr(context_index_broker, "native_memory", False):
                         task_text = pack.task
                         active_memory_text = "\n".join((pack.core, pack.working, pack.task))
                     if memory_block:
                         blocks.append(memory_block)
                 elif self.memory_store is not None:
-                    memory_block = self.memory_store.format_prompt(session_id)
+                    if work_mode:
+                        standing_memory = self.memory_store.format_core_prompt()
+                        memory_block = self.memory_store.format_working_prompt(session_id)
+                    else:
+                        memory_block = self.memory_store.format_prompt(session_id)
                     if memory_block:
                         blocks.append(memory_block)
                 context_index_broker = getattr(self, "context_index_broker", None)
@@ -2501,6 +2513,7 @@ class ReActAgent(AgentBase):
                 )
             self._turn_context_key = cache_key
             self._turn_context_block = "\n\n".join(blocks)
+            self._standing_memory_block = standing_memory
 
         def turn_context_text() -> str:
             dynamic_blocks: list[str] = []
@@ -2571,11 +2584,11 @@ class ReActAgent(AgentBase):
             return [*prepared, *non_system]
 
         def rebuild_prompt() -> list[dict]:
-            work_mode = self.tool_allowlist is None and not self.minimal_mode
             rebuilt = self.context.get_prompt(
                 content_overrides=self._vision_prompt_content_overrides(),
                 runtime_context=turn_context_text() if work_mode else None,
                 include_runtime_context=work_mode,
+                standing_memory=self._standing_memory_block if work_mode else None,
             )
             if not work_mode:
                 rebuilt = with_turn_context(rebuilt)
