@@ -44,6 +44,7 @@ ABSTAIN_MARKERS = (
     # Seen in correct abstentions that the list above missed.
     "答不上来", "答不出来", "没存下来", "搜不到", "找不到", "真没有", "没有这条",
     "can't find", "cannot find", "couldn't find any", "nothing about",
+    "不知道", "没记住", "没见过", "没聊过", "一次都没出现",
 )
 
 
