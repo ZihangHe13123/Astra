@@ -26,7 +26,10 @@ def test_router_skips_long_term_recall_for_current_only_turn(tmp_path):
 
     assert pack.trace.decision == "skipped"
     assert pack.recalled == ()
-    assert record.content not in pack.render()
+    # No recall; the preference shows only as its line in the always-visible index.
+    rendered = pack.render()
+    assert "<retrieved-memory>" not in rendered
+    assert rendered.count(record.content) == 1 and "<memory-index>" in rendered
 
 
 def test_router_recalls_matching_local_observation_for_project_turn(tmp_path):

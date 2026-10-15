@@ -283,6 +283,8 @@ export type PyEvent =
   | { type: "wakeup_status"; plan: Record<string, unknown>; message: string }
   | { type: "peer_message"; direction: "in" | "out"; peer: string; task_id: string; state: string; text: string }
   | { type: "background_wakeup"; state: "started" | "limited"; message: string }
+  | { type: "memory_notice"; event: "saved" | "revised" | "forgotten"; memory_id: string; summary: string; kind: string; scope: string; previous_id?: string }
+  | { type: "memory_recall"; count: number; items: string[] }
   | {
       type: "error";
       message: string;

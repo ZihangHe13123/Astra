@@ -41,6 +41,9 @@ ABSTAIN_MARKERS = (
     "not sure", "don't have", "do not have", "no record", "didn't mention", "did not mention",
     "haven't mentioned", "never mentioned", "couldn't find", "could not find", "no information",
     "don't know", "not aware", "no mention",
+    # Seen in correct abstentions that the list above missed.
+    "答不上来", "答不出来", "没存下来", "搜不到", "找不到", "真没有", "没有这条",
+    "can't find", "cannot find", "couldn't find any", "nothing about",
 )
 
 
@@ -88,7 +91,9 @@ def score_answer(live: LiveSpec, answer: str, archive_dates: dict[str, str]) -> 
     def has(keyword: str) -> bool:
         if keyword.startswith("date:"):
             iso = archive_dates.get(keyword[5:], "")
-            return bool(iso) and any(normalize(form) in text for form in _date_forms(iso))
+            # "9 月 27 号" and "9月27号" are the same date.
+            compact = text.replace(" ", "")
+            return bool(iso) and any(normalize(form).replace(" ", "") in compact for form in _date_forms(iso))
         return normalize(keyword) in text
 
     must_ok = all(any(has(keyword) for keyword in group) for group in live.must)

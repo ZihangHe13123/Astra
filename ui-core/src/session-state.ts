@@ -1,3 +1,4 @@
+import { memoryNoticeText, memoryRecallText } from "./memory-notices.js";
 import { reduceAgentTeamEvent, type AgentTeamView } from "./agent-team-state.js";
 import type { ResponseVersions, ResponseOperation, ResponseRegeneration } from "./response-versions.js";
 import type { PyEvent } from "./types.js";
@@ -236,6 +237,9 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
       append("system", `${event.direction === "in" ? "来自" : "发给"} ${event.peer}（${event.state}）：${event.text}`); break;
     // Background work ended after the reply: the turn Astra starts for it, or why it waits for the user.
     case "background_wakeup": append("system", event.message); break;
+    // Saved memories as they change, and which ones a turn brought back.
+    case "memory_notice": append("system", memoryNoticeText(event)); break;
+    case "memory_recall": append("system", memoryRecallText(event)); break;
     default: state.info = { ...state.info, [event.type]: event }; break;
   }
   return state;

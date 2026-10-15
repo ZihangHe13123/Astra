@@ -894,6 +894,7 @@ async def _async_init(llm_config: LLMConfig, sandbox_timeout: int, workdir: str)
         tools,
         memory_store,
         session_id=lambda: Path(agent_holder["agent"].context.session_path).stem if agent_holder else "default",
+        messages=lambda: agent_holder["agent"].context.messages if agent_holder else [],
     )
     register_skill_tools(
         tools, skill_store,

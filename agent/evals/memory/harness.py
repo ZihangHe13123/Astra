@@ -143,7 +143,8 @@ def build_agent(
     def session_scope() -> str:
         return holder["agent"].context.session_scope if holder else "default"
 
-    register_memory_tools(tools, memory_store, session_id=session_scope)
+    register_memory_tools(tools, memory_store, session_id=session_scope,
+                          messages=lambda: holder["agent"].context.messages if holder else [])
     register_session_recall_tools(tools)
     register_time_tools(tools)
     broker = create_context_index_broker(ContextIndexPreferences(mode, 900), str(paths.workspace))
