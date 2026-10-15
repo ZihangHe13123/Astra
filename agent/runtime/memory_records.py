@@ -155,6 +155,12 @@ class MemoryRecordRepository:
                     ON memory_records(source_session_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_memory_records_supersedes
                     ON memory_records(supersedes_id);
+                CREATE TABLE IF NOT EXISTS memory_usage (
+                    record_id TEXT PRIMARY KEY,
+                    recalls INTEGER NOT NULL DEFAULT 0,
+                    reads INTEGER NOT NULL DEFAULT 0,
+                    last_used_at TEXT NOT NULL DEFAULT ''
+                );
                 """
             )
             try:
@@ -512,6 +518,27 @@ class MemoryRecordRepository:
                 (_now(), str(record_id)),
             )
             return cursor.rowcount > 0
+
+    def note_use(self, record_ids: Iterable[str], *, read: bool = False, now: str | None = None) -> None:
+        """Count a recall into a turn, or an explicit read, for each record."""
+        ids = tuple(dict.fromkeys(str(record_id) for record_id in record_ids if record_id))
+        if not ids:
+            return
+        column = "reads" if read else "recalls"
+        current = self._timestamp(now, default=_now())
+        with self._lock, self._connection() as db:
+            db.executemany(
+                f"INSERT INTO memory_usage(record_id, {column}, last_used_at) VALUES (?, 1, ?) "
+                f"ON CONFLICT(record_id) DO UPDATE SET {column} = {column} + 1, last_used_at = excluded.last_used_at",
+                [(record_id, current) for record_id in ids],
+            )
+
+    def usage(self) -> dict[str, tuple[int, int, str]]:
+        """Recalls, reads and last use per record that has been used."""
+        with self._lock, self._connection() as db:
+            rows = db.execute("SELECT record_id, recalls, reads, last_used_at FROM memory_usage").fetchall()
+        return {str(row["record_id"]): (int(row["recalls"]), int(row["reads"]), str(row["last_used_at"]))
+                for row in rows}
 
     def stats(self) -> dict[str, Any]:
         with self._lock, self._connection() as db:

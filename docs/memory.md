@@ -18,7 +18,11 @@ checkout). An index of saved memories, one dated line each, newest first, at mos
 reads a memory's full text when it needs more than the summary. Only memories
 for all projects and for the current one are listed; superseded and expired ones
 are not. Records from before saved memories are listed only when they are
-preferences or facts about you.
+preferences or facts about you. When more memories qualify than fit, the ones
+saved or used most recently are listed. Used means recalled into a turn or
+read in full; listed lines stay in date order, so the index changes only when
+a memory enters or leaves it. `read` shows how often a memory was used, and
+`/memory` counts saved memories unused for 90 days.
 
 In Work mode the core entries and the index reach the model as a separate
 standing-memory copy, sent once and again only when they change, so they are

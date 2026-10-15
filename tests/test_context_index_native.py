@@ -366,3 +366,5 @@ def test_native_runtime_uses_astra_records_without_calling_provider(tmp_path):
     assert store.format_core_prompt() == before
     assert len(llm.calls) == 1
     assert router.provider.calls == 0
+    # A record the index puts in front of the model counts as used.
+    assert store.record_store.usage()[record.record_id][0] == 1

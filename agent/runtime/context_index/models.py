@@ -82,6 +82,8 @@ class ContextIndexRow:
     cache_state: str = ""
     timestamp: float = 0.0
     channels: tuple[str, ...] = ()
+    # The record id of a structured-memory row, for usage counts.
+    memory_id: str = ""
 
 
 @dataclass(frozen=True)
