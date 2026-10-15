@@ -59,13 +59,15 @@ class PathGate:
             await asyncio.sleep(0.01)
 
 
-def build_workspace(tmp_path, monkeypatch):
+def build_workspace(tmp_path, monkeypatch, needles=("dir07",)):
     monkeypatch.setenv("ASTRA_HOME", str(tmp_path / "astra-home"))
+    monkeypatch.delenv("ASTRA_SEARCH_TIME_BUDGET_SECONDS", raising=False)
     workspace = tmp_path / "workspace"
     for index in range(20):
         (workspace / f"dir{index:02d}").mkdir(parents=True)
         (workspace / f"dir{index:02d}" / "other.md").write_text("unrelated\n", encoding="utf-8")
-    (workspace / "dir07" / "needle.txt").write_text("needle\n", encoding="utf-8", newline="\n")
+    for directory in needles:
+        (workspace / directory / "needle.txt").write_text("needle\n", encoding="utf-8", newline="\n")
     registry = ToolRegistry()
     register_file_tools(registry, str(workspace))
     return workspace, registry
@@ -140,6 +142,8 @@ def test_search_time_limit_interrupts_a_long_walk(tmp_path, monkeypatch, tool, a
     tool_def = registry.get(tool)
     assert tool_def is not None
     tool_def.timeout = 0.3
+    # One listing outlasts both the search's own budget and the tool limit,
+    # so the worker never gets to return its matches itself.
     gate = PathGate(monkeypatch, os, "scandir", workspace / "dir07")
 
     async def scenario():
@@ -158,6 +162,108 @@ def test_search_time_limit_interrupts_a_long_walk(tmp_path, monkeypatch, tool, a
     assert "narrower directory" in result["recovery_hint"]
     assert result["details"]["directories_listed"] >= 1
     assert gate.calls_after_release == []
+
+
+INCOMPLETE_NOTE = "Results are incomplete: the search stopped at its time limit after "
+
+
+def split_partial_output(tool: str, output: str) -> tuple[list[str], str]:
+    """Separate a budget-stopped search's matches from its incompleteness note."""
+    lines = output.splitlines()
+    if tool == "search_files":
+        return lines[:-1], lines[-1]
+    header, *matches = lines
+    count, note = header.split(" so far. ", 1)
+    assert count == f"{len(matches)} match(es)"
+    return matches, note
+
+
+@pytest.mark.parametrize("tool,args", SEARCHES)
+def test_search_out_of_budget_returns_the_matches_found_so_far(tmp_path, monkeypatch, tool, args):
+    workspace, registry = build_workspace(tmp_path, monkeypatch, needles=("dir03", "dir12"))
+    monkeypatch.setenv("ASTRA_SEARCH_TIME_BUDGET_SECONDS", "0.2")
+    gate = PathGate(monkeypatch, os, "scandir", workspace / "dir07")
+
+    async def scenario():
+        search = asyncio.create_task(registry.execute(tool, args))
+        try:
+            await gate.wait_entered()
+            # Hold the walk past its budget, far inside the tool's own limit.
+            await asyncio.sleep(0.4)
+        finally:
+            gate.release.set()
+        return await asyncio.wait_for(search, GATE_WAIT_SECONDS)
+
+    result = asyncio.run(scenario())
+    assert result["error"] == ""
+    assert result["partial"] is True
+    matches, note = split_partial_output(tool, result["output"])
+    found = os.path.join("dir03", "needle.txt")
+    assert matches == [found if tool == "search_files" else f"{found}:1: needle"]
+    assert note.startswith(INCOMPLETE_NOTE)
+    assert "narrower directory" in note
+    # The walk stopped where the budget ran out: dir12 was never listed.
+    assert gate.calls_after_release == []
+
+
+@pytest.mark.parametrize("tool,args", SEARCHES)
+def test_search_out_of_budget_without_matches_says_the_rest_was_not_searched(
+    tmp_path, monkeypatch, tool, args
+):
+    workspace, registry = build_workspace(tmp_path, monkeypatch, needles=("dir12",))
+    monkeypatch.setenv("ASTRA_SEARCH_TIME_BUDGET_SECONDS", "0.2")
+    gate = PathGate(monkeypatch, os, "scandir", workspace / "dir07")
+
+    async def scenario():
+        search = asyncio.create_task(registry.execute(tool, args))
+        try:
+            await gate.wait_entered()
+            await asyncio.sleep(0.4)
+        finally:
+            gate.release.set()
+        return await asyncio.wait_for(search, GATE_WAIT_SECONDS)
+
+    result = asyncio.run(scenario())
+    assert result["error"] == ""
+    assert result["partial"] is True
+    first, note = result["output"].splitlines()
+    assert first.startswith("No files matching" if tool == "search_files" else "No lines matching")
+    assert first.endswith("searched so far.")
+    assert note.startswith(INCOMPLETE_NOTE)
+    # Neither the rest of the walk nor a near-miss probe listed anything more.
+    assert gate.calls_after_release == []
+
+
+@pytest.mark.parametrize("tool,args", SEARCHES)
+def test_search_budget_ends_before_the_tool_time_limit(tmp_path, monkeypatch, tool, args):
+    workspace, registry = build_workspace(tmp_path, monkeypatch, needles=("dir03",))
+    for index in range(300):
+        (workspace / "more" / f"d{index:03d}").mkdir(parents=True)
+    tool_def = registry.get(tool)
+    assert tool_def is not None
+    tool_def.timeout = 2.0
+    original_scandir = os.scandir
+
+    def slow_scandir(path=".", *args, **kwargs):
+        # Every listing is slow, so the whole walk takes longer than the limit.
+        time.sleep(0.01)
+        return original_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "scandir", slow_scandir)
+
+    async def scenario():
+        started = time.perf_counter()
+        result = await asyncio.wait_for(registry.execute(tool, args), GATE_WAIT_SECONDS)
+        return result, time.perf_counter() - started
+
+    result, elapsed = asyncio.run(scenario())
+    assert elapsed < 2.0
+    assert result["error"] == ""
+    assert result["partial"] is True
+    matches, note = split_partial_output(tool, result["output"])
+    found = os.path.join("dir03", "needle.txt")
+    assert matches == [found if tool == "search_files" else f"{found}:1: needle"]
+    assert note.startswith(INCOMPLETE_NOTE)
 
 
 @pytest.mark.parametrize("tool", ["read_file", "stat_file"])

@@ -256,21 +256,41 @@ class _WorkerCancelled(Exception):
     """The tool call that owns a worker-thread operation has ended."""
 
 
+class _WorkerOutOfTime(Exception):
+    """A worker reached its time budget; it returns what it has found so far."""
+
+
 class _WorkerControl:
     """Cross-thread state for blocking filesystem work run off the event loop.
 
     ``cancelled`` is set as soon as the awaiting tool call ends for any reason
     (cancellation or the tool time limit). The worker checks it per directory
     and file, so it stops instead of walking on after nobody awaits it.
+
+    With a ``time_budget`` the same checks raise :class:`_WorkerOutOfTime`
+    once that many seconds have passed since the call started, so a search
+    can return its matches before the tool time limit discards them.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, time_budget: float | None = None) -> None:
         self.cancelled = threading.Event()
         self.directories_listed = 0
+        self.started = time.monotonic()
+        self.deadline = None if time_budget is None else self.started + time_budget
 
     def check(self) -> None:
         if self.cancelled.is_set():
             raise _WorkerCancelled()
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise _WorkerOutOfTime()
+
+    def stopped_note(self) -> str:
+        """How far a walk got before its time budget ran out."""
+        elapsed = time.monotonic() - self.started
+        return (
+            f"the search stopped at its time limit after {elapsed:.1f} s and "
+            f"{self.directories_listed} directories"
+        )
 
     def enter_directory(self) -> None:
         self.check()
@@ -370,14 +390,45 @@ def _cancellable_rglob(
     yield from select(search, ("**", *parts))
 
 
-async def _run_off_loop(operation: str, work: Callable[..., _T], *args: object) -> _T:
+SEARCH_TIME_BUDGET_SHARE = 0.9
+
+
+def _search_time_budget(tool_timeout: float | None) -> float | None:
+    """Seconds a search may walk before it returns the matches found so far.
+
+    The walk stops a little before the tool's own time limit, so its matches
+    reach the model instead of a timeout error that discards them.
+    ``ASTRA_SEARCH_TIME_BUDGET_SECONDS`` can shorten the budget, never extend
+    it past that limit.
+    """
+    budget = None if tool_timeout is None else float(tool_timeout) * SEARCH_TIME_BUDGET_SHARE
+    configured = os.getenv("ASTRA_SEARCH_TIME_BUDGET_SECONDS", "").strip()
+    if configured:
+        try:
+            override = float(configured)
+        except ValueError:
+            override = 0.0
+        if override > 0:
+            return override if budget is None else min(override, budget)
+        logger.warning("ignoring invalid ASTRA_SEARCH_TIME_BUDGET_SECONDS=%r", configured)
+    return budget
+
+
+async def _run_off_loop(
+    operation: str,
+    work: Callable[..., _T],
+    *args: object,
+    time_budget: float | None = None,
+) -> _T:
     """Run blocking filesystem work in a worker thread the tool call can stop.
 
     ``work`` receives a :class:`_WorkerControl` after ``args``. Ending the call
     (cancellation or the tool time limit) frees the event loop at once and
-    stops the worker at its next directory or file.
+    stops the worker at its next directory or file. ``time_budget`` makes the
+    control's checks raise :class:`_WorkerOutOfTime` after that many seconds,
+    which ``work`` handles itself.
     """
-    control = _WorkerControl()
+    control = _WorkerControl(time_budget)
     try:
         return await asyncio.to_thread(work, *args, control)
     except asyncio.CancelledError:
@@ -1464,25 +1515,41 @@ def register_file_tools(
             return ToolFailure("not_a_directory", f"Not a directory: {search}", False,
                                "Use a directory path for search_files; use read_file for a single file.", details={"path": str(search)})
         matches = []
-        for match in _cancellable_rglob(search, pattern, control, prune_noise=not include_ignored):
-            if _readable_search_path(match, access) is None:
-                continue
-            relative = match.relative_to(search)
-            if (
-                not include_ignored
-                and any(_is_search_noise(part) for part in relative.parts)
-            ):
-                continue
-            matches.append(match)
+        stopped = False
+        try:
+            for match in _cancellable_rglob(search, pattern, control, prune_noise=not include_ignored):
+                if _readable_search_path(match, access) is None:
+                    continue
+                relative = match.relative_to(search)
+                if (
+                    not include_ignored
+                    and any(_is_search_noise(part) for part in relative.parts)
+                ):
+                    continue
+                matches.append(match)
+        except _WorkerOutOfTime:
+            stopped = True
         matches.sort()
+        incomplete = (
+            f"Results are incomplete: {control.stopped_note()}. "
+            "Search a narrower directory with path, or use a more specific pattern."
+        ) if stopped else ""
         if not matches:
+            if stopped:
+                return PartialResult(
+                    f"No files matching '{pattern}' found in the part of {search} searched so far.\n"
+                    + incomplete
+                )
             pattern_parts = pattern.replace("\\", "/").rsplit("/", 1)
             dirname = pattern_parts[0] if len(pattern_parts) > 1 else ""
             needle = pattern_parts[-1]
-            suggestions = _near_miss_suggestions(
-                search, needle, access=access, include_ignored=include_ignored, dirname=dirname,
-                control=control,
-            )
+            try:
+                suggestions = _near_miss_suggestions(
+                    search, needle, access=access, include_ignored=include_ignored, dirname=dirname,
+                    control=control,
+                )
+            except _WorkerOutOfTime:
+                suggestions = []
             if suggestions:
                 return (
                     f"No files matching '{pattern}' found in {search}\n"
@@ -1496,6 +1563,9 @@ def register_file_tools(
                 f"... and {len(matches) - 100} more not listed; "
                 "narrow the pattern or path to see them"
             )
+        if stopped:
+            lines.append(incomplete)
+        if len(matches) > 100 or stopped:
             return PartialResult("\n".join(lines))
         return "\n".join(lines)
 
@@ -1506,8 +1576,10 @@ def register_file_tools(
     ) -> str | ToolFailure:
         # A walk over a large root takes seconds to minutes; it must not stall
         # model streaming, heartbeats and cancellation on the event loop.
+        tool = registry.get("search_files")
         return await _run_off_loop(
-            "search_files", _search_files_blocking, pattern, path, include_ignored
+            "search_files", _search_files_blocking, pattern, path, include_ignored,
+            time_budget=_search_time_budget(tool.timeout if tool is not None else None),
         )
 
     def _search_text_blocking(
@@ -1551,59 +1623,76 @@ def register_file_tools(
         max_results = max(1, max_results)
         results: list[str] = []
         capped = False
+        stopped = False
         candidate_files = 0
         glob_files = 0
 
-        for dirpath_str, dirnames, filenames in os.walk(str(search)):
-            control.enter_directory()
-            # Prune noise directories in-place so we don't descend into them.
-            if not include_ignored:
-                dirnames[:] = [
-                    d for d in dirnames
-                    if not _is_search_noise(d)
-                ]
-            relative_dir = Path(dirpath_str).relative_to(search).parts
+        try:
+            for dirpath_str, dirnames, filenames in os.walk(str(search)):
+                control.enter_directory()
+                # Prune noise directories in-place so we don't descend into them.
+                if not include_ignored:
+                    dirnames[:] = [
+                        d for d in dirnames
+                        if not _is_search_noise(d)
+                    ]
+                relative_dir = Path(dirpath_str).relative_to(search).parts
 
-            for fname in filenames:
-                if not include_ignored and _is_search_noise(fname):
-                    continue
-                candidate_files += 1
-                if not _search_glob_matches((*relative_dir, fname), glob):
-                    continue
-                glob_files += 1
-                control.check()
-                fp = Path(dirpath_str) / fname
-                readable = _readable_search_path(fp, access)
-                if readable is None:
-                    continue
-                # Check size before reading
-                try:
-                    st = readable.stat()
-                except OSError:
-                    continue
-                if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_FILE_BYTES:
-                    continue
-                # Read once, then reject obvious binary content before decoding.
-                try:
-                    raw = readable.read_bytes()
-                except OSError:
-                    continue
-                if b"\x00" in raw[:8192]:
-                    continue
-                text = raw.decode("utf-8", errors="replace")
-                shown = _tool_path(fp)
-                for lineno, line in enumerate(text.splitlines(), 1):
-                    if compiled.search(line):
-                        if len(results) >= max_results:
-                            # One more match exists, so the list really is cut short.
-                            capped = True
-                            break
-                        results.append(f"{shown}:{lineno}: {line.rstrip()}")
+                for fname in filenames:
+                    if not include_ignored and _is_search_noise(fname):
+                        continue
+                    candidate_files += 1
+                    if not _search_glob_matches((*relative_dir, fname), glob):
+                        continue
+                    glob_files += 1
+                    control.check()
+                    fp = Path(dirpath_str) / fname
+                    readable = _readable_search_path(fp, access)
+                    if readable is None:
+                        continue
+                    # Check size before reading
+                    try:
+                        st = readable.stat()
+                    except OSError:
+                        continue
+                    if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_FILE_BYTES:
+                        continue
+                    # Read once, then reject obvious binary content before decoding.
+                    try:
+                        raw = readable.read_bytes()
+                    except OSError:
+                        continue
+                    if b"\x00" in raw[:8192]:
+                        continue
+                    text = raw.decode("utf-8", errors="replace")
+                    shown = _tool_path(fp)
+                    for lineno, line in enumerate(text.splitlines(), 1):
+                        if compiled.search(line):
+                            if len(results) >= max_results:
+                                # One more match exists, so the list really is cut short.
+                                capped = True
+                                break
+                            results.append(f"{shown}:{lineno}: {line.rstrip()}")
+                    if capped:
+                        break
                 if capped:
                     break
-            if capped:
-                break
+        except _WorkerOutOfTime:
+            stopped = True
 
+        if stopped:
+            incomplete = (
+                f"Results are incomplete: {control.stopped_note()}. "
+                "Search a narrower directory with path, or narrow the glob or pattern."
+            )
+            if not results:
+                return PartialResult(
+                    f"No lines matching '{pattern}' found in the part of {search} searched so far.\n"
+                    + incomplete
+                )
+            return PartialResult(
+                f"{len(results)} match(es) so far. {incomplete}\n" + "\n".join(results)
+            )
         if not results:
             if candidate_files and not glob_files:
                 return (
@@ -1611,14 +1700,18 @@ def register_file_tools(
                     "A glob without '/' is matched against file names; a glob with '/' is matched "
                     "against the path relative to the search directory, where '**/' spans directories."
                 )
-            content_suggestions = _content_near_miss_suggestions(
-                search, pattern, access=access, include_ignored=include_ignored, glob_filter=glob,
-                control=control,
-            )
-            suggestions = _near_miss_suggestions(
-                search, pattern, access=access, include_ignored=include_ignored, glob_filter=glob,
-                control=control,
-            )
+            try:
+                content_suggestions = _content_near_miss_suggestions(
+                    search, pattern, access=access, include_ignored=include_ignored, glob_filter=glob,
+                    control=control,
+                )
+                suggestions = _near_miss_suggestions(
+                    search, pattern, access=access, include_ignored=include_ignored, glob_filter=glob,
+                    control=control,
+                )
+            except _WorkerOutOfTime:
+                # The search itself finished; suggestions are only a courtesy.
+                content_suggestions, suggestions = [], []
             content_only = [
                 name for name in content_suggestions if name not in suggestions
             ]
@@ -1658,10 +1751,13 @@ def register_file_tools(
         build directories, including .sandbox_* files and directories.
 
         The walk and file reads run in a worker thread that stops when the
-        call is cancelled or reaches its time limit.
+        call is cancelled. Shortly before the tool's time limit it stops on
+        its own and returns the matches found so far as a partial result.
         """
+        tool = registry.get("search_text")
         return await _run_off_loop(
-            "search_text", _search_text_blocking, pattern, path, glob, max_results, include_ignored
+            "search_text", _search_text_blocking, pattern, path, glob, max_results, include_ignored,
+            time_budget=_search_time_budget(tool.timeout if tool is not None else None),
         )
 
     async def _edit_file(
