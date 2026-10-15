@@ -461,7 +461,7 @@
          "text": "Is test_sync_retry still flaky?",
          "expect": [["msg:s3.u1", "rec:retry_fix"]],
          "stale": ["times out about 1 in 10 runs"],
-         "live": {"must": [["fixed", "修复", "no longer", "not flaky", "已经修", "resolved"]]}},
+         "live": {"must": [["fixed", "修复", "no longer", "not flaky", "已经修", "resolved", "不是了", "不再"]]}},
         {"id": "flaky.nose2_false_premise", "category": "abstention",
          "text": "What did we decide about migrating the test suite to nose2?",
          "live": {"abstain": true}},

@@ -10,6 +10,7 @@ request carries, including replayed older snapshots.
 from __future__ import annotations
 
 import math
+import re
 from collections.abc import Sequence
 from datetime import datetime
 from statistics import mean
@@ -18,6 +19,15 @@ from typing import Any
 from .fixture import CATEGORIES, NO_EVIDENCE_CATEGORIES, TurnSpec, normalize
 from .injection import core_occurrences, diff_request, fresh_segments, prefix_stability
 from .world import SeededWorld
+
+
+# The saved-memory index is always visible, like core memory: it counts as evidence
+# the model can see, but not as a recall brought in for this turn.
+_INDEX_BLOCK = re.compile(r"<memory-index>.*?</memory-index>", re.DOTALL)
+
+
+def without_index(text: str) -> str:
+    return _INDEX_BLOCK.sub("", text)
 
 
 def estimate_tokens(text: str) -> int:
@@ -59,6 +69,7 @@ def analyze_requests(requests: Sequence[dict], core_entries: Sequence[str]) -> l
             "core_entry_occurrences": len(core_found),
             "injected_tokens": estimate_tokens(injected),
             "core_tokens": estimate_tokens(core_text),
+            "index_tokens": estimate_tokens("\n".join(_INDEX_BLOCK.findall(injected))),
             "other_tokens": estimate_tokens(other.strip()),
             "fresh_chars": len(fresh_text),
             "fresh_tokens": estimate_tokens(fresh_text),
@@ -108,8 +119,10 @@ def score_probe(turn: TurnSpec, world: SeededWorld, request: dict[str, Any]) -> 
             "dated": _dated(hit, current, world) if hit else None,
         })
     injected_items = sorted(ref for ref, item in world.items.items() if item.fragment in current_n)
+    recalled_n = normalize(without_index(current))
+    recalled_items = [ref for ref in injected_items if world.items[ref].fragment in recalled_n]
     expected = {ref for group in turn.expect for ref in group} | set(turn.allowed)
-    unexpected = [ref for ref in injected_items if ref not in expected]
+    unexpected = [ref for ref in recalled_items if ref not in expected]
     stale = [snippet for snippet in turn.stale if normalize(snippet) in current_n]
     stale_visible = [snippet for snippet in turn.stale if normalize(snippet) in visible_n]
     hits = [item for item in requirements if item["hit"]]
@@ -134,7 +147,7 @@ def score_probe(turn: TurnSpec, world: SeededWorld, request: dict[str, Any]) -> 
         "current_context_chars": len(current),
         **{key: request[key] for key in (
             "latency_ms", "injected_messages", "augmented_messages", "injected_chars", "core_chars",
-            "injected_tokens", "core_tokens", "other_tokens", "fresh_tokens", "prefix_stable",
+            "injected_tokens", "core_tokens", "index_tokens", "other_tokens", "fresh_tokens", "prefix_stable",
         )},
     }
 
@@ -172,6 +185,7 @@ def aggregate_probes(probes: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "mean_unexpected_items": mean_or_none([len(probe["unexpected_items"]) for probe in probes]),
         "mean_injected_tokens": mean_or_none([probe["injected_tokens"] for probe in probes]),
         "mean_core_tokens": mean_or_none([probe["core_tokens"] for probe in probes]),
+        "mean_index_tokens": mean_or_none([probe["index_tokens"] for probe in probes]),
         "mean_other_tokens": mean_or_none([probe["other_tokens"] for probe in probes]),
         "mean_fresh_tokens": mean_or_none([probe["fresh_tokens"] for probe in probes]),
         "mean_injected_messages": mean_or_none([probe["injected_messages"] for probe in probes]),

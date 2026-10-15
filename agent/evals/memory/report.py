@@ -25,7 +25,7 @@ def _table(header: list[str], rows: list[list[Any]]) -> list[str]:
 
 def mode_table(modes: dict[str, Any]) -> list[str]:
     header = ["mode", "recall", "recall(vis)", "full hit", "false inj", "stale inj", "stale(vis)", "dated",
-              "inj tok/req", "core tok/req", "fresh tok/req", "core share", "cum tok/conv", "msgs/req",
+              "inj tok/req", "core tok/req", "index tok/req", "fresh tok/req", "core share", "cum tok/conv", "msgs/req",
               "prefix stable", "p50 ms", "p95 ms"]
     rows = []
     for mode, data in modes.items():
@@ -33,7 +33,8 @@ def mode_table(modes: dict[str, Any]) -> list[str]:
         rows.append([
             mode, o["evidence_recall"], o["evidence_recall_visible"], o["full_hit_rate"], o["false_injection_rate"],
             o["stale_injection_rate"], o["stale_visible_rate"], o["dated_evidence_rate"], o["mean_injected_tokens"],
-            o["mean_core_tokens"], o["mean_fresh_tokens"], o["core_token_share"], o["mean_cumulative_injected_tokens"],
+            o["mean_core_tokens"], o.get("mean_index_tokens"), o["mean_fresh_tokens"], o["core_token_share"],
+            o["mean_cumulative_injected_tokens"],
             o["mean_injected_messages"], o["prefix_stable_rate"], o["latency_p50_ms"], o["latency_p95_ms"],
         ])
     return _table(header, rows)
