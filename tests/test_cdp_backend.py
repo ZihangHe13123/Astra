@@ -54,6 +54,26 @@ def run(coro):
     return asyncio.run(coro)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def warm_native_chrome(request):
+    """Pay a fresh runner's first headless Chrome start once, with room for it.
+
+    On new Windows CI machines the first launches printed nothing for the whole
+    30 s production budget, sometimes for a minute or two, while later launches
+    were quick. The tests below check behaviour within that budget once Chrome
+    has started; this start is reported.
+    """
+    if sys.platform != "win32" or not find_chrome():
+        yield
+        return
+    started = time.perf_counter()
+    result = run(CdpBrowserBackend(find_chrome(), timeout=180).extract("data:text/html,<p>warm-up</p>"))
+    reporter = request.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line(f"headless Chrome first start: {time.perf_counter() - started:.1f}s ({result[:60]!r})")
+    yield
+
+
 async def _read_headless_output(read, process, stream, started, n=-1):
     if n != -1:
         return await read(n)
