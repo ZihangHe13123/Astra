@@ -49,6 +49,9 @@ STATE_PATHS: dict[str, str] = {
     "TOOL_RESULT_DIR": "home/tool-results",
     "WEB_EXTRACT_CACHE_DIR": "home/web-cache",
     "ASTRA_COMPUTER_CACHE_ROOT": "home/computer-cache",
+    # Provider caches (DeepSeek image files, Claude Code's working directory).
+    "ASTRA_DEEPSEEK_FILE_CACHE": "home/cache/deepseek-files.db",
+    "XDG_CACHE_HOME": "home/cache",
     # Never read a real .env: point the loader at a file that does not exist.
     "ASTRA_ENV_FILE": "home/absent.env",
     "SANDBOX_WORKDIR": "workspace",
