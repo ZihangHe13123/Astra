@@ -48,6 +48,18 @@ ASCII identifiers remain searchable. Terms are unique and capped at 12; explicit
 literal targets have priority over long Chinese gram runs. No tokenizer package
 or dictionary service is required.
 
+A date in the question becomes a local calendar window that filters every
+source, and its words leave the search terms (上周体重 searches 体重 within last
+week). Covered: ISO dates; 今天, 昨天, 前天, 大前天; N天前, N周前, N个月前, in Arabic or
+Chinese numerals; 上周, 这周, 上周三; 上个月, 本月; 前几天; 最近一周, 最近一个月;
+M月D号; and the English forms (today, yesterday, N days/weeks/months ago, last
+week, last Monday, this month, past week, Sep 27). Weeks start on Monday. A
+month-day later than today means last year's. Compounds that only contain a
+date word, such as 晚上周末 and "may 5 people", are not windows. A windowed
+question also considers what happened in the window, except when a window
+longer than a day names a topic that matched nothing there: that question
+abstains instead of filling the slots with unrelated items.
+
 Session Recall keeps a second FTS5 table for two-character terms,
 `messages_cjk`: each message's distinct CJK character pairs. It is written in
 the same transaction as the message, and `recall_meta.cjk_pairs_through`

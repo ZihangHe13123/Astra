@@ -63,12 +63,21 @@ def select_rows(
     if plan is not None and not plan.should_recall:
         return ()
     lexical = LexicalQuery.from_text(plan.query) if plan else None
+    recent = plan is None or plan.include_recent
+    # A named topic that matched nothing in a multi-day window is a question to
+    # abstain on, not one to fill with whatever else happened then.
+    if (plan is not None and recent and plan.intent == "temporal" and lexical is not None and lexical.terms
+            and (not plan.time_end or plan.time_end - plan.time_start > 86400)
+            and not any(plan.contains(item.timestamp)
+                        for result in (session_result, activity_result, memory_result) if result is not None
+                        for item in result.relevance)):
+        recent = False
     pool: list[RecommendationCandidate] = []
     for source_name, result in (("session", session_result), ("activity", activity_result), ("memory", memory_result)):
         if result is None:
             continue
         channels = [("lexical", result.relevance)]
-        if plan is None or plan.include_recent:
+        if recent:
             channels.append(("recent", result.recency))
         for channel, values in channels:
             if lexical is not None and lexical.anchors:

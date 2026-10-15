@@ -76,7 +76,7 @@ Hindsight 是可选的联合语义召回增强。启用时与本地权威库结�
 /context-index feedback R1 outdated    # Ranking feedback; does not rewrite facts
 ```
 
-中文问题会在助词、代词和疑问词处切开（“牙医是哪天”按“牙医”检索），两字词保持完整；会话存档为此维护一个字符对索引，查找两字词不需要扫描全部历史。活动历史仍按三字片段检索。检索行为、预算、诊断、反馈和质量检查见[原生记忆推荐设计（英文）](../native-memory-recommendation.md)；可选 embedding 的设置见[平台配置](context-index-platforms.md)。初始预览默认 900 字符、最高 2,000 字符，并受 500-token 估算预算限制。系统可以不返回推荐；旧记录不代表当前指令或事实证明。
+中文问题会在助词、代词和疑问词处切开（“牙医是哪天”按“牙医”检索），两字词保持完整；会话存档为此维护一个字符对索引，查找两字词不需要扫描全部历史。活动历史仍按三字片段检索。“上周”“三天前”“上个月”“9月27号”“last week”这类相对日期会变成日期范围，而不是要匹配的词。检索行为、预算、诊断、反馈和质量检查见[原生记忆推荐设计（英文）](../native-memory-recommendation.md)；可选 embedding 的设置见[平台配置](context-index-platforms.md)。初始预览默认 900 字符、最高 2,000 字符，并受 500-token 估算预算限制。系统可以不返回推荐；旧记录不代表当前指令或事实证明。
 
 <a id="importing-hermes-history"></a>
 

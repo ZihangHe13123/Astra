@@ -173,7 +173,9 @@ builtin router (Hindsight's automatic merge included).
 Chinese questions are split at particles, pronouns and question words, so a
 two-character word stays whole (牙医是哪天 searches 牙医). Session history keeps a
 character-pair index for these words, so finding one does not scan the whole
-archive; Activity history still searches three-character pieces.
+archive; Activity history still searches three-character pieces. Relative
+dates such as 上周, 三天前, 上个月, 9月27号 or "last week" become a date range
+instead of words to find.
 
 Use [native memory recommendation](native-memory-recommendation.md) for
 retrieval behavior, budgets, diagnostics, feedback and quality checks, and
