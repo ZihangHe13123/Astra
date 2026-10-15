@@ -108,6 +108,21 @@ class TurnSpec:
 
 
 @dataclass(frozen=True)
+class ConsolidationExpect:
+    """A change one consolidation pass should propose: text matching every group, optionally as a revision."""
+
+    must: tuple[tuple[str, ...], ...]
+    revises: str = ""
+
+
+@dataclass(frozen=True)
+class ConsolidationSpec:
+    # Records left out of the seeded world, so the archive is ahead of memory.
+    without: tuple[str, ...] = ()
+    expect: tuple[ConsolidationExpect, ...] = ()
+
+
+@dataclass(frozen=True)
 class ScenarioSpec:
     id: str
     title: str
@@ -116,6 +131,7 @@ class ScenarioSpec:
     records: tuple[RecordSpec, ...]
     archive: tuple[SessionSpec, ...]
     conversation: tuple[TurnSpec, ...]
+    consolidation: ConsolidationSpec | None = None
 
     @property
     def probes(self) -> tuple[TurnSpec, ...]:
@@ -284,7 +300,22 @@ def _parse_scenario(raw: dict) -> ScenarioSpec:
         core_user=_strings(core.get("user"), f"{scenario_id}.core.user"),
         core_memory=_strings(core.get("memory"), f"{scenario_id}.core.memory"),
         records=tuple(records), archive=tuple(archive), conversation=tuple(conversation),
+        consolidation=_consolidation(raw.get("consolidation"), f"{scenario_id}.consolidation"),
     )
+
+
+def _consolidation(raw: object, label: str) -> ConsolidationSpec | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise ValueError(f"{label} must be an object")
+    expects = []
+    for index, item in enumerate(raw.get("expect") or []):
+        must = tuple(_strings(group, f"{label}.expect[{index}].must[]") for group in item.get("must") or [])
+        if not must or not all(must):
+            raise ValueError(f"{label}.expect[{index}] needs non-empty must groups")
+        expects.append(ConsolidationExpect(must, str(item.get("revises") or "")))
+    return ConsolidationSpec(_strings(raw.get("without"), f"{label}.without"), tuple(expects))
 
 
 def validate_scenario(scenario: ScenarioSpec) -> None:
@@ -297,6 +328,11 @@ def validate_scenario(scenario: ScenarioSpec) -> None:
     if len(session_keys) != len(set(session_keys)):
         raise ValueError(f"{scenario.id}: duplicate archive session keys")
     by_key = {record.key: record for record in scenario.records}
+    if scenario.consolidation is not None:
+        named = [*scenario.consolidation.without,
+                 *(item.revises for item in scenario.consolidation.expect if item.revises)]
+        if unknown := [key for key in named if key not in by_key]:
+            raise ValueError(f"{scenario.id}.consolidation names unknown records {unknown}")
     for record in scenario.records:
         if record.supersedes:
             old = by_key.get(record.supersedes)

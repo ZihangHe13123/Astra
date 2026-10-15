@@ -5,6 +5,7 @@
     {
       "id": "dev_env",
       "title": "Developer environment with a superseded editor preference",
+      "consolidation": {"without": ["editor_new"], "expect": [{"must": [["Zed"]], "revises": "editor_old"}]},
       "core": {
         "user": [
           "称呼用户为思远；默认用中文回答，代码、命令和技术术语保留英文。",
@@ -73,6 +74,7 @@
     {
       "id": "daily_prefs",
       "title": "Food, coffee and gym preferences with an unsuperseded stale record",
+      "consolidation": {"expect": [{"must": [["沙拉", "salad"]], "revises": "lunch"}]},
       "core": {
         "user": [
           "思远对花生过敏，推荐餐厅、食谱或零食时必须避开花生。",
@@ -264,6 +266,7 @@
     {
       "id": "household",
       "title": "Household facts with corrections that live only in the archive",
+      "consolidation": {"without": ["parking"], "expect": [{"must": [["B2"], ["47"]]}, {"must": [["5 号", "5号", "5th"]], "revises": "rent"}]},
       "core": {
         "user": ["思远和太太 Mei 住在 Toa Payoh，女儿 Lulu 4 岁。"],
         "memory": []
@@ -330,6 +333,7 @@
     {
       "id": "writing_full_core",
       "title": "Writing preferences with both core files close to their hard limits",
+      "consolidation": {},
       "core": {
         "user": [
           "称呼用户为思远（Siyuan）；默认用简体中文回答，代码、命令、报错信息和专有名词保留英文原文，不要翻译变量名。",
@@ -472,6 +476,7 @@
     {
       "id": "kyoto_trip",
       "title": "Trip planning with a superseded date range",
+      "consolidation": {"without": ["trip"], "expect": [{"must": [["22"]]}]},
       "core": {
         "user": [
           "称呼用户为思远；默认中文回答。",
@@ -536,6 +541,7 @@
     {
       "id": "deploy_workflow",
       "title": "Deployment and lint settings with a superseded host",
+      "consolidation": {"without": ["deploy"], "expect": [{"must": [["fly"]]}]},
       "core": {
         "user": ["默认中文回答。"],
         "memory": ["Astra 约定：提交前跑 ruff 和 pytest；不要直接 push 到 main，改动走分支和 PR。"]
@@ -595,6 +601,7 @@
     {
       "id": "running_log",
       "title": "Training log aggregated over the past week",
+      "consolidation": {"without": ["race"], "expect": [{"must": [["half marathon", "半马", "半程马拉松"]]}]},
       "core": {
         "user": ["思远每周跑步三次左右，最近在备战半马。"],
         "memory": []

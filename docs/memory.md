@@ -99,6 +99,24 @@ observation duplicates with matching provenance, scope and lifetime. It preserve
 the original records, does not increase confidence for repetition, and does not
 promote temporary episodes into permanent facts. Existing memories are not
 rewritten on upgrade; use `/memory inspect`, `correct` and `forget` to review them.
+
+Memory consolidation reviews new conversations while Astra is idle and proposes
+changes; it never changes memory itself. When the desktop or terminal app has
+had no turn for 10 minutes and you have sent at least four messages since the
+last review (at most every 30 minutes), DeepSeek Flash reads those messages
+(your own in full, the assistant's shortened) with what memory already holds,
+and proposes up to five changes: remember a lasting fact or preference you
+stated, revise a memory a later statement changed, or forget one you withdrew.
+Each proposal quotes the message it rests on; only your own messages count as
+evidence, and secret-looking text is dropped. A notice says how many are
+waiting. `/memory proposals` lists them, `/memory accept <n|all>` applies them
+as ordinary saved-memory changes with that message as the source, and
+`/memory dismiss <n|all>` drops them. The first review reads only the last
+three days. Conversations are sent to DeepSeek and need a DeepSeek key; the
+archive holds only your messages and the assistant's replies, never tool
+output, and Minimal, bar and installed local modes are not recorded. Consolidation is on
+by default; `/memory consolidation off` turns it off, and `now` runs a review at
+the next idle moment.
 Semantic recall treats ordinary English words in Chinese questions as soft terms;
 explicit literals and code identifiers still constrain matching results.
 
@@ -138,6 +156,10 @@ cursor progress, protections and undo.
 /memory correct <id> <replacement text>
 /memory forget <id>
 /memory clear-working
+/memory proposals
+/memory accept <n|all>
+/memory dismiss <n|all>
+/memory consolidation [on|off|now]
 ```
 
 The model can use the `memory` tool to maintain the same stores. Credential-like
@@ -201,6 +223,10 @@ injected and core-memory tokens per request and per conversation, prefix
 stability and preparation latency, by probe category. `--live --model <key>`
 asks a real model and scores its answers by keywords, dates and abstention,
 including whether a preference stated in one session is remembered in the next.
+`--consolidation` runs one memory review per world that has expected changes,
+with some records left out so the archive is ahead of memory, and reports
+which expected changes were proposed, whether stale memories were revised in
+place rather than duplicated, and how many other proposals were made.
 
 ## Importing Hermes history
 

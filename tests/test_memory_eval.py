@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -279,3 +280,32 @@ def test_live_tier_plumbing_with_a_scripted_provider(tmp_path, monkeypatch):
     assert cat["teach"][0]["tool_calls"] == ["memory"]
     assert any("Mochi" in entry for entry in cat["retained"]["core_entries"])
     assert cat["answer"]["verdict"] == "pass"
+
+
+def test_consolidation_tier_scores_proposals_against_the_world_it_seeded(tmp_path, monkeypatch):
+    from agent.evals.memory import consolidation, live
+    from agent.runtime.llm import LLMConfig
+
+    class ReviewModel:
+        """Revises the rent memory from the user's own message, and remembers nothing else."""
+
+        def __init__(self, config):
+            pass
+
+        async def chat_limited(self, messages, tools=None, **options):
+            request = json.loads(messages[-1]["content"])
+            rent = next(item["id"] for item in request["saved_memories"] if "房租" in item["summary"])
+            moved = next(item["id"] for item in request["messages"] if "5 号" in item["text"] and item["role"] == "user")
+            return {"content": json.dumps({"proposals": [{
+                "action": "revise", "memory_id": rent, "summary": "房租每月 5 号前转", "content": "房租每月 5 号前转给房东。",
+                "evidence": [moved]}]})}
+
+    config = LLMConfig(model="scripted", api_key="offline", base_url="http://127.0.0.1:9/v1")
+    monkeypatch.setattr(live, "resolve_live_config", lambda model_key=None: (config, "scripted"))
+    monkeypatch.setattr("agent.runtime.llm.LLMClient", ReviewModel)
+    report = consolidation.run_consolidation(load_fixture().select(["household"]), tmp_path / "consolidation")
+    assert report["isolation"]["violations"] == [] and report["consolidation"]["failures"] == []
+    [world] = report["consolidation"]["worlds"]
+    # The parking record was left out and nothing proposed it; the rent was revised in place.
+    assert [(item["hit"], item["revised"]) for item in world["expected"]] == [(False, None), (True, True)]
+    assert world["extra"] == 0 and "MISSED" in consolidation.render_consolidation(report)
