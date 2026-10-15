@@ -14,6 +14,7 @@ import { COMPACTION_LABEL, compactionNotice } from "./context-compaction.js";
 import { TurnChangesRenderGate } from "./turn-changes.js";
 import { turnChangesCard } from "./turn-changes-card.js";
 import { describeTool } from "@astra/ui-core/tool-activity";
+import { memoryNoticeText, memoryRecallText } from "@astra/ui-core/memory-notices";
 import { processRowCells, toolRowCells } from "./tool-row.js";
 import { gapLine, noticeItem, TranscriptFlow, type FlowGap, type FlowItem } from "./transcript-flow.js";
 import { createBackendEventReceiver, EventDeliveryState, writeProtocolDiagnostic } from "./backend-protocol.js";
@@ -1738,6 +1739,10 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           textBatcher.accept(event);
           if (event.type === "wakeup_status" || event.type === "background_wakeup") {
             if (event.message) addMessageRef.current("system", event.message);
+          } else if (event.type === "memory_notice") {
+            addMessageRef.current("system", memoryNoticeText(event));
+          } else if (event.type === "memory_recall") {
+            addMessageRef.current("system", memoryRecallText(event));
           } else if (event.type === "peer_message") {
             // Another Astra session on this computer: a notice, never the user's words.
             addMessageRef.current("system", `PEER ${event.direction === "in" ? "←" : "→"} ${event.peer} · ${event.state} · ${event.task_id}\n${event.text}`);
