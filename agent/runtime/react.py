@@ -272,19 +272,19 @@ class ReActAgent(AgentBase):
             from .memory_router import MemoryRouter
 
             recall_provider = builtin_memory_provider
+            recall_timeout = self._float_env("HINDSIGHT_INTERACTIVE_RECALL_TIMEOUT", 2.5)
             if self.external_memory_provider is not None:
                 recall_provider = FederatedMemoryProvider(
                     builtin_memory_provider,
                     self.external_memory_provider,
+                    # Ends before the whole recall's budget, so builtin results survive.
+                    external_timeout=max(0.05, recall_timeout - 0.25),
                 )
             self.memory_router = MemoryRouter(
                 recall_provider,
                 memory_store,
                 task_store,
-                recall_timeout=self._float_env(
-                    "HINDSIGHT_INTERACTIVE_RECALL_TIMEOUT",
-                    2.5,
-                ),
+                recall_timeout=recall_timeout,
             )
         else:
             self.memory_router = None
