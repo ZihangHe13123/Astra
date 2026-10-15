@@ -19,6 +19,7 @@ from .token_estimator import estimate_value_tokens
 
 
 _TURN_CONTEXT_MARKER = "[SYSTEM-SUPPLIED TURN CONTEXT — "
+_STANDING_MEMORY_MARKER = "[SYSTEM-SUPPLIED STANDING MEMORY — "
 
 
 def _truthy(name: str) -> bool:
@@ -84,11 +85,11 @@ def _request_segments(messages: list[dict], tools: list[dict]) -> list[dict[str,
                     "tokens": estimate_value_tokens(dynamic),
                 })
                 continue
+        content = str(message.get("content") or "") if message.get("role") == "user" else ""
         segments.append({
-            "kind": "runtime_context" if (
-                message.get("role") == "user"
-                and str(message.get("content") or "").startswith(_TURN_CONTEXT_MARKER)
-            ) else str(message.get("role") or "message"),
+            "kind": "runtime_context" if content.startswith(_TURN_CONTEXT_MARKER)
+            else "standing_memory" if content.startswith(_STANDING_MEMORY_MARKER)
+            else str(message.get("role") or "message"),
             "message_index": index,
             "hash": _digest(message),
             "tokens": estimate_value_tokens(message),
