@@ -113,8 +113,10 @@ neither it nor the four-entry recommendation limit changes the three-handle
 
 Session readers remain read-only. Native partial-match queries rank by shared
 query-character coverage; session and native Activity reuse trigram posting
-lists and apply literal-target boundaries before limits. These paths use Python
-and SQLite on both platforms, with no schema migration or added service.
+lists, session also a character-pair index for two-character Chinese words,
+and both apply literal-target boundaries before limits. These paths use Python
+and SQLite on both platforms with no added service; Session Recall builds the
+pair table in its own archive on first use.
 Semantic channel ranks enter the existing RRF fusion.
 Independent semantic tasks cannot discard completed text results on timeout.
 The budget overrides above are local tuning; the shared defaults remain 75ms

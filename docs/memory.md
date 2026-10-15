@@ -166,6 +166,11 @@ builtin router (Hindsight's automatic merge included).
 /context-index feedback R1 outdated    # Ranking feedback; does not rewrite facts
 ```
 
+Chinese questions are split at particles, pronouns and question words, so a
+two-character word stays whole (牙医是哪天 searches 牙医). Session history keeps a
+character-pair index for these words, so finding one does not scan the whole
+archive; Activity history still searches three-character pieces.
+
 Use [native memory recommendation](native-memory-recommendation.md) for
 retrieval behavior, budgets, diagnostics, feedback and quality checks, and
 [platform configuration](context-index-platforms.md) for optional embeddings.

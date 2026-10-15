@@ -8,6 +8,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..session_recall import CJK_PAIRS_TABLE, CJK_PAIRS_THROUGH
 from .models import (
     EvidenceResult,
     RecommendationCandidate,
@@ -15,7 +16,7 @@ from .models import (
     SourceResult,
 )
 from .sqlite_reader import observe_stage, open_readonly, set_read_window
-from .lexical import LexicalQuery
+from .lexical import LexicalQuery, PairIndex
 from .query import QueryPlan
 from .workspace import WorkspaceIdentity
 
@@ -306,6 +307,19 @@ def _validate_schema(connection: sqlite3.Connection) -> set[str]:
         if table == "sessions":
             session_columns = columns
     return session_columns
+
+
+def _pair_index(connection: sqlite3.Connection) -> PairIndex | None:
+    """The archive's CJK pair index, when its writer has built one."""
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (CJK_PAIRS_TABLE,)
+    ).fetchone() is None:
+        return None
+    row = connection.execute("SELECT value FROM recall_meta WHERE key = ?", (CJK_PAIRS_THROUGH,)).fetchone()
+    try:
+        return PairIndex(CJK_PAIRS_TABLE, "messages", "content", int(row[0])) if row is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _is_deadline(exc: sqlite3.DatabaseError) -> bool:
@@ -679,7 +693,7 @@ class SessionRecommendationSource:
             placeholders = ", ".join("?" for _ in inferred_ids)
             pools.append(f"AND session_id IN ({placeholders})")
             pool_params.extend((*inferred_ids, pool_limit))
-        indexed_masks, indexed_params = lexical.indexed_masks_sql("messages_fts")
+        indexed_masks, indexed_params = lexical.indexed_masks_sql("messages_fts", _pair_index(connection))
         if indexed_masks:
             from_clause = "query_masks AS q JOIN messages AS m ON m.id = q.id"
             mask, term_params = "q.query_match_mask", ()

@@ -49,11 +49,22 @@ _SEARCH_STOP = frozenset({
     "之前", "上次", "继续", "一下", "这个", "那个", "什么", "怎么", "如何",
     "昨天", "今天", "前天", "最近", "刚才", "记得",
 })
-_CJK_SEARCH_STOP = re.compile("|".join(sorted(
-    {term for term in _SEARCH_STOP if "\u3400" <= term[0] <= "\u9fff"}
-    | {"帮我", "帮忙", "请问", "麻烦", "看看", "目前", "现在"},
-    key=lambda term: (-len(term), term),
-)))
+_CJK_PHRASE_STOP = {term for term in _SEARCH_STOP if "\u3400" <= term[0] <= "\u9fff"} | {
+    "帮我", "帮忙", "请问", "麻烦", "看看", "目前", "现在"}
+_CJK_SEARCH_STOP = re.compile("|".join(sorted(_CJK_PHRASE_STOP, key=lambda term: (-len(term), term))))
+# Once runs split into words, a common word alone would match most history.
+_CJK_WORD_STOP = re.compile("|".join(sorted(_CJK_PHRASE_STOP | {
+    "多少", "为什么", "怎么样", "怎么办", "觉得", "知道", "可以", "需要", "应该", "问题", "时候",
+    "东西", "事情", "怎样", "一些", "有点", "有些", "可能", "已经", "然后", "因为", "所以", "但是",
+    "如果", "或者", "就是", "只是", "自己", "大家", "一起", "告诉", "其实", "真的", "具体", "情况",
+    "感觉", "好像", "一直", "刚刚",
+    # Question words about time leave a stray character (哪天 → 天) when split.
+    "哪天", "哪几天", "哪一天", "几天", "几号", "几点", "几月", "多久"}, key=lambda term: (-len(term), term))))
+# Particles, pronouns, copulas and question words join the words of a question
+# rather than form them. Splitting there keeps a two-character word such as
+# 牙医 or 车位 whole instead of cutting grams across the boundary (牙医是, 位在哪).
+# Characters that commonly start or end content words (都, 就, 有, 更, 太) stay.
+_CJK_FUNCTION = re.compile("[的了吗呢啊呀嘛哦啦是哪谁啥几么我你他她它们在还和与跟或也又再很最被把给让这那个不没]")
 
 
 @dataclass(frozen=True)
@@ -83,16 +94,28 @@ def text_features(text: str) -> frozenset[str]:
     )
 
 
-def retrieval_terms(text: str) -> tuple[str, ...]:
-    """Bounded Unicode terms, including CJK phrases without a tokenizer package."""
+def retrieval_terms(text: str, *, word_split: bool = True) -> tuple[str, ...]:
+    """Bounded Unicode terms, including CJK phrases without a tokenizer package.
+
+    ``word_split`` splits CJK runs at function characters, which leaves
+    two-character words; only sources with a pair index can look those up
+    without scanning.
+    """
     value = unicodedata.normalize("NFKC", str(text)[:900]).casefold()
     # Split conversational phrases before generating character terms. Removing
     # only final stop terms leaves spurious boundary grams such as "个报".
-    value = _CJK_SEARCH_STOP.sub(" ", value)
+    value = (_CJK_WORD_STOP if word_split else _CJK_SEARCH_STOP).sub(" ", value)
     terms = []
-    tokens = re.findall(r"[a-z0-9][a-z0-9_.-]*|[\u3400-\u9fff]+", value)
+    tokens = []
+    for token in re.findall(r"[a-z0-9][a-z0-9_.-]*|[\u3400-\u9fff]+", value):
+        pieces = _CJK_FUNCTION.split(token) if word_split else [token]
+        # A lone character left between function words is not a search term.
+        tokens.extend(piece for piece in pieces if len(piece) > 1 or (piece and len(pieces) == 1))
     for token in tokens:
-        if "\u3400" <= token[0] <= "\u9fff" and len(token) > 2:
+        if word_split and "\u3400" <= token[0] <= "\u9fff" and len(token) in (3, 4):
+            # Usually two words (课程讲师): trigrams would straddle them.
+            terms.extend(token[i:i + 2] for i in range(len(token) - 1))
+        elif "\u3400" <= token[0] <= "\u9fff" and len(token) > 2:
             # Match Astra's existing FTS5 trigram index. Bigrams force full
             # scans of long archives and carry little specificity by themselves.
             terms.extend(token[i:i + 3] for i in range(len(token) - 2))

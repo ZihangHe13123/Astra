@@ -39,6 +39,24 @@ _OUTPUT_DESTINATION = re.compile(
 
 
 @dataclass(frozen=True)
+class PairIndex:
+    """A CJK character-pair FTS5 table complete up to ``through`` (internal names)."""
+
+    table: str
+    rows: str
+    column: str
+    through: int
+
+
+def _is_pair(term: str) -> bool:
+    return len(term) == 2 and all(_CJK.match(character) for character in term)
+
+
+def _like(term: str) -> str:
+    return "%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+
+
+@dataclass(frozen=True)
 class LexicalQuery:
     terms: tuple[str, ...]
     anchors: tuple[str, ...]
@@ -48,7 +66,8 @@ class LexicalQuery:
     semantic_anchors: tuple[str, ...] = ()
 
     @classmethod
-    def from_text(cls, text: str) -> LexicalQuery:
+    def from_text(cls, text: str, *, word_split: bool = True) -> LexicalQuery:
+        """``word_split=False`` keeps character trigrams for sources without a pair index."""
         raw = unicodedata.normalize("NFKC", str(text)[:900])
         normalized = raw.casefold()
         mixed = bool(_CJK.search(raw))
@@ -79,7 +98,7 @@ class LexicalQuery:
         anchors = tuple(dict.fromkeys(anchor_words))[:12]
         # Preserve explicit targets even after a long Chinese query reaches
         # the gram cap. The total SQL term budget is still twelve.
-        terms = tuple(dict.fromkeys((*anchors, *retrieval_terms(raw))))[:12]
+        terms = tuple(dict.fromkeys((*anchors, *retrieval_terms(raw, word_split=word_split))))[:12]
         characters: dict[int, int] = {}
         positions: Counter[int] = Counter()
         for index, term in enumerate(terms):
@@ -104,9 +123,7 @@ class LexicalQuery:
             f"(CASE WHEN {column} LIKE ? ESCAPE '\\' THEN {1 << i} ELSE 0 END)"
             for i in range(len(self.terms))
         )
-        params = tuple("%" + term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
-                       for term in self.terms)
-        return sql or "0", params
+        return sql or "0", tuple(_like(term) for term in self.terms)
 
     def count_sql(self, mask: str) -> str:
         return " + ".join(f"(({mask} & {1 << i}) != 0)" for i in range(len(self.terms))) or "0"
@@ -128,30 +145,41 @@ class LexicalQuery:
             return ""
         return " OR ".join(f'"{term}"' for term in self.anchors)
 
-    def indexed_masks_sql(self, table: str) -> tuple[str, tuple[object, ...]]:
+    def indexed_masks_sql(
+        self, table: str, pairs: PairIndex | None = None,
+    ) -> tuple[str, tuple[object, ...]]:
         """Exact term masks from a trigram index; table is an internal name.
 
         Each posting is visited once per query term. Short terms cannot use
-        trigram MATCH and must keep the literal scan path instead. In particular,
-        do not truncate the posting lists before coverage or time filtering.
+        trigram MATCH and must keep the literal scan path instead, unless a
+        two-character CJK term has a pair index: its postings up to the
+        watermark, plus a literal check of the rows written after it. In
+        particular, do not truncate the posting lists before coverage or time
+        filtering.
         """
-        if not self.terms or any(len(term) < 3 for term in self.terms):
+        if not self.terms or any(len(term) < 3 and not (pairs and _is_pair(term)) for term in self.terms):
             return "", ()
-        postings = " UNION ALL ".join(
-            f"SELECT rowid AS id, {1 << i} AS bit FROM {table}(?)"
-            for i in range(len(self.terms))
-        )
         # A short target list is selective; repeating a broad OR of many
         # targets in every posting lookup adds work without useful pruning.
         anchors = self.anchor_fts_query() if len(self.anchors) <= 2 else ""
-        queries = tuple(
-            f'"{term}" AND ({anchors})' if anchors else f'"{term}"'
-            for term in self.terms
-        )
+        postings: list[str] = []
+        params: list[object] = []
+        for i, term in enumerate(self.terms):
+            if len(term) >= 3:
+                postings.append(f"SELECT rowid AS id, {1 << i} AS bit FROM {table}(?)")
+                params.append(f'"{term}" AND ({anchors})' if anchors else f'"{term}"')
+            elif pairs is not None:
+                # Targets are applied by the caller's row filter instead.
+                postings.append(
+                    f"SELECT rowid AS id, {1 << i} AS bit FROM {pairs.table}(?) WHERE rowid <= ? "
+                    f"UNION ALL SELECT id, {1 << i} AS bit FROM {pairs.rows} "
+                    f"WHERE id > ? AND {pairs.column} LIKE ? ESCAPE '\\'"
+                )
+                params.extend((f'"{term}"', pairs.through, pairs.through, _like(term)))
         return (
             "query_masks AS MATERIALIZED (SELECT id, sum(bit) AS query_match_mask FROM ("
-            + postings + ") GROUP BY id HAVING count(*) >= ?)",
-            (*queries, self.minimum),
+            + " UNION ALL ".join(postings) + ") GROUP BY id HAVING count(*) >= ?)",
+            (*params, self.minimum),
         )
 
     def bind_anchor_sql(self, connection: sqlite3.Connection, column: str) -> str:
