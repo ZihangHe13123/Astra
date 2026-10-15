@@ -2345,7 +2345,18 @@ async def _main(startup_started: float):
         _send({"type": "error", "message": "Conversation selection could not be verified. Reopen this session before sending more messages."})
         return False
 
+    launching = {"messages": 0}
+
     async def _launch_message(msg: Msg, input_text: str, resume_task: dict | None = None) -> bool:
+        # Launching awaits before the turn starts; a background wake started meanwhile
+        # would turn this message into steering for an automatic turn.
+        launching["messages"] += 1
+        try:
+            return await _launch_message_now(msg, input_text, resume_task)
+        finally:
+            launching["messages"] -= 1
+
+    async def _launch_message_now(msg: Msg, input_text: str, resume_task: dict | None = None) -> bool:
         nonlocal active_task, active_task_id, goal_turn_generation, _reply_done
         if _response_regenerating or not _response_head_current():
             return False
@@ -2553,7 +2564,8 @@ async def _main(startup_started: float):
     async def _background_tick() -> None:
         """Start a turn for background work that ended after the agent answered."""
         session = agent.context.session_scope
-        if (not session or _turn_busy() or _response_regenerating or restart.draining or active_channel.get()
+        if (not session or _turn_busy() or launching["messages"] or _response_regenerating or restart.draining
+                or active_channel.get()
                 or bar_mode.active or minimal_mode.active or local_mode.active
                 or agent.llm.config.connection_required or appshot_admission.reserved
                 # A turn started now would expire a question still waiting for the user.

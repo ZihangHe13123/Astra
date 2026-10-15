@@ -415,6 +415,7 @@ class ContextIndexBroker:
                             cache_state=candidate.cache_state,
                             timestamp=candidate.timestamp,
                             channels=tuple(sorted({name for name, _rank in candidate.channel_ranks} & CHANNELS)),
+                            memory_id=candidate.locator.primary if candidate.locator.kind == "memory_record" else "",
                         ),
                         candidate,
                     )

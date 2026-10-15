@@ -84,7 +84,10 @@ def register_memory_tools(
             if not memory_id:
                 return _invalid(f"{action} needs memory_id", "Pass the id shown in the memory index.")
             if action == "read":
-                return store.read_memory(memory_id)
+                text = store.read_memory(memory_id)
+                if (record := store.resolve_record(memory_id)) is not None:
+                    store.note_memory_use([record.record_id], read=True)
+                return text
             if action == "revise":
                 if not content.strip():
                     return _invalid("revise needs the new full text in content",

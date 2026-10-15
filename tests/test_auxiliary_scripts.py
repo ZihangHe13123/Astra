@@ -98,8 +98,24 @@ def test_windows_helpers_forward_arguments_and_failure_from_another_directory(
     assert json.loads(result.stdout) == {"args": ARGS, "cwd": str(expected_cwd)}
 
 
+@pytest.fixture(scope="module")
+def warm_powershell(request):
+    """Pay a fresh runner's first powershell.exe start once, with room for it.
+
+    On a new Windows CI machine the first start took about 20 s, the whole budget
+    of the wrapper test below; later starts are quick. The cold start is reported.
+    """
+    started = time.perf_counter()
+    subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "exit 0"],
+                   capture_output=True, check=False, timeout=180)
+    reporter = request.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line(f"powershell.exe first start: {time.perf_counter() - started:.1f}s")
+
+
 @pytest.mark.skipif(os.name != "nt", reason="native Windows PowerShell acceptance")
 @pytest.mark.parametrize("wrapper", SERVICE_WRAPPERS)
+@pytest.mark.usefixtures("warm_powershell")
 def test_windows_service_helpers_use_sibling_script_and_return_failure(
     tmp_path: Path, wrapper: str,
 ) -> None:
@@ -116,7 +132,9 @@ def test_windows_service_helpers_use_sibling_script_and_return_failure(
         'Mark-Phase "entered action=$Action"\n'
         '[Console]::OutputEncoding = [Text.UTF8Encoding]::new()\n'
         'Mark-Phase "before-json-stdout"\n'
-        '@{action=$Action; root=$PSScriptRoot; cwd=$PWD.Path} | ConvertTo-Json -Compress\n'
+        # Built by hand: a first ConvertTo-Json loads its module, 6-9 s on a fresh runner.
+        "function Quote([string]$Value) { '\"' + $Value.Replace('\\', '\\\\').Replace('\"', '\\\"') + '\"' }\n"
+        "'{\"action\":' + (Quote $Action) + ',\"root\":' + (Quote $PSScriptRoot) + ',\"cwd\":' + (Quote $PWD.Path) + '}'\n"
         'Mark-Phase "after-json-stdout"\n'
         'Mark-Phase "before-exit-29"\n'
         'exit 29\n', encoding="utf-8",

@@ -11,7 +11,7 @@ import re
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 
@@ -37,6 +37,8 @@ MEMORY_SCOPES = ("global", "project")
 MEMORY_SUMMARY_CHARS = 160
 MEMORY_INDEX_CHARS = 2400
 MEMORY_INDEX_LINES = 30
+# A saved memory neither saved nor used for this long is reported as unused.
+MEMORY_UNUSED_DAYS = 90
 # Records from before saved memories are listed only for these kinds; older
 # automatic observations stay searchable but out of the always-visible index.
 _INDEXED_LEGACY_KINDS = frozenset({"persona", "user_fact", "preference"})
@@ -543,9 +545,27 @@ class MemoryStore:
             lines.append(f"From session {record.source_session_id}"
                          + (f", message {record.source_message_id}" if record.source_message_id else ""))
         lines.append(f"Summary: {self.memory_summary(record)}")
+        recalls, reads, last_used = self.record_store.usage().get(record.record_id, (0, 0, ""))
+        lines.append(f"Used: recalled {recalls} times, read {reads} times, last {last_used[:10]}"
+                     if last_used else "Used: not since saved")
         lines.append(record.content)
         lines.append(self.memory_timeline(record.record_id))
         return "\n".join(lines)
+
+    def note_memory_use(self, record_ids: Iterable[str], *, read: bool = False) -> None:
+        """Count records recalled into a turn, or read in full."""
+        self.record_store.note_use(record_ids, read=read)
+
+    def unused_memories(self, days: int = MEMORY_UNUSED_DAYS) -> int:
+        """Active saved memories neither saved nor used in the last ``days`` days."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()[:10]
+        usage = self.record_store.usage()
+        return sum(
+            record.metadata.get("origin") == "memory_tool"
+            and max((record.valid_from or record.created_at)[:10],
+                    usage.get(record.record_id, (0, 0, ""))[2][:10]) < cutoff
+            for record in self.record_store.list_records(status="active")
+        )
 
     def memory_index(self, workspace_key: str = "") -> str:
         """One dated line per active saved memory in scope, newest first, within a fixed budget."""
@@ -562,16 +582,27 @@ class MemoryStore:
         ]
         if not records:
             return ""
-        records.sort(key=lambda record: (record.valid_from or record.created_at, record.record_id), reverse=True)
-        lines, used = [], 0
+        usage = self.record_store.usage()
+
+        def saved(record: MemoryRecord) -> str:
+            return record.valid_from or record.created_at
+
+        def active(record: MemoryRecord) -> str:
+            # By day, so the index changes only when a memory enters or leaves it.
+            return max(saved(record)[:10], usage.get(record.record_id, (0, 0, ""))[2][:10])
+
+        # When the index is full, the memories saved or used most recently stay.
+        records.sort(key=lambda record: (active(record), saved(record), record.record_id), reverse=True)
+        chosen, used = [], 0
         for record in records[:MEMORY_INDEX_LINES]:
             scope = " · project" if record.metadata.get("scope") == "project" else ""
-            line = (f"- #{record.record_id[:8]} {(record.valid_from or record.created_at)[:10]} "
+            line = (f"- #{record.record_id[:8]} {saved(record)[:10]} "
                     f"{record.kind}{scope}: {self._prompt_safe(self.memory_summary(record))}")
             if used + len(line) > MEMORY_INDEX_CHARS:
                 break
-            lines.append(line)
+            chosen.append((saved(record), record.record_id, line))
             used += len(line)
+        lines = [line for *_, line in sorted(chosen, reverse=True)]
         omitted = len(records) - len(lines)
         return "\n".join([
             "<memory-index>",
@@ -581,7 +612,8 @@ class MemoryStore:
             "have changed it, check before relying on it, and revise it if it is out of date. "
             "Superseded and expired memories are not listed.",
             *lines,
-            *([f"({omitted} older saved memories are not listed; they are found by search.)"] if omitted else []),
+            *([f"({omitted} saved memories not saved or used recently are not listed; they are found by search.)"]
+              if omitted else []),
             "</memory-index>",
         ])
 
@@ -900,7 +932,8 @@ class MemoryStore:
         record_stats = self.record_store.stats()
         saved = sum(record.metadata.get("origin") == "memory_tool"
                     for record in self.record_store.list_records(status="active"))
-        lines.append(f"Saved memories: {saved} active; the index lists up to {MEMORY_INDEX_LINES}, newest first")
+        lines.append(f"Saved memories: {saved} active; the index lists up to {MEMORY_INDEX_LINES}, newest first"
+                     + (f"; {unused} unused for {MEMORY_UNUSED_DAYS}+ days" if (unused := self.unused_memories()) else ""))
         lines.append(
             "Structured records: "
             f"{record_stats['total']} total; "

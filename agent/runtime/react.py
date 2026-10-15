@@ -2402,6 +2402,7 @@ class ReActAgent(AgentBase):
             blocks = []
             standing_memory = ""
             recalled: list[str] = []
+            recalled_ids: list[str] = []
             context_index_broker = getattr(self, "context_index_broker", None)
             native_index = bool(
                 context_index_broker is not None
@@ -2438,6 +2439,7 @@ class ReActAgent(AgentBase):
                         recall_char_limit=self.memory_router.recall_char_limit, include_core=not work_mode,
                     )
                     recalled.extend(self.memory_store.memory_summary(record) for record in pack.recalled)
+                    recalled_ids.extend(record.record_id for record in pack.recalled)
                     if work_mode:
                         standing_memory = pack.core
                     if getattr(context_index_broker, "native_memory", False):
@@ -2495,6 +2497,7 @@ class ReActAgent(AgentBase):
                         if index_pack.rendered:
                             blocks.append(index_pack.rendered)
                         recalled.extend(row.description for row in index_pack.rows if row.source == "memory")
+                        recalled_ids.extend(row.memory_id for row in index_pack.rows if row.memory_id)
             if self.tool_allowlist is None and self.runtime_turn_context_provider is not None:
                 try:
                     turn_block = str(self.runtime_turn_context_provider() or "").strip()
@@ -2522,6 +2525,7 @@ class ReActAgent(AgentBase):
             self._turn_context_block = "\n\n".join(blocks)
             self._standing_memory_block = standing_memory
             self._report_memory_recall(recalled)
+            self._note_memory_use(recalled_ids)
 
         def turn_context_text() -> str:
             dynamic_blocks: list[str] = []
@@ -3128,6 +3132,14 @@ class ReActAgent(AgentBase):
                "Their mailbox results will be joined automatically when you are "
                "otherwise ready to give the final answer.")
         )
+
+    def _note_memory_use(self, record_ids: list[str]) -> None:
+        if not record_ids or self.memory_store is None:
+            return
+        try:
+            self.memory_store.note_memory_use(record_ids)
+        except Exception:
+            logger.debug("memory usage was not recorded", exc_info=True)
 
     def _report_memory_recall(self, recalled: list[str]) -> None:
         if not recalled or self.on_memory_recall is None:

@@ -145,7 +145,7 @@ def test_the_index_lists_older_kinds_selectively_skips_expired_and_stays_within_
     for number in range(MEMORY_INDEX_LINES + 5):
         _call(registry, action="remember", kind="observation", summary=f"Fact number {number}")
     lines = [line for line in _index(store).splitlines() if line.startswith("- #")]
-    assert len(lines) == MEMORY_INDEX_LINES and "older saved memories are not listed" in _index(store)
+    assert len(lines) == MEMORY_INDEX_LINES and "not saved or used recently are not listed" in _index(store)
 
 
 def test_recalled_memories_carry_their_dates(tmp_path):
@@ -202,3 +202,60 @@ def test_a_memory_saved_in_one_turn_is_in_the_index_the_next_turn_sees(tmp_path)
     turn("今天天气怎么样")
     last = "\n".join(str(message.get("content")) for message in llm.requests[-1])
     assert "<memory-index>" in last and "preference: Answers in Chinese" in last
+
+
+def _age(store, record_id, day):
+    with store.record_store._connection() as db:
+        db.execute("UPDATE memory_records SET created_at = ?, valid_from = ? WHERE id = ?",
+                   (f"{day}T09:00:00+00:00", f"{day}T09:00:00+00:00", record_id))
+
+
+def test_a_full_index_keeps_memories_that_were_used_recently(tmp_path):
+    store, registry, _, _ = _setup(tmp_path)
+    for number in range(MEMORY_INDEX_LINES + 5):
+        _call(registry, action="remember", kind="observation", summary=f"Fact number {number}")
+    records = {record.metadata["summary"]: record for record in store.record_store.list_records(status="active")}
+    for number in range(10):
+        _age(store, records[f"Fact number {number}"].record_id, f"2026-01-{number + 10:02d}")
+    oldest = records["Fact number 0"].record_id
+    assert "Fact number 0\n" not in _index(store) and "5 saved memories" in _index(store)
+
+    first = _call(registry, action="read", memory_id=oldest[:8])["output"]
+    assert "Used: not since saved" in first
+    index = _index(store)
+    assert "Fact number 0\n" in index and "Fact number 5\n" not in index
+    # Listed by date, not by use: the old memory stays near the end.
+    lines = [line for line in index.splitlines() if line.startswith("- #")]
+    assert lines[-1].endswith("Fact number 0") and len(lines) == MEMORY_INDEX_LINES
+    assert "read 1 times" in _call(registry, action="read", memory_id=oldest[:8])["output"]
+
+
+def test_a_memory_recalled_into_a_turn_counts_once_per_turn(tmp_path, monkeypatch):
+    monkeypatch.setenv("HINDSIGHT_ENABLED", "0")
+
+    class FakeLLM:
+        class config:
+            model = "fake"
+            capabilities = frozenset()
+
+    store = MemoryStore(tmp_path / "memory.db", core_dir=tmp_path / "core")
+    record = store.add_record(kind="observation", content="macOS 沙箱使用 astra-sandbox 镜像", tags=("sandbox",))
+    agent = ReActAgent("agent", FakeLLM(), ToolRegistry(), memory_store=store)  # type: ignore[arg-type]
+    agent.context.set_session(str(tmp_path / "s1.jsonl"))
+    agent.context.add_user("mac 沙箱现在用哪个镜像？")
+    agent._memory_turn_key = "turn-1"
+    for _ in range(2):
+        asyncio.run(agent._prepare_prompt_for_llm("mac 沙箱现在用哪个镜像？", None))
+    recalls, reads, last_used = store.record_store.usage()[record.record_id]
+    assert (recalls, reads) == (1, 0) and last_used
+
+
+def test_status_counts_saved_memories_unused_for_ninety_days(tmp_path):
+    store, registry, _, _ = _setup(tmp_path)
+    _call(registry, action="remember", kind="preference", summary="Prefers dark themes")
+    _call(registry, action="remember", kind="preference", summary="Prefers short answers")
+    old = store.record_store.list_records(status="active")[0]
+    _age(store, old.record_id, "2025-01-01")
+    assert "1 unused for 90+ days" in store.status("session-1")
+    store.note_memory_use([old.record_id])
+    assert "unused for" not in store.status("session-1")

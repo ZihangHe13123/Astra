@@ -650,6 +650,43 @@
         {"id": "running.control_css", "category": "unrelated",
          "text": "How do I center a div with CSS grid?"}
       ]
+    },
+    {
+      "id": "body_log",
+      "title": "Weekly weigh-ins found by relative dates (last week, three days ago)",
+      "core": {"user": [], "memory": []},
+      "archive": [
+        {"key": "s1", "days_ago": 21, "at": "08:10", "messages": [
+          {"key": "u1", "role": "user", "content": "早上称了体重，72.4 公斤。"},
+          {"key": "a1", "role": "assistant", "content": "记下了，之后每周记一次。"}]},
+        {"key": "s2", "days_ago": 14, "at": "08:05", "messages": [
+          {"key": "u1", "role": "user", "content": "体重 71.9 公斤，这周开始晚饭不吃米饭。"},
+          {"key": "a1", "role": "assistant", "content": "好，继续观察两周。"}]},
+        {"key": "s3", "days_ago": 7, "at": "08:00", "messages": [
+          {"key": "u1", "role": "user", "content": "今早体重 71.6 公斤。"},
+          {"key": "a1", "role": "assistant", "content": "比上次又轻了一点。"}]},
+        {"key": "s4", "days_ago": 3, "at": "20:30", "messages": [
+          {"key": "u1", "role": "user", "content": "今天去做了体检，医生说血压 128/82，有点偏高。"},
+          {"key": "a1", "role": "assistant", "content": "记下了，饮食上可以少放点盐。"}]}
+      ],
+      "conversation": [
+        {"id": "body.last_week", "category": "temporal",
+         "text": "上周体重是多少？",
+         "expect": [["msg:s3.u1"]],
+         "live": {"must": [["71.6"]]}},
+        {"id": "body.three_days_ago", "category": "temporal",
+         "text": "三天前我去做了什么？",
+         "expect": [["msg:s4.u1"]],
+         "live": {"must": [["体检", "血压"]]}},
+        {"id": "body.two_weeks_ago", "category": "temporal",
+         "text": "两周前称的体重是多少？",
+         "expect": [["msg:s2.u1"]],
+         "live": {"must": [["71.9"]]}},
+        {"id": "body.last_week_en", "category": "cross_lingual",
+         "text": "How much did I weigh last week?",
+         "expect": [["msg:s3.u1"]],
+         "live": {"must": [["71.6"]]}}
+      ]
     }
   ],
   "write_path": [

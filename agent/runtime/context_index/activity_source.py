@@ -365,7 +365,8 @@ class ActivityRecommendationReader:
             return SourceResult("disabled")
         # Preserve native literal identifiers (e.g. error_code or a-b); parsing
         # the already prepared terms again changes matches and scan cost.
-        lexical = LexicalQuery.from_text(query) if plan is not None else None
+        # No pair index here: two-character words would force a full scan.
+        lexical = LexicalQuery.from_text(query, word_split=False) if plan is not None else None
         lexical_query = lexical.terms if lexical is not None else query
         budget = None
         try:
