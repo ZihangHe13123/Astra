@@ -74,8 +74,10 @@ def archive_session_key(scenario_id: str, session_key: str, started: datetime) -
     return f"session_{started:%Y%m%d_%H%M%S}_{suffix}"
 
 
-def seed_world(scenario: ScenarioSpec, *, now: datetime, workspace: Path) -> SeededWorld:
-    """Seed core files, the archive and records into the configured state paths."""
+def seed_world(
+    scenario: ScenarioSpec, *, now: datetime, workspace: Path, without: tuple[str, ...] = (),
+) -> SeededWorld:
+    """Seed core files, the archive and records (except ``without``) into the configured state paths."""
     from agent.runtime.context_index.workspace import resolve_workspace
     from agent.runtime.memory import MemoryStore
     from agent.runtime.session_recall import SessionRecall
@@ -124,6 +126,8 @@ def seed_world(scenario: ScenarioSpec, *, now: datetime, workspace: Path) -> See
 
     record_ids: dict[str, str] = {}
     for record in sorted(scenario.records, key=lambda item: scenario_time(now, item.days_ago, item.at)):
+        if record.key in without:
+            continue
         moment = scenario_time(now, record.days_ago, record.at)
         source_session = source_message = ""
         if record.source:
@@ -152,6 +156,8 @@ def seed_world(scenario: ScenarioSpec, *, now: datetime, workspace: Path) -> See
             record.ref, "record", record.content, items[record.ref][1], moment.timestamp(), saved.record_id,
         )
     for record in scenario.records:
+        if record.key in without:
+            continue
         stored = store.record_store.get(record_ids[record.key])
         if stored is not None and stored.status != "active":
             item = world.items[record.ref]

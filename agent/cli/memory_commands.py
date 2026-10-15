@@ -6,6 +6,7 @@ from agent.runtime.memory import MemoryStore
 from agent.runtime.memory_records import MemoryRecord
 
 if TYPE_CHECKING:
+    from agent.runtime.memory_proposals import ConsolidationScheduler
     from agent.runtime.memory_retainer import MemoryRetainer
     from agent.runtime.memory_router import MemoryRouter
 
@@ -23,7 +24,11 @@ MEMORY_USAGE = (
     "  /memory why\n"
     "  /memory correct <id> <replacement text>\n"
     "  /memory forget <id>\n"
-    "  /memory clear-working"
+    "  /memory clear-working\n"
+    "  /memory proposals        # changes proposed by consolidation\n"
+    "  /memory accept <n|all>\n"
+    "  /memory dismiss <n|all>\n"
+    "  /memory consolidation [on|off|now]"
 )
 
 
@@ -47,6 +52,46 @@ def _format_record(record: MemoryRecord) -> str:
     )
 
 
+def _consolidation_command(
+    store: MemoryStore, action: str, args: list[str], scheduler: "ConsolidationScheduler | None",
+) -> tuple[str, str]:
+    from agent.runtime.memory_proposals import accept_proposal, format_proposals
+
+    pending = store.record_store.proposals()
+    if action == "proposals":
+        return format_proposals(pending), ""
+    if action == "consolidation":
+        if scheduler is None:
+            return "", "Memory consolidation runs in the desktop and terminal app."
+        choice = args[0].lower() if args else "status"
+        if choice in {"on", "off"}:
+            from agent.cli.memory_consolidation_preferences import save_memory_consolidation_enabled
+
+            save_memory_consolidation_enabled(choice == "on")
+            scheduler.enabled = choice == "on"
+        elif choice == "now":
+            scheduler.request()
+            return "A memory review starts at the next idle moment.", ""
+        elif choice != "status":
+            return "", "Usage: /memory consolidation [on|off|now]"
+        return scheduler.status(), ""
+    wanted = {"all"} if args and args[0].lower() == "all" else {arg.upper().lstrip("P") for arg in args}
+    chosen = [item for item in pending if "all" in wanted or str(item["id"]) in wanted]
+    if not args or not chosen:
+        return "", f"Usage: /memory {action} <n|all>; see /memory proposals"
+    if action == "dismiss":
+        for item in chosen:
+            store.record_store.decide_proposal(item["id"], "dismissed")
+        return "Dismissed " + ", ".join(f"P{item['id']}" for item in chosen) + ".", ""
+    results = []
+    for item in chosen:
+        try:
+            results.append(accept_proposal(store, item))
+        except ValueError as exc:
+            results.append(f"P{item['id']} was not applied: {exc}")
+    return "\n".join(results), ""
+
+
 def execute_memory_command(
     store: MemoryStore,
     args: list[str],
@@ -54,11 +99,15 @@ def execute_memory_command(
     session_id: str,
     router: "MemoryRouter | None" = None,
     retainer: "MemoryRetainer | None" = None,
+    consolidation: "ConsolidationScheduler | None" = None,
 ) -> tuple[str, str]:
     action = args[0].lower() if args else "status"
     try:
         if action in {"status", "list"}:
-            return store.status(session_id), ""
+            status = store.status(session_id)
+            return status + (f"\n{consolidation.status()}" if consolidation is not None else ""), ""
+        if action in {"proposals", "accept", "dismiss", "consolidation"}:
+            return _consolidation_command(store, action, args[1:], consolidation)
         if action == "inspect":
             query = " ".join(args[1:]).strip()
             if query and " " not in query:

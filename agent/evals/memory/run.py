@@ -82,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--model", help="live: model catalog key (default: LLM_MODEL or the persisted selection)")
     parser.add_argument("--max-iterations", type=int, default=8, help="live: ReAct iteration limit per turn")
     parser.add_argument("--skip-write-path", action="store_true", help="live: skip the write-path probes")
+    parser.add_argument("--consolidation", action="store_true",
+                        help="run one idle-review pass per world with --model (default deepseek-flash) and score its proposals")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
 
@@ -93,6 +95,23 @@ def main(argv: list[str] | None = None) -> int:
         state_root.mkdir(parents=True, exist_ok=True)
     else:
         state_root = Path(tempfile.mkdtemp(prefix="astra-memory-eval-")).resolve()
+    if args.consolidation:
+        from .consolidation import render_consolidation, run_consolidation
+
+        try:
+            result = run_consolidation(fixture, state_root, model_key=args.model, progress=progress)
+        finally:
+            if not args.keep_state:
+                shutil.rmtree(state_root, ignore_errors=True)
+        result = {"meta": {"tier": "consolidation", "fixture_sha256": fixture.sha256, "git_head": _git_head(),
+                           "generated_at": datetime.now().astimezone().isoformat(timespec="seconds")}, **result}
+        markdown = render_consolidation(result)
+        if args.out:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            args.out.with_suffix(".md").write_text(markdown, encoding="utf-8")
+        print(markdown)
+        return 2 if result["isolation"]["violations"] else 0
     try:
         if args.live:
             from .live import run_live

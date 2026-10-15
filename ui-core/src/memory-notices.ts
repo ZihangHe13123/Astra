@@ -1,11 +1,14 @@
 // Only the fields read here, so both a typed PyEvent and a reducer UIEvent fit.
-type MemoryNotice = { type?: string; event?: string; memory_id?: string; summary?: string; scope?: string };
+type MemoryNotice = { type?: string; event?: string; memory_id?: string; summary?: string; scope?: string; count?: number };
 type MemoryRecall = { type?: string; count?: number; items?: string[] };
 
 const actions: Record<string, string> = { saved: "已记住", revised: "已更新记忆", forgotten: "已忘记" };
 
 /** One line per saved-memory change, with the id the user can inspect or forget. */
 export function memoryNoticeText(event: MemoryNotice): string {
+  if (event.event === "proposed") {
+    return `记忆整理：${event.count ?? 0} 条建议待你审核（/memory proposals）${event.summary ? `，如“${event.summary}”` : ""}`;
+  }
   const scope = event.scope === "project" ? " · 本项目" : "";
   const id = String(event.memory_id ?? "").slice(0, 8);
   return `${actions[event.event ?? ""] ?? "记忆变更"}：${event.summary ?? ""}（#${id}${scope}）`;

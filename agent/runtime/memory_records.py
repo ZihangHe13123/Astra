@@ -161,6 +161,19 @@ class MemoryRecordRepository:
                     reads INTEGER NOT NULL DEFAULT 0,
                     last_used_at TEXT NOT NULL DEFAULT ''
                 );
+                CREATE TABLE IF NOT EXISTS memory_proposals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT '',
+                    decided_at TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS memory_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 """
             )
             try:
@@ -539,6 +552,53 @@ class MemoryRecordRepository:
             rows = db.execute("SELECT record_id, recalls, reads, last_used_at FROM memory_usage").fetchall()
         return {str(row["record_id"]): (int(row["recalls"]), int(row["reads"]), str(row["last_used_at"]))
                 for row in rows}
+
+    def add_proposals(self, items: Iterable[tuple[dict[str, Any], list[dict[str, Any]]]], *, model: str) -> list[int]:
+        """Store proposed memory changes (payload, evidence) as pending."""
+        ids = []
+        with self._lock, self._connection() as db:
+            for payload, evidence in items:
+                cursor = db.execute(
+                    "INSERT INTO memory_proposals(created_at, status, payload_json, evidence_json, model) "
+                    "VALUES (?, 'pending', ?, ?, ?)",
+                    (_now(), json.dumps(payload, ensure_ascii=False), json.dumps(evidence, ensure_ascii=False), model),
+                )
+                ids.append(int(cursor.lastrowid or 0))
+        return ids
+
+    def proposals(self, *, status: str = "pending") -> list[dict[str, Any]]:
+        with self._lock, self._connection() as db:
+            rows = db.execute(
+                "SELECT * FROM memory_proposals WHERE status = ? ORDER BY id", (status,)
+            ).fetchall()
+        return [{
+            "id": int(row["id"]), "created_at": str(row["created_at"]), "status": str(row["status"]),
+            "model": str(row["model"]), **json.loads(row["payload_json"]),
+            "evidence": json.loads(row["evidence_json"]),
+        } for row in rows]
+
+    def decide_proposal(self, proposal_id: int, status: str) -> bool:
+        """Move a pending proposal to accepted or dismissed; False if it was not pending."""
+        if status not in {"accepted", "dismissed"}:
+            raise ValueError(f"Invalid proposal decision: {status}")
+        with self._lock, self._connection() as db:
+            changed = db.execute(
+                "UPDATE memory_proposals SET status = ?, decided_at = ? WHERE id = ? AND status = 'pending'",
+                (status, _now(), int(proposal_id)),
+            ).rowcount
+        return bool(changed)
+
+    def meta(self, key: str, default: str = "") -> str:
+        with self._lock, self._connection() as db:
+            row = db.execute("SELECT value FROM memory_meta WHERE key = ?", (key,)).fetchone()
+        return str(row["value"]) if row is not None else default
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._lock, self._connection() as db:
+            db.execute(
+                "INSERT INTO memory_meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, str(value)),
+            )
 
     def stats(self) -> dict[str, Any]:
         with self._lock, self._connection() as db:
