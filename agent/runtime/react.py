@@ -328,6 +328,8 @@ class ReActAgent(AgentBase):
         # Set by a host that watches this agent's background runs: the ended ones of a
         # session as (notice, display text), each given once (runtime/background_completion.py).
         self.background_notices: Callable[[str], list[tuple[str, str]]] | None = None
+        # Set by a host that shows which saved memories a turn brought back, once per turn.
+        self.on_memory_recall: Callable[[dict], None] | None = None
         # Local-only frontends attach the process-scoped Computer Use runtime.
         # Remote/API surfaces intentionally leave it as None.
         self._computer_runtime: Any | None = None
@@ -2399,6 +2401,7 @@ class ReActAgent(AgentBase):
         if cache_key != self._turn_context_key:
             blocks = []
             standing_memory = ""
+            recalled: list[str] = []
             context_index_broker = getattr(self, "context_index_broker", None)
             native_index = bool(
                 context_index_broker is not None
@@ -2415,12 +2418,14 @@ class ReActAgent(AgentBase):
             # once per user turn so TaskRun checkpoints cannot mutate the
             # already-cached prefix between tool iterations.
             with profile.phase("memory_and_turn_context"):
+                workspace_key = self._memory_workspace_key()
                 if self.memory_router is not None and self.memory_store is not None:
                     with trace_span("agent.memory.recall", ctx=trace_ctx) as memory_span:
                         pack = await self.memory_router.build_context(
                             user_text,
                             session_id=session_id,
                             turn_key=self._memory_turn_key,
+                            workspace_key=workspace_key,
                             **({"recall_enabled": False} if native_index else {}),
                         )
                         memory_ids = ",".join(pack.trace.record_ids)
@@ -2432,6 +2437,7 @@ class ReActAgent(AgentBase):
                     memory_block = pack.render(
                         recall_char_limit=self.memory_router.recall_char_limit, include_core=not work_mode,
                     )
+                    recalled.extend(self.memory_store.memory_summary(record) for record in pack.recalled)
                     if work_mode:
                         standing_memory = pack.core
                     if getattr(context_index_broker, "native_memory", False):
@@ -2441,10 +2447,10 @@ class ReActAgent(AgentBase):
                         blocks.append(memory_block)
                 elif self.memory_store is not None:
                     if work_mode:
-                        standing_memory = self.memory_store.format_core_prompt()
+                        standing_memory = self.memory_store.format_core_prompt(workspace_key)
                         memory_block = self.memory_store.format_working_prompt(session_id)
                     else:
-                        memory_block = self.memory_store.format_prompt(session_id)
+                        memory_block = self.memory_store.format_prompt(session_id, workspace_key)
                     if memory_block:
                         blocks.append(memory_block)
                 context_index_broker = getattr(self, "context_index_broker", None)
@@ -2488,6 +2494,7 @@ class ReActAgent(AgentBase):
                     else:
                         if index_pack.rendered:
                             blocks.append(index_pack.rendered)
+                        recalled.extend(row.description for row in index_pack.rows if row.source == "memory")
             if self.tool_allowlist is None and self.runtime_turn_context_provider is not None:
                 try:
                     turn_block = str(self.runtime_turn_context_provider() or "").strip()
@@ -2514,6 +2521,7 @@ class ReActAgent(AgentBase):
             self._turn_context_key = cache_key
             self._turn_context_block = "\n\n".join(blocks)
             self._standing_memory_block = standing_memory
+            self._report_memory_recall(recalled)
 
         def turn_context_text() -> str:
             dynamic_blocks: list[str] = []
@@ -3120,6 +3128,20 @@ class ReActAgent(AgentBase):
                "Their mailbox results will be joined automatically when you are "
                "otherwise ready to give the final answer.")
         )
+
+    def _report_memory_recall(self, recalled: list[str]) -> None:
+        if not recalled or self.on_memory_recall is None:
+            return
+        try:
+            self.on_memory_recall({"count": len(recalled), "items": recalled[:3]})
+        except Exception:
+            logger.exception("memory recall notice failed")
+
+    @staticmethod
+    def _memory_workspace_key() -> str:
+        from .memory import current_workspace_key
+
+        return current_workspace_key()
 
     def _admit_background_notices(self) -> None:
         """Put this session's background runs that ended since the last step before the model."""

@@ -105,7 +105,9 @@ class ContextPack:
             ]
             used = 0
             for record in self.recalled:
-                item = f"- {_safe(record.content)}"
+                # The date the memory holds from, so an older value reads as older.
+                saved = (record.valid_from or record.created_at)[:10]
+                item = f"- [{saved}] {_safe(record.content)}" if saved else f"- {_safe(record.content)}"
                 if used + len(item) > recall_char_limit:
                     break
                 lines.append(item)
@@ -292,6 +294,7 @@ class MemoryRouter:
         session_id: str,
         turn_key: str = "",
         recall_enabled: bool = True,
+        workspace_key: str = "",
     ) -> ContextPack:
         cache_key = (str(turn_key).strip() + (":native-index" if not recall_enabled else "")) if turn_key else ""
         cached = self._turn_cache.get(cache_key) if cache_key else None
@@ -346,7 +349,7 @@ class MemoryRouter:
             task_block = f"{task_block}\n\n{goal_block}" if task_block else goal_block
         return ContextPack(
             session_id=session_id,
-            core=self.store.format_core_prompt(),
+            core=self.store.format_core_prompt(workspace_key),
             working=self.store.format_working_prompt(session_id),
             task=task_block,
             recalled=records,

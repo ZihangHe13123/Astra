@@ -8,14 +8,23 @@ Astra keeps a small core memory, searchable history and reusable skills. Each ha
 
 ## Core memory and task state
 
-Core memory is global and intentionally small. `MEMORY.md` and `USER.md` are
-the direct always-injected sources of truth, not mirrors of SQLite records.
-They use fixed hard limits. In Work mode they reach the model as a separate
-standing-memory copy, sent once and again only when either file changes, so
-they are not repeated in every turn's context and an edit shows on the next
-turn; restricted modes add them to the current turn's context. The persisted
-user message remains unchanged. Core Markdown currently has no project-folder
-scope.
+Memory has two layers. Core memory is global and intentionally small: `MEMORY.md`
+and `USER.md` are pinned entries you can edit directly, with fixed hard limits.
+Saved memories are the growing layer: records in `.astra/memory.db` that Astra
+writes with its `memory` tool (`remember`), each with a one-line summary, the
+conversation it came from, a date, and global or project scope (the current
+checkout). An index of saved memories, one dated line each, newest first, at most
+30 lines and 2,400 characters, is always visible after the core entries; Astra
+reads a memory's full text when it needs more than the summary. Only memories
+for all projects and for the current one are listed; superseded and expired ones
+are not. Records from before saved memories are listed only when they are
+preferences or facts about you.
+
+In Work mode the core entries and the index reach the model as a separate
+standing-memory copy, sent once and again only when they change, so they are
+not repeated in every turn's context and a change shows on the next turn;
+restricted modes add them to the current turn's context. The persisted user
+message remains unchanged.
 
 Durable execution uses `TaskRun → Step/TaskEvent` in `.astra/tasks.db`.
 Every request receives an independent TaskRun with checkpoints, tool results,
@@ -63,11 +72,17 @@ characters per turn. Project/configuration questions can match local
 observations without requiring the user to say “remember”; trivial turns,
 slash commands, and unrelated questions skip automatic recall. SQLite FTS5 is
 used when available, with deterministic substring fallback for Chinese text.
-Nothing currently adds new structured records except a correction, which
-supersedes the record it corrects; existing records stay searchable.
+A recalled record is shown with its date.
 
 Personal facts and corrections are written through the model's memory tools or
-explicit `/memory` commands. Astra does not turn conversation sentences into facts
+explicit `/memory` commands. When something changes, Astra revises the memory:
+the new one supersedes it, and the old one is kept, marked superseded with an
+end date, so its history stays readable with `/memory timeline`. The conversation
+shows each change as it happens (“已记住”, “已更新记忆”, “已忘记”, with the id), and
+a turn that recalls saved memories says how many. If a turn has read a web
+page, a browser page, an MCP result, or content delivered by a subagent, another
+session or a background run, saving a memory in it needs your approval: such
+text can carry instructions written to plant themselves in memory. Astra does not turn conversation sentences into facts
 using patterns such as “I like”, “remember”, or “change to”. Optional tool-authored
 retention is off by default (`MEMORY_AUTO_RETAIN=0`); enabling it admits only tools
 that explicitly provide attributable evidence from successful calls, and no current
@@ -125,8 +140,10 @@ The model can use the `memory` tool to maintain the same stores. Credential-like
 content is rejected. `MEMORY.md` is limited to 2,200 characters and `USER.md` to
 1,375 characters. Core additions and removals do not require approval; the model
 is told to remove a core entry only when you ask, or when a file is full and the
-entry is obsolete, duplicated or superseded. Structured records are forgotten only
-through `/memory forget <id>` or a deletion you select in `/memory review`.
+entry is obsolete, duplicated or superseded. Saved memories are added and revised without
+approval (except after outside content, as above); the model may forget one only
+when you ask, and you approve each forget. You can also use `/memory forget <id>`
+or select a deletion in `/memory review`.
 
 ## Proactive Context Index
 

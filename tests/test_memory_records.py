@@ -294,7 +294,11 @@ def test_structured_record_retains_provenance_and_is_not_blindly_injected(tmp_pa
     assert recalled[0].confidence == 0.95
     assert recalled[0].tags == ("education", "northstar")
     assert recalled[0].metadata["retained_by"] == "explicit-user-statement"
-    assert "Northstar University" not in store.format_prompt("session-1")
+    # Not pinned: a user fact is a dated line in the saved-memory index.
+    prompt = store.format_prompt("session-1")
+    index = prompt[prompt.index("<memory-index>"):prompt.index("</memory-index>")]
+    assert "Northstar University" in index and record.created_at[:10] in index
+    assert "[USER.md]" not in prompt
 
 
 def test_supersede_marks_old_fact_inactive_and_links_replacement(tmp_path):

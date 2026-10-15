@@ -901,7 +901,10 @@ async def _main(startup_started: float):
         tools,
         memory_store,
         session_id=lambda: agent_holder["agent"].context.session_scope if agent_holder else "default",
+        messages=lambda: agent_holder["agent"].context.messages if agent_holder else [],
     )
+    # Saved, revised or forgotten memories are shown to the user as they happen.
+    memory_store.on_change = lambda change: _send({"type": "memory_notice", **change})
     register_goal_tools(
         tools,
         task_store,
@@ -1181,6 +1184,7 @@ async def _main(startup_started: float):
     agent.context.compaction_observer = _send
     agent.set_persona(persona_state, system_prompt)
     agent.delegate_mailbox = delegate_mailbox
+    agent.on_memory_recall = lambda recall: _send({"type": "memory_recall", **recall})
     delegate_mailbox.wakes_parent = lambda task_id: bool(task_id) and task_id == work_turn["task_id"]
     agent.background_notices = lambda session: (
         [] if bar_mode.active or minimal_mode.active or local_mode.active else completions.drain(session)
