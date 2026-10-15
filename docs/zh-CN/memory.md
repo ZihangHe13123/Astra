@@ -2,7 +2,7 @@
 
 [首页](../../README.zh-CN.md) · [文档导航](README.md) · [English](../memory.md)
 
-[核心记忆与任务状态](#core-memory-and-task-state) · [按需历史与自动技能](#on-demand-history-and-learned-skills) · [记忆命令](#memory-commands) · [主动 Context Index](#proactive-context-index) · [导入 Hermes 历史](#importing-hermes-history) · [可选 Hindsight 服务](#optional-hindsight-service)
+[核心记忆与任务状态](#core-memory-and-task-state) · [按需历史与自动技能](#on-demand-history-and-learned-skills) · [记忆命令](#memory-commands) · [主动 Context Index](#proactive-context-index) · [评测记忆](#evaluating-memory) · [导入 Hermes 历史](#importing-hermes-history) · [可选 Hindsight 服务](#optional-hindsight-service)
 
 Astra 分别维护少量核心记忆、可检索历史和可复用技能，三者用途和生命周期不同。
 
@@ -77,6 +77,17 @@ Hindsight 是可选的联合语义召回增强。启用时与本地权威库结�
 检索行为、预算、诊断、反馈和质量检查见[原生记忆推荐设计（英文）](../native-memory-recommendation.md)；可选 embedding 的设置见[平台配置](context-index-platforms.md)。初始预览默认 900 字符、最高 2,000 字符，并受 500-token 估算预算限制。系统可以不返回推荐；旧记录不代表当前指令或事实证明。
 
 <a id="importing-hermes-history"></a>
+
+<a id="evaluating-memory"></a>
+## 评测记忆
+
+`agent/evals/memory` 测量记忆实际送到模型面前的内容。它使用合成的中文、英文和混合语料，通过公开的记忆和归档接口写入，全部在临时状态里运行，不会碰你的安装数据：
+
+```bash
+python -m agent.evals.memory.run --mode off,session,all --out memory-eval.json
+```
+
+默认离线运行，不调用模型。它按后端的方式构造 agent，跑多轮对话，按问题类别报告：证据召回（最新上下文中和整体可见两种）、误注入与旧值注入、带日期的条目、每次请求和每个对话注入的 token 及其中核心记忆的部分、前缀稳定性和准备耗时。`--live --model <key>` 会调用真实模型，按关键词、日期和拒答给回答打分，并检查在一个会话里说过的偏好下个会话是否还记得。
 
 ## 导入 Hermes 历史
 

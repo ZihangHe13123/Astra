@@ -4,7 +4,7 @@
 
 Astra keeps a small core memory, searchable history and reusable skills. Each has a different purpose and lifecycle.
 
-[Core memory and task state](#core-memory-and-task-state) · [On-demand history and learned skills](#on-demand-history-and-learned-skills) · [Memory commands](#memory-commands) · [Proactive Context Index](#proactive-context-index) · [Importing Hermes history](#importing-hermes-history) · [Optional Hindsight service](#optional-hindsight-service)
+[Core memory and task state](#core-memory-and-task-state) · [On-demand history and learned skills](#on-demand-history-and-learned-skills) · [Memory commands](#memory-commands) · [Proactive Context Index](#proactive-context-index) · [Evaluating memory](#evaluating-memory) · [Importing Hermes history](#importing-hermes-history) · [Optional Hindsight service](#optional-hindsight-service)
 
 ## Core memory and task state
 
@@ -155,6 +155,24 @@ retrieval behavior, budgets, diagnostics, feedback and quality checks, and
 The initial preview defaults to 900 characters (at most 2,000) and a 500-token
 estimate. Context Index can return no recommendation; retrieved notes remain
 historical evidence, not current instructions or proof of a fact.
+
+## Evaluating memory
+
+`agent/evals/memory` measures what memory puts in front of the model, using
+synthetic worlds (Chinese, English and mixed) seeded through the public memory
+and archive APIs, in temporary state that never touches your installation:
+
+```bash
+python -m agent.evals.memory.run --mode off,session,all --out memory-eval.json
+```
+
+The default offline run uses no model. It builds the agent as the backend does,
+runs multi-turn conversations, and reports evidence recall (in the newest
+context and anywhere visible), false and stale injection, dated items,
+injected and core-memory tokens per request and per conversation, prefix
+stability and preparation latency, by probe category. `--live --model <key>`
+asks a real model and scores its answers by keywords, dates and abstention,
+including whether a preference stated in one session is remembered in the next.
 
 ## Importing Hermes history
 
