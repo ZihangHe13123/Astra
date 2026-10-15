@@ -187,3 +187,63 @@ def test_search_files_marks_a_capped_listing_partial(tmp_path):
     complete = run(registry.execute("search_files", {"pattern": "f00*.txt"}))
     assert complete["output"].split("\n") == [f"f{index:03d}.txt" for index in range(10)]
     assert not complete.get("partial")
+
+
+RGLOB_PATTERNS = [
+    "",
+    "*",
+    "*/",
+    "*.py",
+    "*.PY",
+    "**/*.py",
+    "**/**/*.txt",
+    "src/*.py",
+    "src/**/*.py",
+    "**/pkg/**/*.txt",
+    "pkg",
+    "Main.py",
+    "../*.md",
+    "link/*.py",
+]
+
+
+@pytest.mark.parametrize("include_ignored", [False, True])
+def test_search_files_lists_exactly_what_rglob_finds(tmp_path, include_ignored):
+    from agent.runtime.tools.files import DEFAULT_SEARCH_SKIP_DIRS
+
+    for relative in (
+        "Main.py", "notes.md", "src/app.py", "src/pkg/data.txt", "src/pkg/deep/more.txt",
+        "lib/pkg/src/inner.py", "lib/pkg/readme.md", "docs/guide.md", "node_modules/pkg/dep.py",
+        ".venv/lib/site.py", "build/out.txt", ".sandbox_tmp/scratch.py", "empty/",
+    ):
+        target = tmp_path / relative
+        if relative.endswith("/"):
+            target.mkdir(parents=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x\n", encoding="utf-8")
+    try:
+        (tmp_path / "link").symlink_to(tmp_path / "src", target_is_directory=True)
+    except OSError:
+        pass  # Creating symlinks needs a privilege on Windows; the rest still applies.
+
+    def noisy(part):
+        return part in DEFAULT_SEARCH_SKIP_DIRS or part.startswith(".sandbox_")
+
+    registry = ToolRegistry()
+    register_file_tools(registry, str(tmp_path))
+    for pattern in RGLOB_PATTERNS:
+        expected = sorted(
+            match for match in tmp_path.rglob(pattern)
+            if include_ignored or not any(noisy(part) for part in match.relative_to(tmp_path).parts)
+        )
+        result = run(registry.execute(
+            "search_files", {"pattern": pattern, "include_ignored": include_ignored}
+        ))
+        assert result["error"] == "", pattern
+        if expected:
+            assert result["output"].split("\n") == [
+                str(match.relative_to(tmp_path)) for match in expected
+            ], pattern
+        else:
+            assert result["output"].startswith("No files matching"), pattern

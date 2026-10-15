@@ -1,0 +1,193 @@
+"""File tools must not block the backend's event loop.
+
+Each test holds one real filesystem call for one path (a "gate" inside
+``os.scandir`` or ``Path.open``) and observes the loop from a concurrent ticker
+task while the tool runs through the real registry.
+"""
+
+import asyncio
+import json
+import os
+import threading
+import time
+from pathlib import Path
+
+import pytest
+
+from agent.runtime.tools.files import register_file_tools
+from agent.runtime.tools.registry import ToolRegistry
+
+
+GATE_WAIT_SECONDS = 5.0
+
+SEARCHES = [
+    ("search_files", {"pattern": "**/*.txt"}),
+    ("search_text", {"pattern": "needle"}),
+]
+EXPECTED_OUTPUT = {
+    "search_files": os.path.join("dir07", "needle.txt"),
+    "search_text": "1 match(es):\n" + os.path.join("dir07", "needle.txt") + ":1: needle",
+}
+
+
+class PathGate:
+    """Hold the first call of ``owner.attribute`` for one path until released."""
+
+    def __init__(self, monkeypatch, owner, attribute, target):
+        self.target = os.path.normcase(os.path.abspath(target))
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.calls_after_release: list[str] = []
+        original = getattr(owner, attribute)
+
+        def gated(path=".", *args, **kwargs):
+            normalized = os.path.normcase(os.path.abspath(os.fspath(path)))
+            if self.release.is_set():
+                self.calls_after_release.append(normalized)
+            elif normalized == self.target and not self.entered.is_set():
+                self.entered.set()
+                # A loop-blocking implementation stalls here on the loop thread.
+                self.release.wait(GATE_WAIT_SECONDS)
+            return original(path, *args, **kwargs)
+
+        monkeypatch.setattr(owner, attribute, gated)
+
+    async def wait_entered(self):
+        deadline = time.monotonic() + GATE_WAIT_SECONDS
+        while not self.entered.is_set():
+            assert time.monotonic() < deadline, "the tool never reached the gated path"
+            await asyncio.sleep(0.01)
+
+
+def build_workspace(tmp_path, monkeypatch):
+    monkeypatch.setenv("ASTRA_HOME", str(tmp_path / "astra-home"))
+    workspace = tmp_path / "workspace"
+    for index in range(20):
+        (workspace / f"dir{index:02d}").mkdir(parents=True)
+        (workspace / f"dir{index:02d}" / "other.md").write_text("unrelated\n", encoding="utf-8")
+    (workspace / "dir07" / "needle.txt").write_text("needle\n", encoding="utf-8", newline="\n")
+    registry = ToolRegistry()
+    register_file_tools(registry, str(workspace))
+    return workspace, registry
+
+
+async def tick(ticks: list[float], stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        ticks.append(time.perf_counter())
+        await asyncio.sleep(0.01)
+
+
+@pytest.mark.parametrize("tool,args", SEARCHES)
+def test_search_keeps_the_event_loop_responsive(tmp_path, monkeypatch, tool, args):
+    workspace, registry = build_workspace(tmp_path, monkeypatch)
+    gate = PathGate(monkeypatch, os, "scandir", workspace / "dir07")
+
+    async def scenario():
+        ticks: list[float] = []
+        stop = asyncio.Event()
+        ticker = asyncio.create_task(tick(ticks, stop))
+        search = asyncio.create_task(registry.execute(tool, args))
+        try:
+            await gate.wait_entered()
+            before = len(ticks)
+            await asyncio.sleep(0.3)
+            ticked_while_blocked = len(ticks) - before
+            still_running = not search.done()
+        finally:
+            gate.release.set()
+        result = await asyncio.wait_for(search, GATE_WAIT_SECONDS)
+        stop.set()
+        await ticker
+        return ticked_while_blocked, still_running, result
+
+    ticked_while_blocked, still_running, result = asyncio.run(scenario())
+    # The walk is parked in its worker, while the loop keeps scheduling tasks.
+    assert still_running
+    assert ticked_while_blocked >= 5
+    assert result["error"] == ""
+    assert result["output"] == EXPECTED_OUTPUT[tool]
+
+
+@pytest.mark.parametrize("tool,args", SEARCHES)
+def test_cancelled_search_returns_at_once_and_stops_walking(tmp_path, monkeypatch, tool, args):
+    workspace, registry = build_workspace(tmp_path, monkeypatch)
+    gate = PathGate(monkeypatch, os, "scandir", workspace)
+
+    async def scenario():
+        search = asyncio.create_task(registry.execute(tool, args))
+        try:
+            await gate.wait_entered()
+            search.cancel()
+            started = time.perf_counter()
+            with pytest.raises(asyncio.CancelledError):
+                await search
+            cancel_seconds = time.perf_counter() - started
+        finally:
+            gate.release.set()
+        # The worker resumes from the held listing; give it time to walk on.
+        await asyncio.sleep(0.3)
+        return cancel_seconds
+
+    cancel_seconds = asyncio.run(scenario())
+    assert cancel_seconds < 0.5
+    # Twenty unvisited directories remained; a cancelled walk lists none of them.
+    assert gate.calls_after_release == []
+
+
+@pytest.mark.parametrize("tool,args", SEARCHES)
+def test_search_time_limit_interrupts_a_long_walk(tmp_path, monkeypatch, tool, args):
+    workspace, registry = build_workspace(tmp_path, monkeypatch)
+    tool_def = registry.get(tool)
+    assert tool_def is not None
+    tool_def.timeout = 0.3
+    gate = PathGate(monkeypatch, os, "scandir", workspace / "dir07")
+
+    async def scenario():
+        started = time.perf_counter()
+        try:
+            result = await asyncio.wait_for(registry.execute(tool, args), GATE_WAIT_SECONDS)
+        finally:
+            gate.release.set()
+        elapsed = time.perf_counter() - started
+        await asyncio.sleep(0.3)
+        return result, elapsed
+
+    result, elapsed = asyncio.run(scenario())
+    assert elapsed < 2.0
+    assert result["code"] == "overall_timeout"
+    assert "narrower directory" in result["recovery_hint"]
+    assert result["details"]["directories_listed"] >= 1
+    assert gate.calls_after_release == []
+
+
+@pytest.mark.parametrize("tool", ["read_file", "stat_file"])
+def test_file_reads_keep_the_event_loop_responsive(tmp_path, monkeypatch, tool):
+    workspace, registry = build_workspace(tmp_path, monkeypatch)
+    gate = PathGate(monkeypatch, Path, "open", workspace / "dir07" / "needle.txt")
+
+    async def scenario():
+        ticks: list[float] = []
+        stop = asyncio.Event()
+        ticker = asyncio.create_task(tick(ticks, stop))
+        read = asyncio.create_task(registry.execute(tool, {"path": os.path.join("dir07", "needle.txt")}))
+        try:
+            await gate.wait_entered()
+            before = len(ticks)
+            await asyncio.sleep(0.3)
+            ticked_while_blocked = len(ticks) - before
+            still_running = not read.done()
+        finally:
+            gate.release.set()
+        result = await asyncio.wait_for(read, GATE_WAIT_SECONDS)
+        stop.set()
+        await ticker
+        return ticked_while_blocked, still_running, result
+
+    ticked_while_blocked, still_running, result = asyncio.run(scenario())
+    assert still_running
+    assert ticked_while_blocked >= 5
+    assert result["error"] == ""
+    if tool == "read_file":
+        assert result["output"] == "needle\n"
+    else:
+        assert json.loads(result["output"])["total_lines"] == 1
