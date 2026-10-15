@@ -123,3 +123,25 @@ def pytest_configure(config: pytest.Config) -> None:
     patch.setenv("ASTRA_LOCAL_MODE_FILE", os.path.join(persona_state.name, "missing-local-mode.py"))
     config.add_cleanup(patch.undo)
     _patch_win32_scandir_retry()
+
+
+@pytest.fixture(scope="session")
+def warm_native_chrome(request):
+    """Pay a fresh Windows runner's first headless Chrome start once, with room for it.
+
+    On new Windows CI machines the first launches printed nothing for a whole
+    25-30 s production budget, sometimes for a minute or two, while later
+    launches were quick. Tests that start native Chrome check behaviour within
+    that budget once Chrome has started; this start is reported.
+    """
+    import asyncio
+
+    from agent.runtime.cdp_backend import CdpBrowserBackend, find_chrome
+
+    if sys.platform != "win32" or not find_chrome():
+        return
+    started = time.perf_counter()
+    result = asyncio.run(CdpBrowserBackend(find_chrome(), timeout=180).extract("data:text/html,<p>warm-up</p>"))
+    reporter = request.config.pluginmanager.get_plugin("terminalreporter")
+    if reporter is not None:
+        reporter.write_line(f"headless Chrome first start: {time.perf_counter() - started:.1f}s ({result[:60]!r})")
