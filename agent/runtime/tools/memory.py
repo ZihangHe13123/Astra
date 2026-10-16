@@ -58,6 +58,14 @@ def outside_content(messages: list[dict], registry: ToolRegistry) -> str:
     return ""
 
 
+def _record_date(created_at: object) -> str:
+    """The record's own date, or "" when Hindsight had none or it cannot be read."""
+    try:
+        return datetime.fromisoformat(str(created_at).strip().replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        return ""
+
+
 def register_memory_tools(
     registry: ToolRegistry,
     store: MemoryStore,
@@ -121,7 +129,7 @@ def register_memory_tools(
         if extra:
             lines.append("Hindsight (historical, non-authoritative; Astra's memories above override conflicts):")
             for record in extra:
-                date = str(getattr(record, "created_at", "") or "")[:10]
+                date = _record_date(getattr(record, "created_at", ""))
                 text = " ".join(str(record.content).split())
                 lines.append(f"- {date + ' ' if date else ''}[{record.kind}] {text[:300]}{'…' if len(text) > 300 else ''}")
         if note:

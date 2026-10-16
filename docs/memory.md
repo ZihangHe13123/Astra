@@ -132,8 +132,9 @@ a turn automatically. When it is enabled, `memory(action="search")` sends it the
 same words and lists its results after Astra's own, marked historical and
 non-authoritative, without the ones that repeat a memory already listed. A
 service that fails or takes more than five seconds leaves Astra's own results
-and a note saying so. Its `hindsight_recall`, `hindsight_reflect` and
-`hindsight_retain` tools remain available. Current user statements, Core
+and a note saying so. Search is the only way to read Hindsight's memories; its
+`hindsight_reflect` (a synthesized answer) and `hindsight_retain` tools remain
+available. Current user statements, Core
 Markdown, concrete TaskRun results, Goal state, and temporary conversation state
 always take precedence over recalled records.
 

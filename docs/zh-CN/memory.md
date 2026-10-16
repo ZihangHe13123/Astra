@@ -32,7 +32,7 @@ Work 模式下，核心条目和索引以单独的“常驻记忆”副本发给
 
 后台整理记忆在 Astra 空闲时回顾新的对话并提出修改建议。桌面或终端应用 10 分钟没有对话、且距上次回顾你至少发了 4 条消息时（最多每 30 分钟一次），DeepSeek Flash 会读这些消息（你的完整，助手的回复截短）和已有记忆，提出最多 5 条建议：记住你说过的长期事实或偏好、修订被后来的话改变的记忆、忘记你收回的记忆。每条建议都附上它依据的那句话；只有你自己的消息算依据，像密钥的内容会被丢弃。有建议时会提示数量。`/memory proposals` 查看，`/memory accept <n|all>` 按普通的已保存记忆修改生效（来源记为那句话），`/memory dismiss <n|all>` 丢弃。第一次回顾只读最近三天。对话会发给 DeepSeek，需要 DeepSeek 密钥；归档里只有你的消息和助手的回复，没有工具输出，极简、酒吧和当前安装提供的本地模式不会被记录。后台整理有三种模式。默认的 `review` 只提建议，你接受之前什么都不改。`auto` 让“记住”和“修订”建议直接生效：每处修改都像普通的记忆提示一样显示，并标上“记忆整理”；修订过的记忆保留旧版本，可以用 `/memory timeline` 查看；新记住的可以用 `/memory forget <id>` 撤销。“忘记”建议仍然等你确认。`off` 停止回顾。`/memory consolidation off|review|auto` 切换模式（以前设的 `on` 按 `review` 处理），`now` 会在下一个空闲时刻回顾一次。中文问题中的普通英文词是软匹配项，明确字面量和代码标识符仍约束结果。
 
-Hindsight 是搜索的可选附加来源，它的内容不会被自动加进某一轮。启用时，`memory(action="search")` 用同样的词去问它，结果列在 Astra 自己的结果之后，标为历史、非权威，与已列出的记忆重复的不列。服务失败或超过 5 秒没有回答时，保留 Astra 自己的结果并附一句说明。它的 `hindsight_recall`、`hindsight_reflect` 和 `hindsight_retain` 工具仍可用。当前用户陈述、核心 Markdown、实际 TaskRun 结果、Goal 和临时对话状态都优先于旧召回内容。
+Hindsight 是搜索的可选附加来源，它的内容不会被自动加进某一轮。启用时，`memory(action="search")` 用同样的词去问它，结果列在 Astra 自己的结果之后，标为历史、非权威，与已列出的记忆重复的不列。服务失败或超过 5 秒没有回答时，保留 Astra 自己的结果并附一句说明。读 Hindsight 的记忆只通过搜索；它的 `hindsight_reflect`（综合作答）和 `hindsight_retain` 工具仍可用。当前用户陈述、核心 Markdown、实际 TaskRun 结果、Goal 和临时对话状态都优先于旧召回内容。
 
 <a id="on-demand-history-and-learned-skills"></a>
 

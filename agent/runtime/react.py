@@ -185,7 +185,7 @@ class ReActAgent(AgentBase):
             builtin_memory_provider = BuiltinMemoryProvider(memory_store)
             # Hindsight is reached on demand: its own tools, and memory search.
             self.external_memory_provider = HindsightMemoryProvider.from_env()
-        if self.external_memory_provider is not None and self.tools.get("hindsight_recall") is None:
+        if self.external_memory_provider is not None and self.tools.get("hindsight_retain") is None:
             from .tools.hindsight import register_hindsight_tools
 
             register_hindsight_tools(self.tools, self.external_memory_provider)

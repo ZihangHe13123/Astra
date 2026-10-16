@@ -163,7 +163,7 @@ def build_runtime_capabilities(agent, sandbox=None, mcp_manager=None) -> Capabil
                 state,
                 health.detail,
                 (
-                    "automatic historical recall is unavailable; session_search remains explicit"
+                    "memory search lists Astra's own memories only; session_search remains available"
                     if state is CapabilityState.DEGRADED else ""
                 ,),
             )
