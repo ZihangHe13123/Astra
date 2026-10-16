@@ -700,7 +700,8 @@ try {
  await page.waitForFunction(()=>[...document.querySelectorAll('.choice-grid.three button')].some(b=>b.getAttribute('aria-pressed')==='true'&&b.textContent.startsWith('需审核')));
  await reviewChoice('自动同意').click();
  await page.waitForFunction(async()=>{const b=await window.astra.bootstrap();const s=b.sessions.find(s=>s.id===b.active);return s?.info.memory_consolidation_status?.mode==='auto';});
- assert.equal(await reviewChoice('自动同意').getAttribute('aria-pressed'),'true');
+ // The main process holds the new status before the window has drawn it.
+ await expect(reviewChoice('自动同意')).toHaveAttribute('aria-pressed','true');
  assert.equal(JSON.parse(readFileSync(join(folder,'settings.json'),'utf8')).memory_consolidation,'auto');
  await page.getByRole('button',{name:'关闭',exact:true}).click();
  passed('settings switch the background memory review and save the choice');
