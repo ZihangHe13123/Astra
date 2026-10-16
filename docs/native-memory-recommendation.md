@@ -27,9 +27,11 @@ Context Index and `context_open` contracts.
 
 Ordinary Markdown core memory and current working/task context remain separate
 from historical evidence. When native recommendation is enabled, dynamic local
-records enter the same selection and budget as session/activity candidates;
-`MemoryRouter` does not additionally recall through its provider. Existing
-optional integrations are not dependencies of this pipeline.
+records enter the same selection and budget as session/activity candidates.
+This is the only automatic recall of records. `memory(action="search")` runs
+the same `RecordSource` on the model's own query, and lowers the required term
+count to one only when no record contains two of the terms. Existing optional
+integrations are not dependencies of this pipeline.
 
 ## Retrieval and budgets
 

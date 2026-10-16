@@ -8,7 +8,6 @@ from agent.runtime.memory_records import MemoryRecord
 if TYPE_CHECKING:
     from agent.runtime.memory_proposals import ConsolidationScheduler
     from agent.runtime.memory_retainer import MemoryRetainer
-    from agent.runtime.memory_router import MemoryRouter
 
 
 MEMORY_USAGE = (
@@ -28,7 +27,7 @@ MEMORY_USAGE = (
     "  /memory proposals        # changes proposed by consolidation\n"
     "  /memory accept <n|all>\n"
     "  /memory dismiss <n|all>\n"
-    "  /memory consolidation [on|off|now]"
+    "  /memory consolidation [off|review|auto|now]"
 )
 
 
@@ -64,16 +63,17 @@ def _consolidation_command(
         if scheduler is None:
             return "", "Memory consolidation runs in the desktop and terminal app."
         choice = args[0].lower() if args else "status"
-        if choice in {"on", "off"}:
-            from agent.cli.memory_consolidation_preferences import save_memory_consolidation_enabled
+        choice = "review" if choice == "on" else choice  # on meant review before auto existed
+        if choice in {"off", "review", "auto"}:
+            from agent.cli.memory_consolidation_preferences import save_memory_consolidation_mode
 
-            save_memory_consolidation_enabled(choice == "on")
-            scheduler.enabled = choice == "on"
+            save_memory_consolidation_mode(choice)
+            scheduler.mode = choice
         elif choice == "now":
             scheduler.request()
             return "A memory review starts at the next idle moment.", ""
         elif choice != "status":
-            return "", "Usage: /memory consolidation [on|off|now]"
+            return "", "Usage: /memory consolidation [off|review|auto|now]"
         return scheduler.status(), ""
     wanted = {"all"} if args and args[0].lower() == "all" else {arg.upper().lstrip("P") for arg in args}
     chosen = [item for item in pending if "all" in wanted or str(item["id"]) in wanted]
@@ -97,7 +97,6 @@ def execute_memory_command(
     args: list[str],
     *,
     session_id: str,
-    router: "MemoryRouter | None" = None,
     retainer: "MemoryRetainer | None" = None,
     consolidation: "ConsolidationScheduler | None" = None,
 ) -> tuple[str, str]:
@@ -123,15 +122,12 @@ def execute_memory_command(
                 return "", MEMORY_USAGE
             return store.memory_timeline(args[1]), ""
         if action == "why":
-            if router is None:
-                return "Memory routing is unavailable in this runtime.", ""
-            trace = router.last_trace(session_id)
+            blocks = [
+                "Automatic recall: only through the Context Index (/context-index why explains its last choice). "
+                "With it off, no records are added to a turn; saved memories are listed in the always-visible "
+                "index, and the model looks others up with memory(action=search)."
+            ]
             retention = retainer.last_outcome(session_id) if retainer is not None else None
-            if trace is None and retention is None:
-                return "No memory routing decision has been recorded for this session yet.", ""
-            blocks = []
-            if trace is not None:
-                blocks.append(trace.format())
             if retention is not None:
                 blocks.append(retention.format())
             return "\n\n".join(blocks), ""

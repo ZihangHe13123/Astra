@@ -453,6 +453,8 @@ class MemoryStore:
                 "event": event, "memory_id": record.record_id, "summary": self.memory_summary(record),
                 "kind": record.kind, "scope": str(record.metadata.get("scope") or "global"),
                 **({"previous_id": previous.record_id} if previous is not None else {}),
+                # Consolidation cites an archived message; the notice says the change came from a review.
+                **({"origin": "consolidation"} if str(record.source_message_id).startswith("archive:") else {}),
             })
         except Exception:
             # A display notice must never undo or fail a memory write.
@@ -612,8 +614,8 @@ class MemoryStore:
             "have changed it, check before relying on it, and revise it if it is out of date. "
             "Superseded and expired memories are not listed.",
             *lines,
-            *([f"({omitted} saved memories not saved or used recently are not listed; they are found by search.)"]
-              if omitted else []),
+            *([f"({omitted} saved memories not saved or used recently are not listed; "
+               "memory(action=\"search\") finds them.)"] if omitted else []),
             "</memory-index>",
         ])
 

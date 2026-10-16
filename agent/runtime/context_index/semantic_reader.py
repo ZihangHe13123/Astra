@@ -149,7 +149,7 @@ class SemanticReader:
                 canonical = {str(row["id"]): row for row in rows}
                 for key, score in batch:
                     row = canonical.get(key)
-                    if row is None or _revision(row) != revisions[key] or not _eligible_metadata(row["metadata_json"], workspace.root or None):
+                    if row is None or _revision(row) != revisions[key] or not _eligible_metadata(row["metadata_json"], workspace.root or None, workspace_key=workspace.key):
                         continue
                     timestamp = _epoch(row["last_confirmed_at"])
                     if (not plan.contains(timestamp) or _epoch(row["created_at"]) > plan.cutoff

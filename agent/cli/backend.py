@@ -195,7 +195,7 @@ from agent.cli.context_index_preferences import load_context_index_preferences
 from agent.cli.browser_commands import execute_browser_command
 from agent.cli.computer_commands import ComputerStateEmitter, approval_choices, execute_computer_command
 from agent.cli.memory_commands import execute_memory_command
-from agent.cli.memory_consolidation_preferences import consolidation_client, load_memory_consolidation_enabled
+from agent.cli.memory_consolidation_preferences import consolidation_client, load_memory_consolidation_mode
 from agent.cli.guidance_commands import execute_guidance_or_skill_command, guidance_command_busy
 from agent.cli.learning_commands import execute_learning_command
 from agent.cli.conversation_commands import register_conversation_tools
@@ -905,13 +905,14 @@ async def _main(startup_started: float):
         memory_store,
         session_id=lambda: agent_holder["agent"].context.session_scope if agent_holder else "default",
         messages=lambda: agent_holder["agent"].context.messages if agent_holder else [],
+        external=lambda: agent_holder["agent"].external_memory_provider if agent_holder else None,
     )
     # Saved, revised or forgotten memories are shown to the user as they happen.
     memory_store.on_change = lambda change: _send({"type": "memory_notice", **change})
     # While idle, a side model proposes memory changes; the user accepts each one.
     consolidation = ConsolidationScheduler(
         memory_store, configured_session_recall_path(), consolidation_client,
-        enabled=load_memory_consolidation_enabled(), notify=_send,
+        mode=load_memory_consolidation_mode(), notify=_send,
     )
     register_goal_tools(
         tools,
@@ -4192,7 +4193,6 @@ async def _main(startup_started: float):
                             memory_store,
                             memory_parts,
                             session_id=agent.context.session_scope,
-                            router=agent.memory_router,
                             retainer=agent.memory_retainer,
                             consolidation=consolidation,
                         )

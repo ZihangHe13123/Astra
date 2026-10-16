@@ -4,8 +4,6 @@ import asyncio
 
 from agent.core.msg import ContentBlock, Msg
 from agent.runtime.memory import MEMORY_INDEX_LINES, MemoryStore
-from agent.runtime.memory_provider import BuiltinMemoryProvider
-from agent.runtime.memory_router import MemoryRouter
 from agent.runtime.react import ReActAgent
 from agent.runtime.tools.memory import register_memory_tools
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
@@ -148,14 +146,6 @@ def test_the_index_lists_older_kinds_selectively_skips_expired_and_stays_within_
     assert len(lines) == MEMORY_INDEX_LINES and "not saved or used recently are not listed" in _index(store)
 
 
-def test_recalled_memories_carry_their_dates(tmp_path):
-    store = MemoryStore(tmp_path / "memory.db", core_dir=tmp_path / "core")
-    record = store.add_record(kind="observation", content="macOS 沙箱使用 astra-sandbox 镜像", tags=("sandbox",))
-    router = MemoryRouter(BuiltinMemoryProvider(store), store)
-    pack = asyncio.run(router.build_context("mac 沙箱现在用哪个镜像？", session_id="s"))
-    assert f"- [{record.created_at[:10]}] macOS 沙箱使用 astra-sandbox 镜像" in pack.render()
-
-
 class SavingLLM:
     """Saves a memory in the first turn, then answers."""
 
@@ -228,26 +218,6 @@ def test_a_full_index_keeps_memories_that_were_used_recently(tmp_path):
     lines = [line for line in index.splitlines() if line.startswith("- #")]
     assert lines[-1].endswith("Fact number 0") and len(lines) == MEMORY_INDEX_LINES
     assert "read 1 times" in _call(registry, action="read", memory_id=oldest[:8])["output"]
-
-
-def test_a_memory_recalled_into_a_turn_counts_once_per_turn(tmp_path, monkeypatch):
-    monkeypatch.setenv("HINDSIGHT_ENABLED", "0")
-
-    class FakeLLM:
-        class config:
-            model = "fake"
-            capabilities = frozenset()
-
-    store = MemoryStore(tmp_path / "memory.db", core_dir=tmp_path / "core")
-    record = store.add_record(kind="observation", content="macOS 沙箱使用 astra-sandbox 镜像", tags=("sandbox",))
-    agent = ReActAgent("agent", FakeLLM(), ToolRegistry(), memory_store=store)  # type: ignore[arg-type]
-    agent.context.set_session(str(tmp_path / "s1.jsonl"))
-    agent.context.add_user("mac 沙箱现在用哪个镜像？")
-    agent._memory_turn_key = "turn-1"
-    for _ in range(2):
-        asyncio.run(agent._prepare_prompt_for_llm("mac 沙箱现在用哪个镜像？", None))
-    recalls, reads, last_used = store.record_store.usage()[record.record_id]
-    assert (recalls, reads) == (1, 0) and last_used
 
 
 def test_status_counts_saved_memories_unused_for_ninety_days(tmp_path):

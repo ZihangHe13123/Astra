@@ -183,15 +183,6 @@ def start_new_session(bundle: AgentBundle, paths: StatePaths, session_name: str)
     agent.begin_session()
 
 
-def _router_trace(bundle: AgentBundle) -> dict[str, Any] | None:
-    router = getattr(bundle.agent, "memory_router", None)
-    trace = router.last_trace(bundle.agent.context.session_scope) if router is not None else None
-    if trace is None:
-        return None
-    return {"decision": trace.decision, "reason": trace.reason, "query": trace.query,
-            "kinds": list(trace.kinds), "records": len(trace.record_ids)}
-
-
 def _index_trace(bundle: AgentBundle) -> dict[str, Any] | None:
     trace = getattr(bundle.broker, "last_trace", None)
     if trace is None:
@@ -236,7 +227,7 @@ async def run_turn(bundle: AgentBundle, text: str, *, request_id: str, turn: int
     return {
         "reply": reply, "errors": errors, "tool_calls": tool_calls,
         "requests": len(bundle.recorder.requests) - before,
-        "router": _router_trace(bundle), "index": _index_trace(bundle),
+        "index": _index_trace(bundle),
     }
 
 
@@ -277,7 +268,7 @@ def evaluate_conversation(
         probe = score_probe(turn, world, analysis)
         probe.update({
             "scenario": world.scenario.id, "turn": index, "errors": outcome["errors"],
-            "router": outcome["router"], "index": outcome["index"], "current_context": analysis["current_text"],
+            "index": outcome["index"], "current_context": analysis["current_text"],
             "reply": outcome["reply"], "tool_calls": outcome["tool_calls"], "requests_in_turn": outcome["requests"],
         })
         probes.append(probe)

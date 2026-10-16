@@ -215,7 +215,8 @@ async def _bootstrap_agent():
     agent_holder = {}
     register_workspace_tools(tools, sandbox, workdir=os.getcwd())
     register_memory_tools(tools, memory_store, session_id=_current_memory_session,
-                          messages=lambda: _agent.context.messages if _agent is not None else [])
+                          messages=lambda: _agent.context.messages if _agent is not None else [],
+                          external=lambda: _agent.external_memory_provider if _agent is not None else None)
     register_skill_tools(tools, skill_store)
     register_session_recall_tools(tools)
     register_context_index_tools(tools, context_index_broker)

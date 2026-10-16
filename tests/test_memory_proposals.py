@@ -160,7 +160,7 @@ def test_the_scheduler_waits_for_an_idle_backend_and_announces_proposals(tmp_pat
         runs.append(force)
         return ConsolidationResult([{"id": 1, "action": "remember", "summary": "Uses pnpm"}])
 
-    scheduler = ConsolidationScheduler(store, tmp_path / "sessions.db", lambda: (None, ""), enabled=True,
+    scheduler = ConsolidationScheduler(store, tmp_path / "sessions.db", lambda: (None, ""), mode="review",
                                        notify=notices.append, clock=lambda: now[0], run=run)
 
     async def ticks():
@@ -173,7 +173,7 @@ def test_the_scheduler_waits_for_an_idle_backend_and_announces_proposals(tmp_pat
         await scheduler.task
         scheduler.tick(busy=False)  # the next pass waits for the interval
         assert scheduler.task.done() and runs == [False]
-        scheduler.enabled = False
+        scheduler.mode = "off"
         scheduler.request()
         scheduler.tick(busy=False)
         await scheduler.task
@@ -190,7 +190,7 @@ def test_a_failed_pass_never_reaches_the_conversation(tmp_path):
         raise RuntimeError("network down")
 
     now = [0.0]
-    scheduler = ConsolidationScheduler(store, tmp_path / "sessions.db", lambda: (None, ""), enabled=True,
+    scheduler = ConsolidationScheduler(store, tmp_path / "sessions.db", lambda: (None, ""), mode="review",
                                        notify=lambda event: None, clock=lambda: now[0], run=run)
 
     async def once():
@@ -202,18 +202,61 @@ def test_a_failed_pass_never_reaches_the_conversation(tmp_path):
     assert "failed: RuntimeError" in scheduler.status()
 
 
-def test_turning_consolidation_off_is_saved(tmp_path, monkeypatch):
-    from agent.cli.memory_consolidation_preferences import load_memory_consolidation_enabled
+def test_the_mode_is_saved_and_an_older_on_off_setting_still_reads(tmp_path, monkeypatch):
+    from agent.cli.memory_consolidation_preferences import load_memory_consolidation_mode
 
-    monkeypatch.setenv("AGENT_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    settings = tmp_path / "settings.json"
+    monkeypatch.setenv("AGENT_SETTINGS_PATH", str(settings))
+    assert load_memory_consolidation_mode() == "review"
+    for saved, mode in ((True, "review"), (False, "off"), ("sometimes", "review")):
+        settings.write_text(json.dumps({"memory_consolidation": saved}), encoding="utf-8")
+        assert load_memory_consolidation_mode() == mode
     store = MemoryStore(tmp_path / "memory.db", core_dir=tmp_path / "core")
     scheduler = ConsolidationScheduler(store, tmp_path / "sessions.db", lambda: (None, ""),
-                                       enabled=load_memory_consolidation_enabled(), notify=lambda event: None)
-    assert scheduler.enabled
+                                       mode=load_memory_consolidation_mode(), notify=lambda event: None)
     output, _ = execute_memory_command(store, ["consolidation", "off"], session_id="s", consolidation=scheduler)
-    assert "Memory consolidation: off" in output and not load_memory_consolidation_enabled()
+    assert "Memory consolidation: off" in output and load_memory_consolidation_mode() == "off"
+    assert not scheduler.enabled
+    output, _ = execute_memory_command(store, ["consolidation", "auto"], session_id="s", consolidation=scheduler)
+    assert "Memory consolidation: auto" in output and load_memory_consolidation_mode() == "auto"
     status, _ = execute_memory_command(store, [], session_id="s", consolidation=scheduler)
-    assert "Memory consolidation: off" in status
+    assert "forgetting waits for you" in status
+    execute_memory_command(store, ["consolidation", "on"], session_id="s", consolidation=scheduler)
+    assert scheduler.mode == "review" == load_memory_consolidation_mode()
+    assert execute_memory_command(store, ["consolidation", "always"], session_id="s", consolidation=scheduler)[1]
+
+
+def test_auto_mode_saves_and_revises_at_once_but_forgetting_waits(tmp_path):
+    store, archive, ids, changes = _world(tmp_path, [
+        *CHAT, ("u5", "user", "我已经不养猫了，把那条忘掉吧。"),
+    ])
+    parking, _ = store.remember(kind="user_fact", summary="车位在 B1 层 12 号")
+    cat, _ = store.remember(kind="user_fact", summary="养了一只猫叫年糕")
+    changes.clear()
+    model = ScriptedModel({"proposals": [
+        {"action": "remember", "kind": "preference", "scope": "global", "summary": "前端项目用 pnpm",
+         "content": "前端项目用 pnpm，不用 npm。", "evidence": [ids["u1"]]},
+        {"action": "revise", "memory_id": parking.record_id[:8], "summary": "车位在 B2 层 47 号",
+         "content": "车位换到 B2 层 47 号。", "evidence": [ids["u2"]]},
+        {"action": "forget", "memory_id": cat.record_id[:8], "evidence": [ids["u5"]]},
+    ]})
+    notices = []
+    scheduler = ConsolidationScheduler(store, archive, lambda: (model, "scripted"), mode="auto",
+                                       notify=notices.append)
+
+    async def review():
+        scheduler.request()
+        scheduler.tick(busy=False)
+        await scheduler.task
+
+    asyncio.run(review())
+    assert [(change["event"], change.get("origin")) for change in changes] == [
+        ("saved", "consolidation"), ("revised", "consolidation")]
+    assert store.record_store.get(parking.record_id).status == "superseded"
+    assert store.resolve_record(cat.record_id, active_only=True) is not None
+    [waiting] = store.record_store.proposals()
+    assert waiting["action"] == "forget"
+    assert notices == [{"type": "memory_notice", "event": "proposed", "count": 1, "summary": "养了一只猫叫年糕"}]
 
 
 def test_only_one_astra_reviews_at_a_time(tmp_path):

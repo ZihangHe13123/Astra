@@ -146,11 +146,13 @@ test("saved memories and the ones a turn recalls are shown as notices", () => {
   state = projectEvent(state, { type: "memory_notice", event: "revised", memory_id: "fedcba9876543210", summary: "Parking moved to B2", kind: "user_fact", scope: "project", previous_id: "0123456789abcdef" });
   state = projectEvent(state, { type: "memory_recall", count: 4, items: ["a", "b", "c", "d"] });
   state = projectEvent(state, { type: "memory_notice", event: "proposed", count: 2, summary: "Prefers pnpm" });
+  state = projectEvent(state, { type: "memory_notice", event: "saved", memory_id: "aaaabbbbccccdddd", summary: "Uses pnpm", kind: "preference", scope: "global", origin: "consolidation" });
   assert.deepEqual(state.messages.map(m => [m.role, m.content]), [
     ["system", "已记住：Prefers file:line citations（#01234567）"],
     ["system", "已更新记忆：Parking moved to B2（#fedcba98 · 本项目）"],
     ["system", "回忆了 4 条记忆：a；b；c"],
-    ["system", "记忆整理：2 条建议待你审核（/memory proposals），如“Prefers pnpm”"]]);
+    ["system", "记忆整理：2 条建议待你审核（/memory proposals），如“Prefers pnpm”"],
+    ["system", "记忆整理 · 已记住：Uses pnpm（#aaaabbbb）"]]);
   assert.equal(state.busy, false);
 });
 

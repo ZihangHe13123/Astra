@@ -158,6 +158,24 @@ def test_native_records_skip_pinned_conflicts_and_reject_changed_versions(tmp_pa
     assert reader.open(result.relevance[0].locator, 2).items == ()
 
 
+def test_native_records_keep_a_project_memory_to_its_project(tmp_path):
+    store = MemoryStore(path=tmp_path / "memory.db", core_dir=tmp_path / "core")
+    record, _ = store.remember(kind="observation", scope="project", workspace_key="repo-a",
+                               summary="Astra release builds need the notarization profile")
+    reader = RecordSource(store.path)
+    plan = plan_query("Astra notarization profile", datetime.now().astimezone())
+
+    def found(key):
+        return [row.identity for row in reader.recommend(plan, WorkspaceIdentity(key, "", key), frozenset()).relevance]
+
+    assert found("repo-a") == [record.record_id]
+    assert found("repo-b") == []
+    # A handle taken in one project does not open in another.
+    locator = reader.recommend(plan, WorkspaceIdentity("repo-a", "", "repo-a"), frozenset()).relevance[0].locator
+    reader.recommend(plan, WorkspaceIdentity("repo-b", "", "repo-b"), frozenset())
+    assert reader.open(locator, 0).items == ()
+    assert found("repo-a") == [record.record_id]
+
 def test_native_record_date_filter_precedes_pool_limit(tmp_path):
     store = MemoryStore(path=tmp_path / "memory.db", core_dir=tmp_path / "core")
     yesterday = store.add_record(kind="observation", content="Astra prior recovery constraint")
@@ -320,7 +338,7 @@ def test_shared_open_budget_applies_to_actual_returned_unicode(tmp_path):
         assert "<标记>" not in output
 
 
-def test_native_runtime_uses_astra_records_without_calling_provider(tmp_path):
+def test_native_index_shows_astra_records_and_counts_them_as_used(tmp_path):
     from tests.test_context_index_runtime import DoneLLM
     from tests.test_context_index_broker import FakeSource
     from agent.runtime.memory_router import MemoryRouter
@@ -331,15 +349,7 @@ def test_native_runtime_uses_astra_records_without_calling_provider(tmp_path):
     store = MemoryStore(path=tmp_path / "memory.db", core_dir=tmp_path / "core")
     record = store.add_record(kind="observation", content="Astra recovery requires an atomic SQLite transaction")
 
-    class ForbiddenProvider:
-        name = "forbidden-external"
-        calls = 0
-
-        async def recall(self, *args, **kwargs):
-            self.calls += 1
-            raise AssertionError("native memory must not call a provider")
-
-    router = MemoryRouter(ForbiddenProvider(), store)
+    router = MemoryRouter(store)
     llm = DoneLLM()
     empty = SourceResult("absent")
     broker = ContextIndexBroker(
@@ -365,6 +375,5 @@ def test_native_runtime_uses_astra_records_without_calling_provider(tmp_path):
     assert [row.source for row in broker.last_trace.displayed] == ["memory"]
     assert store.format_core_prompt() == before
     assert len(llm.calls) == 1
-    assert router.provider.calls == 0
     # A record the index puts in front of the model counts as used.
     assert store.record_store.usage()[record.record_id][0] == 1
