@@ -325,6 +325,14 @@ def format_proposals(proposals: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+_LISTED_PROPOSALS = 20
+
+
+def _brief(proposal: dict[str, Any]) -> dict[str, Any]:
+    text = proposal.get("summary") or proposal.get("content") or proposal.get("previous") or ""
+    return {"id": proposal["id"], "action": proposal["action"], "summary": " ".join(str(text).split())[:80]}
+
+
 class ConsolidationScheduler:
     """Starts a pass after the backend has been idle; at most one at a time."""
 
@@ -410,8 +418,10 @@ class ConsolidationScheduler:
     def status_event(self, **reply: str) -> dict[str, Any]:
         """The mode and the waiting proposals for the clients; a command's answer adds message or error."""
         self._refresh()
-        return {"type": "memory_consolidation_status", "mode": self.mode,
-                "pending": len(self.store.record_store.proposals()), **reply}
+        pending = self.store.record_store.proposals()
+        # Menus offer each waiting proposal to accept or dismiss by its number.
+        return {"type": "memory_consolidation_status", "mode": self.mode, "pending": len(pending),
+                "proposals": [_brief(item) for item in pending[:_LISTED_PROPOSALS]], **reply}
 
     def status(self) -> str:
         self._refresh()

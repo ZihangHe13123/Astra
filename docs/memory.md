@@ -113,7 +113,9 @@ Each proposal quotes the message it rests on; only your own messages count as
 evidence, and secret-looking text is dropped. A notice says how many are
 waiting. `/memory proposals` lists them, `/memory accept <n|all>` applies them
 as ordinary saved-memory changes with that message as the source, and
-`/memory dismiss <n|all>` drops them. The first review reads only the last
+`/memory dismiss <n|all>` drops them. In the terminal menu, each waiting
+proposal is offered after `/memory proposals`, `accept` and `dismiss`, and the
+desktop command palette offers them under accept and dismiss. The first review reads only the last
 three days. Conversations are sent to DeepSeek and need a DeepSeek key; the
 archive holds only your messages and the assistant's replies, never tool
 output, and Minimal, bar and installed local modes are not recorded. Consolidation has

@@ -963,6 +963,22 @@ test("the memory review mode can be switched during a reply, and only an answer 
   } finally { h.app.unmount(); }
 });
 
+test("waiting memory proposals are offered after /memory proposals", async () => {
+  const h = await setup(100, 30);
+  try {
+    h.child.event({ type: "memory_consolidation_status", mode: "review", pending: 1,
+      proposals: [{ id: 7, action: "remember", summary: "前端项目用 pnpm" }] });
+    await h.key("/memory proposals");
+    assert.match(h.frame(), /PROPOSALS/);
+    assert.match(h.frame(), /accept P7\s+remember · 前端项目用 pnpm/);
+    assert.match(h.frame(), /dismiss all/);
+    // Choosing one sends the command that applies it.
+    await h.key("\x1b[B");
+    await h.key("\r");
+    assert.deepEqual(h.child.commands.at(-1), { type: "command", cmd: "/memory accept 7" });
+  } finally { h.app.unmount(); }
+});
+
 test("a speech failure is shown once, however many status events repeat it", async () => {
   const h = await setup();
   try {

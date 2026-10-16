@@ -1,6 +1,7 @@
 import React from "react";
 import { ChevronRight } from "lucide-react";
 import type { UIEvent } from "@astra/ui-core/session-state";
+import type { CommandDescription } from "../bridge.js";
 
 export type ReviewMode = "off" | "review" | "auto";
 
@@ -38,4 +39,20 @@ export function MemoryReviewSettings({ status, ready, run, review }: {
     {!ready && <p className="muted small">打开一个会话后可以切换。</p>}
     {ready && view.pending > 0 && <button className="text-button" onClick={review}>{view.pending} 条建议待审核 <ChevronRight size={14}/></button>}
   </>;
+}
+
+const ACTIONS: Record<string, string> = { remember: "记住", revise: "修订", forget: "忘记" };
+
+/** Offer each waiting proposal under /memory accept and dismiss, next to the registered actions. */
+export function withProposalOptions(command: CommandDescription, status: UIEvent | undefined): CommandDescription {
+  const proposals = Array.isArray(status?.proposals) ? status.proposals.filter((item: unknown): item is { id: number; action: string; summary: string } =>
+    !!item && typeof (item as { id?: unknown }).id === "number" && typeof (item as { summary?: unknown }).summary === "string") : [];
+  if (!proposals.length) return command;
+  const option = (label: string, description: string, value: string) => ({ command: label, description, completion: value, submitValue: value });
+  return { ...command, options: [...command.options,
+    ...proposals.flatMap(item => [
+      option(`接受 P${item.id}`, `${ACTIONS[item.action] ?? item.action}：${item.summary}`, `/memory accept ${item.id}`),
+      option(`丢弃 P${item.id}`, `不${ACTIONS[item.action] ?? item.action}：${item.summary}`, `/memory dismiss ${item.id}`)]),
+    option("全部接受", `应用全部 ${proposals.length} 条建议`, "/memory accept all"),
+    option("全部丢弃", `丢弃全部 ${proposals.length} 条建议`, "/memory dismiss all")] };
 }

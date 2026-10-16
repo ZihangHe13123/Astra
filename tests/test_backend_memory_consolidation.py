@@ -61,7 +61,7 @@ def test_the_mode_is_switched_during_a_reply_without_entering_the_conversation(t
     try:
         # A setting saved as on before the three modes reads as review.
         startup = wait(status)
-        assert (startup["mode"], startup["pending"]) == ("review", 0) and "message" not in startup
+        assert (startup["mode"], startup["pending"], startup["proposals"]) == ("review", 0, []) and "message" not in startup
 
         send({"type": "message", "text": "你好"})
         wait(lambda event: event.get("type") == "chunk")
@@ -85,6 +85,44 @@ def test_the_mode_is_switched_during_a_reply_without_entering_the_conversation(t
         assert not [event for event in seen if event.get("type") == "error"]
     finally:
         model.release.set()
+        _stop_protocol_backend(proc)
+        model.shutdown()
+        model.server_close()
+
+
+def test_waiting_proposals_are_listed_and_accepting_one_updates_the_list(tmp_path, monkeypatch):
+    from agent.runtime.memory import MemoryStore
+
+    monkeypatch.setenv("ASTRA_HOME", str(tmp_path / "state"))
+    store = MemoryStore(tmp_path / "memory.db", core_dir=tmp_path / "state" / "core")
+    first, second = store.record_store.add_proposals([
+        ({"action": "remember", "kind": "preference", "scope": "global", "summary": "前端项目用 pnpm",
+          "content": "前端项目用 pnpm。"}, [{"session": "chat-1", "message_id": 1, "date": "2026-10-16", "text": "用 pnpm"}]),
+        ({"action": "remember", "kind": "user_fact", "scope": "global", "summary": "车位在 B2 层 47 号",
+          "content": "车位在 B2 层 47 号。"}, [{"session": "chat-1", "message_id": 2, "date": "2026-10-16", "text": "车位换了"}]),
+    ], model="scripted")
+    model = ThreadingHTTPServer(("127.0.0.1", 0), HeldModel)
+    model.release = threading.Event()
+    model.release.set()
+    threading.Thread(target=model.serve_forever, daemon=True).start()
+    proc, _, _, wait = _start_question_protocol_backend(tmp_path, model.server_address[1], "proposals")
+
+    def status(event: dict) -> bool:
+        return event.get("type") == "memory_consolidation_status"
+
+    try:
+        startup = wait(status)
+        assert startup["pending"] == 2
+        assert startup["proposals"] == [{"id": first, "action": "remember", "summary": "前端项目用 pnpm"},
+                                        {"id": second, "action": "remember", "summary": "车位在 B2 层 47 号"}]
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps({"type": "command", "cmd": f"/memory accept {first}"}) + "\n")
+        proc.stdin.flush()
+        accepted = wait(lambda event: event.get("type") == "tool_result" and event.get("name") == "memory")
+        assert accepted["output"].startswith("Saved #") and not accepted["error"]
+        after = wait(status)
+        assert after["pending"] == 1 and [item["id"] for item in after["proposals"]] == [second]
+    finally:
         _stop_protocol_backend(proc)
         model.shutdown()
         model.server_close()

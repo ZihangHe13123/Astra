@@ -239,6 +239,21 @@ assert.equal(submitSlashCommand("/memory consolidation a", 0), "/memory consolid
 assert.equal(submitSlashCommand("/memory con", 0), "/memory consolidation");
 assert.equal(completeSlashCommand("/memory acc", 0), "/memory accept ");
 assert.equal(submitSlashCommand("/memory prop", 0), "/memory proposals");
+// Waiting proposals follow /memory proposals, accept and dismiss, each by its number.
+const waiting = { proposals: [{ id: 7, action: "remember", summary: "前端项目用 pnpm" }, { id: 9, action: "forget", summary: "养了一只猫" }] };
+assert.deepEqual(
+  slashCommandSuggestions("/memory proposals", [], [], waiting).map((item) => [item.command, item.group]),
+  [["proposals", "MEMORY"], ["accept P7", "PROPOSALS"], ["dismiss P7", "PROPOSALS"], ["accept P9", "PROPOSALS"],
+    ["dismiss P9", "PROPOSALS"], ["accept all", "PROPOSALS"], ["dismiss all", "PROPOSALS"]],
+);
+assert.equal(slashCommandSuggestions("/memory proposals", [], [], waiting)[1].description, "remember · 前端项目用 pnpm");
+assert.deepEqual(slashCommandSuggestions("/memory accept", [], [], waiting).map((item) => item.command),
+  ["accept", "accept P7", "accept P9", "accept all"]);
+assert.equal(submitSlashCommand("/memory accept 9", 0, [], [], waiting), "/memory accept 9");
+assert.equal(submitSlashCommand("/memory dismiss p7", 0, [], [], waiting), "/memory dismiss 7");
+// Nothing waiting: the menu shows only the commands.
+assert.deepEqual(slashCommandSuggestions("/memory proposals").map((item) => item.command), ["proposals"]);
+assert.deepEqual(slashCommandSuggestions("/memory ", [], [], waiting).map((item) => item.command), memoryOptions);
 assert.deepEqual(slashCommandSuggestions("/memory rem").map((item) => item.command), ["remember", "remember-user"]);
 assert.equal(completeSlashCommand("/memory sta", 0), "/memory status");
 assert.equal(submitSlashCommand("/memory sta", 0), "/memory status");

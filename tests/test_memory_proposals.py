@@ -257,7 +257,8 @@ def test_auto_mode_saves_and_revises_at_once_but_forgetting_waits(tmp_path):
     [waiting] = store.record_store.proposals()
     assert waiting["action"] == "forget"
     assert notices == [{"type": "memory_notice", "event": "proposed", "count": 1, "summary": "养了一只猫叫年糕"},
-                       {"type": "memory_consolidation_status", "mode": "auto", "pending": 1}]
+                       {"type": "memory_consolidation_status", "mode": "auto", "pending": 1,
+                        "proposals": [{"id": waiting["id"], "action": "forget", "summary": "养了一只猫叫年糕"}]}]
 
 
 def test_the_scheduler_follows_the_saved_mode_and_reports_it(tmp_path):
@@ -289,10 +290,10 @@ def test_the_scheduler_follows_the_saved_mode_and_reports_it(tmp_path):
 
     asyncio.run(ticks())
     assert runs == [False] and scheduler.mode == "review"
-    assert notices[-1] == {"type": "memory_consolidation_status", "mode": "review", "pending": 0}
+    assert notices[-1] == {"type": "memory_consolidation_status", "mode": "review", "pending": 0, "proposals": []}
     saved[0] = "auto"
     assert scheduler.status_event(message="ok") == {
-        "type": "memory_consolidation_status", "mode": "auto", "pending": 0, "message": "ok"}
+        "type": "memory_consolidation_status", "mode": "auto", "pending": 0, "proposals": [], "message": "ok"}
 
 
 def test_only_one_astra_reviews_at_a_time(tmp_path):
