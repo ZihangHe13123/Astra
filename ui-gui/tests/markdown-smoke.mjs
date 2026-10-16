@@ -247,6 +247,17 @@ try {
   await expect(historyDiagram.locator('img[alt="Mermaid 图表"]')).toBeVisible();
   await waitForImage(historyDiagram);
   await assertMeasuredRows();
+  // One scroll to the top, right after rows were measured, stays there. Made in an animation frame, like a user's
+  // scroll and like scrollToTop's polling, it used to meet the row measurement queued for that frame: following was
+  // still on, so the list was pinned back to the bottom (6 runs in 10 locally; a macOS runner failed on it
+  // 2026-10-16). It is checked here without the retries of scrollToTop.
+  const highest = await page.evaluate(() => new Promise(done => requestAnimationFrame(() => {
+    const el = document.querySelector('.messages-scroll'); el.scrollTop = 0;
+    const start = performance.now(); let max = 0;
+    const sample = () => { max = Math.max(max, el.scrollTop); if (performance.now() - start < 1000) requestAnimationFrame(sample); else done(max); };
+    requestAnimationFrame(sample);
+  })));
+  assert.equal(highest, 0, 'a scroll to the top must not be undone by the next measurement');
   await scrollToTop();
   await expect(historical).toHaveCount(0);
   // Rows coming back are measured again as they mount, so one jump to the bottom can land short
