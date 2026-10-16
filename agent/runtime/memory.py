@@ -453,6 +453,8 @@ class MemoryStore:
                 "event": event, "memory_id": record.record_id, "summary": self.memory_summary(record),
                 "kind": record.kind, "scope": str(record.metadata.get("scope") or "global"),
                 **({"previous_id": previous.record_id} if previous is not None else {}),
+                # Consolidation cites an archived message; the notice says the change came from a review.
+                **({"origin": "consolidation"} if str(record.source_message_id).startswith("archive:") else {}),
             })
         except Exception:
             # A display notice must never undo or fail a memory write.

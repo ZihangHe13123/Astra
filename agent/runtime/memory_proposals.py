@@ -1,10 +1,12 @@
-"""Idle memory consolidation: proposals only, applied when the user accepts.
+"""Idle memory consolidation: proposals the user accepts, or that apply in auto mode.
 
 When Astra has been idle for a while, a side model reads the conversations
 recorded since the last pass together with the saved memories, and proposes
 changes: remember a lasting fact the user stated, revise a memory a later
 statement changed, or forget one the user withdrew. Proposals are stored as
-pending in memory.db. Nothing changes memory until the user accepts one.
+pending in memory.db. In review mode nothing changes memory until the user
+accepts one; in auto mode remember and revise apply at once (a revised memory
+keeps its old version), and forget still waits for the user.
 
 Only the user's own messages count as evidence; assistant replies are context.
 The archive holds user and assistant text only, so tool output and web pages
@@ -45,6 +47,14 @@ _USER_CHARS = 1200
 _ASSISTANT_CHARS = 400
 _THROUGH = "consolidation_through"
 _LAST_RUN = "consolidation_last_run"
+CONSOLIDATION_MODES = ("off", "review", "auto")
+# Auto mode applies these; forgetting a memory always waits for the user.
+AUTO_ACTIONS = frozenset({"remember", "revise"})
+_MODE_TEXT = {
+    "off": "off",
+    "review": "review (proposes changes; you accept each one)",
+    "auto": "auto (saves and revises memories itself; forgetting waits for you)",
+}
 
 _INSTRUCTIONS = """You maintain the saved memories a person's assistant keeps about them. You get the saved memories (id, date, kind, scope, summary) and the conversation messages recorded since the last review (id, date, role, text).
 
@@ -318,16 +328,20 @@ def format_proposals(proposals: list[dict[str, Any]]) -> str:
 class ConsolidationScheduler:
     """Starts a pass after the backend has been idle; at most one at a time."""
 
-    def __init__(self, store: MemoryStore, archive: Path, client: ClientFactory, *, enabled: bool,
+    def __init__(self, store: MemoryStore, archive: Path, client: ClientFactory, *, mode: str = "review",
                  notify: Callable[[dict[str, Any]], None], clock: Callable[[], float] = time.monotonic,
                  run: Callable[..., Awaitable[ConsolidationResult]] = consolidate):
         self.store, self.archive, self.client = store, archive, client
-        self.enabled, self.notify, self.clock, self.run = enabled, notify, clock, run
+        self.mode, self.notify, self.clock, self.run = mode, notify, clock, run
         self.last_busy = clock()
         self.next_after = 0.0
         self.requested = False
         self.last_result: ConsolidationResult | None = None
         self.task: asyncio.Task[None] | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self.mode != "off"
 
     def tick(self, *, busy: bool) -> None:
         now = self.clock()
@@ -353,17 +367,33 @@ class ConsolidationScheduler:
             result = ConsolidationResult(skipped=f"failed: {type(exc).__name__}")
         self.last_result = result
         self.next_after = self.clock() + (FOLLOW_UP_SECONDS if result.more and not result.skipped else INTERVAL_SECONDS)
-        if result.proposed:
+        waiting = self._apply(result.proposed) if self.mode == "auto" else result.proposed
+        if waiting:
             try:
-                self.notify({"type": "memory_notice", "event": "proposed", "count": len(result.proposed),
-                             "summary": str(result.proposed[0].get("summary") or result.proposed[0].get("previous", ""))})
+                self.notify({"type": "memory_notice", "event": "proposed", "count": len(waiting),
+                             "summary": str(waiting[0].get("summary") or waiting[0].get("previous", ""))})
             except Exception:
                 logger.debug("memory proposal notice failed", exc_info=True)
+
+    def _apply(self, proposed: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Auto mode: apply remember and revise now. Returns the proposals still waiting for the user."""
+        pending = {item["id"]: item for item in self.store.record_store.proposals()}
+        for item in proposed:
+            proposal = pending.get(item.get("id"))
+            if proposal is None or proposal["action"] not in AUTO_ACTIONS:
+                continue
+            try:
+                # Each change reaches the conversation as an ordinary memory notice.
+                accept_proposal(self.store, proposal)
+            except Exception as exc:  # A proposal that cannot apply stays for the user to decide.
+                logger.warning("memory proposal P%s was not applied: %s", proposal["id"], exc)
+        still = {item["id"] for item in self.store.record_store.proposals()}
+        return [item for item in proposed if item.get("id") in still]
 
     def status(self) -> str:
         pending = len(self.store.record_store.proposals())
         last = self.store.record_store.meta(_LAST_RUN)
-        line = (f"Memory consolidation: {'on' if self.enabled else 'off'} (proposals only); "
+        line = (f"Memory consolidation: {_MODE_TEXT.get(self.mode, self.mode)}; "
                 f"{pending} waiting for review (/memory proposals)")
         if last:
             line += f"; last review {last[:16].replace('T', ' ')}"

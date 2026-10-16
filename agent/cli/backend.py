@@ -195,7 +195,7 @@ from agent.cli.context_index_preferences import load_context_index_preferences
 from agent.cli.browser_commands import execute_browser_command
 from agent.cli.computer_commands import ComputerStateEmitter, approval_choices, execute_computer_command
 from agent.cli.memory_commands import execute_memory_command
-from agent.cli.memory_consolidation_preferences import consolidation_client, load_memory_consolidation_enabled
+from agent.cli.memory_consolidation_preferences import consolidation_client, load_memory_consolidation_mode
 from agent.cli.guidance_commands import execute_guidance_or_skill_command, guidance_command_busy
 from agent.cli.learning_commands import execute_learning_command
 from agent.cli.conversation_commands import register_conversation_tools
@@ -912,7 +912,7 @@ async def _main(startup_started: float):
     # While idle, a side model proposes memory changes; the user accepts each one.
     consolidation = ConsolidationScheduler(
         memory_store, configured_session_recall_path(), consolidation_client,
-        enabled=load_memory_consolidation_enabled(), notify=_send,
+        mode=load_memory_consolidation_mode(), notify=_send,
     )
     register_goal_tools(
         tools,

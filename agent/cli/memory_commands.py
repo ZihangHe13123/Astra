@@ -27,7 +27,7 @@ MEMORY_USAGE = (
     "  /memory proposals        # changes proposed by consolidation\n"
     "  /memory accept <n|all>\n"
     "  /memory dismiss <n|all>\n"
-    "  /memory consolidation [on|off|now]"
+    "  /memory consolidation [off|review|auto|now]"
 )
 
 
@@ -63,16 +63,17 @@ def _consolidation_command(
         if scheduler is None:
             return "", "Memory consolidation runs in the desktop and terminal app."
         choice = args[0].lower() if args else "status"
-        if choice in {"on", "off"}:
-            from agent.cli.memory_consolidation_preferences import save_memory_consolidation_enabled
+        choice = "review" if choice == "on" else choice  # on meant review before auto existed
+        if choice in {"off", "review", "auto"}:
+            from agent.cli.memory_consolidation_preferences import save_memory_consolidation_mode
 
-            save_memory_consolidation_enabled(choice == "on")
-            scheduler.enabled = choice == "on"
+            save_memory_consolidation_mode(choice)
+            scheduler.mode = choice
         elif choice == "now":
             scheduler.request()
             return "A memory review starts at the next idle moment.", ""
         elif choice != "status":
-            return "", "Usage: /memory consolidation [on|off|now]"
+            return "", "Usage: /memory consolidation [off|review|auto|now]"
         return scheduler.status(), ""
     wanted = {"all"} if args and args[0].lower() == "all" else {arg.upper().lstrip("P") for arg in args}
     chosen = [item for item in pending if "all" in wanted or str(item["id"]) in wanted]

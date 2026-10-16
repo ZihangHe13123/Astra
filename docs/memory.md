@@ -103,7 +103,7 @@ promote temporary episodes into permanent facts. Existing memories are not
 rewritten on upgrade; use `/memory inspect`, `correct` and `forget` to review them.
 
 Memory consolidation reviews new conversations while Astra is idle and proposes
-changes; it never changes memory itself. When the desktop or terminal app has
+changes. When the desktop or terminal app has
 had no turn for 10 minutes and you have sent at least four messages since the
 last review (at most every 30 minutes), DeepSeek Flash reads those messages
 (your own in full, the assistant's shortened) with what memory already holds,
@@ -116,9 +116,14 @@ as ordinary saved-memory changes with that message as the source, and
 `/memory dismiss <n|all>` drops them. The first review reads only the last
 three days. Conversations are sent to DeepSeek and need a DeepSeek key; the
 archive holds only your messages and the assistant's replies, never tool
-output, and Minimal, bar and installed local modes are not recorded. Consolidation is on
-by default; `/memory consolidation off` turns it off, and `now` runs a review at
-the next idle moment.
+output, and Minimal, bar and installed local modes are not recorded. Consolidation has
+three modes. `review`, the default, only proposes: nothing changes until you
+accept. `auto` applies remember and revise proposals at once; each change shows
+as an ordinary memory notice marked 记忆整理, a revised memory keeps its old
+version for `/memory timeline`, and `/memory forget <id>` undoes a new one.
+Forget proposals still wait for you. `off` stops the reviews.
+`/memory consolidation off|review|auto` sets the mode (an earlier `on` reads as
+`review`), and `now` runs a review at the next idle moment.
 Semantic recall treats ordinary English words in Chinese questions as soft terms;
 explicit literals and code identifiers still constrain matching results.
 
@@ -163,7 +168,7 @@ cursor progress, protections and undo.
 /memory proposals
 /memory accept <n|all>
 /memory dismiss <n|all>
-/memory consolidation [on|off|now]
+/memory consolidation [off|review|auto|now]
 ```
 
 The model can use the `memory` tool to maintain the same stores. Credential-like
