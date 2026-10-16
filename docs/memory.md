@@ -123,7 +123,10 @@ as an ordinary memory notice marked 记忆整理, a revised memory keeps its old
 version for `/memory timeline`, and `/memory forget <id>` undoes a new one.
 Forget proposals still wait for you. `off` stops the reviews.
 `/memory consolidation off|review|auto` sets the mode (an earlier `on` reads as
-`review`), and `now` runs a review at the next idle moment.
+`review`), also during a reply, and `now` runs a review at the next idle moment.
+In the desktop app the same three choices are under Settings → 记忆整理, with
+the number of proposals waiting. The mode is saved for the installation, and
+every open session follows it from its next review.
 Semantic recall treats ordinary English words in Chinese questions as soft terms;
 explicit literals and code identifiers still constrain matching results.
 

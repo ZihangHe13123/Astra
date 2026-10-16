@@ -224,6 +224,8 @@ for (const { input, expected } of [
   { input: "/cancel", expected: "preserve" },
   { input: "/theme glitchcity", expected: "preserve" },
   { input: "/timeline off", expected: "preserve" },
+  { input: "/memory consolidation auto", expected: "preserve" },
+  { input: "/memory proposals", expected: "clear" },
   { input: "/reset", expected: "clear" },
   { input: "/reconnect", expected: "clear" },
   { input: "normal user input", expected: "clear" },

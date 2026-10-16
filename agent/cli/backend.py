@@ -437,6 +437,12 @@ def _session_recall_auto_logging_enabled(
 
 
 
+def _is_consolidation_command(command: str) -> bool:
+    """/memory consolidation changes an installation setting, so like /voice it is answered in every mode,
+    during a turn and while a restart drains, with a status instead of a conversation message."""
+    return command.lower().split(maxsplit=2)[:2] == ["/memory", "consolidation"]
+
+
 def _isolated_mode_blocks_command(
     command: str,
     *,
@@ -912,7 +918,7 @@ async def _main(startup_started: float):
     # While idle, a side model proposes memory changes; the user accepts each one.
     consolidation = ConsolidationScheduler(
         memory_store, configured_session_recall_path(), consolidation_client,
-        mode=load_memory_consolidation_mode(), notify=_send,
+        mode=load_memory_consolidation_mode(), notify=_send, load_mode=load_memory_consolidation_mode,
     )
     register_goal_tools(
         tools,
@@ -2299,6 +2305,7 @@ async def _main(startup_started: float):
     session_count_task.add_done_callback(startup_tasks.discard)
     _send_working_memory()
     _send_mode_info()
+    _send(consolidation.status_event())
     _send_bar_session_list()
     _send_minimal_session_list()
     _send_local_mode_info()
@@ -2860,6 +2867,16 @@ async def _main(startup_started: float):
     # command loop below within the type checker's per-function complexity limit (past
     # it, pyright stops checking the function at all). They are called last in a loop
     # pass, so a `return` here is that loop's `continue`.
+    def _consolidation_command(c: str) -> None:
+        try:
+            output, error = execute_memory_command(
+                memory_store, shlex.split(c)[1:], session_id=agent.context.session_scope,
+                consolidation=consolidation,
+            )
+        except ValueError as exc:
+            output, error = "", f"Invalid memory command: {exc}"
+        _send(consolidation.status_event(message=output, error=error))
+
     async def _bar_command(c: str) -> None:
         """/bar: open, leave or switch the night bar, sip, or set its output mode."""
         if minimal_mode.active:
@@ -3986,12 +4003,14 @@ async def _main(startup_started: float):
                         _send({"type": "restart_status", "state": restart.state,
                                "request_id": restart.request_id, "message": str(exc)})
                     continue
-                if restart.draining and c.split(maxsplit=1)[:1] not in (["/cancel"], ["/yolo"], ["/voice"]):
+                if (restart.draining and c.split(maxsplit=1)[:1] not in (["/cancel"], ["/yolo"], ["/voice"])
+                        and not _is_consolidation_command(c)):
                     _send({"type": "restart_status", "state": restart.state,
                            "request_id": restart.request_id,
                            "message": "Restart is pending; use /restart cancel before changing the session."})
                     continue
-                if c.lower().split(maxsplit=1)[:1] not in (["/learn"], ["/yolo"], ["/cancel"], ["/voice"]):
+                if (c.lower().split(maxsplit=1)[:1] not in (["/learn"], ["/yolo"], ["/cancel"], ["/voice"])
+                        and not _is_consolidation_command(c)):
                     await _cancel_manual_reviews()
                 if c.lower().split(maxsplit=1)[:1] == ["/yolo"]:
                     # A control acknowledgement is not a model/tool completion.
@@ -4021,6 +4040,8 @@ async def _main(startup_started: float):
                     except ValueError as exc:
                         message, error = "", f"Invalid voice command: {exc}"
                     voice.report(force=True, message=message, error=error)
+                elif _is_consolidation_command(c):
+                    _consolidation_command(c)
                 elif c == "/bar" or c.startswith("/bar "):
                     await _bar_command(c)
                 elif c == "/minimal" or c.startswith("/minimal "):
@@ -4187,6 +4208,7 @@ async def _main(startup_started: float):
                     try:
                         memory_parts = shlex.split(c)[1:]
                     except ValueError as exc:
+                        memory_parts = []
                         output, error = "", f"Invalid memory command: {exc}"
                     else:
                         output, error = execute_memory_command(
@@ -4197,6 +4219,8 @@ async def _main(startup_started: float):
                             consolidation=consolidation,
                         )
                     _send({"type": "tool_result", "name": "memory", "output": output, "error": error, "code": ""})
+                    if memory_parts[:1] in (["accept"], ["dismiss"]):
+                        _send(consolidation.status_event())
                     if not error:
                         _send_working_memory()
                     _send({"type": "done"})

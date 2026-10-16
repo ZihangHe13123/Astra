@@ -227,13 +227,18 @@ assert.equal(themesWithCurrent.find((item) => item.command === "classic")?.curre
 assert.equal(themesWithCurrent.find((item) => item.command === "glitchcity")?.current, false);
 assert.equal(themesWithCurrent.every((item) => item.group === "THEMES"), true);
 
+// The terminal menu offers what the shared catalog (the desktop's command palette) lists, in order.
+const memoryOptions = (commandCatalog as { command: string; options?: { command: string }[] }[])
+  .find((item) => item.command === "/memory")?.options?.map((option) => option.command);
+assert.deepEqual(slashCommandSuggestions("/memory ").map((item) => item.command), memoryOptions);
 assert.deepEqual(
-  slashCommandSuggestions("/memory ").map((item) => item.command),
-  [
-    "review", "status", "remember", "remember-user", "working", "inspect", "timeline",
-    "why", "correct", "forget", "import-core", "clear-working",
-  ],
+  slashCommandSuggestions("/memory con").map((item) => item.command),
+  ["consolidation", "consolidation off", "consolidation review", "consolidation auto", "consolidation now"],
 );
+assert.equal(submitSlashCommand("/memory consolidation a", 0), "/memory consolidation auto");
+assert.equal(submitSlashCommand("/memory con", 0), "/memory consolidation");
+assert.equal(completeSlashCommand("/memory acc", 0), "/memory accept ");
+assert.equal(submitSlashCommand("/memory prop", 0), "/memory proposals");
 assert.deepEqual(slashCommandSuggestions("/memory rem").map((item) => item.command), ["remember", "remember-user"]);
 assert.equal(completeSlashCommand("/memory sta", 0), "/memory status");
 assert.equal(submitSlashCommand("/memory sta", 0), "/memory status");

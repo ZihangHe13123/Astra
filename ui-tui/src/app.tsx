@@ -397,7 +397,7 @@ export function submitStreamLifecyclePolicy(
   text: string,
   timelineCommand: ReturnType<typeof resolveTimelineCommand> = resolveTimelineCommand(text, false),
 ): SubmitStreamLifecycle {
-  if (timelineCommand !== null || /^\/(?:cancel|theme|restart|wakeup|yolo|voice|help)(?:\s|$)/i.test(text.trim())) {
+  if (timelineCommand !== null || /^\/(?:cancel|theme|restart|wakeup|yolo|voice|help|memory\s+consolidation)(?:\s|$)/i.test(text.trim())) {
     return "preserve";
   }
   return "clear";
@@ -1359,6 +1359,11 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         voiceRef.current = { speaking, error: event.error ?? "" };
         break;
       }
+      case "memory_consolidation_status":
+        // Only the answer to a /memory consolidation command carries text; other statuses are quiet.
+        if (event.message) addMessage("system", event.message);
+        if (event.error) addMessage("error", event.error);
+        break;
       case "yolo_status":
         setYolo(event.yolo);
         if (event.error) {
@@ -2091,7 +2096,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
       return;
     }
     const timelineCommand = resolveTimelineCommand(text, timelineVisibleRef.current);
-    const controlWhileBusy = /^\/(?:cancel|theme|timeline|reconnect|restart|wakeup|yolo|voice|help)(?:\s|$)/i.test(trimmedText);
+    const controlWhileBusy = /^\/(?:cancel|theme|timeline|reconnect|restart|wakeup|yolo|voice|help|memory\s+consolidation)(?:\s|$)/i.test(trimmedText);
     const streamLifecycle = submitStreamLifecyclePolicy(text, timelineCommand);
     if (busyRef.current && !controlWhileBusy) {
       // Auto-steering: send as a normal message; the backend routes it

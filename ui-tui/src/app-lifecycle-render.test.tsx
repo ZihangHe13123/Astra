@@ -943,6 +943,26 @@ test("voice commands work during a reply, and the badge follows the reported sta
   } finally { h.app.unmount(); }
 });
 
+test("the memory review mode can be switched during a reply, and only an answer is shown", async () => {
+  const h = await setup();
+  try {
+    await h.submit("first");
+    h.child.event({ type: "chunk", content: "LIVE MEMORY REPLY" });
+    await settle();
+    await h.submit("/memory consolidation auto");
+    // Sent as a command, not queued as steering for the running reply.
+    assert.deepEqual(h.child.commands.at(-1), { type: "command", cmd: "/memory consolidation auto" });
+    assert.match(h.frame(), /LIVE MEMORY REPLY/);
+    h.child.event({ type: "memory_consolidation_status", mode: "auto", pending: 0, message: "Memory consolidation: auto (saves itself)", error: "" });
+    h.child.event({ type: "memory_consolidation_status", mode: "auto", pending: 2 });
+    h.child.event({ type: "memory_consolidation_status", mode: "auto", pending: 2, message: "", error: "Usage: /memory consolidation [off|review|auto|now]" });
+    await settle();
+    // A status without an answer (after a review pass) adds nothing to the conversation.
+    assert.equal(h.frame().match(/Memory consolidation: auto \(saves itself\)/g)?.length, 1);
+    assert.match(h.frame(), /Usage: \/memory consolidation \[off\|review\|auto\|now\]/);
+  } finally { h.app.unmount(); }
+});
+
 test("a speech failure is shown once, however many status events repeat it", async () => {
   const h = await setup();
   try {

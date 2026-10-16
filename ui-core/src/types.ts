@@ -285,6 +285,8 @@ export type PyEvent =
   | { type: "background_wakeup"; state: "started" | "limited"; message: string }
   | { type: "memory_notice"; event: "saved" | "revised" | "forgotten"; memory_id: string; summary: string; kind: string; scope: string; previous_id?: string; origin?: "consolidation" }
   | { type: "memory_notice"; event: "proposed"; count: number; summary: string }
+  // The background review's mode; the answer to a /memory consolidation command adds message or error.
+  | { type: "memory_consolidation_status"; mode: "off" | "review" | "auto"; pending: number; message?: string; error?: string }
   | { type: "memory_recall"; count: number; items: string[] }
   | {
       type: "error";

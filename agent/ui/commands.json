@@ -332,7 +332,7 @@
       },
       {
         "command": "why",
-        "description": "show the last recall and retention decisions",
+        "description": "show how automatic recall works and the last retention decision",
         "completion": "/memory why",
         "submitValue": "/memory why"
       },
@@ -351,6 +351,52 @@
         "description": "merge external Core Markdown edits",
         "completion": "/memory import-core",
         "submitValue": "/memory import-core"
+      },
+      {
+        "command": "proposals",
+        "description": "list memory changes the background review proposed",
+        "completion": "/memory proposals",
+        "submitValue": "/memory proposals"
+      },
+      {
+        "command": "accept",
+        "description": "apply proposed memory changes · <n|all>",
+        "completion": "/memory accept "
+      },
+      {
+        "command": "dismiss",
+        "description": "drop proposed memory changes · <n|all>",
+        "completion": "/memory dismiss "
+      },
+      {
+        "command": "consolidation",
+        "description": "show the background memory review mode",
+        "completion": "/memory consolidation",
+        "submitValue": "/memory consolidation"
+      },
+      {
+        "command": "consolidation off",
+        "description": "stop background memory reviews",
+        "completion": "/memory consolidation off",
+        "submitValue": "/memory consolidation off"
+      },
+      {
+        "command": "consolidation review",
+        "description": "propose memory changes; you accept each one",
+        "completion": "/memory consolidation review",
+        "submitValue": "/memory consolidation review"
+      },
+      {
+        "command": "consolidation auto",
+        "description": "save and revise memories directly; forgetting waits for you",
+        "completion": "/memory consolidation auto",
+        "submitValue": "/memory consolidation auto"
+      },
+      {
+        "command": "consolidation now",
+        "description": "review new conversations at the next idle moment",
+        "completion": "/memory consolidation now",
+        "submitValue": "/memory consolidation now"
       },
       {
         "command": "clear-working",

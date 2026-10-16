@@ -365,6 +365,8 @@ label { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sma
 .choice-grid button { flex-direction:column; align-items:flex-start; text-align:left; padding:14px; }
 .choice-grid small { color:var(--muted); }
 .choice-grid [aria-pressed=true] { background:var(--soft); border-color:var(--muted); }
+.choice-grid.three { grid-template-columns:repeat(3, minmax(0, 1fr)); }
+@media(max-width:520px) { .choice-grid.three { grid-template-columns:1fr; } }
 /* Informational notices must not intercept unrelated controls below them. */ .toast { pointer-events: none; }
 .toast .icon { pointer-events: auto; }
 /* Message rows retain their measured space while outside the viewport. */ .measured-message { display: flow-root; }

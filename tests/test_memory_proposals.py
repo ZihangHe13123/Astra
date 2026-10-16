@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from agent.cli.memory_commands import execute_memory_command
 from agent.runtime.memory import MemoryStore
 from agent.runtime.memory_proposals import (
-    IDLE_SECONDS, ConsolidationResult, ConsolidationScheduler, consolidate,
+    FOLLOW_UP_SECONDS, IDLE_SECONDS, ConsolidationResult, ConsolidationScheduler, consolidate,
 )
 from agent.runtime.session_recall import SessionRecall
 
@@ -256,7 +256,43 @@ def test_auto_mode_saves_and_revises_at_once_but_forgetting_waits(tmp_path):
     assert store.resolve_record(cat.record_id, active_only=True) is not None
     [waiting] = store.record_store.proposals()
     assert waiting["action"] == "forget"
-    assert notices == [{"type": "memory_notice", "event": "proposed", "count": 1, "summary": "养了一只猫叫年糕"}]
+    assert notices == [{"type": "memory_notice", "event": "proposed", "count": 1, "summary": "养了一只猫叫年糕"},
+                       {"type": "memory_consolidation_status", "mode": "auto", "pending": 1}]
+
+
+def test_the_scheduler_follows_the_saved_mode_and_reports_it(tmp_path):
+    store = MemoryStore(tmp_path / "memory.db", core_dir=tmp_path / "core")
+    saved, reads, runs, notices = ["off"], [], [], []
+    now = [0.0]
+
+    def load_mode():
+        reads.append(saved[0])
+        return saved[0]
+
+    async def run(store, archive, client, *, force=False):
+        runs.append(force)
+        return ConsolidationResult([{"id": 1, "action": "remember", "summary": "Uses pnpm"}])
+
+    # Started while another window had the review off.
+    scheduler = ConsolidationScheduler(store, tmp_path / "sessions.db", lambda: (None, ""), mode="off",
+                                       notify=notices.append, clock=lambda: now[0], run=run, load_mode=load_mode)
+
+    async def ticks():
+        now[0] += IDLE_SECONDS
+        scheduler.tick(busy=False)
+        scheduler.tick(busy=False)
+        assert scheduler.task is None and len(reads) == 1  # off: the file is read again later, not every tick
+        saved[0] = "review"  # another window turned it on
+        now[0] += FOLLOW_UP_SECONDS
+        scheduler.tick(busy=False)
+        await scheduler.task
+
+    asyncio.run(ticks())
+    assert runs == [False] and scheduler.mode == "review"
+    assert notices[-1] == {"type": "memory_consolidation_status", "mode": "review", "pending": 0}
+    saved[0] = "auto"
+    assert scheduler.status_event(message="ok") == {
+        "type": "memory_consolidation_status", "mode": "auto", "pending": 0, "message": "ok"}
 
 
 def test_only_one_astra_reviews_at_a_time(tmp_path):

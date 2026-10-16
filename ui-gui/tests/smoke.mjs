@@ -693,6 +693,17 @@ try {
  await palette('/session'); await page.getByRole('dialog',{name:'管理会话'}).waitFor();
  await page.getByRole('button',{name:'关闭',exact:true}).click();
  passed('command palette transfers to native persona and session panels');
+ // The background memory review belongs to the installation: the panel shows the saved mode and saves a choice.
+ await page.locator('.account').click();
+ const settingsDialog=page.getByRole('dialog',{name:'设置',exact:true}); await settingsDialog.waitFor();
+ const reviewChoice=name=>settingsDialog.getByRole('button',{name,exact:false});
+ await page.waitForFunction(()=>[...document.querySelectorAll('.choice-grid.three button')].some(b=>b.getAttribute('aria-pressed')==='true'&&b.textContent.startsWith('需审核')));
+ await reviewChoice('自动同意').click();
+ await page.waitForFunction(async()=>{const b=await window.astra.bootstrap();const s=b.sessions.find(s=>s.id===b.active);return s?.info.memory_consolidation_status?.mode==='auto';});
+ assert.equal(await reviewChoice('自动同意').getAttribute('aria-pressed'),'true');
+ assert.equal(JSON.parse(readFileSync(join(folder,'settings.json'),'utf8')).memory_consolidation,'auto');
+ await page.getByRole('button',{name:'关闭',exact:true}).click();
+ passed('settings switch the background memory review and save the choice');
  // Rename is a display label, preserving backend identity and on-disk history.
  const menu=async title=>{await page.getByRole('button',{name:`会话操作：${title}`,exact:true}).first().click();await page.getByRole('menu',{name:'会话操作'}).waitFor();};
  await menu(menuName); await page.getByRole('menuitem',{name:'重命名',exact:true}).click();
