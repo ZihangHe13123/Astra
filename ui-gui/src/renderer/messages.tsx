@@ -52,15 +52,22 @@ export const MessageList = memo(function MessageList({ messages: sourceMessages,
   const locatedSerial = useRef<number>();
   const anchor = useRef<{ id: string; offset: number }>();
   const restoredScroll = useRef<number>();
+  // Where the list was last seen: set by every scroll this list makes and every scroll event, never cleared.
+  const lastTop = useRef<number>();
   const layout = useRef({ messages, offsets });
   const rootTop = () => list.current && scroller.current ? list.current.getBoundingClientRect().top - scroller.current.getBoundingClientRect().top + scroller.current.scrollTop : 0;
   useLayoutEffect(() => {
     const el = scroller.current;
     if (!el || !el.clientHeight) return;
-    if (follow) { el.scrollTop = el.scrollHeight; restoredScroll.current = el.scrollTop; }
-    else if (anchor.current) {
+    if (follow) {
+      // A measurement can land between a user's scroll and its event, while following is still on. Keep pinning only
+      // from where the list was last seen or from near the bottom; the event then turns following off.
+      const moved = lastTop.current !== undefined && Math.abs(el.scrollTop - lastTop.current) > 1
+        && el.scrollHeight - el.scrollTop - el.clientHeight >= 120;
+      if (!moved) { el.scrollTop = el.scrollHeight; restoredScroll.current = lastTop.current = el.scrollTop; }
+    } else if (anchor.current) {
       const i = messages.findIndex(m => m.id === anchor.current!.id);
-      if (i >= 0) { el.scrollTop = rootTop() + offsets[i] + anchor.current.offset; restoredScroll.current = el.scrollTop; }
+      if (i >= 0) { el.scrollTop = rootTop() + offsets[i] + anchor.current.offset; restoredScroll.current = lastTop.current = el.scrollTop; }
     }
     layout.current = { messages, offsets };
     const update = () => {
@@ -79,7 +86,7 @@ export const MessageList = memo(function MessageList({ messages: sourceMessages,
     locatedSerial.current = locate.serial;
     anchor.current = { id: locate.id, offset: -16 };
     el.scrollTop = Math.max(0, rootTop() + offsets[index] - 16);
-    restoredScroll.current = el.scrollTop;
+    restoredScroll.current = lastTop.current = el.scrollTop;
     setViewport({ top: el.scrollTop - rootTop(), height: el.clientHeight });
   };
   useLayoutEffect(() => { locateInViewport.current(); }, [locate, messages, offsets]);
@@ -96,7 +103,7 @@ export const MessageList = memo(function MessageList({ messages: sourceMessages,
       if (capture) restoredScroll.current = undefined;
       setViewport(old => old.top === top && old.height === el.clientHeight ? old : { top, height: el.clientHeight });
     };
-    const scroll = () => update(true);
+    const scroll = () => { lastTop.current = el.scrollTop; update(true); };
     el.addEventListener("scroll", scroll, { passive: true });
     const observer = new ResizeObserver(() => { locateInViewport.current(); update(); }); observer.observe(el);
     return () => { el.removeEventListener("scroll", scroll); observer.disconnect(); };
