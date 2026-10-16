@@ -92,7 +92,8 @@ const escape = `<p id="state">probing</p><pre id="result"></pre>
   document.getElementById('state').textContent = 'probed';
   // The test reads every result before explicitly allowing this destructive probe.
   const navigate = document.getElementById('self-navigation');
-  navigate.addEventListener('click', () => { location.href = '${out}/self-navigation?secret=1'; }, { once: true });
+  // Marked first, so a test that sees no stop can tell a missed click from an unreported navigation.
+  navigate.addEventListener('click', () => { navigate.dataset.clicked = 'yes'; location.href = '${out}/self-navigation?secret=1'; }, { once: true });
   navigate.disabled = false;
 })();
 </script>`;
@@ -183,6 +184,30 @@ try {
   const counter = reply('这是一个计数器。'), hostile = reply('试试能不能出去。'), failing = reply('这张会出错。'), plain = reply('这只是代码。'), example = reply('文档里的例子。'), lesson = reply('技能里的例子。');
   const frame = message => message.locator('iframe.card-frame');
   const inside = message => frame(message).contentFrame();
+  const fitOf = async message => { const box = await frame(message).boundingBox(); const content = await inside(message).locator('body').evaluate(body => Math.ceil(body.getBoundingClientRect().height)); return [box.height, content]; };
+  // The hostile card writes its results into itself and grows. Out of view its frame is not rendered, so it reports
+  // the new height only when scrolled in, and the list then moves for a frame or two: a pointer click aimed in that
+  // moment lands beside the button (macOS runners, 2026-10-16; clicking right after scrolling the card in missed it
+  // locally in 10 runs of 15). The card is brought
+  // into view and left to settle, and the button is clicked by an event rather than at a position, since what is
+  // checked here is the host's answer to a card navigating itself. Without a stop, the error says whether the card
+  // got the click.
+  const leave = async (message, options = {}) => {
+    await frame(message).scrollIntoViewIfNeeded();
+    await expect.poll(async () => { const [frameHeight, content] = await fitOf(message); return frameHeight === content; }).toBe(true);
+    let last = '';
+    await expect.poll(async () => { const box = JSON.stringify(await frame(message).boundingBox()); const same = box === last; last = box; return same; }, { intervals: [150] }).toBe(true);
+    await inside(message).getByRole('button', { name: '尝试离开自己的框', exact: true }).dispatchEvent('click');
+    try {
+      await expect(message.locator('.card-block').getByRole('status')).toHaveText('卡片已停止：它试图离开自己的框。', options);
+    } catch (error) {
+      const clicked = await frame(message).count()
+        ? await inside(message).locator('#self-navigation').getAttribute('data-clicked', { timeout: 1000 }).catch(() => 'unreadable')
+        : 'frame gone';
+      error.message += `\nSelf-navigation button: ${clicked === 'yes' ? 'clicked, but the host did not stop the card' : clicked === null ? 'not clicked (the click missed it)' : clicked}`;
+      throw error;
+    }
+  };
   const scroller = page.locator('.messages-scroll');
   const reveal = async message => {
     for (let top = 0; top < 30000 && !(await message.count()); top += 300) { await scroller.evaluate((node, y) => { node.scrollTop = y; }, top); await page.waitForTimeout(80); }
@@ -200,7 +225,7 @@ try {
   await expect(page.getByText('卡片后面的文字。', { exact: true })).toBeVisible();
   // The frame is as tall as its content. It gets there a moment after the card is drawn, and the list moves with it,
   // so the card is clicked only once it has: a click aimed while the button is still moving can land beside it.
-  const fit = async () => { const box = await frame(counter).boundingBox(); const content = await inside(counter).locator('body').evaluate(body => Math.ceil(body.getBoundingClientRect().height)); return [box.height, content]; };
+  const fit = () => fitOf(counter);
   await expect.poll(async () => { const [frameHeight, content] = await fit(); return frameHeight === content && content > 60; }).toBe(true);
   await inside(counter).getByRole('button', { name: '加一', exact: true }).click();
   await expect(inside(counter).locator('#n')).toHaveText('1');
@@ -244,8 +269,7 @@ try {
   };
   await checkHostileProbes();
   // Then it navigates itself away: the host shows that it stopped, and its source instead of a refused page.
-  await inside(hostile).getByRole('button', { name: '尝试离开自己的框', exact: true }).click({ noWaitAfter: true });
-  await expect(hostile.locator('.card-block').getByRole('status')).toHaveText('卡片已停止：它试图离开自己的框。');
+  await leave(hostile);
   await expect(frame(hostile)).toHaveCount(0);
   await expect(hostile.locator('.card-block pre')).toContainText('self-navigation');
   await new Promise(done => setTimeout(done, 1500));
@@ -303,8 +327,7 @@ try {
   // The hostile card ran again when the history was reopened, and stopped again.
   await reveal(hostile);
   await checkHostileProbes();
-  await inside(hostile).getByRole('button', { name: '尝试离开自己的框', exact: true }).click({ noWaitAfter: true });
-  await expect(hostile.locator('.card-block').getByRole('status')).toHaveText('卡片已停止：它试图离开自己的框。', { timeout: 30000 });
+  await leave(hostile, { timeout: 30000 });
   await expect(frame(hostile)).toHaveCount(0);
   await expect(hostile.locator('.card-block pre')).toContainText('self-navigation');
   await new Promise(done => setTimeout(done, 1500));
