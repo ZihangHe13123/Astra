@@ -130,22 +130,34 @@ class TestRuntimeTracePopulation:
         def __init__(self):
             self.config = SimpleNamespace(model="fake", capabilities=frozenset())
 
-    def test_builtin_memory_recall_populates_memory_trace_context(self, tmp_path, monkeypatch):
+    def test_context_index_memory_recall_populates_memory_trace_context(self, tmp_path, monkeypatch):
+        from agent.runtime.context_index.broker import ContextIndexBroker
+        from agent.runtime.context_index.models import SourceResult
+        from tests.test_context_index_broker import FakeSource
+
         monkeypatch.setenv("HINDSIGHT_ENABLED", "0")
         store = MemoryStore(path=tmp_path / "memory.db", core_dir=tmp_path / "core")
-        record = store.add_record(kind="preference", content="用户偏好简洁回答")
-        agent = ReActAgent(
-            "agent",
-            self.FakeLLM(),  # type: ignore[arg-type]
-            ToolRegistry(),
-            memory_store=store,
-        )
-        agent.context.set_session(str(tmp_path / "session-a.jsonl"))
-        trace_ctx = TraceContext(session_id="session-a", request_id="request-a")
+        record = store.add_record(kind="observation", content="Astra recovery requires an atomic SQLite transaction")
+        empty = SourceResult("absent")
 
-        asyncio.run(agent._prepare_prompt_for_llm("你记得我的回答偏好吗", None, trace_ctx))
+        def traced(broker):
+            agent = ReActAgent(
+                "agent",
+                self.FakeLLM(),  # type: ignore[arg-type]
+                ToolRegistry(),
+                memory_store=store,
+                context_index_broker=broker,
+            )
+            agent.context.set_session(str(tmp_path / "session-a.jsonl"))
+            trace_ctx = TraceContext(session_id="session-a", request_id="request-a")
+            asyncio.run(agent._prepare_prompt_for_llm("Astra recovery constraints", None, trace_ctx))
+            return trace_ctx.memory_id
 
-        assert trace_ctx.memory_id == record.record_id
+        assert traced(ContextIndexBroker(
+            "session", 900, FakeSource("session", result=empty), FakeSource("activity", result=empty),
+        )) == record.record_id
+        # With the Context Index off nothing is recalled into the turn, so no memory is traced.
+        assert not traced(None)
 
     def test_browser_tool_populates_trace_context(self, tmp_path):
         registry = ToolRegistry(policy=ToolPolicy(mode="permissive"))

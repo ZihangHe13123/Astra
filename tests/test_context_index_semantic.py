@@ -566,3 +566,16 @@ def test_only_redacted_text_reaches_the_encoder(tmp_path):
     sent = "\n".join(text for call in encoder.calls for text in call)
     assert "sk-live-0123456789abcdef" not in sent
     assert "<redacted>" in sent
+
+
+def test_semantic_memory_keeps_a_project_memory_to_its_project(archive):
+    def scope_to(workspace_key):
+        with sqlite3.connect(archive.memory.path) as db:
+            db.execute("UPDATE memory_records SET metadata_json = json_set(metadata_json, '$.scope', 'project', "
+                       "'$.workspace_key', ?)", (workspace_key,))
+        rebuild_source(archive.memory.path, archive.vectors, "memory", backend=archive.encoder)
+
+    scope_to("another-repo")
+    assert recommend(archive, "memory").relevance == ()
+    scope_to(WORKSPACE.key)
+    assert [item.identity for item in recommend(archive, "memory").relevance] == [archive.record.record_id]

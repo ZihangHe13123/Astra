@@ -547,7 +547,6 @@ async def handle_slash(cmd: str, agent: ReActAgent) -> Msg | None:
                 store,
                 parts[1:],
                 session_id=Path(agent.context.session_path).stem or "default",
-                router=agent.memory_router,
                 retainer=agent.memory_retainer,
             )
             print(f"  {error or output}\n")
@@ -895,6 +894,7 @@ async def _async_init(llm_config: LLMConfig, sandbox_timeout: int, workdir: str)
         memory_store,
         session_id=lambda: Path(agent_holder["agent"].context.session_path).stem if agent_holder else "default",
         messages=lambda: agent_holder["agent"].context.messages if agent_holder else [],
+        external=lambda: agent_holder["agent"].external_memory_provider if agent_holder else None,
     )
     register_skill_tools(
         tools, skill_store,

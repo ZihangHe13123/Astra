@@ -905,6 +905,7 @@ async def _main(startup_started: float):
         memory_store,
         session_id=lambda: agent_holder["agent"].context.session_scope if agent_holder else "default",
         messages=lambda: agent_holder["agent"].context.messages if agent_holder else [],
+        external=lambda: agent_holder["agent"].external_memory_provider if agent_holder else None,
     )
     # Saved, revised or forgotten memories are shown to the user as they happen.
     memory_store.on_change = lambda change: _send({"type": "memory_notice", **change})
@@ -4192,7 +4193,6 @@ async def _main(startup_started: float):
                             memory_store,
                             memory_parts,
                             session_id=agent.context.session_scope,
-                            router=agent.memory_router,
                             retainer=agent.memory_retainer,
                             consolidation=consolidation,
                         )

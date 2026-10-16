@@ -6,13 +6,11 @@ from types import SimpleNamespace
 
 from agent.runtime.hindsight_provider import HindsightMemoryProvider
 from agent.runtime.memory import MemoryStore
-from agent.runtime.memory_provider import (
-    BuiltinMemoryProvider,
-    FederatedMemoryProvider,
-)
-from agent.runtime.memory_router import MemoryRouter
+from agent.runtime.memory_provider import BuiltinMemoryProvider
 from agent.runtime.react import ReActAgent
+from agent.runtime.tools import memory as memory_tools
 from agent.runtime.tools.hindsight import register_hindsight_tools
+from agent.runtime.tools.memory import register_memory_tools
 from agent.runtime.tools.registry import ToolRegistry
 
 
@@ -98,97 +96,59 @@ def test_hindsight_provider_rejects_remote_url_without_explicit_opt_in():
     assert "local-first policy" in health.detail
 
 
-def test_federated_provider_preserves_builtin_when_external_fails(tmp_path):
+def _search_with(store, provider, query):
+    tools = ToolRegistry()
+    register_memory_tools(tools, store, session_id=lambda: "s", workspace_key=lambda: "repo",
+                          external=lambda: provider)
+    result = asyncio.run(tools.execute("memory", {"action": "search", "query": query}))
+    assert result["error"] == ""
+    return result["output"]
+
+
+def test_memory_search_keeps_builtin_results_when_hindsight_fails_or_is_slow(tmp_path, monkeypatch):
+    monkeypatch.setattr(memory_tools, "_SEARCH_EXTERNAL_SECONDS", 0.05)
     store = MemoryStore(tmp_path / "memory.db", core_dir=tmp_path / "memory")
-    expected = store.add_record(
-        kind="preference",
-        content="User prefers concise answers",
-        source_session_id="session-a",
-    )
+    store.add_record(kind="preference", content="User prefers concise answers", source_session_id="session-a")
 
     class FailingExternal(HindsightMemoryProvider):
         async def recall(self, query, *, kinds=(), limit=8):
             raise TimeoutError("offline")
-
-    external = FailingExternal(
-        base_url="http://127.0.0.1:8888",
-        bank_id="main-v2",
-        client=FakeRecallClient(),
-    )
-    provider = FederatedMemoryProvider(BuiltinMemoryProvider(store), external)
-
-    records = asyncio.run(provider.recall("concise answers", limit=4))
-
-    assert [record.record_id for record in records] == [expected.record_id]
-    assert "TimeoutError" in provider.last_external_error
-
-
-def test_slow_external_recall_keeps_builtin_results_within_the_interactive_budget(tmp_path):
-    store = MemoryStore(tmp_path / "memory.db", core_dir=tmp_path / "memory")
-    expected = store.add_record(kind="preference", content="User prefers concise answers",
-                                source_session_id="session-a")
 
     class SlowExternal(HindsightMemoryProvider):
         async def recall(self, query, *, kinds=(), limit=8):
             await asyncio.sleep(10)
             return []
 
-    external = SlowExternal(base_url="http://127.0.0.1:8888", bank_id="main-v2", client=FakeRecallClient())
-    provider = FederatedMemoryProvider(BuiltinMemoryProvider(store), external, external_timeout=0.05)
-    router = MemoryRouter(provider, store, recall_timeout=0.3)
-
-    started = time.monotonic()
-    pack = asyncio.run(router.build_context("remember my preference for concise answers", session_id="s"))
-    assert time.monotonic() - started < 1
-    assert [record.record_id for record in pack.recalled] == [expected.record_id]
-    assert pack.trace.decision == "recalled"
-    assert "TimeoutError" in provider.last_external_error
+    for external in (FailingExternal, SlowExternal):
+        provider = external(base_url="http://127.0.0.1:8888", bank_id="main-v2", client=FakeRecallClient())
+        started = time.monotonic()
+        output = _search_with(store, provider, "concise answers")
+        assert time.monotonic() - started < 1
+        assert "User prefers concise answers" in output
+        assert "Hindsight did not answer (TimeoutError" in output
 
 
-def test_federated_provider_keeps_builtin_first_and_deduplicates(tmp_path):
+def test_memory_search_lists_builtin_first_and_drops_hindsight_repeats(tmp_path):
     store = MemoryStore(tmp_path / "memory.db", core_dir=tmp_path / "memory")
-    builtin = store.add_record(
-        kind="user_fact",
-        content="Test user lives in Example City",
-        source_session_id="session-a",
-    )
+    store.add_record(kind="user_fact", content="Test user lives in Example City", source_session_id="session-a")
     client = FakeRecallClient([
-        SimpleNamespace(
-            id="duplicate",
-            text="Test user lives in Example City",
-            type="observation",
-            occurred_start=None,
-            mentioned_at=None,
-            document_id="old",
-            metadata={},
-            tags=[],
-        ),
-        SimpleNamespace(
-            id="extra",
-            text="Test user previously discussed opening a library account",
-            type="observation",
-            occurred_start=None,
-            mentioned_at=None,
-            document_id="old",
-            metadata={},
-            tags=[],
-        ),
+        SimpleNamespace(id="duplicate", text="Test user lives in Example City", type="observation",
+                        occurred_start=None, mentioned_at=None, document_id="old", metadata={}, tags=[]),
+        SimpleNamespace(id="extra", text="Test user previously discussed opening a library account",
+                        type="observation", occurred_start="2026-05-02T00:00:00Z", mentioned_at=None,
+                        document_id="old", metadata={}, tags=[]),
     ])
-    external = HindsightMemoryProvider(
-        base_url="http://127.0.0.1:8888",
-        bank_id="main-v2",
-        client=client,
-    )
-    provider = FederatedMemoryProvider(BuiltinMemoryProvider(store), external)
+    provider = HindsightMemoryProvider(base_url="http://127.0.0.1:8888", bank_id="main-v2", client=client)
 
-    records = asyncio.run(provider.recall("Example City account", limit=4))
+    output = _search_with(store, provider, "Example City account")
 
-    assert records[0].record_id == builtin.record_id
-    assert [record.content for record in records].count("Test user lives in Example City") == 1
-    assert any(record.record_id == "hs-extra" for record in records)
+    assert output.count("Test user lives in Example City") == 1
+    assert output.index("Test user lives in Example City") < output.index("Hindsight (historical, non-authoritative")
+    assert "- 2026-05-02 [observation] Test user previously discussed opening a library account" in output
+    assert client.calls[0]["query"] == "Example City account"
 
 
-def test_react_federates_builtin_authority_with_optional_hindsight(tmp_path, monkeypatch):
+def test_react_keeps_builtin_authority_and_offers_optional_hindsight(tmp_path, monkeypatch):
     monkeypatch.setenv("HINDSIGHT_ENABLED", "1")
     monkeypatch.setenv("HINDSIGHT_API_URL", "http://127.0.0.1:8888")
     monkeypatch.setenv("HINDSIGHT_BANK_ID", "main-v2")
@@ -209,21 +169,15 @@ def test_react_federates_builtin_authority_with_optional_hindsight(tmp_path, mon
         memory_store=store,
     )
 
-    router = agent.memory_router
-    assert router is not None
-    assert isinstance(router.provider, FederatedMemoryProvider)
-    assert isinstance(router.provider.authority, BuiltinMemoryProvider)
-    assert agent.external_memory_provider is router.provider.external
-    assert router.recall_timeout == 2.5
-    assert router.provider.external_timeout == 2.25
+    assert isinstance(agent.external_memory_provider, HindsightMemoryProvider)
     assert {
         "hindsight_retain",
         "hindsight_recall",
         "hindsight_reflect",
     }.issubset(set(tools.tool_names))
-    assert router.provider.capabilities.reflect is True
     assert agent.memory_retainer is not None
-    assert agent.memory_retainer.provider is router.provider.authority
+    # What Astra saves goes to its own store; Hindsight stays an extra, non-authoritative source.
+    assert isinstance(agent.memory_retainer.provider, BuiltinMemoryProvider)
 
 
 def test_hindsight_tool_labels_results_as_non_authoritative():

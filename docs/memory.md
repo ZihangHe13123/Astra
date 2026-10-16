@@ -19,8 +19,8 @@ reads a memory's full text when it needs more than the summary. Only memories
 for all projects and for the current one are listed; superseded and expired ones
 are not. Records from before saved memories are listed only when they are
 preferences or facts about you. When more memories qualify than fit, the ones
-saved or used most recently are listed. Used means recalled into a turn or
-read in full; listed lines stay in date order, so the index changes only when
+saved or used most recently are listed. Used means recalled into a turn, found
+by a search, or read in full; listed lines stay in date order, so the index changes only when
 a memory enters or leaves it. `read` shows how often a memory was used, and
 `/memory` counts saved memories unused for 90 days.
 
@@ -70,20 +70,22 @@ prompt. There is no Auto Core and no configurable extra L0 budget.
 Structured historical memory is stored locally in `.astra/memory.db` and does
 not require Hindsight. Evidence-backed preferences, user facts, episodes, task
 references, and observations retain provenance, confidence, and lifecycle
-metadata. Core Markdown remains the small always-visible source; SQLite records
-are retrieved only when relevant, at most four records and 2,400 rendered
-characters per turn. Project/configuration questions can match local
-observations without requiring the user to say “remember”; trivial turns,
-slash commands, and unrelated questions skip automatic recall. SQLite FTS5 is
-used when available, with deterministic substring fallback for Chinese text.
-A recalled record is shown with its date.
+metadata. Core Markdown and the saved-memory index are always visible. Other
+records reach the model in two ways: automatically only through the Context
+Index (`session` or `all` mode, below), and on demand when the model calls
+`memory(action="search")`. With the Context Index off, nothing is recalled into
+a turn. Search uses the Context Index's query rules (conversational words
+dropped, short Chinese words kept whole, a relative date such as 上周 read as a
+time window) and lists up to eight current memories for all projects and the
+current one, best match first, each with its date. When no memory contains two
+of the query's words, memories containing any one of them are listed.
 
 Personal facts and corrections are written through the model's memory tools or
 explicit `/memory` commands. When something changes, Astra revises the memory:
 the new one supersedes it, and the old one is kept, marked superseded with an
 end date, so its history stays readable with `/memory timeline`. The conversation
 shows each change as it happens (“已记住”, “已更新记忆”, “已忘记”, with the id), and
-a turn that recalls saved memories says how many. If a turn has read a web
+a turn whose Context Index recall includes saved memories says how many. If a turn has read a web
 page, a browser page, an MCP result, or content delivered by a subagent, another
 session or a background run, saving a memory in it needs your approval: such
 text can carry instructions written to plant themselves in memory. Astra does not turn conversation sentences into facts
@@ -120,13 +122,15 @@ the next idle moment.
 Semantic recall treats ordinary English words in Chinese questions as soft terms;
 explicit literals and code identifiers still constrain matching results.
 
-Hindsight is an optional federated semantic-recall enhancement. When enabled,
-its results are merged with the authoritative builtin store; when disabled or
-unavailable, builtin retention and recall continue locally. A slow service is
-cut off inside the interactive recall budget (`HINDSIGHT_INTERACTIVE_RECALL_TIMEOUT`,
-2.5 s) without losing the builtin results. Current user
-statements, Core Markdown, concrete TaskRun results, Goal state, and temporary
-conversation state always take precedence over recalled records.
+Hindsight is an optional extra source for search; nothing from it is added to
+a turn automatically. When it is enabled, `memory(action="search")` sends it the
+same words and lists its results after Astra's own, marked historical and
+non-authoritative, without the ones that repeat a memory already listed. A
+service that fails or takes more than five seconds leaves Astra's own results
+and a note saying so. Its `hindsight_recall`, `hindsight_reflect` and
+`hindsight_retain` tools remain available. Current user statements, Core
+Markdown, concrete TaskRun results, Goal state, and temporary conversation state
+always take precedence over recalled records.
 
 ## On-demand history and learned skills
 
@@ -178,9 +182,10 @@ pipeline**. Query planning, reciprocal-rank fusion (RRF), diversity selection
 (MMR), evidence budgets, and feedback all run in Astra's Python components.
 It requires no external memory framework, memory server, graph database, or
 auxiliary LLM. Existing embedding backends remain optional. It is **off by
-default**, and ordinary Markdown core memory stays unchanged. In `session` and
-`all` modes it also takes over automatic recall of structured records from the
-builtin router (Hindsight's automatic merge included).
+default**, and ordinary Markdown core memory stays unchanged. It is the only
+automatic recall of structured records: in `session` and `all` modes it adds
+them to a turn, and with it off, records reach the model only through the
+saved-memory index and the model's own searches.
 
 ```text
 /context-index session   # Astra's local records and session history

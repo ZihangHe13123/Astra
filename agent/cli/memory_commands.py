@@ -8,7 +8,6 @@ from agent.runtime.memory_records import MemoryRecord
 if TYPE_CHECKING:
     from agent.runtime.memory_proposals import ConsolidationScheduler
     from agent.runtime.memory_retainer import MemoryRetainer
-    from agent.runtime.memory_router import MemoryRouter
 
 
 MEMORY_USAGE = (
@@ -97,7 +96,6 @@ def execute_memory_command(
     args: list[str],
     *,
     session_id: str,
-    router: "MemoryRouter | None" = None,
     retainer: "MemoryRetainer | None" = None,
     consolidation: "ConsolidationScheduler | None" = None,
 ) -> tuple[str, str]:
@@ -123,15 +121,12 @@ def execute_memory_command(
                 return "", MEMORY_USAGE
             return store.memory_timeline(args[1]), ""
         if action == "why":
-            if router is None:
-                return "Memory routing is unavailable in this runtime.", ""
-            trace = router.last_trace(session_id)
+            blocks = [
+                "Automatic recall: only through the Context Index (/context-index why explains its last choice). "
+                "With it off, no records are added to a turn; saved memories are listed in the always-visible "
+                "index, and the model looks others up with memory(action=search)."
+            ]
             retention = retainer.last_outcome(session_id) if retainer is not None else None
-            if trace is None and retention is None:
-                return "No memory routing decision has been recorded for this session yet.", ""
-            blocks = []
-            if trace is not None:
-                blocks.append(trace.format())
             if retention is not None:
                 blocks.append(retention.format())
             return "\n\n".join(blocks), ""

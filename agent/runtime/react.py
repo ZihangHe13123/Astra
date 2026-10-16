@@ -179,19 +179,11 @@ class ReActAgent(AgentBase):
         self.external_memory_provider: "HindsightMemoryProvider | None" = None
         builtin_memory_provider = None
         if memory_store is not None:
+            from .hindsight_provider import HindsightMemoryProvider
             from .memory_provider import BuiltinMemoryProvider
 
             builtin_memory_provider = BuiltinMemoryProvider(memory_store)
-        if memory_router is not None:
-            router_provider = getattr(memory_router, "provider", None)
-            self.external_memory_provider = (
-                router_provider
-                if getattr(router_provider, "name", "") == "hindsight"
-                else getattr(router_provider, "external", None)
-            )
-        elif memory_store is not None:
-            from .hindsight_provider import HindsightMemoryProvider
-
+            # Hindsight is reached on demand: its own tools, and memory search.
             self.external_memory_provider = HindsightMemoryProvider.from_env()
         if self.external_memory_provider is not None and self.tools.get("hindsight_recall") is None:
             from .tools.hindsight import register_hindsight_tools
@@ -267,25 +259,10 @@ class ReActAgent(AgentBase):
         self.memory_store = memory_store
         if memory_router is not None:
             self.memory_router = memory_router
-        elif memory_store is not None and builtin_memory_provider is not None:
-            from .memory_provider import FederatedMemoryProvider
+        elif memory_store is not None:
             from .memory_router import MemoryRouter
 
-            recall_provider = builtin_memory_provider
-            recall_timeout = self._float_env("HINDSIGHT_INTERACTIVE_RECALL_TIMEOUT", 2.5)
-            if self.external_memory_provider is not None:
-                recall_provider = FederatedMemoryProvider(
-                    builtin_memory_provider,
-                    self.external_memory_provider,
-                    # Ends before the whole recall's budget, so builtin results survive.
-                    external_timeout=max(0.05, recall_timeout - 0.25),
-                )
-            self.memory_router = MemoryRouter(
-                recall_provider,
-                memory_store,
-                task_store,
-                recall_timeout=recall_timeout,
-            )
+            self.memory_router = MemoryRouter(memory_store, task_store)
         else:
             self.memory_router = None
         if memory_retainer is not None:
@@ -2404,14 +2381,6 @@ class ReActAgent(AgentBase):
             recalled: list[str] = []
             recalled_ids: list[str] = []
             context_index_broker = getattr(self, "context_index_broker", None)
-            native_index = bool(
-                context_index_broker is not None
-                and getattr(context_index_broker, "native_memory", False)
-                and context_index_broker.mode in {"session", "all"}
-                and self.tool_allowlist is None
-                and self.memory_store is not None
-                and not str(user_text).lstrip().startswith("/")
-            )
             task_text = ""
             active_memory_text = ""
             # Interaction sandboxes such as Night Bar disable memory by
@@ -2421,25 +2390,8 @@ class ReActAgent(AgentBase):
             with profile.phase("memory_and_turn_context"):
                 workspace_key = self._memory_workspace_key()
                 if self.memory_router is not None and self.memory_store is not None:
-                    with trace_span("agent.memory.recall", ctx=trace_ctx) as memory_span:
-                        pack = await self.memory_router.build_context(
-                            user_text,
-                            session_id=session_id,
-                            turn_key=self._memory_turn_key,
-                            workspace_key=workspace_key,
-                            **({"recall_enabled": False} if native_index else {}),
-                        )
-                        memory_ids = ",".join(pack.trace.record_ids)
-                        if trace_ctx is not None:
-                            trace_ctx.memory_id = memory_ids
-                        if memory_span is not None and memory_ids:
-                            memory_span.set_attribute("agent.memory_id", memory_ids)
-                            memory_span.set_attribute("agent.memory.count", len(pack.trace.record_ids))
-                    memory_block = pack.render(
-                        recall_char_limit=self.memory_router.recall_char_limit, include_core=not work_mode,
-                    )
-                    recalled.extend(self.memory_store.memory_summary(record) for record in pack.recalled)
-                    recalled_ids.extend(record.record_id for record in pack.recalled)
+                    pack = await self.memory_router.build_context(session_id=session_id, workspace_key=workspace_key)
+                    memory_block = pack.render(include_core=not work_mode)
                     if work_mode:
                         standing_memory = pack.core
                     if getattr(context_index_broker, "native_memory", False):
@@ -2526,6 +2478,8 @@ class ReActAgent(AgentBase):
             self._standing_memory_block = standing_memory
             self._report_memory_recall(recalled)
             self._note_memory_use(recalled_ids)
+            if trace_ctx is not None and recalled_ids:
+                trace_ctx.memory_id = ",".join(recalled_ids)
 
         def turn_context_text() -> str:
             dynamic_blocks: list[str] = []
@@ -4934,7 +4888,6 @@ class ReActAgent(AgentBase):
                             user_text,
                             session_id=session_id,
                             message_id=msg.id,
-                            recalled=self.memory_router.last_recalled(session_id),
                             tool_evidence=evidence,
                         )
                         changed_ids = (*outcome.retained_ids, *outcome.confirmed_ids)
