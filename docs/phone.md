@@ -9,6 +9,9 @@ phone. Models, tools and memory stay on the Mac; the phone is another screen of
 the same Astra, and what it does acts on the Mac's backend. The design is in
 `specs/phone-companion.md`.
 
+Read-aloud follows you: replies to a conversation used from the phone are spoken on the
+phone, and on the Mac again once it is used there (see [voice output](voice.md)).
+
 Some things only make sense at the Mac and say so on the phone: choosing files or
 folders (attachments, projects), opening or previewing files, window capture,
 exporting a session, and pairing phones. Model-written cards and pages show their

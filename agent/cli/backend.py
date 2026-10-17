@@ -179,6 +179,7 @@ from agent.cli.diagnostics import build_doctor_report, build_runtime_diagnostics
 from agent.cli.environment import load_project_env
 from agent.cli.persona_preferences import save_selected_persona, startup_persona
 from agent.cli.voice_preferences import VoicePreferences, execute_voice_command
+from agent.speech.player import PhonePlayer
 from agent.speech.service import SpeechService
 from agent.cli.search_preferences import (
     SEARCH_PROVIDERS,
@@ -1217,7 +1218,12 @@ async def _main(startup_started: float):
     tools.hooks.on_session_end(computer_state_emitter.observe_session_end)
     # Spoken output is presentation only: it hears the reply stream and never touches the context.
     voice_preferences = VoicePreferences()
-    voice = SpeechService(voice_preferences, lambda status: _send({"type": "voice_status", **status}))
+    # A paired phone plays speech itself when the conversation is used from it (the desktop sets the route).
+    phone_audio = os.getenv("ASTRA_PHONE_AUDIO_DIR", "").strip()
+    voice = SpeechService(voice_preferences, lambda status: _send({"type": "voice_status", **status}),
+                          open_phone_player=(lambda rate: PhonePlayer(rate, Path(phone_audio),
+                                                                      lambda audio: _send({"type": "voice_audio", **audio})))
+                          if phone_audio else None)
     tools.hooks.on_session_end(lambda _session_id, _reason: voice.stop())
     tools.hooks.on_runtime_event(computer_state_emitter.observe_runtime_event)
     register_run_code_tool(tools, agent_getter=lambda: agent_holder["agent"])

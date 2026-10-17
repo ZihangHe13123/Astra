@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { request } from "node:http";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { PhoneClient } from "../src/phone/client.js";
 import { memory, pairedClient, setup, until } from "./phone-fixture.js";
 
@@ -116,4 +118,19 @@ test("the phone client calls fetch the way Safari requires: never as a method of
     const record = await client.pair(devices.startPairing().code, "iPhone");
     assert.ok(await client.signIn(record));
   } finally { globalThis.fetch = real; await gateway.dispose(); }
+});
+
+test("speech handed to the phone is served to a signed-in phone only, by its id alone", async () => {
+  const { devices, gateway, base, audio } = await setup();
+  try {
+    const id = "0123456789abcdef0123456789abcdef";
+    writeFileSync(join(audio, `${id}.wav`), "RIFF-audio");
+    writeFileSync(join(audio, "..", "secret.wav"), "not served");
+    assert.equal((await fetch(`${base}/api/voice/${id}`)).status, 401);
+    const { client, token } = await pairedClient(devices, base);
+    assert.equal(Buffer.from(await client.voice(token, id)).toString(), "RIFF-audio");
+    for (const bad of ["..%2Fsecret", "ABCDEF0123456789abcdef0123456789", "0123"]) {
+      assert.equal((await fetch(`${base}/api/voice/${bad}`, { headers: { Authorization: `Bearer ${token}` } })).status, 404, bad);
+    }
+  } finally { await gateway.dispose(); }
 });

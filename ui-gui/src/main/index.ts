@@ -34,6 +34,9 @@ let workspace = resolve(process.env.ASTRA_WORKSPACE || process.cwd());
 const data = packaged?.data ?? resolve(process.env.ASTRA_HOME || join(root, ".astra"));
 const gui = join(data, "gui");
 mkdirSync(gui, { recursive: true, mode: 0o700 });
+// Speech for a paired phone is handed over as files here (agent/speech/player.py PhonePlayer); backends inherit it.
+const phoneAudio = join(gui, "phone-audio");
+process.env.ASTRA_PHONE_AUDIO_DIR = phoneAudio;
 const identity = createHash("sha256").update(`${root}\0${data}`).digest("hex").slice(0, 16);
 app.setName("Astra");
 app.setPath("userData", join(gui, `electron-${identity}`));
@@ -75,7 +78,7 @@ let queued: DesktopEvent[] = [];
 let flushTimer: ReturnType<typeof setTimeout> | undefined;
 // Paired phones follow the same sessions as the window (specs/phone-companion.md, phase 1: read-only).
 const phoneDevices = new PhoneDevices(join(gui, "phone-devices.json"));
-const phone = new PhoneGateway(phoneDevices, { staticRoot: join(__dirname, "phone"), rendererRoot: join(__dirname, "renderer"),
+const phone = new PhoneGateway(phoneDevices, { staticRoot: join(__dirname, "phone"), rendererRoot: join(__dirname, "renderer"), audioRoot: phoneAudio,
   invoke: (device, method, args) => phoneInvoke(device, method, args), port: Number(process.env.ASTRA_PHONE_PORT || 8930) });
 let phoneError = "";
 let phoneHost: { name?: string; at: number } = { at: 0 };
@@ -158,6 +161,7 @@ function openSession(options: { session?: string; mode?: string; workspace?: str
   }
   const rt = new Runtime(root, python, work, mode === "work" ? name : `gui_${randomUUID().replaceAll("-", "")}`, mode,
     (r, event) => { broadcast({ runtime: r.id, revision: r.state.revision, event }); appshot.handle(r.id, event);
+      if (event.type === "backend_hello") voiceRoutes.delete(r.id);
       if (event.type === "gui_ready") appshot.update(); });
   // Special modes enter their separate namespace after the Work backend is ready.
   if (mode !== "work") rt.initialModeSession = name;
@@ -170,7 +174,15 @@ function openSession(options: { session?: string; mode?: string; workspace?: str
 }
 register("create", (options: { session?: string; mode?: string; workspace?: string } = {}) => openSession(options));
 register("select", id => { active = id === "" ? "" : runtime(id).id; appshot.update(); });
+/** Where each session's speech plays: on this Mac, or on the phone the conversation was last used from. */
+const voiceRoutes = new Map<string, "mac" | "phone">();
+async function routeVoice(rt: Runtime, command: Record<string, any>, where: "mac" | "phone") {
+  if (!["message", "image", "command"].includes(command.type) || voiceRoutes.get(rt.id) === where) return;
+  voiceRoutes.set(rt.id, where);
+  try { await rt.send({ type: "command", cmd: `/voice route ${where}` }); } catch (error) { voiceRoutes.delete(rt.id); throw error; }
+}
 function forgetRuntime(rt: Runtime) {
+  voiceRoutes.delete(rt.id);
   for (const [key, controller] of previewRequests) if (key.startsWith(`${rt.id}:`)) { controller.abort(); previewRequests.delete(key); }
   runtimes.delete(rt.id);
   if (active === rt.id) { active = ""; preferences.lastSession = null; savePreferences(); }
@@ -187,6 +199,7 @@ register("send", async (id, value) => {
   const rt = runtime(id); const command = checkedCommand(value);
   if (command.type === "image") authorizedFile(id, command.path);
   clipboardFiles.sent(command);
+  await routeVoice(rt, command, "mac");
   try { await rt.send(appshot.prepare(rt.id, command as any)); }
   catch (error) {
     appshot.handle(rt.id, { type: "submission_status", submission_id: command.submission_id, status: "unknown" });
@@ -266,6 +279,7 @@ async function phoneInvoke(device: string, method: PhoneInvokeMethod, args: any[
     ...(command.type === "tool_approval_response" ? { request: command.request_id, decision: command.decision } : {}),
     ...(command.type.startsWith("user_question") ? { request: command.request_id } : {}) });
   if (command.type === "image") authorizedFile(rt.id, command.path);
+  await routeVoice(rt, command, "phone");
   await rt.send(command as any);
 }
 register("phone", async (action, value) => {

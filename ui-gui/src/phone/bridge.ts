@@ -15,6 +15,8 @@ export type BridgeEnvironment = {
   copy(text: string): Promise<void>;
   open(url: string): void;
   sleep(ms: number): Promise<void>;
+  /** Speech the desktop routed to this phone (a voice_audio event): play it here, fetching the audio with `load`. */
+  voice?(event: { id?: string; seconds?: number; at?: number; stop?: boolean }, load: (id: string) => Promise<ArrayBuffer>): void;
 };
 
 const DEFAULTS: Preferences = { theme: "system", drafts: {}, attachments: {}, workspaces: {}, pinned: [], projects: [], titles: {}, timeline: true };
@@ -107,11 +109,23 @@ export class RemoteBridge implements DesktopBridge {
       return;
     }
     if (id !== undefined) this.seq = id;
+    if ("event" in message && message.event?.type === "voice_audio") {
+      this.env.voice?.(message.event as { id?: string; at?: number; stop?: boolean }, voice => this.loadVoice(voice));
+    }
     this.queue.push(message);
     if (this.queue.length === 1) queueMicrotask(() => {
       const events = this.queue; this.queue = [];
       for (const handler of this.handlers) handler(events);
     });
+  }
+
+  private async loadVoice(id: string): Promise<ArrayBuffer> {
+    try { return await this.env.client.voice(await this.authorize(), id); }
+    catch (error) {
+      if (!(error instanceof TokenExpiredError)) throw error;
+      this.token = undefined;
+      return this.env.client.voice(await this.authorize(), id);
+    }
   }
 
   /** After the phone wakes, a stream iOS suspended is replaced at once instead of waiting to time out. */

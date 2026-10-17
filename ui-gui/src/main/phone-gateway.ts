@@ -34,6 +34,8 @@ export type PhoneGatewayOptions = {
   staticRoot: string;
   /** The desktop renderer (dist/renderer), which the phone runs as its interface. */
   rendererRoot: string;
+  /** Speech handed to a phone, one WAV file per unit (agent/speech/player.py PhonePlayer). */
+  audioRoot: string;
   /** Answers a paired phone's calls; the desktop process owns sessions and their rules. */
   invoke: PhoneInvoke;
   port: number;
@@ -118,6 +120,7 @@ export class PhoneGateway {
   private async api(url: URL, request: IncomingMessage, response: ServerResponse) {
     const path = url.pathname;
     if (path === "/api/events" && request.method === "GET") return this.events(url, request, response);
+    if (path.startsWith("/api/voice/") && request.method === "GET") return this.voice(path.slice("/api/voice/".length), request, response);
     if (request.method !== "POST") return send(response, 405, { error: "Method not allowed" });
     if (path === "/api/invoke") {
       const deviceId = this.bearer(request);
@@ -161,6 +164,14 @@ export class PhoneGateway {
     }
     this.streams.add(stream);
     this.write(stream, control({ ready: true, seq: this.seq }));
+  }
+
+  private voice(id: string, request: IncomingMessage, response: ServerResponse) {
+    if (!this.bearer(request)) return send(response, 401, { error: "Sign in again" });
+    const path = resolve(this.options.audioRoot, `${id}.wav`);
+    if (!/^[a-f0-9]{32}$/.test(id) || !existsSync(path)) return send(response, 404, { error: "Not found" });
+    response.writeHead(200, { "Content-Type": "audio/wav", "Cache-Control": "no-store" });
+    response.end(readFileSync(path));
   }
 
   private write(stream: Stream, text: string) {

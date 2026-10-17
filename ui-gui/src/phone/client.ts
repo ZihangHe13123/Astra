@@ -53,6 +53,14 @@ export class PhoneClient {
     return body.result;
   }
 
+  /** One unit of speech the desktop handed to this phone, as WAV bytes. */
+  async voice(token: string, id: string): Promise<ArrayBuffer> {
+    const response = await this.fetcher(`${this.base}/api/voice/${encodeURIComponent(id)}`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });
+    if (response.status === 401) throw new TokenExpiredError();
+    if (!response.ok) throw new Error(`语音没有取到（${response.status}）`);
+    return response.arrayBuffer();
+  }
+
   /** Follows the desktop's events after `after` (or from now) until the stream ends or the signal aborts. */
   async follow(token: string, after: number | undefined, onEvent: (data: string, id?: number) => void, signal: AbortSignal): Promise<void> {
     const query = after === undefined ? "" : `?after=${after}`;

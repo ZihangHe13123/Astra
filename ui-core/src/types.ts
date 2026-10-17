@@ -343,6 +343,8 @@ export type PyEvent =
   | { type: "task_status"; task: TaskInfo | null }
   | { type: "yolo_status"; yolo: boolean; error?: string }
   | { type: "voice_status"; enabled: boolean; configured: boolean; state: "off" | "idle" | "starting" | "speaking"; voice: string; voices: string[]; error?: string; message?: string }
+  // Speech the backend handed to a paired phone instead of playing it (a unit's WAV id), or a request to stop it.
+  | { type: "voice_audio"; id?: string; seconds?: number; at: number; stop?: boolean }
   | ({ type: "startup_banner" } & StartupInfo);
 
 export type StartupInfo = {

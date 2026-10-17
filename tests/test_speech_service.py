@@ -387,3 +387,69 @@ def test_endpoint_and_key_come_from_the_voice_settings_or_a_saved_connection(tmp
     with pytest.raises(SpeechError, match="no saved connection"):
         store.endpoint(SpeechSettings.parse({"connection": "missing"}))
     assert os.environ["VOICE_TEST_KEY"] == "from-environment"
+
+
+def test_phone_player_hands_each_unit_to_the_phone_and_silences_it_only_while_it_plays(tmp_path):
+    import os
+    import wave
+
+    from agent.speech.player import PhonePlayer
+
+    now = [100.0]
+    announced: list[dict] = []
+    stale = tmp_path / "audio" / "old.wav"
+    stale.parent.mkdir()
+    stale.write_bytes(b"RIFF")
+    os.utime(stale, (time.time() - 3600, time.time() - 3600))
+    player = PhonePlayer(16000, tmp_path / "audio", announced.append, clock=lambda: now[0])
+    assert not stale.exists(), "audio older than ten minutes is cleared"
+    player.lead(3.0)
+    player.write("你好，".encode("utf-16-le"))
+    player.write(b"\x00\x00" * 16000)
+    player.unit_done()
+    player.unit_done()  # nothing new: no empty file
+    assert len(announced) == 1 and set(announced[0]) == {"id", "seconds", "at"}
+    path = tmp_path / "audio" / f"{announced[0]['id']}.wav"
+    with wave.open(str(path)) as audio:
+        assert (audio.getnchannels(), audio.getsampwidth(), audio.getframerate()) == (1, 2, 16000)
+        assert audio.readframes(3) == "你好，".encode("utf-16-le")
+    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    assert announced[0]["seconds"] == round((6 + 32000) / 2 / 16000, 3)
+    # Stopped while the phone is still playing: the phone is told to stop.
+    now[0] += 0.5
+    player.stop()
+    assert announced[-1]["stop"] is True
+    # After the audio has played out (the normal end), stopping says nothing, so the last words are not cut.
+    player.write(b"\x00\x00" * 1600)
+    player.unit_done()
+    now[0] += 5
+    count = len(announced)
+    player.stop()
+    assert len(announced) == count
+
+
+def test_speech_plays_where_the_desktop_routes_it(tmp_path, endpoint):
+    from agent.cli.voice_preferences import execute_voice_command
+
+    async def scenario():
+        local: list[Player] = []
+        phone: list[Player] = []
+        service = SpeechService(Store(tmp_path, enabled=True, base_url=endpoint.url),
+                                lambda status: None, open_player=lambda rate, lead: local.append(Player()) or local[-1],
+                                open_phone_player=lambda rate: phone.append(Player()) or phone[-1])
+        store = Store(tmp_path, enabled=True, base_url=endpoint.url)
+        service.say("电脑上读。")
+        await settled(service)
+        assert execute_voice_command(service, store, ["route", "phone"]) == ("", "")
+        service.say("手机上读。")
+        await settled(service)
+        execute_voice_command(service, store, ["route", "mac"])
+        service.say("又回到电脑。")
+        await settled(service)
+        assert execute_voice_command(service, store, ["route", "watch"])[1].startswith("Usage")
+        await service.close()
+        return local, phone
+
+    local, phone = asyncio.run(scenario())
+    assert [player.heard for player in local] == ["电脑上读。", "又回到电脑。"]
+    assert [player.heard for player in phone] == ["手机上读。"]

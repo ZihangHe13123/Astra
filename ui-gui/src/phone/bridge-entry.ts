@@ -56,6 +56,50 @@ function pairingScreen(notice?: string): Promise<PhoneDeviceRecord> {
   });
 }
 
+/**
+ * Plays the speech the desktop hands to this phone, unit after unit without gaps. iOS lets a page
+ * make sound only after a touch, so the first touch unlocks the audio context.
+ */
+class PhoneSpeaker {
+  private context?: AudioContext;
+  private chain: Promise<void> = Promise.resolve();
+  private generation = 0;
+  private next = 0;
+  private playing = new Set<AudioBufferSourceNode>();
+
+  unlock() {
+    this.context ??= new AudioContext();
+    void this.context.resume();
+  }
+
+  handle(event: { id?: string; at?: number; stop?: boolean }, load: (id: string) => Promise<ArrayBuffer>) {
+    if (event.stop) { this.silence(); return; }
+    // Speech for a moment that has passed (a backlog after the phone slept) is not played late.
+    if (!event.id || !event.at || Date.now() / 1000 - event.at > 20) return;
+    const generation = this.generation, id = event.id;
+    this.chain = this.chain.then(async () => {
+      const data = await load(id);
+      const context = this.context;
+      if (generation !== this.generation || !context) return;
+      const buffer = await context.decodeAudioData(data);
+      if (generation !== this.generation) return;
+      const source = context.createBufferSource();
+      source.buffer = buffer; source.connect(context.destination);
+      const at = Math.max(context.currentTime + 0.02, this.next);
+      source.start(at); this.next = at + buffer.duration;
+      this.playing.add(source); source.onended = () => this.playing.delete(source);
+    }).catch(() => undefined);
+  }
+
+  silence() {
+    this.generation++;
+    for (const source of this.playing) { try { source.stop(); } catch { /* already ended */ } }
+    this.playing.clear(); this.next = 0;
+  }
+}
+const speaker = new PhoneSpeaker();
+for (const name of ["touchend", "click"]) document.addEventListener(name, () => speaker.unlock(), { passive: true });
+
 const bridge = new RemoteBridge({
   client,
   load: () => { try { return localStorage.getItem(PREFERENCES); } catch { return null; } },
@@ -65,6 +109,7 @@ const bridge = new RemoteBridge({
   copy: text => navigator.clipboard.writeText(text),
   open: url => { window.open(url, "_blank", "noopener,noreferrer"); },
   sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
+  voice: (event, load) => speaker.handle(event, load),
 });
 window.astra = bridge;
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") bridge.wake(); });

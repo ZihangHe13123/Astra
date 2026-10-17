@@ -1,5 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { RemoteBridge, type BridgeEnvironment } from "../src/phone/bridge.js";
 import { PhoneClient } from "../src/phone/client.js";
 import type { DesktopEvent } from "../src/bridge.js";
@@ -131,4 +133,31 @@ test("a dropped stream resumes after the last event it saw, and a reload request
     assert.deepEqual(afters.slice(0, 2), [undefined, 7]);
     assert.equal(received.length, 2);
   } finally { bridge.dispose(); }
+});
+
+test("speech the desktop routes to this phone is fetched through the gateway and handed to the phone's speaker", async () => {
+  const { devices, gateway, base, audio } = await setup((_device, method) => method === "bootstrap"
+    ? { sessions: [], active: "", workspace: "", preferences: {}, appshot: { connection: "disconnected", enabled: false } } : null);
+  const id = "fedcba9876543210fedcba9876543210";
+  writeFileSync(join(audio, `${id}.wav`), "RIFF-unit");
+  const played: { event: any; data: string }[] = [];
+  try {
+    const client = new PhoneClient(memory(), base);
+    const { env } = environment(client, () => client.pair(devices.startPairing().code, "iPhone"));
+    // Recorded in the order the bridge hands them over; the audio arrives later.
+    env.voice = (event, load) => {
+      const entry = { event, data: "" }; played.push(entry);
+      if (event.id) void load(event.id).then(data => { entry.data = Buffer.from(data).toString(); });
+    };
+    const bridge = new RemoteBridge(env); bridgeOf = bridge;
+    const seen: DesktopEvent[] = [];
+    bridge.onEvents(events => seen.push(...events));
+    await bridge.bootstrap();
+    gateway.publish({ runtime: "rt-1", revision: 1, event: { type: "voice_audio", id, seconds: 1.2, at: Date.now() / 1000 } as any });
+    gateway.publish({ runtime: "rt-1", revision: 2, event: { type: "voice_audio", stop: true, at: Date.now() / 1000 } as any });
+    await until(() => played.length === 2 && played[0].data !== "", "speech handed over");
+    assert.deepEqual(played.map(item => [item.event.id ?? "stop", item.data]), [[id, "RIFF-unit"], ["stop", ""]]);
+    // The window's own handlers still get the events, as they do on the desktop.
+    await until(() => seen.length === 2, "events");
+  } finally { bridgeOf?.dispose(); await gateway.dispose(); }
 });

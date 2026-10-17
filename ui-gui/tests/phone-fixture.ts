@@ -22,13 +22,14 @@ export async function setup(invoke: (device: string, method: PhoneInvokeMethod, 
   const site = join(folder, "phone"); mkdirSync(site);
   for (const name of ["bridge.js", "sw.js", "manifest.webmanifest", "icon-180.png"]) writeFileSync(join(site, name), name);
   writeFileSync(join(folder, "secret.txt"), "not served");
+  const audio = join(folder, "phone-audio"); mkdirSync(audio);
   const devices = new PhoneDevices(join(folder, "gui", "phone-devices.json"));
   devices.setEnabled(true);
   const calls: { device: string; method: string; args: unknown[] }[] = [];
-  const gateway = new PhoneGateway(devices, { staticRoot: site, rendererRoot: renderer, port: 0,
+  const gateway = new PhoneGateway(devices, { staticRoot: site, rendererRoot: renderer, audioRoot: audio, port: 0,
     invoke: (device, method, args) => { calls.push({ device, method, args }); return invoke(device, method, args); } });
   const port = await gateway.start();
-  return { devices, gateway, port, base: `http://127.0.0.1:${port}`, calls };
+  return { devices, gateway, port, base: `http://127.0.0.1:${port}`, calls, audio };
 }
 
 export async function pairedClient(devices: PhoneDevices, base: string) {
