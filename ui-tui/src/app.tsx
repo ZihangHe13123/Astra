@@ -748,6 +748,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   const [learningReviewStatus, setLearningReviewStatus] = useState<"queued" | "running" | null>(null);
   const [yolo, setYolo] = useState(false);
   const [voice, setVoice] = useState<{ badge?: "on" | "speaking"; voices: string[] }>({ voices: [] });
+  const [proposals, setProposals] = useState<{ id: number; action: string; summary: string }[]>([]);
   // Ctrl+C reads these outside React's render cycle.
   const voiceRef = useRef({ speaking: false, error: "" });
   const [workingMemory, setWorkingMemory] = useState<WorkingMemory>({});
@@ -1360,6 +1361,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         break;
       }
       case "memory_consolidation_status":
+        if (Array.isArray(event.proposals)) setProposals(event.proposals);
         // Only the answer to a /memory consolidation command carries text; other statuses are quiet.
         if (event.message) addMessage("system", event.message);
         if (event.error) addMessage("error", event.error);
@@ -1821,6 +1823,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         setBackendStatus("disconnected");
         setYolo(false);
         setVoice({ voices: [] });
+        setProposals([]);
         voiceRef.current = { speaking: false, error: "" };
         setStartupVisible(false);
         restartPendingRef.current = false;
@@ -2538,6 +2541,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           yolo={yolo}
           voice={voice.badge}
           voices={voice.voices}
+          proposals={proposals}
           sessionList={sessionList}
           barSessionList={barSessionList}
           minimalSessionList={minimalSessionList}

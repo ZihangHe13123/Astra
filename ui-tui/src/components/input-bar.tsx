@@ -59,6 +59,7 @@ interface Props {
   /** Shown while replies are read aloud; brighter while one is being spoken. */
   voice?: "on" | "speaking";
   voices?: string[];
+  proposals?: { id: number; action: string; summary: string }[];
   sessionList: SessionMenuItem[];
   barSessionList?: SessionMenuItem[];
   minimalSessionList?: SessionMenuItem[];
@@ -134,6 +135,7 @@ export const InputBar = forwardRef<AppshotInputHandle, Props>(function InputBar(
   yolo = false,
   voice,
   voices,
+  proposals,
   sessionList,
   barSessionList = [],
   minimalSessionList = [],
@@ -337,6 +339,7 @@ export const InputBar = forwardRef<AppshotInputHandle, Props>(function InputBar(
     localMode,
     personas,
     voices,
+    proposals,
   };
   const commandSuggestions = disabled || menuDismissed ? [] : slashCommandSuggestions(input, sessionList, modelList, commandContext);
   const modelSuggestionIndex = selectedModelSuggestion === null ? -1 : commandSuggestions.findIndex(

@@ -24,7 +24,7 @@ import { DelegateHistory, DelegateSummary } from "./delegates.js";
 import { CommandInput } from "./command-input.js";
 import { commandNames, describeCommands, modeSessionTarget, type CommandMode } from "./command-help.js";
 import { VoiceSettings } from "./voice.js";
-import { MemoryReviewSettings, reviewAnswer } from "./memory-review.js";
+import { MemoryReviewSettings, reviewAnswer, withProposalOptions } from "./memory-review.js";
 import { voiceAnswer, voiceButton, voiceNotice, withVoiceOptions } from "./voice-state.js";
 import { sessionTitle, sidebarGroups } from "./sidebar.js";
 import { DESKTOP_THEME_NAMES, PLAIN_THEMES, desktopTheme, followTheme, isDesktopThemeName } from "./theme.js";
@@ -447,7 +447,7 @@ function App() {
   const appshotUnavailable = appshotStatus?.broker?.connection === "disconnected" && appshotStatus?.notice;
   const model = state?.info.model_info;
   const commands = useMemo(() => describeCommands([...catalog, ...localCommandEntry(localDefinition)].map(c => c.command === "/persona" && model?.personas ? { ...c, options: model.personas.map((p: UIEvent) => ({ command: p.name, description: p.description, completion: `/persona ${p.name}` })) }
-    : c.command === "/voice" ? withVoiceOptions(c, voiceStatus) : c), commandModes), [catalog, model?.personas, commandModes, localDefinition, voiceStatus?.voice, voiceStatus?.voices?.join("\n")]);
+    : c.command === "/voice" ? withVoiceOptions(c, voiceStatus) : c.command === "/memory" ? withProposalOptions(c, reviewStatus) : c), commandModes), [catalog, model?.personas, commandModes, localDefinition, voiceStatus?.voice, voiceStatus?.voices?.join("\n"), reviewStatus]);
   const voiceLine = voiceNotice(voiceStatus);
   const voiceControl = voiceButton(voiceStatus);
   useEffect(() => {

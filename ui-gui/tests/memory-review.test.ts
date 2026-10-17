@@ -5,7 +5,7 @@ import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { initialSession, projectEvent } from "@astra/ui-core/session-state";
 import { describeCommands, suggestCommands } from "../src/renderer/command-help.js";
-import { MemoryReviewSettings, reviewAnswer } from "../src/renderer/memory-review.js";
+import { MemoryReviewSettings, reviewAnswer, withProposalOptions } from "../src/renderer/memory-review.js";
 import type { CommandDescription } from "../src/bridge.js";
 
 const status = (fields: Record<string, unknown> = {}) => ({ type: "memory_consolidation_status", mode: "review", pending: 0, ...fields });
@@ -69,4 +69,18 @@ test("the command palette offers the review settings in the desktop's language",
     "/memory consolidation now"]);
   assert.equal(items.find(item => item.value === "/memory consolidation auto")?.label, "记忆整理：自动同意");
   assert.equal(suggestCommands(commands, "/memory prop", [], "work").find(item => item.value === "/memory proposals")?.label, "待审核的建议");
+});
+
+test("the palette offers each waiting proposal to accept or dismiss", () => {
+  const raw = catalog.find(command => command.command === "/memory")!;
+  const waiting = status({ pending: 2, proposals: [{ id: 7, action: "remember", summary: "前端项目用 pnpm" }, { id: 9, action: "forget", summary: "养了一只猫" }] });
+  const commands = describeCommands(catalog.map(command => command === raw ? withProposalOptions(command, waiting) : command), []);
+  const accept = suggestCommands(commands, "/memory accept", [], "work");
+  assert.deepEqual(accept.map(item => [item.value, item.label]), [
+    ["/memory accept", "接受建议"], ["/memory accept 7", "接受 P7"], ["/memory accept 9", "接受 P9"], ["/memory accept all", "全部接受"]]);
+  assert.equal(accept.find(item => item.value === "/memory accept 9")?.description, "忘记：养了一只猫");
+  assert.equal(suggestCommands(commands, "/memory dismiss 7", [], "work")[0]?.label, "丢弃 P7");
+  // Nothing waiting, or an older backend that does not list them: only the registered actions.
+  assert.equal(withProposalOptions(raw, status()), raw);
+  assert.equal(withProposalOptions(raw, undefined), raw);
 });

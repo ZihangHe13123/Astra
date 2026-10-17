@@ -30,6 +30,7 @@ export type CommandMenuContext = {
   localMode?: LocalModeDefinition | null;
   personas?: { name: string; description: string }[];
   voices?: string[];
+  proposals?: { id: number; action: string; summary: string }[];
 };
 
 const SLASH_COMMANDS: SlashCommandSuggestion[] = [
@@ -140,6 +141,20 @@ const MEMORY_SUBCOMMANDS: SlashCommandSuggestion[] = [
   { command: "consolidation now", description: "review new conversations at the next idle moment", completion: "/memory consolidation now", submitValue: "/memory consolidation now", kind: "command" },
   { command: "clear-working", description: "clear this session's working memory", completion: "/memory clear-working", submitValue: "/memory clear-working", kind: "command" },
 ];
+
+function proposalFollowUps(proposals: { id: number; action: string; summary: string }[]): SlashCommandSuggestion[] {
+  if (proposals.length === 0) return [];
+  const item = (command: string, description: string, value: string): SlashCommandSuggestion => (
+    { command, description, completion: value, submitValue: value, kind: "command", group: "PROPOSALS" });
+  return [
+    ...proposals.flatMap((proposal) => [
+      item(`accept P${proposal.id}`, `${proposal.action} · ${proposal.summary}`, `/memory accept ${proposal.id}`),
+      item(`dismiss P${proposal.id}`, `drop this ${proposal.action}`, `/memory dismiss ${proposal.id}`),
+    ]),
+    item("accept all", `apply all ${proposals.length} waiting proposals`, "/memory accept all"),
+    item("dismiss all", `drop all ${proposals.length} waiting proposals`, "/memory dismiss all"),
+  ];
+}
 
 const CONCLAVE_SUBCOMMANDS: SlashCommandSuggestion[] = [
   { command: "config", description: "show current Conclave configuration", completion: "/conclave config", submitValue: "/conclave config", kind: "command" },
@@ -572,7 +587,13 @@ export function slashCommandSuggestions(
   const memoryMatch = trimmed.match(/^\/memory(?:\s+([\s\S]*))?$/i);
   if (memoryMatch && (trimmed.toLowerCase() === "/memory" || trimmed === "/memory " || memoryMatch[1] !== undefined)) {
     const query = (memoryMatch[1] ?? "").trim().toLowerCase();
-    return MEMORY_SUBCOMMANDS.filter((item) => item.command.startsWith(query)).map((item) => ({ ...item, group: "MEMORY" }));
+    const listed = MEMORY_SUBCOMMANDS.filter((item) => item.command.startsWith(query)).map((item) => ({ ...item, group: "MEMORY" }));
+    const followUps = proposalFollowUps(context.proposals ?? []);
+    // What can be done with the waiting proposals follows /memory proposals, accept and dismiss.
+    if (query.startsWith("proposals")) return [...listed, ...followUps];
+    // "accept 3" finds "accept P3".
+    const wanted = query.replace(/^(accept|dismiss) (\d)/, "$1 p$2");
+    return query ? [...listed, ...followUps.filter((item) => item.command.toLowerCase().startsWith(wanted))] : listed;
   }
   const skillsMatch = trimmed.match(/^\/skills(?:\s+([\s\S]*))?$/i);
   if (skillsMatch && (trimmed.toLowerCase() === "/skills" || trimmed === "/skills " || skillsMatch[1] !== undefined)) {
