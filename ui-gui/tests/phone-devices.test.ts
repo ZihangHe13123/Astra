@@ -26,8 +26,8 @@ test("a phone pairs once with the code shown in the window, and signs in with it
   assert.match(code, /^[A-HJ-NP-Z2-9]{8}$/);
   const phone = await phoneKey();
   // Typed with a space or in lower case on the phone keyboard.
-  const device = devices.pair(`${code.slice(0, 4).toLowerCase()} ${code.slice(4)}`, "  纸航的 iPhone  ", phone.publicKey);
-  assert.equal(device.name, "纸航的 iPhone");
+  const device = devices.pair(`${code.slice(0, 4).toLowerCase()} ${code.slice(4)}`, "  测试 iPhone  ", phone.publicKey);
+  assert.equal(device.name, "测试 iPhone");
   assert.equal(devices.currentPairing(), undefined);
   assert.throws(() => devices.pair(code, "again", phone.publicKey), PhoneAuthError, "a code works once");
 

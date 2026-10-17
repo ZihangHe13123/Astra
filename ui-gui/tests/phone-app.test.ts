@@ -20,19 +20,19 @@ test("the stream is read in whatever pieces the network delivers, with ids, and 
 
 test("settings show what the desktop reports: the switch, the serve command, the code and the paired phones", () => {
   const status: PhoneStatus = { enabled: true, port: 8930, running: true, url: "https://mac.tail1234.ts.net",
-    devices: [{ id: "d1", name: "纸航的 iPhone", createdAt: "2026-10-17T04:00:00.000Z" }],
+    devices: [{ id: "d1", name: "测试 iPhone", createdAt: "2026-10-17T04:00:00.000Z" }],
     pairing: { code: "ABCD2345", expiresAt: 1_000_000 + 125_000 } };
   const html = renderToStaticMarkup(React.createElement(PhoneSettingsView, { status, run: () => {}, now: 1_000_000 }));
   assert.match(html, /tailscale serve --bg 8930/);
   assert.match(html, /https:\/\/mac\.tail1234\.ts\.net/);
   assert.match(html, /ABCD 2345/);
   assert.match(html, /2:05 内有效/);
-  assert.match(html, /纸航的 iPhone/);
+  assert.match(html, /测试 iPhone/);
   assert.match(html, /最近连接 从未/);
   const expired = renderToStaticMarkup(React.createElement(PhoneSettingsView, { status, run: () => {}, now: 1_000_000 + 200_000 }));
   assert.match(expired, />添加手机</);
   const off = renderToStaticMarkup(React.createElement(PhoneSettingsView, { status: { ...status, enabled: false }, run: () => {} }));
-  assert.doesNotMatch(off, /添加手机|tailscale serve|纸航的 iPhone/);
+  assert.doesNotMatch(off, /添加手机|tailscale serve|测试 iPhone/);
   const busy = renderToStaticMarkup(React.createElement(PhoneSettingsView, { status: { ...status, pairing: undefined, error: "端口 8930 已被占用。" }, run: () => {} }));
   assert.match(busy, /role="alert">端口 8930 已被占用。/);
 });
@@ -45,7 +45,7 @@ test("the Mac's tailnet name comes from whichever Tailscale install answers, and
     if (!file.startsWith("/opt/homebrew")) throw new Error("not here");
     return JSON.stringify({ Self: { DNSName: name } });
   };
-  assert.equal(await tailscaleName(answer("Zhihang-MacBook.tail1234.ts.net.")), "zhihang-macbook.tail1234.ts.net");
+  assert.equal(await tailscaleName(answer("Studio-Mac.tail1234.ts.net.")), "studio-mac.tail1234.ts.net");
   assert.deepEqual(tried.slice(0, 2), ["/Applications/Tailscale.app/Contents/MacOS/Tailscale", "/opt/homebrew/bin/tailscale"]);
   assert.equal(await tailscaleName(answer("evil.example.com.")), undefined);
   assert.equal(await tailscaleName(async () => { throw new Error("absent"); }), undefined);

@@ -1,6 +1,9 @@
-# Phone companion
+# Phone companion (optional)
 
 [Home](../README.md) · [Documentation](README.md) · [简体中文](zh-CN/phone.md)
+
+An optional helper, off by default: nothing listens until you turn it on in
+Settings → 手机.
 
 A paired iPhone runs the desktop app's own interface remotely: the same session
 list, conversations, approvals and questions, command palette, models, modes,
