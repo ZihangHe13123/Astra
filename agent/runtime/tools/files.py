@@ -6,19 +6,25 @@ on the host so explicitly mounted Windows and WSL paths remain accessible.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import difflib
+import fnmatch
 import json
 import logging
 import os
 import re
 import stat
 import tempfile
+import threading
 import time
 import uuid
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
+from typing import TypeVar
 
+from ..paths import state_path
 from ..tool_execution import PartialResult
 from ..tool_failure import ToolFailure
 from ..file_checkpoints import FileCheckpointStore
@@ -30,10 +36,17 @@ from .file_patch import (
     parse_patch,
     patch_summary,
 )
-from .registry import ToolRegistry, ToolDef, approval_justification_schema
+from .registry import (
+    ToolRegistry,
+    ToolDef,
+    _set_tool_timeout_failure,
+    approval_justification_schema,
+)
 
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 
 DEFAULT_SEARCH_SKIP_DIRS = frozenset({
@@ -105,6 +118,7 @@ def _content_near_miss_suggestions(
     limit: int = 3,
     max_entries: int = 2000,
     max_bytes_per_file: int = 32 * 1024,
+    control: _WorkerControl | None = None,
 ) -> list[str]:
     """Probe file contents for close token matches after a failed search.
 
@@ -122,6 +136,8 @@ def _content_near_miss_suggestions(
     suggestions: list[str] = []
     scanned = 0
     for candidate in search.rglob("*"):
+        if control is not None:
+            control.check()
         scanned += 1
         if scanned > max_entries:
             break
@@ -169,6 +185,7 @@ def _near_miss_suggestions(
     dirname: str = "",
     limit: int = 3,
     max_entries: int = 2000,
+    control: _WorkerControl | None = None,
 ) -> list[str]:
     """Probe close filename matches after a failed search.
 
@@ -187,6 +204,8 @@ def _near_miss_suggestions(
     basenames: list[str] = []
     scanned = 0
     for candidate in search.rglob("*"):
+        if control is not None:
+            control.check()
         scanned += 1
         if scanned > max_entries:
             break
@@ -233,6 +252,199 @@ def _readable_search_path(candidate: Path, access: FilesystemPolicy) -> Path | N
         return None
 
 
+class _WorkerCancelled(Exception):
+    """The tool call that owns a worker-thread operation has ended."""
+
+
+class _WorkerOutOfTime(Exception):
+    """A worker reached its time budget; it returns what it has found so far."""
+
+
+class _WorkerControl:
+    """Cross-thread state for blocking filesystem work run off the event loop.
+
+    ``cancelled`` is set as soon as the awaiting tool call ends for any reason
+    (cancellation or the tool time limit). The worker checks it per directory
+    and file, so it stops instead of walking on after nobody awaits it.
+
+    With a ``time_budget`` the same checks raise :class:`_WorkerOutOfTime`
+    once that many seconds have passed since the call started, so a search
+    can return its matches before the tool time limit discards them.
+    """
+
+    def __init__(self, time_budget: float | None = None) -> None:
+        self.cancelled = threading.Event()
+        self.directories_listed = 0
+        self.started = time.monotonic()
+        self.deadline = None if time_budget is None else self.started + time_budget
+
+    def check(self) -> None:
+        if self.cancelled.is_set():
+            raise _WorkerCancelled()
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            raise _WorkerOutOfTime()
+
+    def stopped_note(self) -> str:
+        """How far a walk got before its time budget ran out."""
+        elapsed = time.monotonic() - self.started
+        return (
+            f"the search stopped at its time limit after {elapsed:.1f} s and "
+            f"{self.directories_listed} directories"
+        )
+
+    def enter_directory(self) -> None:
+        self.check()
+        self.directories_listed += 1
+
+
+def _list_directory(directory: Path, control: _WorkerControl) -> list[os.DirEntry[str]]:
+    control.check()
+    try:
+        with os.scandir(directory) as entries:
+            return list(entries)
+    except OSError:
+        return []
+
+
+def _cancellable_rglob(
+    search: Path,
+    pattern: str,
+    control: _WorkerControl,
+    *,
+    prune_noise: bool,
+) -> Iterator[Path]:
+    """Yield the paths of ``search.rglob(pattern)`` from a walk ``control`` can stop.
+
+    Follows CPython 3.12's ``Path.rglob`` selectors: ``**`` recurses without
+    entering directory symlinks, every other segment is matched against
+    directory entries, a trailing separator selects directories, and
+    unreadable directories are skipped. With ``prune_noise`` the walk does not
+    enter search-noise entries, whose matches the caller filters out anyway.
+    """
+    parsed = PurePath(pattern)
+    if parsed.drive or parsed.root:
+        raise NotImplementedError("Non-relative patterns are unsupported")
+    parts = parsed.parts
+    if pattern and pattern[-1] in (os.sep, os.altsep):
+        parts += ("",)
+    if any(part != "**" and "**" in part for part in parts):
+        raise ValueError("Invalid pattern: '**' can only be an entire path component")
+    flags = 0 if os.path.normcase("Aa") == "Aa" else re.IGNORECASE
+    matchers: dict[str, Callable[[str], object]] = {}
+
+    def directories(top: Path) -> Iterator[Path]:
+        yield top
+        pending = [top]
+        while pending:
+            directory = pending.pop()
+            control.enter_directory()
+            children = []
+            for entry in _list_directory(directory, control):
+                try:
+                    is_dir = entry.is_dir(follow_symlinks=False)
+                except OSError:
+                    is_dir = False
+                if is_dir and not (prune_noise and _is_search_noise(entry.name)):
+                    children.append(directory / entry.name)
+            yield from children
+            pending.extend(reversed(children))
+
+    def select(parent: Path, segments: tuple[str, ...]) -> Iterator[Path]:
+        if not segments or not segments[0]:
+            yield parent
+            return
+        head, rest = segments[0], segments[1:]
+        if head == "**":
+            while rest and rest[0] == "**":
+                rest = rest[1:]
+            if "**" not in rest:
+                for directory in directories(parent):
+                    yield from select(directory, rest)
+                return
+            # Non-adjacent recursive wildcards reach a path more than once.
+            seen: set[Path] = set()
+            for directory in directories(parent):
+                for path in select(directory, rest):
+                    if path not in seen:
+                        seen.add(path)
+                        yield path
+            return
+        if head == "..":
+            yield from select(parent / "..", rest)
+            return
+        match = matchers.get(head)
+        if match is None:
+            match = matchers[head] = re.compile(fnmatch.translate(head), flags).match
+        for entry in _list_directory(parent, control):
+            if prune_noise and _is_search_noise(entry.name):
+                continue
+            if rest:
+                try:
+                    if not entry.is_dir():
+                        continue
+                except OSError:
+                    continue
+            if match(entry.name):
+                yield from select(parent / entry.name, rest)
+
+    yield from select(search, ("**", *parts))
+
+
+SEARCH_TIME_BUDGET_SHARE = 0.9
+
+
+def _search_time_budget(tool_timeout: float | None) -> float | None:
+    """Seconds a search may walk before it returns the matches found so far.
+
+    The walk stops a little before the tool's own time limit, so its matches
+    reach the model instead of a timeout error that discards them.
+    ``ASTRA_SEARCH_TIME_BUDGET_SECONDS`` can shorten the budget, never extend
+    it past that limit.
+    """
+    budget = None if tool_timeout is None else float(tool_timeout) * SEARCH_TIME_BUDGET_SHARE
+    configured = os.getenv("ASTRA_SEARCH_TIME_BUDGET_SECONDS", "").strip()
+    if configured:
+        try:
+            override = float(configured)
+        except ValueError:
+            override = 0.0
+        if override > 0:
+            return override if budget is None else min(override, budget)
+        logger.warning("ignoring invalid ASTRA_SEARCH_TIME_BUDGET_SECONDS=%r", configured)
+    return budget
+
+
+async def _run_off_loop(
+    operation: str,
+    work: Callable[..., _T],
+    *args: object,
+    time_budget: float | None = None,
+) -> _T:
+    """Run blocking filesystem work in a worker thread the tool call can stop.
+
+    ``work`` receives a :class:`_WorkerControl` after ``args``. Ending the call
+    (cancellation or the tool time limit) frees the event loop at once and
+    stops the worker at its next directory or file. ``time_budget`` makes the
+    control's checks raise :class:`_WorkerOutOfTime` after that many seconds,
+    which ``work`` handles itself.
+    """
+    control = _WorkerControl(time_budget)
+    try:
+        return await asyncio.to_thread(work, *args, control)
+    except asyncio.CancelledError:
+        if control.directories_listed:
+            _set_tool_timeout_failure(ToolFailure(
+                code="search_interrupted",
+                message=f"{operation} stopped after listing {control.directories_listed} directories.",
+                retryable=True,
+                recovery_hint="Search a narrower directory with path, or use a more specific pattern or glob.",
+                details={"directories_listed": control.directories_listed},
+            ))
+        raise
+    finally:
+        control.cancelled.set()
+
+
 @dataclass(frozen=True)
 class FilesystemRoot:
     path: Path
@@ -270,34 +482,45 @@ class FilesystemPolicy:
         # Configured host roots are visibility hints, not standing permission.
         # Grants are represented as roots with ``requires_approval=False`` and
         # are revoked after once/session scope.
-        configured = [
-            FilesystemRoot(item.path, item.mode, requires_approval=True)
-            for item in (roots or [])
-        ]
-        configured.append(FilesystemRoot(self.workspace, "rw"))
-        deduplicated: dict[str, FilesystemRoot] = {}
-        for item in configured:
-            resolved = item.path.expanduser().resolve()
+        configured: list[FilesystemRoot] = []
+        for item in roots or []:
             mode = item.mode.strip().lower()
             if mode not in {"ro", "rw"}:
                 raise ValueError(f"Invalid filesystem root mode '{item.mode}' for {item.path}")
-            key = os.path.normcase(str(resolved))
+            configured.append(FilesystemRoot(item.path.expanduser().resolve(), mode, requires_approval=True))
+        self.configured_roots = tuple(configured)
+        self.roots = self._with_workspace(self.configured_roots)
+
+    def _with_workspace(self, configured: tuple[FilesystemRoot, ...]) -> list[FilesystemRoot]:
+        deduplicated: dict[str, FilesystemRoot] = {}
+        for item in (*configured, FilesystemRoot(self.workspace, "rw")):
+            key = os.path.normcase(str(item.path))
             previous = deduplicated.get(key)
-            if previous is None or mode == "rw":
-                deduplicated[key] = FilesystemRoot(
-                    resolved,
-                    mode,
-                    requires_approval=item.requires_approval,
-                )
-        self.roots = sorted(deduplicated.values(), key=lambda item: len(str(item.path)), reverse=True)
+            if previous is None or item.mode == "rw":
+                deduplicated[key] = item
+        return sorted(deduplicated.values(), key=lambda item: len(str(item.path)), reverse=True)
+
+    def for_workspace(self, workdir: str | Path) -> "FilesystemPolicy":
+        """The same configured roots around another workspace, such as a delegate's.
+
+        The roots are already resolved, so rebinding does no host IO for them (a
+        stopped WSL distribution takes seconds to answer). Grants stay with the
+        policy whose user approved them.
+        """
+        rebound = FilesystemPolicy(Path(workdir))
+        rebound.configured_roots = self.configured_roots
+        rebound.roots = rebound._with_workspace(self.configured_roots)
+        return rebound
 
     @classmethod
     def load(cls, workdir: str, config_path: str | None = None) -> "FilesystemPolicy":
         workspace = Path(workdir).expanduser().resolve()
+        # The policy belongs to the installation, like settings.json: every
+        # workspace sees the same roots, and a checkout cannot add its own.
         path = Path(
             config_path
             or os.getenv("AGENT_FILESYSTEM_CONFIG", "")
-            or workspace / ".astra" / "filesystem.json"
+            or state_path("filesystem.json")
         ).expanduser()
         if not path.is_absolute():
             path = workspace / path
@@ -812,12 +1035,13 @@ def register_file_tools(
 
     registry.hooks.on_session_end(cleanup_session_grants)
 
-    async def _read_file(
+    def _read_file_blocking(
         path: str,
-        offset: int = 0,
-        limit: int | None = None,
-        include_metadata: bool = False,
-        byte_offset: int | None = None,
+        offset: int,
+        limit: int | None,
+        include_metadata: bool,
+        byte_offset: int | None,
+        control: _WorkerControl,
     ) -> str | ToolFailure:
         full = access.resolve(path)
         if not full.exists():
@@ -903,12 +1127,14 @@ def register_file_tools(
                     # Skip requested logical lines with bounded memory. Very
                     # long lines are drained in chunks rather than materialized.
                     while scanned_lines < requested_line_offset:
+                        control.check()
                         chunk = handle.readline(max_line_bytes + 1)
                         if not chunk:
                             reached_eof = True
                             break
                         if len(chunk) > max_line_bytes and not chunk.endswith(b"\n"):
                             while chunk and not chunk.endswith(b"\n"):
+                                control.check()
                                 chunk = handle.readline(max_line_bytes + 1)
                         scanned_lines += 1
 
@@ -941,6 +1167,7 @@ def register_file_tools(
                             line_truncated = True
                             next_byte_offset = line_start + len(prefix)
                             while chunk and not chunk.endswith(b"\n"):
+                                control.check()
                                 chunk = handle.readline(max_line_bytes + 1)
                         selected_raw.extend(prefix)
                         selected_lines += 1
@@ -983,6 +1210,7 @@ def register_file_tools(
             try:
                 with full.open("rb") as handle:
                     for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        control.check()
                         if include_metadata:
                             hasher.update(chunk)
                         newline_count += chunk.count(b"\n")
@@ -1025,7 +1253,19 @@ def register_file_tools(
         )
         return PartialResult(text) if truncated else text
 
-    async def _stat_file(path: str, preview_lines: int = 3) -> str | ToolFailure:
+    async def _read_file(
+        path: str,
+        offset: int = 0,
+        limit: int | None = None,
+        include_metadata: bool = False,
+        byte_offset: int | None = None,
+    ) -> str | ToolFailure:
+        # Hashing, counting or skipping through a large file can take seconds.
+        return await _run_off_loop(
+            "read_file", _read_file_blocking, path, offset, limit, include_metadata, byte_offset
+        )
+
+    def _stat_file_blocking(path: str, preview_lines: int, control: _WorkerControl) -> str | ToolFailure:
         full = access.resolve(path)
         if not full.exists():
             return ToolFailure(
@@ -1064,6 +1304,7 @@ def register_file_tools(
             decoder = codecs.getincrementaldecoder("utf-8-sig")("strict")
             with full.open("rb") as handle:
                 for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    control.check()
                     hasher.update(chunk)
                     newline_count += chunk.count(b"\n")
                     final_byte = chunk[-1:]
@@ -1124,6 +1365,10 @@ def register_file_tools(
             "first_lines": first_lines[:count],
             "last_lines": last_lines[-count:] if count else [],
         }, ensure_ascii=False)
+
+    async def _stat_file(path: str, preview_lines: int = 3) -> str | ToolFailure:
+        # The whole file is hashed, whatever its size.
+        return await _run_off_loop("stat_file", _stat_file_blocking, path, preview_lines)
 
     async def _write_file(
         path: str,
@@ -1256,10 +1501,11 @@ def register_file_tools(
             return False, output
         return True, "file operation completed"
 
-    async def _search_files(
+    def _search_files_blocking(
         pattern: str,
-        path: str = ".",
-        include_ignored: bool = False,
+        path: str,
+        include_ignored: bool,
+        control: _WorkerControl,
     ) -> str | ToolFailure:
         search = access.resolve(path)
         if not search.exists():
@@ -1269,24 +1515,41 @@ def register_file_tools(
             return ToolFailure("not_a_directory", f"Not a directory: {search}", False,
                                "Use a directory path for search_files; use read_file for a single file.", details={"path": str(search)})
         matches = []
-        for match in search.rglob(pattern):
-            if _readable_search_path(match, access) is None:
-                continue
-            relative = match.relative_to(search)
-            if (
-                not include_ignored
-                and any(_is_search_noise(part) for part in relative.parts)
-            ):
-                continue
-            matches.append(match)
+        stopped = False
+        try:
+            for match in _cancellable_rglob(search, pattern, control, prune_noise=not include_ignored):
+                if _readable_search_path(match, access) is None:
+                    continue
+                relative = match.relative_to(search)
+                if (
+                    not include_ignored
+                    and any(_is_search_noise(part) for part in relative.parts)
+                ):
+                    continue
+                matches.append(match)
+        except _WorkerOutOfTime:
+            stopped = True
         matches.sort()
+        incomplete = (
+            f"Results are incomplete: {control.stopped_note()}. "
+            "Search a narrower directory with path, or use a more specific pattern."
+        ) if stopped else ""
         if not matches:
+            if stopped:
+                return PartialResult(
+                    f"No files matching '{pattern}' found in the part of {search} searched so far.\n"
+                    + incomplete
+                )
             pattern_parts = pattern.replace("\\", "/").rsplit("/", 1)
             dirname = pattern_parts[0] if len(pattern_parts) > 1 else ""
             needle = pattern_parts[-1]
-            suggestions = _near_miss_suggestions(
-                search, needle, access=access, include_ignored=include_ignored, dirname=dirname
-            )
+            try:
+                suggestions = _near_miss_suggestions(
+                    search, needle, access=access, include_ignored=include_ignored, dirname=dirname,
+                    control=control,
+                )
+            except _WorkerOutOfTime:
+                suggestions = []
             if suggestions:
                 return (
                     f"No files matching '{pattern}' found in {search}\n"
@@ -1300,27 +1563,33 @@ def register_file_tools(
                 f"... and {len(matches) - 100} more not listed; "
                 "narrow the pattern or path to see them"
             )
+        if stopped:
+            lines.append(incomplete)
+        if len(matches) > 100 or stopped:
             return PartialResult("\n".join(lines))
         return "\n".join(lines)
 
-    async def _search_text(
+    async def _search_files(
         pattern: str,
         path: str = ".",
-        glob: str = "*",
-        max_results: int = 50,
         include_ignored: bool = False,
     ) -> str | ToolFailure:
-        """Grep file contents with a regex pattern under an allowed directory.
+        # A walk over a large root takes seconds to minutes; it must not stall
+        # model streaming, heartbeats and cancellation on the event loop.
+        tool = registry.get("search_files")
+        return await _run_off_loop(
+            "search_files", _search_files_blocking, pattern, path, include_ignored,
+            time_budget=_search_time_budget(tool.timeout if tool is not None else None),
+        )
 
-        Skips the same noise directories as search_files by default. The *glob*
-        parameter restricts by filename (e.g. ``"*.py"``) or, when it contains
-        ``/``, by path relative to the search directory. *max_results* caps the
-        total match count. Files larger than 1 MiB and binary files (null byte
-        in first 8 KiB) are silently skipped.
-
-        Set *include_ignored* to True to also search dependency, cache, and
-        build directories, including .sandbox_* files and directories.
-        """
+    def _search_text_blocking(
+        pattern: str,
+        path: str,
+        glob: str,
+        max_results: int,
+        include_ignored: bool,
+        control: _WorkerControl,
+    ) -> str | ToolFailure:
         import re as _re
 
         _MAX_FILE_BYTES = 1_048_576   # 1 MiB
@@ -1354,57 +1623,76 @@ def register_file_tools(
         max_results = max(1, max_results)
         results: list[str] = []
         capped = False
+        stopped = False
         candidate_files = 0
         glob_files = 0
 
-        for dirpath_str, dirnames, filenames in os.walk(str(search)):
-            # Prune noise directories in-place so we don't descend into them.
-            if not include_ignored:
-                dirnames[:] = [
-                    d for d in dirnames
-                    if not _is_search_noise(d)
-                ]
-            relative_dir = Path(dirpath_str).relative_to(search).parts
+        try:
+            for dirpath_str, dirnames, filenames in os.walk(str(search)):
+                control.enter_directory()
+                # Prune noise directories in-place so we don't descend into them.
+                if not include_ignored:
+                    dirnames[:] = [
+                        d for d in dirnames
+                        if not _is_search_noise(d)
+                    ]
+                relative_dir = Path(dirpath_str).relative_to(search).parts
 
-            for fname in filenames:
-                if not include_ignored and _is_search_noise(fname):
-                    continue
-                candidate_files += 1
-                if not _search_glob_matches((*relative_dir, fname), glob):
-                    continue
-                glob_files += 1
-                fp = Path(dirpath_str) / fname
-                readable = _readable_search_path(fp, access)
-                if readable is None:
-                    continue
-                # Check size before reading
-                try:
-                    st = readable.stat()
-                except OSError:
-                    continue
-                if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_FILE_BYTES:
-                    continue
-                # Read once, then reject obvious binary content before decoding.
-                try:
-                    raw = readable.read_bytes()
-                except OSError:
-                    continue
-                if b"\x00" in raw[:8192]:
-                    continue
-                text = raw.decode("utf-8", errors="replace")
-                shown = _tool_path(fp)
-                for lineno, line in enumerate(text.splitlines(), 1):
-                    if compiled.search(line):
-                        if len(results) >= max_results:
-                            # One more match exists, so the list really is cut short.
-                            capped = True
-                            break
-                        results.append(f"{shown}:{lineno}: {line.rstrip()}")
+                for fname in filenames:
+                    if not include_ignored and _is_search_noise(fname):
+                        continue
+                    candidate_files += 1
+                    if not _search_glob_matches((*relative_dir, fname), glob):
+                        continue
+                    glob_files += 1
+                    control.check()
+                    fp = Path(dirpath_str) / fname
+                    readable = _readable_search_path(fp, access)
+                    if readable is None:
+                        continue
+                    # Check size before reading
+                    try:
+                        st = readable.stat()
+                    except OSError:
+                        continue
+                    if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_FILE_BYTES:
+                        continue
+                    # Read once, then reject obvious binary content before decoding.
+                    try:
+                        raw = readable.read_bytes()
+                    except OSError:
+                        continue
+                    if b"\x00" in raw[:8192]:
+                        continue
+                    text = raw.decode("utf-8", errors="replace")
+                    shown = _tool_path(fp)
+                    for lineno, line in enumerate(text.splitlines(), 1):
+                        if compiled.search(line):
+                            if len(results) >= max_results:
+                                # One more match exists, so the list really is cut short.
+                                capped = True
+                                break
+                            results.append(f"{shown}:{lineno}: {line.rstrip()}")
+                    if capped:
+                        break
                 if capped:
                     break
-            if capped:
-                break
+        except _WorkerOutOfTime:
+            stopped = True
 
+        if stopped:
+            incomplete = (
+                f"Results are incomplete: {control.stopped_note()}. "
+                "Search a narrower directory with path, or narrow the glob or pattern."
+            )
+            if not results:
+                return PartialResult(
+                    f"No lines matching '{pattern}' found in the part of {search} searched so far.\n"
+                    + incomplete
+                )
+            return PartialResult(
+                f"{len(results)} match(es) so far. {incomplete}\n" + "\n".join(results)
+            )
         if not results:
             if candidate_files and not glob_files:
                 return (
@@ -1412,12 +1700,18 @@ def register_file_tools(
                     "A glob without '/' is matched against file names; a glob with '/' is matched "
                     "against the path relative to the search directory, where '**/' spans directories."
                 )
-            content_suggestions = _content_near_miss_suggestions(
-                search, pattern, access=access, include_ignored=include_ignored, glob_filter=glob
-            )
-            suggestions = _near_miss_suggestions(
-                search, pattern, access=access, include_ignored=include_ignored, glob_filter=glob
-            )
+            try:
+                content_suggestions = _content_near_miss_suggestions(
+                    search, pattern, access=access, include_ignored=include_ignored, glob_filter=glob,
+                    control=control,
+                )
+                suggestions = _near_miss_suggestions(
+                    search, pattern, access=access, include_ignored=include_ignored, glob_filter=glob,
+                    control=control,
+                )
+            except _WorkerOutOfTime:
+                # The search itself finished; suggestions are only a courtesy.
+                content_suggestions, suggestions = [], []
             content_only = [
                 name for name in content_suggestions if name not in suggestions
             ]
@@ -1437,6 +1731,34 @@ def register_file_tools(
                 "max_results or narrow the pattern, path or glob:\n" + "\n".join(results)
             )
         return f"{len(results)} match(es):\n" + "\n".join(results)
+
+    async def _search_text(
+        pattern: str,
+        path: str = ".",
+        glob: str = "*",
+        max_results: int = 50,
+        include_ignored: bool = False,
+    ) -> str | ToolFailure:
+        """Grep file contents with a regex pattern under an allowed directory.
+
+        Skips the same noise directories as search_files by default. The *glob*
+        parameter restricts by filename (e.g. ``"*.py"``) or, when it contains
+        ``/``, by path relative to the search directory. *max_results* caps the
+        total match count. Files larger than 1 MiB and binary files (null byte
+        in first 8 KiB) are silently skipped.
+
+        Set *include_ignored* to True to also search dependency, cache, and
+        build directories, including .sandbox_* files and directories.
+
+        The walk and file reads run in a worker thread that stops when the
+        call is cancelled. Shortly before the tool's time limit it stops on
+        its own and returns the matches found so far as a partial result.
+        """
+        tool = registry.get("search_text")
+        return await _run_off_loop(
+            "search_text", _search_text_blocking, pattern, path, glob, max_results, include_ignored,
+            time_budget=_search_time_budget(tool.timeout if tool is not None else None),
+        )
 
     async def _edit_file(
         path: str,
