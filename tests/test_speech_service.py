@@ -413,7 +413,8 @@ def test_phone_player_hands_each_unit_to_the_phone_and_silences_it_only_while_it
     with wave.open(str(path)) as audio:
         assert (audio.getnchannels(), audio.getsampwidth(), audio.getframerate()) == (1, 2, 16000)
         assert audio.readframes(3) == "你好，".encode("utf-16-le")
-    assert oct(path.stat().st_mode & 0o777) == "0o600"
+    if os.name != "nt":  # Windows has no owner-only mode bits
+        assert oct(path.stat().st_mode & 0o777) == "0o600"
     assert announced[0]["seconds"] == round((6 + 32000) / 2 / 16000, 3)
     # Stopped while the phone is still playing: the phone is told to stop.
     now[0] += 0.5

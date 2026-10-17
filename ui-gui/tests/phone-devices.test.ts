@@ -38,7 +38,7 @@ test("a phone pairs once with the code shown in the window, and signs in with it
   // The file holds public keys only, readable by the user alone.
   const saved = readFileSync(path, "utf8");
   assert.doesNotMatch(saved, /"d"/);
-  assert.equal(statSync(path).mode & 0o777, 0o600);
+  if (process.platform !== "win32") assert.equal(statSync(path).mode & 0o777, 0o600);  // Windows has no owner-only mode bits
 });
 
 test("a challenge works once, only for its device, and a wrong key or text is refused", async () => {
