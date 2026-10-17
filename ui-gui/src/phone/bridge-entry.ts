@@ -69,4 +69,15 @@ const bridge = new RemoteBridge({
 window.astra = bridge;
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") bridge.wake(); });
 document.documentElement.dataset.remote = "phone";
+// iOS ignores user-scalable=no for pinching; its gesture events are the way to stop it.
+for (const name of ["gesturestart", "gesturechange"]) document.addEventListener(name, event => event.preventDefault(), { passive: false });
+// The keyboard shrinks only the visual viewport on iOS: the app follows it, so the composer sits on the keyboard
+// instead of the page being pushed up under it.
+const viewport = window.visualViewport;
+const fit = () => {
+  document.documentElement.style.setProperty("--app-height", `${Math.round(viewport?.height ?? window.innerHeight)}px`);
+  if (window.scrollY) window.scrollTo(0, 0);
+};
+viewport?.addEventListener("resize", fit); viewport?.addEventListener("scroll", fit); window.addEventListener("orientationchange", fit);
+fit();
 if ("serviceWorker" in navigator) void navigator.serviceWorker.register("./sw.js").catch(() => undefined);

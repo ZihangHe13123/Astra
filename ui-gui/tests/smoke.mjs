@@ -728,6 +728,14 @@ try {
  await phonePage.getByRole('button',{name:'显示侧栏'}).waitFor({timeout:20000});
  assert.equal(await phonePage.evaluate(()=>window.astra.remote),true);
  assert.equal(await phonePage.getByRole('button',{name:'添加附件'}).count(),0);
+ // An app, not a web page: it does not zoom, fields are 16px so iOS does not zoom into them, and the list follows a swipe.
+ assert.match(await phonePage.locator('meta[name=viewport]').getAttribute('content'),/user-scalable=no/);
+ assert.equal(await phonePage.evaluate(()=>getComputedStyle(document.querySelector('.composer textarea')).fontSize),'16px');
+ const swipe=(from,to)=>phonePage.evaluate(([a,b])=>{const at=x=>new Touch({identifier:1,target:document.body,clientX:x,clientY:300});
+  document.dispatchEvent(new TouchEvent('touchstart',{touches:[at(a)],changedTouches:[at(a)]}));
+  document.dispatchEvent(new TouchEvent('touchend',{touches:[],changedTouches:[at(b)]}));},[from,to]);
+ await swipe(6,220); await phonePage.getByRole('button',{name:'隐藏侧栏'}).waitFor();
+ await swipe(260,30); await phonePage.getByRole('button',{name:'隐藏侧栏'}).waitFor({state:'hidden'});
  // Full access (YOLO) is switched from the phone and takes effect in the Mac's backend.
  await phonePage.getByRole('button',{name:'按需审批',exact:true}).click();
  const phonePermissions=phonePage.getByRole('dialog',{name:'权限与对话模式'}); await phonePermissions.waitFor();

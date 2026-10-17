@@ -48,7 +48,7 @@ export function CommandInput({ inputRef, value, onChange, onSubmit, onPaste, dis
       </div>
       <div className="command-suggestions-foot">{hint && <span>{hint}</span>}<span>↑↓ 选择 · Tab / Enter 补全 · Esc 关闭</span></div>
     </div>}
-    <textarea ref={inputRef} aria-label="消息" disabled={disabled} placeholder={placeholder} value={value} rows={1}
+    <textarea ref={inputRef} aria-label="消息" disabled={disabled} placeholder={placeholder} value={value} rows={1} {...({ enterKeyHint: "send" } as object)}
       aria-autocomplete="list" aria-haspopup="listbox" aria-controls={visible ? listId : undefined}
       aria-activedescendant={visible && selected ? `${listId}-${activeIndex}` : undefined}
       onFocus={() => setFocused(true)} onBlur={() => setFocused(false)}

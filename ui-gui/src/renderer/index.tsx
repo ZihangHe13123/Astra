@@ -334,6 +334,28 @@ function App() {
     if (modal === "settings" && sessionReady && state) void window.astra.send(state.id, { type: "command", cmd: "/memory consolidation status" }).catch(() => undefined);
   }, [modal, state?.id, sessionReady]);
   useEffect(() => { if (narrowScreen()) setSide(false); }, [active, preview?.session_id]);
+  // On a phone the session list follows a swipe: from the left edge it opens, a swipe left closes it.
+  useEffect(() => {
+    if (!narrow) return;
+    let start: { x: number; y: number; at: number } | undefined;
+    const down = (event: TouchEvent) => {
+      const touch = event.touches[0];
+      start = event.touches.length === 1 ? { x: touch.clientX, y: touch.clientY, at: Date.now() } : undefined;
+    };
+    const up = (event: TouchEvent) => {
+      const touch = event.changedTouches[0];
+      if (!start || !touch) return;
+      const dx = touch.clientX - start.x, dy = touch.clientY - start.y;
+      if (Date.now() - start.at < 700 && Math.abs(dx) > 60 && Math.abs(dy) < Math.abs(dx) / 2) {
+        if (dx > 0 && start.x < 28) setSide(true);
+        else if (dx < 0) setSide(false);
+      }
+      start = undefined;
+    };
+    document.addEventListener("touchstart", down, { passive: true });
+    document.addEventListener("touchend", up, { passive: true });
+    return () => { document.removeEventListener("touchstart", down); document.removeEventListener("touchend", up); };
+  }, [narrow]);
   const openModels = () => openSessionSettings("model-picker");
   const configureModels = (modelKey?: string) => { setInitialModelKey(modelKey); void openSessionSettings("models"); };
   const responseActionRef = useRef(responseAction); responseActionRef.current = responseAction;

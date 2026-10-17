@@ -20,8 +20,10 @@ const TYPES: Record<string, string> = {
 const PAGE_POLICY = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; "
   + "img-src 'self' data: blob: https:; connect-src 'self'; worker-src 'self' blob:; manifest-src 'self'; frame-src 'none'; "
   + "object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
-const PHONE_HEAD = '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"/>'
-  + '<meta name="apple-mobile-web-app-capable" content="yes"/><meta name="apple-mobile-web-app-status-bar-style" content="default"/>'
+// An app, not a page: no zooming, edge to edge, the status bar in the app's colours.
+const PHONE_HEAD = '<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover"/>'
+  + '<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)"/><meta name="theme-color" content="#18181b" media="(prefers-color-scheme: dark)"/>'
+  + '<meta name="apple-mobile-web-app-capable" content="yes"/><meta name="mobile-web-app-capable" content="yes"/><meta name="apple-mobile-web-app-status-bar-style" content="default"/>'
   + '<meta name="apple-mobile-web-app-title" content="Astra"/><link rel="manifest" href="./manifest.webmanifest"/>'
   + '<link rel="apple-touch-icon" href="./phone/icon-180.png"/><script src="./phone/bridge.js"></script>';
 
