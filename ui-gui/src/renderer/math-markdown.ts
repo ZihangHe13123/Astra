@@ -71,6 +71,23 @@ function looksLikeAmount(body: string, following: string): boolean {
 function literalTeXDollars(body: string): string {
   return body.replace(/(\\+)\$/g, (match, slashes: string) => slashes.length % 2 ? slashes.slice(0, -1) + "\\text{\\char36}" : match);
 }
+/** Math environments KaTeX typesets. Models often write them bare, without $$ or \\[ around them;
+ * other environments (itemize, figure…) are LaTeX document structure and stay text. */
+const MATH_ENVIRONMENTS = new Set(["equation", "equation*", "align", "align*", "aligned", "alignat", "alignat*", "alignedat",
+  "gather", "gather*", "gathered", "split", "cases", "dcases", "rcases", "drcases", "array", "darray",
+  "subarray", "matrix", "pmatrix", "bmatrix", "Bmatrix", "vmatrix", "Vmatrix", "matrix*", "pmatrix*", "bmatrix*", "Bmatrix*",
+  "vmatrix*", "Vmatrix*", "smallmatrix", "CD"]);
+/** The end of a bare `\\begin{name}…\\end{name}` starting at `start`, nested ones of the same name included; -1 while unclosed. */
+function closeEnvironment(text: string, name: string, start: number): number {
+  const open = `\\begin{${name}}`, close = `\\end{${name}}`;
+  let depth = 0;
+  for (let i = start; i < text.length;) {
+    if (text.startsWith(open, i) && !escaped(text, i)) { depth++; i += open.length; continue; }
+    if (text.startsWith(close, i) && !escaped(text, i)) { if (--depth === 0) return i + close.length; i += close.length; continue; }
+    i++;
+  }
+  return -1;
+}
 function normalizeText(text: string, onFormula?: (start: number, end: number) => void): string {
   let result = "";
   const missingClosers = new Set<string>();
@@ -93,6 +110,20 @@ function normalizeText(text: string, onFormula?: (start: number, end: number) =>
       }
       missingClosers.add(endDelimiter);
       result += "\\" + text.slice(i, i + 2); i += 2; continue;
+    }
+    if (text.startsWith("\\begin{", i) && !escaped(text, i)) {
+      const name = /^\\begin\{([A-Za-z]+\*?)\}/.exec(text.slice(i, i + 40))?.[1];
+      // A bare math environment is display math; while it is still streaming (unclosed) it stays text.
+      const end = name && MATH_ENVIRONMENTS.has(name) ? closeEnvironment(text, name, i) : -1;
+      if (end >= 0) {
+        onFormula?.(i, end);
+        const body = literalTeXDollars(dollarsAsText(text.slice(i, end)));
+        // At the start of a line it is a math block: remark-math would read "$$\\begin{…}" on one line as an
+        // opening fence and drop the \\begin as its info, so the body goes on lines of its own.
+        if (/(?:^|\n)[\t ]*$/.test(result)) result += "$$\n" + body + "\n$$" + (text[end] && text[end] !== "\n" ? "\n" : "");
+        else result += "$$" + body + "$$";
+        i = end; continue;
+      }
     }
     if (text[i] === "$" && !escaped(text, i)) {
       let count = 1;
