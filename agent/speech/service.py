@@ -35,8 +35,12 @@ class SpeechService:
     """
 
     def __init__(self, store: VoiceStore, notify: Callable[[dict[str, Any]], None], *,
-                 open_player: Callable[[int, float], Player] = open_player) -> None:
+                 open_player: Callable[[int, float], Player] = open_player,
+                 open_phone_player: Callable[[int], Player] | None = None) -> None:
         self._store, self._notify, self._open_player = store, notify, open_player
+        self._open_phone_player = open_phone_player
+        # Where speech plays: this computer, or the paired phone the conversation is being used from.
+        self.route = "local"
         self.settings = store.load()
         self._segmenter: SpeechSegmenter | None = None
         self._units: asyncio.Queue[str | None] = asyncio.Queue()
@@ -188,7 +192,10 @@ class SpeechService:
                 expected, arrived, since, before = spoken_seconds(text), 0.0, 0.0, 0.0
                 async for pcm in provider.stream(text, voice, first=first):  # a failed unit ends this reply's speech
                     if player is None:
-                        player = self._player = self._open_player(settings.sample_rate, settings.prebuffer_seconds)
+                        player = self._player = (
+                            self._open_phone_player(settings.sample_rate)
+                            if self.route == "phone" and self._open_phone_player is not None
+                            else self._open_player(settings.sample_rate, settings.prebuffer_seconds))
                     now = asyncio.get_running_loop().time()
                     arrived += len(pcm) / 2 / settings.sample_rate
                     if not since:

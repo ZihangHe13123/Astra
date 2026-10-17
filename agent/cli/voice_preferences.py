@@ -90,6 +90,11 @@ def execute_voice_command(service: SpeechService, store: VoicePreferences, args:
         if action == "test":
             service.say(" ".join(args[1:]) or SAMPLE)
             return "Speaking a test line.", ""
+        if action == "route" and len(args) == 2 and args[1].lower() in {"phone", "mac"}:
+            # Sent by the desktop, not typed: speech plays where the conversation is being used.
+            # A change takes effect from the next speech, so a reply already playing is not split.
+            service.route = "phone" if args[1].lower() == "phone" else "local"
+            return "", ""
     except (OSError, SpeechError) as error:
         return "", str(error)
     return "", USAGE

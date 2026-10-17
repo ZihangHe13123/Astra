@@ -6,8 +6,13 @@ export type Preferences = { theme: string; drafts: Record<string, string>; attac
 export type DesktopEvent = { removed: string } | { runtime: string; revision: number; event: UIEvent } | { refresh: true } | { appshot: { connection: string; enabled: boolean } };
 export type Bootstrap = { sessions: SessionState[]; active: string; workspace: string; preferences: Preferences; appshot: { connection: string; enabled: boolean } };
 export type CommandDescription = { id: string; command: string; description: string; takes_args: boolean; group: string; options: { command: string; description: string; completion: string; submitValue?: string }[] };
+import type { PhoneAction, PhoneStatus } from "./phone-protocol.js";
 export interface DesktopBridge {
+  /** Set on a paired phone, where the window runs over the gateway and Mac-only actions are unavailable. */
+  remote?: boolean;
   bootstrap(): Promise<Bootstrap>;
+  /** Paired phones (settings): their list, pairing and removal, and whether the gateway runs. */
+  phone(action: PhoneAction, value?: string): Promise<PhoneStatus>;
   create(options: { session?: string; mode?: string; workspace?: string }): Promise<SessionState>;
   sessionAction(action: "export" | "delete", entry: { name: string; mode: string }): Promise<{ cancelled?: boolean; path?: string; deleted?: boolean }>;
   select(id: string): Promise<void>;

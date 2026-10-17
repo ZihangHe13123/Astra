@@ -118,7 +118,9 @@ const env = { ...cleanEnv, ASTRA_GUI_DISABLE_APPSHOT:'1', ASTRA_DELEGATE_CONCURR
  AGENT_TASK_DB:join(folder,'tasks.db'), ASTRA_APPROVAL_DB:join(folder,'approvals.db'), ASTRA_EVENT_DB:join(folder,'events.db'),
  AGENT_MEMORY_PATH:join(folder,'memory.db'), AGENT_LEARNING_PATH:join(folder,'learning.db'), AGENT_SKILLS_PATH:join(folder,'skills'),
  AGENT_MODELS_FILE:join(folder,'models.yaml'), AGENT_USER_MODELS_FILE:join(folder,'missing-models.yaml'), AGENT_LOG_DIR:join(folder,'logs'),
- AGENT_MCP_CONFIG:join(folder,'missing-mcp.json'), AGENT_TOOL_POLICY:'locked', SANDBOX_DOCKER:'false', SANDBOX_WORKDIR:workspace, ASTRA_WORKSPACE:workspace, LEARNING_REVIEW_AUTO:'0' };
+ AGENT_MCP_CONFIG:join(folder,'missing-mcp.json'), AGENT_TOOL_POLICY:'locked', SANDBOX_DOCKER:'false', SANDBOX_WORKDIR:workspace, ASTRA_WORKSPACE:workspace, LEARNING_REVIEW_AUTO:'0',
+ // Any free port, so a phone gateway the user runs on 8930 is never touched.
+ ASTRA_PHONE_PORT:'0' };
 let app;
 const checks = [];
 const passed = name => { checks.push(name); console.log('PASS', name); };
@@ -705,6 +707,56 @@ try {
  assert.equal(JSON.parse(readFileSync(join(folder,'settings.json'),'utf8')).memory_consolidation,'auto');
  await page.getByRole('button',{name:'关闭',exact:true}).click();
  passed('settings switch the background memory review and save the choice');
+ // A paired phone runs this interface remotely (specs/phone-companion.md): it pairs, loads the desktop's own renderer
+ // through the gateway, and operates the Mac's backend from a phone-sized window.
+ await page.locator('.account').click();
+ const phoneDialog=page.getByRole('dialog',{name:'设置',exact:true}); await phoneDialog.waitFor();
+ await phoneDialog.getByLabel('允许配对的手机连接').check();
+ await phoneDialog.getByRole('button',{name:'添加手机',exact:true}).click();
+ const pairingCode=(await phoneDialog.locator('.phone-code').innerText()).replace(/\s/g,'');
+ const phoneStatus=await page.evaluate(()=>window.astra.phone('status'));
+ assert.equal(phoneStatus.running,true); assert.ok(phoneStatus.port>0);
+ const phoneBase=`http://127.0.0.1:${phoneStatus.port}`;
+ assert.equal((await fetch(phoneBase+'/api/invoke',{method:'POST',body:'{"method":"bootstrap"}'})).status,401);
+ const phoneWindowOpened=app.waitForEvent('window');
+ const phoneWindowId=await app.evaluate(({BrowserWindow},url)=>{const w=new BrowserWindow({width:390,height:844,title:'phone',webPreferences:{contextIsolation:true,sandbox:true}});void w.loadURL(url);return w.id;},phoneBase+'/');
+ const phonePage=await phoneWindowOpened;
+ await phonePage.getByLabel('配对码').fill(pairingCode);
+ await phonePage.getByRole('button',{name:'配对',exact:true}).click();
+ await phoneDialog.getByText('iPhone',{exact:true}).waitFor();
+ // The desktop interface runs on the phone, narrow: the session list starts closed.
+ await phonePage.getByRole('button',{name:'显示侧栏'}).waitFor({timeout:20000});
+ assert.equal(await phonePage.evaluate(()=>window.astra.remote),true);
+ assert.equal(await phonePage.getByRole('button',{name:'添加附件'}).count(),0);
+ // An app, not a web page: it does not zoom, fields are 16px so iOS does not zoom into them, and the list follows a swipe.
+ assert.match(await phonePage.locator('meta[name=viewport]').getAttribute('content'),/user-scalable=no/);
+ assert.equal(await phonePage.evaluate(()=>getComputedStyle(document.querySelector('.composer textarea')).fontSize),'16px');
+ const swipe=(from,to)=>phonePage.evaluate(([a,b])=>{const at=x=>new Touch({identifier:1,target:document.body,clientX:x,clientY:300});
+  document.dispatchEvent(new TouchEvent('touchstart',{touches:[at(a)],changedTouches:[at(a)]}));
+  document.dispatchEvent(new TouchEvent('touchend',{touches:[],changedTouches:[at(b)]}));},[from,to]);
+ await swipe(6,220); await phonePage.getByRole('button',{name:'隐藏侧栏'}).waitFor();
+ await swipe(260,30); await phonePage.getByRole('button',{name:'隐藏侧栏'}).waitFor({state:'hidden'});
+ // Full access (YOLO) is switched from the phone and takes effect in the Mac's backend.
+ await phonePage.getByRole('button',{name:'按需审批',exact:true}).click();
+ const phonePermissions=phonePage.getByRole('dialog',{name:'权限与对话模式'}); await phonePermissions.waitFor();
+ await phonePermissions.getByRole('button',{name:'完全访问',exact:false}).click();
+ await page.waitForFunction(async()=>(await window.astra.bootstrap()).sessions.some(s=>s.info.yolo_status?.yolo===true));
+ // Choosing closes the dialog; the composer's switch, now reading 完全访问, opens it again.
+ await phonePage.locator('.composer-bottom .permission:not(.voice)').filter({hasText:'完全访问'}).click();
+ await phonePermissions.waitFor();
+ await phonePermissions.getByRole('button',{name:'按需审批',exact:false}).click();
+ await page.waitForFunction(async()=>!(await window.astra.bootstrap()).sessions.some(s=>s.info.yolo_status?.yolo===true));
+ await phonePage.screenshot({path:join(output,'phone-remote.png')});
+ assert.match(readFileSync(join(folder,'gui','phone-audit.jsonl'),'utf8'),/"cmd":"\/yolo/);
+ // Removing the phone on the Mac ends its access; switching phones off stops the gateway.
+ await phoneDialog.getByRole('button',{name:'移除',exact:true}).click();
+ await phoneDialog.getByText('iPhone',{exact:true}).waitFor({state:'detached'});
+ await app.evaluate(({BrowserWindow},id)=>BrowserWindow.fromId(id)?.destroy(),phoneWindowId);
+ await phoneDialog.getByLabel('允许配对的手机连接').uncheck();
+ await page.waitForFunction(async()=>!(await window.astra.phone('status')).running);
+ await assert.rejects(fetch(phoneBase+'/'));
+ await page.getByRole('button',{name:'关闭',exact:true}).click();
+ passed('a paired phone runs the desktop interface remotely, switches YOLO in the Mac backend, and is cut off when removed');
  // Rename is a display label, preserving backend identity and on-disk history.
  const menu=async title=>{await page.getByRole('button',{name:`会话操作：${title}`,exact:true}).first().click();await page.getByRole('menu',{name:'会话操作'}).waitFor();};
  await menu(menuName); await page.getByRole('menuitem',{name:'重命名',exact:true}).click();

@@ -366,6 +366,11 @@ label { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sma
 .choice-grid small { color:var(--muted); }
 .choice-grid [aria-pressed=true] { background:var(--soft); border-color:var(--muted); }
 .choice-grid.three { grid-template-columns:repeat(3, minmax(0, 1fr)); }
+.phone-pairing { display:flex; flex-direction:column; gap:6px; padding:12px 14px; border:1px solid var(--line); border-radius:var(--r-2); }
+.phone-code { font-family:var(--font-mono, ui-monospace, monospace); font-size:28px; letter-spacing:0.12em; }
+.phone-devices { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:6px; }
+.phone-devices li { display:flex; align-items:center; justify-content:space-between; gap:10px; }
+.phone-devices li span { display:flex; flex-direction:column; }
 @media(max-width:520px) { .choice-grid.three { grid-template-columns:1fr; } }
 /* Informational notices must not intercept unrelated controls below them. */ .toast { pointer-events: none; }
 .toast .icon { pointer-events: auto; }
@@ -451,3 +456,43 @@ label { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sma
 .approval-facts { display:grid; grid-template-columns:max-content minmax(0,1fr); gap:6px 12px; font-size:12px; }
 .approval-facts dt { color:var(--muted); }
 .approval-facts dd { margin:0; overflow-wrap:anywhere; white-space:pre-wrap; }
+
+/* A phone-sized window (a paired iPhone runs this renderer): one column, the session list as an overlay. */
+.side-scrim { display: none; }
+@media (max-width: 700px) {
+  .app.narrow .sidebar { position: fixed; top: 0; bottom: 0; left: 0; z-index: 30; width: min(86vw, 320px);
+    padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); box-shadow: 0 0 40px var(--shade-2);
+    display: flex; transform: none; visibility: visible; transition: transform var(--dur-2) var(--ease); }
+  /* Closed, the list slides out and then leaves the accessibility tree. */
+  .app.narrow.sidebar-hidden .sidebar { display: flex; transform: translateX(-105%); visibility: hidden; box-shadow: none;
+    transition: transform var(--dur-2) var(--ease), visibility 0s linear var(--dur-2); }
+  .side-scrim { display: block; position: fixed; inset: 0; z-index: 29; background: #0006; animation: astra-fade var(--dur-2) var(--ease) both; }
+  .traffic-space { display: none; }
+  .topbar { height: auto; min-height: 50px; padding: env(safe-area-inset-top) 10px 0; gap: 8px; -webkit-app-region: no-drag; }
+  .topbar > div { min-width: 0; gap: 6px; }
+  .topbar .title { max-width: 46vw; }
+  .messages { padding: 14px 12px 10px; }
+  .composer-wrap { padding: 8px 8px calc(env(safe-area-inset-bottom) + 8px); }
+  .details-panel { position: fixed; inset: 0; z-index: 25; width: 100% !important; max-width: none; min-width: 0;
+    padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
+  .panel-resizer { display: none; }
+  .scrim { padding: calc(env(safe-area-inset-top) + 8px) 8px 8px; }
+  .modal { width: 100%; max-height: calc(100dvh - env(safe-area-inset-top) - 16px); }
+  .modal.wide { width: 100%; }
+  .toast { left: 10px; right: 10px; top: calc(env(safe-area-inset-top) + 56px); max-width: none; }
+}
+
+/* A paired phone: an app, not a web page. Nothing zooms or bounces, the layout follows the keyboard,
+   controls are finger-sized and desktop keyboard hints are left out. */
+html[data-remote=phone] { --fs-ui: 14px; --fs-base: 15px; --fs-body: 16px; touch-action: manipulation; }
+html[data-remote=phone], html[data-remote=phone] body { overscroll-behavior: none; -webkit-tap-highlight-color: transparent; -webkit-text-size-adjust: 100%; }
+html[data-remote=phone] body { position: fixed; inset: 0; overflow: hidden; }
+html[data-remote=phone] .app { height: var(--app-height, 100dvh); }
+html[data-remote=phone] :is(.messages-scroll, .details-panel, .modal, .sidebar) { overscroll-behavior: contain; }
+/* iOS zooms into any field under 16px when it is focused. */
+html[data-remote=phone] :is(input, textarea, select), html[data-remote=phone] .composer textarea { font-size: 16px; }
+html[data-remote=phone] .icon { min-width: 40px; min-height: 40px; }
+html[data-remote=phone] :is(.sidebar, .topbar, .composer-bottom, .panel-tabs, .session-row, button) { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+html[data-remote=phone] button:hover { background: inherit; }
+html[data-remote=phone] button:active:not(:disabled) { transform: none; opacity: .55; }
+html[data-remote=phone] :is(.composer-foot, .approval-keys, .nav-button kbd, .new-chat span, .command-suggestions-foot) { display: none; }

@@ -115,7 +115,10 @@ sentence with small pieces and produce the rest in larger, cheaper ones.
 
 ## Limits
 
-- Audio plays on the machine that runs Astra's backend.
+- Audio plays on the machine that runs Astra's backend, except for a paired phone: when a
+  conversation is used from the phone, its replies and test lines play on the phone
+  (the Mac still synthesizes them), and when it is used from the Mac again, on the Mac.
+  The phone can play only while the app is open in the foreground, after a first tap.
 - The server must return 16-bit mono PCM for `response_format: "pcm"`.
 - Regenerated replies and wake-up summaries are not read.
 - Each open session speaks its own replies; two sessions can talk at once.

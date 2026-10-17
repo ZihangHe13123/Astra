@@ -48,6 +48,8 @@ export const PageFrame = memo(function PageFrame({ source }: { source: string })
     return () => { clearTimeout(timer); clearTimeout(asked.current?.timer); asked.current = undefined; window.removeEventListener("message", listener); media.removeEventListener("change", repaint); observer.disconnect(); };
   }, [source, stopped]);
   useEffect(() => { setStopped(false); }, [source]);
+  // On a paired phone the page would run on the app's own origin, not an isolated one.
+  if (typeof window !== "undefined" && window.astra?.remote) return <div className="page-preview"><p className="small muted" role="status">页面只能在电脑上预览。</p></div>;
   return <div className="page-preview">
     {stopped ? <p className="small muted" role="status">页面已停止：它试图离开自己的框。<button className="text-button small" onClick={() => setStopped(false)}>重新运行</button></p>
       : problem && <p className="small muted" role="status">{problem}</p>}
