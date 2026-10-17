@@ -81,6 +81,21 @@ test("a paired phone follows the desktop's sessions live, and removing it ends t
   } finally { await gateway.dispose(); }
 });
 
+test("the phone client calls fetch the way Safari requires: never as a method of another object", async () => {
+  const { devices, gateway, base } = await setup();
+  const real = globalThis.fetch;
+  // Safari throws when fetch runs with any receiver other than the window.
+  globalThis.fetch = function (this: unknown, ...args: Parameters<typeof fetch>) {
+    if (this !== undefined && this !== globalThis) throw new TypeError("Can only call Window.fetch on instances of Window");
+    return real(...args);
+  } as typeof fetch;
+  try {
+    const client = new PhoneClient(memory(), base);
+    const record = await client.pair(devices.startPairing().code, "iPhone");
+    assert.ok(await client.signIn(record));
+  } finally { globalThis.fetch = real; await gateway.dispose(); }
+});
+
 test("nothing is served without a valid token, to another host or origin, or outside the phone app", async () => {
   const { gateway, port, base } = await setup();
   try {

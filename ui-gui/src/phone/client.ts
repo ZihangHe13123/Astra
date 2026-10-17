@@ -13,7 +13,10 @@ export type DeviceStorage = {
 export class PhoneUnpairedError extends Error {}
 
 export class PhoneClient {
-  constructor(private readonly storage: DeviceStorage, private readonly base = "", private readonly fetcher: typeof fetch = fetch) {}
+  // Safari's fetch must be called on the window: stored and called as this.fetcher(...) it throws
+  // "Can only call Window.fetch on instances of Window", so the default calls it as a plain function.
+  constructor(private readonly storage: DeviceStorage, private readonly base = "",
+              private readonly fetcher: typeof fetch = (input, init) => fetch(input, init)) {}
 
   device() { return this.storage.load(); }
 
