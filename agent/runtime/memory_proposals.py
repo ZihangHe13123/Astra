@@ -330,9 +330,12 @@ class ConsolidationScheduler:
 
     def __init__(self, store: MemoryStore, archive: Path, client: ClientFactory, *, mode: str = "review",
                  notify: Callable[[dict[str, Any]], None], clock: Callable[[], float] = time.monotonic,
-                 run: Callable[..., Awaitable[ConsolidationResult]] = consolidate):
+                 run: Callable[..., Awaitable[ConsolidationResult]] = consolidate,
+                 load_mode: Callable[[], str] | None = None):
         self.store, self.archive, self.client = store, archive, client
         self.mode, self.notify, self.clock, self.run = mode, notify, clock, run
+        # The saved mode: another Astra window may have changed it since this one started.
+        self.load_mode = load_mode
         self.last_busy = clock()
         self.next_after = 0.0
         self.requested = False
@@ -350,7 +353,11 @@ class ConsolidationScheduler:
             return
         if self.task is not None and not self.task.done():
             return
-        if not self.requested and (not self.enabled or now - self.last_busy < IDLE_SECONDS or now < self.next_after):
+        if not self.requested and (now - self.last_busy < IDLE_SECONDS or now < self.next_after):
+            return
+        self._refresh()
+        if not self.requested and not self.enabled:
+            self.next_after = now + FOLLOW_UP_SECONDS  # look at the saved mode again later, not every tick
             return
         forced, self.requested = self.requested, False
         self.task = asyncio.get_running_loop().create_task(self._pass(forced), name="memory-consolidation")
@@ -368,12 +375,14 @@ class ConsolidationScheduler:
         self.last_result = result
         self.next_after = self.clock() + (FOLLOW_UP_SECONDS if result.more and not result.skipped else INTERVAL_SECONDS)
         waiting = self._apply(result.proposed) if self.mode == "auto" else result.proposed
-        if waiting:
-            try:
+        try:
+            if waiting:
                 self.notify({"type": "memory_notice", "event": "proposed", "count": len(waiting),
                              "summary": str(waiting[0].get("summary") or waiting[0].get("previous", ""))})
-            except Exception:
-                logger.debug("memory proposal notice failed", exc_info=True)
+            if result.proposed:
+                self.notify(self.status_event())
+        except Exception:
+            logger.debug("memory proposal notice failed", exc_info=True)
 
     def _apply(self, proposed: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Auto mode: apply remember and revise now. Returns the proposals still waiting for the user."""
@@ -390,7 +399,22 @@ class ConsolidationScheduler:
         still = {item["id"] for item in self.store.record_store.proposals()}
         return [item for item in proposed if item.get("id") in still]
 
+    def _refresh(self) -> None:
+        if self.load_mode is None:
+            return
+        try:
+            self.mode = self.load_mode()
+        except Exception:  # An unreadable settings file keeps the mode this window has.
+            logger.debug("memory consolidation mode was not read", exc_info=True)
+
+    def status_event(self, **reply: str) -> dict[str, Any]:
+        """The mode and the waiting proposals for the clients; a command's answer adds message or error."""
+        self._refresh()
+        return {"type": "memory_consolidation_status", "mode": self.mode,
+                "pending": len(self.store.record_store.proposals()), **reply}
+
     def status(self) -> str:
+        self._refresh()
         pending = len(self.store.record_store.proposals())
         last = self.store.record_store.meta(_LAST_RUN)
         line = (f"Memory consolidation: {_MODE_TEXT.get(self.mode, self.mode)}; "

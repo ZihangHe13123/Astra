@@ -24,6 +24,7 @@ import { DelegateHistory, DelegateSummary } from "./delegates.js";
 import { CommandInput } from "./command-input.js";
 import { commandNames, describeCommands, modeSessionTarget, type CommandMode } from "./command-help.js";
 import { VoiceSettings } from "./voice.js";
+import { MemoryReviewSettings, reviewAnswer } from "./memory-review.js";
 import { voiceAnswer, voiceButton, voiceNotice, withVoiceOptions } from "./voice-state.js";
 import { sessionTitle, sidebarGroups } from "./sidebar.js";
 import { DESKTOP_THEME_NAMES, PLAIN_THEMES, desktopTheme, followTheme, isDesktopThemeName } from "./theme.js";
@@ -91,6 +92,8 @@ function App() {
   const responseBusy = responseControlsBusy(state);
   const responseRequest = useRef(new Set<string>());
   const voiceStatus = state?.info.voice_status;
+  const reviewStatus = state?.info.memory_consolidation_status;
+  const reviewReply = useRef<{ runtime: string; action: string; seen?: UIEvent; at: number }>();
   const voiceReply = useRef<{ runtime: string; action: string; seen?: UIEvent; at: number }>();
   const logBranch = preview && preview.locatedFromRuntime !== active ? preview.branch_id : state?.branchId;
   const logResponseRevision = preview && preview.locatedFromRuntime !== active ? preview.response_versions?.revision : responseVersions?.revision;
@@ -258,6 +261,7 @@ function App() {
     if (value === "/permissions") { await openSessionSettings("permissions"); return; }
     if (value === "/persona") { await openSessionSettings("persona"); return; }
     if (/^\/voice(?:\s+(?:status|list))?$/i.test(value)) { await openVoice(target); return; }
+    if (/^\/memory\s+consolidation(?:\s+status)?$/i.test(value)) { setModal("settings"); return; }
     if (value === "/help") { showCommands(); return; }
     if (/^\/(tool|gallery)(?:\s+\d+)?$/.test(value)) {
       const [name, number] = value.split(/\s+/);
@@ -296,6 +300,10 @@ function App() {
         const match = value.slice(7).trim().match(/^(?:"([^"]+)"|'([^']+)'|(\S+))(?:\s+([\s\S]*))?$/);
         if (!match) throw new Error("用法：/image <路径> [说明]");
         await window.astra.send(rt.id, { type: "image", path: match[1] || match[2] || match[3], prompt: match[4] || "Describe this image.", submission_id: crypto.randomUUID() });
+      } else if (/^\/memory\s+consolidation\s/i.test(value)) {
+        // Like /voice: the answer is a status that carries a message, shown once.
+        reviewReply.current = { runtime: rt.id, action: value.split(/\s+/)[2].toLowerCase(), seen: rt.info.memory_consolidation_status, at: Date.now() };
+        try { await window.astra.send(rt.id, { type: "command", cmd: value }); } catch (error) { reviewReply.current = undefined; throw error; }
       } else if (/^\/voice\s/i.test(value)) {
         // The backend answers a /voice command with a status that carries a message; that one is shown once.
         voiceReply.current = { runtime: rt.id, action: value.split(/\s+/)[1].toLowerCase(), seen: rt.info.voice_status, at: Date.now() };
@@ -310,6 +318,18 @@ function App() {
     if (!voiceStatus || voiceStatus === waiting.seen || voiceStatus.message === undefined) return;
     voiceReply.current = undefined; setToast(voiceAnswer(waiting.action, voiceStatus));
   }, [voiceStatus, state?.id]);
+  useEffect(() => {
+    const waiting = reviewReply.current;
+    if (!waiting) return;
+    if (waiting.runtime !== state?.id || Date.now() - waiting.at > 10000) { reviewReply.current = undefined; return; }
+    if (!reviewStatus || reviewStatus === waiting.seen || (reviewStatus.message === undefined && !reviewStatus.error)) return;
+    reviewReply.current = undefined; setToast(reviewAnswer(waiting.action, reviewStatus));
+  }, [reviewStatus, state?.id]);
+  // Another window may have changed the mode; the open session's backend reads the saved one again.
+  const sessionReady = state?.status === "ready";
+  useEffect(() => {
+    if (modal === "settings" && sessionReady && state) void window.astra.send(state.id, { type: "command", cmd: "/memory consolidation status" }).catch(() => undefined);
+  }, [modal, state?.id, sessionReady]);
   const openModels = () => openSessionSettings("model-picker");
   const configureModels = (modelKey?: string) => { setInitialModelKey(modelKey); void openSessionSettings("models"); };
   const responseActionRef = useRef(responseAction); responseActionRef.current = responseAction;
@@ -567,7 +587,8 @@ function App() {
       <button className="text-button" onClick={() => showCommands(commandModes.find(mode => mode.mode === state?.mode)?.command || "")}>查看{commandModes.find(mode => mode.mode === state?.mode)?.label || "全部"}模式指令 <ChevronRight size={14}/></button>
     </div></Modal>}
     {modal === "settings" && <Modal title="设置" close={() => setModal(undefined)}><div className="form"><h3>外观</h3><div className="theme-choices">{[{ name: "system", label: "跟随系统", icon: Monitor }, { name: "light", label: "浅色", icon: Sun }, { name: "dark", label: "深色", icon: Moon }].map(t => <button key={t.name} className={prefs.theme === t.name ? "selected" : ""} onClick={() => savePrefs({ theme: t.name })}><t.icon size={18}/>{t.label}</button>)}</div><div className="theme-grid">{DESKTOP_THEME_NAMES.filter(name => !(PLAIN_THEMES as readonly string[]).includes(name)).map(name => { const theme = desktopTheme(name); return <button key={name} aria-pressed={prefs.theme === name} className={prefs.theme === name ? "selected" : ""} onClick={() => savePrefs({ theme: name })}><span className="theme-swatch" aria-hidden="true" style={{ background: theme.colors["--bg"], borderColor: theme.colors["--frame"] }}>{["--accent", "--accent-2", "--value"].map(key => <i key={key} style={{ background: theme.colors[key] }}/>)}</span><span>{theme.label}</span></button>; })}</div>
-      <label className="option"><input type="checkbox" checked={prefs.timeline} onChange={e => savePrefs({ timeline: e.target.checked })}/>显示消息时间</label><hr/>
+      <label className="option"><input type="checkbox" checked={prefs.timeline} onChange={e => savePrefs({ timeline: e.target.checked })}/>显示消息时间</label>
+      <MemoryReviewSettings status={reviewStatus} ready={sessionReady} run={cmd => { void send({ type: "command", cmd }); }} review={() => { setModal(undefined); void command("/memory proposals"); }}/><hr/>
       <button onClick={() => configureModels()}>模型与账号 <ChevronRight size={15}/></button>
       <button onClick={() => { void openSessionSettings("permissions"); }}>权限与对话模式 <ChevronRight size={15}/></button>
       <button onClick={() => showSessions()}>管理会话 <ChevronRight size={15}/></button>
