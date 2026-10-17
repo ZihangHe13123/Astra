@@ -25,6 +25,7 @@ import { CommandInput } from "./command-input.js";
 import { commandNames, describeCommands, modeSessionTarget, type CommandMode } from "./command-help.js";
 import { VoiceSettings } from "./voice.js";
 import { MemoryReviewSettings, reviewAnswer, withProposalOptions } from "./memory-review.js";
+import { PhoneSettings } from "./phone-settings.js";
 import { voiceAnswer, voiceButton, voiceNotice, withVoiceOptions } from "./voice-state.js";
 import { sessionTitle, sidebarGroups } from "./sidebar.js";
 import { DESKTOP_THEME_NAMES, PLAIN_THEMES, desktopTheme, followTheme, isDesktopThemeName } from "./theme.js";
@@ -588,7 +589,8 @@ function App() {
     </div></Modal>}
     {modal === "settings" && <Modal title="设置" close={() => setModal(undefined)}><div className="form"><h3>外观</h3><div className="theme-choices">{[{ name: "system", label: "跟随系统", icon: Monitor }, { name: "light", label: "浅色", icon: Sun }, { name: "dark", label: "深色", icon: Moon }].map(t => <button key={t.name} className={prefs.theme === t.name ? "selected" : ""} onClick={() => savePrefs({ theme: t.name })}><t.icon size={18}/>{t.label}</button>)}</div><div className="theme-grid">{DESKTOP_THEME_NAMES.filter(name => !(PLAIN_THEMES as readonly string[]).includes(name)).map(name => { const theme = desktopTheme(name); return <button key={name} aria-pressed={prefs.theme === name} className={prefs.theme === name ? "selected" : ""} onClick={() => savePrefs({ theme: name })}><span className="theme-swatch" aria-hidden="true" style={{ background: theme.colors["--bg"], borderColor: theme.colors["--frame"] }}>{["--accent", "--accent-2", "--value"].map(key => <i key={key} style={{ background: theme.colors[key] }}/>)}</span><span>{theme.label}</span></button>; })}</div>
       <label className="option"><input type="checkbox" checked={prefs.timeline} onChange={e => savePrefs({ timeline: e.target.checked })}/>显示消息时间</label>
-      <MemoryReviewSettings status={reviewStatus} ready={sessionReady} run={cmd => { void send({ type: "command", cmd }); }} review={() => { setModal(undefined); void command("/memory proposals"); }}/><hr/>
+      <MemoryReviewSettings status={reviewStatus} ready={sessionReady} run={cmd => { void send({ type: "command", cmd }); }} review={() => { setModal(undefined); void command("/memory proposals"); }}/>
+      <PhoneSettings phone={window.astra.phone}/><hr/>
       <button onClick={() => configureModels()}>模型与账号 <ChevronRight size={15}/></button>
       <button onClick={() => { void openSessionSettings("permissions"); }}>权限与对话模式 <ChevronRight size={15}/></button>
       <button onClick={() => showSessions()}>管理会话 <ChevronRight size={15}/></button>

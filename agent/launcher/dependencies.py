@@ -65,7 +65,8 @@ def gui_ready(install: Installation) -> bool:
     return (gui_enabled(install) and state.get("root") == str(install.root)
             and state.get("fingerprint") == gui_fingerprint(install)
             and all((install.root / "ui-gui" / name).is_file() for name in
-                    ("node_modules/electron/cli.js", "dist/main.cjs", "dist/preload.cjs", "dist/renderer/index.html")))
+                    ("node_modules/electron/cli.js", "dist/main.cjs", "dist/preload.cjs", "dist/renderer/index.html",
+                     "dist/phone/phone.html")))
 
 
 def gui_health(install: Installation) -> None:

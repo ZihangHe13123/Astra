@@ -10,6 +10,7 @@ function exposeBridge() {
     select: id => invoke("select", id), close: id => invoke("close", id),
     send: (id, command) => invoke("send", id, command),
     query: (method, params, runtime) => invoke("query", method, params, runtime),
+    phone: (action, value) => invoke("phone", action, value),
     preferences: value => invoke("preferences", value), choose: kind => invoke("choose", kind),
     flushPreferences: value => {
       const result = ipcRenderer.sendSync("astra:flushPreferences", value);

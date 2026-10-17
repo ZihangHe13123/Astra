@@ -14,6 +14,7 @@ language; the indexes label language-specific references.
 | --- | --- |
 | Install, update, keep local changes or recover an interrupted update | [Launcher and updates](launcher-update.md) |
 | Use the source desktop preview, model login and file diffs | [Desktop GUI](gui.md) |
+| Follow the Mac's sessions from an iPhone over Tailscale | [Phone companion](phone.md) |
 | Select a model, adjust reasoning and use terminal commands | [Everyday use](usage.md) |
 | Restart safely or check back within the current session | [Session lifecycle](session-lifecycle.md) |
 | Run persistent reminders/checks and inspect local delivery receipts | [Persistent jobs](persistent-jobs.md) |

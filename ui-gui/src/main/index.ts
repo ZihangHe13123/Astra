@@ -20,6 +20,10 @@ import { checkedCommand, checkedPreferences, checkedString, externalURL, inside 
 import { captureHostResponse, cardFrameResponse, guardCardFrames } from "./card-frame.js";
 import { PageSnapshots } from "./page-snapshot.js";
 import { CARD_THEME_COLORS, checkedCardTheme } from "../card-theme.js";
+import type { PhoneStatus } from "../phone-protocol.js";
+import { PhoneDevices } from "./phone-devices.js";
+import { PhoneGateway } from "./phone-gateway.js";
+import { tailscaleName } from "./phone-tailscale.js";
 
 const packaged = configurePackagedRuntime({ isPackaged: app.isPackaged, resourcesPath: process.resourcesPath,
   appData: app.getPath("appData"), platform: process.platform, arch: process.arch });
@@ -68,7 +72,30 @@ const ready = () => {
 };
 let queued: DesktopEvent[] = [];
 let flushTimer: ReturnType<typeof setTimeout> | undefined;
+// Paired phones follow the same sessions as the window (specs/phone-companion.md, phase 1: read-only).
+const phoneDevices = new PhoneDevices(join(gui, "phone-devices.json"));
+const phone = new PhoneGateway(phoneDevices, { staticRoot: join(__dirname, "phone"),
+  snapshot: () => ({ sessions: [...runtimes.values()].map(r => r.state), active }),
+  port: Number(process.env.ASTRA_PHONE_PORT || 8930) });
+let phoneError = "";
+let phoneHost: { name?: string; at: number } = { at: 0 };
+async function syncPhone() {
+  try {
+    if (phoneDevices.enabled) await phone.start(); else await phone.stop();
+    phoneError = "";
+  } catch (error) {
+    phoneError = (error as NodeJS.ErrnoException)?.code === "EADDRINUSE" ? `端口 ${phone.port} 已被占用。` : String(error);
+  }
+}
+async function phoneStatus(): Promise<PhoneStatus> {
+  // Settings asks every second while a code is shown; Tailscale is asked at most once a minute.
+  if (phoneDevices.enabled && Date.now() - phoneHost.at > 60_000) phoneHost = { name: await tailscaleName(), at: Date.now() };
+  return { enabled: phoneDevices.enabled, port: phone.port, running: phone.running, ...(phoneError ? { error: phoneError } : {}),
+    ...(phoneDevices.enabled && phoneHost.name ? { url: `https://${phoneHost.name}` } : {}), devices: phoneDevices.list(),
+    ...(phoneDevices.currentPairing() ? { pairing: phoneDevices.currentPairing() } : {}) };
+}
 function broadcast(event: DesktopEvent) {
+  phone.publish(event);
   queued.push(event);
   if (!flushTimer) flushTimer = setTimeout(() => {
     const events = queued; queued = []; flushTimer = undefined;
@@ -209,6 +236,13 @@ register("sessionAction", async (action, entry) => {
     return result;
   } finally { sessionOperations.delete(key); }
 });
+register("phone", async (action, value) => {
+  if (action === "enable" || action === "disable") { phoneDevices.setEnabled(action === "enable"); await syncPhone(); }
+  else if (action === "pair") { if (!phoneDevices.enabled) throw new Error("先打开“允许手机连接”。"); phoneDevices.startPairing(); }
+  else if (action === "revoke") phoneDevices.revoke(checkedString(value, "device", 100));
+  else if (action !== "status") throw new Error("Unknown phone action");
+  return phoneStatus();
+});
 register("preferences", value => {
   preferences = { ...preferences, ...checkedPreferences(value) }; savePreferences(); return preferences;
 });
@@ -255,7 +289,7 @@ async function performQuit() {
   if (quitting) return;
   quitting = true;
   await Promise.all([...runtimes.values()].map(rt => rt.close()));
-  await Promise.all([appshot.client.close(), queries.close()]);
+  await Promise.all([appshot.client.close(), queries.close(), phone.dispose()]);
   // Let beforeunload supply the newest draft before taking the final snapshot.
   if (window && !window.isDestroyed()) {
     const closingWindow = window;
@@ -360,6 +394,7 @@ else {
     tray = new Tray(icon); tray.setToolTip("Astra");
     tray.setContextMenu(Menu.buildFromTemplate([{ label: "打开 Astra", click: showWindow }, { label: "停止并退出", click: () => requestQuit("quit") }]));
     tray.on("click", showWindow);
+    await syncPhone();
     showWindow();
   }).catch(async error => {
     console.error("Astra desktop startup failed:", error);

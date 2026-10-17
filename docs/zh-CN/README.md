@@ -10,6 +10,7 @@
 | --- | --- |
 | 安装、更新、保留本地改动或恢复中断 | [安装、启动与更新](launcher-update.md) |
 | 使用源码桌面预览版、模型登录和文件差异 | [桌面 GUI](gui.md) |
+| 用 iPhone 经 Tailscale 查看 Mac 上的会话 | [手机随身端](phone.md) |
 | 选择模型、调整推理、使用终端命令 | [日常使用](usage.md) |
 | 受控重启、会话内稍后继续或定期检查 | [会话生命周期](session-lifecycle.md) |
 | 保存定时提醒、只读检查与本地送达回执 | [持久任务](persistent-jobs.md) |
