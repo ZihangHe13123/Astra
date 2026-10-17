@@ -1,5 +1,4 @@
-import { phoneAuthMessage, type PhoneStreamEvent } from "../phone-protocol.js";
-import { parseEventStream } from "./state.js";
+import { parseEventStream, phoneAuthMessage, type PhoneInvokeMethod } from "../phone-protocol.js";
 
 /** What this phone keeps: its id on the desktop and its signing key, which can sign but never be read out. */
 export type PhoneDeviceRecord = { deviceId: string; name: string; privateKey: CryptoKey };
@@ -11,6 +10,8 @@ export type DeviceStorage = {
 
 /** The desktop refused this phone: it was removed there, or never paired. Pairing again is the way back. */
 export class PhoneUnpairedError extends Error {}
+export class TokenExpiredError extends Error {}
+class RefusedError extends Error {}
 
 export class PhoneClient {
   // Safari's fetch must be called on the window: stored and called as this.fetcher(...) it throws
@@ -31,7 +32,7 @@ export class PhoneClient {
 
   async forget() { await this.storage.clear(); }
 
-  /** Proves this phone holds its key and returns a bearer token for the event stream. */
+  /** Proves this phone holds its key and returns a bearer token for the event stream and calls. */
   async signIn(record: PhoneDeviceRecord): Promise<string> {
     let nonce: string;
     try { nonce = String((await this.post("/api/challenge", { deviceId: record.deviceId })).nonce); }
@@ -42,9 +43,20 @@ export class PhoneClient {
     return String(session.token);
   }
 
-  /** Follows the desktop until the stream ends or the signal aborts. A 401 means the token must be renewed. */
-  async follow(token: string, onMessage: (message: PhoneStreamEvent) => void, signal: AbortSignal): Promise<void> {
-    const response = await this.fetcher(`${this.base}/api/events`, { headers: { Authorization: `Bearer ${token}` }, signal, cache: "no-store" });
+  /** A call the desktop answers. A 401 means the token must be renewed. */
+  async invoke(token: string, method: PhoneInvokeMethod, args: unknown[]): Promise<unknown> {
+    const response = await this.fetcher(`${this.base}/api/invoke`, { method: "POST", cache: "no-store",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` }, body: JSON.stringify({ method, args }) });
+    if (response.status === 401) throw new TokenExpiredError();
+    const body = await response.json().catch(() => ({})) as { result?: unknown; error?: string };
+    if (!response.ok) throw new Error(body.error || `请求失败（${response.status}）`);
+    return body.result;
+  }
+
+  /** Follows the desktop's events after `after` (or from now) until the stream ends or the signal aborts. */
+  async follow(token: string, after: number | undefined, onEvent: (data: string, id?: number) => void, signal: AbortSignal): Promise<void> {
+    const query = after === undefined ? "" : `?after=${after}`;
+    const response = await this.fetcher(`${this.base}/api/events${query}`, { headers: { Authorization: `Bearer ${token}` }, signal, cache: "no-store" });
     if (response.status === 401) throw new TokenExpiredError();
     if (!response.ok || !response.body) throw new Error(`连接失败（${response.status}）`);
     const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
@@ -54,7 +66,7 @@ export class PhoneClient {
       if (done) return;
       const parsed = parseEventStream(buffer + value);
       buffer = parsed.rest;
-      for (const payload of parsed.payloads) onMessage(JSON.parse(payload) as PhoneStreamEvent);
+      for (const event of parsed.events) onEvent(event.data, event.id);
     }
   }
 
@@ -67,9 +79,6 @@ export class PhoneClient {
     return result;
   }
 }
-
-export class TokenExpiredError extends Error {}
-class RefusedError extends Error {}
 
 function base64url(buffer: ArrayBuffer): string {
   let text = "";

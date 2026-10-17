@@ -24,7 +24,9 @@ export const CardBlock = memo(function CardBlock({ source, complete, fail }: {
   const [copied, setCopied] = useState(false);
   // The frame paints its canvas before it is told the theme; the address tells it which one to start with.
   const [address] = useState(() => `${CARD_FRAME_URL}${typeof document !== "undefined" && currentTheme().dark ? "?dark" : ""}`);
-  const runnable = complete && source.trim().length > 0 && source.length <= MAX_CARD_SOURCE;
+  // On a paired phone a card would run on the app's own origin, not an isolated one: it is shown as source.
+  const remote = typeof window !== "undefined" && !!window.astra?.remote;
+  const runnable = complete && source.trim().length > 0 && source.length <= MAX_CARD_SOURCE && !remote;
   const showCard = runnable && view === "card" && !stopped;
   useBeforePaint(() => {
     if (!showCard) return;
@@ -57,7 +59,7 @@ export const CardBlock = memo(function CardBlock({ source, complete, fail }: {
       <button aria-label="复制卡片源码" onClick={() => { void window.astra.copyText(source).then(() => setCopied(true)).catch(fail); }}>{copied ? "已复制" : "复制源码"}</button>
     </div>
     {!complete ? <p className="small muted" role="status">卡片输入中…</p>
-      : !runnable ? <p className="small muted" role="status">{source.trim() ? "卡片内容过长，只显示源码。" : "卡片内容为空。"}</p>
+      : !runnable ? <p className="small muted" role="status">{remote ? "卡片只能在电脑上运行，这里显示源码。" : source.trim() ? "卡片内容过长，只显示源码。" : "卡片内容为空。"}</p>
       : stopped ? <p className="small muted" role="status">卡片已停止：它试图离开自己的框。</p>
       : showCard && problem && <p className="small muted" role="status">{problem}</p>}
     {showCard

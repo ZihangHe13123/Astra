@@ -707,7 +707,8 @@ try {
  assert.equal(JSON.parse(readFileSync(join(folder,'settings.json'),'utf8')).memory_consolidation,'auto');
  await page.getByRole('button',{name:'关闭',exact:true}).click();
  passed('settings switch the background memory review and save the choice');
- // A paired phone follows the window's live sessions (specs/phone-companion.md, phase 1) and is cut off when removed.
+ // A paired phone runs this interface remotely (specs/phone-companion.md): it pairs, loads the desktop's own renderer
+ // through the gateway, and operates the Mac's backend from a phone-sized window.
  await page.locator('.account').click();
  const phoneDialog=page.getByRole('dialog',{name:'设置',exact:true}); await phoneDialog.waitFor();
  await phoneDialog.getByLabel('允许配对的手机连接').check();
@@ -716,40 +717,38 @@ try {
  const phoneStatus=await page.evaluate(()=>window.astra.phone('status'));
  assert.equal(phoneStatus.running,true); assert.ok(phoneStatus.port>0);
  const phoneBase=`http://127.0.0.1:${phoneStatus.port}`;
- const phoneKeys=await crypto.subtle.generateKey({name:'ECDSA',namedCurve:'P-256'},false,['sign','verify']);
- const phonePost=async(path,body)=>{const response=await fetch(phoneBase+path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});return {status:response.status,body:await response.json()};};
- const paired=await phonePost('/api/pair',{code:pairingCode,name:'smoke phone',publicKey:await crypto.subtle.exportKey('jwk',phoneKeys.publicKey)});
- assert.equal(paired.status,200,JSON.stringify(paired.body));
- await phoneDialog.getByText('smoke phone',{exact:true}).waitFor();
- const phoneSignIn=async()=>{
-  const challenge=await phonePost('/api/challenge',{deviceId:paired.body.deviceId});
-  if(challenge.status!==200) return challenge;
-  const signed=await crypto.subtle.sign({name:'ECDSA',hash:'SHA-256'},phoneKeys.privateKey,new TextEncoder().encode(`astra-phone-auth-v1\n${challenge.body.nonce}\n${paired.body.deviceId}`));
-  return phonePost('/api/session',{deviceId:paired.body.deviceId,nonce:challenge.body.nonce,signature:Buffer.from(signed).toString('base64url')});
- };
- const phoneSession=await phoneSignIn(); assert.equal(phoneSession.status,200);
- const phoneMessages=[]; let phoneStreamEnded=false;
- const phoneStream=(async()=>{
-  const response=await fetch(phoneBase+'/api/events',{headers:{Authorization:`Bearer ${phoneSession.body.token}`}});
-  const reader=response.body.pipeThrough(new TextDecoderStream()).getReader(); let buffer='';
-  for(;;){const {value,done}=await reader.read(); if(done) break; buffer+=value; const blocks=buffer.split('\n\n'); buffer=blocks.pop();
-   for(const block of blocks){const line=block.split('\n').find(text=>text.startsWith('data: ')); if(line) phoneMessages.push(JSON.parse(line.slice(6)));}}
-  phoneStreamEnded=true;
- })();
- const activeRuntime=(await page.evaluate(()=>window.astra.bootstrap())).active;
- const phoneUntil=async(check,label)=>{const deadline=Date.now()+10000;while(!check()){if(Date.now()>deadline)throw new Error(`phone: ${label}`);await new Promise(r=>setTimeout(r,50));}};
- await phoneUntil(()=>phoneMessages[0]?.type==='hello'&&phoneMessages[0].sessions.some(s=>s.id===activeRuntime),'snapshot with the open session');
- // A change made in the window reaches the phone as it happens.
- await phoneDialog.getByRole('button',{name:'需审核',exact:false}).click();
- await phoneUntil(()=>phoneMessages.some(m=>m.type==='event'&&m.runtime===activeRuntime&&m.event.type==='memory_consolidation_status'&&m.event.mode==='review'),'live event');
+ assert.equal((await fetch(phoneBase+'/api/invoke',{method:'POST',body:'{"method":"bootstrap"}'})).status,401);
+ const phoneWindowOpened=app.waitForEvent('window');
+ const phoneWindowId=await app.evaluate(({BrowserWindow},url)=>{const w=new BrowserWindow({width:390,height:844,title:'phone',webPreferences:{contextIsolation:true,sandbox:true}});void w.loadURL(url);return w.id;},phoneBase+'/');
+ const phonePage=await phoneWindowOpened;
+ await phonePage.getByLabel('配对码').fill(pairingCode);
+ await phonePage.getByRole('button',{name:'配对',exact:true}).click();
+ await phoneDialog.getByText('iPhone',{exact:true}).waitFor();
+ // The desktop interface runs on the phone, narrow: the session list starts closed.
+ await phonePage.getByRole('button',{name:'显示侧栏'}).waitFor({timeout:20000});
+ assert.equal(await phonePage.evaluate(()=>window.astra.remote),true);
+ assert.equal(await phonePage.getByRole('button',{name:'添加附件'}).count(),0);
+ // Full access (YOLO) is switched from the phone and takes effect in the Mac's backend.
+ await phonePage.getByRole('button',{name:'按需审批',exact:true}).click();
+ const phonePermissions=phonePage.getByRole('dialog',{name:'权限与对话模式'}); await phonePermissions.waitFor();
+ await phonePermissions.getByRole('button',{name:'完全访问',exact:false}).click();
+ await page.waitForFunction(async()=>(await window.astra.bootstrap()).sessions.some(s=>s.info.yolo_status?.yolo===true));
+ // Choosing closes the dialog; the composer's switch, now reading 完全访问, opens it again.
+ await phonePage.locator('.composer-bottom .permission:not(.voice)').filter({hasText:'完全访问'}).click();
+ await phonePermissions.waitFor();
+ await phonePermissions.getByRole('button',{name:'按需审批',exact:false}).click();
+ await page.waitForFunction(async()=>!(await window.astra.bootstrap()).sessions.some(s=>s.info.yolo_status?.yolo===true));
+ await phonePage.screenshot({path:join(output,'phone-remote.png')});
+ assert.match(readFileSync(join(folder,'gui','phone-audit.jsonl'),'utf8'),/"cmd":"\/yolo/);
+ // Removing the phone on the Mac ends its access; switching phones off stops the gateway.
  await phoneDialog.getByRole('button',{name:'移除',exact:true}).click();
- await phoneUntil(()=>phoneStreamEnded,'stream ends on removal'); await phoneStream;
- assert.equal((await phoneSignIn()).status,403);
+ await phoneDialog.getByText('iPhone',{exact:true}).waitFor({state:'detached'});
+ await app.evaluate(({BrowserWindow},id)=>BrowserWindow.fromId(id)?.destroy(),phoneWindowId);
  await phoneDialog.getByLabel('允许配对的手机连接').uncheck();
  await page.waitForFunction(async()=>!(await window.astra.phone('status')).running);
  await assert.rejects(fetch(phoneBase+'/'));
  await page.getByRole('button',{name:'关闭',exact:true}).click();
- passed('a paired phone follows the live session, is cut off when removed, and the gateway stops when switched off');
+ passed('a paired phone runs the desktop interface remotely, switches YOLO in the Mac backend, and is cut off when removed');
  // Rename is a display label, preserving backend identity and on-disk history.
  const menu=async title=>{await page.getByRole('button',{name:`会话操作：${title}`,exact:true}).first().click();await page.getByRole('menu',{name:'会话操作'}).waitFor();};
  await menu(menuName); await page.getByRole('menuitem',{name:'重命名',exact:true}).click();

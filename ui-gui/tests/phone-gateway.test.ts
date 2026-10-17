@@ -1,37 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { request } from "node:http";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { initialSession, type SessionState } from "@astra/ui-core/session-state";
-import { PhoneDevices } from "../src/main/phone-devices.js";
-import { PhoneGateway } from "../src/main/phone-gateway.js";
-import { PhoneClient, PhoneUnpairedError, type DeviceStorage, type PhoneDeviceRecord } from "../src/phone/client.js";
-import { applyStream, emptySessions } from "../src/phone/state.js";
-import type { PhoneStreamEvent } from "../src/phone-protocol.js";
-
-function memory(): DeviceStorage & { record?: PhoneDeviceRecord } {
-  const storage: DeviceStorage & { record?: PhoneDeviceRecord } = {
-    load: async () => storage.record, save: async record => { storage.record = record; }, clear: async () => { storage.record = undefined; },
-  };
-  return storage;
-}
-
-async function setup() {
-  const folder = mkdtempSync(join(tmpdir(), "astra-phone-gateway-"));
-  const site = join(folder, "phone"); mkdirSync(join(site, "assets"), { recursive: true });
-  writeFileSync(join(site, "phone.html"), "<!doctype html><title>Astra</title>");
-  writeFileSync(join(site, "assets", "phone-1.js"), "console.log(1)");
-  writeFileSync(join(folder, "secret.txt"), "not served");
-  const devices = new PhoneDevices(join(folder, "gui", "phone-devices.json"));
-  devices.setEnabled(true);
-  const session: SessionState = { ...initialSession("rt-1", "/work"), session: "session_1", status: "ready",
-    messages: [{ id: "m1", role: "user", content: "检查一下测试" }] };
-  const gateway = new PhoneGateway(devices, { staticRoot: site, snapshot: () => ({ sessions: [session], active: "rt-1" }), port: 0 });
-  const port = await gateway.start();
-  return { devices, gateway, port, base: `http://127.0.0.1:${port}` };
-}
+import { PhoneClient } from "../src/phone/client.js";
+import { memory, pairedClient, setup, until } from "./phone-fixture.js";
 
 function raw(port: number, path: string, headers: Record<string, string>, method = "GET"): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -40,44 +11,95 @@ function raw(port: number, path: string, headers: Record<string, string>, method
   });
 }
 
-async function until(check: () => boolean, label: string) {
-  const deadline = Date.now() + 3000;
-  while (!check()) { if (Date.now() > deadline) throw new Error(`timed out: ${label}`); await new Promise(r => setTimeout(r, 10)); }
+/** Reads a stream into a list until aborted; returns the list and the abort. */
+function listen(client: PhoneClient, token: string, after?: number) {
+  const seen: { data: any; id?: number }[] = [];
+  const controller = new AbortController();
+  const done = client.follow(token, after, (data, id) => seen.push({ data: JSON.parse(data), id }), controller.signal).catch(() => undefined);
+  return { seen, stop: () => controller.abort(), done };
 }
 
-test("a paired phone follows the desktop's sessions live, and removing it ends the stream", async () => {
-  const { devices, gateway, base } = await setup();
-  const storage = memory();
-  const client = new PhoneClient(storage, base);
+test("the phone gets the desktop's page with its bridge loaded first, and only the app's files", async () => {
+  const { gateway, port, base } = await setup();
   try {
-    await assert.rejects(client.pair("WRONG123", "iPhone"), /没有进行中的配对/);
-    const { code } = devices.startPairing();
-    const record = await client.pair(code, "iPhone");
-    assert.equal(storage.record?.deviceId, record.deviceId);
-    assert.equal(devices.list()[0].name, "iPhone");
+    const page = await fetch(`${base}/`);
+    const html = await page.text();
+    assert.match(page.headers.get("content-security-policy") ?? "", /frame-src 'none'/);
+    assert.ok(html.indexOf('src="./phone/bridge.js"') < html.indexOf('src="./assets/index-1.js"'), "the bridge comes before the app");
+    assert.match(html, /viewport-fit=cover/);
+    assert.equal(html.match(/name="viewport"/g)?.length, 1);
+    assert.equal(await (await fetch(`${base}/phone/bridge.js`)).text(), "bridge.js");
+    assert.equal(await (await fetch(`${base}/sw.js`)).text(), "sw.js");
+    assert.equal((await fetch(`${base}/manifest.webmanifest`)).headers.get("content-type"), "application/manifest+json");
+    assert.equal((await fetch(`${base}/assets/index-1.js`)).headers.get("cache-control"), "public, max-age=31536000, immutable");
+    for (const path of ["/..%2Fsecret.txt", "/phone/..%2F..%2Fsecret.txt", "/missing.js"]) assert.equal((await fetch(base + path)).status, 404, path);
+    assert.equal(await raw(port, "/", { Host: "attacker.example" }), 421);
+    assert.equal(await raw(port, "/", { Host: "mac.tail1234.ts.net" }), 200);
+  } finally { await gateway.dispose(); }
+});
 
-    const token = await client.signIn(record);
-    let state = emptySessions;
-    const seen: PhoneStreamEvent[] = [];
-    const controller = new AbortController();
-    const following = client.follow(token, message => { seen.push(message); state = applyStream(state, message); }, controller.signal);
-    await until(() => state.order.length === 1, "snapshot");
-    assert.equal(state.active, "rt-1");
-    assert.equal(state.sessions["rt-1"].messages[0].content, "检查一下测试");
+test("calls need a token, go to the desktop with the phone's identity, and only the listed ones are taken", async () => {
+  const { devices, gateway, port, base, calls } = await setup((_device, method, args) => {
+    if (method === "close") throw new Error("该会话仍有任务或提醒，请先停止后再关闭。");
+    return { echoed: args };
+  });
+  try {
+    const anonymous = await fetch(`${base}/api/invoke`, { method: "POST", body: JSON.stringify({ method: "bootstrap" }) });
+    assert.equal(anonymous.status, 401);
+    const { client, record, token } = await pairedClient(devices, base);
+    assert.deepEqual(await client.invoke(token, "send", ["rt-1", { type: "command", cmd: "/yolo on" }]), { echoed: ["rt-1", { type: "command", cmd: "/yolo on" }] });
+    assert.deepEqual(calls.at(-1), { device: record.deviceId, method: "send", args: ["rt-1", { type: "command", cmd: "/yolo on" }] });
+    await assert.rejects(client.invoke(token, "close", ["rt-1"]), /仍有任务/);
+    await assert.rejects(client.invoke(token, "phone" as any, ["pair"]), /Unsupported call/);
+    assert.equal(await raw(port, "/api/invoke", { Host: `127.0.0.1:${port}`, Origin: "https://attacker.example", Authorization: `Bearer ${token}` }, "POST"), 403);
+  } finally { await gateway.dispose(); }
+});
 
+test("the stream says when it is ready, resumes where it stopped, and asks for a reload once it cannot", async () => {
+  const { devices, gateway, base } = await setup();
+  try {
+    const { client, token } = await pairedClient(devices, base);
+    assert.equal((await fetch(`${base}/api/events`)).status, 401);
+    const first = listen(client, token);
+    await until(() => first.seen.length === 1, "ready");
+    assert.deepEqual(first.seen[0].data, { ready: true, seq: 0 });
     gateway.publish({ appshot: { connection: "connected", enabled: true } });
-    gateway.publish({ runtime: "rt-1", revision: 1, event: { type: "chunk", content: "好的" } as any });
-    // The same revision again (a replay) changes nothing, as in the window.
-    gateway.publish({ runtime: "rt-1", revision: 1, event: { type: "chunk", content: "好的" } as any });
-    gateway.publish({ runtime: "rt-1", revision: 2, event: { type: "done" } as any });
-    await until(() => state.sessions["rt-1"].revision === 2, "live events");
-    assert.deepEqual(state.sessions["rt-1"].messages.map(message => message.content), ["检查一下测试", "好的"]);
-    assert.ok(!seen.some(message => JSON.stringify(message).includes("appshot")), "window-only events stay in the window");
+    gateway.publish({ runtime: "rt-1", revision: 1, event: { type: "chunk", content: "一" } as any });
+    gateway.publish({ refresh: true });
+    await until(() => first.seen.length === 3, "events");
+    assert.deepEqual(first.seen.slice(1).map(item => item.id), [1, 2]);
+    assert.ok(!first.seen.some(item => "appshot" in item.data), "Appshot state stays in the window");
+    first.stop(); await first.done;
 
+    // Missed while away: replayed in order, then ready.
+    gateway.publish({ runtime: "rt-1", revision: 2, event: { type: "chunk", content: "二" } as any });
+    gateway.publish({ removed: "rt-1" });
+    const resumed = listen(client, token, 2);
+    await until(() => resumed.seen.some(item => item.data.ready), "resumed");
+    assert.deepEqual(resumed.seen.map(item => item.id ?? item.data), [3, 4, { ready: true, seq: 4 }]);
+    resumed.stop(); await resumed.done;
+
+    // More was missed than the desktop keeps.
+    for (let i = 0; i < 4001; i++) gateway.publish({ refresh: true });
+    const late = listen(client, token, 4);
+    await late.done;
+    assert.deepEqual(late.seen.map(item => item.data), [{ reload: true }]);
+  } finally { await gateway.dispose(); }
+});
+
+test("removing the phone ends its stream at once, and the gateway listens on loopback only", async () => {
+  const { devices, gateway, base, port } = await setup();
+  try {
+    const { client, record, token } = await pairedClient(devices, base);
+    const stream = listen(client, token);
+    await until(() => stream.seen.length === 1, "ready");
     devices.revoke(record.deviceId);
-    await following;
-    await assert.rejects(client.signIn(record), PhoneUnpairedError);
-    controller.abort();
+    await stream.done;
+    await assert.rejects(client.signIn(record), /移除|没有配对/);
+    await gateway.stop();
+    await assert.rejects(fetch(`http://127.0.0.1:${port}/`));
+    const again = await gateway.start();
+    assert.equal((await fetch(`http://127.0.0.1:${again}/`)).status, 200);
   } finally { await gateway.dispose(); }
 });
 
@@ -94,40 +116,4 @@ test("the phone client calls fetch the way Safari requires: never as a method of
     const record = await client.pair(devices.startPairing().code, "iPhone");
     assert.ok(await client.signIn(record));
   } finally { globalThis.fetch = real; await gateway.dispose(); }
-});
-
-test("nothing is served without a valid token, to another host or origin, or outside the phone app", async () => {
-  const { gateway, port, base } = await setup();
-  try {
-    assert.equal((await fetch(`${base}/api/events`)).status, 401);
-    assert.equal((await fetch(`${base}/api/events`, { headers: { Authorization: "Bearer not-a-real-token-at-all" } })).status, 401);
-    // A web page that resolved its own name to this machine is not answered.
-    assert.equal(await raw(port, "/", { Host: "attacker.example" }), 421);
-    assert.equal(await raw(port, "/api/challenge", { Host: `127.0.0.1:${port}`, Origin: "https://attacker.example", "Content-Type": "application/json" }, "POST"), 403);
-    assert.equal(await raw(port, "/", { Host: "mac.tail1234.ts.net" }), 200);
-    assert.equal(await raw(port, "/api/challenge", { Host: "mac.tail1234.ts.net", Origin: "https://mac.tail1234.ts.net", "Content-Type": "application/json" }, "POST"), 403,
-      "same origin reaches the API, which refuses an unknown device");
-
-    const page = await fetch(`${base}/`);
-    assert.equal(page.status, 200);
-    assert.match(page.headers.get("content-security-policy") ?? "", /default-src 'self'/);
-    assert.match(await page.text(), /<title>Astra<\/title>/);
-    assert.equal((await fetch(`${base}/assets/phone-1.js`)).headers.get("cache-control"), "public, max-age=31536000, immutable");
-    assert.equal((await fetch(`${base}/..%2Fsecret.txt`)).status, 404);
-    assert.equal((await fetch(`${base}/missing.js`)).status, 404);
-    assert.equal((await fetch(`${base}/api/pair`, { method: "POST", body: "x".repeat(20_000) })).status, 400);
-  } finally { await gateway.dispose(); }
-});
-
-test("the gateway listens on loopback only and can be stopped and started again", async () => {
-  const { gateway, port } = await setup();
-  try {
-    assert.equal(gateway.running, true);
-    await gateway.stop();
-    assert.equal(gateway.running, false);
-    await assert.rejects(fetch(`http://127.0.0.1:${port}/`));
-    const again = await gateway.start();
-    assert.ok(again > 0);
-    assert.equal((await fetch(`http://127.0.0.1:${again}/`)).status, 200);
-  } finally { await gateway.dispose(); }
 });

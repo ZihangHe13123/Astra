@@ -2,11 +2,19 @@
 
 [Home](../README.md) · [Documentation](README.md) · [简体中文](zh-CN/phone.md)
 
-A paired iPhone can follow the sessions open in the desktop app on your Mac: the
-session list, each conversation as it streams, and what is waiting for you. The
-phone is another screen of the same Astra; models, tools and memory stay on the
-Mac. This first phase is read-only: approvals and questions are still answered on
-the Mac. The design and the later phases are in `specs/phone-companion.md`.
+A paired iPhone runs the desktop app's own interface remotely: the same session
+list, conversations, approvals and questions, command palette, models, modes,
+permissions (Full access included), file changes and history, laid out for a
+phone. Models, tools and memory stay on the Mac; the phone is another screen of
+the same Astra, and what it does acts on the Mac's backend. The design is in
+`specs/phone-companion.md`.
+
+Some things only make sense at the Mac and say so on the phone: choosing files or
+folders (attachments, projects), opening or previewing files, window capture,
+exporting a session, and pairing phones. Model-written cards and pages show their
+source on the phone instead of running, because there they would share the app's
+own origin. Theme, drafts and other display choices stay on the phone; session
+names and pins come from the desktop.
 
 ## Set up
 
@@ -36,5 +44,8 @@ the Mac. The design and the later phases are in `specs/phone-companion.md`.
   minutes and is withdrawn after five wrong tries.
 - Settings lists paired phones. 移除 ends that phone's connection at once and
   stops it from signing in again; it has to be paired anew.
+- Every message, command, approval and question answer sent from a phone is
+  recorded in `phone-audit.jsonl` in Astra's desktop data folder, with the phone,
+  the time and the decision; message text is not kept, only its length.
 - Turning off 允许配对的手机连接 stops the gateway. The desktop app must be running
   for the phone to connect; the tray icon keeps it running without a window.

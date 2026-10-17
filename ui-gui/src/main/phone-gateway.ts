@@ -1,41 +1,54 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { extname, resolve, sep } from "node:path";
-import type { SessionState } from "@astra/ui-core/session-state";
 import type { DesktopEvent } from "../bridge.js";
-import type { PhoneStreamEvent } from "../phone-protocol.js";
+import { PHONE_INVOKE_METHODS, type PhoneInvokeMethod, type PhoneStreamControl } from "../phone-protocol.js";
 import { PhoneAuthError, type PhoneDevices } from "./phone-devices.js";
 
-const BODY_LIMIT = 16 * 1024;
+const AUTH_BODY_LIMIT = 16 * 1024;
+const INVOKE_BODY_LIMIT = 2 * 1024 * 1024;
 const STREAM_BACKLOG_LIMIT = 8 * 1024 * 1024;
+const REPLAY_EVENTS = 4000;
 const HEARTBEAT_MS = 20_000;
 const TYPES: Record<string, string> = {
-  ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".css": "text/css; charset=utf-8",
-  ".json": "application/json", ".webmanifest": "application/manifest+json", ".png": "image/png", ".svg": "image/svg+xml",
-  ".woff2": "font/woff2", ".ico": "image/x-icon",
+  ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8", ".json": "application/json", ".webmanifest": "application/manifest+json",
+  ".png": "image/png", ".svg": "image/svg+xml", ".woff": "font/woff", ".woff2": "font/woff2", ".ttf": "font/ttf",
+  ".ico": "image/x-icon", ".wasm": "application/wasm", ".bcmap": "application/octet-stream", ".pfb": "application/octet-stream",
 };
-const PAGE_POLICY = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
-  + "connect-src 'self'; manifest-src 'self'; worker-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+// The renderer's own policy, without frames: model-written cards would share the app's origin here.
+const PAGE_POLICY = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; font-src 'self' data:; "
+  + "img-src 'self' data: blob: https:; connect-src 'self'; worker-src 'self' blob:; manifest-src 'self'; frame-src 'none'; "
+  + "object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+const PHONE_HEAD = '<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content"/>'
+  + '<meta name="apple-mobile-web-app-capable" content="yes"/><meta name="apple-mobile-web-app-status-bar-style" content="default"/>'
+  + '<meta name="apple-mobile-web-app-title" content="Astra"/><link rel="manifest" href="./manifest.webmanifest"/>'
+  + '<link rel="apple-touch-icon" href="./phone/icon-180.png"/><script src="./phone/bridge.js"></script>';
 
 type Stream = { deviceId: string; response: ServerResponse };
+export type PhoneInvoke = (deviceId: string, method: PhoneInvokeMethod, args: unknown[]) => Promise<unknown> | unknown;
 export type PhoneGatewayOptions = {
-  /** The built phone app (dist/phone). */
+  /** The phone's own files (dist/phone): the bridge script, manifest, service worker and icons. */
   staticRoot: string;
-  /** The sessions open in this desktop, as the window sees them. */
-  snapshot: () => { sessions: SessionState[]; active: string };
+  /** The desktop renderer (dist/renderer), which the phone runs as its interface. */
+  rendererRoot: string;
+  /** Answers a paired phone's calls; the desktop process owns sessions and their rules. */
+  invoke: PhoneInvoke;
   port: number;
 };
 
 /**
- * Serves paired phones from the desktop process, so a phone sees the same live sessions as the
- * window. It listens on loopback only; `tailscale serve` puts HTTPS on the tailnet in front of it.
- * Phase 1 is read-only: a phone can pair, sign in and follow events, and send nothing to a session.
+ * Serves paired phones from the desktop process, so a phone runs the same interface on the same
+ * live sessions as the window. It listens on loopback only; `tailscale serve` puts HTTPS on the
+ * tailnet in front of it.
  */
 export class PhoneGateway {
   private server?: Server;
   private streams = new Set<Stream>();
   private heartbeat?: ReturnType<typeof setInterval>;
   private boundPort = 0;
+  private seq = 0;
+  private recent: { seq: number; text: string }[] = [];
   private stopRevoked: () => void;
 
   constructor(private readonly devices: PhoneDevices, private readonly options: PhoneGatewayOptions) {
@@ -70,16 +83,15 @@ export class PhoneGateway {
 
   dispose() { this.stopRevoked(); return this.stop(); }
 
-  /** Called with every event the window gets. Window-only events (Appshot state) are not sent. */
+  /** Called with every event the window gets. Appshot state is the window's own and is not sent. */
   publish(event: DesktopEvent) {
-    if (!this.streams.size) return;
-    let message: PhoneStreamEvent | undefined;
-    if ("runtime" in event) message = { type: "event", runtime: event.runtime, revision: event.revision, event: event.event };
-    else if ("removed" in event) message = { type: "removed", runtime: event.removed };
-    else if ("refresh" in event) message = { type: "refresh" };
-    if (!message) return;
-    const line = `data: ${JSON.stringify(message)}\n\n`;
-    for (const stream of this.streams) this.write(stream, line);
+    if ("appshot" in event) return;
+    const seq = ++this.seq;
+    const text = `id: ${seq}\ndata: ${JSON.stringify(event)}\n\n`;
+    // Kept so a phone that briefly lost its connection gets what it missed instead of starting over.
+    this.recent.push({ seq, text });
+    if (this.recent.length > REPLAY_EVENTS) this.recent.splice(0, this.recent.length - REPLAY_EVENTS);
+    for (const stream of this.streams) this.write(stream, text);
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse) {
@@ -91,7 +103,7 @@ export class PhoneGateway {
       const url = new URL(request.url || "/", "http://phone.invalid");
       if (url.pathname.startsWith("/api/")) {
         if (!sameOrigin(request)) return send(response, 403, { error: "Cross-origin request" });
-        return await this.api(url.pathname, request, response);
+        return await this.api(url, request, response);
       }
       if (request.method !== "GET" && request.method !== "HEAD") return send(response, 405, { error: "Method not allowed" });
       return this.file(url.pathname, response);
@@ -101,10 +113,21 @@ export class PhoneGateway {
     }
   }
 
-  private async api(path: string, request: IncomingMessage, response: ServerResponse) {
-    if (path === "/api/events" && request.method === "GET") return this.events(request, response);
+  private async api(url: URL, request: IncomingMessage, response: ServerResponse) {
+    const path = url.pathname;
+    if (path === "/api/events" && request.method === "GET") return this.events(url, request, response);
     if (request.method !== "POST") return send(response, 405, { error: "Method not allowed" });
-    const body = await readJson(request);
+    if (path === "/api/invoke") {
+      const deviceId = this.bearer(request);
+      if (!deviceId) return send(response, 401, { error: "Sign in again" });
+      const body = await readJson(request, INVOKE_BODY_LIMIT);
+      const method = body.method as PhoneInvokeMethod;
+      if (!PHONE_INVOKE_METHODS.includes(method)) return send(response, 400, { error: "Unsupported call" });
+      const args = Array.isArray(body.args) ? body.args : [];
+      try { return send(response, 200, { result: (await this.options.invoke(deviceId, method, args)) ?? null }); }
+      catch (error) { return send(response, 400, { error: error instanceof Error ? error.message : String(error) }); }
+    }
+    const body = await readJson(request, AUTH_BODY_LIMIT);
     if (path === "/api/pair") {
       const device = this.devices.pair(body.code, body.name, body.publicKey);
       return send(response, 200, { deviceId: device.id, name: device.name });
@@ -114,22 +137,32 @@ export class PhoneGateway {
     return send(response, 404, { error: "Not found" });
   }
 
-  private events(request: IncomingMessage, response: ServerResponse) {
+  private bearer(request: IncomingMessage): string | undefined {
     const token = /^Bearer ([A-Za-z0-9_-]{20,})$/.exec(request.headers.authorization || "")?.[1];
-    const deviceId = token ? this.devices.deviceForToken(token) : undefined;
+    return token ? this.devices.deviceForToken(token) : undefined;
+  }
+
+  private events(url: URL, request: IncomingMessage, response: ServerResponse) {
+    const deviceId = this.bearer(request);
     if (!deviceId) return send(response, 401, { error: "Sign in again" });
     response.writeHead(200, { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-store",
       Connection: "keep-alive", "X-Accel-Buffering": "no" });
     const stream: Stream = { deviceId, response };
-    this.streams.add(stream);
     // The response's close is the connection ending; a request's close can come as soon as its (empty) body is read.
     response.on("close", () => this.streams.delete(stream));
-    const { sessions, active } = this.options.snapshot();
-    this.write(stream, `data: ${JSON.stringify({ type: "hello", sessions, active } satisfies PhoneStreamEvent)}\n\n`);
+    const after = url.searchParams.has("after") ? Number(url.searchParams.get("after")) : undefined;
+    if (after !== undefined && Number.isSafeInteger(after)) {
+      const missed = this.recent.filter(item => item.seq > after);
+      const complete = after >= this.seq || (missed.length > 0 && missed[0].seq === after + 1);
+      if (!complete) { this.write(stream, control({ reload: true })); response.end(); return; }
+      for (const item of missed) this.write(stream, item.text);
+    }
+    this.streams.add(stream);
+    this.write(stream, control({ ready: true, seq: this.seq }));
   }
 
   private write(stream: Stream, text: string) {
-    // A phone that stopped reading is dropped; it reconnects and starts from a fresh snapshot.
+    // A phone that stopped reading is dropped; it reconnects and catches up or reloads.
     if (stream.response.writableLength > STREAM_BACKLOG_LIMIT) { this.close(stream); return; }
     stream.response.write(text);
   }
@@ -140,19 +173,32 @@ export class PhoneGateway {
   }
 
   private file(pathname: string, response: ServerResponse) {
-    const root = realpathSync(this.options.staticRoot);
-    const relative = pathname === "/" ? "phone.html" : decodeURIComponent(pathname).replace(/^\/+/, "");
+    if (pathname === "/" || pathname === "/index.html") return this.page(response);
+    // The phone's own files live under /phone; the manifest and service worker are served at the root for their scope.
+    const own = pathname === "/sw.js" || pathname === "/manifest.webmanifest";
+    const root = realpathSync(own || pathname.startsWith("/phone/") ? this.options.staticRoot : this.options.rendererRoot);
+    const relative = decodeURIComponent(own ? pathname : pathname.startsWith("/phone/") ? pathname.slice("/phone".length) : pathname).replace(/^\/+/, "");
     const path = resolve(root, relative);
-    if (!(path === root || path.startsWith(root + sep)) || !existsSync(path) || !statSync(path).isFile()
-        || !realpathSync(path).startsWith(root + sep)) return send(response, 404, { error: "Not found" });
+    if (!path.startsWith(root + sep) || !existsSync(path) || !statSync(path).isFile() || !realpathSync(path).startsWith(root + sep)) {
+      return send(response, 404, { error: "Not found" });
+    }
     const type = TYPES[extname(path)] || "application/octet-stream";
-    const hashed = relative.startsWith("assets/");
     response.writeHead(200, { "Content-Type": type,
-      "Cache-Control": hashed ? "public, max-age=31536000, immutable" : "no-cache",
-      ...(type.startsWith("text/html") ? { "Content-Security-Policy": PAGE_POLICY } : {}) });
+      "Cache-Control": relative.startsWith("assets/") ? "public, max-age=31536000, immutable" : "no-cache" });
     response.end(readFileSync(path));
   }
+
+  /** The renderer's page with the phone's bridge loaded first, so `window.astra` exists before the app starts. */
+  private page(response: ServerResponse) {
+    const html = readFileSync(resolve(this.options.rendererRoot, "index.html"), "utf8")
+      .replace(/<meta name="viewport"[^>]*>/, "")
+      .replace("<head>", `<head>${PHONE_HEAD}`);
+    response.writeHead(200, { "Content-Type": TYPES[".html"], "Cache-Control": "no-cache", "Content-Security-Policy": PAGE_POLICY });
+    response.end(html);
+  }
 }
+
+function control(message: PhoneStreamControl) { return `data: ${JSON.stringify(message)}\n\n`; }
 
 function allowedHost(header: string | undefined): boolean {
   if (!header) return false;
@@ -172,11 +218,11 @@ function send(response: ServerResponse, status: number, body: unknown) {
   response.end(JSON.stringify(body));
 }
 
-async function readJson(request: IncomingMessage): Promise<Record<string, unknown>> {
+async function readJson(request: IncomingMessage, limit: number): Promise<Record<string, unknown>> {
   let size = 0; const chunks: Buffer[] = [];
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > BODY_LIMIT) throw new Error("Request too large");
+    if (size > limit) throw new Error("Request too large");
     chunks.push(chunk);
   }
   const value = JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");

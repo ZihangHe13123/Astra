@@ -2,43 +2,20 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { initialSession, type SessionState } from "@astra/ui-core/session-state";
-import { applyStream, emptySessions, parseEventStream, sessionTitle } from "../src/phone/state.js";
+import { parseEventStream } from "../src/phone-protocol.js";
 import { PhoneSettingsView } from "../src/renderer/phone-settings.js";
 import type { PhoneStatus } from "../src/phone-protocol.js";
 
-const session = (id: string, fields: Partial<SessionState> = {}): SessionState => ({ ...initialSession(id, "/work"), status: "ready", ...fields });
 
-test("the stream is read in whatever pieces the network delivers, and heartbeats are skipped", () => {
-  const whole = 'data: {"type":"refresh"}\n\n: ping\n\ndata: {"type":"removed","runtime":"a"}\n\n';
-  let buffer = "", payloads: string[] = [];
-  for (const piece of [whole.slice(0, 7), whole.slice(7, 30), whole.slice(30)]) {
+test("the stream is read in whatever pieces the network delivers, with ids, and heartbeats are skipped", () => {
+  const whole = 'data: {"ready":true,"seq":0}\n\n: ping\n\nid: 7\ndata: {"refresh":true}\n\n';
+  let buffer = "", events: { id?: number; data: string }[] = [];
+  for (const piece of [whole.slice(0, 7), whole.slice(7, 40), whole.slice(40)]) {
     const parsed = parseEventStream(buffer + piece);
-    buffer = parsed.rest; payloads = [...payloads, ...parsed.payloads];
+    buffer = parsed.rest; events = [...events, ...parsed.events];
   }
-  assert.deepEqual(payloads.map(text => JSON.parse(text).type), ["refresh", "removed"]);
+  assert.deepEqual(events, [{ data: '{"ready":true,"seq":0}' }, { id: 7, data: '{"refresh":true}' }]);
   assert.equal(buffer, "");
-});
-
-test("the phone keeps the window's rules: a snapshot, newer revisions only, and a fresh snapshot for a session it lacks", () => {
-  let state = applyStream(emptySessions, { type: "hello", sessions: [session("a", { revision: 5 }), session("b")], active: "b" });
-  assert.deepEqual(state.order, ["a", "b"]);
-  state = applyStream(state, { type: "event", runtime: "a", revision: 4, event: { type: "chunk", content: "旧" } as any });
-  assert.equal(state.sessions.a.messages.length, 0, "an older revision is not applied");
-  state = applyStream(state, { type: "event", runtime: "a", revision: 6, event: { type: "chunk", content: "新" } as any });
-  assert.equal(state.sessions.a.messages[0].content, "新");
-  state = applyStream(state, { type: "removed", runtime: "b" });
-  assert.deepEqual([state.order, state.active], [["a"], ""]);
-  state = applyStream(state, { type: "event", runtime: "c", revision: 1, event: { type: "chunk", content: "x" } as any });
-  assert.equal(state.stale, true);
-  state = applyStream(state, { type: "hello", sessions: [session("c")], active: "c" });
-  assert.equal(state.stale, false);
-});
-
-test("a session is named after its first request, as the window has its own titles", () => {
-  assert.equal(sessionTitle(session("a", { messages: [{ id: "1", role: "assistant", content: "你好" }, { id: "2", role: "user", content: "  帮我\n检查 CI  " }] })), "帮我 检查 CI");
-  assert.equal(sessionTitle(session("a", { messages: [{ id: "1", role: "user", content: "很".repeat(60) }] })).length, 40);
-  assert.equal(sessionTitle(session("a", { isDraft: true })), "新会话");
 });
 
 test("settings show what the desktop reports: the switch, the serve command, the code and the paired phones", () => {

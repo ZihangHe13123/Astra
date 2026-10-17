@@ -1,11 +1,12 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, net, protocol, shell, Tray } from "electron";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync, existsSync, realpathSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, realpathSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { homedir } from "node:os";
 import type { DesktopEvent, Preferences } from "../bridge.js";
+import type { SessionState } from "@astra/ui-core/session-state";
 import { Runtime } from "./runtime.js";
 import { QueryClient } from "./query-client.js";
 import { sessionAction } from "./session-actions.js";
@@ -20,7 +21,7 @@ import { checkedCommand, checkedPreferences, checkedString, externalURL, inside 
 import { captureHostResponse, cardFrameResponse, guardCardFrames } from "./card-frame.js";
 import { PageSnapshots } from "./page-snapshot.js";
 import { CARD_THEME_COLORS, checkedCardTheme } from "../card-theme.js";
-import type { PhoneStatus } from "../phone-protocol.js";
+import { SHARED_PREFERENCE_KEYS, type PhoneInvokeMethod, type PhoneStatus } from "../phone-protocol.js";
 import { PhoneDevices } from "./phone-devices.js";
 import { PhoneGateway } from "./phone-gateway.js";
 import { tailscaleName } from "./phone-tailscale.js";
@@ -74,9 +75,8 @@ let queued: DesktopEvent[] = [];
 let flushTimer: ReturnType<typeof setTimeout> | undefined;
 // Paired phones follow the same sessions as the window (specs/phone-companion.md, phase 1: read-only).
 const phoneDevices = new PhoneDevices(join(gui, "phone-devices.json"));
-const phone = new PhoneGateway(phoneDevices, { staticRoot: join(__dirname, "phone"),
-  snapshot: () => ({ sessions: [...runtimes.values()].map(r => r.state), active }),
-  port: Number(process.env.ASTRA_PHONE_PORT || 8930) });
+const phone = new PhoneGateway(phoneDevices, { staticRoot: join(__dirname, "phone"), rendererRoot: join(__dirname, "renderer"),
+  invoke: (device, method, args) => phoneInvoke(device, method, args), port: Number(process.env.ASTRA_PHONE_PORT || 8930) });
 let phoneError = "";
 let phoneHost: { name?: string; at: number } = { at: 0 };
 async function syncPhone() {
@@ -133,7 +133,8 @@ ipcMain.on("astra:flushPreferences", (event, value) => {
   catch (error) { event.returnValue = String(error); }
 });
 register("bootstrap", () => ({ sessions: [...runtimes.values()].map(r => r.state), active, workspace, preferences, appshot: { connection: appshot.client.state.connection, enabled: appshot.client.state.enabled } }));
-register("create", (options: { session?: string; mode?: string; workspace?: string } = {}) => {
+/** Opens a session or a fresh draft. The window's call selects it; a phone's call leaves the window's selection alone. */
+function openSession(options: { session?: string; mode?: string; workspace?: string } = {}, select = true): SessionState {
   if (!options || typeof options !== "object") throw new Error("Invalid session options");
   const mode = options.mode || "work";
   if (!["work", "local", "minimal", "bar"].includes(mode)) throw new Error("Unknown mode");
@@ -144,7 +145,7 @@ register("create", (options: { session?: string; mode?: string; workspace?: stri
     const draft = [...runtimes.values()].find(r => r.state.isDraft && r.state.mode === mode
       && r.workspace === work && r.state.status !== "disconnected" && !r.isClosing && !r.state.busy
       && !r.state.approvals.length && !r.state.questions.length);
-    if (draft) { active = draft.id; appshot.update(); return draft.state; }
+    if (draft) { if (select) { active = draft.id; appshot.update(); } return draft.state; }
   }
   const name = options.session || `session_${new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14)}_${randomUUID().slice(0, 8)}`;
   if (!/^[\p{L}\p{N}_.-]+$/u.test(name) || [".", ".."].includes(name) || name.length > 200) throw new Error("Invalid session name");
@@ -152,7 +153,8 @@ register("create", (options: { session?: string; mode?: string; workspace?: stri
   const existing = [...runtimes.values()].find(r => r.state.session === name && r.state.mode === mode && r.state.status !== "disconnected");
   if (existing) {
     if (existing.isClosing) throw new Error("会话正在关闭，请稍后再打开。");
-    active = existing.id; return existing.state;
+    if (select) active = existing.id;
+    return existing.state;
   }
   const rt = new Runtime(root, python, work, mode === "work" ? name : `gui_${randomUUID().replaceAll("-", "")}`, mode,
     (r, event) => { broadcast({ runtime: r.id, revision: r.state.revision, event }); appshot.handle(r.id, event);
@@ -162,9 +164,11 @@ register("create", (options: { session?: string; mode?: string; workspace?: stri
   // The backend reads what it is allowed to on its own; the page it names is only drawn here, in isolation.
   rt.pageSnapshot = path => snapshots.capture(path);
   rt.state.isDraft = !options.session && mode === "work";
-  runtimes.set(rt.id, rt); active = rt.id; appshot.update();
+  runtimes.set(rt.id, rt);
+  if (select) { active = rt.id; appshot.update(); }
   return rt.state;
-});
+}
+register("create", (options: { session?: string; mode?: string; workspace?: string } = {}) => openSession(options));
 register("select", id => { active = id === "" ? "" : runtime(id).id; appshot.update(); });
 function forgetRuntime(rt: Runtime) {
   for (const [key, controller] of previewRequests) if (key.startsWith(`${rt.id}:`)) { controller.abort(); previewRequests.delete(key); }
@@ -173,11 +177,12 @@ function forgetRuntime(rt: Runtime) {
   appshot.forget(rt.id);
   broadcast({ removed: rt.id });
 }
-register("close", async id => {
+async function closeSession(id: unknown) {
   const rt = runtime(id);
   if (hasOngoingWork(rt.state)) throw new Error("该会话仍有任务或提醒，请先停止后再关闭。");
   await rt.close(); forgetRuntime(rt);
-});
+}
+register("close", closeSession);
 register("send", async (id, value) => {
   const rt = runtime(id); const command = checkedCommand(value);
   if (command.type === "image") authorizedFile(id, command.path);
@@ -199,13 +204,14 @@ register("appshot", async (id, action, value = "") => {
     else rt.accept({ type: "gui_notice", message: "没有待确认的 Appshot 请求。" });
   } else rt.accept({ type: "gui_notice", message: await appshot.command(rt.id, value) });
 });
-register("query", (method, params = {}, id) => {
+function runQuery(method: any, params: any = {}, id?: unknown) {
   if (!["sessions", "history", "commands", "changes", "request_timeline", "session_log"].includes(method)) throw new Error("Unsupported query");
   if (!params || typeof params !== "object" || Array.isArray(params) || JSON.stringify(params).length > 32768) throw new Error("Invalid query");
   return method === "changes" ? runtime(id).query(method, params) : queries.query(method, params);
-});
+}
+register("query", runQuery);
 const sessionOperations = new Set<string>();
-register("sessionAction", async (action, entry) => {
+async function runSessionAction(action: any, entry: any) {
   if (!["export", "delete"].includes(action) || !entry || typeof entry !== "object") throw new Error("Invalid session action");
   const name = checkedString(entry.name, "session", 200);
   const mode = checkedString(entry.mode, "mode", 20);
@@ -235,7 +241,33 @@ register("sessionAction", async (action, entry) => {
     savePreferences(); broadcast({ refresh: true });
     return result;
   } finally { sessionOperations.delete(key); }
-});
+}
+register("sessionAction", runSessionAction);
+const phoneAuditPath = join(gui, "phone-audit.jsonl");
+/** What a paired phone did, for the user to read later; message text is not kept, only its length. */
+function phoneAudit(device: string, entry: Record<string, unknown>) {
+  try { appendFileSync(phoneAuditPath, `${JSON.stringify({ at: new Date().toISOString(), device, ...entry })}\n`, { mode: 0o600 }); }
+  catch (error) { console.error("Astra phone audit:", error); }
+}
+/** A paired phone's calls (specs/phone-companion.md). The phone runs this renderer; Mac-only calls are answered on the phone. */
+async function phoneInvoke(device: string, method: PhoneInvokeMethod, args: any[]) {
+  if (quitting || leaseLost) throw new Error("应用正在退出，请稍候。");
+  if (method === "bootstrap") return { sessions: [...runtimes.values()].map(r => r.state), active: "", workspace,
+    preferences: Object.fromEntries(SHARED_PREFERENCE_KEYS.map(key => [key, preferences[key]])),
+    appshot: { connection: "disconnected", enabled: false } };
+  if (method === "create") return openSession(args[0] ?? {}, false);
+  if (method === "query") return runQuery(args[0], args[1], args[2]);
+  if (method === "close") { phoneAudit(device, { method, runtime: String(args[0]) }); return closeSession(args[0]); }
+  if (method === "deleteSession") { phoneAudit(device, { method, session: args[0]?.name, mode: args[0]?.mode }); return runSessionAction("delete", args[0]); }
+  const rt = runtime(args[0]); const command = checkedCommand(args[1]);
+  phoneAudit(device, { method, runtime: rt.id, type: command.type,
+    ...(command.type === "message" ? { chars: String(command.text).length } : {}),
+    ...(command.type === "command" ? { cmd: String(command.cmd).slice(0, 200) } : {}),
+    ...(command.type === "tool_approval_response" ? { request: command.request_id, decision: command.decision } : {}),
+    ...(command.type.startsWith("user_question") ? { request: command.request_id } : {}) });
+  if (command.type === "image") authorizedFile(rt.id, command.path);
+  await rt.send(command as any);
+}
 register("phone", async (action, value) => {
   if (action === "enable" || action === "disable") { phoneDevices.setEnabled(action === "enable"); await syncPhone(); }
   else if (action === "pair") { if (!phoneDevices.enabled) throw new Error("先打开“允许手机连接”。"); phoneDevices.startPairing(); }

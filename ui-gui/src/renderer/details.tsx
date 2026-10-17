@@ -96,7 +96,7 @@ export function Details({ state, changeTarget, panel, setPanel, selection, width
           <section><h4>修改前 · {changes.sides.before_state}</h4><pre>{changes.sides.before ?? (changes.sides.before_state === "absent" ? "文件不存在" : "无可用快照")}</pre></section><section><h4>修改后 · {changes.sides.after_state}</h4><pre>{changes.sides.after ?? (changes.sides.after_state === "absent" ? "文件不存在" : "无可用快照")}</pre></section></>}
           {changes.sides.truncated && <p className="muted small">较大快照仅显示开头；增减行数仍取自原始账本。</p>}</div></>}
       </> : panel === "files" ? <>
-        <h3>文件与图片</h3><div className="actions"><button onClick={() => { void window.astra.choose("files").then(paths => { if (paths[0]) openFile(paths[0]); }).catch(fail); }}>选择文件预览</button></div>
+        <h3>文件与图片</h3>{!window.astra.remote && <div className="actions"><button onClick={() => { void window.astra.choose("files").then(paths => { if (paths[0]) openFile(paths[0]); }).catch(fail); }}>选择文件预览</button></div>}
         {artifacts.map(path => <button className="file-row" key={path} onClick={() => openFile(path)}><FolderOpen size={15}/><span>{path.split(/[\\/]/).pop()}</span></button>)}
         {galleries.map(g => <section key={g.index} className="gallery" data-result-index={g.index}><h4>搜图 · 工具结果 {g.index}</h4>{g.images.slice(0, 10).map((image: UIEvent, i: number) => <article key={image.id || i}>
           {/^https:\/\//.test(image.image_url) && <img loading="lazy" src={image.image_url} alt={image.title || "搜索结果"}/>}
