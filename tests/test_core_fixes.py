@@ -3236,10 +3236,10 @@ def test_prompt_profiles_keep_lyra_style_inside_agent_contract():
         DEFAULT_PROMPT_PROFILE,
         DEFAULT_SYSTEM_PROMPT,
         get_prompt_profile,
-        prompt_profiles,
+        selectable_prompt_profiles,
     )
 
-    profiles = prompt_profiles()
+    profiles = selectable_prompt_profiles()
     assert set(profiles) == {"lyra"}
     prompt = get_prompt_profile("lyra").system_prompt()
     assert DEFAULT_SYSTEM_PROMPT == prompt

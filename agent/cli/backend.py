@@ -208,7 +208,7 @@ from agent.channels.approvals import await_chat_approval
 from agent.cli.channel_models import ChannelModels
 from agent.cli.weixin_commands import WeixinCommands, is_weixin_command
 from agent.channels.tools import register_channel_tools
-from agent.runtime.prompts import get_prompt_profile, prompt_profiles
+from agent.runtime.prompts import get_prompt_profile, selectable_prompt_profiles
 from agent.cli.sessions import (
     SessionNameError,
     bar_session_exists,
@@ -2105,7 +2105,7 @@ async def _main(startup_started: float):
         pct = (used / limit * 100) if limit > 0 else 0.0
         personas = [
             {"name": profile.name, "description": profile.description}
-            for profile in prompt_profiles().values()
+            for profile in selectable_prompt_profiles().values()
         ]
         _send({"type": "model_info", "model": agent.llm.config.model,
                "model_key": current_model_key,
@@ -4490,7 +4490,7 @@ async def _main(startup_started: float):
                     _send({"type": "tool_result", "name": "search", "output": output, "error": error, "code": ""})
                     _send({"type": "done"})
                 elif c.startswith("/persona"):
-                    profiles = prompt_profiles()
+                    profiles = selectable_prompt_profiles()
                     parts = c.split(maxsplit=2)
                     arg = parts[1] if len(parts) > 1 else ""
                     if arg:

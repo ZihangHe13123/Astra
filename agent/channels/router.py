@@ -7,11 +7,13 @@ import contextvars
 import hashlib
 import logging
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 from pathlib import Path
 
 from agent.core.msg import ContentBlock, Msg
 from agent.runtime.prompt_budget import prompt_token_budget
+from agent.runtime.prompts import channel_prompt_profile
 from agent.runtime.context import AgentContext
 from agent.runtime.context_compressor import ContextCompressor
 
@@ -93,8 +95,23 @@ class AgentChannelRouter:
         context.compressor = ContextCompressor(self.agent.llm)
         context.set_session(str(self.session_root / f"{session_name}.json"))
         context.load()
+        self._use_channel_persona(context, channel)
         self._contexts[session_name] = context
         return context
+
+    def _use_channel_persona(self, context: AgentContext, channel: str) -> None:
+        """A channel's own version of the selected persona, when there is one (WeChat: tone, no actions).
+
+        A conversation still on another persona switches when it is opened: its system prompt is
+        rebuilt once and later turns keep that prefix. One already on the version is left as it is.
+        """
+        template = self._template
+        profile = channel_prompt_profile(template.persona_id, channel)
+        if profile is None or (context.persona_id, context.persona_definition_version) == (profile.name, profile.version):
+            return
+        state = replace(profile.default_state(), relationship_context=template.persona_relationship_context,
+                        affect=template.persona_affect)
+        context.set_persona(state, profile.system_prompt(state))
 
     async def handle(
         self,

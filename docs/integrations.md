@@ -108,6 +108,11 @@ in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on`,
   short messages the way people text (at most `max_bubbles`; `chat_bubbles:
   false` sends whole replies split only at `max_output_chars`), with a pause
   before each, and WeChat shows "typing…" from the message until the last reply.
+  A persona may have a WeChat version, written for chat (tone rather than
+  described actions); WeChat conversations then use it instead of the persona
+  itself. It is not offered as a persona of its own. A conversation that was
+  on another persona switches when it is next opened, which rebuilds its
+  system prompt once.
 - **Which model.** WeChat follows the default model: the one last chosen with
   `/model` in any window, read for each message. `/weixin model <key>` (a key
   from `/model`, such as `deepseek::deepseek-flash`, or Settings → WeChat →

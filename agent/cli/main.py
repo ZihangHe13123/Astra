@@ -81,7 +81,7 @@ from .learning_commands import execute_learning_command
 from .conversation_commands import register_conversation_tools
 from ..runtime.command_workflows import workflow_message, raw_command as normalize_direct_command
 from ..runtime.tools.conclave import register_conclave_tools
-from ..runtime.prompts import get_prompt_profile, prompt_profiles
+from ..runtime.prompts import get_prompt_profile, selectable_prompt_profiles
 from .render import render_text, render_tool_block, StreamRenderer, ReasoningRenderer, render_status_bar
 from .search_preferences import SEARCH_PROVIDERS, resolve_startup_search_provider, save_selected_search_provider
 
@@ -510,7 +510,7 @@ async def handle_slash(cmd: str, agent: ReActAgent) -> Msg | None:
             print()
 
     elif command == "/persona":
-        profiles = prompt_profiles()
+        profiles = selectable_prompt_profiles()
         if arg:
             if arg in profiles:
                 profile = get_prompt_profile(arg)

@@ -2,7 +2,8 @@
   "source_commit": "ab72bfd4d1df1baabcc70897d11318215d369bd4",
   "core_sha256": "9b247e6a76d48c070ae66e7fb519c2d3b17e1898fd81ef6edb6cd64eade8edf6",
   "profile_sha256": {
-    "lyra": "312dd0fcc5c92198edf36349b6d99ea2b89720f19df20fda45d5a17695199114"
+    "lyra": "312dd0fcc5c92198edf36349b6d99ea2b89720f19df20fda45d5a17695199114",
+    "lyra-weixin": "ca8827b822a71233abca1d3d2b7a396fa3463453987ee347139f29dcbf272daa"
   },
   "learning_contract_update": "2026-09-13: direct skill saving and manual review; persona text unchanged",
   "history_retrieval_update": "2026-09-13: model-initiated local history lookup; persona text unchanged",
