@@ -454,3 +454,25 @@ def test_speech_plays_where_the_desktop_routes_it(tmp_path, endpoint):
     local, phone = asyncio.run(scenario())
     assert [player.heard for player in local] == ["电脑上读。", "又回到电脑。"]
     assert [player.heard for player in phone] == ["手机上读。"]
+
+
+def test_a_whole_text_is_synthesized_to_send_whether_or_not_replies_are_spoken(tmp_path, endpoint):
+    from agent.speech.provider import SpeechError
+
+    async def scenario():
+        service, players, _ = make(tmp_path, enabled=False, base_url=endpoint.url, model="speech-model")
+        try:
+            pcm, rate = await service.synthesize("收到了吗")
+        finally:
+            await service.close()
+        assert pcm.decode("utf-16-le") == "收到了吗" and rate == service.settings.sample_rate
+        assert players == [], "a synthesized note is sent, not played"
+
+        unset, _, _ = make(tmp_path)
+        try:
+            with pytest.raises(SpeechError):
+                await unset.synthesize("你好")
+        finally:
+            await unset.close()
+
+    asyncio.run(scenario())

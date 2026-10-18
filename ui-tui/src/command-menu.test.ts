@@ -24,6 +24,11 @@ assert.deepEqual(
   slashCommandSuggestions("/computer ").map((item) => item.command),
   ["status", "setup", "stop"],
 );
+assert.deepEqual(
+  slashCommandSuggestions("/weixin ").map((item) => item.command),
+  ["status", "login", "on", "off", "logout"],
+);
+assert.equal(completeSlashCommand("/weixin lo", 0), "/weixin login");
 assert.equal(completeSlashCommand("/computer se", 0), "/computer setup");
 assert.deepEqual(resolveSlashCommandSubmission("/computer ", 0), { kind: "submit", value: "/computer status" });
 assert.deepEqual(resolveSlashCommandSubmission("/computer se", 0), { kind: "submit", value: "/computer setup" });

@@ -14,6 +14,7 @@ from agent.runtime.context import AgentContext
 from agent.runtime.context_compressor import ContextCompressor
 
 from .base import ChannelMessage, ReplySink
+from .weixin import CHAT_STYLE as WEIXIN_CHAT_STYLE
 
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,15 @@ active_channel: contextvars.ContextVar[str] = contextvars.ContextVar(
 active_channel_message: contextvars.ContextVar[ChannelMessage | None] = (
     contextvars.ContextVar("astra_active_channel_message", default=None)
 )
+# What a channel turn sent besides text ("file", "voice"). A list the turn's tools append to,
+# since a tool may run in a task of its own, where setting a variable would not reach the turn.
+channel_turn_media: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "astra_channel_turn_media", default=None,
+)
+
+
+# How to talk on a channel, added to the system prompt of its conversations only.
+CHANNEL_STYLES = {"weixin": WEIXIN_CHAT_STYLE}
 
 
 def channel_session_name(message: ChannelMessage) -> str:
@@ -45,7 +55,7 @@ class AgentChannelRouter:
         self._contexts: dict[str, AgentContext] = {}
         self._template = agent.context
 
-    def _context(self, session_name: str) -> AgentContext:
+    def _context(self, session_name: str, channel: str = "") -> AgentContext:
         cached = self._contexts.get(session_name)
         if cached is not None:
             return cached
@@ -62,7 +72,9 @@ class AgentChannelRouter:
         context.persona_active_mode = template.persona_active_mode
         context.persona_relationship_context = template.persona_relationship_context
         context.persona_affect = template.persona_affect
-        context.set_stable_system_suffix(getattr(template, "_stable_system_suffix", ""))
+        suffix = getattr(template, "_stable_system_suffix", "")
+        style = CHANNEL_STYLES.get(channel, "")
+        context.set_stable_system_suffix(f"{suffix}\n\n{style}".strip() if style else suffix)
         context.set_tools_token_cost(getattr(template, "_tools_token_cost", 0))
         context.compressor = ContextCompressor(self.agent.llm)
         context.set_session(str(self.session_root / f"{session_name}.json"))
@@ -82,10 +94,12 @@ class AgentChannelRouter:
             if not self.admission():
                 return "Astra is preparing a restart. Please retry after it reconnects."
             previous = self.agent.context
-            context = self._context(session_name)
+            context = self._context(session_name, message.channel)
             self.agent.context = context
             token = active_channel.set(message.channel)
             message_token = active_channel_message.set(message)
+            media: list[str] = []
+            media_token = channel_turn_media.set(media)
             try:
                 content = message.text
                 if message.is_group and message.sender_name:
@@ -132,9 +146,11 @@ class AgentChannelRouter:
                         phase_chunks.append(chunk)
                 await flush_phase()
                 context.save()
-                response = "".join(chunks).strip() or "(no response)"
+                # A turn that answered with a voice note or a file alone has said what it had to.
+                response = "".join(chunks).strip() or ("" if media else "(no response)")
                 return "" if reply_sink is not None and chunks else response
             finally:
+                channel_turn_media.reset(media_token)
                 active_channel_message.reset(message_token)
                 active_channel.reset(token)
                 self.agent.context = previous

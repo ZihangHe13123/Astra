@@ -10,7 +10,7 @@ import type { AppshotManifestReader } from "./appshot-input.js";
 import type { GenerationProgress, GenerationStats, InputSubmission, LocalModeDefinition } from "./types.js";
 import { generationProgressLabel } from "./generation-progress.js";
 import { preparationLabel, reduceToolPreparation, type ToolPreparation } from "@astra/ui-core/tool-preparation";
-import { COMPACTION_LABEL, compactionNotice } from "./context-compaction.js";
+import { COMPACTION_LABEL, compactionNotice } from "@astra/ui-core/context-compaction";
 import { TurnChangesRenderGate } from "./turn-changes.js";
 import { turnChangesCard } from "./turn-changes-card.js";
 import { describeTool } from "@astra/ui-core/tool-activity";
@@ -1369,6 +1369,12 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         // Only the answer to a /memory consolidation command carries text; other statuses are quiet.
         if (event.message) addMessage("system", event.message);
         if (event.error) addMessage("error", event.error);
+        break;
+      case "weixin_status":
+        // The login code is drawn once, when it is handed out (a code block keeps its spaces); later statuses say what changed.
+        if (event.message && event.login === "scan" && event.qr?.text) addMessage("system", `${event.message}\n\n\`\`\`\n${event.qr.text}\n\`\`\``);
+        else if (event.message) addMessage("system", event.message);
+        if (event.error) addMessage("error", `微信：${event.error}`);
         break;
       case "yolo_status":
         setYolo(event.yolo);

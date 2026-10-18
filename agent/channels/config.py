@@ -105,16 +105,76 @@ class OneBotConfig:
 
 
 @dataclass(frozen=True)
+class WeixinConfig:
+    """WeChat through Tencent's iLink Bot API (see :mod:`agent.channels.weixin`).
+
+    ``allow_users`` empty means only the WeChat user who scanned the login code.
+    """
+
+    enabled: bool = False
+    allow_users: tuple[str, ...] = ()
+    max_input_chars: int = 8_000
+    max_output_chars: int = 1_800
+    max_images: int = 4
+    max_image_bytes: int = 10 * 1024 * 1024
+    keep_awake: bool = True
+    # Send a reply as several short messages, the way people text (see weixin.chat_bubbles).
+    chat_bubbles: bool = True
+    max_bubbles: int = 8
+    # channel_send_file: on, to the person who scanned the code (or file_allow_users), from these roots.
+    send_files_enabled: bool = True
+    file_allow_users: tuple[str, ...] = ()
+    send_file_roots: tuple[str, ...] = (str(Path.home()),)
+    max_send_file_bytes: int = 50 * 1024 * 1024
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "WeixinConfig":
+        # 0 is a valid image limit (text only), so only a missing value takes the default.
+        images = data.get("max_images")
+        return cls(
+            enabled=_bool(data.get("enabled")),
+            allow_users=_items(data.get("allow_users")),
+            max_input_chars=max(1, int(data.get("max_input_chars") or 8_000)),
+            max_output_chars=max(100, min(2_000, int(data.get("max_output_chars") or 1_800))),
+            max_images=max(0, min(8, int(4 if images is None else images))),
+            max_image_bytes=max(1024, int(data.get("max_image_bytes") or 10 * 1024 * 1024)),
+            keep_awake=_bool(data.get("keep_awake"), True),
+            chat_bubbles=_bool(data.get("chat_bubbles"), True),
+            max_bubbles=max(1, min(20, int(data.get("max_bubbles") or 8))),
+            send_files_enabled=_bool(data.get("send_files_enabled"), True),
+            file_allow_users=_items(data.get("file_allow_users")),
+            send_file_roots=_items(data.get("send_file_roots"), (str(Path.home()),)),
+            max_send_file_bytes=max(1024, int(data.get("max_send_file_bytes") or 50 * 1024 * 1024)),
+        )
+
+
+@dataclass(frozen=True)
 class ChannelsConfig:
     onebot: OneBotConfig = field(default_factory=OneBotConfig)
+    weixin: WeixinConfig = field(default_factory=WeixinConfig)
 
     @property
     def enabled(self) -> bool:
-        return self.onebot.enabled
+        return self.onebot.enabled or self.weixin.enabled
+
+
+def channels_config_path(path: str | Path | None = None) -> Path:
+    return Path(path or os.getenv("ASTRA_CHANNEL_CONFIG", "") or DEFAULT_CONFIG_PATH)
+
+
+def set_channel_enabled(section: str, enabled: bool, path: str | Path | None = None) -> Path:
+    """Switch one channel in the config file, keeping everything else in it."""
+    from agent.runtime.json_preferences import update_preferences
+
+    def change(data: dict) -> None:
+        current = data.get(section)
+        data[section] = {**(current if isinstance(current, dict) else {}), "enabled": enabled}
+
+    return update_preferences(channels_config_path(path), change)
 
 
 def load_channels_config(path: str | Path | None = None) -> ChannelsConfig:
-    source = Path(path or os.getenv("ASTRA_CHANNEL_CONFIG", "") or DEFAULT_CONFIG_PATH)
+    source = channels_config_path(path)
     data: dict[str, Any] = {}
     if source.exists():
         try:
@@ -129,4 +189,7 @@ def load_channels_config(path: str | Path | None = None) -> ChannelsConfig:
     if "ASTRA_QQ_ENABLED" in os.environ:
         onebot_data = dict(onebot_data)
         onebot_data["enabled"] = os.environ["ASTRA_QQ_ENABLED"]
-    return ChannelsConfig(onebot=OneBotConfig.from_dict(onebot_data))
+    weixin_data = data.get("weixin") or {}
+    if not isinstance(weixin_data, dict):
+        weixin_data = {}
+    return ChannelsConfig(onebot=OneBotConfig.from_dict(onebot_data), weixin=WeixinConfig.from_dict(weixin_data))

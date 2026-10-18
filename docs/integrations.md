@@ -72,13 +72,61 @@ passed to vision-capable models as native multimodal content. Local file sending
 is deliberately more restrictive: enable `send_files_enabled`, list trusted
 sender QQ IDs in `file_allow_users` (or `allow_users`), and restrict
 `send_file_roots` to output directories that are safe to share. The
-`channel_send_file` tool rejects paths outside those roots and common credential
-files even when requested by the model.
+`channel_send_file` tool rejects paths outside those roots, hidden files and
+folders, application data and common credential files even when requested by
+the model.
 
-The channel contract is protocol-neutral so a Weixin iLink adapter can join the
-same manager without changing Agent routing or session isolation. The first
-native release intentionally implements QQ/OneBot only; it does not silently
-take over the existing Hermes Weixin login.
+### WeChat
+
+WeChat uses Tencent's iLink Bot API: Astra logs in once with a QR code scanned
+in WeChat, then long-polls for messages over HTTPS. It does not drive the WeChat
+desktop client and needs no screen, so it keeps answering with the display off
+or the screen locked, as long as the computer does not sleep.
+
+Run `/weixin login` (or Settings → WeChat → Scan to log in) and scan the code
+with WeChat. The terminal draws the code for a dark background; the desktop
+shows it as an image. The QR code needs the `segno` package
+(`pip install 'segno>=1.6,<2'`, or the `weixin` extra, which also brings the
+`cryptography` used to read images). A successful login sets `weixin.enabled`
+in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on` and
+`/weixin logout` manage it afterwards.
+
+- **Who is answered.** Only the WeChat user who scanned the code, unless
+  `weixin.allow_users` lists others. Group messages are ignored.
+- **One poller.** Every Astra backend may run the channel, but only one polls a
+  login at a time; the others wait and take over when it exits.
+- **Sleep.** While a backend polls, it keeps the computer from idle sleep:
+  `caffeinate -i` on macOS (released when the backend exits), an execution
+  state on Windows, `systemd-inhibit` on Linux. The display still turns off.
+  A closed MacBook lid still sleeps unless an external display and power are
+  connected. Set `weixin.keep_awake` to `false` to leave sleep alone.
+- **What arrives.** Text, quoted messages, WeChat's own transcript of a voice
+  message, and up to `max_images` images (decrypted from WeChat's CDN). Files and
+  videos arrive as a placeholder.
+- **How it answers.** WeChat conversations are told to talk like a chat: short,
+  casual, no Markdown, one thought per message. A reply goes out as several
+  short messages the way people text (at most `max_bubbles`; `chat_bubbles:
+  false` sends whole replies split only at `max_output_chars`), with a pause
+  before each, and WeChat shows "typing…" from the message until the last reply.
+- **Files.** When asked, Astra sends a local file with `channel_send_file`: an
+  image or a video arrives as one, anything else as a file. Only the person who
+  scanned the code receives files (or `weixin.file_allow_users`), only from
+  `weixin.send_file_roots` (default: the home folder), at most
+  `max_send_file_bytes`; hidden files and folders (including Astra's own
+  `.astra`), application data (`Library`, `AppData`) and credential files are
+  always refused. `send_files_enabled: false` turns it off.
+- **Voice notes.** When asked to speak, Astra calls `channel_send_file` with
+  `speak` instead of `path`: the words are spoken in the voice set up for spoken
+  replies ([voice](voice.md)) and sent as an audio file the phone plays with a
+  tap (M4A on macOS, WAV elsewhere); short text may go with it. iLink accepts a
+  bot's native voice message but does not deliver it, so WeChat shows a file
+  rather than a voice bubble.
+- **Privacy.** The bot token lives in the state directory's
+  `channels/weixin/account.json`, readable by the owner only, and never appears
+  in events or logs. Another program that polls the same login (for example
+  Hermes) would compete for messages; log in separately.
+
+Protocol details follow Hermes Agent's adapter (MIT License, Nous Research).
 
 ## MCP
 

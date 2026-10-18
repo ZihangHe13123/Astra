@@ -204,6 +204,7 @@ from agent.runtime.command_workflows import workflow_message, raw_command as nor
 from agent.channels import ChannelManager, load_channels_config
 from agent.channels.manager import is_address_in_use
 from agent.channels.router import AgentChannelRouter, active_channel
+from agent.cli.weixin_commands import WeixinCommands, is_weixin_command
 from agent.channels.tools import register_channel_tools
 from agent.runtime.prompts import get_prompt_profile, prompt_profiles
 from agent.cli.sessions import (
@@ -442,6 +443,11 @@ def _is_consolidation_command(command: str) -> bool:
     """/memory consolidation changes an installation setting, so like /voice it is answered in every mode,
     during a turn and while a restart drains, with a status instead of a conversation message."""
     return command.lower().split(maxsplit=2)[:2] == ["/memory", "consolidation"]
+
+
+def _is_setting_command(command: str) -> bool:
+    """Installation settings answered with a status in every mode, during a turn and while a restart drains."""
+    return _is_consolidation_command(command) or is_weixin_command(command)
 
 
 def _isolated_mode_blocks_command(
@@ -876,6 +882,8 @@ async def _main(startup_started: float):
     register_channel_tools(
         tools,
         lambda: channel_manager_holder.get("manager"),
+        # A voice note in WeChat speaks with the same voice as spoken replies (set up below).
+        speaker=lambda text: voice.synthesize(text),
     )
     memory_store = MemoryStore()
     skill_store = SkillStore()
@@ -2339,11 +2347,13 @@ async def _main(startup_started: float):
                                         admission=lambda: not restart.draining)
     channel_manager = ChannelManager(load_channels_config(), channel_router.handle)
     channel_manager_holder["manager"] = channel_manager
+    weixin_commands = WeixinCommands(lambda: channel_manager_holder.get("manager"), _send)
     # The QQ reverse-WebSocket port is a process-wide resource, while the CLI
     # backend itself is intentionally multi-instance. If another backend owns
     # the channel, keep this CLI useful and leave only that optional adapter
     # disabled in this process.
     await _start_channel_manager(channel_manager)
+    weixin_commands.send_status()
 
     active_task: asyncio.Task | None = None
     active_task_id = ""
@@ -2663,6 +2673,7 @@ async def _main(startup_started: float):
                 await _peer_tick()
             await _background_tick()
             consolidation.tick(busy=busy)
+            weixin_commands.tick()
             if browser_lifecycle is not None:
                 await _browser_handover_tick()
             await asyncio.sleep(0.25)
@@ -4016,13 +4027,13 @@ async def _main(startup_started: float):
                                "request_id": restart.request_id, "message": str(exc)})
                     continue
                 if (restart.draining and c.split(maxsplit=1)[:1] not in (["/cancel"], ["/yolo"], ["/voice"])
-                        and not _is_consolidation_command(c)):
+                        and not _is_setting_command(c)):
                     _send({"type": "restart_status", "state": restart.state,
                            "request_id": restart.request_id,
                            "message": "Restart is pending; use /restart cancel before changing the session."})
                     continue
                 if (c.lower().split(maxsplit=1)[:1] not in (["/learn"], ["/yolo"], ["/cancel"], ["/voice"])
-                        and not _is_consolidation_command(c)):
+                        and not _is_setting_command(c)):
                     await _cancel_manual_reviews()
                 if c.lower().split(maxsplit=1)[:1] == ["/yolo"]:
                     # A control acknowledgement is not a model/tool completion.
@@ -4054,6 +4065,8 @@ async def _main(startup_started: float):
                     voice.report(force=True, message=message, error=error)
                 elif _is_consolidation_command(c):
                     _consolidation_command(c)
+                elif is_weixin_command(c):
+                    await weixin_commands.handle(c)
                 elif c == "/bar" or c.startswith("/bar "):
                     await _bar_command(c)
                 elif c == "/minimal" or c.startswith("/minimal "):

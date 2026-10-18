@@ -127,9 +127,9 @@
   },
   "channel_send_file": {
     "sha256": [
-      "3f8cae65ed3c2d89"
+      "6c1b63aef636f7bf"
     ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+    "reason": "2026-10-18: speak sends a voice note in WeChat; path optional; also sends files in WeChat (images and videos as such); hidden files, application data and credential files blocked."
   },
   "computer_act": {
     "sha256": [
