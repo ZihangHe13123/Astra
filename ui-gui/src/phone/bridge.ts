@@ -1,5 +1,5 @@
 import type { Bootstrap, DesktopBridge, DesktopEvent, Preferences } from "../bridge.js";
-import { SHARED_PREFERENCE_KEYS, type PhoneInvokeMethod, type PhoneStreamControl } from "../phone-protocol.js";
+import { SHARED_PREFERENCE_KEYS, type PhoneInvokeMethod, type PhoneStreamControl, type PhoneStreamPosition } from "../phone-protocol.js";
 import { PhoneUnpairedError, TokenExpiredError, type PhoneClient, type PhoneDeviceRecord } from "./client.js";
 
 /** What the bridge needs from the phone's browser; tests give it their own. */
@@ -37,7 +37,7 @@ export class RemoteBridge implements DesktopBridge {
   private device?: PhoneDeviceRecord;
   private token?: string;
   private signingIn?: Promise<string>;
-  private seq?: number;
+  private position?: PhoneStreamPosition;
   private handlers = new Set<(events: DesktopEvent[]) => void>();
   private queue: DesktopEvent[] = [];
   private streaming = false;
@@ -86,7 +86,7 @@ export class RemoteBridge implements DesktopBridge {
     while (!this.stopped) {
       this.stream = new AbortController();
       try {
-        await this.env.client.follow(await this.authorize(), this.seq, (data, id) => { this.receive(data, id); delay = 1000; }, this.stream.signal);
+        await this.env.client.follow(await this.authorize(), this.position, (data, id) => { this.receive(data, id); delay = 1000; }, this.stream.signal);
       } catch (error) {
         if (error instanceof TokenExpiredError) this.token = undefined;
       }
@@ -103,12 +103,12 @@ export class RemoteBridge implements DesktopBridge {
     const message = JSON.parse(data) as DesktopEvent | PhoneStreamControl;
     if ("reload" in message) { this.env.reload(); return; }
     if ("ready" in message) {
-      this.seq ??= message.seq;
+      this.position ??= { seq: message.seq, instance: message.instance };
       this.isReady = true;
       for (const resolve of this.readyWaiters.splice(0)) resolve();
       return;
     }
-    if (id !== undefined) this.seq = id;
+    if (id !== undefined && this.position) this.position.seq = id;
     if ("event" in message && message.event?.type === "voice_audio") {
       this.env.voice?.(message.event as { id?: string; at?: number; stop?: boolean }, voice => this.loadVoice(voice));
     }

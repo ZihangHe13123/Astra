@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { extname, resolve, sep } from "node:path";
@@ -52,6 +53,8 @@ export class PhoneGateway {
   private heartbeat?: ReturnType<typeof setInterval>;
   private boundPort = 0;
   private seq = 0;
+  /** Names this run of the gateway: after the desktop restarts, numbers from before mean nothing. */
+  private readonly instance = randomUUID();
   private recent: { seq: number; text: string }[] = [];
   private stopRevoked: () => void;
 
@@ -158,12 +161,14 @@ export class PhoneGateway {
     const after = url.searchParams.has("after") ? Number(url.searchParams.get("after")) : undefined;
     if (after !== undefined && Number.isSafeInteger(after)) {
       const missed = this.recent.filter(item => item.seq > after);
-      const complete = after >= this.seq || (missed.length > 0 && missed[0].seq === after + 1);
+      // A position from another run (or a page from before positions named one) cannot be resumed here.
+      const complete = url.searchParams.get("instance") === this.instance
+        && (after === this.seq || (missed.length > 0 && missed[0].seq === after + 1));
       if (!complete) { this.write(stream, control({ reload: true })); response.end(); return; }
       for (const item of missed) this.write(stream, item.text);
     }
     this.streams.add(stream);
-    this.write(stream, control({ ready: true, seq: this.seq }));
+    this.write(stream, control({ ready: true, seq: this.seq, instance: this.instance }));
   }
 
   private voice(id: string, request: IncomingMessage, response: ServerResponse) {
