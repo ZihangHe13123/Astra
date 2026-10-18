@@ -59,7 +59,7 @@ jobs:
             ui-core/package-lock.json
       - name: Install locked Python dependencies
         # Pyright checks every optional import, so the gate installs the extras that bring one.
-        run: uv sync --locked --extra dev --extra mcp --extra tracing --extra server --extra notebook --extra documents --extra voice
+        run: uv sync --locked --extra dev --extra mcp --extra tracing --extra server --extra notebook --extra documents --extra voice --extra weixin
       - name: Check installed Python dependencies
         run: uv pip check
       - name: Install and build shared UI protocol
