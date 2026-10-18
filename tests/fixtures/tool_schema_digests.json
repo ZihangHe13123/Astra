@@ -289,9 +289,10 @@
   },
   "execute_shell": {
     "sha256": [
-      "870fcda05b1a2916"
+      "870fcda05b1a2916",
+      "99269103f2569f42"
     ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction. Windows hosts add their own text on windows/wsl routing (99269103f2569f42, release gate windows-2025)."
   },
   "fetch_url": {
     "sha256": [
