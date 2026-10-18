@@ -1516,6 +1516,9 @@ class ReActAgent(AgentBase):
             broker.mark_submitted(messages)
         if profiler is not None:
             profiler.set_request(messages, tools, self._active_skill_names)
+        remember = getattr(self.context, "remember_request", None)
+        if remember is not None:
+            remember(kwargs["messages"], tools)
         provider_events = self.llm.chat_stream(**kwargs)
         return filter_message_time_events(stream_with_progress(_stream_with_generation_stats(provider_events)))
 
