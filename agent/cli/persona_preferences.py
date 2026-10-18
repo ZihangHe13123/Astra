@@ -6,7 +6,7 @@ from pathlib import Path
 from agent.runtime.json_preferences import update_preferences
 
 from agent.runtime.persona import PersonaState
-from agent.runtime.prompts import DEFAULT_PROMPT_PROFILE, get_prompt_profile, resolve_prompt_profile_name
+from agent.runtime.prompts import DEFAULT_PROMPT_PROFILE, get_prompt_profile, resolve_selectable_profile_name
 
 from .model_preferences import model_settings_path
 
@@ -23,12 +23,12 @@ def load_selected_persona() -> str | None:
     """Load a valid persisted persona name, ignoring missing/corrupt settings."""
     data = _read_settings(model_settings_path())
     selected = data.get("selected_persona")
-    return resolve_prompt_profile_name(selected) if isinstance(selected, str) else None
+    return resolve_selectable_profile_name(selected) if isinstance(selected, str) else None
 
 
 def save_selected_persona(name: str) -> Path:
     """Atomically persist the selected persona profile for future launches."""
-    resolved = resolve_prompt_profile_name(name)
+    resolved = resolve_selectable_profile_name(name)
     if resolved is None:
         raise ValueError(f"Unknown persona: {name}")
     name = resolved
@@ -43,7 +43,7 @@ def resolve_startup_persona(env_persona: str | None = None) -> str:
     selected = load_selected_persona()
     if selected:
         return selected
-    resolved = resolve_prompt_profile_name(env_persona)
+    resolved = resolve_selectable_profile_name(env_persona)
     if resolved:
         return resolved
     return DEFAULT_PROMPT_PROFILE
@@ -61,7 +61,7 @@ def startup_persona(env_persona: str | None = None) -> tuple[str, str, PersonaSt
     profile = get_prompt_profile(name)
     data = _read_settings(model_settings_path())
     selected = data.get("selected_persona")
-    if isinstance(selected, str) and selected != name and resolve_prompt_profile_name(selected) == name:
+    if isinstance(selected, str) and selected != name and resolve_selectable_profile_name(selected) == name:
         save_selected_persona(name)
         data = _read_settings(model_settings_path())
     revision = data.get("persona_state_revision", 0) if data.get("selected_persona") == name else 0

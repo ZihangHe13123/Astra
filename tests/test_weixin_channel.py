@@ -798,3 +798,42 @@ def test_an_approval_whose_request_could_not_be_sent_still_ends_and_answers_afte
 
     assert asyncio.run(scenario()) == "deny"
     assert calls == ["ask", "end:True"]
+
+
+def test_wechat_conversations_use_the_wechat_version_of_the_persona_and_keep_it(tmp_path, monkeypatch):
+    from agent.cli import persona_preferences
+    from agent.runtime.prompts import prompt_profiles, selectable_prompt_profiles
+
+    variant = next(profile for profile in prompt_profiles().values() if profile.channel == "weixin")
+    persona = prompt_profiles()[variant.name.removesuffix("-weixin")]
+    prompts: dict[str, list[str]] = {"weixin": [], "qq": []}
+
+    class Agent:
+        def __init__(self) -> None:
+            state = persona.default_state()
+            self.context = AgentContext(system_prompt="", max_messages=20, max_prompt_tokens=100_000)
+            self.context.set_persona(state, persona.system_prompt(state))
+            self.llm = object()
+
+        async def reply_stream(self, message):
+            prompts[message.metadata["channel"]].append(self.context.system_prompt)
+            self.context.add_user(message.get_text())
+            self.context.add_assistant("ok")
+            yield {"type": "done", "content": "ok"}
+
+    async def talk(router):
+        await router.handle(ChannelMessage("weixin", OWNER, OWNER, "在吗"))
+        await router.handle(ChannelMessage("qq", "peer", "peer", "hi"))
+
+    window = Agent()
+    asyncio.run(talk(AgentChannelRouter(window, asyncio.Lock(), tmp_path)))
+    # Opened again later (a restart): the conversation is already on the WeChat version and stays byte-identical.
+    asyncio.run(talk(AgentChannelRouter(Agent(), asyncio.Lock(), tmp_path)))
+
+    first, again = prompts["weixin"]
+    assert first == again == variant.system_prompt(variant.default_state())
+    assert prompts["qq"] == [window.context.system_prompt] * 2, "other channels keep the selected persona"
+    assert variant.name not in selectable_prompt_profiles() and persona.name in selectable_prompt_profiles()
+    monkeypatch.setenv("AGENT_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    with pytest.raises(ValueError):
+        persona_preferences.save_selected_persona(variant.name)

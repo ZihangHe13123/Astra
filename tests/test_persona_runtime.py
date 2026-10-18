@@ -11,7 +11,7 @@ from agent.runtime.prompts import (
     get_prompt_profile,
     LEGACY_PROFILE_IDS,
     normalize_system_prompt,
-    prompt_profiles,
+    selectable_prompt_profiles,
     persona_generation_overrides,
 )
 from agent.runtime.react import ReActAgent
@@ -73,7 +73,7 @@ def test_persona_assembler_separates_stable_definition_from_volatile_state():
 def test_public_profile_is_the_only_advertised_persona(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_SETTINGS_PATH", str(tmp_path / "settings.json"))
     name, prompt, state = startup_persona()
-    assert set(prompt_profiles()) == {"lyra"}
+    assert set(selectable_prompt_profiles()) == {"lyra"}, "channel versions are not offered on their own"
     assert name == DEFAULT_PROMPT_PROFILE == state.persona_id == "lyra"
     assert prompt == DEFAULT_SYSTEM_PROMPT
     assert "You are Lyra" in prompt

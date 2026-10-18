@@ -49,6 +49,32 @@ DEFAULT_PERSONA_INVARIANTS = (
 
 LYRA_PRIMARY_IDENTITY = "You are Lyra, the AI assistant in Astra."
 
+LYRA_WEIXIN_PERSONA = """You are Lyra, a capable and approachable AI assistant, talking with the user over WeChat.
+
+This is a chat on a phone, so who you are comes through in how you write:
+
+- Write the way people text: short, natural sentences, one thought per message. Use the user's
+  language; in Chinese, plain spoken Chinese rather than written or formal Chinese.
+- Let tone carry warmth: word choice, sentence length, a light particle where it fits (嗯, 呢,
+  吧) and punctuation. Do not describe actions or expressions: no *smiles*, (nods) or narration
+  about yourself.
+- Stay friendly and composed rather than playful or cute. An emoji now and then is fine when
+  it adds something; no kaomoji, no strings of exclamation marks, no pet names.
+- Notice how the user seems and the time of day. When they are tired or upset, acknowledge it
+  briefly before offering anything practical; when they just want to chat, chat instead of
+  turning it into a task.
+- When asked to do something, do it as carefully as anywhere else, then give the result in a
+  sentence or two, and offer detail instead of sending a long message.
+- Give your own view, and say so plainly when you disagree; do not agree just to be agreeable.
+
+Do not assume the user's name, background, preferences or relationship with you. Personalize
+only from information the user provided or explicitly made available. Never invent shared
+experiences.
+
+Follow the current task's permissions and tool boundaries. A persona changes communication
+style, not authorization, factual standards or completion criteria.
+"""
+
 # Migration identifiers only: these profiles are never listed or loaded as presets.
 LEGACY_PROFILE_IDS = frozenset({
     "lyra-work", "lyra-hermes", "yelan", "lyra-rp", "lyra-close",
@@ -82,6 +108,9 @@ class PromptProfile:
     primary_identity: str = ""
     temperature: float | None = None
     provider_default_temperature: bool = False
+    # A version of the persona named before the last "-" for one messaging channel's
+    # conversations ("weixin"); it is not offered as a persona of its own.
+    channel: str = ""
 
     def definition(self) -> PersonaDefinition:
         if self.persona_layer not in {"style", "mode", "identity"}:
@@ -130,13 +159,24 @@ def prompt_profiles() -> dict[str, PromptProfile]:
             primary_identity=LYRA_PRIMARY_IDENTITY,
             provider_default_temperature=True,
         ),
+        "lyra-weixin": PromptProfile(
+            name="lyra-weixin",
+            description="Lyra on WeChat — the same assistant, written for chat: tone rather than described actions.",
+            persona=LYRA_WEIXIN_PERSONA,
+            version=1,
+            persona_layer="identity",
+            active_mode="chat",
+            primary_identity=LYRA_PRIMARY_IDENTITY,
+            provider_default_temperature=True,
+            channel="weixin",
+        ),
     }
 
 
     for raw in local_persona_config().get("profiles", []):
         allowed = set(PromptProfile.__dataclass_fields__)
         strings = {"name", "description", "persona", "persona_layer", "relationship", "mode_overlay",
-                   "active_mode", "primary_identity"}
+                   "active_mode", "primary_identity", "channel"}
         try:
             if set(raw) - allowed or any(not isinstance(raw.get(key), str) for key in ("name", "description", "persona")):
                 raise ValueError
@@ -172,6 +212,23 @@ def resolve_prompt_profile_name(name: str | None) -> str | None:
     if name in prompt_profiles():
         return name
     return DEFAULT_PROMPT_PROFILE if name in LEGACY_PROFILE_IDS else None
+
+
+def selectable_prompt_profiles() -> dict[str, PromptProfile]:
+    """The personas a person can choose; channel versions follow their persona instead."""
+    return {name: profile for name, profile in prompt_profiles().items() if not profile.channel}
+
+
+def resolve_selectable_profile_name(name: str | None) -> str | None:
+    """Like ``resolve_prompt_profile_name``, without channel versions."""
+    resolved = resolve_prompt_profile_name(name)
+    return resolved if resolved in selectable_prompt_profiles() else None
+
+
+def channel_prompt_profile(persona_id: str | None, channel: str) -> PromptProfile | None:
+    """The version of ``persona_id`` made for ``channel``'s conversations, if it has one."""
+    profile = prompt_profiles().get(f"{persona_id}-{channel}") if persona_id and channel else None
+    return profile if profile is not None and profile.channel == channel else None
 
 
 def get_prompt_profile(name: str | None) -> PromptProfile:
