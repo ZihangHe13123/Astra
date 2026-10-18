@@ -518,10 +518,13 @@ class LLMConfig:
     # OpenAI-compatible servers disagree on this non-OpenAI extension:
     # oMLX uses repetition_penalty, while llama.cpp uses repeat_penalty.
     repetition_penalty_parameter: str | None = None
-    timeout: float = 60.0
+    timeout: float = 600.0
     connect_timeout: float = 30.0
     idle_timeout: float = 120.0
     overall_timeout: float | None = None
+    # A stream's own total deadline; None follows overall_timeout. Remote streams default to
+    # none: idle_timeout ends a stalled one, and a long healthy answer is not cut off.
+    stream_overall_timeout: float | None = None
     max_retries: int = 2
     min_request_interval: float = 0.0
     max_concurrent_requests: int = 1
@@ -580,13 +583,16 @@ class OpenAICompatibleProvider:
         )
         overall_env = os.getenv("LLM_OVERALL_TIMEOUT")
         if overall_env is not None:
+            # An explicit deadline covers every request, streamed or not.
             self.config.overall_timeout = self._timeout_value(
                 overall_env,
                 self.config.overall_timeout or 0,
             )
+            self.config.stream_overall_timeout = self.config.overall_timeout
         elif timeout_env is not None:
             # Explicit legacy LLM_TIMEOUT remains an overall deadline.
             self.config.overall_timeout = self.config.timeout
+            self.config.stream_overall_timeout = self.config.overall_timeout
         elif self.config.overall_timeout is None:
             hostname = (urllib.parse.urlparse(config.base_url).hostname or "").lower()
             self.config.overall_timeout = (
@@ -594,6 +600,8 @@ class OpenAICompatibleProvider:
                 if hostname in {"localhost", "127.0.0.1", "::1"}
                 else self.config.timeout
             )
+            if self.config.stream_overall_timeout is None:
+                self.config.stream_overall_timeout = 0.0
         self._estimate_calibration = 1.0
         if AsyncOpenAI is None:
             raise RuntimeError("openai package is required to create LLMClient")
@@ -942,7 +950,9 @@ class OpenAICompatibleProvider:
         kwargs.update({"stream": True, "stream_options": {"include_usage": True}})
 
         budget = _RequestBudget.from_policy(
-            self.config.overall_timeout,
+            self.config.overall_timeout
+            if self.config.stream_overall_timeout is None
+            else self.config.stream_overall_timeout,
             self.config.max_retries,
         )
         stream = await self._with_retry(
