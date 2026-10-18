@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import queue
 import threading
@@ -33,6 +34,9 @@ class FakeIlink:
         self.timeline: list[tuple[str, object]] = []
         self.upload_requests: list[dict] = []
         self.uploads: dict[str, bytes] = {}
+        # Message ids from a counter: Windows' monotonic clock (Python 3.11) ticks every 15.6 ms, so ids
+        # made from it repeat for messages put back to back, and the adapter drops repeats.
+        self._message_ids = itertools.count(1)
         # Answers the CDN gives uploads before taking one: (status, headers, body).
         self.upload_failures: list[tuple[int, dict[str, str], bytes]] = []
         self.upload_attempts = 0
@@ -143,7 +147,7 @@ class FakeIlink:
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def text_message(self, text: str, *, sender: str = OWNER, message_id: str = "", context_token: str = "ctx-1") -> dict:
-        return {"from_user_id": sender, "to_user_id": BOT_ID, "message_id": message_id or f"m-{time.monotonic_ns()}",
+        return {"from_user_id": sender, "to_user_id": BOT_ID, "message_id": message_id or f"m-{next(self._message_ids)}",
                 "context_token": context_token, "item_list": [{"type": 1, "text_item": {"text": text}}]}
 
     def replies_to(self, user: str) -> list[str]:

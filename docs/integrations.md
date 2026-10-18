@@ -116,6 +116,17 @@ in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on`,
   the current choice. The setting is `weixin.model`; it applies from the next
   message, and a model that is no longer in the catalog or has no key falls
   back to the default.
+- **Approvals.** A step that needs approval (a command on this computer, a
+  file outside the workspace) is sent to the chat with what it will do,
+  credentials hidden, and waits for a reply: 同意 runs it once, 拒绝 does
+  not. Only the person whose message started the turn can answer, only
+  while a request waits, and only with a message that is nothing but a short
+  yes or no (同意, 可以, 好 / 拒绝, 不行, 取消); anything else is an ordinary
+  message. No answer within five minutes counts as 拒绝, and the
+  chat is told the step did not run. An open desktop window showing the same
+  request can answer first. Other channels get the same five-minute limit
+  without the chat prompt, so a request nobody can see never holds the
+  channel.
 - **Files.** When asked, Astra sends a local file with `channel_send_file`: an
   image or a video arrives as one, anything else as a file. Only the person who
   scanned the code receives files (or `weixin.file_allow_users`), only from

@@ -203,7 +203,8 @@ from agent.cli.conversation_commands import register_conversation_tools
 from agent.runtime.command_workflows import workflow_message, raw_command as normalize_direct_command
 from agent.channels import ChannelManager, load_channels_config
 from agent.channels.manager import is_address_in_use
-from agent.channels.router import AgentChannelRouter, active_channel
+from agent.channels.router import AgentChannelRouter, active_channel, active_channel_message
+from agent.channels.approvals import await_chat_approval
 from agent.cli.channel_models import ChannelModels
 from agent.cli.weixin_commands import WeixinCommands, is_weixin_command
 from agent.channels.tools import register_channel_tools
@@ -1163,6 +1164,12 @@ async def _main(startup_started: float):
             if tools.yolo and request.get("yolo_bypass_allowed") is True:
                 # YOLO may have been enabled while the inbox write was waiting.
                 resolve_tool_approval(request_id, "once")
+            if channel_name:
+                # Asked in the chat too (WeChat), and never left waiting: no answer in time is a denial.
+                manager = channel_manager_holder.get("manager")
+                return await await_chat_approval(
+                    manager.approver(channel_name) if manager is not None else None, active_channel_message.get(),
+                    request, future, lambda decision: resolve_tool_approval(request_id, decision))
             return await future
         except asyncio.CancelledError:
             if approval_inbox is not None:

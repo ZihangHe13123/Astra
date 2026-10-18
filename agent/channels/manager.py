@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 
+from .approvals import ChatApprover
 from .base import ChannelAdapter, ChannelMessage, FilePolicy, MessageHandler
 from .config import ChannelsConfig
 from .onebot import OneBotAdapter
@@ -134,6 +135,11 @@ class ChannelManager:
         if sender is None:
             raise RuntimeError(f"channel does not support file sending: {message.channel}")
         return await sender(message, path, name)
+
+    def approver(self, channel: str) -> ChatApprover | None:
+        """The adapter that can ask for an approval in its chat, if this channel has one."""
+        adapter = next((item for item in self.adapters if item.name == channel), None)
+        return adapter if hasattr(adapter, "ask_approval") and hasattr(adapter, "end_approval") else None  # type: ignore[return-value]
 
     async def send_voice(self, message: ChannelMessage, pcm: bytes, rate: int) -> dict[str, object]:
         adapter = next((item for item in self.adapters if item.name == message.channel), None)

@@ -46,6 +46,7 @@ from agent.runtime.json_preferences import update_preferences
 from agent.runtime.network import active_proxy_for_url
 from agent.runtime.paths import state_path
 
+from .approvals import approval_reply
 from .base import ChannelAdapter, ChannelImage, ChannelMessage, MessageHandler
 from .config import WeixinConfig
 from .keep_awake import KeepAwake
@@ -91,6 +92,7 @@ CHAT_STYLE = """[微信聊天]
 - 像发微信一样说话：口语、自然、简短，一条消息说一件事；想说几件事就用空行隔开，它们会作为几条消息依次发出。表情偶尔用，别堆砌。
 - 微信不显示 Markdown：不要用标题、加粗、表格和代码块，少用列表，需要分点时直接换行。
 - 对方请你帮忙（查资料、记东西、定提醒）时照常用工具，做完用一两句话说结果，不贴长报告；真需要长内容时先说结论，再问要不要展开。
+- 需要对方批准的操作（比如在电脑上运行命令），系统会自动把请求发到微信，让对方回复“同意”或“拒绝”；你不用先在聊天里另外问一遍。
 - 对方想听你的声音、让你发语音时，用 channel_send_file 的 speak 把要说的话说出来（只写念出来的话，不带表情和符号）。可以再配一两句短文字（比如“收到了吗”），但不要用文字重复语音里的内容。"""
 
 
@@ -557,6 +559,9 @@ class WeixinAdapter(ChannelAdapter):
         self._inbox: asyncio.Queue[dict] = asyncio.Queue()
         self._pause = pause
         self._tickets: dict[str, tuple[str, float]] = {}
+        # Approvals waiting for the person's 同意/拒绝, by sender, and chats whose "typing…" is paused meanwhile.
+        self._approvals: dict[str, Callable[[str], object]] = {}
+        self._typing_paused: set[str] = set()
 
     @property
     def running(self) -> bool:
@@ -661,7 +666,8 @@ class WeixinAdapter(ChannelAdapter):
                 if isinstance(suggested, int) and suggested > 0:
                     timeout_ms = suggested
                 for message in response.get("msgs") or []:
-                    if isinstance(message, dict):
+                    # An answer to a waiting approval cannot queue behind the turn that waits for it.
+                    if isinstance(message, dict) and not await self._answered_approval(message):
                         self._inbox.put_nowait(message)
                 # The cursor moves only after the batch is queued, so a crash re-delivers rather than drops.
                 new_cursor = str(response.get("get_updates_buf") or "")
@@ -694,6 +700,51 @@ class WeixinAdapter(ChannelAdapter):
             self._seen.popitem(last=False)
         return False
 
+    async def ask_approval(self, message: ChannelMessage, prompt: str, answer: Callable[[str], object]) -> None:
+        """Ask the person who wrote ``message`` to approve; their 同意 or 拒绝 goes to ``answer``."""
+        sender = message.sender_id
+        self._approvals[sender] = answer
+        self._typing_paused.add(sender)
+        await self._typing(sender, _TYPING_STOP)
+        account, client = self._account, self._client
+        if account is None or client is None:
+            raise WeixinError("the WeChat channel is not online")
+        await self._send_piece(client, account, sender, prompt)
+
+    async def end_approval(self, message: ChannelMessage, notice: str = "") -> None:
+        """Stop listening for an answer, say why if it timed out, and show "typing…" again."""
+        sender = message.sender_id
+        self._approvals.pop(sender, None)
+        self._typing_paused.discard(sender)
+        account, client = self._account, self._client
+        if notice and account is not None and client is not None:
+            await self._send_piece(client, account, sender, notice)
+        await self._typing(sender, _TYPING_START)
+
+    async def _answered_approval(self, message: dict) -> bool:
+        sender = str(message.get("from_user_id") or "").strip()
+        answer = self._approvals.get(sender)
+        if answer is None or message.get("room_id") or message.get("chat_room_id"):
+            return False
+        items = [item for item in message.get("item_list") or [] if isinstance(item, dict)]
+        if len(items) != 1 or items[0].get("type") != _ITEM_TEXT or items[0].get("ref_msg"):
+            return False
+        decision = approval_reply(str((items[0].get("text_item") or {}).get("text") or ""))
+        if decision is None or self._seen_before(str(message.get("message_id") or "")):
+            return False
+        # The answer carries a fresh reply token; what follows in this turn is sent with it.
+        await self._remember_token(sender, message)
+        self._approvals.pop(sender, None)
+        answer(decision)
+        logger.info("weixin approval answered in the chat: %s", decision)
+        return True
+
+    async def _remember_token(self, sender: str, message: dict) -> None:
+        token = str(message.get("context_token") or "").strip()
+        if token and self._tokens.get(sender) != token:
+            self._tokens[sender] = token
+            await asyncio.to_thread(self.store.save_context_tokens, dict(self._tokens))
+
     async def _handle(self, message: dict) -> None:
         account = self._account
         if account is None:
@@ -708,10 +759,7 @@ class WeixinAdapter(ChannelAdapter):
         if sender not in allowed:
             logger.info("weixin message from a sender who is not allowed: %s", mask(sender))
             return
-        token = str(message.get("context_token") or "").strip()
-        if token and self._tokens.get(sender) != token:
-            self._tokens[sender] = token
-            await asyncio.to_thread(self.store.save_context_tokens, dict(self._tokens))
+        await self._remember_token(sender, message)
         text, images = await self._content(message.get("item_list") or [])
         text = text.strip()[:self.config.max_input_chars]
         if not text and not images:
@@ -820,7 +868,8 @@ class WeixinAdapter(ChannelAdapter):
         try:
             while not _stop_requested():
                 await asyncio.sleep(_TYPING_REFRESH_SECONDS)
-                await self._typing(to, _TYPING_START)
+                if to not in self._typing_paused:
+                    await self._typing(to, _TYPING_START)
         finally:
             # Without an explicit stop WeChat can keep showing "typing…".
             await asyncio.shield(self._typing(to, _TYPING_STOP))
