@@ -1,10 +1,16 @@
 import type { SessionState } from "@astra/ui-core/session-state";
 import type { Preferences, SessionEntry } from "../bridge.js";
+import { maskSecrets } from "@astra/ui-core/secret-mask";
 export const sessionKey = (s: SessionEntry) => `${s.mode}:${s.name}`;
 export function sessionTitle(entry: SessionEntry, titles: Preferences["titles"]): string {
   if (titles[sessionKey(entry)]) return titles[sessionKey(entry)];
   const generated = /^session_(\d{4})(\d{2})(\d{2})_?(\d{2})(\d{2})(\d{2})(?:_|$)/.exec(entry.name);
   return generated ? `${generated[2]}/${generated[3]} ${generated[4]}:${generated[5]} 的对话` : entry.name;
+}
+/** The name a new conversation takes from its first message: the first line, at most 36 characters,
+ * with recognised credentials masked first, so preferences (shared with a phone) never hold one. */
+export function autoTitle(draft: string): string {
+  return [...maskSecrets(draft.trim()).split("\n")[0]].slice(0, 36).join("") || "附件对话";
 }
 export function sidebarGroups(history: SessionEntry[], states: SessionState[], prefs: Pick<Preferences, "titles" | "pinned">, search: string, now = new Date()) {
   const entries = new Map(history.map(e => [sessionKey(e), e]));

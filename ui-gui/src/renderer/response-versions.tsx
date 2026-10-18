@@ -1,6 +1,7 @@
 import React from 'react';
 import { ChevronLeft, ChevronRight } from 'lucide-react';
 import type { Message } from '@astra/ui-core/session-state';
+import { maskSecrets } from '@astra/ui-core/secret-mask';
 import { sameResponseSource, type ResponseGroup, type ResponseRegeneration, type ResponseSource, type ResponseVersions } from '@astra/ui-core/response-versions';
 export type ResponseControls = {
   versions: ResponseVersions; regeneration?: ResponseRegeneration; busy: boolean;
@@ -29,7 +30,7 @@ export function EarlierResponseVersions({ messages, controls }: { messages: Mess
   return <details className="earlier-response-versions"><summary>较早回复版本</summary>
     <p className="small muted">选择已保存的回复版本，后续对话会沿所选版本继续。现实文件和工具操作不会撤销。</p>
     {groups.map(group => <div className="earlier-response-version" key={group.id} data-response-group-id={group.id}>
-      <p>{group.user_text || '较早的请求'}</p><p className="small muted">{group.response_text}</p>
+      <p>{group.user_text ? maskSecrets(group.user_text) : '较早的请求'}</p><p className="small muted">{group.response_text}</p>
       <ResponseVersionNav group={group} busy={controls.busy} select={controls.select}/>
     </div>)}
   </details>;
