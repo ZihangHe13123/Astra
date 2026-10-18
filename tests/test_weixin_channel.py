@@ -609,3 +609,33 @@ def test_the_wechat_model_setting_is_kept_beside_the_other_settings(tmp_path):
     assert (config.model, config.enabled, config.keep_awake) == ("deepseek::deepseek-flash", True, False)
     set_channel_setting("weixin", "model", "", path)
     assert load_channels_config(path).weixin.model == ""
+
+
+def test_a_media_upload_tries_a_passing_server_error_again_and_says_why_it_gave_up(ilink, monkeypatch):
+    from agent.channels import weixin
+    from agent.channels.weixin import WeixinError
+
+    monkeypatch.setattr(weixin, "_UPLOAD_PAUSE", 0)
+    url = f"{ilink.cdn}/upload?encrypted_query_param=up-1&filekey=k"
+
+    async def scenario():
+        client = IlinkClient(base_url=ilink.base, cdn_url=ilink.cdn)
+        try:
+            ilink.upload_failures = [(500, {}, b"<html> busy </html>")]
+            assert await client.upload(url, b"x" * 16) == "enc-1"
+            assert ilink.upload_attempts == 2
+
+            ilink.upload_failures = [(500, {"x-error-message": "upload busy"}, b"")] * 3
+            with pytest.raises(WeixinError, match=r"failed after 3 tries \(HTTP 500: upload busy\)"):
+                await client.upload(url, b"x" * 16)
+            assert ilink.upload_attempts == 5
+
+            ilink.upload_failures = [(400, {"x-error-message": "bad filekey"}, b"")]
+            with pytest.raises(WeixinError, match=r"was refused \(HTTP 400: bad filekey\)"):
+                await client.upload(url, b"x" * 16)
+            assert ilink.upload_attempts == 6, "a refusal is not tried again"
+            assert list(ilink.uploads) == ["enc-1"]
+        finally:
+            await client.close()
+
+    asyncio.run(scenario())

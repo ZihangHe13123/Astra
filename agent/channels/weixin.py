@@ -74,6 +74,9 @@ _CDN_HOSTS = frozenset({
 })
 _SEEN_LIMIT = 512
 _SEND_ATTEMPTS = 4
+# The CDN sometimes answers an upload with a passing server error; try it again after a short pause.
+_UPLOAD_ATTEMPTS = 3
+_UPLOAD_PAUSE = 1.0
 _TYPING_START, _TYPING_STOP = 1, 2
 _TYPING_REFRESH_SECONDS = 4.0
 _TYPING_TICKET_SECONDS = 600.0
@@ -259,13 +262,33 @@ class IlinkClient:
         raise WeixinError("iLink handed out no upload address")
 
     async def upload(self, url: str, data: bytes) -> str:
-        """Upload encrypted bytes; the CDN answers with the parameter the message refers to."""
-        response = await self._http.post(url, content=data, headers={"Content-Type": "application/octet-stream"},
-                                         timeout=120.0)
-        param = response.headers.get("x-encrypted-param") if response.status_code == 200 else None
-        if not param:
-            raise WeixinError(f"WeChat's media upload answered HTTP {response.status_code} without a file reference")
-        return param
+        """Upload encrypted bytes; the CDN answers with the parameter the message refers to.
+
+        A server error, an answer without the parameter or a dropped connection is tried again;
+        a refusal (4xx) and a timeout are not. The CDN's own reason goes into the error.
+        """
+        reason = ""
+        for attempt in range(_UPLOAD_ATTEMPTS):
+            if attempt:
+                await asyncio.sleep(_UPLOAD_PAUSE * attempt)
+            try:
+                response = await self._http.post(url, content=data, headers={"Content-Type": "application/octet-stream"},
+                                                 timeout=120.0)
+            except httpx.TimeoutException:
+                raise
+            except httpx.TransportError as exc:
+                reason = f"connection failed: {type(exc).__name__}"
+                continue
+            param = response.headers.get("x-encrypted-param") if response.status_code == 200 else None
+            if param:
+                return param
+            detail = response.headers.get("x-error-message") or " ".join(response.text.split())[:200]
+            reason = f"HTTP {response.status_code}" + (f": {detail}" if detail else "") + (
+                ", no file reference" if response.status_code == 200 else "")
+            if 400 <= response.status_code < 500:
+                raise WeixinError(f"WeChat's media upload was refused ({reason})")
+            logger.warning("weixin media upload attempt %d failed: %s", attempt + 1, reason)
+        raise WeixinError(f"WeChat's media upload failed after {_UPLOAD_ATTEMPTS} tries ({reason})")
 
     async def typing_ticket(self, account: WeixinAccount, to: str, context_token: str) -> str:
         payload: dict[str, Any] = {"ilink_user_id": to}
