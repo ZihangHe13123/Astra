@@ -186,8 +186,14 @@ class ContextCompressor:
         self._failure_cooldown_until = 0.0
 
     async def compress(self, messages: list[dict], max_prompt_tokens: int,
-                       force: bool = False, *, preserve_on_failure: bool = False) -> list[dict]:
-        """Compress messages by summarizing middle turns. Returns new message list."""
+                       force: bool = False, *, preserve_on_failure: bool = False,
+                       replay: dict | None = None) -> list[dict]:
+        """Compress messages by summarizing middle turns. Returns new message list.
+
+        ``replay`` is the conversation's last sent request extended to now
+        (``AgentContext.summary_replay``); the summary is asked for after it, so the
+        provider's cached prefix covers most of the summary request.
+        """
         if force:
             self._failure_cooldown_until = 0.0
 
@@ -252,6 +258,7 @@ class ContextCompressor:
                 turns,
                 max_tokens=summary_budget,
                 max_input_chars=summary_input_chars,
+                replay=replay,
             )
         elif self._previous_summary:
             summary = f"{SUMMARY_PREFIX}\n{self._previous_summary}"
@@ -645,6 +652,7 @@ class ContextCompressor:
         *,
         max_tokens: int | None = None,
         max_input_chars: int | None = None,
+        replay: dict | None = None,
     ) -> str | None:
         # Check cooldown
         if time.monotonic() < self._failure_cooldown_until:
@@ -697,14 +705,20 @@ class ContextCompressor:
                 f"Use this exact structure:\n\n{_TEMPLATE}"
             )
 
+        output_tokens = self.summary_max_tokens if max_tokens is None else max_tokens
+        summary = (
+            await self._summary_from_replay(replay, protection_block, output_tokens)
+            if replay is not None else None
+        )
         try:
-            response = await self.llm.chat_limited(
-                [{"role": "user", "content": prompt}],
-                max_tokens=(self.summary_max_tokens if max_tokens is None else max_tokens),
-                temperature=0.1,
-                disable_thinking=True,
-            )
-            summary = response.get("content", "").strip()
+            if summary is None:
+                response = await self.llm.chat_limited(
+                    [{"role": "user", "content": prompt}],
+                    max_tokens=output_tokens,
+                    temperature=0.1,
+                    disable_thinking=True,
+                )
+                summary = response.get("content", "").strip()
             if not summary:
                 return None
 
@@ -727,6 +741,66 @@ class ContextCompressor:
             logger.warning("Summary generation failed: %s", e)
             self._failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN
             return None
+
+    async def _summary_from_replay(self, replay: dict, protection_block: str, max_tokens: int) -> str | None:
+        """Ask for the summary right after the conversation itself, as last sent.
+
+        The request repeats the last request byte for byte (system, tools, history),
+        adds what came after it, and ends with the checkpoint instruction, so the
+        provider bills the repeated part at its cached rate and the model reads the
+        original messages rather than a transcript. None when the request would not
+        fit the prompt budget, the call fails, or the model answers with a tool call;
+        the caller then summarizes from a transcript as before.
+        """
+        carry = (
+            "The conversation contains an earlier checkpoint summary: carry forward everything in "
+            "it that is still relevant, add what happened since, and move answered questions to "
+            "Resolved Questions. "
+            if self._previous_summary else ""
+        )
+        instruction = (
+            "[Context checkpoint request from the runtime, not from the user]\n"
+            "The older part of the conversation above is about to be replaced by a checkpoint "
+            "summary that you write now; the most recent messages stay as they are. Do not call "
+            "any tool and do not continue the task: reply with the summary only. "
+            f"{carry}Preserve enough detail for continuity. CRITICAL: '## Active Task' must "
+            f"reflect the most recent unfulfilled request.{protection_block}\n\n"
+            f"Use this exact structure:\n\n{_TEMPLATE}"
+        )
+        messages = [*replay.get("messages", []), {"role": "user", "content": instruction}]
+        tools = list(replay.get("tools") or [])
+        limit = int(replay.get("limit") or 0)
+        estimate = getattr(self.llm, "estimate_tokens", None)
+        if estimate is None or limit <= 0:
+            return None
+        try:
+            needed = int(estimate(messages)) + estimate_value_tokens(tools)
+        except Exception:
+            return None
+        if needed > limit:
+            logger.info("Summary request would not fit replayed (%d > %d tokens); using a transcript", needed, limit)
+            return None
+        try:
+            # Thinking stays as the conversation has it: switching it off renders the whole
+            # prompt differently for DeepSeek, and nothing of the prefix is then cached.
+            response = await self.llm.chat_limited(
+                messages,
+                tools or None,
+                max_tokens=max_tokens,
+                temperature=0.1,
+            )
+        except Exception as exc:
+            logger.info("Replayed summary request failed (%s); using a transcript", exc)
+            return None
+        if response.get("tool_calls"):
+            logger.info("Replayed summary request answered with a tool call; using a transcript")
+            return None
+        usage = response.get("usage") or {}
+        logger.info(
+            "Summary replayed the last request: %s prompt tokens, %s from cache",
+            usage.get("prompt_tokens", "?"), usage.get("prompt_cache_hit_tokens", "?"),
+        )
+        return str(response.get("content") or "").strip() or None
 
     async def _generate_turn_prefix_summary(
         self,

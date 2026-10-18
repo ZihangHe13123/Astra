@@ -2232,6 +2232,68 @@ def test_llm_stream_distinguishes_idle_and_overall_timeouts():
     ))
 
 
+def test_remote_stream_runs_while_it_progresses_and_other_requests_keep_a_deadline(monkeypatch):
+    from types import SimpleNamespace
+
+    for name in ("LLM_TIMEOUT", "LLM_OVERALL_TIMEOUT", "LLM_IDLE_TIMEOUT", "LLM_CONNECT_TIMEOUT"):
+        monkeypatch.delenv(name, raising=False)
+
+    def chunk(content, finish=None):
+        return SimpleNamespace(
+            choices=[SimpleNamespace(finish_reason=finish, delta=SimpleNamespace(
+                reasoning_content=None, content=content, tool_calls=None))],
+            usage=None,
+        )
+
+    class SteadyStream:
+        """Twelve chunks 30 ms apart: longer in all than the 0.15 s request deadline."""
+
+        def __init__(self):
+            self.items = iter([*(chunk(str(i % 10)) for i in range(12)), chunk("", "stop")])
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            await asyncio.sleep(0.03)
+            try:
+                return next(self.items)
+            except StopIteration:
+                raise StopAsyncIteration
+
+    async def create(**kwargs):
+        if kwargs.get("stream"):
+            return SteadyStream()
+        await asyncio.sleep(1)  # a non-streamed answer that takes too long
+        raise AssertionError("the deadline should have ended this request")
+
+    def provider():
+        made = OpenAICompatibleProvider(LLMConfig(
+            base_url="https://llm.example.invalid/v1", api_key="test", model="remote",
+            timeout=0.15, connect_timeout=1, idle_timeout=0.5, max_retries=0,
+        ))
+        made._client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        return made
+
+    async def stream_text(made):
+        events = [event async for event in made.chat_stream([{"role": "user", "content": "long answer"}])]
+        return "".join(event.get("content", "") for event in events if event["type"] == "chunk")
+
+    async def scenario():
+        unset = provider()
+        # Unset: a healthy stream outlives the request deadline; a non-streamed request does not.
+        assert await stream_text(unset) == "012345678901"
+        with pytest.raises(LLMOverallTimeout):
+            await unset.chat([{"role": "user", "content": "slow"}])
+
+        # An explicit deadline covers streams as well.
+        monkeypatch.setenv("LLM_OVERALL_TIMEOUT", "0.15")
+        with pytest.raises(LLMOverallTimeout):
+            await stream_text(provider())
+
+    run(scenario())
+
+
 def test_agent_context_repairs_poisoned_session_tool_history(tmp_path):
     path = tmp_path / "poisoned.json"
     store = SessionStore(path)

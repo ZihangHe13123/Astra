@@ -10,8 +10,14 @@ export type PhoneInvokeMethod = typeof PHONE_INVOKE_METHODS[number];
 /** Desktop preferences a phone shows but keeps its own copy of: names and pins of saved sessions. */
 export const SHARED_PREFERENCE_KEYS = ["titles", "pinned", "projects", "workspaces"] as const;
 
-/** Control lines on the event stream, besides the window's own events. */
-export type PhoneStreamControl = { ready: true; seq: number } | { reload: true };
+/**
+ * Control lines on the event stream, besides the window's own events. Event numbers count within one
+ * running gateway, named by `instance`; a phone resuming from another instance starts again.
+ */
+export type PhoneStreamControl = { ready: true; seq: number; instance: string } | { reload: true };
+
+/** Where a phone stopped reading: the last event number it saw and the gateway that numbered it. */
+export type PhoneStreamPosition = { seq: number; instance: string };
 
 /** The signed text that proves a phone holds its device key. A fixed prefix keeps the signature good for nothing else. */
 export function phoneAuthMessage(nonce: string, deviceId: string): string {

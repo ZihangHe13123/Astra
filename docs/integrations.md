@@ -117,8 +117,8 @@ cannot dispatch on a replacement connection.
 
 ## Web search
 
-`search_web` supports `provider=auto|exa|searxng`. Use `/search` to inspect the
-default and `/search auto|exa|searxng` to switch it persistently. In `auto`
+`search_web` supports `provider=auto|exa|searxng|deepseek`. Use `/search` to inspect the
+default and `/search auto|exa|searxng|deepseek` to switch it persistently. In `auto`
 mode, news, research, model-release and benchmark queries prefer Exa; ordinary
 queries start with SearXNG. A page above 1, an `engine` or a category other than
 science/news is only honoured by SearXNG, so `auto` sends such a call there; an
@@ -133,14 +133,42 @@ contains `EXA_API_KEY`. The latter reuses a credential without copying the
 secret into this project. `/doctor` reports only whether Exa is configured and
 which source was used; it never prints the key.
 
+DeepSeek's Search and Fetch APIs are optional and never chosen automatically:
+`auto` does not search or extract through DeepSeek. Search through it with
+`provider=deepseek`, `/search deepseek` or `WEB_SEARCH_PROVIDER=deepseek`. It
+reads `DEEPSEEK_API_KEY` from the environment or `.env` (a key pasted only into
+`/connect` is not used) and sends only the query and the result count
+(`max_results`, 1–50). The query may have at most 128 characters and accepts
+DeepSeek's operators: `site:` (several joined with `OR`), `-site:`, `-word`,
+`"exact phrase"`, `-"phrase"`, `lang:zh,en`, and `after:`/`before:` with a year
+or date. Page, engine, category, language and inline content are not applied on
+this route, and the answer names them. Each result shows DeepSeek's summary
+written for model reading (its short snippet when there is no summary), with the
+date and site name when present. Astra does not send the optional
+`ori_question` (the user's question) or `localization` (an IP address), so no
+text beyond the query reaches the service; either could become an explicit
+option later. Requests go to `DEEPSEEK_TOOLS_URL` (default
+`https://api.deepseek.com/v1/tools`; search timeout `DEEPSEEK_SEARCH_TIMEOUT`,
+15 seconds), never follow a redirect, and are repeated once after a short wait
+on HTTP 408, 429 or 5xx; a timed-out request is reported rather than repeated.
+A rejected key (401), an exhausted balance (402) and the rate limit (429; 5
+requests per second per account, and per target domain for Fetch) are named in
+the failure. DeepSeek bills each API at 5 CNY per 1,000 successful requests from
+2026-11-01 (Beijing time). `/doctor` and `search_status` report only whether the
+key is set; neither calls the service.
+
 `web_extract` has an independent provider waterfall. `WEB_EXTRACT_PROVIDER=auto`
 tries configured APIs in `Tavily -> Exa -> Parallel` order, then local/cloud
 Firecrawl, and finally direct HTTP with main-content HTML-to-Markdown conversion.
 Failures fall through per URL, so one successful page is not fetched again by
 later providers. Set `provider` on one tool call, or set
 `WEB_EXTRACT_PROVIDER=tavily|exa|parallel|firecrawl|http`, to choose the first
-rung explicitly. Pages over 15,000 characters return a 75/25 head-tail window
-and save the full Markdown under `.astra/cache/web`.
+rung explicitly. DeepSeek Fetch is used only when named the same way
+(`provider=deepseek` or `WEB_EXTRACT_PROVIDER=deepseek`): it is tried first and
+the usual order follows for pages it cannot read. It returns Markdown without a
+final URL, so results keep the requested URL. Pages over 15,000 characters
+return a 75/25 head-tail window and save the full Markdown under
+`.astra/cache/web`.
 
 The optional browser extractor is most safely configured with
 `BROWSER_EXTRACT_ARGV`, a JSON array containing the executable and each fixed

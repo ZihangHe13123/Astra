@@ -27,7 +27,7 @@ import { VoiceSettings } from "./voice.js";
 import { MemoryReviewSettings, reviewAnswer, withProposalOptions } from "./memory-review.js";
 import { PhoneSettings } from "./phone-settings.js";
 import { voiceAnswer, voiceButton, voiceNotice, withVoiceOptions } from "./voice-state.js";
-import { sessionTitle, sidebarGroups } from "./sidebar.js";
+import { autoTitle, sessionTitle, sidebarGroups } from "./sidebar.js";
 import { DESKTOP_THEME_NAMES, PLAIN_THEMES, desktopTheme, followTheme, isDesktopThemeName } from "./theme.js";
 import { setCurrentTheme, useTheme } from "./theme-context.js";
 import { ThemeMark } from "./theme-mark.js";
@@ -382,7 +382,7 @@ function App() {
       else {
         const text = [draft.trim(), ...files.map(p => `"${p.replaceAll('"', '\\"')}"`)].filter(Boolean).join("\n");
         await window.astra.send(target.id, { type: "message", text, submission_id: crypto.randomUUID() });
-        if (!prefs.titles[`${target.mode}:${target.session}`]) setPrefs(old => ({ ...old, workspaces: { ...old.workspaces, [`${target.mode}:${target.session}`]: target.workspace }, titles: { ...old.titles, [`${target.mode}:${target.session}`]: [...draft.trim().split('\n')[0]].slice(0, 36).join('') || '附件对话' } }));
+        if (!prefs.titles[`${target.mode}:${target.session}`]) setPrefs(old => ({ ...old, workspaces: { ...old.workspaces, [`${target.mode}:${target.session}`]: target.workspace }, titles: { ...old.titles, [`${target.mode}:${target.session}`]: autoTitle(draft) } }));
       }
       setPrefs(old => ({ ...old, drafts: { ...old.drafts, [key]: old.drafts[key] === draft ? "" : old.drafts[key],
         [submittedKey]: old.drafts[submittedKey] === draft ? "" : old.drafts[submittedKey] } }));

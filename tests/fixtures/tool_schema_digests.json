@@ -1,0 +1,627 @@
+{
+  "activity_search": {
+    "sha256": [
+      "34f5d6dfc9c907f9"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "apply_patch": {
+    "sha256": [
+      "036a5d86dc900ee9"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "ask_user_question": {
+    "sha256": [
+      "5f5f676216cd79e1"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "browser_check": {
+    "sha256": [
+      "b8d4e0fa569b2094"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "browser_click": {
+    "sha256": [
+      "a6e7634c17545347"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "browser_close": {
+    "sha256": [
+      "1606dc6eed176130"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "browser_connect": {
+    "sha256": [
+      "16dad822fb480349"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "browser_fill": {
+    "sha256": [
+      "728b91db112c68d2"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "browser_handoff": {
+    "sha256": [
+      "a95cb98b76320e2d"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "browser_open": {
+    "sha256": [
+      "1d69ca08f1ac532e"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "browser_read": {
+    "sha256": [
+      "bd32da6944a0ac4e"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "browser_resume": {
+    "sha256": [
+      "7dca2f7db5d10376"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "browser_screenshot": {
+    "sha256": [
+      "fb0c2cd0746ccf31"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "browser_select": {
+    "sha256": [
+      "4c27b2dd0d3673d0"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "browser_snapshot": {
+    "sha256": [
+      "21db9b5b00db6bfd"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "browser_status": {
+    "sha256": [
+      "caf31ee22fbe4633"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "browser_stop": {
+    "sha256": [
+      "886b55221dcc87a6"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "browser_tabs": {
+    "sha256": [
+      "69e26efe4385d322"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "browser_upload": {
+    "sha256": [
+      "1da71331fc2be6fc"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "browser_wait": {
+    "sha256": [
+      "1a7ca0e2986fb2ce"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "cancel_wakeup": {
+    "sha256": [
+      "22ec2237327b6834"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "channel_send_file": {
+    "sha256": [
+      "3f8cae65ed3c2d89"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "computer_act": {
+    "sha256": [
+      "040b9902f3e89a54"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "computer_apps": {
+    "sha256": [
+      "8a850949c4cc2e89"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "computer_begin_takeover": {
+    "sha256": [
+      "6af01cc51de94013"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "computer_close": {
+    "sha256": [
+      "d22b05370f2f83d5"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "computer_end_takeover": {
+    "sha256": [
+      "3e3861ceb03da32e"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "computer_focus": {
+    "sha256": [
+      "478752953d4974a1"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "computer_get_app_state": {
+    "sha256": [
+      "f04cec54ad03f138"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "computer_handoff": {
+    "sha256": [
+      "4b222cfbdd594400"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "computer_resume": {
+    "sha256": [
+      "59de8089e3e95310"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "computer_snapshot": {
+    "sha256": [
+      "099f465d76362e21"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "computer_status": {
+    "sha256": [
+      "634c8fee207ac0cc"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "context_inspect": {
+    "sha256": [
+      "2d9bdfe75bdf0b63"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "context_open": {
+    "sha256": [
+      "3c302b6212d8f7a8"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "current_time": {
+    "sha256": [
+      "551b2ad0b9ddc4cc"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "delegate_cancel": {
+    "sha256": [
+      "05e6a4e928bffcd0"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "delegate_list": {
+    "sha256": [
+      "1dcdf4cf701d4053"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "delegate_poll": {
+    "sha256": [
+      "4ec66fa81c88c464"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "delegate_read": {
+    "sha256": [
+      "219642cd4d0dfebd"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "delegate_task": {
+    "sha256": [
+      "ac1ff1d110ef6d0a"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "doc_check": {
+    "sha256": [
+      "288157fee47ac045"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "doc_create": {
+    "sha256": [
+      "3dfcb1fe801c5546"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "doc_edit": {
+    "sha256": [
+      "d287ac258fe6d2f7"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "doc_export": {
+    "sha256": [
+      "c74c23088aaa747b"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "doc_outline": {
+    "sha256": [
+      "0ed74cae2e98d73c"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "edit_file": {
+    "sha256": [
+      "ef09c393f8ec7484"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "execute_python": {
+    "sha256": [
+      "68a7db26e65b0b9f"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "execute_shell": {
+    "sha256": [
+      "870fcda05b1a2916",
+      "99269103f2569f42"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction. Windows hosts add their own text on windows/wsl routing (99269103f2569f42, release gate windows-2025)."
+  },
+  "fetch_url": {
+    "sha256": [
+      "a478e6eb1ac38b82"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "git_add": {
+    "sha256": [
+      "01216973d6b0986d"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "git_branch": {
+    "sha256": [
+      "f9f29e1a75ca0be2"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "git_checkout": {
+    "sha256": [
+      "ed960d7a5f04833a"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "git_clone": {
+    "sha256": [
+      "57d09209d0dfbd8a"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "git_commit": {
+    "sha256": [
+      "e5d88d0d81b14fc9"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "git_diff": {
+    "sha256": [
+      "2832aafcc0338961"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "git_log": {
+    "sha256": [
+      "e6a55bd634c5238f"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "git_push": {
+    "sha256": [
+      "52394268aab8fa96"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "git_show": {
+    "sha256": [
+      "1b2b3707c108df11"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "git_status": {
+    "sha256": [
+      "46f28e0c18f9eb84"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "goal": {
+    "sha256": [
+      "41cea48dac7f5181"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "inspect_image_metadata": {
+    "sha256": [
+      "b8bf431ece56cc72"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "load_workspace_dependencies": {
+    "sha256": [
+      "b305eb4353a6da67"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "memory": {
+    "sha256": [
+      "4c60b22c31a0ca55"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "memory_correct": {
+    "sha256": [
+      "87e93c9f601856e9"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "memory_forget": {
+    "sha256": [
+      "14f743a92a70c0a2"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "memory_inspect": {
+    "sha256": [
+      "d942ea4af67accaa"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "peer_list": {
+    "sha256": [
+      "5c0a0c8f81510556"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "peer_send": {
+    "sha256": [
+      "4e477c3fbd3393f7"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "peer_task_update": {
+    "sha256": [
+      "bfd62d86beecef75"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "plan_update": {
+    "sha256": [
+      "e4493f46581bad88"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "process_cancel": {
+    "sha256": [
+      "e528bfa572998a57"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "process_list": {
+    "sha256": [
+      "ee41669d27826e62"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "process_poll": {
+    "sha256": [
+      "895c91aa4e7df053"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "process_read": {
+    "sha256": [
+      "5ec0628633aa583a"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "read_file": {
+    "sha256": [
+      "e54d520ce5b60d4d"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "read_image": {
+    "sha256": [
+      "64dc4a5217478b05"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "read_search_images": {
+    "sha256": [
+      "46d05ba9e81bd037"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "report_wakeup": {
+    "sha256": [
+      "8f3e0467c940a0dd"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "request_restart": {
+    "sha256": [
+      "eb62afcece3c5d74"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "runtime_diagnostics": {
+    "sha256": [
+      "d8f24380e7b7d40d"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "schedule_wakeup": {
+    "sha256": [
+      "61e1a226093d5f6b"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "search_files": {
+    "sha256": [
+      "f460f9170fac0970"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "search_images": {
+    "sha256": [
+      "6fa0bda035195cfd"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "search_text": {
+    "sha256": [
+      "8b35653983dd055e"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "search_web": {
+    "sha256": [
+      "2cbbd603b9c523e2"
+    ],
+    "reason": "2026-10-18: provider=deepseek added (DeepSeek Search/Fetch, chosen by name only)."
+  },
+  "session_handoff": {
+    "sha256": [
+      "88b170f933a10512"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "session_search": {
+    "sha256": [
+      "88038d5a442d0356"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "skill_manage": {
+    "sha256": [
+      "03daf66a9df0e4ba"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "skill_review_apply": {
+    "sha256": [
+      "b0fdfd9318c61de3"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "skill_review_snapshot": {
+    "sha256": [
+      "bd5656d484dd8c63"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "skill_view": {
+    "sha256": [
+      "4b19c2522114e15f"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "stat_file": {
+    "sha256": [
+      "98cd98560aaea300"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "team": {
+    "sha256": [
+      "8f3362b8688fc948"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "team_inbox": {
+    "sha256": [
+      "700e543693bbd8be"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "team_restart": {
+    "sha256": [
+      "7b1aed37cda55914"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "team_send": {
+    "sha256": [
+      "b708571af95fbf7a"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "team_spawn": {
+    "sha256": [
+      "65b668fddc527d5b"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "team_task": {
+    "sha256": [
+      "6b05168a76c0e168"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "team_wait": {
+    "sha256": [
+      "f50dea4bdbaf6891"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "wakeup_status": {
+    "sha256": [
+      "813bf08489c12133"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "web_extract": {
+    "sha256": [
+      "c507b919ce2f28e1"
+    ],
+    "reason": "2026-10-18: provider=deepseek added (DeepSeek Search/Fetch, chosen by name only)."
+  },
+  "workflow_design_approval": {
+    "sha256": [
+      "9a6f3f2ebdca98aa"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "write_file": {
+    "sha256": [
+      "82abf03297ce05f2"
+    ],
+    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  }
+}

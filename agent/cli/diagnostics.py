@@ -11,7 +11,7 @@ from agent.runtime.capabilities import build_runtime_capabilities, computer_use_
 from agent.runtime.metrics import runtime_metrics
 from agent.runtime.runtime_identity import runtime_identity
 from agent.runtime.providers import DEFAULT_PROVIDER_REGISTRY
-from agent.runtime.tools.web import exa_configuration_status
+from agent.runtime.tools.web import deepseek_tools_configured, exa_configuration_status
 from agent.runtime.tracing import tracing_status
 
 from .connections import probe_profile
@@ -286,7 +286,8 @@ async def build_doctor_report(agent, sandbox=None, mcp_manager=None, section: st
     exa_ready, exa_source = exa_configuration_status()
     default_search = resolve_startup_search_provider()
     lines.append(
-        f"Web search: default={default_search}; Exa={'configured' if exa_ready else 'not configured'} ({exa_source})"
+        f"Web search: default={default_search}; Exa={'configured' if exa_ready else 'not configured'} ({exa_source}); "
+        f"DeepSeek={'configured' if deepseek_tools_configured() else 'not configured'} (DEEPSEEK_API_KEY)"
     )
     trace = tracing_status()
     trace_detail = f" — {trace.error}" if trace.error else ""

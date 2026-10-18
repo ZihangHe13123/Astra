@@ -9,7 +9,7 @@ from agent.runtime.json_preferences import update_preferences
 from .model_preferences import model_settings_path
 
 
-SEARCH_PROVIDERS = ("auto", "exa", "searxng")
+SEARCH_PROVIDERS = ("auto", "exa", "searxng", "deepseek")
 
 
 def _read_settings(path: Path) -> dict:

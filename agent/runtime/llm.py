@@ -162,6 +162,30 @@ class _RequestCapTimeout(TimeoutError):
     """An internal per-operation cap expired before the overall deadline."""
 
 
+# How long an operation cancelled at its deadline may take to stop, and how long closing a
+# stream may take, before it is left to finish on its own. A transport that ignores
+# cancellation, or a connection whose shutdown waits on a dead peer, must not hold the turn.
+_CANCEL_GRACE_SECONDS = 1.0
+_CLOSE_GRACE_SECONDS = 2.0
+
+
+def _consume_outcome(task: asyncio.Future) -> None:
+    """Retrieve a left-behind task's outcome so its exception is not reported as unhandled."""
+    if not task.cancelled():
+        task.exception()
+
+
+async def _cancel_within(task: asyncio.Future, grace: float) -> bool:
+    """Cancel ``task`` and wait up to ``grace`` seconds; False when it is left running."""
+    task.cancel()
+    done, _ = await asyncio.wait({task}, timeout=grace)
+    if done:
+        _consume_outcome(task)
+        return True
+    task.add_done_callback(_consume_outcome)
+    return False
+
+
 def _retry_backoff_seconds(attempt: int) -> float:
     """Return the deterministic delay after one-based transport attempt."""
 
@@ -267,18 +291,25 @@ class _RequestBudget:
         if limit is None:
             return await factory()
 
-        timeout_context = asyncio.timeout(limit)
+        async def call():
+            return await factory()
+
+        # Raced, not wrapped in a timeout: a read that ignores cancellation would otherwise
+        # hold this await past the deadline it is meant to enforce.
+        task = asyncio.ensure_future(call())
         try:
-            async with timeout_context:
-                return await factory()
-        except LLMOverallTimeout:
+            done, _ = await asyncio.wait({task}, timeout=limit)
+        except asyncio.CancelledError:
+            await _cancel_within(task, _CANCEL_GRACE_SECONDS)
             raise
-        except TimeoutError as exc:
-            if timeout_context.expired():
-                if overall_is_limit:
-                    self._raise_overall_timeout(deadline_expired=True)
-                raise _RequestCapTimeout from exc
-            raise
+        if done:
+            return task.result()
+        if not await _cancel_within(task, _CANCEL_GRACE_SECONDS):
+            logger.warning("LLM request did not stop within %ss of its deadline; left to finish on its own",
+                           _CANCEL_GRACE_SECONDS)
+        if overall_is_limit:
+            self._raise_overall_timeout(deadline_expired=True)
+        raise _RequestCapTimeout()
 
     async def backoff(self, delay: float) -> None:
         remaining = self.remaining()
@@ -518,10 +549,13 @@ class LLMConfig:
     # OpenAI-compatible servers disagree on this non-OpenAI extension:
     # oMLX uses repetition_penalty, while llama.cpp uses repeat_penalty.
     repetition_penalty_parameter: str | None = None
-    timeout: float = 60.0
+    timeout: float = 600.0
     connect_timeout: float = 30.0
     idle_timeout: float = 120.0
     overall_timeout: float | None = None
+    # A stream's own total deadline; None follows overall_timeout. Remote streams default to
+    # none: idle_timeout ends a stalled one, and a long healthy answer is not cut off.
+    stream_overall_timeout: float | None = None
     max_retries: int = 2
     min_request_interval: float = 0.0
     max_concurrent_requests: int = 1
@@ -555,14 +589,25 @@ class _null_context:
     async def __aexit__(self, *args): return False
 
 
-async def _close_async_stream(stream) -> None:
-    """Close an owned sync/async provider stream before its parent returns."""
+async def _close_async_stream(stream, grace: float | None = None) -> None:
+    """Close an owned sync/async provider stream before its parent returns.
+
+    A close still running after ``grace`` seconds (a connection waiting on a dead peer)
+    is left to finish on its own instead of holding the turn.
+    """
     close = getattr(stream, "aclose", None) or getattr(stream, "close", None)
     if close is None:
         return
     result = close()
     if inspect.isawaitable(result):
-        await result
+        grace = _CLOSE_GRACE_SECONDS if grace is None else grace
+        task = asyncio.ensure_future(result)
+        done, _ = await asyncio.wait({task}, timeout=grace)
+        if done:
+            task.result()
+            return
+        task.add_done_callback(_consume_outcome)
+        logger.warning("LLM stream did not close within %ss; left to finish on its own", grace)
 
 
 class OpenAICompatibleProvider:
@@ -580,13 +625,16 @@ class OpenAICompatibleProvider:
         )
         overall_env = os.getenv("LLM_OVERALL_TIMEOUT")
         if overall_env is not None:
+            # An explicit deadline covers every request, streamed or not.
             self.config.overall_timeout = self._timeout_value(
                 overall_env,
                 self.config.overall_timeout or 0,
             )
+            self.config.stream_overall_timeout = self.config.overall_timeout
         elif timeout_env is not None:
             # Explicit legacy LLM_TIMEOUT remains an overall deadline.
             self.config.overall_timeout = self.config.timeout
+            self.config.stream_overall_timeout = self.config.overall_timeout
         elif self.config.overall_timeout is None:
             hostname = (urllib.parse.urlparse(config.base_url).hostname or "").lower()
             self.config.overall_timeout = (
@@ -594,6 +642,8 @@ class OpenAICompatibleProvider:
                 if hostname in {"localhost", "127.0.0.1", "::1"}
                 else self.config.timeout
             )
+            if self.config.stream_overall_timeout is None:
+                self.config.stream_overall_timeout = 0.0
         self._estimate_calibration = 1.0
         if AsyncOpenAI is None:
             raise RuntimeError("openai package is required to create LLMClient")
@@ -942,7 +992,9 @@ class OpenAICompatibleProvider:
         kwargs.update({"stream": True, "stream_options": {"include_usage": True}})
 
         budget = _RequestBudget.from_policy(
-            self.config.overall_timeout,
+            self.config.overall_timeout
+            if self.config.stream_overall_timeout is None
+            else self.config.stream_overall_timeout,
             self.config.max_retries,
         )
         stream = await self._with_retry(

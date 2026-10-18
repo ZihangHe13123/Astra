@@ -1607,9 +1607,10 @@ async def _main(startup_started: float):
                 continuation = decide_goal_continuation(updated, verdict)
                 if continuation is None:
                     if updated.get("status") == "completed":
+                        # stdout is the event protocol: a line printed there can split an event line.
                         print(
                             f"[backend] goal met after {updated.get('round')} round(s): {updated.get('objective', '')}",
-                            flush=True,
+                            file=sys.stderr, flush=True,
                         )
                     elif updated.get("status") == "exhausted":
                         print(
@@ -1636,6 +1637,11 @@ async def _main(startup_started: float):
         except Exception:
             return
         if goal is None or goal.get("status") != "active":
+            return
+        if (completions.pending(session_id) or delegate_mailbox.undelivered(session_id)
+                or delegate_mailbox.lead_waiting(session_id) or delegate_mailbox.session_working(session_id)):
+            # Background work still reports in a turn of its own; the goal is checked after that
+            # turn, so a round is not spent, nor a continuation started, while results are on the way.
             return
         verification = asyncio.create_task(
             _run_goal_verification(

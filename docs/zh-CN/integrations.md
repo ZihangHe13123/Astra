@@ -81,11 +81,13 @@ MCP 派发后的失败会区分读取与动作：可能有副作用的调用在�
 
 ## 网页搜索
 
-`search_web` 支持 `provider=auto|exa|searxng`。`/search` 查看默认值，`/search auto|exa|searxng` 持久切换。auto 对新闻、研究、模型发布和基准问题优先 Exa，普通问题先用 SearXNG；翻页（page 大于 1）、指定 `engine`、science/news 以外的类别只有 SearXNG 支持，auto 会把这类调用交给 SearXNG，由 Exa 返回的结果会注明未生效的参数。SearXNG 每个站点最多列 2 条，查询含 `site:` 时不限。结果为空或失败时，同一次工具调用内相互回退。不设固定每轮搜索次数，但重复调用和 ReAct 上限仍防止无限循环。不使用 DuckDuckGo。
+`search_web` 支持 `provider=auto|exa|searxng|deepseek`。`/search` 查看默认值，`/search auto|exa|searxng|deepseek` 持久切换。auto 对新闻、研究、模型发布和基准问题优先 Exa，普通问题先用 SearXNG；翻页（page 大于 1）、指定 `engine`、science/news 以外的类别只有 SearXNG 支持，auto 会把这类调用交给 SearXNG，由 Exa 返回的结果会注明未生效的参数。SearXNG 每个站点最多列 2 条，查询含 `site:` 时不限。结果为空或失败时，同一次工具调用内相互回退。不设固定每轮搜索次数，但重复调用和 ReAct 上限仍防止无限循环。不使用 DuckDuckGo。
 
 直接配置 `EXA_API_KEY`，或用 `EXA_ENV_FILE` 指向另一份包含该 Key 的 dotenv，以复用凭据而不复制。`/doctor` 只报告是否配置和来源，不打印密钥。
 
-`web_extract` 有独立回退顺序。`WEB_EXTRACT_PROVIDER=auto` 依次尝试已配置的 `Tavily -> Exa -> Parallel`，再到本地/云 Firecrawl，最后 HTTP 与正文 HTML-to-Markdown 提取。逐 URL 回退，成功页面不重复获取。单次工具 `provider` 或 `WEB_EXTRACT_PROVIDER=tavily|exa|parallel|firecrawl|http` 可明确首选。超过 15,000 字符时返回 75/25 首尾窗口，完整 Markdown 保存到 `.astra/cache/web`。
+DeepSeek Search 与 Fetch API 是可选项，不会被自动选择：`auto` 既不用 DeepSeek 搜索也不用它提取。用 `provider=deepseek`、`/search deepseek` 或 `WEB_SEARCH_PROVIDER=deepseek` 选择它搜索；它从环境变量或 `.env` 读取 `DEEPSEEK_API_KEY`（只粘贴在 `/connect` 里的 Key 不会被使用），只发送查询和结果数（`max_results`，1–50）。查询最长 128 个字符，支持 DeepSeek 的运算符：`site:`（多个用 `OR` 连接）、`-site:`、`-词`、`"精确短语"`、`-"短语"`、`lang:zh,en`，以及带年份或日期的 `after:`/`before:`。翻页、引擎、类别、语言和内联正文在这条路线上不生效，结果会注明。每条结果给出 DeepSeek 面向模型阅读的 summary（没有时用简短 snippet），有日期和站点名时一并列出。Astra 不发送可选的 `ori_question`（用户原问题）和 `localization`（IP 地址），查询以外的文本不会到达该服务；以后可作为显式选项再加。请求发往 `DEEPSEEK_TOOLS_URL`（默认 `https://api.deepseek.com/v1/tools`；搜索超时 `DEEPSEEK_SEARCH_TIMEOUT`，15 秒），不跟随重定向；HTTP 408、429、5xx 稍等后重试一次，超时只报告不重发。Key 被拒（401）、余额不足（402）和限流（429；每账号每秒 5 次，Fetch 还按目标域名限制）会在失败信息中写明。DeepSeek 自 2026-11-01（北京时间）起对两个 API 各按每 1,000 次成功请求 5 元计费。`/doctor` 和 `search_status` 只报告是否配置了 Key，不调用该服务。
+
+`web_extract` 有独立回退顺序。`WEB_EXTRACT_PROVIDER=auto` 依次尝试已配置的 `Tavily -> Exa -> Parallel`，再到本地/云 Firecrawl，最后 HTTP 与正文 HTML-to-Markdown 提取。逐 URL 回退，成功页面不重复获取。单次工具 `provider` 或 `WEB_EXTRACT_PROVIDER=tavily|exa|parallel|firecrawl|http` 可明确首选。DeepSeek Fetch 只在同样明确指定（`provider=deepseek` 或 `WEB_EXTRACT_PROVIDER=deepseek`）时使用：先试它，读不到的页面再按常规顺序回退。它返回 Markdown 但不报告最终 URL，结果保留请求的 URL。超过 15,000 字符时返回 75/25 首尾窗口，完整 Markdown 保存到 `.astra/cache/web`。
 
 浏览器提取器优先使用 `BROWSER_EXTRACT_ARGV` JSON 数组，将可执行文件和固定参数分开，例如 `["C:\\Program Files\\Browser Extract\\extract.exe","--render"]`。兼容 Shell 字符串时 `BROWSER_EXTRACT_CMD` 优先于 `WSL_EXTRACT_CMD`，旧变量在所有平台仍作为回退。
 

@@ -1,4 +1,4 @@
-import { parseEventStream, phoneAuthMessage, type PhoneInvokeMethod } from "../phone-protocol.js";
+import { parseEventStream, phoneAuthMessage, type PhoneInvokeMethod, type PhoneStreamPosition } from "../phone-protocol.js";
 
 /** What this phone keeps: its id on the desktop and its signing key, which can sign but never be read out. */
 export type PhoneDeviceRecord = { deviceId: string; name: string; privateKey: CryptoKey };
@@ -62,8 +62,8 @@ export class PhoneClient {
   }
 
   /** Follows the desktop's events after `after` (or from now) until the stream ends or the signal aborts. */
-  async follow(token: string, after: number | undefined, onEvent: (data: string, id?: number) => void, signal: AbortSignal): Promise<void> {
-    const query = after === undefined ? "" : `?after=${after}`;
+  async follow(token: string, from: PhoneStreamPosition | undefined, onEvent: (data: string, id?: number) => void, signal: AbortSignal): Promise<void> {
+    const query = from === undefined ? "" : `?after=${from.seq}&instance=${encodeURIComponent(from.instance)}`;
     const response = await this.fetcher(`${this.base}/api/events${query}`, { headers: { Authorization: `Bearer ${token}` }, signal, cache: "no-store" });
     if (response.status === 401) throw new TokenExpiredError();
     if (!response.ok || !response.body) throw new Error(`连接失败（${response.status}）`);

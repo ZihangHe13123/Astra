@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { RemoteBridge, type BridgeEnvironment } from "../src/phone/bridge.js";
 import { PhoneClient } from "../src/phone/client.js";
 import type { DesktopEvent } from "../src/bridge.js";
+import type { PhoneStreamPosition } from "../src/phone-protocol.js";
 import { memory, setup, until } from "./phone-fixture.js";
 
 let bridgeOf: RemoteBridge | undefined;
@@ -107,16 +108,16 @@ test("after a phone is removed on the desktop, its next call asks to pair again 
 });
 
 test("a dropped stream resumes after the last event it saw, and a reload request reloads the page", async () => {
-  const afters: (number | undefined)[] = [];
+  const afters: (PhoneStreamPosition | undefined)[] = [];
   const scripts = [
-    ['{"ready":true,"seq":5}', '{"runtime":"rt-1","revision":1,"event":{"type":"done"}}#6', '{"refresh":true}#7'],
+    ['{"ready":true,"seq":5,"instance":"run-1"}', '{"runtime":"rt-1","revision":1,"event":{"type":"done"}}#6', '{"refresh":true}#7'],
     ['{"reload":true}'],
   ];
   const client = {
     device: async () => ({ deviceId: "d1", name: "iPhone", privateKey: {} as CryptoKey }),
     signIn: async () => "token-token-token-token",
-    follow: async (_token: string, after: number | undefined, onEvent: (data: string, id?: number) => void) => {
-      afters.push(after);
+    follow: async (_token: string, from: PhoneStreamPosition | undefined, onEvent: (data: string, id?: number) => void) => {
+      afters.push(from && { ...from });
       for (const line of scripts[afters.length - 1] ?? []) {
         const [data, id] = line.split("#");
         onEvent(data, id === undefined ? undefined : Number(id));
@@ -130,7 +131,7 @@ test("a dropped stream resumes after the last event it saw, and a reload request
   bridge.onEvents(events => received.push(...events));
   try {
     await until(() => state.reloads === 1, "reload requested");
-    assert.deepEqual(afters.slice(0, 2), [undefined, 7]);
+    assert.deepEqual(afters.slice(0, 2), [undefined, { seq: 7, instance: "run-1" }]);
     assert.equal(received.length, 2);
   } finally { bridge.dispose(); }
 });

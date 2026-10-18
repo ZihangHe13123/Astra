@@ -8,11 +8,14 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 from test_backend_task_protocol import (
+    NON_JSON_STDOUT,
     _SlowOpenAIHandler,
     _start_question_protocol_backend,
     _stop_protocol_backend,
 )
 from test_session_lifecycle_protocol import send
+
+from agent.runtime.task_store import TaskStore
 
 WAKE = "[Background work ended"
 RUN_ENDED = "[SYSTEM-DELIVERED BACKGROUND RUN ENDED"
@@ -49,12 +52,16 @@ class Script:
 
     def __init__(self):
         self.parent_requests: list[list[dict]] = []
+        self.verifier_requests: list[list[dict]] = []
         self.worker_gate = threading.Event()
         self.worker_gate.set()
         self.lock = threading.Lock()
 
     def reply(self, messages: list[dict]):
         system = _text(messages[0]) if messages and messages[0]["role"] == "system" else ""
+        if system.startswith("You are a strict completion verifier"):
+            self.verifier_requests.append(messages)
+            return json.dumps({"met": True, "evidence": "The survey found three notes.", "next_step": ""})
         if system.startswith(("You are a focused explorer agent", "You are the final report writer")):
             self.worker_gate.wait(timeout=20)
             return "Survey report: three notes found."
@@ -280,6 +287,33 @@ def test_the_parent_answers_while_its_subagent_works_and_the_report_starts_a_tur
         reports = [_text(m) for m in woken if "Survey report: three notes found." in _text(m)]
         assert len(reports) == 1 and SUBAGENT_RESULT in reports[0] and WAKE in reports[0]
         assert not wakes(quiet(2.5))
+    finally:
+        script.worker_gate.set()
+        _stop_protocol_backend(proc)
+
+
+def test_an_active_goal_is_checked_after_its_subagent_reports_not_while_it_works(tmp_path, model):
+    goal = TaskStore(tmp_path / "tasks.db").set_goal("background_session", "Survey the notes folder")
+    proc, seen, wait, quiet = start(tmp_path, model, LLM_MAX_CONCURRENT_REQUESTS="2")
+    script = model[1]
+    script.worker_gate.clear()
+    try:
+        assert "".join(turn(proc, wait, "Delegate the survey")) == "Dispatched the survey."
+        # The turn answered while the survey runs: no verification and no round yet.
+        assert not [e for e in quiet(2.0) if e.get("type") == "goal_status"]
+        assert script.verifier_requests == []
+        assert TaskStore(tmp_path / "tasks.db").get_goal(goal["id"])["round"] == 0
+
+        script.worker_gate.set()
+        wait(lambda e: e.get("type") == "background_wakeup", timeout=30)
+        verdict = wait(lambda e: e.get("type") == "goal_status" and "verdict" in e, timeout=30)
+        assert verdict["goal"]["status"] == "completed" and verdict["goal"]["round"] == 1
+        # One check, made after the report's turn, on a transcript that holds the report.
+        assert len(script.verifier_requests) == 1
+        assert "The survey found three notes." in _text(script.verifier_requests[0][-1])
+        # The verdict is an event; nothing else may reach stdout, where it could split an event line.
+        assert not [e for e in quiet(1.0) if e.get("type") == NON_JSON_STDOUT]
+        assert not [e for e in seen if e.get("type") == NON_JSON_STDOUT]
     finally:
         script.worker_gate.set()
         _stop_protocol_backend(proc)

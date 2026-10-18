@@ -4,6 +4,7 @@ import { request } from "node:http";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PhoneClient } from "../src/phone/client.js";
+import type { PhoneStreamPosition } from "../src/phone-protocol.js";
 import { memory, pairedClient, setup, until } from "./phone-fixture.js";
 
 function raw(port: number, path: string, headers: Record<string, string>, method = "GET"): Promise<number> {
@@ -14,10 +15,10 @@ function raw(port: number, path: string, headers: Record<string, string>, method
 }
 
 /** Reads a stream into a list until aborted; returns the list and the abort. */
-function listen(client: PhoneClient, token: string, after?: number) {
+function listen(client: PhoneClient, token: string, from?: PhoneStreamPosition) {
   const seen: { data: any; id?: number }[] = [];
   const controller = new AbortController();
-  const done = client.follow(token, after, (data, id) => seen.push({ data: JSON.parse(data), id }), controller.signal).catch(() => undefined);
+  const done = client.follow(token, from, (data, id) => seen.push({ data: JSON.parse(data), id }), controller.signal).catch(() => undefined);
   return { seen, stop: () => controller.abort(), done };
 }
 
@@ -64,7 +65,9 @@ test("the stream says when it is ready, resumes where it stopped, and asks for a
     assert.equal((await fetch(`${base}/api/events`)).status, 401);
     const first = listen(client, token);
     await until(() => first.seen.length === 1, "ready");
-    assert.deepEqual(first.seen[0].data, { ready: true, seq: 0 });
+    const { instance } = first.seen[0].data;
+    assert.ok(typeof instance === "string" && instance.length > 0, "the stream names the gateway's run");
+    assert.deepEqual(first.seen[0].data, { ready: true, seq: 0, instance });
     gateway.publish({ appshot: { connection: "connected", enabled: true } });
     gateway.publish({ runtime: "rt-1", revision: 1, event: { type: "chunk", content: "一" } as any });
     gateway.publish({ refresh: true });
@@ -76,17 +79,56 @@ test("the stream says when it is ready, resumes where it stopped, and asks for a
     // Missed while away: replayed in order, then ready.
     gateway.publish({ runtime: "rt-1", revision: 2, event: { type: "chunk", content: "二" } as any });
     gateway.publish({ removed: "rt-1" });
-    const resumed = listen(client, token, 2);
+    const resumed = listen(client, token, { seq: 2, instance });
     await until(() => resumed.seen.some(item => item.data.ready), "resumed");
-    assert.deepEqual(resumed.seen.map(item => item.id ?? item.data), [3, 4, { ready: true, seq: 4 }]);
+    assert.deepEqual(resumed.seen.map(item => item.id ?? item.data), [3, 4, { ready: true, seq: 4, instance }]);
     resumed.stop(); await resumed.done;
 
     // More was missed than the desktop keeps.
     for (let i = 0; i < 4001; i++) gateway.publish({ refresh: true });
-    const late = listen(client, token, 4);
+    const late = listen(client, token, { seq: 4, instance });
     await late.done;
     assert.deepEqual(late.seen.map(item => item.data), [{ reload: true }]);
   } finally { await gateway.dispose(); }
+});
+
+test("after the desktop restarts, a phone resuming from before reloads instead of missing what changed", async () => {
+  const { devices, gateway, base, restarted } = await setup();
+  let next: ReturnType<typeof restarted> | undefined;
+  try {
+    const { client, token } = await pairedClient(devices, base);
+    const before = listen(client, token);
+    await until(() => before.seen.length === 1, "ready");
+    const { instance } = before.seen[0].data;
+    for (let i = 0; i < 3; i++) gateway.publish({ refresh: true });
+    await until(() => before.seen.length === 4, "events before the restart");
+    before.stop(); await before.done;
+    await gateway.dispose();
+
+    next = restarted();
+    const port = await next.start();
+    const phone = new PhoneClient(memory(), `http://127.0.0.1:${port}`);
+    // The new run has numbered fewer events than the phone saw, so the number alone looks caught up.
+    next.publish({ removed: "rt-1" });
+    const resumed = listen(phone, token, { seq: 3, instance });
+    await until(() => resumed.seen.length > 0, "answer after the restart");
+    resumed.stop(); await resumed.done;
+    assert.deepEqual(resumed.seen.map(item => item.data), [{ reload: true }]);
+
+    // A page loaded before streams named their run resumes with a bare number and reloads too.
+    const opened = new AbortController();
+    const old = await fetch(`http://127.0.0.1:${port}/api/events?after=1`, { headers: { Authorization: `Bearer ${token}` }, signal: opened.signal });
+    const first = new TextDecoder().decode((await old.body!.getReader().read()).value);
+    opened.abort();
+    assert.equal(first, `data: ${JSON.stringify({ reload: true })}\n\n`);
+
+    // The reloaded page starts fresh on the new run and follows it from there.
+    const fresh = listen(phone, token);
+    await until(() => fresh.seen.length === 1, "fresh ready");
+    assert.notEqual(fresh.seen[0].data.instance, instance);
+    assert.equal(fresh.seen[0].data.seq, 1);
+    fresh.stop(); await fresh.done;
+  } finally { await next?.dispose(); }
 });
 
 test("removing the phone ends its stream at once, and the gateway listens on loopback only", async () => {

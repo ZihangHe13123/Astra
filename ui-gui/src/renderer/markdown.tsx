@@ -10,6 +10,7 @@ import { normalizeMathMarkdown, remarkMathOptions, rehypeSafeKatex } from "./mat
 import { MermaidBlock } from "./mermaid-block.js";
 import { CardBlock } from "./card-block.js";
 import { isCardLanguage } from "./card-state.js";
+import { rehypeMaskSecrets, SECRET_TAG, SecretReveal, SecretValue } from "./secret-markdown.js";
 
 function InlineImage({ src, alt, runtime, base }: { src?: string; alt?: string; runtime?: string; base?: string }) {
   const [url, setURL] = useState<string>();
@@ -32,8 +33,10 @@ function CodeBlock({ children, node, fail }: { children?: React.ReactNode; node?
   return <div className="code-block"><div className="code-toolbar"><span className="code-language">{language || "代码"}</span><CopyButton label="复制代码" text={source} fail={fail}/></div><pre>{children}</pre></div>;
 }
 
-/** One renderer for chat, delegated results, and saved Markdown previews. */
-export const Markdown = memo(function Markdown({ text, runtime, fail, base }: { text: string; runtime?: string; fail: (e: unknown) => void; base?: string }) {
+/** One renderer for chat, delegated results, and saved Markdown previews. With `maskSecrets` (a sent
+ * user message), recognised credentials are drawn masked, each revealed on its own by a click; the
+ * text itself, and so copying and sending it, is unchanged. */
+export const Markdown = memo(function Markdown({ text, runtime, fail, base, maskSecrets }: { text: string; runtime?: string; fail: (e: unknown) => void; base?: string; maskSecrets?: boolean }) {
   const rendered = useMemo(() => normalizeMathMarkdown(text), [text]);
   const components = useMemo(() => ({
     img: ({ src, alt }: { src?: string; alt?: string }) => <InlineImage src={src} alt={alt} runtime={runtime} base={base}/>,
@@ -42,7 +45,11 @@ export const Markdown = memo(function Markdown({ text, runtime, fail, base }: { 
       else if (runtime) void window.astra.file(runtime, resolveAgainst(base, href), "open").catch(fail);
     }}>{children}</a>,
     pre: ({ children, node }: React.ComponentProps<"pre"> & { node?: Element }) => <CodeBlock node={node} fail={fail}>{children}</CodeBlock>,
-  }), [runtime, fail, base]);
-  return <ReactMarkdown remarkPlugins={[remarkGfm, [remarkMath, remarkMathOptions], remarkCodeMetadata]} rehypePlugins={[rehypeSafeKatex, rehypeCodeBudget, rehypeCodeHighlight]} skipHtml
-    urlTransform={url => /^(?:https?:\/\/|\/|[A-Za-z]:[\\/]|\.\.?\/)/.test(url) || !/^[a-z][a-z\d+.-]*:/i.test(url) ? url : ""} components={components}>{rendered}</ReactMarkdown>;
+    ...maskSecrets ? { [SECRET_TAG]: SecretValue } : {},
+  }), [runtime, fail, base, maskSecrets]);
+  // Kept as one element so revealing a value re-renders that value, not the whole parse.
+  const tree = useMemo(() => <ReactMarkdown remarkPlugins={[remarkGfm, [remarkMath, remarkMathOptions], remarkCodeMetadata]}
+    rehypePlugins={maskSecrets ? [rehypeSafeKatex, rehypeCodeBudget, rehypeCodeHighlight, rehypeMaskSecrets] : [rehypeSafeKatex, rehypeCodeBudget, rehypeCodeHighlight]} skipHtml
+    urlTransform={url => /^(?:https?:\/\/|\/|[A-Za-z]:[\\/]|\.\.?\/)/.test(url) || !/^[a-z][a-z\d+.-]*:/i.test(url) ? url : ""} components={components}>{rendered}</ReactMarkdown>, [rendered, components, maskSecrets]);
+  return maskSecrets ? <SecretReveal text={text}>{tree}</SecretReveal> : tree;
 });

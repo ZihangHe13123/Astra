@@ -15,6 +15,7 @@ import { TurnChangesRenderGate } from "./turn-changes.js";
 import { turnChangesCard } from "./turn-changes-card.js";
 import { describeTool } from "@astra/ui-core/tool-activity";
 import { memoryNoticeText, memoryRecallText } from "@astra/ui-core/memory-notices";
+import { maskSecrets } from "@astra/ui-core/secret-mask";
 import { processRowCells, toolRowCells } from "./tool-row.js";
 import { gapLine, noticeItem, TranscriptFlow, type FlowGap, type FlowItem } from "./transcript-flow.js";
 import { createBackendEventReceiver, EventDeliveryState, writeProtocolDiagnostic } from "./backend-protocol.js";
@@ -297,9 +298,12 @@ export function messageToLines(
   tone?: LineTone,
 ): RenderLine[] {
   if (msg.role === "reasoning" && !showReasoning) return [];
+  // A credential the user pasted is drawn masked; the message itself, and what is sent, stay as written.
   const content = msg.role === "assistant"
     ? stripLegacyAssistantTimeMarker(msg.content)
-    : msg.content;
+    : msg.role === "user"
+      ? maskSecrets(msg.content)
+      : msg.content;
   const bodyWidth = Math.max(30, width - 8);
   const result = markdownBlocksToLines(parseCompleteMarkdown(content), {
     role: msg.role,

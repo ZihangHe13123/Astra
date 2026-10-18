@@ -117,6 +117,7 @@ const SEARCH_PROVIDERS: SlashCommandSuggestion[] = [
   { command: "auto", description: "smart routing with provider fallback", completion: "/search auto", submitValue: "/search auto", kind: "command" },
   { command: "exa", description: "force Exa semantic search", completion: "/search exa", submitValue: "/search exa", kind: "command" },
   { command: "searxng", description: "force local SearXNG metasearch", completion: "/search searxng", submitValue: "/search searxng", kind: "command" },
+  { command: "deepseek", description: "force DeepSeek Search API (billed per request)", completion: "/search deepseek", submitValue: "/search deepseek", kind: "command" },
 ];
 
 const MEMORY_SUBCOMMANDS: SlashCommandSuggestion[] = [

@@ -141,6 +141,11 @@ kbd { font: inherit; font-family: var(--font-chrome); color: var(--muted); font-
 .message table { display: block; border-collapse: collapse; overflow-x: auto; max-width: 100%; margin: 18px 0; font-size: var(--fs-ui); }
 .message td,.message th { text-align: left; padding: 9px 13px; border-bottom: 1px solid var(--line); }
 .message code:not(pre code) { background: var(--soft); color: var(--code); border-radius: var(--r-1); padding: 2px 5px; }
+/* A credential in a sent message, drawn masked; monospace, so showing it leaves the text around it in place. */
+.secret-value { font-family: var(--font-mono); font-size: .92em; cursor: pointer; border-radius: 3px; text-decoration: underline dotted; text-underline-offset: 3px; overflow-wrap: anywhere; }
+.secret-value:hover { background: var(--line); }
+.secret-value:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+pre .secret-value,code .secret-value { font-size: inherit; }
 .code-block { position: relative; margin: 16px 0; border: 1px solid var(--line); border-radius: var(--r-2); background: var(--soft); overflow: hidden; }
 .code-block pre { margin: 0; padding: 16px; overflow-x: auto; white-space: pre; font-size: var(--fs-small); line-height: 1.7; }
 .copy-code { position: absolute; right: 7px; top: 7px; padding: 4px; border: 0; color: var(--muted); background: var(--soft); }

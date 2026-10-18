@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import inspect
 import json
 import logging
 import math
@@ -334,6 +335,9 @@ class AgentContext:
     runtime_projection: RuntimeContextProjection = field(default_factory=RuntimeContextProjection, init=False, repr=False)
     # Core memory, sent once and again only when it changes (not inside every turn snapshot).
     memory_projection: StandingMemoryProjection = field(default_factory=StandingMemoryProjection, init=False, repr=False)
+    # The last request sent for this conversation, as the provider received it, so a
+    # compaction summary can replay it and reuse its cached prefix (see summary_replay).
+    _sent_request: dict | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.max_prompt_tokens == 100_000:
@@ -368,6 +372,7 @@ class AgentContext:
             lease = claim_session(path)
         else:
             lease = None
+        self._sent_request = None
         self._system_prompt_migration = {}
         self.guidance_snapshot = {}
         self.system_projection.reset()
@@ -885,7 +890,33 @@ class AgentContext:
             + sum(self._message_token_costs) + self._runtime_context_tokens()
         ))
 
+    def remember_request(self, messages: list[dict], tools: list[dict]) -> None:
+        """Record the request just sent, and which conversation messages it was built from."""
+        self._sent_request = {
+            "messages": messages,
+            "tools": tools,
+            "count": len(self.messages),
+            "last": copy.deepcopy(self.messages[-1]) if self.messages else None,
+        }
+
+    def summary_replay(self) -> dict | None:
+        """The last sent request plus what the conversation gained since, for a summary.
+
+        A summary request that starts with the bytes of the last request reuses the
+        provider's prompt cache for all of it. None when that request no longer describes
+        this conversation (it was compacted, rewound, switched or never sent).
+        """
+        sent = self._sent_request
+        if sent is None:
+            return None
+        count = sent["count"]
+        if count > len(self.messages) or (count and self.messages[count - 1] != sent["last"]):
+            return None
+        added = [self._provider_message(stored) for stored in self.messages[count:]]
+        return {"messages": [*sent["messages"], *added], "tools": sent["tools"], "limit": int(self.max_prompt_tokens)}
+
     def reset(self):
+        self._sent_request = None
         self.guidance_snapshot = {}
         self.system_projection.reset()
         self.runtime_projection.reset()
@@ -961,6 +992,9 @@ class AgentContext:
         measure_tokens: Callable[[], int], target_tokens: int, report: dict,
     ):
 
+        # Taken before the cleanups below rewrite older messages: the summary may then
+        # still replay what was last sent, cached, with everything those cleanups drop.
+        replay = self.summary_replay()
         # Superseded runtime snapshots are useful only for prefix reuse. Retire
         # them under budget pressure before sacrificing canonical conversation.
         changed = self.runtime_projection.compact(self.messages)
@@ -1000,9 +1034,11 @@ class AgentContext:
 
         if self.compressor is not None:
             prompt = self._compaction_messages()
-            options = {"force": force}
+            options: dict[str, Any] = {"force": force}
             if preserve_on_failure:
                 options["preserve_on_failure"] = True
+            if replay is not None and "replay" in inspect.signature(self.compressor.compress).parameters:
+                options["replay"] = replay
             compressed = await self.compressor.compress(prompt, target_tokens, **options)
             if compressed is prompt:
                 # Compressor declined (nothing safely compressible, or the
@@ -1018,6 +1054,7 @@ class AgentContext:
             self._message_token_costs.clear()  # invalidate cache
             self.last_prompt_tokens = 0
             self._saved_message_count = 0
+            self._sent_request = None
             report["method"] = "summary"
             return True
 
