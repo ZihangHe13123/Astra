@@ -33,6 +33,9 @@ class FakeIlink:
         self.timeline: list[tuple[str, object]] = []
         self.upload_requests: list[dict] = []
         self.uploads: dict[str, bytes] = {}
+        # Answers the CDN gives uploads before taking one: (status, headers, body).
+        self.upload_failures: list[tuple[int, dict[str, str], bytes]] = []
+        self.upload_attempts = 0
         self._cursor = 0
         fake = self
 
@@ -78,6 +81,16 @@ class FakeIlink:
                 body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
                 url = urlparse(self.path)
                 if url.path == "/c2c/upload":
+                    fake.upload_attempts += 1
+                    if fake.upload_failures:
+                        status, headers, answer = fake.upload_failures.pop(0)
+                        self.send_response(status)
+                        for name, value in headers.items():
+                            self.send_header(name, value)
+                        self.send_header("Content-Length", str(len(answer)))
+                        self.end_headers()
+                        self.wfile.write(answer)
+                        return
                     reference = f"enc-{len(fake.uploads) + 1}"
                     fake.uploads[reference] = body
                     self.send_response(200)

@@ -187,6 +187,8 @@ def register_channel_tools(
         },
         fn=channel_send_file,
         risk="write",
+        # Sends the file; the file itself stays as it is.
+        writes_paths=False,
         approval="never",
         timeout=45,
         max_calls_per_turn=3,

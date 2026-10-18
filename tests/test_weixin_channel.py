@@ -609,3 +609,82 @@ def test_the_wechat_model_setting_is_kept_beside_the_other_settings(tmp_path):
     assert (config.model, config.enabled, config.keep_awake) == ("deepseek::deepseek-flash", True, False)
     set_channel_setting("weixin", "model", "", path)
     assert load_channels_config(path).weixin.model == ""
+
+
+def test_a_media_upload_tries_a_passing_server_error_again_and_says_why_it_gave_up(ilink, monkeypatch):
+    from agent.channels import weixin
+    from agent.channels.weixin import WeixinError
+
+    monkeypatch.setattr(weixin, "_UPLOAD_PAUSE", 0)
+    url = f"{ilink.cdn}/upload?encrypted_query_param=up-1&filekey=k"
+
+    async def scenario():
+        client = IlinkClient(base_url=ilink.base, cdn_url=ilink.cdn)
+        try:
+            ilink.upload_failures = [(500, {}, b"<html> busy </html>")]
+            assert await client.upload(url, b"x" * 16) == "enc-1"
+            assert ilink.upload_attempts == 2
+
+            ilink.upload_failures = [(500, {"x-error-message": "upload busy"}, b"")] * 3
+            with pytest.raises(WeixinError, match=r"failed after 3 tries \(HTTP 500: upload busy\)"):
+                await client.upload(url, b"x" * 16)
+            assert ilink.upload_attempts == 5
+
+            ilink.upload_failures = [(400, {"x-error-message": "bad filekey"}, b"")]
+            with pytest.raises(WeixinError, match=r"was refused \(HTTP 400: bad filekey\)"):
+                await client.upload(url, b"x" * 16)
+            assert ilink.upload_attempts == 6, "a refusal is not tried again"
+            assert list(ilink.uploads) == ["enc-1"]
+        finally:
+            await client.close()
+
+    asyncio.run(scenario())
+
+
+def test_sending_a_file_is_not_journaled_as_changing_it(tmp_path):
+    from types import SimpleNamespace
+
+    from agent.channels.base import FilePolicy
+    from agent.channels.router import active_channel_message
+    from agent.channels.tools import register_channel_tools
+    from agent.runtime.react import ReActAgent
+    from agent.runtime.tools.registry import ToolDef, ToolRegistry
+
+    picture = tmp_path / "cat.png"
+    picture.write_bytes(b"\x89PNG\r\n\x1a\n" + bytes(64))
+    sent: list[str] = []
+
+    class Manager:
+        def file_policy(self, channel):
+            return FilePolicy(enabled=True, recipients=(OWNER,), roots=(str(tmp_path),), max_bytes=1 << 20)
+
+        async def send_file(self, message, path, name):
+            sent.append(path)
+            return {"status": "sent"}
+
+    async def edit_probe(path=""):
+        return path
+
+    registry = ToolRegistry()
+    register_channel_tools(registry, lambda: Manager())
+    registry.register(ToolDef(name="edit_probe", description="test mutation", fn=edit_probe, risk="write", group="files",
+                              parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}))
+    llm = SimpleNamespace(config=SimpleNamespace(model="fake", capabilities=frozenset()))
+    agent = ReActAgent("agent", llm, registry, system_prompt="base")  # type: ignore[arg-type]
+
+    async def scenario():
+        token = active_channel_message.set(ChannelMessage("weixin", OWNER, OWNER, "把图发我"))
+        try:
+            shared = await agent._execute_tool_call({"id": "send", "name": "channel_send_file",
+                                                     "arguments": json.dumps({"path": str(picture)})})
+            required_after_send = agent._verification_required
+            edited = await agent._execute_tool_call({"id": "edit", "name": "edit_probe", "arguments": '{"path":"notes.md"}'})
+        finally:
+            active_channel_message.reset(token)
+        return shared, required_after_send, edited
+
+    shared, required_after_send, edited = asyncio.run(scenario())
+    assert shared["error"] == "" and sent == [str(picture.resolve())]
+    assert "coding_change_journal" not in shared and "Coding change journal" not in shared.get("tool_output", "")
+    assert required_after_send is False
+    assert edited["coding_change_journal"] == ["notes.md"], "a tool that writes its path is still journaled"
