@@ -1637,6 +1637,11 @@ async def _main(startup_started: float):
             return
         if goal is None or goal.get("status") != "active":
             return
+        if (completions.pending(session_id) or delegate_mailbox.undelivered(session_id)
+                or delegate_mailbox.lead_waiting(session_id) or delegate_mailbox.session_working(session_id)):
+            # Background work still reports in a turn of its own; the goal is checked after that
+            # turn, so a round is not spent, nor a continuation started, while results are on the way.
+            return
         verification = asyncio.create_task(
             _run_goal_verification(
                 session_id,
