@@ -7,9 +7,11 @@ import contextvars
 import hashlib
 import logging
 from collections.abc import Callable
+from typing import Any
 from pathlib import Path
 
 from agent.core.msg import ContentBlock, Msg
+from agent.runtime.prompt_budget import prompt_token_budget
 from agent.runtime.context import AgentContext
 from agent.runtime.context_compressor import ContextCompressor
 
@@ -47,13 +49,25 @@ class AgentChannelRouter:
     """Serialize use of a stateful ReActAgent and park one context per chat."""
 
     def __init__(self, agent, turn_lock: asyncio.Lock, session_root: Path,
-                 *, admission: Callable[[], bool] | None = None):
+                 *, admission: Callable[[], bool] | None = None,
+                 model_for: Callable[[str], Any] | None = None):
         self.agent = agent
         self.turn_lock = turn_lock
         self.session_root = Path(session_root)
         self.admission = admission or (lambda: True)
+        # A channel's own model client, or None to answer with the agent's.
+        self.model_for = model_for or (lambda channel: None)
         self._contexts: dict[str, AgentContext] = {}
         self._template = agent.context
+
+    def _budget(self, llm) -> int:
+        """Compact a channel conversation for the model answering it: its own, or the window's."""
+        config = getattr(llm, "config", None)
+        limit = getattr(config, "context_limit", None)
+        if config is None or not limit:
+            return self._template.max_prompt_tokens
+        return prompt_token_budget(limit, config.max_tokens, model=config.model, provider=config.provider,
+                                   auto_compact_token_limit=config.auto_compact_token_limit)
 
     def _context(self, session_name: str, channel: str = "") -> AgentContext:
         cached = self._contexts.get(session_name)
@@ -94,8 +108,15 @@ class AgentChannelRouter:
             if not self.admission():
                 return "Astra is preparing a restart. Please retry after it reconnects."
             previous = self.agent.context
+            previous_llm = self.agent.llm
             context = self._context(session_name, message.channel)
             self.agent.context = context
+            llm = self.model_for(message.channel)
+            if llm is not None:
+                self.agent.llm = llm
+            context.max_prompt_tokens = self._budget(llm)
+            if context.compressor is not None:
+                context.compressor.llm = self.agent.llm
             token = active_channel.set(message.channel)
             message_token = active_channel_message.set(message)
             media: list[str] = []
@@ -154,3 +175,4 @@ class AgentChannelRouter:
                 active_channel_message.reset(message_token)
                 active_channel.reset(token)
                 self.agent.context = previous
+                self.agent.llm = previous_llm

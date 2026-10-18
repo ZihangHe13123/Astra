@@ -127,6 +127,7 @@ const WEIXIN_OPTIONS: SlashCommandSuggestion[] = [
   { command: "on", description: "switch the channel on", completion: "/weixin on", submitValue: "/weixin on", kind: "command" },
   { command: "off", description: "switch the channel off", completion: "/weixin off", submitValue: "/weixin off", kind: "command" },
   { command: "logout", description: "log out and forget the login", completion: "/weixin logout", submitValue: "/weixin logout", kind: "command" },
+  { command: "model", description: "the model WeChat answers with: a /model key, or default", completion: "/weixin model ", submitValue: "/weixin model", kind: "command" },
 ];
 
 const MEMORY_SUBCOMMANDS: SlashCommandSuggestion[] = [

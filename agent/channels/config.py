@@ -122,6 +122,8 @@ class WeixinConfig:
     chat_bubbles: bool = True
     max_bubbles: int = 8
     # channel_send_file: on, to the person who scanned the code (or file_allow_users), from these roots.
+    # A catalog model key for WeChat turns ("deepseek::deepseek-flash"); empty follows the default model.
+    model: str = ""
     send_files_enabled: bool = True
     file_allow_users: tuple[str, ...] = ()
     send_file_roots: tuple[str, ...] = (str(Path.home()),)
@@ -141,6 +143,7 @@ class WeixinConfig:
             keep_awake=_bool(data.get("keep_awake"), True),
             chat_bubbles=_bool(data.get("chat_bubbles"), True),
             max_bubbles=max(1, min(20, int(data.get("max_bubbles") or 8))),
+            model=str(data.get("model") or "").strip(),
             send_files_enabled=_bool(data.get("send_files_enabled"), True),
             file_allow_users=_items(data.get("file_allow_users")),
             send_file_roots=_items(data.get("send_file_roots"), (str(Path.home()),)),
@@ -162,15 +165,20 @@ def channels_config_path(path: str | Path | None = None) -> Path:
     return Path(path or os.getenv("ASTRA_CHANNEL_CONFIG", "") or DEFAULT_CONFIG_PATH)
 
 
-def set_channel_enabled(section: str, enabled: bool, path: str | Path | None = None) -> Path:
-    """Switch one channel in the config file, keeping everything else in it."""
+def set_channel_setting(section: str, key: str, value: Any, path: str | Path | None = None) -> Path:
+    """Change one setting of one channel in the config file, keeping everything else in it."""
     from agent.runtime.json_preferences import update_preferences
 
     def change(data: dict) -> None:
         current = data.get(section)
-        data[section] = {**(current if isinstance(current, dict) else {}), "enabled": enabled}
+        data[section] = {**(current if isinstance(current, dict) else {}), key: value}
 
     return update_preferences(channels_config_path(path), change)
+
+
+def set_channel_enabled(section: str, enabled: bool, path: str | Path | None = None) -> Path:
+    """Switch one channel in the config file, keeping everything else in it."""
+    return set_channel_setting(section, "enabled", enabled, path)
 
 
 def load_channels_config(path: str | Path | None = None) -> ChannelsConfig:

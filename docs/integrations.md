@@ -88,8 +88,8 @@ with WeChat. The terminal draws the code for a dark background; the desktop
 shows it as an image. The QR code needs the `segno` package
 (`pip install 'segno>=1.6,<2'`, or the `weixin` extra, which also brings the
 `cryptography` used to read images). A successful login sets `weixin.enabled`
-in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on` and
-`/weixin logout` manage it afterwards.
+in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on`,
+`/weixin logout` and `/weixin model` manage it afterwards.
 
 - **Who is answered.** Only the WeChat user who scanned the code, unless
   `weixin.allow_users` lists others. Group messages are ignored.
@@ -108,6 +108,14 @@ in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on` and
   short messages the way people text (at most `max_bubbles`; `chat_bubbles:
   false` sends whole replies split only at `max_output_chars`), with a pause
   before each, and WeChat shows "typing…" from the message until the last reply.
+- **Which model.** WeChat follows the default model: the one last chosen with
+  `/model` in any window, read for each message. `/weixin model <key>` (a key
+  from `/model`, such as `deepseek::deepseek-flash`, or Settings → WeChat →
+  model) gives WeChat a model of its own without changing any window's;
+  `/weixin model default` follows the default again, and `/weixin model` shows
+  the current choice. The setting is `weixin.model`; it applies from the next
+  message, and a model that is no longer in the catalog or has no key falls
+  back to the default.
 - **Files.** When asked, Astra sends a local file with `channel_send_file`: an
   image or a video arrives as one, anything else as a file. Only the person who
   scanned the code receives files (or `weixin.file_allow_users`), only from

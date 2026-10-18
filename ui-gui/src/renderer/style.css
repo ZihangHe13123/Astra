@@ -372,6 +372,8 @@ label { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sma
 .choice-grid [aria-pressed=true] { background:var(--soft); border-color:var(--muted); }
 .choice-grid.three { grid-template-columns:repeat(3, minmax(0, 1fr)); }
 .weixin-actions { display:flex; flex-wrap:wrap; gap:8px; }
+.weixin-model { display:flex; flex-direction:column; gap:4px; margin:4px 0 10px; }
+.weixin-model select { max-width:360px; }
 /* A code needs dark modules on a light ground to scan, whatever the theme. */
 .weixin-qr { display:flex; flex-direction:column; align-items:flex-start; gap:6px; }
 .weixin-qr img { background:#fff; padding:8px; border-radius:var(--r-2); image-rendering:pixelated; }
