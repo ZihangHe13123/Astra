@@ -22,6 +22,7 @@ import io
 import json
 import logging
 import os
+import re
 import secrets
 import uuid
 from collections import OrderedDict
@@ -62,6 +63,18 @@ _CDN_HOSTS = frozenset({
 })
 _SEEN_LIMIT = 512
 _SEND_ATTEMPTS = 4
+_TYPING_START, _TYPING_STOP = 1, 2
+_TYPING_REFRESH_SECONDS = 4.0
+_TYPING_TICKET_SECONDS = 600.0
+
+# Added to the system prompt of WeChat conversations only (see AgentChannelRouter): it is a
+# chat on a phone, mostly company rather than work.
+CHAT_STYLE = """[微信聊天]
+这段对话来自微信：对方在手机上和你聊天，以闲聊和陪伴为主，偶尔请你帮忙做点小事。像发微信一样回复：
+- 口语、自然、简短。一条消息说一件事；想说几件事就用空行隔开，它们会作为几条消息依次发出。
+- 微信不显示 Markdown：不要用标题、加粗、表格和代码块，少用列表，需要分点时直接换行。
+- 闲聊就好好聊：接话、追问、表达感受都可以，不必每次总结或给建议；表情偶尔用，别堆砌。
+- 需要做事（查资料、记东西、定提醒）照常用工具，做完用一两句话说结果，不贴长报告；真需要长内容时先说结论，再问要不要展开。"""
 
 
 class WeixinError(RuntimeError):
@@ -213,6 +226,17 @@ class IlinkClient:
             message["context_token"] = context_token
         return await self._post(account, "ilink/bot/sendmessage", {"msg": message})
 
+    async def typing_ticket(self, account: WeixinAccount, to: str, context_token: str) -> str:
+        payload: dict[str, Any] = {"ilink_user_id": to}
+        if context_token:
+            payload["context_token"] = context_token
+        data = await self._post(account, "ilink/bot/getconfig", payload, timeout=10.0)
+        return str(data.get("typing_ticket") or "")
+
+    async def send_typing(self, account: WeixinAccount, to: str, ticket: str, status: int) -> None:
+        await self._post(account, "ilink/bot/sendtyping",
+                         {"ilink_user_id": to, "typing_ticket": ticket, "status": status}, timeout=10.0)
+
     async def download(self, url: str, max_bytes: int) -> bytes:
         async with self._http.stream("GET", url, timeout=60.0) as response:
             if response.status_code != 200:
@@ -326,12 +350,79 @@ def split_reply(text: str, limit: int) -> list[str]:
     return pieces
 
 
+_FENCE = re.compile(r"^\s*(```|~~~)")
+_LIST_ITEM = re.compile(r"^\s*(?:[-*•·]|\d+[.、)）])\s+")
+# A full stop ends a sentence only before a space, so decimals and addresses stay whole.
+_SENTENCE_END = re.compile(r"(?<=[。！？!?…；;~～])\s*|(?<=\.)\s+")
+
+
+def plain_text(text: str) -> str:
+    """What WeChat shows as written: headings and emphasis markers removed, everything else kept."""
+    lines = []
+    in_code = False
+    for line in text.splitlines():
+        if _FENCE.match(line):
+            in_code = not in_code
+            continue
+        if not in_code:
+            line = re.sub(r"^\s{0,3}#{1,6}\s+", "", line)
+            line = re.sub(r"(\*\*|__)(.+?)\1", r"\2", line)
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _chatty(lines: list[str]) -> bool:
+    """A block that reads as a few short texts in a row, not a list or a paragraph."""
+    return 2 <= len(lines) <= 6 and all(len(line.strip()) <= 40 and not _LIST_ITEM.match(line) for line in lines)
+
+
+def chat_bubbles(text: str, limit: int, max_bubbles: int = 8, long_paragraph: int = 50, sentences_up_to: int = 30) -> list[str]:
+    """Split a reply the way people text: a message per paragraph, a few short lines as
+    separate messages, a long paragraph at sentence ends. Lists stay whole; nothing
+    exceeds ``limit``; past ``max_bubbles`` neighbours are joined while they fit."""
+    bubbles: list[str] = []
+    for block in re.split(r"\n\s*\n", plain_text(text)):
+        lines = [line for line in block.splitlines() if line.strip()]
+        if not lines:
+            continue
+        if _chatty(lines):
+            bubbles.extend(line.strip() for line in lines)
+        elif len(lines) == 1 and len(lines[0]) > long_paragraph:
+            sentences = [s for s in _SENTENCE_END.split(lines[0].strip()) if s]
+            current = ""
+            for sentence in sentences:
+                if current and len(current) + len(sentence) > sentences_up_to:
+                    bubbles.append(current)
+                    current = ""
+                # The split took the space after an English sentence; put it back between two.
+                current += (" " if current and current[-1] in ".!?;" else "") + sentence
+            if current:
+                bubbles.append(current)
+        else:
+            bubbles.append("\n".join(lines))
+    pieces = [piece for bubble in bubbles for piece in split_reply(bubble, limit)]
+    while len(pieces) > max_bubbles:
+        pairs = [(len(pieces[i]) + len(pieces[i + 1]), i) for i in range(len(pieces) - 1)
+                 if len(pieces[i]) + len(pieces[i + 1]) + 1 <= limit]
+        if not pairs:
+            break
+        _, i = min(pairs)
+        pieces[i:i + 2] = [pieces[i] + "\n" + pieces[i + 1]]
+    return pieces
+
+
+def typing_pause(text: str) -> float:
+    """Seconds between two messages, about the time it takes to type the next one."""
+    return min(2.5, 0.5 + len(text) / 25)
+
+
 class WeixinAdapter(ChannelAdapter):
     name = "weixin"
 
     def __init__(self, config: WeixinConfig, handler: MessageHandler, *, store: WeixinStore | None = None,
                  client: IlinkClient | None = None, keep_awake: KeepAwake | None = None,
-                 owner_retry: float = 30.0, failure_delays: tuple[float, float] = (2.0, 30.0)) -> None:
+                 owner_retry: float = 30.0, failure_delays: tuple[float, float] = (2.0, 30.0),
+                 pause: Callable[[str], float] = typing_pause) -> None:
         super().__init__(handler)
         self.config = config
         self.store = store or WeixinStore()
@@ -347,6 +438,8 @@ class WeixinAdapter(ChannelAdapter):
         self._tokens: dict[str, str] = {}
         self._seen: OrderedDict[str, None] = OrderedDict()
         self._inbox: asyncio.Queue[dict] = asyncio.Queue()
+        self._pause = pause
+        self._tickets: dict[str, tuple[str, float]] = {}
 
     @property
     def running(self) -> bool:
@@ -508,15 +601,25 @@ class WeixinAdapter(ChannelAdapter):
         async def reply(answer: str) -> None:
             await self.send_text(sender, answer)
 
+        # "Typing…" shows in WeChat from the message until the last reply is sent; it is on before
+        # the turn starts, so even a quick reply never arrives ahead of it.
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(self._typing(sender, _TYPING_START), timeout=3.0)
+        typing = asyncio.create_task(self._keep_typing(sender), name="weixin-typing")
         try:
-            response = await self.handler(event, reply)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("weixin turn failed")
-            response = "Astra 处理消息时发生错误，请稍后重试。"
-        if response:
-            await reply(response)
+            try:
+                response = await self.handler(event, reply)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("weixin turn failed")
+                response = "Astra 处理消息时发生错误，请稍后重试。"
+            if response:
+                await reply(response)
+        finally:
+            typing.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await typing
 
     async def _content(self, items: list) -> tuple[str, tuple[ChannelImage, ...]]:
         parts: list[str] = []
@@ -571,13 +674,48 @@ class WeixinAdapter(ChannelAdapter):
         kind = _image_type(data)
         return ChannelImage(data_url=f"data:{kind};base64,{base64.b64encode(data).decode('ascii')}", name="weixin-image")
 
+    async def _ticket(self, to: str) -> str:
+        account, client = self._account, self._client
+        if account is None or client is None:
+            return ""
+        cached = self._tickets.get(to)
+        loop = asyncio.get_running_loop()
+        if cached and loop.time() - cached[1] < _TYPING_TICKET_SECONDS:
+            return cached[0]
+        ticket = await client.typing_ticket(account, to, self._tokens.get(to, ""))
+        if ticket:
+            self._tickets[to] = (ticket, loop.time())
+        return ticket
+
+    async def _typing(self, to: str, status: int) -> None:
+        account, client = self._account, self._client
+        try:
+            ticket = await self._ticket(to)
+            if ticket and account is not None and client is not None:
+                await client.send_typing(account, to, ticket, status)
+        except (httpx.HTTPError, WeixinError) as exc:
+            logger.debug("weixin typing indicator failed: %s", type(exc).__name__)
+
+    async def _keep_typing(self, to: str) -> None:
+        try:
+            while True:
+                await asyncio.sleep(_TYPING_REFRESH_SECONDS)
+                await self._typing(to, _TYPING_START)
+        finally:
+            # Without an explicit stop WeChat can keep showing "typing…".
+            await asyncio.shield(self._typing(to, _TYPING_STOP))
+
     async def send_text(self, to: str, text: str) -> None:
         account, client = self._account, self._client
         if account is None or client is None:
             raise WeixinError("the WeChat channel is not online")
-        for piece in split_reply(text, self.config.max_output_chars):
+        limit = self.config.max_output_chars
+        pieces = (chat_bubbles(text, limit, self.config.max_bubbles) if self.config.chat_bubbles
+                  else split_reply(plain_text(text), limit))
+        for index, piece in enumerate(pieces):
+            if index:
+                await asyncio.sleep(self._pause(piece))
             await self._send_piece(client, account, to, piece)
-            await asyncio.sleep(0.5)
 
     async def _send_piece(self, client: IlinkClient, account: WeixinAccount, to: str, piece: str) -> None:
         token = self._tokens.get(to, "")

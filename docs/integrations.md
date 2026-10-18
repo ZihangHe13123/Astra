@@ -101,7 +101,12 @@ in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on` and
   connected. Set `weixin.keep_awake` to `false` to leave sleep alone.
 - **What arrives.** Text, quoted messages, WeChat's own transcript of a voice
   message, and up to `max_images` images (decrypted from WeChat's CDN). Files and
-  videos arrive as a placeholder. Replies are text, split at `max_output_chars`.
+  videos arrive as a placeholder.
+- **How it answers.** WeChat conversations are told to talk like a chat: short,
+  casual, no Markdown, one thought per message. A reply goes out as several
+  short messages the way people text (at most `max_bubbles`; `chat_bubbles:
+  false` sends whole replies split only at `max_output_chars`), with a pause
+  before each, and WeChat shows "typing…" from the message until the last reply.
 - **Privacy.** The bot token lives in the state directory's
   `channels/weixin/account.json`, readable by the owner only, and never appears
   in events or logs. Another program that polls the same login (for example

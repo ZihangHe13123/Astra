@@ -29,6 +29,8 @@ class FakeIlink:
         self.headers: list[dict] = []
         self.media: dict[str, bytes] = {}
         self.media_requests: list[str] = []
+        # Replies and typing changes in the order they reached the service: ("text", ...) or ("typing", status).
+        self.timeline: list[tuple[str, object]] = []
         self._cursor = 0
         fake = self
 
@@ -91,8 +93,14 @@ class FakeIlink:
                         fake._cursor += 1
                     self._json({"ret": 0, "msgs": messages, "get_updates_buf": f"cursor-{fake._cursor}",
                                 "longpolling_timeout_ms": 500})
+                elif self.path == "/ilink/bot/getconfig":
+                    self._json({"ret": 0, "typing_ticket": f"ticket-{payload.get('ilink_user_id')}"})
+                elif self.path == "/ilink/bot/sendtyping":
+                    fake.timeline.append(("typing", payload.get("status")))
+                    self._json({"ret": 0})
                 elif self.path == "/ilink/bot/sendmessage":
                     fake.sent.append(payload["msg"])
+                    fake.timeline.append(("text", payload["msg"]["item_list"][0]["text_item"]["text"]))
                     try:
                         self._json(fake.send_answers.get_nowait())
                     except queue.Empty:

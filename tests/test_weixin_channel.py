@@ -9,8 +9,11 @@ import sys
 import pytest
 from weixin_fixture import BOT_TOKEN, LOGIN_LINK, OWNER, STRANGER, FakeIlink
 
+from agent.channels.base import ChannelMessage
 from agent.channels.config import WeixinConfig
-from agent.channels.weixin import IlinkClient, WeixinAdapter, WeixinStore, qr_login
+from agent.channels.router import AgentChannelRouter
+from agent.channels.weixin import CHAT_STYLE, IlinkClient, WeixinAdapter, WeixinStore, chat_bubbles, qr_login
+from agent.runtime.context import AgentContext
 
 
 class FakeAwake:
@@ -65,7 +68,8 @@ async def logged_in(fake: FakeIlink, store: WeixinStore):
 
 def adapter(fake, store, handler, *, awake=None, **config):
     return WeixinAdapter(WeixinConfig(enabled=True, **config), handler, store=store, client=client(fake),
-                         keep_awake=awake or FakeAwake(), owner_retry=0.05, failure_delays=(0.01, 0.01))
+                         keep_awake=awake or FakeAwake(), owner_retry=0.05, failure_delays=(0.01, 0.01),
+                         pause=lambda _text: 0.0)
 
 
 def test_a_scanned_login_is_kept_privately_and_the_bot_then_answers_its_owner(ilink, tmp_path):
@@ -273,3 +277,72 @@ def test_on_a_mac_the_channel_holds_off_idle_sleep_only_while_it_polls(ilink, tm
         await until(lambda: not holders(), "released")
 
     asyncio.run(scenario())
+
+
+def test_a_reply_is_split_the_way_people_text():
+    assert chat_bubbles("哈哈，我在呢。\n\n今天怎么样？", 1800) == ["哈哈，我在呢。", "今天怎么样？"]
+    # A few short lines read as separate texts; a list stays one message.
+    assert chat_bubbles("好呀\n我刚查了一下\n明天会下雨", 1800) == ["好呀", "我刚查了一下", "明天会下雨"]
+    assert chat_bubbles("要买的：\n- 牛奶\n- 面包", 1800) == ["要买的：\n- 牛奶\n- 面包"]
+    # WeChat shows Markdown as written, so headings and emphasis markers go.
+    assert chat_bubbles("## 结果\n\n**明天**有雨。", 1800) == ["结果", "明天有雨。"]
+    # A long paragraph is cut at sentence ends; a short one stays whole.
+    long = "今天天气不错，适合出去走走。你上次说想去公园看看樱花，现在正好是花期，要不要周末一起计划一下？我可以帮你查一下哪个公园人少一点。"
+    assert "".join(chat_bubbles(long, 1800)) == long and len(chat_bubbles(long, 1800)) == 3
+    assert chat_bubbles("嗯嗯，早点休息吧。", 1800) == ["嗯嗯，早点休息吧。"]
+    assert chat_bubbles("Sure! It will rain. It costs 3.5 yuan at example.com, so take an umbrella with you today.", 1800) == [
+        "Sure! It will rain.", "It costs 3.5 yuan at example.com, so take an umbrella with you today."]
+    # Never more than the limit allows: neighbours join, and no message exceeds the length cap.
+    many = "\n\n".join(f"第{i}条" for i in range(20))
+    bubbles = chat_bubbles(many, 1800, max_bubbles=5)
+    assert len(bubbles) == 5 and "\n".join(bubbles).split("\n") == [f"第{i}条" for i in range(20)]
+    assert all(len(b) <= 50 for b in chat_bubbles("字" * 400, 50))
+
+
+def test_the_reply_goes_out_as_short_messages_while_wechat_shows_typing(ilink, tmp_path):
+    async def scenario():
+        store = WeixinStore(tmp_path / "weixin")
+        await logged_in(ilink, store)
+
+        async def handler(message, reply):
+            return "哈哈，我在呢。\n\n今天怎么样？"
+
+        channel = adapter(ilink, store, handler)
+        await channel.start()
+        try:
+            ilink.inbound.put(ilink.text_message("在吗"))
+            await until(lambda: ("typing", 2) in ilink.timeline, "typing stopped")
+        finally:
+            await channel.stop()
+        texts = [value for kind, value in ilink.timeline if kind == "text"]
+        assert texts == ["哈哈，我在呢。", "今天怎么样？"]
+        first_text = next(i for i, (kind, _) in enumerate(ilink.timeline) if kind == "text")
+        last_text = max(i for i, (kind, _) in enumerate(ilink.timeline) if kind == "text")
+        assert ("typing", 1) in ilink.timeline[:first_text]
+        assert ilink.timeline[-1] == ("typing", 2) and ilink.timeline.index(("typing", 2)) > last_text
+
+    asyncio.run(scenario())
+
+
+def test_only_wechat_conversations_are_told_to_talk_like_a_chat(tmp_path):
+    prompts: dict[str, str] = {}
+
+    class Agent:
+        def __init__(self) -> None:
+            self.context = AgentContext(system_prompt="system", max_messages=20, max_prompt_tokens=1000)
+            self.context.set_stable_system_suffix("project guidance")
+            self.llm = object()
+
+        async def reply_stream(self, message):
+            prompts[message.metadata["channel"]] = self.context.effective_system_prompt
+            yield {"type": "chunk", "content": "ok"}
+            yield {"type": "done", "content": "ok"}
+
+    async def scenario():
+        router = AgentChannelRouter(Agent(), asyncio.Lock(), tmp_path)
+        await router.handle(ChannelMessage("weixin", OWNER, OWNER, "在吗"))
+        await router.handle(ChannelMessage("qq", "peer", "peer", "hi"))
+
+    asyncio.run(scenario())
+    assert CHAT_STYLE in prompts["weixin"] and "project guidance" in prompts["weixin"]
+    assert CHAT_STYLE not in prompts["qq"] and "project guidance" in prompts["qq"]

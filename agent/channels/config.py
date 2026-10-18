@@ -118,6 +118,9 @@ class WeixinConfig:
     max_images: int = 4
     max_image_bytes: int = 10 * 1024 * 1024
     keep_awake: bool = True
+    # Send a reply as several short messages, the way people text (see weixin.chat_bubbles).
+    chat_bubbles: bool = True
+    max_bubbles: int = 8
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "WeixinConfig":
@@ -131,6 +134,8 @@ class WeixinConfig:
             max_images=max(0, min(8, int(4 if images is None else images))),
             max_image_bytes=max(1024, int(data.get("max_image_bytes") or 10 * 1024 * 1024)),
             keep_awake=_bool(data.get("keep_awake"), True),
+            chat_bubbles=_bool(data.get("chat_bubbles"), True),
+            max_bubbles=max(1, min(20, int(data.get("max_bubbles") or 8))),
         )
 
 
