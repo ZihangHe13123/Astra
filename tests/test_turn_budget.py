@@ -48,16 +48,24 @@ def test_one_deadline_covers_all_requests_and_retries_and_closes_the_source():
 ])
 def test_early_timer_expiry_is_attributed_to_its_limiting_deadline(monkeypatch, request_seconds, cap, error):
     from agent.runtime import turn_budget
-    timeout = asyncio.timeout
+    wait = asyncio.wait
+    races = []
+
+    async def early(aws, timeout=None, **kwargs):
+        # The request races its deadline with asyncio.wait. Report that race as timed out
+        # before the monotonic deadline, reproducing a coarse clock tick without depending
+        # on host timing; later waits (stopping the request) run normally.
+        races.append(timeout)
+        if len(races) == 1:
+            return set(), set(aws)
+        return await wait(aws, timeout=timeout, **kwargs)
 
     async def scenario():
         budget = turn_budget.TurnBudget(60)
         token = turn_budget._CURRENT.set(budget)
         try:
             request = _RequestBudget.from_policy(request_seconds, 0)
-            # Fire the actual asyncio timeout before the monotonic deadline,
-            # reproducing a coarse clock tick without depending on host timing.
-            monkeypatch.setattr(asyncio, "timeout", lambda _: timeout(0))
+            monkeypatch.setattr(asyncio, "wait", early)
             with pytest.raises(error):
                 await request.run(lambda: asyncio.Event().wait(), cap=cap)
             assert request.remaining() > 0
