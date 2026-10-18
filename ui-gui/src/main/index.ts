@@ -8,6 +8,7 @@ import { homedir } from "node:os";
 import type { DesktopEvent, Preferences } from "../bridge.js";
 import type { SessionState } from "@astra/ui-core/session-state";
 import { Runtime } from "./runtime.js";
+import { ChannelHost } from "./channel-host.js";
 import { QueryClient } from "./query-client.js";
 import { sessionAction } from "./session-actions.js";
 import { hasOngoingWork } from "./ongoing-work.js";
@@ -331,11 +332,17 @@ register("file", async (id, value, action, requestId) => {
   finally { if (previewRequests.get(key) === controller) previewRequests.delete(key); }
 });
 
+/** WeChat and QQ answer while the desktop is open, whether or not a conversation is open in the window. */
+const channelHost = new ChannelHost({
+  configPath: process.env.ASTRA_CHANNEL_CONFIG || join(root, ".astra", "channels.json"),
+  create: () => new Runtime(root, python, workspace, "channel_host", "work", () => {}),
+});
+
 async function performQuit() {
   if (quitting) return;
   quitting = true;
   await Promise.all([...runtimes.values()].map(rt => rt.close()));
-  await Promise.all([appshot.client.close(), queries.close(), phone.dispose()]);
+  await Promise.all([appshot.client.close(), queries.close(), phone.dispose(), channelHost.stop()]);
   // Let beforeunload supply the newest draft before taking the final snapshot.
   if (window && !window.isDestroyed()) {
     const closingWindow = window;
@@ -441,6 +448,7 @@ else {
     tray.setContextMenu(Menu.buildFromTemplate([{ label: "打开 Astra", click: showWindow }, { label: "停止并退出", click: () => requestQuit("quit") }]));
     tray.on("click", showWindow);
     await syncPhone();
+    channelHost.start();
     showWindow();
   }).catch(async error => {
     console.error("Astra desktop startup failed:", error);
