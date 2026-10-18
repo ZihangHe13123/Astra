@@ -13,7 +13,7 @@ from weixin_fixture import BOT_TOKEN, LOGIN_LINK, OWNER, STRANGER, FakeIlink
 from agent.channels.base import ChannelMessage
 from agent.channels.config import WeixinConfig
 from agent.channels.router import AgentChannelRouter
-from agent.channels.weixin import CHAT_STYLE, IlinkClient, WeixinAdapter, WeixinStore, chat_bubbles, qr_login
+from agent.channels.weixin import CHAT_STYLE, IlinkClient, WeixinAdapter, WeixinError, WeixinStore, chat_bubbles, qr_login
 from agent.runtime.context import AgentContext
 
 
@@ -688,3 +688,113 @@ def test_sending_a_file_is_not_journaled_as_changing_it(tmp_path):
     assert "coding_change_journal" not in shared and "Coding change journal" not in shared.get("tool_output", "")
     assert required_after_send is False
     assert edited["coding_change_journal"] == ["notes.md"], "a tool that writes its path is still journaled"
+
+
+def test_while_an_approval_waits_only_the_askers_approval_word_answers_it(ilink, tmp_path):
+    from agent.channels.approvals import approval_reply
+
+    answers: list[str] = []
+    turns: list[str] = []
+    decided = asyncio.Event()
+
+    async def scenario():
+        store = WeixinStore(tmp_path / "weixin")
+        await logged_in(ilink, store)
+
+        async def handler(message, reply):
+            turns.append(message.text)
+            if message.text == "写文件":
+                def answer(decision):
+                    answers.append(decision)
+                    decided.set()
+                await channel.ask_approval(message, "需要你批准：写文件", answer)
+                await decided.wait()
+                await channel.end_approval(message)
+            return ""
+
+        channel = adapter(ilink, store, handler, allow_users=(OWNER, STRANGER))
+        await channel.start()
+        await until(lambda: channel.running, "online")
+        try:
+            ilink.inbound.put(ilink.text_message("写文件"))
+            await until(lambda: ilink.replies_to(OWNER) == ["需要你批准：写文件"], "the request reaches the chat")
+            ilink.inbound.put(ilink.text_message("好的我看看"))
+            ilink.inbound.put(ilink.text_message("同意", sender=STRANGER))
+            ilink.inbound.put(ilink.text_message("同意！", context_token="ctx-yes"))
+            await until(lambda: answers == ["once"], "the owner's answer")
+            await until(lambda: len(turns) == 3, "the other two messages are ordinary turns")
+        finally:
+            await channel.stop()
+
+    asyncio.run(scenario())
+    assert turns == ["写文件", "好的我看看", "同意"], "neither the chat nor a stranger's word answered it"
+    assert answers == ["once"]
+    assert [approval_reply(word) for word in ("拒绝", " no ", "同意。", "同意这个吗")] == ["deny", "deny", "once", None]
+
+
+def test_no_answer_in_time_is_a_denial_the_person_hears_about_and_keys_stay_hidden():
+    from agent.channels.approvals import await_chat_approval
+
+    said: list[tuple[str, str]] = []
+
+    class Chat:
+        async def ask_approval(self, message, prompt, answer):
+            said.append(("ask", prompt))
+
+        async def end_approval(self, message, notice=""):
+            said.append(("end", notice))
+
+    async def scenario():
+        decision = asyncio.get_running_loop().create_future()
+
+        def resolve(value):
+            if decision.done():
+                return False
+            decision.set_result(value)
+            return True
+
+        request = {"approval_title": "在受保护主机上运行 shell 命令", "reason": "该命令将在宿主机运行",
+                   "target": "curl -H 'Authorization: Bearer abcdefgh12345678' https://example.com; "
+                             "OPENAI=sk-proj1234abcdEFGHijklMNOP5678 GITHUB_TOKEN=ghp_zyxw9876 "
+                             "git clone https://me:hunter22@example.com/r.git"}
+        return await await_chat_approval(Chat(), ChannelMessage("weixin", OWNER, OWNER, "查一下"), request,
+                                         decision, resolve, timeout=0.05)
+
+    assert asyncio.run(scenario()) == "deny"
+    (ask, prompt), (end, notice) = said
+    assert (ask, end) == ("ask", "end") and prompt.startswith("需要你批准：在受保护主机上运行 shell 命令")
+    for secret in ("abcdefgh12345678", "EFGHijklMNOP5678", "ghp_zyxw9876", "hunter22"):
+        assert secret not in prompt, secret
+    # What the command does stays readable.
+    for kept in ("curl -H 'Authorization: Bearer …' https://example.com", "OPENAI=sk-proj1…", "GITHUB_TOKEN=…",
+                 "git clone https://me:…@example.com/r.git"):
+        assert kept in prompt, (kept, prompt)
+    assert "没有执行" in notice
+
+
+def test_an_approval_whose_request_could_not_be_sent_still_ends_and_answers_after_the_limit():
+    from agent.channels.approvals import await_chat_approval
+
+    calls: list[str] = []
+
+    class Chat:
+        async def ask_approval(self, message, prompt, answer):
+            calls.append("ask")
+            raise WeixinError("WeChat will not take a reply until this person writes to the bot again")
+
+        async def end_approval(self, message, notice=""):
+            calls.append(f"end:{bool(notice)}")
+
+    async def scenario():
+        decision = asyncio.get_running_loop().create_future()
+
+        def resolve(value):
+            if not decision.done():
+                decision.set_result(value)
+            return True
+
+        return await await_chat_approval(Chat(), ChannelMessage("weixin", OWNER, OWNER, "查一下"),
+                                         {"target": "ls"}, decision, resolve, timeout=0.05)
+
+    assert asyncio.run(scenario()) == "deny"
+    assert calls == ["ask", "end:True"]

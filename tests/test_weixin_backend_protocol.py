@@ -178,3 +178,65 @@ def test_weixin_answers_with_its_own_model_and_follows_the_default_again(tmp_pat
         model.shutdown()
         model.server_close()
         ilink.close()
+
+
+def test_a_wechat_turn_asks_for_approval_in_wechat_and_follows_the_answer(tmp_path):
+    from test_backend_task_protocol import _ApprovalOpenAIHandler
+
+    target = tmp_path / "outside-workspace.txt"
+    model = ThreadingHTTPServer(("127.0.0.1", 0), _ApprovalOpenAIHandler)
+    model.target_path, model.target_content, model.call_number = target, "approved in WeChat", 0  # type: ignore[attr-defined]
+    threading.Thread(target=model.serve_forever, daemon=True).start()
+    ilink = FakeIlink()
+    channels = tmp_path / "channels.json"
+    channels.write_text(json.dumps({"weixin": {"keep_awake": False}}), encoding="utf-8")
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    proc, _, seen, wait_for = _start_question_protocol_backend(
+        tmp_path, model.server_port, "weixin_approval_session", workdir=workdir,
+        env_overrides={"ASTRA_HOME": str(tmp_path / "home"), "ASTRA_CHANNEL_CONFIG": str(channels),
+                       "ASTRA_WEIXIN_BASE_URL": ilink.base, "ASTRA_WEIXIN_CDN_URL": ilink.cdn,
+                       "ASTRA_CONTEXT_INDEX_EMBEDDING": "off"},
+    )
+
+    def replies(count: int) -> list[str]:
+        deadline = time.monotonic() + 30
+        while len(ilink.replies_to(OWNER)) < count and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert len(ilink.replies_to(OWNER)) >= count, ilink.replies_to(OWNER)
+        return ilink.replies_to(OWNER)
+
+    try:
+        wait_for(lambda e: e.get("type") == "weixin_status", timeout=30)
+        send(proc, {"type": "command", "cmd": "/weixin login"})
+        wait_for(lambda e: e.get("type") == "weixin_status" and e.get("state") == "online", timeout=30)
+
+        ilink.inbound.put(ilink.text_message("帮我写个文件", context_token="ctx-ask"))
+        prompt = replies(1)[0]
+        assert prompt.startswith("需要你批准") and str(target) in prompt and "回复“同意”执行一次" in prompt
+        request = wait_for(lambda e: e.get("type") == "tool_approval_request")
+        assert request["surface"] == "channel" and request["channel"] == "weixin"
+        assert not target.exists()
+
+        ilink.inbound.put(ilink.text_message("同意", context_token="ctx-answer"))
+        assert replies(2)[1] == "saved"
+        assert target.read_text(encoding="utf-8") == "approved in WeChat"
+        resolved = wait_for(lambda e: e.get("type") == "approval_resolved")
+        assert resolved["request_id"] == request["request_id"] and resolved["decision"] == "once"
+        # The answer settled the approval rather than starting a turn of its own, and the reply used its token.
+        assert model.call_number == 2  # type: ignore[attr-defined]
+        assert ilink.sent[-1]["context_token"] == "ctx-answer"
+
+        model.call_number, model.target_content = 0, "must not be written"  # type: ignore[attr-defined]
+        ilink.inbound.put(ilink.text_message("再写一次", context_token="ctx-again"))
+        assert replies(3)[2].startswith("需要你批准")
+        ilink.inbound.put(ilink.text_message("拒绝", context_token="ctx-no"))
+        replies(4)
+        denied = wait_for(lambda e: e.get("type") == "approval_resolved" and e.get("decision") == "deny")
+        assert denied["request_id"] != request["request_id"]
+        assert target.read_text(encoding="utf-8") == "approved in WeChat"
+    finally:
+        _stop_protocol_backend(proc)
+        model.shutdown()
+        model.server_close()
+        ilink.close()
