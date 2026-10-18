@@ -882,6 +882,8 @@ async def _main(startup_started: float):
     register_channel_tools(
         tools,
         lambda: channel_manager_holder.get("manager"),
+        # A voice note in WeChat speaks with the same voice as spoken replies (set up below).
+        speaker=lambda text: voice.synthesize(text),
     )
     memory_store = MemoryStore()
     skill_store = SkillStore()

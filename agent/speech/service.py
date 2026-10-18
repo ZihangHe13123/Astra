@@ -129,6 +129,25 @@ class SpeechService:
             self._reported = status
             self._notify({**status, **({} if message is None else {"message": message}), **({"error": error} if error else {})})
 
+    async def synthesize(self, text: str) -> tuple[bytes, int]:
+        """All of ``text`` in the selected voice as 16-bit mono PCM, with its sample rate, to send
+        rather than play (a voice note on a channel). Works whether or not spoken replies are on and
+        starts the configured local server as speech does. Raises SpeechError without a voice."""
+        settings = self._store.load()
+        if settings.problem:
+            raise SpeechError(settings.problem)
+        provider = await self._provider(settings)
+        if self._server is not None:
+            self._server.touch()
+        if self._state == "starting" and self._runner is None:
+            self._set_state("idle")
+        pcm = bytearray()
+        async for chunk in provider.stream(text, settings.profile):
+            pcm += chunk
+        if not pcm:
+            raise SpeechError("The speech endpoint answered with no audio.")
+        return bytes(pcm), settings.sample_rate
+
     async def close(self) -> None:
         runner = self._runner
         self.stop()

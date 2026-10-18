@@ -25,6 +25,11 @@ active_channel: contextvars.ContextVar[str] = contextvars.ContextVar(
 active_channel_message: contextvars.ContextVar[ChannelMessage | None] = (
     contextvars.ContextVar("astra_active_channel_message", default=None)
 )
+# What a channel turn sent besides text ("file", "voice"). A list the turn's tools append to,
+# since a tool may run in a task of its own, where setting a variable would not reach the turn.
+channel_turn_media: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "astra_channel_turn_media", default=None,
+)
 
 
 # How to talk on a channel, added to the system prompt of its conversations only.
@@ -93,6 +98,8 @@ class AgentChannelRouter:
             self.agent.context = context
             token = active_channel.set(message.channel)
             message_token = active_channel_message.set(message)
+            media: list[str] = []
+            media_token = channel_turn_media.set(media)
             try:
                 content = message.text
                 if message.is_group and message.sender_name:
@@ -139,9 +146,11 @@ class AgentChannelRouter:
                         phase_chunks.append(chunk)
                 await flush_phase()
                 context.save()
-                response = "".join(chunks).strip() or "(no response)"
+                # A turn that answered with a voice note or a file alone has said what it had to.
+                response = "".join(chunks).strip() or ("" if media else "(no response)")
                 return "" if reply_sink is not None and chunks else response
             finally:
+                channel_turn_media.reset(media_token)
                 active_channel_message.reset(message_token)
                 active_channel.reset(token)
                 self.agent.context = previous

@@ -64,6 +64,7 @@ QQ 图片经公开 URL 检查与大小限制后下载，再作为原生多模态
 - **能收到什么**：文字、引用、微信对语音的转写，以及最多 `max_images` 张图片（从微信 CDN 下载后解密）。文件和视频只收到一个占位说明。
 - **怎么回**：微信会话会被告知按聊天的方式说话：简短、口语、不用 Markdown、一条说一件事。回复像人发微信那样拆成几条短消息依次发出（最多 `max_bubbles` 条；`chat_bubbles: false` 则整段发送，只在超过 `max_output_chars` 时分段），每条之间稍作停顿；从收到消息到最后一条回复发出，微信里一直显示"对方正在输入"。
 - **发文件**：你要的时候，Astra 用 `channel_send_file` 发本地文件：图片和视频按图片、视频发，其他按文件发。只发给扫码的人（或 `weixin.file_allow_users` 列出的人），只从 `weixin.send_file_roots`（默认是用户主目录）里取，不超过 `max_send_file_bytes`；隐藏文件和目录（包括 Astra 自己的 `.astra`）、应用数据（`Library`、`AppData`）和凭据文件一律拒绝。`send_files_enabled: false` 可以关掉。
+- **语音**：你让 Astra 说话时，它用 `channel_send_file` 的 `speak` 代替 `path`：用朗读功能配置的声音（见[语音](voice.md)）念出来，作为音频文件发送，手机上点一下就能听（macOS 上是 M4A，其他平台是 WAV），可以再配几句短文字。iLink 收下 bot 的原生语音消息却不会投递，所以微信里显示的是文件，不是语音条。
 - **隐私**：bot token 存在状态目录的 `channels/weixin/account.json`，只有本人可读，不出现在事件和日志里。另一个程序（比如 Hermes）若用同一个登录长轮询，会抢消息，请分开登录。
 
 协议细节参考 Hermes Agent 的适配器（MIT 许可，Nous Research）。

@@ -115,6 +115,12 @@ in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on` and
   `max_send_file_bytes`; hidden files and folders (including Astra's own
   `.astra`), application data (`Library`, `AppData`) and credential files are
   always refused. `send_files_enabled: false` turns it off.
+- **Voice notes.** When asked to speak, Astra calls `channel_send_file` with
+  `speak` instead of `path`: the words are spoken in the voice set up for spoken
+  replies ([voice](voice.md)) and sent as an audio file the phone plays with a
+  tap (M4A on macOS, WAV elsewhere); short text may go with it. iLink accepts a
+  bot's native voice message but does not deliver it, so WeChat shows a file
+  rather than a voice bubble.
 - **Privacy.** The bot token lives in the state directory's
   `channels/weixin/account.json`, readable by the owner only, and never appears
   in events or logs. Another program that polls the same login (for example

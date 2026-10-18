@@ -25,7 +25,13 @@ import logging
 import os
 import re
 import secrets
+import subprocess
+import sys
+import tempfile
+import time
+import unicodedata
 import uuid
+import wave
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -79,7 +85,8 @@ CHAT_STYLE = """[微信聊天]
 - 口语、自然、简短。一条消息说一件事；想说几件事就用空行隔开，它们会作为几条消息依次发出。
 - 微信不显示 Markdown：不要用标题、加粗、表格和代码块，少用列表，需要分点时直接换行。
 - 闲聊就好好聊：接话、追问、表达感受都可以，不必每次总结或给建议；表情偶尔用，别堆砌。
-- 需要做事（查资料、记东西、定提醒）照常用工具，做完用一两句话说结果，不贴长报告；真需要长内容时先说结论，再问要不要展开。"""
+- 需要做事（查资料、记东西、定提醒）照常用工具，做完用一两句话说结果，不贴长报告；真需要长内容时先说结论，再问要不要展开。
+- 对方想听你的声音、让你发语音时，用 channel_send_file 的 speak 把要说的话说出来（只写念出来的话，不带表情和符号）。可以再配一两句短文字（比如“收到了吗”），但不要用文字重复语音里的内容。"""
 
 
 class WeixinError(RuntimeError):
@@ -464,6 +471,38 @@ def chat_bubbles(text: str, limit: int, max_bubbles: int = 8, long_paragraph: in
     return pieces
 
 
+def spoken_text(text: str) -> str:
+    """What a voice reads: Markdown markers and pictographs (emoji) removed, whitespace collapsed."""
+    plain = "".join(ch for ch in plain_text(text) if unicodedata.category(ch) not in {"So", "Cs"})
+    return " ".join(plain.split())
+
+
+def voice_note_audio(pcm: bytes, rate: int) -> tuple[bytes, str]:
+    """A voice note WeChat plays on a phone with one tap: AAC in M4A where macOS can make it, WAV otherwise.
+
+    iLink accepts a bot's native voice item but does not deliver it (tried 2026-10-18), so speech goes
+    out as an audio file."""
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as out:
+        out.setnchannels(1)
+        out.setsampwidth(2)
+        out.setframerate(rate)
+        out.writeframes(pcm)
+    audio = buffer.getvalue()
+    converter = Path("/usr/bin/afconvert")
+    if sys.platform == "darwin" and converter.exists():
+        with tempfile.TemporaryDirectory() as folder:
+            source, target = Path(folder, "voice.wav"), Path(folder, "voice.m4a")
+            source.write_bytes(audio)
+            try:
+                subprocess.run([str(converter), "-f", "m4af", "-d", "aac", "-b", "48000", str(source), str(target)],
+                               check=True, capture_output=True, timeout=60)
+                return target.read_bytes(), "m4a"
+            except (OSError, subprocess.SubprocessError) as exc:
+                logger.warning("voice note stays WAV: %s", type(exc).__name__)
+    return audio, "wav"
+
+
 def typing_pause(text: str) -> float:
     """Seconds between two messages, about the time it takes to type the next one."""
     return min(2.5, 0.5 + len(text) / 25)
@@ -775,15 +814,24 @@ class WeixinAdapter(ChannelAdapter):
 
     async def send_file(self, message: ChannelMessage, path: str, name: str) -> dict[str, Any]:
         """Send a local file to the person in ``message``: an image or a video as one, anything else as a file."""
-        account, client = self._account, self._client
-        if account is None or client is None:
-            raise WeixinError("the WeChat channel is not online")
         data = await asyncio.to_thread(Path(path).read_bytes)
         suffix = Path(name or path).suffix.lower()
         media = _MEDIA_IMAGE if suffix in _IMAGE_SUFFIXES else _MEDIA_VIDEO if suffix in _VIDEO_SUFFIXES else _MEDIA_FILE
+        return await self._send_media(message.conversation_id, data, name or Path(path).name, media)
+
+    async def send_voice_note(self, message: ChannelMessage, pcm: bytes, rate: int) -> dict[str, Any]:
+        """Send speech as an audio file the phone plays with a tap."""
+        audio, kind = await asyncio.to_thread(voice_note_audio, pcm, rate)
+        result = await self._send_media(message.conversation_id, audio, f"语音 {time.strftime('%H:%M')}.{kind}", _MEDIA_FILE)
+        return {**result, "kind": "voice", "seconds": round(len(pcm) / 2 / rate, 1)}
+
+    async def _send_media(self, to: str, data: bytes, name: str, media: int) -> dict[str, Any]:
+        account, client = self._account, self._client
+        if account is None or client is None:
+            raise WeixinError("the WeChat channel is not online")
         key, filekey, md5 = secrets.token_bytes(16), secrets.token_hex(16), hashlib.md5(data).hexdigest()
         encrypted = await asyncio.to_thread(_encrypt, data, key)
-        url = await client.upload_url(account, message.conversation_id, media_type=media, filekey=filekey, size=len(data),
+        url = await client.upload_url(account, to, media_type=media, filekey=filekey, size=len(data),
                                       md5=md5, encrypted_size=len(encrypted), aes_key_hex=key.hex())
         reference = await client.upload(url, encrypted)
         # iLink takes the key as base64 of its hex text; raw-key base64 shows as a grey box.
@@ -794,10 +842,9 @@ class WeixinAdapter(ChannelAdapter):
             item = {"type": _ITEM_VIDEO, "video_item": {"media": source, "video_size": len(encrypted), "play_length": 0,
                                                         "video_md5": md5}}
         else:
-            item = {"type": _ITEM_FILE, "file_item": {"media": source, "file_name": name or Path(path).name,
-                                                      "len": str(len(data))}}
+            item = {"type": _ITEM_FILE, "file_item": {"media": source, "file_name": name, "len": str(len(data))}}
         try:
-            await self._send_items(client, account, message.conversation_id, [item])
+            await self._send_items(client, account, to, [item])
         except httpx.TimeoutException as exc:
             # Uploaded and handed over, but WeChat never confirmed the message.
             raise TimeoutError("WeChat did not confirm the file message") from exc

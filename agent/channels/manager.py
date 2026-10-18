@@ -134,3 +134,10 @@ class ChannelManager:
         if sender is None:
             raise RuntimeError(f"channel does not support file sending: {message.channel}")
         return await sender(message, path, name)
+
+    async def send_voice(self, message: ChannelMessage, pcm: bytes, rate: int) -> dict[str, object]:
+        adapter = next((item for item in self.adapters if item.name == message.channel), None)
+        sender = getattr(adapter, "send_voice_note", None)
+        if sender is None:
+            raise RuntimeError(f"the {message.channel} channel cannot send voice notes")
+        return await sender(message, pcm, rate)

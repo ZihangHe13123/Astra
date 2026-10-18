@@ -127,9 +127,9 @@
   },
   "channel_send_file": {
     "sha256": [
-      "48dda42ca7ddb159"
+      "6c1b63aef636f7bf"
     ],
-    "reason": "2026-10-18: also sends files in WeChat (images and videos as such); hidden files, application data and credential files blocked."
+    "reason": "2026-10-18: speak sends a voice note in WeChat; path optional; also sends files in WeChat (images and videos as such); hidden files, application data and credential files blocked."
   },
   "computer_act": {
     "sha256": [

@@ -458,3 +458,110 @@ def test_stopping_finishes_even_when_an_http_call_swallows_the_cancellation(ilin
         assert channel.status()["state"] == "stopped"
 
     asyncio.run(scenario())
+
+
+def test_a_voice_note_is_spoken_and_sent_as_audio_and_needs_no_text(ilink, tmp_path):
+    import math
+    import struct
+
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    from agent.channels.config import ChannelsConfig
+    from agent.channels.manager import ChannelManager
+    from agent.channels.router import active_channel_message
+    from agent.channels.tools import register_channel_tools
+    from agent.runtime.tools.registry import ToolRegistry
+
+    rate = 24000
+    tone = b"".join(struct.pack("<h", int(6000 * math.sin(2 * math.pi * 330 * i / rate))) for i in range(rate // 2))
+    spoken: list[str] = []
+
+    async def speaker(text):
+        spoken.append(text)
+        return tone, rate
+
+    async def scenario():
+        store = WeixinStore(tmp_path / "weixin")
+        await logged_in(ilink, store)
+
+        async def handler(message, reply):
+            return ""
+
+        channel = adapter(ilink, store, handler)
+        manager = ChannelManager(ChannelsConfig(weixin=channel.config), handler, adapters=[channel])
+        registry = ToolRegistry()
+        register_channel_tools(registry, lambda: manager, speaker=speaker)
+        await channel.start()
+        await until(lambda: channel.running, "online")
+
+        async def call(arguments, channel_name="weixin", sender=OWNER):
+            token = active_channel_message.set(ChannelMessage(channel_name, sender, sender, "用语音说"))
+            try:
+                return await registry.execute("channel_send_file", arguments)
+            finally:
+                active_channel_message.reset(token)
+
+        try:
+            sent = await call({"speak": "**晚安**，早点休息 😴"})
+            both = await call({"speak": "你好", "path": str(tmp_path)})
+            neither = await call({})
+        finally:
+            await channel.stop()
+        return sent, both, neither
+
+    sent, both, neither = asyncio.run(scenario())
+    assert sent["error"] == "" and spoken == ["晚安，早点休息"], "markup and emoji are not read out"
+    assert "either path" in both["error"] and "either path" in neither["error"]
+    note = ilink.sent[-1]["item_list"][0]
+    assert note["type"] == 4 and note["file_item"]["file_name"].startswith("语音 ")
+    key = bytes.fromhex(base64.b64decode(note["file_item"]["media"]["aes_key"]).decode())
+    decryptor = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
+    audio = decryptor.update(ilink.uploads[note["file_item"]["media"]["encrypt_query_param"]]) + decryptor.finalize()
+    audio = audio[:-audio[-1]]
+    if sys.platform == "darwin":
+        assert note["file_item"]["file_name"].endswith(".m4a") and audio[4:8] == b"ftyp"
+    else:
+        assert note["file_item"]["file_name"].endswith(".wav") and audio[:4] == b"RIFF"
+
+
+def test_a_turn_that_answered_with_a_voice_note_alone_sends_no_placeholder(tmp_path):
+    from agent.channels.router import channel_turn_media
+
+    class Agent:
+        def __init__(self) -> None:
+            self.context = AgentContext(system_prompt="system", max_messages=20, max_prompt_tokens=1000)
+            self.llm = object()
+
+        async def reply_stream(self, message):
+            channel_turn_media.get().append("voice")  # what channel_send_file records
+            yield {"type": "done", "content": ""}
+
+    async def scenario():
+        router = AgentChannelRouter(Agent(), asyncio.Lock(), tmp_path)
+        return await router.handle(ChannelMessage("weixin", OWNER, OWNER, "用语音说晚安"))
+
+    assert asyncio.run(scenario()) == ""
+
+
+def test_voice_notes_are_wechat_only(tmp_path):
+    from agent.channels.config import ChannelsConfig, OneBotConfig
+    from agent.channels.manager import ChannelManager
+    from agent.channels.router import active_channel_message
+    from agent.channels.tools import register_channel_tools
+    from agent.runtime.tools.registry import ToolRegistry
+
+    async def scenario():
+        async def handler(message, reply=None):
+            return ""
+
+        manager = ChannelManager(ChannelsConfig(onebot=OneBotConfig(send_files_enabled=True, file_allow_users=("10001",),
+                                                                   send_file_roots=(str(tmp_path),))), handler, adapters=[])
+        registry = ToolRegistry()
+        register_channel_tools(registry, lambda: manager, speaker=None)
+        token = active_channel_message.set(ChannelMessage("qq", "10001", "10001", "发语音"))
+        try:
+            return await registry.execute("channel_send_file", {"speak": "你好"})
+        finally:
+            active_channel_message.reset(token)
+
+    assert "only available in WeChat" in asyncio.run(scenario())["error"]
