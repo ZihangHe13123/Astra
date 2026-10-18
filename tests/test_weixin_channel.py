@@ -346,3 +346,46 @@ def test_only_wechat_conversations_are_told_to_talk_like_a_chat(tmp_path):
     asyncio.run(scenario())
     assert CHAT_STYLE in prompts["weixin"] and "project guidance" in prompts["weixin"]
     assert CHAT_STYLE not in prompts["qq"] and "project guidance" in prompts["qq"]
+
+
+def test_stopping_finishes_even_when_an_http_call_swallows_the_cancellation(ilink, tmp_path):
+    import httpx
+
+    class SwallowingClient(IlinkClient):
+        """What an HTTP stack can do: turn a cancellation into an ordinary error."""
+
+        async def send_typing(self, account, to, ticket, status):
+            try:
+                await asyncio.sleep(0.05)
+                await super().send_typing(account, to, ticket, status)
+            except asyncio.CancelledError:
+                raise httpx.ReadError("connection closed") from None
+
+    async def scenario():
+        store = WeixinStore(tmp_path / "weixin")
+        await logged_in(ilink, store)
+        started = asyncio.Event()
+
+        async def handler(message, reply):
+            started.set()
+            while True:  # a turn still running when the desktop quits
+                try:
+                    await asyncio.sleep(0.01)
+                except asyncio.CancelledError:
+                    raise httpx.ReadError("connection closed") from None
+
+        channel = WeixinAdapter(WeixinConfig(enabled=True), handler, store=store,
+                                client=SwallowingClient(base_url=ilink.base, cdn_url=ilink.cdn),
+                                keep_awake=FakeAwake(), owner_retry=0.05, failure_delays=(0.01, 0.01),
+                                pause=lambda _text: 0.0)
+        await channel.start()
+        await until(lambda: channel.running, "online")
+        ilink.inbound.put(ilink.text_message("在吗"))
+        await asyncio.wait_for(started.wait(), 5)
+        loop = asyncio.get_running_loop()
+        began = loop.time()
+        await asyncio.wait_for(channel.stop(), 20)
+        assert loop.time() - began < 12
+        assert channel.status()["state"] == "stopped"
+
+    asyncio.run(scenario())

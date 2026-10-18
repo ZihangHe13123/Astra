@@ -335,6 +335,19 @@ def _image_type(data: bytes) -> str:
     return "image/jpeg"
 
 
+def _stop_requested() -> bool:
+    """Whether this task was asked to stop. An HTTP call can turn the cancellation into an ordinary
+    error that a loop then logs and outlives, so loops check this as well as catching it."""
+    task = asyncio.current_task()
+    return task is not None and task.cancelling() > 0
+
+
+async def _finish(task: asyncio.Task, timeout: float) -> None:
+    """Cancel a child task and wait for it, but never longer than ``timeout``."""
+    task.cancel()
+    await asyncio.wait({task}, timeout=timeout)
+
+
 def split_reply(text: str, limit: int) -> list[str]:
     """Pieces of at most ``limit`` characters, cut at a paragraph or line break when one is near."""
     text = text.strip()
@@ -463,9 +476,7 @@ class WeixinAdapter(ChannelAdapter):
     async def stop(self) -> None:
         task, self._task = self._task, None
         if task is not None and not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            await _finish(task, 10.0)
         self._release()
         if self._client is not None:
             await self._client.close()
@@ -520,6 +531,8 @@ class WeixinAdapter(ChannelAdapter):
                 try:
                     response = await self._client.get_updates(account, cursor, timeout_ms)
                 except (httpx.HTTPError, WeixinError) as exc:
+                    if _stop_requested():
+                        raise asyncio.CancelledError from exc
                     failures += 1
                     self._error = f"连接微信失败：{type(exc).__name__}"
                     logger.warning("weixin poll failed (%d): %s", failures, exc)
@@ -547,9 +560,7 @@ class WeixinAdapter(ChannelAdapter):
                     cursor = new_cursor
                     await asyncio.to_thread(self.store.save_sync_buf, cursor)
         finally:
-            worker.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await worker
+            await _finish(worker, 5.0)
 
     async def _work(self) -> None:
         # One message at a time, in the order WeChat delivered them.
@@ -561,6 +572,8 @@ class WeixinAdapter(ChannelAdapter):
                 raise
             except Exception:
                 logger.exception("weixin message handling failed")
+            if _stop_requested():
+                raise asyncio.CancelledError
 
     def _seen_before(self, message_id: str) -> bool:
         if not message_id:
@@ -617,9 +630,7 @@ class WeixinAdapter(ChannelAdapter):
             if response:
                 await reply(response)
         finally:
-            typing.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await typing
+            await _finish(typing, 5.0)
 
     async def _content(self, items: list) -> tuple[str, tuple[ChannelImage, ...]]:
         parts: list[str] = []
@@ -698,7 +709,7 @@ class WeixinAdapter(ChannelAdapter):
 
     async def _keep_typing(self, to: str) -> None:
         try:
-            while True:
+            while not _stop_requested():
                 await asyncio.sleep(_TYPING_REFRESH_SECONDS)
                 await self._typing(to, _TYPING_START)
         finally:
