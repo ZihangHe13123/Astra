@@ -8,6 +8,7 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 from test_backend_task_protocol import (
+    NON_JSON_STDOUT,
     _SlowOpenAIHandler,
     _start_question_protocol_backend,
     _stop_protocol_backend,
@@ -310,6 +311,9 @@ def test_an_active_goal_is_checked_after_its_subagent_reports_not_while_it_works
         # One check, made after the report's turn, on a transcript that holds the report.
         assert len(script.verifier_requests) == 1
         assert "The survey found three notes." in _text(script.verifier_requests[0][-1])
+        # The verdict is an event; nothing else may reach stdout, where it could split an event line.
+        assert not [e for e in quiet(1.0) if e.get("type") == NON_JSON_STDOUT]
+        assert not [e for e in seen if e.get("type") == NON_JSON_STDOUT]
     finally:
         script.worker_gate.set()
         _stop_protocol_backend(proc)

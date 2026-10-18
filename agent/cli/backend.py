@@ -1607,9 +1607,10 @@ async def _main(startup_started: float):
                 continuation = decide_goal_continuation(updated, verdict)
                 if continuation is None:
                     if updated.get("status") == "completed":
+                        # stdout is the event protocol: a line printed there can split an event line.
                         print(
                             f"[backend] goal met after {updated.get('round')} round(s): {updated.get('objective', '')}",
-                            flush=True,
+                            file=sys.stderr, flush=True,
                         )
                     elif updated.get("status") == "exhausted":
                         print(
