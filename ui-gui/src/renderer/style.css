@@ -371,6 +371,10 @@ label { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sma
 .choice-grid small { color:var(--muted); }
 .choice-grid [aria-pressed=true] { background:var(--soft); border-color:var(--muted); }
 .choice-grid.three { grid-template-columns:repeat(3, minmax(0, 1fr)); }
+.weixin-actions { display:flex; flex-wrap:wrap; gap:8px; }
+/* A code needs dark modules on a light ground to scan, whatever the theme. */
+.weixin-qr { display:flex; flex-direction:column; align-items:flex-start; gap:6px; }
+.weixin-qr img { background:#fff; padding:8px; border-radius:var(--r-2); image-rendering:pixelated; }
 .phone-pairing { display:flex; flex-direction:column; gap:6px; padding:12px 14px; border:1px solid var(--line); border-radius:var(--r-2); }
 .phone-code { font-family:var(--font-mono, ui-monospace, monospace); font-size:28px; letter-spacing:0.12em; }
 .phone-devices { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:6px; }

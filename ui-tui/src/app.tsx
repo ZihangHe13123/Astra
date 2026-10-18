@@ -1370,6 +1370,12 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         if (event.message) addMessage("system", event.message);
         if (event.error) addMessage("error", event.error);
         break;
+      case "weixin_status":
+        // The login code is drawn once, when it is handed out (a code block keeps its spaces); later statuses say what changed.
+        if (event.message && event.login === "scan" && event.qr?.text) addMessage("system", `${event.message}\n\n\`\`\`\n${event.qr.text}\n\`\`\``);
+        else if (event.message) addMessage("system", event.message);
+        if (event.error) addMessage("error", `微信：${event.error}`);
+        break;
       case "yolo_status":
         setYolo(event.yolo);
         if (event.error) {

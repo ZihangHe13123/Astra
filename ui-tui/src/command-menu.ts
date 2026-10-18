@@ -49,6 +49,7 @@ const SLASH_COMMANDS: SlashCommandSuggestion[] = [
   { command: "/connect", description: "connect a provider and choose its model", takesArgs: true, group: "MODEL" },
   { command: "/persona", description: "show or switch prompt persona", takesArgs: true, group: "MODEL" },
   { command: "/search", description: "show or switch web search provider", takesArgs: true, group: "TOOLS" },
+  { command: "/weixin", description: "WeChat channel · [status|login|on|off|logout]", takesArgs: true, group: "TOOLS" },
   { command: "/tool", description: "open latest or numbered tool result details", takesArgs: true, group: "TOOLS" },
   { command: "/gallery", description: "open latest or numbered image search gallery", takesArgs: true, group: "TOOLS" },
   { command: "/doc", description: "view the latest or numbered document; /doc open uses the system app", takesArgs: true, group: "TOOLS" },
@@ -118,6 +119,14 @@ const SEARCH_PROVIDERS: SlashCommandSuggestion[] = [
   { command: "exa", description: "force Exa semantic search", completion: "/search exa", submitValue: "/search exa", kind: "command" },
   { command: "searxng", description: "force local SearXNG metasearch", completion: "/search searxng", submitValue: "/search searxng", kind: "command" },
   { command: "deepseek", description: "force DeepSeek Search API (billed per request)", completion: "/search deepseek", submitValue: "/search deepseek", kind: "command" },
+];
+
+const WEIXIN_OPTIONS: SlashCommandSuggestion[] = [
+  { command: "status", description: "show the WeChat channel", completion: "/weixin status", submitValue: "/weixin status", kind: "command" },
+  { command: "login", description: "log in by scanning a QR code in WeChat", completion: "/weixin login", submitValue: "/weixin login", kind: "command" },
+  { command: "on", description: "switch the channel on", completion: "/weixin on", submitValue: "/weixin on", kind: "command" },
+  { command: "off", description: "switch the channel off", completion: "/weixin off", submitValue: "/weixin off", kind: "command" },
+  { command: "logout", description: "log out and forget the login", completion: "/weixin logout", submitValue: "/weixin logout", kind: "command" },
 ];
 
 const MEMORY_SUBCOMMANDS: SlashCommandSuggestion[] = [
@@ -541,6 +550,11 @@ export function slashCommandSuggestions(
   if (searchMatch && (trimmed.toLowerCase() === "/search" || trimmed === "/search " || searchMatch[1] !== undefined)) {
     const query = (searchMatch[1] ?? "").trim().toLowerCase();
     return SEARCH_PROVIDERS.filter((provider) => provider.command.startsWith(query)).map((provider) => ({ ...provider, group: "SEARCH" }));
+  }
+  const weixinMatch = trimmed.match(/^\/weixin(?:\s+([\s\S]*))?$/i);
+  if (weixinMatch && (trimmed.toLowerCase() === "/weixin" || trimmed === "/weixin " || weixinMatch[1] !== undefined)) {
+    const query = (weixinMatch[1] ?? "").trim().toLowerCase();
+    return WEIXIN_OPTIONS.filter((option) => option.command.startsWith(query)).map((option) => ({ ...option, group: "WEIXIN" }));
   }
   const sandboxMatch = trimmed.match(/^\/sandbox(?:\s+([\s\S]*))?$/i);
   if (sandboxMatch && (trimmed.toLowerCase() === "/sandbox" || trimmed === "/sandbox " || sandboxMatch[1] !== undefined)) {

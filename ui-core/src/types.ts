@@ -291,6 +291,9 @@ export type PyEvent =
   // The background review's mode; the answer to a /memory consolidation command adds message or error.
   | { type: "memory_consolidation_status"; mode: "off" | "review" | "auto"; pending: number; proposals?: PendingProposal[]; message?: string; error?: string }
   | { type: "memory_recall"; count: number; items: string[] }
+  // The WeChat channel (iLink). qr is present while a login code waits to be scanned; the answer to a /weixin command adds message or error.
+  | { type: "weixin_status"; enabled: boolean; logged_in: boolean; account: string; state: "off" | "logged_out" | "stopped" | "standby" | "online" | "expired";
+      owner: boolean; keep_awake: boolean; login: "" | "scan" | "confirm"; qr?: { svg: string; text: string }; message?: string; error?: string }
   | {
       type: "error";
       message: string;

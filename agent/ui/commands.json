@@ -269,6 +269,45 @@
     ]
   },
   {
+    "command": "/weixin",
+    "description": "WeChat channel · [status|login|on|off|logout]",
+    "group": "TOOLS",
+    "id": "F57",
+    "takes_args": true,
+    "options": [
+      {
+        "command": "status",
+        "description": "show the WeChat channel",
+        "completion": "/weixin status",
+        "submitValue": "/weixin status"
+      },
+      {
+        "command": "login",
+        "description": "log in by scanning a QR code in WeChat",
+        "completion": "/weixin login",
+        "submitValue": "/weixin login"
+      },
+      {
+        "command": "on",
+        "description": "switch the channel on",
+        "completion": "/weixin on",
+        "submitValue": "/weixin on"
+      },
+      {
+        "command": "off",
+        "description": "switch the channel off",
+        "completion": "/weixin off",
+        "submitValue": "/weixin off"
+      },
+      {
+        "command": "logout",
+        "description": "log out and forget the login",
+        "completion": "/weixin logout",
+        "submitValue": "/weixin logout"
+      }
+    ]
+  },
+  {
     "command": "/tool",
     "description": "open latest or numbered tool result details",
     "group": "TOOLS",

@@ -52,7 +52,19 @@ cp config/channels.example.json .astra/channels.json
 
 QQ 图片经公开 URL 检查与大小限制后下载，再作为原生多模态内容传给视觉模型。发本地文件需启用 `send_files_enabled`、用 `file_allow_users`（或 `allow_users`）列出可信 QQ ID，并把 `send_file_roots` 限定为可分享的输出目录。`channel_send_file` 拒绝越界路径和常见凭据文件。
 
-渠道接口不绑定特定协议，将来可接入 Weixin iLink 而不改 Agent 路由和隔离；当前仅实现 QQ/OneBot，不接管已有 Hermes 微信登录。
+### 微信
+
+微信走腾讯官方的 iLink Bot API：用微信扫一次二维码登录，之后通过 HTTPS 长轮询收消息。不操作微信桌面客户端，也不需要屏幕，所以息屏、锁屏时照样回复，只要电脑不睡眠。
+
+运行 `/weixin login`（或桌面端 设置 → 微信 → 扫码登录），用微信扫码。终端按深色背景画出二维码，桌面端显示为图片。显示二维码需要 `segno`（`pip install 'segno>=1.6,<2'`，或安装 `weixin` 可选依赖，它同时带上读取图片要用的 `cryptography`）。登录成功会在 `.astra/channels.json` 里设置 `weixin.enabled`，之后用 `/weixin status`、`/weixin off`、`/weixin on`、`/weixin logout` 管理。
+
+- **回复谁**：只回复扫码登录的那个微信号；`weixin.allow_users` 可以再列出其他人。群消息忽略。
+- **只有一个在收**：每个 Astra 后端都可以运行这个渠道，但同一时间只有一个在长轮询，其他的待命，它退出后自动接手。
+- **睡眠**：正在收消息的后端会阻止电脑空闲睡眠：macOS 用 `caffeinate -i`（后端退出即释放），Windows 设置执行状态，Linux 用 `systemd-inhibit`。显示器照常关闭。MacBook 合盖仍会睡眠，除非接着电源和外接显示器。不想管睡眠就把 `weixin.keep_awake` 设为 `false`。
+- **能收到什么**：文字、引用、微信对语音的转写，以及最多 `max_images` 张图片（从微信 CDN 下载后解密）。文件和视频只收到一个占位说明。回复是文字，超过 `max_output_chars` 会分段。
+- **隐私**：bot token 存在状态目录的 `channels/weixin/account.json`，只有本人可读，不出现在事件和日志里。另一个程序（比如 Hermes）若用同一个登录长轮询，会抢消息，请分开登录。
+
+协议细节参考 Hermes Agent 的适配器（MIT 许可，Nous Research）。
 
 <a id="mcp"></a>
 

@@ -75,10 +75,39 @@ sender QQ IDs in `file_allow_users` (or `allow_users`), and restrict
 `channel_send_file` tool rejects paths outside those roots and common credential
 files even when requested by the model.
 
-The channel contract is protocol-neutral so a Weixin iLink adapter can join the
-same manager without changing Agent routing or session isolation. The first
-native release intentionally implements QQ/OneBot only; it does not silently
-take over the existing Hermes Weixin login.
+### WeChat
+
+WeChat uses Tencent's iLink Bot API: Astra logs in once with a QR code scanned
+in WeChat, then long-polls for messages over HTTPS. It does not drive the WeChat
+desktop client and needs no screen, so it keeps answering with the display off
+or the screen locked, as long as the computer does not sleep.
+
+Run `/weixin login` (or Settings → WeChat → Scan to log in) and scan the code
+with WeChat. The terminal draws the code for a dark background; the desktop
+shows it as an image. The QR code needs the `segno` package
+(`pip install 'segno>=1.6,<2'`, or the `weixin` extra, which also brings the
+`cryptography` used to read images). A successful login sets `weixin.enabled`
+in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on` and
+`/weixin logout` manage it afterwards.
+
+- **Who is answered.** Only the WeChat user who scanned the code, unless
+  `weixin.allow_users` lists others. Group messages are ignored.
+- **One poller.** Every Astra backend may run the channel, but only one polls a
+  login at a time; the others wait and take over when it exits.
+- **Sleep.** While a backend polls, it keeps the computer from idle sleep:
+  `caffeinate -i` on macOS (released when the backend exits), an execution
+  state on Windows, `systemd-inhibit` on Linux. The display still turns off.
+  A closed MacBook lid still sleeps unless an external display and power are
+  connected. Set `weixin.keep_awake` to `false` to leave sleep alone.
+- **What arrives.** Text, quoted messages, WeChat's own transcript of a voice
+  message, and up to `max_images` images (decrypted from WeChat's CDN). Files and
+  videos arrive as a placeholder. Replies are text, split at `max_output_chars`.
+- **Privacy.** The bot token lives in the state directory's
+  `channels/weixin/account.json`, readable by the owner only, and never appears
+  in events or logs. Another program that polls the same login (for example
+  Hermes) would compete for messages; log in separately.
+
+Protocol details follow Hermes Agent's adapter (MIT License, Nous Research).
 
 ## MCP
 
