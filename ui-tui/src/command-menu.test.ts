@@ -171,11 +171,13 @@ assert.equal(submitSlashCommand("/fixture sessions ", 2, [], [], localContext), 
 
 assert.deepEqual(
   slashCommandSuggestions("/search ").map((item) => item.command),
-  ["auto", "exa", "searxng"],
+  ["auto", "exa", "searxng", "deepseek"],
 );
 assert.deepEqual(slashCommandSuggestions("/search ex").map((item) => item.command), ["exa"]);
 assert.equal(completeSlashCommand("/search ex", 0), "/search exa");
 assert.equal(submitSlashCommand("/search ex", 0), "/search exa");
+assert.deepEqual(slashCommandSuggestions("/search de").map((item) => item.command), ["deepseek"]);
+assert.equal(submitSlashCommand("/search de", 0), "/search deepseek");
 
 assert.deepEqual(slashCommandSuggestions("/sandbox ").map((item) => item.command), ["on", "off", "status"]);
 assert.equal(completeSlashCommand("/sandbox of", 0), "/sandbox off");

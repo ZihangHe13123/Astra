@@ -259,6 +259,12 @@
         "description": "force local SearXNG metasearch",
         "completion": "/search searxng",
         "submitValue": "/search searxng"
+      },
+      {
+        "command": "deepseek",
+        "description": "force DeepSeek Search API (billed per request)",
+        "completion": "/search deepseek",
+        "submitValue": "/search deepseek"
       }
     ]
   },

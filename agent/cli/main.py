@@ -788,7 +788,7 @@ async def handle_slash(cmd: str, agent: ReActAgent) -> Msg | None:
     /prompt ...         — Set system prompt
     /persona [name]     — View / switch saved prompt persona
     /model [name]       — Show / switch model (deepseek-flash, deepseek-v4-pro)
-    /search [provider]  — Show / switch search provider (auto, exa, searxng)
+    /search [provider]  — Show / switch search provider (auto, exa, searxng, deepseek)
     /memory             — Inspect or update working/core memory
     /skills             — List, inspect, or create local procedural skills
     /guidance           — Inspect pending guidance or apply it with refresh --now

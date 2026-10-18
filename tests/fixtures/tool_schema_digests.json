@@ -511,9 +511,9 @@
   },
   "search_web": {
     "sha256": [
-      "c39fa0083d68dc57"
+      "2cbbd603b9c523e2"
     ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+    "reason": "2026-10-18: provider=deepseek added (DeepSeek Search/Fetch, chosen by name only)."
   },
   "session_handoff": {
     "sha256": [
@@ -607,9 +607,9 @@
   },
   "web_extract": {
     "sha256": [
-      "01e95c814fe28243"
+      "c507b919ce2f28e1"
     ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+    "reason": "2026-10-18: provider=deepseek added (DeepSeek Search/Fetch, chosen by name only)."
   },
   "workflow_design_approval": {
     "sha256": [

@@ -1,4 +1,4 @@
-"""web tools: search_web, fetch_url, web_extract, opt-in extract_url (Exa + SearXNG)."""
+"""web tools: search_web, fetch_url, web_extract, opt-in extract_url (Exa + SearXNG, optional DeepSeek)."""
 
 import asyncio
 import atexit
@@ -77,6 +77,24 @@ _NO_MATCH_NOTE = "No match is not proof that nothing exists; try other words, an
 _RETRYABLE_HTTP_STATUS = frozenset({408, 425, 429})
 # A host name that does not resolve and a rejected certificate fail the same way again.
 _LASTING_CONNECT_CAUSES = (socket.gaierror, ssl.SSLCertVerificationError)
+# DeepSeek Search and Fetch: used only when named (provider=deepseek or a configured
+# default), never by an automatic route, because every successful request is billed.
+_DEEPSEEK_TOOLS_URL = "https://api.deepseek.com/v1/tools"
+_DEEPSEEK_QUERY_MAX_CHARS = 128
+_DEEPSEEK_FETCH_URL_MAX_CHARS = 8192
+_DEEPSEEK_TEXT_CHARS = 1200
+# Seconds before the single repeat of a 408, 429 or 5xx answer, which DeepSeek asks for.
+_DEEPSEEK_RETRY_DELAY = 1.0
+_DEEPSEEK_STATUS_MEANINGS = {
+    400: "bad request",
+    401: "the API key was rejected",
+    402: "insufficient balance; the DeepSeek account needs a top-up",
+    403: "DeepSeek's fetch policy refused this URL",
+    404: "DeepSeek found no usable content at this URL",
+    408: "DeepSeek timed out reading the request",
+    413: "request too large",
+    429: "rate limited; DeepSeek allows 5 requests per second per account",
+}
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +453,11 @@ def exa_configuration_status() -> tuple[bool, str]:
     return bool(key), source
 
 
+def deepseek_tools_configured() -> bool:
+    """Whether DEEPSEEK_API_KEY, which DeepSeek Search and Fetch reuse, is set."""
+    return bool(os.getenv("DEEPSEEK_API_KEY", "").strip())
+
+
 async def _public_url_problem(url: str) -> str:
     """Return "" for a safe public URL, otherwise why it is rejected.
 
@@ -485,6 +508,7 @@ class _TransportError(str):
     """A request error message that also records whether trying again can help."""
 
     retryable: bool = False
+    status: int | None = None
 
 
 def _is_transient_error(exc: BaseException) -> bool:
@@ -522,10 +546,40 @@ def _retryable(error: object) -> bool:
     return bool(getattr(error, "retryable", False))
 
 
+def _deepseek_status_error(status: int, body: str, api_key: str) -> _TransportError:
+    """Describe a non-2xx DeepSeek answer without repeating the API key."""
+    meaning = _DEEPSEEK_STATUS_MEANINGS.get(status, "")
+    if 300 <= status < 400:
+        meaning = "redirect not followed; check DEEPSEEK_TOOLS_URL"
+    elif not meaning and status >= 500:
+        meaning = "server error"
+    detail = ""
+    # A rejected-key message can quote part of the key, so a 401 keeps only its status.
+    if status != 401:
+        try:
+            parsed = json.loads(body)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            error = parsed.get("error")
+            text = error.get("message") if isinstance(error, dict) else error
+            if not isinstance(text, str):
+                text = parsed.get("message")
+            if isinstance(text, str):
+                if api_key:
+                    text = text.replace(api_key, "[redacted]")
+                detail = " ".join(text.split())[:200]
+    message = f"HTTP {status}" + (f" ({meaning})" if meaning else "") + (f": {detail}" if detail else "")
+    result = _TransportError(message)
+    result.status = status
+    result.retryable = status in {408, 429} or status >= 500
+    return result
+
+
 class SearchProviderState:
     """Mutable process-local default controlled by the /search command."""
 
-    VALID = ("auto", "exa", "searxng")
+    VALID = ("auto", "exa", "searxng", "deepseek")
 
     def __init__(self, provider: str = "auto"):
         self.set(provider)
@@ -567,6 +621,8 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
     configured_provider = default_provider or os.getenv("WEB_SEARCH_PROVIDER", "auto")
     search_provider_state = SearchProviderState(configured_provider)
     exa_search_type = os.getenv("EXA_SEARCH_TYPE", "auto").strip().lower() or "auto"
+    deepseek_tools_url = os.getenv("DEEPSEEK_TOOLS_URL", "").strip().rstrip("/") or _DEEPSEEK_TOOLS_URL
+    deepseek_search_timeout = _positive_int_env("DEEPSEEK_SEARCH_TIMEOUT", 15)
 
     search_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
     url_cache: OrderedDict[str, tuple[float, str]] = OrderedDict()
@@ -682,6 +738,72 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             return response.json(), None
         except Exception as exc:
             return None, _transport_error(exc)
+
+    async def _http_post_status(
+        url: str,
+        payload: dict,
+        headers: dict[str, str],
+        timeout: int,
+    ) -> tuple[int, str]:
+        """POST JSON and return (status, body) without following a redirect."""
+        if httpx is None:
+            return await asyncio.to_thread(
+                _http_post_status_urllib,
+                url,
+                payload,
+                timeout,
+                headers,
+                active_proxy_for_url(url),
+            )
+        proxy_url = active_proxy_for_url(url)
+        client_key = proxy_url or "direct"
+        if client_key not in shared_clients:
+            shared_clients[client_key] = httpx.AsyncClient(
+                **_client_kwargs(max(search_timeout, url_timeout, exa_timeout), proxy_url)
+            )
+        response = await shared_clients[client_key].post(
+            url,
+            json=payload,
+            headers=headers,
+            timeout=timeout,
+            follow_redirects=False,
+        )
+        return response.status_code, response.text
+
+    async def _deepseek_post(endpoint: str, payload: dict, timeout: int) -> tuple[dict | None, str | None]:
+        """Call one DeepSeek tools endpoint; returns (data, error) and never names the key."""
+        api_key = os.getenv("DEEPSEEK_API_KEY", "").strip()
+        if not api_key:
+            return None, "DEEPSEEK_API_KEY is not configured"
+        url = f"{deepseek_tools_url}/{endpoint}"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                status, body = await _http_post_status(url, payload, headers, timeout)
+            except Exception as exc:
+                # A request that timed out or dropped may have run and been billed:
+                # report it as retryable instead of sending it again here.
+                return None, _transport_error(exc)
+            if 200 <= status < 300:
+                try:
+                    data = json.loads(body)
+                except ValueError:
+                    return None, "DeepSeek returned a response that is not JSON"
+                if not isinstance(data, dict):
+                    return None, "DeepSeek returned an invalid response"
+                return data, None
+            error = _deepseek_status_error(status, body, api_key)
+            # DeepSeek asks callers to wait and retry these once; both endpoints only read.
+            if error.retryable and attempt == 1:
+                await asyncio.sleep(_DEEPSEEK_RETRY_DELAY)
+                continue
+            return None, error
 
     def _main_region(soup):
         # Feeds, threads and listings use one <article> per item, so only a
@@ -853,12 +975,15 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
     def _select_search_provider(query: str, category: str, requested: str) -> tuple[str, bool]:
         requested = (requested or "auto").strip().lower()
         configured = search_provider_state.provider if requested == "auto" else requested
-        if configured not in {"auto", "exa", "searxng"}:
+        if configured not in SearchProviderState.VALID:
             configured = "auto"
         if configured == "exa":
             return "exa", False
         if configured == "searxng":
             return "searxng", False
+        if configured == "deepseek":
+            # Named or chosen as the default only; the automatic route never picks it.
+            return "deepseek", False
         exa_key, _ = resolve_exa_api_key()
         if exa_key and _auto_prefers_exa(query, category):
             return "exa", True
@@ -922,6 +1047,79 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             return f"No Exa results for '{query}'. {_NO_MATCH_NOTE}", None
         return "\n".join(lines).strip(), None
 
+    async def _search_deepseek(query: str, max_results: int) -> tuple[str | None, str | None]:
+        # ori_question and localization are left out: only the query leaves Astra.
+        data, error = await _deepseek_post(
+            "search",
+            {"query": query, "count": max_results, "need_content": False},
+            deepseek_search_timeout,
+        )
+        if error or data is None:
+            return None, error or "empty DeepSeek response"
+        results = data.get("results")
+        if not isinstance(results, list):
+            return None, "invalid DeepSeek response"
+
+        lines = [f"Search: {query}", "Provider: DeepSeek", ""]
+        count = 0
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            url = str(result.get("url") or "").strip()
+            title = str(result.get("title") or "").strip()
+            # summary is the text DeepSeek writes for a model to read; snippet is for display.
+            text = " ".join(str(result.get("summary") or "").split()) or " ".join(
+                str(result.get("snippet") or "").split()
+            )
+            if not url or not (title or text):
+                continue
+            count += 1
+            lines.append(f"[{count}] {title or '(no title)'}")
+            lines.append(f"    URL: {url}")
+            date = result.get("date")
+            if isinstance(date, str) and date.strip():
+                lines.append(f"    Published: {date.strip()}")
+            site = result.get("site_name")
+            if isinstance(site, str) and site.strip():
+                lines.append(f"    Site: {site.strip()}")
+            if text:
+                lines.append(
+                    f"    Snippet: {text[:_DEEPSEEK_TEXT_CHARS]}"
+                    + ("..." if len(text) > _DEEPSEEK_TEXT_CHARS else "")
+                )
+            lines.append("")
+            if count >= max_results:
+                break
+        if count == 0:
+            return f"No DeepSeek results for '{query}'. {_NO_MATCH_NOTE}", None
+        return "\n".join(lines).strip(), None
+
+    def _routes_other_than_deepseek() -> str:
+        return "provider=exa or provider=searxng" if resolve_exa_api_key()[0] else "provider=searxng"
+
+    def _deepseek_search_failure(error: str | None) -> ToolFailure:
+        other = f" search_web with {_routes_other_than_deepseek()} to use another route."
+        if not deepseek_tools_configured():
+            return ToolFailure(
+                code="deepseek_not_configured",
+                message="DeepSeek search is unavailable: DEEPSEEK_API_KEY is not configured",
+                retryable=False,
+                recovery_hint="This setup has no DeepSeek API key, so the DeepSeek route cannot work. Call" + other,
+            )
+        retryable = _retryable(error)
+        status = getattr(error, "status", None)
+        lead = {
+            400: "Check the query: at most 128 characters, operators as the tool description lists. ",
+            401: "Tell the user that DeepSeek rejected DEEPSEEK_API_KEY. ",
+            402: "Tell the user that the DeepSeek account needs a top-up. ",
+        }.get(status if isinstance(status, int) else 0, "")
+        return ToolFailure(
+            code="search_failed",
+            message=f"DeepSeek search failed: {error}",
+            retryable=retryable,
+            recovery_hint=lead + ("Retry later, or call" if retryable else "Call") + other,
+        )
+
     def _other_search_route_hint(retryable: bool, *, exa_tried: bool) -> str:
         if not exa_tried and resolve_exa_api_key()[0]:
             return ("Retry later, or call" if retryable else "Call") + (
@@ -973,7 +1171,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         content_max_length: int = 1200,
         provider: str = "auto",
     ) -> str | ToolFailure:
-        """Return lightweight candidates from Exa or SearXNG."""
+        """Return lightweight candidates from Exa, SearXNG or DeepSeek."""
         if not query.strip():
             return ToolFailure(
                 code="invalid_arguments",
@@ -1004,21 +1202,60 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             searxng_only.append(f"language={language}")
         if include_content:
             searxng_only.append("include_content")
+        # DeepSeek takes only a query and a count; it has no category either.
+        deepseek_unapplied = searxng_only + (
+            [f"category={category}"] if category in {"science", "news"} else []
+        )
 
-        def _exa_reply(output: str) -> str:
-            if not searxng_only:
+        def _route_reply(output: str, route: str, unapplied: list[str], advice: str) -> str:
+            if not unapplied:
                 return output
             head, separator, rest = output.partition("\n\n")
             return (
-                f"{head}\nNot applied on the Exa route: {', '.join(searxng_only)}. "
-                "Exa returns only its first results for a query; use provider=searxng for those options."
+                f"{head}\nNot applied on the {route} route: {', '.join(unapplied)}. "
+                f"{route} returns only its first results for a query; {advice}"
                 f"{separator}{rest}"
             )
+
+        def _exa_reply(output: str) -> str:
+            return _route_reply(output, "Exa", searxng_only, "use provider=searxng for those options.")
 
         if language == "auto":
             language = "zh" if _is_chinese(query) else "en"
 
         selected_provider, allow_fallback = _select_search_provider(query, category, provider)
+        if selected_provider == "deepseek":
+            deepseek_query = query.strip()
+            if len(deepseek_query) > _DEEPSEEK_QUERY_MAX_CHARS:
+                return ToolFailure(
+                    code="invalid_arguments",
+                    message=(
+                        f"query has {len(deepseek_query)} characters; DeepSeek search accepts at most "
+                        f"{_DEEPSEEK_QUERY_MAX_CHARS}"
+                    ),
+                    retryable=False,
+                    recovery_hint=(
+                        f"Shorten the query to {_DEEPSEEK_QUERY_MAX_CHARS} characters or fewer, or call "
+                        f"search_web with {_routes_other_than_deepseek()}."
+                    ),
+                )
+            deepseek_cache_key = json.dumps(
+                {"provider": "deepseek", "query": deepseek_query, "max_results": max_results},
+                sort_keys=True,
+                ensure_ascii=False,
+            )
+            deepseek_output = _cache_get(search_cache, deepseek_cache_key, search_cache_ttl)
+            if deepseek_output is None:
+                deepseek_output, deepseek_error = await _search_deepseek(deepseek_query, max_results)
+                if deepseek_output is None:
+                    return _deepseek_search_failure(deepseek_error)
+                _cache_set(search_cache, deepseek_cache_key, deepseek_output, search_cache_ttl)
+            return _route_reply(
+                deepseek_output,
+                "DeepSeek",
+                deepseek_unapplied,
+                "narrow the query with operators such as site:, lang: or after:, or use provider=searxng.",
+            )
         if selected_provider == "exa" and allow_fallback and needs_searxng:
             # auto must not pick the route that would drop what was asked for.
             selected_provider = "searxng"
@@ -1416,6 +1653,36 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
     async def _firecrawl_extract(urls: list[str], max_chars: int) -> list[dict]:
         return await asyncio.gather(*(_firecrawl_scrape(url, max_chars) for url in urls))
 
+    async def _deepseek_fetch(url: str) -> dict:
+        if len(url) > _DEEPSEEK_FETCH_URL_MAX_CHARS:
+            return _extract_result(
+                requested_url=url,
+                backend="deepseek",
+                error=f"URL is longer than the {_DEEPSEEK_FETCH_URL_MAX_CHARS} characters DeepSeek Fetch accepts",
+            )
+        data, error = await _deepseek_post("fetch", {"url": url}, extract_api_timeout)
+        if error or data is None:
+            return _extract_result(requested_url=url, backend="deepseek", error=error or "empty DeepSeek response")
+        content = data.get("content")
+        if not isinstance(content, str):
+            return _extract_result(requested_url=url, backend="deepseek", error="invalid DeepSeek response")
+        # Fetch reports no final URL, so the page stands under the requested one.
+        return _extract_result(
+            requested_url=url,
+            backend="deepseek",
+            title=str(data.get("title") or ""),
+            content=content,
+            error=None if content.strip() else "DeepSeek returned no content",
+        )
+
+    async def _deepseek_extract(urls: list[str], _max_chars: int) -> list[dict]:
+        if not deepseek_tools_configured():
+            return [
+                _extract_result(requested_url=url, backend="deepseek", error="DEEPSEEK_API_KEY is not configured")
+                for url in urls
+            ]
+        return await asyncio.gather(*(_deepseek_fetch(url) for url in urls))
+
     async def _http_extract(urls: list[str], _max_chars: int) -> list[dict]:
         async def extract_one(url: str) -> dict:
             # Direct fallback must not follow an approved public URL into a
@@ -1459,15 +1726,18 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         "parallel": _parallel_extract,
         "firecrawl": _firecrawl_extract,
         "http": _http_extract,
+        "deepseek": _deepseek_extract,
     }
 
     def _extract_provider_chain(requested: str) -> list[str]:
         order = ["tavily", "exa", "parallel", "firecrawl", "http"]
+        # Named only: DeepSeek Fetch is never part of the automatic order.
+        named_only = ["deepseek"]
         requested = (requested or "auto").strip().lower()
-        if requested not in order:
+        if requested not in order + named_only:
             # "auto" (the tool's default) means the configured first backend.
             requested = configured_extract_provider
-        if requested not in {"auto", *order}:
+        if requested not in {"auto", *order, *named_only}:
             requested = "auto"
         availability = {
             "tavily": bool(os.getenv("TAVILY_API_KEY", "").strip()),
@@ -1475,7 +1745,11 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             "parallel": bool(os.getenv("PARALLEL_API_KEY", "").strip()),
             "firecrawl": bool(firecrawl_url),
             "http": True,
+            "deepseek": deepseek_tools_configured(),
         }
+        if requested in named_only:
+            # The named backend goes first, then the usual order as for any other choice.
+            return [backend for backend in [requested, *order] if availability[backend]]
         start = 0 if requested == "auto" else order.index(requested)
         return [backend for backend in order[start:] if availability[backend]]
 
@@ -1848,6 +2122,9 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             f"Extract provider: {configured_extract_provider}",
             f"Extract chain: {' -> '.join(_extract_provider_chain('auto'))}",
             f"Exa: {'configured' if exa_ready else 'not configured'} ({exa_source})",
+            # Not probed: every successful DeepSeek request is billed.
+            "DeepSeek Search/Fetch: "
+            f"{'configured' if deepseek_tools_configured() else 'not configured'} (DEEPSEEK_API_KEY)",
             f"SearXNG URL: {searxng_url}",
             f"Firecrawl URL: {firecrawl_url}",
         ]
@@ -2082,10 +2359,13 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
     registry.register(ToolDef(
         name="search_web",
         description=(
-            "通过 Exa 或 SearXNG 搜索网页并返回轻量候选链接（标题、URL、摘要）。"
+            "通过 Exa、SearXNG 或 DeepSeek 搜索网页并返回轻量候选链接（标题、URL、摘要）。"
             "provider=auto 会让新闻、论文、新模型和研究查询优先使用 Exa，并在 Exa/SearXNG 间故障回退；"
             "page、engine 及 science/news 以外的 category 只在 SearXNG 生效，auto 下设置它们会改走 SearXNG；"
-            "language、include_content 在 Exa 上不生效。由 Exa 返回的结果会注明未生效的参数。"
+            "language、include_content 在 Exa 上不生效。"
+            "DeepSeek 只在 provider=deepseek 或用户设为默认时使用，只用 query（最长 128 字符）和 max_results，"
+            "query 支持 site:、-site:、-词、\"短语\"、lang:zh,en、after:/before: 等运算符。"
+            "由 Exa 或 DeepSeek 返回的结果会注明未生效的参数。"
             "多个独立查询可同轮并行。摘要足以回答时直接引用；仅在摘要不足或需要核实原文时使用 web_extract。"
             "若仍缺关键证据，可主动使用浏览器访问原站或交互搜索补查，按信息需要自主选择，无需用户点名浏览器。"
         ),
@@ -2100,7 +2380,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
                 },
                 "provider": {
                     "type": "string",
-                    "enum": ["auto", "exa", "searxng"],
+                    "enum": ["auto", "exa", "searxng", "deepseek"],
                     "description": "搜索后端；auto 自动路由并允许故障回退",
                     "default": "auto",
                 },
@@ -2147,7 +2427,8 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         description=(
             "通过可配置后端瀑布流读取网页并返回干净 Markdown。auto 按 Tavily、Exa、Parallel、"
             "Firecrawl、直接 HTTP 的顺序选择并逐 URL 故障回退；整条链失败时会从搜索结果中"
-            "有界重试最多 2 个公开候选，并在结果中标明恢复来源。一次最多 5 个公开 URL，"
+            "有界重试最多 2 个公开候选，并在结果中标明恢复来源。DeepSeek Fetch 只在 provider=deepseek "
+            "或用户配置为首选时使用，失败后接上述顺序。一次最多 5 个公开 URL，"
             "超出的不会读取，并列在结果的 not_processed 中。"
             "提取成功不代表问题已回答；遇到折叠 FAQ、动态内容或需站内搜索等信息缺口，可主动用浏览器交互补查。"
         ),
@@ -2167,7 +2448,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
                 },
                 "provider": {
                     "type": "string",
-                    "enum": ["auto", "tavily", "exa", "parallel", "firecrawl", "http"],
+                    "enum": ["auto", "tavily", "exa", "parallel", "firecrawl", "http", "deepseek"],
                     "description": "首选提取后端；默认 auto",
                     "default": "auto",
                 },
@@ -2326,3 +2607,38 @@ def _http_post_json_urllib(
     opener = urllib.request.build_opener(*handlers) if handlers else urllib.request.build_opener()
     with opener.open(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8", errors="replace"))
+
+
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Answer a redirect as an HTTP error, so request headers never reach another URL."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _http_post_status_urllib(
+    url: str,
+    payload: dict,
+    timeout: int,
+    headers: dict[str, str],
+    http_proxy: str | None = None,
+) -> tuple[int, str]:
+    """POST JSON without following redirects; returns (status, body) for any HTTP answer."""
+    handlers: list[urllib.request.BaseHandler] = [_RefuseRedirects()]
+    if http_proxy:
+        handlers.append(urllib.request.ProxyHandler({"http": http_proxy, "https": http_proxy}))
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"User-Agent": "Agent-System/0.2", **headers},
+        method="POST",
+    )
+    try:
+        with urllib.request.build_opener(*handlers).open(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode("utf-8", errors="replace")
+        except Exception:
+            body = ""
+        return exc.code, body
