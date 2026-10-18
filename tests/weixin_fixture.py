@@ -31,6 +31,8 @@ class FakeIlink:
         self.media_requests: list[str] = []
         # Replies and typing changes in the order they reached the service: ("text", ...) or ("typing", status).
         self.timeline: list[tuple[str, object]] = []
+        self.upload_requests: list[dict] = []
+        self.uploads: dict[str, bytes] = {}
         self._cursor = 0
         fake = self
 
@@ -73,7 +75,17 @@ class FakeIlink:
                     self.send_error(404)
 
             def do_POST(self):
-                payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+                body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+                url = urlparse(self.path)
+                if url.path == "/c2c/upload":
+                    reference = f"enc-{len(fake.uploads) + 1}"
+                    fake.uploads[reference] = body
+                    self.send_response(200)
+                    self.send_header("x-encrypted-param", reference)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                payload = json.loads(body or b"{}")
                 fake.headers.append(dict(self.headers))
                 if self.path == "/ilink/bot/getupdates":
                     fake.polls.append(payload)
@@ -93,6 +105,9 @@ class FakeIlink:
                         fake._cursor += 1
                     self._json({"ret": 0, "msgs": messages, "get_updates_buf": f"cursor-{fake._cursor}",
                                 "longpolling_timeout_ms": 500})
+                elif self.path == "/ilink/bot/getuploadurl":
+                    fake.upload_requests.append(payload)
+                    self._json({"ret": 0, "upload_param": f"up-{len(fake.upload_requests)}"})
                 elif self.path == "/ilink/bot/getconfig":
                     self._json({"ret": 0, "typing_ticket": f"ticket-{payload.get('ilink_user_id')}"})
                 elif self.path == "/ilink/bot/sendtyping":
@@ -100,7 +115,8 @@ class FakeIlink:
                     self._json({"ret": 0})
                 elif self.path == "/ilink/bot/sendmessage":
                     fake.sent.append(payload["msg"])
-                    fake.timeline.append(("text", payload["msg"]["item_list"][0]["text_item"]["text"]))
+                    item = payload["msg"]["item_list"][0]
+                    fake.timeline.append(("text", item["text_item"]["text"]) if "text_item" in item else ("media", item["type"]))
                     try:
                         self._json(fake.send_answers.get_nowait())
                     except queue.Empty:
@@ -119,7 +135,7 @@ class FakeIlink:
 
     def replies_to(self, user: str) -> list[str]:
         return ["".join(item["text_item"]["text"] for item in message["item_list"])
-                for message in self.sent if message["to_user_id"] == user]
+                for message in self.sent if message["to_user_id"] == user and "text_item" in message["item_list"][0]]
 
     def close(self) -> None:
         self.server.shutdown()

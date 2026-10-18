@@ -50,7 +50,7 @@ cp config/channels.example.json .astra/channels.json
 
 2280 端口只能有一个服务占用，启用前先停用或改配 AstrBot。适配器启动失败会报告但不关闭 TUI；后端退出时关闭全部适配器。消息渠道中需要交互授权的操作会被拒绝，不等待不可见提示。
 
-QQ 图片经公开 URL 检查与大小限制后下载，再作为原生多模态内容传给视觉模型。发本地文件需启用 `send_files_enabled`、用 `file_allow_users`（或 `allow_users`）列出可信 QQ ID，并把 `send_file_roots` 限定为可分享的输出目录。`channel_send_file` 拒绝越界路径和常见凭据文件。
+QQ 图片经公开 URL 检查与大小限制后下载，再作为原生多模态内容传给视觉模型。发本地文件需启用 `send_files_enabled`、用 `file_allow_users`（或 `allow_users`）列出可信 QQ ID，并把 `send_file_roots` 限定为可分享的输出目录。`channel_send_file` 拒绝越界路径、隐藏文件和目录、应用数据和常见凭据文件。
 
 ### 微信
 
@@ -63,6 +63,7 @@ QQ 图片经公开 URL 检查与大小限制后下载，再作为原生多模态
 - **睡眠**：正在收消息的后端会阻止电脑空闲睡眠：macOS 用 `caffeinate -i`（后端退出即释放），Windows 设置执行状态，Linux 用 `systemd-inhibit`。显示器照常关闭。MacBook 合盖仍会睡眠，除非接着电源和外接显示器。不想管睡眠就把 `weixin.keep_awake` 设为 `false`。
 - **能收到什么**：文字、引用、微信对语音的转写，以及最多 `max_images` 张图片（从微信 CDN 下载后解密）。文件和视频只收到一个占位说明。
 - **怎么回**：微信会话会被告知按聊天的方式说话：简短、口语、不用 Markdown、一条说一件事。回复像人发微信那样拆成几条短消息依次发出（最多 `max_bubbles` 条；`chat_bubbles: false` 则整段发送，只在超过 `max_output_chars` 时分段），每条之间稍作停顿；从收到消息到最后一条回复发出，微信里一直显示"对方正在输入"。
+- **发文件**：你要的时候，Astra 用 `channel_send_file` 发本地文件：图片和视频按图片、视频发，其他按文件发。只发给扫码的人（或 `weixin.file_allow_users` 列出的人），只从 `weixin.send_file_roots`（默认是用户主目录）里取，不超过 `max_send_file_bytes`；隐藏文件和目录（包括 Astra 自己的 `.astra`）、应用数据（`Library`、`AppData`）和凭据文件一律拒绝。`send_files_enabled: false` 可以关掉。
 - **隐私**：bot token 存在状态目录的 `channels/weixin/account.json`，只有本人可读，不出现在事件和日志里。另一个程序（比如 Hermes）若用同一个登录长轮询，会抢消息，请分开登录。
 
 协议细节参考 Hermes Agent 的适配器（MIT 许可，Nous Research）。

@@ -348,6 +348,75 @@ def test_only_wechat_conversations_are_told_to_talk_like_a_chat(tmp_path):
     assert CHAT_STYLE not in prompts["qq"] and "project guidance" in prompts["qq"]
 
 
+def test_files_go_out_encrypted_as_an_image_or_a_file_and_only_to_the_owner(ilink, tmp_path):
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    from agent.channels.manager import ChannelManager
+    from agent.channels.router import active_channel_message
+    from agent.channels.tools import register_channel_tools
+    from agent.channels.config import ChannelsConfig
+    from agent.runtime.tools.registry import ToolRegistry
+
+    shared = tmp_path / "shared"
+    (shared / "pictures").mkdir(parents=True)
+    picture = shared / "pictures" / "cat.png"
+    picture.write_bytes(b"\x89PNG\r\n\x1a\n" + bytes(range(200)))
+    notes = shared / "notes.txt"
+    notes.write_text("买牛奶", encoding="utf-8")
+    for hidden in (shared / ".astra" / "channels" / "weixin" / "account.json", shared / "Library" / "Keychains" / "login.db"):
+        hidden.parent.mkdir(parents=True)
+        hidden.write_text("secret", encoding="utf-8")
+
+    async def scenario():
+        store = WeixinStore(tmp_path / "weixin")
+        await logged_in(ilink, store)
+
+        async def handler(message, reply):
+            return ""
+
+        channel = adapter(ilink, store, handler, send_file_roots=(str(shared),))
+        manager = ChannelManager(ChannelsConfig(weixin=channel.config), handler, adapters=[channel])
+        registry = ToolRegistry()
+        register_channel_tools(registry, lambda: manager)
+        await channel.start()
+        await until(lambda: channel.running, "online")
+
+        async def send(path, sender=OWNER):
+            token = active_channel_message.set(ChannelMessage("weixin", sender, sender, "发给我"))
+            try:
+                return await registry.execute("channel_send_file", {"path": str(path)})
+            finally:
+                active_channel_message.reset(token)
+
+        try:
+            results = {name: await send(path) for name, path in
+                       (("picture", picture), ("notes", notes),
+                        ("login", shared / ".astra" / "channels" / "weixin" / "account.json"),
+                        ("keychain", shared / "Library" / "Keychains" / "login.db"))}
+            results["stranger"] = await send(picture, sender=STRANGER)
+        finally:
+            await channel.stop()
+        return results
+
+    results = asyncio.run(scenario())
+    assert results["picture"]["error"] == "" and results["notes"]["error"] == ""
+    for refused in ("login", "keychain"):
+        assert "sensitive" in results[refused]["error"], refused
+    assert "not allowed" in results["stranger"]["error"]
+
+    image, document = (message["item_list"][0] for message in ilink.sent)
+    assert [message["to_user_id"] for message in ilink.sent] == [OWNER, OWNER]
+    assert image["type"] == 2 and document["type"] == 4
+    assert document["file_item"]["file_name"] == "notes.txt" and document["file_item"]["len"] == str(len("买牛奶".encode()))
+    assert [r["media_type"] for r in ilink.upload_requests] == [1, 3]
+    # What reached the CDN decrypts, with the key the message carries, to the file itself.
+    for item, source in ((image["image_item"], picture), (document["file_item"], notes)):
+        key = bytes.fromhex(base64.b64decode(item["media"]["aes_key"]).decode())
+        decryptor = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
+        plain = decryptor.update(ilink.uploads[item["media"]["encrypt_query_param"]]) + decryptor.finalize()
+        assert plain[:-plain[-1]] == source.read_bytes()
+
+
 def test_stopping_finishes_even_when_an_http_call_swallows_the_cancellation(ilink, tmp_path):
     import httpx
 

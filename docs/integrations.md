@@ -72,8 +72,9 @@ passed to vision-capable models as native multimodal content. Local file sending
 is deliberately more restrictive: enable `send_files_enabled`, list trusted
 sender QQ IDs in `file_allow_users` (or `allow_users`), and restrict
 `send_file_roots` to output directories that are safe to share. The
-`channel_send_file` tool rejects paths outside those roots and common credential
-files even when requested by the model.
+`channel_send_file` tool rejects paths outside those roots, hidden files and
+folders, application data and common credential files even when requested by
+the model.
 
 ### WeChat
 
@@ -107,6 +108,13 @@ in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on` and
   short messages the way people text (at most `max_bubbles`; `chat_bubbles:
   false` sends whole replies split only at `max_output_chars`), with a pause
   before each, and WeChat shows "typing…" from the message until the last reply.
+- **Files.** When asked, Astra sends a local file with `channel_send_file`: an
+  image or a video arrives as one, anything else as a file. Only the person who
+  scanned the code receives files (or `weixin.file_allow_users`), only from
+  `weixin.send_file_roots` (default: the home folder), at most
+  `max_send_file_bytes`; hidden files and folders (including Astra's own
+  `.astra`), application data (`Library`, `AppData`) and credential files are
+  always refused. `send_files_enabled: false` turns it off.
 - **Privacy.** The bot token lives in the state directory's
   `channels/weixin/account.json`, readable by the owner only, and never appears
   in events or logs. Another program that polls the same login (for example

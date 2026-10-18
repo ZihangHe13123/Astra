@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import hashlib
 import io
 import json
 import logging
@@ -56,6 +57,10 @@ _API_SECONDS = 15.0
 _SESSION_EXPIRED = -14
 _RATE_LIMITED = -2
 _ITEM_TEXT, _ITEM_IMAGE, _ITEM_VOICE, _ITEM_FILE, _ITEM_VIDEO = 1, 2, 3, 4, 5
+# getuploadurl's media_type, numbered differently from the message items.
+_MEDIA_IMAGE, _MEDIA_VIDEO, _MEDIA_FILE = 1, 2, 3
+_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"})
+_VIDEO_SUFFIXES = frozenset({".mp4", ".mov", ".m4v", ".3gp"})
 _MSG_TYPE_BOT = _MSG_STATE_FINISH = 2
 _CDN_HOSTS = frozenset({
     "novac2c.cdn.weixin.qq.com", "ilinkai.weixin.qq.com", "wx.qlogo.cn", "thirdwx.qlogo.cn",
@@ -216,15 +221,42 @@ class IlinkClient:
         except httpx.ReadTimeout:
             return {"ret": 0, "msgs": [], "get_updates_buf": cursor}
 
-    async def send_text(self, account: WeixinAccount, to: str, text: str, context_token: str) -> dict:
+    async def send_items(self, account: WeixinAccount, to: str, items: list[dict], context_token: str) -> dict:
         message: dict[str, Any] = {
             "from_user_id": "", "to_user_id": to, "client_id": f"astra-weixin-{uuid.uuid4().hex}",
-            "message_type": _MSG_TYPE_BOT, "message_state": _MSG_STATE_FINISH,
-            "item_list": [{"type": _ITEM_TEXT, "text_item": {"text": text}}],
+            "message_type": _MSG_TYPE_BOT, "message_state": _MSG_STATE_FINISH, "item_list": items,
         }
         if context_token:
             message["context_token"] = context_token
         return await self._post(account, "ilink/bot/sendmessage", {"msg": message})
+
+    async def send_text(self, account: WeixinAccount, to: str, text: str, context_token: str) -> dict:
+        return await self.send_items(account, to, [{"type": _ITEM_TEXT, "text_item": {"text": text}}], context_token)
+
+    async def upload_url(self, account: WeixinAccount, to: str, *, media_type: int, filekey: str, size: int,
+                         md5: str, encrypted_size: int, aes_key_hex: str) -> str:
+        """Where WeChat's CDN takes the encrypted file."""
+        data = await self._post(account, "ilink/bot/getuploadurl", {
+            "filekey": filekey, "media_type": media_type, "to_user_id": to, "rawsize": size, "rawfilemd5": md5,
+            "filesize": encrypted_size, "no_need_thumb": True, "aeskey": aes_key_hex})
+        full = str(data.get("upload_full_url") or "")
+        param = str(data.get("upload_param") or "")
+        if full:
+            if urlparse(full).scheme not in {"http", "https"}:
+                raise WeixinError("iLink handed out an upload address that is not HTTP")
+            return full
+        if param:
+            return f"{self.cdn_url}/upload?encrypted_query_param={quote(param, safe='')}&filekey={quote(filekey, safe='')}"
+        raise WeixinError("iLink handed out no upload address")
+
+    async def upload(self, url: str, data: bytes) -> str:
+        """Upload encrypted bytes; the CDN answers with the parameter the message refers to."""
+        response = await self._http.post(url, content=data, headers={"Content-Type": "application/octet-stream"},
+                                         timeout=120.0)
+        param = response.headers.get("x-encrypted-param") if response.status_code == 200 else None
+        if not param:
+            raise WeixinError(f"WeChat's media upload answered HTTP {response.status_code} without a file reference")
+        return param
 
     async def typing_ticket(self, account: WeixinAccount, to: str, context_token: str) -> str:
         payload: dict[str, Any] = {"ilink_user_id": to}
@@ -314,6 +346,14 @@ def _aes_key(value: str) -> bytes:
     if text and all(ch in "0123456789abcdefABCDEF" for ch in text):
         return bytes.fromhex(text)
     raise ValueError("unexpected media key format")
+
+
+def _encrypt(data: bytes, key: bytes) -> bytes:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    pad = 16 - len(data) % 16
+    encryptor = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+    return encryptor.update(data + bytes([pad]) * pad) + encryptor.finalize()
 
 
 def _decrypt(data: bytes, key: bytes) -> bytes:
@@ -457,6 +497,11 @@ class WeixinAdapter(ChannelAdapter):
     @property
     def running(self) -> bool:
         return self._state == "online"
+
+    def owner(self) -> str:
+        """The WeChat user who scanned the login code."""
+        account = self._account or self.store.account()
+        return account.user_id if account is not None else ""
 
     def state_key(self) -> tuple:
         """What a status shows that can change on its own, read without touching the disk."""
@@ -728,10 +773,43 @@ class WeixinAdapter(ChannelAdapter):
                 await asyncio.sleep(self._pause(piece))
             await self._send_piece(client, account, to, piece)
 
+    async def send_file(self, message: ChannelMessage, path: str, name: str) -> dict[str, Any]:
+        """Send a local file to the person in ``message``: an image or a video as one, anything else as a file."""
+        account, client = self._account, self._client
+        if account is None or client is None:
+            raise WeixinError("the WeChat channel is not online")
+        data = await asyncio.to_thread(Path(path).read_bytes)
+        suffix = Path(name or path).suffix.lower()
+        media = _MEDIA_IMAGE if suffix in _IMAGE_SUFFIXES else _MEDIA_VIDEO if suffix in _VIDEO_SUFFIXES else _MEDIA_FILE
+        key, filekey, md5 = secrets.token_bytes(16), secrets.token_hex(16), hashlib.md5(data).hexdigest()
+        encrypted = await asyncio.to_thread(_encrypt, data, key)
+        url = await client.upload_url(account, message.conversation_id, media_type=media, filekey=filekey, size=len(data),
+                                      md5=md5, encrypted_size=len(encrypted), aes_key_hex=key.hex())
+        reference = await client.upload(url, encrypted)
+        # iLink takes the key as base64 of its hex text; raw-key base64 shows as a grey box.
+        source = {"encrypt_query_param": reference, "aes_key": base64.b64encode(key.hex().encode()).decode(), "encrypt_type": 1}
+        if media == _MEDIA_IMAGE:
+            item = {"type": _ITEM_IMAGE, "image_item": {"media": source, "mid_size": len(encrypted)}}
+        elif media == _MEDIA_VIDEO:
+            item = {"type": _ITEM_VIDEO, "video_item": {"media": source, "video_size": len(encrypted), "play_length": 0,
+                                                        "video_md5": md5}}
+        else:
+            item = {"type": _ITEM_FILE, "file_item": {"media": source, "file_name": name or Path(path).name,
+                                                      "len": str(len(data))}}
+        try:
+            await self._send_items(client, account, message.conversation_id, [item])
+        except httpx.TimeoutException as exc:
+            # Uploaded and handed over, but WeChat never confirmed the message.
+            raise TimeoutError("WeChat did not confirm the file message") from exc
+        return {"status": "sent", "kind": {_MEDIA_IMAGE: "image", _MEDIA_VIDEO: "video"}.get(media, "file")}
+
     async def _send_piece(self, client: IlinkClient, account: WeixinAccount, to: str, piece: str) -> None:
+        await self._send_items(client, account, to, [{"type": _ITEM_TEXT, "text_item": {"text": piece}}])
+
+    async def _send_items(self, client: IlinkClient, account: WeixinAccount, to: str, items: list[dict]) -> None:
         token = self._tokens.get(to, "")
         for attempt in range(_SEND_ATTEMPTS):
-            response = await client.send_text(account, to, piece, token)
+            response = await client.send_items(account, to, items, token)
             code = response.get("errcode") or response.get("ret") or 0
             if not code:
                 return

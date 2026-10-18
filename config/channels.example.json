@@ -28,6 +28,10 @@
     "max_image_bytes": 10485760,
     "keep_awake": true,
     "chat_bubbles": true,
-    "max_bubbles": 8
+    "max_bubbles": 8,
+    "send_files_enabled": true,
+    "file_allow_users": [],
+    "send_file_roots": ["~"],
+    "max_send_file_bytes": 52428800
   }
 }

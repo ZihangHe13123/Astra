@@ -13,12 +13,18 @@ from .router import active_channel_message
 
 
 _SENSITIVE_NAMES = {
-    ".env",
+    "credentials",
     "credentials.json",
+    "id_dsa",
+    "id_ecdsa",
     "id_ed25519",
     "id_rsa",
+    "cookies",
+    "login data",
 }
 _SENSITIVE_SUFFIXES = {".key", ".pem", ".pfx", ".p12"}
+# Application data on macOS and Windows: tokens and browser stores live there.
+_PRIVATE_DIRS = {"library", "appdata"}
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -27,6 +33,18 @@ def _inside(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _sensitive(path: Path, root: Path) -> bool:
+    """Below a send root: hidden files and folders (.ssh, .env, .git, Astra's own .astra with the
+    channel logins), application data, and files named or shaped like credentials."""
+    parts = path.relative_to(root).parts
+    return (
+        any(part.startswith(".") for part in parts)
+        or any(part.lower() in _PRIVATE_DIRS for part in parts[:-1])
+        or path.name.lower() in _SENSITIVE_NAMES
+        or path.suffix.lower() in _SENSITIVE_SUFFIXES
+    )
 
 
 def register_channel_tools(
@@ -40,11 +58,12 @@ def register_channel_tools(
         manager = manager_getter()
         if manager is None:
             raise RuntimeError("messaging channel manager is not ready")
-        config = manager.config.onebot
-        if not config.send_files_enabled:
+        policy = manager.file_policy(message.channel)
+        if policy is None:
+            raise RuntimeError(f"the {message.channel} channel cannot send files")
+        if not policy.enabled:
             raise PermissionError("channel file sending is disabled")
-        allowed_users = config.file_allow_users or config.allow_users
-        if not allowed_users or message.sender_id not in allowed_users:
+        if not policy.recipients or message.sender_id not in policy.recipients:
             raise PermissionError("sender is not allowed to receive local files")
 
         try:
@@ -54,21 +73,16 @@ def register_channel_tools(
             raise FileNotFoundError(f"file not found: {path}") from None
         if not source.is_file():
             raise ValueError(f"not a file: {source}")
-        roots = [Path(item).expanduser().resolve() for item in config.send_file_roots]
-        if not roots or not any(_inside(source, root) for root in roots):
+        roots = [Path(item).expanduser().resolve() for item in policy.roots]
+        root = next((item for item in roots if _inside(source, item)), None)
+        if root is None:
             raise PermissionError("file is outside configured send_file_roots")
-        lowered_name = source.name.lower()
-        if (
-            ".git" in {part.lower() for part in source.parts}
-            or lowered_name in _SENSITIVE_NAMES
-            or lowered_name.startswith(".env.")
-            or source.suffix.lower() in _SENSITIVE_SUFFIXES
-        ):
+        if _sensitive(source, root):
             raise PermissionError("refusing to send a potentially sensitive credential file")
         size = source.stat().st_size
-        if size > config.max_send_file_bytes:
+        if size > policy.max_bytes:
             raise ValueError(
-                f"file is too large: {size} bytes > {config.max_send_file_bytes} bytes"
+                f"file is too large: {size} bytes > {policy.max_bytes} bytes"
             )
         upload_name = Path(name).name if name.strip() else source.name
         try:
@@ -98,10 +112,12 @@ def register_channel_tools(
     registry.register(ToolDef(
         name="channel_send_file",
         description=(
-            "Send an existing local file to the user in the active QQ/channel conversation. "
+            "Send an existing local file to the user in the active QQ or WeChat conversation; "
+            "an image or video arrives as one, anything else as a file. "
             "Works only in a turn that came from a messaging channel. "
             "Use only when that user explicitly asks to receive a file. The path must be inside "
-            "configured send_file_roots; credential files are always blocked. "
+            "configured send_file_roots; hidden files and folders, application data and credential "
+            "files are always blocked. "
             "At most 3 calls per turn: a further call is not run."
         ),
         parameters={

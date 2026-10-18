@@ -34,6 +34,16 @@ class ChannelMessage:
     raw: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
 
 
+@dataclass(frozen=True)
+class FilePolicy:
+    """Whether channel_send_file may send a local file in a channel, to whom, and from where."""
+
+    enabled: bool
+    recipients: tuple[str, ...]
+    roots: tuple[str, ...]
+    max_bytes: int
+
+
 ReplySink = Callable[[str], Awaitable[None]]
 MessageHandler = Callable[[ChannelMessage, ReplySink | None], Awaitable[str]]
 

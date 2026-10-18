@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from .base import ChannelAdapter, ChannelMessage, MessageHandler
+from .base import ChannelAdapter, ChannelMessage, FilePolicy, MessageHandler
 from .config import ChannelsConfig
 from .onebot import OneBotAdapter
 from .weixin import WeixinAdapter
@@ -101,6 +101,20 @@ class ChannelManager:
             {"name": adapter.name, "running": adapter.running}
             for adapter in self.adapters
         ]
+
+    def file_policy(self, channel: str) -> FilePolicy | None:
+        """What channel_send_file may do in a channel; None where the channel cannot send files."""
+        if channel == "qq":
+            qq = self.config.onebot
+            return FilePolicy(qq.send_files_enabled, qq.file_allow_users or qq.allow_users,
+                              qq.send_file_roots, qq.max_send_file_bytes)
+        if channel == "weixin":
+            wx = self.config.weixin
+            adapter = self.weixin()
+            owner = adapter.owner() if adapter is not None else ""
+            return FilePolicy(wx.send_files_enabled, wx.file_allow_users or ((owner,) if owner else ()),
+                              wx.send_file_roots, wx.max_send_file_bytes)
+        return None
 
     def weixin(self) -> "WeixinAdapter | None":
         adapter = self.adapter("weixin")
