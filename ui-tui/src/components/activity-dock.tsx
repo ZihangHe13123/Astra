@@ -9,7 +9,7 @@ import { WorkingMemoryPanel, workingProgress } from "./working-memory.js";
 import { buildStatusParts, computerIndicator, truncateDisplayText, type ComputerUiState } from "./status-bar.js";
 import { responsiveMode } from "./app-header.js";
 import type { AgentTeamView } from "../agent-team-state.js";
-import { COMPACTION_LABEL } from "../context-compaction.js";
+import { COMPACTION_LABEL } from "@astra/ui-core/context-compaction";
 
 export type ActiveTool = ToolCallInfo & { startedAt: number };
 export type ActivityVisualState = "idle" | "busy" | "error";

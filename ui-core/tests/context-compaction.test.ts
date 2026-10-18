@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { compactionNotice } from "./context-compaction.js";
-import type { ContextCompactionEvent } from "./types.js";
+import { compactionNotice } from "../src/context-compaction.js";
+import type { ContextCompactionEvent } from "../src/types.js";
 
 test("compaction has start, result, failure and cancellation notices", () => {
   const event: ContextCompactionEvent = { type: "context_compaction", status: "started", messages_before: 168, messages_after: 85 };
@@ -46,4 +46,19 @@ test("invalid optional metrics fall back to counts without printing untrusted te
   const text = compactionNotice({ ...event, tokens_before: 100, tokens_after: 50, method: "\x1b[2J" as any, target_tokens: "\x1b[2J" as any })!;
   assert.doesNotMatch(text, /\x1b/);
   assert.match(text, /100 → 50 tokens/);
+});
+
+test("a window shows compaction while it runs and keeps its result in the conversation", async () => {
+  const { initialSession, projectEvent } = await import("../src/session-state.js");
+  const started: ContextCompactionEvent = { type: "context_compaction", status: "started", messages_before: 40, messages_after: 40 };
+  let state = projectEvent(initialSession("fixture"), started as never);
+  assert.equal(state.info.context_compaction?.status, "started");
+  assert.equal(state.messages.length, 0, "the running state is a status, not a message");
+  state = projectEvent(state, { ...started, status: "completed", messages_after: 12, method: "summary",
+    tokens_before: 90000, tokens_after: 20000 } as never);
+  assert.equal(state.info.context_compaction?.status, "completed");
+  assert.deepEqual(state.messages.map(message => [message.role, message.content]),
+    [["system", "上下文历史压缩完成：估算 90,000 → 20,000 tokens，释放 77.8%；消息 40 → 12。"]]);
+  state = projectEvent(state, { ...started, status: "failed" } as never);
+  assert.equal(state.messages.at(-1)?.content, "上下文压缩未完成。");
 });

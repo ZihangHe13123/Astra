@@ -3,6 +3,7 @@ import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useSta
 import { createRoot } from "react-dom/client";
 import { ArrowUp, Square, Plus, Search, PanelLeft, PanelRight, ChevronDown, Folder, Settings, Paperclip, X, Copy, RotateCcw, ChevronRight, Command, Pin, Moon, Sun, Monitor, ArrowLeft, LoaderCircle, SlidersHorizontal, FileDiff, Terminal, Check, FileText } from "lucide-react";
 import { projectEvent, textContent, type SessionState, type UIEvent, type Message } from "@astra/ui-core/session-state";
+import { COMPACTION_LABEL } from "@astra/ui-core/context-compaction";
 import { responseControlsBusy, responseOperationActive, type ResponseSource, type ResponseGroup } from "@astra/ui-core/response-versions";
 import { EarlierResponseVersions, type ResponseControls } from "./response-versions.js";
 import "./response-versions.css";
@@ -596,7 +597,7 @@ function App() {
                 {(responsePending || state?.busy && !draft.trim() && !files.length && !hasAppshot) ? <button className="send" aria-label="停止" onClick={() => command("/cancel")}><Square size={16} fill="currentColor"/></button> : <button className="send" aria-label="发送" disabled={sending || opening || responsePending || (!draft.trim() && !files.length && !hasAppshot)} onClick={() => { void submit(); }}><ArrowUp size={19}/></button>}
               </div></div>
           </div>}
-          <div className="composer-foot"><span>{state?.status === "ready" ? state.busy ? "运行中" : "就绪" : state ? state.status === "disconnected" ? "后端已断开" : "连接后端中…" : "本地运行 · 模型自主选择工具"}</span><span>Enter 发送 · Shift Enter 换行</span></div>
+          <div className="composer-foot"><span>{state?.status === "ready" ? state.info.context_compaction?.status === "started" ? COMPACTION_LABEL : state.busy ? "运行中" : "就绪" : state ? state.status === "disconnected" ? "后端已断开" : "连接后端中…" : "本地运行 · 模型自主选择工具"}</span><span>Enter 发送 · Shift Enter 换行</span></div>
         </div>
       </div>{panel === "logs" && logSession ? <SessionLogPanel key={logScope} session={logSession.name} mode={logSession.mode} branchId={logBranch} responseRevision={logResponseRevision} target={logTarget} width={prefs.detailWidth || 420} close={() => { logNavigation.current++; setPanel(undefined); }} locate={locateLog}/> : panel && panel !== "logs" && state && !preview && <Details key={`${state.id}:${state.mode}:${state.session}:${state.branchId || ""}`} changeTarget={changeTarget} state={state} panel={panel} setPanel={next => { if (next === "logs") { openLog(); return; } if (next !== "files") leaveDoc(); setPanel(next); }} selection={selection} width={prefs.detailWidth || 420} onWidth={detailWidth => savePrefs({ detailWidth })} close={() => { leaveDoc(); setPanel(undefined); }} fail={fail} doc={docTarget && leftDoc.current !== docTarget.path ? docTarget : undefined} onDocDismiss={leaveDoc} openLog={logSession ? call_id => openLog({ call_id }) : undefined} wide={detailsWide} onWide={setDetailsWide} onAttach={attach}/>}</div>
     </main>

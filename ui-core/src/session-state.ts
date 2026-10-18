@@ -1,4 +1,5 @@
 import { memoryNoticeText, memoryRecallText } from "./memory-notices.js";
+import { compactionNotice } from "./context-compaction.js";
 import { reduceAgentTeamEvent, type AgentTeamView } from "./agent-team-state.js";
 import type { ResponseVersions, ResponseOperation, ResponseRegeneration } from "./response-versions.js";
 import type { PyEvent } from "./types.js";
@@ -232,6 +233,13 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
     }
     case "steering": break; // The submitted user message is already present.
     case "gui_notice": append("system", event.message); break;
+    // While it runs, a client shows it from info; its result stays in the conversation as a notice.
+    case "context_compaction": {
+      state.info = { ...state.info, context_compaction: event };
+      const text = event.status === "started" ? null : compactionNotice(event as never);
+      if (text) append("system", text);
+      break;
+    }
     // Another Astra session on this computer: shown as a notice, never as the user's words.
     case "peer_message":
       append("system", `${event.direction === "in" ? "来自" : "发给"} ${event.peer}（${event.state}）：${event.text}`); break;

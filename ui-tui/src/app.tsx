@@ -10,7 +10,7 @@ import type { AppshotManifestReader } from "./appshot-input.js";
 import type { GenerationProgress, GenerationStats, InputSubmission, LocalModeDefinition } from "./types.js";
 import { generationProgressLabel } from "./generation-progress.js";
 import { preparationLabel, reduceToolPreparation, type ToolPreparation } from "@astra/ui-core/tool-preparation";
-import { COMPACTION_LABEL, compactionNotice } from "./context-compaction.js";
+import { COMPACTION_LABEL, compactionNotice } from "@astra/ui-core/context-compaction";
 import { TurnChangesRenderGate } from "./turn-changes.js";
 import { turnChangesCard } from "./turn-changes-card.js";
 import { describeTool } from "@astra/ui-core/tool-activity";
