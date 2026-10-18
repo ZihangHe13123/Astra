@@ -2939,6 +2939,7 @@ class ReActAgent(AgentBase):
             not result.get("error")
             and tool is not None
             and tool.risk == "write"
+            and tool.writes_paths
             and not dry_run_write
         ):
             write_paths = self._tool_mutation_paths(name, args)

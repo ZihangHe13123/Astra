@@ -111,6 +111,9 @@ class ToolDef:
     retry_delay: float = 0.2
     risk: str = "read"
     approval: str = "never"
+    # Whether a write tool changes the file its ``path``/``file_path`` names. A tool that only
+    # reads it (sending the file elsewhere) says False, so the file is not journaled as changed.
+    writes_paths: bool = True
     output_schema: dict | None = None
     idempotent: bool = False
     # Explicit scheduling capability; network risk alone says nothing about

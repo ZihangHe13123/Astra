@@ -639,3 +639,52 @@ def test_a_media_upload_tries_a_passing_server_error_again_and_says_why_it_gave_
             await client.close()
 
     asyncio.run(scenario())
+
+
+def test_sending_a_file_is_not_journaled_as_changing_it(tmp_path):
+    from types import SimpleNamespace
+
+    from agent.channels.base import FilePolicy
+    from agent.channels.router import active_channel_message
+    from agent.channels.tools import register_channel_tools
+    from agent.runtime.react import ReActAgent
+    from agent.runtime.tools.registry import ToolDef, ToolRegistry
+
+    picture = tmp_path / "cat.png"
+    picture.write_bytes(b"\x89PNG\r\n\x1a\n" + bytes(64))
+    sent: list[str] = []
+
+    class Manager:
+        def file_policy(self, channel):
+            return FilePolicy(enabled=True, recipients=(OWNER,), roots=(str(tmp_path),), max_bytes=1 << 20)
+
+        async def send_file(self, message, path, name):
+            sent.append(path)
+            return {"status": "sent"}
+
+    async def edit_probe(path=""):
+        return path
+
+    registry = ToolRegistry()
+    register_channel_tools(registry, lambda: Manager())
+    registry.register(ToolDef(name="edit_probe", description="test mutation", fn=edit_probe, risk="write", group="files",
+                              parameters={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}))
+    llm = SimpleNamespace(config=SimpleNamespace(model="fake", capabilities=frozenset()))
+    agent = ReActAgent("agent", llm, registry, system_prompt="base")  # type: ignore[arg-type]
+
+    async def scenario():
+        token = active_channel_message.set(ChannelMessage("weixin", OWNER, OWNER, "把图发我"))
+        try:
+            shared = await agent._execute_tool_call({"id": "send", "name": "channel_send_file",
+                                                     "arguments": json.dumps({"path": str(picture)})})
+            required_after_send = agent._verification_required
+            edited = await agent._execute_tool_call({"id": "edit", "name": "edit_probe", "arguments": '{"path":"notes.md"}'})
+        finally:
+            active_channel_message.reset(token)
+        return shared, required_after_send, edited
+
+    shared, required_after_send, edited = asyncio.run(scenario())
+    assert shared["error"] == "" and sent == [str(picture.resolve())]
+    assert "coding_change_journal" not in shared and "Coding change journal" not in shared.get("tool_output", "")
+    assert required_after_send is False
+    assert edited["coding_change_journal"] == ["notes.md"], "a tool that writes its path is still journaled"
