@@ -204,6 +204,7 @@ from agent.runtime.command_workflows import workflow_message, raw_command as nor
 from agent.channels import ChannelManager, load_channels_config
 from agent.channels.manager import is_address_in_use
 from agent.channels.router import AgentChannelRouter, active_channel
+from agent.cli.channel_models import ChannelModels
 from agent.cli.weixin_commands import WeixinCommands, is_weixin_command
 from agent.channels.tools import register_channel_tools
 from agent.runtime.prompts import get_prompt_profile, prompt_profiles
@@ -2343,11 +2344,13 @@ async def _main(startup_started: float):
         _send({"type": "gui_ready", "workspace": str(Path(sandbox_workdir).resolve()),
                "session_id": Path(agent.context.session_path).stem})
 
+    channel_models = ChannelModels(lambda: catalog, lambda: current_model_key)
     channel_router = AgentChannelRouter(agent, agent_turn_lock, sessions_dir(PROJECT_ROOT),
-                                        admission=lambda: not restart.draining)
+                                        admission=lambda: not restart.draining, model_for=channel_models.client)
     channel_manager = ChannelManager(load_channels_config(), channel_router.handle)
     channel_manager_holder["manager"] = channel_manager
-    weixin_commands = WeixinCommands(lambda: channel_manager_holder.get("manager"), _send)
+    weixin_commands = WeixinCommands(lambda: channel_manager_holder.get("manager"), _send,
+                                     models=channel_models)
     # The QQ reverse-WebSocket port is a process-wide resource, while the CLI
     # backend itself is intentionally multi-instance. If another backend owns
     # the channel, keep this CLI useful and leave only that optional adapter

@@ -293,7 +293,9 @@ export type PyEvent =
   | { type: "memory_recall"; count: number; items: string[] }
   // The WeChat channel (iLink). qr is present while a login code waits to be scanned; the answer to a /weixin command adds message or error.
   | { type: "weixin_status"; enabled: boolean; logged_in: boolean; account: string; state: "off" | "logged_out" | "stopped" | "standby" | "online" | "expired";
-      owner: boolean; keep_awake: boolean; login: "" | "scan" | "confirm"; qr?: { svg: string; text: string }; message?: string; error?: string }
+      owner: boolean; keep_awake: boolean; login: "" | "scan" | "confirm"; qr?: { svg: string; text: string }; message?: string; error?: string;
+      /** The catalog key WeChat answers with ("" follows the default model), its model name, and the default's. */
+      model: string; model_label: string; default_model: string }
   | {
       type: "error";
       message: string;

@@ -270,7 +270,7 @@
   },
   {
     "command": "/weixin",
-    "description": "WeChat channel · [status|login|on|off|logout]",
+    "description": "WeChat channel · [status|login|on|off|logout|model]",
     "group": "TOOLS",
     "id": "F57",
     "takes_args": true,
@@ -304,6 +304,12 @@
         "description": "log out and forget the login",
         "completion": "/weixin logout",
         "submitValue": "/weixin logout"
+      },
+      {
+        "command": "model",
+        "description": "the model WeChat answers with: a /model key, or default",
+        "completion": "/weixin model ",
+        "submitValue": "/weixin model"
       }
     ]
   },

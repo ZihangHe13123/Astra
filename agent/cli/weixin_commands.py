@@ -9,10 +9,11 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from typing import TYPE_CHECKING
 
 import httpx
 
-from agent.channels.config import load_channels_config, set_channel_enabled
+from agent.channels.config import load_channels_config, set_channel_enabled, set_channel_setting
 from agent.channels.manager import ChannelManager
 from agent.channels.weixin import (
     IlinkClient,
@@ -25,9 +26,13 @@ from agent.channels.weixin import (
     qr_text,
 )
 
+if TYPE_CHECKING:
+    from agent.cli.channel_models import ChannelModels
+    from agent.cli.model_catalog import CatalogEntry
+
 logger = logging.getLogger(__name__)
 
-USAGE = "用法：/weixin [status|login|logout|on|off]"
+USAGE = "用法：/weixin [status|login|logout|on|off|model <模型>|model default]"
 
 
 def is_weixin_command(command: str) -> bool:
@@ -36,9 +41,11 @@ def is_weixin_command(command: str) -> bool:
 
 class WeixinCommands:
     def __init__(self, manager: Callable[[], ChannelManager | None], send: Callable[[dict], None], *,
-                 client_factory: Callable[[], IlinkClient] = IlinkClient) -> None:
+                 client_factory: Callable[[], IlinkClient] = IlinkClient,
+                 models: ChannelModels | None = None) -> None:
         self._manager = manager
         self._send = send
+        self._models = models
         self._client_factory = client_factory
         self._login: asyncio.Task | None = None
         self._qr: dict[str, str] | None = None
@@ -48,7 +55,8 @@ class WeixinCommands:
     def status_event(self, *, message: str = "", error: str = "") -> dict:
         manager = self._manager()
         adapter = manager.weixin() if manager is not None else None
-        enabled = load_channels_config().weixin.enabled
+        config = load_channels_config().weixin
+        enabled = config.enabled
         store = adapter.store if adapter is not None else WeixinStore()
         account = store.account()
         status = adapter.status() if adapter is not None else {
@@ -60,6 +68,10 @@ class WeixinCommands:
             "account": mask(account.account_id) if account is not None else "",
             "state": status["state"], "owner": status["owner"], "keep_awake": status["keep_awake"],
             "login": self._stage,
+            # The model WeChat answers with: a catalog key, or "" for the default model.
+            "model": config.model,
+            "model_label": self._label(self._resolve(config.model), config.model) if config.model else "",
+            "default_model": self._label(self._models.default() if self._models else None, ""),
         }
         if self._qr is not None:
             event["qr"] = dict(self._qr)
@@ -87,7 +99,9 @@ class WeixinCommands:
         parts = command.split()
         action = parts[1].lower() if len(parts) > 1 else "status"
         try:
-            if len(parts) > 2:
+            if action == "model" and len(parts) <= 3:
+                self._model(parts[2] if len(parts) > 2 else "")
+            elif len(parts) > 2:
                 self.send_status(error=USAGE)
             elif action == "status":
                 self.send_status()
@@ -101,6 +115,32 @@ class WeixinCommands:
                 self.send_status(error=USAGE)
         except OSError as exc:
             self.send_status(error=f"微信设置没能保存：{exc}")
+
+    def _model(self, key: str) -> None:
+        if not key:
+            configured = load_channels_config().weixin.model
+            default = self._label(self._models.default() if self._models else None, "")
+            self.send_status(message=f"微信回复用的模型：{self._label(self._resolve(configured), configured)}" if configured
+                             else f"微信回复用的模型：跟随默认{f'（{default}）' if default else ''}")
+            return
+        if key.lower() == "default":
+            set_channel_setting("weixin", "model", "")
+            self.send_status(message="微信改为跟随默认模型，下一条消息生效。")
+            return
+        entry = self._resolve(key)
+        if entry is None:
+            self.send_status(error=f"没有这个模型：{key}。用 /model 查看可选模型的键（形如 deepseek::deepseek-flash）。")
+            return
+        # Save the catalog's own key, so a bare model name means one model from then on.
+        set_channel_setting("weixin", "model", entry.key)
+        self.send_status(message=f"微信改用 {entry.model_id}，下一条消息生效。")
+
+    def _resolve(self, key: str) -> CatalogEntry | None:
+        return self._models.resolve(key) if self._models and key else None
+
+    @staticmethod
+    def _label(entry: CatalogEntry | None, fallback: str) -> str:
+        return entry.model_id if entry else fallback
 
     def _start_login(self) -> None:
         if self._login is not None and not self._login.done():

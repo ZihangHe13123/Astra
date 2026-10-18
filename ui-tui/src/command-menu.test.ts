@@ -26,7 +26,7 @@ assert.deepEqual(
 );
 assert.deepEqual(
   slashCommandSuggestions("/weixin ").map((item) => item.command),
-  ["status", "login", "on", "off", "logout"],
+  ["status", "login", "on", "off", "logout", "model"],
 );
 assert.equal(completeSlashCommand("/weixin lo", 0), "/weixin login");
 assert.equal(completeSlashCommand("/computer se", 0), "/computer setup");

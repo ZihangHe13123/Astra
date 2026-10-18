@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { initialSession, projectEvent } from "@astra/ui-core/session-state";
-import { WeixinSettings, weixinView } from "../src/renderer/weixin-settings.js";
+import { WeixinSettings, weixinModelOptions, weixinView } from "../src/renderer/weixin-settings.js";
 
 const status = (fields: Record<string, unknown> = {}) => ({ type: "weixin_status", enabled: false, logged_in: false, account: "", state: "off",
   owner: false, keep_awake: false, login: "", ...fields });
@@ -39,4 +39,23 @@ test("only an SVG data image is drawn as the code, and nothing can be pressed wi
   assert.doesNotMatch(render({ login: "scan", qr: { svg: "https://example.com/qr.png", text: "" } }), /<img/);
   assert.ok(buttons(render({}, false)).length === 1 && /disabled/.test(render({}, false)));
   assert.match(render({}, false), /打开一个会话后可以设置/);
+});
+
+test("the model WeChat answers with is chosen from the catalog, following the default until one is picked", () => {
+  const models = [{ key: "deepseek::deepseek-flash", name: "deepseek-flash", provider: "DeepSeek" },
+    { key: "local::qwen", name: "qwen", provider: "Local" }];
+  const view = (fields: Record<string, unknown>) => weixinView(status(fields) as never);
+
+  assert.deepEqual(weixinModelOptions(view({ model: "", model_label: "", default_model: "deepseek-flash" }), models),
+    [{ value: "", label: "跟随默认（deepseek-flash）" }, { value: "deepseek::deepseek-flash", label: "deepseek-flash · DeepSeek" },
+      { value: "local::qwen", label: "qwen · Local" }]);
+  assert.deepEqual(weixinModelOptions(view({ model: "gone::old", model_label: "old" }), models).at(-1),
+    { value: "gone::old", label: "old（不在模型列表里）" }, "a saved model that left the catalog stays visible");
+
+  const html = renderToStaticMarkup(React.createElement(WeixinSettings,
+    { status: status({ model: "local::qwen", model_label: "qwen", default_model: "deepseek-flash" }), ready: true, models, run: () => {} }));
+  assert.match(html, /回复用的模型<select>/);
+  assert.match(html, /<option value="local::qwen" selected="">qwen · Local<\/option>/);
+  assert.match(renderToStaticMarkup(React.createElement(WeixinSettings, { status: status(), ready: false, models, run: () => {} })),
+    /<select disabled="">/);
 });

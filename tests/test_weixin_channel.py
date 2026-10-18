@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import json
 import os
 import subprocess
 import sys
@@ -565,3 +566,46 @@ def test_voice_notes_are_wechat_only(tmp_path):
             active_channel_message.reset(token)
 
     assert "only available in WeChat" in asyncio.run(scenario())["error"]
+
+
+def test_a_wechat_turn_runs_on_the_channel_model_and_hands_the_window_its_own_back(tmp_path):
+    from types import SimpleNamespace
+
+    seen: dict[str, tuple] = {}
+    window_llm = SimpleNamespace(config=SimpleNamespace(context_limit=None))
+    chat_llm = SimpleNamespace(config=SimpleNamespace(context_limit=32_768, max_tokens=4096, model="small",
+                                                      provider="openai-compatible", auto_compact_token_limit=None))
+
+    class Agent:
+        def __init__(self) -> None:
+            self.context = AgentContext(system_prompt="system", max_messages=20, max_prompt_tokens=100_000)
+            self.llm = window_llm
+
+        async def reply_stream(self, message):
+            seen[message.metadata["channel"]] = (self.llm, self.context.compressor.llm, self.context.max_prompt_tokens)
+            yield {"type": "done", "content": "ok"}
+
+    agent = Agent()
+    router = AgentChannelRouter(agent, asyncio.Lock(), tmp_path,
+                                model_for=lambda channel: chat_llm if channel == "weixin" else None)
+
+    async def scenario():
+        await router.handle(ChannelMessage("weixin", OWNER, OWNER, "在吗"))
+        await router.handle(ChannelMessage("qq", "peer", "peer", "hi"))
+
+    asyncio.run(scenario())
+    assert seen["weixin"][:2] == (chat_llm, chat_llm) and seen["weixin"][2] == 16_384
+    assert seen["qq"] == (window_llm, window_llm, 100_000)
+    assert agent.llm is window_llm
+
+
+def test_the_wechat_model_setting_is_kept_beside_the_other_settings(tmp_path):
+    from agent.channels.config import load_channels_config, set_channel_setting
+
+    path = tmp_path / "channels.json"
+    path.write_text(json.dumps({"weixin": {"enabled": True, "keep_awake": False}}), encoding="utf-8")
+    set_channel_setting("weixin", "model", " deepseek::deepseek-flash ", path)
+    config = load_channels_config(path).weixin
+    assert (config.model, config.enabled, config.keep_awake) == ("deepseek::deepseek-flash", True, False)
+    set_channel_setting("weixin", "model", "", path)
+    assert load_channels_config(path).weixin.model == ""
