@@ -59,6 +59,43 @@ class PathGate:
             await asyncio.sleep(0.01)
 
 
+class _Listing:
+    """A ``scandir`` iterator over entries already read, in a chosen order."""
+
+    def __init__(self, entries):
+        self._entries = iter(entries)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        return next(self._entries)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def close(self):
+        pass
+
+
+def list_entries_in_reverse_name_order(monkeypatch):
+    """List directories in reverse name order, as ext4 and others may.
+
+    NTFS returns entries sorted by name, so without this a walk that depends
+    on the filesystem's order would only fail on other platforms.
+    """
+    original = os.scandir
+
+    def reversed_scandir(path=".", *args, **kwargs):
+        with original(path, *args, **kwargs) as entries:
+            return _Listing(sorted(entries, key=lambda entry: entry.name, reverse=True))
+
+    monkeypatch.setattr(os, "scandir", reversed_scandir)
+
+
 def build_workspace(tmp_path, monkeypatch, needles=("dir07",)):
     monkeypatch.setenv("ASTRA_HOME", str(tmp_path / "astra-home"))
     monkeypatch.delenv("ASTRA_SEARCH_TIME_BUDGET_SECONDS", raising=False)
@@ -178,10 +215,17 @@ def split_partial_output(tool: str, output: str) -> tuple[list[str], str]:
     return matches, note
 
 
+@pytest.mark.parametrize("listing", ["filesystem order", "reverse name order"])
 @pytest.mark.parametrize("tool,args", SEARCHES)
-def test_search_out_of_budget_returns_the_matches_found_so_far(tmp_path, monkeypatch, tool, args):
+def test_search_out_of_budget_returns_the_matches_found_so_far(
+    tmp_path, monkeypatch, tool, args, listing
+):
     workspace, registry = build_workspace(tmp_path, monkeypatch, needles=("dir03", "dir12"))
     monkeypatch.setenv("ASTRA_SEARCH_TIME_BUDGET_SECONDS", "0.2")
+    if listing == "reverse name order":
+        # The part searched before the budget runs out is the same on every
+        # filesystem: the walk goes in name order, not the listing's order.
+        list_entries_in_reverse_name_order(monkeypatch)
     gate = PathGate(monkeypatch, os, "scandir", workspace / "dir07")
 
     async def scenario():

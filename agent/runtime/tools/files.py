@@ -301,7 +301,9 @@ def _list_directory(directory: Path, control: _WorkerControl) -> list[os.DirEntr
     control.check()
     try:
         with os.scandir(directory) as entries:
-            return list(entries)
+            # Name order, not the filesystem's: a walk stopped at its time
+            # budget then covers the same part of the tree on every platform.
+            return sorted(entries, key=lambda entry: entry.name)
     except OSError:
         return []
 
@@ -1630,15 +1632,15 @@ def register_file_tools(
         try:
             for dirpath_str, dirnames, filenames in os.walk(str(search)):
                 control.enter_directory()
-                # Prune noise directories in-place so we don't descend into them.
-                if not include_ignored:
-                    dirnames[:] = [
-                        d for d in dirnames
-                        if not _is_search_noise(d)
-                    ]
+                # Prune noise directories in-place so we don't descend into
+                # them, and descend in name order like search_files does.
+                dirnames[:] = sorted(
+                    d for d in dirnames
+                    if include_ignored or not _is_search_noise(d)
+                )
                 relative_dir = Path(dirpath_str).relative_to(search).parts
 
-                for fname in filenames:
+                for fname in sorted(filenames):
                     if not include_ignored and _is_search_noise(fname):
                         continue
                     candidate_files += 1
