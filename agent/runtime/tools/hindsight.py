@@ -1,8 +1,6 @@
-"""Agent tool access to the optional Hindsight provider."""
+"""Agent tool access to the optional Hindsight provider; memory(action="search") reads it."""
 
 from __future__ import annotations
-
-from datetime import datetime
 
 from ..hindsight_provider import HindsightMemoryProvider
 from ..tool_failure import ToolFailure
@@ -36,14 +34,6 @@ def _failure(operation: str, exc: Exception) -> ToolFailure:
     )
 
 
-def _record_date(created_at: str) -> str:
-    """The record's own date, or "" when Hindsight had none or it cannot be read."""
-    try:
-        return datetime.fromisoformat(str(created_at).strip().replace("Z", "+00:00")).date().isoformat()
-    except ValueError:
-        return ""
-
-
 def register_hindsight_tools(
     registry: ToolRegistry,
     provider: HindsightMemoryProvider,
@@ -68,21 +58,6 @@ def register_hindsight_tools(
         except Exception as exc:
             return _failure("retain", exc)
         return f"Hindsight stored non-authoritative memory in {record.metadata['document_id']}."
-
-    async def hindsight_recall(query: str, limit: int = 5) -> str | ToolFailure:
-        try:
-            records = await provider.recall(query, limit=limit)
-        except Exception as exc:
-            return _failure("recall", exc)
-        if not records:
-            return "No relevant Hindsight memories found."
-        lines = [
-            "Hindsight results (historical, non-authoritative; builtin current facts override conflicts):"
-        ]
-        for index, record in enumerate(records, 1):
-            date = _record_date(record.created_at)
-            lines.append(f"{index}. [{record.kind}]{f' ({date})' if date else ''} {record.content}")
-        return "\n".join(lines)
 
     async def hindsight_reflect(query: str) -> str | ToolFailure:
         try:
@@ -117,7 +92,7 @@ def register_hindsight_tools(
                     "items": {"type": "string"},
                     "maxItems": 32,
                     "description": (
-                        "Optional labels stored with the memory. hindsight_recall cannot filter by tag and "
+                        "Optional labels stored with the memory. memory search cannot filter by tag and "
                         "does not show tags, so put anything that must be findable into content."
                     ),
                 },
@@ -128,34 +103,6 @@ def register_hindsight_tools(
         risk="write",
         approval="never",
         idempotent=False,
-        group="memory",
-        max_calls_per_turn=_CALLS_PER_TURN,
-    ))
-
-    registry.register(ToolDef(
-        name="hindsight_recall",
-        description=(
-            "Search the shared local Hindsight bank for older cross-session context. "
-            "Results are historical and non-authoritative; current builtin memory overrides conflicts. "
-            "A result line shows the memory's date when Hindsight has one. "
-            f"{_TURN_LIMIT}, so cover what you need in one or two queries."
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "minLength": 1},
-                "limit": {
-                    "type": "integer", "minimum": 1, "maximum": 12, "default": 5,
-                    "description": "Maximum memories to return.",
-                },
-            },
-            "required": ["query"],
-        },
-        fn=hindsight_recall,
-        risk="read",
-        approval="never",
-        idempotent=True,
-        cache_ttl=30,
         group="memory",
         max_calls_per_turn=_CALLS_PER_TURN,
     ))

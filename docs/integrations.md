@@ -72,13 +72,85 @@ passed to vision-capable models as native multimodal content. Local file sending
 is deliberately more restrictive: enable `send_files_enabled`, list trusted
 sender QQ IDs in `file_allow_users` (or `allow_users`), and restrict
 `send_file_roots` to output directories that are safe to share. The
-`channel_send_file` tool rejects paths outside those roots and common credential
-files even when requested by the model.
+`channel_send_file` tool rejects paths outside those roots, hidden files and
+folders, application data and common credential files even when requested by
+the model.
 
-The channel contract is protocol-neutral so a Weixin iLink adapter can join the
-same manager without changing Agent routing or session isolation. The first
-native release intentionally implements QQ/OneBot only; it does not silently
-take over the existing Hermes Weixin login.
+### WeChat
+
+WeChat uses Tencent's iLink Bot API: Astra logs in once with a QR code scanned
+in WeChat, then long-polls for messages over HTTPS. It does not drive the WeChat
+desktop client and needs no screen, so it keeps answering with the display off
+or the screen locked, as long as the computer does not sleep.
+
+Run `/weixin login` (or Settings → WeChat → Scan to log in) and scan the code
+with WeChat. The terminal draws the code for a dark background; the desktop
+shows it as an image. The QR code needs the `segno` package
+(`pip install 'segno>=1.6,<2'`, or the `weixin` extra, which also brings the
+`cryptography` used to read images). A successful login sets `weixin.enabled`
+in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on`,
+`/weixin logout` and `/weixin model` manage it afterwards.
+
+- **Who is answered.** Only the WeChat user who scanned the code, unless
+  `weixin.allow_users` lists others. Group messages are ignored.
+- **One poller.** Every Astra backend may run the channel, but only one polls a
+  login at a time; the others wait and take over when it exits.
+- **Sleep.** While a backend polls, it keeps the computer from idle sleep:
+  `caffeinate -i` on macOS (released when the backend exits), an execution
+  state on Windows, `systemd-inhibit` on Linux. The display still turns off.
+  A closed MacBook lid still sleeps unless an external display and power are
+  connected. Set `weixin.keep_awake` to `false` to leave sleep alone.
+- **What arrives.** Text, quoted messages, WeChat's own transcript of a voice
+  message, and up to `max_images` images (decrypted from WeChat's CDN). Files and
+  videos arrive as a placeholder.
+- **How it answers.** WeChat conversations are told to talk like a chat: short,
+  casual, no Markdown, one thought per message. A reply goes out as several
+  short messages the way people text (at most `max_bubbles`; `chat_bubbles:
+  false` sends whole replies split only at `max_output_chars`), with a pause
+  before each, and WeChat shows "typing…" from the message until the last reply.
+  A persona may have a WeChat version, written for chat (tone rather than
+  described actions); WeChat conversations then use it instead of the persona
+  itself. It is not offered as a persona of its own. A conversation that was
+  on another persona switches when it is next opened, which rebuilds its
+  system prompt once.
+- **Which model.** WeChat follows the default model: the one last chosen with
+  `/model` in any window, read for each message. `/weixin model <key>` (a key
+  from `/model`, such as `deepseek::deepseek-flash`, or Settings → WeChat →
+  model) gives WeChat a model of its own without changing any window's;
+  `/weixin model default` follows the default again, and `/weixin model` shows
+  the current choice. The setting is `weixin.model`; it applies from the next
+  message, and a model that is no longer in the catalog or has no key falls
+  back to the default.
+- **Approvals.** A step that needs approval (a command on this computer, a
+  file outside the workspace) is sent to the chat with what it will do,
+  credentials hidden, and waits for a reply: 同意 runs it once, 拒绝 does
+  not. Only the person whose message started the turn can answer, only
+  while a request waits, and only with a message that is nothing but a short
+  yes or no (同意, 可以, 好 / 拒绝, 不行, 取消); anything else is an ordinary
+  message. No answer within five minutes counts as 拒绝, and the
+  chat is told the step did not run. An open desktop window showing the same
+  request can answer first. Other channels get the same five-minute limit
+  without the chat prompt, so a request nobody can see never holds the
+  channel.
+- **Files.** When asked, Astra sends a local file with `channel_send_file`: an
+  image or a video arrives as one, anything else as a file. Only the person who
+  scanned the code receives files (or `weixin.file_allow_users`), only from
+  `weixin.send_file_roots` (default: the home folder), at most
+  `max_send_file_bytes`; hidden files and folders (including Astra's own
+  `.astra`), application data (`Library`, `AppData`) and credential files are
+  always refused. `send_files_enabled: false` turns it off.
+- **Voice notes.** When asked to speak, Astra calls `channel_send_file` with
+  `speak` instead of `path`: the words are spoken in the voice set up for spoken
+  replies ([voice](voice.md)) and sent as an audio file the phone plays with a
+  tap (M4A on macOS, WAV elsewhere); short text may go with it. iLink accepts a
+  bot's native voice message but does not deliver it, so WeChat shows a file
+  rather than a voice bubble.
+- **Privacy.** The bot token lives in the state directory's
+  `channels/weixin/account.json`, readable by the owner only, and never appears
+  in events or logs. Another program that polls the same login (for example
+  Hermes) would compete for messages; log in separately.
+
+Protocol details follow Hermes Agent's adapter (MIT License, Nous Research).
 
 ## MCP
 
@@ -117,8 +189,8 @@ cannot dispatch on a replacement connection.
 
 ## Web search
 
-`search_web` supports `provider=auto|exa|searxng`. Use `/search` to inspect the
-default and `/search auto|exa|searxng` to switch it persistently. In `auto`
+`search_web` supports `provider=auto|exa|searxng|deepseek`. Use `/search` to inspect the
+default and `/search auto|exa|searxng|deepseek` to switch it persistently. In `auto`
 mode, news, research, model-release and benchmark queries prefer Exa; ordinary
 queries start with SearXNG. A page above 1, an `engine` or a category other than
 science/news is only honoured by SearXNG, so `auto` sends such a call there; an
@@ -133,14 +205,42 @@ contains `EXA_API_KEY`. The latter reuses a credential without copying the
 secret into this project. `/doctor` reports only whether Exa is configured and
 which source was used; it never prints the key.
 
+DeepSeek's Search and Fetch APIs are optional and never chosen automatically:
+`auto` does not search or extract through DeepSeek. Search through it with
+`provider=deepseek`, `/search deepseek` or `WEB_SEARCH_PROVIDER=deepseek`. It
+reads `DEEPSEEK_API_KEY` from the environment or `.env` (a key pasted only into
+`/connect` is not used) and sends only the query and the result count
+(`max_results`, 1–50). The query may have at most 128 characters and accepts
+DeepSeek's operators: `site:` (several joined with `OR`), `-site:`, `-word`,
+`"exact phrase"`, `-"phrase"`, `lang:zh,en`, and `after:`/`before:` with a year
+or date. Page, engine, category, language and inline content are not applied on
+this route, and the answer names them. Each result shows DeepSeek's summary
+written for model reading (its short snippet when there is no summary), with the
+date and site name when present. Astra does not send the optional
+`ori_question` (the user's question) or `localization` (an IP address), so no
+text beyond the query reaches the service; either could become an explicit
+option later. Requests go to `DEEPSEEK_TOOLS_URL` (default
+`https://api.deepseek.com/v1/tools`; search timeout `DEEPSEEK_SEARCH_TIMEOUT`,
+15 seconds), never follow a redirect, and are repeated once after a short wait
+on HTTP 408, 429 or 5xx; a timed-out request is reported rather than repeated.
+A rejected key (401), an exhausted balance (402) and the rate limit (429; 5
+requests per second per account, and per target domain for Fetch) are named in
+the failure. DeepSeek bills each API at 5 CNY per 1,000 successful requests from
+2026-11-01 (Beijing time). `/doctor` and `search_status` report only whether the
+key is set; neither calls the service.
+
 `web_extract` has an independent provider waterfall. `WEB_EXTRACT_PROVIDER=auto`
 tries configured APIs in `Tavily -> Exa -> Parallel` order, then local/cloud
 Firecrawl, and finally direct HTTP with main-content HTML-to-Markdown conversion.
 Failures fall through per URL, so one successful page is not fetched again by
 later providers. Set `provider` on one tool call, or set
 `WEB_EXTRACT_PROVIDER=tavily|exa|parallel|firecrawl|http`, to choose the first
-rung explicitly. Pages over 15,000 characters return a 75/25 head-tail window
-and save the full Markdown under `.astra/cache/web`.
+rung explicitly. DeepSeek Fetch is used only when named the same way
+(`provider=deepseek` or `WEB_EXTRACT_PROVIDER=deepseek`): it is tried first and
+the usual order follows for pages it cannot read. It returns Markdown without a
+final URL, so results keep the requested URL. Pages over 15,000 characters
+return a 75/25 head-tail window and save the full Markdown under
+`.astra/cache/web`.
 
 The optional browser extractor is most safely configured with
 `BROWSER_EXTRACT_ARGV`, a JSON array containing the executable and each fixed

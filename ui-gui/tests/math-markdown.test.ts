@@ -96,3 +96,34 @@ test("GFM literal links retain dollar characters in their URL and label", () => 
     assert.doesNotMatch(render(source), /%5C\$|katex/);
   }
 });
+
+test("bare TeX math environments render as display math, other environments stay text", () => {
+  for (const source of [
+    "\\begin{equation}\nE = mc^2\n\\end{equation}",
+    "推导如下：\n\n\\begin{align*}\na &= b + c \\\\\n  &= d\n\\end{align*}\n\n所以成立。",
+    "\\begin{pmatrix} 1 & 0 \\\\ 0 & 1 \\end{pmatrix}",
+    "f(x) = \\begin{cases} 1 & x > 0 \\\\ 0 & \\text{otherwise} \\end{cases}",
+    // Nested environments of the same name close at the outer end.
+    "\\begin{array}{c} \\begin{array}{c} x \\end{array} \\end{array}",
+  ]) {
+    const html = render(source);
+    assert.equal(mathCount(html), 1, source); assert.match(html, /katex-display/, source);
+    // The source stays only in MathML's TeX annotation, which screen readers use.
+    assert.doesNotMatch(html.replace(/<annotation[^]*?<\/annotation>/g, ""), /\\begin|math-fallback/, source);
+  }
+  // Dollar signs inside an environment are its text, not new delimiters.
+  assert.equal(mathCount(render("\\begin{aligned} \\text{cost} &= \\$5 \\end{aligned}")), 1);
+  // LaTeX document structure is not math; an escaped \begin is literal.
+  for (const source of ["\\begin{itemize}\n\\item one\n\\end{itemize}", "\\\\begin{equation} x \\end{equation}"]) {
+    assert.equal(mathCount(render(source)), 0, source);
+  }
+  // A formula already inside $$ is not wrapped twice.
+  assert.equal(mathCount(render("$$\\begin{aligned} a &= b \\end{aligned}$$")), 1);
+  // While the environment is still streaming it is shown as text, never as an error.
+  const whole = "\\begin{equation}\n\\frac{a}{b}\n\\end{equation}";
+  for (let end = 1; end < whole.length; end++) {
+    const html = render(whole.slice(0, end));
+    assert.equal(mathCount(html), 0, whole.slice(0, end)); assert.doesNotMatch(html, /katex-error|math-fallback/);
+  }
+  assert.equal(mathCount(render(whole)), 1);
+});

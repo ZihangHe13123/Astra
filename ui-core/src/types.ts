@@ -11,6 +11,9 @@ export type LocalModeDefinition = {
   ui: { brand: string; exitLabel: string; headerTag: string; idle: string; busy: string; placeholder: string };
 };
 
+/** A memory change the background review proposed, waiting for /memory accept or dismiss by its id. */
+export type PendingProposal = { id: number; action: "remember" | "revise" | "forget"; summary: string };
+
 export type GenerationStats = {
   completion_tokens: number;
   elapsed_seconds: number;
@@ -283,6 +286,16 @@ export type PyEvent =
   | { type: "wakeup_status"; plan: Record<string, unknown>; message: string }
   | { type: "peer_message"; direction: "in" | "out"; peer: string; task_id: string; state: string; text: string }
   | { type: "background_wakeup"; state: "started" | "limited"; message: string }
+  | { type: "memory_notice"; event: "saved" | "revised" | "forgotten"; memory_id: string; summary: string; kind: string; scope: string; previous_id?: string; origin?: "consolidation" }
+  | { type: "memory_notice"; event: "proposed"; count: number; summary: string }
+  // The background review's mode; the answer to a /memory consolidation command adds message or error.
+  | { type: "memory_consolidation_status"; mode: "off" | "review" | "auto"; pending: number; proposals?: PendingProposal[]; message?: string; error?: string }
+  | { type: "memory_recall"; count: number; items: string[] }
+  // The WeChat channel (iLink). qr is present while a login code waits to be scanned; the answer to a /weixin command adds message or error.
+  | { type: "weixin_status"; enabled: boolean; logged_in: boolean; account: string; state: "off" | "logged_out" | "stopped" | "standby" | "online" | "expired";
+      owner: boolean; keep_awake: boolean; login: "" | "scan" | "confirm"; qr?: { svg: string; text: string }; message?: string; error?: string;
+      /** The catalog key WeChat answers with ("" follows the default model), its model name, and the default's. */
+      model: string; model_label: string; default_model: string }
   | {
       type: "error";
       message: string;
@@ -335,6 +348,8 @@ export type PyEvent =
   | { type: "task_status"; task: TaskInfo | null }
   | { type: "yolo_status"; yolo: boolean; error?: string }
   | { type: "voice_status"; enabled: boolean; configured: boolean; state: "off" | "idle" | "starting" | "speaking"; voice: string; voices: string[]; error?: string; message?: string }
+  // Speech the backend handed to a paired phone instead of playing it (a unit's WAV id), or a request to stop it.
+  | { type: "voice_audio"; id?: string; seconds?: number; at: number; stop?: boolean }
   | ({ type: "startup_banner" } & StartupInfo);
 
 export type StartupInfo = {

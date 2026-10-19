@@ -665,6 +665,16 @@ class DelegateMailbox:
                 if entry.get("session_id") == session_id and entry["status"] != "running"
                 and not entry["delivered"] and not entry.get("restored")]
 
+    def session_working(self, session_id: str) -> bool:
+        """Whether a subagent of this session still works on something it will report.
+
+        Runs left by an earlier backend never start a turn, so they do not count.
+        """
+        self.sync_owners()
+        return bool(session_id) and any(
+            entry.get("session_id") == session_id and not entry.get("restored") and self._pending(entry)
+            for entries in self._runs.values() for entry in entries.values())
+
     def lead_waiting(self, session_id: str) -> bool:
         """Whether a teammate of this session has written to its parent, unread, in this backend's life."""
         return bool(session_id) and self._lead_written and self._lead_pending("", session_id)

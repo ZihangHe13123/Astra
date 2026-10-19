@@ -551,3 +551,31 @@ def test_mixed_language_soft_terms_can_retrieve_chinese_evidence(archive, source
     assert not recommend(archive, source, "查一下之前的 `email` 联络习惯").relevance
     assert not recommend(archive, source, "查一下之前的 mail_config 配置").relevance
     assert not recommend(archive, source, "查一下 NUS 的联络习惯").relevance
+
+
+def test_only_redacted_text_reaches_the_encoder(tmp_path):
+    # Items are redacted when they are encoded, not when the archive is listed.
+    session = tmp_path / "sessions.db"
+    db = _create_recall_database(session)
+    _add_session(db, "secret", "部署", WORKSPACE.key,
+                 [("user", '部署时用 {"api_key": "sk-live-0123456789abcdef"} 这个配置', NOW.timestamp())])
+    db.commit()
+    db.close()
+    encoder = Encoder()
+    assert rebuild_source(session, tmp_path / "vectors.db", "session", backend=encoder)["encoded"] == 1
+    sent = "\n".join(text for call in encoder.calls for text in call)
+    assert "sk-live-0123456789abcdef" not in sent
+    assert "<redacted>" in sent
+
+
+def test_semantic_memory_keeps_a_project_memory_to_its_project(archive):
+    def scope_to(workspace_key):
+        with sqlite3.connect(archive.memory.path) as db:
+            db.execute("UPDATE memory_records SET metadata_json = json_set(metadata_json, '$.scope', 'project', "
+                       "'$.workspace_key', ?)", (workspace_key,))
+        rebuild_source(archive.memory.path, archive.vectors, "memory", backend=archive.encoder)
+
+    scope_to("another-repo")
+    assert recommend(archive, "memory").relevance == ()
+    scope_to(WORKSPACE.key)
+    assert [item.identity for item in recommend(archive, "memory").relevance] == [archive.record.record_id]

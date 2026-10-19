@@ -3,9 +3,14 @@ from __future__ import annotations
 
 import asyncio
 import os
+import struct
 import threading
+import time
+import uuid
 from collections import deque
-from typing import Protocol
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any, Protocol
 
 from .provider import SpeechError
 
@@ -130,3 +135,67 @@ def open_player(sample_rate: int, prebuffer_seconds: float) -> Player:
     if os.getenv("ASTRA_VOICE_PLAYER", "").strip().lower() == "null":
         return NullPlayer()
     return SoundDevicePlayer(sample_rate, prebuffer_seconds)
+
+
+class PhonePlayer:
+    """Plays on a paired phone instead of this computer.
+
+    Each unit's audio becomes a WAV file in `folder`, which the desktop serves to the phone, and a small
+    announcement (id and length, no audio) goes out as an event. The phone plays the files in order.
+    """
+
+    KEEP_SECONDS = 600
+
+    def __init__(self, sample_rate: int, folder: Path, announce: Callable[[dict[str, Any]], None], *,
+                 clock: Callable[[], float] = time.monotonic) -> None:
+        self._rate, self._folder, self._announce, self._clock = sample_rate, folder, announce, clock
+        self._pcm = bytearray()
+        self._until = 0.0  # when the phone will have played what was sent, as estimated here
+        folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self._sweep()
+
+    def lead(self, seconds: float) -> None:
+        pass  # the phone receives whole units, so there is nothing to hold back
+
+    def write(self, pcm: bytes) -> None:
+        self._pcm += pcm
+
+    def unit_done(self) -> None:
+        if not self._pcm:
+            return
+        name = uuid.uuid4().hex
+        data = bytes(self._pcm)
+        self._pcm = bytearray()
+        header = b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVEfmt " + struct.pack(
+            "<IHHIIHH", 16, 1, 1, self._rate, self._rate * 2, 2, 16) + b"data" + struct.pack("<I", len(data))
+        temporary = self._folder / f".{name}.tmp"
+        temporary.write_bytes(header + data)
+        os.chmod(temporary, 0o600)
+        temporary.replace(self._folder / f"{name}.wav")
+        seconds = len(data) / 2 / self._rate
+        self._until = max(self._until, self._clock()) + seconds
+        self._announce({"id": name, "seconds": round(seconds, 3), "at": time.time()})
+
+    def stop(self) -> None:
+        """Silence the phone too, if it is still playing; called after a normal end as well, when it is not."""
+        self._pcm = bytearray()
+        if self._until > self._clock():
+            self._announce({"stop": True, "at": time.time()})
+        self._until = 0.0
+
+    async def drain(self) -> None:
+        # The phone fetches and decodes each unit before playing it: allow it a moment beyond the audio itself.
+        if (wait := self._until - self._clock()) > 0:
+            await asyncio.sleep(wait + 1.0)
+
+    def close(self) -> None:
+        pass
+
+    def _sweep(self) -> None:
+        cutoff = time.time() - self.KEEP_SECONDS
+        for path in self._folder.glob("*.wav"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+            except OSError:
+                pass

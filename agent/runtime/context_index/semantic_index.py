@@ -5,7 +5,8 @@ locators, revisions and vectors, never memory bodies. Query readers do not migra
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import cached_property
 import hashlib
 import math
 import os
@@ -51,7 +52,13 @@ class IndexItem:
     revision: str
     timestamp: float
     available_at: float
-    text: str
+    content: str = field(repr=False)
+
+    @cached_property
+    def text(self) -> str:
+        """What is embedded, redacted and bounded. Each indexer pass encodes only a
+        few changed items, so redaction runs for those, not the whole archive."""
+        return _redact_text(self.content)[:ENCODE_CHARS]
 
 
 def canonical_items(path: Path, source: str, *, limit: int = ARCHIVE_LIMIT) -> list[IndexItem]:
@@ -66,7 +73,7 @@ def canonical_items(path: Path, source: str, *, limit: int = ARCHIVE_LIMIT) -> l
             return [
                 IndexItem(str(row["id"]), session_revision(row["session_id"], row["id"], row["role"],
                           row["content"], row["timestamp"]), float(row["timestamp"]), float(row["timestamp"]),
-                          _redact_text(str(row["content"]))[:ENCODE_CHARS])
+                          str(row["content"]))
                 for row in rows
             ]
         if source != "memory":
@@ -79,7 +86,7 @@ def canonical_items(path: Path, source: str, *, limit: int = ARCHIVE_LIMIT) -> l
             "AND length(trim(content)) > 1 ORDER BY last_confirmed_at DESC, id LIMIT ?", (limit,),
         ).fetchall()
         return [IndexItem(str(row["id"]), _revision(row), _epoch(row["last_confirmed_at"]),
-                          _epoch(row["created_at"]), _redact_text(str(row["content"]))[:ENCODE_CHARS])
+                          _epoch(row["created_at"]), str(row["content"]))
                 for row in rows]
 
 

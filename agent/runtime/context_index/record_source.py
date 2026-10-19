@@ -31,7 +31,8 @@ def _revision(row: sqlite3.Row) -> str:
     return hashlib.sha256(json.dumps([row[name] for name in fields], ensure_ascii=False).encode()).hexdigest()
 
 
-def _eligible_metadata(raw: str, workspace: str | None = None, *, respect_scope: bool = True) -> bool:
+def _eligible_metadata(raw: str, workspace: str | None = None, *, respect_scope: bool = True,
+                       workspace_key: str = "") -> bool:
     try:
         metadata = json.loads(raw)
     except (TypeError, ValueError):
@@ -40,7 +41,11 @@ def _eligible_metadata(raw: str, workspace: str | None = None, *, respect_scope:
         isinstance(metadata, dict)
         and metadata.get("pinned") is not True
         and metadata.get("conflict_state") != "pending"
-        and (not respect_scope or learning_scope_matches(metadata, workspace))
+        and (not respect_scope or (
+            learning_scope_matches(metadata, workspace)
+            # A saved memory scoped to a project belongs to that checkout only.
+            and (metadata.get("scope") != "project"
+                 or (bool(workspace_key) and metadata.get("workspace_key") == workspace_key))))
     )
 
 
@@ -51,16 +56,21 @@ class RecordSource:
         self.path = path
         self._versions: dict[str, str] = {}
         self._workspace: str | None = None
+        self._workspace_key = ""
 
-    def recommend(self, plan: QueryPlan, workspace: WorkspaceIdentity, active: frozenset[str]) -> SourceResult:
+    def recommend(self, plan: QueryPlan, workspace: WorkspaceIdentity, active: frozenset[str], *,
+                  minimum: int | None = None) -> SourceResult:
+        """``minimum`` lowers how many query terms a record must contain, for a search the model asked for."""
         self._workspace = workspace.root or None
+        self._workspace_key = workspace.key
         lexical = LexicalQuery.from_text(plan.query)
         if not lexical.terms or not plan.should_recall:
             return SourceResult("available")
         try:
             with open_readonly(self.path) as db:
                 db.create_function("memory_epoch", 1, _epoch, deterministic=True)
-                db.create_function("memory_eligible", 1, lambda raw: _eligible_metadata(raw, self._workspace), deterministic=True)
+                db.create_function("memory_eligible", 1, lambda raw: _eligible_metadata(
+                    raw, self._workspace, workspace_key=self._workspace_key), deterministic=True)
                 mask, params = lexical.mask_sql("content")
                 anchors, anchor_params = lexical.anchor_sql("content")
                 rows = db.execute(
@@ -78,7 +88,7 @@ class RecordSource:
                         FROM matched WHERE ({lexical.count_sql('query_match_mask')}) >= ?
                         ORDER BY query_coverage DESC, salience DESC, last_confirmed_at DESC, id ASC LIMIT 40""",
                     (*params, plan.cutoff, plan.cutoff, plan.time_start, plan.time_end, plan.time_end,
-                     plan.cutoff, plan.cutoff, *anchor_params, lexical.minimum),
+                     plan.cutoff, plan.cutoff, *anchor_params, lexical.minimum if minimum is None else minimum),
                 ).fetchall()
             candidates = []
             for row in rows:
@@ -127,7 +137,7 @@ class RecordSource:
             if (
                 row is None
                 or _revision(row) != expected
-                or not _eligible_metadata(row["metadata_json"], self._workspace)
+                or not _eligible_metadata(row["metadata_json"], self._workspace, workspace_key=self._workspace_key)
             ):
                 return empty
             return EvidenceResult(

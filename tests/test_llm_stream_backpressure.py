@@ -7,6 +7,7 @@ from typing import cast
 
 import pytest
 
+from agent.runtime import llm as llm_module
 from agent.runtime.llm import LLMClient, LLMIdleTimeout, LLMOverallTimeout
 from agent.runtime.context_compressor import ContextCompressor
 from agent.runtime.stream_progress import stream_with_progress
@@ -142,6 +143,85 @@ def test_real_stall_after_local_pause_still_gets_full_idle_budget_and_closes():
         assert stream.cancelled
         assert len(created) == stream.close_count == 1
     asyncio.run(scenario())
+
+
+def test_a_read_that_ignores_cancellation_still_ends_at_the_idle_limit(monkeypatch):
+    monkeypatch.setattr(llm_module, "_CANCEL_GRACE_SECONDS", 0.1)
+
+    class DeafStream(ObservedStream):
+        """A stalled read that ignores cancellation and ends only when its connection closes."""
+
+        def __init__(self, items):
+            super().__init__(items)
+            self.closed = asyncio.Event()
+            self.ignored = 0
+
+        async def __anext__(self):
+            if self.read_count == 1:
+                self.read_count += 1
+                while not self.closed.is_set():
+                    try:
+                        await self.closed.wait()
+                    except asyncio.CancelledError:
+                        self.ignored += 1
+                raise StopAsyncIteration
+            return await super().__anext__()
+
+        async def aclose(self):
+            await super().aclose()
+            self.closed.set()
+
+    async def scenario():
+        stream = DeafStream([content_chunk("partial")])
+        provider, created = make_provider(stream)
+        output = provider.chat_stream([])
+        try:
+            assert (await anext(output))["content"] == "partial"
+            started = time.monotonic()
+            reading = asyncio.ensure_future(anext(output))
+            done, _ = await asyncio.wait({reading}, timeout=3)
+            if not done:
+                stream.closed.set()  # let the old code's stuck read end so the test can report
+                await asyncio.wait({reading}, timeout=1)
+            assert done, "the stalled read held the stream past its idle limit"
+            with pytest.raises(LLMIdleTimeout):
+                reading.result()
+            assert time.monotonic() - started < 2
+        finally:
+            await output.aclose()
+        assert stream.ignored >= 1
+        assert len(created) == stream.close_count == 1
+    asyncio.run(scenario())
+
+
+def test_a_stream_whose_close_hangs_still_returns_its_answer(monkeypatch):
+    monkeypatch.setattr(llm_module, "_CLOSE_GRACE_SECONDS", 0.1)
+    release = []
+
+    class StuckClose(ObservedStream):
+        async def aclose(self):
+            await super().aclose()
+            gone = asyncio.Event()  # a shutdown waiting on a peer that is gone
+            release.append(gone)
+            await gone.wait()
+
+    async def scenario():
+        stream = StuckClose([content_chunk("answer", "stop")])
+        provider, _ = make_provider(stream)
+        consumed = asyncio.ensure_future(_collect(provider.chat_stream([])))
+        done, _ = await asyncio.wait({consumed}, timeout=3)
+        for gone in release:
+            gone.set()
+        if not done:
+            await asyncio.wait({consumed}, timeout=1)
+        assert done, "closing the stream held the answer"
+        assert "".join(e.get("content", "") for e in consumed.result() if e["type"] == "chunk") == "answer"
+        assert stream.close_count == 1
+    asyncio.run(scenario())
+
+
+async def _collect(output):
+    return [event async for event in output]
 
 
 @pytest.mark.parametrize("deadline", ["request", "turn"])

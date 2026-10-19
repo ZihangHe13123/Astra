@@ -2,7 +2,7 @@
 
 [首页](../../README.zh-CN.md) · [文档导航](README.md) · [English](../memory.md)
 
-[核心记忆与任务状态](#core-memory-and-task-state) · [按需历史与自动技能](#on-demand-history-and-learned-skills) · [记忆命令](#memory-commands) · [主动 Context Index](#proactive-context-index) · [导入 Hermes 历史](#importing-hermes-history) · [可选 Hindsight 服务](#optional-hindsight-service)
+[核心记忆与任务状态](#core-memory-and-task-state) · [按需历史与自动技能](#on-demand-history-and-learned-skills) · [记忆命令](#memory-commands) · [主动 Context Index](#proactive-context-index) · [评测记忆](#evaluating-memory) · [导入 Hermes 历史](#importing-hermes-history) · [可选 Hindsight 服务](#optional-hindsight-service)
 
 Astra 分别维护少量核心记忆、可检索历史和可复用技能，三者用途和生命周期不同。
 
@@ -10,7 +10,9 @@ Astra 分别维护少量核心记忆、可检索历史和可复用技能，三�
 
 ## 核心记忆与任务状态
 
-核心记忆是全局且刻意保持精简的。`MEMORY.md` 和 `USER.md` 是始终注入的直接来源，不是 SQLite 的镜像；只加入当前轮临时上下文，不改写已保存的用户消息。目前核心 Markdown 不按项目文件夹分区。
+记忆分两层。核心记忆是全局且刻意保持精简的：`MEMORY.md` 和 `USER.md` 是你可以直接编辑的置顶条目，有固定的硬上限。已保存的记忆是持续增长的一层：Astra 用 `memory` 工具（`remember`）写进 `.astra/memory.db` 的记录，每条带一行摘要、来自哪个对话、日期，以及全局或本项目（当前代码目录）的范围。已保存记忆的索引始终可见，排在核心条目之后：每条一行、带日期、新的在前，最多 30 行、2,400 字符；需要摘要以外的内容时，Astra 会读取全文。索引只列出适用于所有项目和当前项目的记忆，已被取代或已过期的不列；在这之前留下的旧记录，只有偏好和关于你的事实会被列出。符合条件的记忆超过上限时，列出最近保存或用过的（被召回进某一轮、被搜索到或被完整读取）；列出的行仍按日期排序，所以只有记忆进出索引时索引才会变化。`read` 会显示一条记忆被用过几次，`/memory` 会统计 90 天没用过的已保存记忆。
+
+Work 模式下，核心条目和索引以单独的“常驻记忆”副本发给模型：只发一次，有变化时才再发，不会在每轮上下文里重复，变化在下一轮可见；受限模式仍加入当前轮上下文。已保存的用户消息不会被改写。
 
 持久执行以 `.astra/tasks.db` 中的 `TaskRun → Step/TaskEvent` 为准。每次请求独立记录检查点、工具结果、阻塞、取消和验证证据，`/tasks` 可查看。长任务通过 `/goal` 明确启用，增加独立验证和有限自动继续，不从普通对话猜测用户意图。
 
@@ -22,13 +24,15 @@ Astra 分别维护少量核心记忆、可检索历史和可复用技能，三�
 
 始终可见的记忆只有两个 Markdown 文件：`MEMORY.md` 硬上限 2,200 字符，`USER.md` 硬上限 1,375 字符。超过限额的写入会被拒绝；读取侧还有保护，防止旧文件或人工编辑膨胀提示。没有 Auto Core 或额外可调 L0 预算。
 
-结构化历史记忆保存在本地 `.astra/memory.db`，不要求 Hindsight。偏好、用户事实、经历、任务引用和观察保留来源、置信度与生命周期。相关时每轮最多召回 4 条、渲染总计 2,400 字符；项目/配置问题不必含“记住”也能匹配。简单对话、斜杠命令和无关问题跳过自动召回。可用时使用 SQLite FTS5，中文另有确定性的子串回退。
+结构化历史记忆保存在本地 `.astra/memory.db`，不要求 Hindsight。偏好、用户事实、经历、任务引用和观察保留来源、置信度与生命周期。核心 Markdown 和已保存记忆的索引始终可见。其他记录有两条路到达模型：自动的只有 Context Index（`session` 或 `all` 模式，见下文）；按需的是模型调用 `memory(action="search")`。Context Index 关闭时，不会有记录被自动召回进某一轮。搜索沿用 Context Index 的查询规则（去掉对话用语、短中文词保持完整、“上周”这类相对日期按时间窗口理解），列出最多 8 条适用于所有项目和当前项目的有效记忆，最匹配的在前，每条带日期。没有记忆同时包含查询中的两个词时，列出包含其中任意一个词的记忆。
 
-个人事实和纠正通过模型记忆工具或明确的 `/memory` 命令写入，不用“我喜欢”“记住”等句式规则直接转成事实。工具提供证据的可选保留默认关闭（`MEMORY_AUTO_RETAIN=0`）；开启后只接受成功工具调用明确提供、可归因的证据。诊断显示有效设置。旧 `conservative` / `evolving` 配置仍能加载，但都使用这套受限证据策略。
+个人事实和纠正通过模型记忆工具或明确的 `/memory` 命令写入，不用“我喜欢”“记住”等句式规则直接转成事实。情况变化时，Astra 会修订记忆：新的取代旧的，旧的保留并标为已取代、带上截止日期，可以用 `/memory timeline` 查看历史。每次变化都会在对话中即时显示（“已记住”“已更新记忆”“已忘记”，附编号）；某一轮的 Context Index 召回包含已保存的记忆时，也会显示召回了几条。如果某一轮读过网页、浏览器页面、MCP 结果，或子 agent、其他会话、后台任务送来的内容，在这一轮里保存记忆需要你确认：这类文本可能夹带专门写来植入记忆的指令。工具提供证据的可选保留默认关闭（`MEMORY_AUTO_RETAIN=0`）；开启后只接受成功工具调用明确提供、可归因的证据；目前没有工具提供这种证据，所以开启后暂时不会记录任何内容。诊断显示有效设置。旧 `conservative` / `evolving` 配置仍能加载，但都使用这套受限证据策略。
 
-后台维护只处理明确到期时间，并退休来源、范围、寿命均相同的完全重复观察。它保留原记录，不因重复提高置信度，不把临时经历升级成永久事实。升级不改写已有记忆；用 `/memory inspect`、`correct`、`forget` 管理。中文问题中的普通英文词是软匹配项，明确字面量和代码标识符仍约束结果。
+记忆维护（由 `/compress` 和 Astra 退出时触发）只处理明确到期时间，并退休来源、范围、寿命均相同的完全重复观察。它保留原记录，不因重复提高置信度，不把临时经历升级成永久事实。升级不改写已有记忆；用 `/memory inspect`、`correct`、`forget` 管理。
 
-Hindsight 是可选的联合语义召回增强。启用时与本地权威库结果合并；不可用时本地保留和召回继续工作。当前用户陈述、核心 Markdown、实际 TaskRun 结果、Goal 和临时对话状态都优先于旧召回内容。
+后台整理记忆在 Astra 空闲时回顾新的对话并提出修改建议。桌面或终端应用 10 分钟没有对话、且距上次回顾你至少发了 4 条消息时（最多每 30 分钟一次），DeepSeek Flash 会读这些消息（你的完整，助手的回复截短）和已有记忆，提出最多 5 条建议：记住你说过的长期事实或偏好、修订被后来的话改变的记忆、忘记你收回的记忆。每条建议都附上它依据的那句话；只有你自己的消息算依据，像密钥的内容会被丢弃。有建议时会提示数量。`/memory proposals` 查看，`/memory accept <n|all>` 按普通的已保存记忆修改生效（来源记为那句话），`/memory dismiss <n|all>` 丢弃。终端菜单在 `/memory proposals`、`accept`、`dismiss` 后面列出每条待审核的建议，可以直接选；桌面版命令面板在接受和丢弃下面列出它们。第一次回顾只读最近三天。对话会发给 DeepSeek，需要 DeepSeek 密钥；归档里只有你的消息和助手的回复，没有工具输出，极简、酒吧和当前安装提供的本地模式不会被记录。后台整理有三种模式。默认的 `review` 只提建议，你接受之前什么都不改。`auto` 让“记住”和“修订”建议直接生效：每处修改都像普通的记忆提示一样显示，并标上“记忆整理”；修订过的记忆保留旧版本，可以用 `/memory timeline` 查看；新记住的可以用 `/memory forget <id>` 撤销。“忘记”建议仍然等你确认。`off` 停止回顾。`/memory consolidation off|review|auto` 切换模式（以前设的 `on` 按 `review` 处理），回复进行中也能用；`now` 会在下一个空闲时刻回顾一次。桌面版的“设置 → 记忆整理”里也有这三个选项，并显示有几条建议待审核。模式对整个安装生效，已经打开的会话从下一次回顾起按新模式进行。中文问题中的普通英文词是软匹配项，明确字面量和代码标识符仍约束结果。
+
+Hindsight 是搜索的可选附加来源，它的内容不会被自动加进某一轮。启用时，`memory(action="search")` 用同样的词去问它，结果列在 Astra 自己的结果之后，标为历史、非权威，与已列出的记忆重复的不列。服务失败或超过 5 秒没有回答时，保留 Astra 自己的结果并附一句说明。读 Hindsight 的记忆只通过搜索；它的 `hindsight_reflect`（综合作答）和 `hindsight_retain` 工具仍可用。当前用户陈述、核心 Markdown、实际 TaskRun 结果、Goal 和临时对话状态都优先于旧召回内容。
 
 <a id="on-demand-history-and-learned-skills"></a>
 
@@ -54,15 +58,19 @@ Hindsight 是可选的联合语义召回增强。启用时与本地权威库结�
 /memory correct <id> <replacement text>
 /memory forget <id>
 /memory clear-working
+/memory proposals
+/memory accept <n|all>
+/memory dismiss <n|all>
+/memory consolidation [off|review|auto|now]
 ```
 
-模型可用 `memory` 工具维护相同存储。疑似凭据内容会被拒绝。核心添加无需审批；模型主动删除被阻止，直到用户明确运行 `/memory forget <id>`。
+模型可用 `memory` 工具维护相同存储。疑似凭据内容会被拒绝。`MEMORY.md` 上限 2,200 字符，`USER.md` 上限 1,375 字符。核心记忆的添加和删除都无需审批；模型被要求只在你要求时，或文件已满且条目已过时、重复或被取代时，才删除核心条目。已保存的记忆添加和修订都无需审批（读过外部内容的那一轮除外，见上文）；模型只有在你要求时才能删除，而且每次删除都要你确认。你也可以用 `/memory forget <id>`，或在 `/memory review` 中选定删除。
 
 <a id="proactive-context-index"></a>
 
 ## 主动 Context Index
 
-这是 Astra 原生且可选的记忆推荐流程。查询规划、RRF 排名融合、MMR 多样性选择、证据预算和反馈都在 Astra Python 组件中运行，不要求外部记忆框架、记忆服务、图数据库或辅助模型。Embedding 可选，功能默认关闭，普通核心 Markdown 不变。
+这是 Astra 原生且可选的记忆推荐流程。查询规划、RRF 排名融合、MMR 多样性选择、证据预算和反馈都在 Astra Python 组件中运行，不要求外部记忆框架、记忆服务、图数据库或辅助模型。Embedding 可选，功能默认关闭，普通核心 Markdown 不变。它是结构化记录唯一的自动召回：`session` 和 `all` 模式下由它把记录加进某一轮；关闭时，记录只通过已保存记忆的索引和模型自己的搜索到达模型。
 
 ```text
 /context-index session   # Astra's local records and session history
@@ -74,9 +82,20 @@ Hindsight 是可选的联合语义召回增强。启用时与本地权威库结�
 /context-index feedback R1 outdated    # Ranking feedback; does not rewrite facts
 ```
 
-检索行为、预算、诊断、反馈和质量检查见[原生记忆推荐设计（英文）](../native-memory-recommendation.md)；可选 embedding 的设置见[平台配置](context-index-platforms.md)。初始预览默认 900 字符、最高 2,000 字符，并受 500-token 估算预算限制。系统可以不返回推荐；旧记录不代表当前指令或事实证明。
+中文问题会在助词、代词和疑问词处切开（“牙医是哪天”按“牙医”检索），两字词保持完整；会话存档为此维护一个字符对索引，查找两字词不需要扫描全部历史。活动历史仍按三字片段检索。“上周”“三天前”“上个月”“9月27号”“last week”这类相对日期会变成日期范围，而不是要匹配的词。检索行为、预算、诊断、反馈和质量检查见[原生记忆推荐设计（英文）](../native-memory-recommendation.md)；可选 embedding 的设置见[平台配置](context-index-platforms.md)。初始预览默认 900 字符、最高 2,000 字符，并受 500-token 估算预算限制。系统可以不返回推荐；旧记录不代表当前指令或事实证明。
 
 <a id="importing-hermes-history"></a>
+
+<a id="evaluating-memory"></a>
+## 评测记忆
+
+`agent/evals/memory` 测量记忆实际送到模型面前的内容。它使用合成的中文、英文和混合语料，通过公开的记忆和归档接口写入，全部在临时状态里运行，不会碰你的安装数据：
+
+```bash
+python -m agent.evals.memory.run --mode off,session,all --out memory-eval.json
+```
+
+默认离线运行，不调用模型。它按后端的方式构造 agent，跑多轮对话，按问题类别报告：证据召回（最新上下文中和整体可见两种）、误注入与旧值注入、带日期的条目、每次请求和每个对话注入的 token 及其中核心记忆的部分、前缀稳定性和准备耗时。`--live --model <key>` 会调用真实模型，按关键词、日期和拒答给回答打分，并检查在一个会话里说过的偏好下个会话是否还记得。`--consolidation` 对每个设了预期修改的世界跑一次记忆回顾（故意少写入几条记录，让归档领先于记忆），报告预期的修改有没有被提出、过时的记忆是原地修订还是重复新增，以及其他建议有多少。
 
 ## 导入 Hermes 历史
 

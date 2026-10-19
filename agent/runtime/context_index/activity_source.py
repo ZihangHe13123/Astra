@@ -365,7 +365,8 @@ class ActivityRecommendationReader:
             return SourceResult("disabled")
         # Preserve native literal identifiers (e.g. error_code or a-b); parsing
         # the already prepared terms again changes matches and scan cost.
-        lexical = LexicalQuery.from_text(query) if plan is not None else None
+        # No pair index here: two-character words would force a full scan.
+        lexical = LexicalQuery.from_text(query, word_split=False) if plan is not None else None
         lexical_query = lexical.terms if lexical is not None else query
         budget = None
         try:
@@ -631,21 +632,29 @@ class ActivityRecommendationReader:
         else:
             from_clause = f"{table} AS s"
             mask, term_params = lexical.mask_sql(content)
+            long_terms = tuple(term for term in lexical.terms if len(term) >= 3)
             anchor_query = lexical.anchor_fts_query()
-            if anchor_query:
-                # Short terms still scan literally, within the required indexed
-                # target's posting list; never scan unrelated long observations.
+            if anchor_query or len(lexical.terms) - len(long_terms) < lexical.minimum:
+                # Short terms still scan literally, within an indexed posting list:
+                # the required target's, or, when fewer terms are short than the
+                # required coverage, the long terms' (every valid row contains one;
+                # as in the session source, this prefilter loses no hits).
                 from_clause += f" JOIN {table}_fts(?) AS f ON f.rowid = s.rowid"
-                term_params = (*term_params, anchor_query)
+                term_params = (*term_params, anchor_query or " OR ".join(f'"{term}"' for term in long_terms))
         anchors, anchor_params = lexical.bind_anchor_sql(connection, content), ()
+        # Term coverage is cheap integer work; the time window is a Python call per row.
+        # Filter on coverage first, so a broad query parses timestamps only for rows
+        # that match enough of its terms, not for every row of a large posting list.
         rows = connection.execute(
             "WITH " + (masks + ", " if masks else "") + "matched AS MATERIALIZED ("
             f"SELECT s.rowid AS id, ({mask}) AS query_match_mask FROM {from_clause} "
-            f"WHERE context_activity_timestamp({timestamp}) BETWEEN context_index_after() AND context_index_before() "
-            f"AND context_activity_timestamp(s.imported_at) <= context_index_cutoff() AND ({anchors})), "
+            f"WHERE ({anchors})), "
             "scored AS MATERIALIZED ("
-            f"SELECT id, -({lexical.coverage_sql('query_match_mask')}) AS native_query_rank FROM matched "
-            f"WHERE ({lexical.count_sql('query_match_mask')}) >= ?), "
+            f"SELECT q.id, -({lexical.coverage_sql('q.query_match_mask')}) AS native_query_rank "
+            f"FROM matched AS q JOIN {table} AS s ON s.rowid = q.id "
+            f"WHERE ({lexical.count_sql('q.query_match_mask')}) >= ? "
+            f"AND context_activity_timestamp({timestamp}) BETWEEN context_index_after() AND context_index_before() "
+            "AND context_activity_timestamp(s.imported_at) <= context_index_cutoff()), "
             "selected AS MATERIALIZED ("
             f"SELECT q.*, {tier} AS workspace_tier FROM scored AS q JOIN {table} AS s ON s.rowid = q.id "
             f"ORDER BY workspace_tier, native_query_rank, context_activity_timestamp({timestamp}) DESC, s.rowid DESC LIMIT ?) "

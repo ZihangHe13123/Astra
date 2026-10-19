@@ -1,12 +1,14 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, net, protocol, shell, Tray } from "electron";
 import { createHash, randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync, existsSync, realpathSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, realpathSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { homedir } from "node:os";
 import type { DesktopEvent, Preferences } from "../bridge.js";
+import type { SessionState } from "@astra/ui-core/session-state";
 import { Runtime } from "./runtime.js";
+import { ChannelHost } from "./channel-host.js";
 import { QueryClient } from "./query-client.js";
 import { sessionAction } from "./session-actions.js";
 import { hasOngoingWork } from "./ongoing-work.js";
@@ -20,6 +22,10 @@ import { checkedCommand, checkedPreferences, checkedString, externalURL, inside 
 import { captureHostResponse, cardFrameResponse, guardCardFrames } from "./card-frame.js";
 import { PageSnapshots } from "./page-snapshot.js";
 import { CARD_THEME_COLORS, checkedCardTheme } from "../card-theme.js";
+import { SHARED_PREFERENCE_KEYS, type PhoneInvokeMethod, type PhoneStatus } from "../phone-protocol.js";
+import { PhoneDevices } from "./phone-devices.js";
+import { PhoneGateway } from "./phone-gateway.js";
+import { tailscaleName } from "./phone-tailscale.js";
 
 const packaged = configurePackagedRuntime({ isPackaged: app.isPackaged, resourcesPath: process.resourcesPath,
   appData: app.getPath("appData"), platform: process.platform, arch: process.arch });
@@ -29,6 +35,9 @@ let workspace = resolve(process.env.ASTRA_WORKSPACE || process.cwd());
 const data = packaged?.data ?? resolve(process.env.ASTRA_HOME || join(root, ".astra"));
 const gui = join(data, "gui");
 mkdirSync(gui, { recursive: true, mode: 0o700 });
+// Speech for a paired phone is handed over as files here (agent/speech/player.py PhonePlayer); backends inherit it.
+const phoneAudio = join(gui, "phone-audio");
+process.env.ASTRA_PHONE_AUDIO_DIR = phoneAudio;
 const identity = createHash("sha256").update(`${root}\0${data}`).digest("hex").slice(0, 16);
 app.setName("Astra");
 app.setPath("userData", join(gui, `electron-${identity}`));
@@ -68,7 +77,29 @@ const ready = () => {
 };
 let queued: DesktopEvent[] = [];
 let flushTimer: ReturnType<typeof setTimeout> | undefined;
+// Paired phones follow the same sessions as the window (specs/phone-companion.md, phase 1: read-only).
+const phoneDevices = new PhoneDevices(join(gui, "phone-devices.json"));
+const phone = new PhoneGateway(phoneDevices, { staticRoot: join(__dirname, "phone"), rendererRoot: join(__dirname, "renderer"), audioRoot: phoneAudio,
+  invoke: (device, method, args) => phoneInvoke(device, method, args), port: Number(process.env.ASTRA_PHONE_PORT || 8930) });
+let phoneError = "";
+let phoneHost: { name?: string; at: number } = { at: 0 };
+async function syncPhone() {
+  try {
+    if (phoneDevices.enabled) await phone.start(); else await phone.stop();
+    phoneError = "";
+  } catch (error) {
+    phoneError = (error as NodeJS.ErrnoException)?.code === "EADDRINUSE" ? `端口 ${phone.port} 已被占用。` : String(error);
+  }
+}
+async function phoneStatus(): Promise<PhoneStatus> {
+  // Settings asks every second while a code is shown; Tailscale is asked at most once a minute.
+  if (phoneDevices.enabled && Date.now() - phoneHost.at > 60_000) phoneHost = { name: await tailscaleName(), at: Date.now() };
+  return { enabled: phoneDevices.enabled, port: phone.port, running: phone.running, ...(phoneError ? { error: phoneError } : {}),
+    ...(phoneDevices.enabled && phoneHost.name ? { url: `https://${phoneHost.name}` } : {}), devices: phoneDevices.list(),
+    ...(phoneDevices.currentPairing() ? { pairing: phoneDevices.currentPairing() } : {}) };
+}
 function broadcast(event: DesktopEvent) {
+  phone.publish(event);
   queued.push(event);
   if (!flushTimer) flushTimer = setTimeout(() => {
     const events = queued; queued = []; flushTimer = undefined;
@@ -106,7 +137,8 @@ ipcMain.on("astra:flushPreferences", (event, value) => {
   catch (error) { event.returnValue = String(error); }
 });
 register("bootstrap", () => ({ sessions: [...runtimes.values()].map(r => r.state), active, workspace, preferences, appshot: { connection: appshot.client.state.connection, enabled: appshot.client.state.enabled } }));
-register("create", (options: { session?: string; mode?: string; workspace?: string } = {}) => {
+/** Opens a session or a fresh draft. The window's call selects it; a phone's call leaves the window's selection alone. */
+function openSession(options: { session?: string; mode?: string; workspace?: string } = {}, select = true): SessionState {
   if (!options || typeof options !== "object") throw new Error("Invalid session options");
   const mode = options.mode || "work";
   if (!["work", "local", "minimal", "bar"].includes(mode)) throw new Error("Unknown mode");
@@ -117,7 +149,7 @@ register("create", (options: { session?: string; mode?: string; workspace?: stri
     const draft = [...runtimes.values()].find(r => r.state.isDraft && r.state.mode === mode
       && r.workspace === work && r.state.status !== "disconnected" && !r.isClosing && !r.state.busy
       && !r.state.approvals.length && !r.state.questions.length);
-    if (draft) { active = draft.id; appshot.update(); return draft.state; }
+    if (draft) { if (select) { active = draft.id; appshot.update(); } return draft.state; }
   }
   const name = options.session || `session_${new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14)}_${randomUUID().slice(0, 8)}`;
   if (!/^[\p{L}\p{N}_.-]+$/u.test(name) || [".", ".."].includes(name) || name.length > 200) throw new Error("Invalid session name");
@@ -125,36 +157,50 @@ register("create", (options: { session?: string; mode?: string; workspace?: stri
   const existing = [...runtimes.values()].find(r => r.state.session === name && r.state.mode === mode && r.state.status !== "disconnected");
   if (existing) {
     if (existing.isClosing) throw new Error("会话正在关闭，请稍后再打开。");
-    active = existing.id; return existing.state;
+    if (select) active = existing.id;
+    return existing.state;
   }
   const rt = new Runtime(root, python, work, mode === "work" ? name : `gui_${randomUUID().replaceAll("-", "")}`, mode,
     (r, event) => { broadcast({ runtime: r.id, revision: r.state.revision, event }); appshot.handle(r.id, event);
+      if (event.type === "backend_hello") voiceRoutes.delete(r.id);
       if (event.type === "gui_ready") appshot.update(); });
   // Special modes enter their separate namespace after the Work backend is ready.
   if (mode !== "work") rt.initialModeSession = name;
   // The backend reads what it is allowed to on its own; the page it names is only drawn here, in isolation.
   rt.pageSnapshot = path => snapshots.capture(path);
   rt.state.isDraft = !options.session && mode === "work";
-  runtimes.set(rt.id, rt); active = rt.id; appshot.update();
+  runtimes.set(rt.id, rt);
+  if (select) { active = rt.id; appshot.update(); }
   return rt.state;
-});
+}
+register("create", (options: { session?: string; mode?: string; workspace?: string } = {}) => openSession(options));
 register("select", id => { active = id === "" ? "" : runtime(id).id; appshot.update(); });
+/** Where each session's speech plays: on this Mac, or on the phone the conversation was last used from. */
+const voiceRoutes = new Map<string, "mac" | "phone">();
+async function routeVoice(rt: Runtime, command: Record<string, any>, where: "mac" | "phone") {
+  if (!["message", "image", "command"].includes(command.type) || voiceRoutes.get(rt.id) === where) return;
+  voiceRoutes.set(rt.id, where);
+  try { await rt.send({ type: "command", cmd: `/voice route ${where}` }); } catch (error) { voiceRoutes.delete(rt.id); throw error; }
+}
 function forgetRuntime(rt: Runtime) {
+  voiceRoutes.delete(rt.id);
   for (const [key, controller] of previewRequests) if (key.startsWith(`${rt.id}:`)) { controller.abort(); previewRequests.delete(key); }
   runtimes.delete(rt.id);
   if (active === rt.id) { active = ""; preferences.lastSession = null; savePreferences(); }
   appshot.forget(rt.id);
   broadcast({ removed: rt.id });
 }
-register("close", async id => {
+async function closeSession(id: unknown) {
   const rt = runtime(id);
   if (hasOngoingWork(rt.state)) throw new Error("该会话仍有任务或提醒，请先停止后再关闭。");
   await rt.close(); forgetRuntime(rt);
-});
+}
+register("close", closeSession);
 register("send", async (id, value) => {
   const rt = runtime(id); const command = checkedCommand(value);
   if (command.type === "image") authorizedFile(id, command.path);
   clipboardFiles.sent(command);
+  await routeVoice(rt, command, "mac");
   try { await rt.send(appshot.prepare(rt.id, command as any)); }
   catch (error) {
     appshot.handle(rt.id, { type: "submission_status", submission_id: command.submission_id, status: "unknown" });
@@ -172,13 +218,14 @@ register("appshot", async (id, action, value = "") => {
     else rt.accept({ type: "gui_notice", message: "没有待确认的 Appshot 请求。" });
   } else rt.accept({ type: "gui_notice", message: await appshot.command(rt.id, value) });
 });
-register("query", (method, params = {}, id) => {
+function runQuery(method: any, params: any = {}, id?: unknown) {
   if (!["sessions", "history", "commands", "changes", "request_timeline", "session_log"].includes(method)) throw new Error("Unsupported query");
   if (!params || typeof params !== "object" || Array.isArray(params) || JSON.stringify(params).length > 32768) throw new Error("Invalid query");
   return method === "changes" ? runtime(id).query(method, params) : queries.query(method, params);
-});
+}
+register("query", runQuery);
 const sessionOperations = new Set<string>();
-register("sessionAction", async (action, entry) => {
+async function runSessionAction(action: any, entry: any) {
   if (!["export", "delete"].includes(action) || !entry || typeof entry !== "object") throw new Error("Invalid session action");
   const name = checkedString(entry.name, "session", 200);
   const mode = checkedString(entry.mode, "mode", 20);
@@ -208,6 +255,40 @@ register("sessionAction", async (action, entry) => {
     savePreferences(); broadcast({ refresh: true });
     return result;
   } finally { sessionOperations.delete(key); }
+}
+register("sessionAction", runSessionAction);
+const phoneAuditPath = join(gui, "phone-audit.jsonl");
+/** What a paired phone did, for the user to read later; message text is not kept, only its length. */
+function phoneAudit(device: string, entry: Record<string, unknown>) {
+  try { appendFileSync(phoneAuditPath, `${JSON.stringify({ at: new Date().toISOString(), device, ...entry })}\n`, { mode: 0o600 }); }
+  catch (error) { console.error("Astra phone audit:", error); }
+}
+/** A paired phone's calls (specs/phone-companion.md). The phone runs this renderer; Mac-only calls are answered on the phone. */
+async function phoneInvoke(device: string, method: PhoneInvokeMethod, args: any[]) {
+  if (quitting || leaseLost) throw new Error("应用正在退出，请稍候。");
+  if (method === "bootstrap") return { sessions: [...runtimes.values()].map(r => r.state), active: "", workspace,
+    preferences: Object.fromEntries(SHARED_PREFERENCE_KEYS.map(key => [key, preferences[key]])),
+    appshot: { connection: "disconnected", enabled: false } };
+  if (method === "create") return openSession(args[0] ?? {}, false);
+  if (method === "query") return runQuery(args[0], args[1], args[2]);
+  if (method === "close") { phoneAudit(device, { method, runtime: String(args[0]) }); return closeSession(args[0]); }
+  if (method === "deleteSession") { phoneAudit(device, { method, session: args[0]?.name, mode: args[0]?.mode }); return runSessionAction("delete", args[0]); }
+  const rt = runtime(args[0]); const command = checkedCommand(args[1]);
+  phoneAudit(device, { method, runtime: rt.id, type: command.type,
+    ...(command.type === "message" ? { chars: String(command.text).length } : {}),
+    ...(command.type === "command" ? { cmd: String(command.cmd).slice(0, 200) } : {}),
+    ...(command.type === "tool_approval_response" ? { request: command.request_id, decision: command.decision } : {}),
+    ...(command.type.startsWith("user_question") ? { request: command.request_id } : {}) });
+  if (command.type === "image") authorizedFile(rt.id, command.path);
+  await routeVoice(rt, command, "phone");
+  await rt.send(command as any);
+}
+register("phone", async (action, value) => {
+  if (action === "enable" || action === "disable") { phoneDevices.setEnabled(action === "enable"); await syncPhone(); }
+  else if (action === "pair") { if (!phoneDevices.enabled) throw new Error("先打开“允许手机连接”。"); phoneDevices.startPairing(); }
+  else if (action === "revoke") phoneDevices.revoke(checkedString(value, "device", 100));
+  else if (action !== "status") throw new Error("Unknown phone action");
+  return phoneStatus();
 });
 register("preferences", value => {
   preferences = { ...preferences, ...checkedPreferences(value) }; savePreferences(); return preferences;
@@ -251,11 +332,17 @@ register("file", async (id, value, action, requestId) => {
   finally { if (previewRequests.get(key) === controller) previewRequests.delete(key); }
 });
 
+/** WeChat and QQ answer while the desktop is open, whether or not a conversation is open in the window. */
+const channelHost = new ChannelHost({
+  configPath: process.env.ASTRA_CHANNEL_CONFIG || join(root, ".astra", "channels.json"),
+  create: () => new Runtime(root, python, workspace, "channel_host", "work", () => {}),
+});
+
 async function performQuit() {
   if (quitting) return;
   quitting = true;
   await Promise.all([...runtimes.values()].map(rt => rt.close()));
-  await Promise.all([appshot.client.close(), queries.close()]);
+  await Promise.all([appshot.client.close(), queries.close(), phone.dispose(), channelHost.stop()]);
   // Let beforeunload supply the newest draft before taking the final snapshot.
   if (window && !window.isDestroyed()) {
     const closingWindow = window;
@@ -360,6 +447,8 @@ else {
     tray = new Tray(icon); tray.setToolTip("Astra");
     tray.setContextMenu(Menu.buildFromTemplate([{ label: "打开 Astra", click: showWindow }, { label: "停止并退出", click: () => requestQuit("quit") }]));
     tray.on("click", showWindow);
+    await syncPhone();
+    channelHost.start();
     showWindow();
   }).catch(async error => {
     console.error("Astra desktop startup failed:", error);

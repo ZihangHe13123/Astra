@@ -35,8 +35,12 @@ class SpeechService:
     """
 
     def __init__(self, store: VoiceStore, notify: Callable[[dict[str, Any]], None], *,
-                 open_player: Callable[[int, float], Player] = open_player) -> None:
+                 open_player: Callable[[int, float], Player] = open_player,
+                 open_phone_player: Callable[[int], Player] | None = None) -> None:
         self._store, self._notify, self._open_player = store, notify, open_player
+        self._open_phone_player = open_phone_player
+        # Where speech plays: this computer, or the paired phone the conversation is being used from.
+        self.route = "local"
         self.settings = store.load()
         self._segmenter: SpeechSegmenter | None = None
         self._units: asyncio.Queue[str | None] = asyncio.Queue()
@@ -125,6 +129,25 @@ class SpeechService:
             self._reported = status
             self._notify({**status, **({} if message is None else {"message": message}), **({"error": error} if error else {})})
 
+    async def synthesize(self, text: str) -> tuple[bytes, int]:
+        """All of ``text`` in the selected voice as 16-bit mono PCM, with its sample rate, to send
+        rather than play (a voice note on a channel). Works whether or not spoken replies are on and
+        starts the configured local server as speech does. Raises SpeechError without a voice."""
+        settings = self._store.load()
+        if settings.problem:
+            raise SpeechError(settings.problem)
+        provider = await self._provider(settings)
+        if self._server is not None:
+            self._server.touch()
+        if self._state == "starting" and self._runner is None:
+            self._set_state("idle")
+        pcm = bytearray()
+        async for chunk in provider.stream(text, settings.profile):
+            pcm += chunk
+        if not pcm:
+            raise SpeechError("The speech endpoint answered with no audio.")
+        return bytes(pcm), settings.sample_rate
+
     async def close(self) -> None:
         runner = self._runner
         self.stop()
@@ -188,7 +211,10 @@ class SpeechService:
                 expected, arrived, since, before = spoken_seconds(text), 0.0, 0.0, 0.0
                 async for pcm in provider.stream(text, voice, first=first):  # a failed unit ends this reply's speech
                     if player is None:
-                        player = self._player = self._open_player(settings.sample_rate, settings.prebuffer_seconds)
+                        player = self._player = (
+                            self._open_phone_player(settings.sample_rate)
+                            if self.route == "phone" and self._open_phone_player is not None
+                            else self._open_player(settings.sample_rate, settings.prebuffer_seconds))
                     now = asyncio.get_running_loop().time()
                     arrived += len(pcm) / 2 / settings.sample_rate
                     if not since:

@@ -179,21 +179,13 @@ class ReActAgent(AgentBase):
         self.external_memory_provider: "HindsightMemoryProvider | None" = None
         builtin_memory_provider = None
         if memory_store is not None:
+            from .hindsight_provider import HindsightMemoryProvider
             from .memory_provider import BuiltinMemoryProvider
 
             builtin_memory_provider = BuiltinMemoryProvider(memory_store)
-        if memory_router is not None:
-            router_provider = getattr(memory_router, "provider", None)
-            self.external_memory_provider = (
-                router_provider
-                if getattr(router_provider, "name", "") == "hindsight"
-                else getattr(router_provider, "external", None)
-            )
-        elif memory_store is not None:
-            from .hindsight_provider import HindsightMemoryProvider
-
+            # Hindsight is reached on demand: its own tools, and memory search.
             self.external_memory_provider = HindsightMemoryProvider.from_env()
-        if self.external_memory_provider is not None and self.tools.get("hindsight_recall") is None:
+        if self.external_memory_provider is not None and self.tools.get("hindsight_retain") is None:
             from .tools.hindsight import register_hindsight_tools
 
             register_hindsight_tools(self.tools, self.external_memory_provider)
@@ -267,25 +259,10 @@ class ReActAgent(AgentBase):
         self.memory_store = memory_store
         if memory_router is not None:
             self.memory_router = memory_router
-        elif memory_store is not None and builtin_memory_provider is not None:
-            from .memory_provider import FederatedMemoryProvider
+        elif memory_store is not None:
             from .memory_router import MemoryRouter
 
-            recall_provider = builtin_memory_provider
-            if self.external_memory_provider is not None:
-                recall_provider = FederatedMemoryProvider(
-                    builtin_memory_provider,
-                    self.external_memory_provider,
-                )
-            self.memory_router = MemoryRouter(
-                recall_provider,
-                memory_store,
-                task_store,
-                recall_timeout=self._float_env(
-                    "HINDSIGHT_INTERACTIVE_RECALL_TIMEOUT",
-                    2.5,
-                ),
-            )
+            self.memory_router = MemoryRouter(memory_store, task_store)
         else:
             self.memory_router = None
         if memory_retainer is not None:
@@ -328,6 +305,8 @@ class ReActAgent(AgentBase):
         # Set by a host that watches this agent's background runs: the ended ones of a
         # session as (notice, display text), each given once (runtime/background_completion.py).
         self.background_notices: Callable[[str], list[tuple[str, str]]] | None = None
+        # Set by a host that shows which saved memories a turn brought back, once per turn.
+        self.on_memory_recall: Callable[[dict], None] | None = None
         # Local-only frontends attach the process-scoped Computer Use runtime.
         # Remote/API surfaces intentionally leave it as None.
         self._computer_runtime: Any | None = None
@@ -355,6 +334,8 @@ class ReActAgent(AgentBase):
         self._memory_turn_key = ""
         self._turn_context_key = ""
         self._turn_context_block = ""
+        # Work mode: core memory, sent by the context's standing-memory stream (see get_prompt).
+        self._standing_memory_block = ""
         self._last_ended_session: str | None = None
         append_approval_audit = self.context.append_approval_audit
 
@@ -1535,6 +1516,9 @@ class ReActAgent(AgentBase):
             broker.mark_submitted(messages)
         if profiler is not None:
             profiler.set_request(messages, tools, self._active_skill_names)
+        remember = getattr(self.context, "remember_request", None)
+        if remember is not None:
+            remember(kwargs["messages"], tools)
         provider_events = self.llm.chat_stream(**kwargs)
         return filter_message_time_events(stream_with_progress(_stream_with_generation_stats(provider_events)))
 
@@ -2393,17 +2377,13 @@ class ReActAgent(AgentBase):
                 None,
             )
         cache_key = self._memory_turn_key or f"turn:{current_user_index}"
+        work_mode = self.tool_allowlist is None and not self.minimal_mode
         if cache_key != self._turn_context_key:
             blocks = []
+            standing_memory = ""
+            recalled: list[str] = []
+            recalled_ids: list[str] = []
             context_index_broker = getattr(self, "context_index_broker", None)
-            native_index = bool(
-                context_index_broker is not None
-                and getattr(context_index_broker, "native_memory", False)
-                and context_index_broker.mode in {"session", "all"}
-                and self.tool_allowlist is None
-                and self.memory_store is not None
-                and not str(user_text).lstrip().startswith("/")
-            )
             task_text = ""
             active_memory_text = ""
             # Interaction sandboxes such as Night Bar disable memory by
@@ -2411,28 +2391,23 @@ class ReActAgent(AgentBase):
             # once per user turn so TaskRun checkpoints cannot mutate the
             # already-cached prefix between tool iterations.
             with profile.phase("memory_and_turn_context"):
+                workspace_key = self._memory_workspace_key()
                 if self.memory_router is not None and self.memory_store is not None:
-                    with trace_span("agent.memory.recall", ctx=trace_ctx) as memory_span:
-                        pack = await self.memory_router.build_context(
-                            user_text,
-                            session_id=session_id,
-                            turn_key=self._memory_turn_key,
-                            **({"recall_enabled": False} if native_index else {}),
-                        )
-                        memory_ids = ",".join(pack.trace.record_ids)
-                        if trace_ctx is not None:
-                            trace_ctx.memory_id = memory_ids
-                        if memory_span is not None and memory_ids:
-                            memory_span.set_attribute("agent.memory_id", memory_ids)
-                            memory_span.set_attribute("agent.memory.count", len(pack.trace.record_ids))
-                    memory_block = pack.render(recall_char_limit=self.memory_router.recall_char_limit)
+                    pack = await self.memory_router.build_context(session_id=session_id, workspace_key=workspace_key)
+                    memory_block = pack.render(include_core=not work_mode)
+                    if work_mode:
+                        standing_memory = pack.core
                     if getattr(context_index_broker, "native_memory", False):
                         task_text = pack.task
                         active_memory_text = "\n".join((pack.core, pack.working, pack.task))
                     if memory_block:
                         blocks.append(memory_block)
                 elif self.memory_store is not None:
-                    memory_block = self.memory_store.format_prompt(session_id)
+                    if work_mode:
+                        standing_memory = self.memory_store.format_core_prompt(workspace_key)
+                        memory_block = self.memory_store.format_working_prompt(session_id)
+                    else:
+                        memory_block = self.memory_store.format_prompt(session_id, workspace_key)
                     if memory_block:
                         blocks.append(memory_block)
                 context_index_broker = getattr(self, "context_index_broker", None)
@@ -2476,6 +2451,8 @@ class ReActAgent(AgentBase):
                     else:
                         if index_pack.rendered:
                             blocks.append(index_pack.rendered)
+                        recalled.extend(row.description for row in index_pack.rows if row.source == "memory")
+                        recalled_ids.extend(row.memory_id for row in index_pack.rows if row.memory_id)
             if self.tool_allowlist is None and self.runtime_turn_context_provider is not None:
                 try:
                     turn_block = str(self.runtime_turn_context_provider() or "").strip()
@@ -2501,6 +2478,11 @@ class ReActAgent(AgentBase):
                 )
             self._turn_context_key = cache_key
             self._turn_context_block = "\n\n".join(blocks)
+            self._standing_memory_block = standing_memory
+            self._report_memory_recall(recalled)
+            self._note_memory_use(recalled_ids)
+            if trace_ctx is not None and recalled_ids:
+                trace_ctx.memory_id = ",".join(recalled_ids)
 
         def turn_context_text() -> str:
             dynamic_blocks: list[str] = []
@@ -2571,11 +2553,11 @@ class ReActAgent(AgentBase):
             return [*prepared, *non_system]
 
         def rebuild_prompt() -> list[dict]:
-            work_mode = self.tool_allowlist is None and not self.minimal_mode
             rebuilt = self.context.get_prompt(
                 content_overrides=self._vision_prompt_content_overrides(),
                 runtime_context=turn_context_text() if work_mode else None,
                 include_runtime_context=work_mode,
+                standing_memory=self._standing_memory_block if work_mode else None,
             )
             if not work_mode:
                 rebuilt = with_turn_context(rebuilt)
@@ -2957,6 +2939,7 @@ class ReActAgent(AgentBase):
             not result.get("error")
             and tool is not None
             and tool.risk == "write"
+            and tool.writes_paths
             and not dry_run_write
         ):
             write_paths = self._tool_mutation_paths(name, args)
@@ -3107,6 +3090,28 @@ class ReActAgent(AgentBase):
                "Their mailbox results will be joined automatically when you are "
                "otherwise ready to give the final answer.")
         )
+
+    def _note_memory_use(self, record_ids: list[str]) -> None:
+        if not record_ids or self.memory_store is None:
+            return
+        try:
+            self.memory_store.note_memory_use(record_ids)
+        except Exception:
+            logger.debug("memory usage was not recorded", exc_info=True)
+
+    def _report_memory_recall(self, recalled: list[str]) -> None:
+        if not recalled or self.on_memory_recall is None:
+            return
+        try:
+            self.on_memory_recall({"count": len(recalled), "items": recalled[:3]})
+        except Exception:
+            logger.exception("memory recall notice failed")
+
+    @staticmethod
+    def _memory_workspace_key() -> str:
+        from .memory import current_workspace_key
+
+        return current_workspace_key()
 
     def _admit_background_notices(self) -> None:
         """Put this session's background runs that ended since the last step before the model."""
@@ -4887,7 +4892,6 @@ class ReActAgent(AgentBase):
                             user_text,
                             session_id=session_id,
                             message_id=msg.id,
-                            recalled=self.memory_router.last_recalled(session_id),
                             tool_evidence=evidence,
                         )
                         changed_ids = (*outcome.retained_ids, *outcome.confirmed_ids)

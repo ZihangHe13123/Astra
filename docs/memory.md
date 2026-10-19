@@ -4,15 +4,31 @@
 
 Astra keeps a small core memory, searchable history and reusable skills. Each has a different purpose and lifecycle.
 
-[Core memory and task state](#core-memory-and-task-state) · [On-demand history and learned skills](#on-demand-history-and-learned-skills) · [Memory commands](#memory-commands) · [Proactive Context Index](#proactive-context-index) · [Importing Hermes history](#importing-hermes-history) · [Optional Hindsight service](#optional-hindsight-service)
+[Core memory and task state](#core-memory-and-task-state) · [On-demand history and learned skills](#on-demand-history-and-learned-skills) · [Memory commands](#memory-commands) · [Proactive Context Index](#proactive-context-index) · [Evaluating memory](#evaluating-memory) · [Importing Hermes history](#importing-hermes-history) · [Optional Hindsight service](#optional-hindsight-service)
 
 ## Core memory and task state
 
-Core memory is global and intentionally small. `MEMORY.md` and `USER.md` are
-the direct always-injected sources of truth, not mirrors of SQLite records.
-They use fixed hard limits and are added to temporary context for the current turn;
-the persisted user message remains unchanged. Core Markdown currently has no
-project-folder scope.
+Memory has two layers. Core memory is global and intentionally small: `MEMORY.md`
+and `USER.md` are pinned entries you can edit directly, with fixed hard limits.
+Saved memories are the growing layer: records in `.astra/memory.db` that Astra
+writes with its `memory` tool (`remember`), each with a one-line summary, the
+conversation it came from, a date, and global or project scope (the current
+checkout). An index of saved memories, one dated line each, newest first, at most
+30 lines and 2,400 characters, is always visible after the core entries; Astra
+reads a memory's full text when it needs more than the summary. Only memories
+for all projects and for the current one are listed; superseded and expired ones
+are not. Records from before saved memories are listed only when they are
+preferences or facts about you. When more memories qualify than fit, the ones
+saved or used most recently are listed. Used means recalled into a turn, found
+by a search, or read in full; listed lines stay in date order, so the index changes only when
+a memory enters or leaves it. `read` shows how often a memory was used, and
+`/memory` counts saved memories unused for 90 days.
+
+In Work mode the core entries and the index reach the model as a separate
+standing-memory copy, sent once and again only when they change, so they are
+not repeated in every turn's context and a change shows on the next turn;
+restricted modes add them to the current turn's context. The persisted user
+message remains unchanged.
 
 Durable execution uses `TaskRun → Step/TaskEvent` in `.astra/tasks.db`.
 Every request receives an independent TaskRun with checkpoints, tool results,
@@ -54,34 +70,78 @@ prompt. There is no Auto Core and no configurable extra L0 budget.
 Structured historical memory is stored locally in `.astra/memory.db` and does
 not require Hindsight. Evidence-backed preferences, user facts, episodes, task
 references, and observations retain provenance, confidence, and lifecycle
-metadata. Core Markdown remains the small always-visible source; SQLite records
-are retrieved only when relevant, at most four records and 2,400 rendered
-characters per turn. Project/configuration questions can match local
-observations without requiring the user to say “remember”; trivial turns,
-slash commands, and unrelated questions skip automatic recall. SQLite FTS5 is
-used when available, with deterministic substring fallback for Chinese text.
+metadata. Core Markdown and the saved-memory index are always visible. Other
+records reach the model in two ways: automatically only through the Context
+Index (`session` or `all` mode, below), and on demand when the model calls
+`memory(action="search")`. With the Context Index off, nothing is recalled into
+a turn. Search uses the Context Index's query rules (conversational words
+dropped, short Chinese words kept whole, a relative date such as 上周 read as a
+time window) and lists up to eight current memories for all projects and the
+current one, best match first, each with its date. When no memory contains two
+of the query's words, memories containing any one of them are listed.
 
 Personal facts and corrections are written through the model's memory tools or
-explicit `/memory` commands. Astra does not turn conversation sentences into facts
+explicit `/memory` commands. When something changes, Astra revises the memory:
+the new one supersedes it, and the old one is kept, marked superseded with an
+end date, so its history stays readable with `/memory timeline`. The conversation
+shows each change as it happens (“已记住”, “已更新记忆”, “已忘记”, with the id), and
+a turn whose Context Index recall includes saved memories says how many. If a turn has read a web
+page, a browser page, an MCP result, or content delivered by a subagent, another
+session or a background run, saving a memory in it needs your approval: such
+text can carry instructions written to plant themselves in memory. Astra does not turn conversation sentences into facts
 using patterns such as “I like”, “remember”, or “change to”. Optional tool-authored
 retention is off by default (`MEMORY_AUTO_RETAIN=0`); enabling it admits only tools
-that explicitly provide attributable evidence from successful calls. Diagnostics
+that explicitly provide attributable evidence from successful calls, and no current
+tool provides it, so enabling it records nothing yet. Diagnostics
 show the active runtime setting. Old `conservative` / `evolving` mode values still
 load, but both use this restricted tool-evidence policy.
 
-Background memory maintenance only expires explicit deadlines and retires exact
+Memory maintenance, run by `/compress` and when Astra exits, only expires explicit deadlines and retires exact
 observation duplicates with matching provenance, scope and lifetime. It preserves
 the original records, does not increase confidence for repetition, and does not
 promote temporary episodes into permanent facts. Existing memories are not
 rewritten on upgrade; use `/memory inspect`, `correct` and `forget` to review them.
+
+Memory consolidation reviews new conversations while Astra is idle and proposes
+changes. When the desktop or terminal app has
+had no turn for 10 minutes and you have sent at least four messages since the
+last review (at most every 30 minutes), DeepSeek Flash reads those messages
+(your own in full, the assistant's shortened) with what memory already holds,
+and proposes up to five changes: remember a lasting fact or preference you
+stated, revise a memory a later statement changed, or forget one you withdrew.
+Each proposal quotes the message it rests on; only your own messages count as
+evidence, and secret-looking text is dropped. A notice says how many are
+waiting. `/memory proposals` lists them, `/memory accept <n|all>` applies them
+as ordinary saved-memory changes with that message as the source, and
+`/memory dismiss <n|all>` drops them. In the terminal menu, each waiting
+proposal is offered after `/memory proposals`, `accept` and `dismiss`, and the
+desktop command palette offers them under accept and dismiss. The first review reads only the last
+three days. Conversations are sent to DeepSeek and need a DeepSeek key; the
+archive holds only your messages and the assistant's replies, never tool
+output, and Minimal, bar and installed local modes are not recorded. Consolidation has
+three modes. `review`, the default, only proposes: nothing changes until you
+accept. `auto` applies remember and revise proposals at once; each change shows
+as an ordinary memory notice marked 记忆整理, a revised memory keeps its old
+version for `/memory timeline`, and `/memory forget <id>` undoes a new one.
+Forget proposals still wait for you. `off` stops the reviews.
+`/memory consolidation off|review|auto` sets the mode (an earlier `on` reads as
+`review`), also during a reply, and `now` runs a review at the next idle moment.
+In the desktop app the same three choices are under Settings → 记忆整理, with
+the number of proposals waiting. The mode is saved for the installation, and
+every open session follows it from its next review.
 Semantic recall treats ordinary English words in Chinese questions as soft terms;
 explicit literals and code identifiers still constrain matching results.
 
-Hindsight is an optional federated semantic-recall enhancement. When enabled,
-its results are merged with the authoritative builtin store; when disabled or
-unavailable, builtin retention and recall continue locally. Current user
-statements, Core Markdown, concrete TaskRun results, Goal state, and temporary
-conversation state always take precedence over recalled records.
+Hindsight is an optional extra source for search; nothing from it is added to
+a turn automatically. When it is enabled, `memory(action="search")` sends it the
+same words and lists its results after Astra's own, marked historical and
+non-authoritative, without the ones that repeat a memory already listed. A
+service that fails or takes more than five seconds leaves Astra's own results
+and a note saying so. Search is the only way to read Hindsight's memories; its
+`hindsight_reflect` (a synthesized answer) and `hindsight_retain` tools remain
+available. Current user statements, Core
+Markdown, concrete TaskRun results, Goal state, and temporary conversation state
+always take precedence over recalled records.
 
 ## On-demand history and learned skills
 
@@ -111,12 +171,20 @@ cursor progress, protections and undo.
 /memory correct <id> <replacement text>
 /memory forget <id>
 /memory clear-working
+/memory proposals
+/memory accept <n|all>
+/memory dismiss <n|all>
+/memory consolidation [off|review|auto|now]
 ```
 
 The model can use the `memory` tool to maintain the same stores. Credential-like
-content is rejected. `MEMORY.md` defaults to 2,200 characters and `USER.md` to
-1,375 characters. Core additions do not require approval; model-initiated
-deletion is blocked until the user explicitly runs `/memory forget <id>`.
+content is rejected. `MEMORY.md` is limited to 2,200 characters and `USER.md` to
+1,375 characters. Core additions and removals do not require approval; the model
+is told to remove a core entry only when you ask, or when a file is full and the
+entry is obsolete, duplicated or superseded. Saved memories are added and revised without
+approval (except after outside content, as above); the model may forget one only
+when you ask, and you approve each forget. You can also use `/memory forget <id>`
+or select a deletion in `/memory review`.
 
 ## Proactive Context Index
 
@@ -125,7 +193,10 @@ pipeline**. Query planning, reciprocal-rank fusion (RRF), diversity selection
 (MMR), evidence budgets, and feedback all run in Astra's Python components.
 It requires no external memory framework, memory server, graph database, or
 auxiliary LLM. Existing embedding backends remain optional. It is **off by
-default**, and ordinary Markdown core memory stays unchanged.
+default**, and ordinary Markdown core memory stays unchanged. It is the only
+automatic recall of structured records: in `session` and `all` modes it adds
+them to a turn, and with it off, records reach the model only through the
+saved-memory index and the model's own searches.
 
 ```text
 /context-index session   # Astra's local records and session history
@@ -137,12 +208,41 @@ default**, and ordinary Markdown core memory stays unchanged.
 /context-index feedback R1 outdated    # Ranking feedback; does not rewrite facts
 ```
 
+Chinese questions are split at particles, pronouns and question words, so a
+two-character word stays whole (牙医是哪天 searches 牙医). Session history keeps a
+character-pair index for these words, so finding one does not scan the whole
+archive; Activity history still searches three-character pieces. Relative
+dates such as 上周, 三天前, 上个月, 9月27号 or "last week" become a date range
+instead of words to find.
+
 Use [native memory recommendation](native-memory-recommendation.md) for
 retrieval behavior, budgets, diagnostics, feedback and quality checks, and
 [platform configuration](context-index-platforms.md) for optional embeddings.
 The initial preview defaults to 900 characters (at most 2,000) and a 500-token
 estimate. Context Index can return no recommendation; retrieved notes remain
 historical evidence, not current instructions or proof of a fact.
+
+## Evaluating memory
+
+`agent/evals/memory` measures what memory puts in front of the model, using
+synthetic worlds (Chinese, English and mixed) seeded through the public memory
+and archive APIs, in temporary state that never touches your installation:
+
+```bash
+python -m agent.evals.memory.run --mode off,session,all --out memory-eval.json
+```
+
+The default offline run uses no model. It builds the agent as the backend does,
+runs multi-turn conversations, and reports evidence recall (in the newest
+context and anywhere visible), false and stale injection, dated items,
+injected and core-memory tokens per request and per conversation, prefix
+stability and preparation latency, by probe category. `--live --model <key>`
+asks a real model and scores its answers by keywords, dates and abstention,
+including whether a preference stated in one session is remembered in the next.
+`--consolidation` runs one memory review per world that has expected changes,
+with some records left out so the archive is ahead of memory, and reports
+which expected changes were proposed, whether stale memories were revised in
+place rather than duplicated, and how many other proposals were made.
 
 ## Importing Hermes history
 

@@ -81,7 +81,7 @@ from .learning_commands import execute_learning_command
 from .conversation_commands import register_conversation_tools
 from ..runtime.command_workflows import workflow_message, raw_command as normalize_direct_command
 from ..runtime.tools.conclave import register_conclave_tools
-from ..runtime.prompts import get_prompt_profile, prompt_profiles
+from ..runtime.prompts import get_prompt_profile, selectable_prompt_profiles
 from .render import render_text, render_tool_block, StreamRenderer, ReasoningRenderer, render_status_bar
 from .search_preferences import SEARCH_PROVIDERS, resolve_startup_search_provider, save_selected_search_provider
 
@@ -510,7 +510,7 @@ async def handle_slash(cmd: str, agent: ReActAgent) -> Msg | None:
             print()
 
     elif command == "/persona":
-        profiles = prompt_profiles()
+        profiles = selectable_prompt_profiles()
         if arg:
             if arg in profiles:
                 profile = get_prompt_profile(arg)
@@ -547,7 +547,6 @@ async def handle_slash(cmd: str, agent: ReActAgent) -> Msg | None:
                 store,
                 parts[1:],
                 session_id=Path(agent.context.session_path).stem or "default",
-                router=agent.memory_router,
                 retainer=agent.memory_retainer,
             )
             print(f"  {error or output}\n")
@@ -789,7 +788,7 @@ async def handle_slash(cmd: str, agent: ReActAgent) -> Msg | None:
     /prompt ...         — Set system prompt
     /persona [name]     — View / switch saved prompt persona
     /model [name]       — Show / switch model (deepseek-flash, deepseek-v4-pro)
-    /search [provider]  — Show / switch search provider (auto, exa, searxng)
+    /search [provider]  — Show / switch search provider (auto, exa, searxng, deepseek)
     /memory             — Inspect or update working/core memory
     /skills             — List, inspect, or create local procedural skills
     /guidance           — Inspect pending guidance or apply it with refresh --now
@@ -894,6 +893,8 @@ async def _async_init(llm_config: LLMConfig, sandbox_timeout: int, workdir: str)
         tools,
         memory_store,
         session_id=lambda: Path(agent_holder["agent"].context.session_path).stem if agent_holder else "default",
+        messages=lambda: agent_holder["agent"].context.messages if agent_holder else [],
+        external=lambda: agent_holder["agent"].external_memory_provider if agent_holder else None,
     )
     register_skill_tools(
         tools, skill_store,

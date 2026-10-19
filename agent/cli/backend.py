@@ -130,6 +130,8 @@ from agent.runtime.tools.conclave import register_conclave_tools
 from agent.runtime.tools.delegate import register_delegate_tools
 from agent.runtime.context_index.workspace import resolve_workspace
 from agent.runtime.session_recall import SessionRecall as _SessionRecall
+from agent.runtime.session_recall import configured_session_recall_path
+from agent.runtime.memory_proposals import ConsolidationScheduler
 from agent.runtime.learning import LearningStore
 from agent.runtime.goal_verifier import (
     GoalVerifier,
@@ -177,6 +179,7 @@ from agent.cli.diagnostics import build_doctor_report, build_runtime_diagnostics
 from agent.cli.environment import load_project_env
 from agent.cli.persona_preferences import save_selected_persona, startup_persona
 from agent.cli.voice_preferences import VoicePreferences, execute_voice_command
+from agent.speech.player import PhonePlayer
 from agent.speech.service import SpeechService
 from agent.cli.search_preferences import (
     SEARCH_PROVIDERS,
@@ -193,15 +196,19 @@ from agent.cli.context_index_preferences import load_context_index_preferences
 from agent.cli.browser_commands import execute_browser_command
 from agent.cli.computer_commands import ComputerStateEmitter, approval_choices, execute_computer_command
 from agent.cli.memory_commands import execute_memory_command
+from agent.cli.memory_consolidation_preferences import consolidation_client, load_memory_consolidation_mode
 from agent.cli.guidance_commands import execute_guidance_or_skill_command, guidance_command_busy
 from agent.cli.learning_commands import execute_learning_command
 from agent.cli.conversation_commands import register_conversation_tools
 from agent.runtime.command_workflows import workflow_message, raw_command as normalize_direct_command
 from agent.channels import ChannelManager, load_channels_config
 from agent.channels.manager import is_address_in_use
-from agent.channels.router import AgentChannelRouter, active_channel
+from agent.channels.router import AgentChannelRouter, active_channel, active_channel_message
+from agent.channels.approvals import await_chat_approval
+from agent.cli.channel_models import ChannelModels
+from agent.cli.weixin_commands import WeixinCommands, is_weixin_command
 from agent.channels.tools import register_channel_tools
-from agent.runtime.prompts import get_prompt_profile, prompt_profiles
+from agent.runtime.prompts import get_prompt_profile, selectable_prompt_profiles
 from agent.cli.sessions import (
     SessionNameError,
     bar_session_exists,
@@ -432,6 +439,17 @@ def _session_recall_auto_logging_enabled(
     return not (bar_active or minimal_active or local_active)
 
 
+
+
+def _is_consolidation_command(command: str) -> bool:
+    """/memory consolidation changes an installation setting, so like /voice it is answered in every mode,
+    during a turn and while a restart drains, with a status instead of a conversation message."""
+    return command.lower().split(maxsplit=2)[:2] == ["/memory", "consolidation"]
+
+
+def _is_setting_command(command: str) -> bool:
+    """Installation settings answered with a status in every mode, during a turn and while a restart drains."""
+    return _is_consolidation_command(command) or is_weixin_command(command)
 
 
 def _isolated_mode_blocks_command(
@@ -866,6 +884,8 @@ async def _main(startup_started: float):
     register_channel_tools(
         tools,
         lambda: channel_manager_holder.get("manager"),
+        # A voice note in WeChat speaks with the same voice as spoken replies (set up below).
+        speaker=lambda text: voice.synthesize(text),
     )
     memory_store = MemoryStore()
     skill_store = SkillStore()
@@ -901,6 +921,15 @@ async def _main(startup_started: float):
         tools,
         memory_store,
         session_id=lambda: agent_holder["agent"].context.session_scope if agent_holder else "default",
+        messages=lambda: agent_holder["agent"].context.messages if agent_holder else [],
+        external=lambda: agent_holder["agent"].external_memory_provider if agent_holder else None,
+    )
+    # Saved, revised or forgotten memories are shown to the user as they happen.
+    memory_store.on_change = lambda change: _send({"type": "memory_notice", **change})
+    # While idle, a side model proposes memory changes; the user accepts each one.
+    consolidation = ConsolidationScheduler(
+        memory_store, configured_session_recall_path(), consolidation_client,
+        mode=load_memory_consolidation_mode(), notify=_send, load_mode=load_memory_consolidation_mode,
     )
     register_goal_tools(
         tools,
@@ -1135,6 +1164,12 @@ async def _main(startup_started: float):
             if tools.yolo and request.get("yolo_bypass_allowed") is True:
                 # YOLO may have been enabled while the inbox write was waiting.
                 resolve_tool_approval(request_id, "once")
+            if channel_name:
+                # Asked in the chat too (WeChat), and never left waiting: no answer in time is a denial.
+                manager = channel_manager_holder.get("manager")
+                return await await_chat_approval(
+                    manager.approver(channel_name) if manager is not None else None, active_channel_message.get(),
+                    request, future, lambda decision: resolve_tool_approval(request_id, decision))
             return await future
         except asyncio.CancelledError:
             if approval_inbox is not None:
@@ -1181,6 +1216,7 @@ async def _main(startup_started: float):
     agent.context.compaction_observer = _send
     agent.set_persona(persona_state, system_prompt)
     agent.delegate_mailbox = delegate_mailbox
+    agent.on_memory_recall = lambda recall: _send({"type": "memory_recall", **recall})
     delegate_mailbox.wakes_parent = lambda task_id: bool(task_id) and task_id == work_turn["task_id"]
     agent.background_notices = lambda session: (
         [] if bar_mode.active or minimal_mode.active or local_mode.active else completions.drain(session)
@@ -1198,7 +1234,12 @@ async def _main(startup_started: float):
     tools.hooks.on_session_end(computer_state_emitter.observe_session_end)
     # Spoken output is presentation only: it hears the reply stream and never touches the context.
     voice_preferences = VoicePreferences()
-    voice = SpeechService(voice_preferences, lambda status: _send({"type": "voice_status", **status}))
+    # A paired phone plays speech itself when the conversation is used from it (the desktop sets the route).
+    phone_audio = os.getenv("ASTRA_PHONE_AUDIO_DIR", "").strip()
+    voice = SpeechService(voice_preferences, lambda status: _send({"type": "voice_status", **status}),
+                          open_phone_player=(lambda rate: PhonePlayer(rate, Path(phone_audio),
+                                                                      lambda audio: _send({"type": "voice_audio", **audio})))
+                          if phone_audio else None)
     tools.hooks.on_session_end(lambda _session_id, _reason: voice.stop())
     tools.hooks.on_runtime_event(computer_state_emitter.observe_runtime_event)
     register_run_code_tool(tools, agent_getter=lambda: agent_holder["agent"])
@@ -1582,9 +1623,10 @@ async def _main(startup_started: float):
                 continuation = decide_goal_continuation(updated, verdict)
                 if continuation is None:
                     if updated.get("status") == "completed":
+                        # stdout is the event protocol: a line printed there can split an event line.
                         print(
                             f"[backend] goal met after {updated.get('round')} round(s): {updated.get('objective', '')}",
-                            flush=True,
+                            file=sys.stderr, flush=True,
                         )
                     elif updated.get("status") == "exhausted":
                         print(
@@ -1611,6 +1653,11 @@ async def _main(startup_started: float):
         except Exception:
             return
         if goal is None or goal.get("status") != "active":
+            return
+        if (completions.pending(session_id) or delegate_mailbox.undelivered(session_id)
+                or delegate_mailbox.lead_waiting(session_id) or delegate_mailbox.session_working(session_id)):
+            # Background work still reports in a turn of its own; the goal is checked after that
+            # turn, so a round is not spent, nor a continuation started, while results are on the way.
             return
         verification = asyncio.create_task(
             _run_goal_verification(
@@ -2058,7 +2105,7 @@ async def _main(startup_started: float):
         pct = (used / limit * 100) if limit > 0 else 0.0
         personas = [
             {"name": profile.name, "description": profile.description}
-            for profile in prompt_profiles().values()
+            for profile in selectable_prompt_profiles().values()
         ]
         _send({"type": "model_info", "model": agent.llm.config.model,
                "model_key": current_model_key,
@@ -2286,6 +2333,7 @@ async def _main(startup_started: float):
     session_count_task.add_done_callback(startup_tasks.discard)
     _send_working_memory()
     _send_mode_info()
+    _send(consolidation.status_event())
     _send_bar_session_list()
     _send_minimal_session_list()
     _send_local_mode_info()
@@ -2303,15 +2351,19 @@ async def _main(startup_started: float):
         _send({"type": "gui_ready", "workspace": str(Path(sandbox_workdir).resolve()),
                "session_id": Path(agent.context.session_path).stem})
 
+    channel_models = ChannelModels(lambda: catalog, lambda: current_model_key)
     channel_router = AgentChannelRouter(agent, agent_turn_lock, sessions_dir(PROJECT_ROOT),
-                                        admission=lambda: not restart.draining)
+                                        admission=lambda: not restart.draining, model_for=channel_models.client)
     channel_manager = ChannelManager(load_channels_config(), channel_router.handle)
     channel_manager_holder["manager"] = channel_manager
+    weixin_commands = WeixinCommands(lambda: channel_manager_holder.get("manager"), _send,
+                                     models=channel_models)
     # The QQ reverse-WebSocket port is a process-wide resource, while the CLI
     # backend itself is intentionally multi-instance. If another backend owns
     # the channel, keep this CLI useful and leave only that optional adapter
     # disabled in this process.
     await _start_channel_manager(channel_manager)
+    weixin_commands.send_status()
 
     active_task: asyncio.Task | None = None
     active_task_id = ""
@@ -2341,7 +2393,18 @@ async def _main(startup_started: float):
         _send({"type": "error", "message": "Conversation selection could not be verified. Reopen this session before sending more messages."})
         return False
 
+    launching = {"messages": 0}
+
     async def _launch_message(msg: Msg, input_text: str, resume_task: dict | None = None) -> bool:
+        # Launching awaits before the turn starts; a background wake started meanwhile
+        # would turn this message into steering for an automatic turn.
+        launching["messages"] += 1
+        try:
+            return await _launch_message_now(msg, input_text, resume_task)
+        finally:
+            launching["messages"] -= 1
+
+    async def _launch_message_now(msg: Msg, input_text: str, resume_task: dict | None = None) -> bool:
         nonlocal active_task, active_task_id, goal_turn_generation, _reply_done
         if _response_regenerating or not _response_head_current():
             return False
@@ -2549,7 +2612,8 @@ async def _main(startup_started: float):
     async def _background_tick() -> None:
         """Start a turn for background work that ended after the agent answered."""
         session = agent.context.session_scope
-        if (not session or _turn_busy() or _response_regenerating or restart.draining or active_channel.get()
+        if (not session or _turn_busy() or launching["messages"] or _response_regenerating or restart.draining
+                or active_channel.get()
                 or bar_mode.active or minimal_mode.active or local_mode.active
                 or agent.llm.config.connection_required or appshot_admission.reserved
                 # A turn started now would expire a question still waiting for the user.
@@ -2618,6 +2682,8 @@ async def _main(startup_started: float):
             if peer_link is not None:
                 await _peer_tick()
             await _background_tick()
+            consolidation.tick(busy=busy)
+            weixin_commands.tick()
             if browser_lifecycle is not None:
                 await _browser_handover_tick()
             await asyncio.sleep(0.25)
@@ -2834,6 +2900,16 @@ async def _main(startup_started: float):
     # command loop below within the type checker's per-function complexity limit (past
     # it, pyright stops checking the function at all). They are called last in a loop
     # pass, so a `return` here is that loop's `continue`.
+    def _consolidation_command(c: str) -> None:
+        try:
+            output, error = execute_memory_command(
+                memory_store, shlex.split(c)[1:], session_id=agent.context.session_scope,
+                consolidation=consolidation,
+            )
+        except ValueError as exc:
+            output, error = "", f"Invalid memory command: {exc}"
+        _send(consolidation.status_event(message=output, error=error))
+
     async def _bar_command(c: str) -> None:
         """/bar: open, leave or switch the night bar, sip, or set its output mode."""
         if minimal_mode.active:
@@ -3960,12 +4036,14 @@ async def _main(startup_started: float):
                         _send({"type": "restart_status", "state": restart.state,
                                "request_id": restart.request_id, "message": str(exc)})
                     continue
-                if restart.draining and c.split(maxsplit=1)[:1] not in (["/cancel"], ["/yolo"], ["/voice"]):
+                if (restart.draining and c.split(maxsplit=1)[:1] not in (["/cancel"], ["/yolo"], ["/voice"])
+                        and not _is_setting_command(c)):
                     _send({"type": "restart_status", "state": restart.state,
                            "request_id": restart.request_id,
                            "message": "Restart is pending; use /restart cancel before changing the session."})
                     continue
-                if c.lower().split(maxsplit=1)[:1] not in (["/learn"], ["/yolo"], ["/cancel"], ["/voice"]):
+                if (c.lower().split(maxsplit=1)[:1] not in (["/learn"], ["/yolo"], ["/cancel"], ["/voice"])
+                        and not _is_setting_command(c)):
                     await _cancel_manual_reviews()
                 if c.lower().split(maxsplit=1)[:1] == ["/yolo"]:
                     # A control acknowledgement is not a model/tool completion.
@@ -3995,6 +4073,10 @@ async def _main(startup_started: float):
                     except ValueError as exc:
                         message, error = "", f"Invalid voice command: {exc}"
                     voice.report(force=True, message=message, error=error)
+                elif _is_consolidation_command(c):
+                    _consolidation_command(c)
+                elif is_weixin_command(c):
+                    await weixin_commands.handle(c)
                 elif c == "/bar" or c.startswith("/bar "):
                     await _bar_command(c)
                 elif c == "/minimal" or c.startswith("/minimal "):
@@ -4161,16 +4243,19 @@ async def _main(startup_started: float):
                     try:
                         memory_parts = shlex.split(c)[1:]
                     except ValueError as exc:
+                        memory_parts = []
                         output, error = "", f"Invalid memory command: {exc}"
                     else:
                         output, error = execute_memory_command(
                             memory_store,
                             memory_parts,
                             session_id=agent.context.session_scope,
-                            router=agent.memory_router,
                             retainer=agent.memory_retainer,
+                            consolidation=consolidation,
                         )
                     _send({"type": "tool_result", "name": "memory", "output": output, "error": error, "code": ""})
+                    if memory_parts[:1] in (["accept"], ["dismiss"]):
+                        _send(consolidation.status_event())
                     if not error:
                         _send_working_memory()
                     _send({"type": "done"})
@@ -4405,7 +4490,7 @@ async def _main(startup_started: float):
                     _send({"type": "tool_result", "name": "search", "output": output, "error": error, "code": ""})
                     _send({"type": "done"})
                 elif c.startswith("/persona"):
-                    profiles = prompt_profiles()
+                    profiles = selectable_prompt_profiles()
                     parts = c.split(maxsplit=2)
                     arg = parts[1] if len(parts) > 1 else ""
                     if arg:

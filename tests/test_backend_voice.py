@@ -132,3 +132,43 @@ def test_reply_is_read_aloud_without_entering_the_conversation(tmp_path, monkeyp
             server.server_close()
     settings = json.loads((tmp_path / "settings.json").read_text(encoding="utf-8"))
     assert (settings["voice"]["enabled"], settings["voice"]["selected"]) == (False, "cool")
+
+
+def test_speech_for_a_phone_is_handed_over_as_files_instead_of_played(tmp_path, monkeypatch):
+    import wave
+
+    monkeypatch.setenv("ASTRA_HOME", str(tmp_path / "state"))
+    model = ThreadingHTTPServer(("127.0.0.1", 0), Model)
+    model.payloads = []
+    speech = serve_speech()
+    for server in (model, speech):
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+    audio = tmp_path / "phone-audio"
+    proc, _, _, wait = _start_question_protocol_backend(
+        tmp_path, model.server_address[1], "phone-voice",
+        settings_overrides={"voice": {"enabled": True, "base_url": f"http://127.0.0.1:{speech.server_address[1]}/v1"}},
+        env_overrides={"ASTRA_VOICE_PLAYER": "null", "ASTRA_PHONE_AUDIO_DIR": str(audio)},
+    )
+
+    def send(event: dict) -> None:
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps(event, ensure_ascii=False) + "\n")
+        proc.stdin.flush()
+
+    try:
+        wait(lambda event: event.get("type") == "model_info")
+        send({"type": "command", "cmd": "/voice route phone"})
+        routed = wait(lambda event: event.get("type") == "voice_status" and "message" in event)
+        assert (routed["message"], routed.get("error", "")) == ("", "")
+        send({"type": "command", "cmd": "/voice test 手机上读这一句。"})
+        handed = wait(lambda event: event.get("type") == "voice_audio")
+        path = audio / f"{handed['id']}.wav"
+        with wave.open(str(path)) as heard:
+            assert heard.readframes(heard.getnframes()).decode("utf-16-le") == "手机上读这一句。"
+            assert handed["seconds"] == round(heard.getnframes() / heard.getframerate(), 3)
+        assert abs(handed["at"] - time.time()) < 30
+    finally:
+        _stop_protocol_backend(proc)
+        for server in (model, speech):
+            server.shutdown()
+            server.server_close()

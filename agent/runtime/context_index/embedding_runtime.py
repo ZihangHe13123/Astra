@@ -20,6 +20,15 @@ import time
 PROTOCOL = 1
 MAX_BODY = 128 * 1024
 MAX_RESPONSE = 4 * 1024 * 1024
+DEFAULT_IDLE_SECONDS = 900
+
+
+def idle_seconds() -> float:
+    """How long the model stays loaded without an encode request (ASTRA_EMBEDDING_IDLE_SECONDS)."""
+    try:
+        return max(60.0, float(os.getenv("ASTRA_EMBEDDING_IDLE_SECONDS", DEFAULT_IDLE_SECONDS)))
+    except ValueError:
+        return float(DEFAULT_IDLE_SECONDS)
 
 
 def identity() -> str:
@@ -117,6 +126,9 @@ class SharedMlxBackend:
         self._wake = threading.Event()
         self._active = True
         self._maintenance: threading.Thread | None = None
+        # The last time something wanted a vector. Health pings do not count: without
+        # demand the worker unloads its model after idle_seconds() and is not restarted.
+        self._last_demand = time.monotonic()
 
     def load(self) -> None:
         self._state = ensure_runtime(self.directory)
@@ -143,6 +155,10 @@ class SharedMlxBackend:
                     return
                 if not self._active or not _enabled():
                     continue
+                if time.monotonic() - self._last_demand > idle_seconds():
+                    # Idle: let the worker exit; the next encode request revives it.
+                    self._state = None
+                    continue
                 try:
                     current = ensure_runtime(self.directory)
                     if not self._stop.is_set() and self._active:
@@ -157,11 +173,19 @@ class SharedMlxBackend:
         import math
         from .embedder import EmbeddingUnavailable
         state = self._state
+        self._last_demand = time.monotonic()
         if state is None:
+            # Restart off the request path; this request keeps its lexical results.
+            self._wake.set()
             raise EmbeddingUnavailable("Embedding worker is cold")
         if not texts:
             return []
-        value = request(state, "/encode", {"texts": list(texts)}, timeout=10)
+        try:
+            value = request(state, "/encode", {"texts": list(texts)}, timeout=10)
+        except EmbeddingUnavailable:
+            # The worker may have unloaded after idling; bring it back in the background.
+            self._wake.set()
+            raise
         vectors = value.get("vectors")
         if not isinstance(vectors, list) or len(vectors) != len(texts):
             raise ValueError("Embedding response count mismatch")

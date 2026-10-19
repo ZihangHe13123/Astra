@@ -904,6 +904,9 @@ def test_goal_resume_launches_work_but_verifier_failure_does_not_spend_round(tmp
         server.server_close()
 
 
+NON_JSON_STDOUT = "_non_json_stdout"
+
+
 def _start_question_protocol_backend(
     tmp_path: Path,
     server_port: int,
@@ -1003,7 +1006,8 @@ def _start_question_protocol_backend(
             try:
                 events.put(json.loads(line))
             except json.JSONDecodeError:
-                pass
+                # stdout is the event protocol; keep a stray line visible to tests that check for it.
+                events.put({"type": NON_JSON_STDOUT, "line": line[:300]})
 
     threading.Thread(target=read_events, daemon=True).start()
 

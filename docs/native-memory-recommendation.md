@@ -11,7 +11,7 @@ Context Index and `context_open` contracts.
 
 | Component | Responsibility |
 | --- | --- |
-| `query.py` | Bounded task queries, CJK trigrams, shared lexical coverage, trivial-turn abstention, resume context, local-date windows |
+| `query.py` | Bounded task queries, CJK word splitting and character grams, shared lexical coverage, trivial-turn abstention, resume context, local-date windows |
 | `lexical.py` | Literal-target constraints, output-destination recognition, and shared query-character coverage in SQL and fusion |
 | `session_source.py` | Read-only FTS/LIKE and session-window retrieval, current-message exclusion |
 | `activity_source.py` | Independent text and warm-vector channels over cached Activity |
@@ -27,28 +27,62 @@ Context Index and `context_open` contracts.
 
 Ordinary Markdown core memory and current working/task context remain separate
 from historical evidence. When native recommendation is enabled, dynamic local
-records enter the same selection and budget as session/activity candidates;
-`MemoryRouter` does not additionally recall through its provider. Existing
-optional integrations are not dependencies of this pipeline.
+records enter the same selection and budget as session/activity candidates.
+This is the only automatic recall of records. `memory(action="search")` runs
+the same `RecordSource` on the model's own query, and lowers the required term
+count to one only when no record contains two of the terms. Existing optional
+integrations are not dependencies of this pipeline.
 
 ## Retrieval and budgets
 
 Native lexical queries remove common conversational search phrases before
 generating character terms. Whole, simple arithmetic such as `2+2` skips
 retrieval instead of searching historical numbers; dates, versions and
-substantive requests such as `2+2 报错` remain eligible. Chinese runs of three or more characters use
-overlapping trigrams, matching Astra's existing FTS5 index; shorter meaningful
-terms and literal ASCII identifiers remain searchable. Terms are unique and
-capped at 12; explicit literal targets have priority over long Chinese gram
-runs, including native Activity queries. No tokenizer
-package, dictionary service, or index migration is required.
+substantive requests such as `2+2 报错` remain eligible. Chinese runs are then
+split at particles, pronouns, copulas and question words (的、是、哪、吗、在…),
+and common words that would match most history (觉得、问题、多少…) are dropped,
+so the words of a question stay whole: 牙医是哪天 searches 牙医, not 牙医是 / 医是哪
+/ 是哪天. Characters that often begin or end content words (都、就、有) do not
+split. A remaining two-character word is one term; a three- or four-character
+run, usually two words, becomes overlapping character pairs (课程讲师 → 课程、程讲、讲师);
+longer runs use overlapping trigrams, matching the FTS5 trigram index. Literal
+ASCII identifiers remain searchable. Terms are unique and capped at 12; explicit
+literal targets have priority over long Chinese gram runs. No tokenizer package
+or dictionary service is required.
+
+A date in the question becomes a local calendar window that filters every
+source, and its words leave the search terms (上周体重 searches 体重 within last
+week). Covered: ISO dates; 今天, 昨天, 前天, 大前天; N天前, N周前, N个月前, in Arabic or
+Chinese numerals; 上周, 这周, 上周三; 上个月, 本月; 前几天; 最近一周, 最近一个月;
+M月D号; and the English forms (today, yesterday, N days/weeks/months ago, last
+week, last Monday, this month, past week, Sep 27). Weeks start on Monday. A
+month-day later than today means last year's. Compounds that only contain a
+date word, such as 晚上周末 and "may 5 people", are not windows. A windowed
+question also considers what happened in the window, except when a window
+longer than a day names a topic that matched nothing there: that question
+abstains instead of filling the slots with unrelated items.
+
+Session Recall keeps a second FTS5 table for two-character terms,
+`messages_cjk`: each message's distinct CJK character pairs. It is written in
+the same transaction as the message, and `recall_meta.cjk_pairs_through`
+records the highest indexed message id. The first open after an upgrade indexes
+the existing archive for at most half a second, and each later message indexes
+up to 500 more. Readers use the index up to that id and check later messages
+literally, so messages written by an older Astra or an import are found before
+they are indexed. SQL triggers remove a deleted message's pairs; an edit removes
+them and moves the watermark back so the message is indexed again. SQLite
+before 3.43 cannot delete from a contentless table, so there the table stores
+its pair text (about twice the size). Native Activity has no pair index; it
+keeps the unsplit trigram terms, so short words cannot force full scans of its
+much larger archive.
 
 Session and record lookups accept partial matches: multi-term queries require
 at least two distinct query terms; a single-term query requires one. This is a
 lexical eligibility floor, not a semantic confidence score. Coverage is computed
 before candidate limits, so weak newer matches cannot crowd out stronger older
 ones. When every term is at least three characters, native Session and Activity
-combine one indexed posting list per term into a bitmask. Each term contributes
+combine one indexed posting list per term into a bitmask; Session also reads
+two-character Chinese terms from its pair index. Each term contributes
 once, and coverage uses integer operations without repeatedly decoding long
 bodies. One or two indexed targets restrict postings before common grams are read;
 broad target lists use the shared masks and a single boundary check instead
@@ -283,9 +317,12 @@ views, and the worker synchronizes and clears scratch buffers even on failure.
 is set to zero. The 6 GiB `set_memory_limit` is a scheduling guideline that MLX
 can exceed, not a hard memory guarantee.
 
-Active clients heartbeat every 30 seconds. Once all clients pause/exit, the
-worker exits after about 90 idle seconds. Lost workers recover during client
-maintenance; a current request falls back immediately if no endpoint is ready.
+Active clients check the worker every 30 seconds, but only an encode request
+counts as use: after `ASTRA_EMBEDDING_IDLE_SECONDS` (default 900, at least 60)
+without one, the worker exits and releases the model, also while Astra keeps
+running. Loading never counts as idle. The next encode request (a query, or the
+indexer after new messages) starts it again in the background; that request,
+like any request when no endpoint is ready, falls back to text immediately.
 Restart pre-update Astra sessions to release their old process-local models.
 See [platform runtime controls](context-index-platforms.md#macos) for status and
 explicit stop commands.

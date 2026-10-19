@@ -215,6 +215,74 @@ def test_idle_worker_releases_ownership_and_removes_endpoint(tmp_path):
     assert not runtime.state_path(tmp_path).exists()
 
 
+def _start_worker(tmp_path, idle_seconds):
+    backend = Backend()
+    thread = threading.Thread(target=serve, args=(tmp_path, backend), kwargs={"idle_seconds": idle_seconds},
+                              daemon=True)
+    thread.start()
+    until = time.monotonic() + 3
+    while time.monotonic() < until:
+        try:
+            state = runtime.read_state(tmp_path)
+            if runtime.request(state, "/health")["state"] == "ready":
+                return thread, state
+        except (OSError, ValueError, RuntimeError):
+            pass
+        time.sleep(0.01)
+    raise AssertionError("worker did not start")
+
+
+def test_health_checks_do_not_keep_an_idle_model_loaded(tmp_path):
+    thread, state = _start_worker(tmp_path, idle_seconds=0.5)
+    until = time.monotonic() + 3
+    with pytest.raises(embedder.EmbeddingUnavailable):
+        # Clients check health every 30 s while they run; that is not use.
+        while time.monotonic() < until:
+            runtime.request(state, "/health", timeout=0.3)
+            time.sleep(0.05)
+    thread.join(3)
+    assert not thread.is_alive()
+    assert not runtime.state_path(tmp_path).exists()
+
+
+def test_encode_requests_keep_the_model_loaded(tmp_path):
+    thread, state = _start_worker(tmp_path, idle_seconds=0.5)
+    try:
+        until = time.monotonic() + 1.5
+        while time.monotonic() < until:
+            assert runtime.request(state, "/encode", {"texts": ["query"]})["vectors"]
+            time.sleep(0.1)
+        assert thread.is_alive()
+    finally:
+        runtime.request(state, "/stop", {})
+        thread.join(3)
+
+
+def test_an_idle_client_lets_the_worker_go_until_a_vector_is_needed(worker, monkeypatch):
+    monkeypatch.setenv("ASTRA_EMBEDDING_RUNTIME_DIR", str(worker.directory))
+    monkeypatch.setenv("ASTRA_CONTEXT_INDEX_EMBEDDING", "on")
+    client = runtime.SharedMlxBackend()
+    client.load()
+    restarts = []
+    monkeypatch.setattr(runtime, "ensure_runtime", lambda directory: restarts.append(directory) or worker.state)
+    monkeypatch.setattr(runtime, "idle_seconds", lambda: 0.2)
+    try:
+        client._last_demand = time.monotonic() - 1
+        client._wake.set()
+        until = time.monotonic() + 2
+        while client._state is not None and time.monotonic() < until:
+            time.sleep(0.01)
+        assert client._state is None and not restarts  # idle: no restart, model may unload
+        # A query finds it cold, keeps its lexical results, and wakes a background restart.
+        assert embedder.Embedder(client).encode(["query"]) is None
+        until = time.monotonic() + 2
+        while client._state is None and time.monotonic() < until:
+            time.sleep(0.01)
+        assert restarts and client._state == worker.state
+    finally:
+        client.close()
+
+
 def test_mlx_materializes_plain_numbers_with_single_text_batches_and_clears_scratch(monkeypatch):
     calls = []
 

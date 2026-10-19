@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, Iterable
 
 from .hooks import HookRegistry, HookReject
 from .memory_provider import MemoryProvider
-from .memory_records import MemoryRecord
 
 if TYPE_CHECKING:
     from .memory import MemoryStore
@@ -76,10 +75,8 @@ class MemoryRetainer:
                        for key in ("tool_name", "tool_call_id")) for row in rows)
 
     async def retain_turn(self, user_text: str, *, session_id: str, message_id: str,
-                          recalled: Iterable[MemoryRecord] = (),
                           tool_evidence: Iterable[ToolEvidence] = ()) -> RetentionOutcome:
-        # Neither user_text nor recalled memories are inputs to a semantic
-        # classifier. In particular, "remember", quotations and "change to"
+        # user_text is not an input to a semantic classifier. In particular, "remember", quotations and "change to"
         # must never authorize a background write or supersede operation.
         retained: list[str] = []
         outcome = RetentionOutcome(session_id, "skipped", "no opted-in tool evidence")

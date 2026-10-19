@@ -54,6 +54,10 @@ def run(coro):
     return asyncio.run(coro)
 
 
+# The first headless Chrome on a fresh runner is started once by conftest.
+pytestmark = pytest.mark.usefixtures("warm_native_chrome")
+
+
 async def _read_headless_output(read, process, stream, started, n=-1):
     if n != -1:
         return await read(n)

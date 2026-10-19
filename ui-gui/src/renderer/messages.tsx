@@ -28,7 +28,7 @@ export const MessageRow = memo(function MessageRow({ message: m, runtime, timeli
   return <article data-message-id={m.id} data-response-group-id={response.group?.id} data-response-pending={response.pending || undefined} className={`message ${m.role}${m.source_ref && openLog ? " has-source" : ""}${located ? " located-message" : ""}`}>
     {m.role === "reasoning" ? reasoning && <details className="reasoning" open={open} onToggle={toggle}><summary>{roles.reasoning}</summary><Markdown text={m.content} runtime={runtime} fail={fail}/></details> : m.role === "tool" ? <details className="command-result" open={open} onToggle={toggle}><summary>操作结果</summary><Markdown text={m.content} runtime={runtime} fail={fail}/></details> : <>
       <div className="message-head"><span>{roles[m.role === "user" || m.role === "assistant" || m.role === "error" ? m.role : "system"]}</span>{timeline && m.timestamp && <time>{new Date(m.timestamp * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>}</div>
-      <div className="message-body">{response.pending && !response.content ? <p className="response-pending-label" role="status"><span className="pulse"/>正在重新生成回复…</p> : <Markdown text={response.content} runtime={runtime} fail={fail}/>}</div>
+      <div className="message-body">{response.pending && !response.content ? <p className="response-pending-label" role="status"><span className="pulse"/>正在重新生成回复…</p> : <Markdown text={response.content} runtime={runtime} fail={fail} maskSecrets={m.role === "user"}/>}</div>
       {m.submissionState === "rejected" ? <p className="small error-text" role="status">未发送：{m.submissionError || "后端拒收；可检查并重新发送草稿。"}</p> : m.submissionState === "unknown" ? <p className="small muted" role="status">接收状态未知，请先确认后端状态，避免重复发送。</p> : m.pending && <span className="muted small">正在等待接收确认…</span>}
       <div className="message-actions"><CopyButton text={response.content} fail={fail}/>{!response.pending && openLog && m.source_ref && <button className="icon" aria-label="查看消息记录" title="查看已保存的会话记录" onClick={() => openLog(m.source_ref!)}><FileText size={14}/></button>}{response.target && responses && <button className="icon" aria-label="重新生成回复" title="重新生成这条回复；保留已有版本" disabled={responses.busy} onClick={() => responses.regenerate(response.target!.source_ref)}><RotateCcw size={14}/></button>}{response.group && responses && <ResponseVersionNav group={response.group} busy={responses.busy} select={responses.select}/>}</div>
     </>}
@@ -52,15 +52,22 @@ export const MessageList = memo(function MessageList({ messages: sourceMessages,
   const locatedSerial = useRef<number>();
   const anchor = useRef<{ id: string; offset: number }>();
   const restoredScroll = useRef<number>();
+  // Where the list was last seen: set by every scroll this list makes and every scroll event, never cleared.
+  const lastTop = useRef<number>();
   const layout = useRef({ messages, offsets });
   const rootTop = () => list.current && scroller.current ? list.current.getBoundingClientRect().top - scroller.current.getBoundingClientRect().top + scroller.current.scrollTop : 0;
   useLayoutEffect(() => {
     const el = scroller.current;
     if (!el || !el.clientHeight) return;
-    if (follow) { el.scrollTop = el.scrollHeight; restoredScroll.current = el.scrollTop; }
-    else if (anchor.current) {
+    if (follow) {
+      // A measurement can land between a user's scroll and its event, while following is still on. Keep pinning only
+      // from where the list was last seen or from near the bottom; the event then turns following off.
+      const moved = lastTop.current !== undefined && Math.abs(el.scrollTop - lastTop.current) > 1
+        && el.scrollHeight - el.scrollTop - el.clientHeight >= 120;
+      if (!moved) { el.scrollTop = el.scrollHeight; restoredScroll.current = lastTop.current = el.scrollTop; }
+    } else if (anchor.current) {
       const i = messages.findIndex(m => m.id === anchor.current!.id);
-      if (i >= 0) { el.scrollTop = rootTop() + offsets[i] + anchor.current.offset; restoredScroll.current = el.scrollTop; }
+      if (i >= 0) { el.scrollTop = rootTop() + offsets[i] + anchor.current.offset; restoredScroll.current = lastTop.current = el.scrollTop; }
     }
     layout.current = { messages, offsets };
     const update = () => {
@@ -79,7 +86,7 @@ export const MessageList = memo(function MessageList({ messages: sourceMessages,
     locatedSerial.current = locate.serial;
     anchor.current = { id: locate.id, offset: -16 };
     el.scrollTop = Math.max(0, rootTop() + offsets[index] - 16);
-    restoredScroll.current = el.scrollTop;
+    restoredScroll.current = lastTop.current = el.scrollTop;
     setViewport({ top: el.scrollTop - rootTop(), height: el.clientHeight });
   };
   useLayoutEffect(() => { locateInViewport.current(); }, [locate, messages, offsets]);
@@ -96,7 +103,7 @@ export const MessageList = memo(function MessageList({ messages: sourceMessages,
       if (capture) restoredScroll.current = undefined;
       setViewport(old => old.top === top && old.height === el.clientHeight ? old : { top, height: el.clientHeight });
     };
-    const scroll = () => update(true);
+    const scroll = () => { lastTop.current = el.scrollTop; update(true); };
     el.addEventListener("scroll", scroll, { passive: true });
     const observer = new ResizeObserver(() => { locateInViewport.current(); update(); }); observer.observe(el);
     return () => { el.removeEventListener("scroll", scroll); observer.disconnect(); };

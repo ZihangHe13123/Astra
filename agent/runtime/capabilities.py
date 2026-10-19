@@ -129,7 +129,7 @@ def build_runtime_capabilities(agent, sandbox=None, mcp_manager=None) -> Capabil
         report.add(
             "memory.recall_router",
             CapabilityState.AVAILABLE if router is not None else CapabilityState.UNSUPPORTED,
-            "Hindsight-only; query-driven; max_results=" + str(getattr(router, "recall_limit", "(unknown)"))
+            "automatic recall only through the Context Index; otherwise memory(action=search) on demand"
             if router is not None else "router is not initialized",
         )
         retainer = getattr(agent, "memory_retainer", None)
@@ -163,7 +163,7 @@ def build_runtime_capabilities(agent, sandbox=None, mcp_manager=None) -> Capabil
                 state,
                 health.detail,
                 (
-                    "automatic historical recall is unavailable; session_search remains explicit"
+                    "memory search lists Astra's own memories only; session_search remains available"
                     if state is CapabilityState.DEGRADED else ""
                 ,),
             )

@@ -1,16 +1,16 @@
 import asyncio
 import json
+import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from agent.runtime.hindsight_provider import HindsightMemoryProvider
 from agent.runtime.memory import MemoryStore
-from agent.runtime.memory_provider import (
-    BuiltinMemoryProvider,
-    FederatedMemoryProvider,
-)
+from agent.runtime.memory_provider import BuiltinMemoryProvider
 from agent.runtime.react import ReActAgent
+from agent.runtime.tools import memory as memory_tools
 from agent.runtime.tools.hindsight import register_hindsight_tools
+from agent.runtime.tools.memory import register_memory_tools
 from agent.runtime.tools.registry import ToolRegistry
 
 
@@ -96,75 +96,59 @@ def test_hindsight_provider_rejects_remote_url_without_explicit_opt_in():
     assert "local-first policy" in health.detail
 
 
-def test_federated_provider_preserves_builtin_when_external_fails(tmp_path):
+def _search_with(store, provider, query):
+    tools = ToolRegistry()
+    register_memory_tools(tools, store, session_id=lambda: "s", workspace_key=lambda: "repo",
+                          external=lambda: provider)
+    result = asyncio.run(tools.execute("memory", {"action": "search", "query": query}))
+    assert result["error"] == ""
+    return result["output"]
+
+
+def test_memory_search_keeps_builtin_results_when_hindsight_fails_or_is_slow(tmp_path, monkeypatch):
+    monkeypatch.setattr(memory_tools, "_SEARCH_EXTERNAL_SECONDS", 0.05)
     store = MemoryStore(tmp_path / "memory.db", core_dir=tmp_path / "memory")
-    expected = store.add_record(
-        kind="preference",
-        content="User prefers concise answers",
-        source_session_id="session-a",
-    )
+    store.add_record(kind="preference", content="User prefers concise answers", source_session_id="session-a")
 
     class FailingExternal(HindsightMemoryProvider):
         async def recall(self, query, *, kinds=(), limit=8):
             raise TimeoutError("offline")
 
-    external = FailingExternal(
-        base_url="http://127.0.0.1:8888",
-        bank_id="main-v2",
-        client=FakeRecallClient(),
-    )
-    provider = FederatedMemoryProvider(BuiltinMemoryProvider(store), external)
+    class SlowExternal(HindsightMemoryProvider):
+        async def recall(self, query, *, kinds=(), limit=8):
+            await asyncio.sleep(10)
+            return []
 
-    records = asyncio.run(provider.recall("concise answers", limit=4))
+    for external in (FailingExternal, SlowExternal):
+        provider = external(base_url="http://127.0.0.1:8888", bank_id="main-v2", client=FakeRecallClient())
+        started = time.monotonic()
+        output = _search_with(store, provider, "concise answers")
+        assert time.monotonic() - started < 1
+        assert "User prefers concise answers" in output
+        assert "Hindsight did not answer (TimeoutError" in output
 
-    assert [record.record_id for record in records] == [expected.record_id]
-    assert "TimeoutError" in provider.last_external_error
 
-
-def test_federated_provider_keeps_builtin_first_and_deduplicates(tmp_path):
+def test_memory_search_lists_builtin_first_and_drops_hindsight_repeats(tmp_path):
     store = MemoryStore(tmp_path / "memory.db", core_dir=tmp_path / "memory")
-    builtin = store.add_record(
-        kind="user_fact",
-        content="Test user lives in Example City",
-        source_session_id="session-a",
-    )
+    store.add_record(kind="user_fact", content="Test user lives in Example City", source_session_id="session-a")
     client = FakeRecallClient([
-        SimpleNamespace(
-            id="duplicate",
-            text="Test user lives in Example City",
-            type="observation",
-            occurred_start=None,
-            mentioned_at=None,
-            document_id="old",
-            metadata={},
-            tags=[],
-        ),
-        SimpleNamespace(
-            id="extra",
-            text="Test user previously discussed opening a library account",
-            type="observation",
-            occurred_start=None,
-            mentioned_at=None,
-            document_id="old",
-            metadata={},
-            tags=[],
-        ),
+        SimpleNamespace(id="duplicate", text="Test user lives in Example City", type="observation",
+                        occurred_start=None, mentioned_at=None, document_id="old", metadata={}, tags=[]),
+        SimpleNamespace(id="extra", text="Test user previously discussed opening a library account",
+                        type="observation", occurred_start="2026-05-02T00:00:00Z", mentioned_at=None,
+                        document_id="old", metadata={}, tags=[]),
     ])
-    external = HindsightMemoryProvider(
-        base_url="http://127.0.0.1:8888",
-        bank_id="main-v2",
-        client=client,
-    )
-    provider = FederatedMemoryProvider(BuiltinMemoryProvider(store), external)
+    provider = HindsightMemoryProvider(base_url="http://127.0.0.1:8888", bank_id="main-v2", client=client)
 
-    records = asyncio.run(provider.recall("Example City account", limit=4))
+    output = _search_with(store, provider, "Example City account")
 
-    assert records[0].record_id == builtin.record_id
-    assert [record.content for record in records].count("Test user lives in Example City") == 1
-    assert any(record.record_id == "hs-extra" for record in records)
+    assert output.count("Test user lives in Example City") == 1
+    assert output.index("Test user lives in Example City") < output.index("Hindsight (historical, non-authoritative")
+    assert "- 2026-05-02 [observation] Test user previously discussed opening a library account" in output
+    assert client.calls[0]["query"] == "Example City account"
 
 
-def test_react_federates_builtin_authority_with_optional_hindsight(tmp_path, monkeypatch):
+def test_react_keeps_builtin_authority_and_offers_optional_hindsight(tmp_path, monkeypatch):
     monkeypatch.setenv("HINDSIGHT_ENABLED", "1")
     monkeypatch.setenv("HINDSIGHT_API_URL", "http://127.0.0.1:8888")
     monkeypatch.setenv("HINDSIGHT_BANK_ID", "main-v2")
@@ -185,54 +169,16 @@ def test_react_federates_builtin_authority_with_optional_hindsight(tmp_path, mon
         memory_store=store,
     )
 
-    router = agent.memory_router
-    assert router is not None
-    assert isinstance(router.provider, FederatedMemoryProvider)
-    assert isinstance(router.provider.authority, BuiltinMemoryProvider)
-    assert agent.external_memory_provider is router.provider.external
-    assert router.recall_timeout == 2.5
-    assert {
-        "hindsight_retain",
-        "hindsight_recall",
-        "hindsight_reflect",
-    }.issubset(set(tools.tool_names))
-    assert router.provider.capabilities.reflect is True
+    assert isinstance(agent.external_memory_provider, HindsightMemoryProvider)
+    assert {"hindsight_retain", "hindsight_reflect"}.issubset(set(tools.tool_names))
+    # Hindsight is searched through memory(action="search"), not a tool of its own.
+    assert "hindsight_recall" not in tools.tool_names
     assert agent.memory_retainer is not None
-    assert agent.memory_retainer.provider is router.provider.authority
+    # What Astra saves goes to its own store; Hindsight stays an extra, non-authoritative source.
+    assert isinstance(agent.memory_retainer.provider, BuiltinMemoryProvider)
 
 
-def test_hindsight_tool_labels_results_as_non_authoritative():
-    client = FakeRecallClient([
-        SimpleNamespace(
-            id="history",
-            text="A historical preference",
-            type="observation",
-            occurred_start=None,
-            mentioned_at=None,
-            document_id="old",
-            metadata={},
-            tags=[],
-        )
-    ])
-    provider = HindsightMemoryProvider(
-        base_url="http://127.0.0.1:8888",
-        bank_id="main-v2",
-        client=client,
-    )
-    tools = ToolRegistry()
-    register_hindsight_tools(tools, provider)
-
-    result = asyncio.run(tools.execute(
-        "hindsight_recall",
-        {"query": "preference", "limit": 2},
-    ))
-
-    assert result["error"] == ""
-    assert "historical, non-authoritative" in result["output"]
-    assert "A historical preference" in result["output"]
-
-
-def test_hindsight_recall_shows_a_memory_date_only_when_hindsight_has_one():
+def test_memory_search_shows_a_hindsight_date_only_when_hindsight_has_one(tmp_path):
     def memory(identifier, text, occurred):
         return SimpleNamespace(id=identifier, text=text, type="observation", occurred_start=occurred,
                                mentioned_at=None, document_id="doc", metadata={}, tags=[])
@@ -242,14 +188,14 @@ def test_hindsight_recall_shows_a_memory_date_only_when_hindsight_has_one():
         memory("undated", "Prefers short summaries", None),
     ])
     provider = HindsightMemoryProvider(base_url="http://127.0.0.1:8888", bank_id="main-v2", client=client)
-    tools = ToolRegistry()
-    register_hindsight_tools(tools, provider)
+    store = MemoryStore(tmp_path / "memory.db", core_dir=tmp_path / "memory")
 
-    result = asyncio.run(tools.execute("hindsight_recall", {"query": "setup"}))
+    output = _search_with(store, provider, "NAS rack setup")
 
-    dated, undated = result["output"].splitlines()[1:]
-    assert dated == "1. [observation] (2026-03-04) Moved the NAS to the new rack"
-    assert undated == "2. [observation] Prefers short summaries"
+    assert output.splitlines()[-2:] == [
+        "- 2026-03-04 [observation] Moved the NAS to the new rack",
+        "- [observation] Prefers short summaries",
+    ]
 
 
 def test_hindsight_provider_keeps_an_undated_memory_undated():
@@ -277,7 +223,7 @@ def test_hindsight_provider_keeps_an_undated_memory_undated():
     assert records["undated"].to_dict()["created_at"] == ""
 
 
-def test_hindsight_recall_keeps_the_date_of_a_memory_dated_during_the_call():
+def test_memory_search_keeps_the_date_of_a_hindsight_memory_dated_during_the_call(tmp_path):
     class JustRecordedClient(FakeRecallClient):
         stamp = ""
 
@@ -291,34 +237,27 @@ def test_hindsight_recall_keeps_the_date_of_a_memory_dated_during_the_call():
 
     client = JustRecordedClient()
     provider = HindsightMemoryProvider(base_url="http://127.0.0.1:8888", bank_id="main-v2", client=client)
-    tools = ToolRegistry()
-    register_hindsight_tools(tools, provider)
+    store = MemoryStore(tmp_path / "memory.db", core_dir=tmp_path / "memory")
 
-    result = asyncio.run(tools.execute("hindsight_recall", {"query": "deploy"}))
+    output = _search_with(store, provider, "deploy build")
 
     # A date inside the call's own start and end used to be taken for a missing one and dropped.
-    assert result["output"].splitlines()[1] == f"1. [observation] ({client.stamp[:10]}) Deployed build 41"
+    assert output.splitlines()[-1] == f"- {client.stamp[:10]} [observation] Deployed build 41"
 
 
 def test_hindsight_failures_are_real_failures_and_a_retry_is_not_served_from_cache():
     class DownClient(FakeRecallClient):
         down = True
 
-        async def arecall(self, **kwargs):
-            if self.down:
-                raise ConnectionError("connection refused")
-            return await super().arecall(**kwargs)
-
         async def areflect(self, **kwargs):
-            raise TimeoutError()
+            if self.down:
+                raise TimeoutError()
+            return await super().areflect(**kwargs)
 
         async def aretain(self, **kwargs):
             raise ConnectionError("connection reset")
 
-    client = DownClient([SimpleNamespace(
-        id="m", text="Back again", type="observation", occurred_start=None, mentioned_at=None,
-        document_id="doc", metadata={}, tags=[],
-    )])
+    client = DownClient(reflect_text="Back again")
     provider = HindsightMemoryProvider(base_url="http://127.0.0.1:8888", bank_id="main-v2", client=client)
     tools = ToolRegistry()
     register_hindsight_tools(tools, provider)
@@ -326,12 +265,9 @@ def test_hindsight_failures_are_real_failures_and_a_retry_is_not_served_from_cac
     def call(name, **arguments):
         return asyncio.run(tools.execute(name, arguments))
 
-    recall = call("hindsight_recall", query="anything")
-    assert recall["output"] == "" and recall["code"] == "hindsight_error"
-    assert "connection refused" in recall["error"] and "session_search" in recall["recovery_hint"]
-
     reflect = call("hindsight_reflect", query="anything")
-    assert reflect["code"] == "hindsight_timeout" and "did not answer in time" in reflect["error"]
+    assert reflect["output"] == "" and reflect["code"] == "hindsight_timeout"
+    assert "did not answer in time" in reflect["error"] and "session_search" in reflect["recovery_hint"]
 
     retain = call("hindsight_retain", content="A fact")
     assert retain["code"] == "hindsight_error"
@@ -339,23 +275,22 @@ def test_hindsight_failures_are_real_failures_and_a_retry_is_not_served_from_cac
     blank = call("hindsight_retain", content="   ")
     assert blank["code"] == "invalid_arguments" and "non-empty content" in blank["error"]
 
-    # In a turn, an identical recall after the service is back runs again: a returned
+    # In a turn, an identical reflect after the service is back runs again: a returned
     # error string used to be cached as a result and replayed.
-    client.down = True
     agent = ReActAgent("test", SimpleNamespace(), tools)
     turn_cache: dict[str, dict] = {}
 
-    def recall_in_turn(call_id):
+    def reflect_in_turn(call_id):
         async def scenario():
             event, = await agent._execute_tool_calls([{
-                "id": call_id, "name": "hindsight_recall", "arguments": json.dumps({"query": "anything"}),
+                "id": call_id, "name": "hindsight_reflect", "arguments": json.dumps({"query": "anything"}),
             }], turn_cache)
             return event
         return asyncio.run(scenario())
 
-    assert recall_in_turn("first")["code"] == "hindsight_error"
+    assert reflect_in_turn("first")["code"] == "hindsight_timeout"
     client.down = False
-    again = recall_in_turn("second")
+    again = reflect_in_turn("second")
     assert not again["error"] and not again.get("cached") and "Back again" in again["output"]
 
 
@@ -366,7 +301,7 @@ def test_hindsight_descriptions_state_the_per_turn_limit_and_what_tags_do():
     tools = ToolRegistry()
     register_hindsight_tools(tools, provider)
 
-    for name in ("hindsight_retain", "hindsight_recall", "hindsight_reflect"):
+    for name in ("hindsight_retain", "hindsight_reflect"):
         tool = tools.get(name)
         assert f"At most {tool.max_calls_per_turn} calls per turn" in tool.description
         assert "is not run" in tool.description
@@ -375,7 +310,7 @@ def test_hindsight_descriptions_state_the_per_turn_limit_and_what_tags_do():
     assert properties["context"]["description"] and properties["content"]["description"]
 
 
-def test_hindsight_registers_native_retain_recall_and_reflect_tools():
+def test_hindsight_registers_native_retain_and_reflect_tools():
     client = FakeRecallClient()
     provider = HindsightMemoryProvider(
         base_url="http://127.0.0.1:8888",
@@ -385,11 +320,8 @@ def test_hindsight_registers_native_retain_recall_and_reflect_tools():
     tools = ToolRegistry()
     register_hindsight_tools(tools, provider)
 
-    assert {
-        "hindsight_retain",
-        "hindsight_recall",
-        "hindsight_reflect",
-    }.issubset(set(tools.tool_names))
+    assert {"hindsight_retain", "hindsight_reflect"} == {
+        name for name in tools.tool_names if name.startswith("hindsight_")}
 
     retained = asyncio.run(tools.execute(
         "hindsight_retain",

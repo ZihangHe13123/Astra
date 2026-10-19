@@ -392,7 +392,7 @@ G0 还要从实际解析器和动态配置提取完整参数、别名与有效�
 | F13 | `/mode` | 输入框推理强度选择器；可用值及实际生效情况由后端提供 | G2 |
 | F14 | `/connect` | 账号/模型设置；OAuth、API Key、环境变量、分区与独立计费路线 | G2 |
 | F15 | `/persona` | 人格选择器，依据当前发行版与用户配置动态列出 | G5 |
-| F16 | `/search` | 工具设置选择 auto/exa/searxng 等后端支持的搜索来源 | G5 |
+| F16 | `/search` | 工具设置选择 auto/exa/searxng/deepseek 等后端支持的搜索来源 | G5 |
 | F17 | `/tool` | 最新或编号工具结果详情；全文、截断、附件、错误及耗时 | G3 |
 | F18 | `/gallery` | 搜索图片画廊；编号、来源、预览及失败状态 | G4 |
 | F19 | `/memory` | 记忆页：review/status/remember/remember-user/working/inspect/timeline/why/correct/forget/import-core/validate-core/clear-working | G5 |

@@ -50,9 +50,26 @@ cp config/channels.example.json .astra/channels.json
 
 2280 端口只能有一个服务占用，启用前先停用或改配 AstrBot。适配器启动失败会报告但不关闭 TUI；后端退出时关闭全部适配器。消息渠道中需要交互授权的操作会被拒绝，不等待不可见提示。
 
-QQ 图片经公开 URL 检查与大小限制后下载，再作为原生多模态内容传给视觉模型。发本地文件需启用 `send_files_enabled`、用 `file_allow_users`（或 `allow_users`）列出可信 QQ ID，并把 `send_file_roots` 限定为可分享的输出目录。`channel_send_file` 拒绝越界路径和常见凭据文件。
+QQ 图片经公开 URL 检查与大小限制后下载，再作为原生多模态内容传给视觉模型。发本地文件需启用 `send_files_enabled`、用 `file_allow_users`（或 `allow_users`）列出可信 QQ ID，并把 `send_file_roots` 限定为可分享的输出目录。`channel_send_file` 拒绝越界路径、隐藏文件和目录、应用数据和常见凭据文件。
 
-渠道接口不绑定特定协议，将来可接入 Weixin iLink 而不改 Agent 路由和隔离；当前仅实现 QQ/OneBot，不接管已有 Hermes 微信登录。
+### 微信
+
+微信走腾讯官方的 iLink Bot API：用微信扫一次二维码登录，之后通过 HTTPS 长轮询收消息。不操作微信桌面客户端，也不需要屏幕，所以息屏、锁屏时照样回复，只要电脑不睡眠。
+
+运行 `/weixin login`（或桌面端 设置 → 微信 → 扫码登录），用微信扫码。终端按深色背景画出二维码，桌面端显示为图片。显示二维码需要 `segno`（`pip install 'segno>=1.6,<2'`，或安装 `weixin` 可选依赖，它同时带上读取图片要用的 `cryptography`）。登录成功会在 `.astra/channels.json` 里设置 `weixin.enabled`，之后用 `/weixin status`、`/weixin off`、`/weixin on`、`/weixin logout`、`/weixin model` 管理。
+
+- **回复谁**：只回复扫码登录的那个微信号；`weixin.allow_users` 可以再列出其他人。群消息忽略。
+- **只有一个在收**：每个 Astra 后端都可以运行这个渠道，但同一时间只有一个在长轮询，其他的待命，它退出后自动接手。
+- **睡眠**：正在收消息的后端会阻止电脑空闲睡眠：macOS 用 `caffeinate -i`（后端退出即释放），Windows 设置执行状态，Linux 用 `systemd-inhibit`。显示器照常关闭。MacBook 合盖仍会睡眠，除非接着电源和外接显示器。不想管睡眠就把 `weixin.keep_awake` 设为 `false`。
+- **能收到什么**：文字、引用、微信对语音的转写，以及最多 `max_images` 张图片（从微信 CDN 下载后解密）。文件和视频只收到一个占位说明。
+- **怎么回**：微信会话会被告知按聊天的方式说话：简短、口语、不用 Markdown、一条说一件事。回复像人发微信那样拆成几条短消息依次发出（最多 `max_bubbles` 条；`chat_bubbles: false` 则整段发送，只在超过 `max_output_chars` 时分段），每条之间稍作停顿；从收到消息到最后一条回复发出，微信里一直显示"对方正在输入"。人格可以有一个微信版，专门为聊天写（靠语气，不描写动作）；有的话，微信对话就用这个版本代替人格本身，它不会作为单独的人格出现在选择里。之前用别的人格的微信对话，下次打开时切换过来，系统提示词只重建这一次。
+- **用哪个模型**：微信默认跟随默认模型，也就是任意窗口里最近一次用 `/model` 选的那个，每条消息都重新读取。`/weixin model <键>`（`/model` 里的键，比如 `deepseek::deepseek-flash`；或桌面端 设置 → 微信 → 回复用的模型）给微信单独指定模型，不影响任何窗口；`/weixin model default` 改回跟随默认，`/weixin model` 查看当前设置。配置项是 `weixin.model`，下一条消息起生效；指定的模型已不在模型列表里或缺少密钥时，回退到默认模型。
+- **批准**：需要批准的操作（在这台电脑上运行命令、写工作区外的文件等）会发到微信，写明要做什么（密钥会遮住），等你回复：“同意”执行一次，“拒绝”不执行。只有发起这轮对话的人能回复，只在有请求等待时才算数，而且整条消息只能是一个简短的同意或拒绝（如“同意”“可以”“好”，“拒绝”“不行”“取消”），其他内容照常当聊天。五分钟没回复按“拒绝”处理，并告诉你这一步没有执行。开着的桌面窗口里也会显示这条请求，那边先批也行。其他渠道同样有五分钟时限，只是不在聊天里提示，所以没人看得到的请求不会一直卡住渠道。
+- **发文件**：你要的时候，Astra 用 `channel_send_file` 发本地文件：图片和视频按图片、视频发，其他按文件发。只发给扫码的人（或 `weixin.file_allow_users` 列出的人），只从 `weixin.send_file_roots`（默认是用户主目录）里取，不超过 `max_send_file_bytes`；隐藏文件和目录（包括 Astra 自己的 `.astra`）、应用数据（`Library`、`AppData`）和凭据文件一律拒绝。`send_files_enabled: false` 可以关掉。
+- **语音**：你让 Astra 说话时，它用 `channel_send_file` 的 `speak` 代替 `path`：用朗读功能配置的声音（见[语音](voice.md)）念出来，作为音频文件发送，手机上点一下就能听（macOS 上是 M4A，其他平台是 WAV），可以再配几句短文字。iLink 收下 bot 的原生语音消息却不会投递，所以微信里显示的是文件，不是语音条。
+- **隐私**：bot token 存在状态目录的 `channels/weixin/account.json`，只有本人可读，不出现在事件和日志里。另一个程序（比如 Hermes）若用同一个登录长轮询，会抢消息，请分开登录。
+
+协议细节参考 Hermes Agent 的适配器（MIT 许可，Nous Research）。
 
 <a id="mcp"></a>
 
@@ -81,11 +98,13 @@ MCP 派发后的失败会区分读取与动作：可能有副作用的调用在�
 
 ## 网页搜索
 
-`search_web` 支持 `provider=auto|exa|searxng`。`/search` 查看默认值，`/search auto|exa|searxng` 持久切换。auto 对新闻、研究、模型发布和基准问题优先 Exa，普通问题先用 SearXNG；翻页（page 大于 1）、指定 `engine`、science/news 以外的类别只有 SearXNG 支持，auto 会把这类调用交给 SearXNG，由 Exa 返回的结果会注明未生效的参数。SearXNG 每个站点最多列 2 条，查询含 `site:` 时不限。结果为空或失败时，同一次工具调用内相互回退。不设固定每轮搜索次数，但重复调用和 ReAct 上限仍防止无限循环。不使用 DuckDuckGo。
+`search_web` 支持 `provider=auto|exa|searxng|deepseek`。`/search` 查看默认值，`/search auto|exa|searxng|deepseek` 持久切换。auto 对新闻、研究、模型发布和基准问题优先 Exa，普通问题先用 SearXNG；翻页（page 大于 1）、指定 `engine`、science/news 以外的类别只有 SearXNG 支持，auto 会把这类调用交给 SearXNG，由 Exa 返回的结果会注明未生效的参数。SearXNG 每个站点最多列 2 条，查询含 `site:` 时不限。结果为空或失败时，同一次工具调用内相互回退。不设固定每轮搜索次数，但重复调用和 ReAct 上限仍防止无限循环。不使用 DuckDuckGo。
 
 直接配置 `EXA_API_KEY`，或用 `EXA_ENV_FILE` 指向另一份包含该 Key 的 dotenv，以复用凭据而不复制。`/doctor` 只报告是否配置和来源，不打印密钥。
 
-`web_extract` 有独立回退顺序。`WEB_EXTRACT_PROVIDER=auto` 依次尝试已配置的 `Tavily -> Exa -> Parallel`，再到本地/云 Firecrawl，最后 HTTP 与正文 HTML-to-Markdown 提取。逐 URL 回退，成功页面不重复获取。单次工具 `provider` 或 `WEB_EXTRACT_PROVIDER=tavily|exa|parallel|firecrawl|http` 可明确首选。超过 15,000 字符时返回 75/25 首尾窗口，完整 Markdown 保存到 `.astra/cache/web`。
+DeepSeek Search 与 Fetch API 是可选项，不会被自动选择：`auto` 既不用 DeepSeek 搜索也不用它提取。用 `provider=deepseek`、`/search deepseek` 或 `WEB_SEARCH_PROVIDER=deepseek` 选择它搜索；它从环境变量或 `.env` 读取 `DEEPSEEK_API_KEY`（只粘贴在 `/connect` 里的 Key 不会被使用），只发送查询和结果数（`max_results`，1–50）。查询最长 128 个字符，支持 DeepSeek 的运算符：`site:`（多个用 `OR` 连接）、`-site:`、`-词`、`"精确短语"`、`-"短语"`、`lang:zh,en`，以及带年份或日期的 `after:`/`before:`。翻页、引擎、类别、语言和内联正文在这条路线上不生效，结果会注明。每条结果给出 DeepSeek 面向模型阅读的 summary（没有时用简短 snippet），有日期和站点名时一并列出。Astra 不发送可选的 `ori_question`（用户原问题）和 `localization`（IP 地址），查询以外的文本不会到达该服务；以后可作为显式选项再加。请求发往 `DEEPSEEK_TOOLS_URL`（默认 `https://api.deepseek.com/v1/tools`；搜索超时 `DEEPSEEK_SEARCH_TIMEOUT`，15 秒），不跟随重定向；HTTP 408、429、5xx 稍等后重试一次，超时只报告不重发。Key 被拒（401）、余额不足（402）和限流（429；每账号每秒 5 次，Fetch 还按目标域名限制）会在失败信息中写明。DeepSeek 自 2026-11-01（北京时间）起对两个 API 各按每 1,000 次成功请求 5 元计费。`/doctor` 和 `search_status` 只报告是否配置了 Key，不调用该服务。
+
+`web_extract` 有独立回退顺序。`WEB_EXTRACT_PROVIDER=auto` 依次尝试已配置的 `Tavily -> Exa -> Parallel`，再到本地/云 Firecrawl，最后 HTTP 与正文 HTML-to-Markdown 提取。逐 URL 回退，成功页面不重复获取。单次工具 `provider` 或 `WEB_EXTRACT_PROVIDER=tavily|exa|parallel|firecrawl|http` 可明确首选。DeepSeek Fetch 只在同样明确指定（`provider=deepseek` 或 `WEB_EXTRACT_PROVIDER=deepseek`）时使用：先试它，读不到的页面再按常规顺序回退。它返回 Markdown 但不报告最终 URL，结果保留请求的 URL。超过 15,000 字符时返回 75/25 首尾窗口，完整 Markdown 保存到 `.astra/cache/web`。
 
 浏览器提取器优先使用 `BROWSER_EXTRACT_ARGV` JSON 数组，将可执行文件和固定参数分开，例如 `["C:\\Program Files\\Browser Extract\\extract.exe","--render"]`。兼容 Shell 字符串时 `BROWSER_EXTRACT_CMD` 优先于 `WSL_EXTRACT_CMD`，旧变量在所有平台仍作为回退。
 

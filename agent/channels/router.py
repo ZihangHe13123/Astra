@@ -7,13 +7,18 @@ import contextvars
 import hashlib
 import logging
 from collections.abc import Callable
+from dataclasses import replace
+from typing import Any
 from pathlib import Path
 
 from agent.core.msg import ContentBlock, Msg
+from agent.runtime.prompt_budget import prompt_token_budget
+from agent.runtime.prompts import channel_prompt_profile
 from agent.runtime.context import AgentContext
 from agent.runtime.context_compressor import ContextCompressor
 
 from .base import ChannelMessage, ReplySink
+from .weixin import CHAT_STYLE as WEIXIN_CHAT_STYLE
 
 
 logger = logging.getLogger(__name__)
@@ -24,6 +29,15 @@ active_channel: contextvars.ContextVar[str] = contextvars.ContextVar(
 active_channel_message: contextvars.ContextVar[ChannelMessage | None] = (
     contextvars.ContextVar("astra_active_channel_message", default=None)
 )
+# What a channel turn sent besides text ("file", "voice"). A list the turn's tools append to,
+# since a tool may run in a task of its own, where setting a variable would not reach the turn.
+channel_turn_media: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "astra_channel_turn_media", default=None,
+)
+
+
+# How to talk on a channel, added to the system prompt of its conversations only.
+CHANNEL_STYLES = {"weixin": WEIXIN_CHAT_STYLE}
 
 
 def channel_session_name(message: ChannelMessage) -> str:
@@ -37,15 +51,27 @@ class AgentChannelRouter:
     """Serialize use of a stateful ReActAgent and park one context per chat."""
 
     def __init__(self, agent, turn_lock: asyncio.Lock, session_root: Path,
-                 *, admission: Callable[[], bool] | None = None):
+                 *, admission: Callable[[], bool] | None = None,
+                 model_for: Callable[[str], Any] | None = None):
         self.agent = agent
         self.turn_lock = turn_lock
         self.session_root = Path(session_root)
         self.admission = admission or (lambda: True)
+        # A channel's own model client, or None to answer with the agent's.
+        self.model_for = model_for or (lambda channel: None)
         self._contexts: dict[str, AgentContext] = {}
         self._template = agent.context
 
-    def _context(self, session_name: str) -> AgentContext:
+    def _budget(self, llm) -> int:
+        """Compact a channel conversation for the model answering it: its own, or the window's."""
+        config = getattr(llm, "config", None)
+        limit = getattr(config, "context_limit", None)
+        if config is None or not limit:
+            return self._template.max_prompt_tokens
+        return prompt_token_budget(limit, config.max_tokens, model=config.model, provider=config.provider,
+                                   auto_compact_token_limit=config.auto_compact_token_limit)
+
+    def _context(self, session_name: str, channel: str = "") -> AgentContext:
         cached = self._contexts.get(session_name)
         if cached is not None:
             return cached
@@ -62,13 +88,30 @@ class AgentChannelRouter:
         context.persona_active_mode = template.persona_active_mode
         context.persona_relationship_context = template.persona_relationship_context
         context.persona_affect = template.persona_affect
-        context.set_stable_system_suffix(getattr(template, "_stable_system_suffix", ""))
+        suffix = getattr(template, "_stable_system_suffix", "")
+        style = CHANNEL_STYLES.get(channel, "")
+        context.set_stable_system_suffix(f"{suffix}\n\n{style}".strip() if style else suffix)
         context.set_tools_token_cost(getattr(template, "_tools_token_cost", 0))
         context.compressor = ContextCompressor(self.agent.llm)
         context.set_session(str(self.session_root / f"{session_name}.json"))
         context.load()
+        self._use_channel_persona(context, channel)
         self._contexts[session_name] = context
         return context
+
+    def _use_channel_persona(self, context: AgentContext, channel: str) -> None:
+        """A channel's own version of the selected persona, when there is one (WeChat: tone, no actions).
+
+        A conversation still on another persona switches when it is opened: its system prompt is
+        rebuilt once and later turns keep that prefix. One already on the version is left as it is.
+        """
+        template = self._template
+        profile = channel_prompt_profile(template.persona_id, channel)
+        if profile is None or (context.persona_id, context.persona_definition_version) == (profile.name, profile.version):
+            return
+        state = replace(profile.default_state(), relationship_context=template.persona_relationship_context,
+                        affect=template.persona_affect)
+        context.set_persona(state, profile.system_prompt(state))
 
     async def handle(
         self,
@@ -82,10 +125,19 @@ class AgentChannelRouter:
             if not self.admission():
                 return "Astra is preparing a restart. Please retry after it reconnects."
             previous = self.agent.context
-            context = self._context(session_name)
+            previous_llm = self.agent.llm
+            context = self._context(session_name, message.channel)
             self.agent.context = context
+            llm = self.model_for(message.channel)
+            if llm is not None:
+                self.agent.llm = llm
+            context.max_prompt_tokens = self._budget(llm)
+            if context.compressor is not None:
+                context.compressor.llm = self.agent.llm
             token = active_channel.set(message.channel)
             message_token = active_channel_message.set(message)
+            media: list[str] = []
+            media_token = channel_turn_media.set(media)
             try:
                 content = message.text
                 if message.is_group and message.sender_name:
@@ -132,9 +184,12 @@ class AgentChannelRouter:
                         phase_chunks.append(chunk)
                 await flush_phase()
                 context.save()
-                response = "".join(chunks).strip() or "(no response)"
+                # A turn that answered with a voice note or a file alone has said what it had to.
+                response = "".join(chunks).strip() or ("" if media else "(no response)")
                 return "" if reply_sink is not None and chunks else response
             finally:
+                channel_turn_media.reset(media_token)
                 active_channel_message.reset(message_token)
                 active_channel.reset(token)
                 self.agent.context = previous
+                self.agent.llm = previous_llm

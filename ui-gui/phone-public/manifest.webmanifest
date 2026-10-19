@@ -1,0 +1,15 @@
+{
+  "name": "Astra",
+  "short_name": "Astra",
+  "description": "Mac 上的 Astra，随身查看",
+  "lang": "zh-CN",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#18181b",
+  "theme_color": "#18181b",
+  "icons": [
+    { "src": "phone/icon-180.png", "sizes": "180x180", "type": "image/png" },
+    { "src": "phone/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }
+  ]
+}

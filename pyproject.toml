@@ -45,6 +45,7 @@ tracing = [
 ]
 embedding = ["mlx-embeddings>=0.1,<0.2; sys_platform == 'darwin'", "numpy>=1.26"]
 voice = ["sounddevice>=0.5,<0.6"]
+weixin = ["segno>=1.6,<2", "cryptography>=42"]
 dev = ["pytest==9.1.1", "ruff==0.16.4", "pyright==1.1.411", "pypdf>=5", "numpy>=1.26", "pydantic>=2,<3"]
 
 [project.scripts]

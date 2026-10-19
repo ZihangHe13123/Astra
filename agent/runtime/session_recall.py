@@ -21,6 +21,7 @@ import re
 import sqlite3
 import tempfile
 import time
+import unicodedata
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +46,34 @@ CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
     INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
 END;
 """
+# Two-character Chinese words (牙医, 车位) are shorter than a trigram, so
+# messages_fts cannot find them. messages_cjk holds each message's distinct CJK
+# character pairs. Python writes it in the same transaction as the message and
+# records the highest indexed id; readers scan only messages past that id.
+# Pure-SQL triggers keep deletes and edits exact for writers without this code.
+CJK_PAIRS_TABLE = "messages_cjk"
+CJK_PAIRS_THROUGH = "cjk_pairs_through"
+_CJK_RUN = re.compile(r"[\u3400-\u9fff]{2,}")
+_CJK_PAIRS_TRIGGERS_SQL = """
+CREATE TRIGGER IF NOT EXISTS messages_cjk_ad AFTER DELETE ON messages BEGIN
+    DELETE FROM messages_cjk WHERE rowid = old.id;
+END;
+CREATE TRIGGER IF NOT EXISTS messages_cjk_au AFTER UPDATE OF content ON messages BEGIN
+    DELETE FROM messages_cjk WHERE rowid = old.id;
+    UPDATE recall_meta SET value = CAST(min(CAST(value AS INTEGER), old.id - 1) AS TEXT)
+    WHERE key = 'cjk_pairs_through';
+END;
+"""
+
+
+def cjk_pairs(text: str) -> str:
+    """Distinct overlapping CJK character pairs, space-separated for unicode61."""
+    value = unicodedata.normalize("NFKC", str(text or "")).casefold()
+    return " ".join(dict.fromkeys(
+        run[index:index + 2] for run in _CJK_RUN.findall(value) for index in range(len(run) - 1)
+    ))
+
+
 _DROP_FTS_TRIGGERS_SQL = """
 DROP TRIGGER IF EXISTS messages_ai;
 DROP TRIGGER IF EXISTS messages_ad;
@@ -292,6 +321,79 @@ class SessionRecall:
             "ON sessions(source_session_key) WHERE source_session_key IS NOT NULL"
         )
         conn.commit()
+        if self._ensure_cjk_pairs(conn):
+            # A first build after upgrade is bounded; later messages finish it.
+            deadline = time.perf_counter() + 0.5
+            while self._index_cjk_pairs(conn, 2000) and time.perf_counter() < deadline:
+                pass
+
+    @staticmethod
+    def _ensure_cjk_pairs(conn: sqlite3.Connection) -> bool:
+        try:
+            if conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (CJK_PAIRS_TABLE,)
+            ).fetchone() is None:
+                try:
+                    conn.execute(
+                        f"CREATE VIRTUAL TABLE {CJK_PAIRS_TABLE} USING fts5("
+                        "grams, content='', contentless_delete=1, tokenize='unicode61')"
+                    )
+                except sqlite3.OperationalError:
+                    # SQLite before 3.43 cannot delete from a contentless table.
+                    conn.execute(
+                        f"CREATE VIRTUAL TABLE {CJK_PAIRS_TABLE} USING fts5("
+                        "grams, detail=none, tokenize='unicode61')"
+                    )
+                conn.execute(
+                    "INSERT INTO recall_meta(key, value) VALUES(?, '0') "
+                    "ON CONFLICT(key) DO UPDATE SET value='0'",
+                    (CJK_PAIRS_THROUGH,),
+                )
+            conn.executescript(_CJK_PAIRS_TRIGGERS_SQL)
+            return True
+        except sqlite3.DatabaseError as exc:
+            conn.rollback()
+            logger.warning("Session Recall short-word index unavailable: %s", exc)
+            return False
+
+    @staticmethod
+    def _index_cjk_pairs(conn: sqlite3.Connection, limit: int) -> bool:
+        """Index the oldest messages past the watermark; True when more remain.
+
+        Idempotent: a concurrent writer may index the same rows again. Commits
+        only a transaction it opened itself.
+        """
+        own = not conn.in_transaction
+        try:
+            if own:
+                conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT value FROM recall_meta WHERE key=?", (CJK_PAIRS_THROUGH,)
+            ).fetchone()
+            if row is None:
+                if own:
+                    conn.rollback()
+                return False
+            rows = conn.execute(
+                "SELECT id, content FROM messages WHERE id > ? ORDER BY id LIMIT ?",
+                (int(row[0]), limit),
+            ).fetchall()
+            if rows:
+                conn.executemany(
+                    f"INSERT OR REPLACE INTO {CJK_PAIRS_TABLE}(rowid, grams) VALUES (?, ?)",
+                    [(message_id, grams) for message_id, content in rows if (grams := cjk_pairs(content))],
+                )
+                conn.execute(
+                    "UPDATE recall_meta SET value=? WHERE key=?", (str(rows[-1][0]), CJK_PAIRS_THROUGH)
+                )
+            if own:
+                conn.commit()
+            return len(rows) == limit
+        except (sqlite3.DatabaseError, ValueError) as exc:
+            if own:
+                conn.rollback()
+            logger.debug("Session Recall short-word indexing deferred: %s", exc)
+            return False
 
     def _migrate_fts_trigram(self, conn: sqlite3.Connection) -> None:
         """Rebuild the FTS index with the trigram tokenizer for CJK support."""
@@ -463,32 +565,35 @@ class SessionRecall:
         next_idx = row[0]
         now = time.time()
         try:
-            conn.execute(
+            message_id = conn.execute(
                 "INSERT INTO messages (session_id, role, content, tool_name, timestamp, msg_index) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (session_id, role, content, tool_name, now, next_idx),
-            )
+            ).lastrowid
             conn.execute(
                 "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
                 (session_id,),
             )
+            self._index_cjk_pairs(conn, 500)
             conn.commit()
         except sqlite3.DatabaseError as exc:
             if not self._is_fts_write_failure(exc):
                 conn.rollback()
                 raise
             self._detach_fts(conn, exc)
-            conn.execute(
+            message_id = conn.execute(
                 "INSERT INTO messages (session_id, role, content, tool_name, timestamp, msg_index) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (session_id, role, content, tool_name, now, next_idx),
-            )
+            ).lastrowid
             conn.execute(
                 "UPDATE sessions SET message_count = message_count + 1 WHERE id = ?",
                 (session_id,),
             )
+            self._index_cjk_pairs(conn, 500)
             conn.commit()
-        return conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        # The short-word index writes rows too; return the message's own id.
+        return int(message_id or 0)
 
     # ── search ────────────────────────────────────────────────
 

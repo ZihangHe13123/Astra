@@ -40,6 +40,13 @@ const optionHelp: Record<string, [string, string]> = {
   "/voice on": ["开启朗读", "回复生成时自动朗读"], "/voice off": ["关闭朗读", "不再朗读回复"],
   "/voice stop": ["停止朗读", "立刻停下正在朗读的内容"], "/voice list": ["音色与设置", "查看音色，打开语音设置"],
   "/voice test": ["试听", "用当前音色朗读一句示例"],
+  "/memory proposals": ["待审核的建议", "查看后台整理提出的记忆修改"],
+  "/memory accept": ["接受建议", "按编号或 all 应用修改建议"], "/memory dismiss": ["丢弃建议", "按编号或 all 丢弃修改建议"],
+  "/memory consolidation": ["记忆整理设置", "查看后台整理模式，打开设置"],
+  "/memory consolidation off": ["关闭记忆整理", "不在后台整理记忆"],
+  "/memory consolidation review": ["记忆整理：需审核", "提出修改建议，你逐条确认"],
+  "/memory consolidation auto": ["记忆整理：自动同意", "记住和修订直接生效，遗忘仍等你确认"],
+  "/memory consolidation now": ["马上整理一次", "在下一个空闲时刻整理新的对话"],
 };
 
 export function commandNames(modes: CommandMode[]): Record<string, string> {

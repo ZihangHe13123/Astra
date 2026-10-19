@@ -20,10 +20,12 @@ There is no extra package dependency.
 Boot warmup or explicitly enabling recommendation may start it when a vector
 file exists; explicit index preparation may start it without a vector file.
 Query encoding never spawns it or waits for model loading. Busy/unavailable
-workers return text fallback. Active clients send a heartbeat every 30 seconds;
-closing them or using `/context-index off` ends their heartbeat. After about
-90 seconds without clients or encoding, the worker exits and releases the model.
-Clients recover a lost worker in the background, outside query handling.
+workers return text fallback. Active clients check the worker every 30 seconds,
+but only encoding counts as use: after `ASTRA_EMBEDDING_IDLE_SECONDS` (default
+900, at least 60) without an encode request, the worker exits and releases the
+model, even while Astra runs. The next encode request restarts it in the
+background, outside query handling; that request uses text fallback. The first
+turn after a long pause therefore has no semantic channel.
 
 The private endpoint/token file defaults to `~/.astra/embedding-runtime`, with
 an override in `ASTRA_EMBEDDING_RUNTIME_DIR`. Using different directories creates
@@ -111,8 +113,10 @@ neither it nor the four-entry recommendation limit changes the three-handle
 
 Session readers remain read-only. Native partial-match queries rank by shared
 query-character coverage; session and native Activity reuse trigram posting
-lists and apply literal-target boundaries before limits. These paths use Python
-and SQLite on both platforms, with no schema migration or added service.
+lists, session also a character-pair index for two-character Chinese words,
+and both apply literal-target boundaries before limits. These paths use Python
+and SQLite on both platforms with no added service; Session Recall builds the
+pair table in its own archive on first use.
 Semantic channel ranks enter the existing RRF fusion.
 Independent semantic tasks cannot discard completed text results on timeout.
 The budget overrides above are local tuning; the shared defaults remain 75ms

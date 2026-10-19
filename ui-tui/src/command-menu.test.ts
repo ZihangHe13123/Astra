@@ -24,6 +24,11 @@ assert.deepEqual(
   slashCommandSuggestions("/computer ").map((item) => item.command),
   ["status", "setup", "stop"],
 );
+assert.deepEqual(
+  slashCommandSuggestions("/weixin ").map((item) => item.command),
+  ["status", "login", "on", "off", "logout", "model"],
+);
+assert.equal(completeSlashCommand("/weixin lo", 0), "/weixin login");
 assert.equal(completeSlashCommand("/computer se", 0), "/computer setup");
 assert.deepEqual(resolveSlashCommandSubmission("/computer ", 0), { kind: "submit", value: "/computer status" });
 assert.deepEqual(resolveSlashCommandSubmission("/computer se", 0), { kind: "submit", value: "/computer setup" });
@@ -171,11 +176,13 @@ assert.equal(submitSlashCommand("/fixture sessions ", 2, [], [], localContext), 
 
 assert.deepEqual(
   slashCommandSuggestions("/search ").map((item) => item.command),
-  ["auto", "exa", "searxng"],
+  ["auto", "exa", "searxng", "deepseek"],
 );
 assert.deepEqual(slashCommandSuggestions("/search ex").map((item) => item.command), ["exa"]);
 assert.equal(completeSlashCommand("/search ex", 0), "/search exa");
 assert.equal(submitSlashCommand("/search ex", 0), "/search exa");
+assert.deepEqual(slashCommandSuggestions("/search de").map((item) => item.command), ["deepseek"]);
+assert.equal(submitSlashCommand("/search de", 0), "/search deepseek");
 
 assert.deepEqual(slashCommandSuggestions("/sandbox ").map((item) => item.command), ["on", "off", "status"]);
 assert.equal(completeSlashCommand("/sandbox of", 0), "/sandbox off");
@@ -227,13 +234,33 @@ assert.equal(themesWithCurrent.find((item) => item.command === "classic")?.curre
 assert.equal(themesWithCurrent.find((item) => item.command === "glitchcity")?.current, false);
 assert.equal(themesWithCurrent.every((item) => item.group === "THEMES"), true);
 
+// The terminal menu offers what the shared catalog (the desktop's command palette) lists, in order.
+const memoryOptions = (commandCatalog as { command: string; options?: { command: string }[] }[])
+  .find((item) => item.command === "/memory")?.options?.map((option) => option.command);
+assert.deepEqual(slashCommandSuggestions("/memory ").map((item) => item.command), memoryOptions);
 assert.deepEqual(
-  slashCommandSuggestions("/memory ").map((item) => item.command),
-  [
-    "review", "status", "remember", "remember-user", "working", "inspect", "timeline",
-    "why", "correct", "forget", "import-core", "clear-working",
-  ],
+  slashCommandSuggestions("/memory con").map((item) => item.command),
+  ["consolidation", "consolidation off", "consolidation review", "consolidation auto", "consolidation now"],
 );
+assert.equal(submitSlashCommand("/memory consolidation a", 0), "/memory consolidation auto");
+assert.equal(submitSlashCommand("/memory con", 0), "/memory consolidation");
+assert.equal(completeSlashCommand("/memory acc", 0), "/memory accept ");
+assert.equal(submitSlashCommand("/memory prop", 0), "/memory proposals");
+// Waiting proposals follow /memory proposals, accept and dismiss, each by its number.
+const waiting = { proposals: [{ id: 7, action: "remember", summary: "前端项目用 pnpm" }, { id: 9, action: "forget", summary: "养了一只猫" }] };
+assert.deepEqual(
+  slashCommandSuggestions("/memory proposals", [], [], waiting).map((item) => [item.command, item.group]),
+  [["proposals", "MEMORY"], ["accept P7", "PROPOSALS"], ["dismiss P7", "PROPOSALS"], ["accept P9", "PROPOSALS"],
+    ["dismiss P9", "PROPOSALS"], ["accept all", "PROPOSALS"], ["dismiss all", "PROPOSALS"]],
+);
+assert.equal(slashCommandSuggestions("/memory proposals", [], [], waiting)[1].description, "remember · 前端项目用 pnpm");
+assert.deepEqual(slashCommandSuggestions("/memory accept", [], [], waiting).map((item) => item.command),
+  ["accept", "accept P7", "accept P9", "accept all"]);
+assert.equal(submitSlashCommand("/memory accept 9", 0, [], [], waiting), "/memory accept 9");
+assert.equal(submitSlashCommand("/memory dismiss p7", 0, [], [], waiting), "/memory dismiss 7");
+// Nothing waiting: the menu shows only the commands.
+assert.deepEqual(slashCommandSuggestions("/memory proposals").map((item) => item.command), ["proposals"]);
+assert.deepEqual(slashCommandSuggestions("/memory ", [], [], waiting).map((item) => item.command), memoryOptions);
 assert.deepEqual(slashCommandSuggestions("/memory rem").map((item) => item.command), ["remember", "remember-user"]);
 assert.equal(completeSlashCommand("/memory sta", 0), "/memory status");
 assert.equal(submitSlashCommand("/memory sta", 0), "/memory status");

@@ -5,6 +5,8 @@ It is not a list of shipped features or permission to start implementation.
 
 - [Peer Agent workspace](peer-agent-workspace.md): collaboration across explicitly
   paired installations; transport, wake-up and file acceptance remain open.
+- [Phone companion](phone-companion.md): the optional remote interface for a paired
+  phone; push notifications, voice input and a native app remain open.
 - [Outbound request byte budget](llm-request-byte-budget.md): measure serialized
   requests independently of the existing token budget before choosing a policy.
 

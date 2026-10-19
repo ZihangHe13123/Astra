@@ -10,7 +10,7 @@ from agent.core.msg import ContentBlock, Msg
 READ_ONLY_WORKFLOWS = frozenset({"skill_review", "skill_create", "doctor", "diagnostics", "memory_review"})
 READ_TOOLS = frozenset({
     "skills_list", "skill_view", "skill_review_snapshot", "runtime_diagnostics", "memory_inspect",
-    "read_file", "stat_file", "search_files", "search_text", "session_search", "session_read",
+    "read_file", "stat_file", "search_files", "search_text", "session_search",
     "context_inspect", "context_open", "ask_user_question", "current_time",
 })
 

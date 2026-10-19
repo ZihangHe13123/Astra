@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import inspect
 import json
 import logging
 import math
@@ -17,7 +18,7 @@ from .token_estimator import estimate_value_tokens
 from .persona import PersonaState, parse_persona_metadata
 from .prompts import get_prompt_profile, is_legacy_persona_prompt, normalize_system_prompt
 from .system_prompt_projection import SystemPromptProjection
-from .runtime_context_projection import RuntimeContextProjection
+from .runtime_context_projection import RuntimeContextProjection, StandingMemoryProjection, history_anchors
 from .system_suffix import split_legacy_suffix
 from .time_utils import needs_relative_date_anchor, relative_date_anchor, relative_date_metadata, weekday_label
 
@@ -332,6 +333,11 @@ class AgentContext:
     guidance_snapshot: dict = field(default_factory=dict, init=False, repr=False)
     system_projection: SystemPromptProjection = field(default_factory=SystemPromptProjection, init=False, repr=False)
     runtime_projection: RuntimeContextProjection = field(default_factory=RuntimeContextProjection, init=False, repr=False)
+    # Core memory, sent once and again only when it changes (not inside every turn snapshot).
+    memory_projection: StandingMemoryProjection = field(default_factory=StandingMemoryProjection, init=False, repr=False)
+    # The last request sent for this conversation, as the provider received it, so a
+    # compaction summary can replay it and reuse its cached prefix (see summary_replay).
+    _sent_request: dict | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.max_prompt_tokens == 100_000:
@@ -366,10 +372,12 @@ class AgentContext:
             lease = claim_session(path)
         else:
             lease = None
+        self._sent_request = None
         self._system_prompt_migration = {}
         self.guidance_snapshot = {}
         self.system_projection.reset()
         self.runtime_projection.reset()
+        self.memory_projection.reset()
         self._session_path = path
         self._session_lease = lease
         self._session_store = store
@@ -534,6 +542,7 @@ class AgentContext:
             "system_prompt_migration": self._system_prompt_migration,
             "system_prompt_projection": self.system_projection.state,
             "runtime_context_projection": self.runtime_projection.state,
+            "standing_memory_projection": self.memory_projection.state,
             "persona_id": self.persona_id,
             "persona_definition_version": self.persona_definition_version,
             "persona_state_revision": self.persona_state_revision,
@@ -559,6 +568,7 @@ class AgentContext:
         candidate = copy.copy(self)
         candidate.system_projection = copy.deepcopy(self.system_projection)
         candidate.runtime_projection = copy.deepcopy(self.runtime_projection)
+        candidate.memory_projection = copy.deepcopy(self.memory_projection)
         candidate.messages = []
         candidate._message_token_costs = []
         candidate.compressor = None  # never reset the live compressor in preview
@@ -590,6 +600,7 @@ class AgentContext:
                 raw, validate=lambda message: hydrate_content(message.get("content"), self.session_path))
             self.system_projection = SystemPromptProjection(data.get("system_prompt_projection"))
             self.runtime_projection = RuntimeContextProjection(data.get("runtime_context_projection"))
+            self.memory_projection = StandingMemoryProjection(data.get("standing_memory_projection"))
             guidance = data.get("guidance_snapshot")
             self.guidance_snapshot = copy.deepcopy(guidance) if isinstance(guidance, dict) else {}
             migration = data.get("system_prompt_migration")
@@ -765,6 +776,7 @@ class AgentContext:
         *,
         runtime_context: str | None = None,
         include_runtime_context: bool = True,
+        standing_memory: str | None = None,
     ) -> list[dict]:
         """Build provider context with optional non-canonical message content.
 
@@ -778,7 +790,7 @@ class AgentContext:
         effective_system = self.effective_system_prompt
         if effective_system:
             result.append({"role": "system", "content": effective_system})
-        inserts = self.runtime_projection.project(self.messages, runtime_context) if include_runtime_context else {}
+        inserts = self._projection_inserts(runtime_context, standing_memory) if include_runtime_context else {}
         result.extend(inserts.get(0, []))
         for index, stored in enumerate(self.messages):
             override = _NO_OVERRIDE
@@ -789,10 +801,19 @@ class AgentContext:
             result.extend(inserts.get(index + 1, []))
         return result
 
+    def _projection_inserts(
+        self, runtime_context: str | None = None, standing_memory: str | None = None,
+    ) -> dict[int, list[dict]]:
+        """Both snapshot streams; at one anchor the standing memory comes first."""
+        anchors = history_anchors(self.messages) if self.messages else {}
+        memory = self.memory_projection.project(self.messages, standing_memory, anchors=anchors)
+        turn = self.runtime_projection.project(self.messages, runtime_context, anchors=anchors)
+        return {after: [*memory.get(after, []), *turn.get(after, [])] for after in sorted({*memory, *turn})}
+
     def _runtime_context_tokens(self) -> int:
         return sum(
             _estimate_value_tokens(message)
-            for items in self.runtime_projection.project(self.messages).values()
+            for items in self._projection_inserts().values()
             for message in items
         )
 
@@ -869,10 +890,37 @@ class AgentContext:
             + sum(self._message_token_costs) + self._runtime_context_tokens()
         ))
 
+    def remember_request(self, messages: list[dict], tools: list[dict]) -> None:
+        """Record the request just sent, and which conversation messages it was built from."""
+        self._sent_request = {
+            "messages": messages,
+            "tools": tools,
+            "count": len(self.messages),
+            "last": copy.deepcopy(self.messages[-1]) if self.messages else None,
+        }
+
+    def summary_replay(self) -> dict | None:
+        """The last sent request plus what the conversation gained since, for a summary.
+
+        A summary request that starts with the bytes of the last request reuses the
+        provider's prompt cache for all of it. None when that request no longer describes
+        this conversation (it was compacted, rewound, switched or never sent).
+        """
+        sent = self._sent_request
+        if sent is None:
+            return None
+        count = sent["count"]
+        if count > len(self.messages) or (count and self.messages[count - 1] != sent["last"]):
+            return None
+        added = [self._provider_message(stored) for stored in self.messages[count:]]
+        return {"messages": [*sent["messages"], *added], "tools": sent["tools"], "limit": int(self.max_prompt_tokens)}
+
     def reset(self):
+        self._sent_request = None
         self.guidance_snapshot = {}
         self.system_projection.reset()
         self.runtime_projection.reset()
+        self.memory_projection.reset()
         self.messages.clear()
         self.total_prompt_tokens = 0
         self.total_completion_tokens = 0
@@ -944,9 +992,13 @@ class AgentContext:
         measure_tokens: Callable[[], int], target_tokens: int, report: dict,
     ):
 
+        # Taken before the cleanups below rewrite older messages: the summary may then
+        # still replay what was last sent, cached, with everything those cleanups drop.
+        replay = self.summary_replay()
         # Superseded runtime snapshots are useful only for prefix reuse. Retire
         # them under budget pressure before sacrificing canonical conversation.
         changed = self.runtime_projection.compact(self.messages)
+        changed = self.memory_projection.compact(self.messages) or changed
         if changed:
             report["method"] = "cleanup"
             if not force and measure_tokens() <= target_tokens:
@@ -982,9 +1034,11 @@ class AgentContext:
 
         if self.compressor is not None:
             prompt = self._compaction_messages()
-            options = {"force": force}
+            options: dict[str, Any] = {"force": force}
             if preserve_on_failure:
                 options["preserve_on_failure"] = True
+            if replay is not None and "replay" in inspect.signature(self.compressor.compress).parameters:
+                options["replay"] = replay
             compressed = await self.compressor.compress(prompt, target_tokens, **options)
             if compressed is prompt:
                 # Compressor declined (nothing safely compressible, or the
@@ -1000,6 +1054,7 @@ class AgentContext:
             self._message_token_costs.clear()  # invalidate cache
             self.last_prompt_tokens = 0
             self._saved_message_count = 0
+            self._sent_request = None
             report["method"] = "summary"
             return True
 

@@ -54,17 +54,15 @@ def test_stable_system_suffix_survives_legacy_session_restore(tmp_path: Path):
 
 def test_react_freezes_turn_context_and_system_prefix_across_tool_iterations():
     class FakePack:
-        trace = SimpleNamespace(record_ids=())
+        core = ""
 
         def __init__(self, marker: str):
             self.marker = marker
 
-        def render(self, recall_char_limit: int):
+        def render(self, include_core: bool = True):
             return f"<agent-memory>{self.marker}</agent-memory>"
 
     class ChangingRouter:
-        recall_char_limit = 1000
-
         def __init__(self):
             self.calls = 0
 
@@ -150,14 +148,12 @@ def test_react_freezes_turn_context_and_system_prefix_across_tool_iterations():
 
 def test_context_index_coexists_with_memory_router_in_one_frozen_snapshot():
     class Pack:
-        trace = SimpleNamespace(record_ids=())
+        core = ""
 
-        def render(self, recall_char_limit: int):
+        def render(self, include_core: bool = True):
             return "<agent-memory>remembered</agent-memory>"
 
     class Router:
-        recall_char_limit = 1000
-
         async def build_context(self, *args, **kwargs):
             return Pack()
 
@@ -165,7 +161,7 @@ def test_context_index_coexists_with_memory_router_in_one_frozen_snapshot():
         mode = "session"
 
         async def build(self, user_text, **kwargs):
-            return SimpleNamespace(rendered="<context-index>suggested</context-index>")
+            return SimpleNamespace(rendered="<context-index>suggested</context-index>", rows=())
 
         def complete_request(self, request_id):
             pass

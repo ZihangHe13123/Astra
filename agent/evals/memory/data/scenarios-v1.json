@@ -1,0 +1,717 @@
+{
+  "schema_version": 1,
+  "provenance": "Synthetic, hand-written worlds for one fictional user (Siyuan, Singapore) with manually specified evidence. Chinese, English and code-switched text. Timestamps are relative (days_ago + local time) and resolved against the run time. No private histories, model-generated labels or real credentials.",
+  "scenarios": [
+    {
+      "id": "dev_env",
+      "title": "Developer environment with a superseded editor preference",
+      "consolidation": {"without": ["editor_new"], "expect": [{"must": [["Zed"]], "revises": "editor_old"}]},
+      "core": {
+        "user": [
+          "称呼用户为思远；默认用中文回答，代码、命令和技术术语保留英文。",
+          "User is based in Singapore (UTC+8) and mostly codes in the evening."
+        ],
+        "memory": [
+          "Tidepool：家庭记账 side project，Rust 后端 + TypeScript 前端，主分支 main。"
+        ]
+      },
+      "records": [
+        {"key": "python", "kind": "user_fact", "days_ago": 28, "at": "21:20",
+         "content": "本机 Python 固定用 3.11.9，虚拟环境统一交给 uv 管理。"},
+        {"key": "editor_old", "kind": "preference", "days_ago": 36, "at": "21:15", "source": "s1.u1",
+         "content": "Uses VS Code with the Solarized Light theme and JetBrains Mono 14pt."},
+        {"key": "editor_new", "supersedes": "editor_old", "days_ago": 13, "at": "22:45", "source": "s2.u1",
+         "content": "Switched the main editor from VS Code to Zed; theme is One Dark, font still JetBrains Mono."},
+        {"key": "port", "kind": "observation", "days_ago": 9, "at": "20:30", "source": "s3.u2",
+         "content": "Tidepool 前端 dev server 端口从 5173 改为 5180，因为 5173 被另一个本地服务占用。"}
+      ],
+      "archive": [
+        {"key": "s1", "days_ago": 36, "at": "21:10", "messages": [
+          {"key": "u1", "role": "user", "content": "I mostly code in VS Code with Solarized Light and JetBrains Mono 14pt. Any extensions you'd recommend for Rust?"},
+          {"key": "a1", "role": "assistant", "content": "For Rust: rust-analyzer, Even Better TOML, crates and CodeLLDB for debugging."}
+        ]},
+        {"key": "s2", "days_ago": 13, "at": "22:40", "messages": [
+          {"key": "u1", "role": "user", "content": "VS Code 在 monorepo 里太卡了，这周已经换成 Zed，主题用 One Dark。"},
+          {"key": "a1", "role": "assistant", "content": "了解，之后按 Zed 的快捷键和配置来给建议。"}
+        ]},
+        {"key": "s3", "days_ago": 9, "at": "20:15", "messages": [
+          {"key": "u1", "role": "user", "content": "Tidepool 的 dev server 起不来，提示 5173 端口已经被占用。"},
+          {"key": "a1", "role": "assistant", "content": "可以在 vite.config.ts 里把 server.port 改成 5180，或者先用 lsof 查一下谁占了 5173。"},
+          {"key": "u2", "role": "user", "content": "改成 5180 之后就好了，以后就用这个端口。"},
+          {"key": "a2", "role": "assistant", "content": "好的，已记下：dev server 用 5180。"}
+        ]},
+        {"key": "s4", "days_ago": 2, "at": "19:30", "messages": [
+          {"key": "u1", "role": "user", "content": "cargo test 在 CI 上比本地慢很多，大概要 9 分钟。"},
+          {"key": "a1", "role": "assistant", "content": "CI 每次都从零编译 target 目录，加上 target 缓存后通常能降到 3 分钟左右。"}
+        ]}
+      ],
+      "conversation": [
+        {"id": "dev_env.python", "category": "single_fact",
+         "text": "我本机的 Python 版本和虚拟环境工具是什么来着？",
+         "expect": [["rec:python"]],
+         "live": {"must": [["3.11.9"], ["uv"]]}},
+        {"id": "dev_env.editor_now", "category": "knowledge_update",
+         "text": "What editor and theme am I using these days?",
+         "expect": [["rec:editor_new", "msg:s2.u1"]],
+         "stale": ["Solarized Light"],
+         "live": {"must": [["Zed"], ["One Dark"]], "stale": ["Solarized"]}},
+        {"filler": true, "text": "好的，谢谢。"},
+        {"id": "dev_env.port", "category": "chinese_short_terms",
+         "text": "端口现在是多少？",
+         "expect": [["rec:port", "msg:s3.u2", "msg:s3.a2"]],
+         "live": {"must": [["5180"]]}},
+        {"id": "dev_env.editor_when", "category": "temporal",
+         "text": "我是哪天把编辑器换成 Zed 的？",
+         "expect": [["msg:s2.u1", "rec:editor_new"]],
+         "live": {"must": [["date:s2"]]}},
+        {"id": "dev_env.control_csv", "category": "unrelated",
+         "text": "用 Python 写个函数，把 CSV 文件里每一列分别求和。"},
+        {"id": "dev_env.gpu_false_premise", "category": "abstention",
+         "text": "上次我说的那台 Windows 台式机的显卡型号是什么？",
+         "live": {"abstain": true}}
+      ]
+    },
+    {
+      "id": "daily_prefs",
+      "title": "Food, coffee and gym preferences with an unsuperseded stale record",
+      "consolidation": {"expect": [{"must": [["沙拉", "salad"]], "revises": "lunch"}]},
+      "core": {
+        "user": [
+          "思远对花生过敏，推荐餐厅、食谱或零食时必须避开花生。",
+          "Prefers concise answers: bullet points first, no long preambles."
+        ],
+        "memory": []
+      },
+      "records": [
+        {"key": "coffee", "kind": "preference", "days_ago": 20, "at": "15:20", "source": "s3.u1",
+         "content": "咖啡只喝燕麦拿铁；下午三点以后不喝含咖啡因的饮料，否则睡不着。"},
+        {"key": "gym", "kind": "preference", "days_ago": 25, "at": "07:50",
+         "content": "健身固定在周二、周四早上 7 点，周末休息。"},
+        {"key": "lunch", "kind": "preference", "days_ago": 30, "at": "12:30", "source": "s1.u1",
+         "content": "工作日午饭常点海南鸡饭。"}
+      ],
+      "archive": [
+        {"key": "s1", "days_ago": 30, "at": "12:20", "messages": [
+          {"key": "u1", "role": "user", "content": "中午又点了海南鸡饭，这周已经第四次了哈哈。"},
+          {"key": "a1", "role": "assistant", "content": "看来是真爱，不过也可以偶尔换换口味。"}
+        ]},
+        {"key": "s2", "days_ago": 6, "at": "12:40", "messages": [
+          {"key": "u1", "role": "user", "content": "最近在控制体重，工作日午饭改成轻食沙拉了，鸡饭先戒掉。"},
+          {"key": "a1", "role": "assistant", "content": "好的，之后推荐午饭会以轻食为主。"}
+        ]},
+        {"key": "s3", "days_ago": 20, "at": "15:10", "messages": [
+          {"key": "u1", "role": "user", "content": "I only drink oat lattes, and nothing caffeinated after 3pm or I can't sleep."},
+          {"key": "a1", "role": "assistant", "content": "Got it: oat latte, and caffeine-free drinks after 3pm."}
+        ]},
+        {"key": "s4", "days_ago": 3, "at": "18:30", "messages": [
+          {"key": "u1", "role": "user", "content": "这周三下午约了牙医，所以周四的健身挪到周五早上。"},
+          {"key": "a1", "role": "assistant", "content": "已调整：本周健身改为周二和周五早上。"}
+        ]}
+      ],
+      "conversation": [
+        {"id": "daily_prefs.afternoon_drink", "category": "preference_application",
+         "text": "下午四点了，帮我推荐一杯楼下咖啡店能点的饮料。",
+         "expect": [["rec:coffee", "msg:s3.u1"]],
+         "live": {"must": [["低因", "decaf", "无咖啡因", "不含咖啡因", "caffeine-free", "花草茶", "herbal"]]}},
+        {"id": "daily_prefs.lunch_now", "category": "knowledge_update",
+         "text": "工作日午饭我一般吃什么？",
+         "expect": [["msg:s2.u1"]],
+         "stale": ["海南鸡饭"],
+         "live": {"must": [["沙拉", "salad", "轻食"]], "stale": ["鸡饭"]}},
+        {"id": "daily_prefs.dentist", "category": "chinese_short_terms",
+         "text": "牙医是哪天？",
+         "expect": [["msg:s4.u1"]],
+         "live": {"must": [["周三", "星期三", "Wednesday"]]}},
+        {"id": "daily_prefs.workout_plan", "category": "preference_application",
+         "text": "帮我排一下下周的运动计划。",
+         "expect": [["rec:gym"]],
+         "live": {"must": [["周二", "星期二", "Tuesday"]]}},
+        {"id": "daily_prefs.sushi_false_premise", "category": "abstention",
+         "text": "我之前说过我最喜欢的寿司店叫什么吗？",
+         "live": {"abstain": true}},
+        {"id": "daily_prefs.allergy", "category": "single_fact",
+         "text": "我对什么食物过敏？",
+         "expect": [["text:对花生过敏"]],
+         "live": {"must": [["花生", "peanut"]]}},
+        {"id": "daily_prefs.gym_days_en", "category": "cross_lingual",
+         "text": "Which mornings do I usually go to the gym?",
+         "expect": [["rec:gym"]],
+         "live": {"must": [["周二", "星期二", "Tuesday", "Tue"]]}}
+      ]
+    },
+    {
+      "id": "atlas_timeline",
+      "title": "Work project timeline across six weekly sessions",
+      "core": {
+        "user": ["称呼用户为思远；默认中文回答。"],
+        "memory": ["Atlas：工作项目，把财务部的 Excel 报表迁到 Metabase。"]
+      },
+      "records": [
+        {"key": "scope", "kind": "task_ref", "days_ago": 34, "at": "10:20", "source": "s1.u1",
+         "content": "Atlas 报表迁移范围：12 张 Excel 报表迁到 Metabase，思远负责。"},
+        {"key": "golive", "kind": "observation", "days_ago": 12, "at": "17:50", "source": "s4.u1",
+         "content": "Atlas go-live postponed by two weeks to allow an extra finance UAT round."}
+      ],
+      "archive": [
+        {"key": "s1", "days_ago": 34, "at": "10:00", "messages": [
+          {"key": "u1", "role": "user", "content": "Kick-off：Atlas 报表迁移今天正式开始，目标是把 12 张 Excel 报表迁到 Metabase，计划 6 周后上线。"},
+          {"key": "a1", "role": "assistant", "content": "好的，建议先按使用频率排一个迁移顺序。"}
+        ]},
+        {"key": "s2", "days_ago": 27, "at": "16:20", "messages": [
+          {"key": "u1", "role": "user", "content": "Atlas 进度：已经迁完 3 张报表，销售日报、库存周报、退货明细。"},
+          {"key": "a1", "role": "assistant", "content": "不错，下一批建议先做财务最常用的。"}
+        ]},
+        {"key": "s3", "days_ago": 19, "at": "11:05", "messages": [
+          {"key": "u1", "role": "user", "content": "Atlas 又迁了 4 张：应收账款、应付账款、渠道月报、费用明细。数据源从 MySQL 主库换成只读副本了。"},
+          {"key": "a1", "role": "assistant", "content": "换只读副本是对的，可以避免报表查询拖慢主库。"}
+        ]},
+        {"key": "s4", "days_ago": 12, "at": "17:40", "messages": [
+          {"key": "u1", "role": "user", "content": "Decided with Priya: Atlas go-live is pushed back two weeks because finance wants another UAT round."},
+          {"key": "a1", "role": "assistant", "content": "Understood. I'll treat the new date as two weeks after the original plan."}
+        ]},
+        {"key": "s5", "days_ago": 5, "at": "14:30", "messages": [
+          {"key": "u1", "role": "user", "content": "Atlas 本周又迁完 2 张：现金流量表和预算对比，还剩 3 张。"},
+          {"key": "a1", "role": "assistant", "content": "进度很稳，剩下 3 张可以排进下周。"}
+        ]},
+        {"key": "s6", "days_ago": 1, "at": "10:10", "messages": [
+          {"key": "u1", "role": "user", "content": "UAT 发现渠道月报的汇总口径不对，先回滚到 Excel 版本用着。"},
+          {"key": "a1", "role": "assistant", "content": "建议先和财务确认口径定义，再修 Metabase 里的汇总逻辑。"}
+        ]}
+      ],
+      "conversation": [
+        {"id": "atlas.count", "category": "multi_session",
+         "text": "Atlas 一共已经迁完几张报表了？",
+         "expect": ["msg:s2.u1", "msg:s3.u1", "msg:s5.u1"],
+         "live": {"must": [["9", "九"]]}},
+        {"id": "atlas.start", "category": "temporal",
+         "text": "Atlas 项目是哪天开始的？",
+         "expect": [["msg:s1.u1"]],
+         "live": {"must": [["date:s1"]]}},
+        {"id": "atlas.order", "category": "temporal",
+         "text": "数据源换成只读副本，是在上线推迟之前还是之后？",
+         "expect": ["msg:s3.u1", ["msg:s4.u1", "rec:golive"]],
+         "live": {"must": [["之前", "before"]]}},
+        {"id": "atlas.yesterday", "category": "temporal",
+         "text": "昨天 UAT 出了什么问题？",
+         "expect": [["msg:s6.u1"]],
+         "live": {"must": [["口径", "渠道月报"]]}},
+        {"id": "atlas.golive_now", "category": "knowledge_update",
+         "text": "Atlas 现在还按原计划的时间上线吗？",
+         "expect": [["msg:s4.u1", "rec:golive"]],
+         "stale": ["计划 6 周后上线"],
+         "live": {"must": [["推迟", "延后", "postpone", "pushed back", "两周", "two weeks"]]}},
+        {"id": "atlas.control_join", "category": "unrelated",
+         "text": "Explain the difference between LEFT JOIN and INNER JOIN with a tiny example."},
+        {"id": "atlas.report_names", "category": "multi_session",
+         "text": "List every Atlas report that has been migrated so far.",
+         "expect": ["msg:s2.u1", "msg:s3.u1", "msg:s5.u1"],
+         "live": {"must": [["销售日报"], ["应收账款"], ["现金流量表"]]}}
+      ]
+    },
+    {
+      "id": "infra_crosslingual",
+      "title": "Staging infrastructure notes recalled across languages",
+      "core": {
+        "user": ["默认中文回答，技术名词保留英文。"],
+        "memory": ["Tidepool staging 环境由思远自己维护。"]
+      },
+      "records": [
+        {"key": "staging_db", "kind": "observation", "days_ago": 22, "at": "23:20", "source": "s1.u1",
+         "content": "PostgreSQL 16 now backs the staging database on the new Frankfurt VPS; the old MySQL instance is retired."},
+        {"key": "backup", "kind": "observation", "days_ago": 15, "at": "09:30", "source": "s2.u1",
+         "content": "每天凌晨 3 点用 pg_dump 备份 staging 数据库，备份保留 14 天。"}
+      ],
+      "archive": [
+        {"key": "s1", "days_ago": 22, "at": "23:10", "messages": [
+          {"key": "u1", "role": "user", "content": "Moved the staging DB to PostgreSQL 16 on the new Frankfurt VPS and retired the old MySQL box."},
+          {"key": "a1", "role": "assistant", "content": "Nice. Remember to update the connection string in the deploy configuration."}
+        ]},
+        {"key": "s2", "days_ago": 15, "at": "09:20", "messages": [
+          {"key": "u1", "role": "user", "content": "备份脚本改好了：每天凌晨 3 点跑 pg_dump，保留 14 天，存到对象存储。"},
+          {"key": "a1", "role": "assistant", "content": "可以再加一个每周的恢复演练，确认备份真的能用。"}
+        ]},
+        {"key": "s3", "days_ago": 8, "at": "20:00", "messages": [
+          {"key": "u1", "role": "user", "content": "The TLS cert for staging has to be renewed every quarter, and renewal is still manual with certbot."},
+          {"key": "a1", "role": "assistant", "content": "Consider a systemd timer for certbot renew so it stops being manual."}
+        ]},
+        {"key": "s4", "days_ago": 4, "at": "21:30", "messages": [
+          {"key": "u1", "role": "user", "content": "redis 的 maxmemory 调到 2gb 了，淘汰策略用 allkeys-lru。"},
+          {"key": "a1", "role": "assistant", "content": "allkeys-lru 适合纯缓存场景，没问题。"}
+        ]}
+      ],
+      "conversation": [
+        {"id": "infra.db_version_zh", "category": "cross_lingual",
+         "text": "预发环境的数据库现在是什么版本，部署在哪？",
+         "expect": [["rec:staging_db", "msg:s1.u1"]],
+         "live": {"must": [["PostgreSQL 16", "Postgres 16", "PG 16", "PG16", "PostgreSQL16"], ["Frankfurt", "法兰克福"]]}},
+        {"id": "infra.backup_retention_en", "category": "cross_lingual",
+         "text": "How long do we keep the staging database backups?",
+         "expect": [["rec:backup", "msg:s2.u1"]],
+         "live": {"must": [["14"]]}},
+        {"id": "infra.cert_zh", "category": "cross_lingual",
+         "text": "证书多久要续一次？现在是手动还是自动？",
+         "expect": [["msg:s3.u1"]],
+         "live": {"must": [["季度", "quarter", "三个月"], ["手动", "manual"]]}},
+        {"id": "infra.redis_en", "category": "cross_lingual",
+         "text": "What eviction policy did I set for Redis?",
+         "expect": [["msg:s4.u1", "msg:s4.a1"]],
+         "live": {"must": [["allkeys-lru"]]}},
+        {"id": "infra.control_poem", "category": "unrelated",
+         "text": "写一首关于秋天的五言绝句。"},
+        {"id": "infra.cdn_false_premise", "category": "abstention",
+         "text": "我们 staging 用的是哪家 CDN？",
+         "live": {"abstain": true}}
+      ]
+    },
+    {
+      "id": "household",
+      "title": "Household facts with corrections that live only in the archive",
+      "consolidation": {"without": ["parking"], "expect": [{"must": [["B2"], ["47"]]}, {"must": [["5 号", "5号", "5th"]], "revises": "rent"}]},
+      "core": {
+        "user": ["思远和太太 Mei 住在 Toa Payoh，女儿 Lulu 4 岁。"],
+        "memory": []
+      },
+      "records": [
+        {"key": "parking", "kind": "user_fact", "days_ago": 18, "at": "08:50", "source": "s1.u1",
+         "content": "车位在 B2 层 47 号，月租 120 新币。"},
+        {"key": "rent", "kind": "user_fact", "days_ago": 45, "at": "10:00",
+         "content": "房租每月 3 号前转给房东，金额 3,200 新币。"},
+        {"key": "school", "kind": "user_fact", "days_ago": 33, "at": "08:00",
+         "content": "Lulu 的幼儿园早上 8:15 入园，下午 3 点放学。"}
+      ],
+      "archive": [
+        {"key": "s0", "days_ago": 40, "at": "09:00", "messages": [
+          {"key": "u1", "role": "user", "content": "我的车位是 B1 层 12 号，月租 100 新币。"},
+          {"key": "a1", "role": "assistant", "content": "记下了：车位 B1 层 12 号，月租 100 新币。"}
+        ]},
+        {"key": "s1", "days_ago": 18, "at": "08:40", "messages": [
+          {"key": "u1", "role": "user", "content": "车位换了：从 B1 的 12 号换到 B2 的 47 号，月租涨到 120。"},
+          {"key": "a1", "role": "assistant", "content": "已更新：B2 层 47 号，月租 120 新币。"}
+        ]},
+        {"key": "s3", "days_ago": 11, "at": "22:15", "messages": [
+          {"key": "u1", "role": "user", "content": "Lulu's kindergarten moved Wednesday pickup to 1pm starting this month."},
+          {"key": "a1", "role": "assistant", "content": "Noted: Wednesday pickup is now 1pm."}
+        ]},
+        {"key": "s4", "days_ago": 7, "at": "19:05", "messages": [
+          {"key": "u1", "role": "user", "content": "房东说下个月起房租改成每月 5 号前转就行。"},
+          {"key": "a1", "role": "assistant", "content": "好的，房租转账日改为每月 5 号前。"}
+        ]}
+      ],
+      "conversation": [
+        {"id": "household.parking_where", "category": "chinese_short_terms",
+         "text": "车位在哪？",
+         "expect": [["rec:parking", "msg:s1.u1", "msg:s1.a1"]],
+         "stale": ["B1 层 12 号"],
+         "live": {"must": [["B2"], ["47"]], "stale": ["B1"]}},
+        {"id": "household.rent_day", "category": "knowledge_update",
+         "text": "房租现在每月几号前要转？",
+         "expect": [["msg:s4.u1", "msg:s4.a1"]],
+         "stale": ["每月 3 号前转给房东"],
+         "live": {"must": [["5 号", "5号", "5th", "五号"]], "stale": ["3 号", "3号"]}},
+        {"id": "household.school_start", "category": "single_fact",
+         "text": "Lulu 几点入园？",
+         "expect": [["rec:school"]],
+         "live": {"must": [["8:15"]]}},
+        {"id": "household.parking_rent", "category": "chinese_short_terms",
+         "text": "月租多少？",
+         "expect": [["rec:parking", "msg:s1.u1", "msg:s1.a1"]],
+         "stale": ["月租 100"],
+         "live": {"must": [["120"]], "stale": ["100"]}},
+        {"id": "household.control_temperature", "category": "unrelated",
+         "text": "Convert 72 degrees Fahrenheit to Celsius."},
+        {"id": "household.parking_when", "category": "temporal",
+         "text": "车位是什么时候换的？",
+         "expect": [["msg:s1.u1"]],
+         "live": {"must": [["date:s1"]]}},
+        {"id": "household.parking_floor_en", "category": "cross_lingual",
+         "text": "Which floor is my parking spot on now?",
+         "expect": [["rec:parking", "msg:s1.u1", "msg:s1.a1"]],
+         "stale": ["B1 层 12 号"],
+         "live": {"must": [["B2"]], "stale": ["B1"]}}
+      ]
+    },
+    {
+      "id": "writing_full_core",
+      "title": "Writing preferences with both core files close to their hard limits",
+      "consolidation": {},
+      "core": {
+        "user": [
+          "称呼用户为思远（Siyuan）；默认用简体中文回答，代码、命令、报错信息和专有名词保留英文原文，不要翻译变量名。",
+          "User is a data engineer based in Singapore (UTC+8); works 9:30-18:30 on weekdays and does side projects in the evening, so evening messages are usually about Tidepool rather than work.",
+          "回答风格：先给结论，再给理由；能用 3 条以内的要点说清楚就不要写长段落；不确定的地方直接说不确定，不要编造。",
+          "Writing preferences: plain, direct English for work emails; avoid buzzwords like 'synergy' or 'leverage'; British spelling is fine but not required.",
+          "思远对花生过敏；推荐餐厅、食谱或零食时必须避开花生和花生油。",
+          "Family: wife Mei works in hospital administration; daughter Lulu is 4 and goes to kindergarten near Toa Payoh. Weekends are family time, so avoid suggesting weekend work sessions unless asked.",
+          "常用设备：工作用 MacBook Pro 14（M3 Pro，36GB），家里有一台 Windows 台式机主要用来打游戏，不用于开发。",
+          "Communication: prefers async text over calls; for anything urgent, say so explicitly in the first line.",
+          "学习计划：在看《Designing Data-Intensive Applications》第 8 章，偶尔会问分布式系统相关问题，可以结合书里的术语解释。",
+          "Health: runs three times a week, usually Tue/Thu/Sat mornings; knee occasionally hurts, so suggestions should keep weekly mileage moderate.",
+          "饮食：工作日午饭以轻食为主，晚上很少喝咖啡；周末喜欢带家人去吃点心。",
+          "Time management: likes plans as numbered checklists with rough time estimates; dislikes calendar invites without an agenda."
+        ],
+        "memory": [
+          "Tidepool：家庭记账 side project，Rust（axum）后端 + TypeScript（SvelteKit）前端，SQLite 存储；仓库目录 tidepool，主分支 main，提交前跑 cargo test 和 pnpm test。",
+          "Atlas 报表迁移（工作项目）：把财务部门的 12 张 Excel 报表迁移到 Metabase，数据源是 MySQL 只读副本；对接人是财务部的 Priya 和 IT 的 Marcus。",
+          "Agent decisions: never push directly to main; open a branch and a PR even for one-line fixes. Run ruff and pytest before proposing a commit in Python repos.",
+          "When the user asks for SQL, default to PostgreSQL syntax unless the context says MySQL; always use explicit JOIN ... ON instead of comma joins.",
+          "Tidepool 的前端 dev server 用 Vite，配置在 vite.config.ts；后端本地监听 8080，前端通过 api 前缀代理到后端。",
+          "Formatting: code blocks must state the language; shell commands should be copy-pasteable without prompts and without comments on the same line.",
+          "思远习惯用 uv 管理 Python 环境、用 pnpm 管理 Node 依赖，不要建议 pip install 到全局或 npm -g。",
+          "Data conventions at work: dates in reports use ISO format (YYYY-MM-DD), currency is SGD with two decimals, fiscal year starts in April.",
+          "周报每周五下午 5 点前发给组长；月报在每月第一个工作日发，抄送财务部的 Priya。",
+          "Known environment quirk: corporate VPN breaks Docker Desktop DNS; workaround is to set dns to 1.1.1.1 in the daemon config while on VPN.",
+          "测试约定：Python 项目统一用 pytest，测试文件放在 tests 目录，命名 test_*.py；不要 mock 数据库，用临时 SQLite 文件。",
+          "Preferred diagram style: Mermaid flowcharts for architecture, sequence diagrams only when timing matters; keep under 12 nodes.",
+          "思远在学习 Rust 的 async，解释时可以对比 Python asyncio；避免过度使用宏。",
+          "Release checklist for Tidepool: bump version in Cargo.toml and package.json, update CHANGELOG.md, tag vX.Y.Z, then deploy to fly.io region sin.",
+          "公司内网 Wiki 需要 SSO，助手无法访问；涉及内部文档时请思远贴相关段落。",
+          "Metabase dashboards follow naming 'FIN - report - frequency'; collections are owned by the finance team, not IT.",
+          "Unit preferences: metric units, 24-hour time, temperatures in Celsius.",
+          "When summarizing meetings, list decisions first, then action items with owners and due dates, then open questions.",
+          "Tidepool 的 CI 在 GitHub Actions 上跑，Rust 用 rust-cache 缓存 target 目录，前端缓存 pnpm store。"
+        ]
+      },
+      "records": [
+        {"key": "weekly", "kind": "preference", "days_ago": 17, "at": "18:10", "source": "s1.u1",
+         "content": "周报格式：先写三条本周结论，再列风险；不要用表格，控制在 200 字以内。"},
+        {"key": "email", "kind": "preference", "days_ago": 24, "at": "11:30", "source": "s2.u1",
+         "content": "Work emails: put the ask in the first sentence and sign off with 'Best, Siyuan'."},
+        {"key": "slides", "kind": "preference", "days_ago": 9, "at": "21:00", "source": "s3.u1",
+         "content": "做 slides 时每页最多 3 个要点，图表优先用柱状图。"}
+      ],
+      "archive": [
+        {"key": "s1", "days_ago": 17, "at": "18:00", "messages": [
+          {"key": "u1", "role": "user", "content": "以后周报别用表格了，老板都在手机上看，先写三条结论就行。"},
+          {"key": "a1", "role": "assistant", "content": "好的，周报改为结论优先、不用表格。"}
+        ]},
+        {"key": "s2", "days_ago": 24, "at": "11:20", "messages": [
+          {"key": "u1", "role": "user", "content": "For emails to the finance team, put the ask in the very first sentence. They skim."},
+          {"key": "a1", "role": "assistant", "content": "Will do: ask first, context after."}
+        ]},
+        {"key": "s3", "days_ago": 9, "at": "20:50", "messages": [
+          {"key": "u1", "role": "user", "content": "上次那份 deck 太密了，每页最多放 3 个要点。"},
+          {"key": "a1", "role": "assistant", "content": "明白，之后每页控制在 3 个要点以内。"}
+        ]}
+      ],
+      "conversation": [
+        {"id": "writing.weekly_report", "category": "preference_application",
+         "text": "帮我写这周的周报：完成了 Atlas 两张报表迁移，修了一个导出 bug，风险是财务 UAT 排期不确定。",
+         "expect": [["rec:weekly", "msg:s1.u1"]],
+         "live": {"forbid": ["|---", "| ---", "|:--"]}},
+        {"id": "writing.finance_email", "category": "preference_application",
+         "text": "Draft an email to finance asking them to confirm the UAT date for the Atlas reports.",
+         "expect": [["rec:email", "msg:s2.u1"]],
+         "live": {"must": [["Best, Siyuan", "Best,\nSiyuan"]]}},
+        {"filler": true, "text": "OK, thanks."},
+        {"id": "writing.slides_outline", "category": "preference_application",
+         "text": "帮我把 Atlas 进度整理成 3 页 slides 的大纲。",
+         "expect": [["rec:slides", "msg:s3.u1"]]},
+        {"id": "writing.signature", "category": "single_fact",
+         "text": "我的英文邮件署名是什么？",
+         "expect": [["rec:email"]],
+         "live": {"must": [["Best, Siyuan", "Siyuan"]]}},
+        {"id": "writing.control_capital", "category": "unrelated",
+         "text": "What is the capital of Australia?"},
+        {"id": "writing.linkedin_false_premise", "category": "abstention",
+         "text": "我上次让你记的那段 LinkedIn 个人简介还记得吗？",
+         "live": {"abstain": true}}
+      ]
+    },
+    {
+      "id": "flaky_tests",
+      "title": "Debugging episodes over a month, mostly in English",
+      "core": {
+        "user": ["Default to English for code discussions; Chinese is fine for chat."],
+        "memory": ["Tidepool uses pytest for the Python sync service under services/sync."]
+      },
+      "records": [
+        {"key": "csv_fix", "kind": "observation", "days_ago": 26, "at": "22:10", "source": "s1.a1", "fragment": "Windows 上的编码问题",
+         "content": "test_export_csv 在 Windows 上的编码问题：读文件时显式指定 encoding='utf-8'。"},
+        {"key": "retry_fix", "kind": "episode", "days_ago": 9, "at": "21:40", "source": "s3.u1", "fragment": "flakiness fixed by",
+         "content": "test_sync_retry flakiness fixed by injecting the clock instead of time.sleep (200 runs green)."}
+      ],
+      "archive": [
+        {"key": "s1", "days_ago": 26, "at": "21:50", "messages": [
+          {"key": "u1", "role": "user", "content": "pytest keeps failing on test_export_csv only on the Windows runner, something about decoding the fixture file."},
+          {"key": "a1", "role": "assistant", "content": "Windows defaults to cp1252, so open the fixture with encoding='utf-8' explicitly."}
+        ]},
+        {"key": "s2", "days_ago": 17, "at": "20:30", "messages": [
+          {"key": "u1", "role": "user", "content": "Flaky again: test_sync_retry times out about 1 in 10 runs on the macOS runner."},
+          {"key": "a1", "role": "assistant", "content": "It sleeps on real time; inject a fake clock and advance it instead."}
+        ]},
+        {"key": "s3", "days_ago": 9, "at": "21:30", "messages": [
+          {"key": "u1", "role": "user", "content": "Fixed test_sync_retry by replacing time.sleep with the injected clock, 200 runs green."},
+          {"key": "a1", "role": "assistant", "content": "Great, that removes the timing dependency entirely."}
+        ]},
+        {"key": "s4", "days_ago": 1, "at": "23:05", "messages": [
+          {"key": "u1", "role": "user", "content": "New flaky one: test_upload_resume hangs when the mock server closes the socket early."},
+          {"key": "a1", "role": "assistant", "content": "Add a read timeout to the client and assert the retry path; the hang suggests a missing timeout."}
+        ]}
+      ],
+      "conversation": [
+        {"id": "flaky.inventory", "category": "multi_session",
+         "text": "Which flaky tests have we dealt with so far, and which ones are fixed?",
+         "expect": ["msg:s2.u1", "msg:s3.u1", "msg:s4.u1"],
+         "live": {"must": [["test_sync_retry"], ["test_upload_resume"]]}},
+        {"id": "flaky.csv_fix", "category": "single_fact",
+         "text": "test_export_csv 在 Windows 上挂掉是怎么修的？",
+         "expect": [["rec:csv_fix", "msg:s1.a1"]],
+         "live": {"must": [["utf-8", "utf8"]]}},
+        {"id": "flaky.yesterday", "category": "temporal",
+         "text": "What was the new flaky test I mentioned yesterday?",
+         "expect": [["msg:s4.u1"]],
+         "live": {"must": [["test_upload_resume"]]}},
+        {"id": "flaky.retry_status", "category": "knowledge_update",
+         "text": "Is test_sync_retry still flaky?",
+         "expect": [["msg:s3.u1", "rec:retry_fix"]],
+         "stale": ["times out about 1 in 10 runs"],
+         "live": {"must": [["fixed", "修复", "no longer", "not flaky", "已经修", "resolved", "不是了", "不再"]]}},
+        {"id": "flaky.nose2_false_premise", "category": "abstention",
+         "text": "What did we decide about migrating the test suite to nose2?",
+         "live": {"abstain": true}},
+        {"id": "flaky.control_gil", "category": "unrelated",
+         "text": "给我解释一下 Python 里的 GIL 是什么。"}
+      ]
+    },
+    {
+      "id": "kyoto_trip",
+      "title": "Trip planning with a superseded date range",
+      "consolidation": {"without": ["trip"], "expect": [{"must": [["22"]]}]},
+      "core": {
+        "user": [
+          "称呼用户为思远；默认中文回答。",
+          "Wife Mei travels for work sometimes; plan family trips around her schedule."
+        ],
+        "memory": []
+      },
+      "records": [
+        {"key": "trip_old", "kind": "episode", "days_ago": 30, "at": "22:00", "source": "s1.u1",
+         "content": "京都红叶行程：11 月 15 日到 20 日。"},
+        {"key": "trip", "supersedes": "trip_old", "days_ago": 16, "at": "21:30", "source": "s2.u1",
+         "content": "京都红叶行程改为 11 月 22–27 日，Mei 原定那周要出差。"},
+        {"key": "hotel", "kind": "episode", "days_ago": 10, "at": "20:40", "source": "s3.u1",
+         "content": "Kyoto hotel booked near Shijo station, 5 nights, free cancellation until Nov 15."}
+      ],
+      "archive": [
+        {"key": "s1", "days_ago": 30, "at": "21:50", "messages": [
+          {"key": "u1", "role": "user", "content": "十一月中旬想去京都看红叶，大概 11 月 15 号到 20 号。"},
+          {"key": "a1", "role": "assistant", "content": "那个时间红叶刚好进入最佳期，可以开始看酒店了。"}
+        ]},
+        {"key": "s2", "days_ago": 16, "at": "21:20", "messages": [
+          {"key": "u1", "role": "user", "content": "京都行程改了：改成 11 月 22 号到 27 号，因为 Mei 原来那周要出差。"},
+          {"key": "a1", "role": "assistant", "content": "好的，行程更新为 11 月 22–27 日。"}
+        ]},
+        {"key": "s3", "days_ago": 10, "at": "20:30", "messages": [
+          {"key": "u1", "role": "user", "content": "Booked the Kyoto hotel near Shijo station: 5 nights, free cancellation until Nov 15."},
+          {"key": "a1", "role": "assistant", "content": "Nice location, with easy train access to both Gion and Arashiyama."}
+        ]},
+        {"key": "s4", "days_ago": 3, "at": "22:10", "messages": [
+          {"key": "u1", "role": "user", "content": "JR Pass 不买了，京都市内用 ICOCA 就够。"},
+          {"key": "a1", "role": "assistant", "content": "对，只在京都和大阪之间移动的话 ICOCA 更划算。"}
+        ]}
+      ],
+      "conversation": [
+        {"id": "kyoto.dates", "category": "knowledge_update",
+         "text": "我京都是哪几天去？",
+         "expect": [["rec:trip", "msg:s2.u1", "msg:s2.a1"]],
+         "stale": ["11 月 15 号到 20 号", "11 月 15 日到 20 日"],
+         "live": {"must": [["22"], ["27"]], "stale": ["15 号到 20", "15 日到 20", "15-20", "15–20"]}},
+        {"id": "kyoto.hotel", "category": "single_fact",
+         "text": "Where is my Kyoto hotel?",
+         "expect": [["msg:s3.u1", "rec:hotel"]],
+         "live": {"must": [["Shijo", "四条"]]}},
+        {"id": "kyoto.cancel_deadline", "category": "temporal",
+         "text": "酒店免费取消到哪天截止？",
+         "expect": [["msg:s3.u1", "rec:hotel"]],
+         "live": {"must": [["Nov 15", "11 月 15", "11月15", "November 15", "15 号", "15日"]]}},
+        {"id": "kyoto.transport", "category": "chinese_short_terms",
+         "text": "京都交通怎么解决？",
+         "expect": [["msg:s4.u1", "msg:s4.a1"]],
+         "live": {"must": [["ICOCA"]]}},
+        {"id": "kyoto.airline_false_premise", "category": "abstention",
+         "text": "我订的是哪家航空公司的机票？",
+         "live": {"abstain": true}},
+        {"id": "kyoto.summary", "category": "multi_session",
+         "text": "Summarize all the Kyoto trip decisions so far.",
+         "expect": [["msg:s2.u1", "msg:s2.a1", "rec:trip"], ["msg:s3.u1", "rec:hotel"], ["msg:s4.u1", "msg:s4.a1"]],
+         "stale": ["11 月 15 号到 20 号", "11 月 15 日到 20 日"],
+         "live": {"must": [["22"], ["Shijo", "四条"], ["ICOCA"]]}}
+      ]
+    },
+    {
+      "id": "deploy_workflow",
+      "title": "Deployment and lint settings with a superseded host",
+      "consolidation": {"without": ["deploy"], "expect": [{"must": [["fly"]]}]},
+      "core": {
+        "user": ["默认中文回答。"],
+        "memory": ["Astra 约定：提交前跑 ruff 和 pytest；不要直接 push 到 main，改动走分支和 PR。"]
+      },
+      "records": [
+        {"key": "deploy_old", "kind": "observation", "days_ago": 32, "at": "22:30", "source": "s1.u1",
+         "content": "Tidepool 部署在 Render 免费套餐上。"},
+        {"key": "deploy", "supersedes": "deploy_old", "days_ago": 12, "at": "23:00", "source": "s2.u1",
+         "content": "Tidepool 已迁到 fly.io，region 为 sin。"},
+        {"key": "ruff", "kind": "observation", "days_ago": 2, "at": "21:10", "source": "s4.u1",
+         "content": "ruff line-length 设为 120；tests 目录下忽略 E501。"}
+      ],
+      "archive": [
+        {"key": "s1", "days_ago": 32, "at": "22:20", "messages": [
+          {"key": "u1", "role": "user", "content": "Tidepool 先放在 Render 免费套餐上跑着，之后再说。"},
+          {"key": "a1", "role": "assistant", "content": "可以，免费套餐会休眠，首个请求会比较慢。"}
+        ]},
+        {"key": "s2", "days_ago": 12, "at": "22:50", "messages": [
+          {"key": "u1", "role": "user", "content": "Render 免费套餐冷启动太慢了，Tidepool 迁到 fly.io，region 选 sin。"},
+          {"key": "a1", "role": "assistant", "content": "sin 离新加坡近，延迟会好很多。"}
+        ]},
+        {"key": "s3", "days_ago": 6, "at": "21:45", "messages": [
+          {"key": "u1", "role": "user", "content": "fly deploy 默认是 immediate，我改成了 --strategy rolling，避免更新时停机。"},
+          {"key": "a1", "role": "assistant", "content": "rolling 会逐台替换机器，至少要两台实例才能真正零停机。"}
+        ]},
+        {"key": "s4", "days_ago": 2, "at": "21:00", "messages": [
+          {"key": "u1", "role": "user", "content": "ruff 的 line-length 我改成 120 了，tests 目录下忽略 E501。", "fragment": "line-length 我改成 120"},
+          {"key": "a1", "role": "assistant", "content": "好的，pyproject.toml 里的 per-file-ignores 可以这样写。"}
+        ]}
+      ],
+      "conversation": [
+        {"id": "deploy.host_now", "category": "knowledge_update",
+         "text": "Where is Tidepool deployed now?",
+         "expect": [["rec:deploy", "msg:s2.u1"]],
+         "stale": ["Render 免费套餐上跑着", "部署在 Render 免费套餐上"],
+         "live": {"must": [["fly.io", "fly"]], "stale": ["Render"]}},
+        {"id": "deploy.ruff_length", "category": "single_fact",
+         "text": "ruff 的 line-length 现在设的多少？",
+         "expect": [["rec:ruff", "msg:s4.u1"]],
+         "live": {"must": [["120"]]}},
+        {"id": "deploy.rolling_when", "category": "temporal",
+         "text": "我是什么时候把 fly deploy 改成 rolling 的？",
+         "expect": [["msg:s3.u1"]],
+         "live": {"must": [["date:s3"]]}},
+        {"id": "deploy.push_main", "category": "preference_application",
+         "text": "帮我把这个改动直接 push 到 main 吧。",
+         "expect": [["text:不要直接 push 到 main"]],
+         "live": {"must": [["分支", "branch", "PR", "pull request"]]}},
+        {"id": "deploy.control_regex", "category": "unrelated",
+         "text": "Write a regex that matches ISO dates like 2024-03-09."},
+        {"id": "deploy.strategy_en", "category": "cross_lingual",
+         "text": "What deploy strategy does fly use for Tidepool now?",
+         "expect": [["msg:s3.u1", "msg:s3.a1"]],
+         "live": {"must": [["rolling"]]}}
+      ]
+    },
+    {
+      "id": "running_log",
+      "title": "Training log aggregated over the past week",
+      "consolidation": {"without": ["race"], "expect": [{"must": [["half marathon", "半马", "半程马拉松"]]}]},
+      "core": {
+        "user": ["思远每周跑步三次左右，最近在备战半马。"],
+        "memory": []
+      },
+      "records": [
+        {"key": "knee", "kind": "observation", "days_ago": 20, "at": "19:20", "source": "s4.u1",
+         "content": "膝盖不适时每周跑量不超过 20 公里（医生建议）。"},
+        {"key": "race", "kind": "episode", "days_ago": 12, "at": "21:15", "source": "s5.u1",
+         "content": "Registered for a harbourfront half marathon in early December."}
+      ],
+      "archive": [
+        {"key": "s4", "days_ago": 20, "at": "19:00", "messages": [
+          {"key": "u1", "role": "user", "content": "医生说膝盖不舒服的时候，每周跑量别超过 20 公里。"},
+          {"key": "a1", "role": "assistant", "content": "记下了，之后的计划会控制总跑量。"}
+        ]},
+        {"key": "s5", "days_ago": 12, "at": "21:00", "messages": [
+          {"key": "u1", "role": "user", "content": "Signed up for the harbourfront half marathon in early December!"},
+          {"key": "a1", "role": "assistant", "content": "Congrats! That gives you about seven weeks to build up."}
+        ]},
+        {"key": "s1", "days_ago": 6, "at": "07:40", "messages": [
+          {"key": "u1", "role": "user", "content": "今天跑了 5 公里，配速 6 分 10。"},
+          {"key": "a1", "role": "assistant", "content": "节奏不错，保持住。"}
+        ]},
+        {"key": "s2", "days_ago": 4, "at": "07:35", "messages": [
+          {"key": "u1", "role": "user", "content": "Ran 8 km this morning, pace 6:30, knee felt fine."},
+          {"key": "a1", "role": "assistant", "content": "Nice steady run."}
+        ]},
+        {"key": "s3", "days_ago": 2, "at": "07:50", "messages": [
+          {"key": "u1", "role": "user", "content": "今天跑了 3 公里就停了，膝盖有点疼。"},
+          {"key": "a1", "role": "assistant", "content": "先休息两天，疼痛持续的话要去看医生。"}
+        ]}
+      ],
+      "conversation": [
+        {"id": "running.week_total", "category": "multi_session",
+         "text": "最近一周我一共跑了多少公里？",
+         "expect": ["msg:s1.u1", "msg:s2.u1", "msg:s3.u1"],
+         "live": {"must": [["16"]]}},
+        {"id": "running.next_week_plan", "category": "preference_application",
+         "text": "帮我安排下周的跑步计划。",
+         "expect": [["rec:knee", "msg:s4.u1"]],
+         "live": {"must": [["膝盖", "knee"]]}},
+        {"id": "running.race_signup", "category": "temporal",
+         "text": "我是哪天报名的半马？",
+         "expect": [["msg:s5.u1", "rec:race"]],
+         "live": {"must": [["date:s5"]]}},
+        {"id": "running.body_fat_false_premise", "category": "abstention",
+         "text": "我上个月的体脂率是多少？",
+         "live": {"abstain": true}},
+        {"id": "running.knee", "category": "chinese_short_terms",
+         "text": "膝盖还疼吗？上次说的。",
+         "expect": [["msg:s3.u1"]],
+         "live": {"must": [["疼", "pain", "hurt", "休息"]]}},
+        {"id": "running.control_css", "category": "unrelated",
+         "text": "How do I center a div with CSS grid?"}
+      ]
+    },
+    {
+      "id": "body_log",
+      "title": "Weekly weigh-ins found by relative dates (last week, three days ago)",
+      "core": {"user": [], "memory": []},
+      "archive": [
+        {"key": "s1", "days_ago": 21, "at": "08:10", "messages": [
+          {"key": "u1", "role": "user", "content": "早上称了体重，72.4 公斤。"},
+          {"key": "a1", "role": "assistant", "content": "记下了，之后每周记一次。"}]},
+        {"key": "s2", "days_ago": 14, "at": "08:05", "messages": [
+          {"key": "u1", "role": "user", "content": "体重 71.9 公斤，这周开始晚饭不吃米饭。"},
+          {"key": "a1", "role": "assistant", "content": "好，继续观察两周。"}]},
+        {"key": "s3", "days_ago": 7, "at": "08:00", "messages": [
+          {"key": "u1", "role": "user", "content": "今早体重 71.6 公斤。"},
+          {"key": "a1", "role": "assistant", "content": "比上次又轻了一点。"}]},
+        {"key": "s4", "days_ago": 3, "at": "20:30", "messages": [
+          {"key": "u1", "role": "user", "content": "今天去做了体检，医生说血压 128/82，有点偏高。"},
+          {"key": "a1", "role": "assistant", "content": "记下了，饮食上可以少放点盐。"}]}
+      ],
+      "conversation": [
+        {"id": "body.last_week", "category": "temporal",
+         "text": "上周体重是多少？",
+         "expect": [["msg:s3.u1"]],
+         "live": {"must": [["71.6"]]}},
+        {"id": "body.three_days_ago", "category": "temporal",
+         "text": "三天前我去做了什么？",
+         "expect": [["msg:s4.u1"]],
+         "live": {"must": [["体检", "血压"]]}},
+        {"id": "body.two_weeks_ago", "category": "temporal",
+         "text": "两周前称的体重是多少？",
+         "expect": [["msg:s2.u1"]],
+         "live": {"must": [["71.9"]]}},
+        {"id": "body.last_week_en", "category": "cross_lingual",
+         "text": "How much did I weigh last week?",
+         "expect": [["msg:s3.u1"]],
+         "live": {"must": [["71.6"]]}}
+      ]
+    }
+  ],
+  "write_path": [
+    {"id": "write.github_username",
+     "sessions": [["记一下：我的 GitHub 用户名是 tidepool-sy。"]],
+     "ask": "我的 GitHub 用户名是什么？",
+     "live": {"must": [["tidepool-sy"]]}},
+    {"id": "write.meeting_time",
+     "sessions": [["My preferred time for meetings is Tuesday 10am Singapore time. Please remember that."]],
+     "ask": "什么时候约我开会比较好？",
+     "live": {"must": [["周二", "星期二", "Tuesday"], ["10"]]}},
+    {"id": "write.cat_name",
+     "sessions": [["我家的猫叫 Mochi，是只橘猫，帮我记住。"]],
+     "ask": "我家猫叫什么名字？",
+     "live": {"must": [["Mochi"]]}},
+    {"id": "write.theme_update",
+     "sessions": [["我最喜欢的编辑器主题是 Gruvbox，记一下。"], ["主题我改成 Catppuccin 了，Gruvbox 不用了，帮我更新一下。"]],
+     "ask": "我现在用什么编辑器主题？",
+     "live": {"must": [["Catppuccin"]], "stale": ["Gruvbox"]}}
+  ]
+}

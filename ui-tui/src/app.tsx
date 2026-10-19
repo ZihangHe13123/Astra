@@ -10,10 +10,12 @@ import type { AppshotManifestReader } from "./appshot-input.js";
 import type { GenerationProgress, GenerationStats, InputSubmission, LocalModeDefinition } from "./types.js";
 import { generationProgressLabel } from "./generation-progress.js";
 import { preparationLabel, reduceToolPreparation, type ToolPreparation } from "@astra/ui-core/tool-preparation";
-import { COMPACTION_LABEL, compactionNotice } from "./context-compaction.js";
+import { COMPACTION_LABEL, compactionNotice } from "@astra/ui-core/context-compaction";
 import { TurnChangesRenderGate } from "./turn-changes.js";
 import { turnChangesCard } from "./turn-changes-card.js";
 import { describeTool } from "@astra/ui-core/tool-activity";
+import { memoryNoticeText, memoryRecallText } from "@astra/ui-core/memory-notices";
+import { maskSecrets } from "@astra/ui-core/secret-mask";
 import { processRowCells, toolRowCells } from "./tool-row.js";
 import { gapLine, noticeItem, TranscriptFlow, type FlowGap, type FlowItem } from "./transcript-flow.js";
 import { createBackendEventReceiver, EventDeliveryState, writeProtocolDiagnostic } from "./backend-protocol.js";
@@ -296,9 +298,12 @@ export function messageToLines(
   tone?: LineTone,
 ): RenderLine[] {
   if (msg.role === "reasoning" && !showReasoning) return [];
+  // A credential the user pasted is drawn masked; the message itself, and what is sent, stay as written.
   const content = msg.role === "assistant"
     ? stripLegacyAssistantTimeMarker(msg.content)
-    : msg.content;
+    : msg.role === "user"
+      ? maskSecrets(msg.content)
+      : msg.content;
   const bodyWidth = Math.max(30, width - 8);
   const result = markdownBlocksToLines(parseCompleteMarkdown(content), {
     role: msg.role,
@@ -396,7 +401,7 @@ export function submitStreamLifecyclePolicy(
   text: string,
   timelineCommand: ReturnType<typeof resolveTimelineCommand> = resolveTimelineCommand(text, false),
 ): SubmitStreamLifecycle {
-  if (timelineCommand !== null || /^\/(?:cancel|theme|restart|wakeup|yolo|voice|help)(?:\s|$)/i.test(text.trim())) {
+  if (timelineCommand !== null || /^\/(?:cancel|theme|restart|wakeup|yolo|voice|help|memory\s+consolidation)(?:\s|$)/i.test(text.trim())) {
     return "preserve";
   }
   return "clear";
@@ -747,6 +752,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   const [learningReviewStatus, setLearningReviewStatus] = useState<"queued" | "running" | null>(null);
   const [yolo, setYolo] = useState(false);
   const [voice, setVoice] = useState<{ badge?: "on" | "speaking"; voices: string[] }>({ voices: [] });
+  const [proposals, setProposals] = useState<{ id: number; action: string; summary: string }[]>([]);
   // Ctrl+C reads these outside React's render cycle.
   const voiceRef = useRef({ speaking: false, error: "" });
   const [workingMemory, setWorkingMemory] = useState<WorkingMemory>({});
@@ -1358,6 +1364,18 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         voiceRef.current = { speaking, error: event.error ?? "" };
         break;
       }
+      case "memory_consolidation_status":
+        if (Array.isArray(event.proposals)) setProposals(event.proposals);
+        // Only the answer to a /memory consolidation command carries text; other statuses are quiet.
+        if (event.message) addMessage("system", event.message);
+        if (event.error) addMessage("error", event.error);
+        break;
+      case "weixin_status":
+        // The login code is drawn once, when it is handed out (a code block keeps its spaces); later statuses say what changed.
+        if (event.message && event.login === "scan" && event.qr?.text) addMessage("system", `${event.message}\n\n\`\`\`\n${event.qr.text}\n\`\`\``);
+        else if (event.message) addMessage("system", event.message);
+        if (event.error) addMessage("error", `微信：${event.error}`);
+        break;
       case "yolo_status":
         setYolo(event.yolo);
         if (event.error) {
@@ -1738,6 +1756,10 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           textBatcher.accept(event);
           if (event.type === "wakeup_status" || event.type === "background_wakeup") {
             if (event.message) addMessageRef.current("system", event.message);
+          } else if (event.type === "memory_notice") {
+            addMessageRef.current("system", memoryNoticeText(event));
+          } else if (event.type === "memory_recall") {
+            addMessageRef.current("system", memoryRecallText(event));
           } else if (event.type === "peer_message") {
             // Another Astra session on this computer: a notice, never the user's words.
             addMessageRef.current("system", `PEER ${event.direction === "in" ? "←" : "→"} ${event.peer} · ${event.state} · ${event.task_id}\n${event.text}`);
@@ -1811,6 +1833,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         setBackendStatus("disconnected");
         setYolo(false);
         setVoice({ voices: [] });
+        setProposals([]);
         voiceRef.current = { speaking: false, error: "" };
         setStartupVisible(false);
         restartPendingRef.current = false;
@@ -2086,7 +2109,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
       return;
     }
     const timelineCommand = resolveTimelineCommand(text, timelineVisibleRef.current);
-    const controlWhileBusy = /^\/(?:cancel|theme|timeline|reconnect|restart|wakeup|yolo|voice|help)(?:\s|$)/i.test(trimmedText);
+    const controlWhileBusy = /^\/(?:cancel|theme|timeline|reconnect|restart|wakeup|yolo|voice|help|memory\s+consolidation)(?:\s|$)/i.test(trimmedText);
     const streamLifecycle = submitStreamLifecyclePolicy(text, timelineCommand);
     if (busyRef.current && !controlWhileBusy) {
       // Auto-steering: send as a normal message; the backend routes it
@@ -2528,6 +2551,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           yolo={yolo}
           voice={voice.badge}
           voices={voice.voices}
+          proposals={proposals}
           sessionList={sessionList}
           barSessionList={barSessionList}
           minimalSessionList={minimalSessionList}

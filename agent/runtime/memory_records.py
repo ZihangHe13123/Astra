@@ -155,6 +155,25 @@ class MemoryRecordRepository:
                     ON memory_records(source_session_id, created_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_memory_records_supersedes
                     ON memory_records(supersedes_id);
+                CREATE TABLE IF NOT EXISTS memory_usage (
+                    record_id TEXT PRIMARY KEY,
+                    recalls INTEGER NOT NULL DEFAULT 0,
+                    reads INTEGER NOT NULL DEFAULT 0,
+                    last_used_at TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS memory_proposals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    evidence_json TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT '',
+                    decided_at TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE IF NOT EXISTS memory_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
                 """
             )
             try:
@@ -381,82 +400,6 @@ class MemoryRecordRepository:
             raise ValueError(f"Memory id prefix is ambiguous: {record_id}")
         return self._from_row(rows[0]) if rows else None
 
-    def find_active_by_content(self, kind: str, content: str) -> MemoryRecord | None:
-        clean_kind = self._validate_kind(kind)
-        with self._lock, self._connection() as db:
-            row = db.execute(
-                "SELECT * FROM memory_records WHERE kind=? AND status='active' AND lower(content)=lower(?) "
-                "ORDER BY created_at DESC LIMIT 1",
-                (clean_kind, str(content)),
-            ).fetchone()
-        return self._from_row(row) if row else None
-
-    def confirm(self, record_id: str, *, confidence: float | None = None) -> MemoryRecord:
-        record = self.get(record_id)
-        if record is None or record.status != "active":
-            raise ValueError(f"Active memory record not found: {record_id}")
-        next_confidence = record.confidence if confidence is None else max(
-            record.confidence,
-            self._score(confidence, "confidence"),
-        )
-        with self._lock, self._connection() as db:
-            db.execute(
-                "UPDATE memory_records SET last_confirmed_at=?, confidence=? WHERE id=? AND status='active'",
-                (_now(), next_confidence, record.record_id),
-            )
-        confirmed = self.get(record.record_id)
-        if confirmed is None:
-            raise RuntimeError("confirmed memory record disappeared")
-        return confirmed
-
-    def update_lifecycle(
-        self,
-        record_id: str,
-        *,
-        metadata: dict[str, Any],
-        confidence: float | None = None,
-        salience: float | None = None,
-        valid_until: str | None = None,
-        supersedes_id: str | None = None,
-    ) -> MemoryRecord:
-        """Atomically update lifecycle fields on one active record."""
-        record = self.get(record_id)
-        if record is None or record.status != "active":
-            raise ValueError(f"Active memory record not found: {record_id}")
-        values: dict[str, Any] = {
-            "id": record.record_id,
-            "metadata_json": json.dumps(metadata, ensure_ascii=False, sort_keys=True),
-            "last_confirmed_at": _now(),
-            "confidence": record.confidence if confidence is None else self._score(confidence, "confidence"),
-            "salience": record.salience if salience is None else self._score(salience, "salience"),
-            "valid_until": (
-                record.valid_until
-                if valid_until is None
-                else self._timestamp(valid_until)
-            ),
-            "supersedes_id": record.supersedes_id if supersedes_id is None else str(supersedes_id),
-        }
-        with self._lock, self._connection() as db:
-            cursor = db.execute(
-                """
-                UPDATE memory_records
-                SET metadata_json=:metadata_json,
-                    last_confirmed_at=:last_confirmed_at,
-                    confidence=:confidence,
-                    salience=:salience,
-                    valid_until=:valid_until,
-                    supersedes_id=:supersedes_id
-                WHERE id=:id AND status='active'
-                """,
-                values,
-            )
-        if cursor.rowcount != 1:
-            raise RuntimeError(f"Lifecycle update lost active record: {record_id}")
-        updated = self.get(record.record_id)
-        if updated is None:
-            raise RuntimeError("updated memory record disappeared")
-        return updated
-
     def recall(
         self,
         query: str = "",
@@ -588,6 +531,74 @@ class MemoryRecordRepository:
                 (_now(), str(record_id)),
             )
             return cursor.rowcount > 0
+
+    def note_use(self, record_ids: Iterable[str], *, read: bool = False, now: str | None = None) -> None:
+        """Count a recall into a turn, or an explicit read, for each record."""
+        ids = tuple(dict.fromkeys(str(record_id) for record_id in record_ids if record_id))
+        if not ids:
+            return
+        column = "reads" if read else "recalls"
+        current = self._timestamp(now, default=_now())
+        with self._lock, self._connection() as db:
+            db.executemany(
+                f"INSERT INTO memory_usage(record_id, {column}, last_used_at) VALUES (?, 1, ?) "
+                f"ON CONFLICT(record_id) DO UPDATE SET {column} = {column} + 1, last_used_at = excluded.last_used_at",
+                [(record_id, current) for record_id in ids],
+            )
+
+    def usage(self) -> dict[str, tuple[int, int, str]]:
+        """Recalls, reads and last use per record that has been used."""
+        with self._lock, self._connection() as db:
+            rows = db.execute("SELECT record_id, recalls, reads, last_used_at FROM memory_usage").fetchall()
+        return {str(row["record_id"]): (int(row["recalls"]), int(row["reads"]), str(row["last_used_at"]))
+                for row in rows}
+
+    def add_proposals(self, items: Iterable[tuple[dict[str, Any], list[dict[str, Any]]]], *, model: str) -> list[int]:
+        """Store proposed memory changes (payload, evidence) as pending."""
+        ids = []
+        with self._lock, self._connection() as db:
+            for payload, evidence in items:
+                cursor = db.execute(
+                    "INSERT INTO memory_proposals(created_at, status, payload_json, evidence_json, model) "
+                    "VALUES (?, 'pending', ?, ?, ?)",
+                    (_now(), json.dumps(payload, ensure_ascii=False), json.dumps(evidence, ensure_ascii=False), model),
+                )
+                ids.append(int(cursor.lastrowid or 0))
+        return ids
+
+    def proposals(self, *, status: str = "pending") -> list[dict[str, Any]]:
+        with self._lock, self._connection() as db:
+            rows = db.execute(
+                "SELECT * FROM memory_proposals WHERE status = ? ORDER BY id", (status,)
+            ).fetchall()
+        return [{
+            "id": int(row["id"]), "created_at": str(row["created_at"]), "status": str(row["status"]),
+            "model": str(row["model"]), **json.loads(row["payload_json"]),
+            "evidence": json.loads(row["evidence_json"]),
+        } for row in rows]
+
+    def decide_proposal(self, proposal_id: int, status: str) -> bool:
+        """Move a pending proposal to accepted or dismissed; False if it was not pending."""
+        if status not in {"accepted", "dismissed"}:
+            raise ValueError(f"Invalid proposal decision: {status}")
+        with self._lock, self._connection() as db:
+            changed = db.execute(
+                "UPDATE memory_proposals SET status = ?, decided_at = ? WHERE id = ? AND status = 'pending'",
+                (status, _now(), int(proposal_id)),
+            ).rowcount
+        return bool(changed)
+
+    def meta(self, key: str, default: str = "") -> str:
+        with self._lock, self._connection() as db:
+            row = db.execute("SELECT value FROM memory_meta WHERE key = ?", (key,)).fetchone()
+        return str(row["value"]) if row is not None else default
+
+    def set_meta(self, key: str, value: str) -> None:
+        with self._lock, self._connection() as db:
+            db.execute(
+                "INSERT INTO memory_meta(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, str(value)),
+            )
 
     def stats(self) -> dict[str, Any]:
         with self._lock, self._connection() as db:

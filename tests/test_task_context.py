@@ -18,11 +18,11 @@ from agent.runtime.tools.registry import ToolRegistry
 def stores(tmp_path):
     memory = MemoryStore(path=tmp_path / "memory.db", core_dir=tmp_path / "core")
     tasks = TaskStore(tmp_path / "tasks.db")
-    return memory, tasks, MemoryRouter(None, memory, tasks)
+    return memory, tasks, MemoryRouter(memory, tasks)
 
 
 def task_context(router, text="下一步", session="s1"):
-    return asyncio.run(router.build_context(text, session_id=session, recall_enabled=False)).task
+    return asyncio.run(router.build_context(session_id=session)).task
 
 
 @pytest.mark.parametrize("user_text", ["你好", "继续吧", "修复 Astra 数据库锁", "长问题" * 4000],

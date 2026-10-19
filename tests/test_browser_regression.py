@@ -21,10 +21,11 @@ from agent.runtime.cdp_backend import CdpBrowserBackend, find_chrome
 
 # Skip the whole browser launch suite unless this is native Windows Chrome.
 chrome_path = find_chrome()
-pytestmark = pytest.mark.skipif(
-    sys.platform != "win32" or not chrome_path,
-    reason="Requires native Windows Chrome",
-)
+pytestmark = [
+    pytest.mark.skipif(sys.platform != "win32" or not chrome_path, reason="Requires native Windows Chrome"),
+    # The first headless Chrome on a fresh runner is started once by conftest.
+    pytest.mark.usefixtures("warm_native_chrome"),
+]
 
 # ---------------------------------------------------------------------------
 # Shared event loop + backend for the whole module.

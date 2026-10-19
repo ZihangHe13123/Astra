@@ -52,7 +52,8 @@ const server = createServer(async (req, res) => {
     chunk({ role: 'assistant', content: partial });
     await streamGate;
     chunk({ content: '\n```\n\n' + source });
-  } else chunk({ role: 'assistant', content: invalid });
+  } else if (text.includes('SECRET_MASK')) chunk({ role: 'assistant', content: 'SECRET_MASK_REPLY' });
+  else chunk({ role: 'assistant', content: invalid });
   chunk({}, 'stop'); res.end('data: [DONE]\n\n');
 });
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -207,6 +208,31 @@ try {
   await expect.poll(clipboardText).toBe(invalid);
   passed('invalid math and diagrams preserve source and the rest of the message remains usable');
 
+  // Obviously fake fixtures of published credential shapes. A sent message draws them masked; the
+  // model and the message copy keep them as written, and a click shows one value.
+  const fakeKey = 'sk-test' + '0'.repeat(28);
+  const fakeToken = 'ghp_' + '0'.repeat(16) + 'T'.repeat(20);
+  const maskedValue = value => value.slice(0, 8) + '\u2022'.repeat(value.length - 8);
+  const secretMessage = `SECRET_MASK 用 ${fakeKey} 和 \`${fakeToken}\``;
+  await submit(secretMessage);
+  await page.locator('.message.assistant').filter({ hasText: 'SECRET_MASK_REPLY' }).waitFor();
+  await waitIdle();
+  assert.ok(requests.some(payload => payload.messages.some(message => message.role === 'user' && String(message.content).includes(secretMessage))), 'the model receives the message as written');
+  const sent = page.locator('.message.user').filter({ hasText: 'SECRET_MASK' });
+  const secretValues = sent.locator('.secret-value');
+  await expect(secretValues).toHaveCount(2);
+  await expect(secretValues.first()).toHaveText(maskedValue(fakeKey));
+  assert.ok(!(await sent.innerText()).includes(fakeKey.slice(8)) && !(await sent.innerText()).includes(fakeToken.slice(8)), 'credentials are drawn masked');
+  await secretValues.first().click();
+  await expect(secretValues.first()).toHaveText(fakeKey);
+  await expect(secretValues.nth(1)).toHaveText(maskedValue(fakeToken));
+  await secretValues.first().click();
+  await expect(secretValues.first()).toHaveText(maskedValue(fakeKey));
+  // The user's copy button is shown only beside a saved record; its action copies the original text.
+  await sent.locator('button[aria-label="复制消息"]').evaluate(button => button.click());
+  await expect.poll(clipboardText).toBe(secretMessage);
+  passed('a credential in a sent message is drawn masked, shown one value at a time, and sent and copied as written');
+
   // Select a fixture through the normal file chooser IPC. The renderer never
   // receives an injected preview or arbitrary file-read capability.
   await app.evaluate(({ dialog, shell }, path) => {
@@ -247,6 +273,17 @@ try {
   await expect(historyDiagram.locator('img[alt="Mermaid 图表"]')).toBeVisible();
   await waitForImage(historyDiagram);
   await assertMeasuredRows();
+  // One scroll to the top, right after rows were measured, stays there. Made in an animation frame, like a user's
+  // scroll and like scrollToTop's polling, it used to meet the row measurement queued for that frame: following was
+  // still on, so the list was pinned back to the bottom (6 runs in 10 locally; a macOS runner failed on it
+  // 2026-10-16). It is checked here without the retries of scrollToTop.
+  const highest = await page.evaluate(() => new Promise(done => requestAnimationFrame(() => {
+    const el = document.querySelector('.messages-scroll'); el.scrollTop = 0;
+    const start = performance.now(); let max = 0;
+    const sample = () => { max = Math.max(max, el.scrollTop); if (performance.now() - start < 1000) requestAnimationFrame(sample); else done(max); };
+    requestAnimationFrame(sample);
+  })));
+  assert.equal(highest, 0, 'a scroll to the top must not be undone by the next measurement');
   await scrollToTop();
   await expect(historical).toHaveCount(0);
   // Rows coming back are measured again as they mount, so one jump to the bottom can land short

@@ -30,6 +30,7 @@ export type CommandMenuContext = {
   localMode?: LocalModeDefinition | null;
   personas?: { name: string; description: string }[];
   voices?: string[];
+  proposals?: { id: number; action: string; summary: string }[];
 };
 
 const SLASH_COMMANDS: SlashCommandSuggestion[] = [
@@ -48,6 +49,7 @@ const SLASH_COMMANDS: SlashCommandSuggestion[] = [
   { command: "/connect", description: "connect a provider and choose its model", takesArgs: true, group: "MODEL" },
   { command: "/persona", description: "show or switch prompt persona", takesArgs: true, group: "MODEL" },
   { command: "/search", description: "show or switch web search provider", takesArgs: true, group: "TOOLS" },
+  { command: "/weixin", description: "WeChat channel · [status|login|on|off|logout]", takesArgs: true, group: "TOOLS" },
   { command: "/tool", description: "open latest or numbered tool result details", takesArgs: true, group: "TOOLS" },
   { command: "/gallery", description: "open latest or numbered image search gallery", takesArgs: true, group: "TOOLS" },
   { command: "/doc", description: "view the latest or numbered document; /doc open uses the system app", takesArgs: true, group: "TOOLS" },
@@ -116,6 +118,16 @@ const SEARCH_PROVIDERS: SlashCommandSuggestion[] = [
   { command: "auto", description: "smart routing with provider fallback", completion: "/search auto", submitValue: "/search auto", kind: "command" },
   { command: "exa", description: "force Exa semantic search", completion: "/search exa", submitValue: "/search exa", kind: "command" },
   { command: "searxng", description: "force local SearXNG metasearch", completion: "/search searxng", submitValue: "/search searxng", kind: "command" },
+  { command: "deepseek", description: "force DeepSeek Search API (billed per request)", completion: "/search deepseek", submitValue: "/search deepseek", kind: "command" },
+];
+
+const WEIXIN_OPTIONS: SlashCommandSuggestion[] = [
+  { command: "status", description: "show the WeChat channel", completion: "/weixin status", submitValue: "/weixin status", kind: "command" },
+  { command: "login", description: "log in by scanning a QR code in WeChat", completion: "/weixin login", submitValue: "/weixin login", kind: "command" },
+  { command: "on", description: "switch the channel on", completion: "/weixin on", submitValue: "/weixin on", kind: "command" },
+  { command: "off", description: "switch the channel off", completion: "/weixin off", submitValue: "/weixin off", kind: "command" },
+  { command: "logout", description: "log out and forget the login", completion: "/weixin logout", submitValue: "/weixin logout", kind: "command" },
+  { command: "model", description: "the model WeChat answers with: a /model key, or default", completion: "/weixin model ", submitValue: "/weixin model", kind: "command" },
 ];
 
 const MEMORY_SUBCOMMANDS: SlashCommandSuggestion[] = [
@@ -126,12 +138,34 @@ const MEMORY_SUBCOMMANDS: SlashCommandSuggestion[] = [
   { command: "working", description: "update a working-memory field", completion: "/memory working ", kind: "command" },
   { command: "inspect", description: "inspect structured memory by query or id", completion: "/memory inspect ", kind: "command" },
   { command: "timeline", description: "show lifecycle and supersession history", completion: "/memory timeline ", kind: "command" },
-  { command: "why", description: "show the last recall and retention decisions", completion: "/memory why", submitValue: "/memory why", kind: "command" },
+  { command: "why", description: "show how automatic recall works and the last retention decision", completion: "/memory why", submitValue: "/memory why", kind: "command" },
   { command: "correct", description: "supersede one active memory with a correction", completion: "/memory correct ", kind: "command" },
   { command: "forget", description: "forget an active core or structured memory", completion: "/memory forget ", kind: "command" },
   { command: "import-core", description: "merge external Core Markdown edits", completion: "/memory import-core", submitValue: "/memory import-core", kind: "command" },
+  { command: "proposals", description: "list memory changes the background review proposed", completion: "/memory proposals", submitValue: "/memory proposals", kind: "command" },
+  { command: "accept", description: "apply proposed memory changes · <n|all>", completion: "/memory accept ", kind: "command" },
+  { command: "dismiss", description: "drop proposed memory changes · <n|all>", completion: "/memory dismiss ", kind: "command" },
+  { command: "consolidation", description: "show the background memory review mode", completion: "/memory consolidation", submitValue: "/memory consolidation", kind: "command" },
+  { command: "consolidation off", description: "stop background memory reviews", completion: "/memory consolidation off", submitValue: "/memory consolidation off", kind: "command" },
+  { command: "consolidation review", description: "propose memory changes; you accept each one", completion: "/memory consolidation review", submitValue: "/memory consolidation review", kind: "command" },
+  { command: "consolidation auto", description: "save and revise memories directly; forgetting waits for you", completion: "/memory consolidation auto", submitValue: "/memory consolidation auto", kind: "command" },
+  { command: "consolidation now", description: "review new conversations at the next idle moment", completion: "/memory consolidation now", submitValue: "/memory consolidation now", kind: "command" },
   { command: "clear-working", description: "clear this session's working memory", completion: "/memory clear-working", submitValue: "/memory clear-working", kind: "command" },
 ];
+
+function proposalFollowUps(proposals: { id: number; action: string; summary: string }[]): SlashCommandSuggestion[] {
+  if (proposals.length === 0) return [];
+  const item = (command: string, description: string, value: string): SlashCommandSuggestion => (
+    { command, description, completion: value, submitValue: value, kind: "command", group: "PROPOSALS" });
+  return [
+    ...proposals.flatMap((proposal) => [
+      item(`accept P${proposal.id}`, `${proposal.action} · ${proposal.summary}`, `/memory accept ${proposal.id}`),
+      item(`dismiss P${proposal.id}`, `drop this ${proposal.action}`, `/memory dismiss ${proposal.id}`),
+    ]),
+    item("accept all", `apply all ${proposals.length} waiting proposals`, "/memory accept all"),
+    item("dismiss all", `drop all ${proposals.length} waiting proposals`, "/memory dismiss all"),
+  ];
+}
 
 const CONCLAVE_SUBCOMMANDS: SlashCommandSuggestion[] = [
   { command: "config", description: "show current Conclave configuration", completion: "/conclave config", submitValue: "/conclave config", kind: "command" },
@@ -518,6 +552,11 @@ export function slashCommandSuggestions(
     const query = (searchMatch[1] ?? "").trim().toLowerCase();
     return SEARCH_PROVIDERS.filter((provider) => provider.command.startsWith(query)).map((provider) => ({ ...provider, group: "SEARCH" }));
   }
+  const weixinMatch = trimmed.match(/^\/weixin(?:\s+([\s\S]*))?$/i);
+  if (weixinMatch && (trimmed.toLowerCase() === "/weixin" || trimmed === "/weixin " || weixinMatch[1] !== undefined)) {
+    const query = (weixinMatch[1] ?? "").trim().toLowerCase();
+    return WEIXIN_OPTIONS.filter((option) => option.command.startsWith(query)).map((option) => ({ ...option, group: "WEIXIN" }));
+  }
   const sandboxMatch = trimmed.match(/^\/sandbox(?:\s+([\s\S]*))?$/i);
   if (sandboxMatch && (trimmed.toLowerCase() === "/sandbox" || trimmed === "/sandbox " || sandboxMatch[1] !== undefined)) {
     const query = (sandboxMatch[1] ?? "").trim().toLowerCase();
@@ -564,7 +603,13 @@ export function slashCommandSuggestions(
   const memoryMatch = trimmed.match(/^\/memory(?:\s+([\s\S]*))?$/i);
   if (memoryMatch && (trimmed.toLowerCase() === "/memory" || trimmed === "/memory " || memoryMatch[1] !== undefined)) {
     const query = (memoryMatch[1] ?? "").trim().toLowerCase();
-    return MEMORY_SUBCOMMANDS.filter((item) => item.command.startsWith(query)).map((item) => ({ ...item, group: "MEMORY" }));
+    const listed = MEMORY_SUBCOMMANDS.filter((item) => item.command.startsWith(query)).map((item) => ({ ...item, group: "MEMORY" }));
+    const followUps = proposalFollowUps(context.proposals ?? []);
+    // What can be done with the waiting proposals follows /memory proposals, accept and dismiss.
+    if (query.startsWith("proposals")) return [...listed, ...followUps];
+    // "accept 3" finds "accept P3".
+    const wanted = query.replace(/^(accept|dismiss) (\d)/, "$1 p$2");
+    return query ? [...listed, ...followUps.filter((item) => item.command.toLowerCase().startsWith(wanted))] : listed;
   }
   const skillsMatch = trimmed.match(/^\/skills(?:\s+([\s\S]*))?$/i);
   if (skillsMatch && (trimmed.toLowerCase() === "/skills" || trimmed === "/skills " || skillsMatch[1] !== undefined)) {
