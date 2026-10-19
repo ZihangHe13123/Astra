@@ -57,6 +57,15 @@ def _isolate_local_personas(tmp_path, monkeypatch, _isolate_application_environm
 
 
 @pytest.fixture(autouse=True)
+def _isolate_filesystem_policy(request, tmp_path, monkeypatch, _isolate_application_environment):
+    # The default policy is the installation's. A source checkout must not give
+    # tests, or the backends they start, the developer's real host roots.
+    if request.node.get_closest_marker("allow_application_environment") is not None:
+        return
+    monkeypatch.setenv("AGENT_FILESYSTEM_CONFIG", str(tmp_path / "installation-filesystem.json"))
+
+
+@pytest.fixture(autouse=True)
 def _isolate_learning_archive(tmp_path, monkeypatch, _isolate_application_environment):
     # Local history is now exposed by session_search too. Tests and their child
     # processes must never read or create the user's real learning archive.

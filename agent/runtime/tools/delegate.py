@@ -67,7 +67,7 @@ from ..worker import (
 )
 from .processes import OutputCallback, ProcessManager
 from .registry import ToolDef, ToolRegistry
-from .files import register_file_tools
+from .files import FilesystemPolicy, register_file_tools
 from .code import register_code_tools
 from .git import register_git_tools
 from agent.sandbox.local import LocalSandbox
@@ -1408,7 +1408,12 @@ def _create_workspace_registry(
     local = _workspace_sandbox(sandbox, root)
     rebound = ToolRegistry(policy=main_registry.policy)
     rebound.share_session_with(main_registry)
-    register_file_tools(rebound, workdir=str(root), sandbox=local)
+    # The parent's configured roots, not a reload: this runs on the event loop.
+    parent_access = main_registry.filesystem_policy
+    register_file_tools(
+        rebound, workdir=str(root), sandbox=local,
+        policy=parent_access.for_workspace(root) if isinstance(parent_access, FilesystemPolicy) else None,
+    )
     register_git_tools(
         rebound,
         workdir=str(root),
