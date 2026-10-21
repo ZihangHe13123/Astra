@@ -124,7 +124,8 @@ def test_safe_opened_maps_real_broker_statuses_back_to_displayed_sources() -> No
             del locator, window
             return EvidenceResult("activity", "untrusted_observation", "", ())
 
-    broker = ContextIndexBroker("session", 900, OpenableSession(), EmptyActivity())
+    # Not a test of the 200 ms source deadline, which can run out on a busy runner before a source thread starts.
+    broker = ContextIndexBroker("session", 900, OpenableSession(), EmptyActivity(), source_deadline_seconds=5.0)
     pack = asyncio.run(broker.build(
         "continue", "real-trace", "session", WorkspaceIdentity("key", "", "fixture"), 1.0, frozenset()
     ))

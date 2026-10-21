@@ -121,7 +121,7 @@ class ReplacementRaceSource(FakeSource):
 
 
 class PausedSource(FakeSource):
-    """Hold the first worker until the caller changes its generation or mode."""
+    """Hold the first worker until the test releases it."""
 
     def __init__(self) -> None:
         super().__init__("session")
@@ -145,7 +145,9 @@ def make_broker(
     mode: str = "all",
     session: FakeSource | None = None,
     activity: FakeSource | None = None,
-    source_deadline_seconds: float | None = None,
+    # Most tests here are not about the 200 ms source deadline, and on a busy runner a fake source's
+    # thread can start after it, dropping its row. A test about the deadline passes its own.
+    source_deadline_seconds: float = 5.0,
 ) -> ContextIndexBroker:
     return ContextIndexBroker(
         mode=mode,
@@ -547,14 +549,20 @@ def test_session_mode_never_starts_activity_source() -> None:
 
 
 def test_one_slow_source_does_not_block_completed_source() -> None:
-    # delay 跟随预算常量：任何 deadline 调整都不会把这个契约测试变哑炮。
-    from agent.runtime.context_index.broker import _SOURCE_DEADLINE_SECONDS
-
-    session = FakeSource("session", delay=_SOURCE_DEADLINE_SECONDS + 0.06)
+    # This contract is about the deadline, so the test sets its own. The session source is held until the
+    # build returns and so always misses it, whatever the deadline; the activity source answers at once,
+    # and a whole second leaves its thread room to start on a busy runner.
+    session = PausedSource()
     activity = FakeSource("activity")
-    broker = make_broker(session=session, activity=activity)
+    broker = make_broker(session=session, activity=activity, source_deadline_seconds=1.0)
 
-    pack = asyncio.run(_build(broker))
+    async def build_then_release():
+        try:
+            return await _build(broker)
+        finally:
+            session.release.set()
+
+    pack = asyncio.run(build_then_release())
 
     assert "activity" in pack.rendered
     assert broker.last_trace is not None

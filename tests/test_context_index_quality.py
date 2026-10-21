@@ -1,4 +1,5 @@
 import sqlite3
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -44,6 +45,11 @@ def test_quality_fixture_has_disjoint_scenarios_and_explicit_negatives():
 def test_quality_replay_exercises_sources_without_live_archives_or_models(monkeypatch):
     from agent.runtime.context_index import embedder
     monkeypatch.setattr(embedder, "get_embedder", lambda: (_ for _ in ()).throw(AssertionError("no model")))
+    # Replay builds its own broker with the 200 ms source deadline, which can run out on a busy runner
+    # before a source thread starts. This test is about what the sources find, so that broker waits longer.
+    monkeypatch.setattr(
+        quality, "ContextIndexBroker", partial(quality.ContextIndexBroker, source_deadline_seconds=5.0),
+    )
     rows = replay(load_fixture()["scenarios"][:2])
     lexical = [row for row in rows if row.kind == "lexical" and row.case_id.startswith("contact/")]
     negatives = [row for row in rows if row.kind == "negative"]

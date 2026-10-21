@@ -162,7 +162,10 @@ def test_broker_injects_chinese_session_evidence_without_unrelated_record(tmp_pa
     db.close()
     store = MemoryStore(path=tmp_path / "memory.db", core_dir=tmp_path / "core")
     store.add_record(kind="observation", content="Lyra 的身世记忆片段")
-    broker = ContextIndexBroker("session", 900, SessionRecommendationSource(path), EmptyActivity())
+    # Not a test of the 200 ms source deadline, which can run out on a busy runner before a source thread starts.
+    broker = ContextIndexBroker(
+        "session", 900, SessionRecommendationSource(path), EmptyActivity(), source_deadline_seconds=5.0,
+    )
     pack = asyncio.run(broker.build(
         "新记忆推荐库，质量如何", "request", "current", WORKSPACE, datetime.now().astimezone(),
         frozenset(), memory_path=store.path,
