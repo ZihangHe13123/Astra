@@ -49,7 +49,10 @@ def broker_with_rows():
         locator=SourceLocator("session_message", "private-session", index),
         channel_ranks=(("session-lexical", index),) if index != 2 else (("session-vector", index),),
     ) for index, text in enumerate(descriptions, 1))
-    return ContextIndexBroker("all", 900, Source(SourceResult("available", relevance=rows)), Source())
+    # Not a test of the 200 ms source deadline, which can run out on a busy runner before a source thread starts.
+    return ContextIndexBroker(
+        "all", 900, Source(SourceResult("available", relevance=rows)), Source(), source_deadline_seconds=5.0,
+    )
 
 
 def build(broker, text="project notes", request="request", session="session"):

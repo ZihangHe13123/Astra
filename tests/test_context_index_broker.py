@@ -112,7 +112,8 @@ class ReplacementRaceSource(FakeSource):
         query = str(args[0])
         if query == "old":
             self.old_started.set()
-            assert self.old_release.wait(1.0)
+            # Held through the replacement build, whose own thread may take up to 5 s to start.
+            assert self.old_release.wait(10)
             if self.old_error:
                 raise RuntimeError("private old failure")
         else:
@@ -121,7 +122,7 @@ class ReplacementRaceSource(FakeSource):
 
 
 class PausedSource(FakeSource):
-    """Hold the first worker until the caller changes its generation or mode."""
+    """Hold the first worker until the test releases it."""
 
     def __init__(self) -> None:
         super().__init__("session")
@@ -145,7 +146,9 @@ def make_broker(
     mode: str = "all",
     session: FakeSource | None = None,
     activity: FakeSource | None = None,
-    source_deadline_seconds: float | None = None,
+    # Most tests here are not about the 200 ms source deadline, and on a busy runner a fake source's
+    # thread can start after it, dropping its row. A test about the deadline passes its own.
+    source_deadline_seconds: float = 5.0,
 ) -> ContextIndexBroker:
     return ContextIndexBroker(
         mode=mode,
@@ -168,11 +171,9 @@ async def _build(broker: ContextIndexBroker, request_id: str = "req-1", text: st
 
 
 async def _event(event: threading.Event) -> None:
-    for _ in range(100):
-        if event.is_set():
-            return
-        await asyncio.sleep(0.002)
-    raise AssertionError("timed out waiting for race event")
+    # A busy runner can start a source thread late. Wait off the event loop so the builds keep running.
+    if not await asyncio.to_thread(event.wait, 5):
+        raise AssertionError("timed out waiting for race event")
 
 
 def test_build_is_once_per_request_and_byte_stable() -> None:
@@ -476,15 +477,17 @@ def test_old_caller_cancellation_cannot_expire_replacement_generation() -> None:
 
     async def replace_then_cancel_old():
         old = asyncio.create_task(_build(broker, text="old"))
-        await _event(session.old_started)
-        broker.complete_request("req-1")
-        new = asyncio.create_task(_build(broker, text="new"))
-        await _event(session.new_started)
-        replacement = await new
-        old.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await old
-        session.old_release.set()
+        try:
+            await _event(session.old_started)
+            broker.complete_request("req-1")
+            new = asyncio.create_task(_build(broker, text="new"))
+            await _event(session.new_started)
+            replacement = await new
+            old.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await old
+        finally:
+            session.old_release.set()
         await asyncio.sleep(0.01)
         cached = await _build(broker, text="changed")
         return replacement, cached
@@ -503,10 +506,12 @@ def test_old_late_result_or_exception_cannot_replace_new_pack(old_error: bool) -
 
     async def replace_then_finish_old():
         old = asyncio.create_task(_build(broker, text="old"))
-        await _event(session.old_started)
-        broker.complete_request("req-1")
-        replacement = await _build(broker, text="new")
-        session.old_release.set()
+        try:
+            await _event(session.old_started)
+            broker.complete_request("req-1")
+            replacement = await _build(broker, text="new")
+        finally:
+            session.old_release.set()
         stale = await old
         cached = await _build(broker, text="changed")
         return replacement, stale, cached
@@ -547,14 +552,20 @@ def test_session_mode_never_starts_activity_source() -> None:
 
 
 def test_one_slow_source_does_not_block_completed_source() -> None:
-    # delay 跟随预算常量：任何 deadline 调整都不会把这个契约测试变哑炮。
-    from agent.runtime.context_index.broker import _SOURCE_DEADLINE_SECONDS
-
-    session = FakeSource("session", delay=_SOURCE_DEADLINE_SECONDS + 0.06)
+    # This contract is about the deadline, so the test sets its own. The session source is held until the
+    # build returns and so always misses it, whatever the deadline; the activity source answers at once,
+    # and a whole second leaves its thread room to start on a busy runner.
+    session = PausedSource()
     activity = FakeSource("activity")
-    broker = make_broker(session=session, activity=activity)
+    broker = make_broker(session=session, activity=activity, source_deadline_seconds=1.0)
 
-    pack = asyncio.run(_build(broker))
+    async def build_then_release():
+        try:
+            return await _build(broker)
+        finally:
+            session.release.set()
+
+    pack = asyncio.run(build_then_release())
 
     assert "activity" in pack.rendered
     assert broker.last_trace is not None

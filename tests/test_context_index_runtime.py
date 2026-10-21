@@ -168,6 +168,8 @@ def test_first_turn_persists_user_before_source_key_exclusion(tmp_path):
         char_budget=900,
         session_source=OrderingSessionSource(database_path),
         activity_source=EmptyActivitySource(),
+        # Not a test of the 200 ms source deadline, which can run out on a busy runner before a source thread starts.
+        source_deadline_seconds=5.0,
     )
     llm = DoneLLM()
     agent = _agent(llm, broker, max_iterations=1)

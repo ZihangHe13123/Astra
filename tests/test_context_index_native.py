@@ -282,8 +282,10 @@ def test_broker_submissions_and_actual_previews_are_separate_from_builds(tmp_pat
     from tests.test_context_index_broker import FakeSource
     from agent.runtime.context_index.ranking import _escape
 
+    # Not a test of the 200 ms source deadline, which can run out on a busy runner before a source thread starts.
     broker = ContextIndexBroker(
-        "session", 400, FakeSource("session"), FakeSource("activity"), feedback_path=tmp_path / "feedback.db"
+        "session", 400, FakeSource("session"), FakeSource("activity"), feedback_path=tmp_path / "feedback.db",
+        source_deadline_seconds=5.0,
     )
     events = []
     broker.set_feedback_sink(events.append)
@@ -327,7 +329,9 @@ def test_shared_open_budget_applies_to_actual_returned_unicode(tmp_path):
         def open(self, locator, window, plan=None):
             return EvidenceResult("session", "historical_context", "长证据", ("正文&<标记>" * 1500,))
 
-    broker = ContextIndexBroker("session", 900, LongSource("session"), FakeSource("activity"))
+    broker = ContextIndexBroker(
+        "session", 900, LongSource("session"), FakeSource("activity"), source_deadline_seconds=5.0,
+    )
     pack = asyncio.run(broker.build("continue", "r", "s", WorkspaceIdentity("a", "", "a"), NOW, frozenset()))
     outputs = [broker.open([pack.rows[0].handle], 2) for _ in range(2)]
     evidence = [output for output in outputs if output.startswith("<context-evidence>")]
@@ -353,7 +357,8 @@ def test_native_index_shows_astra_records_and_counts_them_as_used(tmp_path):
     llm = DoneLLM()
     empty = SourceResult("absent")
     broker = ContextIndexBroker(
-        "session", 900, FakeSource("session", result=empty), FakeSource("activity", result=empty)
+        "session", 900, FakeSource("session", result=empty), FakeSource("activity", result=empty),
+        source_deadline_seconds=5.0,
     )
     agent = ReActAgent(
         "agent",

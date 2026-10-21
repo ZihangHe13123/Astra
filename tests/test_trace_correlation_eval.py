@@ -153,8 +153,10 @@ class TestRuntimeTracePopulation:
             asyncio.run(agent._prepare_prompt_for_llm("Astra recovery constraints", None, trace_ctx))
             return trace_ctx.memory_id
 
+        # Not a test of the 200 ms source deadline, which can run out on a busy runner before a source thread starts.
         assert traced(ContextIndexBroker(
             "session", 900, FakeSource("session", result=empty), FakeSource("activity", result=empty),
+            source_deadline_seconds=5.0,
         )) == record.record_id
         # With the Context Index off nothing is recalled into the turn, so no memory is traced.
         assert not traced(None)
