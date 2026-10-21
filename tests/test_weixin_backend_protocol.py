@@ -240,3 +240,47 @@ def test_a_wechat_turn_asks_for_approval_in_wechat_and_follows_the_answer(tmp_pa
         model.shutdown()
         model.server_close()
         ilink.close()
+
+
+def test_new_in_wechat_starts_a_new_conversation(tmp_path):
+    from agent.channels.router import NEW_CONVERSATION_REPLY
+
+    model = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
+    threading.Thread(target=model.serve_forever, daemon=True).start()
+    ilink = FakeIlink()
+    home = tmp_path / "home"
+    channels = tmp_path / "channels.json"
+    channels.write_text(json.dumps({"weixin": {"keep_awake": False}}), encoding="utf-8")
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    proc, _, _, wait_for = _start_question_protocol_backend(
+        tmp_path, model.server_port, "weixin_new_session", workdir=workdir,
+        env_overrides={"ASTRA_HOME": str(home), "ASTRA_CHANNEL_CONFIG": str(channels),
+                       "ASTRA_WEIXIN_BASE_URL": ilink.base, "ASTRA_WEIXIN_CDN_URL": ilink.cdn,
+                       "ASTRA_CONTEXT_INDEX_EMBEDDING": "off"},
+    )
+
+    def say(text: str) -> str:
+        answered = len(ilink.replies_to(OWNER))
+        ilink.inbound.put(ilink.text_message(text))
+        deadline = time.monotonic() + 30
+        while len(ilink.replies_to(OWNER)) == answered and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return ilink.replies_to(OWNER)[-1]
+
+    try:
+        wait_for(lambda e: e.get("type") == "weixin_status", timeout=30)
+        send(proc, {"type": "command", "cmd": "/weixin login"})
+        wait_for(lambda e: e.get("type") == "weixin_status" and e.get("state") == "online", timeout=30)
+        assert say("第一句") == "收到，现在是测试时间。"
+        assert say("/new") == NEW_CONVERSATION_REPLY
+        assert say("新的开始") == "收到，现在是测试时间。"
+        conversations = sorted({path.name.split(".")[0] for path in (tmp_path / "sessions").glob("channel_weixin_*")})
+        assert len(conversations) == 2 and conversations[1].startswith(f"{conversations[0]}_")
+        saved = json.loads((home / "channels" / "conversations.json").read_text(encoding="utf-8"))
+        assert saved == {conversations[0]: conversations[1]}
+    finally:
+        _stop_protocol_backend(proc)
+        model.shutdown()
+        model.server_close()
+        ilink.close()

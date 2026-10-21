@@ -113,6 +113,11 @@ in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on`,
   itself. It is not offered as a persona of its own. A conversation that was
   on another persona switches when it is next opened, which rebuilds its
   system prompt once.
+- **A new conversation.** Each chat keeps one conversation, across restarts.
+  Send `/new` (or `/reset`) on its own to start a new one: the next message
+  begins with an empty history, while the old conversation stays saved and
+  remains reachable through memory and session recall. The command is not
+  passed to the model. It works the same on QQ.
 - **Which model.** WeChat follows the default model: the one last chosen with
   `/model` in any window, read for each message. `/weixin model <key>` (a key
   from `/model`, such as `deepseek::deepseek-flash`, or Settings → WeChat →

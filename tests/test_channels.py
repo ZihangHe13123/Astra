@@ -634,3 +634,39 @@ def test_channel_manager_warns_for_port_in_use(caplog):
     assert adapter.stopped is True
     assert any("port already in use" in record.message for record in caplog.records)
     assert "channel failed to start" not in caplog.text
+
+
+def test_new_starts_a_new_conversation_that_survives_a_restart_and_keeps_the_old_one(tmp_path, monkeypatch):
+    from agent.channels.router import NEW_CONVERSATION_REPLY
+    from agent.runtime.session_store import SessionStore
+
+    monkeypatch.setenv("ASTRA_HOME", str(tmp_path / "home"))
+    sessions = tmp_path / "sessions"
+    sessions.mkdir()
+
+    async def say(router, channel, text, sender="u1"):
+        return await router.handle(ChannelMessage(channel, sender, sender, text))
+
+    async def scenario():
+        router = AgentChannelRouter(FakeAgent(tmp_path / "tui.json"), asyncio.Lock(), sessions)
+        first = await say(router, "weixin", "第一句")
+        started = await say(router, "weixin", " /NEW ")
+        second = await say(router, "weixin", "新的开始")
+        other = await say(router, "qq", "hi")
+        # After a restart the chat stays in the conversation it started.
+        restarted = AgentChannelRouter(FakeAgent(tmp_path / "tui.json"), asyncio.Lock(), sessions)
+        third = await say(restarted, "weixin", "还在吗")
+        return first, started, second, other, third
+
+    first, started, second, other, third = asyncio.run(scenario())
+    old, new = first.split(":")[0], second.split(":")[0]
+    assert started == NEW_CONVERSATION_REPLY
+    assert new.startswith(f"{old}_") and third.split(":")[0] == new
+    assert other.split(":")[0] == channel_session_name(ChannelMessage("qq", "u1", "u1", "hi")), "other chats keep theirs"
+
+    def said(name):
+        data = SessionStore(str(sessions / f"{name}.json")).load(readonly=True)
+        return [m["content"] for m in data["messages"] if m["role"] == "user"]
+
+    assert said(old) == ["第一句"], "the old conversation is kept, and /new is not part of any"
+    assert said(new) == ["新的开始", "还在吗"]
