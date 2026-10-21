@@ -439,8 +439,32 @@ def split_reply(text: str, limit: int) -> list[str]:
 
 _FENCE = re.compile(r"^\s*(```|~~~)")
 _LIST_ITEM = re.compile(r"^\s*(?:[-*•·]|\d+[.、)）])\s+")
-# A full stop ends a sentence only before a space, so decimals and addresses stay whole.
-_SENTENCE_END = re.compile(r"(?<=[。！？!?…；;~～])\s*|(?<=\.)\s+")
+_SENTENCE_STOPS = frozenset("。！？!?…；;~～")
+
+
+def _sentences(text: str) -> list[str]:
+    """Split a paragraph after sentence-ending marks, never inside brackets: kaomoji such as
+    (´;ω;`) carry ; and ~. A full stop ends a sentence only before a space, so decimals and
+    addresses stay whole; runs such as ！！ or ？！ stay with their sentence."""
+    pieces, start, depth, i = [], 0, 0, 0
+    while i < len(text):
+        char = text[i]
+        if char in "(（":
+            depth += 1
+        elif char in ")）":
+            depth = max(0, depth - 1)
+        elif depth == 0 and (char in _SENTENCE_STOPS or (char == "." and text[i + 1:i + 2].isspace())):
+            end = i + 1
+            while end < len(text) and text[end] in _SENTENCE_STOPS:
+                end += 1
+            pieces.append(text[start:end])
+            while end < len(text) and text[end].isspace():
+                end += 1
+            start = i = end
+            continue
+        i += 1
+    pieces.append(text[start:])
+    return [piece for piece in pieces if piece]
 
 
 def plain_text(text: str) -> str:
@@ -475,7 +499,7 @@ def chat_bubbles(text: str, limit: int, max_bubbles: int = 8, long_paragraph: in
         if _chatty(lines):
             bubbles.extend(line.strip() for line in lines)
         elif len(lines) == 1 and len(lines[0]) > long_paragraph:
-            sentences = [s for s in _SENTENCE_END.split(lines[0].strip()) if s]
+            sentences = _sentences(lines[0].strip())
             current = ""
             for sentence in sentences:
                 if current and len(current) + len(sentence) > sentences_up_to:
