@@ -40,7 +40,10 @@ class FakeIlink:
         # Answers the CDN gives uploads before taking one: (status, headers, body).
         self.upload_failures: list[tuple[int, dict[str, str], bytes]] = []
         self.upload_attempts = 0
-        self._cursor = 0
+        # Every message delivered, in order; a cursor is how many of them a client has read, so a
+        # poll whose answer never arrived (a cancelled long poll) gets the same messages again.
+        self._log: list[dict] = []
+        self._sync = threading.Lock()
         fake = self
 
         class Handler(BaseHTTPRequestHandler):
@@ -111,16 +114,21 @@ class FakeIlink:
                         return
                     except queue.Empty:
                         pass
-                    messages = []
+                    sent = str(payload.get("get_updates_buf") or "")
+                    read = int(sent.removeprefix("cursor-")) if sent.startswith("cursor-") else 0
                     deadline = time.monotonic() + 0.3
-                    while time.monotonic() < deadline and not messages:
+                    while True:
+                        with fake._sync:
+                            unread = fake._log[read:]
+                        if unread or time.monotonic() >= deadline:
+                            break
                         try:
-                            messages.append(fake.inbound.get(timeout=0.05))
+                            arrived = fake.inbound.get(timeout=0.05)
                         except queue.Empty:
                             continue
-                    if messages:
-                        fake._cursor += 1
-                    self._json({"ret": 0, "msgs": messages, "get_updates_buf": f"cursor-{fake._cursor}",
+                        with fake._sync:
+                            fake._log.append(arrived)
+                    self._json({"ret": 0, "msgs": unread, "get_updates_buf": f"cursor-{read + len(unread)}",
                                 "longpolling_timeout_ms": 500})
                 elif self.path == "/ilink/bot/getuploadurl":
                     fake.upload_requests.append(payload)
@@ -145,6 +153,12 @@ class FakeIlink:
         self.base = f"http://127.0.0.1:{self.server.server_port}"
         self.cdn = f"{self.base}/c2c"
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    @property
+    def _cursor(self) -> int:
+        """How many messages have been delivered: the cursor of a client that read them all."""
+        with self._sync:
+            return len(self._log)
 
     def text_message(self, text: str, *, sender: str = OWNER, message_id: str = "", context_token: str = "ctx-1") -> dict:
         return {"from_user_id": sender, "to_user_id": BOT_ID, "message_id": message_id or f"m-{next(self._message_ids)}",

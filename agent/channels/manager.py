@@ -6,7 +6,7 @@ import logging
 
 from .approvals import ChatApprover
 from .base import ChannelAdapter, ChannelMessage, FilePolicy, MessageHandler
-from .config import ChannelsConfig
+from .config import ChannelsConfig, WeixinConfig
 from .onebot import OneBotAdapter
 from .weixin import WeixinAdapter
 
@@ -31,9 +31,12 @@ class ChannelManager:
         handler: MessageHandler,
         *,
         adapters: list[ChannelAdapter] | None = None,
+        channel_host: bool = False,
     ):
         self.config = config
         self.handler = handler
+        # The desktop's channel host: WeChat goes to it before any other backend.
+        self.channel_host = channel_host
         self.adapters = adapters if adapters is not None else self._build_adapters()
         self._started: list[ChannelAdapter] = []
 
@@ -42,8 +45,11 @@ class ChannelManager:
         if self.config.onebot.enabled:
             adapters.append(OneBotAdapter(self.config.onebot, self.handler))
         if self.config.weixin.enabled:
-            adapters.append(WeixinAdapter(self.config.weixin, self.handler))
+            adapters.append(self.new_weixin(self.config.weixin))
         return adapters
+
+    def new_weixin(self, config: WeixinConfig) -> WeixinAdapter:
+        return WeixinAdapter(config, self.handler, priority=self.channel_host)
 
     def adapter(self, name: str) -> ChannelAdapter | None:
         return next((item for item in self.adapters if item.name == name), None)

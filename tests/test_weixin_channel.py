@@ -846,3 +846,89 @@ def test_a_kaomoji_is_never_split_across_messages():
     assert "".join(bubbles).replace(" ", "") == reply.replace(" ", "")
     assert any(bubble.endswith("盯着你去吃！！") for bubble in bubbles), "a run of marks stays with its sentence"
     assert chat_bubbles("Version 3.14 is out. It runs on Python 3.11 and fixes the parser; try it now please.", limit=1800)[0].startswith("Version 3.14 is out.")
+
+
+def _desktop_host(fake, store, handler):
+    return WeixinAdapter(WeixinConfig(enabled=True), handler, store=store, client=client(fake), keep_awake=FakeAwake(),
+                         owner_retry=0.05, failure_delays=(0.01, 0.01), pause=lambda _text: 0.0, priority=True)
+
+
+def test_the_desktop_channel_host_takes_wechat_over_and_gives_it_back_when_it_stops(ilink, tmp_path, monkeypatch):
+    from agent.channels import weixin
+
+    monkeypatch.setattr(weixin, "_HOST_CHECK_SECONDS", 0.05)
+    answered: list[tuple[str, str]] = []
+
+    async def scenario():
+        store = WeixinStore(tmp_path / "weixin")
+        await logged_in(ilink, store)
+
+        def handler_for(name):
+            async def handler(message, reply):
+                answered.append((name, message.text))
+                return f"{name}:{message.text}"
+            return handler
+
+        terminal = adapter(ilink, store, handler_for("terminal"))
+        await terminal.start()
+        await until(lambda: terminal.running, "an old terminal backend polls WeChat")
+        ilink.inbound.put(ilink.text_message("before"))
+        await until(lambda: ("terminal", "before") in answered, "the terminal answers")
+
+        host = _desktop_host(ilink, WeixinStore(tmp_path / "weixin"), handler_for("host"))
+        await host.start()
+        await until(lambda: host.running, "the desktop's host takes over")
+        assert terminal.status()["state"] == "standby"
+        ilink.inbound.put(ilink.text_message("after"))
+        await until(lambda: ("host", "after") in answered, "the host answers")
+        await asyncio.sleep(0.3)
+        assert terminal.status()["state"] == "standby", "it does not take WeChat back while the host runs"
+
+        await host.stop()
+        await until(lambda: terminal.running, "the terminal takes over again once the host is gone")
+        await terminal.stop()
+
+    asyncio.run(scenario())
+    assert answered == [("terminal", "before"), ("host", "after")]
+
+
+def test_a_turn_in_progress_is_answered_before_the_channel_is_handed_over(ilink, tmp_path, monkeypatch):
+    from agent.channels import weixin
+
+    monkeypatch.setattr(weixin, "_HOST_CHECK_SECONDS", 0.05)
+    answered: list[tuple[str, str]] = []
+    release = asyncio.Event()
+
+    async def scenario():
+        store = WeixinStore(tmp_path / "weixin")
+        await logged_in(ilink, store)
+
+        async def slow(message, reply):
+            await release.wait()
+            answered.append(("terminal", message.text))
+            return "done"
+
+        async def fast(message, reply):
+            answered.append(("host", message.text))
+            return "ok"
+
+        terminal = adapter(ilink, store, slow)
+        await terminal.start()
+        await until(lambda: terminal.running, "online")
+        ilink.inbound.put(ilink.text_message("一个长任务"))
+        await until(lambda: terminal._busy, "the turn started")
+
+        host = _desktop_host(ilink, WeixinStore(tmp_path / "weixin"), fast)
+        await host.start()
+        await asyncio.sleep(0.3)
+        assert not host.running, "the host waits for the turn in progress"
+        release.set()
+        await until(lambda: host.running, "then it takes over")
+        assert ilink.replies_to(OWNER) == ["done"]
+        ilink.inbound.put(ilink.text_message("下一条"))
+        await until(lambda: ("host", "下一条") in answered, "the host answers the next one")
+        await host.stop()
+        await terminal.stop()
+
+    asyncio.run(scenario())
+    assert answered == [("terminal", "一个长任务"), ("host", "下一条")], "each message answered once"

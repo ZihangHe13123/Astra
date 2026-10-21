@@ -17,7 +17,6 @@ from agent.channels.config import load_channels_config, set_channel_enabled, set
 from agent.channels.manager import ChannelManager
 from agent.channels.weixin import (
     IlinkClient,
-    WeixinAdapter,
     WeixinError,
     WeixinStore,
     mask,
@@ -181,7 +180,7 @@ class WeixinCommands:
         if manager is None:
             return
         config = load_channels_config()
-        adapter = WeixinAdapter(config.weixin, manager.handler) if config.weixin.enabled else None
+        adapter = manager.new_weixin(config.weixin) if config.weixin.enabled else None
         await manager.replace("weixin", adapter, config)
 
     async def _logout(self) -> None:

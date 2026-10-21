@@ -335,7 +335,8 @@ register("file", async (id, value, action, requestId) => {
 /** WeChat and QQ answer while the desktop is open, whether or not a conversation is open in the window. */
 const channelHost = new ChannelHost({
   configPath: process.env.ASTRA_CHANNEL_CONFIG || join(root, ".astra", "channels.json"),
-  create: () => new Runtime(root, python, workspace, "channel_host", "work", () => {}),
+  // The channel host takes WeChat over from other backends, such as an old terminal session.
+  create: () => new Runtime(root, python, workspace, "channel_host", "work", () => {}, { ASTRA_CHANNEL_HOST: "1" }),
 });
 
 async function performQuit() {
