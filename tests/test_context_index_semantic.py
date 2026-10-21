@@ -285,6 +285,9 @@ def test_invalid_batch_is_atomic_and_corrupt_snapshot_falls_back(archive):
 
 
 def test_cold_backend_preserves_lexical_results_and_never_loads(archive, monkeypatch):
+    # This checks the cold-backend fallback, not the 200 ms source deadline.
+    # Leave the lexical thread room to start on a busy runner.
+    monkeypatch.setenv("ASTRA_CONTEXT_INDEX_SOURCE_MS", "2000")
     monkeypatch.setattr(embedder, "ready_embedder", lambda: None)
     monkeypatch.setattr(embedder, "get_embedder", lambda: pytest.fail("no query-time model load"))
     broker = create_context_index_broker(SimpleNamespace(mode="session", char_budget=900), Path.cwd())
@@ -293,6 +296,9 @@ def test_cold_backend_preserves_lexical_results_and_never_loads(archive, monkeyp
 
 
 def test_slow_semantics_cannot_discard_completed_lexical_results(archive, monkeypatch):
+    # The encoder is held until the build returns, so it always misses the deadline; a
+    # whole second leaves the threaded lexical stand-in room to start on a busy runner.
+    deadline = 1.0
     release = threading.Event()
     class SlowEncoder:
         def encode(self, texts):
@@ -300,7 +306,7 @@ def test_slow_semantics_cannot_discard_completed_lexical_results(archive, monkey
             return [[1.0, 0.0]]
     monkeypatch.setattr(embedder, "ready_embedder", lambda: SlowEncoder())
     broker = create_context_index_broker(SimpleNamespace(mode="session", char_budget=900), Path.cwd())
-    broker.source_deadline_seconds = 0.08
+    broker.source_deadline_seconds = deadline
     query = "下班后发邮件"
     # This contract starts with completed lexical work. Keep the real archive
     # lookup outside the semantic timeout race, including cold Windows disk I/O.
@@ -314,7 +320,8 @@ def test_slow_semantics_cannot_discard_completed_lexical_results(archive, monkey
         start = time.monotonic()
         try:
             pack = await broker.build(query, "slow", "current", WORKSPACE, NOW, frozenset())
-            assert time.monotonic() - start < 0.3
+            # Returned at the deadline; waiting for the encoder would take its whole 5 s.
+            assert time.monotonic() - start < 2 * deadline
             assert pack.rows and TEXT in pack.rendered
             assert broker.last_trace.source_status["session"] == "available"
             assert broker.last_trace.semantic_status["session"] == "timeout"
