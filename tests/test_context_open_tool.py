@@ -138,7 +138,9 @@ def _live_broker(
             habit=_candidate("habit", "habit"),
         ),
     )
-    broker = ContextIndexBroker("all", 900, session, activity)  # type: ignore[arg-type]
+    # These tests are about opening handles, not about the 200 ms source deadline: on a busy runner a
+    # source thread can start after it, leaving its row out of the pack (a KeyError below).
+    broker = ContextIndexBroker("all", 900, session, activity, source_deadline_seconds=5.0)  # type: ignore[arg-type]
     pack = asyncio.run(
         broker.build("habit", "req-live", "session-current", WORKSPACE, NOW, frozenset())
     )
