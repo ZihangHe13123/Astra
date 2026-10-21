@@ -32,7 +32,8 @@ export class Runtime {
   get isClosing() { return this.closing; }
   constructor(readonly root: string, readonly python: string, readonly workspace: string,
               readonly session: string, readonly mode: string,
-              private emit: (runtime: Runtime, event: UIEvent) => void) {
+              private emit: (runtime: Runtime, event: UIEvent) => void,
+              private readonly extraEnv: Record<string, string> = {}) {
     this.state = initialSession(this.id, workspace);
     this.state.session = session;
     this.start();
@@ -43,7 +44,7 @@ export class Runtime {
       AGENT_SESSION: this.restartSession || this.session,
       ASTRA_UI_SURFACE: "gui", ASTRA_TUI_PID: String(process.pid), ASTRA_TUI_RESTART: "1", ASTRA_EVENT_SCOPE: this.scope,
       ASTRA_PROFILE_QUERY: process.env.ASTRA_PROFILE_QUERY ?? "1",
-      PYTHONUNBUFFERED: "1" };
+      PYTHONUNBUFFERED: "1", ...this.extraEnv };
     const child = spawn(this.python, [...(process.env.ASTRA_DESKTOP_RUNTIME === "1" ? ["-P"] : []), "-m", "agent.cli.backend"], { cwd: this.workspace, env, windowsHide: true });
     this.child = child;
     const logDir = process.env.AGENT_LOG_DIR || join(this.root, ".logs");

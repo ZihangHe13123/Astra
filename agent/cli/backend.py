@@ -2354,7 +2354,10 @@ async def _main(startup_started: float):
     channel_models = ChannelModels(lambda: catalog, lambda: current_model_key)
     channel_router = AgentChannelRouter(agent, agent_turn_lock, sessions_dir(PROJECT_ROOT),
                                         admission=lambda: not restart.draining, model_for=channel_models.client)
-    channel_manager = ChannelManager(load_channels_config(), channel_router.handle)
+    # The desktop's channel host takes WeChat over from other backends. Popped so nothing this
+    # backend starts inherits the claim.
+    channel_manager = ChannelManager(load_channels_config(), channel_router.handle,
+                                     channel_host=os.environ.pop("ASTRA_CHANNEL_HOST", "") == "1")
     channel_manager_holder["manager"] = channel_manager
     weixin_commands = WeixinCommands(lambda: channel_manager_holder.get("manager"), _send,
                                      models=channel_models)

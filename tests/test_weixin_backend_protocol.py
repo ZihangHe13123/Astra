@@ -284,3 +284,48 @@ def test_new_in_wechat_starts_a_new_conversation(tmp_path):
         model.shutdown()
         model.server_close()
         ilink.close()
+
+
+def test_the_desktop_channel_host_backend_takes_wechat_from_an_older_backend(tmp_path):
+    model = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
+    threading.Thread(target=model.serve_forever, daemon=True).start()
+    ilink = FakeIlink()
+    home = tmp_path / "home"
+    channels = tmp_path / "channels.json"
+    channels.write_text(json.dumps({"weixin": {"keep_awake": False}}), encoding="utf-8")
+    shared = {"ASTRA_HOME": str(home), "ASTRA_CHANNEL_CONFIG": str(channels),
+              "ASTRA_WEIXIN_BASE_URL": ilink.base, "ASTRA_WEIXIN_CDN_URL": ilink.cdn,
+              "ASTRA_CONTEXT_INDEX_EMBEDDING": "off"}
+    backends = []
+
+    def start(name: str, **extra: str):
+        root = tmp_path / name
+        (root / "work").mkdir(parents=True)
+        proc, _, _, wait_for = _start_question_protocol_backend(
+            root, model.server_port, f"{name}_session", workdir=root / "work", env_overrides={**shared, **extra})
+        backends.append(proc)
+        return proc, wait_for
+
+    try:
+        terminal, terminal_events = start("terminal")
+        terminal_events(lambda e: e.get("type") == "weixin_status", timeout=30)
+        send(terminal, {"type": "command", "cmd": "/weixin login"})
+        terminal_events(lambda e: e.get("type") == "weixin_status" and e.get("state") == "online", timeout=30)
+
+        host, host_events = start("host", ASTRA_CHANNEL_HOST="1")
+        host_events(lambda e: e.get("type") == "weixin_status" and e.get("state") == "online", timeout=30)
+        terminal_events(lambda e: e.get("type") == "weixin_status" and e.get("state") == "standby", timeout=30)
+
+        ilink.inbound.put(ilink.text_message("现在谁在？"))
+        deadline = time.monotonic() + 30
+        while not ilink.replies_to(OWNER) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert ilink.replies_to(OWNER) == ["收到，现在是测试时间。"]
+        assert any((tmp_path / "host" / "sessions").glob("channel_weixin_*"))
+        assert not list((tmp_path / "terminal" / "sessions").glob("channel_weixin_*")), "the older backend answered nothing"
+    finally:
+        for proc in backends:
+            _stop_protocol_backend(proc)
+        model.shutdown()
+        model.server_close()
+        ilink.close()

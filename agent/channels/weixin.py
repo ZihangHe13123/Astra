@@ -75,6 +75,10 @@ _CDN_HOSTS = frozenset({
 })
 _SEEN_LIMIT = 512
 _SEND_ATTEMPTS = 4
+# How often a backend that polls checks whether the desktop's channel host wants the channel,
+# and how long it then keeps answering what it already took from WeChat before handing over.
+_HOST_CHECK_SECONDS = 2.0
+_HANDOVER_DRAIN_SECONDS = 120.0
 # The CDN sometimes answers an upload with a passing server error; try it again after a short pause.
 _UPLOAD_ATTEMPTS = 3
 _UPLOAD_PAUSE = 1.0
@@ -127,6 +131,11 @@ class WeixinStore:
     @property
     def owner_lock(self) -> Path:
         return self.root / "owner.lock"
+
+    @property
+    def host_lock(self) -> Path:
+        """Held by the desktop's channel host while it runs this channel."""
+        return self.root / "host.lock"
 
     def _read(self, name: str) -> dict:
         try:
@@ -565,13 +574,17 @@ class WeixinAdapter(ChannelAdapter):
     def __init__(self, config: WeixinConfig, handler: MessageHandler, *, store: WeixinStore | None = None,
                  client: IlinkClient | None = None, keep_awake: KeepAwake | None = None,
                  owner_retry: float = 30.0, failure_delays: tuple[float, float] = (2.0, 30.0),
-                 pause: Callable[[str], float] = typing_pause) -> None:
+                 pause: Callable[[str], float] = typing_pause, priority: bool = False) -> None:
         super().__init__(handler)
         self.config = config
         self.store = store or WeixinStore()
         self._client = client
         self._keep_awake = keep_awake if keep_awake is not None else KeepAwake("Astra WeChat channel online")
         self._owner_retry = owner_retry
+        # The desktop's channel host: other backends hand the channel over to it.
+        self._priority = priority
+        self._host: InstanceLock | None = None
+        self._busy = False
         self._failure_delays = failure_delays
         self._task: asyncio.Task | None = None
         self._lock: InstanceLock | None = None
@@ -616,6 +629,7 @@ class WeixinAdapter(ChannelAdapter):
         if task is not None and not task.done():
             await _finish(task, 10.0)
         self._release()
+        self._leave_host()
         if self._client is not None:
             await self._client.close()
             self._client = None
@@ -628,19 +642,63 @@ class WeixinAdapter(ChannelAdapter):
         if lock is not None:
             lock.release()
 
+    def _claim_host(self) -> bool:
+        """As the desktop's channel host, hold the host lock while the channel runs."""
+        if not self._priority:
+            return False
+        if self._host is None:
+            lock = InstanceLock(self.store.host_lock)
+            try:
+                lock.acquire()
+            except InstanceAlreadyRunning:
+                # Another desktop, or a backend checking this instant: try again next round.
+                return False
+            self._host = lock
+        return True
+
+    def _leave_host(self) -> None:
+        lock, self._host = self._host, None
+        if lock is not None:
+            lock.release()
+
+    def _host_present(self) -> bool:
+        """Whether the desktop's channel host runs this channel, so this backend leaves it to it."""
+        if self._host is not None:
+            return False
+        probe = InstanceLock(self.store.host_lock)
+        try:
+            probe.acquire()
+        except InstanceAlreadyRunning:
+            return True
+        probe.release()
+        return False
+
     async def _run(self) -> None:
+        try:
+            await self._run_owned()
+        finally:
+            self._leave_host()
+
+    async def _run_owned(self) -> None:
         while True:
             account = self.store.account()
             if account is None:
                 self._state = "logged_out"
                 return
+            hosting = self._claim_host()
+            if not hosting and self._host_present():
+                # The desktop's channel host answers WeChat; wait until it is gone.
+                self._state = "standby"
+                await asyncio.sleep(self._owner_retry)
+                continue
             lock = InstanceLock(self.store.owner_lock)
             try:
                 lock.acquire()
             except InstanceAlreadyRunning:
-                # Another backend polls this login; take over when it exits.
+                # Another backend polls this login: the host waits for it to hand over,
+                # anyone else takes over when it exits.
                 self._state = "standby"
-                await asyncio.sleep(self._owner_retry)
+                await asyncio.sleep(min(self._owner_retry, _HOST_CHECK_SECONDS) if hosting else self._owner_retry)
                 continue
             self._lock = lock
             try:
@@ -651,7 +709,7 @@ class WeixinAdapter(ChannelAdapter):
                 self._account = account
                 self._tokens = self.store.context_tokens()
                 self._state = "online"
-                expired = await self._poll(account)
+                expired = await self._poll(account, yield_to_host=not hosting)
             finally:
                 self._release()
             if expired:
@@ -659,15 +717,23 @@ class WeixinAdapter(ChannelAdapter):
                 self._error = "微信登录已失效，请重新扫码登录。"
                 return
 
-    async def _poll(self, account: WeixinAccount) -> bool:
-        """Deliver messages until cancelled; True when WeChat reports the login expired."""
+    async def _poll(self, account: WeixinAccount, *, yield_to_host: bool = False) -> bool:
+        """Deliver messages until cancelled; True when WeChat reports the login expired.
+
+        With ``yield_to_host``, polling stops when the desktop's channel host appears: what was
+        already taken from WeChat is answered first, then the host continues from the saved cursor.
+        """
         assert self._client is not None
         worker = asyncio.create_task(self._work(), name="weixin-inbox")
         cursor, timeout_ms, failures = self.store.sync_buf(), _LONG_POLL_MS, 0
         try:
             while True:
                 try:
-                    response = await self._client.get_updates(account, cursor, timeout_ms)
+                    response = await self._next_updates(account, cursor, timeout_ms, yield_to_host)
+                    if response is None:
+                        logger.info("weixin handed over to the desktop's channel host")
+                        await self._drain()
+                        return False
                 except (httpx.HTTPError, WeixinError) as exc:
                     if _stop_requested():
                         raise asyncio.CancelledError from exc
@@ -701,16 +767,47 @@ class WeixinAdapter(ChannelAdapter):
         finally:
             await _finish(worker, 5.0)
 
+    async def _next_updates(self, account: WeixinAccount, cursor: str, timeout_ms: int,
+                            yield_to_host: bool) -> dict | None:
+        """The next long poll; None when the desktop's channel host takes over first.
+
+        A poll given up early returns nothing and moves no cursor, so the host gets the same messages.
+        """
+        assert self._client is not None
+        if yield_to_host and self._host_present():
+            return None
+        request = asyncio.create_task(self._client.get_updates(account, cursor, timeout_ms))
+        try:
+            while True:
+                done, _ = await asyncio.wait({request}, timeout=_HOST_CHECK_SECONDS)
+                if done:
+                    return request.result()
+                if yield_to_host and self._host_present():
+                    return None
+        finally:
+            if not request.done():
+                await _finish(request, 5.0)
+
+    async def _drain(self) -> None:
+        """Answer the messages already taken from WeChat before handing the channel over."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _HANDOVER_DRAIN_SECONDS
+        while (self._busy or not self._inbox.empty()) and loop.time() < deadline:
+            await asyncio.sleep(0.1)
+
     async def _work(self) -> None:
         # One message at a time, in the order WeChat delivered them.
         while True:
             message = await self._inbox.get()
+            self._busy = True
             try:
                 await self._handle(message)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("weixin message handling failed")
+            finally:
+                self._busy = False
             if _stop_requested():
                 raise asyncio.CancelledError
 

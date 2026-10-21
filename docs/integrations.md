@@ -93,8 +93,13 @@ in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on`,
 
 - **Who is answered.** Only the WeChat user who scanned the code, unless
   `weixin.allow_users` lists others. Group messages are ignored.
-- **One poller.** Every Astra backend may run the channel, but only one polls a
-  login at a time; the others wait and take over when it exits.
+- **One poller, the desktop first.** Every Astra backend may run the channel,
+  but only one polls a login at a time; the others wait and take over when it
+  exits. While the desktop is open, its channel host has precedence: a
+  backend that polls (an old terminal session, say) answers what it already
+  received, then hands the channel over within a few seconds and waits until
+  the desktop closes. The long poll it gives up moves no cursor, so no message
+  is lost.
 - **Sleep.** While a backend polls, it keeps the computer from idle sleep:
   `caffeinate -i` on macOS (released when the backend exits), an execution
   state on Windows, `systemd-inhibit` on Linux. The display still turns off.
