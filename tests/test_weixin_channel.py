@@ -837,3 +837,12 @@ def test_wechat_conversations_use_the_wechat_version_of_the_persona_and_keep_it(
     monkeypatch.setenv("AGENT_SETTINGS_PATH", str(tmp_path / "settings.json"))
     with pytest.raises(ValueError):
         persona_preferences.save_selected_persona(variant.name)
+
+
+def test_a_kaomoji_is_never_split_across_messages():
+    reply = "先别想任何事了，喝口水，靠一会儿。好消息之后还压着一整天的会，你这情绪都被榨干了吧 (´;ω;`) 晚饭吃了没？没吃的话我盯着你去吃！！"
+    bubbles = chat_bubbles(reply, limit=1800)
+    assert any("(´;ω;`)" in bubble for bubble in bubbles), bubbles
+    assert "".join(bubbles).replace(" ", "") == reply.replace(" ", "")
+    assert any(bubble.endswith("盯着你去吃！！") for bubble in bubbles), "a run of marks stays with its sentence"
+    assert chat_bubbles("Version 3.14 is out. It runs on Python 3.11 and fixes the parser; try it now please.", limit=1800)[0].startswith("Version 3.14 is out.")

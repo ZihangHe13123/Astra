@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import hashlib
+import json
 import logging
+import time
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
@@ -16,6 +18,8 @@ from agent.runtime.prompt_budget import prompt_token_budget
 from agent.runtime.prompts import channel_prompt_profile
 from agent.runtime.context import AgentContext
 from agent.runtime.context_compressor import ContextCompressor
+from agent.runtime.json_preferences import update_preferences
+from agent.runtime.paths import state_path
 
 from .base import ChannelMessage, ReplySink
 from .weixin import CHAT_STYLE as WEIXIN_CHAT_STYLE
@@ -40,6 +44,16 @@ channel_turn_media: contextvars.ContextVar[list[str] | None] = contextvars.Conte
 CHANNEL_STYLES = {"weixin": WEIXIN_CHAT_STYLE}
 
 
+# A message that is nothing but one of these starts a new conversation with that chat.
+NEW_CONVERSATION_COMMANDS = frozenset({"/new", "/reset"})
+NEW_CONVERSATION_REPLY = "已开始新的对话，之前的聊天记录都保存着。"
+
+
+def channel_conversations_path() -> Path:
+    """Which conversation each chat is in now, when it started a new one with /new."""
+    return state_path("channels", "conversations.json")
+
+
 def channel_session_name(message: ChannelMessage) -> str:
     kind = "group" if message.is_group else "private"
     identity = f"{message.channel}:{kind}:{message.conversation_id}"
@@ -61,6 +75,38 @@ class AgentChannelRouter:
         self.model_for = model_for or (lambda channel: None)
         self._contexts: dict[str, AgentContext] = {}
         self._template = agent.context
+
+    @staticmethod
+    def _current_sessions() -> dict:
+        try:
+            data = json.loads(channel_conversations_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _session_name(self, message: ChannelMessage) -> str:
+        """The chat's current conversation: the first one, or the last started with /new."""
+        base = channel_session_name(message)
+        current = self._current_sessions().get(base)
+        return current if isinstance(current, str) and current.startswith(f"{base}_") else base
+
+    async def _start_new_conversation(self, message: ChannelMessage) -> str:
+        """Close the chat's conversation (kept on disk) and send its next message to a new one."""
+        base = channel_session_name(message)
+        old = self._session_name(message)
+        context = self._contexts.pop(old, None)
+        if context is not None:
+            await context.save_async()
+            context.record_session_end("new_conversation")
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        name, n = f"{base}_{stamp}", 1
+        while name == old or any(self.session_root.glob(f"{name}.*")):
+            n += 1
+            name = f"{base}_{stamp}_{n}"
+        await asyncio.to_thread(update_preferences, channel_conversations_path(),
+                                lambda data: data.__setitem__(base, name))
+        logger.info("channel %s started a new conversation", message.channel)
+        return NEW_CONVERSATION_REPLY
 
     def _budget(self, llm) -> int:
         """Compact a channel conversation for the model answering it: its own, or the window's."""
@@ -120,7 +166,10 @@ class AgentChannelRouter:
     ) -> str:
         if not self.admission():
             return "Astra is preparing a restart. Please retry after it reconnects."
-        session_name = channel_session_name(message)
+        if not message.images and message.text.strip().lower() in NEW_CONVERSATION_COMMANDS:
+            async with self.turn_lock:
+                return await self._start_new_conversation(message)
+        session_name = self._session_name(message)
         async with self.turn_lock:
             if not self.admission():
                 return "Astra is preparing a restart. Please retry after it reconnects."
