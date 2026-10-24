@@ -15,6 +15,7 @@ import math
 import mimetypes
 import os
 import re
+import shlex
 import sys
 import time as _time
 import uuid
@@ -879,14 +880,85 @@ class ReActAgent(AgentBase):
 
     @staticmethod
     def _tracked_source_command(command: str) -> bool:
+        # Only the program a simple command runs counts. A formatter's name in
+        # an argument, a quoted prompt or a heredoc body ("a small black cat")
+        # is text, not an invocation.
         patterns = (
-            r"\b(?:ruff\s+format|black|isort|cargo\s+fmt|rustfmt)\b",
-            r"\b(?:prettier|eslint|biome)\b[^;&|\r\n]*(?:--write|--fix)\b",
-            r"\b(?:clang-format|gofmt)\b[^;&|\r\n]*(?:\s-i\b|\s-w\b)",
-            r"\b(?:npm|pnpm|yarn)(?:\s+run)?\s+(?:format|fmt|lint:fix|generate|codegen)\b",
-            r"\bpython(?:\d+(?:\.\d+)?)?\s+[^;&|\r\n]*(?:generate|codegen)[\w.-]*\.py\b",
+            r"(?:ruff\s+format|black|isort|cargo\s+fmt|rustfmt)\b",
+            r"(?:prettier|eslint|biome)\b.*(?:--write|--fix)\b",
+            r"(?:clang-format|gofmt)\b.*(?:\s-i\b|\s-w\b)",
+            r"(?:npm|pnpm|yarn)(?:\s+run)?\s+(?:format|fmt|lint:fix|generate|codegen)\b",
+            r"python(?:\d+(?:\.\d+)?)?\s+.*(?:generate|codegen)[\w.-]*\.py\b",
         )
-        return any(re.search(pattern, command) for pattern in patterns)
+        return any(
+            re.match(pattern, " ".join(words))
+            for words in ReActAgent._shell_invocations(command)
+            for pattern in patterns
+        )
+
+    @staticmethod
+    def _shell_invocations(command: str, depth: int = 0) -> list[list[str]]:
+        """The words of each simple command, from the program it runs onwards.
+
+        Environment assignments and launchers (`env`, `xargs`, `uv run`,
+        `npx`, `python -m`, `bash -c`, ...) are unwrapped; the program is
+        reduced to its file name. This reads shell syntax, not shell semantics.
+        """
+        separators = ";&|\n()"
+        text = ReActAgent._strip_heredocs(command)
+        try:
+            lexer = shlex.shlex(text, posix=True, punctuation_chars=separators)
+            lexer.whitespace = " \t\r"
+            lexer.whitespace_split = True
+            lexer.commenters = ""
+            tokens = list(lexer)
+        except ValueError:
+            # Unbalanced quotes: fall back to plain words so a formatter that
+            # does run is still tracked.
+            tokens = [word.strip("\"'") for word in re.split(r"([;&|\n()])|\s+", text) if word]
+        launchers = {
+            "env", "command", "exec", "sudo", "nohup", "time", "nice", "timeout", "xargs",
+            "npx", "bunx", "uvx", "!", "{", "if", "then", "else", "elif", "while", "until", "do",
+        }
+        runners = {"uv": {"run"}, "poetry": {"run"}, "pdm": {"run"}, "hatch": {"run"},
+                   "pipx": {"run"}, "npm": {"exec"}, "pnpm": {"exec", "dlx"}, "yarn": {"exec", "dlx"}}
+        shells = {"sh", "bash", "zsh", "dash", "fish", "powershell", "pwsh", "cmd"}
+        invocations: list[list[str]] = []
+        words: list[str] = []
+        for token in [*tokens, ";"]:
+            if not token or not all(char in separators for char in token):
+                words.append(token)
+                continue
+            while words:
+                program = words[0].rsplit("/", 1)[-1].removesuffix(".exe").removesuffix(".cmd")
+                skip = 0
+                if re.fullmatch(r"[A-Za-z_]\w*=.*", words[0]) or program in launchers:
+                    skip = 1
+                elif len(words) > 1 and words[1] in runners.get(program, ()):
+                    skip = 2
+                elif re.fullmatch(r"python(?:\d+(?:\.\d+)?)?|py", program) and "-m" in words:
+                    module = words.index("-m")
+                    if all(word.startswith("-") for word in words[1:module]):
+                        skip = module + 1
+                elif program in shells:
+                    flag = next((index for index, word in enumerate(words)
+                                 if word in {"-c", "-lc", "-ic", "-command", "/c"}), None)
+                    if flag is not None and depth < 4:
+                        invocations.extend(
+                            ReActAgent._shell_invocations(" ".join(words[flag + 1:]), depth + 1))
+                        words = []
+                        break
+                if not skip:
+                    words[0] = program
+                    invocations.append(words)
+                    break
+                launcher = program in launchers or skip == 2
+                words = words[skip:]
+                while launcher and words and (words[0].startswith("-") or words[0].isdigit()):
+                    # Launcher options and counts: `xargs -0`, `timeout 60`.
+                    words = words[1:]
+            words = []
+        return invocations
 
     def _source_tracking_workdir(self) -> Path:
         sandbox = self._sandbox

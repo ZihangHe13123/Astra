@@ -590,6 +590,64 @@ def test_react_tracks_formatter_changes_in_coding_journal(formatter_fails):
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize(("command", "runs_formatter"), [
+    ("python3 render.py 'A small black cat sits on the step.' --prefix cat 2>&1", False),
+    ("python3 - <<'EOF'\nprompt = 'a black cat'\nprint(prompt)\nEOF", False),
+    ("echo black cat", False),
+    ("grep -rn isort docs/", False),
+    ("black agent/", True),
+    ("cd repo && .venv/bin/python -m black .", True),
+    ("find . -name '*.py' | xargs -0 isort", True),
+    ("bash -lc 'uv run ruff format agent'", True),
+    ("npx prettier --write src", True),
+])
+def test_react_tracks_only_commands_that_run_a_formatter(tmp_path, command, runs_formatter):
+    class FakeConfig:
+        model = "fake"
+        capabilities = frozenset()
+
+    class FakeLLM:
+        config = FakeConfig()
+
+    calls = []
+    registry = ToolRegistry()
+
+    async def execute_shell(command=""):
+        calls.append(command)
+        return "done"
+
+    registry.register(ToolDef(
+        name="execute_shell",
+        description="test execution",
+        parameters={
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+        fn=execute_shell,
+        risk="execute",
+        group="code",
+    ))
+    agent = ReActAgent("agent", FakeLLM(), registry, system_prompt="base")  # type: ignore[arg-type]
+    # Outside a Git worktree a formatter's changes cannot be tracked, so it is refused.
+    agent._sandbox = SimpleNamespace(workdir=str(tmp_path))
+
+    async def scenario():
+        result = await agent._execute_tool_call({
+            "id": "shell",
+            "name": "execute_shell",
+            "arguments": json.dumps({"command": command}),
+        })
+        if runs_formatter:
+            assert result["error_type"] == "source_mutation_tracking_unavailable"
+            assert calls == []
+        else:
+            assert result["error"] == ""
+            assert calls == [command]
+
+    asyncio.run(scenario())
+
+
 def test_git_worktree_snapshot_detects_further_changes_to_dirty_file(tmp_path):
     repo = tmp_path / "repo"
     source = repo / "agent" / "probe.py"
