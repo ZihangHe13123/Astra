@@ -177,6 +177,9 @@ class TaskStore:
                 db.execute("ALTER TABLE task_runs ADD COLUMN verification_json TEXT NOT NULL DEFAULT '{}'")
             if "verified_at" not in columns:
                 db.execute("ALTER TABLE task_runs ADD COLUMN verified_at TEXT")
+            # Where the request came from: desktop, terminal, or a channel such as weixin.
+            if "source" not in columns:
+                db.execute("ALTER TABLE task_runs ADD COLUMN source TEXT NOT NULL DEFAULT ''")
             db.execute("DROP INDEX IF EXISTS idx_task_runs_case_updated")
             db.execute("CREATE INDEX IF NOT EXISTS idx_task_runs_status_scheduled ON task_runs(status, scheduled_at)")
 
@@ -215,6 +218,7 @@ class TaskStore:
         session_id: str = "",
         model: str = "",
         parent_id: str | None = None,
+        source: str = "",
     ) -> dict[str, Any]:
         with self._lock, self._connection() as db:
             existing = db.execute("SELECT * FROM task_runs WHERE request_id=?", (request_id,)).fetchone()
@@ -225,9 +229,9 @@ class TaskStore:
         with self._lock, self._connection() as db:
             db.execute(
                 """INSERT OR IGNORE INTO task_runs
-                   (id, request_id, parent_id, session_id, input_text, model, status, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?)""",
-                (run_id, request_id, parent_id, session_id, input_text, model, now, now),
+                   (id, request_id, parent_id, session_id, input_text, model, status, created_at, updated_at, source)
+                   VALUES (?, ?, ?, ?, ?, ?, 'running', ?, ?, ?)""",
+                (run_id, request_id, parent_id, session_id, input_text, model, now, now, source),
             )
             row = db.execute("SELECT * FROM task_runs WHERE request_id=?", (request_id,)).fetchone()
         assert row is not None

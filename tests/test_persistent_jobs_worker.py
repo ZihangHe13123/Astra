@@ -41,10 +41,11 @@ class Handler(BaseHTTPRequestHandler):
                 "name": "write_file", "arguments": json.dumps({"path": str(self.server.target), "content": "MODIFIED"})}}]}
             reason = "tool_calls"
         else:
-            delta = {"content": "fixture-check-result"}
+            delta = {"content": getattr(self.server, "reply", "fixture-check-result")}
             reason = "stop"
         for chunk in ({"choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
-                      {"choices": [{"index": 0, "delta": {}, "finish_reason": reason}]}):
+                      {"choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
+                       "usage": {"prompt_tokens": 41, "completion_tokens": 7, "total_tokens": 48}}):
             self.wfile.write(("data: " + json.dumps(chunk) + "\n\n").encode())
         self.wfile.write(b"data: [DONE]\n\n")
         self.wfile.flush()
@@ -187,3 +188,22 @@ while True:
     assert elapsed >= (2.9 if active else 0.9)
     assert scheduler.recover_abandoned(store) == 0
     assert store.claim_due(now=1000) is None
+
+
+def test_real_worker_tells_only_changes_for_an_on_change_check(tmp_path, provider):
+    env = environment(tmp_path / "A", provider)
+    job = command(env, "add", "news", "--after", "60", "--model", "fixture", "--workdir", str(tmp_path),
+                  "--notify", "on_change", "--prompt", "Any new posts?", "--request", "Tell me only about new posts")
+    first = command(env, "run", job["id"])["executed"][0]
+    assert "(nothing reported yet)" in json.dumps(provider.requests[-1]["body"]["messages"])
+    provider.reply = "NO_UPDATE"
+    second = command(env, "run", job["id"])["executed"][0]
+    # The second check is compared against what the person was actually told.
+    assert "fixture-check-result" in json.dumps(provider.requests[-1]["body"]["messages"])
+    third = command(env, "run", job["id"])["executed"][0]
+    assert "fixture-check-result" in json.dumps(provider.requests[-1]["body"]["messages"])
+    results = {item["id"]: item for item in command(env, "inbox")}
+    assert [results[run["id"]]["quiet"] for run in (first, second, third)] == [0, 1, 1]
+    assert all(results[run["id"]]["state"] == "completed" for run in (first, second, third))
+    assert results[first["id"]]["usage"]["prompt_tokens"] == 41
+    assert results[first["id"]]["usage"]["completion_tokens"] == 7

@@ -1,4 +1,5 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, net, protocol, shell, Tray } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, net, Notification, protocol, shell, Tray } from "electron";
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, realpathSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -9,6 +10,7 @@ import type { DesktopEvent, Preferences } from "../bridge.js";
 import type { SessionState } from "@astra/ui-core/session-state";
 import { Runtime } from "./runtime.js";
 import { ChannelHost } from "./channel-host.js";
+import { Attention, type AttentionNotice } from "./attention.js";
 import { QueryClient } from "./query-client.js";
 import { sessionAction } from "./session-actions.js";
 import { hasOngoingWork } from "./ongoing-work.js";
@@ -98,6 +100,17 @@ async function phoneStatus(): Promise<PhoneStatus> {
     ...(phoneDevices.enabled && phoneHost.name ? { url: `https://${phoneHost.name}` } : {}), devices: phoneDevices.list(),
     ...(phoneDevices.currentPairing() ? { pairing: phoneDevices.currentPairing() } : {}) };
 }
+const attention = new Attention({ focused: () => !!window && !window.isDestroyed() && window.isFocused() });
+// Held until closed or clicked, so a notification is not collected before its click handler runs.
+const notices = new Set<Notification>();
+function notify(notice: AttentionNotice | undefined) {
+  if (!notice || !Notification.isSupported()) return;
+  const shown = new Notification({ title: notice.title, body: notice.body });
+  notices.add(shown);
+  shown.on("click", () => { notices.delete(shown); showWindow(); });
+  shown.on("close", () => notices.delete(shown));
+  shown.show();
+}
 function broadcast(event: DesktopEvent) {
   phone.publish(event);
   queued.push(event);
@@ -162,6 +175,7 @@ function openSession(options: { session?: string; mode?: string; workspace?: str
   }
   const rt = new Runtime(root, python, work, mode === "work" ? name : `gui_${randomUUID().replaceAll("-", "")}`, mode,
     (r, event) => { broadcast({ runtime: r.id, revision: r.state.revision, event }); appshot.handle(r.id, event);
+      notify(attention.session(r.id, "", r.state.busy, event));
       if (event.type === "backend_hello") voiceRoutes.delete(r.id);
       if (event.type === "gui_ready") appshot.update(); });
   // Special modes enter their separate namespace after the Work backend is ready.
@@ -219,11 +233,30 @@ register("appshot", async (id, action, value = "") => {
   } else rt.accept({ type: "gui_notice", message: await appshot.command(rt.id, value) });
 });
 function runQuery(method: any, params: any = {}, id?: unknown) {
-  if (!["sessions", "history", "commands", "changes", "request_timeline", "session_log"].includes(method)) throw new Error("Unsupported query");
+  if (!["sessions", "history", "commands", "changes", "request_timeline", "session_log", "jobs", "activity"].includes(method)) throw new Error("Unsupported query");
   if (!params || typeof params !== "object" || Array.isArray(params) || JSON.stringify(params).length > 32768) throw new Error("Invalid query");
   return method === "changes" ? runtime(id).query(method, params) : queries.query(method, params);
 }
 register("query", runQuery);
+/** The person's own changes to scheduled jobs, from the jobs page: the same as `astra jobs` in a terminal. */
+function runJobs(action: unknown, value?: unknown, extra?: unknown): Promise<unknown> {
+  let args: string[];
+  if (action === "quiet") {
+    const clock = (text: unknown) => { const v = checkedString(text, "time", 5); if (!/^([01]?\d|2[0-3]):[0-5]\d$/.test(v)) throw new Error("Invalid time"); return v; };
+    args = value === "off" ? ["quiet", "off"] : ["quiet", clock(value), clock(extra)];
+  } else {
+    const id = checkedString(value, "job", 32);
+    if (!/^[0-9a-f]{32}$/.test(id)) throw new Error("Invalid job");
+    if (action === "read") args = ["inbox", "--read", id, "--limit", "1"];
+    else if (action === "run") args = ["run", id, "--queue"];
+    else if (action === "pause" || action === "resume" || action === "remove") args = [action, id];
+    else throw new Error("Unsupported job action");
+  }
+  return new Promise((done, fail) => execFile(python, ["-m", "agent.cli.jobs_commands", ...args],
+    { cwd: root, env: process.env, timeout: 30_000, windowsHide: true, encoding: "utf8" },
+    (error, stdout, stderr) => error ? fail(new Error(String(stderr).trim().split("\n").at(-1) || error.message)) : done(JSON.parse(stdout || "null"))));
+}
+register("jobs", runJobs);
 const sessionOperations = new Set<string>();
 async function runSessionAction(action: any, entry: any) {
   if (!["export", "delete"].includes(action) || !entry || typeof entry !== "object") throw new Error("Invalid session action");
@@ -271,6 +304,7 @@ async function phoneInvoke(device: string, method: PhoneInvokeMethod, args: any[
     appshot: { connection: "disconnected", enabled: false } };
   if (method === "create") return openSession(args[0] ?? {}, false);
   if (method === "query") return runQuery(args[0], args[1], args[2]);
+  if (method === "jobs") { phoneAudit(device, { method, action: String(args[0]).slice(0, 20) }); return runJobs(args[0], args[1], args[2]); }
   if (method === "close") { phoneAudit(device, { method, runtime: String(args[0]) }); return closeSession(args[0]); }
   if (method === "deleteSession") { phoneAudit(device, { method, session: args[0]?.name, mode: args[0]?.mode }); return runSessionAction("delete", args[0]); }
   const rt = runtime(args[0]); const command = checkedCommand(args[1]);
@@ -335,8 +369,12 @@ register("file", async (id, value, action, requestId) => {
 /** WeChat and QQ answer while the desktop is open, whether or not a conversation is open in the window. */
 const channelHost = new ChannelHost({
   configPath: process.env.ASTRA_CHANNEL_CONFIG || join(root, ".astra", "channels.json"),
-  // The channel host takes WeChat over from other backends, such as an old terminal session.
-  create: () => new Runtime(root, python, workspace, "channel_host", "work", () => {}, { ASTRA_CHANNEL_HOST: "1" }),
+  // Kept by the job store while a scheduled job may run or a result still waits to be pushed.
+  jobsMarker: join(data, "jobs", "active"),
+  // The channel host takes WeChat over from other backends, such as an old terminal session. It also
+  // runs scheduled jobs; their results become notifications here.
+  create: () => new Runtime(root, python, workspace, "channel_host", "work", (_r, event) => notify(attention.host(event)),
+    { ASTRA_CHANNEL_HOST: "1" }),
 });
 
 async function performQuit() {

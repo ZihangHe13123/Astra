@@ -167,6 +167,7 @@ export class RemoteBridge implements DesktopBridge {
   close(id: string) { return this.call("close", [id]); }
   send(id: string, command: Record<string, unknown>) { return this.call("send", [id, command]); }
   query(method: string, params?: Record<string, unknown>, runtime?: string) { return this.call("query", [method, params ?? {}, runtime]); }
+  jobs(action: string, value?: string, extra?: string) { return this.call("jobs", [action, value, extra]); }
   sessionAction(action: "export" | "delete", entry: { name: string; mode: string }) {
     return action === "delete" ? this.call("deleteSession", [entry]) : Promise.reject(new Error(UNAVAILABLE.export));
   }

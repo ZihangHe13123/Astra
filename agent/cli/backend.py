@@ -39,7 +39,7 @@ if __name__ == "__main__":
     # gui_ready still marks completion of runtime and session initialization.
     _handshake()
 
-from agent.runtime.paths import sessions_dir, state_path
+from agent.runtime.paths import sessions_dir, state_dir, state_path
 from agent.runtime.appshot_media import AppshotMediaError
 
 import sqlite3
@@ -77,6 +77,7 @@ from agent.cli.mode_preferences import (
     reasoning_effort_status,
     set_reasoning_effort,
 )
+from agent.cli.jobs_commands import job_model_key
 from agent.cli.turn_budget import execute_budget_command
 from agent.cli.turn_changes_command import execute_changes_command
 from agent.cli.stream_events import tool_progress_event, tool_result_event
@@ -103,9 +104,12 @@ from agent.runtime.event_writer import OrderedEventWriter
 from agent.runtime.async_io import durable_io
 from agent.runtime.latency import RuntimeProfiler, current_profiler, profile_request
 from agent.runtime.user_questions import UserQuestionBroker
+from agent.runtime.tools.jobs import register_jobs_tool
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
 from agent.cli.session_lifecycle import ControlledRestart, RESTART_EXIT_CODE
 from agent.runtime.background_completion import BackgroundCompletions, wake_display, wake_prompt
+from agent.runtime.jobs.host import JobsHost
+from agent.runtime.jobs.store import note_interaction
 from agent.runtime.session_wakeup import SessionWakeups, visible_wakeup_history, wakeup_prompt
 from agent.runtime.browser_control_transport import set_owner_label_provider
 from agent.runtime.peer_link import (HEARTBEAT_SECONDS, PeerError, PeerLink, default_name, fallback_name,
@@ -203,6 +207,7 @@ from agent.cli.conversation_commands import register_conversation_tools
 from agent.runtime.command_workflows import workflow_message, raw_command as normalize_direct_command
 from agent.channels import ChannelManager, load_channels_config
 from agent.channels.manager import is_address_in_use
+from agent.channels.job_push import weixin_job_push
 from agent.channels.router import AgentChannelRouter, active_channel, active_channel_message
 from agent.channels.approvals import await_chat_approval
 from agent.cli.channel_models import ChannelModels
@@ -1382,6 +1387,12 @@ async def _main(startup_started: float):
         }, "required": ["outcome"]}, fn=_report_wakeup, cache_results=False,
     ))
 
+    # Reminders and read-only checks the person schedules; each change is approved by them.
+    register_jobs_tool(
+        tools, home=state_dir(), workdir=agent._source_tracking_workdir, model_key=lambda: job_model_key(""),
+        request=lambda: message.text if (message := active_channel_message.get()) else latest_user_request,
+    )
+
     # Other Astra sessions on this computer: one shared mailbox (agent/runtime/peer_link.py).
     try:
         peer_link: PeerLink | None = PeerLink(os.getenv("ASTRA_PEER_DB") or state_path("peers.db"))
@@ -2353,11 +2364,12 @@ async def _main(startup_started: float):
 
     channel_models = ChannelModels(lambda: catalog, lambda: current_model_key)
     channel_router = AgentChannelRouter(agent, agent_turn_lock, sessions_dir(PROJECT_ROOT),
-                                        admission=lambda: not restart.draining, model_for=channel_models.client)
+                                        admission=lambda: not restart.draining, model_for=channel_models.client,
+                                        tasks=task_store)
     # The desktop's channel host takes WeChat over from other backends. Popped so nothing this
     # backend starts inherits the claim.
-    channel_manager = ChannelManager(load_channels_config(), channel_router.handle,
-                                     channel_host=os.environ.pop("ASTRA_CHANNEL_HOST", "") == "1")
+    channel_host = os.environ.pop("ASTRA_CHANNEL_HOST", "") == "1"
+    channel_manager = ChannelManager(load_channels_config(), channel_router.handle, channel_host=channel_host)
     channel_manager_holder["manager"] = channel_manager
     weixin_commands = WeixinCommands(lambda: channel_manager_holder.get("manager"), _send,
                                      models=channel_models)
@@ -2367,6 +2379,9 @@ async def _main(startup_started: float):
     # disabled in this process.
     await _start_channel_manager(channel_manager)
     weixin_commands.send_status()
+    # The background host also runs scheduled jobs and pushes their results to the desktop and WeChat.
+    jobs_host = JobsHost(state_dir(), desktop=_send, weixin=weixin_job_push(channel_manager, channel_router)
+                         ).start() if channel_host else None
 
     active_task: asyncio.Task | None = None
     active_task_id = ""
@@ -2501,6 +2516,7 @@ async def _main(startup_started: float):
                         str(request_id), input_text,
                         session_id=agent.context.session_scope,
                         model=agent.llm.config.model,
+                        source="desktop" if os.getenv("ASTRA_UI_SURFACE") == "gui" else "terminal",
                     )
 
                 try:
@@ -3873,6 +3889,7 @@ async def _main(startup_started: float):
 
             elif cmd.get("type") == "message":
                 completions.user_turn()
+                note_interaction(state_dir())
                 if isinstance(cmd.get("text"), str):
                     latest_user_request = cmd["text"][:8000]
                 if cmd.get("appshots") or ("submission_id" in cmd and os.getenv("ASTRA_UI_SURFACE") != "gui"):
@@ -4542,6 +4559,8 @@ async def _main(startup_started: float):
         lifecycle_task.cancel()
         with suppress(asyncio.CancelledError):
             await lifecycle_task
+        if jobs_host is not None:
+            await jobs_host.close()
         await channel_manager.stop()
         pending_startup = [task for task in [*startup_tasks, *catalog_tasks.values()] if not task.done()]
         for task in pending_startup:

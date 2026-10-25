@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import time
+import uuid
 from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
@@ -19,7 +20,8 @@ from agent.runtime.prompts import channel_prompt_profile
 from agent.runtime.context import AgentContext
 from agent.runtime.context_compressor import ContextCompressor
 from agent.runtime.json_preferences import update_preferences
-from agent.runtime.paths import state_path
+from agent.runtime.jobs.store import note_interaction
+from agent.runtime.paths import state_dir, state_path
 
 from .base import ChannelMessage, ReplySink
 from .weixin import CHAT_STYLE as WEIXIN_CHAT_STYLE
@@ -66,13 +68,16 @@ class AgentChannelRouter:
 
     def __init__(self, agent, turn_lock: asyncio.Lock, session_root: Path,
                  *, admission: Callable[[], bool] | None = None,
-                 model_for: Callable[[str], Any] | None = None):
+                 model_for: Callable[[str], Any] | None = None, tasks: Any = None):
         self.agent = agent
         self.turn_lock = turn_lock
         self.session_root = Path(session_root)
         self.admission = admission or (lambda: True)
         # A channel's own model client, or None to answer with the agent's.
         self.model_for = model_for or (lambda channel: None)
+        # The task store, when there is one: each chat turn is recorded there as a run with
+        # its steps, like a desktop turn, so the activity page shows what Astra did in chats.
+        self.tasks = tasks
         self._contexts: dict[str, AgentContext] = {}
         self._template = agent.context
 
@@ -107,6 +112,34 @@ class AgentChannelRouter:
                                 lambda data: data.__setitem__(base, name))
         logger.info("channel %s started a new conversation", message.channel)
         return NEW_CONVERSATION_REPLY
+
+    async def _start_task(self, message: ChannelMessage, context: AgentContext) -> str:
+        if self.tasks is None:
+            return ""
+        try:
+            run = await asyncio.to_thread(
+                self.tasks.start_run, f"channel:{message.channel}:{uuid.uuid4().hex}", message.text[:8000],
+                session_id=context.session_scope, model=getattr(getattr(self.agent.llm, "config", None), "model", ""),
+                source=message.channel)
+        except Exception:
+            logger.exception("channel turn not recorded in the task store")
+            return ""
+        return str(run.get("id") or "")
+
+    async def _finish_task(self, task_id: str, outcome: str) -> None:
+        try:
+            await asyncio.to_thread(self.tasks.finish_run, task_id, outcome)
+        except Exception:
+            logger.exception("channel turn outcome not recorded in the task store")
+
+    async def record_outbound(self, channel: str, conversation_id: str, text: str) -> None:
+        """Keep a message Astra sent on its own, such as a job result, in that private chat's
+        conversation, so the person's reply ("tell me more about the second one") has it."""
+        message = ChannelMessage(channel=channel, conversation_id=conversation_id, sender_id=conversation_id, text="")
+        async with self.turn_lock:
+            context = self._context(self._session_name(message), channel)
+            context.add_assistant(text)
+            await context.save_async()
 
     def _budget(self, llm) -> int:
         """Compact a channel conversation for the model answering it: its own, or the window's."""
@@ -170,6 +203,7 @@ class AgentChannelRouter:
             async with self.turn_lock:
                 return await self._start_new_conversation(message)
         session_name = self._session_name(message)
+        note_interaction(state_dir())
         async with self.turn_lock:
             if not self.admission():
                 return "Astra is preparing a restart. Please retry after it reconnects."
@@ -187,6 +221,7 @@ class AgentChannelRouter:
             message_token = active_channel_message.set(message)
             media: list[str] = []
             media_token = channel_turn_media.set(media)
+            task_id, outcome = "", "failed"
             try:
                 content = message.text
                 if message.is_group and message.sender_name:
@@ -206,6 +241,9 @@ class AgentChannelRouter:
                         "channel_message_id": message.message_id,
                     },
                 )
+                task_id = await self._start_task(message, context)
+                if task_id:
+                    msg.metadata["task_id"] = task_id
                 chunks: list[str] = []
                 phase_chunks: list[str] = []
 
@@ -233,10 +271,16 @@ class AgentChannelRouter:
                         phase_chunks.append(chunk)
                 await flush_phase()
                 context.save()
+                outcome = "completed"
                 # A turn that answered with a voice note or a file alone has said what it had to.
                 response = "".join(chunks).strip() or ("" if media else "(no response)")
                 return "" if reply_sink is not None and chunks else response
+            except asyncio.CancelledError:
+                outcome = "cancelled"
+                raise
             finally:
+                if task_id:
+                    await self._finish_task(task_id, outcome)
                 channel_turn_media.reset(media_token)
                 active_channel_message.reset(message_token)
                 active_channel.reset(token)

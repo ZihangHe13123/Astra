@@ -244,6 +244,22 @@ closing the backend, but offline history browsing, export and deletion are not y
 available in the GUI; manage those histories with the extension's own commands.
 Public Astra does not bundle a private mode or private personas.
 
+## Scheduled jobs and activity
+
+**定时任务** in the sidebar lists the jobs Astra scheduled for you (see
+[persistent jobs](persistent-jobs.md)): when each runs next, how it reports, and
+whether it was paused and why. Pause, resume, run once now or remove one there;
+these are your own changes and ask for no approval. The quiet hours are set on the
+same page, and the inbox below keeps every result, unread ones marked, with where
+each was pushed and its token usage.
+
+**活动** lists what Astra did in the last 7 days, newest first: conversation turns
+from the desktop, the terminal and WeChat with the files they changed, the commands
+they ran and the approvals you gave, and job runs. Turns that only talked are hidden
+until asked for. **打开这次对话** opens the turn's conversation. While the window is
+in the background, a waiting approval or question, a reply that took 20 seconds or
+more, and job results arrive as system notifications.
+
 ## Permissions and persona
 
 The approval-mode button in the composer opens **权限与对话模式**. Choose

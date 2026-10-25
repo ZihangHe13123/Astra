@@ -1,7 +1,7 @@
 import "./file-preview.css";
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { ArrowUp, Square, Plus, Search, PanelLeft, PanelRight, ChevronDown, Folder, Settings, Paperclip, X, Copy, RotateCcw, ChevronRight, Command, Pin, Moon, Sun, Monitor, ArrowLeft, LoaderCircle, SlidersHorizontal, FileDiff, Terminal, Check, FileText } from "lucide-react";
+import { ArrowUp, Square, Plus, Search, PanelLeft, PanelRight, ChevronDown, Folder, Settings, Paperclip, X, Copy, RotateCcw, ChevronRight, Command, Pin, Moon, Sun, Monitor, ArrowLeft, LoaderCircle, SlidersHorizontal, FileDiff, Terminal, Check, FileText, AlarmClock, History } from "lucide-react";
 import { projectEvent, textContent, type SessionState, type UIEvent, type Message } from "@astra/ui-core/session-state";
 import { COMPACTION_LABEL } from "@astra/ui-core/context-compaction";
 import { responseControlsBusy, responseOperationActive, type ResponseSource, type ResponseGroup } from "@astra/ui-core/response-versions";
@@ -28,6 +28,8 @@ import { VoiceSettings } from "./voice.js";
 import { MemoryReviewSettings, reviewAnswer, withProposalOptions } from "./memory-review.js";
 import { PhoneSettings } from "./phone-settings.js";
 import { WeixinSettings } from "./weixin-settings.js";
+import { JobsPanel } from "./jobs-page.js";
+import { ActivityPanel } from "./activity-page.js";
 import { voiceAnswer, voiceButton, voiceNotice, withVoiceOptions } from "./voice-state.js";
 import { autoTitle, sessionTitle, sidebarGroups } from "./sidebar.js";
 import { DESKTOP_THEME_NAMES, PLAIN_THEMES, desktopTheme, followTheme, isDesktopThemeName } from "./theme.js";
@@ -62,7 +64,7 @@ function App() {
   const narrow = useNarrow();
   const [side, setSide] = useState(() => !narrowScreen());
   const [panel, setPanel] = useState<Panel>();
-  const [modal, setModal] = useState<"commands" | "models" | "model-picker" | "settings" | "permissions" | "sessions" | "persona" | "voice">();
+  const [modal, setModal] = useState<"commands" | "models" | "model-picker" | "settings" | "permissions" | "sessions" | "persona" | "voice" | "jobs" | "activity">();
   const [sessionMode, setSessionMode] = useState<string>();
   const [commandQuery, setCommandQuery] = useState("");
   const [sessionDialog, setSessionDialog] = useState<{ action: "rename" | "delete"; entry: SessionEntry; title: string }>();
@@ -550,6 +552,8 @@ function App() {
     <aside className="sidebar"><div className="traffic-space"/><div className="brand">{theme.console ? <><ThemeMark className="brand-mark"/><span className="brand-name"><strong>ASTRA</strong><small title={theme.wording.brand}>{theme.wording.brand}</small></span></> : <><span className="astra-mark">A</span><strong>Astra</strong></>}<button className="icon" aria-label="隐藏侧栏" onClick={() => setSide(false)}><PanelLeft size={17}/></button></div>
       <button className="new-chat" onClick={() => newChat()}><Plus size={18}/>新对话<span>{navigator.platform.includes("Mac") ? "⌘" : "Ctrl"} N</span></button>
       <button className="nav-button" onClick={() => showCommands()}><Command size={17}/>命令与功能<kbd>{navigator.platform.includes("Mac") ? "⌘" : "Ctrl"} K</kbd></button>
+      <button className="nav-button" onClick={() => setModal("jobs")}><AlarmClock size={17}/>定时任务</button>
+      <button className="nav-button" onClick={() => setModal("activity")}><History size={17}/>活动</button>
       <div className="sidebar-search"><Search size={15}/><input aria-label="搜索会话" value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索会话"/></div>
       <div className="session-scroll">
         {!!groups.pinned.length && <><h4 className="section-label">置顶</h4>{groups.pinned.map(entryButton)}</>}
@@ -608,6 +612,13 @@ function App() {
     {sessionDialog && <SessionActionDialog key={`${sessionDialog.action}:${sessionDialog.entry.mode}:${sessionDialog.entry.name}`} action={sessionDialog.action} title={sessionDialog.title} close={() => setSessionDialog(undefined)} confirm={confirmSessionAction}/>}
     {modal === "sessions" && <Modal title="管理会话" close={() => setModal(undefined)}><div className="form"><label>对话模式<select aria-label="筛选对话模式" value={sessionMode || ""} onChange={e => setSessionMode(e.target.value || undefined)}><option value="">全部模式</option><option value="work">通用</option>{commandModes.map(mode => <option key={mode.mode} value={mode.mode}>{mode.label}</option>)}</select></label><input aria-label="筛选会话" value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索会话…"/>{historyFiltered.filter(entry => !sessionMode || entry.mode === sessionMode).map(entryButton)}{!historyFiltered.some(entry => !sessionMode || entry.mode === sessionMode) && <p className="muted">暂无匹配的会话。</p>}</div></Modal>}
     {modal === "persona" && <Modal title="人格设置" close={() => setModal(undefined)}><div className="form"><p className="muted small">选择当前会话使用的人格。</p>{(model?.personas || []).map((p: UIEvent) => <button key={p.name} onClick={() => { setModal(undefined); void command(`/persona ${p.name}`); }}><span>{p.name}<small>{p.description}</small></span></button>)}</div></Modal>}
+    {modal === "jobs" && <Modal title="定时任务" wide close={() => setModal(undefined)}><JobsPanel fail={fail}/></Modal>}
+    {modal === "activity" && <Modal title="活动" wide close={() => setModal(undefined)}><ActivityPanel fail={fail} openSession={name => {
+      // A turn names its conversation's scope; a branch adds to the file's name.
+      const entry = history.find(item => item.name === name) || history.find(item => name.startsWith(`${item.name}`));
+      if (!entry) { fail(new Error("找不到这次对话，它可能已被删除。")); return; }
+      setModal(undefined); browse(entry);
+    }}/></Modal>}
     {modal === "voice" && <VoiceSettings status={voiceStatus} ready={state?.status === "ready"} run={cmd => { void send({ type: "command", cmd }); }} close={() => setModal(undefined)}/>}
     {modal === "permissions" && <Modal title="权限与对话模式" close={() => setModal(undefined)}><div className="form"><h3>工具审批</h3><p className="muted small">控制工具操作是否需要你确认。</p>
       <div className="choice-grid">{[{ value: false, name: "按需审批", description: "按现有权限规则确认操作" }, { value: true, name: "完全访问", description: "直接执行工具操作，跳过审批" }].map(option => <button key={option.name} disabled={state?.status !== "ready"} aria-pressed={!!state?.info.yolo_status?.yolo === option.value} className={!!state?.info.yolo_status?.yolo === option.value ? "selected" : ""} onClick={() => { setModal(undefined); void command(`/yolo ${option.value ? "on" : "off"}`); }}><strong>{option.name}</strong><small>{option.description}</small></button>)}</div>

@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-from agent.runtime.jobs.store import MAX_OUTPUT, JobStore
+from agent.runtime.jobs.store import MAX_OUTPUT, NO_UPDATE, JobStore
 
 READ_TOOLS = frozenset({"read_file", "stat_file", "search_files", "search_text", "current_time"})
 WEB_TOOLS = frozenset({"search_web", "fetch_url", "search_status"})
@@ -93,9 +93,13 @@ async def run_check(store: JobStore, run: dict) -> None:
     error = ""
     last_progress = 0.0
     try:
-        msg = Msg(sender="user", role="user", content=[ContentBlock.text(
-            f"Original user request:\n{spec['original_request']}\n\nScheduled check:\n{spec['prompt']}"
-        )],
+        text = f"Original user request:\n{spec['original_request']}\n\nScheduled check:\n{spec['prompt']}"
+        on_change = spec.get("notify") == "on_change"
+        if on_change:
+            previous = store.last_reported_output(run["job_id"], before=run["id"]) or "(nothing reported yet)"
+            text += (f"\n\nThe person is told only about changes. The last result they were given:\n{previous}\n\n"
+                     f"Report only what is new or different since that result. If nothing is, reply exactly {NO_UPDATE}.")
+        msg = Msg(sender="user", role="user", content=[ContentBlock.text(text)],
                   metadata={"source": "scheduled_job", "request_id": run["id"]})
         async for event in agent.reply_stream(msg):
             now = time.monotonic()
@@ -115,7 +119,12 @@ async def run_check(store: JobStore, run: dict) -> None:
         await agent.context.save_async()
         if not output.strip() and not error:
             error = "scheduled_check_returned_no_result"
-        store.finish(run["id"], "failed" if error else "completed", output=output, detail=error)
+        context = agent.context
+        usage = {"prompt_tokens": context.total_prompt_tokens, "completion_tokens": context.total_completion_tokens,
+                 "cache_hit_tokens": context.total_cache_hit_tokens}
+        quiet = on_change and not error and output.strip().strip("`*. ") == NO_UPDATE
+        store.finish(run["id"], "failed" if error else "completed", output=output, detail=error,
+                     quiet=quiet, usage=usage)
     finally:
         agent.end_session("scheduled_job_finished")
         await agent.close_external_memory()
