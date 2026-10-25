@@ -1,5 +1,6 @@
 /** Interactive cards in the desktop: real Electron/Python, a loopback model, and a card that tries to get out. */
 import { launchElectron } from './electron-launch.mjs';
+import { clickInFrame } from './frame-click.mjs';
 import { expect } from '@playwright/test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
@@ -177,8 +178,15 @@ try {
   console.log('START', folder);
   const composer = page.getByRole('textbox', { name: '消息', exact: true });
   const state = async () => page.evaluate(async () => { const boot = await window.astra.bootstrap(); return boot.sessions.find(item => item.id === boot.active); });
-  const idle = async () => expect.poll(async () => { const current = await state(); return current?.status === 'ready' && !current.busy; }, { timeout: 30000 }).toBe(true);
-  const send = async text => { await composer.fill(text); await page.getByRole('button', { name: '发送', exact: true }).click(); };
+  const submit = async text => { await composer.fill(text); await page.getByRole('button', { name: '发送', exact: true }).click(); };
+  // A turn is over once the backend has saved the person's message and is idle. Idle alone is true before the turn
+  // starts, and a message sent while the previous turn is still closing is taken as steering for it and never
+  // answered (Windows runner 2026-10-25: the reply to 文档 never came).
+  const finished = text => expect.poll(async () => {
+    const current = await state();
+    return current?.status === 'ready' && !current.busy && current.messages.some(message => message.role === 'user' && message.content === text && message.source_ref);
+  }, { timeout: 30000, message: `the turn for ${text} finishes` }).toBe(true);
+  const send = async text => { await submit(text); await finished(text); };
   // The list mounts only the rows near the viewport, so each card is found through its own reply.
   const reply = text => page.locator('.message.assistant').filter({ hasText: text });
   const counter = reply('这是一个计数器。'), hostile = reply('试试能不能出去。'), failing = reply('这张会出错。'), plain = reply('这只是代码。'), example = reply('文档里的例子。'), lesson = reply('技能里的例子。');
@@ -215,11 +223,11 @@ try {
   };
 
   // While the block is being written nothing runs; once the fence closes the card appears and works.
-  await send('慢慢 计数');
+  await submit('慢慢 计数');
   await expect.poll(() => streamHeld).toBe(true);
   await expect(counter.locator('.card-block').getByRole('status')).toHaveText('卡片输入中…');
   await expect(page.locator('iframe')).toHaveCount(0);
-  holdStream(); await idle();
+  holdStream(); await finished('慢慢 计数');
   await expect(frame(counter)).toHaveCount(1);
   await expect(inside(counter).getByRole('heading', { name: '计数器' })).toBeVisible();
   await expect(page.getByText('卡片后面的文字。', { exact: true })).toBeVisible();
@@ -227,9 +235,9 @@ try {
   // so the card is clicked only once it has: a click aimed while the button is still moving can land beside it.
   const fit = () => fitOf(counter);
   await expect.poll(async () => { const [frameHeight, content] = await fit(); return frameHeight === content && content > 60; }).toBe(true);
-  await inside(counter).getByRole('button', { name: '加一', exact: true }).click();
+  await clickInFrame(inside(counter).getByRole('button', { name: '加一', exact: true }));
   await expect(inside(counter).locator('#n')).toHaveText('1');
-  await inside(counter).getByRole('button', { name: '加一', exact: true }).click();
+  await clickInFrame(inside(counter).getByRole('button', { name: '加一', exact: true }));
   await expect(inside(counter).locator('#n')).toHaveText('2');
   // It takes the reply's colours.
   const colours = () => Promise.all([page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue('--text').trim()), inside(counter).locator('html').evaluate(node => getComputedStyle(node).getPropertyValue('--text').trim()), inside(counter).locator('html').evaluate(node => getComputedStyle(node).colorScheme)]);
@@ -254,7 +262,6 @@ try {
 
   // A card that tries every way out. It learns nothing about the host, and nothing it sends arrives anywhere.
   await send('逃逸');
-  await idle();
   const checkHostileProbes = async () => {
     await expect(inside(hostile).locator('#state')).toHaveText('probed', { timeout: 20000 });
     probed = JSON.parse(await inside(hostile).locator('#result').textContent());
@@ -282,23 +289,19 @@ try {
 
   // A card whose script fails says so; an html block is code and never runs.
   await send('报错');
-  await idle();
   await expect(failing.locator('.card-block').getByRole('status')).toHaveText(/卡片脚本出错：.*CARD_FIXTURE_FAILURE/);
   await expect(inside(failing).getByText('before', { exact: true })).toBeVisible();
   await send('网页');
-  await idle();
   await expect(plain.locator('.code-block')).toContainText('not run');
   await expect(plain.locator('iframe')).toHaveCount(0);
   assert.equal(await page.title(), 'Astra');
   // The guide's own example works as written, with the inherited styles and nothing loaded.
   await send('文档');
-  await idle();
   await expect(inside(example).locator('#total')).toHaveText('2,653');
   await inside(example).locator('#years').fill('1');
   await expect(inside(example).locator('#total')).toHaveText('1,050');
   await page.screenshot({ path: join(output, 'card-example.png') });
   await send('技能');
-  await idle();
   await expect(inside(lesson).locator('#total')).toHaveText('2,653');
   await expect(inside(lesson).locator('#shown')).toHaveText('20');
   await inside(lesson).locator('#years').fill('40');
@@ -311,12 +314,12 @@ try {
 
   // Scrolled out of the mounted rows and back, and reopened from saved history, the card runs again.
   await reveal(counter);
-  await inside(counter).getByRole('button', { name: '加一', exact: true }).click();
+  await clickInFrame(inside(counter).getByRole('button', { name: '加一', exact: true }));
   await expect(inside(counter).locator('#n')).toHaveText(/^[1-9]/);
   await page.reload();
   await expect(page.locator('.message.assistant').first()).toBeVisible();
   await reveal(counter);
-  await inside(counter).getByRole('button', { name: '加一', exact: true }).click();
+  await clickInFrame(inside(counter).getByRole('button', { name: '加一', exact: true }));
   await expect(inside(counter).locator('#n')).toHaveText('1');
   // In the smallest window it still fits.
   await resize(850, 600);

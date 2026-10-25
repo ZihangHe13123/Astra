@@ -1,5 +1,6 @@
 /** Pages in the desktop: real Electron/Python, a loopback model that writes page files, and a page that tries to get out. */
 import { launchElectron } from './electron-launch.mjs';
+import { clickInFrame } from './frame-click.mjs';
 import { expect } from '@playwright/test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
@@ -303,8 +304,8 @@ try {
   assert.equal(await shown(), 'demo.page.html');
   assert.equal(readFileSync(join(workspace, 'demo.page.html'), 'utf8'), writes.画布.content);
   await expect(inside.getByRole('heading', { name: 'CANVAS V1' })).toBeVisible();
-  await inside.getByRole('button', { name: '加一', exact: true }).click();
-  await inside.getByRole('button', { name: '加一', exact: true }).click();
+  await clickInFrame(inside.getByRole('button', { name: '加一', exact: true }));
+  await clickInFrame(inside.getByRole('button', { name: '加一', exact: true }));
   await expect(inside.locator('#n')).toHaveText('2');
   // It is a document of its own: its doctype counts, its body is its own, and its styles are the only ones.
   const facts = await inside.locator('body').evaluate(body => ({
@@ -404,7 +405,7 @@ try {
   await ask('技能', 'lesson.page.html');
   assert.equal(await shown(), 'lesson.page.html');
   await expect(inside.locator('#detail')).toHaveText(/^方案 A/);
-  await inside.getByRole('button', { name: '方案 B' }).click();
+  await clickInFrame(inside.getByRole('button', { name: '方案 B' }));
   await expect(inside.locator('#detail')).toHaveText(/^方案 B/);
   await expect(inside.getByRole('button', { name: '方案 B' })).toHaveAttribute('aria-pressed', 'true');
   await page.screenshot({ path: join(output, 'page-lesson.png') });
