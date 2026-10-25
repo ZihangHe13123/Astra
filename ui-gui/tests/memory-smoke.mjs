@@ -75,7 +75,7 @@ try {
   }, archive);
   await dialog.getByRole('button', { name: '导出…' }).click();
   await dialog.getByText(/已导出到 .*export\.zip/).waitFor({ timeout: 30000 });
-  const listed = run(`import zipfile\nprint("\\n".join(zipfile.ZipFile(${JSON.stringify(archive)}).namelist()))`).split('\n');
+  const listed = run(`import zipfile\nprint("\\n".join(zipfile.ZipFile(${JSON.stringify(archive)}).namelist()))`).split(/\r?\n/);
   assert.ok(listed.includes('astra-export/core-user/USER.md') && listed.includes('astra-export/memory/memory.db'));
   assert.ok(!listed.some(name => name.includes('.env') || name.includes('settings.json')));
   console.log('PASS export writes one zip with the memories and no settings or secrets');
