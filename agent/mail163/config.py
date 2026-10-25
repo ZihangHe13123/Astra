@@ -81,7 +81,7 @@ def load_mail_config(
         default_folders=("INBOX", sent_folder),
         sent_folder=sent_folder,
         send_id=send_id,
-        sync_limit=_read_positive_int(values.get("ASTRA_MAIL_SYNC_LIMIT"), "ASTRA_MAIL_SYNC_LIMIT", default=300),
+        sync_limit=_read_positive_int(values.get("ASTRA_MAIL_SYNC_LIMIT"), "ASTRA_MAIL_SYNC_LIMIT", default=100),
     )
 
 

@@ -221,3 +221,19 @@ def test_real_worker_offers_mail_only_to_a_check_allowed_to_read_it(tmp_path, pr
     command(env, "run", mail["id"])
     names = {tool["function"]["name"] for tool in provider.requests[-1]["body"]["tools"]}
     assert "mail" in names and not names.intersection({"write_file", "execute_shell"})
+
+
+def test_real_worker_is_told_which_mail_started_its_run(tmp_path, provider):
+    home = tmp_path / "A"
+    env = environment(home, provider)
+    job = command(env, "add", "tan", "--model", "fixture", "--workdir", str(tmp_path), "--on-mail-from", "tan@",
+                  "--prompt", "Summarise the new mail", "--request", "Tell me when Prof Tan writes")
+    assert job["spec"]["mail"] is True
+    JobStore(home).fire(job["id"], [{"type": "mail", "folder": "INBOX", "uid": 42, "from": "Prof Tan <tan@example.edu>",
+                                     "subject": "Meeting moved"}], "7:42")
+    result = command(env, "tick")
+    assert result["executed"][0]["state"] == "completed"
+    request = provider.requests[-1]["body"]
+    assert "started by new mail in INBOX: #42 From: Prof Tan <tan@example.edu> | Subject: Meeting moved" in json.dumps(
+        request["messages"], ensure_ascii=False)
+    assert "mail" in {tool["function"]["name"] for tool in request["tools"]}

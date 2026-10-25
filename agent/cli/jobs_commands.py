@@ -38,6 +38,11 @@ def jobs_parser() -> JobParser:
     add.add_argument("--tz", default="", help="with --time: IANA time zone (default this computer's)")
     add.add_argument("--notify", choices=sorted(NOTIFY_POLICIES), default="always",
                      help="on_change: deliver a check's result only when it reports something new")
+    add.add_argument("--on-mail-from", default=None, help="start on new mail whose sender contains this")
+    add.add_argument("--on-mail-subject", default=None, help="start on new mail whose subject contains this")
+    add.add_argument("--on-mail-folder", default="INBOX", help="with --on-mail-*: the folder to watch")
+    add.add_argument("--on-new-file", metavar="PATTERN", default=None,
+                     help="start when a new file matching PATTERN (such as '*.pdf') appears in --workdir")
     add.add_argument("--targets", default=",".join(PUSH_TARGETS),
                      help="where results are pushed besides the inbox: desktop,weixin (empty for the inbox only)")
     add.add_argument("--catch-up", type=float, help="maximum lateness in seconds, from 1 to 86400")
@@ -122,23 +127,32 @@ def execute_jobs_command(argv: list[str], *, home: Path | None = None,
             now = time.time()
             calendar = None
             next_at: float | None = None
-            if args.time:
-                if period:
-                    raise ValueError("Choose --every or --time, not both.")
-                calendar = {"time": args.time, "days": [day for day in args.days.split(",") if day.strip()],
-                            "tz": args.tz}
-            elif args.days or args.tz:
-                raise ValueError("--days and --tz apply to --time.")
-            elif args.at:
-                instant = datetime.fromisoformat(args.at.replace("Z", "+00:00"))
-                if instant.tzinfo is None:
-                    raise ValueError("--at needs an explicit UTC Z or numeric timezone offset.")
-                next_at = instant.timestamp()
-            elif args.after is not None or period:
-                delay = finite(args.after if args.after is not None else period, 60, 365 * 86400, "Delay")
-                next_at = now + delay
-            else:
-                raise ValueError("Choose --at, --after, --every or --time.")
+            trigger = None
+            if args.on_mail_from is not None or args.on_mail_subject is not None:
+                trigger = {"type": "mail", "from": args.on_mail_from or "", "subject": args.on_mail_subject or "",
+                           "folder": args.on_mail_folder}
+            elif args.on_new_file is not None:
+                trigger = {"type": "file", "pattern": args.on_new_file}
+            if trigger and (args.time or args.at or args.after is not None or period):
+                raise ValueError("A job starts on a schedule or on an event, not both.")
+            if trigger is None:
+                if args.time:
+                    if period:
+                        raise ValueError("Choose --every or --time, not both.")
+                    calendar = {"time": args.time, "days": [day for day in args.days.split(",") if day.strip()],
+                                "tz": args.tz}
+                elif args.days or args.tz:
+                    raise ValueError("--days and --tz apply to --time.")
+                elif args.at:
+                    instant = datetime.fromisoformat(args.at.replace("Z", "+00:00"))
+                    if instant.tzinfo is None:
+                        raise ValueError("--at needs an explicit UTC Z or numeric timezone offset.")
+                    next_at = instant.timestamp()
+                elif args.after is not None or period:
+                    delay = finite(args.after if args.after is not None else period, 60, 365 * 86400, "Delay")
+                    next_at = now + delay
+                else:
+                    raise ValueError("Choose --at, --after, --every or --time.")
             if not args.reminder and not args.request:
                 raise ValueError("Agent checks require --request with the original user authorization.")
             model = args.model
@@ -146,7 +160,7 @@ def execute_jobs_command(argv: list[str], *, home: Path | None = None,
                 model = job_model_key(model)
             value = store.add(name=args.name, prompt=args.prompt, original_request=args.request or args.prompt,
                               workdir=args.workdir or workdir or Path.cwd(), next_at=next_at,
-                              interval_seconds=period, calendar=calendar, notify=args.notify,
+                              interval_seconds=period, calendar=calendar, trigger=trigger, notify=args.notify,
                               targets=[target for target in args.targets.split(",") if target.strip()],
                               grace_seconds=args.catch_up if args.catch_up is not None
                               else 3600 if calendar else min(period / 2, 3600) if period else 300,

@@ -158,7 +158,7 @@ Astra 自己用只读的 `mail` 工具读取已配置的邮箱：最近的邮件
 保存记忆需要你批准。不只 163，任何 IMAP 邮箱都可以：用 `ASTRA_MAIL_ADDRESS` 和 `ASTRA_MAIL_PASSWORD`
 （应用专用密码或授权码）代替下面的 163 变量名。Gmail、QQ、iCloud、163/126/yeah 会根据地址自动识别；
 其他服务商还要设置 `ASTRA_MAIL_IMAP_HOST`（端口或已发送文件夹不同时再设 `ASTRA_MAIL_IMAP_PORT`、
-`ASTRA_MAIL_SENT_FOLDER`）。每个文件夹第一次同步只缓存最新的 300 封（`ASTRA_MAIL_SYNC_LIMIT`），之后只取
+`ASTRA_MAIL_SENT_FOLDER`）。每个文件夹第一次同步只缓存最新的 100 封（`ASTRA_MAIL_SYNC_LIMIT`），之后只取
 新到的邮件，不回补更早的历史。
 
 可选邮件集成增量缓存邮件，用于本地检索。在安装目录 `.env` 填写账号和客户端授权码（不是网页登录密码）：

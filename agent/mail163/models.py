@@ -21,7 +21,7 @@ class MailConfig:
     send_id: bool = True
     # A folder's first sync caches only its newest messages; later syncs fetch what arrived
     # since, never older history.
-    sync_limit: int = 300
+    sync_limit: int = 100
 
 
 @dataclass(frozen=True)

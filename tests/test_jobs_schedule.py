@@ -98,7 +98,7 @@ def test_version_one_database_gains_columns_and_keeps_its_jobs(tmp_path):
     db.close()
     store = JobStore(home)
     with store.connect() as reopened:
-        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 3
+        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 4
     [job] = store.jobs()
     assert job["active_since"] == 900 and job["paused_reason"] == ""
     run = store.claim_due(now=1000)

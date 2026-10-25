@@ -110,6 +110,17 @@ does not hold their delivery until that check completes. A running occurrence
 still blocks another occurrence of the same job; later missed slots follow the
 same accounting policy.
 
+A job can also start on an event instead of a time. `--on-mail-from TEXT` and
+`--on-mail-subject TEXT` (with `--on-mail-folder`, default the inbox) start it when new mail
+arrives whose sender or subject contains the text; `--on-new-file PATTERN` starts it when a new
+file matching the pattern (such as `'*.pdf'`) appears directly in `--workdir`. The desktop's
+background host looks every five minutes; its first look only notes where things stand, so mail
+and files already there never start a run, and one look starts at most five runs per job. A
+reminder started this way delivers its text with the mail's sender and subject or the file's
+name; a check is told which mail or file started it (and can read the mail). Results of
+event-started jobs wait out the quiet hours like check results. The jobs tool's `on_new_mail` and
+`on_new_file` do the same from a conversation.
+
 Jobs stop themselves in two cases, and the reason reaches the inbox:
 
 - A recurring job pauses after 3 failed or unknown runs in a row.

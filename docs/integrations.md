@@ -341,7 +341,7 @@ password or authorization code) instead of the 163 names below. Gmail, QQ,
 iCloud and 163/126/yeah are recognised from the address; for another provider
 also set `ASTRA_MAIL_IMAP_HOST` (and `ASTRA_MAIL_IMAP_PORT` or
 `ASTRA_MAIL_SENT_FOLDER` when they differ). A folder's first sync caches its
-newest 300 messages (`ASTRA_MAIL_SYNC_LIMIT`); later syncs fetch what arrived
+newest 100 messages (`ASTRA_MAIL_SYNC_LIMIT`); later syncs fetch what arrived
 since and never older history.
 
 The optional 163 integration incrementally caches mail for local queries. Put

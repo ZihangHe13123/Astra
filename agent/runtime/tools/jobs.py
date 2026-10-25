@@ -11,13 +11,13 @@ from pathlib import Path
 from typing import Any
 
 from agent.runtime.jobs.calendar import WEEKDAYS, calendar_schedule, describe, local_timezone_name, set_quiet_hours, zone
-from agent.runtime.jobs.store import NOTIFY_POLICIES, PUSH_TARGETS, JobStore
+from agent.runtime.jobs.store import NOTIFY_POLICIES, PUSH_TARGETS, JobStore, normalize_trigger
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
 
 ACTIONS = ("add", "list", "update", "pause", "resume", "remove", "run", "quiet")
 # Listing and pausing only narrow what runs; everything else is shown to the person first.
 _UNGUARDED = frozenset({"list", "pause"})
-_SCHEDULE_KEYS = ("time", "days", "every_minutes", "at", "after_minutes")
+_SCHEDULE_KEYS = ("time", "days", "every_minutes", "at", "after_minutes", "on_new_mail", "on_new_file")
 
 DESCRIPTION = (
     "Schedule reminders and read-only checks that run later without the person, and manage them. Use only when "
@@ -25,7 +25,8 @@ DESCRIPTION = (
     "A check runs in a fresh read-only session: workspace files, plus web search and fetch when web is true. It "
     "cannot write, send, browse with logins or use the computer. A reminder delivers its text as written. "
     "add, update, resume, remove and run are each shown to the person for approval. Times are the person's "
-    "local time; schedule with time (+days), every_minutes, at, or after_minutes. quiet sets the hours when "
+    "local time; schedule with time (+days), every_minutes, at, or after_minutes, or start it on an event with "
+    "on_new_mail or on_new_file instead. quiet sets the hours when "
     "check results wait instead of being pushed (quiet_hours), also with approval."
 )
 
@@ -43,6 +44,13 @@ PARAMETERS = {"type": "object", "properties": {
     "at": {"type": "string", "description": "One run (the first, with every_minutes) at YYYY-MM-DD HH:MM local "
                                             "time, or ISO 8601 with an offset."},
     "after_minutes": {"type": "number", "minimum": 1, "description": "One run this many minutes from now."},
+    "on_new_mail": {"type": "object", "description": "Run whenever new mail arrives that matches: from and subject "
+                    "are parts of the sender and subject (either may be empty); folder defaults to inbox.",
+                    "properties": {"from": {"type": "string"}, "subject": {"type": "string"},
+                                   "folder": {"type": "string"}}},
+    "on_new_file": {"type": "object", "description": "Run whenever a new file matching pattern (such as *.pdf) "
+                    "appears directly in folder.",
+                    "properties": {"folder": {"type": "string"}, "pattern": {"type": "string"}}, "required": ["folder"]},
     "notify": {"type": "string", "enum": sorted(NOTIFY_POLICIES),
                "description": "on_change: tell the person only when a check finds something new."},
     "web": {"type": "boolean", "description": "Let a check search and fetch web pages."},
@@ -110,6 +118,16 @@ def _schedule(args: dict, now: float) -> dict[str, Any] | None:
     given = [key for key in _SCHEDULE_KEYS if args.get(key) not in (None, "", [])]
     if not given:
         return None
+    if args.get("on_new_mail") or args.get("on_new_file"):
+        if len(given) > 1:
+            raise ValueError("A job runs on a schedule or on one kind of event, not both.")
+        if args.get("on_new_mail"):
+            return {"trigger": normalize_trigger({"type": "mail", **dict(args["on_new_mail"])})}
+        files = dict(args["on_new_file"])
+        folder = Path(str(files.get("folder") or "")).expanduser()
+        if not folder.is_dir():
+            raise ValueError("on_new_file needs an existing folder.")
+        return {"trigger": normalize_trigger({"type": "file", "pattern": files.get("pattern")}), "folder": folder.resolve()}
     if args.get("days") and not args.get("time"):
         raise ValueError("days applies to time.")
     if args.get("time"):
@@ -135,6 +153,11 @@ def _local(instant: float, job_spec: dict) -> str:
 
 def _when(job: dict) -> str:
     spec = job["spec"]
+    trigger = spec.get("trigger")
+    if trigger and trigger["type"] == "mail":
+        return "on new mail" + "".join(f" {key} {trigger[key]!r}" for key in ("from", "subject") if trigger[key])
+    if trigger:
+        return f"on a new file matching {trigger['pattern']!r} in {spec['workdir']}"
     if spec.get("calendar"):
         return describe(spec["calendar"])
     if job["interval_seconds"]:
@@ -155,10 +178,27 @@ def _summary(job: dict) -> dict[str, Any]:
     spec = job["spec"]
     return {"job_id": job["id"], "name": spec["name"], "kind": spec["kind"], "state": job["state"],
             "paused_reason": job.get("paused_reason") or "", "schedule": _when(job),
-            "next_run": _local(job["next_at"], spec) if job["state"] == "enabled" else "",
+            "next_run": _local(job["next_at"], spec) if job["state"] == "enabled" and not spec.get("trigger") else "",
             "notify": spec.get("notify", "always"), "web": spec.get("web", False), "mail": spec.get("mail", False),
             "targets": spec.get("targets", list(PUSH_TARGETS)),
             "last_outcome": job.get("last_outcome") or "", "prompt": spec["prompt"]}
+
+
+def trigger_text(trigger: dict, folder: str = "") -> str:
+    """An event that starts a job, as the person reads it."""
+    if trigger["type"] == "mail":
+        parts = [f"发件人含「{trigger['from']}」" if trigger.get("from") else "",
+                 f"标题含「{trigger['subject']}」" if trigger.get("subject") else ""]
+        where = "" if trigger.get("folder", "INBOX") == "INBOX" else f"（{trigger['folder']}）"
+        return f"有新邮件时{where}" + (f"：{'、'.join(part for part in parts if part)}" if any(parts) else "")
+    return f"「{folder}」里出现新的 {trigger.get('pattern', '*')} 文件时"
+
+
+def job_schedule_text(spec: dict, interval: float, first: float | None) -> str:
+    """A saved job's schedule or event, as the person reads it."""
+    if spec.get("trigger"):
+        return trigger_text(spec["trigger"], spec.get("workdir", ""))
+    return schedule_text(spec.get("calendar"), interval, first)
 
 
 def schedule_text(calendar: dict | None, interval: float, first: float | None) -> str:
@@ -190,6 +230,8 @@ def _quiet(value: object) -> dict | None:
 def _plan(args: dict, now: float) -> str:
     """What a schedule would read as before it exists, for the approval card."""
     schedule = _schedule(args, now) or {}
+    if schedule.get("trigger"):
+        return trigger_text(schedule["trigger"], str(schedule.get("folder") or ""))
     return schedule_text(schedule.get("calendar"), schedule.get("interval_seconds", 0), schedule.get("at"))
 
 
@@ -219,6 +261,8 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
                 raise ValueError(f"{action} needs a job_id from list.")
             store().job(str(args["job_id"]))
             if action == "update":
+                if args.get("on_new_mail") or args.get("on_new_file"):
+                    raise ValueError("To start a job on an event, add a new one; update keeps the kind of start.")
                 _schedule(args, now)
 
     def permission(args: dict) -> dict[str, Any] | None:
@@ -236,7 +280,8 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
                     "choices": ["once", "deny"]}
         if action == "add":
             kind = args.get("kind") or "check"
-            sources = ["工作区文件"] + (["联网搜索"] if args.get("web") else []) + (["你的邮件"] if args.get("mail") else [])
+            sources = ["工作区文件"] + (["联网搜索"] if args.get("web") else []) + (
+                ["你的邮件"] if args.get("mail") or args.get("on_new_mail") else [])
             reads = ("一次只读检查：" + "、".join(sources)) if kind == "check" else "一条提醒"
             title = f"新建定时任务：{str(args.get('name') or '').strip()}"
             target = f"{_plan(args, now)}；{reads}"
@@ -246,8 +291,8 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
         else:
             job = store().job(str(args.get("job_id") or ""))
             name = job["spec"]["name"]
-            target = (_plan(args, now) if action == "update" else "") or schedule_text(
-                job["spec"].get("calendar"), job["interval_seconds"], job["next_at"])
+            target = (_plan(args, now) if action == "update" else "") or job_schedule_text(
+                job["spec"], job["interval_seconds"], job["next_at"])
             title, effect, question = {
                 "update": (f"修改定时任务：{name}", "之后的运行按新的设置进行" + (
                     f"，结果{_where(args['targets'])}" if args.get("targets") is not None else "") + "。", "要这样修改吗？"),
@@ -263,8 +308,9 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
                    time: str = "", days: list[str] | None = None, every_minutes: float | None = None,
                    at: str = "", after_minutes: float | None = None, notify: str | None = None,
                    web: bool | None = None, mail: bool | None = None, targets: list[str] | None = None,
-                   quiet_hours: str = "") -> str:
-        args = {"time": time, "days": days, "every_minutes": every_minutes, "at": at, "after_minutes": after_minutes}
+                   quiet_hours: str = "", on_new_mail: dict | None = None, on_new_file: dict | None = None) -> str:
+        args = {"time": time, "days": days, "every_minutes": every_minutes, "at": at, "after_minutes": after_minutes,
+                "on_new_mail": on_new_mail, "on_new_file": on_new_file}
         jobs_store = store()
         now = _now()
         if action == "list":
@@ -280,9 +326,9 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
             check = kind != "reminder"
             interval = schedule.get("interval_seconds", 0)
             job = jobs_store.add(
-                name=name, prompt=prompt, original_request=authority[:8000], workdir=workdir(),
+                name=name, prompt=prompt, original_request=authority[:8000], workdir=schedule.get("folder") or workdir(),
                 next_at=schedule.get("at"), interval_seconds=interval,
-                calendar=schedule.get("calendar"), notify=notify or "always",
+                calendar=schedule.get("calendar"), trigger=schedule.get("trigger"), notify=notify or "always",
                 targets=PUSH_TARGETS if targets is None else targets,
                 # The same catch-up windows as `astra jobs add`.
                 grace_seconds=3600 if schedule.get("calendar") else min(interval / 2, 3600) if interval else 300,

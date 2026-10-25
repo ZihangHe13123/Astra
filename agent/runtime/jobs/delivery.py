@@ -34,7 +34,7 @@ def push_message(push: dict) -> tuple[str, str]:
     name = spec["name"]
     state = push["run_state"]
     if state == "completed":
-        title = f"提醒：{name}" if spec["kind"] == "reminder" else f"定时任务：{name}"
+        title = f"提醒：{name}" if spec["kind"] == "reminder" and not spec.get("trigger") else f"定时任务：{name}"
         body = push["output"].strip()
     elif state == "skipped":
         title = f"定时任务已暂停：{name}"
@@ -78,7 +78,9 @@ class JobDelivery:
             if now - push["created_at"] > MAX_AGE:
                 await asyncio.to_thread(self.store.mark_push, run_id, target, "failed", detail="expired", now=now)
                 continue
-            timed = push["spec"]["kind"] == "reminder" and push["run_state"] == "completed"
+            # A reminder set for a time is sent then; one started by mail or a file waits like a check result.
+            timed = (push["spec"]["kind"] == "reminder" and push["run_state"] == "completed"
+                     and not push["spec"].get("trigger"))
             if quiet is not None and not timed:
                 await asyncio.to_thread(self.store.mark_push, run_id, target, "pending", next_try=quiet,
                                         attempted=False, detail="quiet hours", now=now)

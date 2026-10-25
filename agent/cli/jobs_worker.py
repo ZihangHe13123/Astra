@@ -100,6 +100,13 @@ async def run_check(store: JobStore, run: dict) -> None:
     last_progress = 0.0
     try:
         text = f"Original user request:\n{spec['original_request']}\n\nScheduled check:\n{spec['prompt']}"
+        event = spec.get("event")
+        if event and event.get("type") == "mail":
+            text += (f"\n\nThis run was started by new mail in {event.get('folder')}: #{event.get('uid')} "
+                     f"From: {event.get('from')} | Subject: {event.get('subject')}. Read it with the mail tool "
+                     f"(action read, uid {event.get('uid')}, folder {event.get('folder')}) when the check needs it.")
+        elif event:
+            text += f"\n\nThis run was started by a new file: {event.get('path')}. Read it with read_file when needed."
         on_change = spec.get("notify") == "on_change"
         if on_change:
             previous = store.last_reported_output(run["job_id"], before=run["id"]) or "(nothing reported yet)"

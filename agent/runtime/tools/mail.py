@@ -113,5 +113,6 @@ def register_mail_tool(registry: ToolRegistry, *, project_root: Path,
         except MailError as exc:
             raise ValueError(f"Mail: {exc}") from None
 
+    # A mailbox's first sync downloads its newest messages and can take a minute; later ones are quick.
     registry.register(ToolDef(name="mail", description=DESCRIPTION, parameters=PARAMETERS, fn=mail, risk="network",
-                              group="mail", cache_results=False))
+                              group="mail", cache_results=False, timeout=120.0))
