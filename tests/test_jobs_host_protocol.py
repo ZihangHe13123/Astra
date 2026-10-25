@@ -76,6 +76,12 @@ def test_host_pushes_a_reminder_to_wechat_and_the_desktop_and_keeps_it_in_the_ch
         asked = RecordingHandler.conversations[before]
         texts = [str(message.get("content")) for message in asked if message.get("role") == "assistant"]
         assert any("【提醒：喝水】" in text and "该喝水了" in text for text in texts)
+        # Each chat turn is a task run from WeChat, for the activity page.
+        from agent.runtime.task_store import TaskStore
+        runs = TaskStore(tmp_path / "tasks.db").list_tasks(limit=10)
+        chat = [run for run in runs if run.get("source") == "weixin"]
+        assert {run["input_text"] for run in chat} == {"你好", "刚才提醒我什么？"}
+        assert all(run["status"] == "completed" and run["session_id"].startswith("channel_weixin_private_") for run in chat)
         # Pushed once each, however many ticks passed.
         assert sum("该喝水了" in reply for reply in ilink.replies_to(OWNER)) == 1
         assert len([e for e in seen if e.get("type") == "job_notification"]) == 1

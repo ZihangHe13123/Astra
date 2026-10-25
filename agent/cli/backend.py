@@ -2364,7 +2364,8 @@ async def _main(startup_started: float):
 
     channel_models = ChannelModels(lambda: catalog, lambda: current_model_key)
     channel_router = AgentChannelRouter(agent, agent_turn_lock, sessions_dir(PROJECT_ROOT),
-                                        admission=lambda: not restart.draining, model_for=channel_models.client)
+                                        admission=lambda: not restart.draining, model_for=channel_models.client,
+                                        tasks=task_store)
     # The desktop's channel host takes WeChat over from other backends. Popped so nothing this
     # backend starts inherits the claim.
     channel_host = os.environ.pop("ASTRA_CHANNEL_HOST", "") == "1"
@@ -2515,6 +2516,7 @@ async def _main(startup_started: float):
                         str(request_id), input_text,
                         session_id=agent.context.session_scope,
                         model=agent.llm.config.model,
+                        source="desktop" if os.getenv("ASTRA_UI_SURFACE") == "gui" else "terminal",
                     )
 
                 try:

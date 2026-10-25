@@ -148,6 +148,14 @@ def query(request: dict, *, agent=None) -> object:
         return history(str(params.get("name", "")), str(params.get("mode", "work")),
                        before=params.get("before"), limit=int(params.get("limit", 200)), source_ref=params.get("source_ref"),
                        branch_id=params.get("branch_id"))
+    if method == "jobs":
+        from agent.runtime.paths import state_dir
+        from agent.ui.activity import jobs_overview
+        return jobs_overview(state_dir())
+    if method == "activity":
+        from agent.runtime.paths import state_dir
+        from agent.ui.activity import activity
+        return activity(state_dir(), days=int(params.get("days", 7)))
     if method == "changes" and agent is not None:
         return changes(agent, int(params.get("turn", 1)), params.get("index"), source=params.get("source"))
     raise ValueError("Unknown UI query")

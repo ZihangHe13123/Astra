@@ -1,4 +1,5 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, net, Notification, protocol, shell, Tray } from "electron";
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, realpathSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
@@ -232,11 +233,30 @@ register("appshot", async (id, action, value = "") => {
   } else rt.accept({ type: "gui_notice", message: await appshot.command(rt.id, value) });
 });
 function runQuery(method: any, params: any = {}, id?: unknown) {
-  if (!["sessions", "history", "commands", "changes", "request_timeline", "session_log"].includes(method)) throw new Error("Unsupported query");
+  if (!["sessions", "history", "commands", "changes", "request_timeline", "session_log", "jobs", "activity"].includes(method)) throw new Error("Unsupported query");
   if (!params || typeof params !== "object" || Array.isArray(params) || JSON.stringify(params).length > 32768) throw new Error("Invalid query");
   return method === "changes" ? runtime(id).query(method, params) : queries.query(method, params);
 }
 register("query", runQuery);
+/** The person's own changes to scheduled jobs, from the jobs page: the same as `astra jobs` in a terminal. */
+function runJobs(action: unknown, value?: unknown, extra?: unknown): Promise<unknown> {
+  let args: string[];
+  if (action === "quiet") {
+    const clock = (text: unknown) => { const v = checkedString(text, "time", 5); if (!/^([01]?\d|2[0-3]):[0-5]\d$/.test(v)) throw new Error("Invalid time"); return v; };
+    args = value === "off" ? ["quiet", "off"] : ["quiet", clock(value), clock(extra)];
+  } else {
+    const id = checkedString(value, "job", 32);
+    if (!/^[0-9a-f]{32}$/.test(id)) throw new Error("Invalid job");
+    if (action === "read") args = ["inbox", "--read", id, "--limit", "1"];
+    else if (action === "run") args = ["run", id, "--queue"];
+    else if (action === "pause" || action === "resume" || action === "remove") args = [action, id];
+    else throw new Error("Unsupported job action");
+  }
+  return new Promise((done, fail) => execFile(python, ["-m", "agent.cli.jobs_commands", ...args],
+    { cwd: root, env: process.env, timeout: 30_000, windowsHide: true, encoding: "utf8" },
+    (error, stdout, stderr) => error ? fail(new Error(String(stderr).trim().split("\n").at(-1) || error.message)) : done(JSON.parse(stdout || "null"))));
+}
+register("jobs", runJobs);
 const sessionOperations = new Set<string>();
 async function runSessionAction(action: any, entry: any) {
   if (!["export", "delete"].includes(action) || !entry || typeof entry !== "object") throw new Error("Invalid session action");
@@ -284,6 +304,7 @@ async function phoneInvoke(device: string, method: PhoneInvokeMethod, args: any[
     appshot: { connection: "disconnected", enabled: false } };
   if (method === "create") return openSession(args[0] ?? {}, false);
   if (method === "query") return runQuery(args[0], args[1], args[2]);
+  if (method === "jobs") { phoneAudit(device, { method, action: String(args[0]).slice(0, 20) }); return runJobs(args[0], args[1], args[2]); }
   if (method === "close") { phoneAudit(device, { method, runtime: String(args[0]) }); return closeSession(args[0]); }
   if (method === "deleteSession") { phoneAudit(device, { method, session: args[0]?.name, mode: args[0]?.mode }); return runSessionAction("delete", args[0]); }
   const rt = runtime(args[0]); const command = checkedCommand(args[1]);

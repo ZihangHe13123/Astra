@@ -57,6 +57,9 @@ Check results and pause notices wait out the quiet hours, 23:00–08:00 unless c
 for. The desktop starts the background host while a channel is switched on or a job may still run
 or push (the job store keeps `jobs/active` for it).
 
+The desktop's **定时任务** page shows the same jobs, results and quiet hours, with pause, resume,
+run-once and remove buttons.
+
 Without the desktop, start the independent scheduler in another terminal:
 
 ```sh
@@ -112,7 +115,8 @@ Jobs stop themselves in two cases, and the reason reaches the inbox:
   jobs pause instead of running on unattended. One-shot jobs still run.
 
 Resuming starts again from the next scheduled time; slots that passed while a job was paused are
-not caught up. `astra jobs run`, or the tool's `run`, adds one occurrence without moving the schedule.
+not caught up. `astra jobs run`, or the tool's `run`, adds one occurrence without moving the schedule;
+`astra jobs run ID --queue` leaves it to the running scheduler, as the desktop page does.
 
 `--idle SECONDS` limits inactivity, reset by actual model/tool events (default
 120 seconds); `--timeout SECONDS` is a separate hard run limit (default 900).

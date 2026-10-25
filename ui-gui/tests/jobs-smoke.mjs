@@ -1,5 +1,6 @@
-// A reminder due in an isolated home: the desktop starts its background host for it, the host runs it,
-// and the desktop shows it as a system notification, once. No channel is switched on.
+// Scheduled jobs on a real desktop with an isolated home and no channel switched on: a due reminder
+// brings the background host up and is shown as a system notification, once; the jobs page lists jobs
+// and results and pauses and resumes a job; the activity page shows the run.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -30,8 +31,11 @@ const seed = `
 import sys, time
 from pathlib import Path
 from agent.runtime.jobs.store import JobStore
-JobStore(Path(sys.argv[1])).add(name="喝水", prompt="该喝水了", original_request="提醒我喝水", kind="reminder",
-                                workdir=Path(sys.argv[2]), next_at=time.time() + 4, targets=["desktop"])
+store = JobStore(Path(sys.argv[1]))
+store.add(name="喝水", prompt="该喝水了", original_request="提醒我喝水", kind="reminder",
+          workdir=Path(sys.argv[2]), next_at=time.time() + 4, targets=["desktop"])
+store.add(name="站立会", prompt="开站立会", original_request="工作日早上提醒我开站立会", kind="reminder",
+          workdir=Path(sys.argv[2]), calendar={"time": "09:15", "days": ["mon", "tue", "wed", "thu", "fri"]})
 `;
 execFileSync(python, ['-c', seed, folder, workspace], { cwd: root, env });
 const marker = join(folder, 'jobs', 'active');
@@ -40,7 +44,8 @@ assert.ok(existsSync(marker), 'the job store asks for a background host');
 let app;
 try {
   app = await launchElectron({ args: [join(root, 'ui-gui')], env, timeout: 30000 });
-  await app.firstWindow();
+  const page = await app.firstWindow();
+  const errors = []; page.on('pageerror', error => errors.push(error.message));
   await app.evaluate(({ Notification }) => {
     globalThis.__astraShown = [];
     const show = Notification.prototype.show;
@@ -57,8 +62,35 @@ try {
   console.log('PASS the background host ran the reminder and the desktop showed it');
   await new Promise(r => setTimeout(r, 3000));
   assert.equal((await app.evaluate(() => globalThis.__astraShown)).length, 1, 'shown once');
-  assert.ok(!existsSync(marker), 'nothing left to run or push');
-  console.log('PASS shown once; the job store no longer asks for a host');
+  console.log('PASS shown once');
+
+  await page.getByRole('button', { name: '定时任务' }).click();
+  const dialog = page.getByRole('dialog', { name: '定时任务' });
+  const standup = dialog.locator('.job-row', { hasText: '站立会' });
+  await standup.getByText('启用中').waitFor();
+  assert.match(await standup.innerText(), /工作日 09:15/);
+  await dialog.locator('.job-row', { hasText: '喝水' }).getByText('已完成').waitFor();
+  const result = dialog.locator('.inbox-row', { hasText: '喝水' });
+  assert.match(await result.innerText(), /提醒[\s\S]*已发到桌面通知[\s\S]*该喝水了/);
+  assert.ok(await result.evaluate(row => row.classList.contains('unread')));
+  await result.locator('.inbox-head').click();
+  await dialog.locator('.inbox-row.unread').waitFor({ state: 'detached' });
+  await standup.getByRole('button', { name: '暂停' }).click();
+  await standup.getByText('已暂停').waitFor();
+  await standup.getByRole('button', { name: '恢复' }).click();
+  await standup.getByText('启用中').waitFor();
+  console.log('PASS the jobs page lists jobs and results, marks a result read, pauses and resumes a job');
+  // The modal answers Escape while focus is inside it; a click on a re-rendered button may have left it.
+  await dialog.press('Escape');
+  await dialog.waitFor({ state: 'detached' });
+
+  await page.getByRole('button', { name: '活动' }).click();
+  const activity = page.getByRole('dialog', { name: '活动' });
+  const entry = activity.locator('.activity-row[data-kind="job"]', { hasText: '喝水' });
+  await entry.waitFor();
+  assert.match(await entry.innerText(), /定时任务[\s\S]*该喝水了/);
+  console.log('PASS the activity page shows the job run');
+  assert.deepEqual(errors, []);
 } finally {
   if (app) await app.close().catch(() => {});
   rmSync(folder, { recursive: true, force: true });

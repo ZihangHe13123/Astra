@@ -19,6 +19,8 @@ export interface DesktopBridge {
   close(id: string): Promise<void>;
   send(id: string, command: UIEvent): Promise<void>;
   query(method: string, params?: Record<string, unknown>, runtime?: string): Promise<any>;
+  /** The person's change to a scheduled job (pause, resume, remove, run, read) or to the quiet hours. */
+  jobs(action: "pause" | "resume" | "remove" | "run" | "read" | "quiet", value?: string, extra?: string): Promise<any>;
   preferences(value: Partial<Preferences>): Promise<Preferences>;
   flushPreferences(value: Partial<Preferences>): void;
   choose(kind: "files" | "folder"): Promise<string[]>;

@@ -115,7 +115,7 @@ def _summary(job: dict) -> dict[str, Any]:
             "last_outcome": job.get("last_outcome") or "", "prompt": spec["prompt"]}
 
 
-def _zh(calendar: dict | None, interval: float, first: float | None) -> str:
+def schedule_text(calendar: dict | None, interval: float, first: float | None) -> str:
     """The schedule as the person reads it on the approval card."""
     if calendar:
         days = calendar["days"]
@@ -123,7 +123,7 @@ def _zh(calendar: dict | None, interval: float, first: float | None) -> str:
         when = ("每天" if len(days) == 7 else "工作日" if days == list(WEEKDAYS[:5]) else "周末" if days == ["sat", "sun"]
                 else "每周" + "、".join(names[WEEKDAYS.index(day)] for day in days))
         return f"{when} {calendar['time']}（{calendar['tz']}）"
-    start = _local(first, {}) if first else ""
+    start = datetime.fromtimestamp(first, zone(local_timezone_name())).strftime("%Y-%m-%d %H:%M") if first else ""
     if interval:
         return f"每 {interval / 60:g} 分钟，从 {start} 开始"
     return f"{start} 运行一次" if start else ""
@@ -132,7 +132,7 @@ def _zh(calendar: dict | None, interval: float, first: float | None) -> str:
 def _plan(args: dict, now: float) -> str:
     """What a schedule would read as before it exists, for the approval card."""
     schedule = _schedule(args, now) or {}
-    return _zh(schedule.get("calendar"), schedule.get("interval_seconds", 0), schedule.get("at"))
+    return schedule_text(schedule.get("calendar"), schedule.get("interval_seconds", 0), schedule.get("at"))
 
 
 def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[[], Path],
@@ -177,7 +177,7 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
         else:
             job = store().job(str(args.get("job_id") or ""))
             name = job["spec"]["name"]
-            target = (_plan(args, now) if action == "update" else "") or _zh(
+            target = (_plan(args, now) if action == "update" else "") or schedule_text(
                 job["spec"].get("calendar"), job["interval_seconds"], job["next_at"])
             title, effect, question = {
                 "update": (f"修改定时任务：{name}", "之后的运行按新的设置进行" + (

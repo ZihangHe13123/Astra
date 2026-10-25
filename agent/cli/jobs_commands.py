@@ -54,6 +54,9 @@ def jobs_parser() -> JobParser:
     for action in ("show", "pause", "resume", "remove", "run"):
         item = commands.add_parser(action)
         item.add_argument("id")
+        if action == "run":
+            item.add_argument("--queue", action="store_true",
+                              help="leave the extra run to the running scheduler instead of running it here")
     history = commands.add_parser("history", help="show occurrence outcomes, including missed slots")
     history.add_argument("id", nargs="?", default="")
     history.add_argument("--limit", type=int, default=50)
@@ -106,6 +109,9 @@ def execute_jobs_command(argv: list[str], *, home: Path | None = None,
         return (child or parser).format_help(), ""
     try:
         args = parser.parse_args(argv)
+        if args.action == "run" and args.queue:
+            return json.dumps(JobStore(home if home is not None else state_dir()).request_run(args.id),
+                              ensure_ascii=False, indent=2), ""
         if args.action in {"run", "tick", "serve"} and not allow_execution:
             raise ValueError("Start execution with 'astra jobs run ID', 'astra jobs tick', or 'astra jobs serve' "
                              "in a separate terminal. Job checks never run inside the active conversation.")
