@@ -84,9 +84,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         message = apply(arguments[0] if arguments else "", arguments[1:])
     except ValueError as exc:
-        print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+        print(json.dumps({"ok": False, "error": str(exc)}))
         return 1
-    print(json.dumps({"ok": True, "message": message}, ensure_ascii=False))
+    print(json.dumps({"ok": True, "message": message}))
     return 0
 
 
