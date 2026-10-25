@@ -110,6 +110,13 @@ plutil -replace CFBundleShortVersionString -string '1.0' "$plist"
 plutil -replace CFBundleVersion -string '1' "$plist"
 plutil -replace LSUIElement -bool YES "$plist"
 plutil -replace NSScreenCaptureUsageDescription -string 'Astra uses screen recording to capture an approved application window.' "$plist"
+# The calendar mode runs as its own responsible process, so macOS shows these texts when it asks.
+for calendar_key in NSCalendarsFullAccessUsageDescription NSCalendarsUsageDescription; do
+  plutil -replace "$calendar_key" -string 'Astra reads your calendars and, when you approve, adds events to them.' "$plist"
+done
+for reminders_key in NSRemindersFullAccessUsageDescription NSRemindersUsageDescription; do
+  plutil -replace "$reminders_key" -string 'Astra reads your reminders and, when you approve, adds or completes them.' "$plist"
+done
 
 # Record build-time provenance inside the signed bundle; never infer it from
 # the caller's checkout when status is requested later.

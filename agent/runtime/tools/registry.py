@@ -959,6 +959,8 @@ class ToolRegistry:
             "git": r"\bgit\b|\b(commit|branch|merge|diff|repository|repo)\b|提交|分支|合并|仓库",
             "memory": r"\b(memory|hindsight|recall|reflect)\b|记忆|记住|回忆|反思|工作计划|核心记忆",
             "mail": r"\b(e-?mails?|mailbox|inbox)\b|邮件|邮箱|收件箱|发件人|来信",
+            "calendar": r"\b(calendars?|agenda|schedule|meetings?|appointments?|reminders? app|to-?dos?|deadlines?)\b"
+                        r"|日历|日程|行程|会议|开会|约会|待办|提醒事项|课表|有空",
             "schedule": r"\b(remind(er)?s?|schedul\w*|every (day|morning|evening|night|week|hour)|daily|weekly|"
                         r"jobs?)\b|提醒|定时|每天|每周|每晚|每早|每小时|闹钟|日程任务",
             "skills": r"\bskills?\b|技能|学习复盘|learning review",

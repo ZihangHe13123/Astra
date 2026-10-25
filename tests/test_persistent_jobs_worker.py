@@ -223,6 +223,17 @@ def test_real_worker_offers_mail_only_to_a_check_allowed_to_read_it(tmp_path, pr
     assert "mail" in names and not names.intersection({"write_file", "execute_shell"})
 
 
+@pytest.mark.skipif(sys.platform != "darwin", reason="Calendar and Reminders are macOS only")
+def test_real_worker_offers_the_calendar_read_only_to_a_check_allowed_to_read_it(tmp_path, provider):
+    env = environment(tmp_path / "A", provider)
+    job = command(env, "add", "agenda", "--after", "60", "--model", "fixture", "--workdir", str(tmp_path),
+                  "--read-calendar", "--prompt", "What is on today?", "--request", "Tell me my day each morning")
+    assert job["spec"]["read_calendar"] is True and job["spec"]["mail"] is False
+    command(env, "run", job["id"])
+    tools = {tool["function"]["name"]: tool["function"] for tool in provider.requests[-1]["body"]["tools"]}
+    assert "calendar" in tools and "mail" not in tools
+
+
 def test_real_worker_is_told_which_mail_started_its_run(tmp_path, provider):
     home = tmp_path / "A"
     env = environment(home, provider)

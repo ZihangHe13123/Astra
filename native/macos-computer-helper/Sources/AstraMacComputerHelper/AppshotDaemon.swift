@@ -4,13 +4,15 @@ import Foundation
 import AstraAppshotCore
 
 public enum AppshotHelperMode: Equatable {
-  case computerUse, daemon, clientIdentity, brokerIdentity, unsupported
+  case computerUse, daemon, clientIdentity, brokerIdentity, calendar, calendarChild, unsupported
   public init(arguments: [String]) {
     switch arguments {
     case []: self = .computerUse
     case ["--appshot-daemon"]: self = .daemon
     case ["--appshot-client-identity"]: self = .clientIdentity
     case ["--appshot-broker-identity"]: self = .brokerIdentity
+    case ["--calendar"]: self = .calendar
+    case ["--calendar-child"]: self = .calendarChild
     default: self = .unsupported
     }
   }

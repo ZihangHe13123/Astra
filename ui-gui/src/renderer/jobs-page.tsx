@@ -33,7 +33,7 @@ export function JobsPanel({ fail }: { fail: (error: unknown) => void }) {
       const state = jobState(job);
       return <li key={job.id} className="job-row" data-job={job.id}>
         <div className="job-head"><strong>{job.name}</strong><span className={`job-state ${state.tone}`}>{state.label}</span></div>
-        <div className="muted small">{job.schedule}{job.next_at ? ` · 下次 ${timeLabel(job.next_at)}` : ""} · {job.kind === "reminder" ? "提醒" : `只读检查${job.web || job.mail ? `（${[job.web && "可联网", job.mail && "可读邮件"].filter(Boolean).join("、")}）` : ""}`}{job.notify === "on_change" ? " · 有变化才提醒" : ""} · {targetsLabel(job.targets)}</div>
+        <div className="muted small">{job.schedule}{job.next_at ? ` · 下次 ${timeLabel(job.next_at)}` : ""} · {job.kind === "reminder" ? "提醒" : `只读检查${job.web || job.mail || job.read_calendar ? `（${[job.web && "可联网", job.mail && "可读邮件", job.read_calendar && "可读日程"].filter(Boolean).join("、")}）` : ""}`}{job.notify === "on_change" ? " · 有变化才提醒" : ""} · {targetsLabel(job.targets)}</div>
         <div className="job-actions">
           {job.state === "enabled" && <button disabled={busy} onClick={() => { void act("pause", job.id); }}>暂停</button>}
           {job.state === "paused" && <button disabled={busy} onClick={() => { void act("resume", job.id); }}>恢复</button>}

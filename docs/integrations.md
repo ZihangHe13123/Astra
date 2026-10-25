@@ -4,7 +4,7 @@
 
 Enable only the services you need. Run shell examples from the installation checkout. Provider credentials belong in your local `.env`.
 
-[Optional OpenAI-compatible API](#optional-openai-compatible-api) · [Native messaging channels](#native-messaging-channels) · [MCP](#mcp) · [Web search](#web-search) · [Conclave multi-expert research](#conclave-multi-expert-research) · [Image tools](#image-tools) · [Read-only 163 mail](#read-only-163-mail)
+[Optional OpenAI-compatible API](#optional-openai-compatible-api) · [Native messaging channels](#native-messaging-channels) · [MCP](#mcp) · [Web search](#web-search) · [Conclave multi-expert research](#conclave-multi-expert-research) · [Image tools](#image-tools) · [Read-only 163 mail](#read-only-163-mail) · [Calendar and Reminders (macOS)](#calendar-and-reminders-macos)
 
 ## Optional OpenAI-compatible API
 
@@ -396,3 +396,24 @@ Source checkouts also include the repository-local
 [163 mail skill](../.astra/skills/operations/163-email-sync/SKILL.md). It is discovered
 through the normal project-trust checks; setup does not install or update it.
 Mail credentials, cache and other private `.astra` state remain local and ignored.
+
+## Calendar and Reminders (macOS)
+
+On macOS, the `calendar` tool reads the person's Calendar and Reminders apps
+through the computer helper's EventKit mode (build the helper with
+`scripts/build_macos_computer_helper.sh`): what is on between two times, open
+reminders, and the names of calendars and lists. Adding an event or a reminder,
+or ticking a reminder off, shows an approval card every time; nothing is ever
+deleted. A reminder with a time gets an alert, so Reminders notifies the person
+on their other devices too. Use the `jobs` tool instead when Astra itself should
+push a reminder.
+
+The helper answers calendar requests as its own process, so the first use makes
+macOS ask whether **AstraMacComputerHelper** may access Calendars or Reminders;
+the switches are in System Settings > Privacy & Security. The helper is ad-hoc
+signed, so a rebuilt helper may be asked again. A scheduled check given
+`--read-calendar` (or `read_calendar` in the `jobs` tool) can read the calendar
+but never adds, changes or completes anything, and never makes macOS ask.
+Invitations and shared lists can carry other people's text, so a memory saved in
+a turn that read the calendar needs approval, as with mail. Windows and Linux
+have no calendar tool.

@@ -201,8 +201,8 @@ class JobStore:
             calendar: dict | None = None, trigger: dict | None = None, notify: str = "always",
             targets: list[str] | tuple[str, ...] = PUSH_TARGETS,
             grace_seconds: float = 300, kind: str = "check", model: str = "",
-            web: bool = False, mail: bool = False, idle_seconds: float = 120, timeout_seconds: float = 900,
-            max_iterations: int = 10, now: float | None = None) -> dict:
+            web: bool = False, mail: bool = False, read_calendar: bool = False, idle_seconds: float = 120,
+            timeout_seconds: float = 900, max_iterations: int = 10, now: float | None = None) -> dict:
         now = time.time() if now is None else now
         if trigger:
             if calendar or interval_seconds or next_at is not None:
@@ -219,7 +219,7 @@ class JobStore:
         finite(timeout_seconds, idle_seconds, 86400, "Hard budget")
         if type(max_iterations) is not int or not 1 <= max_iterations <= 50:
             raise ValueError("Iterations must be between 1 and 50.")
-        if kind not in {"check", "reminder"} or type(web) is not bool or type(mail) is not bool:
+        if kind not in {"check", "reminder"} or any(type(flag) is not bool for flag in (web, mail, read_calendar)):
             raise ValueError("Choose a check or reminder and a boolean network option.")
         fields = ((name, 120), (prompt, 4000), (original_request, 8000))
         if any(not isinstance(value, str) or not value.strip() or len(value) > limit for value, limit in fields):
@@ -229,12 +229,13 @@ class JobStore:
             raise ValueError("The working directory must be a directory.")
         if kind == "check" and (not model.strip() or len(model) > 200):
             raise ValueError("An agent check needs a configured model key.")
-        if kind == "reminder" and (model or web or mail):
-            raise ValueError("A reminder does not use a model, network tools or mail.")
+        if kind == "reminder" and (model or web or mail or read_calendar):
+            raise ValueError("A reminder does not use a model, network tools, mail or the calendar.")
         spec = {"name": name.strip(), "prompt": prompt.strip(), "original_request": original_request.strip(),
                 "workdir": str(directory), "kind": kind, "model": model, "web": web,
                 "idle_seconds": idle_seconds, "timeout_seconds": timeout_seconds,
-                "max_iterations": max_iterations, "notify": notify, "targets": targets, "mail": mail}
+                "max_iterations": max_iterations, "notify": notify, "targets": targets, "mail": mail,
+                "read_calendar": read_calendar}
         if calendar:
             spec["calendar"] = calendar
         if trigger:
@@ -304,7 +305,7 @@ class JobStore:
     def update(self, identity: str, *, request: str, name: str | None = None, prompt: str | None = None,
                interval_seconds: float | None = None, calendar: dict | None = None, at: float | None = None,
                notify: str | None = None, web: bool | None = None, targets: list[str] | None = None,
-               mail: bool | None = None, now: float | None = None) -> dict:
+               mail: bool | None = None, read_calendar: bool | None = None, now: float | None = None) -> dict:
         """Change a job's future runs; ``request`` is the person's words asking for the change."""
         now = time.time() if now is None else now
         if not isinstance(request, str) or not request.strip():
@@ -335,6 +336,10 @@ class JobStore:
                 if type(mail) is not bool or (mail and spec["kind"] == "reminder"):
                     raise ValueError("A reminder does not read mail.")
                 spec["mail"] = mail
+            if read_calendar is not None:
+                if type(read_calendar) is not bool or (read_calendar and spec["kind"] == "reminder"):
+                    raise ValueError("A reminder does not read the calendar.")
+                spec["read_calendar"] = read_calendar
             interval, next_at = row["interval_seconds"], row["next_at"]
             if spec.get("trigger") and (interval_seconds or calendar is not None or at is not None):
                 raise ValueError("This job starts on an event; add a new job for a schedule.")

@@ -21,7 +21,7 @@ _UNSHOWN_FIELDS = ("goal", "plan", "progress", "artifacts")
 # Writes that persist across conversations, and what can bring outside text into a turn.
 _DURABLE_WRITES = frozenset({"remember", "revise", "core_add"})
 _DELIVERED = frozenset({"delegate", "peer_message", "background_run", "background_completion"})
-_INGESTING_GROUPS = frozenset({"web", "browser", "mail"})
+_INGESTING_GROUPS = frozenset({"web", "browser", "mail", "calendar"})
 # A search shows this many memories, and waits this long for Hindsight's.
 _SEARCH_LIMIT = 8
 _SEARCH_EXTERNAL_SECONDS = 5.0

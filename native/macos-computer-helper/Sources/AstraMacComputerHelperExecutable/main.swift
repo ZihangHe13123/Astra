@@ -21,6 +21,10 @@ case .brokerIdentity:
     FileHandle.standardError.write(Data("broker_unavailable\n".utf8))
     exit(69)
   }
+case .calendar:
+  exit(runCalendarCommand(child: false))
+case .calendarChild:
+  exit(runCalendarCommand(child: true))
 case .unsupported:
   FileHandle.standardError.write(Data("unsupported helper mode\n".utf8))
   exit(64)

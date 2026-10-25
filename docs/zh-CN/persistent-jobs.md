@@ -41,7 +41,8 @@ Astra 桌面端开着（包括只留在托盘）时，它的后台进程负责�
 
 `--reminder` 直接投递文字，不调用模型；普通检查记录创建时选定的模型，
 可以用 `--model KEY` 指定。普通检查必须填写原始用户授权 `--request`；
-`--web` 才启用联网工具。每次检查使用独立的新会话，仅提供文件读取、
+`--web` 才启用联网工具，`--mail` 允许读邮箱（只读），macOS 上 `--read-calendar` 允许读日历和提醒事项
+（只读，见[日历](integrations.md#calendar-and-reminders-macos)）。每次检查使用独立的新会话，仅提供文件读取、
 搜索和时间工具，没有 Shell、写文件、CU、子代理或外部渠道发送。
 
 常用命令：`list`、`show JOB_ID`、`history JOB_ID`、`inbox`、

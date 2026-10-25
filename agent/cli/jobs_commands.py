@@ -53,6 +53,8 @@ def jobs_parser() -> JobParser:
     add.add_argument("--model", default="", help="configured model key; captured when the job is created")
     add.add_argument("--web", action="store_true", help="allow existing web search/fetch tools for this check")
     add.add_argument("--mail", action="store_true", help="let this check read the configured mailbox (read-only)")
+    add.add_argument("--read-calendar", action="store_true",
+                     help="let this check read Calendar and Reminders on macOS (read-only)")
     add.add_argument("--idle", type=float, default=120)
     add.add_argument("--timeout", type=float, default=900)
     add.add_argument("--iterations", type=int, default=10)
@@ -165,6 +167,7 @@ def execute_jobs_command(argv: list[str], *, home: Path | None = None,
                               grace_seconds=args.catch_up if args.catch_up is not None
                               else 3600 if calendar else min(period / 2, 3600) if period else 300,
                               kind="reminder" if args.reminder else "check", model=model, web=args.web, mail=args.mail,
+                              read_calendar=args.read_calendar,
                               idle_seconds=args.idle, timeout_seconds=args.timeout, max_iterations=args.iterations)
             _with_times(value)
         elif args.action == "list":

@@ -66,6 +66,12 @@ async def run_check(store: JobStore, run: dict) -> None:
 
         register_mail_tool(source, project_root=Path(__file__).resolve().parents[2])
         names.add("mail")
+    if spec.get("read_calendar") and sys.platform == "darwin":
+        from agent.runtime.tools.calendar import register_calendar_tool
+
+        # Read-only, and an undecided permission stays undecided rather than prompting at night.
+        register_calendar_tool(source, interactive=False)
+        names.add("calendar")
     if spec["web"]:
         from agent.cli.search_preferences import resolve_startup_search_provider
         from agent.runtime.tools.web import register_web_tools

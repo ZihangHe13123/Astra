@@ -73,6 +73,7 @@ def jobs_overview(home: Path, *, inbox_limit: int = 50) -> dict[str, Any]:
                 "schedule": job_schedule_text(spec, row["interval_seconds"], row["next_at"]),
                 "next_at": row["next_at"] if row["state"] == "enabled" and not spec.get("trigger") else None,
                 "notify": spec.get("notify", "always"), "web": bool(spec.get("web")), "mail": bool(spec.get("mail")),
+                "read_calendar": bool(spec.get("read_calendar")),
                 "prompt": spec["prompt"],
                 "targets": spec.get("targets", list(PUSH_TARGETS)), "last_outcome": row["last_outcome"] or "",
             })

@@ -2,7 +2,7 @@
 
 [首页](../../README.zh-CN.md) · [文档导航](README.md) · [English](../integrations.md)
 
-[OpenAI 兼容 API](#optional-openai-compatible-api) · [原生消息渠道](#native-messaging-channels) · [MCP](#mcp) · [网页搜索](#web-search) · [Conclave 多专家研究](#conclave-multi-expert-research) · [图片工具](#image-tools) · [163 邮件只读集成](#read-only-163-mail)
+[OpenAI 兼容 API](#optional-openai-compatible-api) · [原生消息渠道](#native-messaging-channels) · [MCP](#mcp) · [网页搜索](#web-search) · [Conclave 多专家研究](#conclave-multi-expert-research) · [图片工具](#image-tools) · [163 邮件只读集成](#read-only-163-mail) · [日历和提醒事项（macOS）](#calendar-and-reminders-macos)
 
 按需启用服务。Shell 示例从安装目录执行，提供方凭据放在本地 `.env`。
 
@@ -197,3 +197,18 @@ macOS/Linux：
 同步把头部和解码文字存入 `.astra/mail/163.sqlite3`，不下载附件载荷；只有明确的 `attachment` 命令把选定附件写入 `.astra/mail/attachments/`。邮箱以只读方式选择，不标记已读，不移动、删除、回复或发送邮件。
 
 源码安装附有[163 邮件技能](../../.astra/skills/operations/163-email-sync/SKILL.md)，通过项目信任检查发现，Setup 不负责安装或更新该技能。凭据、缓存和其他私有 `.astra` 状态保持本地且被 Git 忽略。
+
+<a id="calendar-and-reminders-macos"></a>
+
+## 日历和提醒事项（macOS）
+
+在 macOS 上，`calendar` 工具通过电脑助手的 EventKit 模式读取「日历」和「提醒事项」App（先用
+`scripts/build_macos_computer_helper.sh` 构建助手）：某段时间里的日程、未完成的提醒事项、日历和列表的名字。
+添加日程或提醒事项、把提醒事项标成完成，每次都会弹出审批卡；不会删除任何内容。带时间的提醒事项会附带闹钟，
+所以其他设备上的「提醒事项」也会准时提醒。希望由 Astra 自己到点推送时，用 `jobs` 工具。
+
+助手以自己的进程回答日历请求，所以第一次使用时 macOS 会询问是否允许 **AstraMacComputerHelper** 访问日历或
+提醒事项，开关在「系统设置 > 隐私与安全性」里。助手是临时签名的，重新构建后可能会再问一次。带
+`--read-calendar`（`jobs` 工具里是 `read_calendar`）的定时检查可以读日历，但不会添加、修改或完成任何内容，
+也不会触发系统询问。邀请和共享列表里可能有别人写的文字，所以和邮件一样，读过日历的那一轮里保存记忆需要你批准。
+Windows 和 Linux 没有日历工具。
