@@ -18,6 +18,8 @@ from agent.runtime.tools.memory import outside_content
 from agent.runtime.tools.registry import ToolRegistry
 
 SG = ZoneInfo("Asia/Singapore")
+# The stand-in helper is a script with a shebang, which Windows cannot run; the calendar is macOS only anyway.
+runs_helper = pytest.mark.skipif(sys.platform == "win32", reason="the stand-in helper is a POSIX script")
 
 
 def at(*parts: int) -> float:
@@ -77,6 +79,7 @@ EVENTS = {"ok": True, "total": 3, "items": [
 ]}
 
 
+@runs_helper
 def test_events_list_the_days_in_local_time_as_outside_text(tmp_path):
     helper = Helper(tmp_path, {"events": EVENTS})
     registry, asked = tool(helper)
@@ -97,6 +100,7 @@ def test_events_list_the_days_in_local_time_as_outside_text(tmp_path):
                                                         "may_ask": True}
 
 
+@runs_helper
 def test_without_a_start_events_show_today(tmp_path):
     helper = Helper(tmp_path, {"events": {"ok": True, "items": [], "total": 0}})
     registry, _ = tool(helper)
@@ -106,6 +110,7 @@ def test_without_a_start_events_show_today(tmp_path):
     assert helper.requests[0]["end"] - helper.requests[0]["start"] == 7 * 86_400
 
 
+@runs_helper
 def test_reminders_show_ids_due_times_and_lists(tmp_path):
     helper = Helper(tmp_path, {"reminders": {"ok": True, "total": 2, "items": [
         {"id": "R1", "title": "Submit essay", "due": at(2026, 10, 30, 23, 59), "list": "School", "completed": False},
@@ -118,6 +123,7 @@ def test_reminders_show_ids_due_times_and_lists(tmp_path):
     assert "- Pay rent — due 2026-11-01 [Reminders] (id R2)" in text
 
 
+@runs_helper
 def test_adding_an_event_is_approved_on_a_chinese_card_and_sent_in_local_time(tmp_path):
     helper = Helper(tmp_path, {"add_event": {"ok": True, "item": EVENTS["items"][1]}})
     registry, asked = tool(helper, decision="deny")
@@ -133,6 +139,7 @@ def test_adding_an_event_is_approved_on_a_chinese_card_and_sent_in_local_time(tm
                                 "may_ask": True}]
 
 
+@runs_helper
 def test_all_day_events_and_dated_reminders_send_days_and_timed_reminders_an_instant(tmp_path):
     helper = Helper(tmp_path, {})
     registry, asked = tool(helper)
@@ -150,6 +157,7 @@ def test_all_day_events_and_dated_reminders_send_days_and_timed_reminders_an_ins
     assert sent[2]["due"] == at(2026, 10, 30, 23, 59) and "due_date" not in sent[2]
 
 
+@runs_helper
 def test_completing_a_reminder_sends_the_title_the_person_approved(tmp_path):
     helper = Helper(tmp_path, {})
     registry, asked = tool(helper)
@@ -172,6 +180,7 @@ def test_malformed_times_are_refused_before_the_helper_or_the_person_sees_them(t
     assert helper.requests == [] and asked == []
 
 
+@runs_helper
 def test_missing_permission_says_where_to_switch_it_on(tmp_path):
     helper = Helper(tmp_path, {"reminders": {"ok": False, "error": "access_denied",
                                              "message": "reminders access is denied"}})
@@ -180,6 +189,7 @@ def test_missing_permission_says_where_to_switch_it_on(tmp_path):
     assert "System Settings > Privacy & Security > Reminders" in error and "AstraMacComputerHelper" in error
 
 
+@runs_helper
 def test_background_jobs_read_without_a_prompt_and_never_write(tmp_path):
     helper = Helper(tmp_path, {"events": {"ok": False, "error": "not_determined",
                                           "message": "events access is not_determined"}})
