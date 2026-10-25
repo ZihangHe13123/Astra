@@ -109,6 +109,15 @@ class AgentChannelRouter:
         logger.info("channel %s started a new conversation", message.channel)
         return NEW_CONVERSATION_REPLY
 
+    async def record_outbound(self, channel: str, conversation_id: str, text: str) -> None:
+        """Keep a message Astra sent on its own, such as a job result, in that private chat's
+        conversation, so the person's reply ("tell me more about the second one") has it."""
+        message = ChannelMessage(channel=channel, conversation_id=conversation_id, sender_id=conversation_id, text="")
+        async with self.turn_lock:
+            context = self._context(self._session_name(message), channel)
+            context.add_assistant(text)
+            await context.save_async()
+
     def _budget(self, llm) -> int:
         """Compact a channel conversation for the model answering it: its own, or the window's."""
         config = getattr(llm, "config", None)

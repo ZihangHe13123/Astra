@@ -108,6 +108,7 @@ from agent.runtime.tools.jobs import register_jobs_tool
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
 from agent.cli.session_lifecycle import ControlledRestart, RESTART_EXIT_CODE
 from agent.runtime.background_completion import BackgroundCompletions, wake_display, wake_prompt
+from agent.runtime.jobs.host import JobsHost
 from agent.runtime.jobs.store import note_interaction
 from agent.runtime.session_wakeup import SessionWakeups, visible_wakeup_history, wakeup_prompt
 from agent.runtime.browser_control_transport import set_owner_label_provider
@@ -206,6 +207,7 @@ from agent.cli.conversation_commands import register_conversation_tools
 from agent.runtime.command_workflows import workflow_message, raw_command as normalize_direct_command
 from agent.channels import ChannelManager, load_channels_config
 from agent.channels.manager import is_address_in_use
+from agent.channels.job_push import weixin_job_push
 from agent.channels.router import AgentChannelRouter, active_channel, active_channel_message
 from agent.channels.approvals import await_chat_approval
 from agent.cli.channel_models import ChannelModels
@@ -2365,8 +2367,8 @@ async def _main(startup_started: float):
                                         admission=lambda: not restart.draining, model_for=channel_models.client)
     # The desktop's channel host takes WeChat over from other backends. Popped so nothing this
     # backend starts inherits the claim.
-    channel_manager = ChannelManager(load_channels_config(), channel_router.handle,
-                                     channel_host=os.environ.pop("ASTRA_CHANNEL_HOST", "") == "1")
+    channel_host = os.environ.pop("ASTRA_CHANNEL_HOST", "") == "1"
+    channel_manager = ChannelManager(load_channels_config(), channel_router.handle, channel_host=channel_host)
     channel_manager_holder["manager"] = channel_manager
     weixin_commands = WeixinCommands(lambda: channel_manager_holder.get("manager"), _send,
                                      models=channel_models)
@@ -2376,6 +2378,9 @@ async def _main(startup_started: float):
     # disabled in this process.
     await _start_channel_manager(channel_manager)
     weixin_commands.send_status()
+    # The background host also runs scheduled jobs and pushes their results to the desktop and WeChat.
+    jobs_host = JobsHost(state_dir(), desktop=_send, weixin=weixin_job_push(channel_manager, channel_router)
+                         ).start() if channel_host else None
 
     active_task: asyncio.Task | None = None
     active_task_id = ""
@@ -4552,6 +4557,8 @@ async def _main(startup_started: float):
         lifecycle_task.cancel()
         with suppress(asyncio.CancelledError):
             await lifecycle_task
+        if jobs_host is not None:
+            await jobs_host.close()
         await channel_manager.stop()
         pending_startup = [task for task in [*startup_tasks, *catalog_tasks.values()] if not task.done()]
         for task in pending_startup:

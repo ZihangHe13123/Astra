@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.runtime.jobs.calendar import WEEKDAYS, calendar_schedule, describe, local_timezone_name, zone
-from agent.runtime.jobs.store import NOTIFY_POLICIES, JobStore
+from agent.runtime.jobs.store import NOTIFY_POLICIES, PUSH_TARGETS, JobStore
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
 
 ACTIONS = ("add", "list", "update", "pause", "resume", "remove", "run")
@@ -44,6 +44,8 @@ PARAMETERS = {"type": "object", "properties": {
     "notify": {"type": "string", "enum": sorted(NOTIFY_POLICIES),
                "description": "on_change: tell the person only when a check finds something new."},
     "web": {"type": "boolean", "description": "Let a check search and fetch web pages."},
+    "targets": {"type": "array", "items": {"type": "string", "enum": list(PUSH_TARGETS)},
+                "description": "Where results are pushed besides the inbox. Omit for both; [] for the inbox only."},
 }, "required": ["action"]}
 
 
@@ -95,12 +97,21 @@ def _when(job: dict) -> str:
     return f"once at {_local(job['next_at'], spec)}"
 
 
+_TARGET_NAMES = {"desktop": "桌面通知", "weixin": "微信"}
+
+
+def _where(targets) -> str:
+    names = [_TARGET_NAMES[target] for target in targets]
+    return ("发到" + "和".join(names) + "，收件箱里也有一份") if names else "只放进收件箱"
+
+
 def _summary(job: dict) -> dict[str, Any]:
     spec = job["spec"]
     return {"job_id": job["id"], "name": spec["name"], "kind": spec["kind"], "state": job["state"],
             "paused_reason": job.get("paused_reason") or "", "schedule": _when(job),
             "next_run": _local(job["next_at"], spec) if job["state"] == "enabled" else "",
             "notify": spec.get("notify", "always"), "web": spec.get("web", False),
+            "targets": spec.get("targets", list(PUSH_TARGETS)),
             "last_outcome": job.get("last_outcome") or "", "prompt": spec["prompt"]}
 
 
@@ -160,7 +171,8 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
             reads = ("一次只读检查：工作区文件" + ("和联网搜索" if args.get("web") else "")) if kind == "check" else "一条提醒"
             title = f"新建定时任务：{str(args.get('name') or '').strip()}"
             target = f"{_plan(args, now)}；{reads}"
-            effect = f"到点在本机运行{reads}，结果进入收件箱。不会写入文件、发送消息或操作电脑。"
+            where = _where(args["targets"] if args.get("targets") is not None else PUSH_TARGETS)
+            effect = f"到点在本机运行{reads}，结果{where}。不会写入文件、替你发消息或操作电脑。"
             question = "要创建这个定时任务吗？"
         else:
             job = store().job(str(args.get("job_id") or ""))
@@ -168,7 +180,8 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
             target = (_plan(args, now) if action == "update" else "") or _zh(
                 job["spec"].get("calendar"), job["interval_seconds"], job["next_at"])
             title, effect, question = {
-                "update": (f"修改定时任务：{name}", "之后的运行按新的设置进行。", "要这样修改吗？"),
+                "update": (f"修改定时任务：{name}", "之后的运行按新的设置进行" + (
+                    f"，结果{_where(args['targets'])}" if args.get("targets") is not None else "") + "。", "要这样修改吗？"),
                 "resume": (f"恢复定时任务：{name}", "从下一个时间点起重新运行；暂停期间错过的不补跑。", "要恢复吗？"),
                 "remove": (f"删除定时任务：{name}", "以后不再运行；历史结果保留。", "要删除吗？"),
                 "run": (f"立即运行定时任务：{name}", "调度器下一次检查时额外运行一次，不改变原来的时间表。", "要现在运行一次吗？"),
@@ -180,7 +193,7 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
     async def jobs(action: str, job_id: str = "", name: str = "", kind: str = "check", prompt: str = "",
                    time: str = "", days: list[str] | None = None, every_minutes: float | None = None,
                    at: str = "", after_minutes: float | None = None, notify: str | None = None,
-                   web: bool | None = None) -> str:
+                   web: bool | None = None, targets: list[str] | None = None) -> str:
         args = {"time": time, "days": days, "every_minutes": every_minutes, "at": at, "after_minutes": after_minutes}
         jobs_store = store()
         now = _now()
@@ -198,6 +211,7 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
                 name=name, prompt=prompt, original_request=authority[:8000], workdir=workdir(),
                 next_at=schedule.get("at"), interval_seconds=interval,
                 calendar=schedule.get("calendar"), notify=notify or "always",
+                targets=PUSH_TARGETS if targets is None else targets,
                 # The same catch-up windows as `astra jobs add`.
                 grace_seconds=3600 if schedule.get("calendar") else min(interval / 2, 3600) if interval else 300,
                 kind="check" if check else "reminder", model=model_key() if check else "",
@@ -207,15 +221,16 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
             job = jobs_store.update(
                 job_id, request=authority, name=name or None, prompt=prompt or None,
                 interval_seconds=schedule.get("interval_seconds", 0) if schedule else None,
-                calendar=schedule.get("calendar"), at=schedule.get("at"), notify=notify, web=web, now=now)
+                calendar=schedule.get("calendar"), at=schedule.get("at"), notify=notify, web=web,
+                targets=targets, now=now)
         elif action == "run":
             job = jobs_store.request_run(job_id, now=now)
         else:
             job = jobs_store.set_state(job_id, {"pause": "paused", "resume": "enabled", "remove": "removed"}[action],
                                        now=now)
         return json.dumps({"job": _summary(job), "delivery": (
-            "Results go to the Astra inbox (/jobs inbox). They run while a scheduler is running "
-            "(astra jobs serve).")}, ensure_ascii=False)
+            "Results are pushed to the listed targets and kept in the Astra inbox (/jobs inbox). Jobs run while "
+            "the Astra desktop app is open, or while `astra jobs serve` runs.")}, ensure_ascii=False)
 
     registry.register(ToolDef(
         name="jobs", description=DESCRIPTION, parameters=PARAMETERS, fn=jobs, risk="write", group="schedule",

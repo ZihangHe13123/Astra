@@ -12,8 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import NoReturn
 
-from agent.runtime.jobs.calendar import zone
-from agent.runtime.jobs.store import NOTIFY_POLICIES, JobStore, finite
+from agent.runtime.jobs.calendar import quiet_hours, set_quiet_hours, zone
+from agent.runtime.jobs.store import NOTIFY_POLICIES, PUSH_TARGETS, JobStore, finite
 from agent.runtime.paths import state_dir
 
 
@@ -38,6 +38,8 @@ def jobs_parser() -> JobParser:
     add.add_argument("--tz", default="", help="with --time: IANA time zone (default this computer's)")
     add.add_argument("--notify", choices=sorted(NOTIFY_POLICIES), default="always",
                      help="on_change: deliver a check's result only when it reports something new")
+    add.add_argument("--targets", default=",".join(PUSH_TARGETS),
+                     help="where results are pushed besides the inbox: desktop,weixin (empty for the inbox only)")
     add.add_argument("--catch-up", type=float, help="maximum lateness in seconds, from 1 to 86400")
     add.add_argument("--prompt", required=True)
     add.add_argument("--request", help="original user authorization; required for agent checks")
@@ -58,6 +60,8 @@ def jobs_parser() -> JobParser:
     inbox = commands.add_parser("inbox", help="read results and delivery receipts")
     inbox.add_argument("--read", default="", help="acknowledge one result by occurrence ID")
     inbox.add_argument("--limit", type=int, default=50)
+    quiet = commands.add_parser("quiet", help="show or set the hours when results wait instead of being pushed")
+    quiet.add_argument("hours", nargs="*", help="START END as HH:MM (default 23:00 08:00), or 'off'")
     commands.add_parser("tick", help="recover receipts and execute currently due jobs once")
     serve = commands.add_parser("serve", help="foreground standalone scheduler; stop with Ctrl+C")
     serve.add_argument("--poll", type=float, default=5)
@@ -136,6 +140,7 @@ def execute_jobs_command(argv: list[str], *, home: Path | None = None,
             value = store.add(name=args.name, prompt=args.prompt, original_request=args.request or args.prompt,
                               workdir=args.workdir or workdir or Path.cwd(), next_at=next_at,
                               interval_seconds=period, calendar=calendar, notify=args.notify,
+                              targets=[target for target in args.targets.split(",") if target.strip()],
                               grace_seconds=args.catch_up if args.catch_up is not None
                               else 3600 if calendar else min(period / 2, 3600) if period else 300,
                               kind="reminder" if args.reminder else "check", model=model, web=args.web,
@@ -149,6 +154,15 @@ def execute_jobs_command(argv: list[str], *, home: Path | None = None,
             value = {"job": store.job(args.id), "occurrences": store.history(args.id)}
         elif args.action in {"pause", "resume", "remove"}:
             value = store.set_state(args.id, {"pause": "paused", "resume": "enabled", "remove": "removed"}[args.action])
+        elif args.action == "quiet":
+            if args.hours == ["off"]:
+                value = {"quiet_hours": set_quiet_hours(store.home, None)}
+            elif len(args.hours) == 2:
+                value = {"quiet_hours": set_quiet_hours(store.home, {"start": args.hours[0], "end": args.hours[1]})}
+            elif not args.hours:
+                value = {"quiet_hours": quiet_hours(store.home)}
+            else:
+                raise ValueError("Give START END, or 'off'.")
         elif args.action == "history":
             value = store.history(args.id, limit=args.limit)
         elif args.action == "inbox":

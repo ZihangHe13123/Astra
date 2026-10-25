@@ -16,8 +16,13 @@ from agent.runtime.instance_lock import InstanceLock
 from agent.runtime.jobs.calendar import calendar_schedule, next_slot
 
 MAX_OUTPUT = 64_000
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 NOTIFY_POLICIES = frozenset({"always", "on_change"})
+# Where results are pushed besides the local inbox, which always receives them.
+PUSH_TARGETS = ("desktop", "weixin")
+# Exists while a job may still run or a result still waits to be pushed: the desktop starts
+# its background host for it.
+ACTIVE_MARKER = "active"
 # A check under ``on_change`` answers exactly this when it has nothing new to report.
 NO_UPDATE = "NO_UPDATE"
 FAILURES_BEFORE_PAUSE = 3
@@ -60,6 +65,13 @@ def finite(value: float, minimum: float, maximum: float, label: str) -> float:
     return float(value)
 
 
+def _targets(targets: list[str] | tuple[str, ...] | None) -> list[str]:
+    chosen: list[str] = list(dict.fromkeys(targets or ()))
+    if any(target not in PUSH_TARGETS for target in chosen):
+        raise ValueError("Push targets are " + ", ".join(PUSH_TARGETS) + ".")
+    return chosen
+
+
 class JobStore:
     def __init__(self, home: Path):
         self.home = Path(home).expanduser().resolve()
@@ -68,7 +80,7 @@ class JobStore:
         self.path = self.root / "jobs.sqlite3"
         with self.connect() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in {0, 1, SCHEMA_VERSION}:
+            if version not in {0, 1, 2, SCHEMA_VERSION}:
                 raise ValueError("Unsupported jobs database version; preserve it for inspection.")
             if version == SCHEMA_VERSION:
                 return
@@ -99,17 +111,26 @@ class JobStore:
                 CREATE INDEX IF NOT EXISTS jobs_due ON jobs(state, next_at);
                 CREATE INDEX IF NOT EXISTS runs_owner ON runs(job_id, state);
             """)
-            # Version 2 only adds columns, in one transaction, so version 1
-            # rows keep their meaning and a concurrent opener sees all or none.
+            # Later versions only add columns and tables, in one transaction, so
+            # older rows keep their meaning and a concurrent opener sees all or none.
             db.execute("BEGIN IMMEDIATE")
             try:
-                if db.execute("PRAGMA user_version").fetchone()[0] != SCHEMA_VERSION:
+                current = db.execute("PRAGMA user_version").fetchone()[0]
+                if current < 2:
                     for table, columns in _V2_COLUMNS.items():
                         present = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
                         for column, definition in columns:
                             if column not in present:
                                 db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
                     db.execute("UPDATE jobs SET active_since=created_at WHERE active_since=0")
+                if current < 3:
+                    db.execute("""CREATE TABLE IF NOT EXISTS pushes (
+                        run_id TEXT NOT NULL REFERENCES runs(id), target TEXT NOT NULL,
+                        state TEXT NOT NULL CHECK(state IN ('pending','sent','failed')),
+                        attempts INTEGER NOT NULL DEFAULT 0, next_try REAL NOT NULL, updated_at REAL NOT NULL,
+                        detail TEXT NOT NULL DEFAULT '', PRIMARY KEY(run_id, target))""")
+                    db.execute("CREATE INDEX IF NOT EXISTS pushes_due ON pushes(state, next_try)")
+                if current < SCHEMA_VERSION:
                     db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             except BaseException:
                 db.rollback()
@@ -151,7 +172,7 @@ class JobStore:
 
     def add(self, *, name: str, prompt: str, original_request: str,
             workdir: Path, next_at: float | None = None, interval_seconds: float = 0,
-            calendar: dict | None = None, notify: str = "always",
+            calendar: dict | None = None, notify: str = "always", targets: list[str] | tuple[str, ...] = PUSH_TARGETS,
             grace_seconds: float = 300, kind: str = "check", model: str = "",
             web: bool = False, idle_seconds: float = 120, timeout_seconds: float = 900,
             max_iterations: int = 10, now: float | None = None) -> dict:
@@ -159,6 +180,7 @@ class JobStore:
         calendar, next_at = self._schedule(calendar, interval_seconds, next_at, now)
         if notify not in NOTIFY_POLICIES:
             raise ValueError("Notify must be 'always' or 'on_change'.")
+        targets = _targets(targets)
         finite(grace_seconds, 1, 86400, "Catch-up grace")
         finite(idle_seconds, 1, 3600, "Idle budget")
         finite(timeout_seconds, idle_seconds, 86400, "Hard budget")
@@ -179,7 +201,7 @@ class JobStore:
         spec = {"name": name.strip(), "prompt": prompt.strip(), "original_request": original_request.strip(),
                 "workdir": str(directory), "kind": kind, "model": model, "web": web,
                 "idle_seconds": idle_seconds, "timeout_seconds": timeout_seconds,
-                "max_iterations": max_iterations, "notify": notify}
+                "max_iterations": max_iterations, "notify": notify, "targets": targets}
         if calendar:
             spec["calendar"] = calendar
         identity = uuid.uuid4().hex
@@ -187,6 +209,7 @@ class JobStore:
             db.execute("INSERT INTO jobs (id,name,spec,state,next_at,interval_seconds,grace_seconds,created_at,"
                        "active_since) VALUES (?,?,?,'enabled',?,?,?,?,?)",
                        (identity, spec["name"], json.dumps(spec), next_at, interval_seconds, grace_seconds, now, now))
+        self._sync_active()
         return self.job(identity)
 
     @staticmethod
@@ -240,11 +263,13 @@ class JobStore:
                 next_at = self._slots(next_at, row["interval_seconds"], calendar, now)[2]
             db.execute("UPDATE jobs SET state=?,paused_reason='',next_at=?,active_since=? WHERE id=?",
                        (state, next_at, now if state == "enabled" else row["active_since"], identity))
+        self._sync_active()
         return self.job(identity)
 
     def update(self, identity: str, *, request: str, name: str | None = None, prompt: str | None = None,
                interval_seconds: float | None = None, calendar: dict | None = None, at: float | None = None,
-               notify: str | None = None, web: bool | None = None, now: float | None = None) -> dict:
+               notify: str | None = None, web: bool | None = None, targets: list[str] | None = None,
+               now: float | None = None) -> dict:
         """Change a job's future runs; ``request`` is the person's words asking for the change."""
         now = time.time() if now is None else now
         if not isinstance(request, str) or not request.strip():
@@ -269,6 +294,8 @@ class JobStore:
                 if type(web) is not bool or (web and spec["kind"] == "reminder"):
                     raise ValueError("A reminder does not use network tools.")
                 spec["web"] = web
+            if targets is not None:
+                spec["targets"] = _targets(targets)
             interval, next_at = row["interval_seconds"], row["next_at"]
             if interval_seconds is not None or calendar is not None or at is not None:
                 interval = interval_seconds or 0
@@ -281,6 +308,7 @@ class JobStore:
             spec["original_request"] = (f"{spec['original_request']}\n\nChanged {changed}: {request.strip()}")[-8000:]
             db.execute("UPDATE jobs SET name=?,spec=?,next_at=?,interval_seconds=? WHERE id=?",
                        (spec["name"], json.dumps(spec), next_at, interval, identity))
+        self._sync_active()
         return self.job(identity)
 
     def request_run(self, identity: str, *, now: float | None = None) -> dict:
@@ -289,6 +317,7 @@ class JobStore:
             if not db.execute("UPDATE jobs SET run_requested_at=? WHERE id=? AND state!='removed'",
                               (time.time() if now is None else now, identity)).rowcount:
                 raise ValueError("Unknown or removed job ID.")
+        self._sync_active()
         return self.job(identity)
 
     def last_reported_output(self, job_id: str, *, before: str) -> str:
@@ -340,6 +369,7 @@ class JobStore:
             else:
                 identity = (self._claim_requested(db, now, reminders_only)
                             or self._claim_scheduled(db, now, reminders_only, last_interaction))
+        self._sync_active()
         return self.run(identity) if identity else None
 
     def _claim_requested(self, db: sqlite3.Connection, now: float, reminders_only: bool) -> str:
@@ -453,14 +483,67 @@ class JobStore:
                 run_id))
 
     def deliver_pending(self) -> int:
-        """The only first-version transport: idempotent, transaction-owned local inbox."""
+        """Move finished results into the local inbox, and queue their pushes, in one transaction."""
         with self.transaction() as db:
-            pending = db.execute("SELECT run_id FROM deliveries WHERE state='pending'").fetchall()
+            pending = db.execute("SELECT runs.* FROM deliveries JOIN runs ON runs.id=deliveries.run_id "
+                                 "WHERE deliveries.state='pending'").fetchall()
             now = time.time()
-            for row in pending:
-                db.execute("INSERT OR IGNORE INTO inbox (run_id,received_at) VALUES (?,?)", (row["run_id"], now))
-                db.execute("UPDATE deliveries SET state='delivered',delivered_at=? WHERE run_id=?", (now, row["run_id"]))
+            for run in pending:
+                db.execute("INSERT OR IGNORE INTO inbox (run_id,received_at) VALUES (?,?)", (run["id"], now))
+                db.execute("UPDATE deliveries SET state='delivered',delivered_at=? WHERE run_id=?", (now, run["id"]))
+                # Quiet results and records of missed slots stay in the inbox only.
+                if run["quiet"] or (run["state"] == "skipped" and run["skipped_count"]):
+                    continue
+                for target in json.loads(run["spec"]).get("targets", PUSH_TARGETS):
+                    db.execute("INSERT OR IGNORE INTO pushes (run_id,target,state,next_try,updated_at) "
+                               "VALUES (?,?,'pending',?,?)", (run["id"], target, now, now))
+        if pending:
+            self._sync_active()
         return len(pending)
+
+    def due_pushes(self, *, now: float | None = None, limit: int = 20) -> list[dict]:
+        """Pushes whose time has come, with the run and job they report."""
+        with self.connect() as db:
+            return [self.record(row) for row in db.execute(
+                "SELECT pushes.run_id,pushes.target,pushes.attempts,runs.job_id,runs.state AS run_state,runs.output,"
+                "runs.detail,runs.spec,runs.created_at,runs.finished_at,jobs.state AS job_state,jobs.paused_reason "
+                "FROM pushes JOIN runs ON runs.id=pushes.run_id JOIN jobs ON jobs.id=runs.job_id "
+                "WHERE pushes.state='pending' AND pushes.next_try<=? ORDER BY pushes.next_try,pushes.run_id LIMIT ?",
+                (time.time() if now is None else now, min(100, max(1, limit))))]
+
+    def mark_push(self, run_id: str, target: str, state: str, *, detail: str = "",
+                  next_try: float | None = None, attempted: bool = True, now: float | None = None) -> None:
+        """Record a push's outcome: sent, failed for good, or pending again until ``next_try``."""
+        if state not in {"pending", "sent", "failed"} or (state == "pending" and next_try is None):
+            raise ValueError("A push is sent, failed, or pending with a next try.")
+        now = time.time() if now is None else now
+        with self.transaction() as db:
+            db.execute("UPDATE pushes SET state=?,attempts=attempts+?,next_try=COALESCE(?,next_try),updated_at=?,"
+                       "detail=? WHERE run_id=? AND target=? AND state='pending'",
+                       (state, int(attempted), next_try, now, detail[:500], run_id, target))
+        if state != "pending":
+            self._sync_active()
+
+    def pushes(self, run_id: str) -> list[dict]:
+        with self.connect() as db:
+            return [dict(row) for row in db.execute("SELECT * FROM pushes WHERE run_id=? ORDER BY target", (run_id,))]
+
+    def _sync_active(self) -> None:
+        """Keep the marker that asks the desktop for a background host in step with the database."""
+        with self.connect() as db:
+            active = db.execute(
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE state='enabled' OR (state!='removed' AND run_requested_at "
+                "IS NOT NULL)) OR EXISTS(SELECT 1 FROM runs WHERE state IN ('claimed','running')) OR "
+                "EXISTS(SELECT 1 FROM pushes WHERE state='pending') OR "
+                "EXISTS(SELECT 1 FROM deliveries WHERE state='pending')").fetchone()[0]
+        marker = self.root / ACTIVE_MARKER
+        try:
+            if active:
+                marker.touch(exist_ok=True)
+            else:
+                marker.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     def inbox(self, *, limit: int = 50) -> list[dict]:
         with self.connect() as db:

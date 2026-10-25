@@ -1,23 +1,25 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChannelHost, channelsEnabled, type HostedBackend } from "../src/main/channel-host.js";
 
 function fixture() {
-  const config = join(mkdtempSync(join(tmpdir(), "astra-channel-host-")), "channels.json");
+  const directory = mkdtempSync(join(tmpdir(), "astra-channel-host-"));
+  const config = join(directory, "channels.json");
+  const jobsMarker = join(directory, "jobs", "active");
   const backends: (HostedBackend & { closed: boolean })[] = [];
   let now = 0;
   const host = new ChannelHost({
-    configPath: config, intervalMs: 60_000, retryMs: 30_000, now: () => now,
+    configPath: config, jobsMarker, intervalMs: 60_000, retryMs: 30_000, now: () => now,
     create: () => {
       const backend = { state: { status: "ready" }, closed: false, close: async () => { backend.closed = true; } };
       backends.push(backend);
       return backend;
     },
   });
-  return { config, backends, host, later: (ms: number) => { now += ms; } };
+  return { config, jobsMarker, backends, host, later: (ms: number) => { now += ms; } };
 }
 
 test("channels.json is read the way the backend reads it", () => {
@@ -63,4 +65,19 @@ test("a backend runs for the channels while one is on, comes back after it exits
   later(60_000);
   await host.check();
   assert.equal(backends.length, 3, "nothing starts after the desktop quit");
+});
+
+test("an active scheduled job also keeps the background backend, with no channel on", async () => {
+  const { jobsMarker, backends, host, later } = fixture();
+  await host.check();
+  assert.equal(backends.length, 0, "no channel and no job");
+  // The job store keeps this marker while a job may run or a result still waits to be pushed.
+  mkdirSync(join(jobsMarker, ".."), { recursive: true });
+  writeFileSync(jobsMarker, "");
+  await host.check();
+  assert.equal(backends.length, 1);
+  rmSync(jobsMarker);
+  later(30_000);
+  await host.check();
+  assert.ok(backends[0].closed && !host.running, "nothing left to run or push: the backend closes");
 });

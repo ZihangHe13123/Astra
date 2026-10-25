@@ -45,7 +45,19 @@ at a time or on a schedule ("remind me at 3pm", "every morning…"). Creating, c
 removing or running a job now is shown to you for approval first, in the desktop or in WeChat; the
 job records your own message as its authority. Listing and pausing need no approval.
 
-Start the independent scheduler in another terminal:
+While the Astra desktop app is open (also from the tray), its background host runs due jobs
+and pushes results: a desktop notification, and a WeChat message to the person who logged WeChat
+in, which also joins that chat's conversation so a reply can refer to it. `--targets` chooses
+(`desktop,weixin` by default; empty for the inbox only). Every result stays in the inbox. Quiet
+results and records of missed slots are not pushed. A push that fails is tried again after 1, 5,
+15 and 30 minutes, then given up; one whose run started more than 12 hours ago is not sent.
+
+Check results and pause notices wait out the quiet hours, 23:00–08:00 unless changed with
+`astra jobs quiet START END` or `astra jobs quiet off`; a reminder is sent at the time it was set
+for. The desktop starts the background host while a channel is switched on or a job may still run
+or push (the job store keeps `jobs/active` for it).
+
+Without the desktop, start the independent scheduler in another terminal:
 
 ```sh
 astra jobs serve
@@ -75,7 +87,7 @@ advance the original recurring schedule. Pause/remove affect future scheduled
 occurrences; they do not cancel a running check. Removal preserves audit history.
 Completed one-shot jobs cannot be resumed; create a new job for another reminder.
 Local inbox insertion and its receipt commit atomically, so restart cannot insert
-the same notification twice. External platform delivery is not included yet.
+the same notification twice. `astra jobs serve` and `tick` fill the inbox; pushes are sent by the desktop's background host.
 
 Schedules use `--after SECONDS`, `--every SECONDS` (minimum 60), `--time HH:MM`, or `--at` with an
 ISO timestamp containing `Z` or a numeric offset. You can combine `--at`/`--after`

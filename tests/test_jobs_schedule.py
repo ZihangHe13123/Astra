@@ -98,14 +98,14 @@ def test_version_one_database_gains_columns_and_keeps_its_jobs(tmp_path):
     db.close()
     store = JobStore(home)
     with store.connect() as reopened:
-        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert reopened.execute("PRAGMA user_version").fetchone()[0] == 3
     [job] = store.jobs()
     assert job["active_since"] == 900 and job["paused_reason"] == ""
     run = store.claim_due(now=1000)
     assert run["job_id"] == job["id"]
     store.finish(run["id"], "completed", output="Stretch")
     assert store.run(run["id"])["usage"] == {} and store.run(run["id"])["quiet"] == 0
-    # Opening again is a no-op at version 2.
+    # Opening again is a no-op at the current version.
     assert JobStore(home).job(job["id"])["state"] == "enabled"
 
 
