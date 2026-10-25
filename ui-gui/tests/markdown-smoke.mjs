@@ -284,6 +284,25 @@ try {
     requestAnimationFrame(sample);
   })));
   assert.equal(highest, 0, 'a scroll to the top must not be undone by the next measurement');
+  // Not following, the list keeps a row in place across measurements, and that anchor must not be put back over a
+  // newer scroll either (a Windows runner returned to the old position, 36139 px down, 2026-10-25). Here a row changes
+  // height in the frame before the scroll, so its measurement lands between the scroll and its event every time.
+  const scrolling = page.locator('.messages-scroll');
+  await scrolling.evaluate(el => { el.scrollTop = el.scrollHeight - el.clientHeight - 300; });
+  await expect(page.locator('.jump-latest')).toBeVisible();
+  await assertMeasuredRows();
+  let lastSeen;
+  await expect.poll(async () => { const top = await scrolling.evaluate(el => el.scrollTop); const same = top === lastSeen; lastSeen = top; return same; }, { intervals: [150] }).toBe(true);
+  const anchoredHighest = await page.evaluate(() => new Promise(done => requestAnimationFrame(() => {
+    const row = [...document.querySelectorAll('.measured-message')].at(-1).firstElementChild; row.style.paddingBottom = '3px';
+    requestAnimationFrame(() => {
+      const el = document.querySelector('.messages-scroll'); el.scrollTop = 0;
+      const start = performance.now(); let max = 0;
+      const sample = () => { max = Math.max(max, el.scrollTop); if (performance.now() - start < 1000) requestAnimationFrame(sample); else { row.style.paddingBottom = ''; done(max); } };
+      requestAnimationFrame(sample);
+    });
+  })));
+  assert.equal(anchoredHighest, 0, 'a scroll made while not following must not be undone by restoring the earlier anchor');
   await scrollToTop();
   await expect(historical).toHaveCount(0);
   // Rows coming back are measured again as they mount, so one jump to the bottom can land short
