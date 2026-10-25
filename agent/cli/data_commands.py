@@ -298,9 +298,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             value = wipe(args.confirm, browser_data=args.browser_data, desktop=args.desktop, root=args.root)
     except (ValueError, OSError, LauncherError) as exc:
-        print(json.dumps({"error": str(exc)}, ensure_ascii=False))
+        print(json.dumps({"error": str(exc)}))
         return 1
-    print(json.dumps(value, ensure_ascii=False))
+    print(json.dumps(value))
     return 1 if value.get("failed") else 0
 
 
