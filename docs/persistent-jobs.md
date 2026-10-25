@@ -43,7 +43,8 @@ that run is kept as a quiet result. Each run records its token usage.
 In a conversation, Astra can manage the same jobs with its `jobs` tool when you ask for something
 at a time or on a schedule ("remind me at 3pm", "every morning…"). Creating, changing, resuming,
 removing or running a job now is shown to you for approval first, in the desktop or in WeChat; the
-job records your own message as its authority. Listing and pausing need no approval.
+job records your own words as its authority: your message and the questions you answered after it.
+Listing and pausing need no approval. Its `quiet` action sets the quiet hours, also with approval.
 
 While the Astra desktop app is open (also from the tray), its background host runs due jobs
 and pushes results: a desktop notification, and a WeChat message to the person who logged WeChat

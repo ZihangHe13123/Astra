@@ -67,6 +67,7 @@ const SLASH_COMMANDS: SlashCommandSuggestion[] = [
   { command: "/cancel", description: "cancel the active or selected task", takesArgs: true, group: "SESSION" },
   { command: "/goal", description: "set/show/pause/resume the session goal (long-horizon verification mode)", takesArgs: true, group: "SESSION" },
   { command: "/today", description: "list today's task runs", group: "SESSION" },
+  { command: "/onboard", description: "let Astra get to know you: name, routine, preferences; saves what you confirm", group: "CHAT" },
   { command: "/session", description: "list or switch sessions", takesArgs: true, group: "SESSION" },
   { command: "/handoff", description: "compose, save, and revise a continuation brief", takesArgs: true, group: "SESSION" },
   { command: "/theme", description: "show or switch terminal color theme", takesArgs: true, group: "DISPLAY" },

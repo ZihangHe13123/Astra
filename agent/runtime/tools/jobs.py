@@ -3,17 +3,18 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from agent.runtime.jobs.calendar import WEEKDAYS, calendar_schedule, describe, local_timezone_name, zone
+from agent.runtime.jobs.calendar import WEEKDAYS, calendar_schedule, describe, local_timezone_name, set_quiet_hours, zone
 from agent.runtime.jobs.store import NOTIFY_POLICIES, PUSH_TARGETS, JobStore
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
 
-ACTIONS = ("add", "list", "update", "pause", "resume", "remove", "run")
+ACTIONS = ("add", "list", "update", "pause", "resume", "remove", "run", "quiet")
 # Listing and pausing only narrow what runs; everything else is shown to the person first.
 _UNGUARDED = frozenset({"list", "pause"})
 _SCHEDULE_KEYS = ("time", "days", "every_minutes", "at", "after_minutes")
@@ -24,7 +25,8 @@ DESCRIPTION = (
     "A check runs in a fresh read-only session: workspace files, plus web search and fetch when web is true. It "
     "cannot write, send, browse with logins or use the computer. A reminder delivers its text as written. "
     "add, update, resume, remove and run are each shown to the person for approval. Times are the person's "
-    "local time; schedule with time (+days), every_minutes, at, or after_minutes."
+    "local time; schedule with time (+days), every_minutes, at, or after_minutes. quiet sets the hours when "
+    "check results wait instead of being pushed (quiet_hours), also with approval."
 )
 
 PARAMETERS = {"type": "object", "properties": {
@@ -44,9 +46,52 @@ PARAMETERS = {"type": "object", "properties": {
     "notify": {"type": "string", "enum": sorted(NOTIFY_POLICIES),
                "description": "on_change: tell the person only when a check finds something new."},
     "web": {"type": "boolean", "description": "Let a check search and fetch web pages."},
+    "quiet_hours": {"type": "string", "description": "For quiet: HH:MM-HH:MM on a 24-hour clock, or off."},
     "targets": {"type": "array", "items": {"type": "string", "enum": list(PUSH_TARGETS)},
                 "description": "Where results are pushed besides the inbox. Omit for both; [] for the inbox only."},
 }, "required": ["action"]}
+
+
+_MESSAGE_TIME = re.compile(r"<message_time>.*?</message_time>\s*", re.S)
+
+
+def _text(content: object) -> str:
+    if isinstance(content, list):
+        content = "\n".join(part.get("text", "") for part in content if isinstance(part, dict))
+    return _MESSAGE_TIME.sub("", str(content or "")).strip()
+
+
+def _answers(content: str) -> list[str]:
+    """What the person typed or picked in an ask_user_question result."""
+    try:
+        data = json.loads(content[content.index("{"):content.rindex("}") + 1])
+    except ValueError:
+        return []
+    words = []
+    for answer in data.get("answers", []) if isinstance(data, dict) else []:
+        if isinstance(answer, dict):
+            words += [str(label) for label in answer.get("selected") or []]
+            if str(answer.get("custom") or "").strip():
+                words.append(str(answer["custom"]).strip())
+    return words
+
+
+def person_words(messages: list[dict]) -> str:
+    """The person's own words behind the current turn: their last message and the questions they answered
+    since, in order. Text the model wrote never counts."""
+    asked = {call.get("id") for message in messages if message.get("role") == "assistant"
+             for call in message.get("tool_calls") or [] if (call.get("function") or {}).get("name") == "ask_user_question"}
+    found: list[str] = []
+    for message in reversed(messages):
+        role = message.get("role")
+        if role == "tool" and message.get("tool_call_id") in asked:
+            found += reversed(_answers(_text(message.get("content"))))
+        elif role == "user" and message.get("provenance") == "user_question_answer":
+            found.append(_text(message.get("content")))
+        elif role == "user" and not message.get("provenance"):
+            found.append(_text(message.get("content")))
+            break
+    return "\n".join(reversed([words for words in found if words]))[-8000:]
 
 
 def _instant(text: str, now: float) -> float:
@@ -129,6 +174,18 @@ def schedule_text(calendar: dict | None, interval: float, first: float | None) -
     return f"{start} 运行一次" if start else ""
 
 
+def _quiet(value: object) -> dict | None:
+    """The quiet hours asked for: {"start", "end"}, or None for off."""
+    text = str(value or "").strip().lower()
+    if text == "off":
+        return None
+    match = re.fullmatch(r"(\d{1,2}:\d{2})\s*[-–~]\s*(\d{1,2}:\d{2})", text)
+    if match is None:
+        raise ValueError("quiet_hours is HH:MM-HH:MM, or off.")
+    # Both must be real times of day.
+    return {"start": calendar_schedule(match[1])["time"], "end": calendar_schedule(match[2])["time"]}
+
+
 def _plan(args: dict, now: float) -> str:
     """What a schedule would read as before it exists, for the approval card."""
     schedule = _schedule(args, now) or {}
@@ -147,7 +204,9 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
         if action not in ACTIONS:
             raise ValueError("Unknown action.")
         now = time.time()
-        if action == "add":
+        if action == "quiet":
+            _quiet(args.get("quiet_hours"))
+        elif action == "add":
             if not str(args.get("name") or "").strip() or not str(args.get("prompt") or "").strip():
                 raise ValueError("add needs a name and a prompt.")
             if _schedule(args, now) is None:
@@ -166,6 +225,14 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
         if action in _UNGUARDED:
             return None
         now = time.time()
+        if action == "quiet":
+            window = _quiet(args.get("quiet_hours"))
+            title = f"修改安静时段：{window['start']}–{window['end']}" if window else "关闭安静时段"
+            target = (f"{window['start']}–{window['end']} 之间的检查结果先攒着，到点再发；定了时间的提醒照常发。"
+                      if window else "检查结果随时推送。")
+            return {"reason": title, "approval_title": title, "target": target, "approval_summary": target,
+                    "approval_effect": "只改推送的时间，任务本身照常运行。", "approval_question": "要这样设置吗？",
+                    "choices": ["once", "deny"]}
         if action == "add":
             kind = args.get("kind") or "check"
             reads = ("一次只读检查：工作区文件" + ("和联网搜索" if args.get("web") else "")) if kind == "check" else "一条提醒"
@@ -193,7 +260,7 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
     async def jobs(action: str, job_id: str = "", name: str = "", kind: str = "check", prompt: str = "",
                    time: str = "", days: list[str] | None = None, every_minutes: float | None = None,
                    at: str = "", after_minutes: float | None = None, notify: str | None = None,
-                   web: bool | None = None, targets: list[str] | None = None) -> str:
+                   web: bool | None = None, targets: list[str] | None = None, quiet_hours: str = "") -> str:
         args = {"time": time, "days": days, "every_minutes": every_minutes, "at": at, "after_minutes": after_minutes}
         jobs_store = store()
         now = _now()
@@ -203,6 +270,8 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
         authority = request().strip()
         if action not in _UNGUARDED and not authority:
             raise ValueError("Scheduling needs the person's own request in this conversation.")
+        if action == "quiet":
+            return json.dumps({"quiet_hours": set_quiet_hours(home, _quiet(quiet_hours))}, ensure_ascii=False)
         if action == "add":
             schedule = _schedule(args, now) or {}
             check = kind != "reminder"

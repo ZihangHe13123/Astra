@@ -169,6 +169,12 @@ wait at the end with the message each rests on, to accept or dismiss. These chan
 your own and need no approval; they take effect from the next turn. Deleting a
 conversation does not remove the memories saved from it; forget them here.
 
+To set things up from a conversation instead, send `/onboard` (or use **让 Astra 认识你** on the
+welcome screen). Astra asks a few questions, how to address you, your usual day, how you like
+replies, what you would like it to do on its own, and where to reach you, shows a draft, and
+after you confirm saves the lines to USER.md, sets the quiet hours and offers scheduled jobs, each
+of which you approve. Run it again any time.
+
 ## Memory commands
 
 ```text

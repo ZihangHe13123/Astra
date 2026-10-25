@@ -374,9 +374,9 @@
   },
   "jobs": {
     "sha256": [
-      "ddcb4d10b2ef98ea"
+      "399241fc3e0b6fcc"
     ],
-    "reason": "2026-10-25: new tool; the model schedules reminders and read-only checks the person asks for, each change approved. targets chooses where results are pushed."
+    "reason": "2026-10-25: new tool; the model schedules reminders and read-only checks the person asks for, each change approved. targets chooses where results are pushed; quiet sets the quiet hours (onboarding asks for them)."
   },
   "load_workspace_dependencies": {
     "sha256": [

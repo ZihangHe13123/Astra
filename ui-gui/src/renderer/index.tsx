@@ -257,6 +257,11 @@ function App() {
     finally { responseRequest.current.delete(state.id); }
   };
   const command = async (value: string, target?: SessionState) => {
+    // /onboard is a request to the model (its onboarding skill), so it is sent as the person's message.
+    if (/^\/onboard(?:\s|$)/.test(value)) {
+      const rt = target || await ensureSession();
+      await window.astra.send(rt.id, { type: "message", text: value, submission_id: crypto.randomUUID() }); return;
+    }
     if (value === "/retry") {
       const target = responseVersions?.targets.at(-1);
       if (!target || preview) { fail("当前没有可重新生成的已保存回复；请先继续会话并等待回复完成。"); return false; }
