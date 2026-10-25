@@ -12,7 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import NoReturn
 
-from agent.runtime.jobs.store import JobStore, finite
+from agent.runtime.jobs.calendar import zone
+from agent.runtime.jobs.store import NOTIFY_POLICIES, JobStore, finite
 from agent.runtime.paths import state_dir
 
 
@@ -31,7 +32,12 @@ def jobs_parser() -> JobParser:
     schedule = add.add_mutually_exclusive_group()
     schedule.add_argument("--at", help="one-shot or first UTC/offset ISO timestamp")
     schedule.add_argument("--after", type=float, help="first run after at least 60 seconds")
+    schedule.add_argument("--time", help="local time of day, HH:MM on a 24-hour clock; repeats on --days")
     add.add_argument("--every", type=float, default=0, help="fixed interval in seconds, at least 60")
+    add.add_argument("--days", default="", help="with --time: weekdays such as mon,wed,fri (default every day)")
+    add.add_argument("--tz", default="", help="with --time: IANA time zone (default this computer's)")
+    add.add_argument("--notify", choices=sorted(NOTIFY_POLICIES), default="always",
+                     help="on_change: deliver a check's result only when it reports something new")
     add.add_argument("--catch-up", type=float, help="maximum lateness in seconds, from 1 to 86400")
     add.add_argument("--prompt", required=True)
     add.add_argument("--request", help="original user authorization; required for agent checks")
@@ -58,7 +64,7 @@ def jobs_parser() -> JobParser:
     return parser
 
 
-def _model_key(selected: str) -> str:
+def job_model_key(selected: str) -> str:
     from agent.cli.model_catalog import configured_model_catalog
     from agent.cli.model_preferences import read_selected_model
     from agent.cli.models import model_profiles
@@ -75,6 +81,13 @@ def _model_key(selected: str) -> str:
     if entry is None:
         raise ValueError("Unknown configured model. Choose an explicit --model key.")
     return entry.key
+
+
+def _with_times(job: dict) -> None:
+    job["next_at_utc"] = datetime.fromtimestamp(job["next_at"], timezone.utc).isoformat()
+    calendar = job["spec"].get("calendar")
+    if calendar:
+        job["next_at_local"] = datetime.fromtimestamp(job["next_at"], zone(calendar["tz"])).isoformat()
 
 
 def execute_jobs_command(argv: list[str], *, home: Path | None = None,
@@ -96,7 +109,16 @@ def execute_jobs_command(argv: list[str], *, home: Path | None = None,
         if args.action == "add":
             period = finite(args.every, 0, 365 * 86400, "Interval")
             now = time.time()
-            if args.at:
+            calendar = None
+            next_at: float | None = None
+            if args.time:
+                if period:
+                    raise ValueError("Choose --every or --time, not both.")
+                calendar = {"time": args.time, "days": [day for day in args.days.split(",") if day.strip()],
+                            "tz": args.tz}
+            elif args.days or args.tz:
+                raise ValueError("--days and --tz apply to --time.")
+            elif args.at:
                 instant = datetime.fromisoformat(args.at.replace("Z", "+00:00"))
                 if instant.tzinfo is None:
                     raise ValueError("--at needs an explicit UTC Z or numeric timezone offset.")
@@ -105,23 +127,24 @@ def execute_jobs_command(argv: list[str], *, home: Path | None = None,
                 delay = finite(args.after if args.after is not None else period, 60, 365 * 86400, "Delay")
                 next_at = now + delay
             else:
-                raise ValueError("Choose --at, --after or --every.")
+                raise ValueError("Choose --at, --after, --every or --time.")
             if not args.reminder and not args.request:
                 raise ValueError("Agent checks require --request with the original user authorization.")
             model = args.model
             if not args.reminder:
-                model = _model_key(model)
+                model = job_model_key(model)
             value = store.add(name=args.name, prompt=args.prompt, original_request=args.request or args.prompt,
                               workdir=args.workdir or workdir or Path.cwd(), next_at=next_at,
-                              interval_seconds=period,
-                              grace_seconds=args.catch_up if args.catch_up is not None else min(period / 2, 3600) if period else 300,
+                              interval_seconds=period, calendar=calendar, notify=args.notify,
+                              grace_seconds=args.catch_up if args.catch_up is not None
+                              else 3600 if calendar else min(period / 2, 3600) if period else 300,
                               kind="reminder" if args.reminder else "check", model=model, web=args.web,
                               idle_seconds=args.idle, timeout_seconds=args.timeout, max_iterations=args.iterations)
-            value["next_at_utc"] = datetime.fromtimestamp(value["next_at"], timezone.utc).isoformat()
+            _with_times(value)
         elif args.action == "list":
             value = store.jobs()
             for job in value:
-                job["next_at_utc"] = datetime.fromtimestamp(job["next_at"], timezone.utc).isoformat()
+                _with_times(job)
         elif args.action == "show":
             value = {"job": store.job(args.id), "occurrences": store.history(args.id)}
         elif args.action in {"pause", "resume", "remove"}:

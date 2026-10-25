@@ -115,7 +115,7 @@ def test_pause_remove_manual_occurrence_and_original_schedule(tmp_path):
         store.claim_due(now=1000, manual_job=job["id"])
     store.finish(manual["id"], "completed", output="manual")
     assert store.job(job["id"])["next_at"] == 1000
-    store.set_state(job["id"], "enabled")
+    store.set_state(job["id"], "enabled", now=1000)
     assert store.claim_due(now=1000)["scheduled_at"] == 1000
     store.set_state(job["id"], "removed")
     with pytest.raises(ValueError, match="removed"):

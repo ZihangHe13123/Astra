@@ -344,7 +344,7 @@ def test_worker_shutdown_restores_handler_and_avoids_non_main_thread(tmp_path, m
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX cancellation of the actual ReAct stream")
 def test_cancelled_real_worker_is_unknown_even_when_react_emits_an_error(tmp_path, monkeypatch):
     from test_persistent_jobs_worker import environment
-    from agent.cli.jobs_commands import _model_key
+    from agent.cli.jobs_commands import job_model_key
 
     arrived, release = threading.Event(), threading.Event()
     class WaitingProvider(BaseHTTPRequestHandler):
@@ -368,7 +368,7 @@ def test_cancelled_real_worker_is_unknown_even_when_react_emits_an_error(tmp_pat
     for key, value in environment(home, provider).items():
         monkeypatch.setenv(key, value)
     store = JobStore(home)
-    store.add(name="fixture", prompt="wait", original_request="fixture", model=_model_key("fixture"),
+    store.add(name="fixture", prompt="wait", original_request="fixture", model=job_model_key("fixture"),
               workdir=tmp_path, next_at=1000, idle_seconds=3, timeout_seconds=10)
     run = store.claim_due(now=1000)
     try:

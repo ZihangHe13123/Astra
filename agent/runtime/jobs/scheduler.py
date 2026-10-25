@@ -14,7 +14,7 @@ from agent.runtime.instance_lock import InstanceAlreadyRunning, InstanceLock
 from agent.runtime.process_env import hidden_process_creationflags
 from agent.sandbox.windows_job import WindowsJob
 
-from .store import JobStore
+from .store import JobStore, last_interaction
 
 
 def recover_abandoned(store: JobStore) -> int:
@@ -224,6 +224,7 @@ def tick(store: JobStore, *, manual_job: str = "", now: float | None = None, max
         with InstanceLock(store.root / "scheduler.lock"):
             recovered = recover_abandoned(store)
             delivered = store.deliver_pending()
+            interaction = last_interaction(store.home)
             fired = []
 
             def service_reminders() -> None:
@@ -231,7 +232,7 @@ def tick(store: JobStore, *, manual_job: str = "", now: float | None = None, max
                 # Retain the single scheduler owner and per-job occurrence
                 # locks. Only model-free reminders may run beside a check.
                 for _ in range(100):
-                    notice = store.claim_due(now=now, reminders_only=True)
+                    notice = store.claim_due(now=now, reminders_only=True, last_interaction=interaction)
                     if notice is None:
                         break
                     execute(store, notice)
@@ -240,7 +241,7 @@ def tick(store: JobStore, *, manual_job: str = "", now: float | None = None, max
                 delivered += store.deliver_pending()
 
             for _ in range(1 if manual_job else min(100, max(1, max_runs))):
-                run = store.claim_due(now=now, manual_job=manual_job)
+                run = store.claim_due(now=now, manual_job=manual_job, last_interaction=interaction)
                 if run is None:
                     break
                 execute(store, run, service_reminders=service_reminders)

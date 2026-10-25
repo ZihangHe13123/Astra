@@ -39,7 +39,7 @@ if __name__ == "__main__":
     # gui_ready still marks completion of runtime and session initialization.
     _handshake()
 
-from agent.runtime.paths import sessions_dir, state_path
+from agent.runtime.paths import sessions_dir, state_dir, state_path
 from agent.runtime.appshot_media import AppshotMediaError
 
 import sqlite3
@@ -77,6 +77,7 @@ from agent.cli.mode_preferences import (
     reasoning_effort_status,
     set_reasoning_effort,
 )
+from agent.cli.jobs_commands import job_model_key
 from agent.cli.turn_budget import execute_budget_command
 from agent.cli.turn_changes_command import execute_changes_command
 from agent.cli.stream_events import tool_progress_event, tool_result_event
@@ -103,9 +104,11 @@ from agent.runtime.event_writer import OrderedEventWriter
 from agent.runtime.async_io import durable_io
 from agent.runtime.latency import RuntimeProfiler, current_profiler, profile_request
 from agent.runtime.user_questions import UserQuestionBroker
+from agent.runtime.tools.jobs import register_jobs_tool
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
 from agent.cli.session_lifecycle import ControlledRestart, RESTART_EXIT_CODE
 from agent.runtime.background_completion import BackgroundCompletions, wake_display, wake_prompt
+from agent.runtime.jobs.store import note_interaction
 from agent.runtime.session_wakeup import SessionWakeups, visible_wakeup_history, wakeup_prompt
 from agent.runtime.browser_control_transport import set_owner_label_provider
 from agent.runtime.peer_link import (HEARTBEAT_SECONDS, PeerError, PeerLink, default_name, fallback_name,
@@ -1381,6 +1384,12 @@ async def _main(startup_started: float):
             "summary": {"type": "string", "maxLength": 4000},
         }, "required": ["outcome"]}, fn=_report_wakeup, cache_results=False,
     ))
+
+    # Reminders and read-only checks the person schedules; each change is approved by them.
+    register_jobs_tool(
+        tools, home=state_dir(), workdir=agent._source_tracking_workdir, model_key=lambda: job_model_key(""),
+        request=lambda: message.text if (message := active_channel_message.get()) else latest_user_request,
+    )
 
     # Other Astra sessions on this computer: one shared mailbox (agent/runtime/peer_link.py).
     try:
@@ -3873,6 +3882,7 @@ async def _main(startup_started: float):
 
             elif cmd.get("type") == "message":
                 completions.user_turn()
+                note_interaction(state_dir())
                 if isinstance(cmd.get("text"), str):
                     latest_user_request = cmd["text"][:8000]
                 if cmd.get("appshots") or ("submission_id" in cmd and os.getenv("ASTRA_UI_SURFACE") != "gui"):

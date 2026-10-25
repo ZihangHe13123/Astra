@@ -372,6 +372,12 @@
     ],
     "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
   },
+  "jobs": {
+    "sha256": [
+      "fd9a714c91fbb610"
+    ],
+    "reason": "2026-10-25: new tool; the model schedules reminders and read-only checks the person asks for, each change approved."
+  },
   "load_workspace_dependencies": {
     "sha256": [
       "b305eb4353a6da67"

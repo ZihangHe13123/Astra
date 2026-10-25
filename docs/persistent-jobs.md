@@ -27,6 +27,24 @@ session under `ASTRA_HOME/jobs/runs/ID/`, loading project guidance under current
 trust rules. Credentials remain in the selected profile's existing configuration;
 they are not stored in the job.
 
+Run a check every weekday at a local time, and hear from it only when something changed:
+
+```sh
+astra jobs add rust-news --time 08:00 --days mon,tue,wed,thu,fri --web --notify on_change \
+  --prompt "Look for new Rust 2026 edition discussions" \
+  --request "Tell me each weekday morning if there are new Rust edition discussions"
+```
+
+`--time HH:MM` repeats on `--days` (default every day) in `--tz` (an IANA zone; default this
+computer's), so 08:00 stays 08:00 across daylight-saving changes. With `--notify on_change` a
+check is given the last result the person was told and answers `NO_UPDATE` when nothing is new;
+that run is kept as a quiet result. Each run records its token usage.
+
+In a conversation, Astra can manage the same jobs with its `jobs` tool when you ask for something
+at a time or on a schedule ("remind me at 3pm", "every morning…"). Creating, changing, resuming,
+removing or running a job now is shown to you for approval first, in the desktop or in WeChat; the
+job records your own message as its authority. Listing and pausing need no approval.
+
 Start the independent scheduler in another terminal:
 
 ```sh
@@ -59,11 +77,10 @@ Completed one-shot jobs cannot be resumed; create a new job for another reminder
 Local inbox insertion and its receipt commit atomically, so restart cannot insert
 the same notification twice. External platform delivery is not included yet.
 
-Schedules use `--after SECONDS`, `--every SECONDS` (minimum 60), or `--at` with an
+Schedules use `--after SECONDS`, `--every SECONDS` (minimum 60), `--time HH:MM`, or `--at` with an
 ISO timestamp containing `Z` or a numeric offset. You can combine `--at`/`--after`
-with `--every` for a different first instant. Intervals are elapsed-time periods,
-not local wall-clock cron expressions; `--every 86400` does not track daylight
-saving changes. For example, a one-shot time is `--at 2026-10-06T09:00:00+08:00`.
+with `--every` for a different first instant. Intervals are elapsed-time periods;
+`--every 86400` does not track daylight saving changes, `--time` does. For example, a one-shot time is `--at 2026-10-06T09:00:00+08:00`.
 
 `--catch-up SECONDS` sets the maximum lateness (1–86400). The default is five
 minutes for a one-shot and half the interval, capped at one hour, for repeats.
@@ -75,6 +92,15 @@ reminders are serviced while a check worker is running, so a slow model request
 does not hold their delivery until that check completes. A running occurrence
 still blocks another occurrence of the same job; later missed slots follow the
 same accounting policy.
+
+Jobs stop themselves in two cases, and the reason reaches the inbox:
+
+- A recurring job pauses after 3 failed or unknown runs in a row.
+- When the desktop or a messaging channel has recorded no message from you for 7 days, recurring
+  jobs pause instead of running on unattended. One-shot jobs still run.
+
+Resuming starts again from the next scheduled time; slots that passed while a job was paused are
+not caught up. `astra jobs run`, or the tool's `run`, adds one occurrence without moving the schedule.
 
 `--idle SECONDS` limits inactivity, reset by actual model/tool events (default
 120 seconds); `--timeout SECONDS` is a separate hard run limit (default 900).

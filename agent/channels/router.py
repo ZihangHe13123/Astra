@@ -19,7 +19,8 @@ from agent.runtime.prompts import channel_prompt_profile
 from agent.runtime.context import AgentContext
 from agent.runtime.context_compressor import ContextCompressor
 from agent.runtime.json_preferences import update_preferences
-from agent.runtime.paths import state_path
+from agent.runtime.jobs.store import note_interaction
+from agent.runtime.paths import state_dir, state_path
 
 from .base import ChannelMessage, ReplySink
 from .weixin import CHAT_STYLE as WEIXIN_CHAT_STYLE
@@ -170,6 +171,7 @@ class AgentChannelRouter:
             async with self.turn_lock:
                 return await self._start_new_conversation(message)
         session_name = self._session_name(message)
+        note_interaction(state_dir())
         async with self.turn_lock:
             if not self.admission():
                 return "Astra is preparing a restart. Please retry after it reconnects."
