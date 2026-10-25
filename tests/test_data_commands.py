@@ -94,7 +94,9 @@ def test_export_holds_the_persons_data_consistently_and_no_credentials(tmp_path)
     code, result = data(environment(home), "export", "--out", str(out))
     live.close()
     assert code == 0 and result["path"] == str(out.resolve())
-    assert out.stat().st_mode & 0o777 == 0o600 and not list(out.parent.glob("*.partial"))
+    assert not list(out.parent.glob("*.partial"))
+    if os.name == "posix":
+        assert out.stat().st_mode & 0o777 == 0o600
     with zipfile.ZipFile(out) as archive:
         names = set(archive.namelist())
         manifest = json.loads(archive.read("astra-export/manifest.json"))
