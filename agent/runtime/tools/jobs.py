@@ -46,6 +46,7 @@ PARAMETERS = {"type": "object", "properties": {
     "notify": {"type": "string", "enum": sorted(NOTIFY_POLICIES),
                "description": "on_change: tell the person only when a check finds something new."},
     "web": {"type": "boolean", "description": "Let a check search and fetch web pages."},
+    "mail": {"type": "boolean", "description": "Let a check read the person's email (read-only)."},
     "quiet_hours": {"type": "string", "description": "For quiet: HH:MM-HH:MM on a 24-hour clock, or off."},
     "targets": {"type": "array", "items": {"type": "string", "enum": list(PUSH_TARGETS)},
                 "description": "Where results are pushed besides the inbox. Omit for both; [] for the inbox only."},
@@ -155,7 +156,7 @@ def _summary(job: dict) -> dict[str, Any]:
     return {"job_id": job["id"], "name": spec["name"], "kind": spec["kind"], "state": job["state"],
             "paused_reason": job.get("paused_reason") or "", "schedule": _when(job),
             "next_run": _local(job["next_at"], spec) if job["state"] == "enabled" else "",
-            "notify": spec.get("notify", "always"), "web": spec.get("web", False),
+            "notify": spec.get("notify", "always"), "web": spec.get("web", False), "mail": spec.get("mail", False),
             "targets": spec.get("targets", list(PUSH_TARGETS)),
             "last_outcome": job.get("last_outcome") or "", "prompt": spec["prompt"]}
 
@@ -211,8 +212,8 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
                 raise ValueError("add needs a name and a prompt.")
             if _schedule(args, now) is None:
                 raise ValueError("add needs a schedule: time (+days), every_minutes, at, or after_minutes.")
-            if args.get("kind") == "reminder" and args.get("web"):
-                raise ValueError("A reminder does not use the web.")
+            if args.get("kind") == "reminder" and (args.get("web") or args.get("mail")):
+                raise ValueError("A reminder does not use the web or mail.")
         elif action != "list":
             if not args.get("job_id"):
                 raise ValueError(f"{action} needs a job_id from list.")
@@ -235,7 +236,8 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
                     "choices": ["once", "deny"]}
         if action == "add":
             kind = args.get("kind") or "check"
-            reads = ("一次只读检查：工作区文件" + ("和联网搜索" if args.get("web") else "")) if kind == "check" else "一条提醒"
+            sources = ["工作区文件"] + (["联网搜索"] if args.get("web") else []) + (["你的邮件"] if args.get("mail") else [])
+            reads = ("一次只读检查：" + "、".join(sources)) if kind == "check" else "一条提醒"
             title = f"新建定时任务：{str(args.get('name') or '').strip()}"
             target = f"{_plan(args, now)}；{reads}"
             where = _where(args["targets"] if args.get("targets") is not None else PUSH_TARGETS)
@@ -260,7 +262,8 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
     async def jobs(action: str, job_id: str = "", name: str = "", kind: str = "check", prompt: str = "",
                    time: str = "", days: list[str] | None = None, every_minutes: float | None = None,
                    at: str = "", after_minutes: float | None = None, notify: str | None = None,
-                   web: bool | None = None, targets: list[str] | None = None, quiet_hours: str = "") -> str:
+                   web: bool | None = None, mail: bool | None = None, targets: list[str] | None = None,
+                   quiet_hours: str = "") -> str:
         args = {"time": time, "days": days, "every_minutes": every_minutes, "at": at, "after_minutes": after_minutes}
         jobs_store = store()
         now = _now()
@@ -284,14 +287,14 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
                 # The same catch-up windows as `astra jobs add`.
                 grace_seconds=3600 if schedule.get("calendar") else min(interval / 2, 3600) if interval else 300,
                 kind="check" if check else "reminder", model=model_key() if check else "",
-                web=bool(web) if check else False, now=now)
+                web=bool(web) if check else False, mail=bool(mail) if check else False, now=now)
         elif action == "update":
             schedule = _schedule(args, now) or {}
             job = jobs_store.update(
                 job_id, request=authority, name=name or None, prompt=prompt or None,
                 interval_seconds=schedule.get("interval_seconds", 0) if schedule else None,
                 calendar=schedule.get("calendar"), at=schedule.get("at"), notify=notify, web=web,
-                targets=targets, now=now)
+                targets=targets, mail=mail, now=now)
         elif action == "run":
             job = jobs_store.request_run(job_id, now=now)
         else:

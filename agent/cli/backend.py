@@ -105,6 +105,7 @@ from agent.runtime.async_io import durable_io
 from agent.runtime.latency import RuntimeProfiler, current_profiler, profile_request
 from agent.runtime.user_questions import UserQuestionBroker
 from agent.runtime.tools.jobs import person_words, register_jobs_tool
+from agent.runtime.tools.mail import register_mail_tool
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
 from agent.cli.session_lifecycle import ControlledRestart, RESTART_EXIT_CODE
 from agent.runtime.background_completion import BackgroundCompletions, wake_display, wake_prompt
@@ -1387,6 +1388,8 @@ async def _main(startup_started: float):
         }, "required": ["outcome"]}, fn=_report_wakeup, cache_results=False,
     ))
 
+    # The person's own mailbox, read-only (agent/runtime/tools/mail.py).
+    register_mail_tool(tools, project_root=PROJECT_ROOT)
     # Reminders and read-only checks the person schedules; each change is approved by them.
     register_jobs_tool(
         tools, home=state_dir(), workdir=agent._source_tracking_workdir, model_key=lambda: job_model_key(""),

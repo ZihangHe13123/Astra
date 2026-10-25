@@ -20,7 +20,8 @@ astra jobs add project-status --every 3600 --workdir /path/to/project \
 ```
 
 The current configured model is captured at creation. Use `--model KEY` to pick
-another configured model. `--web` explicitly enables existing search/fetch tools.
+another configured model. `--web` explicitly enables existing search/fetch tools, and `--mail` lets the check read the
+configured mailbox (read-only; see [mail](integrations.md#read-only-163-mail)).
 Checks expose file reading/search and time tools, with no shell, writes, memory
 providers, Computer Use, delegates or channel sends. Each execution has a fresh
 session under `ASTRA_HOME/jobs/runs/ID/`, loading project guidance under current

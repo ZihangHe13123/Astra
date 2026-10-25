@@ -374,15 +374,21 @@
   },
   "jobs": {
     "sha256": [
-      "399241fc3e0b6fcc"
+      "f9581c75ca02e17b"
     ],
-    "reason": "2026-10-25: new tool; the model schedules reminders and read-only checks the person asks for, each change approved. targets chooses where results are pushed; quiet sets the quiet hours (onboarding asks for them)."
+    "reason": "2026-10-25: new tool; the model schedules reminders and read-only checks the person asks for, each change approved. targets chooses where results are pushed; quiet sets the quiet hours; mail lets a check read the mailbox."
   },
   "load_workspace_dependencies": {
     "sha256": [
       "b305eb4353a6da67"
     ],
     "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "mail": {
+    "sha256": [
+      "66adf4068775754c"
+    ],
+    "reason": "2026-10-25: new tool; the person's own mailbox, read-only (recent, search, read, status)."
   },
   "memory": {
     "sha256": [

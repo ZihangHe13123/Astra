@@ -207,3 +207,17 @@ def test_real_worker_tells_only_changes_for_an_on_change_check(tmp_path, provide
     assert all(results[run["id"]]["state"] == "completed" for run in (first, second, third))
     assert results[first["id"]]["usage"]["prompt_tokens"] == 41
     assert results[first["id"]]["usage"]["completion_tokens"] == 7
+
+
+def test_real_worker_offers_mail_only_to_a_check_allowed_to_read_it(tmp_path, provider):
+    env = environment(tmp_path / "A", provider)
+    plain = command(env, "add", "plain", "--after", "60", "--model", "fixture", "--workdir", str(tmp_path),
+                    "--prompt", "Any news?", "--request", "Check my project")
+    command(env, "run", plain["id"])
+    assert "mail" not in {tool["function"]["name"] for tool in provider.requests[-1]["body"]["tools"]}
+    mail = command(env, "add", "mail", "--after", "60", "--model", "fixture", "--workdir", str(tmp_path), "--mail",
+                   "--prompt", "Any mail from my professor?", "--request", "Tell me each morning if my professor wrote")
+    assert mail["spec"]["mail"] is True
+    command(env, "run", mail["id"])
+    names = {tool["function"]["name"] for tool in provider.requests[-1]["body"]["tools"]}
+    assert "mail" in names and not names.intersection({"write_file", "execute_shell"})

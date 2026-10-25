@@ -326,3 +326,12 @@ def test_a_jobs_authority_is_the_persons_message_and_answers_never_the_models_te
     ]
     assert person_words(messages) == "/onboard\n每天早上\n看看 Rust 新闻\n也提醒我喝水"
     assert person_words([{"role": "assistant", "content": "nothing from the person"}]) == ""
+
+
+def test_tool_shows_a_check_that_reads_mail_on_its_card(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_TIMEZONE", "Asia/Singapore")
+    registry, asked, _answer = tool(tmp_path, request="每天早上看看导师有没有来邮件")
+    created = call(registry, action="add", name="导师来信", prompt="Any mail from my supervisor?", time="08:00", mail=True)
+    assert created["error"] == "" and json.loads(created["output"])["job"]["mail"] is True
+    assert asked[-1]["target"] == "每天 08:00（Asia/Singapore）；一次只读检查：工作区文件、你的邮件"
+    assert call(registry, action="add", name="x", kind="reminder", prompt="x", time="08:00", mail=True)["error_type"] == "invalid_input"

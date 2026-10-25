@@ -174,7 +174,7 @@ class JobStore:
             workdir: Path, next_at: float | None = None, interval_seconds: float = 0,
             calendar: dict | None = None, notify: str = "always", targets: list[str] | tuple[str, ...] = PUSH_TARGETS,
             grace_seconds: float = 300, kind: str = "check", model: str = "",
-            web: bool = False, idle_seconds: float = 120, timeout_seconds: float = 900,
+            web: bool = False, mail: bool = False, idle_seconds: float = 120, timeout_seconds: float = 900,
             max_iterations: int = 10, now: float | None = None) -> dict:
         now = time.time() if now is None else now
         calendar, next_at = self._schedule(calendar, interval_seconds, next_at, now)
@@ -186,7 +186,7 @@ class JobStore:
         finite(timeout_seconds, idle_seconds, 86400, "Hard budget")
         if type(max_iterations) is not int or not 1 <= max_iterations <= 50:
             raise ValueError("Iterations must be between 1 and 50.")
-        if kind not in {"check", "reminder"} or type(web) is not bool:
+        if kind not in {"check", "reminder"} or type(web) is not bool or type(mail) is not bool:
             raise ValueError("Choose a check or reminder and a boolean network option.")
         fields = ((name, 120), (prompt, 4000), (original_request, 8000))
         if any(not isinstance(value, str) or not value.strip() or len(value) > limit for value, limit in fields):
@@ -196,12 +196,12 @@ class JobStore:
             raise ValueError("The working directory must be a directory.")
         if kind == "check" and (not model.strip() or len(model) > 200):
             raise ValueError("An agent check needs a configured model key.")
-        if kind == "reminder" and (model or web):
-            raise ValueError("A reminder does not use a model or network tools.")
+        if kind == "reminder" and (model or web or mail):
+            raise ValueError("A reminder does not use a model, network tools or mail.")
         spec = {"name": name.strip(), "prompt": prompt.strip(), "original_request": original_request.strip(),
                 "workdir": str(directory), "kind": kind, "model": model, "web": web,
                 "idle_seconds": idle_seconds, "timeout_seconds": timeout_seconds,
-                "max_iterations": max_iterations, "notify": notify, "targets": targets}
+                "max_iterations": max_iterations, "notify": notify, "targets": targets, "mail": mail}
         if calendar:
             spec["calendar"] = calendar
         identity = uuid.uuid4().hex
@@ -269,7 +269,7 @@ class JobStore:
     def update(self, identity: str, *, request: str, name: str | None = None, prompt: str | None = None,
                interval_seconds: float | None = None, calendar: dict | None = None, at: float | None = None,
                notify: str | None = None, web: bool | None = None, targets: list[str] | None = None,
-               now: float | None = None) -> dict:
+               mail: bool | None = None, now: float | None = None) -> dict:
         """Change a job's future runs; ``request`` is the person's words asking for the change."""
         now = time.time() if now is None else now
         if not isinstance(request, str) or not request.strip():
@@ -296,6 +296,10 @@ class JobStore:
                 spec["web"] = web
             if targets is not None:
                 spec["targets"] = _targets(targets)
+            if mail is not None:
+                if type(mail) is not bool or (mail and spec["kind"] == "reminder"):
+                    raise ValueError("A reminder does not read mail.")
+                spec["mail"] = mail
             interval, next_at = row["interval_seconds"], row["next_at"]
             if interval_seconds is not None or calendar is not None or at is not None:
                 interval = interval_seconds or 0

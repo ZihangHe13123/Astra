@@ -332,6 +332,18 @@ WSL selection.
 
 ## Read-only 163 mail
 
+Astra reads the configured mailbox itself with its read-only `mail` tool: recent
+mail (or only unread), search, and one message's text, in any conversation or a
+scheduled check given `--mail`. Mail is treated as outside text, like a web page:
+a memory saved in a turn that read mail needs your approval. Any IMAP account
+works, not only 163: set `ASTRA_MAIL_ADDRESS` and `ASTRA_MAIL_PASSWORD` (an app
+password or authorization code) instead of the 163 names below. Gmail, QQ,
+iCloud and 163/126/yeah are recognised from the address; for another provider
+also set `ASTRA_MAIL_IMAP_HOST` (and `ASTRA_MAIL_IMAP_PORT` or
+`ASTRA_MAIL_SENT_FOLDER` when they differ). A folder's first sync caches its
+newest 300 messages (`ASTRA_MAIL_SYNC_LIMIT`); later syncs fetch what arrived
+since and never older history.
+
 The optional 163 integration incrementally caches mail for local queries. Put
 your account and a 163 client authorization code (not the web password) in the
 repository `.env`:

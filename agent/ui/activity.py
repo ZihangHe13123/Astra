@@ -72,7 +72,8 @@ def jobs_overview(home: Path, *, inbox_limit: int = 50) -> dict[str, Any]:
                 "paused_reason": row["paused_reason"] if "paused_reason" in job_columns else "",
                 "schedule": schedule_text(spec.get("calendar"), row["interval_seconds"], row["next_at"]),
                 "next_at": row["next_at"] if row["state"] == "enabled" else None,
-                "notify": spec.get("notify", "always"), "web": bool(spec.get("web")), "prompt": spec["prompt"],
+                "notify": spec.get("notify", "always"), "web": bool(spec.get("web")), "mail": bool(spec.get("mail")),
+                "prompt": spec["prompt"],
                 "targets": spec.get("targets", list(PUSH_TARGETS)), "last_outcome": row["last_outcome"] or "",
             })
         run_columns = _columns(db, "runs")
