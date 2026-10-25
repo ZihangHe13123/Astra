@@ -261,13 +261,7 @@ async def _prepare_appshot_message(agent, msg, cache):
     preview._project_instructions = copy.deepcopy(agent._project_instructions)
     msg.metadata["appshot_budget_required"] = True
     _, user_index, _, _ = await preview._prepare_turn(msg)
-    transient = [
-        {
-            "role": "system",
-            "content": "[USER STEERING — mid-run correction, authoritative]\n" + text + "\n[END USER STEERING]",
-        }
-        for text in preview._steering
-    ]
+    transient = preview._steering_overlays(str(msg.metadata.get("request_id") or msg.id))
     if preview._verification_required:
         transient.append(
             {

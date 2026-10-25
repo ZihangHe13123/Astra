@@ -330,8 +330,9 @@ class ReActAgent(AgentBase):
         self._request_local_tool_context_ids: set[str] = set()
         self._user_question_answers: dict[str, tuple[str, str, str]] = {}
         self._consumed_user_question_answers: set[str] = set()
-        self._steering: list[str] = []
-        self._steering_seen: set[str] = set()  # texts already queued this task
+        # (request id, text): steering belongs to the one turn it was sent into.
+        self._steering: list[tuple[str, str]] = []
+        self._steering_seen: set[tuple[str, str]] = set()  # queued during that turn
         self._memory_turn_key = ""
         self._turn_context_key = ""
         self._turn_context_block = ""
@@ -476,23 +477,54 @@ class ReActAgent(AgentBase):
         if hasattr(self, "skill_store") and hasattr(self.context, "set_stable_system_suffix"):
             self._refresh_skill_catalog()
 
-    def queue_steering(self, text: str) -> None:
-        """Inject a steering message into the running ReAct loop.
+    def queue_steering(self, text: str, *, request_id: str) -> bool:
+        """Inject a steering message into the running turn ``request_id``.
 
-        Picked up at the start of the next iteration as a transient system
-        instruction (never persisted to conversation history).  Thread-safe:
-        ``list.append`` is atomic under CPython's GIL, and the loop drains
-        with ``list()`` + ``clear()`` on the single event-loop thread.
+        That turn picks it up at the start of its next iteration as a
+        transient system instruction (never persisted to conversation
+        history). Another turn using this agent, such as a channel's,
+        never sees it. Call on the event-loop thread.
 
-        Duplicate suppression: identical text is dropped for the entire
-        task lifetime (guards against TUI re-render / terminal echo
-        re-sending the same steering text across multiple iterations).
-        The seen-set is cleared when the task ends (reset_conversation).
+        Duplicate suppression: identical text is dropped for the rest of
+        the turn (guards against TUI re-render / terminal echo re-sending
+        the same steering text across iterations); returns False then.
+        ``take_undelivered_steering`` ends the turn's steering.
         """
-        if text in self._steering_seen:
-            return
-        self._steering_seen.add(text)
-        self._steering.append(text)
+        key = (request_id, text)
+        if key in self._steering_seen:
+            return False
+        self._steering_seen.add(key)
+        self._steering.append(key)
+        return True
+
+    def take_undelivered_steering(self, request_id: str) -> list[str]:
+        """End a turn's steering; return, in order, what its model never saw.
+
+        A turn reads steering only when an iteration starts, so text sent
+        during its last model call is still here when it ends. The caller
+        decides what happens to it; it never reaches a later request.
+        """
+        undelivered = [text for owner, text in self._steering if owner == request_id]
+        self._steering[:] = [item for item in self._steering if item[0] != request_id]
+        self._steering_seen = {item for item in self._steering_seen if item[0] != request_id}
+        return undelivered
+
+    def _steering_overlays(self, request_id: str, *, take: bool = False) -> list[dict]:
+        """Transient system messages for the steering queued into one turn."""
+        texts = [text for owner, text in self._steering if owner == request_id]
+        if take and texts:
+            self._steering[:] = [item for item in self._steering if item[0] != request_id]
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "[USER STEERING — mid-run correction, authoritative]\n"
+                    f"{text}\n"
+                    "[END USER STEERING]"
+                ),
+            }
+            for text in texts
+        ]
 
     def queue_user_question_answer(self, request_id: str, text: str, *, session_scope: str = "", task_id: str = "") -> None:
         """Queue a correlated user answer until a complete tool step can admit it."""
@@ -3918,18 +3950,7 @@ class ReActAgent(AgentBase):
                 for question_request_id, _ in question_answers:
                     self._consumed_user_question_answers.add(question_request_id)
                     self._user_question_answers.pop(question_request_id, None)
-            if self._steering:
-                steering_texts = list(self._steering)
-                self._steering.clear()
-                for steering_text in steering_texts:
-                    transient_messages.append({
-                        "role": "system",
-                        "content": (
-                            "[USER STEERING — mid-run correction, authoritative]\n"
-                            f"{steering_text}\n"
-                            "[END USER STEERING]"
-                        ),
-                    })
+            transient_messages.extend(self._steering_overlays(str(request_id), take=True))
             if recovery_overlay:
                 transient_messages.append({
                     "role": "system",
