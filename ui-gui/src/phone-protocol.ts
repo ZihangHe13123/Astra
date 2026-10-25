@@ -4,7 +4,7 @@
  */
 
 /** Calls the desktop answers for a phone; everything else in the bridge is handled on the phone. */
-export const PHONE_INVOKE_METHODS = ["bootstrap", "create", "close", "send", "query", "deleteSession", "jobs"] as const;
+export const PHONE_INVOKE_METHODS = ["bootstrap", "create", "close", "send", "query", "deleteSession", "jobs", "memory"] as const;
 export type PhoneInvokeMethod = typeof PHONE_INVOKE_METHODS[number];
 
 /** Desktop preferences a phone shows but keeps its own copy of: names and pins of saved sessions. */

@@ -4,7 +4,7 @@
 
 Astra keeps a small core memory, searchable history and reusable skills. Each has a different purpose and lifecycle.
 
-[Core memory and task state](#core-memory-and-task-state) · [On-demand history and learned skills](#on-demand-history-and-learned-skills) · [Memory commands](#memory-commands) · [Proactive Context Index](#proactive-context-index) · [Evaluating memory](#evaluating-memory) · [Importing Hermes history](#importing-hermes-history) · [Optional Hindsight service](#optional-hindsight-service)
+[Core memory and task state](#core-memory-and-task-state) · [On-demand history and learned skills](#on-demand-history-and-learned-skills) · [The memory page](#the-memory-page) · [Memory commands](#memory-commands) · [Proactive Context Index](#proactive-context-index) · [Evaluating memory](#evaluating-memory) · [Importing Hermes history](#importing-hermes-history) · [Optional Hindsight service](#optional-hindsight-service)
 
 ## Core memory and task state
 
@@ -156,6 +156,18 @@ Reusable procedures use the skill library. Only its catalog is injected;
 user-added skills have separate ownership. `/learn review` starts a read-only discussion of the next automatic-skill batch;
 user-selected edits and optional execution checks happen on a subsequent turn. See [skill learning](skill-learning.md) for migration,
 cursor progress, protections and undo.
+
+## The memory page
+
+In the desktop app, **记忆** in the sidebar shows what Astra keeps about you. The two
+core files, **关于你** (`USER.md`) and **长期笔记** (`MEMORY.md`), are listed entry by entry
+with how full each is; edit, remove or add an entry there. Saved memories follow, newest
+first, each with its kind, date, how often it was used and the conversation it came
+from; correct one (the old text is kept as a superseded version) or forget it (it is no
+longer used, and stays readable under **显示旧版本和已忘记的**). Consolidation proposals
+wait at the end with the message each rests on, to accept or dismiss. These changes are
+your own and need no approval; they take effect from the next turn. Deleting a
+conversation does not remove the memories saved from it; forget them here.
 
 ## Memory commands
 

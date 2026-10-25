@@ -21,6 +21,8 @@ export interface DesktopBridge {
   query(method: string, params?: Record<string, unknown>, runtime?: string): Promise<any>;
   /** The person's change to a scheduled job (pause, resume, remove, run, read) or to the quiet hours. */
   jobs(action: "pause" | "resume" | "remove" | "run" | "read" | "quiet", value?: string, extra?: string): Promise<any>;
+  /** The person's change to their memory: core entries (add, edit, remove), saved memories (forget, correct), proposals. */
+  memory(action: "core-add" | "core-edit" | "core-remove" | "forget" | "correct" | "accept" | "dismiss", ...values: string[]): Promise<string>;
   preferences(value: Partial<Preferences>): Promise<Preferences>;
   flushPreferences(value: Partial<Preferences>): void;
   choose(kind: "files" | "folder"): Promise<string[]>;

@@ -233,7 +233,7 @@ register("appshot", async (id, action, value = "") => {
   } else rt.accept({ type: "gui_notice", message: await appshot.command(rt.id, value) });
 });
 function runQuery(method: any, params: any = {}, id?: unknown) {
-  if (!["sessions", "history", "commands", "changes", "request_timeline", "session_log", "jobs", "activity"].includes(method)) throw new Error("Unsupported query");
+  if (!["sessions", "history", "commands", "changes", "request_timeline", "session_log", "jobs", "activity", "memory"].includes(method)) throw new Error("Unsupported query");
   if (!params || typeof params !== "object" || Array.isArray(params) || JSON.stringify(params).length > 32768) throw new Error("Invalid query");
   return method === "changes" ? runtime(id).query(method, params) : queries.query(method, params);
 }
@@ -257,6 +257,21 @@ function runJobs(action: unknown, value?: unknown, extra?: unknown): Promise<unk
     (error, stdout, stderr) => error ? fail(new Error(String(stderr).trim().split("\n").at(-1) || error.message)) : done(JSON.parse(stdout || "null"))));
 }
 register("jobs", runJobs);
+/** The person's own change to their memory, from the memory page: no approval, it is theirs. */
+function runMemory(action: unknown, ...values: unknown[]): Promise<unknown> {
+  const allowed: Record<string, number> = { "core-add": 2, "core-edit": 3, "core-remove": 1, forget: 1, correct: 2, accept: 1, dismiss: 1 };
+  const name = checkedString(action, "action", 20);
+  if (!(name in allowed) || values.length !== allowed[name]) throw new Error("Unsupported memory change");
+  const args = values.map(value => checkedString(value, "memory", 4000));
+  return new Promise((done, fail) => execFile(python, ["-m", "agent.ui.memory_page", name, ...args],
+    { cwd: root, env: process.env, timeout: 30_000, windowsHide: true, encoding: "utf8" },
+    (_error, stdout) => {
+      let result: { ok?: boolean; message?: string; error?: string } = {};
+      try { result = JSON.parse(String(stdout).trim().split("\n").at(-1) || "{}"); } catch { /* reported below */ }
+      result.ok ? done(result.message) : fail(new Error(result.error || "记忆没有改成功。"));
+    }));
+}
+register("memory", runMemory);
 const sessionOperations = new Set<string>();
 async function runSessionAction(action: any, entry: any) {
   if (!["export", "delete"].includes(action) || !entry || typeof entry !== "object") throw new Error("Invalid session action");
@@ -305,6 +320,7 @@ async function phoneInvoke(device: string, method: PhoneInvokeMethod, args: any[
   if (method === "create") return openSession(args[0] ?? {}, false);
   if (method === "query") return runQuery(args[0], args[1], args[2]);
   if (method === "jobs") { phoneAudit(device, { method, action: String(args[0]).slice(0, 20) }); return runJobs(args[0], args[1], args[2]); }
+  if (method === "memory") { phoneAudit(device, { method, action: String(args[0]).slice(0, 20) }); return runMemory(args[0], ...args.slice(1)); }
   if (method === "close") { phoneAudit(device, { method, runtime: String(args[0]) }); return closeSession(args[0]); }
   if (method === "deleteSession") { phoneAudit(device, { method, session: args[0]?.name, mode: args[0]?.mode }); return runSessionAction("delete", args[0]); }
   const rt = runtime(args[0]); const command = checkedCommand(args[1]);

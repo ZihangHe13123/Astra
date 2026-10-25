@@ -156,6 +156,9 @@ def query(request: dict, *, agent=None) -> object:
         from agent.runtime.paths import state_dir
         from agent.ui.activity import activity
         return activity(state_dir(), days=int(params.get("days", 7)))
+    if method == "memory":
+        from agent.ui.memory_page import memory_overview
+        return memory_overview(history=bool(params.get("history")))
     if method == "changes" and agent is not None:
         return changes(agent, int(params.get("turn", 1)), params.get("index"), source=params.get("source"))
     raise ValueError("Unknown UI query")

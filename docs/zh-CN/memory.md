@@ -2,7 +2,7 @@
 
 [首页](../../README.zh-CN.md) · [文档导航](README.md) · [English](../memory.md)
 
-[核心记忆与任务状态](#core-memory-and-task-state) · [按需历史与自动技能](#on-demand-history-and-learned-skills) · [记忆命令](#memory-commands) · [主动 Context Index](#proactive-context-index) · [评测记忆](#evaluating-memory) · [导入 Hermes 历史](#importing-hermes-history) · [可选 Hindsight 服务](#optional-hindsight-service)
+[核心记忆与任务状态](#core-memory-and-task-state) · [按需历史与自动技能](#on-demand-history-and-learned-skills) · [记忆页](#the-memory-page) · [记忆命令](#memory-commands) · [主动 Context Index](#proactive-context-index) · [评测记忆](#evaluating-memory) · [导入 Hermes 历史](#importing-hermes-history) · [可选 Hindsight 服务](#optional-hindsight-service)
 
 Astra 分别维护少量核心记忆、可检索历史和可复用技能，三者用途和生命周期不同。
 
@@ -41,6 +41,17 @@ Hindsight 是搜索的可选附加来源，它的内容不会被自动加进某�
 模型可用 `session_search` 查找相关的旧对话、修复和环境观察。关掉终端后档案仍存在，不复制进始终可见的记忆。过滤、展开与过时证据处理见[本地历史检索](local-history-retrieval.md)。
 
 可复用方法进入技能库，提示只带目录，`skill_view` 按需读全文。模型总结与用户技能归属分开，`/learn review` 手动检查下一批自动技能，不审用户技能，也不执行其中流程。迁移、游标、保护和撤销见[技能学习](skill-learning.md)。
+
+<a id="the-memory-page"></a>
+
+## 记忆页
+
+桌面端侧栏的 **记忆** 显示 Astra 记着的关于你的内容。两份核心记忆 **关于你**（`USER.md`）和
+**长期笔记**（`MEMORY.md`）逐条列出，并显示已用容量，可以编辑、删除或添加。下面是已保存的记忆，
+新的在前，每条显示类型、日期、用到过几次和来自哪次对话；可以改正（旧内容作为被替换的版本保留）
+或忘记（以后不再使用，勾选 **显示旧版本和已忘记的** 仍能看到）。最后是待确认的整理建议，附上依据的
+那句话，可以采纳或不用。这些是你自己的改动，不需要批准，从下一轮对话起生效。删除一段对话不会删除
+从中记下的记忆，要在这里忘记它。
 
 <a id="memory-commands"></a>
 
