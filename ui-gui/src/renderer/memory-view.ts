@@ -63,3 +63,21 @@ const ACTIONS: Record<string, string> = { remember: "记住", revise: "更新", 
 export function proposalLabel(proposal: Proposal) {
   return ACTIONS[proposal.action] || proposal.action;
 }
+
+/** What `astra data plan` lists: each place export and wipe act on, and what stays. */
+export type DataItem = { key: string; label: string; path: string; present: boolean; bytes: number; export: boolean; browser: boolean };
+export type DataPlan = { items: DataItem[]; not_exported: string[]; kept: string[]; confirmation: string };
+
+export function sizeLabel(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`;
+  const units = ["KB", "MB", "GB"];
+  let value = bytes / 1024, unit = 0;
+  while (value >= 1024 && unit < units.length - 1) { value /= 1024; unit++; }
+  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
+}
+
+/** What a wipe would delete, by name, once each, with the total size; browser logins only when chosen. */
+export function wipeSummary(plan: DataPlan, browserData: boolean) {
+  const items = plan.items.filter(item => item.present && (browserData || !item.browser));
+  return { labels: [...new Set(items.map(item => item.label))], size: sizeLabel(items.reduce((sum, item) => sum + item.bytes, 0)) };
+}

@@ -81,3 +81,16 @@ test("an active scheduled job also keeps the background backend, with no channel
   await host.check();
   assert.ok(backends[0].closed && !host.running, "nothing left to run or push: the backend closes");
 });
+
+test("a host stopped for a wipe watches again when resumed", async () => {
+  const { config, backends, host, later } = fixture();
+  writeFileSync(config, '{"weixin": {"enabled": true}}');
+  await host.check();
+  await host.stop();
+  assert.ok(backends[0].closed && !host.running);
+  host.resume();
+  await host.check();
+  assert.equal(backends.length, 2, "started again at once, without waiting out the retry interval");
+  later(60_000);
+  await host.stop();
+});

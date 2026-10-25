@@ -546,6 +546,8 @@ html[data-remote=phone] :is(.composer-foot, .approval-keys, .nav-button kbd, .ne
 .memory-row.inactive { opacity:.7; }
 .memory-row textarea { width:100%; resize:vertical; }
 .memory-actions, .memory-add, .memory-filter { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.data-wipe { border:1px solid var(--error); border-radius:var(--r-2); padding:10px 12px; display:flex; flex-direction:column; gap:8px; }
+.data-wipe p { margin:0; }
 .memory-add input, .memory-filter input { flex:1; min-width:200px; }
 .memory-room { height:6px; border-radius:3px; background:var(--soft); overflow:hidden; }
 .memory-room span { display:block; height:100%; background:var(--accent); }

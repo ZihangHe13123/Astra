@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { coreRoom, filterMemories, kindLabel, proposalLabel, statusLabel, usedLabel, type CoreFile, type SavedMemory }
-  from "../src/renderer/memory-view.js";
+import { coreRoom, filterMemories, kindLabel, proposalLabel, sizeLabel, statusLabel, usedLabel, wipeSummary, type CoreFile,
+  type DataPlan, type SavedMemory } from "../src/renderer/memory-view.js";
 
 const memory = (fields: Partial<SavedMemory>) => ({ id: "m", summary: "喜欢简短的回答", content: "回答尽量简短", kind: "preference",
   status: "active", scope: "global", saved_by_astra: true, created_at: "2026-10-25T08:00:00", valid_until: "", supersedes: "",
@@ -29,4 +29,20 @@ test("the filter matches summaries, full text and kinds", () => {
   assert.deepEqual(filterMemories(memories, "简短").map(item => item.id), ["a"]);
   assert.deepEqual(filterMemories(memories, "关于你").map(item => item.id), ["b"]);
   assert.equal(filterMemories(memories, "  ").length, 2);
+});
+
+test("sizes read in the unit that fits", () => {
+  assert.deepEqual([0, 900, 2048, 5 * 1024 * 1024 + 1, 300 * 1024 * 1024, 3 * 1024 ** 3].map(sizeLabel),
+    ["0 B", "900 B", "2.0 KB", "5.0 MB", "300 MB", "3.0 GB"]);
+});
+
+test("a wipe lists what is there once each, and browser logins only when chosen", () => {
+  const item = (key: string, label: string, bytes: number, fields = {}) =>
+    ({ key, label, path: `/x/${key}`, present: true, bytes, export: true, browser: false, ...fields });
+  const plan: DataPlan = { confirmation: "清除", kept: [], not_exported: [], items: [
+    item("memory", "已保存的记忆", 1024), item("vectors:a", "对话的向量索引", 512), item("vectors:b", "对话的向量索引", 512),
+    item("tasks", "任务和步骤记录", 0, { present: false }), item("browser-profiles", "Astra 浏览器的登录和 Cookie", 1024, { browser: true }),
+  ] };
+  assert.deepEqual(wipeSummary(plan, false), { labels: ["已保存的记忆", "对话的向量索引"], size: "2.0 KB" });
+  assert.deepEqual(wipeSummary(plan, true).labels.at(-1), "Astra 浏览器的登录和 Cookie");
 });

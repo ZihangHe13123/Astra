@@ -58,6 +58,10 @@ def parser() -> argparse.ArgumentParser:
     jobs = commands.add_parser("jobs", help="Manage persistent reminders and read-only scheduled checks", add_help=False)
     jobs.add_argument("-h", "--help", action="store_true", dest="jobs_help")
     jobs.add_argument("args", nargs=argparse.REMAINDER)
+    data = commands.add_parser("data", help="Export or wipe your own Astra data (memories, conversations, jobs, "
+                               "learned skills)", add_help=False)
+    data.add_argument("-h", "--help", action="store_true", dest="data_help")
+    data.add_argument("args", nargs=argparse.REMAINDER)
     auth = commands.add_parser("auth", help="Manage Astra's ChatGPT / Codex subscription login")
     auth.add_argument("action", choices=("login", "status", "logout"), nargs="?", default="status")
     browser = commands.add_parser("browser-control", help="Manage the opt-in Edge/Chrome native host (Windows/macOS)")
@@ -202,6 +206,10 @@ def main(argv: list[str] | None = None, *, root: Path | None = None) -> int:
         if command == "jobs":
             job_args = ["--help"] if options.jobs_help else options.args
             return subprocess.run([str(install.python), "-m", "agent.cli.jobs_commands", *job_args],
+                cwd=install.root, env=runtime_environment(install, Path.cwd()), check=False).returncode
+        if command == "data":
+            data_args = ["--help"] if options.data_help else options.args
+            return subprocess.run([str(install.python), "-m", "agent.cli.data_commands", *data_args],
                 cwd=install.root, env=runtime_environment(install, Path.cwd()), check=False).returncode
         if command in {"setup", "update"}:
             if options.setup_only:

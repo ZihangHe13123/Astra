@@ -1,6 +1,6 @@
 import React from "react";
-import { CORE_TITLES, coreRoom, dateLabel, filterMemories, kindLabel, proposalLabel, statusLabel, usedLabel,
-  type CoreEntry, type CoreFile, type MemoryOverview, type SavedMemory } from "./memory-view.js";
+import { CORE_TITLES, coreRoom, dateLabel, filterMemories, kindLabel, proposalLabel, sizeLabel, statusLabel, usedLabel,
+  wipeSummary, type CoreEntry, type CoreFile, type DataPlan, type MemoryOverview, type SavedMemory } from "./memory-view.js";
 
 type Change = Parameters<typeof window.astra.memory>[0];
 
@@ -72,6 +72,59 @@ function SavedRow({ memory, busy, change }: { memory: SavedMemory; busy: boolean
 }
 
 /**
+ * The person's whole data: export it as a zip, or wipe it once they have read what goes and typed the word.
+ * A wipe closes every conversation first, so the window reloads afterwards.
+ */
+function DataSection({ fail }: { fail: (error: unknown) => void }) {
+  const [plan, setPlan] = React.useState<DataPlan>();
+  const [typed, setTyped] = React.useState("");
+  const [browserData, setBrowserData] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const [notice, setNotice] = React.useState("");
+  const exportAll = async () => {
+    setBusy(true); setNotice("");
+    try {
+      const result = await window.astra.data("export");
+      if (!result?.cancelled) setNotice(`已导出到 ${result.path}（${sizeLabel(result.bytes)}）。`);
+    } catch (error) { fail(error); }
+    finally { setBusy(false); }
+  };
+  const openWipe = async () => {
+    setBusy(true);
+    try { setPlan(await window.astra.data("plan") as DataPlan); } catch (error) { fail(error); }
+    finally { setBusy(false); }
+  };
+  const close = () => { setPlan(undefined); setTyped(""); setBrowserData(false); };
+  const wipe = async () => {
+    setBusy(true);
+    // On success the desktop reloads this window; it stays busy until then.
+    try { await window.astra.data("wipe", typed, browserData); }
+    catch (error) { fail(error); setBusy(false); }
+  };
+  const summary = plan && wipeSummary(plan, browserData);
+  return <section className="memory-data">
+    <h3>你的数据</h3>
+    <p className="muted small">导出成一个 zip：核心记忆、已保存的记忆、对话记录、定时任务和学到的技能。不含密钥、登录和设置。</p>
+    {notice && <p className="small" role="status">{notice}</p>}
+    <div className="memory-actions">
+      <button disabled={busy} onClick={() => { void exportAll(); }}>导出…</button>
+      {!plan && <button disabled={busy} onClick={() => { void openWipe(); }}>清除…</button>}
+    </div>
+    {plan && summary && <div className="data-wipe" role="group" aria-label="清除数据">
+      <p className="small"><strong>会永久删除（{summary.size}）：</strong>{summary.labels.join("、") || "没有可删除的数据"}。删除后无法恢复，建议先导出。</p>
+      <p className="muted small">保留：{plan.kept.join("、")}。</p>
+      <label className="activity-toggle small"><input type="checkbox" checked={browserData} onChange={event => setBrowserData(event.target.checked)}/> 同时清除 Astra 浏览器里的登录和 Cookie</label>
+      <p className="muted small">清除时会先关掉所有对话和后台任务，完成后窗口重新载入。</p>
+      <div className="memory-actions">
+        <input aria-label="输入清除两个字确认" placeholder={`输入「${plan.confirmation}」确认`} value={typed} onChange={event => setTyped(event.target.value)}/>
+        <button className="danger" disabled={busy || typed !== plan.confirmation} onClick={() => { void wipe(); }}>永久清除</button>
+        <button disabled={busy} onClick={close}>取消</button>
+      </div>
+    </div>}
+  </section>;
+}
+
+/**
  * What Astra keeps about the person: the two core files (always in every conversation), saved memories
  * (an index is always visible, the text is read when needed) and consolidation proposals. Changes here are
  * the person's own and need no approval.
@@ -117,5 +170,6 @@ export function MemoryPanel({ fail }: { fail: (error: unknown) => void }) {
         </div>
       </li>)}</ul>
     </section>}
+    {!window.astra.remote && <DataSection fail={fail}/>}
   </div>;
 }

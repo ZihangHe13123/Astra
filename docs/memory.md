@@ -175,6 +175,21 @@ replies, what you would like it to do on its own, and where to reach you, shows 
 after you confirm saves the lines to USER.md, sets the quiet hours and offers scheduled jobs, each
 of which you approve. Run it again any time.
 
+### Exporting or wiping your data
+
+**你的数据** at the end of the memory page saves everything Astra keeps about you as one zip:
+the two core files, saved memories, conversations and their search index, scheduled jobs and
+their results, and learned skills. It never includes `.env` or other keys, provider
+connections, the WeChat login, browser logins or settings. **清除…** lists what a wipe would
+delete and what stays, and deletes only after you type 清除: the same data plus every copy made
+from it (search and vector indexes, task, event and approval records, the desktop's history cache
+and pasted images). Logins in Astra's own browser go only if you tick that box. Settings,
+models, keys, the WeChat login, the mail cache and activity history stay, and a Hindsight server
+keeps its own memories. The desktop closes every conversation and its background host first and
+reloads afterwards. In a terminal the same is `astra data plan`, `astra data export --out
+FILE.zip` and `astra data wipe --confirm 清除 [--browser-data]`; a wipe refuses while any other
+Astra runs. In a source checkout, files tracked by git (such as bundled skills) are never deleted.
+
 ## Memory commands
 
 ```text

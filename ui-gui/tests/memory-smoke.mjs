@@ -2,7 +2,7 @@
 // saved memories, and the person's edits, additions and forgets reach the stores the agent reads.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -66,6 +66,34 @@ try {
   await dialog.getByLabel('显示旧版本和已忘记的').check();
   await dialog.locator('.memory-row.saved', { hasText: '养了一只猫' }).getByText('已忘记').waitFor();
   console.log('PASS forgetting a saved memory takes it out of use and keeps it in the history');
+
+  // The save dialog and Finder are the system's; the smoke answers for them in the main process.
+  const archive = join(folder, 'export.zip');
+  await app.evaluate(({ dialog, shell }, path) => {
+    dialog.showSaveDialog = async () => ({ canceled: false, filePath: path });
+    shell.showItemInFolder = () => {};
+  }, archive);
+  await dialog.getByRole('button', { name: '导出…' }).click();
+  await dialog.getByText(/已导出到 .*export\.zip/).waitFor({ timeout: 30000 });
+  const listed = run(`import zipfile\nprint("\\n".join(zipfile.ZipFile(${JSON.stringify(archive)}).namelist()))`).split('\n');
+  assert.ok(listed.includes('astra-export/core-user/USER.md') && listed.includes('astra-export/memory/memory.db'));
+  assert.ok(!listed.some(name => name.includes('.env') || name.includes('settings.json')));
+  console.log('PASS export writes one zip with the memories and no settings or secrets');
+
+  writeFileSync(join(folder, 'settings.json'), '{}');
+  await dialog.getByRole('button', { name: '清除…' }).click();
+  const wipe = dialog.getByRole('group', { name: '清除数据' });
+  assert.match(await wipe.innerText(), /会永久删除[\s\S]*核心记忆[\s\S]*保留：设置和模型/);
+  await wipe.getByLabel('输入清除两个字确认').fill('清楚');
+  assert.equal(await wipe.getByRole('button', { name: '永久清除' }).isDisabled(), true);
+  await wipe.getByLabel('输入清除两个字确认').fill('清除');
+  await Promise.all([page.waitForEvent('load', { timeout: 60000 }), wipe.getByRole('button', { name: '永久清除' }).click()]);
+  assert.deepEqual(core(), []);
+  assert.deepEqual(active(), []);
+  assert.ok(existsSync(join(folder, 'settings.json')) && existsSync(join(folder, '.env')));
+  await page.getByRole('button', { name: '记忆', exact: true }).click();
+  await page.getByRole('dialog', { name: '记忆' }).getByText('还没有保存的记忆。').waitFor();
+  console.log('PASS wiping after typing 清除 empties the memories, keeps settings, and the window comes back');
   assert.deepEqual(errors, []);
 } finally {
   if (app) await app.close().catch(() => {});

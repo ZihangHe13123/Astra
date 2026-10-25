@@ -67,6 +67,14 @@ export class ChannelHost {
     } finally { this.checking = false; }
   }
 
+  /** Watches again after stop(), as after the desktop wiped the data the host was using. */
+  resume() {
+    if (!this.stopped) return;
+    this.stopped = false;
+    this.startedAt = -Infinity;
+    this.start();
+  }
+
   async stop() {
     this.stopped = true;
     clearInterval(this.timer);
