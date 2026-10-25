@@ -99,6 +99,10 @@ def job_model_key(selected: str) -> str:
 
 
 def _with_times(job: dict) -> None:
+    if job["spec"].get("trigger"):
+        # An event starts it; its stored time is a far-future sentinel that Windows cannot even format.
+        job["next_at_utc"] = None
+        return
     job["next_at_utc"] = datetime.fromtimestamp(job["next_at"], timezone.utc).isoformat()
     calendar = job["spec"].get("calendar")
     if calendar:

@@ -176,5 +176,9 @@ def test_the_tool_and_command_line_start_jobs_on_events(tmp_path, monkeypatch):
                                          home=tmp_path / "home", workdir=tmp_path)
     assert error == "" and json.loads(output)["spec"]["trigger"] == {"type": "mail", "from": "", "subject": "deadline",
                                                                       "folder": "INBOX"}
+    # No time of its own: nothing formats the far-future sentinel, which Windows cannot represent.
+    assert json.loads(output)["next_at_utc"] is None
+    listed = json.loads(execute_jobs_command(["list"], home=tmp_path / "home", workdir=tmp_path)[0])
+    assert {job["next_at_utc"] for job in listed if job["spec"].get("trigger")} == {None}
     assert execute_jobs_command(["add", "x", "--reminder", "--prompt", "x", "--on-new-file", "*", "--time", "08:00"],
                                 home=tmp_path / "home", workdir=tmp_path)[1]
