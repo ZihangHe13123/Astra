@@ -572,12 +572,12 @@ class JobStore:
                 f"Paused after {FAILURES_BEFORE_PAUSE} failed runs in a row; resume it once the cause is fixed. ",
                 run_id))
 
-    def deliver_pending(self) -> int:
-        """Move finished results into the local inbox, and queue their pushes, in one transaction."""
+    def deliver_pending(self, *, now: float | None = None) -> int:
+        """Move finished results into the local inbox, and queue their pushes (due at ``now``), in one transaction."""
+        now = time.time() if now is None else now
         with self.transaction() as db:
             pending = db.execute("SELECT runs.* FROM deliveries JOIN runs ON runs.id=deliveries.run_id "
                                  "WHERE deliveries.state='pending'").fetchall()
-            now = time.time()
             for run in pending:
                 db.execute("INSERT OR IGNORE INTO inbox (run_id,received_at) VALUES (?,?)", (run["id"], now))
                 db.execute("UPDATE deliveries SET state='delivered',delivered_at=? WHERE run_id=?", (now, run["id"]))
