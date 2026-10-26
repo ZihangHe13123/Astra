@@ -14,7 +14,7 @@ import { projectFolder } from "./conversation-folder.js";
 import { Attention, type AttentionNotice } from "./attention.js";
 import { QueryClient } from "./query-client.js";
 import { sessionAction } from "./session-actions.js";
-import { hasOngoingWork } from "./ongoing-work.js";
+import { hasOngoingWork, holdsUp } from "./ongoing-work.js";
 import { QuitCoordinator, type QuitReason } from "./quit.js";
 import { PreferenceWriter } from "./preferences.js";
 import { DocumentPreviewService, sourceVersion } from "./file-preview.js";
@@ -376,7 +376,7 @@ async function runData(action: unknown, confirmation?: unknown, browserData?: un
   if (action !== "wipe") throw new Error("Unsupported data action");
   if (confirmation !== "清除") throw new Error("请输入「清除」确认。");
   if (wiping) throw new Error("正在清除，请稍候。");
-  if ([...runtimes.values()].some(rt => hasOngoingWork(rt.state))) throw new Error("还有对话在运行任务或等你回答，请先停止它们。");
+  if ([...runtimes.values()].some(rt => holdsUp(rt.state))) throw new Error("还有对话在运行任务或等你回答，请先停止它们。");
   wiping = true;
   try {
     // Nothing of Astra's may hold the data open: every session, the background host and the query helper close first.
@@ -590,7 +590,7 @@ async function performQuit() {
   app.quit();
 }
 const quitCoordinator = new QuitCoordinator({
-  inspect: () => [...runtimes.values()].some(r => hasOngoingWork(r.state)),
+  inspect: () => [...runtimes.values()].some(r => holdsUp(r.state)),
   confirm: async reason => {
     const background = reason === "window";
     const options: Electron.MessageBoxOptions = { type: "question", message: "仍有任务或会话提醒在运行",

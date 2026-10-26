@@ -12,3 +12,13 @@ export function hasOngoingWork(state: SessionState): boolean {
     || Object.values(state.teams).some(team => !["completed", "cancelled", "failed", "stopped"].includes(team.status))
     || ["scheduled", "running", "active"].includes(state.info.wakeup_status?.plan?.state);
 }
+
+/**
+ * Whether quitting or wiping the data must wait for this session. The personal thread is the background
+ * host's, which starts and restarts it on its own: while it is only starting it holds nothing up, though
+ * work of its own (a reply, an approval waiting) still does.
+ */
+export function holdsUp(state: SessionState): boolean {
+  if (state.personal && state.status !== "ready" && state.status !== "disconnected") return false;
+  return hasOngoingWork(state);
+}
