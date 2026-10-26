@@ -1,6 +1,6 @@
 import React, { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { useTheme } from "./theme-context.js";
-import { RotateCcw, FileText } from "lucide-react";
+import { RotateCcw, FileText, AlarmClock, ChevronRight, Sparkles, Wrench } from "lucide-react";
 import type { Message, TurnChangeNote, UIEvent } from "@astra/ui-core/session-state";
 import { withActivity, type Row } from "./activity-state.js";
 import { Activity, TurnChanges } from "./activity.js";
@@ -11,21 +11,49 @@ import { CopyButton } from "./copy-button.js";
 import { changeSource, type ChangeSource } from "./change-navigation.js";
 import { responseForMessage, ResponseVersionNav, type ResponseControls } from "./response-versions.js";
 import { Markdown } from "./markdown.js";
+import { activitySummary, chatRows, jobResult } from "./chat-view.js";
 
 /** Open a side panel from the conversation; for the tools panel, at the call with this result number. */
 export type OpenPanel = (panel: "tools" | "changes", resultIndex?: number, source?: ChangeSource) => void;
 export { Markdown } from "./markdown.js";
 
-export const MessageRow = memo(function MessageRow({ message: m, runtime, timeline, reasoning, expanded, responses, fail, openLog, located, openPanel }: {
-  message: Row; openPanel?: OpenPanel; runtime?: string; timeline: boolean; reasoning: boolean; expanded: Map<string, boolean>; responses?: ResponseControls; fail: (e: unknown) => void; openLog?: (source: SourceRef) => void; located?: boolean;
+/** In the chat, a step's tool calls are one line; it opens to the usual list. */
+function ChatActivity({ tools, open, toggle, openDetails }: { tools: UIEvent[]; open: boolean; toggle: () => void; openDetails?: (tool: UIEvent) => void }) {
+  return <div className="chat-activity">
+    <button type="button" className="chat-activity-line" aria-expanded={open} onClick={toggle}><Wrench size={13}/>{activitySummary(tools)}<ChevronRight size={13} className={open ? "turned" : ""}/></button>
+    {open && <Activity tools={tools} openDetails={openDetails}/>}
+  </div>;
+}
+
+/** A scheduled job's result in the chat: a card naming the job, its text shortened until opened. */
+function JobCard({ title, body, open, toggle, runtime, fail }: { title: string; body: string; open: boolean; toggle: () => void; runtime?: string; fail: (e: unknown) => void }) {
+  const long = body.length > 280 || body.split("\n").length > 8;
+  return <div className="job-card-body">
+    <div className="job-card-title"><AlarmClock size={13}/>{title}</div>
+    <div className={`message-body${long && !open ? " clamped" : ""}`}><Markdown text={body} runtime={runtime} fail={fail}/></div>
+    {long && <button type="button" className="text-button small" onClick={toggle}>{open ? "收起" : "展开全文"}</button>}
+  </div>;
+}
+
+export const MessageRow = memo(function MessageRow({ message: m, runtime, timeline, reasoning, expanded, responses, fail, openLog, located, openPanel, chat }: {
+  message: Row; openPanel?: OpenPanel; runtime?: string; timeline: boolean; reasoning: boolean; expanded: Map<string, boolean>; responses?: ResponseControls; fail: (e: unknown) => void; openLog?: (source: SourceRef) => void; located?: boolean; chat?: boolean;
 }) {
   const response = responseForMessage(m, responses);
   const [open, setOpen] = useState(() => expanded.get(m.id) || false);
   const toggle = (e: React.SyntheticEvent<HTMLDetailsElement>) => { expanded.set(m.id, e.currentTarget.open); setOpen(e.currentTarget.open); };
+  const flip = () => { expanded.set(m.id, !open); setOpen(!open); };
   const { roles } = useTheme().wording;
-  if (m.role === "activity") return <Activity tools={m.tools || []} openDetails={openPanel && (tool => openPanel("tools", Number(tool.result_index) || undefined))}/>;
+  const openTool = openPanel && ((tool: UIEvent) => openPanel("tools", Number(tool.result_index) || undefined));
+  if (m.role === "time") return <div className="chat-time" role="separator">{m.content}</div>;
+  if (m.role === "activity") return chat ? <ChatActivity tools={m.tools || []} open={open} toggle={flip} openDetails={openTool}/> : <Activity tools={m.tools || []} openDetails={openTool}/>;
+  const job = chat && m.role === "assistant" ? jobResult(response.content) : undefined;
+  if (job) return <article data-message-id={m.id} className="message assistant job-card">
+    <span className="chat-avatar" aria-hidden="true"><Sparkles size={14}/></span>
+    <JobCard title={job.title} body={job.body} open={open} toggle={flip} runtime={runtime} fail={fail}/>
+  </article>;
   if (m.role === "changes") return m.changes ? <TurnChanges note={m.changes} open={openPanel && (() => openPanel("changes", undefined, changeSource(m.changes!)))}/> : null;
   return <article data-message-id={m.id} data-response-group-id={response.group?.id} data-response-pending={response.pending || undefined} className={`message ${m.role}${m.source_ref && openLog ? " has-source" : ""}${located ? " located-message" : ""}`}>
+    {chat && m.role === "assistant" && <span className="chat-avatar" aria-hidden="true"><Sparkles size={14}/></span>}
     {m.role === "reasoning" ? reasoning && <details className="reasoning" open={open} onToggle={toggle}><summary>{roles.reasoning}</summary><Markdown text={m.content} runtime={runtime} fail={fail}/></details> : m.role === "tool" ? <details className="command-result" open={open} onToggle={toggle}><summary>操作结果</summary><Markdown text={m.content} runtime={runtime} fail={fail}/></details> : <>
       <div className="message-head"><span>{roles[m.role === "user" || m.role === "assistant" || m.role === "error" ? m.role : "system"]}</span>{timeline && m.timestamp && <time>{new Date(m.timestamp * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</time>}</div>
       <div className="message-body">{response.pending && !response.content ? <p className="response-pending-label" role="status"><span className="pulse"/>正在重新生成回复…</p> : <Markdown text={response.content} runtime={runtime} fail={fail} maskSecrets={m.role === "user"}/>}</div>
@@ -38,10 +66,15 @@ export const MessageRow = memo(function MessageRow({ message: m, runtime, timeli
 
 /** Measured window: all loaded messages remain reachable; only viewport + overscan mount.
  * Heights are kept by message id, so prepending a page preserves the visible anchor. */
-export const MessageList = memo(function MessageList({ messages: sourceMessages, runtime, timeline, reasoning, scroller, follow, responses, fail, openLog, locate, tools, changes, openPanel }: {
+export const MessageList = memo(function MessageList({ messages: sourceMessages, runtime, timeline, reasoning, scroller, follow, responses, fail, openLog, locate, tools, changes, openPanel, chat }: {
   messages: Message[]; tools?: UIEvent[]; changes?: TurnChangeNote[]; openPanel?: OpenPanel; runtime?: string; timeline: boolean; reasoning: boolean; scroller: React.RefObject<HTMLDivElement>; follow: boolean; responses?: ResponseControls; fail: (e: unknown) => void; openLog?: (source: SourceRef) => void; locate?: { id: string; serial: number };
+  /** The personal thread: bubbles, time headings, steps folded to a line, job results as cards. */
+  chat?: boolean;
 }) {
-  const messages = useMemo(() => withActivity(expandRestoredReasoning(sourceMessages, reasoning), tools, changes).rows, [sourceMessages, reasoning, tools, changes]);
+  const messages = useMemo(() => {
+    const rows = withActivity(expandRestoredReasoning(sourceMessages, reasoning), tools, changes).rows;
+    return chat ? chatRows(rows) : rows;
+  }, [sourceMessages, reasoning, tools, changes, chat]);
   const list = useRef<HTMLDivElement>(null);
   const sizes = useRef(new Map<string, number>());
   const expanded = useRef(new Map<string, boolean>());
@@ -126,7 +159,7 @@ export const MessageList = memo(function MessageList({ messages: sourceMessages,
   return <div className="message-window" ref={list} data-total-messages={sourceMessages.length}>
     <div aria-hidden="true" style={{ height: offsets[range.start] }}/>
     {messages.slice(range.start, range.end).map(m => <div className="measured-message" data-row-id={m.id} key={m.id}>
-      <MessageRow message={m} openPanel={openPanel} openLog={openLog} located={m.id === locate?.id} runtime={runtime} timeline={timeline} reasoning={reasoning} expanded={expanded.current} responses={responses} fail={fail}/>
+      <MessageRow message={m} openPanel={openPanel} openLog={openLog} located={m.id === locate?.id} runtime={runtime} timeline={timeline && !chat} reasoning={reasoning} expanded={expanded.current} responses={responses} fail={fail} chat={chat}/>
     </div>)}
     <div aria-hidden="true" style={{ height: offsets[messages.length] - offsets[range.end] }}/>
   </div>;

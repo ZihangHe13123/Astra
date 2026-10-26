@@ -71,8 +71,10 @@ project sessions. The desktop's background host holds it, so it keeps running wi
 window closed (from the tray), and a paired phone opens on it. Every scheduled job's
 result arrives in it as Astra's message, so you can ask about it right there. It works
 in its own folder (`personal` in Astra's data folder) rather than in a project, and its
-model is switched like any conversation's. It cannot be closed or deleted; `/new` in it
-starts afresh. WeChat keeps its own conversations. The design is in
+model is switched like any conversation's. It reads as a chat: your messages and Astra's in
+bubbles, a time heading after each pause, the tool calls of a step folded into one line that
+opens on a click, and job results as cards naming the job. It cannot be closed or deleted;
+`/new` in it starts afresh. WeChat keeps its own conversations. The design is in
 `specs/personal-thread.md`.
 
 ## Conversations and tools

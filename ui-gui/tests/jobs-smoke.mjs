@@ -66,7 +66,11 @@ try {
 
   // The reminder also joined the personal thread, which the background host holds and the sidebar keeps on top.
   await page.getByRole('button', { name: '个人对话' }).click();
-  await page.locator('.message.assistant', { hasText: '【提醒：喝水】' }).first().waitFor();
+  // It reads as a chat there: the reminder is a card naming the job.
+  await page.locator('main.chat-view').waitFor();
+  const card = page.locator('.message.job-card', { hasText: '提醒：喝水' }).first();
+  await card.waitFor();
+  assert.match(await card.innerText(), /提醒：喝水[\s\S]*该喝水了/);
   assert.equal(await page.evaluate(async () => { const boot = await window.astra.bootstrap(); return boot.sessions.find(s => s.id === boot.active)?.personal; }), true);
   console.log('PASS the personal thread shows the reminder');
 
