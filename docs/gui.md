@@ -248,7 +248,8 @@ Public Astra does not bundle a private mode or private personas.
 
 **定时任务** in the sidebar lists the jobs Astra scheduled for you (see
 [persistent jobs](persistent-jobs.md)): when each runs next, how it reports, and
-whether it was paused and why. Pause, resume, run once now or remove one there;
+whether it was paused and why. Pause, resume, run once now or remove one there, and
+choose the model a check runs with (following the default, or one of yours);
 these are your own changes and ask for no approval. The quiet hours are set on the
 same page, and the inbox below keeps every result, unread ones marked, with where
 each was pushed and its token usage.

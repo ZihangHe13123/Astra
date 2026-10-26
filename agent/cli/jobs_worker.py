@@ -45,7 +45,10 @@ async def run_check(store: JobStore, run: dict) -> None:
     progress.touch()
     load_project_env(Path(__file__).resolve().parents[2])
     os.chdir(spec["workdir"])
-    entry = configured_model_catalog().resolve_persisted(spec["model"])
+    # A check without a model of its own uses the default model as it is now.
+    from agent.cli.jobs_commands import job_model_key
+
+    entry = configured_model_catalog().resolve_persisted(spec["model"] or job_model_key(""))
     if entry is None:
         raise ValueError("The scheduled model is no longer configured.")
     profile = entry.profile

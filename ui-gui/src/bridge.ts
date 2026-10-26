@@ -22,7 +22,7 @@ export interface DesktopBridge {
   send(id: string, command: UIEvent): Promise<void>;
   query(method: string, params?: Record<string, unknown>, runtime?: string): Promise<any>;
   /** The person's change to a scheduled job (pause, resume, remove, run, read) or to the quiet hours. */
-  jobs(action: "pause" | "resume" | "remove" | "run" | "read" | "quiet", value?: string, extra?: string): Promise<any>;
+  jobs(action: "pause" | "resume" | "remove" | "run" | "read" | "quiet" | "model", value?: string, extra?: string): Promise<any>;
   /** The person's change to their memory: core entries (add, edit, remove), saved memories (forget, correct), proposals. */
   memory(action: "core-add" | "core-edit" | "core-remove" | "forget" | "correct" | "accept" | "dismiss", ...values: string[]): Promise<string>;
   /** The person's daily model budget ("off", a token count or an amount like ¥5) and per-million prices. */

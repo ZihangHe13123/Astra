@@ -55,10 +55,22 @@ def _instant(value: Any) -> float:
         return 0.0
 
 
+def _default_model() -> str:
+    """The model a check following the default would run with now, by its model name."""
+    try:
+        from agent.cli.jobs_commands import job_model_key
+        from agent.cli.model_catalog import configured_model_catalog
+
+        entry = configured_model_catalog().resolve_persisted(job_model_key(""))
+        return entry.model_id if entry is not None else ""
+    except Exception:  # noqa: BLE001 - only a label; the page still lists the jobs
+        return ""
+
+
 def jobs_overview(home: Path, *, inbox_limit: int = 50) -> dict[str, Any]:
     """Every job that is not removed, the latest results, and the quiet hours."""
     db = _connect(Path(home) / "jobs" / "jobs.sqlite3")
-    result: dict[str, Any] = {"jobs": [], "inbox": [], "quiet_hours": quiet_hours(home)}
+    result: dict[str, Any] = {"jobs": [], "inbox": [], "quiet_hours": quiet_hours(home), "default_model": _default_model()}
     if db is None:
         return result
     with closing(db):
@@ -76,6 +88,8 @@ def jobs_overview(home: Path, *, inbox_limit: int = 50) -> dict[str, Any]:
                 "read_calendar": bool(spec.get("read_calendar")),
                 "prompt": spec["prompt"],
                 "targets": spec.get("targets", list(PUSH_TARGETS)), "last_outcome": row["last_outcome"] or "",
+                # A catalog key, or "" for the default model at each run.
+                "model": spec.get("model", ""),
             })
         run_columns = _columns(db, "runs")
         pushes = "pushes" in {row["name"] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}

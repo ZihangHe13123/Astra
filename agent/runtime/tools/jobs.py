@@ -188,8 +188,8 @@ def _summary(job: dict) -> dict[str, Any]:
             "next_run": _local(job["next_at"], spec) if job["state"] == "enabled" and not spec.get("trigger") else "",
             "notify": spec.get("notify", "always"), "web": spec.get("web", False), "mail": spec.get("mail", False),
             "read_calendar": spec.get("read_calendar", False), "targets": spec.get("targets", list(PUSH_TARGETS)),
-            **({"max_rounds": spec.get("max_iterations"), "time_limit_minutes": spec.get("timeout_seconds", 0) / 60}
-               if spec["kind"] == "check" else {}),
+            **({"model": spec.get("model") or "default", "max_rounds": spec.get("max_iterations"),
+                "time_limit_minutes": spec.get("timeout_seconds", 0) / 60} if spec["kind"] == "check" else {}),
             "last_outcome": job.get("last_outcome") or "", "prompt": spec["prompt"]}
 
 
@@ -354,6 +354,9 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
         if action == "add":
             schedule = _schedule(args, now) or {}
             check = kind != "reminder"
+            if check:
+                # A check follows the default model as it is at each run; there must be one to follow now.
+                model_key()
             interval = schedule.get("interval_seconds", 0)
             job = jobs_store.add(
                 name=name, prompt=prompt, original_request=authority[:8000], workdir=schedule.get("folder") or workdir(),
@@ -362,7 +365,7 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
                 targets=PUSH_TARGETS if targets is None else targets,
                 # The same catch-up windows as `astra jobs add`.
                 grace_seconds=3600 if schedule.get("calendar") else min(interval / 2, 3600) if interval else 300,
-                kind="check" if check else "reminder", model=model_key() if check else "",
+                kind="check" if check else "reminder", model="",
                 web=bool(web) if check else False, mail=bool(mail) if check else False,
                 read_calendar=bool(read_calendar) if check else False,
                 max_iterations=max_rounds if check else None, timeout_seconds=timeout if check else None, now=now)

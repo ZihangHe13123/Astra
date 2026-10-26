@@ -277,6 +277,12 @@ function runJobs(action: unknown, value?: unknown, extra?: unknown): Promise<unk
     if (action === "read") args = ["inbox", "--read", id, "--limit", "1"];
     else if (action === "run") args = ["run", id, "--queue"];
     else if (action === "pause" || action === "resume" || action === "remove") args = [action, id];
+    else if (action === "model") {
+      // A configured model key, or "default" to follow the default model; the CLI checks it against the catalog.
+      const model = checkedString(extra, "model", 200);
+      if (!/^[A-Za-z0-9_.:@/+-]+$/.test(model)) throw new Error("Invalid model");
+      args = ["update", id, "--model", model, "--request", "在定时任务页换了模型。"];
+    }
     else throw new Error("Unsupported job action");
   }
   return new Promise((done, fail) => execFile(python, ["-m", "agent.cli.jobs_commands", ...args],

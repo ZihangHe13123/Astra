@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { dayLabel, groupByDay, jobState, resultLabel, resultText, sourceLabel, targetsLabel, timeLabel, type InboxRow, type JobRow }
+import { dayLabel, groupByDay, jobModelOptions, jobState, resultLabel, resultText, sourceLabel, targetsLabel, timeLabel, type InboxRow, type JobRow }
   from "../src/renderer/jobs-view.js";
 
 const noon = new Date(2026, 9, 26, 12, 0).getTime();
@@ -44,4 +44,13 @@ test("activity groups by day, newest first", () => {
   const groups = groupByDay([{ time: at(25, 9) }, { time: at(26, 8) }, { time: at(26, 11) }, { time: at(24, 20) }], noon);
   assert.deepEqual(groups.map(group => [group.label, group.entries.length]), [["今天", 2], ["昨天", 1], ["10月24日", 1]]);
   assert.equal(groups[0].entries[0].time, at(26, 11));
+});
+
+test("a check runs with the default model or one picked for it, and a picked one that is gone stays listed", () => {
+  const job = { model: "" } as JobRow;
+  const models = [{ key: "deepseek::deepseek-flash", name: "deepseek-flash", provider: "DeepSeek" }, { key: "", name: "broken" }];
+  assert.deepEqual(jobModelOptions(job, "opus", models), [
+    { value: "", label: "跟随默认（opus）" }, { value: "deepseek::deepseek-flash", label: "deepseek-flash · DeepSeek" }]);
+  assert.equal(jobModelOptions(job)[0].label, "跟随默认");
+  assert.deepEqual(jobModelOptions({ model: "old::gone" } as JobRow, "opus", models).at(-1), { value: "old::gone", label: "old::gone（不在模型列表里）" });
 });

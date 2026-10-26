@@ -239,8 +239,9 @@ class JobStore:
         directory = Path(workdir).expanduser().resolve(strict=True)
         if not directory.is_dir():
             raise ValueError("The working directory must be a directory.")
-        if kind == "check" and (not model.strip() or len(model) > 200):
-            raise ValueError("An agent check needs a configured model key.")
+        # A check's model is a catalog key, or "" to follow the default model as it is when the check runs.
+        if not isinstance(model, str) or len(model) > 200:
+            raise ValueError("A check's model is a configured model key, or empty to follow the default.")
         if kind == "reminder" and (model or web or mail or read_calendar):
             raise ValueError("A reminder does not use a model, network tools, mail or the calendar.")
         spec = {"name": name.strip(), "prompt": prompt.strip(), "original_request": original_request.strip(),
@@ -318,7 +319,7 @@ class JobStore:
                interval_seconds: float | None = None, calendar: dict | None = None, at: float | None = None,
                notify: str | None = None, web: bool | None = None, targets: list[str] | None = None,
                mail: bool | None = None, read_calendar: bool | None = None, max_iterations: int | None = None,
-               timeout_seconds: float | None = None, now: float | None = None) -> dict:
+               timeout_seconds: float | None = None, model: str | None = None, now: float | None = None) -> dict:
         """Change a job's future runs; ``request`` is the person's words asking for the change."""
         now = time.time() if now is None else now
         if not isinstance(request, str) or not request.strip():
@@ -353,8 +354,13 @@ class JobStore:
                 if type(read_calendar) is not bool or (read_calendar and spec["kind"] == "reminder"):
                     raise ValueError("A reminder does not read the calendar.")
                 spec["read_calendar"] = read_calendar
-            if (max_iterations is not None or timeout_seconds is not None) and spec["kind"] == "reminder":
-                raise ValueError("A reminder does not use a model, so it has no rounds or time limit.")
+            if (max_iterations is not None or timeout_seconds is not None or model is not None) and spec["kind"] == "reminder":
+                raise ValueError("A reminder does not use a model, so it has no model, rounds or time limit.")
+            if model is not None:
+                # The caller checks the key against the configured models; "" follows the default.
+                if not isinstance(model, str) or len(model) > 200:
+                    raise ValueError("A check's model is a configured model key, or empty to follow the default.")
+                spec["model"] = model.strip()
             if max_iterations is not None:
                 if type(max_iterations) is not int or not 1 <= max_iterations <= 50:
                     raise ValueError("Iterations must be between 1 and 50.")

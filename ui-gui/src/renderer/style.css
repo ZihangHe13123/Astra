@@ -526,6 +526,8 @@ html[data-remote=phone] :is(.composer-foot, .approval-keys, .nav-button kbd, .ne
 .job-state.off { color:var(--muted); }
 .job-state.warn { color:var(--warn); }
 .job-actions, .quiet-hours { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+.job-model { display:flex; align-items:center; gap:6px; }
+.job-model select { max-width:280px; }
 .quiet-hours label, .activity-toggle { flex-direction:row; align-items:center; gap:6px; }
 .quiet-hours input { width:9em; }
 .activity-toggle input { width:auto; margin:0; }

@@ -3,12 +3,23 @@
 export type JobRow = {
   id: string; name: string; kind: string; state: string; paused_reason: string; schedule: string;
   next_at: number | null; notify: string; web: boolean; mail?: boolean; read_calendar?: boolean; prompt: string; targets: string[]; last_outcome: string;
+  /** A configured model key, or "" to follow the default model at each run. */
+  model?: string;
 };
 export type InboxRow = {
   id: string; job_id: string; name: string; kind: string; state: string; quiet: boolean; output: string; detail: string;
   skipped_count: number; usage: Record<string, number>; time: number; read: boolean; sent: string[];
 };
-export type JobsOverview = { jobs: JobRow[]; inbox: InboxRow[]; quiet_hours: { start: string; end: string } | null };
+export type JobsOverview = { jobs: JobRow[]; inbox: InboxRow[]; quiet_hours: { start: string; end: string } | null; default_model?: string };
+type ModelEntry = { key?: unknown; name?: unknown; provider?: unknown };
+
+/** The models a check can run with: following the default, or one of the catalog's. A saved one that is gone stays listed. */
+export function jobModelOptions(job: JobRow, defaultModel = "", models: ModelEntry[] = []) {
+  const options = [{ value: "", label: defaultModel ? `跟随默认（${defaultModel}）` : "跟随默认" },
+    ...models.filter(model => typeof model?.key === "string" && model.key).map(model => ({ value: String(model.key), label: `${model.name} · ${model.provider}` }))];
+  if (job.model && !options.some(option => option.value === job.model)) options.push({ value: job.model, label: `${job.model}（不在模型列表里）` });
+  return options;
+}
 export type ActivityEntry = {
   kind: "turn" | "job"; id: string; source: string; time: number; title: string; status: string;
   session?: string; effects?: { name: string; risk: string; status: string; summary: string }[];

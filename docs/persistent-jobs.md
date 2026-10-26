@@ -19,8 +19,10 @@ astra jobs add project-status --every 3600 --workdir /path/to/project \
   --request "Check this project each hour and leave results in my local inbox"
 ```
 
-The current configured model is captured at creation. Use `--model KEY` to pick
-another configured model. `--web` explicitly enables existing search/fetch tools, and `--mail` lets the check read the
+A check follows the default model, the one selected when it runs. `--model KEY`
+pins a configured model instead; `astra jobs update ID --model KEY` changes it later
+and `--model default` returns to following the default, as does the model menu on
+the desktop's jobs page. `--web` explicitly enables existing search/fetch tools, and `--mail` lets the check read the
 configured mailbox (read-only; see [mail](integrations.md#read-only-163-mail)). On macOS,
 `--read-calendar` lets it read Calendar and Reminders, never change them
 ([calendar](integrations.md#calendar-and-reminders-macos)).

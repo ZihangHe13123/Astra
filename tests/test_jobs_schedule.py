@@ -191,8 +191,13 @@ def test_a_check_gets_rounds_and_time_for_what_it_reads_and_can_be_given_more(tm
     for limits in ({"max_iterations": 0}, {"max_iterations": 51}, {"timeout_seconds": 60}):
         with pytest.raises(ValueError):
             store.update(web["id"], request="x", now=now, **limits)
-    with pytest.raises(ValueError, match="no rounds"):
-        store.update(daily(store, tmp_path, now=now)["id"], request="x", max_iterations=20, now=now)
+    reminder = daily(store, tmp_path, now=now)["id"]
+    for change in ({"max_iterations": 20}, {"model": "fixture"}):
+        with pytest.raises(ValueError, match="no model, rounds"):
+            store.update(reminder, request="x", now=now, **change)
+    assert store.update(web["id"], request="换成 DeepSeek", model="deepseek::deepseek-flash", now=now)["spec"]["model"] == (
+        "deepseek::deepseek-flash")
+    assert store.update(web["id"], request="跟随默认", model="", now=now)["spec"]["model"] == ""
     output, error = execute_jobs_command(["update", files["id"], "--iterations", "25", "--timeout", "1200"],
                                          home=tmp_path / "home", workdir=tmp_path)
     assert error == "" and (json.loads(output)["spec"]["max_iterations"], json.loads(output)["spec"]["timeout_seconds"]) == (
@@ -295,6 +300,8 @@ def test_tool_gives_a_check_more_rounds_and_time_with_approval(tmp_path, monkeyp
     created = json.loads(call(registry, action="add", name="AI 晚报", prompt="整理今天的 AI 新闻", time="20:00",
                               web=True)["output"])["job"]
     assert (created["max_rounds"], created["time_limit_minutes"]) == (30, 45)
+    # A check made in a conversation follows the default model; the jobs page can pin one.
+    assert created["model"] == "default" and JobStore(tmp_path / "home").job(created["job_id"])["spec"]["model"] == ""
     changed = call(registry, action="update", job_id=created["job_id"], max_rounds=40, time_limit_minutes=60)
     assert changed["error"] == ""
     assert asked[-1]["target"] == "每天 20:00（Asia/Singapore）；最多 40 轮、每次最多 60 分钟"

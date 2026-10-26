@@ -186,6 +186,24 @@ def test_a_check_stopped_for_repeating_itself_still_delivers_and_the_clock_may_b
     assert len(provider.requests) - before == REPEATED_CALLS_PER_TURN + 3
 
 
+def test_a_check_follows_the_default_model_unless_given_one(tmp_path, provider):
+    env = environment(tmp_path / "A", provider)
+    (tmp_path / "A" / "settings.json").write_text(json.dumps({"selected_model": "fixture"}), encoding="utf-8")
+    job = command(env, "add", "check", "--after", "60", "--workdir", str(tmp_path), "--prompt", "Look around",
+                  "--request", "Check this")
+    assert job["spec"]["model"] == ""
+    command(env, "run", job["id"])
+    [run] = command(env, "show", job["id"])["occurrences"]
+    assert run["state"] == "completed" and provider.requests[-1]["body"]["model"] == "jobs-fixture"
+    # Pinned by its catalog key.
+    assert command(env, "update", job["id"], "--model", "fixture")["spec"]["model"].endswith("jobs-fixture")
+    changed = command(env, "update", job["id"], "--model", "default")
+    assert changed["spec"]["model"] == "" and changed["spec"]["original_request"].endswith("Changed from the command line.")
+    unknown = subprocess.run([sys.executable, "-m", "agent.cli.jobs_commands", "update", job["id"], "--model", "no-such"],
+                             cwd=ROOT, env=env, text=True, capture_output=True, timeout=40)
+    assert unknown.returncode != 0 and command(env, "show", job["id"])["job"]["spec"]["model"] == ""
+
+
 def test_real_worker_secrets_and_results_follow_a_to_b_to_a_scope(tmp_path, provider):
     for name in ("A", "B", "A"):
         env = environment(tmp_path / name, provider)

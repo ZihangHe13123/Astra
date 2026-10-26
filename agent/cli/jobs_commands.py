@@ -50,7 +50,7 @@ def jobs_parser() -> JobParser:
     add.add_argument("--request", help="original user authorization; required for agent checks")
     add.add_argument("--reminder", action="store_true", help="deliver the text without using a model")
     add.add_argument("--workdir", type=Path)
-    add.add_argument("--model", default="", help="configured model key; captured when the job is created")
+    add.add_argument("--model", default="", help="configured model key; without it a check follows the default model")
     add.add_argument("--web", action="store_true", help="allow existing web search/fetch tools for this check")
     add.add_argument("--mail", action="store_true", help="let this check read the configured mailbox (read-only)")
     add.add_argument("--read-calendar", action="store_true",
@@ -64,6 +64,7 @@ def jobs_parser() -> JobParser:
     update.add_argument("id")
     update.add_argument("--iterations", type=int, help="most model rounds per run, 1 to 50")
     update.add_argument("--timeout", type=float, help="hard limit in seconds per run")
+    update.add_argument("--model", help="configured model key, or 'default' to follow the default model")
     update.add_argument("--request", default="", help="why it changed, kept with the job's authorization")
     commands.add_parser("list", help="show jobs and their schedules")
     for action in ("show", "pause", "resume", "remove", "run"):
@@ -170,7 +171,9 @@ def execute_jobs_command(argv: list[str], *, home: Path | None = None,
                 raise ValueError("Agent checks require --request with the original user authorization.")
             model = args.model
             if not args.reminder:
-                model = job_model_key(model)
+                # Without --model a check follows the default model, read at each run; there must be one now.
+                key = job_model_key(model)
+                model = key if model else ""
             value = store.add(name=args.name, prompt=args.prompt, original_request=args.request or args.prompt,
                               workdir=args.workdir or workdir or Path.cwd(), next_at=next_at,
                               interval_seconds=period, calendar=calendar, trigger=trigger, notify=args.notify,
@@ -182,10 +185,11 @@ def execute_jobs_command(argv: list[str], *, home: Path | None = None,
                               idle_seconds=args.idle, timeout_seconds=args.timeout, max_iterations=args.iterations)
             _with_times(value)
         elif args.action == "update":
-            if args.iterations is None and args.timeout is None:
-                raise ValueError("Give --iterations or --timeout.")
+            if args.iterations is None and args.timeout is None and args.model is None:
+                raise ValueError("Give --iterations, --timeout or --model.")
+            model = None if args.model is None else "" if args.model == "default" else job_model_key(args.model)
             value = store.update(args.id, request=args.request.strip() or "Changed from the command line.",
-                                 max_iterations=args.iterations, timeout_seconds=args.timeout)
+                                 max_iterations=args.iterations, timeout_seconds=args.timeout, model=model)
             _with_times(value)
         elif args.action == "list":
             value = store.jobs()
