@@ -2138,6 +2138,15 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
       return;
     }
 
+    // /onboard is a request to the model (its onboarding skill), so it goes as the person's message.
+    if (/^\/onboard(?:\s|$)/i.test(trimmedText)) {
+      if (send({ type: "message", text: trimmedText })) {
+        busyRef.current = true;
+        setBusy(true);
+      }
+      return;
+    }
+
     if (text.startsWith("/")) {
       const themeMatch = text.match(/^\/theme(?:\s+(\S+))?$/i);
       if (themeMatch) {

@@ -146,13 +146,21 @@ function register(method: string, handler: (...args: any[]) => any) {
 }
 // Only the final validated preference flush is synchronous, during unload.
 ipcMain.on("astra:flushPreferences", (event, value) => {
-  try { checkSender(event); preferences = { ...preferences, ...checkedPreferences(value) }; preferenceWriter.flushSync(preferences); event.returnValue = true; }
+  try {
+    checkSender(event);
+    if (!staleRenderer) { preferences = { ...preferences, ...checkedPreferences(value) }; preferenceWriter.flushSync(preferences); }
+    event.returnValue = true;
+  }
   catch (error) { event.returnValue = String(error); }
 });
-register("bootstrap", () => ({ sessions: [...runtimes.values()].map(r => r.state), active, workspace, preferences, appshot: { connection: appshot.client.state.connection, enabled: appshot.client.state.enabled } }));
+register("bootstrap", () => {
+  staleRenderer = false;
+  return { sessions: [...runtimes.values()].map(r => r.state), active, workspace, preferences, appshot: { connection: appshot.client.state.connection, enabled: appshot.client.state.enabled } };
+});
 /** Opens a session or a fresh draft. The window's call selects it; a phone's call leaves the window's selection alone. */
 function openSession(options: { session?: string; mode?: string; workspace?: string } = {}, select = true): SessionState {
   if (!options || typeof options !== "object") throw new Error("Invalid session options");
+  if (wiping) throw new Error("正在清除数据，请稍候。");
   const mode = options.mode || "work";
   if (!["work", "local", "minimal", "bar"].includes(mode)) throw new Error("Unknown mode");
   const work = resolve(options.workspace || workspace);
@@ -233,7 +241,7 @@ register("appshot", async (id, action, value = "") => {
   } else rt.accept({ type: "gui_notice", message: await appshot.command(rt.id, value) });
 });
 function runQuery(method: any, params: any = {}, id?: unknown) {
-  if (!["sessions", "history", "commands", "changes", "request_timeline", "session_log", "jobs", "activity"].includes(method)) throw new Error("Unsupported query");
+  if (!["sessions", "history", "commands", "changes", "request_timeline", "session_log", "jobs", "activity", "memory"].includes(method)) throw new Error("Unsupported query");
   if (!params || typeof params !== "object" || Array.isArray(params) || JSON.stringify(params).length > 32768) throw new Error("Invalid query");
   return method === "changes" ? runtime(id).query(method, params) : queries.query(method, params);
 }
@@ -257,6 +265,73 @@ function runJobs(action: unknown, value?: unknown, extra?: unknown): Promise<unk
     (error, stdout, stderr) => error ? fail(new Error(String(stderr).trim().split("\n").at(-1) || error.message)) : done(JSON.parse(stdout || "null"))));
 }
 register("jobs", runJobs);
+/** The person's own change to their memory, from the memory page: no approval, it is theirs. */
+function runMemory(action: unknown, ...values: unknown[]): Promise<unknown> {
+  const allowed: Record<string, number> = { "core-add": 2, "core-edit": 3, "core-remove": 1, forget: 1, correct: 2, accept: 1, dismiss: 1 };
+  const name = checkedString(action, "action", 20);
+  if (!(name in allowed) || values.length !== allowed[name]) throw new Error("Unsupported memory change");
+  const args = values.map(value => checkedString(value, "memory", 4000));
+  return new Promise((done, fail) => execFile(python, ["-m", "agent.ui.memory_page", name, ...args],
+    { cwd: root, env: process.env, timeout: 30_000, windowsHide: true, encoding: "utf8" },
+    (_error, stdout) => {
+      let result: { ok?: boolean; message?: string; error?: string } = {};
+      try { result = JSON.parse(String(stdout).trim().split("\n").at(-1) || "{}"); } catch { /* reported below */ }
+      result.ok ? done(result.message) : fail(new Error(result.error || "记忆没有改成功。"));
+    }));
+}
+register("memory", runMemory);
+/** One run of `astra data` (agent/cli/data_commands.py); it answers with a JSON line, an error included. */
+function dataCommand(args: string[], timeout: number): Promise<any> {
+  return new Promise((done, fail) => execFile(python, ["-m", "agent.cli.data_commands", ...args],
+    { cwd: root, env: process.env, timeout, windowsHide: true, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
+    (error, stdout) => {
+      let result: any;
+      try { result = JSON.parse(String(stdout).trim().split("\n").at(-1) || "null"); } catch { /* reported below */ }
+      if (result?.error) fail(new Error(result.error));
+      else if (result && typeof result === "object") done(result);
+      else fail(new Error(error?.message || "没有得到结果。"));
+    }));
+}
+/** After a wipe the window reloads; what it still holds about the old conversations is not written back. */
+let staleRenderer = false;
+let wiping = false;
+/** The person's whole data, from the memory page: what export and wipe take, an export to a zip, or a wipe. */
+async function runData(action: unknown, confirmation?: unknown, browserData?: unknown) {
+  if (action === "plan") return dataCommand(["plan"], 60_000);
+  if (action === "export") {
+    const day = new Date().toISOString().slice(0, 10);
+    const choice = await dialog.showSaveDialog(window!, { title: "导出我的数据", defaultPath: `astra-data-${day}.zip`,
+      filters: [{ name: "Zip", extensions: ["zip"] }] });
+    if (choice.canceled || !choice.filePath) return { cancelled: true };
+    const result = await dataCommand(["export", "--out", choice.filePath], 30 * 60_000);
+    shell.showItemInFolder(result.path);
+    return result;
+  }
+  if (action !== "wipe") throw new Error("Unsupported data action");
+  if (confirmation !== "清除") throw new Error("请输入「清除」确认。");
+  if (wiping) throw new Error("正在清除，请稍候。");
+  if ([...runtimes.values()].some(rt => hasOngoingWork(rt.state))) throw new Error("还有对话在运行任务或等你回答，请先停止它们。");
+  wiping = true;
+  try {
+    // Nothing of Astra's may hold the data open: every session, the background host and the query helper close first.
+    for (const rt of [...runtimes.values()]) { await rt.close(); forgetRuntime(rt); }
+    await channelHost.stop();
+    await queries.close();
+    const result = await dataCommand(["wipe", "--confirm", "清除", "--desktop", ...(browserData === true ? ["--browser-data"] : [])],
+      10 * 60_000);
+    preferences = { ...preferences, drafts: {}, attachments: {}, workspaces: {}, titles: {}, pinned: [], lastSession: null };
+    preferenceWriter.flushSync(preferences);
+    staleRenderer = true;
+    // The window blocks navigation it starts itself, so the reload comes from here, after this answer.
+    setTimeout(() => { if (window && !window.isDestroyed()) window.webContents.reload(); }, 0);
+    return result;
+  } finally {
+    queries = new QueryClient(root, python);
+    channelHost.resume();
+    wiping = false;
+  }
+}
+register("data", runData);
 const sessionOperations = new Set<string>();
 async function runSessionAction(action: any, entry: any) {
   if (!["export", "delete"].includes(action) || !entry || typeof entry !== "object") throw new Error("Invalid session action");
@@ -305,6 +380,7 @@ async function phoneInvoke(device: string, method: PhoneInvokeMethod, args: any[
   if (method === "create") return openSession(args[0] ?? {}, false);
   if (method === "query") return runQuery(args[0], args[1], args[2]);
   if (method === "jobs") { phoneAudit(device, { method, action: String(args[0]).slice(0, 20) }); return runJobs(args[0], args[1], args[2]); }
+  if (method === "memory") { phoneAudit(device, { method, action: String(args[0]).slice(0, 20) }); return runMemory(args[0], ...args.slice(1)); }
   if (method === "close") { phoneAudit(device, { method, runtime: String(args[0]) }); return closeSession(args[0]); }
   if (method === "deleteSession") { phoneAudit(device, { method, session: args[0]?.name, mode: args[0]?.mode }); return runSessionAction("delete", args[0]); }
   const rt = runtime(args[0]); const command = checkedCommand(args[1]);
@@ -325,7 +401,8 @@ register("phone", async (action, value) => {
   return phoneStatus();
 });
 register("preferences", value => {
-  preferences = { ...preferences, ...checkedPreferences(value) }; savePreferences(); return preferences;
+  if (!staleRenderer) { preferences = { ...preferences, ...checkedPreferences(value) }; savePreferences(); }
+  return preferences;
 });
 register("choose", async kind => {
   if (!["files", "folder"].includes(kind)) throw new Error("Invalid picker");

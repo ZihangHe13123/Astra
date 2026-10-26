@@ -11,6 +11,8 @@ function exposeBridge() {
     send: (id, command) => invoke("send", id, command),
     query: (method, params, runtime) => invoke("query", method, params, runtime),
     jobs: (action, value, extra) => invoke("jobs", action, value, extra),
+    memory: (action, ...values) => invoke("memory", action, ...values),
+    data: (action, confirmation, browserData) => invoke("data", action, confirmation, browserData),
     phone: (action, value) => invoke("phone", action, value),
     preferences: value => invoke("preferences", value), choose: kind => invoke("choose", kind),
     flushPreferences: value => {

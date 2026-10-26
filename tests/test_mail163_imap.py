@@ -969,3 +969,12 @@ def test_one_malformed_message_does_not_abort_other_uids(config: MailConfig) -> 
     assert messages[0].warnings
     assert messages[1].body_text == "good"
     assert messages[1].warnings == ()
+
+
+def test_a_server_that_does_not_need_id_gets_none(config: MailConfig, fake_imap: FakeImap) -> None:
+    from dataclasses import replace
+
+    gmail = replace(config, account="user@gmail.com", host="imap.gmail.com", send_id=False)
+    with Imap163Client(gmail, connection_factory=lambda host, port: fake_imap) as client:
+        client.snapshot("INBOX")
+    assert fake_imap.commands[0][0] == "login" and not any(command[0] == "ID" for command in fake_imap.commands)

@@ -80,8 +80,9 @@ class Imap163Client:
             raise MailNetworkError("IMAP connection failed") from None
         self._connection = connection
         try:
-            status, _data = self._protocol_call("ID", connection._simple_command, "ID", '("name" "Astra")')
-            self._require_ok(status, "ID")
+            if self.config.send_id:
+                status, _data = self._protocol_call("ID", connection._simple_command, "ID", '("name" "Astra")')
+                self._require_ok(status, "ID")
         except MailProtocolError:
             self._safe_logout()
             raise

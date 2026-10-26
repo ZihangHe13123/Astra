@@ -2,7 +2,7 @@
 
 [首页](../../README.zh-CN.md) · [文档导航](README.md) · [English](../integrations.md)
 
-[OpenAI 兼容 API](#optional-openai-compatible-api) · [原生消息渠道](#native-messaging-channels) · [MCP](#mcp) · [网页搜索](#web-search) · [Conclave 多专家研究](#conclave-multi-expert-research) · [图片工具](#image-tools) · [163 邮件只读集成](#read-only-163-mail)
+[OpenAI 兼容 API](#optional-openai-compatible-api) · [原生消息渠道](#native-messaging-channels) · [MCP](#mcp) · [网页搜索](#web-search) · [Conclave 多专家研究](#conclave-multi-expert-research) · [图片工具](#image-tools) · [163 邮件只读集成](#read-only-163-mail) · [日历和提醒事项（macOS）](#calendar-and-reminders-macos)
 
 按需启用服务。Shell 示例从安装目录执行，提供方凭据放在本地 `.env`。
 
@@ -153,6 +153,14 @@ Windows 图片路径和 Shell 命令统一使用 `AGENT_WSL_DISTRO` 选择 WSL �
 
 ## 163 邮件只读集成
 
+Astra 自己用只读的 `mail` 工具读取已配置的邮箱：最近的邮件（或只看未读）、搜索、读一封邮件的正文，
+在任何对话里都可以，定时检查加上 `--mail` 也可以。邮件和网页一样被当作外部文本：读过邮件的那一轮里
+保存记忆需要你批准。不只 163，任何 IMAP 邮箱都可以：用 `ASTRA_MAIL_ADDRESS` 和 `ASTRA_MAIL_PASSWORD`
+（应用专用密码或授权码）代替下面的 163 变量名。Gmail、QQ、iCloud、163/126/yeah 会根据地址自动识别；
+其他服务商还要设置 `ASTRA_MAIL_IMAP_HOST`（端口或已发送文件夹不同时再设 `ASTRA_MAIL_IMAP_PORT`、
+`ASTRA_MAIL_SENT_FOLDER`）。每个文件夹第一次同步只缓存最新的 100 封（`ASTRA_MAIL_SYNC_LIMIT`），之后只取
+新到的邮件，不回补更早的历史。
+
 可选邮件集成增量缓存邮件，用于本地检索。在安装目录 `.env` 填写账号和客户端授权码（不是网页登录密码）：
 
 ```dotenv
@@ -189,3 +197,18 @@ macOS/Linux：
 同步把头部和解码文字存入 `.astra/mail/163.sqlite3`，不下载附件载荷；只有明确的 `attachment` 命令把选定附件写入 `.astra/mail/attachments/`。邮箱以只读方式选择，不标记已读，不移动、删除、回复或发送邮件。
 
 源码安装附有[163 邮件技能](../../.astra/skills/operations/163-email-sync/SKILL.md)，通过项目信任检查发现，Setup 不负责安装或更新该技能。凭据、缓存和其他私有 `.astra` 状态保持本地且被 Git 忽略。
+
+<a id="calendar-and-reminders-macos"></a>
+
+## 日历和提醒事项（macOS）
+
+在 macOS 上，`calendar` 工具通过电脑助手的 EventKit 模式读取「日历」和「提醒事项」App（先用
+`scripts/build_macos_computer_helper.sh` 构建助手）：某段时间里的日程、未完成的提醒事项、日历和列表的名字。
+添加日程或提醒事项、把提醒事项标成完成，每次都会弹出审批卡；不会删除任何内容。带时间的提醒事项会附带闹钟，
+所以其他设备上的「提醒事项」也会准时提醒。希望由 Astra 自己到点推送时，用 `jobs` 工具。
+
+助手以自己的进程回答日历请求，所以第一次使用时 macOS 会询问是否允许 **AstraMacComputerHelper** 访问日历或
+提醒事项，开关在「系统设置 > 隐私与安全性」里。助手是临时签名的，重新构建后可能会再问一次。带
+`--read-calendar`（`jobs` 工具里是 `read_calendar`）的定时检查可以读日历，但不会添加、修改或完成任何内容，
+也不会触发系统询问。邀请和共享列表里可能有别人写的文字，所以和邮件一样，读过日历的那一轮里保存记忆需要你批准。
+Windows 和 Linux 没有日历工具。

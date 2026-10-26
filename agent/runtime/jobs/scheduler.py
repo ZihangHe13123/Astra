@@ -164,12 +164,22 @@ def _wait_for_owner_exit(store: JobStore, identity: str, *, deadline: float | No
             return
 
 
+def event_line(event: dict | None) -> str:
+    """What started an event-started run, as the person reads it."""
+    if not event:
+        return ""
+    if event.get("type") == "mail":
+        return f"新邮件：{event.get('from', '')} — {event.get('subject', '')}"
+    return f"新文件：{event.get('name') or event.get('path', '')}"
+
+
 def execute(store: JobStore, run: dict, *, service_reminders: Callable[[], None] | None = None) -> None:
     identity = run["id"]
     if run["spec"]["kind"] == "reminder":
         with store.run_lock(identity):
             if store.start(identity):
-                store.finish(identity, "completed", output=run["spec"]["prompt"])
+                store.finish(identity, "completed", output="\n".join(filter(None, (
+                    run["spec"]["prompt"], event_line(run["spec"].get("event"))))))
         return
     progress = store.run_dir(identity) / "progress"
     try:

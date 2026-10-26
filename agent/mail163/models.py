@@ -15,6 +15,13 @@ class MailConfig:
     attachments_dir: Path
     max_body_bytes: int
     default_folders: tuple[str, ...]
+    # The account's sent folder, which "sent" means; and whether the server needs the IMAP ID
+    # command before login (163 and its sister domains refuse a login without it).
+    sent_folder: str = "已发送"
+    send_id: bool = True
+    # A folder's first sync caches only its newest messages; later syncs fetch what arrived
+    # since, never older history.
+    sync_limit: int = 100
 
 
 @dataclass(frozen=True)

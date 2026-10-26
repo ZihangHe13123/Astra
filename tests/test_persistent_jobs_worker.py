@@ -207,3 +207,44 @@ def test_real_worker_tells_only_changes_for_an_on_change_check(tmp_path, provide
     assert all(results[run["id"]]["state"] == "completed" for run in (first, second, third))
     assert results[first["id"]]["usage"]["prompt_tokens"] == 41
     assert results[first["id"]]["usage"]["completion_tokens"] == 7
+
+
+def test_real_worker_offers_mail_only_to_a_check_allowed_to_read_it(tmp_path, provider):
+    env = environment(tmp_path / "A", provider)
+    plain = command(env, "add", "plain", "--after", "60", "--model", "fixture", "--workdir", str(tmp_path),
+                    "--prompt", "Any news?", "--request", "Check my project")
+    command(env, "run", plain["id"])
+    assert "mail" not in {tool["function"]["name"] for tool in provider.requests[-1]["body"]["tools"]}
+    mail = command(env, "add", "mail", "--after", "60", "--model", "fixture", "--workdir", str(tmp_path), "--mail",
+                   "--prompt", "Any mail from my professor?", "--request", "Tell me each morning if my professor wrote")
+    assert mail["spec"]["mail"] is True
+    command(env, "run", mail["id"])
+    names = {tool["function"]["name"] for tool in provider.requests[-1]["body"]["tools"]}
+    assert "mail" in names and not names.intersection({"write_file", "execute_shell"})
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Calendar and Reminders are macOS only")
+def test_real_worker_offers_the_calendar_read_only_to_a_check_allowed_to_read_it(tmp_path, provider):
+    env = environment(tmp_path / "A", provider)
+    job = command(env, "add", "agenda", "--after", "60", "--model", "fixture", "--workdir", str(tmp_path),
+                  "--read-calendar", "--prompt", "What is on today?", "--request", "Tell me my day each morning")
+    assert job["spec"]["read_calendar"] is True and job["spec"]["mail"] is False
+    command(env, "run", job["id"])
+    tools = {tool["function"]["name"]: tool["function"] for tool in provider.requests[-1]["body"]["tools"]}
+    assert "calendar" in tools and "mail" not in tools
+
+
+def test_real_worker_is_told_which_mail_started_its_run(tmp_path, provider):
+    home = tmp_path / "A"
+    env = environment(home, provider)
+    job = command(env, "add", "tan", "--model", "fixture", "--workdir", str(tmp_path), "--on-mail-from", "tan@",
+                  "--prompt", "Summarise the new mail", "--request", "Tell me when Prof Tan writes")
+    assert job["spec"]["mail"] is True
+    JobStore(home).fire(job["id"], [{"type": "mail", "folder": "INBOX", "uid": 42, "from": "Prof Tan <tan@example.edu>",
+                                     "subject": "Meeting moved"}], "7:42")
+    result = command(env, "tick")
+    assert result["executed"][0]["state"] == "completed"
+    request = provider.requests[-1]["body"]
+    assert "started by new mail in INBOX: #42 From: Prof Tan <tan@example.edu> | Subject: Meeting moved" in json.dumps(
+        request["messages"], ensure_ascii=False)
+    assert "mail" in {tool["function"]["name"] for tool in request["tools"]}

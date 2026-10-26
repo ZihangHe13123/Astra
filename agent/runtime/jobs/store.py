@@ -16,7 +16,10 @@ from agent.runtime.instance_lock import InstanceLock
 from agent.runtime.jobs.calendar import calendar_schedule, next_slot
 
 MAX_OUTPUT = 64_000
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
+# A job started by events (new mail, a new file) has no time of its own.
+NEVER = 253402300799.0
+TRIGGER_TYPES = frozenset({"mail", "file"})
 NOTIFY_POLICIES = frozenset({"always", "on_change"})
 # Where results are pushed besides the local inbox, which always receives them.
 PUSH_TARGETS = ("desktop", "weixin")
@@ -65,6 +68,22 @@ def finite(value: float, minimum: float, maximum: float, label: str) -> float:
     return float(value)
 
 
+def normalize_trigger(value: dict) -> dict:
+    """A validated trigger: new mail matching from/subject in a folder, or a new file matching a pattern."""
+    kind = str(value.get("type") or "")
+    if kind not in TRIGGER_TYPES:
+        raise ValueError("A trigger is new mail or a new file.")
+    if kind == "mail":
+        folder = str(value.get("folder") or "").strip()
+        fields = {"from": str(value.get("from") or "").strip(), "subject": str(value.get("subject") or "").strip(),
+                  "folder": "INBOX" if folder.casefold() in {"", "inbox", "收件箱", "received"} else folder}
+    else:
+        fields = {"pattern": str(value.get("pattern") or "*").strip() or "*"}
+    if any(len(text) > 200 for text in fields.values()):
+        raise ValueError("Trigger filters are at most 200 characters.")
+    return {"type": kind, **fields}
+
+
 def _targets(targets: list[str] | tuple[str, ...] | None) -> list[str]:
     chosen: list[str] = list(dict.fromkeys(targets or ()))
     if any(target not in PUSH_TARGETS for target in chosen):
@@ -80,7 +99,7 @@ class JobStore:
         self.path = self.root / "jobs.sqlite3"
         with self.connect() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in {0, 1, 2, SCHEMA_VERSION}:
+            if version not in {0, 1, 2, 3, SCHEMA_VERSION}:
                 raise ValueError("Unsupported jobs database version; preserve it for inspection.")
             if version == SCHEMA_VERSION:
                 return
@@ -130,6 +149,13 @@ class JobStore:
                         attempts INTEGER NOT NULL DEFAULT 0, next_try REAL NOT NULL, updated_at REAL NOT NULL,
                         detail TEXT NOT NULL DEFAULT '', PRIMARY KEY(run_id, target))""")
                     db.execute("CREATE INDEX IF NOT EXISTS pushes_due ON pushes(state, next_try)")
+                if current < 4:
+                    db.execute("""CREATE TABLE IF NOT EXISTS trigger_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT NOT NULL REFERENCES jobs(id),
+                        payload TEXT NOT NULL, created_at REAL NOT NULL, run_id TEXT)""")
+                    db.execute("CREATE INDEX IF NOT EXISTS trigger_events_waiting ON trigger_events(run_id, job_id)")
+                    db.execute("""CREATE TABLE IF NOT EXISTS trigger_cursors (
+                        job_id TEXT PRIMARY KEY REFERENCES jobs(id), cursor TEXT NOT NULL, checked_at REAL NOT NULL)""")
                 if current < SCHEMA_VERSION:
                     db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             except BaseException:
@@ -172,11 +198,18 @@ class JobStore:
 
     def add(self, *, name: str, prompt: str, original_request: str,
             workdir: Path, next_at: float | None = None, interval_seconds: float = 0,
-            calendar: dict | None = None, notify: str = "always", targets: list[str] | tuple[str, ...] = PUSH_TARGETS,
+            calendar: dict | None = None, trigger: dict | None = None, notify: str = "always",
+            targets: list[str] | tuple[str, ...] = PUSH_TARGETS,
             grace_seconds: float = 300, kind: str = "check", model: str = "",
-            web: bool = False, idle_seconds: float = 120, timeout_seconds: float = 900,
-            max_iterations: int = 10, now: float | None = None) -> dict:
+            web: bool = False, mail: bool = False, read_calendar: bool = False, idle_seconds: float = 120,
+            timeout_seconds: float = 900, max_iterations: int = 10, now: float | None = None) -> dict:
         now = time.time() if now is None else now
+        if trigger:
+            if calendar or interval_seconds or next_at is not None:
+                raise ValueError("A job runs on a schedule or on an event, not both.")
+            trigger, next_at = normalize_trigger(trigger), NEVER
+            # A check started by mail reads it; a reminder only names it.
+            mail = mail or (trigger["type"] == "mail" and kind == "check")
         calendar, next_at = self._schedule(calendar, interval_seconds, next_at, now)
         if notify not in NOTIFY_POLICIES:
             raise ValueError("Notify must be 'always' or 'on_change'.")
@@ -186,7 +219,7 @@ class JobStore:
         finite(timeout_seconds, idle_seconds, 86400, "Hard budget")
         if type(max_iterations) is not int or not 1 <= max_iterations <= 50:
             raise ValueError("Iterations must be between 1 and 50.")
-        if kind not in {"check", "reminder"} or type(web) is not bool:
+        if kind not in {"check", "reminder"} or any(type(flag) is not bool for flag in (web, mail, read_calendar)):
             raise ValueError("Choose a check or reminder and a boolean network option.")
         fields = ((name, 120), (prompt, 4000), (original_request, 8000))
         if any(not isinstance(value, str) or not value.strip() or len(value) > limit for value, limit in fields):
@@ -196,14 +229,17 @@ class JobStore:
             raise ValueError("The working directory must be a directory.")
         if kind == "check" and (not model.strip() or len(model) > 200):
             raise ValueError("An agent check needs a configured model key.")
-        if kind == "reminder" and (model or web):
-            raise ValueError("A reminder does not use a model or network tools.")
+        if kind == "reminder" and (model or web or mail or read_calendar):
+            raise ValueError("A reminder does not use a model, network tools, mail or the calendar.")
         spec = {"name": name.strip(), "prompt": prompt.strip(), "original_request": original_request.strip(),
                 "workdir": str(directory), "kind": kind, "model": model, "web": web,
                 "idle_seconds": idle_seconds, "timeout_seconds": timeout_seconds,
-                "max_iterations": max_iterations, "notify": notify, "targets": targets}
+                "max_iterations": max_iterations, "notify": notify, "targets": targets, "mail": mail,
+                "read_calendar": read_calendar}
         if calendar:
             spec["calendar"] = calendar
+        if trigger:
+            spec["trigger"] = trigger
         identity = uuid.uuid4().hex
         with self.transaction() as db:
             db.execute("INSERT INTO jobs (id,name,spec,state,next_at,interval_seconds,grace_seconds,created_at,"
@@ -269,7 +305,7 @@ class JobStore:
     def update(self, identity: str, *, request: str, name: str | None = None, prompt: str | None = None,
                interval_seconds: float | None = None, calendar: dict | None = None, at: float | None = None,
                notify: str | None = None, web: bool | None = None, targets: list[str] | None = None,
-               now: float | None = None) -> dict:
+               mail: bool | None = None, read_calendar: bool | None = None, now: float | None = None) -> dict:
         """Change a job's future runs; ``request`` is the person's words asking for the change."""
         now = time.time() if now is None else now
         if not isinstance(request, str) or not request.strip():
@@ -296,7 +332,17 @@ class JobStore:
                 spec["web"] = web
             if targets is not None:
                 spec["targets"] = _targets(targets)
+            if mail is not None:
+                if type(mail) is not bool or (mail and spec["kind"] == "reminder"):
+                    raise ValueError("A reminder does not read mail.")
+                spec["mail"] = mail
+            if read_calendar is not None:
+                if type(read_calendar) is not bool or (read_calendar and spec["kind"] == "reminder"):
+                    raise ValueError("A reminder does not read the calendar.")
+                spec["read_calendar"] = read_calendar
             interval, next_at = row["interval_seconds"], row["next_at"]
+            if spec.get("trigger") and (interval_seconds or calendar is not None or at is not None):
+                raise ValueError("This job starts on an event; add a new job for a schedule.")
             if interval_seconds is not None or calendar is not None or at is not None:
                 interval = interval_seconds or 0
                 first = at if at is not None else None if calendar else now + interval if interval else None
@@ -342,13 +388,14 @@ class JobStore:
 
     @staticmethod
     def _insert_run(db: sqlite3.Connection, job: sqlite3.Row, slot: float | None,
-                    now: float, *, skipped: int = 0, notice: str = "") -> str:
+                    now: float, *, skipped: int = 0, notice: str = "", event: dict | None = None) -> str:
         identity = uuid.uuid4().hex
         state = "skipped" if skipped or notice else "claimed"
         detail = notice or (f"Missed {skipped} slot(s) outside the catch-up policy." if skipped else "")
         db.execute("INSERT INTO runs (id,job_id,scheduled_at,created_at,finished_at,state,spec,detail,skipped_count) "
                    "VALUES (?,?,?,?,?,?,?,?,?)", (identity, job["id"], slot, now, now if state == "skipped" else None,
-                                                state, job["spec"], detail, skipped))
+                                                state, json.dumps({**json.loads(job["spec"]), "event": event})
+                                                if event else job["spec"], detail, skipped))
         if state == "skipped":
             db.execute("INSERT INTO deliveries (run_id,state) VALUES (?,'pending')", (identity,))
         return identity
@@ -380,7 +427,50 @@ class JobStore:
                 continue
             db.execute("UPDATE jobs SET run_requested_at=NULL WHERE id=?", (job["id"],))
             return self._insert_run(db, job, None, now)
+        for event in db.execute("SELECT trigger_events.id AS event_id, trigger_events.payload, jobs.* FROM trigger_events "
+                                "JOIN jobs ON jobs.id=trigger_events.job_id WHERE trigger_events.run_id IS NULL "
+                                "AND jobs.state='enabled' AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.job_id=jobs.id "
+                                "AND runs.state IN ('claimed','running')) ORDER BY trigger_events.id").fetchall():
+            if reminders_only and json.loads(event["spec"])["kind"] != "reminder":
+                continue
+            identity = self._insert_run(db, event, None, now, event=json.loads(event["payload"]))
+            db.execute("UPDATE trigger_events SET run_id=? WHERE id=?", (identity, event["event_id"]))
+            return identity
         return ""
+
+    def trigger_cursor(self, job_id: str) -> str | None:
+        """Where a job's trigger last looked, or None before its first look."""
+        with self.connect() as db:
+            row = db.execute("SELECT cursor FROM trigger_cursors WHERE job_id=?", (job_id,)).fetchone()
+        return None if row is None else str(row["cursor"])
+
+    def fire(self, job_id: str, events: list[dict], cursor: str, *, now: float | None = None) -> int:
+        """Queue one run per event and move the trigger's cursor past them, in one transaction."""
+        now = time.time() if now is None else now
+        with self.transaction() as db:
+            if db.execute("SELECT 1 FROM jobs WHERE id=? AND state='enabled'", (job_id,)).fetchone() is None:
+                return 0
+            for event in events:
+                db.execute("INSERT INTO trigger_events (job_id,payload,created_at) VALUES (?,?,?)",
+                           (job_id, json.dumps(event, ensure_ascii=False), now))
+            db.execute("INSERT INTO trigger_cursors (job_id,cursor,checked_at) VALUES (?,?,?) ON CONFLICT(job_id) "
+                       "DO UPDATE SET cursor=excluded.cursor,checked_at=excluded.checked_at", (job_id, cursor, now))
+        if events:
+            self._sync_active()
+        return len(events)
+
+    def pause_inactive(self, job_id: str, *, now: float | None = None) -> bool:
+        """Pause a recurring or event-started job nobody has been around for, and say so once."""
+        now = time.time() if now is None else now
+        with self.transaction() as db:
+            job = db.execute("SELECT * FROM jobs WHERE id=? AND state='enabled'", (job_id,)).fetchone()
+            if job is None:
+                return False
+            db.execute("UPDATE jobs SET state='paused',paused_reason='inactive' WHERE id=?", (job_id,))
+            self._insert_run(db, job, None, now, notice=(
+                "Paused because nobody talked to Astra for 7 days. Resume the job to continue."))
+        self._sync_active()
+        return True
 
     def _claim_scheduled(self, db: sqlite3.Connection, now: float, reminders_only: bool,
                          last_interaction: float | None) -> str:
@@ -535,7 +625,8 @@ class JobStore:
                 "SELECT EXISTS(SELECT 1 FROM jobs WHERE state='enabled' OR (state!='removed' AND run_requested_at "
                 "IS NOT NULL)) OR EXISTS(SELECT 1 FROM runs WHERE state IN ('claimed','running')) OR "
                 "EXISTS(SELECT 1 FROM pushes WHERE state='pending') OR "
-                "EXISTS(SELECT 1 FROM deliveries WHERE state='pending')").fetchone()[0]
+                "EXISTS(SELECT 1 FROM deliveries WHERE state='pending') OR "
+                "EXISTS(SELECT 1 FROM trigger_events WHERE run_id IS NULL)").fetchone()[0]
         marker = self.root / ACTIVE_MARKER
         try:
             if active:

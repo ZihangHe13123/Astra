@@ -17,7 +17,7 @@ from agent.runtime.approval_inbox import approval_db_path
 from agent.runtime.jobs.calendar import quiet_hours
 from agent.runtime.jobs.store import PUSH_TARGETS
 from agent.runtime.task_store import task_db_path
-from agent.runtime.tools.jobs import schedule_text
+from agent.runtime.tools.jobs import job_schedule_text
 
 PREVIEW_CHARS = 280
 # Tool steps shown on the activity page: those that change something, run something or act for the person.
@@ -70,9 +70,11 @@ def jobs_overview(home: Path, *, inbox_limit: int = 50) -> dict[str, Any]:
             result["jobs"].append({
                 "id": row["id"], "name": spec["name"], "kind": spec["kind"], "state": row["state"],
                 "paused_reason": row["paused_reason"] if "paused_reason" in job_columns else "",
-                "schedule": schedule_text(spec.get("calendar"), row["interval_seconds"], row["next_at"]),
-                "next_at": row["next_at"] if row["state"] == "enabled" else None,
-                "notify": spec.get("notify", "always"), "web": bool(spec.get("web")), "prompt": spec["prompt"],
+                "schedule": job_schedule_text(spec, row["interval_seconds"], row["next_at"]),
+                "next_at": row["next_at"] if row["state"] == "enabled" and not spec.get("trigger") else None,
+                "notify": spec.get("notify", "always"), "web": bool(spec.get("web")), "mail": bool(spec.get("mail")),
+                "read_calendar": bool(spec.get("read_calendar")),
+                "prompt": spec["prompt"],
                 "targets": spec.get("targets", list(PUSH_TARGETS)), "last_outcome": row["last_outcome"] or "",
             })
         run_columns = _columns(db, "runs")

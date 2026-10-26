@@ -260,6 +260,8 @@ until asked for. **打开这次对话** opens the turn's conversation. While the
 in the background, a waiting approval or question, a reply that took 20 seconds or
 more, and job results arrive as system notifications.
 
+**记忆** shows and edits what Astra keeps about you; see [the memory page](memory.md#the-memory-page).
+
 ## Permissions and persona
 
 The approval-mode button in the composer opens **权限与对话模式**. Choose

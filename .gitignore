@@ -30,6 +30,10 @@ nul
 .astra/skills/operations/activity-history/*
 !.astra/skills/operations/activity-history/SKILL.md
 .astra/skills/operations/activity-history/SKILL.md/
+!.astra/skills/operations/onboarding/
+.astra/skills/operations/onboarding/*
+!.astra/skills/operations/onboarding/SKILL.md
+.astra/skills/operations/onboarding/SKILL.md/
 !.astra/skills/operations/using-computer-use/
 .astra/skills/operations/using-computer-use/*
 !.astra/skills/operations/using-computer-use/SKILL.md

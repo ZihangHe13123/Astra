@@ -995,7 +995,7 @@ def test_sync_redacts_authorization_code_from_unexpected_error(
 
     assert report.status == "failed"
     assert report.folders[0].error_code == "sync_failed"
-    assert report.folders[0].error_message == "163 mail synchronization failed"
+    assert report.folders[0].error_message == "Mail synchronization failed"
     assert config.auth_code not in str(report)
 
 
@@ -1006,17 +1006,17 @@ def test_sync_redacts_authorization_code_from_unexpected_error(
         (
             MailUnsafeLoginError("unsafe detail: super-secret-auth-code"),
             "unsafe_login",
-            "163 rejected login as unsafe",
+            "The mail server rejected the login as unsafe",
         ),
         (
             MailAuthenticationError("auth detail: super-secret-auth-code"),
             "auth_failed",
-            "163 authentication failed",
+            "Mail login failed",
         ),
         (
             MailProtocolError("IMAP ID failed: super-secret-auth-code"),
             "protocol_error",
-            "163 mail server response could not be processed",
+            "The mail server response could not be processed",
         ),
     ],
 )
@@ -1040,3 +1040,21 @@ def test_service_preserves_stable_protocol_error_classifications(
     assert report.folders[0].error_message == expected_message
     assert report.folders[0].synced_at is None
     assert config.auth_code not in str(report)
+
+
+def test_a_large_mailbox_caches_its_newest_messages_first_and_only_newer_ones_later(config: MailConfig) -> None:
+    settings = replace(config, sync_limit=5, default_folders=("INBOX",))
+    uids = frozenset(range(1, 101))
+    client = ScriptedClient(
+        snapshots={"INBOX": FolderSnapshot("INBOX", 10, uids, {uid: () for uid in uids})},
+        messages={("INBOX", uid): message("INBOX", 10, uid, subject=f"m{uid}") for uid in range(1, 104)},
+    )
+    service = MailService(settings, client_factory=ClientFactory(client))
+    service.sync()
+    assert client.fetch_calls[-1] == ("INBOX", {96, 97, 98, 99, 100})
+    newer = frozenset(range(1, 104))
+    client.snapshots["INBOX"] = FolderSnapshot("INBOX", 10, newer, {uid: () for uid in newer})
+    service.sync()
+    # Two new messages arrived; the 95 older ones are not backfilled.
+    assert client.fetch_calls[-1] == ("INBOX", {101, 102, 103})
+    assert [item["uid"] for item in service.recent(refresh=False, limit=50)["items"]][:3] == [103, 102, 101]

@@ -20,7 +20,10 @@ astra jobs add project-status --every 3600 --workdir /path/to/project \
 ```
 
 The current configured model is captured at creation. Use `--model KEY` to pick
-another configured model. `--web` explicitly enables existing search/fetch tools.
+another configured model. `--web` explicitly enables existing search/fetch tools, and `--mail` lets the check read the
+configured mailbox (read-only; see [mail](integrations.md#read-only-163-mail)). On macOS,
+`--read-calendar` lets it read Calendar and Reminders, never change them
+([calendar](integrations.md#calendar-and-reminders-macos)).
 Checks expose file reading/search and time tools, with no shell, writes, memory
 providers, Computer Use, delegates or channel sends. Each execution has a fresh
 session under `ASTRA_HOME/jobs/runs/ID/`, loading project guidance under current
@@ -43,7 +46,8 @@ that run is kept as a quiet result. Each run records its token usage.
 In a conversation, Astra can manage the same jobs with its `jobs` tool when you ask for something
 at a time or on a schedule ("remind me at 3pm", "every morning…"). Creating, changing, resuming,
 removing or running a job now is shown to you for approval first, in the desktop or in WeChat; the
-job records your own message as its authority. Listing and pausing need no approval.
+job records your own words as its authority: your message and the questions you answered after it.
+Listing and pausing need no approval. Its `quiet` action sets the quiet hours, also with approval.
 
 While the Astra desktop app is open (also from the tray), its background host runs due jobs
 and pushes results: a desktop notification, and a WeChat message to the person who logged WeChat
@@ -107,6 +111,17 @@ reminders are serviced while a check worker is running, so a slow model request
 does not hold their delivery until that check completes. A running occurrence
 still blocks another occurrence of the same job; later missed slots follow the
 same accounting policy.
+
+A job can also start on an event instead of a time. `--on-mail-from TEXT` and
+`--on-mail-subject TEXT` (with `--on-mail-folder`, default the inbox) start it when new mail
+arrives whose sender or subject contains the text; `--on-new-file PATTERN` starts it when a new
+file matching the pattern (such as `'*.pdf'`) appears directly in `--workdir`. The desktop's
+background host looks every five minutes; its first look only notes where things stand, so mail
+and files already there never start a run, and one look starts at most five runs per job. A
+reminder started this way delivers its text with the mail's sender and subject or the file's
+name; a check is told which mail or file started it (and can read the mail). Results of
+event-started jobs wait out the quiet hours like check results. The jobs tool's `on_new_mail` and
+`on_new_file` do the same from a conversation.
 
 Jobs stop themselves in two cases, and the reason reaches the inbox:
 

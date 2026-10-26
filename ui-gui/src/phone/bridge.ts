@@ -26,6 +26,7 @@ const UNAVAILABLE = {
   appshot: "窗口捕获只在电脑上可用。",
   export: "导出会话只在电脑上可用。",
   phone: "手机配对只能在电脑上管理。",
+  data: "导出和清除数据只能在电脑上操作。",
 };
 
 /**
@@ -168,6 +169,8 @@ export class RemoteBridge implements DesktopBridge {
   send(id: string, command: Record<string, unknown>) { return this.call("send", [id, command]); }
   query(method: string, params?: Record<string, unknown>, runtime?: string) { return this.call("query", [method, params ?? {}, runtime]); }
   jobs(action: string, value?: string, extra?: string) { return this.call("jobs", [action, value, extra]); }
+  memory(action: string, ...values: string[]) { return this.call("memory", [action, ...values]) as Promise<string>; }
+  data(): Promise<never> { return Promise.reject(new Error(UNAVAILABLE.data)); }
   sessionAction(action: "export" | "delete", entry: { name: string; mode: string }) {
     return action === "delete" ? this.call("deleteSession", [entry]) : Promise.reject(new Error(UNAVAILABLE.export));
   }

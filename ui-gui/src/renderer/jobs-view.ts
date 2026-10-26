@@ -2,7 +2,7 @@
 
 export type JobRow = {
   id: string; name: string; kind: string; state: string; paused_reason: string; schedule: string;
-  next_at: number | null; notify: string; web: boolean; prompt: string; targets: string[]; last_outcome: string;
+  next_at: number | null; notify: string; web: boolean; mail?: boolean; read_calendar?: boolean; prompt: string; targets: string[]; last_outcome: string;
 };
 export type InboxRow = {
   id: string; job_id: string; name: string; kind: string; state: string; quiet: boolean; output: string; detail: string;

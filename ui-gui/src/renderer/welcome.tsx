@@ -1,5 +1,5 @@
 import React from "react";
-import { Command, SlidersHorizontal } from "lucide-react";
+import { Command, SlidersHorizontal, UserRound } from "lucide-react";
 import { THEMES, isThemeName } from "@astra/ui-core/themes";
 import type { UIEvent } from "@astra/ui-core/session-state";
 import { useTheme } from "./theme-context.js";
@@ -11,7 +11,7 @@ export function Welcome({ info, openModels, showCommands, run }: {
   info?: UIEvent; openModels: () => void; showCommands: (query?: string) => void; run: (command: string) => void;
 }) {
   const theme = useTheme();
-  if (!theme.console || !isThemeName(theme.name)) return <section className="welcome"><div className="welcome-mark">A</div><h1>从一个想法开始。</h1><p>对话、研究、编写代码，或把手头的事情交给 Astra。</p><div className="welcome-actions"><button onClick={openModels}><SlidersHorizontal size={16}/>连接或选择模型</button><button onClick={() => showCommands()}><Command size={16}/>浏览全部功能</button></div></section>;
+  if (!theme.console || !isThemeName(theme.name)) return <section className="welcome"><div className="welcome-mark">A</div><h1>从一个想法开始。</h1><p>对话、研究、编写代码，或把手头的事情交给 Astra。</p><div className="welcome-actions"><button onClick={openModels}><SlidersHorizontal size={16}/>连接或选择模型</button><button onClick={() => run("/onboard")}><UserRound size={16}/>让 Astra 认识你</button><button onClick={() => showCommands()}><Command size={16}/>浏览全部功能</button></div></section>;
   const words = THEMES[theme.name].console;
   const servers = Array.isArray(info?.mcp) ? info.mcp.filter((server: UIEvent) => server.state !== "disabled") : [];
   const failing = servers.filter((server: UIEvent) => server.state === "error").length;
@@ -40,6 +40,7 @@ export function Welcome({ info, openModels, showCommands, run }: {
       <h2>{words.commandTitle}</h2>
       <div>
         <button onClick={openModels}><code>/model</code><span>连接或选择模型</span></button>
+        <button onClick={() => run("/onboard")}><code>/onboard</code><span>让 Astra 认识你</span></button>
         <button onClick={() => run("/skills")}><code>/skills</code><span>浏览技能</span></button>
         <button onClick={() => showCommands()}><code>/help</code><span>浏览全部功能</span></button>
       </div>

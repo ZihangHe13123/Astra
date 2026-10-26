@@ -1127,5 +1127,13 @@
     "id": "F51",
     "takes_args": false,
     "options": []
+  },
+  {
+    "command": "/onboard",
+    "description": "let Astra get to know you: name, routine, preferences; saves what you confirm",
+    "group": "CHAT",
+    "id": "F58",
+    "takes_args": false,
+    "options": []
   }
 ]

@@ -4,7 +4,7 @@
 
 Enable only the services you need. Run shell examples from the installation checkout. Provider credentials belong in your local `.env`.
 
-[Optional OpenAI-compatible API](#optional-openai-compatible-api) · [Native messaging channels](#native-messaging-channels) · [MCP](#mcp) · [Web search](#web-search) · [Conclave multi-expert research](#conclave-multi-expert-research) · [Image tools](#image-tools) · [Read-only 163 mail](#read-only-163-mail)
+[Optional OpenAI-compatible API](#optional-openai-compatible-api) · [Native messaging channels](#native-messaging-channels) · [MCP](#mcp) · [Web search](#web-search) · [Conclave multi-expert research](#conclave-multi-expert-research) · [Image tools](#image-tools) · [Read-only 163 mail](#read-only-163-mail) · [Calendar and Reminders (macOS)](#calendar-and-reminders-macos)
 
 ## Optional OpenAI-compatible API
 
@@ -332,6 +332,18 @@ WSL selection.
 
 ## Read-only 163 mail
 
+Astra reads the configured mailbox itself with its read-only `mail` tool: recent
+mail (or only unread), search, and one message's text, in any conversation or a
+scheduled check given `--mail`. Mail is treated as outside text, like a web page:
+a memory saved in a turn that read mail needs your approval. Any IMAP account
+works, not only 163: set `ASTRA_MAIL_ADDRESS` and `ASTRA_MAIL_PASSWORD` (an app
+password or authorization code) instead of the 163 names below. Gmail, QQ,
+iCloud and 163/126/yeah are recognised from the address; for another provider
+also set `ASTRA_MAIL_IMAP_HOST` (and `ASTRA_MAIL_IMAP_PORT` or
+`ASTRA_MAIL_SENT_FOLDER` when they differ). A folder's first sync caches its
+newest 100 messages (`ASTRA_MAIL_SYNC_LIMIT`); later syncs fetch what arrived
+since and never older history.
+
 The optional 163 integration incrementally caches mail for local queries. Put
 your account and a 163 client authorization code (not the web password) in the
 repository `.env`:
@@ -384,3 +396,24 @@ Source checkouts also include the repository-local
 [163 mail skill](../.astra/skills/operations/163-email-sync/SKILL.md). It is discovered
 through the normal project-trust checks; setup does not install or update it.
 Mail credentials, cache and other private `.astra` state remain local and ignored.
+
+## Calendar and Reminders (macOS)
+
+On macOS, the `calendar` tool reads the person's Calendar and Reminders apps
+through the computer helper's EventKit mode (build the helper with
+`scripts/build_macos_computer_helper.sh`): what is on between two times, open
+reminders, and the names of calendars and lists. Adding an event or a reminder,
+or ticking a reminder off, shows an approval card every time; nothing is ever
+deleted. A reminder with a time gets an alert, so Reminders notifies the person
+on their other devices too. Use the `jobs` tool instead when Astra itself should
+push a reminder.
+
+The helper answers calendar requests as its own process, so the first use makes
+macOS ask whether **AstraMacComputerHelper** may access Calendars or Reminders;
+the switches are in System Settings > Privacy & Security. The helper is ad-hoc
+signed, so a rebuilt helper may be asked again. A scheduled check given
+`--read-calendar` (or `read_calendar` in the `jobs` tool) can read the calendar
+but never adds, changes or completes anything, and never makes macOS ask.
+Invitations and shared lists can carry other people's text, so a memory saved in
+a turn that read the calendar needs approval, as with mail. Windows and Linux
+have no calendar tool.

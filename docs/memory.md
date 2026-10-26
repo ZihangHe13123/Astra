@@ -4,7 +4,7 @@
 
 Astra keeps a small core memory, searchable history and reusable skills. Each has a different purpose and lifecycle.
 
-[Core memory and task state](#core-memory-and-task-state) · [On-demand history and learned skills](#on-demand-history-and-learned-skills) · [Memory commands](#memory-commands) · [Proactive Context Index](#proactive-context-index) · [Evaluating memory](#evaluating-memory) · [Importing Hermes history](#importing-hermes-history) · [Optional Hindsight service](#optional-hindsight-service)
+[Core memory and task state](#core-memory-and-task-state) · [On-demand history and learned skills](#on-demand-history-and-learned-skills) · [The memory page](#the-memory-page) · [Memory commands](#memory-commands) · [Proactive Context Index](#proactive-context-index) · [Evaluating memory](#evaluating-memory) · [Importing Hermes history](#importing-hermes-history) · [Optional Hindsight service](#optional-hindsight-service)
 
 ## Core memory and task state
 
@@ -156,6 +156,39 @@ Reusable procedures use the skill library. Only its catalog is injected;
 user-added skills have separate ownership. `/learn review` starts a read-only discussion of the next automatic-skill batch;
 user-selected edits and optional execution checks happen on a subsequent turn. See [skill learning](skill-learning.md) for migration,
 cursor progress, protections and undo.
+
+## The memory page
+
+In the desktop app, **记忆** in the sidebar shows what Astra keeps about you. The two
+core files, **关于你** (`USER.md`) and **长期笔记** (`MEMORY.md`), are listed entry by entry
+with how full each is; edit, remove or add an entry there. Saved memories follow, newest
+first, each with its kind, date, how often it was used and the conversation it came
+from; correct one (the old text is kept as a superseded version) or forget it (it is no
+longer used, and stays readable under **显示旧版本和已忘记的**). Consolidation proposals
+wait at the end with the message each rests on, to accept or dismiss. These changes are
+your own and need no approval; they take effect from the next turn. Deleting a
+conversation does not remove the memories saved from it; forget them here.
+
+To set things up from a conversation instead, send `/onboard` (or use **让 Astra 认识你** on the
+welcome screen). Astra asks a few questions, how to address you, your usual day, how you like
+replies, what you would like it to do on its own, and where to reach you, shows a draft, and
+after you confirm saves the lines to USER.md, sets the quiet hours and offers scheduled jobs, each
+of which you approve. Run it again any time.
+
+### Exporting or wiping your data
+
+**你的数据** at the end of the memory page saves everything Astra keeps about you as one zip:
+the two core files, saved memories, conversations and their search index, scheduled jobs and
+their results, and learned skills. It never includes `.env` or other keys, provider
+connections, the WeChat login, browser logins or settings. **清除…** lists what a wipe would
+delete and what stays, and deletes only after you type 清除: the same data plus every copy made
+from it (search and vector indexes, task, event and approval records, the desktop's history cache
+and pasted images). Logins in Astra's own browser go only if you tick that box. Settings,
+models, keys, the WeChat login, the mail cache and activity history stay, and a Hindsight server
+keeps its own memories. The desktop closes every conversation and its background host first and
+reloads afterwards. In a terminal the same is `astra data plan`, `astra data export --out
+FILE.zip` and `astra data wipe --confirm 清除 [--browser-data]`; a wipe refuses while any other
+Astra runs. In a source checkout, files tracked by git (such as bundled skills) are never deleted.
 
 ## Memory commands
 

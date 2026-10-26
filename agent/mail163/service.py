@@ -80,7 +80,11 @@ class MailService:
                             folder,
                             snapshot.uidvalidity,
                         )
-                        messages = client.fetch_messages(folder, snapshot, set(snapshot.uids) - known)
+                        # Newest first and bounded: a large mailbox's first sync stays quick,
+                        # and nothing older than the oldest cached message is fetched later.
+                        floor = min(known) if known else 0
+                        wanted = sorted(uid for uid in set(snapshot.uids) - known if uid > floor)
+                        messages = client.fetch_messages(folder, snapshot, set(wanted[-self.config.sync_limit:]))
                         synced_at = self.clock()
                         fetched, updated_flags, remote_removed = self.store.apply_folder_sync(
                             self._account(),
@@ -117,7 +121,7 @@ class MailService:
         refresh: bool = True,
         include_removed: bool = False,
     ) -> dict[str, object]:
-        canonical = resolve_folder(folder)
+        canonical = resolve_folder(folder, self.config.sent_folder)
         report = self._refresh(canonical) if refresh else None
         self._require_cache()
         try:
@@ -143,7 +147,7 @@ class MailService:
         refresh: bool = True,
         include_removed: bool = False,
     ) -> dict[str, object]:
-        canonical = resolve_folder(folder) if folder is not None else None
+        canonical = resolve_folder(folder, self.config.sent_folder) if folder is not None else None
         report = self._refresh(canonical) if refresh else None
         self._require_cache()
         try:
@@ -169,7 +173,7 @@ class MailService:
         uidvalidity: int | None = None,
         refresh: bool = True,
     ) -> dict[str, object]:
-        canonical = resolve_folder(folder)
+        canonical = resolve_folder(folder, self.config.sent_folder)
         report = self._refresh(canonical) if refresh else None
         self._require_cache()
         self._require_fallback_cache(report, folder=canonical)
@@ -213,7 +217,7 @@ class MailService:
 
         states = self._folder_states(allow_missing=True)
         return {
-            "items": self._merge_folder_states(remote_folders, states),
+            "items": self._merge_folder_states(remote_folders, states, self.config.sent_folder),
             "cache_used": False,
             "sync_status": "ok",
             "last_success": self._last_success(states),
@@ -237,7 +241,7 @@ class MailService:
         uid: int,
         part_id: str,
     ) -> dict[str, object]:
-        canonical = resolve_folder(folder)
+        canonical = resolve_folder(folder, self.config.sent_folder)
         self._require_cache()
         try:
             metadata = self.store.attachment(
@@ -546,9 +550,9 @@ class MailService:
         if isinstance(error, MailTlsError):
             return MailError("tls_error", f"TLS connection to {self.config.host} failed", 4)
         if isinstance(error, MailUnsafeLoginError):
-            return MailError("unsafe_login", "163 rejected login as unsafe", 4)
+            return MailError("unsafe_login", "The mail server rejected the login as unsafe", 4)
         if isinstance(error, MailAuthenticationError):
-            return MailError("auth_failed", "163 authentication failed", 4)
+            return MailError("auth_failed", "Mail login failed", 4)
         if isinstance(error, MailNetworkError):
             return MailError("network_error", f"Unable to reach {self.config.host}", 4)
         if isinstance(error, OSError):
@@ -556,13 +560,13 @@ class MailService:
         if isinstance(error, MailProtocolError):
             description = self._redact(str(error)).casefold()
             if "login" in description or "auth" in description:
-                return MailError("auth_failed", "163 authentication failed", 4)
+                return MailError("auth_failed", "Mail login failed", 4)
             if "connection" in description:
                 return MailError("network_error", f"Unable to reach {self.config.host}", 4)
             if "select" in description or "folder" in description or "mailbox" in description:
                 return MailError("folder_unavailable", "Mailbox folder is unavailable", 4)
-            return MailError("protocol_error", "163 mail server response could not be processed", 4)
-        return MailError("sync_failed", "163 mail synchronization failed", 4)
+            return MailError("protocol_error", "The mail server response could not be processed", 4)
+        return MailError("sync_failed", "Mail synchronization failed", 4)
 
     def _redact(self, value: str) -> str:
         redacted = value
@@ -573,7 +577,7 @@ class MailService:
 
     def _canonical_folders(self, folders: Sequence[str] | None) -> tuple[str, ...]:
         requested = self.config.default_folders if folders is None else folders
-        return tuple(dict.fromkeys(resolve_folder(folder) for folder in requested))
+        return tuple(dict.fromkeys(resolve_folder(folder, self.config.sent_folder) for folder in requested))
 
     @staticmethod
     def _report_status(results: Sequence[FolderSyncResult]) -> Literal["ok", "partial", "failed"]:
@@ -617,12 +621,13 @@ class MailService:
     def _merge_folder_states(
         remote_folders: Sequence[str],
         local_states: Sequence[dict[str, object]],
+        sent_folder: str = "已发送",
     ) -> list[dict[str, object]]:
         local_by_folder = {str(state["folder"]): state for state in local_states}
         merged: list[dict[str, object]] = []
         seen: set[str] = set()
         for folder in remote_folders:
-            canonical = resolve_folder(folder)
+            canonical = resolve_folder(folder, sent_folder)
             if canonical in seen:
                 continue
             seen.add(canonical)

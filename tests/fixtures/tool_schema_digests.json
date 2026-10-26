@@ -119,6 +119,12 @@
     ],
     "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
   },
+  "calendar": {
+    "sha256": [
+      "7763f5697b2a0039"
+    ],
+    "reason": "2026-10-26: new tool (macOS); the person's Calendar and Reminders through the helper's EventKit mode: read events, reminders and lists; add_event, add_reminder and complete_reminder each approved."
+  },
   "cancel_wakeup": {
     "sha256": [
       "22ec2237327b6834"
@@ -374,15 +380,21 @@
   },
   "jobs": {
     "sha256": [
-      "ddcb4d10b2ef98ea"
+      "6799f26192f374ab"
     ],
-    "reason": "2026-10-25: new tool; the model schedules reminders and read-only checks the person asks for, each change approved. targets chooses where results are pushed."
+    "reason": "2026-10-25: new tool; the model schedules reminders and read-only checks the person asks for, each change approved. targets chooses where results are pushed; quiet sets the quiet hours; mail lets a check read the mailbox; on_new_mail and on_new_file start a job on an event; read_calendar (2026-10-26) lets a check read Calendar and Reminders."
   },
   "load_workspace_dependencies": {
     "sha256": [
       "b305eb4353a6da67"
     ],
     "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "mail": {
+    "sha256": [
+      "66adf4068775754c"
+    ],
+    "reason": "2026-10-25: new tool; the person's own mailbox, read-only (recent, search, read, status)."
   },
   "memory": {
     "sha256": [
