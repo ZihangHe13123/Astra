@@ -40,6 +40,11 @@ class Handler(BaseHTTPRequestHandler):
             delta = {"tool_calls": [{"index": 0, "id": "unauthorized-write", "type": "function", "function": {
                 "name": "write_file", "arguments": json.dumps({"path": str(self.server.target), "content": "MODIFIED"})}}]}
             reason = "tool_calls"
+        elif body.get("tools") and sum(message["role"] == "tool" for message in body["messages"]) < self.server.tool_rounds:
+            # Keeps looking, round after round of the same run, while it is offered tools.
+            delta = {"tool_calls": [{"index": 0, "id": f"look-{len(self.server.requests)}", "type": "function",
+                                     "function": {"name": "current_time", "arguments": "{}"}}]}
+            reason = "tool_calls"
         else:
             delta = {"content": getattr(self.server, "reply", "fixture-check-result")}
             reason = "stop"
@@ -56,6 +61,7 @@ def provider(tmp_path):
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.requests = []
     server.try_write = False
+    server.tool_rounds = 0
     server.target = tmp_path / "protected.txt"
     server.target.write_text("ORIGINAL", encoding="utf-8")
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -133,6 +139,23 @@ def test_real_worker_fresh_context_read_only_tools_result_and_receipt(tmp_path, 
     command(env, "run", job["id"])
     assert "JOBS_GUIDANCE_VERSION_TWO" in provider.requests[before]["body"]["messages"][0]["content"]
     assert len(command(env, "inbox")) == 2
+
+
+def test_a_check_that_runs_out_of_rounds_delivers_what_it_found_as_a_result(tmp_path, provider):
+    env = environment(tmp_path / "A", provider)
+    provider.tool_rounds = 2
+    provider.reply = "Found two things before the rounds ran out."
+    job = command(env, "add", "check", "--every", "3600", "--model", "fixture", "--workdir", str(tmp_path),
+                  "--iterations", "2", "--prompt", "Look around", "--request", "Check hourly")
+    for _ in range(3):
+        command(env, "run", job["id"])
+    runs = command(env, "show", job["id"])["occurrences"]
+    assert [(run["state"], run["detail"]) for run in runs] == [("completed", "iteration_budget")] * 3
+    assert runs[0]["output"].endswith("Found two things before the rounds ran out.")
+    # Rounds used up are not failures: the job is not paused after three of them.
+    assert command(env, "show", job["id"])["job"]["state"] == "enabled"
+    # The last request asked for an answer without tools.
+    assert not provider.requests[-1]["body"].get("tools")
 
 
 def test_real_worker_secrets_and_results_follow_a_to_b_to_a_scope(tmp_path, provider):

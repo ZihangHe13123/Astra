@@ -56,8 +56,15 @@ def jobs_parser() -> JobParser:
     add.add_argument("--read-calendar", action="store_true",
                      help="let this check read Calendar and Reminders on macOS (read-only)")
     add.add_argument("--idle", type=float, default=120)
-    add.add_argument("--timeout", type=float, default=900)
-    add.add_argument("--iterations", type=int, default=10)
+    add.add_argument("--timeout", type=float, default=None,
+                     help="hard limit in seconds per run (default 2700 with --web, else 900)")
+    add.add_argument("--iterations", type=int, default=None,
+                     help="most model rounds per run, 1 to 50 (default 30 with --web, else 10)")
+    update = commands.add_parser("update", help="change a check's rounds or time limit for its later runs")
+    update.add_argument("id")
+    update.add_argument("--iterations", type=int, help="most model rounds per run, 1 to 50")
+    update.add_argument("--timeout", type=float, help="hard limit in seconds per run")
+    update.add_argument("--request", default="", help="why it changed, kept with the job's authorization")
     commands.add_parser("list", help="show jobs and their schedules")
     for action in ("show", "pause", "resume", "remove", "run"):
         item = commands.add_parser(action)
@@ -173,6 +180,12 @@ def execute_jobs_command(argv: list[str], *, home: Path | None = None,
                               kind="reminder" if args.reminder else "check", model=model, web=args.web, mail=args.mail,
                               read_calendar=args.read_calendar,
                               idle_seconds=args.idle, timeout_seconds=args.timeout, max_iterations=args.iterations)
+            _with_times(value)
+        elif args.action == "update":
+            if args.iterations is None and args.timeout is None:
+                raise ValueError("Give --iterations or --timeout.")
+            value = store.update(args.id, request=args.request.strip() or "Changed from the command line.",
+                                 max_iterations=args.iterations, timeout_seconds=args.timeout)
             _with_times(value)
         elif args.action == "list":
             value = store.jobs()

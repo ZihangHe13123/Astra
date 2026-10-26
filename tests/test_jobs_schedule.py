@@ -176,6 +176,30 @@ def test_update_changes_future_runs_and_records_the_request(tmp_path):
         store.update(job["id"], request="", name="x")
 
 
+def test_a_check_gets_rounds_and_time_for_what_it_reads_and_can_be_given_more(tmp_path):
+    store = JobStore(tmp_path / "home")
+    now = at("2026-10-25T09:30")
+    files = daily(store, tmp_path, now=now, kind="check")
+    web = daily(store, tmp_path, now=now, kind="check", web=True)
+    assert [(job["spec"]["max_iterations"], job["spec"]["timeout_seconds"]) for job in (files, web)] == [
+        (10, 900), (30, 2700)]
+    given = daily(store, tmp_path, now=now, kind="check", web=True, max_iterations=12, timeout_seconds=600)
+    assert (given["spec"]["max_iterations"], given["spec"]["timeout_seconds"]) == (12, 600)
+    changed = store.update(web["id"], request="晚报轮数太少了", max_iterations=40, timeout_seconds=3600, now=now)
+    assert (changed["spec"]["max_iterations"], changed["spec"]["timeout_seconds"]) == (40, 3600)
+    assert changed["spec"]["original_request"].endswith("晚报轮数太少了") and changed["next_at"] == web["next_at"]
+    for limits in ({"max_iterations": 0}, {"max_iterations": 51}, {"timeout_seconds": 60}):
+        with pytest.raises(ValueError):
+            store.update(web["id"], request="x", now=now, **limits)
+    with pytest.raises(ValueError, match="no rounds"):
+        store.update(daily(store, tmp_path, now=now)["id"], request="x", max_iterations=20, now=now)
+    output, error = execute_jobs_command(["update", files["id"], "--iterations", "25", "--timeout", "1200"],
+                                         home=tmp_path / "home", workdir=tmp_path)
+    assert error == "" and (json.loads(output)["spec"]["max_iterations"], json.loads(output)["spec"]["timeout_seconds"]) == (
+        25, 1200)
+    assert execute_jobs_command(["update", files["id"]], home=tmp_path / "home", workdir=tmp_path)[1]
+
+
 def test_quiet_result_is_kept_but_not_offered_as_the_last_report(tmp_path):
     store = JobStore(tmp_path / "home")
     job = daily(store, tmp_path, now=at("2026-10-25T09:30"), kind="check", notify="on_change")
@@ -263,6 +287,25 @@ def test_tool_list_and_pause_need_no_approval_but_other_changes_do(tmp_path, mon
         assert asked[-1]["approval_title"] == f"{title}：Rust 早报"
     mixed = call(registry, action="add", name="x", prompt="x", time="07:00", days=["mon"], every_minutes=5)
     assert mixed["error_type"] == "invalid_input" and len(asked) == before + 4
+
+
+def test_tool_gives_a_check_more_rounds_and_time_with_approval(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_TIMEZONE", "Asia/Singapore")
+    registry, asked, _answer = tool(tmp_path, request="晚报轮数太少了，多给点")
+    created = json.loads(call(registry, action="add", name="AI 晚报", prompt="整理今天的 AI 新闻", time="20:00",
+                              web=True)["output"])["job"]
+    assert (created["max_rounds"], created["time_limit_minutes"]) == (30, 45)
+    changed = call(registry, action="update", job_id=created["job_id"], max_rounds=40, time_limit_minutes=60)
+    assert changed["error"] == ""
+    assert asked[-1]["target"] == "每天 20:00（Asia/Singapore）；最多 40 轮、每次最多 60 分钟"
+    spec = JobStore(tmp_path / "home").job(created["job_id"])["spec"]
+    assert (spec["max_iterations"], spec["timeout_seconds"]) == (40, 3600)
+    before = len(asked)
+    reminder = json.loads(call(registry, action="add", name="喝水", kind="reminder", prompt="喝水",
+                               time="08:00")["output"])["job"]
+    assert "max_rounds" not in reminder
+    refused = call(registry, action="update", job_id=reminder["job_id"], max_rounds=20)
+    assert refused["error_type"] == "invalid_input" and len(asked) == before + 1
 
 
 def test_tool_refuses_without_the_persons_request_and_checks_arguments_before_asking(tmp_path):

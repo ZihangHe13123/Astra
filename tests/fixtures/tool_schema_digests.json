@@ -380,9 +380,9 @@
   },
   "jobs": {
     "sha256": [
-      "6799f26192f374ab"
+      "541fd06ce5ab04bd"
     ],
-    "reason": "2026-10-25: new tool; the model schedules reminders and read-only checks the person asks for, each change approved. targets chooses where results are pushed; quiet sets the quiet hours; mail lets a check read the mailbox; on_new_mail and on_new_file start a job on an event; read_calendar (2026-10-26) lets a check read Calendar and Reminders."
+    "reason": "2026-10-25: new tool; the model schedules reminders and read-only checks the person asks for, each change approved. targets chooses where results are pushed; quiet sets the quiet hours; mail lets a check read the mailbox; on_new_mail and on_new_file start a job on an event; read_calendar (2026-10-26) lets a check read Calendar and Reminders; max_rounds and time_limit_minutes (2026-10-26) give a check more rounds and time."
   },
   "load_workspace_dependencies": {
     "sha256": [

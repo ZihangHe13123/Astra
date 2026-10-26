@@ -4874,6 +4874,7 @@ class ReActAgent(AgentBase):
                 })
             yield with_request({
                 "type": "error",
+                "code": "iteration_budget",
                 "message": f"Stopping: maximum ReAct iterations reached (limit={self.max_iterations}).",
                 "recoverable": True,
             })

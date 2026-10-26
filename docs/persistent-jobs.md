@@ -137,7 +137,8 @@ not caught up. `astra jobs run`, or the tool's `run`, adds one occurrence withou
 `astra jobs run ID --queue` leaves it to the running scheduler, as the desktop page does.
 
 `--idle SECONDS` limits inactivity, reset by actual model/tool events (default
-120 seconds); `--timeout SECONDS` is a separate hard run limit (default 900).
+120 seconds); `--timeout SECONDS` is a separate hard run limit (default 2700 for a
+check with `--web`, otherwise 900).
 
 Workers run in an owned process group on POSIX and a Windows Job on Windows.
 On interruption, the scheduler stops that group/job and checks the execution
@@ -145,7 +146,12 @@ owner lease before recording an unknown outcome. If cleanup cannot be confirmed,
 the active occurrence remains fenced until recovery observes that the owner has
 exited; it is never automatically replayed. POSIX gives the worker a bounded
 grace period to close detached provider processes before stopping its group.
-`--iterations N` bounds the ReAct loop (default 10, maximum 50). If an execution
+`--iterations N` bounds the ReAct loop (default 30 for a check with `--web`,
+otherwise 10; maximum 50). `astra jobs update ID --iterations N --timeout SECONDS`
+changes them for later runs, and the tool's `update` takes `max_rounds` and
+`time_limit_minutes`. A check that uses up its rounds still answers from what it
+found: that answer is the result, marked "rounds used up, maybe incomplete" in the
+inbox and the push, and it does not count toward the failures that pause a job. If an execution
 owner disappears or a running worker must be terminated, the occurrence becomes
 `unknown` and is never automatically replayed. Inspect its saved session before
 starting another check. A child still alive after its scheduler exits retains its

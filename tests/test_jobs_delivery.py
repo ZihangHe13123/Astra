@@ -188,6 +188,9 @@ def test_messages_name_the_job_and_explain_pauses_and_failures(tmp_path):
     long = {"spec": {"name": "x", "kind": "check"}, "run_state": "completed", "output": "字" * (TEXT_LIMIT + 50),
             "detail": "", "job_state": "enabled", "paused_reason": ""}
     assert push_message(long)[1].endswith(INBOX_NOTE)
+    # Out of rounds, the check still answered from what it found: that answer is sent, marked as maybe incomplete.
+    used_up = {**long, "output": "三条已核实的新闻", "detail": "iteration_budget"}
+    assert push_message(used_up) == ("定时任务：x（轮数用完，可能不全）", "三条已核实的新闻")
 
 
 def test_the_active_marker_follows_jobs_and_pending_pushes(tmp_path):

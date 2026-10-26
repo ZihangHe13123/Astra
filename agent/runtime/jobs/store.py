@@ -29,6 +29,11 @@ ACTIVE_MARKER = "active"
 # A check under ``on_change`` answers exactly this when it has nothing new to report.
 NO_UPDATE = "NO_UPDATE"
 FAILURES_BEFORE_PAUSE = 3
+# A check's ceilings on model rounds and on wall time. Searching the web takes many more rounds than reading files.
+CHECK_ROUNDS, WEB_CHECK_ROUNDS = 10, 30
+CHECK_SECONDS, WEB_CHECK_SECONDS = 900.0, 2700.0
+# A run that used up its rounds still answers from what it found: a result, though maybe an incomplete one.
+ROUNDS_USED_UP = "iteration_budget"
 BUDGET_NOTICE = "今天的模型用量已超过每日预算，这次检查没有运行；明天照常。"
 INACTIVE_SECONDS = 7 * 86400
 INTERACTION_FILE = "last-interaction"
@@ -203,8 +208,12 @@ class JobStore:
             targets: list[str] | tuple[str, ...] = PUSH_TARGETS,
             grace_seconds: float = 300, kind: str = "check", model: str = "",
             web: bool = False, mail: bool = False, read_calendar: bool = False, idle_seconds: float = 120,
-            timeout_seconds: float = 900, max_iterations: int = 10, now: float | None = None) -> dict:
+            timeout_seconds: float | None = None, max_iterations: int | None = None, now: float | None = None) -> dict:
         now = time.time() if now is None else now
+        if max_iterations is None:
+            max_iterations = WEB_CHECK_ROUNDS if web else CHECK_ROUNDS
+        if timeout_seconds is None:
+            timeout_seconds = WEB_CHECK_SECONDS if web else CHECK_SECONDS
         if trigger:
             if calendar or interval_seconds or next_at is not None:
                 raise ValueError("A job runs on a schedule or on an event, not both.")
@@ -306,7 +315,8 @@ class JobStore:
     def update(self, identity: str, *, request: str, name: str | None = None, prompt: str | None = None,
                interval_seconds: float | None = None, calendar: dict | None = None, at: float | None = None,
                notify: str | None = None, web: bool | None = None, targets: list[str] | None = None,
-               mail: bool | None = None, read_calendar: bool | None = None, now: float | None = None) -> dict:
+               mail: bool | None = None, read_calendar: bool | None = None, max_iterations: int | None = None,
+               timeout_seconds: float | None = None, now: float | None = None) -> dict:
         """Change a job's future runs; ``request`` is the person's words asking for the change."""
         now = time.time() if now is None else now
         if not isinstance(request, str) or not request.strip():
@@ -341,6 +351,14 @@ class JobStore:
                 if type(read_calendar) is not bool or (read_calendar and spec["kind"] == "reminder"):
                     raise ValueError("A reminder does not read the calendar.")
                 spec["read_calendar"] = read_calendar
+            if (max_iterations is not None or timeout_seconds is not None) and spec["kind"] == "reminder":
+                raise ValueError("A reminder does not use a model, so it has no rounds or time limit.")
+            if max_iterations is not None:
+                if type(max_iterations) is not int or not 1 <= max_iterations <= 50:
+                    raise ValueError("Iterations must be between 1 and 50.")
+                spec["max_iterations"] = max_iterations
+            if timeout_seconds is not None:
+                spec["timeout_seconds"] = finite(timeout_seconds, spec["idle_seconds"], 86400, "Hard budget")
             interval, next_at = row["interval_seconds"], row["next_at"]
             if spec.get("trigger") and (interval_seconds or calendar is not None or at is not None):
                 raise ValueError("This job starts on an event; add a new job for a schedule.")

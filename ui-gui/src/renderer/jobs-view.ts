@@ -53,7 +53,7 @@ export function targetsLabel(targets: string[]) {
 
 /** One inbox row's headline: what happened, before its text. */
 export function resultLabel(row: InboxRow) {
-  if (row.state === "completed") return row.quiet ? "没有新内容" : row.kind === "reminder" ? "提醒" : "结果";
+  if (row.state === "completed") return row.quiet ? "没有新内容" : row.kind === "reminder" ? "提醒" : row.detail === "iteration_budget" ? "结果（轮数用完，可能不全）" : "结果";
   if (row.state === "skipped") return row.skipped_count ? `错过 ${row.skipped_count} 次` : "已暂停";
   return row.state === "unknown" ? "结果未知" : "没能完成";
 }

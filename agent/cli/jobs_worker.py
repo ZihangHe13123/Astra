@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-from agent.runtime.jobs.store import MAX_OUTPUT, NO_UPDATE, JobStore
+from agent.runtime.jobs.store import MAX_OUTPUT, NO_UPDATE, ROUNDS_USED_UP, JobStore
 from agent.runtime.usage import (
     UsageLedger,
     UsagePreferences,
@@ -111,6 +111,7 @@ async def run_check(store: JobStore, run: dict) -> None:
     agent.context.set_session(str(root / "session.json"))
     output = ""
     error = ""
+    rounds_used_up = False
     last_progress = 0.0
     # This run's model requests count toward today's usage and budget, as a scheduled job's.
     try:
@@ -143,7 +144,12 @@ async def run_check(store: JobStore, run: dict) -> None:
                 output = (output + str(event.get("content", "")))[:MAX_OUTPUT]
             elif event.get("type") == "error":
                 # Provider errors may embed URLs or secrets; keep the public code only.
-                error = str(event.get("code") or "scheduled_check_failed")[:120]
+                code = str(event.get("code") or "scheduled_check_failed")[:120]
+                # Out of rounds, the check still answers from what it found; that answer is the result.
+                if code == ROUNDS_USED_UP:
+                    rounds_used_up = True
+                else:
+                    error = code
         current = asyncio.current_task()
         if current is not None and current.cancelling():
             # ReAct can turn cancellation into a final error event. It is still
@@ -156,8 +162,8 @@ async def run_check(store: JobStore, run: dict) -> None:
         usage = {"prompt_tokens": context.total_prompt_tokens, "completion_tokens": context.total_completion_tokens,
                  "cache_hit_tokens": context.total_cache_hit_tokens}
         quiet = on_change and not error and output.strip().strip("`*. ") == NO_UPDATE
-        store.finish(run["id"], "failed" if error else "completed", output=output, detail=error,
-                     quiet=quiet, usage=usage)
+        store.finish(run["id"], "failed" if error else "completed", output=output,
+                     detail=error or (ROUNDS_USED_UP if rounds_used_up else ""), quiet=quiet, usage=usage)
     finally:
         reset_usage_context(usage_tokens)
         agent.end_session("scheduled_job_finished")
