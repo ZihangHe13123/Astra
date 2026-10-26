@@ -2014,7 +2014,9 @@ async def _main(startup_started: float):
                 _send({"type": "task_status", "task": {"id": runtime_task_id, "status": status}})
             await _send_model_info()
             _send_startup_status()
-            if tick is None and not msg.metadata.get("command_workflow") and should_verify_goal_turn(
+            _settle_steering(str(msg.metadata.get("request_id") or msg.id), cancelled=was_cancelled)
+            # A message still waiting for its turn is answered before the goal is checked.
+            if tick is None and not msg.metadata.get("command_workflow") and not waiting_inputs and should_verify_goal_turn(
                 turn_completed=turn_completed,
                 was_cancelled=was_cancelled,
                 failed_message=failed_message,
@@ -2393,11 +2395,50 @@ async def _main(startup_started: float):
 
     active_task: asyncio.Task | None = None
     active_task_id = ""
+    active_request_id = ""
     active_task_persisted = False
     active_wakeup = False
     goal_turn_generation = 0
     _reply_done = False  # True once {"type": "done"} is sent; post-processing may still run
     _response_regenerating = False
+    # Messages sent into a running turn as steering: (its request id, message, text).
+    steering_inputs: list[tuple[str, Msg, str]] = []
+    # Accepted messages that still wait for a turn of their own, oldest first.
+    waiting_inputs: list[tuple[Msg, str, dict | None]] = []
+
+    def _not_run(msg: Msg, reason: str) -> None:
+        sid = msg.metadata.get("submission_id")
+        if sid and sid in gui_submissions.records:
+            _send({**gui_submissions.finish(sid, False), "reason": reason})
+        else:
+            _send({"type": "error", "code": "message_not_run", "message": reason})
+
+    def _settle_steering(request_id: str, *, cancelled: bool) -> None:
+        """A turn has ended: steering its model never saw waits for a turn of its own.
+
+        A turn reads steering only when an iteration starts, so a message sent
+        while the final answer streams would otherwise get no answer and no
+        saved record. Stopping a turn also drops what waits behind it.
+        """
+        undelivered = agent.take_undelivered_steering(request_id)
+        sent = [item for item in steering_inputs if item[0] == request_id]
+        steering_inputs[:] = [item for item in steering_inputs if item[0] != request_id]
+        late = [(msg, text, None) for _, msg, text in sent if text in undelivered]
+        if not cancelled:
+            waiting_inputs.extend(late)
+            return
+        for msg, _, _ in [*late, *waiting_inputs]:
+            _not_run(msg, "回复已停止，这条消息没有交给 Astra；需要时请重新发送。")
+        waiting_inputs.clear()
+
+    def _start_waiting_input() -> None:
+        # Called as a turn ends, with no await before the next starts, so no
+        # message, wakeup or restart can come between them.
+        while waiting_inputs:
+            msg, text, resume_task = waiting_inputs.pop(0)
+            if _start_message(msg, text, resume_task=resume_task):
+                return
+            _not_run(msg, "这条消息没能开始新的一轮；请重新发送。")
 
     async def _stop_wakeup_turn() -> None:
         # A tool inside this turn may stop repetition without awaiting its own parent.
@@ -2446,18 +2487,27 @@ async def _main(startup_started: float):
         await _cancel_goal_verifications(exclude=asyncio.current_task())
         if appshot_admission.reserved:
             return False
-        if active_task is not None and not active_task.done() and not _reply_done:
-            # Auto-steering: user typed while the agent is working.
-            # Inject as a mid-run correction instead of rejecting.
-            agent.queue_steering(input_text)
-            voice.stop()
-            _send({"type": "steering", "message": f"Steering injected into running task {active_task_id}.", "text": input_text})
-            return True
-        if active_task is not None:
+        while True:
+            if waiting_inputs:
+                # Earlier messages still wait for their own turns; this one goes after them.
+                waiting_inputs.append((msg, input_text, resume_task))
+                return True
+            if active_task is None or active_task.done():
+                break
+            if not _reply_done:
+                # Auto-steering: user typed while the agent is working.
+                # Inject as a mid-run correction instead of rejecting.
+                if agent.queue_steering(input_text, request_id=active_request_id):
+                    steering_inputs.append((active_request_id, msg, input_text))
+                voice.stop()
+                _send({"type": "steering", "message": f"Steering injected into running task {active_task_id}.", "text": input_text})
+                return True
+            finishing = active_task
             with suppress(asyncio.CancelledError, Exception):
-                await active_task
-            active_task = None
-            active_task_id = ""
+                await finishing
+            # The finished turn may have started the turn of a message sent before this one.
+        active_task = None
+        active_task_id = ""
 
         # A user request cancels manual skill maintenance. This
         # also releases the shared LLM request slot immediately.
@@ -2482,7 +2532,7 @@ async def _main(startup_started: float):
         return _start_message(msg, input_text, resume_task=resume_task)
 
     def _start_message(msg: Msg, input_text: str, resume_task: dict | None = None, *, appshot_turn_owned: bool = False) -> bool:
-        nonlocal active_task, active_task_id, active_task_persisted, active_wakeup, goal_turn_generation, _reply_done
+        nonlocal active_task, active_task_id, active_request_id, active_task_persisted, active_wakeup, goal_turn_generation, _reply_done
         if _response_regenerating or not _response_head_current():
             return False
         active_wakeup = msg.metadata.get("source") == "session_wakeup"
@@ -2503,15 +2553,17 @@ async def _main(startup_started: float):
         active_task_persisted = _task_tracking_enabled()
         persisted = active_task_persisted and task_store is not None
         active_task_id = str(resume_task["id"] if resume_task is not None else request_id)
+        active_request_id = str(request_id)
         goal_turn_generation += 1
         _reply_done = False
         agent_holder["question_task_id"] = active_task_id
         msg.metadata["request_id"] = str(request_id)
         msg.metadata["goal_turn_generation"] = goal_turn_generation
         entered = False
+        stopped = False
 
         async def start_and_stream() -> None:
-            nonlocal active_task_id, _reply_done, entered
+            nonlocal active_task_id, _reply_done, entered, stopped
             entered = True
             with profile_request(str(request_id)):
                 run = resume_task
@@ -2551,6 +2603,7 @@ async def _main(startup_started: float):
                     if streaming:
                         raise
                     cancelled = isinstance(exc, asyncio.CancelledError)
+                    stopped = cancelled
                     if persisted and run is not None and task_store is not None:
                         if cancelled:
                             await durable_io(task_store.request_cancel, str(run["id"]))
@@ -2566,14 +2619,27 @@ async def _main(startup_started: float):
                     if not cancelled:
                         logger.exception("task start failed")
 
+        async def run_turn() -> None:
+            nonlocal stopped
+            try:
+                await start_and_stream()
+            except asyncio.CancelledError:
+                stopped = True
+                raise
+            finally:
+                _settle_steering(str(request_id), cancelled=stopped)
+                if not stopped:
+                    _start_waiting_input()
+
         def cancelled_before_start(task: asyncio.Task) -> None:
             nonlocal _reply_done
             if task.cancelled() and not entered:
                 _reply_done = True
                 _send({"type": "error", "code": "cancelled", "message": "Cancelled before model execution."})
                 _send({"type": "done"})
+                _settle_steering(str(request_id), cancelled=True)
 
-        coroutine = start_and_stream()
+        coroutine = run_turn()
         if appshot_turn_owned:
             active_task = schedule_reserved_turn(coroutine, agent_turn_lock, name=f"task-{active_task_id}")
         else:

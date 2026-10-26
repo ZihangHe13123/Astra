@@ -59,13 +59,13 @@ export const MessageList = memo(function MessageList({ messages: sourceMessages,
   useLayoutEffect(() => {
     const el = scroller.current;
     if (!el || !el.clientHeight) return;
+    // A measurement can land between a scroll and its event. Until the event, the list stays where that scroll put it:
+    // while following it pins only from where it was last seen or from near the bottom, and an anchor taken before the
+    // scroll is not put back over it. The event then turns following off or takes a new anchor.
+    const moved = lastTop.current !== undefined && Math.abs(el.scrollTop - lastTop.current) > 1;
     if (follow) {
-      // A measurement can land between a user's scroll and its event, while following is still on. Keep pinning only
-      // from where the list was last seen or from near the bottom; the event then turns following off.
-      const moved = lastTop.current !== undefined && Math.abs(el.scrollTop - lastTop.current) > 1
-        && el.scrollHeight - el.scrollTop - el.clientHeight >= 120;
-      if (!moved) { el.scrollTop = el.scrollHeight; restoredScroll.current = lastTop.current = el.scrollTop; }
-    } else if (anchor.current) {
+      if (!moved || el.scrollHeight - el.scrollTop - el.clientHeight < 120) { el.scrollTop = el.scrollHeight; restoredScroll.current = lastTop.current = el.scrollTop; }
+    } else if (anchor.current && !moved) {
       const i = messages.findIndex(m => m.id === anchor.current!.id);
       if (i >= 0) { el.scrollTop = rootTop() + offsets[i] + anchor.current.offset; restoredScroll.current = lastTop.current = el.scrollTop; }
     }
