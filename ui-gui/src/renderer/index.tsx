@@ -58,6 +58,8 @@ function App() {
   const [preview, setPreview] = useState<any>();
   const [workspace, setWorkspace] = useState("");
   const [nativeCapture, setNativeCapture] = useState({ connection: "disconnected", enabled: false });
+  // On a phone: the Mac could not be reached for a while (asleep, Astra closed, or off the tailnet).
+  const [macOffline, setMacOffline] = useState(false);
   const captureStarting = useRef(false);
   const [prefs, setPrefs] = useState(defaults);
   const prefsRef = useRef(prefs); prefsRef.current = prefs;
@@ -145,6 +147,7 @@ function App() {
       for (const message of events) {
         if (message.refresh) { refresh(); continue; }
         if (message.appshot) { setNativeCapture(message.appshot); continue; }
+        if (message.link) { setMacOffline(message.link === "offline"); continue; }
         if (message.opened) {
           // Started by the background host, not by this window: join what arrived before it was known.
           let current = next[message.opened.id]?.revision > message.opened.revision ? next[message.opened.id] : message.opened;
@@ -611,6 +614,7 @@ function App() {
         </div></div>
         <div className="composer-wrap">
           {!follow && messages.length > 0 && <button className="jump-latest" onClick={() => { if (preview?.locatedFromRuntime) select(preview.locatedFromRuntime); else if (preview?.locatedFromLog) browse({ name: preview.session_id, mode: preview.mode, modified: 0 }); else setFollow(true); }}>回到最新消息 ↓</button>}
+          {macOffline && <div className="connection-status" role="status"><span>连不上 Mac：它可能休眠了、Astra 没开，或手机没连上 Tailscale。恢复后会自动接上。</span></div>}
           {!preview && currentConnection.configured === false && <div className="connection-status" role="status"><span>当前模型尚未连接，请先登录或配置 API Key。</span><button onClick={() => configureModels(model?.model_key)}>连接模型</button></div>}
           {!preview && voiceLine && <div className="connection-status" role="status"><span>{voiceLine.text}</span>{voiceLine.action === "stop" ? <button onClick={() => { void send({ type: "command", cmd: "/voice stop" }); }}>停止朗读</button> : <button onClick={() => { void openVoice(); }}>语音设置</button>}</div>}
           {!preview && appshotUnavailable && <div className="connection-status" role="status"><span>窗口捕获暂不可用，不影响对话。</span><button onClick={() => { void window.astra.appshot(active, "command", "/appshot status").catch(fail); }}>检查连接</button></div>}
@@ -621,8 +625,12 @@ function App() {
             <div className="composer-line">{theme.console && theme.wording.promptLabel && <span className="composer-prompt" aria-hidden="true">{theme.wording.promptLabel}</span>}<CommandInput inputRef={input} disabled={opening} placeholder={chat ? (state?.busy ? "补充一句…" : "发消息给 Astra") : state?.busy ? "补充指令，或告诉 Astra 调整方向…" : "向 Astra 描述你的任务，输入 / 查看指令…"} value={draft}
               commands={commands} modes={commandModes} mode={state?.mode || "work"} attachments={!!files.length || hasAppshot}
               onChange={value => savePrefs({ drafts: { ...prefs.drafts, [key]: value } })} onSubmit={() => { void submit(); }}
-              onPaste={e => { if ([...e.clipboardData.items].some(i => i.type.startsWith("image/"))) { e.preventDefault(); void window.astra.clipboardImage().then(p => { if (p) attach([p]); }).catch(fail); } }}/></div>
-            <div className="composer-bottom"><div>{!window.astra.remote && <button className="icon" aria-label="添加附件" onClick={() => { void window.astra.choose("files").then(attach).catch(fail); }}><Plus size={20}/></button>}<button className={`permission ${state?.info.yolo_status?.yolo ? "yolo" : ""}`} onClick={() => { void openSessionSettings("permissions"); }} title="工具审批设置">{state?.info.yolo_status?.yolo ? "完全访问" : "按需审批"}</button>{usage && <span className={`usage-status small ${usage.over ? "over" : "muted"}`} title="今天全部对话、微信和定时任务的模型用量">{usage.text}</span>}{voiceControl && <button className={`permission voice ${voiceControl.on ? "on" : ""}`} onClick={() => { void openVoice(); }} title="语音朗读设置">{voiceControl.label}</button>}</div>
+              onPaste={e => {
+                // On a phone the pasted picture itself is sent to the Mac; the desktop reads its own clipboard.
+                const pasted = [...e.clipboardData.files];
+                if (window.astra.upload && pasted.length) { e.preventDefault(); void window.astra.upload(pasted).then(attach).catch(fail); return; }
+                if ([...e.clipboardData.items].some(i => i.type.startsWith("image/"))) { e.preventDefault(); void window.astra.clipboardImage().then(p => { if (p) attach([p]); }).catch(fail); } }}/></div>
+            <div className="composer-bottom"><div>{(!window.astra.remote || window.astra.upload) && <button className="icon" aria-label="添加附件" onClick={() => { void window.astra.choose("files").then(attach).catch(fail); }}><Plus size={20}/></button>}<button className={`permission ${state?.info.yolo_status?.yolo ? "yolo" : ""}`} onClick={() => { void openSessionSettings("permissions"); }} title="工具审批设置">{state?.info.yolo_status?.yolo ? "完全访问" : "按需审批"}</button>{usage && <span className={`usage-status small ${usage.over ? "over" : "muted"}`} title="今天全部对话、微信和定时任务的模型用量">{usage.text}</span>}{voiceControl && <button className={`permission voice ${voiceControl.on ? "on" : ""}`} onClick={() => { void openVoice(); }} title="语音朗读设置">{voiceControl.label}</button>}</div>
               <div><button className="model-button" title={model?.served_model ? `${model.model}（实际：${model.served_model}）` : undefined} onClick={() => { void openModels(); }}>{model?.model && model.model !== "none" ? modelDisplayName(model.model, model.served_model) : "选择模型"}<ChevronDown size={13}/></button>
                 <select aria-label="推理强度" value={model?.reasoning_effort || "high"} disabled={!model?.reasoning_effort} onChange={e => command(`/mode ${e.target.value}`)}><option value="low">低</option><option value="high">高</option><option value="xhigh">超高</option><option value="max">最高</option></select>
                 {(responsePending || state?.busy && !draft.trim() && !files.length && !hasAppshot) ? <button className="send" aria-label="停止" onClick={() => command("/cancel")}><Square size={16} fill="currentColor"/></button> : <button className="send" aria-label="发送" disabled={sending || opening || responsePending || (!draft.trim() && !files.length && !hasAppshot)} onClick={() => { void submit(); }}><ArrowUp size={19}/></button>}

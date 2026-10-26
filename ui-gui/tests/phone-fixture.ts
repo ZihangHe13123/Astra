@@ -26,13 +26,15 @@ export async function setup(invoke: (device: string, method: PhoneInvokeMethod, 
   const devices = new PhoneDevices(join(folder, "gui", "phone-devices.json"));
   devices.setEnabled(true);
   const calls: { device: string; method: string; args: unknown[] }[] = [];
+  const uploads: { device: string; path: string; bytes: number }[] = [];
   const options = { staticRoot: site, rendererRoot: renderer, audioRoot: audio, port: 0,
+    uploadRoot: join(folder, "uploads"), uploaded: (device: string, path: string, bytes: number) => { uploads.push({ device, path, bytes }); },
     invoke: (device: string, method: PhoneInvokeMethod, args: unknown[]) => { calls.push({ device, method, args }); return invoke(device, method, args); } };
   const gateway = new PhoneGateway(devices, options);
   const port = await gateway.start();
   // What the desktop starts after a restart: a new gateway over the same paired phones and files.
   const restarted = () => new PhoneGateway(devices, options);
-  return { devices, gateway, port, base: `http://127.0.0.1:${port}`, calls, audio, restarted };
+  return { devices, gateway, port, base: `http://127.0.0.1:${port}`, calls, audio, restarted, uploads, uploadRoot: options.uploadRoot };
 }
 
 export async function pairedClient(devices: PhoneDevices, base: string) {

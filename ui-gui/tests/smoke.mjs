@@ -741,7 +741,9 @@ try {
  // The desktop interface runs on the phone, narrow: the session list starts closed.
  await phonePage.getByRole('button',{name:'显示侧栏'}).waitFor({timeout:20000});
  assert.equal(await phonePage.evaluate(()=>window.astra.remote),true);
- assert.equal(await phonePage.getByRole('button',{name:'添加附件'}).count(),0);
+ // It opens on the personal thread, as a chat, and its + sends photos and files to the Mac.
+ await phonePage.locator('main.chat-view').waitFor();
+ assert.equal(await phonePage.getByRole('button',{name:'添加附件'}).count(),1);
  // An app, not a web page: it does not zoom, fields are 16px so iOS does not zoom into them, and the list follows a swipe.
  assert.match(await phonePage.locator('meta[name=viewport]').getAttribute('content'),/user-scalable=no/);
  assert.equal(await phonePage.evaluate(()=>getComputedStyle(document.querySelector('.composer textarea')).fontSize),'16px');

@@ -3,7 +3,7 @@ import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, realpathSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { homedir } from "node:os";
 import { PERSONAL_SESSION, type DesktopEvent, type Preferences } from "../bridge.js";
@@ -84,7 +84,10 @@ let flushTimer: ReturnType<typeof setTimeout> | undefined;
 // Paired phones follow the same sessions as the window (specs/phone-companion.md, phase 1: read-only).
 const phoneDevices = new PhoneDevices(join(gui, "phone-devices.json"));
 const phone = new PhoneGateway(phoneDevices, { staticRoot: join(__dirname, "phone"), rendererRoot: join(__dirname, "renderer"), audioRoot: phoneAudio,
-  invoke: (device, method, args) => phoneInvoke(device, method, args), port: Number(process.env.ASTRA_PHONE_PORT || 8930) });
+  invoke: (device, method, args) => phoneInvoke(device, method, args), port: Number(process.env.ASTRA_PHONE_PORT || 8930),
+  // Photos and files from a phone, inside the personal thread's own folder so it reads them without asking.
+  uploadRoot: join(data, "personal", "uploads"),
+  uploaded: (device, path, bytes) => phoneAudit(device, { method: "upload", name: basename(path), bytes }) });
 let phoneError = "";
 let phoneHost: { name?: string; at: number } = { at: 0 };
 async function syncPhone() {

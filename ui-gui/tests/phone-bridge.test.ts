@@ -73,7 +73,7 @@ test("Mac-only actions answer on the phone instead of reaching the desktop", asy
     const { env, state } = environment(client, () => client.pair(devices.startPairing().code, "iPhone"));
     const bridge = new RemoteBridge(env); bridgeOf = bridge;
     assert.equal(bridge.remote, true);
-    await assert.rejects(bridge.choose(), /手机上还不能选择文件/);
+    await assert.rejects(bridge.choose("folder"), /不能选择文件夹/);
     await assert.rejects(bridge.file(), /只在电脑上可用/);
     await assert.rejects(bridge.appshot(), /窗口捕获只在电脑上可用/);
     await assert.rejects(bridge.phone(), /只能在电脑上管理/);
@@ -161,4 +161,44 @@ test("speech the desktop routes to this phone is fetched through the gateway and
     // The window's own handlers still get the events, as they do on the desktop.
     await until(() => seen.length === 2, "events");
   } finally { bridgeOf?.dispose(); await gateway.dispose(); }
+});
+
+test("the phone's picker sends what was picked to the Mac and the paths come back as attachments", async () => {
+  const { devices, gateway, base, uploadRoot } = await setup();
+  try {
+    const client = new PhoneClient(memory(), base);
+    const { env } = environment(client, () => client.pair(devices.startPairing().code, "iPhone"));
+    let picked: File[] = [new File([new Uint8Array([7])], "IMG_0001.HEIC", { type: "image/heic" }), new File(["x"], "", { type: "image/png" })];
+    env.pickFiles = async () => picked;
+    const bridge = new RemoteBridge(env); bridgeOf = bridge;
+    const paths = await bridge.choose("files");
+    assert.equal(paths.length, 2);
+    assert.ok(paths.every(path => path.startsWith(uploadRoot)));
+    assert.match(paths[0], /IMG_0001\.HEIC$/);
+    assert.match(paths[1], /photo\.png$/, "a pasted picture has no name of its own");
+    picked = [];
+    assert.deepEqual(await bridge.choose("files"), [], "cancelled: nothing sent");
+    assert.deepEqual(await bridge.upload([new File(["p"], "paste.png", { type: "image/png" })]).then(p => p.length), 1);
+  } finally { bridgeOf?.dispose(); await gateway.dispose(); }
+});
+
+test("when the Mac cannot be reached the page is told, and told again once it answers", async () => {
+  let attempts = 0;
+  const client = {
+    device: async () => ({ deviceId: "d1", name: "iPhone", privateKey: {} as CryptoKey }),
+    signIn: async () => "token-token-token-token",
+    follow: async (_token: string, _from: PhoneStreamPosition | undefined, onEvent: (data: string, id?: number) => void) => {
+      if (++attempts <= 2) throw new TypeError("Load failed");
+      onEvent('{"ready":true,"seq":1,"instance":"run-1"}');
+      await new Promise(() => {});
+    },
+  } as unknown as PhoneClient;
+  const { env } = environment(client, async () => { throw new Error("not used"); });
+  const bridge = new RemoteBridge(env); bridgeOf = bridge;
+  const links: unknown[] = [];
+  bridge.onEvents(events => { for (const event of events) if ("link" in event) links.push(event.link); });
+  void bridge.bootstrap().catch(() => undefined);
+  await until(() => links.length === 2, "offline then online");
+  assert.deepEqual(links, ["offline", "online"]);
+  bridge.dispose();
 });
