@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from "react";
-import type { PhoneAction, PhoneStatus } from "../phone-protocol.js";
+import type { PhoneAction, PhoneNotificationState, PhoneStatus } from "../phone-protocol.js";
 
 const time = (iso?: string) => iso ? new Date(iso).toLocaleString("zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) : "从未";
 
@@ -22,7 +22,7 @@ export function PhoneSettingsView({ status, run, now = Date.now() }: {
           <strong className="phone-code">{status.pairing.code.slice(0, 4)} {status.pairing.code.slice(4)}</strong></div>
         : <button onClick={() => run("pair")}>添加手机</button>}
       {status.devices.length > 0 && <ul className="phone-devices">{status.devices.map(device =>
-        <li key={device.id}><span><strong>{device.name}</strong><small className="muted">配对于 {time(device.createdAt)} · 最近连接 {time(device.lastSeen)}</small></span>
+        <li key={device.id}><span><strong>{device.name}</strong><small className="muted">配对于 {time(device.createdAt)} · 最近连接 {time(device.lastSeen)}{device.notifications ? " · 通知已开启" : ""}</small></span>
           <button onClick={() => run("revoke", device.id)}>移除</button></li>)}</ul>}
     </>}
   </>;
@@ -48,4 +48,32 @@ export function PhoneSettings({ phone }: { phone: (action: PhoneAction, value?: 
     return () => clearInterval(timer);
   }, [status?.pairing?.code]);
   return <>{error && <p className="error-text small" role="alert">{error}</p>}<PhoneSettingsView status={status} run={run} now={now}/></>;
+}
+
+/** On the phone: its own notifications, turned on there (iOS asks only from a tap) and sent by the desktop. */
+export function PhoneNotificationsView({ state, busy, run }: {
+  state: PhoneNotificationState | undefined; busy: boolean; run: (action: "enable" | "disable") => void;
+}) {
+  if (!state) return <p className="muted small">正在读取通知设置…</p>;
+  if (state.state === "unsupported") return <p className="muted small">{state.reason}</p>;
+  return <>
+    <label className="option"><input type="checkbox" checked={state.state === "on"} disabled={busy}
+      onChange={event => run(event.target.checked ? "enable" : "disable")}/>手机通知</label>
+    {state.state === "denied" ? <p className="error-text small" role="alert">{state.reason}</p>
+      : <p className="muted small">需要你批准、回答问题时马上通知；其他提醒（定时任务结果、长任务完成）一分钟内合成一条。手机正打开 Astra 时不通知。</p>}
+  </>;
+}
+
+export function PhoneNotifications({ notifications }: { notifications: (action: "status" | "enable" | "disable") => Promise<PhoneNotificationState> }) {
+  const [state, setState] = useState<PhoneNotificationState>();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const run = (action: "status" | "enable" | "disable") => {
+    setBusy(true);
+    void notifications(action).then(next => { setState(next); setError(""); })
+      .catch(cause => setError(cause instanceof Error ? cause.message : String(cause)))
+      .finally(() => setBusy(false));
+  };
+  useEffect(() => { run("status"); }, []);
+  return <>{error && <p className="error-text small" role="alert">{error}</p>}<PhoneNotificationsView state={state} busy={busy} run={run}/></>;
 }

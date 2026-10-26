@@ -100,6 +100,28 @@ class PhoneSpeaker {
 const speaker = new PhoneSpeaker();
 for (const name of ["touchend", "click"]) document.addEventListener(name, () => speaker.unlock(), { passive: true });
 
+/** Web Push from the desktop. iOS offers it only to the app added to the Home Screen (iOS 16.4 or later). */
+const push = {
+  unsupported: () => !("serviceWorker" in navigator) || !("PushManager" in window) || !("Notification" in window)
+    ? "先在 Safari 里把这个页面“添加到主屏幕”，从主屏幕打开后再开启通知（需要 iOS 16.4 或更高）。" : "",
+  permission: () => Notification.requestPermission(),
+  async subscribe(publicKey: string) {
+    const registration = await navigator.serviceWorker.ready;
+    const existing = await registration.pushManager.getSubscription();
+    const subscription = existing ?? await registration.pushManager.subscribe({
+      userVisibleOnly: true, applicationServerKey: Uint8Array.from(atob(publicKey.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0)),
+    });
+    return subscription.toJSON();
+  },
+  async unsubscribe() {
+    const registration = await navigator.serviceWorker.ready;
+    await (await registration.pushManager.getSubscription())?.unsubscribe();
+  },
+};
+// A notification opens the app at ?runtime=…; the address is put back so a reload does not reopen it.
+const opening = new URLSearchParams(location.search).get("runtime") || undefined;
+if (opening) history.replaceState(null, "", location.pathname);
+
 const bridge = new RemoteBridge({
   client,
   load: () => { try { return localStorage.getItem(PREFERENCES); } catch { return null; } },
@@ -110,9 +132,11 @@ const bridge = new RemoteBridge({
   open: url => { window.open(url, "_blank", "noopener,noreferrer"); },
   sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
   voice: (event, load) => speaker.handle(event, load),
+  push,
+  opening,
 });
 window.astra = bridge;
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") bridge.wake(); });
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") bridge.wake(); else bridge.hide(); });
 document.documentElement.dataset.remote = "phone";
 // iOS ignores user-scalable=no for pinching; its gesture events are the way to stop it.
 for (const name of ["gesturestart", "gesturechange"]) document.addEventListener(name, event => event.preventDefault(), { passive: false });

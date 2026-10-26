@@ -257,8 +257,10 @@ each was pushed and its token usage.
 from the desktop, the terminal and WeChat with the files they changed, the commands
 they ran and the approvals you gave, and job runs. Turns that only talked are hidden
 until asked for. **打开这次对话** opens the turn's conversation. While the window is
-in the background, a waiting approval or question, a reply that took 20 seconds or
-more, and job results arrive as system notifications.
+in the background (or the Mac has been idle or locked for two minutes), a waiting
+approval or question, a reply that took 20 seconds or more, and job results arrive as
+system notifications, and on a paired phone that turned notifications on
+([phone companion](phone.md#notifications)).
 
 Its top shows **今日用量**: today's tokens for every model request Astra made (desktop
 and terminal conversations, WeChat and QQ chats, scheduled jobs, and the work behind them

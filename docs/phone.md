@@ -40,6 +40,26 @@ names and pins come from the desktop.
 6. In Settings on the Mac, click 添加手机 and type the eight-character code on the
    phone within five minutes.
 
+## Notifications
+
+On the phone, open Settings and turn on 手机通知. iOS offers notifications only to
+the app opened from the Home Screen (iOS 16.4 or later), and asks once; if it was
+refused, turn it back on in the iPhone's Settings → Notifications → Astra.
+
+The phone is notified of what the Mac would notify you of while you are not at
+it: an approval or a question at once, and finished long replies, scheduled-job
+results and the budget notice gathered into one notification a minute. Nothing
+is sent while the phone has Astra open, and you count as away from the Mac when
+its window is not in front or the Mac has been idle or locked for two minutes.
+Tapping a notification opens that conversation.
+
+Notifications use standard Web Push: the Mac encrypts each one for that phone
+(RFC 8291) and signs the request with its own key (RFC 8292, kept in
+`phone-push-key.json` in Astra's desktop data folder), so Apple's push service
+carries only ciphertext. The Mac sends them itself, so it must be awake and online;
+the phone does not need Tailscale to receive them. Settings on the Mac shows which
+phones have notifications on; 移除 also stops them.
+
 ## How it is protected
 
 - Nothing listens on a network address: only Tailscale reaches the desktop, and

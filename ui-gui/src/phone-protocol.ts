@@ -4,7 +4,7 @@
  */
 
 /** Calls the desktop answers for a phone; everything else in the bridge is handled on the phone. */
-export const PHONE_INVOKE_METHODS = ["bootstrap", "create", "close", "send", "query", "deleteSession", "jobs", "memory"] as const;
+export const PHONE_INVOKE_METHODS = ["bootstrap", "create", "close", "send", "query", "deleteSession", "jobs", "memory", "push"] as const;
 export type PhoneInvokeMethod = typeof PHONE_INVOKE_METHODS[number];
 
 /** Desktop preferences a phone shows but keeps its own copy of: names and pins of saved sessions. */
@@ -29,7 +29,7 @@ export const PAIRING_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 export const PAIRING_CODE_LENGTH = 8;
 
 /** The phone settings section, as the window asks for it. */
-export type PhoneDevice = { id: string; name: string; createdAt: string; lastSeen?: string };
+export type PhoneDevice = { id: string; name: string; createdAt: string; lastSeen?: string; notifications?: boolean };
 export type PhoneStatus = {
   enabled: boolean;
   /** Listening on 127.0.0.1:port; tailscale serve puts HTTPS in front of it. */
@@ -42,6 +42,8 @@ export type PhoneStatus = {
   pairing?: { code: string; expiresAt: number };
 };
 export type PhoneAction = "status" | "enable" | "disable" | "pair" | "revoke";
+/** A phone's notifications: on, off, refused in iOS settings, or not possible from where the page was opened. */
+export type PhoneNotificationState = { state: "on" | "off" | "denied" | "unsupported"; reason?: string };
 
 /** Splits a text/event-stream buffer into complete events (id and data); comments (heartbeats) are skipped. */
 export function parseEventStream(buffer: string): { events: { id?: number; data: string }[]; rest: string } {

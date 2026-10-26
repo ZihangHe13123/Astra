@@ -34,10 +34,10 @@ test("a short reply, or any reply while the window is in front, is not announced
 test("approvals and questions in the window ask for the person; a WeChat approval does not", () => {
   const { attention } = fixture();
   assert.deepEqual(attention.session("a", "", true, { type: "tool_approval_request", approval_title: "新建定时任务：喝水" }),
-    { title: "Astra 需要你批准", body: "新建定时任务：喝水", runtime: "a" });
+    { title: "Astra 需要你批准", body: "新建定时任务：喝水", runtime: "a", urgent: true });
   assert.equal(attention.session("a", "", true, { type: "tool_approval_request", approval_title: "x", channel: "weixin" }), undefined);
   assert.deepEqual(attention.session("a", "", true, { type: "user_question_request", questions: [{ question: "用哪个模型？" }] }),
-    { title: "Astra 有问题想问你", body: "用哪个模型？", runtime: "a" });
+    { title: "Astra 有问题想问你", body: "用哪个模型？", runtime: "a", urgent: true });
 });
 
 test("the background host's job results become notifications, clipped", () => {

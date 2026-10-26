@@ -1,6 +1,6 @@
 /** When to tell the person, with a system notification, that Astra needs them or has something for them. */
 
-export type AttentionNotice = { title: string; body: string; runtime?: string };
+export type AttentionNotice = { title: string; body: string; runtime?: string; /** Waiting for an answer: a phone hears it at once. */ urgent?: boolean };
 type Event = { type?: string; [key: string]: unknown };
 
 /** A reply that took at least this long is worth a notification when the window is in the background. */
@@ -26,12 +26,12 @@ export class Attention {
     if (this.options.focused()) return undefined;
     // A channel's approval is answered in that chat, not in the window.
     if (event.type === "tool_approval_request" && !event.channel) {
-      return { title: "Astra 需要你批准", body: clip(event.approval_title || event.tool_name, "一个操作在等你决定"), runtime };
+      return { title: "Astra 需要你批准", body: clip(event.approval_title || event.tool_name, "一个操作在等你决定"), runtime, urgent: true };
     }
     if (event.type === "usage_notice") return { title: "今天的模型用量超过预算了", body: clip(event.message, "定时检查暂停到明天"), runtime };
     if (event.type === "user_question_request") {
       const questions = Array.isArray(event.questions) ? event.questions as Event[] : [];
-      return { title: "Astra 有问题想问你", body: clip(questions[0]?.question, "回到对话看看吧"), runtime };
+      return { title: "Astra 有问题想问你", body: clip(questions[0]?.question, "回到对话看看吧"), runtime, urgent: true };
     }
     if (!busy && started !== undefined && now - started >= LONG_TURN_MS) {
       return { title: "Astra 回复好了", body: clip(label, "回到对话看看吧"), runtime };

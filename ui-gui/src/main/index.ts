@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, net, Notification, protocol, shell, Tray } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, net, Notification, powerMonitor, protocol, shell, Tray } from "electron";
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, realpathSync, statSync } from "node:fs";
@@ -27,6 +27,8 @@ import { CARD_THEME_COLORS, checkedCardTheme } from "../card-theme.js";
 import { SHARED_PREFERENCE_KEYS, type PhoneInvokeMethod, type PhoneStatus } from "../phone-protocol.js";
 import { PhoneDevices } from "./phone-devices.js";
 import { PhoneGateway } from "./phone-gateway.js";
+import { PhonePush, phonePushRequest } from "./phone-push.js";
+import { VapidKey, webPushSender } from "./web-push.js";
 import { tailscaleName } from "./phone-tailscale.js";
 
 const packaged = configurePackagedRuntime({ isPackaged: app.isPackaged, resourcesPath: process.resourcesPath,
@@ -100,10 +102,27 @@ async function phoneStatus(): Promise<PhoneStatus> {
     ...(phoneDevices.enabled && phoneHost.name ? { url: `https://${phoneHost.name}` } : {}), devices: phoneDevices.list(),
     ...(phoneDevices.currentPairing() ? { pairing: phoneDevices.currentPairing() } : {}) };
 }
-const attention = new Attention({ focused: () => !!window && !window.isDestroyed() && window.isFocused() });
+// The person is at the window only while it is focused and the Mac is in use: a window left in front of a
+// locked or idle Mac does not keep notifications (and a paired phone's) from them.
+const attention = new Attention({ focused: () => !!window && !window.isDestroyed() && window.isFocused()
+  && !["idle", "locked"].includes(powerMonitor.getSystemIdleState(120)) });
+// Made the first time a phone asks for it, so a desktop without phones keeps no key.
+let pushKey: VapidKey | undefined;
+const phonePushKey = () => (pushKey ??= new VapidKey(join(gui, "phone-push-key.json")));
+/** Paired phones without the app open hear what the window would have notified (specs/phone-companion.md D5). */
+const phonePush = new PhonePush({
+  targets: () => phoneDevices.enabled ? phoneDevices.pushTargets() : [],
+  live: deviceId => phone.isLive(deviceId),
+  // The push service may write to the subject about this sender: the phone's own address, else the project.
+  send: webPushSender(phonePushKey,
+    () => phoneHost.name ? `https://${phoneHost.name}` : "https://github.com/ZihangHe13123/Astra"),
+  drop: deviceId => { phoneDevices.setPush(deviceId, undefined); },
+  report: error => console.error("Astra phone push:", error),
+});
 // Held until closed or clicked, so a notification is not collected before its click handler runs.
 const notices = new Set<Notification>();
 function notify(notice: AttentionNotice | undefined) {
+  if (notice) phonePush.notify(notice);
   if (!notice || !Notification.isSupported()) return;
   const shown = new Notification({ title: notice.title, body: notice.body });
   notices.add(shown);
@@ -409,6 +428,10 @@ async function phoneInvoke(device: string, method: PhoneInvokeMethod, args: any[
   if (method === "query") return runQuery(args[0], args[1], args[2]);
   if (method === "jobs") { phoneAudit(device, { method, action: String(args[0]).slice(0, 20) }); return runJobs(args[0], args[1], args[2]); }
   if (method === "memory") { phoneAudit(device, { method, action: String(args[0]).slice(0, 20) }); return runMemory(args[0], ...args.slice(1)); }
+  if (method === "push") {
+    if (args[0] === "subscribe" || args[0] === "unsubscribe") phoneAudit(device, { method, action: args[0] });
+    return phonePushRequest(phoneDevices, phonePushKey, device, args[0], args[1]);
+  }
   if (method === "close") { phoneAudit(device, { method, runtime: String(args[0]) }); return closeSession(args[0]); }
   if (method === "deleteSession") { phoneAudit(device, { method, session: args[0]?.name, mode: args[0]?.mode }); return runSessionAction("delete", args[0]); }
   const rt = runtime(args[0]); const command = checkedCommand(args[1]);
@@ -486,6 +509,7 @@ async function performQuit() {
   if (quitting) return;
   quitting = true;
   await Promise.all([...runtimes.values()].map(rt => rt.close()));
+  phonePush.dispose();
   await Promise.all([appshot.client.close(), queries.close(), phone.dispose(), channelHost.stop()]);
   // Let beforeunload supply the newest draft before taking the final snapshot.
   if (window && !window.isDestroyed()) {

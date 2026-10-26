@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { parseEventStream } from "../src/phone-protocol.js";
-import { PhoneSettingsView } from "../src/renderer/phone-settings.js";
+import { PhoneNotificationsView, PhoneSettingsView } from "../src/renderer/phone-settings.js";
 import type { PhoneStatus } from "../src/phone-protocol.js";
 
 
@@ -35,6 +35,22 @@ test("settings show what the desktop reports: the switch, the serve command, the
   assert.doesNotMatch(off, /添加手机|tailscale serve|测试 iPhone/);
   const busy = renderToStaticMarkup(React.createElement(PhoneSettingsView, { status: { ...status, pairing: undefined, error: "端口 8930 已被占用。" }, run: () => {} }));
   assert.match(busy, /role="alert">端口 8930 已被占用。/);
+  assert.doesNotMatch(html, /通知已开启/);
+  const notified = renderToStaticMarkup(React.createElement(PhoneSettingsView, { status: { ...status, devices: [{ ...status.devices[0], notifications: true }] }, run: () => {} }));
+  assert.match(notified, /最近连接 从未 · 通知已开启/);
+});
+
+test("on the phone, notifications show as a switch, or say why they cannot be turned on there", () => {
+  const view = (state: any, busy = false) => renderToStaticMarkup(React.createElement(PhoneNotificationsView, { state, busy, run: () => {} }));
+  assert.match(view({ state: "on" }), /checked=""[^>]*\/>手机通知/);
+  assert.match(view({ state: "on" }), /批准、回答问题时马上通知/);
+  assert.doesNotMatch(view({ state: "off" }), /checked/);
+  assert.match(view({ state: "off" }, true), /disabled=""/);
+  const unsupported = view({ state: "unsupported", reason: "先添加到主屏幕" });
+  assert.match(unsupported, /先添加到主屏幕/);
+  assert.doesNotMatch(unsupported, /checkbox/);
+  assert.match(view({ state: "denied", reason: "到 iPhone 的设置里打开" }), /role="alert">到 iPhone 的设置里打开/);
+  assert.match(view(undefined), /正在读取/);
 });
 
 test("the Mac's tailnet name comes from whichever Tailscale install answers, and only a ts.net name is shown", async () => {

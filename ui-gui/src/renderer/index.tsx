@@ -26,7 +26,7 @@ import { CommandInput } from "./command-input.js";
 import { commandNames, describeCommands, modeSessionTarget, type CommandMode } from "./command-help.js";
 import { VoiceSettings } from "./voice.js";
 import { MemoryReviewSettings, reviewAnswer, withProposalOptions } from "./memory-review.js";
-import { PhoneSettings } from "./phone-settings.js";
+import { PhoneNotifications, PhoneSettings } from "./phone-settings.js";
 import { WeixinSettings } from "./weixin-settings.js";
 import { JobsPanel } from "./jobs-page.js";
 import { ActivityPanel } from "./activity-page.js";
@@ -642,7 +642,8 @@ function App() {
       <label className="option"><input type="checkbox" checked={prefs.timeline} onChange={e => savePrefs({ timeline: e.target.checked })}/>显示消息时间</label>
       <MemoryReviewSettings status={reviewStatus} ready={sessionReady} run={cmd => { void send({ type: "command", cmd }); }} review={() => { setModal(undefined); void command("/memory proposals"); }}/>
       <WeixinSettings status={state?.info.weixin_status} ready={sessionReady} models={state?.info.model_info?.models} run={cmd => { void send({ type: "command", cmd }); }}/>
-      {window.astra.remote ? <><h3>手机</h3><p className="muted small">这台手机已配对，正在远程使用 Mac 上的 Astra。在 Mac 的“设置 → 手机”里可以移除它。</p></>
+      {window.astra.remote ? <><h3>手机</h3><p className="muted small">这台手机已配对，正在远程使用 Mac 上的 Astra。在 Mac 的“设置 → 手机”里可以移除它。</p>
+        {window.astra.notifications && <PhoneNotifications notifications={action => window.astra.notifications!(action)}/>}</>
         : <PhoneSettings phone={window.astra.phone}/>}<hr/>
       <button onClick={() => configureModels()}>模型与账号 <ChevronRight size={15}/></button>
       <button onClick={() => { void openSessionSettings("permissions"); }}>权限与对话模式 <ChevronRight size={15}/></button>
