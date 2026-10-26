@@ -81,6 +81,24 @@ def test_results_are_pushed_once_to_each_target_and_kept_in_the_inbox(tmp_path):
     assert len(recorder.weixin) == 1 and store.inbox()[0]["id"] == run["id"]
 
 
+def test_wechat_gets_a_long_result_whole_and_the_desktop_its_start(tmp_path):
+    from agent.channels.weixin import chat_bubbles
+
+    store = JobStore(tmp_path / "home")
+    now = at("2026-10-26T20:00")
+    check(store, tmp_path, next_at=now)
+    report = "\n\n".join(f"{index}. 第 {index} 条新闻：" + "内容" * 120 for index in range(1, 9))
+    finish(store, now, output=report)
+    recorder = Recorder()
+    assert deliver(store, recorder, now) == 2
+    assert recorder.weixin == [f"【定时任务：Rust 早报】\n{report}"] and INBOX_NOTE not in recorder.weixin[0]
+    assert len(recorder.desktop[0]["body"]) == 300
+    # The channel sends it as several messages, none over its limit, nothing left out.
+    pieces = chat_bubbles(recorder.weixin[0], 1800)
+    assert len(pieces) > 1 and all(len(piece) <= 1800 for piece in pieces)
+    assert "".join("".join(pieces).split()) == "".join(recorder.weixin[0].split())
+
+
 def test_quiet_results_missed_slots_and_inbox_only_jobs_are_not_pushed(tmp_path):
     store = JobStore(tmp_path / "home")
     now = at("2026-10-26T15:00")
@@ -188,6 +206,9 @@ def test_messages_name_the_job_and_explain_pauses_and_failures(tmp_path):
     long = {"spec": {"name": "x", "kind": "check"}, "run_state": "completed", "output": "字" * (TEXT_LIMIT + 50),
             "detail": "", "job_state": "enabled", "paused_reason": ""}
     assert push_message(long)[1].endswith(INBOX_NOTE)
+    # A full news report fits whole.
+    report = {**long, "output": "\n\n".join(f"{index}. " + "新闻" * 150 for index in range(10))}
+    assert push_message(report)[1] == report["output"] and len(report["output"]) > 2000
     # Out of rounds, the check still answered from what it found: that answer is sent, marked as maybe incomplete.
     used_up = {**long, "output": "三条已核实的新闻", "detail": "iteration_budget"}
     assert push_message(used_up) == ("定时任务：x（轮数用完，可能不全）", "三条已核实的新闻")

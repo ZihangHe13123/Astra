@@ -20,7 +20,9 @@ logger = logging.getLogger(__name__)
 
 RETRY_SECONDS = (60, 300, 900, 1800)
 MAX_AGE = 12 * 3600
-TEXT_LIMIT = 1800
+# WeChat gets the whole result, split into several messages by the channel; only a runaway one is cut here.
+# A desktop notification shows the start of it.
+TEXT_LIMIT = 8000
 INBOX_NOTE = "…（完整结果在 Astra 的定时任务收件箱里）"
 
 DesktopNotify = Callable[[dict], None]
