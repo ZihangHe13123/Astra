@@ -995,12 +995,14 @@ class WeixinAdapter(ChannelAdapter):
             # Without an explicit stop WeChat can keep showing "typing…".
             await asyncio.shield(self._typing(to, _TYPING_STOP))
 
-    async def send_text(self, to: str, text: str) -> None:
+    async def send_text(self, to: str, text: str, *, bubbles: bool = True) -> None:
+        """A reply reads as chat bubbles. Pushed text (``bubbles=False``) goes in as few messages as fit: WeChat
+        lets the bot send only a few messages after each one from the person, and a bubble is a message."""
         account, client = self._account, self._client
         if account is None or client is None:
             raise WeixinError("the WeChat channel is not online")
         limit = self.config.max_output_chars
-        pieces = (chat_bubbles(text, limit, self.config.max_bubbles) if self.config.chat_bubbles
+        pieces = (chat_bubbles(text, limit, self.config.max_bubbles) if bubbles and self.config.chat_bubbles
                   else split_reply(plain_text(text), limit))
         for index, piece in enumerate(pieces):
             if index:

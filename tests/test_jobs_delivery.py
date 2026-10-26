@@ -82,7 +82,7 @@ def test_results_are_pushed_once_to_each_target_and_kept_in_the_inbox(tmp_path):
 
 
 def test_wechat_gets_a_long_result_whole_and_the_desktop_its_start(tmp_path):
-    from agent.channels.weixin import chat_bubbles
+    from agent.channels.weixin import plain_text, split_reply
 
     store = JobStore(tmp_path / "home")
     now = at("2026-10-26T20:00")
@@ -93,9 +93,9 @@ def test_wechat_gets_a_long_result_whole_and_the_desktop_its_start(tmp_path):
     assert deliver(store, recorder, now) == 2
     assert recorder.weixin == [f"【定时任务：Rust 早报】\n{report}"] and INBOX_NOTE not in recorder.weixin[0]
     assert len(recorder.desktop[0]["body"]) == 300
-    # The channel sends it as several messages, none over its limit, nothing left out.
-    pieces = chat_bubbles(recorder.weixin[0], 1800)
-    assert len(pieces) > 1 and all(len(piece) <= 1800 for piece in pieces)
+    # The channel sends it as few messages as fit (not chat bubbles), none over its limit, nothing left out.
+    pieces = split_reply(plain_text(recorder.weixin[0]), 1800)
+    assert len(pieces) == 2 and all(len(piece) <= 1800 for piece in pieces)
     assert "".join("".join(pieces).split()) == "".join(recorder.weixin[0].split())
 
 

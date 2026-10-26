@@ -59,10 +59,10 @@ def test_host_pushes_a_reminder_to_wechat_and_the_desktop_and_keeps_it_in_the_ch
         notice = wait_for(lambda e: e.get("type") == "job_notification", timeout=30)
         assert notice["title"] == "提醒：喝水" and notice["body"] == "该喝水了" and notice["job_id"] == job["id"]
         deadline = time.monotonic() + 30
-        while len(ilink.replies_to(OWNER)) < 3 and time.monotonic() < deadline:
+        while len(ilink.replies_to(OWNER)) < 2 and time.monotonic() < deadline:
             time.sleep(0.05)
-        # Sent as chat bubbles, like a reply.
-        assert ilink.replies_to(OWNER)[1:] == ["【提醒：喝水】", "该喝水了"]
+        # One message, not chat bubbles: each message spends what WeChat lets the bot send unasked.
+        assert ilink.replies_to(OWNER)[1:] == ["【提醒：喝水】\n该喝水了"]
         time.sleep(1.5)
         sent = len(ilink.replies_to(OWNER))
         assert [push["state"] for push in store.pushes(notice["run_id"])] == ["sent", "sent"]

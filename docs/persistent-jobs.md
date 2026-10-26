@@ -57,7 +57,8 @@ Listing and pausing need no approval. Its `quiet` action sets the quiet hours, a
 While the Astra desktop app is open (also from the tray), its background host runs due jobs
 and pushes results: a desktop notification, and a WeChat message to the person who logged WeChat
 in, which also joins that chat's conversation so a reply can refer to it. WeChat gets the whole
-result, sent as several messages when it is long (past 8,000 characters the rest is in the inbox);
+result as one message where it fits, split at paragraphs when longer, not as chat bubbles: WeChat
+lets the bot send only a few messages after each one from you (past 8,000 characters the rest is in the inbox);
 the desktop notification shows its start. `--targets` chooses
 (`desktop,weixin` by default; empty for the inbox only). Every result stays in the inbox. Quiet
 results and records of missed slots are not pushed. A push that fails is tried again after 1, 5,
