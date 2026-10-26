@@ -228,7 +228,14 @@ export type PyEvent =
       };
       preview?: string;
       arguments?: Record<string, unknown>;
-      choices?: ("once" | "session" | "deny")[];
+      choices?: ("once" | "task" | "session" | "always" | "deny")[];
+      /** pay, send, delete or publish: asked per call, offered once and deny only. */
+      consequential?: string;
+      /** What a send would put out, shown as is; the card then reads 发送 / 丢弃. */
+      draft?: { to?: string; subject?: string; text?: string; via?: string };
+      /** The button or link a consequential click would press. */
+      action_label?: string;
+      grant_label?: string;
       surface?: "tui" | "gui" | "channel";
       channel?: string;
       state?: "pending";
@@ -247,7 +254,7 @@ export type PyEvent =
       type: "approval_resolved";
       request_id: string;
       state: "approved" | "denied" | "cancelled" | "orphaned";
-      decision?: "once" | "session" | "deny" | "";
+      decision?: "once" | "task" | "session" | "always" | "deny" | "";
     }
   | {
       type: "approval_response_rejected";
@@ -465,7 +472,7 @@ export type TuiCommand =
   | { type: "connect_provider"; request_id: string; route_id: string; base_url: string; api_key: string; api_key_env: string }
   | { type: "cancel_connection"; request_id: string }
   | { type: "event_replay"; after_cursor: number; limit?: number }
-  | { type: "tool_approval_response"; request_id: string; decision: "once" | "session" | "deny" }
+  | { type: "tool_approval_response"; request_id: string; decision: "once" | "task" | "session" | "always" | "deny" }
   | { type: "user_question_response"; request_id: string; answers: UserQuestionAnswer[] }
   | { type: "user_question_cancel"; request_id: string }
   | { type: "user_question_editing"; request_id: string; editing: boolean }

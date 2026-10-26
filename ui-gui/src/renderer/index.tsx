@@ -31,6 +31,7 @@ import { WeixinSettings } from "./weixin-settings.js";
 import { JobsPanel } from "./jobs-page.js";
 import { ActivityPanel } from "./activity-page.js";
 import { MemoryPanel } from "./memory-page.js";
+import { ApprovalRules } from "./approval-rules.js";
 import { voiceAnswer, voiceButton, voiceNotice, withVoiceOptions } from "./voice-state.js";
 import { autoTitle, sessionTitle, sidebarGroups } from "./sidebar.js";
 import { DESKTOP_THEME_NAMES, PLAIN_THEMES, desktopTheme, followTheme, isDesktopThemeName } from "./theme.js";
@@ -630,6 +631,7 @@ function App() {
     {modal === "voice" && <VoiceSettings status={voiceStatus} ready={state?.status === "ready"} run={cmd => { void send({ type: "command", cmd }); }} close={() => setModal(undefined)}/>}
     {modal === "permissions" && <Modal title="权限与对话模式" close={() => setModal(undefined)}><div className="form"><h3>工具审批</h3><p className="muted small">控制工具操作是否需要你确认。</p>
       <div className="choice-grid">{[{ value: false, name: "按需审批", description: "按现有权限规则确认操作" }, { value: true, name: "完全访问", description: "直接执行工具操作，跳过审批" }].map(option => <button key={option.name} disabled={state?.status !== "ready"} aria-pressed={!!state?.info.yolo_status?.yolo === option.value} className={!!state?.info.yolo_status?.yolo === option.value ? "selected" : ""} onClick={() => { setModal(undefined); void command(`/yolo ${option.value ? "on" : "off"}`); }}><strong>{option.name}</strong><small>{option.description}</small></button>)}</div>
+      {!window.astra.remote && <ApprovalRules fail={fail}/>}
       <h3>对话模式</h3><div className="choice-grid">{modeChoices(localDefinition).map(option => <button key={option.mode} disabled={state?.status !== "ready" || !!state?.busy || option.mode === state?.mode || state?.mode !== "work" && option.mode !== "work"} aria-pressed={option.mode === (state?.mode || "work")} onClick={() => { void changeMode(option.mode); }}><strong>{option.label}</strong><small>{option.description}</small></button>)}</div>
       {state?.mode && state.mode !== "work" && <p className="muted small">先返回通用模式，再选择其他模式。</p>}
       <button className="text-button" onClick={() => showCommands(commandModes.find(mode => mode.mode === state?.mode)?.command || "")}>查看{commandModes.find(mode => mode.mode === state?.mode)?.label || "全部"}模式指令 <ChevronRight size={14}/></button>

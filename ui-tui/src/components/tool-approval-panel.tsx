@@ -6,6 +6,7 @@ import { clampToolDetailOffset } from "../tool-results.js";
 import { wrapToolResult } from "../tool-results.js";
 import type { ToolApprovalRequest } from "../types.js";
 import { useTheme } from "../theme-context.js";
+import { consequenceNote } from "@astra/ui-core/approval-choices";
 
 export interface ToolApprovalPanelProps {
   request: ToolApprovalRequest;
@@ -97,6 +98,13 @@ export function ToolApprovalPanel({
       )
     : "";
   const shortcuts = (expanded ? view.shortcutHint : collapsedShortcutHint(view.shortcutHint)) + "   [Ctrl+Y] YOLO";
+  const note = consequenceNote(request);
+  // What a send would put out, as is: who it goes to, then its text (a few lines; V shows all of it).
+  const draftLines = request.draft?.text ? [
+    ...(request.draft.to ? [truncateDisplay(`发给：${request.draft.to}`, contentWidth)] : []),
+    ...(request.draft.subject ? [truncateDisplay(`主题：${request.draft.subject}`, contentWidth)] : []),
+    ...wrapToolResult(request.draft.text, contentWidth).slice(0, expanded ? 3 : 6),
+  ] : [];
   const shortcutRows = wrapToolResult(shortcuts, contentWidth).length;
   const bodyHeight = maxHeight === undefined ? undefined : Math.max(1, maxHeight - 3 - shortcutRows - (expanded ? 1 : 0));
   return (
@@ -111,6 +119,13 @@ export function ToolApprovalPanel({
         {header}{expanded ? ` · 详情 ${safeOffset + 1}-${end}/${view.detailLines.length}` : ""}
       </Text>
       <Box flexDirection="column" height={bodyHeight} overflowY="hidden">
+      {note && <Text color={theme.danger} wrap="truncate-end">{truncateDisplay(note, contentWidth)}</Text>}
+      {request.action_label && (
+        <Text color={theme.text} wrap="truncate-end">{truncateDisplay(`将点击：${request.action_label}`, contentWidth)}</Text>
+      )}
+      {draftLines.map((line, index) => (
+        <Text key={`${request.request_id}-draft-${index}`} color={theme.text}>{line || " "}</Text>
+      ))}
       {expanded ? visibleDetailLines.map((line, index) => (
         <Text key={`${request.request_id}-${safeOffset + index}`} color={theme.text}>
           {line || " "}

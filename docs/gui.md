@@ -271,6 +271,19 @@ modes. These controls call the existing backend commands;
 they do not add a model workflow or tool quota. Pending approvals continue to appear
 inside the conversation.
 
+An approval card answers the same way on the desktop, a paired phone, the terminal and in
+WeChat: **允许一次** (this call), **本任务允许** (until the work of your current message is
+done), **本会话允许** (until this conversation ends) or **拒绝**. Each conversation has its
+own grants: a WeChat chat never uses what the desktop session allowed, nor the other way round.
+Paying, sending, deleting and publishing (a browser button that submits, pays or deletes;
+`git push`, a hard reset, `rm` and publish commands; an MCP tool named for sending, deleting or
+paying; an upload) are asked every time with only allow-once and deny, and no earlier grant
+covers them; they are also not answered by the window-wide keys. When such a step would send
+text, the card shows that text as a draft with **发送** and **丢弃**. After you have approved
+the same ordinary request five times on two different days and never refused it, its card also
+offers **以后都允许**; those standing rules are listed under **权限与对话模式 → 以后都允许的操作**,
+where you can remove them.
+
 Use **设置 → 人格设置** to choose from the current backend's available personas.
 The model button, session menus and these settings provide direct controls for common
 actions; **命令与功能** remains available for other commands and free-form parameters.

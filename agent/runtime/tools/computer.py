@@ -38,6 +38,7 @@ from ..computer_observation import observe_action_effect, window_transition
 from ..computer_policy import (
     ComputerApprovalRequest,
     ComputerPolicyDecision,
+    ComputerRisk,
     app_state_approval_scope,
     app_state_permission_request,
     classify_computer_batch,
@@ -4108,6 +4109,7 @@ def register_computer_tools(
             request = permission_request(approvals, background)
             if isinstance(request, ComputerApprovalRequest):
                 request.private_call_id = call_id
+                _attach_draft(request, prepared)
             return request
         if (
             not plan.requires_takeover
@@ -4163,7 +4165,18 @@ def register_computer_tools(
             prepared.restore_previous_focus = False
         if isinstance(request, ComputerApprovalRequest):
             request.private_call_id = call_id
+            _attach_draft(request, prepared)
         return request
+
+    def _attach_draft(request: ComputerApprovalRequest, prepared) -> None:
+        """A high-impact batch that types text shows that text as the draft it would send."""
+        decision = prepared.decision
+        if decision is None or decision.risk is not ComputerRisk.HIGH_IMPACT:
+            return
+        typed = [str(action.text) for action in prepared.actions if action.type == "type" and action.text]
+        if typed:
+            request["draft"] = {"text": "\n".join(typed)[:2000], "via": decision.application}
+            request["consequential"] = "send"
 
     def act_permission_grant(args: dict, request: dict[str, Any], decision: str):
         if manager.handed_off:
@@ -4344,7 +4357,7 @@ def register_computer_tools(
         completion_finalizer=complete_observation, permission_finalizer=finalize_observation,
         permission_check=app_state_permission_check,
         permission_grant=app_state_permission_grant,
-        permission_authoritative=True, permission_yolo_auto_grant=True,
+        permission_authoritative=True, permission_yolo_auto_grant=True, owns_session_grants=True,
         postcondition=verify_app_state,
         repeat_guard=False, max_calls_per_turn=32,
         **common,
@@ -4356,7 +4369,7 @@ def register_computer_tools(
         risk="read", approval="never", replay="safe", result_persistence="request_local",
         completion_finalizer=complete_observation, permission_finalizer=finalize_observation,
         permission_check=display_permission_check, permission_grant=display_permission_grant,
-        permission_authoritative=True, permission_yolo_auto_grant=True,
+        permission_authoritative=True, permission_yolo_auto_grant=True, owns_session_grants=True,
         postcondition=verify_snapshot, repeat_guard=False, max_calls_per_turn=32, **common,
     ))
     registry.register(ToolDef(
@@ -4366,7 +4379,7 @@ def register_computer_tools(
         permission_grant=act_permission_grant, permission_finalizer=finalize_act_permission,
         completion_finalizer=complete_act,
         postcondition=verify_snapshot,
-        permission_authoritative=True, permission_yolo_auto_grant=True,
+        permission_authoritative=True, permission_yolo_auto_grant=True, owns_session_grants=True,
         argument_persistence="request_local", argument_validator=validate_act_arguments,
         argument_redactor=redact_act_arguments, **common,
     ))

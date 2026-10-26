@@ -280,6 +280,20 @@ function runMemory(action: unknown, ...values: unknown[]): Promise<unknown> {
     }));
 }
 register("memory", runMemory);
+/** The person's standing approval rules, from the permissions panel (agent/ui/approval_rules.py). */
+function runApprovalRules(action: unknown, key?: unknown): Promise<unknown> {
+  const args = action === "list" ? ["list"] : action === "remove" && typeof key === "string" && /^[0-9a-f]{32}$/.test(key)
+    ? ["remove", key] : undefined;
+  if (!args) throw new Error("Unsupported approval rule change");
+  return new Promise((done, fail) => execFile(python, ["-m", "agent.ui.approval_rules", ...args],
+    { cwd: root, env: process.env, timeout: 30_000, windowsHide: true, encoding: "utf8" },
+    (_error, stdout) => {
+      let result: { ok?: boolean; error?: string; rules?: unknown[] } = {};
+      try { result = JSON.parse(String(stdout).trim().split("\n").at(-1) || "{}"); } catch { /* reported below */ }
+      result.ok ? done(result) : fail(new Error(result.error || "审批规则没有改成功。"));
+    }));
+}
+register("approvalRules", runApprovalRules);
 /** One run of `astra data` (agent/cli/data_commands.py); it answers with a JSON line, an error included. */
 function dataCommand(args: string[], timeout: number): Promise<any> {
   return new Promise((done, fail) => execFile(python, ["-m", "agent.cli.data_commands", ...args],

@@ -464,6 +464,11 @@ label { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sma
 .session-log-pagination { justify-content: space-between; padding-top: 14px; flex-wrap: wrap; }
 .message.user.has-source .message-actions { display: flex; justify-content: flex-end; }
 
+.approval.consequential { border-color:var(--error); }
+.approval-consequence { color:var(--error); margin:0; }
+.approval-draft { border:1px solid var(--line); border-radius:var(--r-2); padding:8px 12px; display:flex; flex-direction:column; gap:4px; }
+.approval-draft p { margin:0; }
+.approval-draft .draft-text { white-space:pre-wrap; margin:0; font-size:14px; }
 .approval-facts { display:grid; grid-template-columns:max-content minmax(0,1fr); gap:6px 12px; font-size:12px; }
 .approval-facts dt { color:var(--muted); }
 .approval-facts dd { margin:0; overflow-wrap:anywhere; white-space:pre-wrap; }

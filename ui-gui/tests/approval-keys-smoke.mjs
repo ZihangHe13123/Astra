@@ -89,7 +89,7 @@ try {
 
   // Nothing typed is taken for an answer, wherever the text goes, and the keys keep their own meaning in a field with text.
   await ask('写入 one');
-  await expect(card.locator('.approval-keys')).toHaveText(`${command === 'Meta' ? '⌘' : 'Ctrl'} Enter 允许一次 · ${command === 'Meta' ? '⌘' : 'Ctrl'} Shift Enter 本会话允许 · ${command === 'Meta' ? '⌘ ⌫' : 'Ctrl Backspace'} 拒绝 · 点选卡片后可按 Y / A / N`);
+  await expect(card.locator('.approval-keys')).toHaveText(`${command === 'Meta' ? '⌘' : 'Ctrl'} Enter 允许一次 · ${command === 'Meta' ? '⌘' : 'Ctrl'} Shift Enter 本会话允许 · ${command === 'Meta' ? '⌘ ⌫' : 'Ctrl Backspace'} 拒绝 · 点选卡片后可按 Y / T / A / N`);
   assert.equal(await card.evaluate(node => node.contains(document.activeElement)), false, 'the card does not take the focus when it appears');
   await composer.click(); await page.keyboard.type('yan YAN');
   await expect(composer).toHaveValue('yan YAN');
@@ -146,11 +146,15 @@ try {
   await card.locator('h3').click(); await page.keyboard.press('a');
   await done('five');
   assert.deepEqual([(await decisions()).at(-1), written('five')], ['session', 'five']);
+  await ask('写入 tee');
+  await card.locator('h3').click(); await page.keyboard.press('t');
+  await done('tee');
+  assert.deepEqual([(await decisions()).at(-1), written('tee')], ['task', 'tee']);
   await ask('写入 six');
   await card.locator('h3').click(); await page.keyboard.press('n');
   await done('six');
   assert.deepEqual([(await decisions()).at(-1), written('six')], ['deny', null]);
-  passed('in the focused card Y allows once, A allows for the session and N denies');
+  passed('in the focused card Y allows once, T for this task, A for the session and N denies');
 
   // Escape in the card denies and does not also close the open side panel.
   await ask('写入 seven');
@@ -210,7 +214,7 @@ try {
   await done('twelve');
   assert.equal(written('twelve'), 'twelve');
   passed('a request scrolled out of sight is brought into view by the first press and answered by the second');
-  assert.deepEqual(await decisions(), ['once', 'deny', 'session', 'once', 'session', 'deny', 'deny', 'deny', 'once', 'once', 'deny', 'once']);
+  assert.deepEqual(await decisions(), ['once', 'deny', 'session', 'once', 'session', 'task', 'deny', 'deny', 'deny', 'once', 'once', 'deny', 'once']);
   assert.deepEqual(errors, []); assert.deepEqual(externalRequests, []);
 } catch (error) {
   failure = error; console.error(error);

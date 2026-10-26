@@ -90,3 +90,23 @@ test("the card can take the focus and shows its keys; a later card does not clai
   assert.match(render(true), /Enter 允许一次 · .*Shift Enter 本会话允许 · .*拒绝 · 点选卡片后可按 Y \/ A \/ N/);
   assert.match(render(false), /<p class="approval-keys[^"]*">点选卡片后可按 Y \/ A \/ N<\/p>/);
 });
+
+test("T answers for this task inside the card, and a standing rule has no key", () => {
+  const card = { in: "card", onButton: false } as const;
+  const four = ["once", "task", "session", "always", "deny"];
+  assert.equal(approvalDecision({ key: "t" }, card, four), "task");
+  assert.equal(approvalDecision({ key: "t" }, card, ["once", "session", "deny"]), undefined);
+  assert.equal(approvalKeyHint(four, false, true), "点选卡片后可按 Y / T / A / N");
+});
+
+test("a draft reads as send or discard, and a consequential card ignores the window's keys", () => {
+  const event = { type: "tool_approval_request", request_id: "r2", tool_name: "mcp__mail__send_email", reason: "发邮件",
+    choices: ["once", "deny"], consequential: "send", draft: { to: "tan@example.edu", subject: "Meeting", text: "明天见" } };
+  const markup = renderToStaticMarkup(React.createElement(Approval, { event, send: async () => {}, windowKeys: true }));
+  assert.match(markup, /要发出去的内容/);
+  assert.match(markup, /发送类操作：每次都会单独问你/);
+  assert.match(markup, /<strong>发给：<\/strong>tan@example.edu/);
+  assert.match(markup, /<pre class="draft-text">明天见<\/pre>/);
+  assert.match(markup, />发送<\/button><button[^>]*>丢弃<\/button>/);
+  assert.match(markup, /<p class="approval-keys[^"]*">点选卡片后可按 Y \/ N<\/p>/);
+});

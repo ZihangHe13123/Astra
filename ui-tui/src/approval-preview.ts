@@ -1,4 +1,5 @@
 import stringWidth from "string-width";
+import { approvalChoices, type ApprovalChoice } from "@astra/ui-core/approval-choices";
 import type { ToolApprovalRequest } from "./types.js";
 import { summarizeToolResult, wrapToolResult } from "./tool-results.js";
 
@@ -481,11 +482,10 @@ export function approvalChoiceHint(
   request: ToolApprovalRequest,
   expanded: boolean,
 ): string {
-  const choices: readonly ("once" | "session" | "deny")[] = request.choices?.length
-    ? request.choices
-    : isComputerTakeoverRequest(request)
-      ? ["once", "deny"]
-      : ["once", "session", "deny"];
+  const choices: readonly ApprovalChoice[] = !request.choices?.length && isComputerTakeoverRequest(request)
+    ? ["once", "deny"]
+    : approvalChoices(request);
+  const draft = Boolean(request.draft?.text);
   const sessionLabel = isComputerTakeoverRequest(request)
     ? "本次 CU 会话内允许此应用的普通操作"
     : request.scope_kind === "directory"
@@ -498,8 +498,10 @@ export function approvalChoiceHint(
         ? `会话内允许 ${displayText(request.session_scope_label)}`
       : "会话内允许";
   return [
-    choices.includes("once") ? "[Y/回车] 仅本次允许" : "",
+    choices.includes("once") ? (draft ? "[Y/回车] 发送" : "[Y/回车] 仅本次允许") : "",
+    expanded && choices.includes("task") ? "[T] 本任务允许" : "",
     (expanded || isComputerTakeoverRequest(request)) && choices.includes("session") ? `[A] ${sessionLabel}` : "",
-    choices.includes("deny") ? (expanded ? "[N] 拒绝" : "[N/Esc] 拒绝") : "",
+    expanded && choices.includes("always") ? "[L] 以后都允许" : "",
+    choices.includes("deny") ? (draft ? (expanded ? "[N] 丢弃" : "[N/Esc] 丢弃") : expanded ? "[N] 拒绝" : "[N/Esc] 拒绝") : "",
   ].filter(Boolean).join("   ");
 }

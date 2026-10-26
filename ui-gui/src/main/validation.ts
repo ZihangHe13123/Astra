@@ -80,7 +80,7 @@ export function checkedCommand(value: unknown): Record<string, any> {
   if (["message", "image", "submission_status"].includes(c.type) && !/^[A-Za-z0-9_-]{1,128}$/.test(c.submission_id)) throw new Error("Invalid submission ID");
   if (c.type === "select_model" && (!/^[^\s]+$/.test(c.model_key) || c.model_key.length > 512)) throw new Error("Invalid model key");
   if (c.type === "command" && !c.cmd.startsWith("/")) throw new Error("Commands must begin with /");
-  if (c.type === "tool_approval_response" && !["once", "session", "deny"].includes(c.decision)) throw new Error("Invalid approval decision");
+  if (c.type === "tool_approval_response" && !["once", "task", "session", "always", "deny"].includes(c.decision)) throw new Error("Invalid approval decision");
   if (c.type === "user_question_response" && !Array.isArray(c.answers)) throw new Error("Missing answers");
   if (c.type === "user_question_editing" && typeof c.editing !== "boolean") throw new Error("Invalid editing state");
   if (c.type === "refresh_models") {

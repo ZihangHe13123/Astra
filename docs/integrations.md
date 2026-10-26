@@ -133,11 +133,14 @@ in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on`,
   back to the default.
 - **Approvals.** A step that needs approval (a command on this computer, a
   file outside the workspace) is sent to the chat with what it will do,
-  credentials hidden, and waits for a reply: 同意 runs it once, 拒绝 does
-  not. Only the person whose message started the turn can answer, only
-  while a request waits, and only with a message that is nothing but a short
-  yes or no (同意, 可以, 好 / 拒绝, 不行, 取消); anything else is an ordinary
-  message. No answer within five minutes counts as 拒绝, and the
+  credentials hidden, and waits for a reply: 同意 runs it once, 本任务 allows
+  it for the rest of this request, 本会话 for this chat, 拒绝 does not run it
+  (the prompt lists only what that request offers; a send shows its text and
+  takes 发送 or 丢弃). The chat's grants are its own: what the desktop allowed
+  never applies here. Only the person whose message started the turn can
+  answer, only while a request waits, and only with a message that is nothing
+  but one of those short answers (同意, 可以, 好 / 拒绝, 不行, 取消 and so on);
+  anything else is an ordinary message. No answer within five minutes counts as 拒绝, and the
   chat is told the step did not run. An open desktop window showing the same
   request can answer first. Other channels get the same five-minute limit
   without the chat prompt, so a request nobody can see never holds the

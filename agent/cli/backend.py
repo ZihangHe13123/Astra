@@ -169,7 +169,8 @@ from agent.cli.model_catalog import (
     discover_model_catalog,
     parse_model_command_argument,
 )
-from agent.cli.model_preferences import read_selected_model
+from agent.cli.model_preferences import model_settings_path, read_selected_model
+from agent.runtime.tools.grants import AllowRules
 from agent.cli.bar_preferences import load_bar_output_mode, save_bar_output_mode
 from agent.cli.provider_connections import connection_routes_event
 from agent.cli.model_catalog import provider_menu_items
@@ -1084,7 +1085,7 @@ async def _main(startup_started: float):
         future = pending_tool_approvals.get(request_id)
         if future is None or future.done() or request_id in approval_resolutions:
             return False
-        normalized = decision if decision in {"once", "session", "deny"} else "deny"
+        normalized = decision if decision in {"once", "task", "session", "always", "deny"} else "deny"
 
         async def resolve() -> None:
             try:
@@ -1190,6 +1191,10 @@ async def _main(startup_started: float):
             pending_yolo_approvals.discard(request_id)
 
     tools.set_approval_handler(request_tool_approval)
+    # "以后都允许" rules the person adds from a card (settings.json), and when a card may offer one.
+    tools.grants.rules = AllowRules(model_settings_path())
+    if approval_inbox is not None:
+        tools.rule_advisor = approval_inbox.rule_eligible
     if orphaned_approvals:
         _send({
             "type": "approval_inbox_snapshot",
@@ -1309,7 +1314,9 @@ async def _main(startup_started: float):
         return {"reason": "Restart the current backend after its current work is delivered.",
                 "approval_title": "Restart Astra backend",
                 "approval_question": "Restart this backend after the current reply finishes?",
-                "approval_effect": "The TUI stays open; the same session is restored. Other services are not restarted."}
+                "approval_effect": "The TUI stays open; the same session is restored. Other services are not restarted.",
+                # Each restart is its own decision.
+                "choices": ["once", "deny"]}
 
     tools.register(ToolDef(
         name="request_restart",

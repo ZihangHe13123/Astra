@@ -1,8 +1,9 @@
 import { connectionFlow, filterCommands, moveSelection, opensCommandInterface } from "./control-state.js";
 import { modelConnection } from "./model-connection.js";
 import { names } from "./command-help.js";
-import { approvalPreview } from "./approval-preview.js";
+import { approvalPreview, approvalText } from "./approval-preview.js";
 import { approvalDecision, approvalKeyHint, typingIn } from "./approval-keys.js";
+import { approvalChoiceLabel, approvalChoices, consequenceNote } from "@astra/ui-core/approval-choices";
 import React, { useState } from "react";
 import { X, Check, ChevronRight, ExternalLink, LoaderCircle } from "lucide-react";
 import type { CommandDescription } from "../bridge.js";
@@ -215,8 +216,11 @@ export function ModelSettings({ state, send, close, initialModelKey }: {
 }
 export function Approval({ event, send, windowKeys = false }: { event: UIEvent; send: (c: UIEvent) => Promise<void>; windowKeys?: boolean }) {
   const [pending, setPending] = useState(false);
-  const choices: string[] = event.choices || ["once", "session", "deny"];
+  const choices: string[] = approvalChoices(event);
   const preview = approvalPreview(event);
+  const note = consequenceNote(event);
+  // A send, payment or deletion is answered on the card itself, never by a key pressed elsewhere.
+  const globalKeys = windowKeys && !note;
   const decide = (decision: string) => {
     if (pending) return;
     setPending(true); void send({ type: "tool_approval_response", request_id: event.request_id, decision }).catch(() => setPending(false));
@@ -226,7 +230,7 @@ export function Approval({ event, send, windowKeys = false }: { event: UIEvent; 
   // The Cmd/Ctrl keys answer the oldest pending approval from anywhere in the window. A key pressed
   // inside an approval card belongs to that card alone.
   React.useEffect(() => {
-    if (!windowKeys) return;
+    if (!globalKeys) return;
     const listener = (e: KeyboardEvent) => {
       const target = e.target instanceof Element ? e.target : null;
       if (target?.closest(".approval")) return;
@@ -240,20 +244,30 @@ export function Approval({ event, send, windowKeys = false }: { event: UIEvent; 
       latest.current.decide(decision);
     };
     window.addEventListener("keydown", listener); return () => window.removeEventListener("keydown", listener);
-  }, [windowKeys]);
+  }, [globalKeys]);
   const mac = typeof navigator !== "undefined" && navigator.platform.includes("Mac");
-  return <section className="approval interactive-card" tabIndex={0} aria-label={`需要你的许可：${preview.title}`} onKeyDown={e => {
+  const draft = event.draft?.text ? event.draft : undefined;
+  return <section className={`approval interactive-card${note ? " consequential" : ""}`} tabIndex={0} aria-label={`需要你的许可：${preview.title}`} onKeyDown={e => {
     const decision = approvalDecision(e.nativeEvent, { in: "card", onButton: e.target instanceof HTMLButtonElement }, choices);
     // Stopping here keeps Escape from also closing a side panel.
     if (decision) { e.preventDefault(); e.stopPropagation(); decide(decision); }
-  }}><span className="eyebrow">需要你的许可</span><h3>{preview.title}</h3>
+  }}><span className="eyebrow">{draft ? "要发出去的内容" : "需要你的许可"}</span><h3>{preview.title}</h3>
+    {note && <p className="approval-consequence" role="note">{note}</p>}
+    {event.action_label && <p><strong>将点击：</strong>{approvalText(event.action_label)}</p>}
+    {draft && <div className="approval-draft">
+      {draft.to && <p><strong>发给：</strong>{approvalText(draft.to)}</p>}
+      {draft.subject && <p><strong>主题：</strong>{approvalText(draft.subject)}</p>}
+      <pre className="draft-text">{approvalText(draft.text)}</pre>
+      {draft.via && <p className="small muted">通过 {approvalText(draft.via)}</p>}
+    </div>}
     <p>{preview.explanationLabel}：{preview.explanation}</p>
     {preview.summary && <p>{preview.summary}</p>}
     <p className="small muted">{preview.targetLabel}</p><pre>{preview.target}</pre>
     <dl className="approval-facts">{preview.facts.map(fact => <React.Fragment key={fact.label}><dt>{fact.label}</dt><dd>{fact.value}</dd></React.Fragment>)}</dl>
     <details><summary>查看后端提供的审批详情</summary><pre>{preview.details}</pre></details>
-    <div className="actions" ref={actions}>{choices.map((decision: string) => <button key={decision} disabled={pending} className={decision === "once" ? "primary" : ""} onClick={() => decide(decision)}>{({ once: "允许一次", session: "本会话允许", deny: "拒绝" } as Record<string, string>)[decision]}</button>)}</div>
-    <p className="approval-keys small muted">{approvalKeyHint(choices, windowKeys, mac)}</p>
+    <div className="actions" ref={actions}>{choices.map((decision: string) => <button key={decision} disabled={pending} className={decision === "once" ? "primary" : ""} onClick={() => decide(decision)}>{approvalChoiceLabel(decision, event)}</button>)}</div>
+    {choices.includes("always") && <p className="small muted">「以后都允许」：你已多次批准这类操作，点了之后同类请求不再问，可以在审批设置里随时删除。</p>}
+    <p className="approval-keys small muted">{approvalKeyHint(choices, globalKeys, mac)}</p>
   </section>;
 }
 export function Question({ event, send }: { event: UIEvent; send: (c: UIEvent) => Promise<void> }) {

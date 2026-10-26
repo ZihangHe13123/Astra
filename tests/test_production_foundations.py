@@ -1000,7 +1000,7 @@ def test_mcp_approval_of_one_colliding_tool_does_not_cover_the_other(tmp_path):
     manager = MCPManager(tmp_path / "mcp.json")
     session = _ListedSession()
     manager._register_tools(
-        registry, "demo", session, [FakeRemoteTool(name="send.note"), FakeRemoteTool(name="send_note")],
+        registry, "demo", session, [FakeRemoteTool(name="save.note"), FakeRemoteTool(name="save_note")],
         {"risk": "write"},
     )
     requests = []
@@ -1013,9 +1013,36 @@ def test_mcp_approval_of_one_colliding_tool_does_not_cover_the_other(tmp_path):
     reached = _reached(registry, session)
 
     # Approval is asked and remembered per server tool, not per registered name.
-    assert sorted(request["target"] for request in requests) == ["demo/send.note", "demo/send_note"]
+    assert sorted(request["target"] for request in requests) == ["demo/save.note", "demo/save_note"]
     assert len({request["scope"] for request in requests}) == 2
     assert _reached(registry, session) == reached and len(requests) == 2
+
+
+def test_mcp_tools_that_send_or_delete_are_asked_every_call_and_show_their_draft(tmp_path):
+    registry = ToolRegistry()
+    manager = MCPManager(tmp_path / "mcp.json")
+    session = _ListedSession()
+    manager._register_tools(registry, "mail", session, [FakeRemoteTool(name="send_email"),
+                                                         FakeRemoteTool(name="delete_thread"),
+                                                         FakeRemoteTool(name="list_threads")], {})
+    requests = []
+
+    async def decide(request):
+        requests.append(request)
+        return "session"
+
+    registry.set_approval_handler(decide)
+    letter = {"query": "x", "to": "tan@example.edu", "subject": "Meeting", "text": "明天下午三点见。"}
+    for _ in range(2):
+        assert run(registry.execute("mcp__mail__send_email", letter))["error"] == ""
+    assert run(registry.execute("mcp__mail__delete_thread", {"query": "x"}))["error"] == ""
+    assert run(registry.execute("mcp__mail__list_threads", {"query": "x"}))["error"] == ""
+    # Every send and delete is asked, only once or deny is offered, and "session" counts as once.
+    assert [request["target"] for request in requests] == ["mail/send_email", "mail/send_email", "mail/delete_thread"]
+    assert all(request["choices"] == ["once", "deny"] for request in requests)
+    assert [request["consequential"] for request in requests] == ["send", "send", "delete"]
+    assert requests[0]["draft"] == {"to": "tan@example.edu", "subject": "Meeting", "text": "明天下午三点见。",
+                                    "via": "mail/send_email"}
 
 
 def test_mcp_tool_name_held_by_another_server_gets_its_own_name(tmp_path):

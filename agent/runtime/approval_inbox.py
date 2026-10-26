@@ -18,7 +18,10 @@ from typing import Any
 
 PENDING_APPROVAL_STATES = frozenset({"pending"})
 TERMINAL_APPROVAL_STATES = frozenset({"approved", "denied", "cancelled", "orphaned"})
-APPROVAL_DECISIONS = frozenset({"once", "session", "deny"})
+APPROVAL_DECISIONS = frozenset({"once", "task", "session", "always", "deny"})
+# A card offers "always" once the same request was approved this often, on this many days, and never refused.
+RULE_APPROVALS = 5
+RULE_DAYS = 2
 
 _REQUEST_TEXT_FIELDS = (
     "call_id",
@@ -43,6 +46,9 @@ _REQUEST_TEXT_FIELDS = (
     "workspace",
     "verifier",
     "preview",
+    "grant_key",
+    "grant_label",
+    "consequential",
 )
 _REQUEST_BOOL_FIELDS = ("outside_workspace",)
 _REQUEST_INT_FIELDS = ("compound_command_count",)
@@ -89,7 +95,7 @@ def safe_approval_request(request: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(request.get("choices"), (list, tuple)):
         result["choices"] = list(dict.fromkeys(
             choice for choice in request["choices"]
-            if isinstance(choice, str) and choice in {"once", "session", "deny"}
+            if isinstance(choice, str) and choice in APPROVAL_DECISIONS
         ))
     for key in _REQUEST_TEXT_FIELDS:
         if key in request and (not takeover or key in _TAKEOVER_TEXT_FIELDS):
@@ -139,6 +145,11 @@ def safe_approval_request(request: Mapping[str, Any]) -> dict[str, Any]:
         result["compound_commands"] = [
             _bounded_text(value, 2_000) for value in compound_commands[:16]
         ]
+
+    draft = request.get("draft")
+    if not takeover and isinstance(draft, Mapping):
+        result["draft"] = {key: _bounded_text(draft[key], 8_000 if key == "text" else 500)
+                           for key in ("to", "subject", "text", "via") if draft.get(key)}
 
     change_summary = request.get("change_summary")
     if not takeover and isinstance(change_summary, Mapping):
@@ -327,6 +338,20 @@ class ApprovalInbox:
             ).fetchone()
         assert row is not None
         return self._record(row)
+
+    def rule_eligible(self, grant_key: str) -> bool:
+        """Whether the person approved this kind of request often enough, on separate days, and never refused it."""
+        if not grant_key:
+            return False
+        with self._lock, self._connection() as db:
+            rows = db.execute(
+                """SELECT state, substr(created_at, 1, 10) AS day FROM approval_requests
+                   WHERE json_extract(request_json, '$.grant_key')=? AND state IN ('approved', 'denied')""",
+                (str(grant_key),),
+            ).fetchall()
+        if any(row["state"] == "denied" for row in rows):
+            return False
+        return len(rows) >= RULE_APPROVALS and len({row["day"] for row in rows}) >= RULE_DAYS
 
     def cancel(self, request_id: str) -> ApprovalRecord | None:
         return self._transition_pending(request_id, "cancelled")
