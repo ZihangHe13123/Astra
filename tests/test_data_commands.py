@@ -45,7 +45,7 @@ DATABASES = ("memory.db", "sessions.db", "jobs/jobs.sqlite3", "learning.db", "ta
 def seed(home: Path) -> sqlite3.Connection:
     for name, text in {**OWNED, **DERIVED, **KEPT, **BROWSER}.items():
         (home / name).parent.mkdir(parents=True, exist_ok=True)
-        (home / name).write_text(text)
+        (home / name).write_text(text, newline="\n")
     (home / "sessions" / ".writers").mkdir()
     (home / "sessions" / ".writers" / "abc.lock").write_text("")
     (home / "jobs" / "active").write_text("")
