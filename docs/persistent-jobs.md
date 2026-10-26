@@ -54,13 +54,17 @@ removing or running a job now is shown to you for approval first, in the desktop
 job records your own words as its authority: your message and the questions you answered after it.
 Listing and pausing need no approval. Its `quiet` action sets the quiet hours, also with approval.
 
-While the Astra desktop app is open (also from the tray), its background host runs due jobs
-and pushes results: a desktop notification, and a WeChat message to the person who logged WeChat
+While the Astra desktop app is open (also from the tray), its background host runs due jobs.
+Every result is written into the **personal thread** (see [desktop](gui.md#personal-thread)) as
+Astra's own message, so you can ask about it there; that happens at once, quiet hours or not.
+Results are then pushed: by default as a desktop notification, which a paired phone with
+notifications on also receives. A job can add WeChat: a message to the person who logged WeChat
 in, which also joins that chat's conversation so a reply can refer to it. WeChat gets the whole
 result as one message where it fits, split at paragraphs when longer, not as chat bubbles: WeChat
 lets the bot send only a few messages after each one from you (past 8,000 characters the rest is in the inbox);
 the desktop notification shows its start. `--targets` chooses
-(`desktop,weixin` by default; empty for the inbox only). Every result stays in the inbox. Quiet
+(`desktop` by default for new jobs; `desktop,weixin` adds WeChat; empty for no push), and
+`astra jobs update ID --targets ...` changes it later. Every result stays in the inbox. Quiet
 results and records of missed slots are not pushed. A push that fails is tried again after 1, 5,
 15 and 30 minutes, then given up; one whose run started more than 12 hours ago is not sent.
 

@@ -1,7 +1,7 @@
 import "./file-preview.css";
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { ArrowUp, Square, Plus, Search, PanelLeft, PanelRight, ChevronDown, Folder, Settings, Paperclip, X, Copy, RotateCcw, ChevronRight, Command, Pin, Moon, Sun, Monitor, ArrowLeft, LoaderCircle, SlidersHorizontal, FileDiff, Terminal, Check, FileText, AlarmClock, History, Brain } from "lucide-react";
+import { ArrowUp, Square, Plus, Search, PanelLeft, PanelRight, ChevronDown, Folder, Settings, Paperclip, X, Copy, RotateCcw, ChevronRight, Command, Pin, Moon, Sun, Monitor, ArrowLeft, LoaderCircle, SlidersHorizontal, FileDiff, Terminal, Check, FileText, AlarmClock, History, Brain, MessageCircle } from "lucide-react";
 import { projectEvent, textContent, type SessionState, type UIEvent, type Message } from "@astra/ui-core/session-state";
 import { COMPACTION_LABEL } from "@astra/ui-core/context-compaction";
 import { responseControlsBusy, responseOperationActive, type ResponseSource, type ResponseGroup } from "@astra/ui-core/response-versions";
@@ -145,6 +145,14 @@ function App() {
       for (const message of events) {
         if (message.refresh) { refresh(); continue; }
         if (message.appshot) { setNativeCapture(message.appshot); continue; }
+        if (message.opened) {
+          // Started by the background host, not by this window: join what arrived before it was known.
+          let current = next[message.opened.id]?.revision > message.opened.revision ? next[message.opened.id] : message.opened;
+          for (const e of earlyEvents.current[message.opened.id] || []) if (e.revision > current.revision) current = { ...projectEvent(current, e.event), revision: e.revision };
+          delete earlyEvents.current[message.opened.id];
+          next[message.opened.id] = current;
+          continue;
+        }
         if (message.removed) {
           const removed = next[message.removed];
           if (removed && prefsRef.current.lastSession?.session === removed.session && prefsRef.current.lastSession?.mode === removed.mode) setPrefs(p => ({ ...p, lastSession: null }));
@@ -479,7 +487,9 @@ function App() {
       if (request === historyRequest.current && scope === logScopeRef.current) setPreview((old: any) => old?.session_id === page.session_id && old?.mode === page.mode && old?.before === before ? { ...old, ...page, request: old.request, messages: [...page.messages, ...old.messages] } : old);
     } catch (error) { fail(error); } finally { if (request === historyRequest.current) setOlderLoading(false); }
   };
-  const currentTitle = preview ? sessionTitle({ name: preview.session_id, mode: preview.mode, modified: 0 }, prefs.titles) : !state || state.isDraft ? "新对话" : sessionTitle({ name: state.session, mode: state.mode, modified: 0 }, prefs.titles);
+  const currentTitle = preview ? sessionTitle({ name: preview.session_id, mode: preview.mode, modified: 0 }, prefs.titles) : state?.personal ? "个人对话" : !state || state.isDraft ? "新对话" : sessionTitle({ name: state.session, mode: state.mode, modified: 0 }, prefs.titles);
+  // The background host's conversation: always open, at the top of the sidebar (specs/personal-thread.md).
+  const personal = Object.values(states).find(s => s.personal);
   const currentConnection = modelConnection(state?.info.model_info, state?.info.model_info?.models?.find((m: UIEvent) => m.key === state.info.model_info.model_key));
   const appshotStatus = state?.info.gui_appshot;
   const appshotUnavailable = appshotStatus?.broker?.connection === "disconnected" && appshotStatus?.notice;
@@ -490,7 +500,8 @@ function App() {
   const voiceLine = voiceNotice(voiceStatus);
   const voiceControl = voiceButton(voiceStatus);
   useEffect(() => {
-    if (state?.status !== "ready" || !state.session || state.isDraft || preview) return;
+    // The personal thread is always there; the window reopens the last ordinary session.
+    if (state?.status !== "ready" || !state.session || state.isDraft || state.personal || preview) return;
     setPrefs(old => ({ ...old, lastSession: { session: state.session, mode: state.mode, workspace: state.workspace },
       workspaces: { ...old.workspaces, [`${state.mode}:${state.session}`]: state.workspace } }));
   }, [state?.session, state?.mode, state?.workspace, state?.status, state?.isDraft, preview?.session_id]);
@@ -560,6 +571,9 @@ function App() {
     {narrow && side && <div className="side-scrim" aria-hidden="true" onClick={() => setSide(false)}/>}
     <aside className="sidebar"><div className="traffic-space"/><div className="brand">{theme.console ? <><ThemeMark className="brand-mark"/><span className="brand-name"><strong>ASTRA</strong><small title={theme.wording.brand}>{theme.wording.brand}</small></span></> : <><span className="astra-mark">A</span><strong>Astra</strong></>}<button className="icon" aria-label="隐藏侧栏" onClick={() => setSide(false)}><PanelLeft size={17}/></button></div>
       <button className="new-chat" onClick={() => newChat()}><Plus size={18}/>新对话<span>{navigator.platform.includes("Mac") ? "⌘" : "Ctrl"} N</span></button>
+      {personal && <button className={`nav-button personal-entry ${state?.personal && !preview ? "selected" : ""}`} onClick={() => select(personal.id)}>
+        <MessageCircle size={17}/>个人对话{!!(personal.approvals.length || personal.questions.length || personal.busy) && <i className={`status-dot ${personal.approvals.length || personal.questions.length ? "waiting" : "running"}`}/>}
+      </button>}
       <button className="nav-button" onClick={() => showCommands()}><Command size={17}/>命令与功能<kbd>{navigator.platform.includes("Mac") ? "⌘" : "Ctrl"} K</kbd></button>
       <button className="nav-button" onClick={() => setModal("jobs")}><AlarmClock size={17}/>定时任务</button>
       <button className="nav-button" onClick={() => setModal("activity")}><History size={17}/>活动</button>

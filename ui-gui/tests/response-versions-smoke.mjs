@@ -149,7 +149,9 @@ try {
   assert.equal(readFileSync(target, 'utf8'), 'ORIGINAL_EFFECT');
   const originalWriteTime = statSync(target, { bigint: true }).mtimeNs;
   const originalState = await state(), originalPids = await backendPids();
-  assert.equal(originalPids.length, 1, 'one live fixture backend should own this conversation');
+  // Besides the personal thread's backend, which the background host keeps running.
+  const personalHosts = await page.evaluate(async () => (await window.astra.bootstrap()).sessions.filter(s => s.personal && s.status !== 'disconnected').length);
+  assert.equal(originalPids.length, 1 + personalHosts, 'one live fixture backend should own this conversation');
   const originalUser = originalState.messages.find(message => message.role === 'user' && message.content.includes('ROOT_BRANCH_QUESTION'));
   assert.ok(originalUser);
   await expect.poll(() => activeLog(answers.a)).not.toBeNull();

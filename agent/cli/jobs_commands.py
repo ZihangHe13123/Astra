@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import NoReturn
 
 from agent.runtime.jobs.calendar import quiet_hours, set_quiet_hours, zone
-from agent.runtime.jobs.store import NOTIFY_POLICIES, PUSH_TARGETS, JobStore, finite
+from agent.runtime.jobs.store import DEFAULT_TARGETS, NOTIFY_POLICIES, JobStore, finite
 from agent.runtime.paths import state_dir
 
 
@@ -43,8 +43,9 @@ def jobs_parser() -> JobParser:
     add.add_argument("--on-mail-folder", default="INBOX", help="with --on-mail-*: the folder to watch")
     add.add_argument("--on-new-file", metavar="PATTERN", default=None,
                      help="start when a new file matching PATTERN (such as '*.pdf') appears in --workdir")
-    add.add_argument("--targets", default=",".join(PUSH_TARGETS),
-                     help="where results are pushed besides the inbox: desktop,weixin (empty for the inbox only)")
+    add.add_argument("--targets", default=",".join(DEFAULT_TARGETS),
+                     help="where results are pushed besides the personal thread and the inbox: desktop "
+                          "(default; also notifies a paired phone), weixin, or empty for no push")
     add.add_argument("--catch-up", type=float, help="maximum lateness in seconds, from 1 to 86400")
     add.add_argument("--prompt", required=True)
     add.add_argument("--request", help="original user authorization; required for agent checks")
@@ -65,6 +66,8 @@ def jobs_parser() -> JobParser:
     update.add_argument("--iterations", type=int, help="most model rounds per run, 1 to 50")
     update.add_argument("--timeout", type=float, help="hard limit in seconds per run")
     update.add_argument("--model", help="configured model key, or 'default' to follow the default model")
+    update.add_argument("--targets", help="where results are pushed besides the personal thread: desktop, weixin, "
+                                          "both comma-separated, or empty for no push")
     update.add_argument("--request", default="", help="why it changed, kept with the job's authorization")
     commands.add_parser("list", help="show jobs and their schedules")
     for action in ("show", "pause", "resume", "remove", "run"):
@@ -185,11 +188,13 @@ def execute_jobs_command(argv: list[str], *, home: Path | None = None,
                               idle_seconds=args.idle, timeout_seconds=args.timeout, max_iterations=args.iterations)
             _with_times(value)
         elif args.action == "update":
-            if args.iterations is None and args.timeout is None and args.model is None:
-                raise ValueError("Give --iterations, --timeout or --model.")
+            if args.iterations is None and args.timeout is None and args.model is None and args.targets is None:
+                raise ValueError("Give --iterations, --timeout, --model or --targets.")
             model = None if args.model is None else "" if args.model == "default" else job_model_key(args.model)
+            targets = None if args.targets is None else [target for target in args.targets.split(",") if target.strip()]
             value = store.update(args.id, request=args.request.strip() or "Changed from the command line.",
-                                 max_iterations=args.iterations, timeout_seconds=args.timeout, model=model)
+                                 max_iterations=args.iterations, timeout_seconds=args.timeout, model=model,
+                                 targets=targets)
             _with_times(value)
         elif args.action == "list":
             value = store.jobs()

@@ -214,6 +214,9 @@ export function ModelSettings({ state, send, close, initialModelKey }: {
     </section></div>
   </Modal>;
 }
+/** A chat's own conversation asks too: shown where the background host's requests appear, the personal thread. */
+const CHANNEL_NAMES: Record<string, string> = { weixin: "微信", qq: "QQ", onebot: "QQ" };
+
 export function Approval({ event, send, windowKeys = false }: { event: UIEvent; send: (c: UIEvent) => Promise<void>; windowKeys?: boolean }) {
   const [pending, setPending] = useState(false);
   const choices: string[] = approvalChoices(event);
@@ -251,7 +254,7 @@ export function Approval({ event, send, windowKeys = false }: { event: UIEvent; 
     const decision = approvalDecision(e.nativeEvent, { in: "card", onButton: e.target instanceof HTMLButtonElement }, choices);
     // Stopping here keeps Escape from also closing a side panel.
     if (decision) { e.preventDefault(); e.stopPropagation(); decide(decision); }
-  }}><span className="eyebrow">{draft ? "要发出去的内容" : "需要你的许可"}</span><h3>{preview.title}</h3>
+  }}><span className="eyebrow">{draft ? "要发出去的内容" : "需要你的许可"}{event.channel ? `：来自${CHANNEL_NAMES[event.channel] ?? event.channel}的对话` : ""}</span><h3>{preview.title}</h3>
     {note && <p className="approval-consequence" role="note">{note}</p>}
     {event.action_label && <p><strong>将点击：</strong>{approvalText(event.action_label)}</p>}
     {draft && <div className="approval-draft">

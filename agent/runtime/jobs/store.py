@@ -23,6 +23,11 @@ TRIGGER_TYPES = frozenset({"mail", "file"})
 NOTIFY_POLICIES = frozenset({"always", "on_change"})
 # Where results are pushed besides the local inbox, which always receives them.
 PUSH_TARGETS = ("desktop", "weixin")
+# Where a new job pushes unless it says otherwise: the desktop, which also notifies a paired phone.
+DEFAULT_TARGETS = ("desktop",)
+# Every result is also written into the personal thread, the conversation the desktop's background host
+# keeps (specs/personal-thread.md). It is queued like a push but chosen by no job.
+THREAD_TARGET = "thread"
 # Exists while a job may still run or a result still waits to be pushed: the desktop starts
 # its background host for it.
 ACTIVE_MARKER = "active"
@@ -207,7 +212,7 @@ class JobStore:
     def add(self, *, name: str, prompt: str, original_request: str,
             workdir: Path, next_at: float | None = None, interval_seconds: float = 0,
             calendar: dict | None = None, trigger: dict | None = None, notify: str = "always",
-            targets: list[str] | tuple[str, ...] = PUSH_TARGETS,
+            targets: list[str] | tuple[str, ...] = DEFAULT_TARGETS,
             grace_seconds: float = 300, kind: str = "check", model: str = "",
             web: bool = False, mail: bool = False, read_calendar: bool = False, idle_seconds: float = 120,
             timeout_seconds: float | None = None, max_iterations: int | None = None, now: float | None = None) -> dict:
@@ -625,7 +630,7 @@ class JobStore:
                 # Quiet results and records of missed slots stay in the inbox only.
                 if run["quiet"] or (run["state"] == "skipped" and run["skipped_count"]):
                     continue
-                for target in json.loads(run["spec"]).get("targets", PUSH_TARGETS):
+                for target in (*json.loads(run["spec"]).get("targets", PUSH_TARGETS), THREAD_TARGET):
                     db.execute("INSERT OR IGNORE INTO pushes (run_id,target,state,next_try,updated_at) "
                                "VALUES (?,?,'pending',?,?)", (run["id"], target, now, now))
         if pending:

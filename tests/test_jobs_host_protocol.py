@@ -1,4 +1,5 @@
-"""The desktop's background host runs a scheduled job and pushes it to WeChat and the desktop, once."""
+"""The desktop's background host runs a scheduled job, pushes it to WeChat and the desktop once, and keeps it in
+the personal thread it holds."""
 
 import io
 import json
@@ -41,7 +42,8 @@ def test_host_pushes_a_reminder_to_wechat_and_the_desktop_and_keeps_it_in_the_ch
         env_overrides={"ASTRA_HOME": str(home), "ASTRA_CHANNEL_CONFIG": str(channels),
                        "ASTRA_WEIXIN_BASE_URL": ilink.base, "ASTRA_WEIXIN_CDN_URL": ilink.cdn,
                        "ASTRA_CONTEXT_INDEX_EMBEDDING": "off", "ASTRA_CHANNEL_HOST": "1",
-                       "ASTRA_JOBS_TICK_SECONDS": "0.3", "ASTRA_JOBS_PUSH_SECONDS": "0.3"},
+                       "ASTRA_JOBS_TICK_SECONDS": "0.3", "ASTRA_JOBS_PUSH_SECONDS": "0.3",
+                       "ASTRA_PERSONAL_THREAD": "1"},
     )
     try:
         wait_for(lambda e: e.get("type") == "weixin_status", timeout=30)
@@ -55,7 +57,7 @@ def test_host_pushes_a_reminder_to_wechat_and_the_desktop_and_keeps_it_in_the_ch
 
         store = JobStore(home)
         job = store.add(name="喝水", prompt="该喝水了", original_request="提醒我喝水", kind="reminder",
-                        workdir=workdir, next_at=time.time())
+                        workdir=workdir, next_at=time.time(), targets=["desktop", "weixin"])
         notice = wait_for(lambda e: e.get("type") == "job_notification", timeout=30)
         assert notice["title"] == "提醒：喝水" and notice["body"] == "该喝水了" and notice["job_id"] == job["id"]
         deadline = time.monotonic() + 30
@@ -65,7 +67,11 @@ def test_host_pushes_a_reminder_to_wechat_and_the_desktop_and_keeps_it_in_the_ch
         assert ilink.replies_to(OWNER)[1:] == ["【提醒：喝水】\n该喝水了"]
         time.sleep(1.5)
         sent = len(ilink.replies_to(OWNER))
-        assert [push["state"] for push in store.pushes(notice["run_id"])] == ["sent", "sent"]
+        # The personal thread (this backend's own conversation) has it too, and the window was told.
+        recorded = wait_for(lambda e: e.get("type") == "job_result", timeout=30)
+        assert (recorded["title"], recorded["text"], recorded["run_id"]) == ("提醒：喝水", "该喝水了", notice["run_id"])
+        assert [(push["target"], push["state"]) for push in store.pushes(notice["run_id"])] == [
+            ("desktop", "sent"), ("thread", "sent"), ("weixin", "sent")]
 
         # The person replies to the reminder: the model sees it in that chat's conversation.
         before = len(RecordingHandler.conversations)
@@ -91,6 +97,18 @@ def test_host_pushes_a_reminder_to_wechat_and_the_desktop_and_keeps_it_in_the_ch
         # Pushed once each, however many ticks passed.
         assert sum("该喝水了" in reply for reply in ilink.replies_to(OWNER)) == 1
         assert len([e for e in seen if e.get("type") == "job_notification"]) == 1
+        assert len([e for e in seen if e.get("type") == "job_result"]) == 1
+
+        # Asked in the thread itself, the model sees the reminder there as its own words.
+        before = len(RecordingHandler.conversations)
+        send(proc, {"type": "message", "text": "刚才那条是什么？"})
+        deadline = time.monotonic() + 30
+        while len(RecordingHandler.conversations) == before and time.monotonic() < deadline:
+            time.sleep(0.05)
+        asked = RecordingHandler.conversations[before]
+        assert {"role": "assistant", "content": "【提醒：喝水】\n该喝水了"}.items() <= next(
+            message for message in asked if "提醒：喝水" in str(message.get("content"))).items()
+        assert not any(str(message.get("content")).startswith("你好") for message in asked), "the WeChat chat stays apart"
     finally:
         _stop_protocol_backend(proc)
         model.shutdown()

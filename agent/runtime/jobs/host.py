@@ -16,7 +16,7 @@ import time
 from contextlib import suppress
 from pathlib import Path
 
-from .delivery import DesktopNotify, JobDelivery, WeixinPush
+from .delivery import DesktopNotify, JobDelivery, ThreadRecord, WeixinPush
 from .scheduler import tick
 from .store import JobStore
 from .triggers import LOOK_SECONDS, TriggerWatcher
@@ -36,9 +36,10 @@ def _seconds(name: str, default: float) -> float:
 
 class JobsHost:
     def __init__(self, home: Path, *, desktop: DesktopNotify | None, weixin: WeixinPush | None,
-                 tick_seconds: float | None = None, push_seconds: float | None = None):
+                 thread: ThreadRecord | None = None, tick_seconds: float | None = None,
+                 push_seconds: float | None = None):
         self.store = JobStore(home)
-        self.delivery = JobDelivery(self.store, desktop=desktop, weixin=weixin)
+        self.delivery = JobDelivery(self.store, desktop=desktop, weixin=weixin, thread=thread)
         self.triggers = TriggerWatcher(self.store)
         self._look_seconds = _seconds("ASTRA_JOBS_TRIGGER_SECONDS", LOOK_SECONDS)
         self._stop = threading.Event()

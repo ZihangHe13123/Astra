@@ -1,5 +1,5 @@
 import type { SessionState } from "@astra/ui-core/session-state";
-import type { Preferences, SessionEntry } from "../bridge.js";
+import { PERSONAL_SESSION, type Preferences, type SessionEntry } from "../bridge.js";
 import { maskSecrets } from "@astra/ui-core/secret-mask";
 export const sessionKey = (s: SessionEntry) => `${s.mode}:${s.name}`;
 export function sessionTitle(entry: SessionEntry, titles: Preferences["titles"]): string {
@@ -12,10 +12,12 @@ export function sessionTitle(entry: SessionEntry, titles: Preferences["titles"])
 export function autoTitle(draft: string): string {
   return [...maskSecrets(draft.trim()).split("\n")[0]].slice(0, 36).join("") || "附件对话";
 }
+/** The personal thread has its own place at the top of the sidebar, never among the sessions. */
+export const isPersonal = (entry: SessionEntry) => entry.name === PERSONAL_SESSION && entry.mode === "work";
 export function sidebarGroups(history: SessionEntry[], states: SessionState[], prefs: Pick<Preferences, "titles" | "pinned">, search: string, now = new Date()) {
-  const entries = new Map(history.map(e => [sessionKey(e), e]));
+  const entries = new Map(history.filter(e => !isPersonal(e)).map(e => [sessionKey(e), e]));
   const live = new Set<string>();
-  for (const state of states) if (!state.isDraft) {
+  for (const state of states) if (!state.isDraft && !state.personal) {
     const key = `${state.mode}:${state.session}`;
     live.add(key);
     if (!entries.has(key)) entries.set(key, { name: state.session, mode: state.mode, modified: 0 });

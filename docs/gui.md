@@ -64,6 +64,17 @@ current model. A missing current connection also has a **连接模型** action a
 the composer. This is useful for a separate checkout whose `.env` and login storage
 have not been configured yet.
 
+## Personal thread
+
+**个人对话** at the top of the sidebar is one long-lived conversation, apart from your
+project sessions. The desktop's background host holds it, so it keeps running with the
+window closed (from the tray), and a paired phone opens on it. Every scheduled job's
+result arrives in it as Astra's message, so you can ask about it right there. It works
+in its own folder (`personal` in Astra's data folder) rather than in a project, and its
+model is switched like any conversation's. It cannot be closed or deleted; `/new` in it
+starts afresh. WeChat keeps its own conversations. The design is in
+`specs/personal-thread.md`.
+
 ## Conversations and tools
 
 - **新对话** returns to the current project's blank draft. Repeated clicks reuse

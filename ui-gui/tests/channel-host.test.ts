@@ -5,14 +5,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ChannelHost, channelsEnabled, type HostedBackend } from "../src/main/channel-host.js";
 
-function fixture() {
+function fixture(always = false) {
   const directory = mkdtempSync(join(tmpdir(), "astra-channel-host-"));
   const config = join(directory, "channels.json");
   const jobsMarker = join(directory, "jobs", "active");
   const backends: (HostedBackend & { closed: boolean })[] = [];
   let now = 0;
   const host = new ChannelHost({
-    configPath: config, jobsMarker, intervalMs: 60_000, retryMs: 30_000, now: () => now,
+    configPath: config, jobsMarker, intervalMs: 60_000, retryMs: 30_000, now: () => now, always,
     create: () => {
       const backend = { state: { status: "ready" }, closed: false, close: async () => { backend.closed = true; } };
       backends.push(backend);
@@ -93,4 +93,19 @@ test("a host stopped for a wipe watches again when resumed", async () => {
   assert.equal(backends.length, 2, "started again at once, without waiting out the retry interval");
   later(60_000);
   await host.stop();
+});
+
+test("holding the personal thread, the background backend runs with no channel or job, and comes back after it exits", async () => {
+  const { backends, host, later } = fixture(true);
+  await host.check();
+  assert.equal(backends.length, 1, "started with nothing else to do");
+  later(30_000);
+  await host.check();
+  assert.equal(backends.length, 1, "kept, not restarted");
+  backends[0].state.status = "disconnected";
+  later(30_000);
+  await host.check();
+  assert.equal(backends.length, 2, "started again after it exited");
+  await host.stop();
+  assert.ok(backends[1].closed, "closed with the desktop");
 });

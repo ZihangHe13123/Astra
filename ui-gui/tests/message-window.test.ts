@@ -30,3 +30,10 @@ test('sidebar deduplicates pinned/live/history while retaining disconnected sess
  assert.equal(sidebarGroups(entries,states,{titles:{'work:one':'First'},pinned:[]},'first').all.length,1);
  assert.equal(sessionTitle({name:'session_20260921051059_abcd',mode:'work',modified:0},{}),'09/21 05:10 的对话');
 });
+test('the personal thread is never listed among the sessions: it has its own place', () => {
+ const entries=[{name:'personal',mode:'work',modified:3},{name:'personal',mode:'writing',modified:2},{name:'one',mode:'work',modified:1}];
+ const states=[{...initialSession('host','/tmp'),session:'personal',isDraft:false,status:'ready' as const,personal:true}];
+ const groups=sidebarGroups(entries,states,{titles:{},pinned:['work:personal']},'');
+ assert.deepEqual(groups.all.map(e=>`${e.mode}:${e.name}`),['writing:personal','work:one']);
+ assert.equal(groups.open.length,0); assert.equal(groups.pinned.length,0);
+});

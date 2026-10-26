@@ -112,6 +112,7 @@ from agent.cli.session_lifecycle import ControlledRestart, RESTART_EXIT_CODE
 from agent.runtime.background_completion import BackgroundCompletions, wake_display, wake_prompt
 from agent.runtime.jobs.host import JobsHost
 from agent.runtime.jobs.store import note_interaction
+from agent.runtime.jobs.thread import thread_recorder
 from agent.runtime.session_wakeup import SessionWakeups, visible_wakeup_history, wakeup_prompt
 from agent.runtime.browser_control_transport import set_owner_label_provider
 from agent.runtime.peer_link import (HEARTBEAT_SECONDS, PeerError, PeerLink, default_name, fallback_name,
@@ -2421,7 +2422,10 @@ async def _main(startup_started: float):
     await _start_channel_manager(channel_manager)
     weixin_commands.send_status()
     # The background host also runs scheduled jobs and pushes their results to the desktop and WeChat.
-    jobs_host = JobsHost(state_dir(), desktop=_send, weixin=weixin_job_push(channel_manager, channel_router)
+    # When it holds the personal thread, every result is written into that conversation too.
+    personal_thread = os.environ.get("ASTRA_PERSONAL_THREAD", "") == "1"
+    jobs_host = JobsHost(state_dir(), desktop=_send, weixin=weixin_job_push(channel_manager, channel_router),
+                         thread=thread_recorder(agent, agent_turn_lock, _send) if personal_thread else None,
                          ).start() if channel_host else None
 
     active_task: asyncio.Task | None = None

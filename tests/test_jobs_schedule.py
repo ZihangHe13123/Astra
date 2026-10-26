@@ -203,6 +203,11 @@ def test_a_check_gets_rounds_and_time_for_what_it_reads_and_can_be_given_more(tm
     assert error == "" and (json.loads(output)["spec"]["max_iterations"], json.loads(output)["spec"]["timeout_seconds"]) == (
         25, 1200)
     assert execute_jobs_command(["update", files["id"]], home=tmp_path / "home", workdir=tmp_path)[1]
+    for given, chosen in (("desktop", ["desktop"]), ("desktop,weixin", ["desktop", "weixin"]), ("", [])):
+        output, error = execute_jobs_command(["update", files["id"], "--targets", given], home=tmp_path / "home",
+                                             workdir=tmp_path)
+        assert error == "" and json.loads(output)["spec"]["targets"] == chosen
+    assert execute_jobs_command(["update", files["id"], "--targets", "email"], home=tmp_path / "home", workdir=tmp_path)[1]
 
 
 def test_quiet_result_is_kept_but_not_offered_as_the_last_report(tmp_path):

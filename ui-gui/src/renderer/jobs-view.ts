@@ -55,11 +55,12 @@ export function jobState(job: JobRow): { label: string; tone: "on" | "off" | "wa
   return { label: "已暂停", tone: "off" };
 }
 
-const TARGETS: Record<string, string> = { desktop: "桌面通知", weixin: "微信" };
+const TARGETS: Record<string, string> = { thread: "个人对话", desktop: "桌面和手机", weixin: "微信" };
 
+/** Where a job pushes (every result is in the personal thread too), or where a result went. */
 export function targetsLabel(targets: string[]) {
   const names = targets.map(target => TARGETS[target] || target);
-  return names.length ? `发到${names.join("和")}` : "只进收件箱";
+  return names.length ? `发到${names.join("、")}` : "不另外推送";
 }
 
 /** A check a safety guard stopped still answered from what it found (agent/runtime/jobs/store.py). */

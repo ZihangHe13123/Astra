@@ -6,10 +6,10 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { homedir } from "node:os";
-import type { DesktopEvent, Preferences } from "../bridge.js";
+import { PERSONAL_SESSION, type DesktopEvent, type Preferences } from "../bridge.js";
 import type { SessionState } from "@astra/ui-core/session-state";
 import { Runtime } from "./runtime.js";
-import { ChannelHost } from "./channel-host.js";
+import { ChannelHost, type HostedBackend } from "./channel-host.js";
 import { Attention, type AttentionNotice } from "./attention.js";
 import { QueryClient } from "./query-client.js";
 import { sessionAction } from "./session-actions.js";
@@ -194,6 +194,12 @@ function openSession(options: { session?: string; mode?: string; workspace?: str
   const name = options.session || `session_${new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14)}_${randomUUID().slice(0, 8)}`;
   if (!/^[\p{L}\p{N}_.-]+$/u.test(name) || [".", ".."].includes(name) || name.length > 200) throw new Error("Invalid session name");
   if (sessionOperations.has(`${mode}:${name}`)) throw new Error("该会话的操作尚未完成，请稍后再打开。");
+  if (name === PERSONAL_SESSION && mode === "work") {
+    // One owner: the background host. Opening it again would start a second writer on the same conversation.
+    if (!personal) throw new Error("个人对话还没有启动，请稍候。");
+    if (select) active = personal.id;
+    return personal.state;
+  }
   const existing = [...runtimes.values()].find(r => r.state.session === name && r.state.mode === mode && r.state.status !== "disconnected");
   if (existing) {
     if (existing.isClosing) throw new Error("会话正在关闭，请稍后再打开。");
@@ -233,6 +239,7 @@ function forgetRuntime(rt: Runtime) {
 }
 async function closeSession(id: unknown) {
   const rt = runtime(id);
+  if (rt.state.personal) throw new Error("个人对话一直开着，不能关闭。");
   if (hasOngoingWork(rt.state)) throw new Error("该会话仍有任务或提醒，请先停止后再关闭。");
   await rt.close(); forgetRuntime(rt);
 }
@@ -392,6 +399,7 @@ async function runSessionAction(action: any, entry: any) {
   const mode = checkedString(entry.mode, "mode", 20);
   if (!/^[\p{L}\p{N}_.-]+$/u.test(name) || [".", ".."].includes(name) || !["work", "minimal", "bar"].includes(mode)) throw new Error("Invalid session");
   const key = `${mode}:${name}`;
+  if (action === "delete" && name === PERSONAL_SESSION && mode === "work") throw new Error("个人对话不能删除；可以在对话里用 /new 从头开始。");
   if (sessionOperations.has(key)) throw new Error("该会话的操作尚未完成。");
   sessionOperations.add(key);
   try {
@@ -427,7 +435,8 @@ function phoneAudit(device: string, entry: Record<string, unknown>) {
 /** A paired phone's calls (specs/phone-companion.md). The phone runs this renderer; Mac-only calls are answered on the phone. */
 async function phoneInvoke(device: string, method: PhoneInvokeMethod, args: any[]) {
   if (quitting || leaseLost) throw new Error("应用正在退出，请稍候。");
-  if (method === "bootstrap") return { sessions: [...runtimes.values()].map(r => r.state), active: "", workspace,
+  // A phone opens on the personal thread.
+  if (method === "bootstrap") return { sessions: [...runtimes.values()].map(r => r.state), active: personal?.id ?? "", workspace,
     preferences: Object.fromEntries(SHARED_PREFERENCE_KEYS.map(key => [key, preferences[key]])),
     appshot: { connection: "disconnected", enabled: false } };
   if (method === "create") return openSession(args[0] ?? {}, false);
@@ -500,15 +509,45 @@ register("file", async (id, value, action, requestId) => {
   finally { if (previewRequests.get(key) === controller) previewRequests.delete(key); }
 });
 
-/** WeChat and QQ answer while the desktop is open, whether or not a conversation is open in the window. */
+/**
+ * The personal thread (specs/personal-thread.md): the background host's own conversation, shown in the window
+ * and on a paired phone like a session that is always open. Its own folder is its workspace; project work
+ * belongs to the window's sessions.
+ */
+const personalHome = join(data, "personal");
+let personal: Runtime | undefined;
+function openPersonal(): HostedBackend {
+  if (personal) { const old = personal; personal = undefined; forgetRuntime(old); }
+  mkdirSync(personalHome, { recursive: true, mode: 0o700 });
+  const rt = new Runtime(root, python, personalHome, PERSONAL_SESSION, "work", (r, event) => {
+    broadcast({ runtime: r.id, revision: r.state.revision, event }); appshot.handle(r.id, event);
+    // A job's result opens this thread when its notification is tapped; the thread's own approvals,
+    // questions and long replies notify like any session's.
+    const own = attention.session(r.id, "", r.state.busy, event);
+    const hosted = attention.host(event);
+    notify(hosted ? { ...hosted, runtime: r.id } : own);
+    if (event.type === "backend_hello") voiceRoutes.delete(r.id);
+    if (event.type === "gui_ready") appshot.update();
+  }, { ASTRA_CHANNEL_HOST: "1", ASTRA_PERSONAL_THREAD: "1" });
+  rt.pageSnapshot = path => snapshots.capture(path);
+  rt.state.personal = true;
+  personal = rt;
+  runtimes.set(rt.id, rt);
+  broadcast({ opened: rt.state });
+  return {
+    get state() { return rt.state; },
+    close: async () => { await rt.close(); if (personal === rt) { personal = undefined; forgetRuntime(rt); } },
+  };
+}
+/** WeChat and QQ answer and scheduled jobs run while the desktop is open, and the personal thread is always there. */
 const channelHost = new ChannelHost({
   configPath: process.env.ASTRA_CHANNEL_CONFIG || join(root, ".astra", "channels.json"),
   // Kept by the job store while a scheduled job may run or a result still waits to be pushed.
   jobsMarker: join(data, "jobs", "active"),
-  // The channel host takes WeChat over from other backends, such as an old terminal session. It also
-  // runs scheduled jobs; their results become notifications here.
-  create: () => new Runtime(root, python, workspace, "channel_host", "work", (_r, event) => notify(attention.host(event)),
-    { ASTRA_CHANNEL_HOST: "1" }),
+  // The host takes WeChat over from other backends, such as an old terminal session, runs scheduled jobs
+  // (their results become notifications here) and holds the personal thread.
+  create: openPersonal,
+  always: true,
 });
 
 async function performQuit() {

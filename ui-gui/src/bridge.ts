@@ -3,7 +3,11 @@ import type { FilePreview } from "./file-preview-types.js";
 
 export type SessionEntry = { name: string; mode: string; modified: number };
 export type Preferences = { theme: string; drafts: Record<string, string>; attachments: Record<string, string[]>; workspaces: Record<string, string>; pinned: string[]; projects: string[]; titles: Record<string, string>; timeline: boolean; detailWidth?: number; lastSession?: { session: string; mode: string; workspace: string } | null };
-export type DesktopEvent = { removed: string } | { runtime: string; revision: number; event: UIEvent } | { refresh: true } | { appshot: { connection: string; enabled: boolean } };
+export type DesktopEvent = { removed: string } | { runtime: string; revision: number; event: UIEvent } | { refresh: true } | { appshot: { connection: string; enabled: boolean } }
+  /** A session the window did not open: the personal thread, started (again) by the background host. */
+  | { opened: SessionState };
+/** The personal thread's session name (specs/personal-thread.md); the background host holds it. */
+export const PERSONAL_SESSION = "personal";
 export type Bootstrap = { sessions: SessionState[]; active: string; workspace: string; preferences: Preferences; appshot: { connection: string; enabled: boolean } };
 export type CommandDescription = { id: string; command: string; description: string; takes_args: boolean; group: string; options: { command: string; description: string; completion: string; submitValue?: string }[] };
 import type { PhoneAction, PhoneNotificationState, PhoneStatus } from "./phone-protocol.js";

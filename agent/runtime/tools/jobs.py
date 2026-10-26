@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.runtime.jobs.calendar import WEEKDAYS, calendar_schedule, describe, local_timezone_name, set_quiet_hours, zone
-from agent.runtime.jobs.store import NOTIFY_POLICIES, PUSH_TARGETS, JobStore, normalize_trigger
+from agent.runtime.jobs.store import DEFAULT_TARGETS, NOTIFY_POLICIES, PUSH_TARGETS, JobStore, normalize_trigger
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
 
 ACTIONS = ("add", "list", "update", "pause", "resume", "remove", "run", "quiet")
@@ -59,7 +59,9 @@ PARAMETERS = {"type": "object", "properties": {
                                                         "(read-only, macOS)."},
     "quiet_hours": {"type": "string", "description": "For quiet: HH:MM-HH:MM on a 24-hour clock, or off."},
     "targets": {"type": "array", "items": {"type": "string", "enum": list(PUSH_TARGETS)},
-                "description": "Where results are pushed besides the inbox. Omit for both; [] for the inbox only."},
+                "description": "Where results are pushed besides the personal thread and the inbox. Omit for the "
+                               "desktop (which also notifies the phone); add weixin only when the person asks for "
+                               "WeChat; [] for no push."},
     "max_rounds": {"type": "integer", "minimum": 1, "maximum": 50,
                    "description": "A check's most model rounds per run (default 30 with web, else 10). Raise it "
                                   "when a check runs out of rounds before it has covered what was asked."},
@@ -173,12 +175,12 @@ def _when(job: dict) -> str:
     return f"once at {_local(job['next_at'], spec)}"
 
 
-_TARGET_NAMES = {"desktop": "桌面通知", "weixin": "微信"}
+_TARGET_NAMES = {"desktop": "桌面和手机", "weixin": "微信"}
 
 
 def _where(targets) -> str:
     names = [_TARGET_NAMES[target] for target in targets]
-    return ("发到" + "和".join(names) + "，收件箱里也有一份") if names else "只放进收件箱"
+    return "写进个人对话" + (("，并通知" + "、".join(names)) if names else "，不另外通知")
 
 
 def _summary(job: dict) -> dict[str, Any]:
@@ -310,7 +312,7 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
             reads = ("一次只读检查：" + "、".join(sources)) if kind == "check" else "一条提醒"
             title = f"新建定时任务：{str(args.get('name') or '').strip()}"
             target = f"{_plan(args, now)}；{reads}" + _limits_text(args)
-            where = _where(args["targets"] if args.get("targets") is not None else PUSH_TARGETS)
+            where = _where(args["targets"] if args.get("targets") is not None else DEFAULT_TARGETS)
             effect = f"到点在本机运行{reads}，结果{where}。不会写入文件、替你发消息或操作电脑。"
             question = "要创建这个定时任务吗？"
         else:
@@ -362,7 +364,7 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
                 name=name, prompt=prompt, original_request=authority[:8000], workdir=schedule.get("folder") or workdir(),
                 next_at=schedule.get("at"), interval_seconds=interval,
                 calendar=schedule.get("calendar"), trigger=schedule.get("trigger"), notify=notify or "always",
-                targets=PUSH_TARGETS if targets is None else targets,
+                targets=DEFAULT_TARGETS if targets is None else targets,
                 # The same catch-up windows as `astra jobs add`.
                 grace_seconds=3600 if schedule.get("calendar") else min(interval / 2, 3600) if interval else 300,
                 kind="check" if check else "reminder", model="",

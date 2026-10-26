@@ -166,6 +166,18 @@ try {
  await page.getByRole('textbox',{name:'消息'}).waitFor();
  await page.evaluate(()=>{window.__events=[];window.astra.onEvents(e=>window.__events.push(...e.map(x=>({type:x.event?.type,message:x.event?.message}))));});
  await page.screenshot({path:join(output,'welcome.png')}); passed('window and sandboxed preload');
+ // The desktop's backend children. The background host starts the personal thread's at launch, before any
+ // conversation, so the ones running now are its; a later transport-loss test kills only the window's own.
+ const hostPid=await app.evaluate(()=>process.pid);
+ const childBackends=async()=>process.platform==='win32'
+   ? [JSON.parse(execFileSync('powershell.exe',['-NoProfile','-Command',`ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq ${hostPid} -and $_.CommandLine -match '-m agent.cli.backend' } | ForEach-Object { $_.ProcessId })`],{encoding:'utf8'})||'[]')].flat()
+   : execFileSync('ps',['-axo','pid=,ppid=,command='],{encoding:'utf8'}).split('\n').flatMap(line=>{
+       const match=line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
+       return match&&Number(match[2])===hostPid&&match[3].includes('-m agent.cli.backend')?[Number(match[1])]:[];
+     });
+ await page.waitForFunction(async()=>(await window.astra.bootstrap()).sessions.some(s=>s.personal));
+ const personalBackends=await childBackends();
+ assert.equal(personalBackends.length,1,'the background host runs the personal thread from launch');
  // Command help operates on the local draft; completion never sends a command.
  const composerInput=page.getByRole('textbox',{name:'消息'});
  const suggestions=page.getByRole('listbox',{name:'指令建议'});
@@ -183,7 +195,9 @@ try {
  assert.equal(await composerInput.inputValue(),'/bar ');
  await suggestions.getByRole('option').filter({hasText:'/bar leave'}).click();
  assert.equal(await composerInput.inputValue(),'/bar leave');
- assert.equal((await page.evaluate(()=>window.astra.bootstrap())).sessions.length,0);
+ // The window's own sessions: the personal thread is the background host's, always there and never a draft.
+ const ownSessions=async()=>(await page.evaluate(()=>window.astra.bootstrap())).sessions.filter(s=>!s.personal);
+ assert.equal((await ownSessions()).length,0);
  assert.equal(requests.length,0);
  await composerInput.fill('/bar output ');
  assert.equal(await suggestions.getByRole('option').count(),3);
@@ -200,7 +214,7 @@ try {
  await composerInput.fill(''); assert.ok(await page.locator('.composer').evaluate(el=>el.getBoundingClientRect().height)<105);
  passed('compact composer grows and shrinks; slash matching, keyboard, pointer and IME never dispatch during completion');
  for(let i=0;i<8;i++) await page.getByRole('button',{name:'新对话',exact:false}).click();
- assert.equal((await page.evaluate(()=>window.astra.bootstrap())).sessions.length,0);
+ assert.equal((await ownSessions()).length,0);
  await page.getByRole('textbox',{name:'消息'}).fill('空白页草稿');
  await page.getByRole('button',{name:'新对话',exact:false}).click();
  assert.equal(await page.getByRole('textbox',{name:'消息'}).inputValue(),'空白页草稿');
@@ -214,22 +228,28 @@ try {
  assert.equal(await page.getByLabel('提供商 / 计费路线').inputValue(),'deepseek');
  await page.getByText(/尚未连接。请在右侧登录/).waitFor();
  assert.equal(await page.locator('.message.error').count(),0);
- const blank=await page.evaluate(()=>window.astra.bootstrap());
- assert.equal(blank.sessions.length,1); assert.equal(blank.sessions[0].isDraft,true);
- assert.equal(blank.sessions[0].tools.length,0); assert.equal(requests.length,0);
+ const blank=await ownSessions();
+ assert.equal(blank.length,1); assert.equal(blank[0].isDraft,true);
+ assert.equal(blank[0].tools.length,0); assert.equal(requests.length,0);
  const failure=await page.evaluate(async()=>{
-   const b=await window.astra.bootstrap(); const s=b.sessions[0];
+   const b=await window.astra.bootstrap(); const s=b.sessions.find(s=>!s.personal);
    try {await window.astra.send(s.id,{type:'select_model',model_key:s.info.model_info.models.find(m=>m.name==='missing-model').key,request_id:'missing-test'});return '';}
    catch(e){return String(e);}
  });
  assert.match(failure,/Missing API key/);
- await page.waitForFunction(async()=> (await window.astra.bootstrap()).sessions[0].info.gui_model_result?.code==='provider_not_configured');
+ await page.waitForFunction(async()=> (await window.astra.bootstrap()).sessions.find(s=>!s.personal).info.gui_model_result?.code==='provider_not_configured');
  assert.equal(await page.locator('.message.error').count(),0);
  await page.screenshot({path:join(output,'model-connection-guidance.png')});
  await page.getByRole('button',{name:'关闭',exact:true}).click();
  for(let i=0;i<8;i++) await page.getByRole('button',{name:'新对话',exact:false}).click();
  const ids=await page.evaluate(async()=>Promise.all(Array.from({length:5},()=>window.astra.create({}))).then(rs=>rs.map(r=>r.id)));
- assert.equal(new Set(ids).size,1); assert.equal((await page.evaluate(()=>window.astra.bootstrap())).sessions.length,1);
+ assert.equal(new Set(ids).size,1); assert.equal((await ownSessions()).length,1);
+ // The personal thread runs beside them, at the top of the sidebar, and cannot be closed.
+ await page.getByRole('button',{name:'个人对话',exact:true}).waitFor();
+ const personal=(await page.evaluate(()=>window.astra.bootstrap())).sessions.find(s=>s.personal);
+ assert.ok(personal&&!personal.isDraft&&personal.session==='personal');
+ assert.match(await page.evaluate(id=>window.astra.close(id).then(()=>'',e=>String(e)),personal.id),/不能关闭/);
+ passed('the personal thread is always open beside the window\'s sessions and cannot be closed');
  assert.equal(await page.locator('.open-session').count(),0);
  assert.equal(await page.locator('.topbar .title').innerText(),'新对话');
  passed('missing credentials guide setup; failed selection stays local; concurrent setup reuses one draft backend');
@@ -240,16 +260,10 @@ try {
  // Fail before admission: an unpersisted draft must stay visible.
  // Explicit close now releases a runtime. Kill only this fixture's Python child
  // to simulate transport loss while preserving its renderer/runtime identity.
- const hostPid=await app.evaluate(()=>process.pid);
- const backendPids=process.platform==='win32'
-   ? JSON.parse(execFileSync('powershell.exe',['-NoProfile','-Command',`ConvertTo-Json -Compress -InputObject @(Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq ${hostPid} -and $_.CommandLine -match '-m agent.cli.backend' } | ForEach-Object { $_.ProcessId })`],{encoding:'utf8'}))
-   : execFileSync('ps',['-axo','pid=,ppid=,command='],{encoding:'utf8'}).split('\n').flatMap(line=>{
-       const match=line.trim().match(/^(\d+)\s+(\d+)\s+(.+)$/);
-       return match&&Number(match[2])===hostPid&&match[3].includes('-m agent.cli.backend')?[Number(match[1])]:[];
-     });
- assert.equal(backendPids.length,1,'only the isolated draft backend should be running');
+ const backendPids=(await childBackends()).filter(pid=>!personalBackends.includes(pid));
+ assert.equal(backendPids.length,1,'only the isolated draft backend should be running beside the personal thread');
  process.kill(backendPids[0],'SIGKILL');
- await page.waitForFunction(async()=> (await window.astra.bootstrap()).sessions.every(s=>s.status==='disconnected'));
+ await page.waitForFunction(async()=> (await window.astra.bootstrap()).sessions.filter(s=>!s.personal).every(s=>s.status==='disconnected'));
  await submit('发送失败仍保留的草稿');
  await page.getByRole('alert').filter({hasText:/Backend|后端/}).waitFor();
  assert.equal(await page.getByRole('textbox',{name:'消息'}).inputValue(),'发送失败仍保留的草稿');
@@ -866,10 +880,11 @@ try {
  await restored.waitForFunction(async name=>{const b=await window.astra.bootstrap();return b.sessions.find(s=>s.id===b.active)?.session===name;},last);
  assert.equal(await restored.getByRole('textbox',{name:'消息'}).inputValue(),'退出前的草稿');
  passed('closed delegate history survives full desktop relaunch with stable IDs, final reports and no model request');
- await restored.evaluate(()=>{window.__restarted=false;window.astra.onEvents(events=>{if(events.some(e=>e.event?.type==='backend_hello'))window.__restarted=true;});});
+ // This session's own backend, not the personal thread's, which is ready all along.
+ await restored.evaluate(async()=>{const b=await window.astra.bootstrap();window.__restarted=false;window.astra.onEvents(events=>{if(events.some(e=>e.runtime===b.active&&e.event?.type==='backend_hello'))window.__restarted=true;});});
  await restored.getByRole('textbox',{name:'消息'}).fill('/restart');
  await restored.getByRole('button',{name:'发送',exact:true}).click();
- await expect.poll(async()=>restored.evaluate(async()=>window.__restarted&&(await window.astra.bootstrap()).sessions.some(s=>s.status==='ready')),{timeout:30000}).toBe(true);
+ await expect.poll(async()=>restored.evaluate(async()=>window.__restarted&&(await window.astra.bootstrap()).sessions.some(s=>!s.personal&&s.status==='ready')),{timeout:30000}).toBe(true);
  await restored.getByText('你好，Astra 桌面连接成功。',{exact:true}).waitFor();
  assert.equal(await restored.getByText('你好，Astra 桌面连接成功。',{exact:true}).count(),1);
  await expandSavedReasoning();

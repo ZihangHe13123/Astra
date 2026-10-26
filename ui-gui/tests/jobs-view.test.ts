@@ -34,8 +34,9 @@ test("results say what happened and where they went", () => {
   assert.equal(resultLabel(row({ state: "skipped", skipped_count: 3 })), "错过 3 次");
   assert.equal(resultLabel(row({ state: "failed", detail: "provider_error" })), "没能完成");
   assert.equal(resultText(row({ state: "failed", detail: "provider_error" })), "provider_error");
-  assert.equal(targetsLabel(["desktop", "weixin"]), "发到桌面通知和微信");
-  assert.equal(targetsLabel([]), "只进收件箱");
+  assert.equal(targetsLabel(["desktop", "weixin"]), "发到桌面和手机、微信");
+  assert.equal(targetsLabel(["thread", "desktop"]), "发到个人对话、桌面和手机");
+  assert.equal(targetsLabel([]), "不另外推送");
   assert.equal(sourceLabel("weixin"), "微信");
   assert.equal(sourceLabel(""), "对话");
 });

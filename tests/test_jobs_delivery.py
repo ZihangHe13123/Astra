@@ -14,6 +14,7 @@ from agent.cli.jobs_commands import execute_jobs_command
 from agent.runtime.jobs.calendar import quiet_hours, quiet_until, set_quiet_hours
 from agent.runtime.jobs.delivery import INBOX_NOTE, MAX_AGE, RETRY_SECONDS, TEXT_LIMIT, JobDelivery, push_message
 from agent.runtime.jobs.store import ACTIVE_MARKER, INACTIVE_SECONDS, NO_UPDATE, JobStore, note_interaction
+from agent.runtime.jobs.thread import thread_recorder, thread_text
 
 SINGAPORE = ZoneInfo("Asia/Singapore")
 
@@ -22,12 +23,18 @@ def at(text: str) -> float:
     return datetime.fromisoformat(text).replace(tzinfo=SINGAPORE).timestamp()
 
 
+# These jobs push to both targets unless a test says otherwise; a new job's own default is the desktop only.
+BOTH = ["desktop", "weixin"]
+
+
 def reminder(store: JobStore, tmp_path: Path, *, next_at: float, **kwargs) -> dict:
+    kwargs.setdefault("targets", BOTH)
     return store.add(name="喝水", prompt="该喝水了", original_request="每天提醒我喝水", kind="reminder",
                      workdir=tmp_path, next_at=next_at, now=next_at - 60, **kwargs)
 
 
 def check(store: JobStore, tmp_path: Path, *, next_at: float, **kwargs) -> dict:
+    kwargs.setdefault("targets", BOTH)
     return store.add(name="Rust 早报", prompt="看看 Rust 新闻", original_request="每天告诉我 Rust 新闻",
                      workdir=tmp_path, next_at=next_at, model="fixture", now=next_at - 60, **kwargs)
 
@@ -44,7 +51,15 @@ class Recorder:
     def __init__(self, failures: int = 0):
         self.desktop: list[dict] = []
         self.weixin: list[str] = []
+        self.thread: list[str] = []
+        self.thread_busy = False
         self.failures = failures
+
+    async def record(self, push: dict, title: str, body: str) -> bool:
+        if self.thread_busy:
+            return False
+        self.thread.append(thread_text(title, body))
+        return True
 
     def notify(self, event: dict) -> None:
         self.desktop.append(event)
@@ -56,8 +71,9 @@ class Recorder:
         self.weixin.append(text)
 
 
-def deliver(store: JobStore, recorder: Recorder, now: float, *, weixin: bool = True) -> int:
-    delivery = JobDelivery(store, desktop=recorder.notify, weixin=recorder.send if weixin else None)
+def deliver(store: JobStore, recorder: Recorder, now: float, *, weixin: bool = True, thread: bool = True) -> int:
+    delivery = JobDelivery(store, desktop=recorder.notify, weixin=recorder.send if weixin else None,
+                           thread=recorder.record if thread else None)
     return asyncio.run(delivery.deliver_due(now=now))
 
 
@@ -72,11 +88,12 @@ def test_results_are_pushed_once_to_each_target_and_kept_in_the_inbox(tmp_path):
     job = check(store, tmp_path, next_at=now)
     run = finish(store, now, output="Rust 1.92 发布了")
     recorder = Recorder()
-    assert deliver(store, recorder, now) == 2
-    assert recorder.weixin == ["【定时任务：Rust 早报】\nRust 1.92 发布了"]
+    assert deliver(store, recorder, now) == 3
+    assert recorder.weixin == ["【定时任务：Rust 早报】\nRust 1.92 发布了"] == recorder.thread
     assert recorder.desktop == [{"type": "job_notification", "title": "定时任务：Rust 早报", "body": "Rust 1.92 发布了",
                                  "job_id": job["id"], "run_id": run["id"]}]
-    assert {push["target"]: push["state"] for push in store.pushes(run["id"])} == {"desktop": "sent", "weixin": "sent"}
+    assert {push["target"]: push["state"] for push in store.pushes(run["id"])} == {
+        "desktop": "sent", "weixin": "sent", "thread": "sent"}
     assert deliver(store, recorder, now + 60) == 0
     assert len(recorder.weixin) == 1 and store.inbox()[0]["id"] == run["id"]
 
@@ -90,7 +107,7 @@ def test_wechat_gets_a_long_result_whole_and_the_desktop_its_start(tmp_path):
     report = "\n\n".join(f"{index}. 第 {index} 条新闻：" + "内容" * 120 for index in range(1, 9))
     finish(store, now, output=report)
     recorder = Recorder()
-    assert deliver(store, recorder, now) == 2
+    assert deliver(store, recorder, now) == 3
     assert recorder.weixin == [f"【定时任务：Rust 早报】\n{report}"] and INBOX_NOTE not in recorder.weixin[0]
     assert len(recorder.desktop[0]["body"]) == 300
     # The channel sends it as few messages as fit (not chat bubbles), none over its limit, nothing left out.
@@ -99,7 +116,7 @@ def test_wechat_gets_a_long_result_whole_and_the_desktop_its_start(tmp_path):
     assert "".join("".join(pieces).split()) == "".join(recorder.weixin[0].split())
 
 
-def test_quiet_results_missed_slots_and_inbox_only_jobs_are_not_pushed(tmp_path):
+def test_quiet_results_and_missed_slots_are_not_pushed_and_an_unpushed_job_reaches_only_the_thread(tmp_path):
     store = JobStore(tmp_path / "home")
     now = at("2026-10-26T15:00")
     check(store, tmp_path, next_at=now, notify="on_change")
@@ -111,8 +128,10 @@ def test_quiet_results_missed_slots_and_inbox_only_jobs_are_not_pushed(tmp_path)
     store.deliver_pending(now=now + 3600)
     missed = next(row for row in store.history(repeating["id"]) if row["state"] == "skipped")
     assert missed["skipped_count"] > 0
-    for run_id in (quiet["id"], missed["id"], *[row["id"] for row in store.history(inbox_only["id"])]):
+    for run_id in (quiet["id"], missed["id"]):
         assert store.pushes(run_id) == []
+    [unpushed] = store.history(inbox_only["id"])
+    assert [push["target"] for push in store.pushes(unpushed["id"])] == ["thread"]
     assert len(store.inbox()) >= 3
 
 
@@ -126,6 +145,8 @@ def test_check_results_wait_out_quiet_hours_but_a_timed_reminder_does_not(tmp_pa
     recorder = Recorder()
     deliver(store, recorder, night + 60)
     assert recorder.weixin == ["【提醒：喝水】\n该睡觉了"]
+    # The thread rings nothing, so it keeps the night's result at once.
+    assert recorder.thread == ["【定时任务：Rust 早报】\n夜里有新讨论", "【提醒：喝水】\n该睡觉了"]
     held = {push["target"]: push for push in store.pushes(result["id"])}
     assert held["weixin"]["state"] == "pending" and held["weixin"]["next_try"] == at("2026-10-27T08:00")
     assert held["weixin"]["attempts"] == 0
@@ -159,13 +180,16 @@ def test_failed_pushes_are_retried_with_growing_pauses_then_given_up(tmp_path):
     run = finish(store, now, output="该喝水了")
     recorder = Recorder(failures=len(RETRY_SECONDS) + 1)
     clock = now
+    def weixin_push() -> dict:
+        return {push["target"]: push for push in store.pushes(run["id"])}["weixin"]
+
     for pause in RETRY_SECONDS:
         deliver(store, recorder, clock)
-        [push] = store.pushes(run["id"])
+        push = weixin_push()
         assert push["state"] == "pending" and push["next_try"] == clock + pause
         clock += pause
     deliver(store, recorder, clock)
-    [push] = store.pushes(run["id"])
+    push = weixin_push()
     assert push["state"] == "failed" and "not online" in push["detail"] and recorder.weixin == []
 
 
@@ -182,7 +206,9 @@ def test_a_missing_channel_fails_at_once_and_an_old_result_is_not_sent(tmp_path)
     later = reminder(store, tmp_path, next_at=now + 60)
     stale = finish(store, now + 60, output="早就过时了")
     deliver(store, recorder, now + 60 + MAX_AGE + 1)
-    assert {push["state"] for push in store.pushes(stale["id"])} == {"failed"}
+    # An old result is no news to push, but the thread still keeps it.
+    assert {push["target"]: push["state"] for push in store.pushes(stale["id"])} == {
+        "desktop": "failed", "weixin": "failed", "thread": "sent"}
     assert all("过时" not in text for text in recorder.weixin) and later["id"]
 
 
@@ -241,3 +267,56 @@ def test_cli_and_tool_choose_where_results_go(tmp_path):
     assert error == "" and json.loads(output)["spec"]["targets"] == ["weixin"]
     assert execute_jobs_command(["add", "y", "--after", "60", "--reminder", "--prompt", "y", "--targets", "email"],
                                 home=tmp_path / "home", workdir=tmp_path)[1]
+
+
+def test_a_new_job_pushes_to_the_desktop_and_every_result_waits_for_a_busy_thread(tmp_path):
+    store = JobStore(tmp_path / "home")
+    now = at("2026-10-26T15:00")
+    job = store.add(name="喝水", prompt="该喝水了", original_request="提醒我喝水", kind="reminder", workdir=tmp_path,
+                    next_at=now, now=now - 60)
+    assert job["spec"]["targets"] == ["desktop"]
+    run = finish(store, now, output="该喝水了")
+    recorder = Recorder()
+    recorder.thread_busy = True
+    assert deliver(store, recorder, now) == 1
+    # A turn in progress is waited out without spending a try.
+    thread = {push["target"]: push for push in store.pushes(run["id"])}["thread"]
+    assert (thread["state"], thread["attempts"], thread["next_try"]) == ("pending", 0, now + 30)
+    recorder.thread_busy = False
+    assert deliver(store, recorder, now + 30) == 1 and recorder.thread == ["【提醒：喝水】\n该喝水了"]
+    # Where no personal thread runs (`astra jobs serve`), the result stays in the inbox.
+    reminder(store, tmp_path, next_at=now + 86400)
+    later = finish(store, now + 86400, output="该喝水了")
+    deliver(store, Recorder(), now + 86400, thread=False)
+    thread = {push["target"]: push for push in store.pushes(later["id"])}["thread"]
+    assert (thread["state"], thread["detail"]) == ("failed", "no personal thread here")
+
+
+def test_a_result_joins_the_thread_as_astras_own_words_between_turns():
+    class Context:
+        def __init__(self):
+            self.messages: list[str] = []
+            self.saved = 0
+
+        def add_assistant(self, text: str) -> None:
+            self.messages.append(text)
+
+        async def save_async(self) -> None:
+            self.saved += 1
+
+    class Agent:
+        context = Context()
+
+    async def scenario() -> tuple[bool, bool, list[dict]]:
+        lock, sent = asyncio.Lock(), []
+        record = thread_recorder(Agent, lock, sent.append)
+        push = {"job_id": "j1", "run_id": "r1", "run_state": "completed"}
+        async with lock:
+            busy = await record(push, "定时任务：AI 晚报", "三条新闻")
+        return busy, await record(push, "定时任务：AI 晚报", "三条新闻"), sent
+
+    busy, recorded, sent = asyncio.run(scenario())
+    assert (busy, recorded) == (False, True)
+    assert Agent.context.messages == ["【定时任务：AI 晚报】\n三条新闻"] and Agent.context.saved == 1
+    assert sent == [{"type": "job_result", "title": "定时任务：AI 晚报", "text": "三条新闻", "job_id": "j1",
+                     "run_id": "r1", "state": "completed"}]

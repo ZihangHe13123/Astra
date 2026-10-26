@@ -12,6 +12,10 @@ phone. Models, tools and memory stay on the Mac; the phone is another screen of
 the same Astra, and what it does acts on the Mac's backend. The design is in
 `specs/phone-companion.md`.
 
+The phone opens on the **personal thread** ([desktop](gui.md#personal-thread)): the one
+conversation the desktop keeps apart from your projects, where scheduled results arrive.
+The sidebar switches to your other sessions.
+
 Read-aloud follows you: replies to a conversation used from the phone are spoken on the
 phone, and on the Mac again once it is used there (see [voice output](voice.md)).
 

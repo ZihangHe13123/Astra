@@ -57,6 +57,7 @@ kbd { font: inherit; font-family: var(--font-chrome); color: var(--muted); font-
 .brand .icon { color: var(--muted); }
 .new-chat,.nav-button { justify-content: flex-start; border: 0; background: transparent; height: 40px; padding: 8px 11px; margin-bottom: 3px; font-size: var(--fs-base); }
 .new-chat span,.nav-button kbd { margin-left: auto; color: var(--muted); font-size: var(--fs-micro); }
+.personal-entry .status-dot { margin-left: auto; }
 .sidebar-search { display: flex; gap: 6px; align-items: center; margin: 12px 8px 5px; color: var(--muted); }
 .sidebar-search input { background: transparent; border: 0; padding: 5px 2px; width: 100%; font-size: var(--fs-small); }
 .session-scroll { overflow: auto; flex: 1; margin-right: -6px; padding-right: 6px; }
