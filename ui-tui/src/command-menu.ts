@@ -63,6 +63,7 @@ const SLASH_COMMANDS: SlashCommandSuggestion[] = [
   { command: "/appshot", description: "status · shortcut · enable · disable", takesArgs: true, group: "CAPTURE" },
   { command: "/tasks", description: "list or inspect per-request task runs", takesArgs: true, group: "SESSION" },
   { command: "/budget", description: "set turn time limit in seconds, or off", takesArgs: true, group: "SESSION" },
+  { command: "/usage", description: "model tokens and cost today and in this session; set a daily budget or model prices", takesArgs: true, group: "SESSION" },
   { command: "/resume", description: "resume an interrupted task", takesArgs: true, argsRequired: true, usage: "Usage: /resume <task-id>", group: "SESSION" },
   { command: "/cancel", description: "cancel the active or selected task", takesArgs: true, group: "SESSION" },
   { command: "/goal", description: "set/show/pause/resume the session goal (long-horizon verification mode)", takesArgs: true, group: "SESSION" },

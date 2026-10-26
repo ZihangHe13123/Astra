@@ -1760,6 +1760,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
             addMessageRef.current("system", memoryNoticeText(event));
           } else if (event.type === "memory_recall") {
             addMessageRef.current("system", memoryRecallText(event));
+          } else if (event.type === "usage_notice") {
+            addMessageRef.current("system", event.message);
           } else if (event.type === "peer_message") {
             // Another Astra session on this computer: a notice, never the user's words.
             addMessageRef.current("system", `PEER ${event.direction === "in" ? "←" : "→"} ${event.peer} · ${event.state} · ${event.task_id}\n${event.text}`);

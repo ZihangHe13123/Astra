@@ -13,6 +13,8 @@ function exposeBridge() {
     jobs: (action, value, extra) => invoke("jobs", action, value, extra),
     memory: (action, ...values) => invoke("memory", action, ...values),
     data: (action, confirmation, browserData) => invoke("data", action, confirmation, browserData),
+    approvalRules: (action, key) => invoke("approvalRules", action, key),
+    usage: (action, ...values) => invoke("usage", action, ...values),
     phone: (action, value) => invoke("phone", action, value),
     preferences: value => invoke("preferences", value), choose: kind => invoke("choose", kind),
     flushPreferences: value => {

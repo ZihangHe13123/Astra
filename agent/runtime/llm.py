@@ -22,6 +22,7 @@ from .provider_errors import summarize_provider_error
 from .providers import DEFAULT_PROVIDER_REGISTRY, ProviderRegistry
 from .token_estimator import estimate_messages_tokens, messages_to_tokenize_text
 from .tool_preparation import with_tool_preparation
+from .usage import report_usage
 from .tracing import trace_span
 from .vision_policy import VisionPreprocessPolicy
 
@@ -1509,6 +1510,8 @@ class LLMClient:
                     )
                 try:
                     async for event in stream:
+                        if event.get("type") in {"done", "tool_calls"}:
+                            report_usage(self.config.provider, self.config.model, event.get("usage"))
                         yield event
                 finally:
                     await _close_async_stream(stream)
@@ -1537,15 +1540,23 @@ class LLMClient:
                     self.provider.chat, "max_tokens"
                 ):
                     if tool_choice is None:
-                        return await self.provider.chat(
+                        result = await self.provider.chat(
                             messages, tools, max_tokens=max_tokens,
                         )
-                    return await self.provider.chat(
-                        messages, tools, tool_choice, max_tokens=max_tokens,
-                    )
-                if tool_choice is None:
-                    return await self.provider.chat(messages, tools)
-                return await self.provider.chat(messages, tools, tool_choice)
+                    else:
+                        result = await self.provider.chat(
+                            messages, tools, tool_choice, max_tokens=max_tokens,
+                        )
+                elif tool_choice is None:
+                    result = await self.provider.chat(messages, tools)
+                else:
+                    result = await self.provider.chat(messages, tools, tool_choice)
+                self._report(result)
+                return result
+
+    def _report(self, result: object) -> None:
+        if isinstance(result, dict):
+            report_usage(self.config.provider, self.config.model, result.get("usage"))
 
     async def chat_limited(
         self,
@@ -1563,7 +1574,9 @@ class LLMClient:
             await self._wait_for_rate_limit()
             limited = getattr(self.provider, "chat_limited", None)
             if limited is None:
-                return await self.provider.chat(messages, tools)
+                result = await self.provider.chat(messages, tools)
+                self._report(result)
+                return result
             options = {
                 "max_tokens": max_tokens,
                 "temperature": temperature,
@@ -1574,11 +1587,13 @@ class LLMClient:
                 options["request_timeout"] = request_timeout
             if _accepts_keyword(limited, "max_retries"):
                 options["max_retries"] = max_retries
-            return await limited(
+            result = await limited(
                 messages,
                 tools,
                 **options,
             )
+            self._report(result)
+            return result
 
     def estimate_tokens(self, messages: list[dict]) -> int:
         estimator = getattr(self.provider, "estimate_tokens", None)

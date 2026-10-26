@@ -95,6 +95,12 @@ class ToolArgumentError(ValueError):
     pass
 
 
+# One tool failing this many times in a row in a turn, with different arguments each time: the model is told
+# to stop and say what fails; at the limit the turn ends, like the same-signature circuit.
+FAILURE_STREAK_NOTICE = 3
+FAILURE_STREAK_LIMIT = 5
+
+
 async def _stream_with_generation_stats(events):
     """Report provider-counted output over one successful request's wall time.
 
@@ -251,6 +257,8 @@ class ReActAgent(AgentBase):
         self._turn_change_store_session: str | None = None
         self._turn_changes_ready: dict | None = None
         self.failure_threshold = max(1, failure_threshold or self._int_env("TOOL_FAILURE_THRESHOLD", 3))
+        # Failures of one tool in a row this turn, whatever its arguments (reset each turn).
+        self._failure_streaks: dict[str, int] = {}
         # Runtime-owned resources are attached by the CLI entrypoints and
         # retained here so cleanup/diagnostics do not rely on dynamic attrs.
         self._sandbox: Any | None = None
@@ -3338,6 +3346,19 @@ class ReActAgent(AgentBase):
                 # new action rather than a repeat.
                 tool_signature_counts.pop(call_signatures.get(call_id, ""), None)
 
+    def _note_failure_streak(self, tc: dict, event: dict, refusals: dict | None) -> None:
+        """Count one tool's failures in a row this turn; the third is flagged to the model."""
+        name = str(tc.get("name") or "")
+        if not name or name == self.tools.ACTIVATE_GROUP_TOOL or str(tc.get("id") or "") in (refusals or {}):
+            return
+        streaks = self._failure_streaks
+        if not event.get("error"):
+            streaks.pop(name, None)
+            return
+        streaks[name] = streaks.get(name, 0) + 1
+        if streaks[name] == FAILURE_STREAK_NOTICE:
+            event["_failure_streak"] = streaks[name]
+
     def _steps_that_may_change_state(self, task_id: str) -> int:
         """Count this task's recorded steps that were not repeatable observations."""
         assert self.task_store is not None
@@ -3517,6 +3538,7 @@ class ReActAgent(AgentBase):
             else:
                 if str(tc.get("id") or "") in repeat_notice_ids:
                     event["_repeat_limit_reached"] = True
+                self._note_failure_streak(tc, event, refusals)
                 context_result = self._tool_result_context(event)
             self.context.add_tool(tc["id"], context_result)
             fresh_output = event.pop("_fresh_output", None)
@@ -3679,6 +3701,12 @@ class ReActAgent(AgentBase):
             lines.append(
                 "Repeat limit: one more identical call in this turn will not run and will "
                 "end the turn. Change the arguments or take a different step."
+            )
+        if event.get("_failure_streak"):
+            lines.append(
+                f"Failure streak: this tool has now failed {event['_failure_streak']} times in a row in this "
+                "turn, each time with different arguments. Unless a clearly different approach fixes the cause, "
+                f"stop retrying it and tell the person what is failing; at {FAILURE_STREAK_LIMIT} the turn ends."
             )
         if event.get("request_local_placeholder"):
             lines.append("Result lifecycle: request-local content is no longer retained.")
@@ -3883,10 +3911,13 @@ class ReActAgent(AgentBase):
         auto_image_messages: list[tuple[int, object]] = []
         active_groups = {"core"}
         blocked_tools: set[str] = set()
-        # Per tool, track only consecutive failures of the exact same
+        # Per tool, the circuit counts consecutive failures of the exact same
         # normalized invocation. Different arguments are diagnostic progress,
-        # not a retry loop, even when their wrapper errors look identical.
+        # not a retry loop, even when their wrapper errors look identical, up to
+        # a point: FAILURE_STREAK_NOTICE failures in a row are flagged to the
+        # model and FAILURE_STREAK_LIMIT end the turn.
         failure_state: dict[str, tuple[str, int]] = {}
+        self._failure_streaks = {}
         failed_tool_signatures: set[str] = set()
         tool_recovery_counts: dict[str, int] = {}
         tool_recovery_total = 0
@@ -4611,6 +4642,7 @@ class ReActAgent(AgentBase):
                     tool_signature_counts.clear()
                     failed_tool_signatures.clear()
                     failure_state.clear()
+                    self._failure_streaks.clear()
                 # Streamed results were published at individual completion;
                 # model context above still preserves original call ordering.
 
@@ -4664,6 +4696,11 @@ class ReActAgent(AgentBase):
                     if count >= self.failure_threshold:
                         blocked_tools.add(name)
                         circuit = (name, fingerprint, count)
+                        break
+                    streak = self._failure_streaks.get(name, 0)
+                    if streak >= FAILURE_STREAK_LIMIT:
+                        blocked_tools.add(name)
+                        circuit = (name, fingerprint, streak)
                         break
                 if task_id and self.task_store is not None:
                     # Save only after assistant tool_calls, every tool result,

@@ -6,11 +6,13 @@ export type Preferences = { theme: string; drafts: Record<string, string>; attac
 export type DesktopEvent = { removed: string } | { runtime: string; revision: number; event: UIEvent } | { refresh: true } | { appshot: { connection: string; enabled: boolean } };
 export type Bootstrap = { sessions: SessionState[]; active: string; workspace: string; preferences: Preferences; appshot: { connection: string; enabled: boolean } };
 export type CommandDescription = { id: string; command: string; description: string; takes_args: boolean; group: string; options: { command: string; description: string; completion: string; submitValue?: string }[] };
-import type { PhoneAction, PhoneStatus } from "./phone-protocol.js";
+import type { PhoneAction, PhoneNotificationState, PhoneStatus } from "./phone-protocol.js";
 export interface DesktopBridge {
   /** Set on a paired phone, where the window runs over the gateway and Mac-only actions are unavailable. */
   remote?: boolean;
   bootstrap(): Promise<Bootstrap>;
+  /** On a paired phone: its notifications (Web Push), off until the person turns them on there. */
+  notifications?(action: "status" | "enable" | "disable"): Promise<PhoneNotificationState>;
   /** Paired phones (settings): their list, pairing and removal, and whether the gateway runs. */
   phone(action: PhoneAction, value?: string): Promise<PhoneStatus>;
   create(options: { session?: string; mode?: string; workspace?: string }): Promise<SessionState>;
@@ -23,6 +25,10 @@ export interface DesktopBridge {
   jobs(action: "pause" | "resume" | "remove" | "run" | "read" | "quiet", value?: string, extra?: string): Promise<any>;
   /** The person's change to their memory: core entries (add, edit, remove), saved memories (forget, correct), proposals. */
   memory(action: "core-add" | "core-edit" | "core-remove" | "forget" | "correct" | "accept" | "dismiss", ...values: string[]): Promise<string>;
+  /** The person's daily model budget ("off", a token count or an amount like ¥5) and per-million prices. */
+  usage(action: "budget" | "price", ...values: string[]): Promise<unknown>;
+  /** The person's "以后都允许" rules: list them, or remove one by its key. */
+  approvalRules(action: "list" | "remove", key?: string): Promise<{ rules?: { key: string; label: string; tool: string; created_at: string }[] }>;
   /** The person's whole data, from the memory page: what export and wipe take, an export to a zip, or a wipe after 清除 is typed. */
   data(action: "plan" | "export" | "wipe", confirmation?: string, browserData?: boolean): Promise<any>;
   preferences(value: Partial<Preferences>): Promise<Preferences>;

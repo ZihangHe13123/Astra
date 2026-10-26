@@ -26,11 +26,13 @@ import { CommandInput } from "./command-input.js";
 import { commandNames, describeCommands, modeSessionTarget, type CommandMode } from "./command-help.js";
 import { VoiceSettings } from "./voice.js";
 import { MemoryReviewSettings, reviewAnswer, withProposalOptions } from "./memory-review.js";
-import { PhoneSettings } from "./phone-settings.js";
+import { PhoneNotifications, PhoneSettings } from "./phone-settings.js";
 import { WeixinSettings } from "./weixin-settings.js";
 import { JobsPanel } from "./jobs-page.js";
 import { ActivityPanel } from "./activity-page.js";
 import { MemoryPanel } from "./memory-page.js";
+import { ApprovalRules } from "./approval-rules.js";
+import { usageStatus } from "./usage-view.js";
 import { voiceAnswer, voiceButton, voiceNotice, withVoiceOptions } from "./voice-state.js";
 import { autoTitle, sessionTitle, sidebarGroups } from "./sidebar.js";
 import { DESKTOP_THEME_NAMES, PLAIN_THEMES, desktopTheme, followTheme, isDesktopThemeName } from "./theme.js";
@@ -482,6 +484,7 @@ function App() {
   const appshotStatus = state?.info.gui_appshot;
   const appshotUnavailable = appshotStatus?.broker?.connection === "disconnected" && appshotStatus?.notice;
   const model = state?.info.model_info;
+  const usage = usageStatus(model?.usage_today);
   const commands = useMemo(() => describeCommands([...catalog, ...localCommandEntry(localDefinition)].map(c => c.command === "/persona" && model?.personas ? { ...c, options: model.personas.map((p: UIEvent) => ({ command: p.name, description: p.description, completion: `/persona ${p.name}` })) }
     : c.command === "/voice" ? withVoiceOptions(c, voiceStatus) : c.command === "/memory" ? withProposalOptions(c, reviewStatus) : c), commandModes), [catalog, model?.personas, commandModes, localDefinition, voiceStatus?.voice, voiceStatus?.voices?.join("\n"), reviewStatus]);
   const voiceLine = voiceNotice(voiceStatus);
@@ -602,7 +605,7 @@ function App() {
               commands={commands} modes={commandModes} mode={state?.mode || "work"} attachments={!!files.length || hasAppshot}
               onChange={value => savePrefs({ drafts: { ...prefs.drafts, [key]: value } })} onSubmit={() => { void submit(); }}
               onPaste={e => { if ([...e.clipboardData.items].some(i => i.type.startsWith("image/"))) { e.preventDefault(); void window.astra.clipboardImage().then(p => { if (p) attach([p]); }).catch(fail); } }}/></div>
-            <div className="composer-bottom"><div>{!window.astra.remote && <button className="icon" aria-label="添加附件" onClick={() => { void window.astra.choose("files").then(attach).catch(fail); }}><Plus size={20}/></button>}<button className={`permission ${state?.info.yolo_status?.yolo ? "yolo" : ""}`} onClick={() => { void openSessionSettings("permissions"); }} title="工具审批设置">{state?.info.yolo_status?.yolo ? "完全访问" : "按需审批"}</button>{voiceControl && <button className={`permission voice ${voiceControl.on ? "on" : ""}`} onClick={() => { void openVoice(); }} title="语音朗读设置">{voiceControl.label}</button>}</div>
+            <div className="composer-bottom"><div>{!window.astra.remote && <button className="icon" aria-label="添加附件" onClick={() => { void window.astra.choose("files").then(attach).catch(fail); }}><Plus size={20}/></button>}<button className={`permission ${state?.info.yolo_status?.yolo ? "yolo" : ""}`} onClick={() => { void openSessionSettings("permissions"); }} title="工具审批设置">{state?.info.yolo_status?.yolo ? "完全访问" : "按需审批"}</button>{usage && <span className={`usage-status small ${usage.over ? "over" : "muted"}`} title="今天全部对话、微信和定时任务的模型用量">{usage.text}</span>}{voiceControl && <button className={`permission voice ${voiceControl.on ? "on" : ""}`} onClick={() => { void openVoice(); }} title="语音朗读设置">{voiceControl.label}</button>}</div>
               <div><button className="model-button" title={model?.served_model ? `${model.model}（实际：${model.served_model}）` : undefined} onClick={() => { void openModels(); }}>{model?.model && model.model !== "none" ? modelDisplayName(model.model, model.served_model) : "选择模型"}<ChevronDown size={13}/></button>
                 <select aria-label="推理强度" value={model?.reasoning_effort || "high"} disabled={!model?.reasoning_effort} onChange={e => command(`/mode ${e.target.value}`)}><option value="low">低</option><option value="high">高</option><option value="xhigh">超高</option><option value="max">最高</option></select>
                 {(responsePending || state?.busy && !draft.trim() && !files.length && !hasAppshot) ? <button className="send" aria-label="停止" onClick={() => command("/cancel")}><Square size={16} fill="currentColor"/></button> : <button className="send" aria-label="发送" disabled={sending || opening || responsePending || (!draft.trim() && !files.length && !hasAppshot)} onClick={() => { void submit(); }}><ArrowUp size={19}/></button>}
@@ -630,6 +633,7 @@ function App() {
     {modal === "voice" && <VoiceSettings status={voiceStatus} ready={state?.status === "ready"} run={cmd => { void send({ type: "command", cmd }); }} close={() => setModal(undefined)}/>}
     {modal === "permissions" && <Modal title="权限与对话模式" close={() => setModal(undefined)}><div className="form"><h3>工具审批</h3><p className="muted small">控制工具操作是否需要你确认。</p>
       <div className="choice-grid">{[{ value: false, name: "按需审批", description: "按现有权限规则确认操作" }, { value: true, name: "完全访问", description: "直接执行工具操作，跳过审批" }].map(option => <button key={option.name} disabled={state?.status !== "ready"} aria-pressed={!!state?.info.yolo_status?.yolo === option.value} className={!!state?.info.yolo_status?.yolo === option.value ? "selected" : ""} onClick={() => { setModal(undefined); void command(`/yolo ${option.value ? "on" : "off"}`); }}><strong>{option.name}</strong><small>{option.description}</small></button>)}</div>
+      {!window.astra.remote && <ApprovalRules fail={fail}/>}
       <h3>对话模式</h3><div className="choice-grid">{modeChoices(localDefinition).map(option => <button key={option.mode} disabled={state?.status !== "ready" || !!state?.busy || option.mode === state?.mode || state?.mode !== "work" && option.mode !== "work"} aria-pressed={option.mode === (state?.mode || "work")} onClick={() => { void changeMode(option.mode); }}><strong>{option.label}</strong><small>{option.description}</small></button>)}</div>
       {state?.mode && state.mode !== "work" && <p className="muted small">先返回通用模式，再选择其他模式。</p>}
       <button className="text-button" onClick={() => showCommands(commandModes.find(mode => mode.mode === state?.mode)?.command || "")}>查看{commandModes.find(mode => mode.mode === state?.mode)?.label || "全部"}模式指令 <ChevronRight size={14}/></button>
@@ -638,7 +642,8 @@ function App() {
       <label className="option"><input type="checkbox" checked={prefs.timeline} onChange={e => savePrefs({ timeline: e.target.checked })}/>显示消息时间</label>
       <MemoryReviewSettings status={reviewStatus} ready={sessionReady} run={cmd => { void send({ type: "command", cmd }); }} review={() => { setModal(undefined); void command("/memory proposals"); }}/>
       <WeixinSettings status={state?.info.weixin_status} ready={sessionReady} models={state?.info.model_info?.models} run={cmd => { void send({ type: "command", cmd }); }}/>
-      {window.astra.remote ? <><h3>手机</h3><p className="muted small">这台手机已配对，正在远程使用 Mac 上的 Astra。在 Mac 的“设置 → 手机”里可以移除它。</p></>
+      {window.astra.remote ? <><h3>手机</h3><p className="muted small">这台手机已配对，正在远程使用 Mac 上的 Astra。在 Mac 的“设置 → 手机”里可以移除它。</p>
+        {window.astra.notifications && <PhoneNotifications notifications={action => window.astra.notifications!(action)}/>}</>
         : <PhoneSettings phone={window.astra.phone}/>}<hr/>
       <button onClick={() => configureModels()}>模型与账号 <ChevronRight size={15}/></button>
       <button onClick={() => { void openSessionSettings("permissions"); }}>权限与对话模式 <ChevronRight size={15}/></button>

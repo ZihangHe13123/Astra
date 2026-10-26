@@ -16,6 +16,7 @@ from ..tool_execution import ExecutionFailure, ExecutionResult, PartialResult
 from ..execution_limits import COMMAND_FOREGROUND_MAX_MS, POLL_MAX_MS, validate_wait_ms
 
 from .approval import ScopedApprovalStore
+from .consequence import command_category
 from .processes import ProcessManager
 from .registry import ToolRegistry, ToolDef, approval_justification_schema
 
@@ -360,6 +361,11 @@ def register_code_tools(
             and session_scope is not None
         ):
             return None
+        parts_for_category = _compound_commands(command) or [command]
+        category = command_category(parts_for_category)
+        if category:
+            # Deleting, pushing, publishing: asked per command, and no prefix grant covers it.
+            session_scope = None
         command_digest = hashlib.sha256(command.encode("utf-8")).hexdigest()
         exact_scope = f"host-execution:shell:{environment}:{command_digest}"
         if exact_scope in host_approvals.approved_scopes or (
@@ -399,6 +405,8 @@ def register_code_tools(
             request["detail"] += (
                 f" 复合命令共 {len(parts)} 项；操作预览已单独列出。"
             )
+        if request is not None and category:
+            request["consequential"] = category
         if request is not None and session_scope is not None:
             request["session_scope"] = session_scope[0]
             request["session_scope_label"] = session_scope[1]

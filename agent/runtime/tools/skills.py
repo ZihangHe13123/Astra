@@ -125,6 +125,8 @@ def register_skill_tools(
             "detail": summary[:500],
             "scope": "workflow-design:current",
             "approval_question": "是否批准这份工作流设计？",
+            # Each design is approved on its own.
+            "choices": ["once", "deny"],
         }
 
     def _grant_design_approval(

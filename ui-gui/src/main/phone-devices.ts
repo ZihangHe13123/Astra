@@ -2,6 +2,7 @@ import { createPublicKey, randomBytes, randomInt, randomUUID, timingSafeEqual, v
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { PAIRING_ALPHABET, PAIRING_CODE_LENGTH, phoneAuthMessage, type PhoneDevice } from "../phone-protocol.js";
+import type { PushSubscription } from "./web-push.js";
 
 const PAIRING_SECONDS = 300;
 const PAIRING_ATTEMPTS = 5;
@@ -10,7 +11,7 @@ const TOKEN_SECONDS = 12 * 3600;
 
 /** A public key as WebCrypto exports it; a private part ("d") is never accepted. */
 type JsonWebKey = { kty?: string; crv?: string; x?: string; y?: string; d?: string };
-type StoredDevice = PhoneDevice & { publicKey: JsonWebKey };
+type StoredDevice = PhoneDevice & { publicKey: JsonWebKey; push?: PushSubscription };
 type Stored = { enabled: boolean; devices: StoredDevice[] };
 
 /**
@@ -42,7 +43,21 @@ export class PhoneDevices {
   setEnabled(enabled: boolean) { this.stored.enabled = enabled; this.save(); if (!enabled) this.endPairing(); }
 
   list(): PhoneDevice[] {
-    return this.stored.devices.map(({ id, name, createdAt, lastSeen }) => ({ id, name, createdAt, ...(lastSeen ? { lastSeen } : {}) }));
+    return this.stored.devices.map(({ id, name, createdAt, lastSeen, push }) =>
+      ({ id, name, createdAt, ...(lastSeen ? { lastSeen } : {}), ...(push ? { notifications: true } : {}) }));
+  }
+
+  /** Where a phone receives notifications, as its browser subscribed (or none: notifications off). */
+  setPush(deviceId: string, subscription: PushSubscription | undefined): boolean {
+    const device = this.stored.devices.find(item => item.id === deviceId);
+    if (!device) return false;
+    if (subscription) device.push = checkedSubscription(subscription); else delete device.push;
+    this.save();
+    return true;
+  }
+
+  pushTargets(): { id: string; push: PushSubscription }[] {
+    return this.stored.devices.flatMap(device => device.push ? [{ id: device.id, push: device.push }] : []);
   }
 
   currentPairing(): { code: string; expiresAt: number } | undefined {
@@ -146,6 +161,18 @@ export class PhoneDevices {
 }
 
 export class PhoneAuthError extends Error {}
+
+/** A push subscription as a browser hands it out: an HTTPS endpoint and its two keys, nothing else kept. */
+export function checkedSubscription(value: unknown): PushSubscription {
+  const raw = value as { endpoint?: unknown; keys?: { p256dh?: unknown; auth?: unknown } } | undefined;
+  const endpoint = String(raw?.endpoint ?? ""), p256dh = String(raw?.keys?.p256dh ?? ""), auth = String(raw?.keys?.auth ?? "");
+  let url: URL;
+  try { url = new URL(endpoint); } catch { throw new PhoneAuthError("通知订阅格式不对。"); }
+  if (url.protocol !== "https:" || endpoint.length > 2000 || !/^[A-Za-z0-9_-]{80,100}$/.test(p256dh) || !/^[A-Za-z0-9_-]{16,32}$/.test(auth)) {
+    throw new PhoneAuthError("通知订阅格式不对。");
+  }
+  return { endpoint, keys: { p256dh, auth } };
+}
 
 /** Only an EC P-256 public key is accepted; anything else (or a private key) is refused. */
 function publicKey(value: unknown): KeyObject {

@@ -257,8 +257,22 @@ each was pushed and its token usage.
 from the desktop, the terminal and WeChat with the files they changed, the commands
 they ran and the approvals you gave, and job runs. Turns that only talked are hidden
 until asked for. **打开这次对话** opens the turn's conversation. While the window is
-in the background, a waiting approval or question, a reply that took 20 seconds or
-more, and job results arrive as system notifications.
+in the background (or the Mac has been idle or locked for two minutes), a waiting
+approval or question, a reply that took 20 seconds or more, and job results arrive as
+system notifications, and on a paired phone that turned notifications on
+([phone companion](phone.md#notifications)).
+
+Its top shows **今日用量**: today's tokens for every model request Astra made (desktop
+and terminal conversations, WeChat and QQ chats, scheduled jobs, and the work behind them
+such as delegates and context compaction), by model and by source. Enter a model's prices
+per million tokens there (or `/usage price MODEL INPUT OUTPUT [CACHED]`) and its cost is
+shown too. A daily budget, in tokens (`500000`) or money (`¥5`, which needs prices), is set
+there or with `/usage budget`; once set, the line under the composer shows today against it.
+The first request that goes over the budget says so once in the conversation (and as a
+notification); scheduled checks then wait until the next day, while conversations, reminders
+and runs you ask for go on. `/usage` shows today and the current conversation in any client.
+A tool that keeps failing with different arguments is flagged to the model on the third
+failure in a row and stopped at the fifth.
 
 **记忆** shows and edits what Astra keeps about you; see [the memory page](memory.md#the-memory-page).
 
@@ -270,6 +284,19 @@ Work, Minimal or Bar. Return to Work before switching between isolated
 modes. These controls call the existing backend commands;
 they do not add a model workflow or tool quota. Pending approvals continue to appear
 inside the conversation.
+
+An approval card answers the same way on the desktop, a paired phone, the terminal and in
+WeChat: **允许一次** (this call), **本任务允许** (until the work of your current message is
+done), **本会话允许** (until this conversation ends) or **拒绝**. Each conversation has its
+own grants: a WeChat chat never uses what the desktop session allowed, nor the other way round.
+Paying, sending, deleting and publishing (a browser button that submits, pays or deletes;
+`git push`, a hard reset, `rm` and publish commands; an MCP tool named for sending, deleting or
+paying; an upload) are asked every time with only allow-once and deny, and no earlier grant
+covers them; they are also not answered by the window-wide keys. When such a step would send
+text, the card shows that text as a draft with **发送** and **丢弃**. After you have approved
+the same ordinary request five times on two different days and never refused it, its card also
+offers **以后都允许**; those standing rules are listed under **权限与对话模式 → 以后都允许的操作**,
+where you can remove them.
 
 Use **设置 → 人格设置** to choose from the current backend's available personas.
 The model button, session menus and these settings provide direct controls for common

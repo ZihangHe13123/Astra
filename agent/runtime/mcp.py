@@ -21,6 +21,7 @@ from .tool_execution import PartialResult
 from .tool_failure import ToolFailure
 from .process_env import mark_agent_environment
 from .tools.approval import ScopedApprovalStore
+from .tools.consequence import draft_from_arguments, tool_category
 from .tools.registry import ToolDef, ToolRegistry
 from .project_trust import ProjectTrust
 
@@ -1023,12 +1024,33 @@ class MCPManager:
                     return PartialResult(attachment) if omitted or shown != text else attachment
                 return PartialResult(text) if omitted else text
 
+            category = tool_category(remote_name)
+
             def permission_check(
                 args: dict,
                 _server=server,
                 _remote_name=remote_name,
                 _risk=risk,
+                _category=category,
             ) -> dict | None:
+                if _category:
+                    # A tool named for sending, paying, deleting or publishing: asked per call, whatever risk
+                    # its server declares, with what it would send shown as a draft.
+                    request = side_effect_approvals.request(
+                        scope=f"mcp-side-effect:{_server}:{_remote_name}",
+                        kind="mcp_side_effect",
+                        operation=f"Call MCP tool {_remote_name}",
+                        target=f"{_server}/{_remote_name}",
+                        reason=f"{_remote_name} may {_category} on your behalf",
+                        detail="Asked for every call: no earlier approval covers it.",
+                        arguments={str(key): "<redacted>" for key in args} if _risk == "secret" else None,
+                    )
+                    if request is not None:
+                        request["consequential"] = _category
+                        draft = {} if _risk == "secret" else draft_from_arguments(args)
+                        if draft:
+                            request["draft"] = {**draft, "via": f"{_server}/{_remote_name}"}
+                    return request
                 if _risk not in {"write", "execute", "secret"}:
                     return None
                 argument_preview = None

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, net, Notification, protocol, shell, Tray } from "electron";
+import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, nativeImage, net, Notification, powerMonitor, protocol, shell, Tray } from "electron";
 import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync, existsSync, realpathSync, statSync } from "node:fs";
@@ -27,6 +27,8 @@ import { CARD_THEME_COLORS, checkedCardTheme } from "../card-theme.js";
 import { SHARED_PREFERENCE_KEYS, type PhoneInvokeMethod, type PhoneStatus } from "../phone-protocol.js";
 import { PhoneDevices } from "./phone-devices.js";
 import { PhoneGateway } from "./phone-gateway.js";
+import { PhonePush, phonePushRequest } from "./phone-push.js";
+import { VapidKey, webPushSender } from "./web-push.js";
 import { tailscaleName } from "./phone-tailscale.js";
 
 const packaged = configurePackagedRuntime({ isPackaged: app.isPackaged, resourcesPath: process.resourcesPath,
@@ -100,10 +102,27 @@ async function phoneStatus(): Promise<PhoneStatus> {
     ...(phoneDevices.enabled && phoneHost.name ? { url: `https://${phoneHost.name}` } : {}), devices: phoneDevices.list(),
     ...(phoneDevices.currentPairing() ? { pairing: phoneDevices.currentPairing() } : {}) };
 }
-const attention = new Attention({ focused: () => !!window && !window.isDestroyed() && window.isFocused() });
+// The person is at the window only while it is focused and the Mac is in use: a window left in front of a
+// locked or idle Mac does not keep notifications (and a paired phone's) from them.
+const attention = new Attention({ focused: () => !!window && !window.isDestroyed() && window.isFocused()
+  && !["idle", "locked"].includes(powerMonitor.getSystemIdleState(120)) });
+// Made the first time a phone asks for it, so a desktop without phones keeps no key.
+let pushKey: VapidKey | undefined;
+const phonePushKey = () => (pushKey ??= new VapidKey(join(gui, "phone-push-key.json")));
+/** Paired phones without the app open hear what the window would have notified (specs/phone-companion.md D5). */
+const phonePush = new PhonePush({
+  targets: () => phoneDevices.enabled ? phoneDevices.pushTargets() : [],
+  live: deviceId => phone.isLive(deviceId),
+  // The push service may write to the subject about this sender: the phone's own address, else the project.
+  send: webPushSender(phonePushKey,
+    () => phoneHost.name ? `https://${phoneHost.name}` : "https://github.com/ZihangHe13123/Astra"),
+  drop: deviceId => { phoneDevices.setPush(deviceId, undefined); },
+  report: error => console.error("Astra phone push:", error),
+});
 // Held until closed or clicked, so a notification is not collected before its click handler runs.
 const notices = new Set<Notification>();
 function notify(notice: AttentionNotice | undefined) {
+  if (notice) phonePush.notify(notice);
   if (!notice || !Notification.isSupported()) return;
   const shown = new Notification({ title: notice.title, body: notice.body });
   notices.add(shown);
@@ -280,6 +299,34 @@ function runMemory(action: unknown, ...values: unknown[]): Promise<unknown> {
     }));
 }
 register("memory", runMemory);
+/** The person's standing approval rules, from the permissions panel (agent/ui/approval_rules.py). */
+function runApprovalRules(action: unknown, key?: unknown): Promise<unknown> {
+  const args = action === "list" ? ["list"] : action === "remove" && typeof key === "string" && /^[0-9a-f]{32}$/.test(key)
+    ? ["remove", key] : undefined;
+  if (!args) throw new Error("Unsupported approval rule change");
+  return new Promise((done, fail) => execFile(python, ["-m", "agent.ui.approval_rules", ...args],
+    { cwd: root, env: process.env, timeout: 30_000, windowsHide: true, encoding: "utf8" },
+    (_error, stdout) => {
+      let result: { ok?: boolean; error?: string; rules?: unknown[] } = {};
+      try { result = JSON.parse(String(stdout).trim().split("\n").at(-1) || "{}"); } catch { /* reported below */ }
+      result.ok ? done(result) : fail(new Error(result.error || "审批规则没有改成功。"));
+    }));
+}
+register("approvalRules", runApprovalRules);
+/** The daily model budget and per-million prices, from the activity page (agent/cli/usage_commands.py). */
+function runUsage(action: unknown, ...values: unknown[]): Promise<unknown> {
+  const name = checkedString(action, "action", 10);
+  const args = values.map(value => checkedString(value, "usage", 200));
+  if (!(name === "budget" && args.length === 1 || name === "price" && args.length >= 3 && args.length <= 4)) throw new Error("Unsupported usage change");
+  return new Promise((done, fail) => execFile(python, ["-m", "agent.cli.usage_commands", name, ...args],
+    { cwd: root, env: process.env, timeout: 30_000, windowsHide: true, encoding: "utf8" },
+    (_error, stdout) => {
+      let result: { ok?: boolean; error?: string } = {};
+      try { result = JSON.parse(String(stdout).trim().split("\n").at(-1) || "{}"); } catch { /* reported below */ }
+      result.ok ? done(result) : fail(new Error(result.error || "没有改成功。"));
+    }));
+}
+register("usage", runUsage);
 /** One run of `astra data` (agent/cli/data_commands.py); it answers with a JSON line, an error included. */
 function dataCommand(args: string[], timeout: number): Promise<any> {
   return new Promise((done, fail) => execFile(python, ["-m", "agent.cli.data_commands", ...args],
@@ -381,6 +428,10 @@ async function phoneInvoke(device: string, method: PhoneInvokeMethod, args: any[
   if (method === "query") return runQuery(args[0], args[1], args[2]);
   if (method === "jobs") { phoneAudit(device, { method, action: String(args[0]).slice(0, 20) }); return runJobs(args[0], args[1], args[2]); }
   if (method === "memory") { phoneAudit(device, { method, action: String(args[0]).slice(0, 20) }); return runMemory(args[0], ...args.slice(1)); }
+  if (method === "push") {
+    if (args[0] === "subscribe" || args[0] === "unsubscribe") phoneAudit(device, { method, action: args[0] });
+    return phonePushRequest(phoneDevices, phonePushKey, device, args[0], args[1]);
+  }
   if (method === "close") { phoneAudit(device, { method, runtime: String(args[0]) }); return closeSession(args[0]); }
   if (method === "deleteSession") { phoneAudit(device, { method, session: args[0]?.name, mode: args[0]?.mode }); return runSessionAction("delete", args[0]); }
   const rt = runtime(args[0]); const command = checkedCommand(args[1]);
@@ -458,6 +509,7 @@ async function performQuit() {
   if (quitting) return;
   quitting = true;
   await Promise.all([...runtimes.values()].map(rt => rt.close()));
+  phonePush.dispose();
   await Promise.all([appshot.client.close(), queries.close(), phone.dispose(), channelHost.stop()]);
   // Let beforeunload supply the newest draft before taking the final snapshot.
   if (window && !window.isDestroyed()) {

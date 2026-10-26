@@ -248,6 +248,8 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
     // Saved memories as they change, and which ones a turn brought back.
     case "memory_notice": append("system", memoryNoticeText(event)); break;
     case "memory_recall": append("system", memoryRecallText(event)); break;
+    // Over today's budget: said once a day, in whichever conversation crossed it.
+    case "usage_notice": append("system", event.message); break;
     default: state.info = { ...state.info, [event.type]: event }; break;
   }
   return state;

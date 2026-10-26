@@ -265,7 +265,7 @@ def register_git_tools(
             scope, target = _git_scope(operation, str(args.get("path", ".")))
             if os.getenv("AGENT_ALLOW_GIT_WRITE") == "1":
                 return None
-            return approvals.request(
+            request = approvals.request(
                 scope=scope,
                 kind="git_write",
                 operation=operation,
@@ -273,6 +273,12 @@ def register_git_tools(
                 reason=f"{operation} wants to modify Git state",
                 detail=f"{operation} changes Git state. {git_write_requirement}",
             )
+            category = ("publish" if operation == "git_push" else
+                        "delete" if operation == "git_reset" and str(args.get("mode") or "").lower() == "hard" else "")
+            if request is not None and category:
+                # Pushing and discarding work are asked per call, whatever this repository was allowed.
+                request["consequential"] = category
+            return request
         return check
 
     def _git_permission_grant(args: dict, request: dict, decision: str):

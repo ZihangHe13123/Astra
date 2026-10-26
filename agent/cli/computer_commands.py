@@ -26,6 +26,8 @@ _BIDI_CONTROLS = frozenset("\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u20
 _DEFAULT_IGNORABLE_CONTROLS = frozenset("\u00ad\u034f\u180e\u200b\u200c\u2060\ufeff")
 _COMPUTER_CONTROLS = frozenset({"inactive", "background", "foreground_takeover", "user_control", "paused"})
 _APPROVAL_CHOICES = ("once", "session", "deny")
+# What a request may offer; the registry decides which of them it does.
+_KNOWN_CHOICES = ("once", "task", "session", "always", "deny")
 
 
 def _is_emoji_base(character: str) -> bool:
@@ -201,7 +203,7 @@ def approval_choices(request: Mapping[str, object]) -> list[str]:
         return ["once", "deny"]
     raw = request.get("choices")
     if isinstance(raw, (list, tuple)):
-        choices = list(dict.fromkeys(choice for choice in raw if choice in _APPROVAL_CHOICES))
+        choices = list(dict.fromkeys(choice for choice in raw if choice in _KNOWN_CHOICES))
         if choices:
             return choices
     if request.get("kind") == "computer_foreground_takeover":

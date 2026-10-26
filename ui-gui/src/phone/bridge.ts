@@ -1,5 +1,5 @@
 import type { Bootstrap, DesktopBridge, DesktopEvent, Preferences } from "../bridge.js";
-import { SHARED_PREFERENCE_KEYS, type PhoneInvokeMethod, type PhoneStreamControl, type PhoneStreamPosition } from "../phone-protocol.js";
+import { SHARED_PREFERENCE_KEYS, type PhoneInvokeMethod, type PhoneNotificationState, type PhoneStreamControl, type PhoneStreamPosition } from "../phone-protocol.js";
 import { PhoneUnpairedError, TokenExpiredError, type PhoneClient, type PhoneDeviceRecord } from "./client.js";
 
 /** What the bridge needs from the phone's browser; tests give it their own. */
@@ -17,6 +17,15 @@ export type BridgeEnvironment = {
   sleep(ms: number): Promise<void>;
   /** Speech the desktop routed to this phone (a voice_audio event): play it here, fetching the audio with `load`. */
   voice?(event: { id?: string; seconds?: number; at?: number; stop?: boolean }, load: (id: string) => Promise<ArrayBuffer>): void;
+  /** Web Push in this browser: why it cannot work here (""), asking permission, subscribing with the desktop's key. */
+  push?: {
+    unsupported(): string;
+    permission(): Promise<NotificationPermission | string>;
+    subscribe(publicKey: string): Promise<unknown>;
+    unsubscribe(): Promise<void>;
+  };
+  /** The session a notification opened the app for, if any. */
+  opening?: string;
 };
 
 const DEFAULTS: Preferences = { theme: "system", drafts: {}, attachments: {}, workspaces: {}, pinned: [], projects: [], titles: {}, timeline: true };
@@ -27,6 +36,8 @@ const UNAVAILABLE = {
   export: "导出会话只在电脑上可用。",
   phone: "手机配对只能在电脑上管理。",
   data: "导出和清除数据只能在电脑上操作。",
+  approvalRules: "审批规则只能在电脑上管理。",
+  usage: "预算和单价只能在电脑上设置。",
 };
 
 /**
@@ -43,6 +54,9 @@ export class RemoteBridge implements DesktopBridge {
   private queue: DesktopEvent[] = [];
   private streaming = false;
   private stream?: AbortController;
+  /** While the page is hidden the stream stays closed, so the desktop knows to notify instead. */
+  private hidden = false;
+  private shown?: () => void;
   private shared: Partial<Preferences> = {};
   private readyWaiters: (() => void)[] = [];
   private isReady = false;
@@ -92,13 +106,14 @@ export class RemoteBridge implements DesktopBridge {
         if (error instanceof TokenExpiredError) this.token = undefined;
       }
       if (this.stopped) return;
+      if (this.hidden) { await new Promise<void>(resolve => { this.shown = resolve; }); this.shown = undefined; continue; }
       await this.env.sleep(delay);
       delay = Math.min(delay * 2, 10_000);
     }
   }
 
   /** Stops following the desktop (the page is going away). */
-  dispose() { this.stopped = true; this.stream?.abort(); }
+  dispose() { this.stopped = true; this.stream?.abort(); this.shown?.(); }
 
   private receive(data: string, id?: number) {
     const message = JSON.parse(data) as DesktopEvent | PhoneStreamControl;
@@ -129,8 +144,19 @@ export class RemoteBridge implements DesktopBridge {
     }
   }
 
+  /**
+   * The page is hidden: the stream closes now, while iOS still lets it, rather than lingering half-open behind
+   * Tailscale; the desktop then sees no phone watching and sends notifications. What happens meanwhile is
+   * replayed from the same position on wake.
+   */
+  hide() { if (!this.streaming || this.hidden) return; this.hidden = true; this.stream?.abort(); }
+
   /** After the phone wakes, a stream iOS suspended is replaced at once instead of waiting to time out. */
-  wake() { if (this.streaming) this.stream?.abort(); }
+  wake() {
+    if (!this.streaming) return;
+    if (this.hidden) { this.hidden = false; this.shown?.(); return; }
+    this.stream?.abort();
+  }
 
   private ready(): Promise<void> {
     this.start();
@@ -154,7 +180,9 @@ export class RemoteBridge implements DesktopBridge {
     await this.ready();
     const boot = await this.call("bootstrap", []) as Bootstrap;
     this.shared = boot.preferences ?? {};
-    return { ...boot, preferences: this.merged() };
+    // Opened from a notification: straight to that conversation, while it is still open on the desktop.
+    const opening = this.env.opening && boot.sessions.some(session => session.id === this.env.opening) ? this.env.opening : "";
+    return { ...boot, ...(opening ? { active: opening } : {}), preferences: this.merged() };
   }
 
   onEvents(handler: (events: DesktopEvent[]) => void) {
@@ -171,6 +199,8 @@ export class RemoteBridge implements DesktopBridge {
   jobs(action: string, value?: string, extra?: string) { return this.call("jobs", [action, value, extra]); }
   memory(action: string, ...values: string[]) { return this.call("memory", [action, ...values]) as Promise<string>; }
   data(): Promise<never> { return Promise.reject(new Error(UNAVAILABLE.data)); }
+  approvalRules(): Promise<never> { return Promise.reject(new Error(UNAVAILABLE.approvalRules)); }
+  usage(): Promise<never> { return Promise.reject(new Error(UNAVAILABLE.usage)); }
   sessionAction(action: "export" | "delete", entry: { name: string; mode: string }) {
     return action === "delete" ? this.call("deleteSession", [entry]) : Promise.reject(new Error(UNAVAILABLE.export));
   }
@@ -185,4 +215,21 @@ export class RemoteBridge implements DesktopBridge {
   file(): Promise<never> { return Promise.reject(new Error(UNAVAILABLE.file)); }
   cancelPreview() { return Promise.resolve(); }
   phone(): Promise<never> { return Promise.reject(new Error(UNAVAILABLE.phone)); }
+
+  async notifications(action: "status" | "enable" | "disable"): Promise<PhoneNotificationState> {
+    const push = this.env.push;
+    const reason = push ? push.unsupported() : "这个浏览器不支持通知。";
+    if (!push || reason) return { state: "unsupported", reason };
+    if (action === "disable") {
+      await push.unsubscribe();
+      await this.call("push", ["unsubscribe"]);
+      return { state: "off" };
+    }
+    if (action === "status") return { state: (await this.call("push", ["status"])).enabled ? "on" : "off" };
+    // iOS asks only from a tap, so this runs straight from the button.
+    if (await push.permission() !== "granted") return { state: "denied", reason: "通知被关掉了：到 iPhone 的“设置 → 通知 → Astra”打开。" };
+    const { publicKey } = await this.call("push", ["key"]) as { publicKey: string };
+    await this.call("push", ["subscribe", await push.subscribe(publicKey)]);
+    return { state: "on" };
+  }
 }

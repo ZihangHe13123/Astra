@@ -43,6 +43,7 @@ from ..tool_execution import PartialResult, StateChanged
 from ..tool_failure import ToolFailure
 from ..browser_lifecycle import BrowserLifecycle
 from .approval import ScopedApprovalStore, normalized_origin
+from .consequence import label_category
 from .registry import ToolDef, ToolRegistry, _set_tool_timeout_failure
 
 logger = logging.getLogger(__name__)
@@ -91,6 +92,23 @@ def _page_text_note(observation: object) -> str:
     # A page script from before this flag does not report it; a full window is the only sign.
     if cut is None and len(text) >= _PAGE_TEXT_LIMIT:
         return f"Note: page text fills the {_PAGE_TEXT_LIMIT}-character limit, so later text may be missing. {rest}"
+    return ""
+
+
+def _find_ref(data: Any, ref: str) -> str:
+    if isinstance(data, dict):
+        if str(data.get("ref") or "") in {ref, f"ref:{ref}"}:
+            return " ".join(str(data[key]) for key in ("name", "text", "label", "value", "role")
+                            if isinstance(data.get(key), str) and data[key].strip())
+        values = data.values()
+    elif isinstance(data, list):
+        values = data
+    else:
+        return ""
+    for value in values:
+        found = _find_ref(value, ref)
+        if found:
+            return found
     return ""
 
 
@@ -183,6 +201,8 @@ def register_browser_tools(
             approval_title="向网页提供指定文件", approval_effect="读取列出的文件并选择到目标网页；网站可能立即上传。",
             approval_boundary="仅此文件列表、文件身份和目标控件；不包含 Submit")
         if request is not None:
+            # Files leave this computer: asked every time, whatever was allowed before.
+            request["consequential"] = "send"
             request["files"] = [{**f.metadata(), "path": str(f.path)} for f in files]
             request["filesystem_requests"] = [r for f in files if
                 (r := file_access.permission_request(str(f.path), write=False, operation="Upload file"))]
@@ -265,7 +285,7 @@ def register_browser_tools(
                     if value_key == "text"
                     else value[:240]
                 )
-            return browser_approvals.request(
+            request = browser_approvals.request(
                 scope=f"browser-write:{origin}",
                 kind="browser_write",
                 operation=operation,
@@ -274,8 +294,30 @@ def register_browser_tools(
                 detail="Session approval is limited to browser write actions on this origin.",
                 arguments=preview,
             )
+            if request is not None and operation == "Click page element":
+                name = _element_name(tab, selector)
+                category = label_category(name or selector)
+                if category:
+                    # Submitting, paying, sending, deleting: asked per click, whatever this site was allowed.
+                    request["consequential"] = category
+                    request["action_label"] = (name or selector)[:200]
+            return request
 
         return check
+
+    def _element_name(tab, selector: str) -> str:
+        """The visible name of the element a ref points at, from the tab's latest snapshot."""
+        if not selector.startswith("ref:"):
+            return ""
+        ref = selector[4:]
+        snapshot = str(getattr(tab, "last_snapshot", "") or "")
+        try:
+            found = _find_ref(json.loads(snapshot), ref)
+        except ValueError:
+            found = ""
+        if found:
+            return found
+        return next((line.strip()[:300] for line in snapshot.splitlines() if ref and ref in line), "")
 
     def _profile_dir(tab_id: str) -> str:
         """Resolve an opaque profile reference to a project-owned directory."""

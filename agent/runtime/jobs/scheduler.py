@@ -14,6 +14,7 @@ from agent.runtime.instance_lock import InstanceAlreadyRunning, InstanceLock
 from agent.runtime.process_env import hidden_process_creationflags
 from agent.sandbox.windows_job import WindowsJob
 
+from agent.runtime.usage import budget_exceeded
 from .store import JobStore, last_interaction
 
 
@@ -251,7 +252,8 @@ def tick(store: JobStore, *, manual_job: str = "", now: float | None = None, max
                 delivered += store.deliver_pending(now=now)
 
             for _ in range(1 if manual_job else min(100, max(1, max_runs))):
-                run = store.claim_due(now=now, manual_job=manual_job, last_interaction=interaction)
+                run = store.claim_due(now=now, manual_job=manual_job, last_interaction=interaction,
+                                      over_budget=not manual_job and budget_exceeded())
                 if run is None:
                     break
                 execute(store, run, service_reminders=service_reminders)

@@ -21,7 +21,8 @@ from ..metrics import runtime_metrics
 from ..tool_failure import ToolFailure
 from ..tool_execution import ExecutionFailure, ExecutionResult, PartialResult, StateChanged
 from ..tracing import trace_span
-from .policy import VALID_RISKS, ToolPolicy
+from .grants import DECISIONS, GrantLedger, granted_keys, request_keys, rule_key
+from .policy import VALID_RISKS, ToolPolicy, policy_call_scope
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,10 @@ class ToolDef:
     # Explicit opt-in: YOLO supplies an automatic once decision, while exact
     # preflight, grant validation, cleanup, and finalization still run.
     permission_yolo_auto_grant: bool = False
+    # The tool's grant handler keeps its own session boundary (Computer Use: per CU session and app) and
+    # receives "session" itself. Every other tool only ever receives "once"; task, session and standing
+    # grants are kept by the registry's GrantLedger, per conversation.
+    owns_session_grants: bool = False
     # Backend-generated, user-facing description. This may explain the call,
     # but it cannot change the authoritative tool/risk/scope fields.
     approval_formatter: ApprovalFormatter | None = None
@@ -287,6 +292,11 @@ class ToolRegistry:
         # Policy approvals accepted through the interactive broker are also
         # session-scoped. Explicit /permissions overrides remain process-local.
         self._session_policy_allows: set[str] = set()
+        # Task, session and standing ("always") grants, per conversation (tools/grants.py).
+        self.grants = GrantLedger()
+        # Set by an interactive backend: whether the person approved this kind of request often enough,
+        # and never refused it, for the card to offer "always".
+        self.rule_advisor: Callable[[str], bool] | None = None
         self.hooks.on_session_end(self._clear_session_approvals)
         self.max_inline_chars = max_inline_chars or self._positive_int_env("TOOL_MAX_INLINE_CHARS", 12_000)
         self.max_fresh_chars = self._positive_int_env("TOOL_MAX_FRESH_RESULT_CHARS", 100_000)
@@ -320,6 +330,7 @@ class ToolRegistry:
         self.approved_permission_scopes.clear()
         self.policy.clear_allowed_calls(self._session_policy_allows)
         self._session_policy_allows.clear()
+        self.grants.end_session()
 
     @staticmethod
     def _safe_argument_summary(args: dict) -> dict[str, str]:
@@ -379,6 +390,8 @@ class ToolRegistry:
         self.share_yolo_with(parent)
         self.approved_permission_scopes = parent.approved_permission_scopes
         self._session_policy_allows = parent._session_policy_allows
+        self.grants = parent.grants
+        self.rule_advisor = parent.rule_advisor
         self.artifact_dir = parent.artifact_dir
         self.max_inline_chars = parent.max_inline_chars
         self.max_fresh_chars = parent.max_fresh_chars
@@ -393,6 +406,8 @@ class ToolRegistry:
         agent_reason: str = "",
         request: dict[str, Any] | None = None,
         bypass_yolo: bool = True,
+        choices: list[str] | None = None,
+        grant_key: str = "",
     ) -> str | None:
         if self.yolo and bypass_yolo:
             return "once"
@@ -417,6 +432,11 @@ class ToolRegistry:
             **(request or {}),
         }
         payload["reason_source"] = "agent" if agent_reason else "backend"
+        if choices:
+            payload["choices"] = list(choices)
+        if grant_key:
+            payload["grant_key"] = grant_key
+            payload["grant_label"] = self._grant_label(tool, payload)
         # Set after request descriptors: only the registered permission boundary
         # can opt a pending request into live YOLO, never tool/model arguments.
         payload["yolo_bypass_allowed"] = bypass_yolo or tool.permission_yolo_auto_grant
@@ -448,7 +468,14 @@ class ToolRegistry:
                 })
                 return None
             raw_decision = str(await self.approval_handler(payload)).strip().lower()
-            decision = raw_decision if raw_decision in {"once", "session", "deny"} else "deny"
+            offered = [str(choice) for choice in payload.get("choices") or ("once", "session", "deny")]
+            if raw_decision in offered and raw_decision in DECISIONS:
+                decision = raw_decision
+            elif raw_decision in {"task", "session", "always"} and "once" in offered:
+                # A frontend may not broaden what the card offered: the exact call at most.
+                decision = "once"
+            else:
+                decision = "deny"
         except BaseException as exc:
             await self._audit_approval({
                 "type": "approval_decided",
@@ -469,6 +496,36 @@ class ToolRegistry:
             "duration_ms": int((time.time() - asked_at) * 1000),
         })
         return decision
+
+    @staticmethod
+    def _grant_label(tool: ToolDef, payload: dict[str, Any]) -> str:
+        """How a standing rule made from this request reads in the person's list."""
+        title = str(payload.get("approval_title") or payload.get("operation") or tool.name)
+        target = str(payload.get("session_scope_label") or payload.get("target") or "")
+        return f"{title}：{target}"[:300] if target else title[:300]
+
+    def _approval_choices(self, tool: ToolDef, request: dict[str, Any] | None, task_id: str, *,
+                          consequential: bool, rule: str, hook_ask: bool = False) -> list[str]:
+        """What the card offers. A consequential request, or one a hook insists on, is decided per call."""
+        declared = request.get("choices") if isinstance(request, dict) else None
+        if tool.owns_session_grants:
+            known = [choice for choice in (declared or ("once", "session", "deny"))
+                     if choice in {"once", "session", "deny"}]
+            return known or ["once", "deny"]
+        if consequential or hook_ask:
+            return ["once", "deny"]
+        if declared:
+            known = [choice for choice in declared if choice in {"once", "session", "deny"}]
+            if "session" not in known:
+                return known or ["once", "deny"]
+        choices = ["once", *(["task"] if task_id else []), "session"]
+        if rule and self.rule_advisor is not None:
+            try:
+                if self.rule_advisor(rule):
+                    choices.append("always")
+            except Exception:
+                logger.exception("approval rule advisor failed")
+        return [*choices, "deny"]
 
     @staticmethod
     def _positive_int_env(name: str, default: int) -> int:
@@ -1253,17 +1310,29 @@ class ToolRegistry:
                         "error_type": "policy_denied",
                         "recoverable": False,
                     })
+                hook_ask = hook_decision.kind == "ask"
+                call_scope = policy_call_scope(name, args)
+                policy_keys = request_keys(name, None, call_scope)
+                covered = "" if hook_ask or tool.permission_authoritative else self.grants.covering(policy_keys, task_id)
                 if tool.permission_authoritative:
                     policy_reason = f"{policy_reason}; exact permission is authoritative"
+                elif covered:
+                    # Allowed earlier for this task, this conversation or always; still one call at a time.
+                    policy_reason = f"{covered} approval"
+                    report("approved", message=policy_reason)
                 else:
                     report("awaiting_approval", message=policy_reason)
                     approval_started = time.perf_counter()
+                    policy_rule = "" if hook_ask else rule_key(name, None, call_scope)
                     decision = await self._request_approval(
                         call_id=call_id,
                         tool=tool,
                         args=args,
                         reason=policy_reason,
                         agent_reason=agent_reason,
+                        choices=self._approval_choices(tool, None, task_id, consequential=False, rule=policy_rule,
+                                                       hook_ask=hook_ask),
+                        grant_key=policy_rule,
                     )
                     runtime_metrics.observe(
                         "approval_wait_ms",
@@ -1293,9 +1362,11 @@ class ToolRegistry:
                             "error_type": "approval_denied",
                             "recoverable": False,
                         })
-                    if decision == "session":
-                        scope = self.policy.allow_call(name, args)
-                        self._session_policy_allows.add(scope)
+                    if decision in {"task", "session", "always"}:
+                        summary = ", ".join(f"{key}={value}" for key, value in
+                                            self._safe_argument_summary(self.persistence_safe_args(tool, args)).items())
+                        self.grants.remember(decision, policy_keys[:1], task_id=task_id, rule=policy_rule,
+                                             label=f"{name}：{summary}"[:300] if summary else name, tool=name)
                     interactive_decision = decision
                     policy_reason = f"interactive {decision} approval"
                     report("approved", message=policy_reason)
@@ -1313,14 +1384,20 @@ class ToolRegistry:
                 if permission_request is not None:
                     reason = str(permission_request.get("reason") or f"{name} requires approval")
                     auto_grant = self.yolo and tool.permission_yolo_auto_grant
-                    if not auto_grant:
+                    # Sending, paying, deleting, publishing: decided per call, whatever was allowed before.
+                    consequential = bool(permission_request.get("consequential"))
+                    covered = "" if auto_grant or consequential or tool.owns_session_grants else \
+                        self.grants.covering(request_keys(name, permission_request), task_id)
+                    if not auto_grant and not covered:
                         report("awaiting_approval", message=reason)
-                    if auto_grant:
+                    if auto_grant or covered:
                         decision = "once"
                     elif interactive_decision and not tool.permission_authoritative:
-                        decision = interactive_decision
+                        decision = "once" if consequential and interactive_decision != "deny" else interactive_decision
                     else:
                         approval_started = time.perf_counter()
+                        permission_rule = "" if consequential or tool.owns_session_grants else \
+                            rule_key(name, permission_request)
                         decision = await self._request_approval(
                             call_id=call_id,
                             tool=tool,
@@ -1329,6 +1406,9 @@ class ToolRegistry:
                             agent_reason=agent_reason,
                             request=permission_request,
                             bypass_yolo=not tool.permission_authoritative,
+                            choices=self._approval_choices(tool, permission_request, task_id,
+                                                           consequential=consequential, rule=permission_rule),
+                            grant_key=permission_rule,
                         )
                         runtime_metrics.observe(
                             "approval_wait_ms",
@@ -1358,8 +1438,15 @@ class ToolRegistry:
                         })
                     if tool.permission_grant is None:
                         raise RuntimeError(f"{name} requested approval without a permission grant handler")
-                    permission_cleanup = tool.permission_grant(args, permission_request, decision)
-                    source = "YOLO automatic" if auto_grant else "interactive"
+                    # The handler applies this call's grant; broader ones are the ledger's, per conversation.
+                    permission_cleanup = tool.permission_grant(
+                        args, permission_request, decision if tool.owns_session_grants else "once")
+                    if not tool.owns_session_grants and decision in {"task", "session", "always"}:
+                        self.grants.remember(
+                            decision, granted_keys(name, permission_request), task_id=task_id,
+                            rule=rule_key(name, permission_request), label=self._grant_label(tool, permission_request),
+                            tool=name)
+                    source = "YOLO automatic" if auto_grant else covered or "interactive"
                     report("approved", message=f"{source} {decision} approval")
 
             with trace_span("agent.tool", {

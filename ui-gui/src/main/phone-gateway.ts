@@ -145,6 +145,12 @@ export class PhoneGateway {
     return send(response, 404, { error: "Not found" });
   }
 
+  /** Whether this phone has the app open: its event stream is connected, so it needs no push. */
+  isLive(deviceId: string): boolean {
+    for (const stream of this.streams) if (stream.deviceId === deviceId) return true;
+    return false;
+  }
+
   private bearer(request: IncomingMessage): string | undefined {
     const token = /^Bearer ([A-Za-z0-9_-]{20,})$/.exec(request.headers.authorization || "")?.[1];
     return token ? this.devices.deviceForToken(token) : undefined;

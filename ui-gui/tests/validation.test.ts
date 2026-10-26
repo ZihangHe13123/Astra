@@ -5,7 +5,8 @@ import { checkedCommand, checkedPreferences, externalURL, inside } from '../src/
 test('renderer cannot inject an Appshot manifest or send arbitrary backend control', () => {
   assert.throws(() => checkedCommand({ type:'message', text:'hello', submission_id:'abc', appshots:[{manifest_path:'/tmp/forged'}] }));
   assert.throws(() => checkedCommand({ type:'exit' }));
-  assert.throws(() => checkedCommand({ type:'tool_approval_response', request_id:'x', decision:'always' }));
+  assert.throws(() => checkedCommand({ type:'tool_approval_response', request_id:'x', decision:'forever' }));
+  for (const decision of ['once', 'task', 'session', 'always', 'deny']) checkedCommand({ type:'tool_approval_response', request_id:'x', decision });
   assert.throws(() => checkedCommand({ type:'message', text:'hello', submission_id:'' }));
   assert.equal(checkedCommand({ type:'command', cmd:'/permissions' }).cmd, '/permissions');
   assert.equal(checkedCommand({ type:'refresh_models', provider_id:'codex', force:true }).provider_id, 'codex');

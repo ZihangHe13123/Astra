@@ -343,6 +343,44 @@ def test_different_failed_invocations_do_not_open_tool_circuit():
     assert events[-1]["type"] == "done"
 
 
+def test_a_tool_failing_on_and_on_with_new_arguments_is_flagged_then_stopped():
+    class StubbornLLM:
+        def __init__(self):
+            self.calls = 0
+            self.seen: list[str] = []
+
+        async def chat_stream(self, messages, tools):
+            self.calls += 1
+            self.seen.append(json.dumps(messages, ensure_ascii=False))
+            if tools:
+                yield {"type": "tool_calls", "calls": [{"id": f"try-{self.calls}", "name": "probe",
+                       "arguments": json.dumps({"target": f"candidate-{self.calls}"})}],
+                       "content": "", "reasoning_content": "", "usage": None}
+                return
+            yield {"type": "chunk", "content": "试了几种都不行，卡在 probe 上。"}
+            yield {"type": "done", "content": "试了几种都不行，卡在 probe 上。", "usage": None}
+
+    attempted = []
+
+    async def probe(target: str):
+        attempted.append(target)
+        raise RuntimeError("probe failed")
+
+    registry = ToolRegistry()
+    registry.register(ToolDef("probe", "probe a candidate", {"type": "object", "properties": {
+        "target": {"type": "string"}}, "required": ["target"]}, probe))
+    llm = StubbornLLM()
+    agent = ReActAgent("agent", llm, registry, max_iterations=12, failure_threshold=3)  # type: ignore[arg-type]
+
+    events = run(_collect(agent.reply_stream(Msg(content=[ContentBlock.text("diagnose")]))))
+
+    # The third failure in a row is flagged to the model; the fifth ends the attempts.
+    assert attempted == [f"candidate-{n}" for n in range(1, 6)]
+    assert "Failure streak" not in llm.seen[2] and "failed 3 times in a row" in llm.seen[3]
+    assert any("circuit opened" in event.get("message", "") for event in events)
+    assert events[-1]["type"] == "done"
+
+
 async def _collect(stream):
     return [event async for event in stream]
 def test_tool_definition_rejects_unknown_replay_policy():

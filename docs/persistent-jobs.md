@@ -24,6 +24,9 @@ another configured model. `--web` explicitly enables existing search/fetch tools
 configured mailbox (read-only; see [mail](integrations.md#read-only-163-mail)). On macOS,
 `--read-calendar` lets it read Calendar and Reminders, never change them
 ([calendar](integrations.md#calendar-and-reminders-macos)).
+While today's model usage is over the daily budget (`/usage budget`), checks that come
+due are recorded as skipped and not pushed; the next day they run as usual. Reminders and a
+run you ask for still run.
 Checks expose file reading/search and time tools, with no shell, writes, memory
 providers, Computer Use, delegates or channel sends. Each execution has a fresh
 session under `ASTRA_HOME/jobs/runs/ID/`, loading project guidance under current

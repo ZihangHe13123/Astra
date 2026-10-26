@@ -1,4 +1,5 @@
 import type { ToolApprovalRequest } from "./types.js";
+import { approvalChoices, type ApprovalChoice } from "@astra/ui-core/approval-choices";
 import { clampToolDetailOffset } from "./tool-results.js";
 
 export interface ApprovalInputKey {
@@ -25,7 +26,7 @@ export interface ApprovalInteractionTransition extends ApprovalInteractionState 
   handled: boolean;
   response?: {
     requestId: string;
-    decision: "once" | "session" | "deny";
+    decision: ApprovalChoice;
   };
 }
 
@@ -38,15 +39,13 @@ export function transitionApprovalInput(
   const request = state.requests[0];
   if (!request) return { ...state, handled: false };
 
-  const choices: readonly ("once" | "session" | "deny")[] = request.choices?.length
-    ? request.choices
-    : request.kind === "computer_foreground_takeover"
-      ? ["once", "deny"]
-      : ["once", "session", "deny"];
+  const choices: readonly ApprovalChoice[] = !request.choices?.length && request.kind === "computer_foreground_takeover"
+    ? ["once", "deny"]
+    : approvalChoices(request);
   const normalizedInput = input.toLowerCase();
 
   const resolve = (
-    decision: "once" | "session" | "deny",
+    decision: ApprovalChoice,
   ): ApprovalInteractionTransition => ({
     requests: state.requests.slice(1),
     detailOpen: false,
@@ -58,8 +57,14 @@ export function transitionApprovalInput(
   if ((key.return || normalizedInput === "y") && choices.includes("once")) {
     return resolve("once");
   }
+  if (normalizedInput === "t" && choices.includes("task")) {
+    return resolve("task");
+  }
   if (normalizedInput === "a" && choices.includes("session")) {
     return resolve("session");
+  }
+  if (normalizedInput === "l" && choices.includes("always")) {
+    return resolve("always");
   }
   if (normalizedInput === "v") {
     return {
