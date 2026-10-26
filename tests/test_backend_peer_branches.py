@@ -14,7 +14,7 @@ from agent.cli.images import build_user_message_content  # noqa: F401 - globals 
 from agent.core.msg import Msg
 from agent.runtime.async_io import durable_io
 from agent.runtime.conversation_branches import ConversationBranches, branch_scope
-from agent.runtime.peer_link import HEARTBEAT_SECONDS, PeerError, PeerLink, default_name, fallback_name, incoming_prompt  # noqa: F401 - globals used by the executed backend closures
+from agent.runtime.peer_link import HEARTBEAT_SECONDS, PERSONAL_PEER_NAME, PeerError, PeerLink, default_name, fallback_name, incoming_prompt  # noqa: F401 - globals used by the executed backend closures
 
 
 def backend_functions(namespace, names):
@@ -47,8 +47,10 @@ def harness(tmp_path):
               _send=events.append, pending_tool_approvals={}, approval_resolutions={},
               question_broker=SimpleNamespace(pending_count=0, queued_request_ids=[]),
               wakeups=SimpleNamespace(status=lambda: {"state": "idle"}), process_manager=SimpleNamespace(list=lambda **kw: []),
-              delegate_mailbox=SimpleNamespace(manager=SimpleNamespace(list=lambda **kw: [])), delegate_statuses={})
-    backend_functions(ns, {"_peer", "_peer_sync_locked", "_peer_tick", "_response_guard", "_response_head_current"})
+              delegate_mailbox=SimpleNamespace(manager=SimpleNamespace(list=lambda **kw: [])), delegate_statuses={},
+              personal_thread=False)
+    backend_functions(ns, {"_peer", "_peer_sync_locked", "_peer_snapshot", "_peer_tick", "_response_guard",
+                           "_response_head_current"})
     return ns, receiver, sender, context, idle, launched
 
 

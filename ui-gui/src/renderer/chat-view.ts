@@ -1,6 +1,7 @@
 /** The personal thread read as a chat (specs/personal-thread.md D4): the same rows, laid out for talking. */
-import type { UIEvent } from "@astra/ui-core/session-state";
+import type { SessionState, UIEvent } from "@astra/ui-core/session-state";
 import type { Row } from "./activity-state.js";
+import { PERSONAL_PEER_NAME } from "../bridge.js";
 
 /** A pause this long between two messages starts a new time heading. */
 export const CHAT_GAP_SECONDS = 10 * 60;
@@ -49,4 +50,13 @@ export function activitySummary(tools: UIEvent[]): string {
   const failed = tools.filter(tool => tool.status === "failed" || tool.error).length;
   if (running) return `正在使用工具（${tools.length - running}/${tools.length}）`;
   return `用了 ${tools.length} 个工具${failed ? `，${failed} 个出错` : ""}`;
+}
+
+/** An open task between sessions, as the backend reports them (agent/runtime/peer_link.py tasks()). */
+export type PeerTask = { task_id: string; title: string; state: string; role: "requester" | "assignee"; with: string };
+
+/** The task the personal thread handed this conversation, while it still manages it. */
+export function managedBy(state: SessionState): PeerTask | undefined {
+  const tasks: unknown = state.info.peer_tasks?.tasks;
+  return Array.isArray(tasks) ? tasks.find((task: PeerTask) => task?.role === "assignee" && task.with === PERSONAL_PEER_NAME) : undefined;
 }

@@ -39,6 +39,16 @@ export class Attention {
     return undefined;
   }
 
+  /** The personal thread heard back from a conversation it handed work to: done, or not done. A question
+   * back is the thread's to answer or to put to the person, so it rings only if the thread asks. */
+  handedBack(runtime: string, event: Event): AttentionNotice | undefined {
+    if (event.type !== "peer_message" || event.direction !== "in" || this.options.focused()) return undefined;
+    const peer = clip(event.peer, "一个对话");
+    if (event.state === "completed") return { title: `个人对话：${peer}做完了`, body: clip(event.text, "结果在个人对话里"), runtime };
+    if (event.state === "failed" || event.state === "rejected") return { title: `个人对话：${peer}没做成`, body: clip(event.text, "原因在个人对话里"), runtime };
+    return undefined;
+  }
+
   /** One event of the background host: scheduled-job results it pushes to the desktop. */
   host(event: Event): AttentionNotice | undefined {
     if (event.type === "usage_notice") return { title: "今天的模型用量超过预算了", body: clip(event.message, "定时检查暂停到明天") };

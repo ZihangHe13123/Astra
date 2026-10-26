@@ -48,3 +48,15 @@ test("the background host's job results become notifications, clipped", () => {
   const long = attention.host({ type: "job_notification", title: "t", body: "字".repeat(500) });
   assert.ok(long && long.body.length === 160 && long.body.endsWith("…"));
 });
+
+test("the personal thread rings when a conversation it handed work to is done or could not do it", () => {
+  let focused = false;
+  const attention = new Attention({ focused: () => focused });
+  const heard = (state: string, text = "两个测试是超时") => attention.handedBack("thread", { type: "peer_message", direction: "in", peer: "查测试", state, text });
+  assert.deepEqual(heard("completed"), { title: "个人对话：查测试做完了", body: "两个测试是超时", runtime: "thread" });
+  assert.equal(heard("failed")?.title, "个人对话：查测试没做成");
+  assert.equal(heard("input-required"), undefined, "the thread answers a question back itself, or asks");
+  assert.equal(attention.handedBack("thread", { type: "peer_message", direction: "out", peer: "查测试", state: "submitted", text: "x" }), undefined);
+  focused = true;
+  assert.equal(heard("completed"), undefined);
+});

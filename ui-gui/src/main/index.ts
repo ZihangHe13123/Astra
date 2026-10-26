@@ -10,6 +10,7 @@ import { PERSONAL_SESSION, type DesktopEvent, type Preferences } from "../bridge
 import type { SessionState } from "@astra/ui-core/session-state";
 import { Runtime } from "./runtime.js";
 import { ChannelHost, type HostedBackend } from "./channel-host.js";
+import { projectFolder } from "./conversation-folder.js";
 import { Attention, type AttentionNotice } from "./attention.js";
 import { QueryClient } from "./query-client.js";
 import { sessionAction } from "./session-actions.js";
@@ -221,6 +222,8 @@ function openSession(options: { session?: string; mode?: string; workspace?: str
   rt.state.isDraft = !options.session && mode === "work";
   runtimes.set(rt.id, rt);
   if (select) { active = rt.id; appshot.update(); }
+  // Opened for a phone or the personal thread: the window learns of it here, not from its own call.
+  else broadcast({ opened: rt.state });
   return rt.state;
 }
 register("create", (options: { session?: string; mode?: string; workspace?: string } = {}) => openSession(options));
@@ -528,11 +531,21 @@ function openPersonal(): HostedBackend {
     // questions and long replies notify like any session's.
     const own = attention.session(r.id, "", r.state.busy, event);
     const hosted = attention.host(event);
-    notify(hosted ? { ...hosted, runtime: r.id } : own);
+    notify(hosted ? { ...hosted, runtime: r.id } : attention.handedBack(r.id, event) ?? own);
     if (event.type === "backend_hello") voiceRoutes.delete(r.id);
     if (event.type === "gui_ready") appshot.update();
   }, { ASTRA_CHANNEL_HOST: "1", ASTRA_PERSONAL_THREAD: "1" });
   rt.pageSnapshot = path => snapshots.capture(path);
+  // Work in a project goes to a conversation there, which the thread then manages (specs/personal-thread.md D6).
+  rt.openConversation = async where => {
+    const known = [...preferences.projects, ...Object.values(preferences.workspaces), ...[...runtimes.values()].map(r => r.workspace)]
+      .filter(folder => folder && resolve(folder) !== resolve(personalHome));
+    const found = projectFolder(where, known, path => { try { return statSync(path).isDirectory(); } catch { return false; } });
+    if ("error" in found) throw new Error(found.error);
+    const session = `session_${new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 14)}_${randomUUID().slice(0, 8)}`;
+    openSession({ session, workspace: found.folder, mode: "work" }, false);
+    return { session, workspace: found.folder };
+  };
   rt.state.personal = true;
   personal = rt;
   runtimes.set(rt.id, rt);

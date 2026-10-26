@@ -38,6 +38,10 @@ MAX_TASK_MESSAGES = 20
 MAX_NEW_TASKS_PER_HOUR = 20
 MAX_TEXT = 20_000
 MAX_NAME = 40
+# The personal thread's name among the sessions it hands work to (specs/personal-thread.md D6).
+PERSONAL_PEER_NAME = "个人对话"
+# What the session that asked hears when the person takes a task over where it is being done.
+TAKEN_OVER = "The user took this task over in that conversation and carries on there; do not follow it up."
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS peers(
@@ -276,6 +280,19 @@ class PeerLink:
             self._post(db, task, other, state, text or state)
             other_name = task["requester_name"] if other == task["requester"] else task["assignee_name"]
             return {"task_id": task["task_id"], "to": other_name, "state": state}
+
+    def take_over(self, task_id: str = "") -> list[dict]:
+        """The person took over, in this session, tasks another session gave it: each is closed as canceled and
+        the session that asked is told, so it stops sending more. Only the session doing the task does this."""
+        with self._db(write=True) as db:
+            rows = db.execute("SELECT * FROM peer_tasks WHERE assignee=? AND state NOT IN "
+                              f"({','.join('?' * len(TERMINAL_STATES))})" + (" AND task_id=?" if task_id else ""),
+                              (self.peer_id, *sorted(TERMINAL_STATES), *([task_id] if task_id else []))).fetchall()
+            if task_id and not rows:
+                raise PeerError(f"No open task {task_id!r} was given to this session.")
+            for task in rows:
+                self._post(db, task, task["requester"], "canceled", TAKEN_OVER)
+        return [{"task_id": task["task_id"], "to": task["requester_name"], "state": "canceled"} for task in rows]
 
     def claim_inbox(self, limit: int = 20) -> list[dict]:
         """Take this session's unread mail, oldest first; each message is handed out once."""

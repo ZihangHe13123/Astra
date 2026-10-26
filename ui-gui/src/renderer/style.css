@@ -608,3 +608,6 @@ html[data-remote=phone] :is(.composer-foot, .approval-keys, .nav-button kbd, .ne
 html[data-remote=phone] .chat-view .messages { padding: 16px 12px 12px; }
 html[data-remote=phone] .chat-view .message.user { max-width: 86%; }
 html[data-remote=phone] .chat-view .interactive-card button { min-height: 40px; }
+.managed-row { margin: 6px 0 14px 36px; }
+.managed-head { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: var(--fs-small); }
+.managed-head .text-button { margin-left: auto; }

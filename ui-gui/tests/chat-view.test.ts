@@ -2,7 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { activitySummary, chatRows, chatTime, jobResult, CHAT_GAP_SECONDS } from "../src/renderer/chat-view.js";
+import { activitySummary, chatRows, chatTime, jobResult, managedBy, CHAT_GAP_SECONDS } from "../src/renderer/chat-view.js";
+import { initialSession } from "@astra/ui-core/session-state";
 import { MessageRow } from "../src/renderer/messages.js";
 import type { Row } from "../src/renderer/activity-state.js";
 
@@ -55,4 +56,14 @@ test("in the chat a job result is a card, a step is one line, and Astra's words 
   assert.match(render({ id: "t", role: "time", content: "08:30" }), /role="separator">08:30</);
   // Outside the chat the same rows look as before.
   assert.doesNotMatch(render({ id: "j", role: "assistant", content: "【定时任务：AI 晚报】\n新闻" }, false), /job-card|chat-avatar/);
+});
+
+test("a conversation knows the personal thread manages it while the task it was handed is open", () => {
+  const state = initialSession("w");
+  assert.equal(managedBy(state), undefined);
+  const task = { task_id: "mac:t-1", title: "查一下为什么测试失败", state: "working", role: "assignee", with: "个人对话" };
+  state.info = { peer_tasks: { type: "peer_tasks", tasks: [{ ...task, role: "requester", with: "别的会话" }, task] } };
+  assert.deepEqual(managedBy(state), task);
+  state.info = { peer_tasks: { type: "peer_tasks", tasks: [{ ...task, with: "做PPT" }] } };
+  assert.equal(managedBy(state), undefined, "a task from another session is not the thread managing it");
 });

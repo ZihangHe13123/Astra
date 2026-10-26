@@ -27,6 +27,7 @@ import { commandNames, describeCommands, modeSessionTarget, type CommandMode } f
 import { VoiceSettings } from "./voice.js";
 import { MemoryReviewSettings, reviewAnswer, withProposalOptions } from "./memory-review.js";
 import { PhoneNotifications, PhoneSettings } from "./phone-settings.js";
+import { managedBy } from "./chat-view.js";
 import { WeixinSettings } from "./weixin-settings.js";
 import { JobsPanel } from "./jobs-page.js";
 import { ActivityPanel } from "./activity-page.js";
@@ -495,6 +496,9 @@ function App() {
   const personal = Object.values(states).find(s => s.personal);
   // It reads as a chat, on the desktop and on a phone alike.
   const chat = !!state?.personal && !preview;
+  // Conversations it handed work to; and, in one of them, the task it manages there.
+  const managedSessions = chat ? Object.values(states).filter(s => !s.personal && s.status !== "disconnected" && managedBy(s)) : [];
+  const managing = state && !preview && !state.personal ? managedBy(state) : undefined;
   const currentConnection = modelConnection(state?.info.model_info, state?.info.model_info?.models?.find((m: UIEvent) => m.key === state.info.model_info.model_key));
   const appshotStatus = state?.info.gui_appshot;
   const appshotUnavailable = appshotStatus?.broker?.connection === "disconnected" && appshotStatus?.notice;
@@ -608,12 +612,21 @@ function App() {
           {state && !preview && <><ToolPreparation preparation={state.preparation}/>{unplacedTools.length > 0 && <button className="execution-summary" onClick={() => setPanel("tools")}><Terminal size={15}/>{unplacedTools.some(t => t.status === "running") ? "工具正在执行" : `${unplacedTools.length} 项工具结果`}<ChevronRight size={15}/></button>}
             <DelegateSummary delegates={state.delegates} open={() => setPanel("tools")}/>
             {state.approvals.map((e, index) => <Approval key={e.request_id} event={e} send={respond} windowKeys={index === 0 && !modal && !sessionDialog}/>)}{state.questions.map(e => <Question key={e.request_id} event={e} send={respond}/>)}
+            {managedSessions.map(s => <div key={s.id} className="managed-row">
+              <div className="managed-head"><i className={`status-dot ${s.approvals.length || s.questions.length ? "waiting" : s.busy ? "running" : ""}`}/>
+                <span>交给了一个对话：{managedBy(s)!.title}{s.approvals.length || s.questions.length ? " · 在等你" : s.busy ? " · 进行中" : ""}</span>
+                <button className="text-button small" onClick={() => select(s.id)}>打开<ChevronRight size={13}/></button></div>
+              {s.approvals.map(e => <Approval key={e.request_id} event={e} send={value => window.astra.send(s.id, value)}/>)}
+              {s.questions.map(e => <Question key={e.request_id} event={e} send={value => window.astra.send(s.id, value)}/>)}
+            </div>)}
             {state.busy && <div className="generating"><span className="pulse"/>Astra 正在工作<span>{state.info.generation_progress?.phase === "waiting" ? "等待模型响应" : ""}</span></div>}
             {state.status === "disconnected" && <div className="disconnected"><p>后端已断开，已显示的内容仍保留。</p><button onClick={() => command("/reconnect")}>重新连接</button></div>}
           </>}
         </div></div>
         <div className="composer-wrap">
           {!follow && messages.length > 0 && <button className="jump-latest" onClick={() => { if (preview?.locatedFromRuntime) select(preview.locatedFromRuntime); else if (preview?.locatedFromLog) browse({ name: preview.session_id, mode: preview.mode, modified: 0 }); else setFollow(true); }}>回到最新消息 ↓</button>}
+          {managing && <div className="connection-status managed-banner" role="status"><span>个人对话正在管理这个任务：{managing.title}</span>
+            <button onClick={() => { void command("/peers takeover").catch(fail); }}>接管</button></div>}
           {macOffline && <div className="connection-status" role="status"><span>连不上 Mac：它可能休眠了、Astra 没开，或手机没连上 Tailscale。恢复后会自动接上。</span></div>}
           {!preview && currentConnection.configured === false && <div className="connection-status" role="status"><span>当前模型尚未连接，请先登录或配置 API Key。</span><button onClick={() => configureModels(model?.model_key)}>连接模型</button></div>}
           {!preview && voiceLine && <div className="connection-status" role="status"><span>{voiceLine.text}</span>{voiceLine.action === "stop" ? <button onClick={() => { void send({ type: "command", cmd: "/voice stop" }); }}>停止朗读</button> : <button onClick={() => { void openVoice(); }}>语音设置</button>}</div>}

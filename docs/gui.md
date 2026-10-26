@@ -77,6 +77,15 @@ opens on a click, and job results as cards naming the job. It cannot be closed o
 `/new` in it starts afresh. WeChat keeps its own conversations. The design is in
 `specs/personal-thread.md`.
 
+Work in a project goes to a conversation there. Ask the thread ("in astra-master, find out
+why this test fails") and it opens a conversation in that project (a folder path, or a
+project's name as the sidebar lists it) and hands it the task through the local mailbox.
+That conversation works with its own tools, permissions and approvals, and shows
+**个人对话正在管理这个任务** with **接管**: take it over and the thread stops following
+it. While it works, the thread lists it with whatever it waits on: its approvals and
+questions can be answered right there, on the phone too. When it is done the thread hears
+back and tells you, and the desktop and a paired phone are notified.
+
 ## Conversations and tools
 
 - **新对话** returns to the current project's blank draft. Repeated clicks reuse

@@ -10,6 +10,8 @@ export type DesktopEvent = { removed: string } | { runtime: string; revision: nu
   | { link: "online" | "offline" };
 /** The personal thread's session name (specs/personal-thread.md); the background host holds it. */
 export const PERSONAL_SESSION = "personal";
+/** The personal thread's name among the conversations it hands work to (agent/runtime/peer_link.py). */
+export const PERSONAL_PEER_NAME = "个人对话";
 export type Bootstrap = { sessions: SessionState[]; active: string; workspace: string; preferences: Preferences; appshot: { connection: string; enabled: boolean } };
 export type CommandDescription = { id: string; command: string; description: string; takes_args: boolean; group: string; options: { command: string; description: string; completion: string; submitValue?: string }[] };
 import type { PhoneAction, PhoneNotificationState, PhoneStatus } from "./phone-protocol.js";

@@ -16,6 +16,8 @@ export class Runtime {
   readonly id = randomUUID();
   state: SessionState;
   initialModeSession = "";
+  /** Opens a conversation in a project for the personal thread to hand a task to. Set for that thread alone. */
+  openConversation?: (where: string) => Promise<{ session: string; workspace: string }>;
   /** Draws the page at a path and says where its picture is. Set by the host; the backend asks through it. */
   pageSnapshot?: (path: string) => Promise<{ path: string; width: number; height: number; pageHeight: number; scriptError: string }>;
   private child?: ChildProcessWithoutNullStreams;
@@ -74,6 +76,7 @@ export class Runtime {
       if (e.type === "response_operation_result" && this.responseOperations.finish(e)) return;
       // A request to the host, not something to show: the conversation never sees it.
       if (e.type === "page_snapshot_request") { void this.answerPageSnapshot(e); return; }
+      if (e.type === "open_conversation_request") { void this.answerOpenConversation(e); return; }
       this.accept(e);
       if (["message_accepted", "message_rejected", "submission_status"].includes(e.type)) {
         const pending = this.submissions.get(e.submission_id);
@@ -135,6 +138,14 @@ export class Runtime {
     } catch (error) { answer = { error: error instanceof Error ? error.message : String(error) }; }
     // A backend that has gone is no longer waiting for the answer.
     try { this.write({ type: "page_snapshot_response", request_id: request.request_id, ...answer }); } catch { /* nothing waits */ }
+  }
+  private async answerOpenConversation(request: UIEvent) {
+    let answer: Record<string, unknown>;
+    try {
+      if (!this.openConversation || typeof request.where !== "string") throw new Error("Only the personal thread can open a conversation.");
+      answer = await this.openConversation(request.where);
+    } catch (error) { answer = { error: error instanceof Error ? error.message : String(error) }; }
+    try { this.write({ type: "open_conversation_response", request_id: request.request_id, ...answer }); } catch { /* nothing waits */ }
   }
   accept(event: UIEvent) {
     if (event.type === "model_selection_result") {

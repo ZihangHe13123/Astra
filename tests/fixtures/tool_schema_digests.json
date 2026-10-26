@@ -428,9 +428,9 @@
   },
   "peer_send": {
     "sha256": [
-      "4e477c3fbd3393f7"
+      "e7cb214f8df1ba44"
     ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+    "reason": "2026-10-27: workspace lets the personal thread open a conversation in a project and hand it the task (specs/personal-thread.md D6)."
   },
   "peer_task_update": {
     "sha256": [

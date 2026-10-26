@@ -115,11 +115,12 @@ from agent.runtime.jobs.store import note_interaction
 from agent.runtime.jobs.thread import thread_recorder
 from agent.runtime.session_wakeup import SessionWakeups, visible_wakeup_history, wakeup_prompt
 from agent.runtime.browser_control_transport import set_owner_label_provider
-from agent.runtime.peer_link import (HEARTBEAT_SECONDS, PeerError, PeerLink, default_name, fallback_name,
-                                     incoming_prompt)
+from agent.runtime.peer_link import (HEARTBEAT_SECONDS, PERSONAL_PEER_NAME, TAKEN_OVER, PeerError, PeerLink,
+                                     default_name, fallback_name, incoming_prompt)
 from agent.runtime.tools.web import register_web_tools, create_browser_extract_fn, create_browser_status_fn
 from agent.runtime.tools.workspace import register_workspace_tools
 from agent.runtime.tools.image import register_image_tools, select_vision_tiles_from_holder
+from agent.runtime.conversation_opener import OPENED_JOIN_SECONDS, ConversationOpener, ConversationOpenError
 from agent.runtime.page_snapshot import PageSnapshotBroker
 from agent.runtime.tools.computer import register_local_computer_runtime
 from agent.runtime.tools.browser import register_browser_tools
@@ -1037,6 +1038,13 @@ async def _main(startup_started: float):
     )
     # Pages are drawn by the desktop alone, so only its backend offers to look at one.
     page_snapshots = PageSnapshotBroker(_send)
+    # The desktop's background host holding the personal thread (specs/personal-thread.md): it may ask the
+    # desktop to open conversations in projects and hand them tasks.
+    personal_thread = os.environ.get("ASTRA_PERSONAL_THREAD", "") == "1"
+    conversations = ConversationOpener(_send) if personal_thread else None
+    # The desktop's answers to what this backend asked it for, by answer type.
+    desktop_answers = {"page_snapshot_response": page_snapshots.resolve,
+                       **({"open_conversation_response": conversations.resolve} if conversations else {})}
     register_image_tools(
         tools,
         workdir=os.getcwd(),
@@ -1455,12 +1463,26 @@ async def _main(startup_started: float):
         if peer_link.peer_id:
             await durable_io(peer_link.leave)
         first = _first_request(agent.context.messages)
-        await durable_io(peer_link.join, session, default_name(first, session), workspace=os.getcwd())
+        # Other sessions see the personal thread by that name: their banner and notices say who manages them.
+        name = PERSONAL_PEER_NAME if personal_thread and session == "personal" else default_name(first, session)
+        await durable_io(peer_link.join, session, name, workspace=os.getcwd())
         peer_clock.update(heartbeat=time.monotonic(), inbox=0.0)
+        await _peer_snapshot()
 
     def _peer_event(direction: str, peer: str, task_id: str, state: str, text: str) -> None:
         _send({"type": "peer_message", "direction": direction, "peer": peer, "task_id": task_id,
                "state": state, "text": text[:4000]})
+
+    async def _peer_snapshot() -> None:
+        """This session's open tasks with others, for the window: who manages it, what it waits on."""
+        if peer_link is None or not peer_link.peer_id:
+            return
+        try:
+            tasks = await durable_io(peer_link.tasks)
+        except Exception:
+            logger.exception("could not read open peer tasks")
+            return
+        _send({"type": "peer_tasks", "tasks": tasks})
 
     def _peer_overview(link: PeerLink) -> str:
         lines = [f"This session: {link.name} ({link.peer_id})", "Open sessions:"]
@@ -1477,13 +1499,36 @@ async def _main(startup_started: float):
         return json.dumps({"you": {"name": link.name, "peer_id": link.peer_id}, "open_sessions": peers,
                            "open_tasks": tasks}, ensure_ascii=False)
 
-    async def _peer_send(text: str, to: str = "", task_id: str = "") -> str:
+    async def _open_conversation(link: PeerLink, where: str) -> str:
+        """Ask the desktop for a new conversation in ``where``; wait until it is in the mailbox; its peer_id."""
+        if conversations is None:
+            raise ValueError("Only the personal thread can open a conversation; hand the task to an open session instead.")
+        try:
+            opened = await conversations.request(where)
+        except ConversationOpenError as exc:
+            raise ValueError(str(exc)) from None
+        peer_id = f"{link.site}:{opened['session']}"
+        # Its backend joins the mailbox once it has started; the task then waits there until it is idle.
+        deadline = time.monotonic() + OPENED_JOIN_SECONDS
+        while not any(peer["peer_id"] == peer_id for peer in await durable_io(link.peers)):
+            if time.monotonic() > deadline:
+                raise ValueError(f"The new conversation in {opened['workspace'] or where} did not start in time; "
+                                 "it is open on the desktop, so try again with to set to it.")
+            await asyncio.sleep(0.5)
+        return peer_id
+
+    async def _peer_send(text: str, to: str = "", task_id: str = "", workspace: str = "") -> str:
         link = _peer()
+        if workspace and (to or task_id):
+            raise ValueError("Give workspace to open a new conversation, or to/task_id for an open one, not both.")
+        if workspace:
+            to = await _open_conversation(link, workspace)
         try:
             result = await asyncio.to_thread(link.send, text, to=to, task_id=task_id)
         except PeerError as exc:
             raise ValueError(str(exc)) from None
         _peer_event("out", result["to"], result["task_id"], result["state"], text)
+        await _peer_snapshot()
         # Live 2026-09-25: the asker slept and polled peer_list for the reply, which can only
         # arrive once its own turn ends, until the repeat guard stopped the turn.
         return json.dumps({**result, "next": f"Sent to {result['to']}. Its reply arrives here as a new turn after "
@@ -1497,6 +1542,7 @@ async def _main(startup_started: float):
         except PeerError as exc:
             raise ValueError(str(exc)) from None
         _peer_event("out", result["to"], result["task_id"], result["state"], text or state)
+        await _peer_snapshot()
         return json.dumps(result, ensure_ascii=False)
 
     tools.register(ToolDef(
@@ -1516,6 +1562,9 @@ async def _main(startup_started: float):
                      "question. Replies can only arrive after this turn ends, so after sending, finish the turn and tell "
                      "the user what you asked; do not wait, sleep or poll for the reply. Use it when another session's "
                      "work or context helps the user's request; never for thanks or acknowledgements. "
+                     "In the personal thread, work in a project belongs to a conversation in that project: give "
+                     "`workspace` (the project's folder, or its name as the desktop lists it) instead of `to` to open "
+                     "a new conversation there with this task; it shows that the personal thread manages it. "
                      "Limits: at most 8 calls per turn (a further call is not run), 20 messages "
                      "per task counting both directions, and 20 new tasks per hour from this session."),
         parameters={"type": "object", "properties": {
@@ -1525,6 +1574,9 @@ async def _main(startup_started: float):
                    "description": "Name or peer_id of an open session from peer_list. Needed to open a task; not read when task_id is given."},
             "task_id": {"type": "string", "maxLength": 200,
                         "description": "An open task between this session and another, to continue it. Omit to open a new task."},
+            "workspace": {"type": "string", "maxLength": 1000,
+                          "description": "Personal thread only: a project folder (path, or project name) to open a new "
+                                         "conversation in for this task. Leave `to` and task_id empty."},
         }, "required": ["text"]}, fn=_peer_send, risk="write", cache_results=False, max_calls_per_turn=8,
     ))
     tools.register(ToolDef(
@@ -2000,6 +2052,8 @@ async def _main(startup_started: float):
                     finished = []
                 for item in finished:
                     _peer_event("out", item["to"], item["task_id"], item["state"], answer or "No result.")
+                if finished:
+                    await _peer_snapshot()
             await agent.context.save_async()
             if os.getenv("ASTRA_UI_SURFACE") == "gui":
                 _send({"type": "response_versions", **ConversationBranches(agent.context.session_path).state(branch_id=agent.context.branch_id)})
@@ -2423,7 +2477,6 @@ async def _main(startup_started: float):
     weixin_commands.send_status()
     # The background host also runs scheduled jobs and pushes their results to the desktop and WeChat.
     # When it holds the personal thread, every result is written into that conversation too.
-    personal_thread = os.environ.get("ASTRA_PERSONAL_THREAD", "") == "1"
     jobs_host = JobsHost(state_dir(), desktop=_send, weixin=weixin_job_push(channel_manager, channel_router),
                          thread=thread_recorder(agent, agent_turn_lock, _send) if personal_thread else None,
                          ).start() if channel_host else None
@@ -3018,6 +3071,7 @@ async def _main(startup_started: float):
                     for message in messages:
                         _peer_event("in", message["sender_name"], message["task_id"],
                                     message["state"] or message["task_state"], message["body"])
+                    await _peer_snapshot()
             except Exception:
                 logger.exception("peer mailbox tick failed")
             finally:
@@ -3030,6 +3084,29 @@ async def _main(startup_started: float):
     # command loop below within the type checker's per-function complexity limit (past
     # it, pyright stops checking the function at all). They are called last in a loop
     # pass, so a `return` here is that loop's `continue`.
+    async def _peers_command(argument: str) -> None:
+        output, error = "", ""
+        try:
+            link = _peer()
+            if argument.startswith("name "):
+                output = f"This session is now called {await asyncio.to_thread(link.rename, argument[5:])}."
+            elif argument == "takeover" or argument.startswith("takeover "):
+                # The person carries on here: the session that handed the task over stops following it.
+                taken = await asyncio.to_thread(link.take_over, argument[len("takeover"):].strip())
+                for item in taken:
+                    _peer_event("out", item["to"], item["task_id"], item["state"], TAKEN_OVER)
+                await _peer_snapshot()
+                output = (f"Taken over: {', '.join(item['task_id'] for item in taken)}. "
+                          f"{taken[0]['to']} will not send more on it." if taken else "No task here to take over.")
+            elif argument:
+                raise ValueError("Usage: /peers [name NEW_NAME | takeover [TASK_ID]]")
+            else:
+                output = await asyncio.to_thread(_peer_overview, link)
+        except (ValueError, PeerError) as exc:
+            error = str(exc)
+        _send({"type": "tool_result", "name": "peers", "output": output, "error": error, "code": ""})
+        _send({"type": "done"})
+
     def _consolidation_command(c: str) -> None:
         try:
             output, error = execute_memory_command(
@@ -3970,8 +4047,8 @@ async def _main(startup_started: float):
                         "retryable": retryable,
                     })
 
-            elif cmd.get("type") == "page_snapshot_response":
-                page_snapshots.resolve(cmd)
+            elif cmd.get("type") in desktop_answers:
+                desktop_answers[cmd["type"]](cmd)
 
             elif cmd.get("type") == "user_question_editing":
                 editing = cmd.get("editing")
@@ -4139,20 +4216,7 @@ async def _main(startup_started: float):
                         _wakeup_event(wakeups.status(), str(exc))
                     continue
                 if c == "/peers" or c.startswith("/peers "):
-                    argument = c[len("/peers"):].strip()
-                    output, error = "", ""
-                    try:
-                        link = _peer()
-                        if argument.startswith("name "):
-                            output = f"This session is now called {await asyncio.to_thread(link.rename, argument[5:])}."
-                        elif argument:
-                            raise ValueError("Usage: /peers [name NEW_NAME]")
-                        else:
-                            output = await asyncio.to_thread(_peer_overview, link)
-                    except (ValueError, PeerError) as exc:
-                        error = str(exc)
-                    _send({"type": "tool_result", "name": "peers", "output": output, "error": error, "code": ""})
-                    _send({"type": "done"})
+                    await _peers_command(c[len("/peers"):].strip())
                     continue
                 if c == "/restart" or c.startswith("/restart "):
                     try:
