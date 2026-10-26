@@ -28,6 +28,7 @@ const UNAVAILABLE = {
   phone: "手机配对只能在电脑上管理。",
   data: "导出和清除数据只能在电脑上操作。",
   approvalRules: "审批规则只能在电脑上管理。",
+  usage: "预算和单价只能在电脑上设置。",
 };
 
 /**
@@ -173,6 +174,7 @@ export class RemoteBridge implements DesktopBridge {
   memory(action: string, ...values: string[]) { return this.call("memory", [action, ...values]) as Promise<string>; }
   data(): Promise<never> { return Promise.reject(new Error(UNAVAILABLE.data)); }
   approvalRules(): Promise<never> { return Promise.reject(new Error(UNAVAILABLE.approvalRules)); }
+  usage(): Promise<never> { return Promise.reject(new Error(UNAVAILABLE.usage)); }
   sessionAction(action: "export" | "delete", entry: { name: string; mode: string }) {
     return action === "delete" ? this.call("deleteSession", [entry]) : Promise.reject(new Error(UNAVAILABLE.export));
   }

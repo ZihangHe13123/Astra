@@ -28,6 +28,7 @@ export class Attention {
     if (event.type === "tool_approval_request" && !event.channel) {
       return { title: "Astra 需要你批准", body: clip(event.approval_title || event.tool_name, "一个操作在等你决定"), runtime };
     }
+    if (event.type === "usage_notice") return { title: "今天的模型用量超过预算了", body: clip(event.message, "定时检查暂停到明天"), runtime };
     if (event.type === "user_question_request") {
       const questions = Array.isArray(event.questions) ? event.questions as Event[] : [];
       return { title: "Astra 有问题想问你", body: clip(questions[0]?.question, "回到对话看看吧"), runtime };
@@ -40,6 +41,7 @@ export class Attention {
 
   /** One event of the background host: scheduled-job results it pushes to the desktop. */
   host(event: Event): AttentionNotice | undefined {
+    if (event.type === "usage_notice") return { title: "今天的模型用量超过预算了", body: clip(event.message, "定时检查暂停到明天") };
     if (event.type !== "job_notification") return undefined;
     return { title: clip(event.title, "定时任务"), body: clip(event.body, "结果在定时任务收件箱里") };
   }

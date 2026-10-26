@@ -23,6 +23,8 @@ export interface DesktopBridge {
   jobs(action: "pause" | "resume" | "remove" | "run" | "read" | "quiet", value?: string, extra?: string): Promise<any>;
   /** The person's change to their memory: core entries (add, edit, remove), saved memories (forget, correct), proposals. */
   memory(action: "core-add" | "core-edit" | "core-remove" | "forget" | "correct" | "accept" | "dismiss", ...values: string[]): Promise<string>;
+  /** The person's daily model budget ("off", a token count or an amount like ¥5) and per-million prices. */
+  usage(action: "budget" | "price", ...values: string[]): Promise<unknown>;
   /** The person's "以后都允许" rules: list them, or remove one by its key. */
   approvalRules(action: "list" | "remove", key?: string): Promise<{ rules?: { key: string; label: string; tool: string; created_at: string }[] }>;
   /** The person's whole data, from the memory page: what export and wipe take, an export to a zip, or a wipe after 清除 is typed. */

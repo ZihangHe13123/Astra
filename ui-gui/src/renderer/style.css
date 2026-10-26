@@ -559,3 +559,10 @@ html[data-remote=phone] :is(.composer-foot, .approval-keys, .nav-button kbd, .ne
 .memory-room.full span { background:var(--warn); }
 .memory-row .memory-head { display:flex; justify-content:space-between; gap:12px; text-align:left; background:none; border:0; padding:0; min-height:0; color:inherit; font:inherit; cursor:pointer; }
 .memory-content { white-space:pre-wrap; }
+.usage-status { align-self:center; margin-left:8px; white-space:nowrap; }
+.usage-status.over { color:var(--error); }
+.usage-panel { display:flex; flex-direction:column; gap:6px; margin-bottom:12px; }
+.usage-panel p, .usage-panel h3 { margin:0; }
+.usage-models { margin:0; padding-left:18px; display:flex; flex-direction:column; gap:4px; }
+.usage-price { display:inline-flex; flex-wrap:wrap; gap:4px; align-items:center; }
+.usage-price input { width:72px; }

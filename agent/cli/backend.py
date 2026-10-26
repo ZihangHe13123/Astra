@@ -171,6 +171,8 @@ from agent.cli.model_catalog import (
 )
 from agent.cli.model_preferences import model_settings_path, read_selected_model
 from agent.runtime.tools.grants import AllowRules
+from agent.runtime.usage import UsageLedger, UsagePreferences, install_usage_ledger, installed_usage_ledger, usage_context
+from agent.cli.usage_commands import execute_usage_command, over_budget_message
 from agent.cli.bar_preferences import load_bar_output_mode, save_bar_output_mode
 from agent.cli.provider_connections import connection_routes_event
 from agent.cli.model_catalog import provider_menu_items
@@ -472,8 +474,8 @@ def _isolated_mode_blocks_command(
         return False
     command = command.strip()
     if (
-        command in {"/cancel", "/reset", "/think", "/vision-tiles", "/budget"}
-        or command.startswith(("/think ", "/vision-tiles ", "/budget "))
+        command in {"/cancel", "/reset", "/think", "/vision-tiles", "/budget", "/usage"}
+        or command.startswith(("/think ", "/vision-tiles ", "/budget ", "/usage "))
     ):
         return False
     if command in {"/undo", "/retry"} or command.startswith("/undo "):
@@ -1195,6 +1197,16 @@ async def _main(startup_started: float):
     tools.grants.rules = AllowRules(model_settings_path())
     if approval_inbox is not None:
         tools.rule_advisor = approval_inbox.rule_eligible
+    # Every model request's tokens, for /usage, the activity page and the daily budget (runtime/usage.py).
+    try:
+        usage_ledger: UsageLedger | None = UsageLedger(preferences=UsagePreferences(model_settings_path()))
+    except Exception:  # noqa: BLE001 - accounting is optional; the conversation is not
+        logger.exception("model usage ledger unavailable")
+        usage_ledger = None
+    install_usage_ledger(usage_ledger)
+    if usage_ledger is not None:
+        usage_ledger.on_over_budget = lambda summary: _send({
+            "type": "usage_notice", "message": over_budget_message(summary), "day": summary["day"]})
     if orphaned_approvals:
         _send({
             "type": "approval_inbox_snapshot",
@@ -2157,7 +2169,19 @@ async def _main(startup_started: float):
                "context_pct": round(pct, 1),
                "context_limit": limit,
                "show_reasoning": ctx.show_reasoning,
+               **({"usage_today": _usage_today()} if _usage_today() else {}),
                **({"served_model": served} if served else {})})
+
+    def _usage_today() -> dict:
+        """Today's tokens, cost and budget for the status line; empty when nothing is accounted."""
+        ledger = installed_usage_ledger()
+        if ledger is None:
+            return {}
+        try:
+            day = ledger.day()
+        except Exception:  # noqa: BLE001 - a status line must not fail the session
+            return {}
+        return {key: day[key] for key in ("tokens", "cost", "currency", "budget", "over_budget")}
 
     async def _send_history():
         from agent.runtime.message_source import message_source_ref
@@ -2572,7 +2596,9 @@ async def _main(startup_started: float):
         async def start_and_stream() -> None:
             nonlocal active_task_id, _reply_done, entered, stopped
             entered = True
-            with profile_request(str(request_id)):
+            context_path = agent.context.session_path
+            with profile_request(str(request_id)), usage_context(
+                    source="chat", session=Path(context_path).stem if context_path else ""):
                 run = resume_task
                 streaming = False
 
@@ -4494,6 +4520,12 @@ async def _main(startup_started: float):
                         "error": error,
                         "code": "",
                     })
+                    _send({"type": "done"})
+                elif c == "/usage" or c.startswith("/usage "):
+                    context_path = agent.context.session_path
+                    output, error = execute_usage_command(c[len("/usage"):].strip(),
+                                                          session=Path(context_path).stem if context_path else "")
+                    _send({"type": "tool_result", "name": "usage", "output": output, "error": error, "code": ""})
                     _send({"type": "done"})
                 elif c == "/budget" or c.startswith("/budget "):
                     output, error = execute_budget_command(agent, c[len("/budget"):].strip())

@@ -12,6 +12,14 @@ import time
 from pathlib import Path
 
 from agent.runtime.jobs.store import MAX_OUTPUT, NO_UPDATE, JobStore
+from agent.runtime.usage import (
+    UsageLedger,
+    UsagePreferences,
+    default_settings_path,
+    install_usage_ledger,
+    reset_usage_context,
+    set_usage_context,
+)
 
 READ_TOOLS = frozenset({"read_file", "stat_file", "search_files", "search_text", "current_time"})
 WEB_TOOLS = frozenset({"search_web", "fetch_url", "search_status"})
@@ -104,6 +112,12 @@ async def run_check(store: JobStore, run: dict) -> None:
     output = ""
     error = ""
     last_progress = 0.0
+    # This run's model requests count toward today's usage and budget, as a scheduled job's.
+    try:
+        install_usage_ledger(UsageLedger(preferences=UsagePreferences(default_settings_path())))
+    except Exception:  # noqa: BLE001 - accounting is optional; the check is not
+        install_usage_ledger(None)
+    usage_tokens = set_usage_context(source="job", session=f"job:{run['job_id']}")
     try:
         text = f"Original user request:\n{spec['original_request']}\n\nScheduled check:\n{spec['prompt']}"
         event = spec.get("event")
@@ -145,6 +159,7 @@ async def run_check(store: JobStore, run: dict) -> None:
         store.finish(run["id"], "failed" if error else "completed", output=output, detail=error,
                      quiet=quiet, usage=usage)
     finally:
+        reset_usage_context(usage_tokens)
         agent.end_session("scheduled_job_finished")
         await agent.close_external_memory()
         await sandbox.close()

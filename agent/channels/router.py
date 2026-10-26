@@ -16,6 +16,7 @@ from pathlib import Path
 
 from agent.core.msg import ContentBlock, Msg
 from agent.runtime.tools.grants import enter_grant_space, leave_grant_space
+from agent.runtime.usage import reset_usage_context, set_usage_context
 from agent.runtime.prompt_budget import prompt_token_budget
 from agent.runtime.prompts import channel_prompt_profile
 from agent.runtime.context import AgentContext
@@ -221,6 +222,7 @@ class AgentChannelRouter:
             token = active_channel.set(message.channel)
             # This chat's own approvals: the desktop's grants never cover it, nor another chat's.
             space_token = enter_grant_space(f"channel:{session_name}")
+            usage_tokens = set_usage_context(source="channel", session=session_name)
             message_token = active_channel_message.set(message)
             media: list[str] = []
             media_token = channel_turn_media.set(media)
@@ -286,6 +288,7 @@ class AgentChannelRouter:
                     await self._finish_task(task_id, outcome)
                 channel_turn_media.reset(media_token)
                 active_channel_message.reset(message_token)
+                reset_usage_context(usage_tokens)
                 leave_grant_space(space_token)
                 active_channel.reset(token)
                 self.agent.context = previous

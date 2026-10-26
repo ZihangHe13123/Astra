@@ -260,6 +260,18 @@ until asked for. **打开这次对话** opens the turn's conversation. While the
 in the background, a waiting approval or question, a reply that took 20 seconds or
 more, and job results arrive as system notifications.
 
+Its top shows **今日用量**: today's tokens for every model request Astra made (desktop
+and terminal conversations, WeChat and QQ chats, scheduled jobs, and the work behind them
+such as delegates and context compaction), by model and by source. Enter a model's prices
+per million tokens there (or `/usage price MODEL INPUT OUTPUT [CACHED]`) and its cost is
+shown too. A daily budget, in tokens (`500000`) or money (`¥5`, which needs prices), is set
+there or with `/usage budget`; once set, the line under the composer shows today against it.
+The first request that goes over the budget says so once in the conversation (and as a
+notification); scheduled checks then wait until the next day, while conversations, reminders
+and runs you ask for go on. `/usage` shows today and the current conversation in any client.
+A tool that keeps failing with different arguments is flagged to the model on the third
+failure in a row and stopped at the fifth.
+
 **记忆** shows and edits what Astra keeps about you; see [the memory page](memory.md#the-memory-page).
 
 ## Permissions and persona

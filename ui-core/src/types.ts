@@ -295,6 +295,8 @@ export type PyEvent =
   | { type: "background_wakeup"; state: "started" | "limited"; message: string }
   | { type: "memory_notice"; event: "saved" | "revised" | "forgotten"; memory_id: string; summary: string; kind: string; scope: string; previous_id?: string; origin?: "consolidation" }
   | { type: "memory_notice"; event: "proposed"; count: number; summary: string }
+  /** Today's model usage went over the person's daily budget (once a day). */
+  | { type: "usage_notice"; message: string; day: string }
   // The background review's mode; the answer to a /memory consolidation command adds message or error.
   | { type: "memory_consolidation_status"; mode: "off" | "review" | "auto"; pending: number; proposals?: PendingProposal[]; message?: string; error?: string }
   | { type: "memory_recall"; count: number; items: string[] }
@@ -317,7 +319,9 @@ export type PyEvent =
       details?: Record<string, unknown>;
       artifact_ref?: string;
     }
-  | { type: "model_info"; model: string; model_key?: string; served_model?: string; reasoning_effort?: "low" | "high" | "max" | null; code_mode?: "native" | "code" | "both"; personas?: { name: string; description: string }[]; models?: (string | ModelInfo)[]; providers?: ProviderInfo[]; connection_routes?: ConnectionRoute[]; recent_models?: string[]; provider_errors?: Record<string, string>; total_tokens: number; prompt_tokens: number; completion_tokens: number; cache_hit_tokens?: number; cache_miss_tokens?: number; context_pct: number; context_used?: number; context_limit: number; show_reasoning?: boolean }
+  | { type: "model_info"; model: string; model_key?: string;
+      usage_today?: { tokens: number; cost: number | null; currency: string;
+        budget: { daily_tokens?: number; daily_cost?: number }; over_budget: boolean }; served_model?: string; reasoning_effort?: "low" | "high" | "max" | null; code_mode?: "native" | "code" | "both"; personas?: { name: string; description: string }[]; models?: (string | ModelInfo)[]; providers?: ProviderInfo[]; connection_routes?: ConnectionRoute[]; recent_models?: string[]; provider_errors?: Record<string, string>; total_tokens: number; prompt_tokens: number; completion_tokens: number; cache_hit_tokens?: number; cache_miss_tokens?: number; context_pct: number; context_used?: number; context_limit: number; show_reasoning?: boolean }
   | { type: "session_info"; name: string; messages: number }
     | { type: "cache_status"; cache_hit_tokens: number; cache_miss_tokens: number }
 

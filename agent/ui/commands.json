@@ -1135,5 +1135,13 @@
     "id": "F58",
     "takes_args": false,
     "options": []
+  },
+  {
+    "command": "/usage",
+    "description": "model tokens and cost today and in this session; set a daily budget or model prices",
+    "group": "SESSION",
+    "id": "F59",
+    "takes_args": true,
+    "options": []
   }
 ]

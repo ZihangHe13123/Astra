@@ -29,6 +29,7 @@ ACTIVE_MARKER = "active"
 # A check under ``on_change`` answers exactly this when it has nothing new to report.
 NO_UPDATE = "NO_UPDATE"
 FAILURES_BEFORE_PAUSE = 3
+BUDGET_NOTICE = "今天的模型用量已超过每日预算，这次检查没有运行；明天照常。"
 INACTIVE_SECONDS = 7 * 86400
 INTERACTION_FILE = "last-interaction"
 # Columns added after version 1, with their definitions.
@@ -388,7 +389,8 @@ class JobStore:
 
     @staticmethod
     def _insert_run(db: sqlite3.Connection, job: sqlite3.Row, slot: float | None,
-                    now: float, *, skipped: int = 0, notice: str = "", event: dict | None = None) -> str:
+                    now: float, *, skipped: int = 0, notice: str = "", event: dict | None = None,
+                    deliver: bool = True) -> str:
         identity = uuid.uuid4().hex
         state = "skipped" if skipped or notice else "claimed"
         detail = notice or (f"Missed {skipped} slot(s) outside the catch-up policy." if skipped else "")
@@ -396,12 +398,15 @@ class JobStore:
                    "VALUES (?,?,?,?,?,?,?,?,?)", (identity, job["id"], slot, now, now if state == "skipped" else None,
                                                 state, json.dumps({**json.loads(job["spec"]), "event": event})
                                                 if event else job["spec"], detail, skipped))
-        if state == "skipped":
+        if state == "skipped" and deliver:
             db.execute("INSERT INTO deliveries (run_id,state) VALUES (?,'pending')", (identity,))
         return identity
 
     def claim_due(self, *, now: float | None = None, manual_job: str = "",
-                  reminders_only: bool = False, last_interaction: float | None = None) -> dict | None:
+                  reminders_only: bool = False, last_interaction: float | None = None,
+                  over_budget: bool = False) -> dict | None:
+        """The next run to execute. ``over_budget``: checks that come due are recorded as skipped (not pushed);
+        reminders and runs the person asked for still run."""
         now = time.time() if now is None else now
         identity = ""
         with self.transaction() as db:
@@ -414,12 +419,13 @@ class JobStore:
                     raise ValueError("This job already has an active occurrence.")
                 identity = self._insert_run(db, job, None, now)
             else:
-                identity = (self._claim_requested(db, now, reminders_only)
-                            or self._claim_scheduled(db, now, reminders_only, last_interaction))
+                identity = (self._claim_requested(db, now, reminders_only, over_budget)
+                            or self._claim_scheduled(db, now, reminders_only, last_interaction, over_budget))
         self._sync_active()
         return self.run(identity) if identity else None
 
-    def _claim_requested(self, db: sqlite3.Connection, now: float, reminders_only: bool) -> str:
+    def _claim_requested(self, db: sqlite3.Connection, now: float, reminders_only: bool,
+                         over_budget: bool = False) -> str:
         for job in db.execute("SELECT * FROM jobs WHERE run_requested_at IS NOT NULL AND state!='removed' "
                               "AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.job_id=jobs.id "
                               "AND runs.state IN ('claimed','running')) ORDER BY run_requested_at,id").fetchall():
@@ -432,6 +438,11 @@ class JobStore:
                                 "AND jobs.state='enabled' AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.job_id=jobs.id "
                                 "AND runs.state IN ('claimed','running')) ORDER BY trigger_events.id").fetchall():
             if reminders_only and json.loads(event["spec"])["kind"] != "reminder":
+                continue
+            if over_budget and json.loads(event["spec"])["kind"] != "reminder":
+                identity = self._insert_run(db, event, None, now, notice=BUDGET_NOTICE, deliver=False,
+                                            event=json.loads(event["payload"]))
+                db.execute("UPDATE trigger_events SET run_id=? WHERE id=?", (identity, event["event_id"]))
                 continue
             identity = self._insert_run(db, event, None, now, event=json.loads(event["payload"]))
             db.execute("UPDATE trigger_events SET run_id=? WHERE id=?", (identity, event["event_id"]))
@@ -473,7 +484,7 @@ class JobStore:
         return True
 
     def _claim_scheduled(self, db: sqlite3.Connection, now: float, reminders_only: bool,
-                         last_interaction: float | None) -> str:
+                         last_interaction: float | None, over_budget: bool = False) -> str:
         candidates = db.execute("SELECT * FROM jobs WHERE state='enabled' AND next_at<=? "
                                 "AND NOT EXISTS (SELECT 1 FROM runs WHERE runs.job_id=jobs.id "
                                 "AND runs.state IN ('claimed','running')) ORDER BY next_at,id", (now,)).fetchall()
@@ -502,6 +513,10 @@ class JobStore:
                 db.execute("UPDATE jobs SET next_at=? WHERE id=?", (following, job["id"]))
             else:
                 db.execute("UPDATE jobs SET state='completed' WHERE id=?", (job["id"],))
+            if eligible and over_budget and spec["kind"] != "reminder":
+                # Over today's budget: the slot passes, quietly; the next one runs as usual.
+                self._insert_run(db, job, latest, now, notice=BUDGET_NOTICE, deliver=False)
+                continue
             if eligible:
                 return self._insert_run(db, job, latest, now)
         return ""

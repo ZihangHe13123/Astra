@@ -156,4 +156,16 @@ def activity(home: Path, *, days: int = 7, now: float | None = None, limit: int 
                                 "quiet": bool(run["quiet"]) if quiet else False,
                                 "summary": _clip(run["output"] or run["detail"])})
     entries.sort(key=lambda entry: entry["time"], reverse=True)
-    return {"entries": entries[:limit], "since": since}
+    return {"entries": entries[:limit], "since": since, "usage": _usage_today()}
+
+
+def _usage_today() -> dict | None:
+    """Today's model usage from the ledger, or None before any request was accounted."""
+    from agent.runtime.usage import UsageLedger, UsagePreferences, default_settings_path, usage_db_path
+
+    if not usage_db_path().exists():
+        return None
+    try:
+        return UsageLedger(preferences=UsagePreferences(default_settings_path())).day()
+    except (OSError, sqlite3.Error):
+        return None

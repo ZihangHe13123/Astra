@@ -294,6 +294,20 @@ function runApprovalRules(action: unknown, key?: unknown): Promise<unknown> {
     }));
 }
 register("approvalRules", runApprovalRules);
+/** The daily model budget and per-million prices, from the activity page (agent/cli/usage_commands.py). */
+function runUsage(action: unknown, ...values: unknown[]): Promise<unknown> {
+  const name = checkedString(action, "action", 10);
+  const args = values.map(value => checkedString(value, "usage", 200));
+  if (!(name === "budget" && args.length === 1 || name === "price" && args.length >= 3 && args.length <= 4)) throw new Error("Unsupported usage change");
+  return new Promise((done, fail) => execFile(python, ["-m", "agent.cli.usage_commands", name, ...args],
+    { cwd: root, env: process.env, timeout: 30_000, windowsHide: true, encoding: "utf8" },
+    (_error, stdout) => {
+      let result: { ok?: boolean; error?: string } = {};
+      try { result = JSON.parse(String(stdout).trim().split("\n").at(-1) || "{}"); } catch { /* reported below */ }
+      result.ok ? done(result) : fail(new Error(result.error || "没有改成功。"));
+    }));
+}
+register("usage", runUsage);
 /** One run of `astra data` (agent/cli/data_commands.py); it answers with a JSON line, an error included. */
 function dataCommand(args: string[], timeout: number): Promise<any> {
   return new Promise((done, fail) => execFile(python, ["-m", "agent.cli.data_commands", ...args],
