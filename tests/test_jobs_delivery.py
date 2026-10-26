@@ -36,7 +36,7 @@ def finish(store: JobStore, now: float, state: str = "completed", output: str = 
     run = store.claim_due(now=now)
     assert run is not None
     store.finish(run["id"], state, output=output, **kwargs)
-    store.deliver_pending()
+    store.deliver_pending(now=now)
     return run
 
 
@@ -90,7 +90,7 @@ def test_quiet_results_missed_slots_and_inbox_only_jobs_are_not_pushed(tmp_path)
     finish(store, now + 600, output="该喝水了")
     repeating = reminder(store, tmp_path, next_at=now, interval_seconds=60, grace_seconds=10)
     store.claim_due(now=now + 3600)
-    store.deliver_pending()
+    store.deliver_pending(now=now + 3600)
     missed = next(row for row in store.history(repeating["id"]) if row["state"] == "skipped")
     assert missed["skipped_count"] > 0
     for run_id in (quiet["id"], missed["id"], *[row["id"] for row in store.history(inbox_only["id"])]):
@@ -181,7 +181,7 @@ def test_messages_name_the_job_and_explain_pauses_and_failures(tmp_path):
     store.set_state(job["id"], "enabled", now=now + 4 * 3600)
     note_interaction(store.home, now=now)
     store.claim_due(now=now + INACTIVE_SECONDS + 5 * 3600, last_interaction=now)
-    store.deliver_pending()
+    store.deliver_pending(now=now + INACTIVE_SECONDS + 5 * 3600)
     notice = [push for push in store.due_pushes(now=now + INACTIVE_SECONDS + 5 * 3600)
               if push["run_state"] == "skipped" and push["target"] == "weixin"]
     assert push_message(notice[0]) == ("定时任务已暂停：Rust 早报", "你已经 7 天没找我了，我先把它暂停了。要继续就跟我说一声。")

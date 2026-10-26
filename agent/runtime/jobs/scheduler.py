@@ -233,7 +233,7 @@ def tick(store: JobStore, *, manual_job: str = "", now: float | None = None, max
     try:
         with InstanceLock(store.root / "scheduler.lock"):
             recovered = recover_abandoned(store)
-            delivered = store.deliver_pending()
+            delivered = store.deliver_pending(now=now)
             interaction = last_interaction(store.home)
             fired = []
 
@@ -248,7 +248,7 @@ def tick(store: JobStore, *, manual_job: str = "", now: float | None = None, max
                     execute(store, notice)
                     fired.append({"id": notice["id"], "job_id": notice["job_id"],
                                   "state": store.run(notice["id"])["state"]})
-                delivered += store.deliver_pending()
+                delivered += store.deliver_pending(now=now)
 
             for _ in range(1 if manual_job else min(100, max(1, max_runs))):
                 run = store.claim_due(now=now, manual_job=manual_job, last_interaction=interaction)
@@ -256,10 +256,10 @@ def tick(store: JobStore, *, manual_job: str = "", now: float | None = None, max
                     break
                 execute(store, run, service_reminders=service_reminders)
                 fired.append({"id": run["id"], "job_id": run["job_id"], "state": store.run(run["id"])["state"]})
-                delivered += store.deliver_pending()
+                delivered += store.deliver_pending(now=now)
             # claim_due can record only missed slots and return no runnable
             # occurrence; those outcomes still need delivery in this tick.
-            delivered += store.deliver_pending()
+            delivered += store.deliver_pending(now=now)
             return {"scheduler": "idle", "executed": fired, "recovered_unknown": recovered, "delivered": delivered}
     except InstanceAlreadyRunning:
         return {"scheduler": "busy", "executed": [], "recovered_unknown": 0, "delivered": 0}
