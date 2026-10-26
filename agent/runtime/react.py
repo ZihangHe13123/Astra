@@ -99,6 +99,9 @@ class ToolArgumentError(ValueError):
 # to stop and say what fails; at the limit the turn ends, like the same-signature circuit.
 FAILURE_STREAK_NOTICE = 3
 FAILURE_STREAK_LIMIT = 5
+# Identical calls (same tool, same arguments) allowed in one turn. The last allowed one carries a warning;
+# one more ends the turn as a loop. Tools whose answer changes on its own opt out (ToolDef.repeat_guard).
+REPEATED_CALLS_PER_TURN = 3
 
 
 async def _stream_with_generation_stats(events):
@@ -3929,7 +3932,7 @@ class ReActAgent(AgentBase):
         stop_reason = ""
         hard_prompt_stop = False
         completed_normally = False
-        repeated_tool_limit = 2
+        repeated_tool_limit = REPEATED_CALLS_PER_TURN
         forced_tool_failures = 0
         mailbox_iteration_extension = 0
         overflow_recoveries = 0
@@ -4536,6 +4539,7 @@ class ReActAgent(AgentBase):
                         self.context.add_tool(tc["id"], f"[ToolCircuitOpen] {stop_reason}")
                     yield with_request({
                         "type": "error",
+                        "code": "repeated_tool_call",
                         "message": f"Stopping: repeated tool call detected ({repeated_label}).",
                         "recoverable": True,
                     })
@@ -4547,6 +4551,7 @@ class ReActAgent(AgentBase):
                         self.context.add_tool(tc["id"], f"[ToolBudgetExhausted] {stop_reason}")
                     yield with_request({
                         "type": "error",
+                        "code": "tool_budget",
                         "message": f"Stopping: per-turn tool budget exhausted ({name}, limit={limit}).",
                         "recoverable": True,
                     })
@@ -4787,6 +4792,7 @@ class ReActAgent(AgentBase):
                     stop_reason = f"工具 {name} 连续 {count} 次出现同类错误（{fingerprint}），熔断器已打开"
                     yield with_request({
                         "type": "error",
+                        "code": "tool_circuit",
                         "message": f"Stopping: tool circuit opened ({name}, failures={count}, fingerprint={fingerprint}).",
                         "recoverable": True,
                     })

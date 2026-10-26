@@ -51,9 +51,13 @@ export function targetsLabel(targets: string[]) {
   return names.length ? `发到${names.join("和")}` : "只进收件箱";
 }
 
+/** A check a safety guard stopped still answered from what it found (agent/runtime/jobs/store.py). */
+const STOPPED_EARLY = new Set(["repeated_tool_call", "tool_budget", "tool_circuit"]);
+
 /** One inbox row's headline: what happened, before its text. */
 export function resultLabel(row: InboxRow) {
-  if (row.state === "completed") return row.quiet ? "没有新内容" : row.kind === "reminder" ? "提醒" : row.detail === "iteration_budget" ? "结果（轮数用完，可能不全）" : "结果";
+  if (row.state === "completed") return row.quiet ? "没有新内容" : row.kind === "reminder" ? "提醒"
+    : row.detail === "iteration_budget" ? "结果（轮数用完，可能不全）" : STOPPED_EARLY.has(row.detail) ? "结果（提前收尾，可能不全）" : "结果";
   if (row.state === "skipped") return row.skipped_count ? `错过 ${row.skipped_count} 次` : "已暂停";
   return row.state === "unknown" ? "结果未知" : "没能完成";
 }

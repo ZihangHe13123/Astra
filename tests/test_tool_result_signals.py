@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from agent.core.msg import ContentBlock, Msg
-from agent.runtime.react import ReActAgent
+from agent.runtime.react import REPEATED_CALLS_PER_TURN, ReActAgent
 from agent.runtime.task_store import TaskStore
 from agent.runtime.tool_execution import PartialResult
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
@@ -108,18 +108,20 @@ def test_repeated_observation_says_it_is_a_replay_and_that_one_more_ends_the_tur
     world = _World()
     registry = ToolRegistry()
     world.register(registry)
-    llm = _ScriptedLLM([("status", "{}"), ("status", "{}")])
+    llm = _ScriptedLLM([("status", "{}")] * REPEATED_CALLS_PER_TURN)
     agent = ReActAgent("agent", llm, registry, max_iterations=6, task_store=store)
 
     _turn(agent, store)
 
-    first, second = _tool_messages(agent)
-    assert world.reads == 1
+    first, *replays = _tool_messages(agent)
+    assert world.reads == 1 and len(replays) == REPEATED_CALLS_PER_TURN - 1
     assert "not run again" not in first
     assert "identical call" not in first
-    assert "value is before" in second
-    assert "not run again" in second
-    assert "one more identical call" in second
+    for replay in replays:
+        assert "value is before" in replay
+        assert "not run again" in replay
+    # Only the last allowed one warns that another identical call ends the turn.
+    assert ["one more identical call" in replay for replay in replays] == [False] * (len(replays) - 1) + [True]
 
 
 def test_failed_observation_is_tried_again_on_retry(tmp_path: Path):

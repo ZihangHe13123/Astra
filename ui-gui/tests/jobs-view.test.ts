@@ -28,6 +28,7 @@ test("results say what happened and where they went", () => {
   assert.equal(resultLabel(row({})), "结果");
   assert.equal(resultLabel(row({ quiet: true })), "没有新内容");
   assert.equal(resultLabel(row({ detail: "iteration_budget" })), "结果（轮数用完，可能不全）");
+  assert.equal(resultLabel(row({ detail: "repeated_tool_call" })), "结果（提前收尾，可能不全）");
   assert.equal(resultText(row({ quiet: true })), "和上次相比没有变化，没有打扰你。");
   assert.equal(resultLabel(row({ kind: "reminder" })), "提醒");
   assert.equal(resultLabel(row({ state: "skipped", skipped_count: 3 })), "错过 3 次");

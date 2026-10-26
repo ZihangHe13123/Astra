@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-from agent.runtime.jobs.store import MAX_OUTPUT, NO_UPDATE, ROUNDS_USED_UP, JobStore
+from agent.runtime.jobs.store import MAX_OUTPUT, NO_UPDATE, STOPPED_EARLY, JobStore
 from agent.runtime.usage import (
     UsageLedger,
     UsagePreferences,
@@ -111,7 +111,7 @@ async def run_check(store: JobStore, run: dict) -> None:
     agent.context.set_session(str(root / "session.json"))
     output = ""
     error = ""
-    rounds_used_up = False
+    stopped_early = ""
     last_progress = 0.0
     # This run's model requests count toward today's usage and budget, as a scheduled job's.
     try:
@@ -145,9 +145,9 @@ async def run_check(store: JobStore, run: dict) -> None:
             elif event.get("type") == "error":
                 # Provider errors may embed URLs or secrets; keep the public code only.
                 code = str(event.get("code") or "scheduled_check_failed")[:120]
-                # Out of rounds, the check still answers from what it found; that answer is the result.
-                if code == ROUNDS_USED_UP:
-                    rounds_used_up = True
+                # Stopped by a guard, the check still answers from what it found; that answer is the result.
+                if code in STOPPED_EARLY:
+                    stopped_early = stopped_early or code
                 else:
                     error = code
         current = asyncio.current_task()
@@ -163,7 +163,7 @@ async def run_check(store: JobStore, run: dict) -> None:
                  "cache_hit_tokens": context.total_cache_hit_tokens}
         quiet = on_change and not error and output.strip().strip("`*. ") == NO_UPDATE
         store.finish(run["id"], "failed" if error else "completed", output=output,
-                     detail=error or (ROUNDS_USED_UP if rounds_used_up else ""), quiet=quiet, usage=usage)
+                     detail=error or stopped_early, quiet=quiet, usage=usage)
     finally:
         reset_usage_context(usage_tokens)
         agent.end_session("scheduled_job_finished")

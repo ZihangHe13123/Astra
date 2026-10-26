@@ -14,7 +14,7 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from .calendar import quiet_hours, quiet_until
-from .store import ROUNDS_USED_UP, JobStore
+from .store import ROUNDS_USED_UP, STOPPED_EARLY, JobStore
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +39,8 @@ def push_message(push: dict) -> tuple[str, str]:
         title = f"提醒：{name}" if spec["kind"] == "reminder" and not spec.get("trigger") else f"定时任务：{name}"
         if push["detail"] == ROUNDS_USED_UP:
             title += "（轮数用完，可能不全）"
+        elif push["detail"] in STOPPED_EARLY:
+            title += "（提前收尾，可能不全）"
         body = push["output"].strip()
     elif state == "skipped":
         title = f"定时任务已暂停：{name}"

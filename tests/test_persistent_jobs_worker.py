@@ -15,6 +15,7 @@ import pytest
 
 from agent.runtime.jobs import scheduler
 from agent.runtime.jobs.store import JobStore
+from agent.runtime.react import REPEATED_CALLS_PER_TURN
 from agent.runtime.session_store import SessionStore
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,8 +43,9 @@ class Handler(BaseHTTPRequestHandler):
             reason = "tool_calls"
         elif body.get("tools") and sum(message["role"] == "tool" for message in body["messages"]) < self.server.tool_rounds:
             # Keeps looking, round after round of the same run, while it is offered tools.
+            name, arguments = self.server.tool_call
             delta = {"tool_calls": [{"index": 0, "id": f"look-{len(self.server.requests)}", "type": "function",
-                                     "function": {"name": "current_time", "arguments": "{}"}}]}
+                                     "function": {"name": name, "arguments": arguments}}]}
             reason = "tool_calls"
         else:
             delta = {"content": getattr(self.server, "reply", "fixture-check-result")}
@@ -62,6 +64,7 @@ def provider(tmp_path):
     server.requests = []
     server.try_write = False
     server.tool_rounds = 0
+    server.tool_call = ("current_time", "{}")
     server.target = tmp_path / "protected.txt"
     server.target.write_text("ORIGINAL", encoding="utf-8")
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -156,6 +159,31 @@ def test_a_check_that_runs_out_of_rounds_delivers_what_it_found_as_a_result(tmp_
     assert command(env, "show", job["id"])["job"]["state"] == "enabled"
     # The last request asked for an answer without tools.
     assert not provider.requests[-1]["body"].get("tools")
+
+
+def test_a_check_stopped_for_repeating_itself_still_delivers_and_the_clock_may_be_read_again(tmp_path, provider):
+    env = environment(tmp_path / "A", provider)
+    (tmp_path / "notes.txt").write_text("unchanged notes", encoding="utf-8")
+    provider.tool_rounds = 10
+    provider.tool_call = ("read_file", json.dumps({"path": "notes.txt"}))
+    provider.reply = "What the notes say, written up."
+    job = command(env, "add", "check", "--after", "60", "--model", "fixture", "--workdir", str(tmp_path),
+                  "--prompt", "Read my notes", "--request", "Check my notes")
+    command(env, "run", job["id"])
+    [run] = command(env, "show", job["id"])["occurrences"]
+    assert (run["state"], run["detail"]) == ("completed", "repeated_tool_call")
+    assert run["output"].endswith("What the notes say, written up.")
+    # Allowed identical reads, the one refused, and the answer without tools.
+    assert len(provider.requests) == REPEATED_CALLS_PER_TURN + 2
+    # The time differs on every call, so asking for it again and again is not a loop.
+    before = len(provider.requests)
+    provider.tool_rounds, provider.tool_call = REPEATED_CALLS_PER_TURN + 2, ("current_time", "{}")
+    clock = command(env, "add", "check", "--after", "60", "--model", "fixture", "--workdir", str(tmp_path),
+                    "--prompt", "Watch the clock", "--request", "Check the time")
+    command(env, "run", clock["id"])
+    [run] = command(env, "show", clock["id"])["occurrences"]
+    assert (run["state"], run["detail"]) == ("completed", "")
+    assert len(provider.requests) - before == REPEATED_CALLS_PER_TURN + 3
 
 
 def test_real_worker_secrets_and_results_follow_a_to_b_to_a_scope(tmp_path, provider):

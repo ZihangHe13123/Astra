@@ -212,6 +212,8 @@ def test_messages_name_the_job_and_explain_pauses_and_failures(tmp_path):
     # Out of rounds, the check still answered from what it found: that answer is sent, marked as maybe incomplete.
     used_up = {**long, "output": "三条已核实的新闻", "detail": "iteration_budget"}
     assert push_message(used_up) == ("定时任务：x（轮数用完，可能不全）", "三条已核实的新闻")
+    repeated = {**used_up, "detail": "repeated_tool_call"}
+    assert push_message(repeated) == ("定时任务：x（提前收尾，可能不全）", "三条已核实的新闻")
 
 
 def test_the_active_marker_follows_jobs_and_pending_pushes(tmp_path):

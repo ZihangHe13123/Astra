@@ -151,9 +151,11 @@ grace period to close detached provider processes before stopping its group.
 `--iterations N` bounds the ReAct loop (default 30 for a check with `--web`,
 otherwise 10; maximum 50). `astra jobs update ID --iterations N --timeout SECONDS`
 changes them for later runs, and the tool's `update` takes `max_rounds` and
-`time_limit_minutes`. A check that uses up its rounds still answers from what it
-found: that answer is the result, marked "rounds used up, maybe incomplete" in the
-inbox and the push, and it does not count toward the failures that pause a job. If an execution
+`time_limit_minutes`. A check that a safety guard stops still answers from what it
+found: out of rounds, the same call a fourth time in a turn, a tool's calls for the
+turn used up, or a tool failing again and again. That answer is the result, marked
+"rounds used up" or "stopped early", maybe incomplete, in the inbox and the push,
+and it does not count toward the failures that pause a job. If an execution
 owner disappears or a running worker must be terminated, the occurrence becomes
 `unknown` and is never automatically replayed. Inspect its saved session before
 starting another check. A child still alive after its scheduler exits retains its

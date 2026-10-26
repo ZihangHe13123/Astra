@@ -32,8 +32,10 @@ FAILURES_BEFORE_PAUSE = 3
 # A check's ceilings on model rounds and on wall time. Searching the web takes many more rounds than reading files.
 CHECK_ROUNDS, WEB_CHECK_ROUNDS = 10, 30
 CHECK_SECONDS, WEB_CHECK_SECONDS = 900.0, 2700.0
-# A run that used up its rounds still answers from what it found: a result, though maybe an incomplete one.
+# A run a safety guard stopped still answers from what it found: a result, though maybe an incomplete one.
+# Out of rounds; the same call again and again; a tool's calls for the turn used up; a tool failing in a row.
 ROUNDS_USED_UP = "iteration_budget"
+STOPPED_EARLY = frozenset({ROUNDS_USED_UP, "repeated_tool_call", "tool_budget", "tool_circuit"})
 BUDGET_NOTICE = "今天的模型用量已超过每日预算，这次检查没有运行；明天照常。"
 INACTIVE_SECONDS = 7 * 86400
 INTERACTION_FILE = "last-interaction"
