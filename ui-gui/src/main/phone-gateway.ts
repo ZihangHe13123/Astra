@@ -1,13 +1,15 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
-import { extname, resolve, sep } from "node:path";
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { basename, extname, join, resolve, sep } from "node:path";
 import type { DesktopEvent } from "../bridge.js";
 import { PHONE_INVOKE_METHODS, type PhoneInvokeMethod, type PhoneStreamControl } from "../phone-protocol.js";
 import { PhoneAuthError, type PhoneDevices } from "./phone-devices.js";
 
 const AUTH_BODY_LIMIT = 16 * 1024;
 const INVOKE_BODY_LIMIT = 2 * 1024 * 1024;
+/** One photo or file a phone hands over for a conversation. */
+export const UPLOAD_LIMIT = 25 * 1024 * 1024;
 const STREAM_BACKLOG_LIMIT = 8 * 1024 * 1024;
 const REPLAY_EVENTS = 4000;
 const HEARTBEAT_MS = 20_000;
@@ -40,6 +42,10 @@ export type PhoneGatewayOptions = {
   /** Answers a paired phone's calls; the desktop process owns sessions and their rules. */
   invoke: PhoneInvoke;
   port: number;
+  /** Where photos and files a phone sends are kept, one folder a day; none: the phone cannot send files. */
+  uploadRoot?: string;
+  /** Told of each file a phone sent, for the audit log. */
+  uploaded?: (deviceId: string, path: string, bytes: number) => void;
 };
 
 /**
@@ -125,6 +131,14 @@ export class PhoneGateway {
     if (path === "/api/events" && request.method === "GET") return this.events(url, request, response);
     if (path.startsWith("/api/voice/") && request.method === "GET") return this.voice(path.slice("/api/voice/".length), request, response);
     if (request.method !== "POST") return send(response, 405, { error: "Method not allowed" });
+    if (path === "/api/upload") {
+      const deviceId = this.bearer(request);
+      if (!deviceId) return send(response, 401, { error: "Sign in again" });
+      if (!this.options.uploadRoot) return send(response, 404, { error: "Not found" });
+      const saved = await this.saveUpload(request, uploadName(request.headers["x-astra-file-name"]));
+      this.options.uploaded?.(deviceId, saved.path, saved.bytes);
+      return send(response, 200, { path: saved.path });
+    }
     if (path === "/api/invoke") {
       const deviceId = this.bearer(request);
       if (!deviceId) return send(response, 401, { error: "Sign in again" });
@@ -143,6 +157,22 @@ export class PhoneGateway {
     if (path === "/api/challenge") return send(response, 200, { nonce: this.devices.challenge(body.deviceId) });
     if (path === "/api/session") return send(response, 200, this.devices.signIn(body.deviceId, body.nonce, body.signature));
     return send(response, 404, { error: "Not found" });
+  }
+
+  /** Keeps what a phone sent under the day's folder, readable by this user alone, and says where. */
+  private async saveUpload(request: IncomingMessage, name: string): Promise<{ path: string; bytes: number }> {
+    let size = 0; const chunks: Buffer[] = [];
+    for await (const chunk of request) {
+      size += chunk.length;
+      if (size > UPLOAD_LIMIT) throw new Error(`文件太大：一次最多 ${UPLOAD_LIMIT / 1024 / 1024} MB。`);
+      chunks.push(chunk);
+    }
+    const now = new Date(), pad = (value: number) => String(value).padStart(2, "0");
+    const folder = join(this.options.uploadRoot!, `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`);
+    mkdirSync(folder, { recursive: true, mode: 0o700 });
+    const path = join(folder, `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}-${randomUUID().slice(0, 6)}-${name}`);
+    writeFileSync(path, Buffer.concat(chunks), { mode: 0o600, flag: "wx" });
+    return { path, bytes: size };
   }
 
   /** Whether this phone has the app open: its event stream is connected, so it needs no push. */
@@ -235,6 +265,16 @@ function sameOrigin(request: IncomingMessage): boolean {
   const origin = request.headers.origin;
   if (!origin) return true;
   try { return new URL(origin).host === request.headers.host; } catch { return false; }
+}
+
+/** A file name a phone sent, made safe to keep: no folders, no control characters, a bounded length. */
+export function uploadName(header: string | string[] | undefined): string {
+  let name = Array.isArray(header) ? header[0] : header || "";
+  try { name = decodeURIComponent(name); } catch { /* sent unencoded */ }
+  name = basename(name.replace(/\\/g, "/")).replace(/[\u0000-\u001f\u007f"]/g, "").trim();
+  if (!name || name === "." || name === "..") return "file";
+  const extension = extname(name).slice(0, 16);
+  return name.length > 120 ? `${name.slice(0, 120 - extension.length)}${extension}` : name;
 }
 
 function send(response: ServerResponse, status: number, body: unknown) {

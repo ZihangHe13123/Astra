@@ -27,6 +27,8 @@ export type SessionState = {
   preparation?: ToolPreparation;
   responseVersions?: ResponseVersions; responseOperation?: ResponseOperation; regeneration?: ResponseRegeneration;
   branchId?: string;
+  /** The personal thread: the desktop background host's own conversation (specs/personal-thread.md). */
+  personal?: boolean;
 };
 export function initialSession(id: string, workspace = ""): SessionState {
   return { id, workspace, session: "", mode: "work", status: "connecting", busy: false, isDraft: false,
@@ -250,6 +252,8 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
     case "memory_recall": append("system", memoryRecallText(event)); break;
     // Over today's budget: said once a day, in whichever conversation crossed it.
     case "usage_notice": append("system", event.message); break;
+    // A scheduled job's result joined the personal thread as Astra's own message, worded as the backend keeps it.
+    case "job_result": append("assistant", `【${event.title}】\n${event.text}`); break;
     default: state.info = { ...state.info, [event.type]: event }; break;
   }
   return state;

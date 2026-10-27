@@ -55,4 +55,6 @@ def register_time_tools(registry: ToolRegistry):
         },
         fn=_current_time,
         sandboxed=True,
+        # The answer changes with every call, so asking again is never a loop.
+        repeat_guard=False,
     ))

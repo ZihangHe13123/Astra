@@ -53,6 +53,17 @@ export class PhoneClient {
     return body.result;
   }
 
+  /** Hands a photo or file to the desktop; answers where it was kept, for the conversation to read. */
+  async upload(token: string, file: Blob, name: string): Promise<string> {
+    const response = await this.fetcher(`${this.base}/api/upload`, { method: "POST", cache: "no-store",
+      headers: { "Content-Type": "application/octet-stream", Authorization: `Bearer ${token}`, "X-Astra-File-Name": encodeURIComponent(name) },
+      body: file });
+    if (response.status === 401) throw new TokenExpiredError();
+    const body = await response.json().catch(() => ({})) as { path?: string; error?: string };
+    if (!response.ok || !body.path) throw new Error(body.error || `上传失败（${response.status}）`);
+    return body.path;
+  }
+
   /** One unit of speech the desktop handed to this phone, as WAV bytes. */
   async voice(token: string, id: string): Promise<ArrayBuffer> {
     const response = await this.fetcher(`${this.base}/api/voice/${encodeURIComponent(id)}`, { headers: { Authorization: `Bearer ${token}` }, cache: "no-store" });

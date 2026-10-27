@@ -11,7 +11,7 @@ import threading
 import time
 from pathlib import Path
 
-from agent.runtime.jobs.store import MAX_OUTPUT, NO_UPDATE, JobStore
+from agent.runtime.jobs.store import MAX_OUTPUT, NO_UPDATE, STOPPED_EARLY, JobStore
 from agent.runtime.usage import (
     UsageLedger,
     UsagePreferences,
@@ -45,7 +45,10 @@ async def run_check(store: JobStore, run: dict) -> None:
     progress.touch()
     load_project_env(Path(__file__).resolve().parents[2])
     os.chdir(spec["workdir"])
-    entry = configured_model_catalog().resolve_persisted(spec["model"])
+    # A check without a model of its own uses the default model as it is now.
+    from agent.cli.jobs_commands import job_model_key
+
+    entry = configured_model_catalog().resolve_persisted(spec["model"] or job_model_key(""))
     if entry is None:
         raise ValueError("The scheduled model is no longer configured.")
     profile = entry.profile
@@ -111,6 +114,7 @@ async def run_check(store: JobStore, run: dict) -> None:
     agent.context.set_session(str(root / "session.json"))
     output = ""
     error = ""
+    stopped_early = ""
     last_progress = 0.0
     # This run's model requests count toward today's usage and budget, as a scheduled job's.
     try:
@@ -143,7 +147,12 @@ async def run_check(store: JobStore, run: dict) -> None:
                 output = (output + str(event.get("content", "")))[:MAX_OUTPUT]
             elif event.get("type") == "error":
                 # Provider errors may embed URLs or secrets; keep the public code only.
-                error = str(event.get("code") or "scheduled_check_failed")[:120]
+                code = str(event.get("code") or "scheduled_check_failed")[:120]
+                # Stopped by a guard, the check still answers from what it found; that answer is the result.
+                if code in STOPPED_EARLY:
+                    stopped_early = stopped_early or code
+                else:
+                    error = code
         current = asyncio.current_task()
         if current is not None and current.cancelling():
             # ReAct can turn cancellation into a final error event. It is still
@@ -156,8 +165,8 @@ async def run_check(store: JobStore, run: dict) -> None:
         usage = {"prompt_tokens": context.total_prompt_tokens, "completion_tokens": context.total_completion_tokens,
                  "cache_hit_tokens": context.total_cache_hit_tokens}
         quiet = on_change and not error and output.strip().strip("`*. ") == NO_UPDATE
-        store.finish(run["id"], "failed" if error else "completed", output=output, detail=error,
-                     quiet=quiet, usage=usage)
+        store.finish(run["id"], "failed" if error else "completed", output=output,
+                     detail=error or stopped_early, quiet=quiet, usage=usage)
     finally:
         reset_usage_context(usage_tokens)
         agent.end_session("scheduled_job_finished")

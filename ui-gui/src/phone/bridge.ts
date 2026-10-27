@@ -26,11 +26,13 @@ export type BridgeEnvironment = {
   };
   /** The session a notification opened the app for, if any. */
   opening?: string;
+  /** The phone's own picker: camera, photo library or files. Resolves with nothing when cancelled. */
+  pickFiles?(): Promise<File[]>;
 };
 
 const DEFAULTS: Preferences = { theme: "system", drafts: {}, attachments: {}, workspaces: {}, pinned: [], projects: [], titles: {}, timeline: true };
 const UNAVAILABLE = {
-  choose: "手机上还不能选择文件或文件夹。",
+  choose: "手机上不能选择文件夹。",
   file: "文件预览和打开只在电脑上可用。",
   appshot: "窗口捕获只在电脑上可用。",
   export: "导出会话只在电脑上可用。",
@@ -57,6 +59,9 @@ export class RemoteBridge implements DesktopBridge {
   /** While the page is hidden the stream stays closed, so the desktop knows to notify instead. */
   private hidden = false;
   private shown?: () => void;
+  /** Failed attempts to reach the Mac in a row, and whether the page was told it is unreachable. */
+  private failures = 0;
+  private offline = false;
   private shared: Partial<Preferences> = {};
   private readyWaiters: (() => void)[] = [];
   private isReady = false;
@@ -104,6 +109,10 @@ export class RemoteBridge implements DesktopBridge {
         await this.env.client.follow(await this.authorize(), this.position, (data, id) => { this.receive(data, id); delay = 1000; }, this.stream.signal);
       } catch (error) {
         if (error instanceof TokenExpiredError) this.token = undefined;
+        // Two misses in a row (not a stream closed on purpose) say the Mac cannot be reached right now.
+        else if (!this.stream?.signal.aborted && !this.stopped && ++this.failures >= 2 && !this.offline) {
+          this.offline = true; this.deliver([{ link: "offline" }]);
+        }
       }
       if (this.stopped) return;
       if (this.hidden) { await new Promise<void>(resolve => { this.shown = resolve; }); this.shown = undefined; continue; }
@@ -115,10 +124,14 @@ export class RemoteBridge implements DesktopBridge {
   /** Stops following the desktop (the page is going away). */
   dispose() { this.stopped = true; this.stream?.abort(); this.shown?.(); }
 
+  private deliver(events: DesktopEvent[]) { for (const handler of this.handlers) handler(events); }
+
   private receive(data: string, id?: number) {
     const message = JSON.parse(data) as DesktopEvent | PhoneStreamControl;
     if ("reload" in message) { this.env.reload(); return; }
     if ("ready" in message) {
+      this.failures = 0;
+      if (this.offline) { this.offline = false; this.deliver([{ link: "online" }]); }
       this.position ??= { seq: message.seq, instance: message.instance };
       this.isReady = true;
       for (const resolve of this.readyWaiters.splice(0)) resolve();
@@ -206,7 +219,26 @@ export class RemoteBridge implements DesktopBridge {
   }
   async preferences(value: Partial<Preferences>) { this.store(value); return this.merged(); }
   flushPreferences(value: Partial<Preferences>) { this.store(value); }
-  choose(): Promise<string[]> { return Promise.reject(new Error(UNAVAILABLE.choose)); }
+  /** Files only: opened straight from the tap, as iOS shows its picker only then; each is then sent to the Mac. */
+  choose(kind: "files" | "folder" = "files"): Promise<string[]> {
+    if (kind !== "files") return Promise.reject(new Error(UNAVAILABLE.choose));
+    if (!this.env.pickFiles) return Promise.reject(new Error("这个浏览器不能选择文件。"));
+    return this.env.pickFiles().then(files => this.upload(files));
+  }
+
+  async upload(files: File[]): Promise<string[]> {
+    const paths: string[] = [];
+    for (const file of files) {
+      const name = file.name || `${file.type.startsWith("image/") ? "photo" : "file"}.${file.type.split("/")[1] || "bin"}`;
+      try { paths.push(await this.env.client.upload(await this.authorize(), file, name)); }
+      catch (error) {
+        if (!(error instanceof TokenExpiredError)) throw error;
+        this.token = undefined;
+        paths.push(await this.env.client.upload(await this.authorize(), file, name));
+      }
+    }
+    return paths;
+  }
   clipboardImage() { return Promise.resolve(null); }
   copyText(text: string) { return this.env.copy(text); }
   appshot(): Promise<void> { return Promise.reject(new Error(UNAVAILABLE.appshot)); }

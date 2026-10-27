@@ -3,7 +3,15 @@ import type { FilePreview } from "./file-preview-types.js";
 
 export type SessionEntry = { name: string; mode: string; modified: number };
 export type Preferences = { theme: string; drafts: Record<string, string>; attachments: Record<string, string[]>; workspaces: Record<string, string>; pinned: string[]; projects: string[]; titles: Record<string, string>; timeline: boolean; detailWidth?: number; lastSession?: { session: string; mode: string; workspace: string } | null };
-export type DesktopEvent = { removed: string } | { runtime: string; revision: number; event: UIEvent } | { refresh: true } | { appshot: { connection: string; enabled: boolean } };
+export type DesktopEvent = { removed: string } | { runtime: string; revision: number; event: UIEvent } | { refresh: true } | { appshot: { connection: string; enabled: boolean } }
+  /** A session the window did not open: the personal thread, started (again) by the background host. */
+  | { opened: SessionState }
+  /** On a phone: whether the Mac can be reached (it may be asleep, closed, or off the tailnet). */
+  | { link: "online" | "offline" };
+/** The personal thread's session name (specs/personal-thread.md); the background host holds it. */
+export const PERSONAL_SESSION = "personal";
+/** The personal thread's name among the conversations it hands work to (agent/runtime/peer_link.py). */
+export const PERSONAL_PEER_NAME = "个人对话";
 export type Bootstrap = { sessions: SessionState[]; active: string; workspace: string; preferences: Preferences; appshot: { connection: string; enabled: boolean } };
 export type CommandDescription = { id: string; command: string; description: string; takes_args: boolean; group: string; options: { command: string; description: string; completion: string; submitValue?: string }[] };
 import type { PhoneAction, PhoneNotificationState, PhoneStatus } from "./phone-protocol.js";
@@ -11,6 +19,8 @@ export interface DesktopBridge {
   /** Set on a paired phone, where the window runs over the gateway and Mac-only actions are unavailable. */
   remote?: boolean;
   bootstrap(): Promise<Bootstrap>;
+  /** On a paired phone: hands photos or files (a paste, say) to the Mac and answers where they were kept. */
+  upload?(files: File[]): Promise<string[]>;
   /** On a paired phone: its notifications (Web Push), off until the person turns them on there. */
   notifications?(action: "status" | "enable" | "disable"): Promise<PhoneNotificationState>;
   /** Paired phones (settings): their list, pairing and removal, and whether the gateway runs. */
@@ -22,7 +32,7 @@ export interface DesktopBridge {
   send(id: string, command: UIEvent): Promise<void>;
   query(method: string, params?: Record<string, unknown>, runtime?: string): Promise<any>;
   /** The person's change to a scheduled job (pause, resume, remove, run, read) or to the quiet hours. */
-  jobs(action: "pause" | "resume" | "remove" | "run" | "read" | "quiet", value?: string, extra?: string): Promise<any>;
+  jobs(action: "pause" | "resume" | "remove" | "run" | "read" | "quiet" | "model", value?: string, extra?: string): Promise<any>;
   /** The person's change to their memory: core entries (add, edit, remove), saved memories (forget, correct), proposals. */
   memory(action: "core-add" | "core-edit" | "core-remove" | "forget" | "correct" | "accept" | "dismiss", ...values: string[]): Promise<string>;
   /** The person's daily model budget ("off", a token count or an amount like ¥5) and per-million prices. */

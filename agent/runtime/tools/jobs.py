@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.runtime.jobs.calendar import WEEKDAYS, calendar_schedule, describe, local_timezone_name, set_quiet_hours, zone
-from agent.runtime.jobs.store import NOTIFY_POLICIES, PUSH_TARGETS, JobStore, normalize_trigger
+from agent.runtime.jobs.store import DEFAULT_TARGETS, NOTIFY_POLICIES, PUSH_TARGETS, JobStore, normalize_trigger
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
 
 ACTIONS = ("add", "list", "update", "pause", "resume", "remove", "run", "quiet")
@@ -59,7 +59,14 @@ PARAMETERS = {"type": "object", "properties": {
                                                         "(read-only, macOS)."},
     "quiet_hours": {"type": "string", "description": "For quiet: HH:MM-HH:MM on a 24-hour clock, or off."},
     "targets": {"type": "array", "items": {"type": "string", "enum": list(PUSH_TARGETS)},
-                "description": "Where results are pushed besides the inbox. Omit for both; [] for the inbox only."},
+                "description": "Where results are pushed besides the personal thread and the inbox. Omit for the "
+                               "desktop (which also notifies the phone); add weixin only when the person asks for "
+                               "WeChat; [] for no push."},
+    "max_rounds": {"type": "integer", "minimum": 1, "maximum": 50,
+                   "description": "A check's most model rounds per run (default 30 with web, else 10). Raise it "
+                                  "when a check runs out of rounds before it has covered what was asked."},
+    "time_limit_minutes": {"type": "number", "minimum": 2, "maximum": 1440,
+                           "description": "A check's most minutes per run (default 45 with web, else 15)."},
 }, "required": ["action"]}
 
 
@@ -168,12 +175,12 @@ def _when(job: dict) -> str:
     return f"once at {_local(job['next_at'], spec)}"
 
 
-_TARGET_NAMES = {"desktop": "桌面通知", "weixin": "微信"}
+_TARGET_NAMES = {"desktop": "桌面和手机", "weixin": "微信"}
 
 
 def _where(targets) -> str:
     names = [_TARGET_NAMES[target] for target in targets]
-    return ("发到" + "和".join(names) + "，收件箱里也有一份") if names else "只放进收件箱"
+    return "写进个人对话" + (("，并通知" + "、".join(names)) if names else "，不另外通知")
 
 
 def _summary(job: dict) -> dict[str, Any]:
@@ -183,6 +190,8 @@ def _summary(job: dict) -> dict[str, Any]:
             "next_run": _local(job["next_at"], spec) if job["state"] == "enabled" and not spec.get("trigger") else "",
             "notify": spec.get("notify", "always"), "web": spec.get("web", False), "mail": spec.get("mail", False),
             "read_calendar": spec.get("read_calendar", False), "targets": spec.get("targets", list(PUSH_TARGETS)),
+            **({"model": spec.get("model") or "default", "max_rounds": spec.get("max_iterations"),
+                "time_limit_minutes": spec.get("timeout_seconds", 0) / 60} if spec["kind"] == "check" else {}),
             "last_outcome": job.get("last_outcome") or "", "prompt": spec["prompt"]}
 
 
@@ -229,6 +238,17 @@ def _quiet(value: object) -> dict | None:
     return {"start": calendar_schedule(match[1])["time"], "end": calendar_schedule(match[2])["time"]}
 
 
+def _limits(args: dict) -> bool:
+    return args.get("max_rounds") is not None or args.get("time_limit_minutes") is not None
+
+
+def _limits_text(args: dict) -> str:
+    """A check's new ceilings, for the approval card."""
+    parts = ([f"最多 {args['max_rounds']} 轮"] if args.get("max_rounds") is not None else []) + (
+        [f"每次最多 {float(args['time_limit_minutes']):g} 分钟"] if args.get("time_limit_minutes") is not None else [])
+    return ("；" + "、".join(parts)) if parts else ""
+
+
 def _plan(args: dict, now: float) -> str:
     """What a schedule would read as before it exists, for the approval card."""
     schedule = _schedule(args, now) or {}
@@ -258,14 +278,18 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
                 raise ValueError("add needs a schedule: time (+days), every_minutes, at, or after_minutes.")
             if args.get("kind") == "reminder" and (args.get("web") or args.get("mail") or args.get("read_calendar")):
                 raise ValueError("A reminder does not use the web, mail or the calendar.")
+            if args.get("kind") == "reminder" and _limits(args):
+                raise ValueError("A reminder does not use a model, so it has no rounds or time limit.")
         elif action != "list":
             if not args.get("job_id"):
                 raise ValueError(f"{action} needs a job_id from list.")
-            store().job(str(args["job_id"]))
+            job = store().job(str(args["job_id"]))
             if action == "update":
                 if args.get("on_new_mail") or args.get("on_new_file"):
                     raise ValueError("To start a job on an event, add a new one; update keeps the kind of start.")
                 _schedule(args, now)
+                if job["spec"]["kind"] == "reminder" and _limits(args):
+                    raise ValueError("A reminder does not use a model, so it has no rounds or time limit.")
 
     def permission(args: dict) -> dict[str, Any] | None:
         action = str(args.get("action") or "")
@@ -287,8 +311,8 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
                 ["你的日程和提醒事项"] if args.get("read_calendar") else [])
             reads = ("一次只读检查：" + "、".join(sources)) if kind == "check" else "一条提醒"
             title = f"新建定时任务：{str(args.get('name') or '').strip()}"
-            target = f"{_plan(args, now)}；{reads}"
-            where = _where(args["targets"] if args.get("targets") is not None else PUSH_TARGETS)
+            target = f"{_plan(args, now)}；{reads}" + _limits_text(args)
+            where = _where(args["targets"] if args.get("targets") is not None else DEFAULT_TARGETS)
             effect = f"到点在本机运行{reads}，结果{where}。不会写入文件、替你发消息或操作电脑。"
             question = "要创建这个定时任务吗？"
         else:
@@ -296,6 +320,8 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
             name = job["spec"]["name"]
             target = (_plan(args, now) if action == "update" else "") or job_schedule_text(
                 job["spec"], job["interval_seconds"], job["next_at"])
+            if action == "update":
+                target += _limits_text(args)
             title, effect, question = {
                 "update": (f"修改定时任务：{name}", "之后的运行按新的设置进行" + (
                     f"，结果{_where(args['targets'])}" if args.get("targets") is not None else "") + "。", "要这样修改吗？"),
@@ -312,9 +338,11 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
                    at: str = "", after_minutes: float | None = None, notify: str | None = None,
                    web: bool | None = None, mail: bool | None = None, read_calendar: bool | None = None,
                    targets: list[str] | None = None,
-                   quiet_hours: str = "", on_new_mail: dict | None = None, on_new_file: dict | None = None) -> str:
+                   quiet_hours: str = "", on_new_mail: dict | None = None, on_new_file: dict | None = None,
+                   max_rounds: int | None = None, time_limit_minutes: float | None = None) -> str:
         args = {"time": time, "days": days, "every_minutes": every_minutes, "at": at, "after_minutes": after_minutes,
                 "on_new_mail": on_new_mail, "on_new_file": on_new_file}
+        timeout = time_limit_minutes * 60 if time_limit_minutes is not None else None
         jobs_store = store()
         now = _now()
         if action == "list":
@@ -328,24 +356,29 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
         if action == "add":
             schedule = _schedule(args, now) or {}
             check = kind != "reminder"
+            if check:
+                # A check follows the default model as it is at each run; there must be one to follow now.
+                model_key()
             interval = schedule.get("interval_seconds", 0)
             job = jobs_store.add(
                 name=name, prompt=prompt, original_request=authority[:8000], workdir=schedule.get("folder") or workdir(),
                 next_at=schedule.get("at"), interval_seconds=interval,
                 calendar=schedule.get("calendar"), trigger=schedule.get("trigger"), notify=notify or "always",
-                targets=PUSH_TARGETS if targets is None else targets,
+                targets=DEFAULT_TARGETS if targets is None else targets,
                 # The same catch-up windows as `astra jobs add`.
                 grace_seconds=3600 if schedule.get("calendar") else min(interval / 2, 3600) if interval else 300,
-                kind="check" if check else "reminder", model=model_key() if check else "",
+                kind="check" if check else "reminder", model="",
                 web=bool(web) if check else False, mail=bool(mail) if check else False,
-                read_calendar=bool(read_calendar) if check else False, now=now)
+                read_calendar=bool(read_calendar) if check else False,
+                max_iterations=max_rounds if check else None, timeout_seconds=timeout if check else None, now=now)
         elif action == "update":
             schedule = _schedule(args, now) or {}
             job = jobs_store.update(
                 job_id, request=authority, name=name or None, prompt=prompt or None,
                 interval_seconds=schedule.get("interval_seconds", 0) if schedule else None,
                 calendar=schedule.get("calendar"), at=schedule.get("at"), notify=notify, web=web,
-                targets=targets, mail=mail, read_calendar=read_calendar, now=now)
+                targets=targets, mail=mail, read_calendar=read_calendar, max_iterations=max_rounds,
+                timeout_seconds=timeout, now=now)
         elif action == "run":
             job = jobs_store.request_run(job_id, now=now)
         else:

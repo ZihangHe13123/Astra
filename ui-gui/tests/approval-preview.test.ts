@@ -46,3 +46,8 @@ test('filesystem and takeover approvals retain the actual targets and all suppli
   const takeover = render({ tool_name: 'computer', kind: 'computer_foreground_takeover', arguments: { application: 'Editor', window: 'draft', action_classes: ['text'], expected_effect: 'type text' } });
   for (const field of ['Editor', 'draft', 'text', 'type text']) assert.ok(takeover.includes(field));
 });
+
+test("a request from a chat's own conversation says which chat asks", () => {
+  assert.match(render({ channel: "weixin" }), /需要你的许可：来自微信的对话/);
+  assert.doesNotMatch(render({}), /来自/);
+});

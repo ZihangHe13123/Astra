@@ -78,6 +78,7 @@ jobs:
           node ui-gui/tests/card-smoke.mjs
           node ui-gui/tests/page-smoke.mjs
           node ui-gui/tests/jobs-smoke.mjs
+          node ui-gui/tests/personal-thread-smoke.mjs
           node ui-gui/tests/memory-smoke.mjs
       - name: Preserve failed desktop diagnostics
         if: failure()

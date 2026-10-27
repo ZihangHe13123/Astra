@@ -26,7 +26,11 @@ def home(tmp_path, monkeypatch):
 
 
 def test_views_of_an_empty_home_create_nothing(home, tmp_path):
-    assert jobs_overview(home) == {"jobs": [], "inbox": [], "quiet_hours": {"start": "23:00", "end": "08:00"}}
+    view = jobs_overview(home)
+    assert {key: view[key] for key in ("jobs", "inbox", "quiet_hours")} == {
+        "jobs": [], "inbox": [], "quiet_hours": {"start": "23:00", "end": "08:00"}}
+    # The page names the model a check following the default would use.
+    assert isinstance(view["default_model"], str)
     assert activity(home)["entries"] == []
     assert not home.exists() and not (tmp_path / "tasks.db").exists()
 
@@ -54,6 +58,7 @@ def test_jobs_overview_lists_jobs_results_and_where_they_went(home, tmp_path):
     [row] = view["jobs"]
     assert row["schedule"] == "每天 08:00（Asia/Singapore）" and row["targets"] == ["weixin"] and row["web"]
     assert row["next_at"] and row["notify"] == "on_change"
+    assert row["model"] == "fixture" and isinstance(view["default_model"], str)
     by_id = {item["id"]: item for item in view["inbox"]}
     assert by_id[first["id"]]["sent"] == ["weixin"] and by_id[first["id"]]["usage"] == {"prompt_tokens": 90}
     assert by_id[second["id"]]["quiet"] and by_id[second["id"]]["sent"] == []

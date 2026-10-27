@@ -46,7 +46,7 @@ from agent.runtime.llm import (
     _messages_for_capabilities,
 )
 from agent.runtime.message_source import message_source_ref
-from agent.runtime.react import ReActAgent
+from agent.runtime.react import REPEATED_CALLS_PER_TURN, ReActAgent
 from agent.runtime.session_store import SessionStore
 from agent.runtime.task_store import TaskStore
 from agent.runtime.tools.files import FilesystemPolicy, register_file_tools
@@ -1013,9 +1013,10 @@ def test_react_agent_stops_repeated_identical_tool_calls():
         agent = ReActAgent("agent", llm, registry, max_iterations=15)
         events = [event async for event in agent.reply_stream(Msg(content=[ContentBlock.text("loop")]))]
 
-        # Three planning attempts plus one final synthesis with tools disabled.
-        assert llm.calls <= 4
-        assert any(event["type"] == "error" and "repeated tool call" in event["message"] for event in events)
+        # The allowed identical calls, the one that ends the turn, and one final synthesis with tools disabled.
+        assert llm.calls == REPEATED_CALLS_PER_TURN + 2
+        assert any(event["type"] == "error" and event.get("code") == "repeated_tool_call"
+                   and "repeated tool call" in event["message"] for event in events)
         assert any(event["type"] == "chunk" and "工具执行已安全停止" in event["content"] for event in events)
         assert runtime_metrics.snapshot()["repeated_payload_count"] == 1
 

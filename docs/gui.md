@@ -64,6 +64,28 @@ current model. A missing current connection also has a **连接模型** action a
 the composer. This is useful for a separate checkout whose `.env` and login storage
 have not been configured yet.
 
+## Personal thread
+
+**个人对话** at the top of the sidebar is one long-lived conversation, apart from your
+project sessions. The desktop's background host holds it, so it keeps running with the
+window closed (from the tray), and a paired phone opens on it. Every scheduled job's
+result arrives in it as Astra's message, so you can ask about it right there. It works
+in its own folder (`personal` in Astra's data folder) rather than in a project, and its
+model is switched like any conversation's. It reads as a chat: your messages and Astra's in
+bubbles, a time heading after each pause, the tool calls of a step folded into one line that
+opens on a click, and job results as cards naming the job. It cannot be closed or deleted;
+`/new` in it starts afresh. WeChat keeps its own conversations. The design is in
+`specs/personal-thread.md`.
+
+Work in a project goes to a conversation there. Ask the thread ("in astra-master, find out
+why this test fails") and it opens a conversation in that project (a folder path, or a
+project's name as the sidebar lists it) and hands it the task through the local mailbox.
+That conversation works with its own tools, permissions and approvals, and shows
+**个人对话正在管理这个任务** with **接管**: take it over and the thread stops following
+it. While it works, the thread lists it with whatever it waits on: its approvals and
+questions can be answered right there, on the phone too. When it is done the thread hears
+back and tells you, and the desktop and a paired phone are notified.
+
 ## Conversations and tools
 
 - **新对话** returns to the current project's blank draft. Repeated clicks reuse
@@ -248,7 +270,8 @@ Public Astra does not bundle a private mode or private personas.
 
 **定时任务** in the sidebar lists the jobs Astra scheduled for you (see
 [persistent jobs](persistent-jobs.md)): when each runs next, how it reports, and
-whether it was paused and why. Pause, resume, run once now or remove one there;
+whether it was paused and why. Pause, resume, run once now or remove one there, and
+choose the model a check runs with (following the default, or one of yours);
 these are your own changes and ask for no approval. The quiet hours are set on the
 same page, and the inbox below keeps every result, unread ones marked, with where
 each was pushed and its token usage.

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { dayLabel, groupByDay, jobState, resultLabel, resultText, sourceLabel, targetsLabel, timeLabel, type InboxRow, type JobRow }
+import { dayLabel, groupByDay, jobModelOptions, jobState, resultLabel, resultText, sourceLabel, targetsLabel, timeLabel, type InboxRow, type JobRow }
   from "../src/renderer/jobs-view.js";
 
 const noon = new Date(2026, 9, 26, 12, 0).getTime();
@@ -27,13 +27,16 @@ test("results say what happened and where they went", () => {
     detail: "", skipped_count: 0, ...fields } as InboxRow);
   assert.equal(resultLabel(row({})), "结果");
   assert.equal(resultLabel(row({ quiet: true })), "没有新内容");
+  assert.equal(resultLabel(row({ detail: "iteration_budget" })), "结果（轮数用完，可能不全）");
+  assert.equal(resultLabel(row({ detail: "repeated_tool_call" })), "结果（提前收尾，可能不全）");
   assert.equal(resultText(row({ quiet: true })), "和上次相比没有变化，没有打扰你。");
   assert.equal(resultLabel(row({ kind: "reminder" })), "提醒");
   assert.equal(resultLabel(row({ state: "skipped", skipped_count: 3 })), "错过 3 次");
   assert.equal(resultLabel(row({ state: "failed", detail: "provider_error" })), "没能完成");
   assert.equal(resultText(row({ state: "failed", detail: "provider_error" })), "provider_error");
-  assert.equal(targetsLabel(["desktop", "weixin"]), "发到桌面通知和微信");
-  assert.equal(targetsLabel([]), "只进收件箱");
+  assert.equal(targetsLabel(["desktop", "weixin"]), "发到桌面和手机、微信");
+  assert.equal(targetsLabel(["thread", "desktop"]), "发到个人对话、桌面和手机");
+  assert.equal(targetsLabel([]), "不另外推送");
   assert.equal(sourceLabel("weixin"), "微信");
   assert.equal(sourceLabel(""), "对话");
 });
@@ -42,4 +45,13 @@ test("activity groups by day, newest first", () => {
   const groups = groupByDay([{ time: at(25, 9) }, { time: at(26, 8) }, { time: at(26, 11) }, { time: at(24, 20) }], noon);
   assert.deepEqual(groups.map(group => [group.label, group.entries.length]), [["今天", 2], ["昨天", 1], ["10月24日", 1]]);
   assert.equal(groups[0].entries[0].time, at(26, 11));
+});
+
+test("a check runs with the default model or one picked for it, and a picked one that is gone stays listed", () => {
+  const job = { model: "" } as JobRow;
+  const models = [{ key: "deepseek::deepseek-flash", name: "deepseek-flash", provider: "DeepSeek" }, { key: "", name: "broken" }];
+  assert.deepEqual(jobModelOptions(job, "opus", models), [
+    { value: "", label: "跟随默认（opus）" }, { value: "deepseek::deepseek-flash", label: "deepseek-flash · DeepSeek" }]);
+  assert.equal(jobModelOptions(job)[0].label, "跟随默认");
+  assert.deepEqual(jobModelOptions({ model: "old::gone" } as JobRow, "opus", models).at(-1), { value: "old::gone", label: "old::gone（不在模型列表里）" });
 });

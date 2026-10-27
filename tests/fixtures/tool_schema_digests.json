@@ -380,9 +380,9 @@
   },
   "jobs": {
     "sha256": [
-      "6799f26192f374ab"
+      "f083d90b87315de7"
     ],
-    "reason": "2026-10-25: new tool; the model schedules reminders and read-only checks the person asks for, each change approved. targets chooses where results are pushed; quiet sets the quiet hours; mail lets a check read the mailbox; on_new_mail and on_new_file start a job on an event; read_calendar (2026-10-26) lets a check read Calendar and Reminders."
+    "reason": "2026-10-25: new tool; the model schedules reminders and read-only checks the person asks for, each change approved. targets chooses where results are pushed; quiet sets the quiet hours; mail lets a check read the mailbox; on_new_mail and on_new_file start a job on an event; read_calendar (2026-10-26) lets a check read Calendar and Reminders; max_rounds and time_limit_minutes (2026-10-26) give a check more rounds and time; targets (2026-10-26) default to the desktop, every result also joining the personal thread."
   },
   "load_workspace_dependencies": {
     "sha256": [
@@ -428,9 +428,9 @@
   },
   "peer_send": {
     "sha256": [
-      "4e477c3fbd3393f7"
+      "e7cb214f8df1ba44"
     ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+    "reason": "2026-10-27: workspace lets the personal thread open a conversation in a project and hand it the task (specs/personal-thread.md D6)."
   },
   "peer_task_update": {
     "sha256": [

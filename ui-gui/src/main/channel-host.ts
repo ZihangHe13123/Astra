@@ -25,11 +25,11 @@ export function jobsActive(markerPath: string | undefined): boolean {
 
 /**
  * Keeps one backend running in the background while the desktop is open, so WeChat and QQ answer
- * and scheduled jobs run even when no conversation is open in the window. It is not a session the
- * window shows: it holds no conversation of its own, and each chat keeps its own conversation as
- * before. It follows channels.json and the job store's marker (started when a channel is switched
- * on or a job is active, closed when neither is) and is started again after it exits, at most once
- * per ``retryMs``.
+ * and scheduled jobs run even when no conversation is open in the window. Each chat keeps its own
+ * conversation; with ``always`` the backend also holds the personal thread and runs for as long as the
+ * desktop does. Otherwise it follows channels.json and the job store's marker (started when a channel is
+ * switched on or a job is active, closed when neither is). It is started again after it exits, at most
+ * once per ``retryMs``.
  */
 export class ChannelHost {
   private backend?: HostedBackend;
@@ -40,7 +40,7 @@ export class ChannelHost {
 
   constructor(private readonly options: {
     configPath: string; jobsMarker?: string; create: () => HostedBackend; intervalMs?: number; retryMs?: number;
-    now?: () => number;
+    now?: () => number; always?: boolean;
   }) {}
 
   get running() { return !!this.backend && this.backend.state.status !== "disconnected"; }
@@ -54,7 +54,7 @@ export class ChannelHost {
     if (this.stopped || this.checking) return;
     this.checking = true;
     try {
-      const wanted = channelsEnabled(this.options.configPath) || jobsActive(this.options.jobsMarker);
+      const wanted = !!this.options.always || channelsEnabled(this.options.configPath) || jobsActive(this.options.jobsMarker);
       const now = (this.options.now ?? Date.now)();
       if (wanted && !this.running && now - this.startedAt >= (this.options.retryMs ?? 30_000)) {
         this.startedAt = now;

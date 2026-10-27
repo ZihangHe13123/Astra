@@ -23,12 +23,24 @@ TRIGGER_TYPES = frozenset({"mail", "file"})
 NOTIFY_POLICIES = frozenset({"always", "on_change"})
 # Where results are pushed besides the local inbox, which always receives them.
 PUSH_TARGETS = ("desktop", "weixin")
+# Where a new job pushes unless it says otherwise: the desktop, which also notifies a paired phone.
+DEFAULT_TARGETS = ("desktop",)
+# Every result is also written into the personal thread, the conversation the desktop's background host
+# keeps (specs/personal-thread.md). It is queued like a push but chosen by no job.
+THREAD_TARGET = "thread"
 # Exists while a job may still run or a result still waits to be pushed: the desktop starts
 # its background host for it.
 ACTIVE_MARKER = "active"
 # A check under ``on_change`` answers exactly this when it has nothing new to report.
 NO_UPDATE = "NO_UPDATE"
 FAILURES_BEFORE_PAUSE = 3
+# A check's ceilings on model rounds and on wall time. Searching the web takes many more rounds than reading files.
+CHECK_ROUNDS, WEB_CHECK_ROUNDS = 10, 30
+CHECK_SECONDS, WEB_CHECK_SECONDS = 900.0, 2700.0
+# A run a safety guard stopped still answers from what it found: a result, though maybe an incomplete one.
+# Out of rounds; the same call again and again; a tool's calls for the turn used up; a tool failing in a row.
+ROUNDS_USED_UP = "iteration_budget"
+STOPPED_EARLY = frozenset({ROUNDS_USED_UP, "repeated_tool_call", "tool_budget", "tool_circuit"})
 BUDGET_NOTICE = "今天的模型用量已超过每日预算，这次检查没有运行；明天照常。"
 INACTIVE_SECONDS = 7 * 86400
 INTERACTION_FILE = "last-interaction"
@@ -200,11 +212,15 @@ class JobStore:
     def add(self, *, name: str, prompt: str, original_request: str,
             workdir: Path, next_at: float | None = None, interval_seconds: float = 0,
             calendar: dict | None = None, trigger: dict | None = None, notify: str = "always",
-            targets: list[str] | tuple[str, ...] = PUSH_TARGETS,
+            targets: list[str] | tuple[str, ...] = DEFAULT_TARGETS,
             grace_seconds: float = 300, kind: str = "check", model: str = "",
             web: bool = False, mail: bool = False, read_calendar: bool = False, idle_seconds: float = 120,
-            timeout_seconds: float = 900, max_iterations: int = 10, now: float | None = None) -> dict:
+            timeout_seconds: float | None = None, max_iterations: int | None = None, now: float | None = None) -> dict:
         now = time.time() if now is None else now
+        if max_iterations is None:
+            max_iterations = WEB_CHECK_ROUNDS if web else CHECK_ROUNDS
+        if timeout_seconds is None:
+            timeout_seconds = WEB_CHECK_SECONDS if web else CHECK_SECONDS
         if trigger:
             if calendar or interval_seconds or next_at is not None:
                 raise ValueError("A job runs on a schedule or on an event, not both.")
@@ -228,8 +244,9 @@ class JobStore:
         directory = Path(workdir).expanduser().resolve(strict=True)
         if not directory.is_dir():
             raise ValueError("The working directory must be a directory.")
-        if kind == "check" and (not model.strip() or len(model) > 200):
-            raise ValueError("An agent check needs a configured model key.")
+        # A check's model is a catalog key, or "" to follow the default model as it is when the check runs.
+        if not isinstance(model, str) or len(model) > 200:
+            raise ValueError("A check's model is a configured model key, or empty to follow the default.")
         if kind == "reminder" and (model or web or mail or read_calendar):
             raise ValueError("A reminder does not use a model, network tools, mail or the calendar.")
         spec = {"name": name.strip(), "prompt": prompt.strip(), "original_request": original_request.strip(),
@@ -306,7 +323,8 @@ class JobStore:
     def update(self, identity: str, *, request: str, name: str | None = None, prompt: str | None = None,
                interval_seconds: float | None = None, calendar: dict | None = None, at: float | None = None,
                notify: str | None = None, web: bool | None = None, targets: list[str] | None = None,
-               mail: bool | None = None, read_calendar: bool | None = None, now: float | None = None) -> dict:
+               mail: bool | None = None, read_calendar: bool | None = None, max_iterations: int | None = None,
+               timeout_seconds: float | None = None, model: str | None = None, now: float | None = None) -> dict:
         """Change a job's future runs; ``request`` is the person's words asking for the change."""
         now = time.time() if now is None else now
         if not isinstance(request, str) or not request.strip():
@@ -341,6 +359,19 @@ class JobStore:
                 if type(read_calendar) is not bool or (read_calendar and spec["kind"] == "reminder"):
                     raise ValueError("A reminder does not read the calendar.")
                 spec["read_calendar"] = read_calendar
+            if (max_iterations is not None or timeout_seconds is not None or model is not None) and spec["kind"] == "reminder":
+                raise ValueError("A reminder does not use a model, so it has no model, rounds or time limit.")
+            if model is not None:
+                # The caller checks the key against the configured models; "" follows the default.
+                if not isinstance(model, str) or len(model) > 200:
+                    raise ValueError("A check's model is a configured model key, or empty to follow the default.")
+                spec["model"] = model.strip()
+            if max_iterations is not None:
+                if type(max_iterations) is not int or not 1 <= max_iterations <= 50:
+                    raise ValueError("Iterations must be between 1 and 50.")
+                spec["max_iterations"] = max_iterations
+            if timeout_seconds is not None:
+                spec["timeout_seconds"] = finite(timeout_seconds, spec["idle_seconds"], 86400, "Hard budget")
             interval, next_at = row["interval_seconds"], row["next_at"]
             if spec.get("trigger") and (interval_seconds or calendar is not None or at is not None):
                 raise ValueError("This job starts on an event; add a new job for a schedule.")
@@ -599,7 +630,7 @@ class JobStore:
                 # Quiet results and records of missed slots stay in the inbox only.
                 if run["quiet"] or (run["state"] == "skipped" and run["skipped_count"]):
                     continue
-                for target in json.loads(run["spec"]).get("targets", PUSH_TARGETS):
+                for target in (*json.loads(run["spec"]).get("targets", PUSH_TARGETS), THREAD_TARGET):
                     db.execute("INSERT OR IGNORE INTO pushes (run_id,target,state,next_try,updated_at) "
                                "VALUES (?,?,'pending',?,?)", (run["id"], target, now, now))
         if pending:

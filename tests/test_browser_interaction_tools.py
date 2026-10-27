@@ -792,7 +792,7 @@ PNG = bytes.fromhex(
 
 @pytest.mark.parametrize(('status', 'clicks_run', 'stopped'), [
     ('observed', 5, False),            # each click changed the page: "load more" five times
-    ('no_observed_change', 2, True),   # nothing happened: the third identical click is a stuck repeat
+    ('no_observed_change', 3, True),   # nothing happened: the fourth identical click is a stuck repeat
 ])
 def test_the_same_click_may_repeat_only_while_it_changes_the_page(tmp_path, status, clicks_run, stopped):
     from agent.core.msg import ContentBlock, Msg

@@ -12,11 +12,21 @@ phone. Models, tools and memory stay on the Mac; the phone is another screen of
 the same Astra, and what it does acts on the Mac's backend. The design is in
 `specs/phone-companion.md`.
 
+The phone opens on the **personal thread** ([desktop](gui.md#personal-thread)): the one
+conversation the desktop keeps apart from your projects, where scheduled results arrive.
+The sidebar switches to your other sessions.
+
+The **+** in the composer takes a photo or picks photos and files on the phone; a pasted
+picture works too. Each is sent to the Mac (at most 25 MB a file), kept in the personal
+thread's folder under `uploads`, and attached to your message like a file chosen on the
+Mac. Each one is noted in the audit log. When the Mac cannot be reached (asleep, Astra
+closed, or the phone off the tailnet) the app says so, and picks up again once it answers.
+
 Read-aloud follows you: replies to a conversation used from the phone are spoken on the
 phone, and on the Mac again once it is used there (see [voice output](voice.md)).
 
-Some things only make sense at the Mac and say so on the phone: choosing files or
-folders (attachments, projects), opening or previewing files, window capture,
+Some things only make sense at the Mac and say so on the phone: choosing folders
+(projects), opening or previewing files, window capture,
 exporting a session, and pairing phones. Model-written cards and pages show their
 source on the phone instead of running, because there they would share the app's
 own origin. Theme, drafts and other display choices stay on the phone; session

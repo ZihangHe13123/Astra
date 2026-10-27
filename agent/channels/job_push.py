@@ -25,7 +25,8 @@ def weixin_job_push(manager: ChannelManager, router: AgentChannelRouter) -> Call
         if not adapter.running or not to:
             # Tried again later: WeChat may still be logging in or handing over.
             raise ConnectionError("WeChat is not online")
-        await send(to, text)
+        # One message where it fits, not chat bubbles: each message spends what WeChat lets the bot send.
+        await send(to, text, bubbles=False)
         try:
             await router.record_outbound("weixin", to, text)
         except Exception:

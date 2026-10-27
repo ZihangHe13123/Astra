@@ -134,6 +134,14 @@ const bridge = new RemoteBridge({
   voice: (event, load) => speaker.handle(event, load),
   push,
   opening,
+  // The camera, the photo library or files: iOS offers all three for a plain file input.
+  pickFiles: () => new Promise<File[]>(resolve => {
+    const input = document.createElement("input");
+    input.type = "file"; input.multiple = true;
+    input.addEventListener("change", () => resolve([...(input.files || [])]), { once: true });
+    input.addEventListener("cancel", () => resolve([]), { once: true });
+    input.click();
+  }),
 });
 window.astra = bridge;
 document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") bridge.wake(); else bridge.hide(); });

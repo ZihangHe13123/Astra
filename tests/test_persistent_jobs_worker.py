@@ -15,6 +15,7 @@ import pytest
 
 from agent.runtime.jobs import scheduler
 from agent.runtime.jobs.store import JobStore
+from agent.runtime.react import REPEATED_CALLS_PER_TURN
 from agent.runtime.session_store import SessionStore
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -40,6 +41,12 @@ class Handler(BaseHTTPRequestHandler):
             delta = {"tool_calls": [{"index": 0, "id": "unauthorized-write", "type": "function", "function": {
                 "name": "write_file", "arguments": json.dumps({"path": str(self.server.target), "content": "MODIFIED"})}}]}
             reason = "tool_calls"
+        elif body.get("tools") and sum(message["role"] == "tool" for message in body["messages"]) < self.server.tool_rounds:
+            # Keeps looking, round after round of the same run, while it is offered tools.
+            name, arguments = self.server.tool_call
+            delta = {"tool_calls": [{"index": 0, "id": f"look-{len(self.server.requests)}", "type": "function",
+                                     "function": {"name": name, "arguments": arguments}}]}
+            reason = "tool_calls"
         else:
             delta = {"content": getattr(self.server, "reply", "fixture-check-result")}
             reason = "stop"
@@ -56,6 +63,8 @@ def provider(tmp_path):
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     server.requests = []
     server.try_write = False
+    server.tool_rounds = 0
+    server.tool_call = ("current_time", "{}")
     server.target = tmp_path / "protected.txt"
     server.target.write_text("ORIGINAL", encoding="utf-8")
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -133,6 +142,66 @@ def test_real_worker_fresh_context_read_only_tools_result_and_receipt(tmp_path, 
     command(env, "run", job["id"])
     assert "JOBS_GUIDANCE_VERSION_TWO" in provider.requests[before]["body"]["messages"][0]["content"]
     assert len(command(env, "inbox")) == 2
+
+
+def test_a_check_that_runs_out_of_rounds_delivers_what_it_found_as_a_result(tmp_path, provider):
+    env = environment(tmp_path / "A", provider)
+    provider.tool_rounds = 2
+    provider.reply = "Found two things before the rounds ran out."
+    job = command(env, "add", "check", "--every", "3600", "--model", "fixture", "--workdir", str(tmp_path),
+                  "--iterations", "2", "--prompt", "Look around", "--request", "Check hourly")
+    for _ in range(3):
+        command(env, "run", job["id"])
+    runs = command(env, "show", job["id"])["occurrences"]
+    assert [(run["state"], run["detail"]) for run in runs] == [("completed", "iteration_budget")] * 3
+    assert runs[0]["output"].endswith("Found two things before the rounds ran out.")
+    # Rounds used up are not failures: the job is not paused after three of them.
+    assert command(env, "show", job["id"])["job"]["state"] == "enabled"
+    # The last request asked for an answer without tools.
+    assert not provider.requests[-1]["body"].get("tools")
+
+
+def test_a_check_stopped_for_repeating_itself_still_delivers_and_the_clock_may_be_read_again(tmp_path, provider):
+    env = environment(tmp_path / "A", provider)
+    (tmp_path / "notes.txt").write_text("unchanged notes", encoding="utf-8")
+    provider.tool_rounds = 10
+    provider.tool_call = ("read_file", json.dumps({"path": "notes.txt"}))
+    provider.reply = "What the notes say, written up."
+    job = command(env, "add", "check", "--after", "60", "--model", "fixture", "--workdir", str(tmp_path),
+                  "--prompt", "Read my notes", "--request", "Check my notes")
+    command(env, "run", job["id"])
+    [run] = command(env, "show", job["id"])["occurrences"]
+    assert (run["state"], run["detail"]) == ("completed", "repeated_tool_call")
+    assert run["output"].endswith("What the notes say, written up.")
+    # Allowed identical reads, the one refused, and the answer without tools.
+    assert len(provider.requests) == REPEATED_CALLS_PER_TURN + 2
+    # The time differs on every call, so asking for it again and again is not a loop.
+    before = len(provider.requests)
+    provider.tool_rounds, provider.tool_call = REPEATED_CALLS_PER_TURN + 2, ("current_time", "{}")
+    clock = command(env, "add", "check", "--after", "60", "--model", "fixture", "--workdir", str(tmp_path),
+                    "--prompt", "Watch the clock", "--request", "Check the time")
+    command(env, "run", clock["id"])
+    [run] = command(env, "show", clock["id"])["occurrences"]
+    assert (run["state"], run["detail"]) == ("completed", "")
+    assert len(provider.requests) - before == REPEATED_CALLS_PER_TURN + 3
+
+
+def test_a_check_follows_the_default_model_unless_given_one(tmp_path, provider):
+    env = environment(tmp_path / "A", provider)
+    (tmp_path / "A" / "settings.json").write_text(json.dumps({"selected_model": "fixture"}), encoding="utf-8")
+    job = command(env, "add", "check", "--after", "60", "--workdir", str(tmp_path), "--prompt", "Look around",
+                  "--request", "Check this")
+    assert job["spec"]["model"] == ""
+    command(env, "run", job["id"])
+    [run] = command(env, "show", job["id"])["occurrences"]
+    assert run["state"] == "completed" and provider.requests[-1]["body"]["model"] == "jobs-fixture"
+    # Pinned by its catalog key.
+    assert command(env, "update", job["id"], "--model", "fixture")["spec"]["model"].endswith("jobs-fixture")
+    changed = command(env, "update", job["id"], "--model", "default")
+    assert changed["spec"]["model"] == "" and changed["spec"]["original_request"].endswith("Changed from the command line.")
+    unknown = subprocess.run([sys.executable, "-m", "agent.cli.jobs_commands", "update", job["id"], "--model", "no-such"],
+                             cwd=ROOT, env=env, text=True, capture_output=True, timeout=40)
+    assert unknown.returncode != 0 and command(env, "show", job["id"])["job"]["spec"]["model"] == ""
 
 
 def test_real_worker_secrets_and_results_follow_a_to_b_to_a_scope(tmp_path, provider):

@@ -14,18 +14,24 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from .calendar import quiet_hours, quiet_until
-from .store import JobStore
+from .store import ROUNDS_USED_UP, STOPPED_EARLY, THREAD_TARGET, JobStore
 
 logger = logging.getLogger(__name__)
 
 RETRY_SECONDS = (60, 300, 900, 1800)
 MAX_AGE = 12 * 3600
-TEXT_LIMIT = 1800
+# WeChat gets the whole result, split into several messages by the channel; only a runaway one is cut here.
+# A desktop notification shows the start of it.
+TEXT_LIMIT = 8000
 INBOX_NOTE = "…（完整结果在 Astra 的定时任务收件箱里）"
 
 DesktopNotify = Callable[[dict], None]
 # Sends one text to the person's WeChat and keeps it in that chat's conversation.
 WeixinPush = Callable[[str], Awaitable[None]]
+# Writes one result into the personal thread. Returns False while the thread is busy with a turn.
+ThreadRecord = Callable[[dict, str, str], Awaitable[bool]]
+# How long a result waits for the personal thread to finish the turn it is in.
+THREAD_BUSY_SECONDS = 30
 
 
 def push_message(push: dict) -> tuple[str, str]:
@@ -35,6 +41,10 @@ def push_message(push: dict) -> tuple[str, str]:
     state = push["run_state"]
     if state == "completed":
         title = f"提醒：{name}" if spec["kind"] == "reminder" and not spec.get("trigger") else f"定时任务：{name}"
+        if push["detail"] == ROUNDS_USED_UP:
+            title += "（轮数用完，可能不全）"
+        elif push["detail"] in STOPPED_EARLY:
+            title += "（提前收尾，可能不全）"
         body = push["output"].strip()
     elif state == "skipped":
         title = f"定时任务已暂停：{name}"
@@ -56,10 +66,12 @@ def push_message(push: dict) -> tuple[str, str]:
 class JobDelivery:
     """Sends due pushes. ``weixin`` is None when WeChat is not set up here."""
 
-    def __init__(self, store: JobStore, *, desktop: DesktopNotify | None, weixin: WeixinPush | None):
+    def __init__(self, store: JobStore, *, desktop: DesktopNotify | None, weixin: WeixinPush | None,
+                 thread: ThreadRecord | None = None):
         self.store = store
         self.desktop = desktop
         self.weixin = weixin
+        self.thread = thread
 
     def _home(self) -> Path:
         return self.store.home
@@ -74,6 +86,9 @@ class JobDelivery:
         sent = 0
         for push in due:
             run_id, target = push["run_id"], push["target"]
+            if target == THREAD_TARGET:
+                sent += await self._record_in_thread(push, now)
+                continue
             # Measured from when the run started: a day-old result is no longer news.
             if now - push["created_at"] > MAX_AGE:
                 await asyncio.to_thread(self.store.mark_push, run_id, target, "failed", detail="expired", now=now)
@@ -113,3 +128,32 @@ class JobDelivery:
             await asyncio.to_thread(self.store.mark_push, run_id, target, "sent", now=now)
             sent += 1
         return sent
+
+    async def _record_in_thread(self, push: dict, now: float) -> int:
+        """The personal thread keeps every result, however old, and in quiet hours too: it only adds to the
+        conversation and rings nothing. A turn in progress is waited out without counting as a try."""
+        run_id = push["run_id"]
+        if self.thread is None:
+            await asyncio.to_thread(self.store.mark_push, run_id, THREAD_TARGET, "failed",
+                                    detail="no personal thread here", now=now)
+            return 0
+        title, body = push_message(push)
+        try:
+            recorded = await self.thread(push, title, body)
+        except Exception as exc:
+            attempt = push["attempts"] + 1
+            logger.warning("job result not written into the personal thread (attempt %s): %s", attempt, type(exc).__name__)
+            if attempt > len(RETRY_SECONDS):
+                await asyncio.to_thread(self.store.mark_push, run_id, THREAD_TARGET, "failed",
+                                        detail=f"{type(exc).__name__}: {exc}", now=now)
+            else:
+                await asyncio.to_thread(self.store.mark_push, run_id, THREAD_TARGET, "pending",
+                                        next_try=now + RETRY_SECONDS[attempt - 1], detail=f"{type(exc).__name__}: {exc}",
+                                        now=now)
+            return 0
+        if not recorded:
+            await asyncio.to_thread(self.store.mark_push, run_id, THREAD_TARGET, "pending", next_try=now + THREAD_BUSY_SECONDS,
+                                    attempted=False, detail="the personal thread is busy", now=now)
+            return 0
+        await asyncio.to_thread(self.store.mark_push, run_id, THREAD_TARGET, "sent", now=now)
+        return 1

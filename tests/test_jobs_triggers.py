@@ -116,7 +116,7 @@ def test_a_mail_started_reminder_waits_out_the_quiet_hours(tmp_path, monkeypatch
     monkeypatch.setenv("AGENT_TIMEZONE", "Asia/Singapore")
     store, box = JobStore(tmp_path / "home"), Mailbox(tmp_path)
     box.deliver(1, "tan@example.edu", "x")
-    reminder(store, tmp_path, {"type": "mail", "from": "tan"})
+    reminder(store, tmp_path, {"type": "mail", "from": "tan"}, targets=["weixin"])
     watcher = TriggerWatcher(store, mail_service=box.service)
     watcher.look()
     box.deliver(2, "tan@example.edu", "late night")

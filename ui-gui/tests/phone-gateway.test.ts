@@ -1,10 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { request } from "node:http";
-import { writeFileSync } from "node:fs";
+import { readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PhoneClient } from "../src/phone/client.js";
 import type { PhoneStreamPosition } from "../src/phone-protocol.js";
+import { uploadName } from "../src/main/phone-gateway.js";
 import { memory, pairedClient, setup, until } from "./phone-fixture.js";
 
 function raw(port: number, path: string, headers: Record<string, string>, method = "GET"): Promise<number> {
@@ -175,4 +176,30 @@ test("speech handed to the phone is served to a signed-in phone only, by its id 
       assert.equal((await fetch(`${base}/api/voice/${bad}`, { headers: { Authorization: `Bearer ${token}` } })).status, 404, bad);
     }
   } finally { await gateway.dispose(); }
+});
+
+test("a signed-in phone hands photos and files to the Mac, kept under the day's folder for this user alone", async () => {
+  const { devices, gateway, base, uploads, uploadRoot } = await setup();
+  try {
+    const { client, record, token } = await pairedClient(devices, base);
+    const path = await client.upload(token, new Blob([new Uint8Array([1, 2, 3, 4])]), "../照片\n 1.jpg");
+    assert.ok(path.startsWith(uploadRoot), path);
+    assert.match(path.split(/[\\/]/).pop()!, /^\d{6}-[0-9a-f]{6}-照片 1\.jpg$/);
+    assert.deepEqual([...readFileSync(path)], [1, 2, 3, 4]);
+    if (process.platform !== "win32") assert.equal(statSync(path).mode & 0o777, 0o600);
+    assert.deepEqual(uploads, [{ device: record.deviceId, path, bytes: 4 }]);
+    // Without a signed-in phone nothing is kept.
+    const refused = await fetch(`${base}/api/upload`, { method: "POST", body: new Uint8Array([9]) });
+    assert.equal(refused.status, 401);
+    assert.equal(uploads.length, 1);
+  } finally { await gateway.dispose(); }
+});
+
+test("a sent file's name keeps no folders or control characters, and stays short", () => {
+  assert.equal(uploadName(encodeURIComponent("..\\..\\etc/passwd")), "passwd");
+  assert.equal(uploadName("a%E5%9B%BE.png"), "a图.png");
+  assert.equal(uploadName(undefined), "file");
+  assert.equal(uploadName(".."), "file");
+  const long = uploadName("x".repeat(300) + ".pdf");
+  assert.equal(long.length, 120); assert.ok(long.endsWith(".pdf"));
 });

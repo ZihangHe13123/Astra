@@ -7,6 +7,9 @@ It is not a list of shipped features or permission to start implementation.
   paired installations; transport, wake-up and file acceptance remain open.
 - [Phone companion](phone-companion.md): the optional remote interface for a paired
   phone; push notifications, voice input and a native app remain open.
+- [Personal thread](personal-thread.md): one long-lived conversation shared by the
+  desktop and a paired phone, home of proactive messages and of work handed to project
+  conversations; other computers as peers remain open.
 - [Outbound request byte budget](llm-request-byte-budget.md): measure serialized
   requests independently of the existing token budget before choosing a policy.
 

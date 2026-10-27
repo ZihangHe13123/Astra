@@ -207,3 +207,14 @@ test("tool calls and a turn's file changes remember where in the conversation th
   assert.deepEqual(state.turnChanges, []);
   assert.equal(state.tools[0].after_message, undefined);
 });
+
+test("a job's result joins the personal thread as Astra's message, the way history keeps it", () => {
+  let state = projectEvent(initialSession("a"), { type: "chunk", content: "好的" });
+  state = projectEvent(state, { type: "done" });
+  state = projectEvent(state, { type: "job_result", title: "定时任务：AI 晚报", text: "三条新闻", job_id: "j", run_id: "r", state: "completed" });
+  assert.deepEqual(state.messages.map(m => [m.role, m.content]), [["assistant", "好的"], ["assistant", "【定时任务：AI 晚报】\n三条新闻"]]);
+  assert.equal(state.busy, false);
+  // Reloaded, the thread shows the same words: the backend stored them as an assistant message.
+  const reloaded = projectEvent(state, { type: "history", session_id: "personal", messages: [{ role: "assistant", content: "【定时任务：AI 晚报】\n三条新闻" }] });
+  assert.equal(reloaded.messages.at(-1)?.content, state.messages.at(-1)?.content);
+});

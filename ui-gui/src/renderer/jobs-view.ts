@@ -3,12 +3,23 @@
 export type JobRow = {
   id: string; name: string; kind: string; state: string; paused_reason: string; schedule: string;
   next_at: number | null; notify: string; web: boolean; mail?: boolean; read_calendar?: boolean; prompt: string; targets: string[]; last_outcome: string;
+  /** A configured model key, or "" to follow the default model at each run. */
+  model?: string;
 };
 export type InboxRow = {
   id: string; job_id: string; name: string; kind: string; state: string; quiet: boolean; output: string; detail: string;
   skipped_count: number; usage: Record<string, number>; time: number; read: boolean; sent: string[];
 };
-export type JobsOverview = { jobs: JobRow[]; inbox: InboxRow[]; quiet_hours: { start: string; end: string } | null };
+export type JobsOverview = { jobs: JobRow[]; inbox: InboxRow[]; quiet_hours: { start: string; end: string } | null; default_model?: string };
+type ModelEntry = { key?: unknown; name?: unknown; provider?: unknown };
+
+/** The models a check can run with: following the default, or one of the catalog's. A saved one that is gone stays listed. */
+export function jobModelOptions(job: JobRow, defaultModel = "", models: ModelEntry[] = []) {
+  const options = [{ value: "", label: defaultModel ? `跟随默认（${defaultModel}）` : "跟随默认" },
+    ...models.filter(model => typeof model?.key === "string" && model.key).map(model => ({ value: String(model.key), label: `${model.name} · ${model.provider}` }))];
+  if (job.model && !options.some(option => option.value === job.model)) options.push({ value: job.model, label: `${job.model}（不在模型列表里）` });
+  return options;
+}
 export type ActivityEntry = {
   kind: "turn" | "job"; id: string; source: string; time: number; title: string; status: string;
   session?: string; effects?: { name: string; risk: string; status: string; summary: string }[];
@@ -44,16 +55,21 @@ export function jobState(job: JobRow): { label: string; tone: "on" | "off" | "wa
   return { label: "已暂停", tone: "off" };
 }
 
-const TARGETS: Record<string, string> = { desktop: "桌面通知", weixin: "微信" };
+const TARGETS: Record<string, string> = { thread: "个人对话", desktop: "桌面和手机", weixin: "微信" };
 
+/** Where a job pushes (every result is in the personal thread too), or where a result went. */
 export function targetsLabel(targets: string[]) {
   const names = targets.map(target => TARGETS[target] || target);
-  return names.length ? `发到${names.join("和")}` : "只进收件箱";
+  return names.length ? `发到${names.join("、")}` : "不另外推送";
 }
+
+/** A check a safety guard stopped still answered from what it found (agent/runtime/jobs/store.py). */
+const STOPPED_EARLY = new Set(["repeated_tool_call", "tool_budget", "tool_circuit"]);
 
 /** One inbox row's headline: what happened, before its text. */
 export function resultLabel(row: InboxRow) {
-  if (row.state === "completed") return row.quiet ? "没有新内容" : row.kind === "reminder" ? "提醒" : "结果";
+  if (row.state === "completed") return row.quiet ? "没有新内容" : row.kind === "reminder" ? "提醒"
+    : row.detail === "iteration_budget" ? "结果（轮数用完，可能不全）" : STOPPED_EARLY.has(row.detail) ? "结果（提前收尾，可能不全）" : "结果";
   if (row.state === "skipped") return row.skipped_count ? `错过 ${row.skipped_count} 次` : "已暂停";
   return row.state === "unknown" ? "结果未知" : "没能完成";
 }

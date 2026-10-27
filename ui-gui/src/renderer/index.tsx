@@ -1,7 +1,7 @@
 import "./file-preview.css";
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { ArrowUp, Square, Plus, Search, PanelLeft, PanelRight, ChevronDown, Folder, Settings, Paperclip, X, Copy, RotateCcw, ChevronRight, Command, Pin, Moon, Sun, Monitor, ArrowLeft, LoaderCircle, SlidersHorizontal, FileDiff, Terminal, Check, FileText, AlarmClock, History, Brain } from "lucide-react";
+import { ArrowUp, Square, Plus, Search, PanelLeft, PanelRight, ChevronDown, Folder, Settings, Paperclip, X, Copy, RotateCcw, ChevronRight, Command, Pin, Moon, Sun, Monitor, ArrowLeft, LoaderCircle, SlidersHorizontal, FileDiff, Terminal, Check, FileText, AlarmClock, History, Brain, MessageCircle, Sparkles } from "lucide-react";
 import { projectEvent, textContent, type SessionState, type UIEvent, type Message } from "@astra/ui-core/session-state";
 import { COMPACTION_LABEL } from "@astra/ui-core/context-compaction";
 import { responseControlsBusy, responseOperationActive, type ResponseSource, type ResponseGroup } from "@astra/ui-core/response-versions";
@@ -27,6 +27,7 @@ import { commandNames, describeCommands, modeSessionTarget, type CommandMode } f
 import { VoiceSettings } from "./voice.js";
 import { MemoryReviewSettings, reviewAnswer, withProposalOptions } from "./memory-review.js";
 import { PhoneNotifications, PhoneSettings } from "./phone-settings.js";
+import { managedBy } from "./chat-view.js";
 import { WeixinSettings } from "./weixin-settings.js";
 import { JobsPanel } from "./jobs-page.js";
 import { ActivityPanel } from "./activity-page.js";
@@ -58,6 +59,8 @@ function App() {
   const [preview, setPreview] = useState<any>();
   const [workspace, setWorkspace] = useState("");
   const [nativeCapture, setNativeCapture] = useState({ connection: "disconnected", enabled: false });
+  // On a phone: the Mac could not be reached for a while (asleep, Astra closed, or off the tailnet).
+  const [macOffline, setMacOffline] = useState(false);
   const captureStarting = useRef(false);
   const [prefs, setPrefs] = useState(defaults);
   const prefsRef = useRef(prefs); prefsRef.current = prefs;
@@ -145,6 +148,15 @@ function App() {
       for (const message of events) {
         if (message.refresh) { refresh(); continue; }
         if (message.appshot) { setNativeCapture(message.appshot); continue; }
+        if (message.link) { setMacOffline(message.link === "offline"); continue; }
+        if (message.opened) {
+          // Started by the background host, not by this window: join what arrived before it was known.
+          let current = next[message.opened.id]?.revision > message.opened.revision ? next[message.opened.id] : message.opened;
+          for (const e of earlyEvents.current[message.opened.id] || []) if (e.revision > current.revision) current = { ...projectEvent(current, e.event), revision: e.revision };
+          delete earlyEvents.current[message.opened.id];
+          next[message.opened.id] = current;
+          continue;
+        }
         if (message.removed) {
           const removed = next[message.removed];
           if (removed && prefsRef.current.lastSession?.session === removed.session && prefsRef.current.lastSession?.mode === removed.mode) setPrefs(p => ({ ...p, lastSession: null }));
@@ -479,7 +491,14 @@ function App() {
       if (request === historyRequest.current && scope === logScopeRef.current) setPreview((old: any) => old?.session_id === page.session_id && old?.mode === page.mode && old?.before === before ? { ...old, ...page, request: old.request, messages: [...page.messages, ...old.messages] } : old);
     } catch (error) { fail(error); } finally { if (request === historyRequest.current) setOlderLoading(false); }
   };
-  const currentTitle = preview ? sessionTitle({ name: preview.session_id, mode: preview.mode, modified: 0 }, prefs.titles) : !state || state.isDraft ? "新对话" : sessionTitle({ name: state.session, mode: state.mode, modified: 0 }, prefs.titles);
+  const currentTitle = preview ? sessionTitle({ name: preview.session_id, mode: preview.mode, modified: 0 }, prefs.titles) : state?.personal ? "个人对话" : !state || state.isDraft ? "新对话" : sessionTitle({ name: state.session, mode: state.mode, modified: 0 }, prefs.titles);
+  // The background host's conversation: always open, at the top of the sidebar (specs/personal-thread.md).
+  const personal = Object.values(states).find(s => s.personal);
+  // It reads as a chat, on the desktop and on a phone alike.
+  const chat = !!state?.personal && !preview;
+  // Conversations it handed work to; and, in one of them, the task it manages there.
+  const managedSessions = chat ? Object.values(states).filter(s => !s.personal && s.status !== "disconnected" && managedBy(s)) : [];
+  const managing = state && !preview && !state.personal ? managedBy(state) : undefined;
   const currentConnection = modelConnection(state?.info.model_info, state?.info.model_info?.models?.find((m: UIEvent) => m.key === state.info.model_info.model_key));
   const appshotStatus = state?.info.gui_appshot;
   const appshotUnavailable = appshotStatus?.broker?.connection === "disconnected" && appshotStatus?.notice;
@@ -490,7 +509,8 @@ function App() {
   const voiceLine = voiceNotice(voiceStatus);
   const voiceControl = voiceButton(voiceStatus);
   useEffect(() => {
-    if (state?.status !== "ready" || !state.session || state.isDraft || preview) return;
+    // The personal thread is always there; the window reopens the last ordinary session.
+    if (state?.status !== "ready" || !state.session || state.isDraft || state.personal || preview) return;
     setPrefs(old => ({ ...old, lastSession: { session: state.session, mode: state.mode, workspace: state.workspace },
       workspaces: { ...old.workspaces, [`${state.mode}:${state.session}`]: state.workspace } }));
   }, [state?.session, state?.mode, state?.workspace, state?.status, state?.isDraft, preview?.session_id]);
@@ -560,6 +580,9 @@ function App() {
     {narrow && side && <div className="side-scrim" aria-hidden="true" onClick={() => setSide(false)}/>}
     <aside className="sidebar"><div className="traffic-space"/><div className="brand">{theme.console ? <><ThemeMark className="brand-mark"/><span className="brand-name"><strong>ASTRA</strong><small title={theme.wording.brand}>{theme.wording.brand}</small></span></> : <><span className="astra-mark">A</span><strong>Astra</strong></>}<button className="icon" aria-label="隐藏侧栏" onClick={() => setSide(false)}><PanelLeft size={17}/></button></div>
       <button className="new-chat" onClick={() => newChat()}><Plus size={18}/>新对话<span>{navigator.platform.includes("Mac") ? "⌘" : "Ctrl"} N</span></button>
+      {personal && <button className={`nav-button personal-entry ${state?.personal && !preview ? "selected" : ""}`} onClick={() => select(personal.id)}>
+        <MessageCircle size={17}/>个人对话{!!(personal.approvals.length || personal.questions.length || personal.busy) && <i className={`status-dot ${personal.approvals.length || personal.questions.length ? "waiting" : "running"}`}/>}
+      </button>}
       <button className="nav-button" onClick={() => showCommands()}><Command size={17}/>命令与功能<kbd>{navigator.platform.includes("Mac") ? "⌘" : "Ctrl"} K</kbd></button>
       <button className="nav-button" onClick={() => setModal("jobs")}><AlarmClock size={17}/>定时任务</button>
       <button className="nav-button" onClick={() => setModal("activity")}><History size={17}/>活动</button>
@@ -576,24 +599,35 @@ function App() {
       </div>
       <button className="account" onClick={() => setModal("settings")}><span className="account-icon">A</span><span>Astra 本地工作区<small>{model?.model && model.model !== "none" ? modelDisplayName(model.model, model.served_model) : "连接你的模型"}</small></span><Settings size={17}/></button>
     </aside>
-    <main className="main"><header className="topbar"><div>{!side && <button className="icon" aria-label="显示侧栏" onClick={() => setSide(true)}><PanelLeft size={18}/></button>}<Folder size={17}/><span className="title" title={currentTitle}>{currentTitle}</span>{theme.console && theme.wording.tag && <span className="topbar-tag">{theme.wording.tag}</span>}<span className="mode-badge">{preview ? "只读历史" : state?.mode && state.mode !== "work" ? state.mode : ""}</span></div>
+    <main className={`main${chat ? " chat-view" : ""}`}><header className="topbar"><div>{!side && <button className="icon" aria-label="显示侧栏" onClick={() => setSide(true)}><PanelLeft size={18}/></button>}{chat ? <span className="chat-avatar" aria-hidden="true"><Sparkles size={15}/></span> : <Folder size={17}/>}<span className="title" title={currentTitle}>{currentTitle}</span>{chat && model?.model && model.model !== "none" && <span className="chat-model muted small">{modelDisplayName(model.model, model.served_model)}</span>}{theme.console && theme.wording.tag && <span className="topbar-tag">{theme.wording.tag}</span>}<span className="mode-badge">{preview ? "只读历史" : state?.mode && state.mode !== "work" ? state.mode : ""}</span></div>
       <div>{logSession && <button className="icon" aria-label="查看会话记录" onClick={() => openLog()}><FileText size={17}/></button>}<span className="workspace" title={state?.workspace || workspace}>{(state?.workspace || workspace).split(/[\\/]/).pop()}</span>{historyLoading || state?.status === "connecting" || state?.status === "loading" ? <LoaderCircle size={16} className="spin"/> : null}<button className="icon" aria-label="执行详情" onClick={() => { if (panel) leaveDoc(); setPanel(panel ? undefined : "tools"); }}><PanelRight size={18}/></button></div></header>
       <div className={`body ${(panel === "logs" && logSession || panel && panel !== "logs" && state && !preview) ? "with-details" : ""}${detailsWide && panel === "files" && state && !preview ? " details-wide" : ""}`}><div className="conversation"><div className="messages-scroll" aria-busy={historyLoading} data-history-request={preview?.request || 0} ref={scroller} onScroll={e => { const t = e.currentTarget; if (!t.clientHeight) return; setFollow(t.scrollHeight - t.scrollTop - t.clientHeight < 120); }}>
         <div className="messages">
-          {!messages.length && <Welcome info={preview ? undefined : state?.info.startup_banner} openModels={() => { void openModels(); }} showCommands={showCommands} run={value => { void command(value).catch(fail); }}/>}
+          {!messages.length && (chat ? <div className="chat-welcome"><span className="chat-avatar" aria-hidden="true"><Sparkles size={18}/></span><p>这是你的个人对话：随时聊，定时任务的结果也会发到这里。项目里的活还在各自的会话里做。</p></div>
+            : <Welcome info={preview ? undefined : state?.info.startup_banner} openModels={() => { void openModels(); }} showCommands={showCommands} run={value => { void command(value).catch(fail); }}/>)}
           <EarlierResponseVersions messages={messages} controls={responseControls}/>
           {preview?.has_more && <button className="load-more" disabled={olderLoading} onClick={() => { void loadOlder(); }}>{olderLoading ? "加载中…" : "加载更早历史"}</button>}
-          <MessageList key={preview ? `preview:${preview.mode}:${preview.session_id}` : active || "blank"} messages={messages} runtime={preview ? undefined : state?.id} timeline={prefs.timeline} reasoning={model?.show_reasoning !== false} scroller={scroller} follow={follow} responses={responseControls} fail={fail} openLog={logSession ? source_ref => openLog({ source_ref }) : undefined} locate={chatLocation} tools={preview ? undefined : state?.tools} changes={preview ? undefined : state?.turnChanges} openPanel={preview ? undefined : openPanelAt}/>
+          <MessageList key={preview ? `preview:${preview.mode}:${preview.session_id}` : active || "blank"} messages={messages} runtime={preview ? undefined : state?.id} timeline={prefs.timeline} reasoning={model?.show_reasoning !== false} scroller={scroller} follow={follow} responses={responseControls} fail={fail} openLog={logSession ? source_ref => openLog({ source_ref }) : undefined} locate={chatLocation} tools={preview ? undefined : state?.tools} changes={preview ? undefined : state?.turnChanges} openPanel={preview ? undefined : openPanelAt} chat={chat}/>
           {preview?.delegates?.length > 0 && <DelegateHistory key={`${preview.mode}:${preview.session_id}`} delegates={preview.delegates} fail={fail}/>}
           {state && !preview && <><ToolPreparation preparation={state.preparation}/>{unplacedTools.length > 0 && <button className="execution-summary" onClick={() => setPanel("tools")}><Terminal size={15}/>{unplacedTools.some(t => t.status === "running") ? "工具正在执行" : `${unplacedTools.length} 项工具结果`}<ChevronRight size={15}/></button>}
             <DelegateSummary delegates={state.delegates} open={() => setPanel("tools")}/>
             {state.approvals.map((e, index) => <Approval key={e.request_id} event={e} send={respond} windowKeys={index === 0 && !modal && !sessionDialog}/>)}{state.questions.map(e => <Question key={e.request_id} event={e} send={respond}/>)}
+            {managedSessions.map(s => <div key={s.id} className="managed-row">
+              <div className="managed-head"><i className={`status-dot ${s.approvals.length || s.questions.length ? "waiting" : s.busy ? "running" : ""}`}/>
+                <span>交给了一个对话：{managedBy(s)!.title}{s.approvals.length || s.questions.length ? " · 在等你" : s.busy ? " · 进行中" : ""}</span>
+                <button className="text-button small" onClick={() => select(s.id)}>打开<ChevronRight size={13}/></button></div>
+              {s.approvals.map(e => <Approval key={e.request_id} event={e} send={value => window.astra.send(s.id, value)}/>)}
+              {s.questions.map(e => <Question key={e.request_id} event={e} send={value => window.astra.send(s.id, value)}/>)}
+            </div>)}
             {state.busy && <div className="generating"><span className="pulse"/>Astra 正在工作<span>{state.info.generation_progress?.phase === "waiting" ? "等待模型响应" : ""}</span></div>}
             {state.status === "disconnected" && <div className="disconnected"><p>后端已断开，已显示的内容仍保留。</p><button onClick={() => command("/reconnect")}>重新连接</button></div>}
           </>}
         </div></div>
         <div className="composer-wrap">
           {!follow && messages.length > 0 && <button className="jump-latest" onClick={() => { if (preview?.locatedFromRuntime) select(preview.locatedFromRuntime); else if (preview?.locatedFromLog) browse({ name: preview.session_id, mode: preview.mode, modified: 0 }); else setFollow(true); }}>回到最新消息 ↓</button>}
+          {managing && <div className="connection-status managed-banner" role="status"><span>个人对话正在管理这个任务：{managing.title}</span>
+            <button onClick={() => { void command("/peers takeover").catch(fail); }}>接管</button></div>}
+          {macOffline && <div className="connection-status" role="status"><span>连不上 Mac：它可能休眠了、Astra 没开，或手机没连上 Tailscale。恢复后会自动接上。</span></div>}
           {!preview && currentConnection.configured === false && <div className="connection-status" role="status"><span>当前模型尚未连接，请先登录或配置 API Key。</span><button onClick={() => configureModels(model?.model_key)}>连接模型</button></div>}
           {!preview && voiceLine && <div className="connection-status" role="status"><span>{voiceLine.text}</span>{voiceLine.action === "stop" ? <button onClick={() => { void send({ type: "command", cmd: "/voice stop" }); }}>停止朗读</button> : <button onClick={() => { void openVoice(); }}>语音设置</button>}</div>}
           {!preview && appshotUnavailable && <div className="connection-status" role="status"><span>窗口捕获暂不可用，不影响对话。</span><button onClick={() => { void window.astra.appshot(active, "command", "/appshot status").catch(fail); }}>检查连接</button></div>}
@@ -601,11 +635,15 @@ function App() {
             {!!state?.info.gui_appshot?.attachments?.length && <div className="attachment-list">{state.info.gui_appshot.attachments.map((a: UIEvent) => <span key={a.id}>{a.label}<button className="icon" aria-label="移除窗口捕获" onClick={() => { void window.astra.appshot(active, "remove", a.id).catch(fail); }}><X size={12}/></button></span>)}</div>}
             {state?.info.gui_appshot?.pending && <div className="attachment-list"><span>窗口捕获：{state.info.gui_appshot.pending.status === "unknown" ? "接收状态未知" : "等待接收确认"}</span><button onClick={() => command("/appshot pending status")}>查询状态</button><button onClick={() => command("/appshot pending discard")}>丢弃附件</button></div>}
             {!!files.length && <div className="attachment-list">{files.map(path => <span key={path}><Paperclip size={12}/>{path.split(/[\\/]/).pop()}<button className="icon" aria-label="移除附件" onClick={() => setPrefs(old => ({ ...old, attachments: { ...old.attachments, [key]: files.filter(f => f !== path) } }))}><X size={12}/></button></span>)}</div>}
-            <div className="composer-line">{theme.console && theme.wording.promptLabel && <span className="composer-prompt" aria-hidden="true">{theme.wording.promptLabel}</span>}<CommandInput inputRef={input} disabled={opening} placeholder={state?.busy ? "补充指令，或告诉 Astra 调整方向…" : "向 Astra 描述你的任务，输入 / 查看指令…"} value={draft}
+            <div className="composer-line">{theme.console && theme.wording.promptLabel && <span className="composer-prompt" aria-hidden="true">{theme.wording.promptLabel}</span>}<CommandInput inputRef={input} disabled={opening} placeholder={chat ? (state?.busy ? "补充一句…" : "发消息给 Astra") : state?.busy ? "补充指令，或告诉 Astra 调整方向…" : "向 Astra 描述你的任务，输入 / 查看指令…"} value={draft}
               commands={commands} modes={commandModes} mode={state?.mode || "work"} attachments={!!files.length || hasAppshot}
               onChange={value => savePrefs({ drafts: { ...prefs.drafts, [key]: value } })} onSubmit={() => { void submit(); }}
-              onPaste={e => { if ([...e.clipboardData.items].some(i => i.type.startsWith("image/"))) { e.preventDefault(); void window.astra.clipboardImage().then(p => { if (p) attach([p]); }).catch(fail); } }}/></div>
-            <div className="composer-bottom"><div>{!window.astra.remote && <button className="icon" aria-label="添加附件" onClick={() => { void window.astra.choose("files").then(attach).catch(fail); }}><Plus size={20}/></button>}<button className={`permission ${state?.info.yolo_status?.yolo ? "yolo" : ""}`} onClick={() => { void openSessionSettings("permissions"); }} title="工具审批设置">{state?.info.yolo_status?.yolo ? "完全访问" : "按需审批"}</button>{usage && <span className={`usage-status small ${usage.over ? "over" : "muted"}`} title="今天全部对话、微信和定时任务的模型用量">{usage.text}</span>}{voiceControl && <button className={`permission voice ${voiceControl.on ? "on" : ""}`} onClick={() => { void openVoice(); }} title="语音朗读设置">{voiceControl.label}</button>}</div>
+              onPaste={e => {
+                // On a phone the pasted picture itself is sent to the Mac; the desktop reads its own clipboard.
+                const pasted = [...e.clipboardData.files];
+                if (window.astra.upload && pasted.length) { e.preventDefault(); void window.astra.upload(pasted).then(attach).catch(fail); return; }
+                if ([...e.clipboardData.items].some(i => i.type.startsWith("image/"))) { e.preventDefault(); void window.astra.clipboardImage().then(p => { if (p) attach([p]); }).catch(fail); } }}/></div>
+            <div className="composer-bottom"><div>{(!window.astra.remote || window.astra.upload) && <button className="icon" aria-label="添加附件" onClick={() => { void window.astra.choose("files").then(attach).catch(fail); }}><Plus size={20}/></button>}<button className={`permission ${state?.info.yolo_status?.yolo ? "yolo" : ""}`} onClick={() => { void openSessionSettings("permissions"); }} title="工具审批设置">{state?.info.yolo_status?.yolo ? "完全访问" : "按需审批"}</button>{usage && <span className={`usage-status small ${usage.over ? "over" : "muted"}`} title="今天全部对话、微信和定时任务的模型用量">{usage.text}</span>}{voiceControl && <button className={`permission voice ${voiceControl.on ? "on" : ""}`} onClick={() => { void openVoice(); }} title="语音朗读设置">{voiceControl.label}</button>}</div>
               <div><button className="model-button" title={model?.served_model ? `${model.model}（实际：${model.served_model}）` : undefined} onClick={() => { void openModels(); }}>{model?.model && model.model !== "none" ? modelDisplayName(model.model, model.served_model) : "选择模型"}<ChevronDown size={13}/></button>
                 <select aria-label="推理强度" value={model?.reasoning_effort || "high"} disabled={!model?.reasoning_effort} onChange={e => command(`/mode ${e.target.value}`)}><option value="low">低</option><option value="high">高</option><option value="xhigh">超高</option><option value="max">最高</option></select>
                 {(responsePending || state?.busy && !draft.trim() && !files.length && !hasAppshot) ? <button className="send" aria-label="停止" onClick={() => command("/cancel")}><Square size={16} fill="currentColor"/></button> : <button className="send" aria-label="发送" disabled={sending || opening || responsePending || (!draft.trim() && !files.length && !hasAppshot)} onClick={() => { void submit(); }}><ArrowUp size={19}/></button>}
@@ -623,7 +661,7 @@ function App() {
     {modal === "sessions" && <Modal title="管理会话" close={() => setModal(undefined)}><div className="form"><label>对话模式<select aria-label="筛选对话模式" value={sessionMode || ""} onChange={e => setSessionMode(e.target.value || undefined)}><option value="">全部模式</option><option value="work">通用</option>{commandModes.map(mode => <option key={mode.mode} value={mode.mode}>{mode.label}</option>)}</select></label><input aria-label="筛选会话" value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索会话…"/>{historyFiltered.filter(entry => !sessionMode || entry.mode === sessionMode).map(entryButton)}{!historyFiltered.some(entry => !sessionMode || entry.mode === sessionMode) && <p className="muted">暂无匹配的会话。</p>}</div></Modal>}
     {modal === "persona" && <Modal title="人格设置" close={() => setModal(undefined)}><div className="form"><p className="muted small">选择当前会话使用的人格。</p>{(model?.personas || []).map((p: UIEvent) => <button key={p.name} onClick={() => { setModal(undefined); void command(`/persona ${p.name}`); }}><span>{p.name}<small>{p.description}</small></span></button>)}</div></Modal>}
     {modal === "memory" && <Modal title="记忆" wide close={() => setModal(undefined)}><MemoryPanel fail={fail}/></Modal>}
-    {modal === "jobs" && <Modal title="定时任务" wide close={() => setModal(undefined)}><JobsPanel fail={fail}/></Modal>}
+    {modal === "jobs" && <Modal title="定时任务" wide close={() => setModal(undefined)}><JobsPanel fail={fail} models={state?.info.model_info?.models}/></Modal>}
     {modal === "activity" && <Modal title="活动" wide close={() => setModal(undefined)}><ActivityPanel fail={fail} openSession={name => {
       // A turn names its conversation's scope; a branch adds to the file's name.
       const entry = history.find(item => item.name === name) || history.find(item => name.startsWith(`${item.name}`));

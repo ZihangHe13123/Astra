@@ -23,7 +23,7 @@ const env = { ...cleanEnv, ASTRA_GUI_DISABLE_APPSHOT: '1', AGENT_PROJECT_ROOT: r
   AGENT_SKILLS_PATH: join(folder, 'skills'), AGENT_USER_MODELS_FILE: join(folder, 'missing-models.yaml'), AGENT_LOG_DIR: join(folder, 'logs'),
   AGENT_MCP_CONFIG: join(folder, 'missing-mcp.json'), AGENT_TOOL_POLICY: 'locked', SANDBOX_DOCKER: 'false', SANDBOX_WORKDIR: workspace,
   ASTRA_WORKSPACE: workspace, LEARNING_REVIEW_AUTO: '0', ASTRA_PHONE_PORT: '0',
-  // No messaging channel: the job alone must bring the background host up.
+  // No messaging channel: the background host is up anyway, holding the personal thread.
   ASTRA_CHANNEL_CONFIG: join(folder, 'channels.json'), ASTRA_JOBS_TICK_SECONDS: '0.5', ASTRA_JOBS_PUSH_SECONDS: '0.5' };
 
 // Due in a few seconds, pushed to the desktop only.
@@ -64,6 +64,16 @@ try {
   assert.equal((await app.evaluate(() => globalThis.__astraShown)).length, 1, 'shown once');
   console.log('PASS shown once');
 
+  // The reminder also joined the personal thread, which the background host holds and the sidebar keeps on top.
+  await page.getByRole('button', { name: '个人对话' }).click();
+  // It reads as a chat there: the reminder is a card naming the job.
+  await page.locator('main.chat-view').waitFor();
+  const card = page.locator('.message.job-card', { hasText: '提醒：喝水' }).first();
+  await card.waitFor();
+  assert.match(await card.innerText(), /提醒：喝水[\s\S]*该喝水了/);
+  assert.equal(await page.evaluate(async () => { const boot = await window.astra.bootstrap(); return boot.sessions.find(s => s.id === boot.active)?.personal; }), true);
+  console.log('PASS the personal thread shows the reminder');
+
   await page.getByRole('button', { name: '定时任务' }).click();
   const dialog = page.getByRole('dialog', { name: '定时任务' });
   const standup = dialog.locator('.job-row', { hasText: '站立会' });
@@ -71,7 +81,7 @@ try {
   assert.match(await standup.innerText(), /工作日 09:15/);
   await dialog.locator('.job-row', { hasText: '喝水' }).getByText('已完成').waitFor();
   const result = dialog.locator('.inbox-row', { hasText: '喝水' });
-  assert.match(await result.innerText(), /提醒[\s\S]*已发到桌面通知[\s\S]*该喝水了/);
+  assert.match(await result.innerText(), /提醒[\s\S]*已发到桌面和手机、个人对话[\s\S]*该喝水了/);
   assert.ok(await result.evaluate(row => row.classList.contains('unread')));
   await result.locator('.inbox-head').click();
   await dialog.locator('.inbox-row.unread').waitFor({ state: 'detached' });
