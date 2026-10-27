@@ -221,6 +221,9 @@ try {
  passed('repeated New conversation keeps one local blank page and preserves draft');
  await page.locator('.model-button').click();
  await page.getByRole('dialog',{name:'选择模型',exact:true}).waitFor();
+ // The picker reads top to bottom: the search across the dialog, the list under it, the footer last.
+ assert.deepEqual(await page.evaluate(()=>{const box=s=>document.querySelector('[role=dialog] '+s).getBoundingClientRect(),dialog=box('.model-picker'),search=box('.model-search'),list=box('.model-picker .models'),foot=box('.model-picker-footer');
+  return {wide:search.width>dialog.width*0.8,listBelow:list.top>=search.bottom,footLast:foot.top>=list.bottom};}),{wide:true,listBelow:true,footLast:true});
  await page.locator('.models button').filter({hasText:'missing-model'}).waitFor();
  await page.locator('.models button').filter({hasText:'missing-model'}).click();
  await page.getByRole('dialog',{name:'模型与账号'}).waitFor();

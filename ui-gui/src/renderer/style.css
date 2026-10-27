@@ -245,7 +245,7 @@ summary { cursor: pointer; }
 .permission:hover { color: var(--text); }
 .permission svg { flex-shrink: 0; }
 .permission.yolo { color: var(--warn); }
-.model-picker { display: flex; align-items: center; min-width: 0; }
+.model-choice { display: flex; align-items: center; min-width: 0; }
 .model-button { display: inline-flex; align-items: center; gap: 4px; min-width: 0; max-width: 220px; height: var(--tool); padding: 0 8px 0 10px; border: 0; border-radius: var(--r-pill); background: transparent; font-family: var(--font-chrome); font-size: var(--fs-small); font-weight: 500; white-space: nowrap; }
 .model-button span { overflow: hidden; text-overflow: ellipsis; }
 .model-button svg, .effort-picker svg { flex-shrink: 0; color: var(--muted); }
