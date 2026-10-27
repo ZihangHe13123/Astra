@@ -221,6 +221,9 @@ try {
  passed('repeated New conversation keeps one local blank page and preserves draft');
  await page.locator('.model-button').click();
  await page.getByRole('dialog',{name:'选择模型',exact:true}).waitFor();
+ // The picker reads top to bottom: the search across the dialog, the list under it, the footer last.
+ assert.deepEqual(await page.evaluate(()=>{const box=s=>document.querySelector('[role=dialog] '+s).getBoundingClientRect(),dialog=box('.model-picker'),search=box('.model-search'),list=box('.model-picker .models'),foot=box('.model-picker-footer');
+  return {wide:search.width>dialog.width*0.8,listBelow:list.top>=search.bottom,footLast:foot.top>=list.bottom};}),{wide:true,listBelow:true,footLast:true});
  await page.locator('.models button').filter({hasText:'missing-model'}).waitFor();
  await page.locator('.models button').filter({hasText:'missing-model'}).click();
  await page.getByRole('dialog',{name:'模型与账号'}).waitFor();
@@ -747,6 +750,10 @@ try {
  // An app, not a web page: it does not zoom, fields are 16px so iOS does not zoom into them, and the list follows a swipe.
  assert.match(await phonePage.locator('meta[name=viewport]').getAttribute('content'),/user-scalable=no/);
  assert.equal(await phonePage.evaluate(()=>getComputedStyle(document.querySelector('.composer textarea')).fontSize),'16px');
+ // iOS leaves :hover on a tapped button; the send button looks the same through it.
+ const sendLook=()=>phonePage.locator('.composer-bottom .send').evaluate(el=>getComputedStyle(el).backgroundColor);
+ const restingSend=await sendLook(); await phonePage.locator('.composer-bottom .send').hover({force:true}); await phonePage.waitForTimeout(400);
+ assert.equal(await sendLook(),restingSend);
  const swipe=(from,to)=>phonePage.evaluate(([a,b])=>{const at=x=>new Touch({identifier:1,target:document.body,clientX:x,clientY:300});
   document.dispatchEvent(new TouchEvent('touchstart',{touches:[at(a)],changedTouches:[at(a)]}));
   document.dispatchEvent(new TouchEvent('touchend',{touches:[],changedTouches:[at(b)]}));},[from,to]);

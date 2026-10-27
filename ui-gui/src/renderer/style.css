@@ -239,13 +239,13 @@ summary { cursor: pointer; }
 .composer-bottom>div { display: flex; align-items: center; gap: 2px; min-width: 0; }
 /* Short of room, the voice label gives way before the model's name; a phone has only icons on the left. */
 .composer-send { flex-shrink: 0; }
-.composer-attach { width: var(--tool); height: var(--tool); padding: 0; margin-right: 4px; border: 1px solid var(--line); border-radius: var(--r-pill); color: var(--muted); }
+.composer-attach { width: var(--tool); height: var(--tool); padding: 0; margin-right: 4px; border: 1px solid var(--line); border-radius: var(--r-pill); background: transparent; color: var(--muted); }
 .composer-attach:hover { color: var(--text); }
 .permission { position: relative; display: inline-flex; align-items: center; gap: 5px; height: var(--tool); border: 0; border-radius: var(--r-pill); background: transparent; font-family: var(--font-chrome); font-size: var(--fs-small); color: var(--muted); padding: 0 9px; white-space: nowrap; flex-shrink: 0; }
 .permission:hover { color: var(--text); }
 .permission svg { flex-shrink: 0; }
 .permission.yolo { color: var(--warn); }
-.model-picker { display: flex; align-items: center; min-width: 0; }
+.model-choice { display: flex; align-items: center; min-width: 0; }
 .model-button { display: inline-flex; align-items: center; gap: 4px; min-width: 0; max-width: 220px; height: var(--tool); padding: 0 8px 0 10px; border: 0; border-radius: var(--r-pill); background: transparent; font-family: var(--font-chrome); font-size: var(--fs-small); font-weight: 500; white-space: nowrap; }
 .model-button span { overflow: hidden; text-overflow: ellipsis; }
 .model-button svg, .effort-picker svg { flex-shrink: 0; color: var(--muted); }
@@ -513,7 +513,7 @@ label { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sma
   /* Finger-sized, and the two switches keep only their icons (the words stay for screen readers). */
   .composer-bottom { --tool: 36px; }
   .composer-send { flex-shrink: 1; }
-  .composer-tools .permission { width: var(--tool); padding: 0; justify-content: center; }
+  .composer-tools .permission { width: var(--tool); min-width: var(--tool); flex-shrink: 0; padding: 0; justify-content: center; }
   .composer-tools .permission span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
   .composer-tools .usage-status:not(.over) { display: none; }
   .composer-tools .usage-status { margin: 0 0 0 4px; font-size: var(--fs-micro); }
@@ -544,6 +544,9 @@ html[data-remote=phone] .composer-bottom .icon { min-width: var(--tool); min-hei
 html[data-remote=phone] :is(.sidebar, .topbar, .composer-bottom, .panel-tabs, .session-row, button) { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
 html[data-remote=phone] button:hover { background: inherit; }
 html[data-remote=phone] button:active:not(:disabled) { transform: none; opacity: .55; }
+/* iOS leaves :hover on a button after a tap; the send button keeps its look through it. */
+html[data-remote=phone] .send:hover { background: var(--accent); filter: none; }
+html[data-remote=phone] .send:disabled { background: var(--hover); }
 html[data-remote=phone] :is(.composer-foot, .approval-keys, .nav-button kbd, .new-chat span, .command-suggestions-foot) { display: none; }
 
 /* Scheduled jobs and activity (modals from the sidebar). */
