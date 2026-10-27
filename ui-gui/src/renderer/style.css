@@ -232,15 +232,34 @@ summary { cursor: pointer; }
 :root[data-input-frame=double] .composer { border: 3px double var(--accent-2); }
 .composer textarea { display: block; flex: 1; min-width: 0; width: 100%; border: 0; outline: none; background: none; resize: none; padding: 6px 5px; max-height: 220px; min-height: 36px; font-size: var(--fs-base); line-height: 1.7; }
 .composer textarea::placeholder { color: var(--muted); }
-.composer-bottom { display: flex; align-items: center; justify-content: space-between; gap: 7px; }
-.composer-bottom>div { display: flex; align-items: center; gap: 6px; }
-.permission { border: 0; background: transparent; font-family: var(--font-chrome); font-size: var(--fs-micro); color: var(--muted); padding: 4px 6px; }
+/* The toolbar under the text: quiet controls of one height, rounded like the frame (a chat is always round). */
+:root { --r-pill: 999px; }
+:root[data-frame=single],:root[data-frame=double] { --r-pill: var(--r-1); }
+.composer-bottom { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 4px; --tool: 30px; }
+.composer-bottom>div { display: flex; align-items: center; gap: 2px; min-width: 0; }
+/* Short of room, the voice label gives way before the model's name; a phone has only icons on the left. */
+.composer-send { flex-shrink: 0; }
+.composer-attach { width: var(--tool); height: var(--tool); padding: 0; margin-right: 4px; border: 1px solid var(--line); border-radius: var(--r-pill); color: var(--muted); }
+.composer-attach:hover { color: var(--text); }
+.permission { position: relative; display: inline-flex; align-items: center; gap: 5px; height: var(--tool); border: 0; border-radius: var(--r-pill); background: transparent; font-family: var(--font-chrome); font-size: var(--fs-small); color: var(--muted); padding: 0 9px; white-space: nowrap; flex-shrink: 0; }
+.permission:hover { color: var(--text); }
+.permission svg { flex-shrink: 0; }
 .permission.yolo { color: var(--warn); }
-.model-button { padding: 5px; border: 0; background: transparent; font-family: var(--font-chrome); font-size: var(--fs-small); max-width: 200px; overflow: hidden; white-space: nowrap; }
-.composer select { padding: 3px 0; border: 0; width: 49px; font-size: var(--fs-micro); color: var(--muted); }
-.send { border-radius: 50%; width: 33px; height: 33px; padding: 0; color: var(--on-accent); background: var(--accent); border: 0; }
+.model-picker { display: flex; align-items: center; min-width: 0; }
+.model-button { display: inline-flex; align-items: center; gap: 4px; min-width: 0; max-width: 220px; height: var(--tool); padding: 0 8px 0 10px; border: 0; border-radius: var(--r-pill); background: transparent; font-family: var(--font-chrome); font-size: var(--fs-small); font-weight: 500; white-space: nowrap; }
+.model-button span { overflow: hidden; text-overflow: ellipsis; }
+.model-button svg, .effort-picker svg { flex-shrink: 0; color: var(--muted); }
+.effort-picker { position: relative; display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0; height: var(--tool); padding: 0 8px; border-radius: var(--r-pill); font-family: var(--font-chrome); font-size: var(--fs-small); color: var(--muted); white-space: nowrap; }
+.effort-picker::before { content: ""; position: absolute; left: -1px; width: 1px; height: 14px; background: var(--line); }
+.effort-picker:hover { background: var(--hover); color: var(--text); }
+.effort-picker:has(select:disabled) { opacity: .5; background: transparent; }
+.effort-picker:has(select:focus-visible) { outline: 2px solid var(--accent-2); outline-offset: 2px; }
+.effort-picker select { position: absolute; inset: 0; width: 100%; height: 100%; opacity: 0; cursor: pointer; appearance: none; -webkit-appearance: none; border: 0; padding: 0; }
+.effort-picker select:disabled { cursor: default; }
+.send { flex-shrink: 0; width: 32px; height: 32px; margin-left: 6px; padding: 0; border: 0; border-radius: var(--r-pill); color: var(--on-accent); background: var(--accent); }
 .send:hover { background: var(--accent); filter: brightness(1.1); }
-:root[data-console=true] .send { border-radius: var(--r-1); width: 38px; }
+/* Nothing to send yet: a quiet button rather than a faded accent. */
+.send:disabled { opacity: 1; background: var(--hover); color: var(--muted); filter: none; }
 .composer-foot { font-family: var(--font-chrome); font-size: var(--fs-micro); color: var(--muted); display: flex; justify-content: space-between; padding: 7px 7px 0; }
 .attachment-list { display: flex; gap: 6px; flex-wrap: wrap; padding: 2px 4px 6px; }
 .attachment-list>span { display: inline-flex; align-items: center; gap: 6px; background: var(--soft); border-radius: var(--r-1); font-size: var(--fs-micro); padding: 5px 7px; max-width: 300px; overflow: hidden; }
@@ -352,7 +371,8 @@ label { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sma
 .connection-status button { font-size: var(--fs-small); padding:4px 8px; }
 .connection-status span { min-width:0; overflow-wrap:anywhere; }
 .connection-status button { flex-shrink:0; }
-.permission.voice { display:block; flex-shrink:1; min-width:0; max-width:170px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.permission.voice { flex-shrink:1; min-width:0; max-width:180px; }
+.permission.voice span { overflow:hidden; text-overflow:ellipsis; }
 .permission.voice.on { color:var(--text); }
 .voice-actions { display:flex; align-items:center; gap:10px; }
 .approval:focus-within { border-color:var(--muted); box-shadow:0 0 0 2px var(--soft); }
@@ -489,7 +509,18 @@ label { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sma
   .topbar > div { min-width: 0; gap: 6px; }
   .topbar .title { max-width: 46vw; }
   .messages { padding: 14px 12px 10px; }
-  .composer-wrap { padding: 8px 8px calc(env(safe-area-inset-bottom) + 8px); }
+  .composer-wrap { padding: 6px 10px calc(env(safe-area-inset-bottom) + 8px); }
+  /* Finger-sized, and the two switches keep only their icons (the words stay for screen readers). */
+  .composer-bottom { --tool: 36px; }
+  .composer-send { flex-shrink: 1; }
+  .composer-tools .permission { width: var(--tool); padding: 0; justify-content: center; }
+  .composer-tools .permission span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+  .composer-tools .usage-status:not(.over) { display: none; }
+  .composer-tools .usage-status { margin: 0 0 0 4px; font-size: var(--fs-micro); }
+  .send { width: var(--tool); height: var(--tool); }
+  .model-button { max-width: 40vw; padding: 0 6px 0 8px; font-size: 13px; }
+  .effort-picker { padding: 0 6px; font-size: 13px; }
+  .effort-picker > svg:first-child { display: none; }
   .details-panel { position: fixed; inset: 0; z-index: 25; width: 100% !important; max-width: none; min-width: 0;
     padding-top: env(safe-area-inset-top); padding-bottom: env(safe-area-inset-bottom); }
   .panel-resizer { display: none; }
@@ -509,6 +540,7 @@ html[data-remote=phone] :is(.messages-scroll, .details-panel, .modal, .sidebar) 
 /* iOS zooms into any field under 16px when it is focused. */
 html[data-remote=phone] :is(input, textarea, select), html[data-remote=phone] .composer textarea { font-size: 16px; }
 html[data-remote=phone] .icon { min-width: 40px; min-height: 40px; }
+html[data-remote=phone] .composer-bottom .icon { min-width: var(--tool); min-height: var(--tool); }
 html[data-remote=phone] :is(.sidebar, .topbar, .composer-bottom, .panel-tabs, .session-row, button) { -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
 html[data-remote=phone] button:hover { background: inherit; }
 html[data-remote=phone] button:active:not(:disabled) { transform: none; opacity: .55; }
@@ -601,7 +633,12 @@ html[data-remote=phone] :is(.composer-foot, .approval-keys, .nav-button kbd, .ne
 .job-card-body .message-body.clamped { max-height: 9.5em; overflow: hidden; -webkit-mask-image: linear-gradient(#000 70%, transparent); mask-image: linear-gradient(#000 70%, transparent); }
 .chat-view .interactive-card { margin: 10px 0 14px 36px; padding: 14px 16px; }
 .chat-view .generating { margin: 8px 0 0 36px; }
-:root .main.chat-view .composer { border-radius: 22px; padding: 6px 10px 6px 14px; }
+/* The chat's composer is a card on the page in the reading face, whatever the theme draws around a console's prompt. */
+.main.chat-view { --r-pill: 999px; }
+:root .main.chat-view .composer { --font-chrome: var(--font-ui); border: 1px solid var(--line); border-radius: 24px; padding: 8px 8px 8px 10px; background: var(--panel); box-shadow: 0 1px 2px var(--shade-1), 0 8px 28px var(--shade-1); }
+:root .main.chat-view .composer:focus-within { border-color: var(--frame); }
+:root .main.chat-view .composer textarea { font-family: var(--font-ui); padding: 6px 8px; }
+.chat-view .composer-prompt { display: none; }
 .chat-view .composer-foot { display: none; }
 .chat-welcome { display: flex; gap: 12px; align-items: flex-start; color: var(--muted); max-width: 520px; margin: 40px auto; }
 .chat-welcome p { margin: 3px 0 0; }

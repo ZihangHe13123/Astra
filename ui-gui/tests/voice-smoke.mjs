@@ -155,7 +155,7 @@ try {
     const box = selector => document.querySelector(selector).getBoundingClientRect();
     const row = box('.composer-bottom'), voice = box('.composer-bottom .permission.voice'), send = box('.composer-bottom .send');
     // A name too long for the control is cut at its end; the label still begins with what the control is.
-    const first = document.createRange(), label = document.querySelector('.composer-bottom .permission.voice').firstChild;
+    const first = document.createRange(), label = document.querySelector('.composer-bottom .permission.voice span').firstChild;
     first.setStart(label, 0); first.setEnd(label, 1);
     return { inside: voice.left >= row.left && voice.right <= send.left && send.right <= row.right + 0.5, oneLine: voice.height < 40,
       start: first.getBoundingClientRect().left >= voice.left, scroll: document.documentElement.scrollWidth <= innerWidth };

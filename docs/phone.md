@@ -16,7 +16,8 @@ The phone opens on the **personal thread** ([desktop](gui.md#personal-thread)): 
 conversation the desktop keeps apart from your projects, where scheduled results arrive.
 The sidebar switches to your other sessions.
 
-The **+** in the composer takes a photo or picks photos and files on the phone; a pasted
+On the phone the composer's approval and voice switches show only their icons (a shield and a
+speaker); tapping one opens the same settings as on the Mac. The **+** in the composer takes a photo or picks photos and files on the phone; a pasted
 picture works too. Each is sent to the Mac (at most 25 MB a file), kept in the personal
 thread's folder under `uploads`, and attached to your message like a file chosen on the
 Mac. Each one is noted in the audit log. When the Mac cannot be reached (asleep, Astra
