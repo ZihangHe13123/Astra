@@ -750,6 +750,10 @@ try {
  // An app, not a web page: it does not zoom, fields are 16px so iOS does not zoom into them, and the list follows a swipe.
  assert.match(await phonePage.locator('meta[name=viewport]').getAttribute('content'),/user-scalable=no/);
  assert.equal(await phonePage.evaluate(()=>getComputedStyle(document.querySelector('.composer textarea')).fontSize),'16px');
+ // iOS leaves :hover on a tapped button; the send button looks the same through it.
+ const sendLook=()=>phonePage.locator('.composer-bottom .send').evaluate(el=>getComputedStyle(el).backgroundColor);
+ const restingSend=await sendLook(); await phonePage.locator('.composer-bottom .send').hover({force:true}); await phonePage.waitForTimeout(400);
+ assert.equal(await sendLook(),restingSend);
  const swipe=(from,to)=>phonePage.evaluate(([a,b])=>{const at=x=>new Touch({identifier:1,target:document.body,clientX:x,clientY:300});
   document.dispatchEvent(new TouchEvent('touchstart',{touches:[at(a)],changedTouches:[at(a)]}));
   document.dispatchEvent(new TouchEvent('touchend',{touches:[],changedTouches:[at(b)]}));},[from,to]);
