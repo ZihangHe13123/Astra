@@ -127,17 +127,20 @@ def test_a_mail_started_reminder_waits_out_the_quiet_hours(tmp_path, monkeypatch
     async def push(text: str) -> None:
         sent.append(text)
 
-    from datetime import datetime
+    from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
 
-    night = datetime(2026, 10, 26, 23, 30, tzinfo=ZoneInfo("Asia/Singapore")).timestamp()
+    # The push was queued now, so the night has to come after it: the next 23:30 there, and the morning after.
+    night = datetime.now(ZoneInfo("Asia/Singapore")).replace(hour=23, minute=30, second=0, microsecond=0)
+    if night.timestamp() <= time.time():
+        night += timedelta(days=1)
+    morning = (night + timedelta(days=1)).replace(hour=8, minute=0)
     run = store.history()[0]
     with store.transaction() as db:
-        db.execute("UPDATE runs SET created_at=? WHERE id=?", (night, run["id"]))
-    asyncio.run(JobDelivery(store, desktop=None, weixin=push).deliver_due(now=night))
+        db.execute("UPDATE runs SET created_at=? WHERE id=?", (night.timestamp(), run["id"]))
+    asyncio.run(JobDelivery(store, desktop=None, weixin=push).deliver_due(now=night.timestamp()))
     assert sent == []
-    morning = datetime(2026, 10, 27, 8, 0, tzinfo=ZoneInfo("Asia/Singapore")).timestamp()
-    asyncio.run(JobDelivery(store, desktop=None, weixin=push).deliver_due(now=morning))
+    asyncio.run(JobDelivery(store, desktop=None, weixin=push).deliver_due(now=morning.timestamp()))
     assert sent == ["【定时任务：导师来信】\n导师来信了\n新邮件：tan@example.edu — late night"]
 
 

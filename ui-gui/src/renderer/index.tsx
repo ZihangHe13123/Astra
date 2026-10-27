@@ -1,7 +1,7 @@
 import "./file-preview.css";
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
-import { ArrowUp, Square, Plus, Search, PanelLeft, PanelRight, ChevronDown, Folder, Settings, Paperclip, X, Copy, RotateCcw, ChevronRight, Command, Pin, Moon, Sun, Monitor, ArrowLeft, LoaderCircle, SlidersHorizontal, FileDiff, Terminal, Check, FileText, AlarmClock, History, Brain, MessageCircle, Sparkles } from "lucide-react";
+import { ArrowUp, Square, Plus, Search, PanelLeft, PanelRight, ChevronDown, Folder, Settings, Paperclip, X, Copy, RotateCcw, ChevronRight, Command, Pin, Moon, Sun, Monitor, ArrowLeft, LoaderCircle, SlidersHorizontal, FileDiff, Terminal, Check, FileText, AlarmClock, History, Brain, MessageCircle, Sparkles, ShieldCheck, ShieldAlert, Volume2, VolumeX } from "lucide-react";
 import { projectEvent, textContent, type SessionState, type UIEvent, type Message } from "@astra/ui-core/session-state";
 import { COMPACTION_LABEL } from "@astra/ui-core/context-compaction";
 import { responseControlsBusy, responseOperationActive, type ResponseSource, type ResponseGroup } from "@astra/ui-core/response-versions";
@@ -643,9 +643,10 @@ function App() {
                 const pasted = [...e.clipboardData.files];
                 if (window.astra.upload && pasted.length) { e.preventDefault(); void window.astra.upload(pasted).then(attach).catch(fail); return; }
                 if ([...e.clipboardData.items].some(i => i.type.startsWith("image/"))) { e.preventDefault(); void window.astra.clipboardImage().then(p => { if (p) attach([p]); }).catch(fail); } }}/></div>
-            <div className="composer-bottom"><div>{(!window.astra.remote || window.astra.upload) && <button className="icon" aria-label="添加附件" onClick={() => { void window.astra.choose("files").then(attach).catch(fail); }}><Plus size={20}/></button>}<button className={`permission ${state?.info.yolo_status?.yolo ? "yolo" : ""}`} onClick={() => { void openSessionSettings("permissions"); }} title="工具审批设置">{state?.info.yolo_status?.yolo ? "完全访问" : "按需审批"}</button>{usage && <span className={`usage-status small ${usage.over ? "over" : "muted"}`} title="今天全部对话、微信和定时任务的模型用量">{usage.text}</span>}{voiceControl && <button className={`permission voice ${voiceControl.on ? "on" : ""}`} onClick={() => { void openVoice(); }} title="语音朗读设置">{voiceControl.label}</button>}</div>
-              <div><button className="model-button" title={model?.served_model ? `${model.model}（实际：${model.served_model}）` : undefined} onClick={() => { void openModels(); }}>{model?.model && model.model !== "none" ? modelDisplayName(model.model, model.served_model) : "选择模型"}<ChevronDown size={13}/></button>
-                <select aria-label="推理强度" value={model?.reasoning_effort || "high"} disabled={!model?.reasoning_effort} onChange={e => command(`/mode ${e.target.value}`)}><option value="low">低</option><option value="high">高</option><option value="xhigh">超高</option><option value="max">最高</option></select>
+            {/* Settings on the left, the model and sending on the right. On a phone the two switches keep only their icons. */}
+            <div className="composer-bottom"><div className="composer-tools">{(!window.astra.remote || window.astra.upload) && <button className="icon composer-attach" aria-label="添加附件" title="添加附件" onClick={() => { void window.astra.choose("files").then(attach).catch(fail); }}><Plus size={18}/></button>}<button className={`permission ${state?.info.yolo_status?.yolo ? "yolo" : ""}`} onClick={() => { void openSessionSettings("permissions"); }} title="工具审批设置">{state?.info.yolo_status?.yolo ? <ShieldAlert size={15}/> : <ShieldCheck size={15}/>}<span>{state?.info.yolo_status?.yolo ? "完全访问" : "按需审批"}</span></button>{usage && <span className={`usage-status small ${usage.over ? "over" : "muted"}`} title="今天全部对话、微信和定时任务的模型用量">{usage.text}</span>}{voiceControl && <button className={`permission voice ${voiceControl.on ? "on" : ""}`} onClick={() => { void openVoice(); }} title="语音朗读设置">{voiceControl.on ? <Volume2 size={15}/> : <VolumeX size={15}/>}<span>{voiceControl.label}</span></button>}</div>
+              <div className="composer-send"><div className="model-picker"><button className="model-button" title={model?.served_model ? `${model.model}（实际：${model.served_model}）` : undefined} onClick={() => { void openModels(); }}><span>{model?.model && model.model !== "none" ? modelDisplayName(model.model, model.served_model) : "选择模型"}</span><ChevronDown size={13}/></button>
+                <span className="effort-picker" title="推理强度"><Brain size={13}/><span aria-hidden="true">{EFFORTS.find(([value]) => value === (model?.reasoning_effort || "high"))?.[1]}</span><ChevronDown size={12}/><select aria-label="推理强度" value={model?.reasoning_effort || "high"} disabled={!model?.reasoning_effort} onChange={e => command(`/mode ${e.target.value}`)}>{EFFORTS.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></span></div>
                 {(responsePending || state?.busy && !draft.trim() && !files.length && !hasAppshot) ? <button className="send" aria-label="停止" onClick={() => command("/cancel")}><Square size={16} fill="currentColor"/></button> : <button className="send" aria-label="发送" disabled={sending || opening || responsePending || (!draft.trim() && !files.length && !hasAppshot)} onClick={() => { void submit(); }}><ArrowUp size={19}/></button>}
               </div></div>
           </div>}
@@ -696,6 +697,8 @@ function App() {
   </div>;
 }
 
+/** Reasoning effort as the composer offers it. The select is see-through over its label, so a phone opens its own picker. */
+const EFFORTS = [["low", "低"], ["high", "高"], ["xhigh", "超高"], ["max", "最高"]] as const;
 const NARROW = "(max-width: 700px)";
 function narrowScreen() { return typeof window !== "undefined" && !!window.matchMedia?.(NARROW).matches; }
 function useNarrow() {
