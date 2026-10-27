@@ -340,9 +340,11 @@ try {
  await delegateSummary.filter({hasText:'3 项进行中'}).waitFor(); assert.match(await delegateSummary.innerText(),/3 项进行中/);
  for(const goal of delegateGoals) assert.match(await delegateSummary.innerText(),new RegExp(goal));
  await delegateSummary.click();
- const delegateCards=page.locator('section[aria-label="委派任务"] article[data-delegate-id]');
- await page.waitForFunction(()=>document.querySelectorAll('section[aria-label="委派任务"] article[data-status="running"]').length===2
-   &&document.querySelectorAll('section[aria-label="委派任务"] article[data-status="queued"]').length===1);
+ // The summary opens the subagent page, and the cards are there, not among the tool receipts.
+ await page.getByRole('tab',{name:/子代理/,selected:true}).waitFor();
+ const delegateCards=page.locator('section[aria-label="子代理"] article[data-delegate-id]');
+ await page.waitForFunction(()=>document.querySelectorAll('section[aria-label="子代理"] article[data-status="running"]').length===2
+   &&document.querySelectorAll('section[aria-label="子代理"] article[data-status="queued"]').length===1);
  const delegateIds=(await delegateCards.evaluateAll(cards=>cards.map(card=>card.dataset.delegateId))).sort();
  assert.equal(new Set(delegateIds).size,3);
  const firstFinishedGoal=delegateGoals.find(goal=>delegateGates.get(goal).reached);
@@ -362,8 +364,8 @@ try {
  const beforeDelegateReload=requests.length;
  await page.reload(); await page.getByRole('textbox',{name:'消息'}).waitFor();
  await page.getByTestId('delegate-summary').click();
- await page.waitForFunction(()=>document.querySelectorAll('section[aria-label="委派任务"] article[data-status="running"]').length===2
-   &&document.querySelectorAll('section[aria-label="委派任务"] article[data-status="queued"]').length===1);
+ await page.waitForFunction(()=>document.querySelectorAll('section[aria-label="子代理"] article[data-status="running"]').length===2
+   &&document.querySelectorAll('section[aria-label="子代理"] article[data-status="queued"]').length===1);
  assert.deepEqual((await delegateCards.evaluateAll(cards=>cards.map(card=>card.dataset.delegateId))).sort(),delegateIds);
  assert.equal(requests.length,beforeDelegateReload);
  passed('renderer reload preserves three live delegate identities without replaying model calls');
@@ -409,7 +411,7 @@ try {
  await page.getByText('DELEGATE_GUI_PARENT_DONE',{exact:true}).waitFor({timeout:30000}); await idle();
  await page.getByTestId('delegate-summary').click();
  await page.waitForFunction(()=>{
-   const cards=[...document.querySelectorAll('section[aria-label="委派任务"] article[data-delegate-id]')];
+   const cards=[...document.querySelectorAll('section[aria-label="子代理"] article[data-delegate-id]')];
    return cards.length===3&&cards.filter(card=>card.dataset.status==='completed').length===2&&cards.filter(card=>card.dataset.status==='failed').length===1;
  });
  for(let i=0;i<2;i++) {
@@ -874,8 +876,8 @@ try {
  await restored.getByRole('button',{name:delegateSession.title,exact:true}).first().click();
  await restored.getByText('只读浏览历史，不会启动模型。',{exact:true}).waitFor();
  await restored.locator('.delegate-history > summary').click();
- const recoveredCards=restored.locator('section[aria-label="委派任务"] article[data-delegate-id]');
- await restored.waitForFunction(()=>document.querySelectorAll('section[aria-label="委派任务"] article[data-delegate-id]').length===3);
+ const recoveredCards=restored.locator('section[aria-label="子代理"] article[data-delegate-id]');
+ await restored.waitForFunction(()=>document.querySelectorAll('section[aria-label="子代理"] article[data-delegate-id]').length===3);
  assert.deepEqual((await recoveredCards.evaluateAll(cards=>cards.map(card=>card.dataset.delegateId))).sort(),delegateIds);
  assert.deepEqual((await recoveredCards.evaluateAll(cards=>cards.map(card=>card.dataset.status))).sort(),['completed','completed','failed']);
  for(let i=0;i<2;i++) {

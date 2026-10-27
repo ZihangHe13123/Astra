@@ -610,7 +610,7 @@ function App() {
           <MessageList key={preview ? `preview:${preview.mode}:${preview.session_id}` : active || "blank"} messages={messages} runtime={preview ? undefined : state?.id} timeline={prefs.timeline} reasoning={model?.show_reasoning !== false} scroller={scroller} follow={follow} responses={responseControls} fail={fail} openLog={logSession ? source_ref => openLog({ source_ref }) : undefined} locate={chatLocation} tools={preview ? undefined : state?.tools} changes={preview ? undefined : state?.turnChanges} openPanel={preview ? undefined : openPanelAt} chat={chat}/>
           {preview?.delegates?.length > 0 && <DelegateHistory key={`${preview.mode}:${preview.session_id}`} delegates={preview.delegates} fail={fail}/>}
           {state && !preview && <><ToolPreparation preparation={state.preparation}/>{unplacedTools.length > 0 && <button className="execution-summary" onClick={() => setPanel("tools")}><Terminal size={15}/>{unplacedTools.some(t => t.status === "running") ? "工具正在执行" : `${unplacedTools.length} 项工具结果`}<ChevronRight size={15}/></button>}
-            <DelegateSummary delegates={state.delegates} open={() => setPanel("tools")}/>
+            <DelegateSummary delegates={state.delegates} teams={state.teams} open={() => setPanel("subagents")}/>
             {state.approvals.map((e, index) => <Approval key={e.request_id} event={e} send={respond} windowKeys={index === 0 && !modal && !sessionDialog}/>)}{state.questions.map(e => <Question key={e.request_id} event={e} send={respond}/>)}
             {managedSessions.map(s => <div key={s.id} className="managed-row">
               <div className="managed-head"><i className={`status-dot ${s.approvals.length || s.questions.length ? "waiting" : s.busy ? "running" : ""}`}/>
