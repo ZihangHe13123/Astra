@@ -266,7 +266,7 @@ summary { cursor: pointer; }
 .history-banner { border: 1px solid var(--line); border-radius: var(--r-3); padding: 14px; display: flex; justify-content: space-between; gap: 15px; align-items: center; font-size: var(--fs-small); color: var(--muted); }
 .details-panel { width: 420px; min-width: 360px; max-width: 48%; background: var(--panel); border-left: 1px solid var(--line); display: flex; flex-direction: column; }
 .panel-tabs { display: flex; padding: 9px 10px; border-bottom: 1px solid var(--line); gap: 1px; align-items: center; }
-.panel-tabs>button { border: 0; background: transparent; padding: 7px 8px; font-family: var(--font-chrome); font-size: var(--fs-micro); color: var(--muted); text-transform: var(--label-case); letter-spacing: var(--label-track); }
+.panel-tabs>button { border: 0; background: transparent; padding: 7px 7px; gap: 5px; font-family: var(--font-chrome); font-size: var(--fs-micro); color: var(--muted); text-transform: var(--label-case); letter-spacing: var(--label-track); }
 .panel-tabs [aria-selected=true] { background: var(--hover); color: var(--text); }
 .panel-tabs>.icon { margin-left: auto; }
 .panel-content { padding: 22px 18px; overflow: auto; min-height: 0; flex: 1; }
@@ -363,7 +363,6 @@ label { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sma
 .gallery img { max-width: 100%; max-height: 180px; object-fit: contain; border-radius: var(--r-2); }
 .gallery p { font-size: var(--fs-small); margin: 8px 0; }
 .message-body img { max-width: 100%; max-height: 500px; border-radius: var(--r-2); }
-.team-card { border-bottom:1px solid var(--line); padding: 12px 0; }
 .team-member { display:flex; gap:8px; align-items:center; margin:10px 0; font-size: var(--fs-small); }
 .team-member>span:nth-child(2) { flex:1; }
 .team-member small,.team-member>span:last-child { color:var(--muted); font-size: var(--fs-micro); }
@@ -442,7 +441,23 @@ label { display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sma
 .delegate-brief { display: grid; grid-template-columns: 6px minmax(0, 1fr) auto; align-items: center; gap: 8px; font-size: var(--fs-small); margin-top: 10px; }
 .delegate-brief > span:nth-child(2) { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .delegate-brief small { color: var(--muted); font-size: var(--fs-micro); overflow-wrap: anywhere; max-width: 200px; }
-.delegates { margin-bottom: 24px; }
+/* The subagent page: a team's members under its name, one-off delegations after. */
+.subagents { margin-bottom: 24px; }
+.panel-tabs .tab-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); margin-left: -2px; align-self: flex-start; margin-top: 2px; }
+.subagents > h3 { display: flex; align-items: baseline; gap: 8px; }
+.subagent-team { border: 1px solid var(--line); border-radius: var(--r-2); padding: 12px 13px 4px; margin: 12px 0 16px; }
+.subagent-team-head { display: flex; align-items: center; gap: 8px; font-size: var(--fs-ui); }
+.subagent-team-head svg { color: var(--muted); flex-shrink: 0; }
+.subagent-team > p { margin: 6px 0; }
+.subagent-team .delegate-card { margin: 10px 0; background: var(--panel); }
+.subagent-tasks h4 { margin: 12px 0 6px; font-size: var(--fs-small); color: var(--muted); }
+.subagent-tasks p { margin: 4px 0; }
+.subagent-solo > h4 { margin: 18px 0 4px; font-size: var(--fs-small); color: var(--muted); }
+.delegate-heading .delegate-role { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.delegate-heading .delegate-state { margin-left: auto; color: var(--muted); white-space: nowrap; }
+.delegate-heading .delegate-unread { margin-left: 0; padding: 1px 7px; border-radius: 999px; background: var(--selected); font-size: var(--fs-micro); white-space: nowrap; }
+.delegate-earlier { margin: 0 0 10px; font-size: var(--fs-small); color: var(--muted); }
+.delegate-earlier .delegate-card { color: var(--text); }
 .delegate-card { border: 1px solid var(--line); border-radius: var(--r-2); padding: 13px; margin: 10px 0; overflow-wrap: anywhere; }
 .delegate-goal { font-size: var(--fs-small); line-height: 1.65; margin: 10px 0 6px; white-space: pre-wrap; max-height: 8em; overflow: auto; }
 .delegate-activity,.delegate-meta { font-size: var(--fs-micro); line-height: 1.6; color: var(--muted); margin: 6px 0; }

@@ -2,48 +2,74 @@ import React, { useEffect, useState } from "react";
 import { ChevronRight, Users } from "lucide-react";
 import { delegateActive, delegateStatusLabel, orderedDelegates, type DelegateView } from "@astra/ui-core/delegates";
 import { Markdown } from "./messages.js";
+import type { AgentTeamAgentView, AgentTeamView } from "@astra/ui-core/agent-team-state";
+import { subagentGroups } from "./subagents.js";
+import { RawDetails, statusLabel } from "./raw-details.js";
 
-export function DelegateSummary({ delegates, open }: { delegates: Record<string, DelegateView>; open: () => void }) {
+export function DelegateSummary({ delegates, teams, open }: { delegates: Record<string, DelegateView>; teams?: Record<string, AgentTeamView>; open: () => void }) {
   const items = orderedDelegates(delegates);
   if (!items.length) return null;
   const active = items.filter(delegateActive);
   const visible = (active.length ? active : items).slice(0, 3);
+  // The count is the subagent page's: a team member still starting is going on too.
+  const going = subagentGroups(delegates, teams || {}).active;
   return <button className="delegate-summary" data-testid="delegate-summary" onClick={open}>
-    <span className="delegate-heading"><Users size={15}/><strong>子代理</strong><span className="muted">{active.length ? `${active.length} 项进行中` : "最近委派"}</span><ChevronRight size={15}/></span>
+    <span className="delegate-heading"><Users size={15}/><strong>子代理</strong><span className="muted">{going ? `${going} 项进行中` : "最近委派"}</span><ChevronRight size={15}/></span>
     {visible.map(d => <span className="delegate-brief" key={d.process_id}><span className={`status-dot ${d.status}`}/><span title={d.goal}>{d.goal}</span><small>{delegateStatusLabel(d.status)}{d.status === "running" && d.current_tool ? ` · ${d.current_tool}` : ""}</small></span>)}
-    {active.length > visible.length && <small className="muted">另有 {active.length - visible.length} 项进行中</small>}
+    {going > visible.filter(delegateActive).length && <small className="muted">另有 {going - visible.filter(delegateActive).length} 项进行中</small>}
   </button>;
 }
 
-export function DelegateCards({ delegates, runtime, fail, openFile }: { delegates: Record<string, DelegateView>; runtime?: string; fail: (e: unknown) => void; openFile?: (path: string) => void }) {
+/** The subagent page: every subagent of the conversation, a team's members under their team, then one-off delegations. */
+export function SubagentPanel({ delegates, teams, runtime, fail, openFile }: { delegates: Record<string, DelegateView>; teams?: Record<string, AgentTeamView>; runtime?: string; fail: (e: unknown) => void; openFile?: (path: string) => void }) {
   const [limit, setLimit] = useState(20);
-  const items = orderedDelegates(delegates);
-  const running = items.some(delegateActive);
-  const [now, setNow] = useState(Date.now());
-  useEffect(() => { if (!running) return; setNow(Date.now()); const id = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(id); }, [running]);
+  const groups = subagentGroups(delegates, teams || {});
+  const now = useClock(groups.active > 0);
   useEffect(() => setLimit(20), [runtime]);
-  if (!items.length) return null;
-  return <section className="delegates" aria-label="委派任务"><h3>子代理 <span className="count">{items.length}</span></h3>
-    {items.some(d => d.history_truncated) && <p className="muted small">仅恢复了最近的部分委派记录。</p>}
-    {items.slice(0, limit).map(d => <DelegateCard key={d.process_id} item={d} now={now} runtime={runtime} fail={fail} openFile={openFile}/>)}
-    {items.length > limit && <button className="text-button" onClick={() => setLimit(n => n + 20)}>显示更多委派（还有 {items.length - limit} 项）</button>}
+  const card = (d: DelegateView, member?: AgentTeamAgentView) => <DelegateCard key={d.process_id} item={d} member={member} now={now} runtime={runtime} fail={fail} openFile={openFile}/>;
+  if (!groups.total && !groups.teams.length) return <section className="subagents" aria-label="子代理"><h3>子代理</h3>
+    <p className="muted">这个对话还没有子代理。主代理委派任务或组建 Team 后，会显示在这里。</p></section>;
+  return <section className="subagents" aria-label="子代理"><h3>子代理 <span className="muted small">{groups.total} 个{groups.active > 0 ? ` · ${groups.active} 个进行中` : ""}</span></h3>
+    {groups.solo.some(d => d.history_truncated) && <p className="muted small">仅恢复了最近的部分委派记录。</p>}
+    {groups.teams.map(({ team, lead, members }) => <section className="subagent-team" key={team.id} aria-label={`Team ${team.name}`}>
+      <div className="subagent-team-head"><Users size={14}/><strong>{team.name}</strong><span className="muted small">Team · {statusLabel(team.status)}</span></div>
+      {team.goal && <p className="muted small">{team.goal}</p>}
+      {!!lead?.unread && <p className="small">主代理有 {lead.unread} 条未读消息</p>}
+      {members.map(({ agent, latest, earlier }) => latest ? <React.Fragment key={agent.id}>{card(latest, agent)}
+        {earlier.length > 0 && <details className="delegate-earlier"><summary>{agent.name} 更早的任务 · {earlier.length} 项</summary>{earlier.map(d => card(d, agent))}</details>}</React.Fragment>
+        : <div className="team-member" key={agent.id}><span className={`status-dot ${agent.status}`}/><span>{agent.name}<small>{agent.role}</small></span><span>{statusLabel(agent.status)}{agent.unread > 0 && ` · ${agent.unread} 条未读`}</span></div>)}
+      {!members.length && <p className="muted small">还没有成员。</p>}
+      {team.tasks.length > 0 && <div className="subagent-tasks"><h4>任务</h4>{team.tasks.map(task => <p className="small" key={task.id}>{task.status === "completed" ? "✓" : "·"} {task.title} <span className="muted">{statusLabel(task.status)}</span></p>)}</div>}
+      <RawDetails label={`诊断详情 · ${team.messageCount} 条消息`} value={team}/>
+    </section>)}
+    {groups.solo.length > 0 && <section className="subagent-solo" aria-label="单次委派">{groups.teams.length > 0 && <h4>单次委派</h4>}
+      {groups.solo.slice(0, limit).map(d => card(d))}
+      {groups.solo.length > limit && <button className="text-button" onClick={() => setLimit(n => n + 20)}>显示更多委派（还有 {groups.solo.length - limit} 项）</button>}
+    </section>}
   </section>;
 }
+/** Read-only history: the delegations a saved conversation recorded, folded under the transcript. */
 export function DelegateHistory({ delegates, fail }: { delegates: DelegateView[]; fail: (e: unknown) => void }) {
   const [open, setOpen] = useState(false);
   if (!delegates.length) return null;
   return <details className="delegate-history" onToggle={e => setOpen(e.currentTarget.open)}><summary>委派记录 · {delegates.length} 项</summary>
-    {open && <DelegateCards delegates={Object.fromEntries(delegates.map(d => [d.process_id, d]))} fail={fail}/>}
+    {open && <SubagentPanel delegates={Object.fromEntries(delegates.map(d => [d.process_id, d]))} fail={fail}/>}
   </details>;
 }
-function DelegateCard({ item: d, now, runtime, fail, openFile }: { item: DelegateView; now: number; runtime?: string; fail: (e: unknown) => void; openFile?: (path: string) => void }) {
+/** The time, every second while something runs, so the cards' durations move. */
+function useClock(running: boolean): number {
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => { if (!running) return; setNow(Date.now()); const id = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(id); }, [running]);
+  return now;
+}
+function DelegateCard({ item: d, member, now, runtime, fail, openFile }: { item: DelegateView; member?: AgentTeamAgentView; now: number; runtime?: string; fail: (e: unknown) => void; openFile?: (path: string) => void }) {
   const [open, setOpen] = useState(false);
   const elapsed = delegateActive(d)
     ? d.started_at ? Math.max(0, now - d.started_at * 1000) : d.duration_ms
     : d.duration_ms;
   const duration = elapsed == null ? "" : elapsed >= 60000 ? `${Math.floor(elapsed / 60000)} 分 ${Math.floor(elapsed / 1000) % 60} 秒` : `${Math.floor(elapsed / 1000)} 秒`;
   return <article className="delegate-card" data-delegate-id={d.process_id} data-status={d.status}>
-    <div className="delegate-heading"><span className={`status-dot ${d.status}`}/><strong>{delegateStatusLabel(d.status)}</strong><span className="muted small">{duration}</span></div>
+    <div className="delegate-heading"><span className={`status-dot ${d.status}`}/>{member ? <><strong>{member.name}</strong>{member.role && <span className="delegate-role muted small">{member.role}</span>}<span className="delegate-state small">{delegateStatusLabel(d.status)}{duration && ` · ${duration}`}</span>{!!member.unread && <span className="delegate-unread">{member.unread} 条未读</span>}</> : <><strong>{delegateStatusLabel(d.status)}</strong><span className="muted small">{duration}</span></>}</div>
     <p className="delegate-goal">{d.goal}{d.goal_truncated && "…"}</p>
     {d.status === "running" && <p className="delegate-activity">{d.current_tool ? `正在调用 ${d.current_tool}` : "正在处理任务"}</p>}
     {d.status === "queued" && <p className="delegate-activity">等待执行名额</p>}

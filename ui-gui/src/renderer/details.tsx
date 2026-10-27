@@ -1,7 +1,9 @@
 import React, { useEffect, useRef, useState } from "react";
 import { FileDiff, Terminal, Layers, Users, X, FolderOpen, FileText } from "lucide-react";
 import type { SessionState, UIEvent } from "@astra/ui-core/session-state";
-import { DelegateCards } from "./delegates.js";
+import { SubagentPanel } from "./delegates.js";
+import { subagentGroups } from "./subagents.js";
+import { RawDetails, statusLabel } from "./raw-details.js";
 import { toolEmptyOutput, toolExpanded, toolStatus } from "./tool-status.js";
 import { toolInput } from "./activity-state.js";
 import { RequestTimeline } from "./request-timeline.js";
@@ -11,7 +13,7 @@ import { ToolPreparation } from "./tool-preparation.js";
 import { changeSource, type ChangeSource, type ChangeTarget } from "./change-navigation.js";
 import { FilePreviewPanel } from "./file-preview-panel.js";
 
-export type Panel = "tools" | "changes" | "files" | "context" | "team" | "logs";
+export type Panel = "tools" | "subagents" | "changes" | "files" | "context" | "logs";
 export function Details({ state, changeTarget, panel, setPanel, selection, width, onWidth, close, fail, doc, onDocDismiss, openLog, wide, onWide, onAttach }: { changeTarget?: ChangeTarget; wide?: boolean; onWide?: (wide: boolean) => void; onAttach?: (paths: string[]) => void; state: SessionState; panel: Panel; setPanel: (p: Panel) => void; selection: { index?: number; serial: number }; width: number; onWidth: (width: number) => void; close: () => void; fail: (e: unknown) => void; doc?: { path: string; serial: number }; onDocDismiss?: () => void; openLog?: (callId: string) => void }) {
   const content = useRef<HTMLDivElement>(null);
   const previewRequest = useRef(0);
@@ -51,7 +53,8 @@ export function Details({ state, changeTarget, panel, setPanel, selection, width
   useEffect(() => { previewRequest.current++; setFile(undefined); setChosenChange(undefined); setPreview(undefined); setChanges(undefined); }, [state.id, state.mode, state.session]);
   // Follow the document or page the agent is writing: each new result for it reloads it.
   useEffect(() => { if (doc && panel === "files") openFile(doc.path); }, [doc?.serial, doc?.path, panel, state.id]);
-  const tabs = [{ id: "tools", label: "执行", icon: Terminal }, { id: "changes", label: "改动", icon: FileDiff }, { id: "files", label: "文件", icon: FolderOpen, FileText }, { id: "context", label: "上下文", icon: Layers }, { id: "team", label: "Team", icon: Users }, { id: "logs", label: "记录", icon: FileText }] as const;
+  const tabs = [{ id: "tools", label: "执行", icon: Terminal }, { id: "subagents", label: "子代理", icon: Users }, { id: "changes", label: "改动", icon: FileDiff }, { id: "files", label: "文件", icon: FolderOpen, FileText }, { id: "context", label: "上下文", icon: Layers }, { id: "logs", label: "记录", icon: FileText }] as const;
+  const activeSubagents = subagentGroups(state.delegates, state.teams).active;
   const galleries = state.tools.flatMap((tool, index) => {
     if (tool.name !== "search_images" || tool.error) return [];
     try { const result = JSON.parse(tool.output); return result.type === "image_search" && result.success && Array.isArray(result.images) ? [{ ...result, index: tool.result_index || index + 1 }] : []; }
@@ -65,11 +68,10 @@ export function Details({ state, changeTarget, panel, setPanel, selection, width
       onPointerMove={e => { if (drag.current && panelRef.current) panelRef.current.style.width = `${Math.max(260, Math.min(720, drag.current.width + drag.current.x - e.clientX))}px`; }}
       onPointerUp={e => { if (drag.current) { onWidth(Math.max(260, Math.min(720, drag.current.width + drag.current.x - e.clientX))); drag.current = undefined; e.currentTarget.releasePointerCapture(e.pointerId); } }}
       onPointerCancel={() => { drag.current = undefined; if (panelRef.current) panelRef.current.style.width = `${width}px`; }}/>
-    <div className="panel-tabs" role="tablist">{tabs.filter(t => t.id !== "logs" || openLog).map(t => <button key={t.id} role="tab" aria-selected={panel === t.id} onClick={() => { previewRequest.current++; setPreview(undefined); setPanel(t.id); }}><t.icon size={15}/>{t.label}</button>)}<button className="icon" onClick={close} aria-label="关闭详情"><X size={15}/></button></div>
+    <div className="panel-tabs" role="tablist">{tabs.filter(t => t.id !== "logs" || openLog).map(t => <button key={t.id} role="tab" aria-selected={panel === t.id} onClick={() => { previewRequest.current++; setPreview(undefined); setPanel(t.id); }}><t.icon size={15}/>{t.label}{t.id === "subagents" && activeSubagents > 0 && <span className="tab-dot" title={`${activeSubagents} 个子代理进行中`}/>}</button>)}<button className="icon" onClick={close} aria-label="关闭详情"><X size={15}/></button></div>
     <div className="panel-content" ref={content}>
       {preview ? <FilePreviewPanel runtime={state.id} path={preview.path} serial={preview.serial} fail={fail} wide={wide} onWide={onWide} onAttach={onAttach} dismiss={() => { if (doc && preview.path === doc.path) onDocDismiss?.(); onWide?.(false); setPreview(undefined); }}/> : panel === "tools" ? <>
         <ToolPreparation preparation={state.preparation}/>
-        <DelegateCards delegates={state.delegates} runtime={state.id} fail={fail} openFile={openFile}/>
         <h3>工具与进程 <span className="count">{state.tools.length}</span></h3>
         {!state.tools.length && <p className="muted">工具运行后，结果会显示在这里。</p>}
         {[...state.tools].sort((a, b) => Number(toolStatus(b) === "running") - Number(toolStatus(a) === "running")).map((tool, i) => <details className="tool-detail" data-result-index={tool.result_index} key={`${tool.result_index || i}:${tool.call_id || "tool"}`} open={toolExpanded(tool)}><summary><span className={`status-dot ${toolStatus(tool)}`}/><strong>{tool.result_index ? `${tool.result_index}. ` : ""}{tool.name}</strong><span className="muted small">{statusLabel(toolStatus(tool))}{tool.duration_ms != null ? ` · ${tool.duration_ms >= 1000 ? `${(tool.duration_ms / 1000).toFixed(1)} 秒` : `${tool.duration_ms} ms`}` : ""}</span></summary>
@@ -102,18 +104,12 @@ export function Details({ state, changeTarget, panel, setPanel, selection, width
           {/^https:\/\//.test(image.image_url) && <img loading="lazy" src={image.image_url} alt={image.title || "搜索结果"}/>}
           <p>{i + 1}. {image.title}</p><button onClick={() => { void window.astra.openExternal(image.source_url).catch(fail); }}>查看来源</button></article>)}</section>)}
         {!artifacts.length && !galleries.length && <p className="muted">工具产物和搜索图片会显示在这里；对话中的文件链接也可直接打开。</p>}
-      </> : panel === "team" ? <>
-        <h3>团队与工作计划</h3>{Object.values(state.teams).map(t => <section className="team-card" key={t.id}>
-          <h4>{t.name} <span className="muted">{statusLabel(t.status)}</span></h4>{t.goal && <p className="muted small">{t.goal}</p>}
-          {t.agents.map(a => <div className="team-member" key={a.id}><span className={`status-dot ${a.status}`}/><span>{a.name}<small>{a.role}</small></span><span>{statusLabel(a.status)}{a.unread > 0 && ` · ${a.unread} 条未读`}</span></div>)}
-          {t.tasks.map(task => <p className="small" key={task.id}>{task.status === "completed" ? "✓" : "·"} {task.title} <span className="muted">{statusLabel(task.status)}</span></p>)}
-          <RawDetails label={`诊断详情 · ${t.messageCount} 条消息`} value={t}/>
-        </section>)}
-        {!Object.keys(state.teams).length && <p className="muted">当前没有 Team 活动。</p>}
-        {state.info.working_memory && <><h4>当前计划</h4><PlanSummary memory={state.info.working_memory.memory}/></>}
+      </> : panel === "subagents" ? <>
+        <SubagentPanel delegates={state.delegates} teams={state.teams} runtime={state.id} fail={fail} openFile={openFile}/>
       </> : <>
         <h3>当前上下文</h3><dl><dt>工作区</dt><dd>{state.workspace}</dd><dt>会话</dt><dd>{state.session}</dd><dt>模式</dt><dd>{state.mode}</dd><dt>模型</dt><dd>{state.info.model_info?.model || "未连接"}{state.info.model_info?.served_model ? `（实际：${state.info.model_info.served_model}）` : ""}</dd><dt>上下文</dt><dd>{state.info.model_info?.context_used?.toLocaleString() || 0} / {state.info.model_info?.context_limit?.toLocaleString() || "—"}</dd></dl>
         {Number(state.info.model_info?.context_limit) > 0 && <div className="context-meter"><progress aria-label="上下文使用量" value={Number(state.info.model_info.context_used || 0)} max={Number(state.info.model_info.context_limit)}/><small className="muted">按当前模型的上下文预算显示</small></div>}
+        {state.info.working_memory && <><h4>当前计划</h4><PlanSummary memory={state.info.working_memory.memory}/></>}
         {state.info.wakeup_status?.plan && <section className="summary-card"><h4>定时提醒 · {statusLabel(state.info.wakeup_status.plan.state)}</h4><p>{state.info.wakeup_status.message || state.info.wakeup_status.plan.prompt || "等待下一次唤醒"}</p></section>}
         <RequestTimeline key={`${state.id}:${state.mode}:${state.session}`} state={state}/>
         <h4 className="diagnostics-title">原始诊断</h4>
@@ -124,11 +120,6 @@ export function Details({ state, changeTarget, panel, setPanel, selection, width
 }
 
 const eventLabels: Record<string, string> = { task_status: "任务状态", generation_progress: "生成进度", working_memory: "工作计划", yolo_status: "工具权限", computer_status: "电脑控制", gui_appshot: "窗口捕获", wakeup_status: "定时提醒", peer_message: "会话互通", turn_changes: "文件改动", usage: "用量", gui_model_result: "模型切换结果" };
-function statusLabel(status?: string) { return ({ running: "运行中", active: "进行中", scheduled: "已安排", completed: "已完成", idle: "待命", pending: "等待中", in_progress: "进行中", done: "已完成", cancelled: "已取消", failed: "失败", interrupted: "已中断", paused: "已暂停", ready: "就绪" } as Record<string, string>)[status || ""] || status || ""; }
-function RawDetails({ value, label = "诊断详情" }: { value: unknown; label?: string }) {
-  const [open, setOpen] = useState(false);
-  return <details className="tool-detail" onToggle={e => setOpen(e.currentTarget.open)}><summary className="muted small">{label}</summary>{open && <pre>{JSON.stringify(value, null, 2)}</pre>}</details>;
-}
 function PlanSummary({ memory }: { memory?: UIEvent }) {
   if (!memory) return null;
   const steps = Array.isArray(memory.plan) ? memory.plan : Array.isArray(memory.steps) ? memory.steps : [];

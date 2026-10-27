@@ -108,9 +108,15 @@ back and tells you, and the desktop and a paired phone are notified.
   Optional questions can use a timed wait: the question remains answerable while
   independent work continues. Required decisions retain blocking waits; a timeout
   grants no approval. See [asynchronous questions](async-user-questions.md).
-- **执行详情** opens tools/processes, per-turn file diffs, files/images, context and
-  Team state. Missing/expired snapshots and unconfirmed changes are labelled separately.
-  Large text previews are bounded; use **系统打开** for the complete file.
+- **执行详情** opens tools/processes, subagents, per-turn file diffs, files/images and
+  context (including the agent's current plan). Missing/expired snapshots and unconfirmed
+  changes are labelled separately. Large text previews are bounded; use **系统打开** for
+  the complete file.
+- **子代理** in that panel holds every subagent of the conversation: a Team's members under
+  the Team, each on its latest run (status, time, the tool it is calling, unread messages,
+  its result and full record) with earlier runs folded, the Team's tasks, then one-off
+  delegations. The subagent summary in the conversation opens it, and a dot on the tab
+  means one is still going.
 - **命令与功能** exposes all current TUI command roots with optional parameters.
   `/tool N` and `/gallery N` locate a recorded result. Commands such as `/memory`,
   `/skills`, `/tasks` and `/diagnostics` currently use compatibility forms and the
