@@ -9,6 +9,7 @@ everywhere: the folder alone is not a file the desktop opens.
 
 from __future__ import annotations
 
+import html
 import json
 import re
 import time
@@ -133,6 +134,51 @@ def starter_slides(title: str) -> str:
 
 
 _SLIDE = re.compile(r"<section\b[^>]*\bclass\s*=\s*(['\"])(?:[^'\"]*\s)?slide(?:\s[^'\"]*)?\1", re.IGNORECASE)
+
+
+def _text(markup: str) -> str:
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", markup))).strip()
+
+
+def slide_parts(root: Path) -> list[tuple[str, str]]:
+    """Each slide's first heading and its speaker notes, as plain text, in order."""
+    try:
+        source = (root / SLIDES_FILE).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    starts = [match.start() for match in _SLIDE.finditer(source)]
+    parts = []
+    for index, start in enumerate(starts):
+        chunk = source[start: starts[index + 1] if index + 1 < len(starts) else len(source)]
+        notes = re.findall(r"<aside\b[^>]*\bclass\s*=\s*['\"][^'\"]*\bnotes\b[^'\"]*['\"][^>]*>(.*?)</aside>", chunk, re.IGNORECASE | re.DOTALL)
+        heading = re.search(r"<h[1-3]\b[^>]*>(.*?)</h[1-3]>", re.sub(r"<aside\b.*?</aside>", "", chunk, flags=re.IGNORECASE | re.DOTALL), re.IGNORECASE | re.DOTALL)
+        parts.append((_text(heading.group(1)) if heading else "", "\n".join(_text(note) for note in notes)))
+    return parts
+
+
+def build_pptx(pictures: list[Path], parts: list[tuple[str, str]], target: Path, title: str) -> None:
+    """A 16:9 deck of one full-slide picture each, the slide's heading as the picture's text for screen readers, its notes as notes."""
+    from pptx import Presentation
+    from pptx.util import Emu
+
+    deck = Presentation()
+    deck.slide_width, deck.slide_height = Emu(12192000), Emu(6858000)
+    width, height = deck.slide_width, deck.slide_height
+    blank = deck.slide_layouts[6]
+    for index, picture_path in enumerate(pictures):
+        slide = deck.slides.add_slide(blank)
+        picture = slide.shapes.add_picture(str(picture_path), Emu(0), Emu(0), width=width, height=height)
+        heading, notes = parts[index] if index < len(parts) else ("", "")
+        picture.name = f"Slide {index + 1}"
+        # The picture's description is what a screen reader says for the slide.
+        properties = next(node for node in picture._element.iter() if str(node.tag).endswith("}cNvPr"))
+        properties.set("descr", heading or f"Slide {index + 1}")
+        frame = slide.notes_slide.notes_text_frame if notes else None
+        if frame is not None:
+            frame.text = notes
+    deck.core_properties.title = title
+    target.parent.mkdir(parents=True, exist_ok=True)
+    deck.save(str(target))
 
 
 def slide_count(root: Path) -> int:

@@ -28,6 +28,18 @@ class Desktop:
         self.asked.append((path, options))
         if self.error:
             raise PageSnapshotError(self.error)
+        if options.get("export") == "slides":
+            from PIL import Image
+
+            folder = Path(str(options["target"]))
+            folder.mkdir(parents=True, exist_ok=True)
+            count = slide_count(path.parent)
+            pictures = []
+            for number in range(1, count + 1):
+                picture = folder / f"slide-{number:03d}.png"
+                Image.new("RGB", (192, 108), (number * 40, 120, 80)).save(picture)
+                pictures.append(picture)
+            return PageSnapshot(image_path=folder, paths=tuple(pictures))
         if options.get("export") == "pdf":
             target = Path(str(options["target"]))
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -108,7 +120,7 @@ def test_export_prints_into_the_canvas_exports_folder(tmp_path):
     assert result == {"success": True, "file": str(target), "format": "pdf", "slides": 1,
                       "canvas": str(tmp_path / "deck.canvas" / "canvas.json"), "title": "deck"}
     assert desktop.asked[-1] == (tmp_path / "deck.canvas" / "canvas.json", {"export": "pdf", "target": str(target), "timeout": 150})
-    assert call(action="export", canvas="deck.canvas", format="pptx")["error"]
+    assert "pdf or pptx" in call(action="export", canvas="deck.canvas", format="docx")["error"]
 
 
 def test_a_desktop_that_cannot_draw_is_reported_once_and_not_retried(tmp_path):
@@ -141,3 +153,29 @@ def test_slides_are_counted_as_the_desktop_counts_them(tmp_path, markup, count):
     folder.mkdir()
     (folder / "slides.html").write_text(markup, encoding="utf-8")
     assert slide_count(folder) == count
+
+
+def test_a_pptx_is_one_picture_per_slide_with_its_heading_and_notes(tmp_path):
+    from pptx import Presentation
+
+    desktop = Desktop(tmp_path)
+    call = tool(tmp_path, desktop)
+    call(action="create", title="季度回顾")
+    (tmp_path / "季度回顾.canvas" / "slides.html").write_text(
+        '<section class="slide title"><h1>季度 &amp; 回顾</h1><aside class="notes">先讲<b>营收</b>。</aside></section>\n'
+        '<section class="slide"><h2>没有备注</h2><p>x</p></section>', encoding="utf-8")
+    result = json.loads(call(action="export", canvas="季度回顾.canvas", format="pptx")["output"])
+    target = tmp_path / "季度回顾.canvas" / "exports" / "季度回顾.pptx"
+    assert (result["file"], result["format"], result["slides"]) == (str(target), "pptx", 2)
+    assert desktop.asked[-1][1]["export"] == "slides"
+    # The pictures were only for the PPTX.
+    assert not (tmp_path / "季度回顾.canvas" / "exports" / ".slides").exists()
+    deck = Presentation(str(target))
+    assert (deck.slide_width, deck.slide_height) == (12192000, 6858000)
+    assert len(deck.slides) == 2
+    pictures = [slide.shapes[0] for slide in deck.slides]
+    assert [(shape.left, shape.top, shape.width, shape.height) for shape in pictures] == [(0, 0, 12192000, 6858000)] * 2
+    assert [shape._element.nvPicPr.cNvPr.get("descr") for shape in pictures] == ["季度 & 回顾", "没有备注"]
+    assert deck.slides[0].notes_slide.notes_text_frame.text == "先讲 营收 。"
+    assert not deck.slides[1].has_notes_slide
+    assert deck.core_properties.title == "季度回顾"

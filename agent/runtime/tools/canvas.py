@@ -11,11 +11,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import shutil
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from agent.runtime.canvas import (
-    GUIDES, MANIFEST, SLIDES_FILE, TYPES, CanvasError, canvas_root, create, read_manifest, slide_count,
+    GUIDES, MANIFEST, SLIDES_FILE, TYPES, CanvasError, build_pptx, canvas_root, create, read_manifest, slide_count, slide_parts,
 )
 from agent.runtime.page_snapshot import PageSnapshot, PageSnapshotError
 from agent.runtime.tool_failure import ToolFailure
@@ -27,8 +28,8 @@ Render = Callable[..., Awaitable[PageSnapshot]]
 DESCRIPTION = (
     "Slide decks the user sees beside the conversation on the desktop. create makes <name>.canvas/ "
     "and returns how to write its slides; edit its slides.html with the file tools (the panel follows "
-    "every write); export prints the deck to a PDF in the canvas's exports folder; types lists the canvas "
-    "types. Look at a slide with canvas_look."
+    "every write); export writes the deck to its exports folder as a PDF (selectable text) or a PPTX (one "
+    "picture per slide, with the speaker notes); types lists the canvas types. Look at a slide with canvas_look."
 )
 LOOK_DESCRIPTION = (
     "Attach a picture of one slide of a canvas, drawn as the desktop shows it, to look at what was "
@@ -81,11 +82,13 @@ def register_canvas_tool(registry: ToolRegistry, *, workdir: str | Path, render:
                     payload["message"] += f" A script raised an error while it was drawn: {picture.script_error}"
                 return json.dumps(payload, ensure_ascii=False)
             if action == "export":
-                if format != "pdf":
-                    raise CanvasError("Only PDF export is available so far.")
+                if format not in {"pdf", "pptx"}:
+                    raise CanvasError("Export to pdf or pptx.")
                 if count == 0:
                     raise CanvasError(f'{folder / SLIDES_FILE} has no <section class="slide">.')
                 stem = folder.name[: -len(".canvas")] or "deck"
+                if format == "pptx":
+                    return await export_pptx(folder, stem, count, str(manifest.get("title", "")))
                 target = folder / "exports" / f"{stem}.pdf"
                 printed = await render(folder / MANIFEST, export="pdf", target=str(target), timeout=150)
                 return json.dumps({"success": True, "file": str(printed.image_path), "format": "pdf", "slides": count,
@@ -96,6 +99,25 @@ def register_canvas_tool(registry: ToolRegistry, *, workdir: str | Path, render:
         except PageSnapshotError as exc:
             # What stops a canvas from being drawn is nearly always its content; asking again draws it the same.
             return ToolFailure(code="canvas_rendering_failed", message=str(exc), retryable=False)
+
+    async def export_pptx(folder: Path, stem: str, count: int, title: str) -> str:
+        try:
+            import pptx  # noqa: F401
+        except ImportError:
+            raise CanvasError("PPTX export needs python-pptx (Astra's documents extra), which is not installed.") from None
+        pictures_folder = folder / "exports" / ".slides"
+        drawn = await render(folder / MANIFEST, export="slides", target=str(pictures_folder), timeout=60 + 10 * count)
+        try:
+            pictures = [path for path in drawn.paths if path.parent == pictures_folder and path.is_file()]
+            if len(pictures) != count:
+                raise CanvasError(f"The desktop drew {len(pictures)} of the deck's {count} slides.")
+            target = folder / "exports" / f"{stem}.pptx"
+            await asyncio.to_thread(build_pptx, pictures, slide_parts(folder), target, title)
+        finally:
+            await asyncio.to_thread(shutil.rmtree, pictures_folder, True)
+        return json.dumps({"success": True, "file": str(target), "format": "pptx", "slides": count,
+                           "canvas": str(folder / MANIFEST), "title": title,
+                           "note": "Each slide is one picture: its text cannot be edited in PowerPoint."}, ensure_ascii=False)
 
     registry.register(ToolDef(
         name="canvas",
@@ -108,14 +130,14 @@ def register_canvas_tool(registry: ToolRegistry, *, workdir: str | Path, render:
                 "title": {"type": "string", "description": "create: the deck's title."},
                 "path": {"type": "string", "description": "create: where to make it, inside the workspace; default <title>.canvas."},
                 "canvas": {"type": "string", "description": "export: the canvas folder or its canvas.json."},
-                "format": {"type": "string", "enum": ["pdf"], "description": "export: the file format.", "default": "pdf"},
+                "format": {"type": "string", "enum": ["pdf", "pptx"], "description": "export: the file format.", "default": "pdf"},
             },
             "required": ["action"],
             "additionalProperties": False,
         },
         fn=canvas_tool, risk="write", group="canvas", sandboxed=False,
-        # A print of a long deck takes a while; the desktop gives up on its own before this.
-        timeout=180,
+        # A print or a PPTX of a long deck takes a while; the desktop gives up on its own before this.
+        timeout=600,
     ))
     registry.register(ToolDef(
         name="canvas_look",

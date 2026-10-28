@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { composeDeck, inlineAssets, slideCount } from "../src/main/canvas-deck.js";
-import { canvasVersion, exportTarget, isCanvasManifest, readCanvas } from "../src/main/canvas-files.js";
+import { canvasVersion, exportTarget, isCanvasManifest, readCanvas, slidesTarget } from "../src/main/canvas-files.js";
 import { PRINT_POLICY, cardFrameResponse, printAddress } from "../src/main/card-frame.js";
 import { canvasManifestFor, pagePathFromTool } from "../src/renderer/page-state.js";
 
@@ -64,6 +64,10 @@ test("a canvas on disk reads as its document, its version follows its slides and
   assert.equal(exportTarget(manifest, join(exports, "deck.pdf")), join(exports, "deck.pdf"));
   for (const target of [join(manifest, "..", "deck.pdf"), join(exports, "deck.html"), join(exports, "x", "deck.pdf")])
     assert.throws(() => exportTarget(manifest, target), /exports/);
+  // The pictures for a PPTX go to one folder of its own, and nowhere else.
+  assert.equal(slidesTarget(manifest, join(exports, ".slides")), join(exports, ".slides"));
+  for (const target of [exports, join(exports, ".slides", "x"), join(manifest, "..", ".slides")]) assert.throws(() => slidesTarget(manifest, target), /\.slides/);
+  assert.equal((await readCanvas(manifest, "capture", 2)).inlined.includes("data:image/png;base64,"), true);
 });
 
 test("an image that leaves the folder, and a canvas of an unknown kind, are refused", async () => {

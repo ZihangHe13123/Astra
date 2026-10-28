@@ -34,6 +34,8 @@ class PageSnapshot:
     page_height: int = 0
     # What a script on the page raised while it was drawn, in the page's own words.
     script_error: str = ""
+    # Every slide's picture, when a whole deck was drawn for a PPTX.
+    paths: tuple[Path, ...] = ()
 
 
 def _pixels(value: object) -> int:
@@ -81,11 +83,13 @@ class PageSnapshotBroker:
             future.set_exception(PageSnapshotError(error.strip()[:500]))
         elif isinstance(image_path, str) and image_path.strip():
             script_error = command.get("script_error")
+            paths = command.get("paths")
             future.set_result(PageSnapshot(
                 image_path=Path(image_path.strip()),
                 height=_pixels(command.get("height")),
                 page_height=_pixels(command.get("page_height")),
                 script_error=script_error.strip()[:300] if isinstance(script_error, str) else "",
+                paths=tuple(Path(item) for item in paths if isinstance(item, str) and item) if isinstance(paths, list) else (),
             ))
         else:
             future.set_exception(PageSnapshotError("The desktop returned no picture of the page."))

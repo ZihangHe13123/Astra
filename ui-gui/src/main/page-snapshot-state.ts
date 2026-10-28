@@ -16,9 +16,10 @@ export const SNAPSHOT_MAX_HEIGHT = SNAPSHOT_SCREEN * 3;
 export const SNAPSHOTS_KEPT = 40;
 export const SNAPSHOT_TIME_LIMIT = 15000;
 
-export type PageSnapshot = { path: string; width: number; height: number; pageHeight: number; scriptError: string };
+/** `paths` holds every slide's picture when a deck was drawn whole, for a PPTX. */
+export type PageSnapshot = { path: string; width: number; height: number; pageHeight: number; scriptError: string; paths?: string[] };
 /** What the backend may ask of a picture: a canvas slide, or a print of a canvas into its exports folder. */
-export type SnapshotOptions = { slide?: number; export?: "pdf"; target?: string };
+export type SnapshotOptions = { slide?: number; export?: "pdf" | "slides"; target?: string };
 /** A slide is drawn at its own size and handed to the model at this width, which reads its text and costs less. */
 export const SLIDE_PICTURE_WIDTH = 1280;
 export const PRINT_TIME_LIMIT = 90000;

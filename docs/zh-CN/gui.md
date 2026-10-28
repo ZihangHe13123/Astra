@@ -174,6 +174,9 @@ Markdown 图片和文件可从当前工作区及 Astra 产物目录预览。外�
 - `canvas` 的 `action="export"` 把整份幻灯片打印成 `<名字>.canvas/exports/<名字>.pdf`：一页一张 16:9，
   文字可选。打印在一个看不见的窗口里进行：幻灯片作为一份独立文档，受和隔离框相同的安全策略约束，
   处在不透明的源里，WebRTC 也被移除。
+- `format="pptx"` 则在同一处写出 `<名字>.pptx`：每页一张 1920 × 1080 的整页图片，每页的标题写进图片的描述
+  （读屏软件能读到），`<aside class="notes">` 写进演讲者备注。PowerPoint 里不能改字。需要 python-pptx
+  （`documents` 可选依赖组，桌面安装包已带）。
 - 幻灯片遵守和页面相同的规则：碰不到 Astra，不能联网、存储、弹窗或跳转。
 
 画布只在桌面端显示；`canvas` 和 `canvas_look` 只提供给桌面端的后端，属于按需加载的工具（`tool_search` 的

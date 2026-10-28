@@ -15,7 +15,8 @@ const ASSET_LIMIT = 8 * 1024 * 1024;
 
 export const isCanvasManifest = (path: string) => basename(path) === CANVAS_MANIFEST && /\.canvas$/i.test(basename(dirname(path)));
 
-export type CanvasDocument = { title: string; type: string; slides: number; source: string; html: string; missing: string[] };
+/** `inlined` is the slides with their images written in, from which each slide's own document is composed. */
+export type CanvasDocument = { title: string; type: string; slides: number; source: string; inlined: string; html: string; missing: string[] };
 
 async function manifestOf(manifestPath: string): Promise<{ title: string; type: string }> {
   if (!isCanvasManifest(manifestPath)) throw new Error("不是画布：画布是名为 <名字>.canvas 的文件夹里的 canvas.json。");
@@ -57,7 +58,7 @@ export async function readCanvas(manifestPath: string, mode: DeckMode, slide = 1
     assets.set(name, { mime, data: await readFile(path) });
   }
   const { html, missing } = inlineAssets(source, name => assets.get(name));
-  return { title, type, slides: slideCount(source), source, html: composeDeck(html, { mode, slide, title }), missing };
+  return { title, type, slides: slideCount(source), source, inlined: html, html: composeDeck(html, { mode, slide, title }), missing };
 }
 
 /** One version for everything the canvas is drawn from: its manifest, its slides and its images. */
@@ -78,5 +79,11 @@ export async function canvasVersion(manifestPath: string): Promise<string> {
 export function exportTarget(manifestPath: string, target: string): string {
   const exports = join(dirname(manifestPath), "exports");
   if (dirname(target) !== exports || !/^[^\\/]+\.pdf$/i.test(basename(target))) throw new Error("导出只能写进画布自己的 exports 文件夹。");
+  return target;
+}
+
+/** Where the slides' pictures for a PPTX may be written: the `.slides` folder in its exports, nowhere else. */
+export function slidesTarget(manifestPath: string, target: string): string {
+  if (target !== join(dirname(manifestPath), "exports", ".slides")) throw new Error("幻灯片图片只能写进画布 exports 里的 .slides 文件夹。");
   return target;
 }

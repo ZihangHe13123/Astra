@@ -1,10 +1,10 @@
 import { BrowserWindow } from "electron";
-import { mkdir, readdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, stat, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import type { CardTheme } from "../card-theme.js";
 import { CAPTURE_HOST_URL, PAGE_FRAME_URL, guardCardFrames, printAddress } from "./card-frame.js";
-import { SLIDE_HEIGHT, SLIDE_WIDTH } from "./canvas-deck.js";
-import { exportTarget, isCanvasManifest, readCanvas } from "./canvas-files.js";
+import { SLIDE_HEIGHT, SLIDE_WIDTH, composeDeck } from "./canvas-deck.js";
+import { exportTarget, isCanvasManifest, readCanvas, slidesTarget } from "./canvas-files.js";
 import { PAGE_PREVIEW_LIMIT } from "./file-preview.js";
 import { PRINT_TIME_LIMIT, SLIDE_PICTURE_WIDTH, SNAPSHOT_SCREEN, SNAPSHOT_TIME_LIMIT, SNAPSHOT_WIDTH, growsWithWindow, pngSize, shownHeight,
   snapshotName, staleSnapshots, type PageSnapshot, type SnapshotOptions } from "./page-snapshot-state.js";
@@ -18,7 +18,8 @@ export class PageSnapshots {
   /** One page at a time: each picture has a window of its own, and they are not worth running side by side. A canvas gives one slide, or its print. */
   capture(path: string, options: SnapshotOptions = {}): Promise<PageSnapshot> {
     const run = this.last.then(() => !isCanvasManifest(path) ? this.render(path)
-      : options.export === "pdf" ? this.print(path, options.target ?? "") : this.slide(path, options.slide ?? 1));
+      : options.export === "pdf" ? this.print(path, options.target ?? "")
+      : options.export === "slides" ? this.slides(path, options.target ?? "") : this.slide(path, options.slide ?? 1));
     this.last = run.catch(() => undefined);
     return run;
   }
@@ -77,6 +78,35 @@ export class PageSnapshots {
       await writeFile(target, png, { mode: 0o600 });
       await this.prune(target).catch(error => console.error("Astra page snapshots:", error));
       return { path: target, ...pngSize(png), pageHeight: SLIDE_HEIGHT, scriptError };
+    });
+  }
+
+  /** Every slide of a deck at its own size, one window drawing them in turn, into the canvas's exports/.slides (for a PPTX). */
+  private async slides(path: string, requested: string): Promise<PageSnapshot> {
+    const folder = slidesTarget(path, resolve(requested));
+    const canvas = await readCanvas(path, "capture", 1);
+    if (!canvas.slides) throw new Error("画布里还没有幻灯片。");
+    const theme = await this.theme().catch(() => undefined);
+    await rm(folder, { recursive: true, force: true });
+    await mkdir(folder, { recursive: true });
+    const limit = Math.min(10 * 60000, SNAPSHOT_TIME_LIMIT + canvas.slides * 8000);
+    return this.within(this.window(SLIDE_WIDTH, SLIDE_HEIGHT, true), limit, "幻灯片在限定时间内没有画完。", async window => {
+      const contents = window.webContents;
+      const host = <T>(call: string): Promise<T> => contents.executeJavaScript(`astraCapture.${call}`);
+      await contents.loadURL(CAPTURE_HOST_URL);
+      const paths: string[] = [];
+      for (let slide = 1; slide <= canvas.slides; slide++) {
+        const html = composeDeck(canvas.inlined, { mode: "capture", slide, title: canvas.title });
+        await host<number>(`open(${JSON.stringify({ html, theme: theme ?? null, address: PAGE_FRAME_URL, width: SLIDE_WIDTH, height: SLIDE_HEIGHT })})`);
+        const image = await contents.capturePage({ x: 0, y: 0, width: SLIDE_WIDTH, height: SLIDE_HEIGHT });
+        if (image.isEmpty()) throw new Error(`没有截到第 ${slide} 页的画面。`);
+        let png = image.toPNG();
+        if (pngSize(png).width !== SLIDE_WIDTH) png = image.resize({ width: SLIDE_WIDTH, quality: "best" }).toPNG();
+        const target = join(folder, `slide-${String(slide).padStart(3, "0")}.png`);
+        await writeFile(target, png);
+        paths.push(target);
+      }
+      return { path: folder, width: SLIDE_WIDTH, height: SLIDE_HEIGHT, pageHeight: SLIDE_HEIGHT, scriptError: "", paths };
     });
   }
 

@@ -127,7 +127,7 @@ const watched = `<!doctype html><title>watched</title><body style="margin: 0"><s
 // It leaves at once, before any picture can be taken.
 const leaver = `<!doctype html><title>leaver</title><p>leaving</p><script>location.href = '${out}/leaver-navigation';</script>`;
 // A deck (specs/canvas.md): a title, a full-bleed image from its assets, and a slide that tries every way out.
-const deckSlides = `<section class="slide title"><h1>季度回顾</h1><p>2026</p></section>
+const deckSlides = `<section class="slide title"><h1>季度回顾</h1><p>2026</p><aside class="notes">先讲营收。</aside></section>
 <section class="slide image"><img id="swatch" src="assets/swatch.png" alt=""><h1>颜色</h1></section>
 <section class="slide"><h1>出口</h1>${escapeBody}</section>`;
 // What the model does when asked: one call that writes or edits a file, then a line of text.
@@ -156,6 +156,7 @@ const writes = {
     expected_sha256: createHash('sha256').update(readFileSync(join(workspace, 'deck.canvas', 'slides.html'))).digest('hex') }),
   看第二页: { tool: 'call_tool', name: 'canvas_look', arguments: { canvas: 'deck.canvas', slide: 2 } },
   导出幻灯片: { tool: 'call_tool', label: 'export', name: 'canvas', arguments: { action: 'export', canvas: 'deck.canvas' } },
+  导出演示文稿: { tool: 'call_tool', label: 'pptx', name: 'canvas', arguments: { action: 'export', canvas: 'deck.canvas', format: 'pptx' } },
 };
 const requests = [];
 const model = createServer(async (req, res) => {
@@ -562,11 +563,22 @@ try {
   assert.ok(pdf.startsWith('%PDF-'), 'a PDF');
   assert.equal(pdf.match(/\/Type\s*\/Page[^s]/g)?.length, 3);
   assert.deepEqual([...new Set(pdf.match(/\/MediaBox\s*\[[^\]]+\]/g))], ['/MediaBox [0 0 1440 810]']);
+  // And as a PPTX: one full picture per slide at its own size, the notes kept, the pictures' folder gone.
+  await step('导出演示文稿', 'pptx');
+  const { stdout: pptx } = await runFile(env.AGENT_PYTHON, ['-c', `import json, struct, sys, zipfile
+z = zipfile.ZipFile(sys.argv[1]); names = z.namelist()
+media = [n for n in names if n.startswith("ppt/media/")]
+print(json.dumps({"slides": sorted(n for n in names if n.startswith("ppt/slides/slide") and n.endswith(".xml")),
+  "sizes": sorted({struct.unpack(">II", z.read(n)[16:24]) for n in media}),
+  "notes": [n for n in names if n.startswith("ppt/notesSlides/") and n.endswith(".xml") and "先讲营收" in z.read(n).decode()]}))`,
+    join(workspace, 'deck.canvas', 'exports', 'deck.pptx')]);
+  assert.deepEqual(JSON.parse(pptx), { slides: ['ppt/slides/slide1.xml', 'ppt/slides/slide2.xml', 'ppt/slides/slide3.xml'], sizes: [[1920, 1080]], notes: ['ppt/notesSlides/notesSlide1.xml'] });
+  assert.equal(readdirSync(join(workspace, 'deck.canvas', 'exports')).includes('.slides'), false);
   assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length), 1, 'the picture and print windows are gone');
   await new Promise(done => setTimeout(done, 1500));
   assert.deepEqual(reached, [], 'nothing the deck tried, on screen, looked at or printed, reached a listener');
   assert.deepEqual(answered, []);
-  passed('the model looks at one slide as the desktop draws it and prints the deck to a PDF of its slides, and nothing the deck tries gets out');
+  passed('the model looks at one slide as the desktop draws it, prints the deck to a PDF of its slides and exports a PPTX of its pictures and notes, and nothing the deck tries gets out');
   // The failing page's own exception is the only one.
   assert.deepEqual([...new Set(errors)], ['PAGE_FIXTURE_FAILURE']);
 } catch (error) {

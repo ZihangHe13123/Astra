@@ -151,7 +151,7 @@ const captureDocument = `<!doctype html><html lang="zh-CN"><head><meta charset="
   const loadTimeout = 5000, answerTimeout = 3000, settleTime = 400, drawTimeout = 8000;
   let frame, asks = 0, problem = "", ready;
   const waiting = new Map();
-  const becameReady = new Promise(resolve => { ready = resolve; });
+  let becameReady = new Promise(resolve => { ready = resolve; });
   const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
   // Two frames, so that what was laid out has also been drawn; a window that draws nothing must not hold the picture up.
   const painted = () => Promise.race([new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))), pause(300)]);
@@ -173,6 +173,8 @@ const captureDocument = `<!doctype html><html lang="zh-CN"><head><meta charset="
   const tall = data => { const value = Number(data.height); return Number.isFinite(value) ? Math.min(100000, Math.max(0, Math.ceil(value))) : 0; };
   window.astraCapture = {
     async open({ html, theme, address, width, height }) {
+      // One page at a time: drawing the next one (a deck's next slide) replaces the frame before it.
+      if (frame) { frame.remove(); becameReady = new Promise(resolve => { ready = resolve; }); problem = ""; }
       frame = document.createElement("iframe");
       frame.setAttribute("sandbox", "allow-scripts"); frame.referrerPolicy = "no-referrer";
       frame.style.width = width + "px"; frame.style.height = height + "px";

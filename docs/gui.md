@@ -246,6 +246,10 @@ conversation, presenting and printing are Astra's own code; the model writes onl
 - `canvas` with `action="export"` prints the deck to `<name>.canvas/exports/<name>.pdf`: one
   16:9 page per slide, with selectable text. The print runs in a window nobody sees, as a
   document of its own under the frame's policy and in an opaque origin, with WebRTC removed.
+- With `format="pptx"` it writes `<name>.pptx` there instead: one full-slide picture per slide at
+  1920 x 1080, each slide's heading as the picture's description for screen readers, and the
+  slide's `<aside class="notes">` as its speaker notes. The text cannot be edited in PowerPoint.
+  This needs python-pptx (the `documents` extra, included in the desktop package).
 - Slides run under the same rules as a page: no access to Astra, no network, no storage, no
   pop-ups, no navigation.
 
