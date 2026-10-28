@@ -147,8 +147,10 @@ def create(workdir: Path, kind: str, title: str, path: str = "") -> Path:
     (target / "assets").mkdir(parents=True)
     manifest = {"type": kind, "title": title, "version": 1, "entry": ENTRIES[kind],
                 "created": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
-    (target / MANIFEST).write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    (target / ENTRIES[kind]).write_text(starter_slides(title) if kind == "slides" else f"# {title}\n\n", encoding="utf-8")
+    # One line ending on every platform: the desktop and the doc_* tools read and compare these files as written.
+    (target / MANIFEST).write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8", newline="\n")
+    (target / ENTRIES[kind]).write_text(starter_slides(title) if kind == "slides" else f"# {title}\n\n",
+                                        encoding="utf-8", newline="\n")
     record_version(target, "create")
     return target
 

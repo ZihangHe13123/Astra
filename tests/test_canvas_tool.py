@@ -188,7 +188,9 @@ def test_a_document_canvas_is_a_doc_md_written_with_the_doc_tools(tmp_path):
     assert result["output"].splitlines()[:2] == [f"Canvas: {folder / 'canvas.json'}", f"Edit: {folder / 'doc.md'}"]
     assert "# Document canvas" in result["output"] and 'tool_search(family="documents")' in result["output"]
     assert json.loads((folder / "canvas.json").read_text(encoding="utf-8"))["entry"] == "doc.md"
-    assert (folder / "doc.md").read_text(encoding="utf-8") == "# 研究计划\n\n"
+    # As bytes: one line ending on every platform, which the desktop compares and restores as written.
+    assert (folder / "doc.md").read_bytes() == "# 研究计划\n\n".encode()
+    assert b"\r" not in (folder / "canvas.json").read_bytes()
     # A document is read as text and exported with doc_export, not looked at or printed here.
     assert "doc_export" in call(action="export", canvas="研究计划.canvas")["error"]
     assert "read as text" in call(action="look", canvas="研究计划.canvas", slide=1)["error"]

@@ -597,7 +597,9 @@ print(json.dumps({"slides": sorted(n for n in names if n.startswith("ppt/slides/
   const sources = () => readdirSync(join(plan, '.versions')).sort().map(id => JSON.parse(readFileSync(join(plan, '.versions', id, 'meta.json'), 'utf8')).source);
   assert.deepEqual(sources(), ['create', 'write'], 'the doc_edit through call_tool is kept as a version');
   // Selecting the passage opens the comment; it is written after the passage, where doc_comments reads it.
-  await passage.click({ clickCount: 3 });
+  // The paragraph is selected whole, as a drag across it would; a triple click stops before the full stop on some platforms.
+  await passage.evaluate(node => { const range = document.createRange(); range.selectNodeContents(node); getSelection().removeAllRanges(); getSelection().addRange(range); });
+  await passage.dispatchEvent('mouseup');
   await preview.locator('.canvas-comment textarea').fill('加上月份');
   await preview.getByRole('button', { name: '写进文档', exact: true }).click();
   await expect(preview.locator('.doc-comments')).toContainText('加上月份');
