@@ -1,12 +1,17 @@
 // Follow saved documents that the agent writes or exports with the doc_* tools, and pages it writes to be looked at.
-import { pagePathFromTool } from "./page-state.js";
+import { canvasManifestFor, pagePathFromTool } from "./page-state.js";
 // Tool entries from the session state; only these fields are read.
 type ToolLike = { readonly [key: string]: unknown };
 
 export const isMarkdownPath = (path: string) => /\.(md|markdown)$/i.test(path);
 
-/** The saved document a successful doc_* tool result refers to. */
+/** The saved document a successful doc_* tool result refers to; a canvas's document is shown as its canvas. */
 export function docPathFromTool(tool: ToolLike): string | undefined {
+  const path = savedDocument(tool);
+  return path && isMarkdownPath(path) ? canvasManifestFor(path) ?? path : path;
+}
+
+function savedDocument(tool: ToolLike): string | undefined {
   const name = typeof tool.name === "string" ? tool.name : "";
   if (!name.startsWith("doc_") || tool.error || typeof tool.output !== "string" || !tool.output) return undefined;
   try {
@@ -44,19 +49,37 @@ export function resolveAgainst(base: string | undefined, target: string): string
   return `${base.replace(/[\\/]+$/, "")}${separator}${decoded}`;
 }
 
-/** Open review comments (<!-- @astra: ... -->) outside fenced code. */
-export function openComments(text: string): string[] {
-  const comments: string[] = [];
+/** The document's lines with those of fenced code blanked: what is prose. */
+function proseLines(text: string): string[] {
   let fence = "";
-  const visible = text.split(/\r?\n/).map(line => {
+  return text.split(/\r?\n/).map(line => {
     const marker = line.match(/^ {0,3}(`{3,}|~{3,})/);
     if (fence) { if (marker && marker[1][0] === fence[0] && marker[1].length >= fence.length && !line.trim().slice(marker[1].length).trim()) fence = ""; return ""; }
     if (marker) { fence = marker[1]; return ""; }
     return line;
-  }).join("\n");
+  });
+}
+
+/** Open review comments (<!-- @astra: ... -->) outside fenced code. */
+export function openComments(text: string): string[] {
+  const comments: string[] = [];
+  const visible = proseLines(text).join("\n");
   for (const match of visible.matchAll(/<!--[ \t]*@astra\b[ \t]*:?([\s\S]*?)-->/g)) {
     const comment = match[1].split(/\s+/).filter(Boolean).join(" ");
     if (comment) comments.push(comment);
   }
   return comments;
+}
+
+/** The document's headings outside fenced code, in order, as they read once rendered: its outline. */
+export function outline(text: string): { level: number; text: string }[] {
+  const headings: { level: number; text: string }[] = [];
+  for (const line of proseLines(text)) {
+    const match = line.match(/^ {0,3}(#{1,6})[ \t]+(.*?)(?:[ \t]+#+)?[ \t]*$/);
+    if (!match) continue;
+    const heading = match[2].replace(/<!--[\s\S]*?-->|<[^>]+>/g, "").replace(/!?\[([^\]]*)\]\([^)]*\)/g, "$1")
+      .replace(/(\*{1,3}|_{1,3}|`+|~~)/g, "").split(/\s+/).filter(Boolean).join(" ");
+    if (heading) headings.push({ level: match[1].length, text: heading });
+  }
+  return headings;
 }

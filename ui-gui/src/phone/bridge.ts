@@ -246,6 +246,7 @@ export class RemoteBridge implements DesktopBridge {
   async openExternal(url: string) { if (/^https?:\/\//i.test(url)) this.env.open(url); }
   file(): Promise<never> { return Promise.reject(new Error(UNAVAILABLE.file)); }
   cancelPreview() { return Promise.resolve(); }
+  canvas(): Promise<never> { return Promise.reject(new Error(UNAVAILABLE.file)); }
   phone(): Promise<never> { return Promise.reject(new Error(UNAVAILABLE.phone)); }
 
   async notifications(action: "status" | "enable" | "disable"): Promise<PhoneNotificationState> {

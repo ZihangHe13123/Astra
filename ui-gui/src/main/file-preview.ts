@@ -120,15 +120,13 @@ export class DocumentPreviewService {
       return {...base, kind:'text', text, truncated, ...oversized};
     } finally { release?.(); }
   }
-  /** A canvas is drawn by its template, as a page; it is read afresh each time, since its slides and images change apart from canvas.json. */
+  /** A canvas is read afresh each time, since its content and images change apart from canvas.json. */
   private async canvas(path: string, signal: AbortSignal, authorize: () => void): Promise<FilePreview> {
     authorize();
     const initialVersion = await canvasVersion(path);
-    const canvas = await readCanvas(path, 'view'); checkSignal(signal);
+    const preview = await canvasPreview(path); checkSignal(signal);
     if (await canvasVersion(path) !== initialVersion) throw changed();
-    return { path, sourceVersion: initialVersion, kind: 'page', text: canvas.html,
-      canvas: { title: canvas.title, slides: canvas.slides, source: canvas.source },
-      ...(canvas.missing.length ? { warnings: [`有图片没有显示：${canvas.missing.join('、')}（放在 assets 文件夹里、8 MiB 以内的 png、jpg、gif、webp、svg 才能显示）。`] } : {}) };
+    return { ...preview, sourceVersion: initialVersion };
   }
   private remember(key: string, result: FilePreview) {
     const bytes = (result.data?.length ?? 0) * 2;
@@ -142,3 +140,15 @@ export class DocumentPreviewService {
 const defaultPreviews = new DocumentPreviewService();
 /** Call only after the host has authorized the real file path. */
 export const filePreview = (path: string, signal?: AbortSignal) => defaultPreviews.preview(path, signal);
+
+/**
+ * A canvas as the panel shows it: a deck drawn by its template, as a page; a document as its Markdown, its
+ * images found next to canvas.json. With `version`, that kept version instead of the current content.
+ */
+export async function canvasPreview(path: string, version = ''): Promise<FilePreview> {
+  const canvas = await readCanvas(path, 'view', 1, version);
+  const meta = { title: canvas.title, type: canvas.type as 'slides' | 'doc', slides: canvas.slides, source: canvas.source, ...(version ? { version } : {}) };
+  if (canvas.type === 'doc') return { path, kind: 'text', text: canvas.source, canvas: meta };
+  return { path, kind: 'page', text: canvas.html, canvas: meta,
+    ...(canvas.missing.length ? { warnings: [`有图片没有显示：${canvas.missing.join('、')}（放在 assets 文件夹里、8 MiB 以内的 png、jpg、gif、webp、svg 才能显示）。`] } : {}) };
+}

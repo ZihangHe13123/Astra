@@ -11,12 +11,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
+import re
 import shutil
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from agent.runtime.canvas import (
-    GUIDES, MANIFEST, SLIDES_FILE, TYPES, CanvasError, build_pptx, canvas_root, create, read_manifest, slide_count, slide_parts,
+    DOC_FILE, GUIDES, MANIFEST, SLIDES_FILE, TYPES, CanvasError, build_pptx, canvas_root, create, read_manifest, record_version,
+    slide_count, slide_parts,
 )
 from agent.runtime.page_snapshot import PageSnapshot, PageSnapshotError
 from agent.runtime.tool_failure import ToolFailure
@@ -24,12 +27,14 @@ from agent.runtime.tool_failure import ToolFailure
 from .registry import ToolDef, ToolRegistry
 
 Render = Callable[..., Awaitable[PageSnapshot]]
+logger = logging.getLogger(__name__)
 
 DESCRIPTION = (
-    "Slide decks the user sees beside the conversation on the desktop. create makes <name>.canvas/ "
-    "and returns how to write its slides; edit its slides.html with the file tools (the panel follows "
-    "every write); export writes the deck to its exports folder as a PDF (selectable text) or a PPTX (one "
-    "picture per slide, with the speaker notes); types lists the canvas types. Look at a slide with canvas_look."
+    "Slide decks and documents the user sees beside the conversation on the desktop. create makes "
+    "<name>.canvas/ and returns how to write it: a deck's slides.html with the file tools, a document's "
+    "doc.md with the doc_* tools; the panel follows every write and keeps every version. export writes a deck "
+    "to its exports folder as a PDF (selectable text) or a PPTX (one picture per slide, with the speaker "
+    "notes). types lists the canvas types. Look at a slide with canvas_look."
 )
 LOOK_DESCRIPTION = (
     "Attach a picture of one slide of a canvas, drawn as the desktop shows it, to look at what was "
@@ -54,8 +59,11 @@ def register_canvas_tool(registry: ToolRegistry, *, workdir: str | Path, render:
                 return "\n".join(f"- {name}: {text}" for name, text in TYPES.items())
             if action == "create":
                 folder = await asyncio.to_thread(create, root, type, title, path)
+                if type == "doc":
+                    # The first line names the canvas: the desktop opens it from this line.
+                    return (f"Canvas: {folder / MANIFEST}\nEdit: {folder / DOC_FILE}\nAssets: {folder / 'assets'}\n\n"
+                            + GUIDES[type].format(doc=folder / DOC_FILE, assets=folder / "assets"))
                 starter = hashlib.sha256((folder / SLIDES_FILE).read_bytes()).hexdigest()
-                # The first line names the canvas: the desktop opens it from this line.
                 return (f"Canvas: {folder / MANIFEST}\nEdit: {folder / SLIDES_FILE}\nAssets: {folder / 'assets'}\n"
                         f"{SLIDES_FILE} holds one title slide (sha256 {starter}): replace it whole with "
                         f"write_file(overwrite=true, expected_sha256=\"{starter}\"), or edit it.\n\n"
@@ -64,6 +72,8 @@ def register_canvas_tool(registry: ToolRegistry, *, workdir: str | Path, render:
                 raise CanvasError("Name the canvas: its folder or its canvas.json.")
             folder = await asyncio.to_thread(folder_of, canvas)
             manifest = await asyncio.to_thread(read_manifest, folder)
+            if manifest["type"] == "doc" and action in {"look", "export"}:
+                raise CanvasError(f"A document canvas is read as text ({folder / DOC_FILE}) and exported with doc_export.")
             count = await asyncio.to_thread(slide_count, folder)
             if action == "look":
                 if count == 0:
@@ -119,6 +129,24 @@ def register_canvas_tool(registry: ToolRegistry, *, workdir: str | Path, render:
                            "canvas": str(folder / MANIFEST), "title": title,
                            "note": "Each slide is one picture: its text cannot be edited in PowerPoint."}, ensure_ascii=False)
 
+    def keep_version(name: str, args: dict, result: dict, tool_def) -> None:
+        """After a write into a canvas, keep its content as a version: what the model changed can be gone back to."""
+        if tool_def is None or tool_def.risk != "write" or result.get("error"):
+            return None
+        named = [args.get(key) for key in ("path", "file_path")]
+        named += re.findall(r"^\*\*\* (?:Add|Update) File: (.+)$", str(args.get("patch") or ""), re.MULTILINE)
+        for value in {str(item).strip() for item in named if isinstance(item, str) and ".canvas" in item}:
+            try:
+                folder = folder_of(value)
+                record_version(folder, "write")
+            except CanvasError:
+                continue
+            except Exception:
+                logger.exception("Could not keep a version of the canvas %s", value)
+        return None
+
+    registry.hooks.on_after_tool(keep_version)
+
     registry.register(ToolDef(
         name="canvas",
         description=DESCRIPTION,
@@ -127,7 +155,7 @@ def register_canvas_tool(registry: ToolRegistry, *, workdir: str | Path, render:
             "properties": {
                 "action": {"type": "string", "enum": ["types", "create", "export"]},
                 "type": {"type": "string", "enum": sorted(TYPES), "description": "create: the canvas type.", "default": "slides"},
-                "title": {"type": "string", "description": "create: the deck's title."},
+                "title": {"type": "string", "description": "create: the title."},
                 "path": {"type": "string", "description": "create: where to make it, inside the workspace; default <title>.canvas."},
                 "canvas": {"type": "string", "description": "export: the canvas folder or its canvas.json."},
                 "format": {"type": "string", "enum": ["pdf", "pptx"], "description": "export: the file format.", "default": "pdf"},

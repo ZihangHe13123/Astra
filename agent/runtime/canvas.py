@@ -1,7 +1,8 @@
 """Canvases: a work the user sees beside the conversation, drawn from a template (specs/canvas.md).
 
 A canvas is a folder ``<name>.canvas`` holding ``canvas.json`` (its type and title), the content its
-template renders (slides: ``slides.html``) and ``assets/``. The model writes the content with the
+template renders (slides: ``slides.html``; a document: ``doc.md``) and ``assets/``. Every change to
+that content is kept in ``.versions/``, so an earlier one can be looked at and restored. The model writes the content with the
 ordinary file tools; the desktop renders it with the template's own code, in the same isolated frame
 as a page, and draws pictures and prints of it when asked. ``canvas.json`` is how a canvas is named
 everywhere: the folder alone is not a file the desktop opens.
@@ -9,22 +10,30 @@ everywhere: the folder alone is not a file the desktop opens.
 
 from __future__ import annotations
 
+import hashlib
 import html
 import json
 import re
+import shutil
 import time
 from pathlib import Path
 
 MANIFEST = "canvas.json"
 SUFFIX = ".canvas"
 SLIDES_FILE = "slides.html"
+DOC_FILE = "doc.md"
+VERSIONS = ".versions"
+MAX_VERSIONS = 30
 # The desktop renders slides.html whole or not at all.
 MAX_SLIDES_BYTES = 2 * 1024 * 1024
 
 TYPES = {
     "slides": "a 16:9 slide deck: one 1920x1080 slide per <section>, shown as a list and presented "
               "full-screen; exported as PDF or PPTX",
+    "doc": "a document written section by section with the doc_* tools (doc.md), shown with its outline; "
+           "the user can comment on a passage; exported as Word, PDF or HTML with doc_export",
 }
+ENTRIES = {"slides": SLIDES_FILE, "doc": DOC_FILE}
 
 SLIDES_GUIDE = """# Slides canvas
 
@@ -68,7 +77,22 @@ In a <style> block, set any of these on :root to restyle the whole deck:
 - One idea per slide; titles under about 40 characters; prefer a chart or numbers to a paragraph.
 """
 
-GUIDES = {"slides": SLIDES_GUIDE}
+DOC_GUIDE = """# Document canvas
+
+The document is {doc}, an ordinary doc_* document: its first heading is the title, the text under
+it the lead (section "_lead"), every other heading a section. Load the documents tools with
+tool_search(family="documents") and write it with them: doc_outline to see its sections, doc_edit to
+write the lead, add sections and write each one. The panel beside the conversation shows it with its
+outline and follows every change.
+
+The user comments on a passage from the panel; a comment is written into the document as
+<!-- @astra: ... --> after the passage. doc_comments lists the open ones with their section and
+nearby text: act on each with doc_edit, then resolve it with doc_edit(action="resolve_comment").
+Export with doc_export (docx, pdf or html). Images go in {assets} and are written as
+![text](assets/name.png).
+"""
+
+GUIDES = {"slides": SLIDES_GUIDE, "doc": DOC_GUIDE}
 
 
 class CanvasError(ValueError):
@@ -121,11 +145,53 @@ def create(workdir: Path, kind: str, title: str, path: str = "") -> Path:
     if target != workdir and workdir not in target.parents:
         raise CanvasError("A canvas is made inside the workspace.")
     (target / "assets").mkdir(parents=True)
-    manifest = {"type": kind, "title": title, "version": 1, "entry": SLIDES_FILE,
+    manifest = {"type": kind, "title": title, "version": 1, "entry": ENTRIES[kind],
                 "created": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
     (target / MANIFEST).write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    (target / SLIDES_FILE).write_text(starter_slides(title), encoding="utf-8")
+    (target / ENTRIES[kind]).write_text(starter_slides(title) if kind == "slides" else f"# {title}\n\n", encoding="utf-8")
+    record_version(target, "create")
     return target
+
+
+def content_file(root: Path) -> Path:
+    """The file a canvas's template renders: slides.html or doc.md."""
+    return root / ENTRIES[read_manifest(root)["type"]]
+
+
+def list_versions(root: Path) -> list[dict]:
+    """The kept versions of a canvas's content, oldest first."""
+    versions = []
+    for folder in sorted((root / VERSIONS).glob("[0-9][0-9][0-9][0-9]")):
+        try:
+            meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(meta, dict):
+            versions.append({**meta, "id": folder.name})
+    return versions
+
+
+def record_version(root: Path, source: str) -> str | None:
+    """Keep the canvas's content as a new version, unless it is the same as the last one; drop the oldest."""
+    content = content_file(root)
+    data = content.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+    versions = list_versions(root)
+    if versions and versions[-1].get("sha256") == digest:
+        return None
+    # Numbered past every folder there, a version that cannot be read included.
+    taken = [int(folder.name) for folder in (root / VERSIONS).glob("[0-9][0-9][0-9][0-9]")]
+    number = max(taken, default=0) + 1
+    if number > 9999:
+        raise CanvasError("This canvas has used up its version numbers.")
+    folder = root / VERSIONS / f"{number:04d}"
+    folder.mkdir(parents=True)
+    (folder / content.name).write_bytes(data)
+    (folder / "meta.json").write_text(json.dumps({"at": time.time(), "source": source, "sha256": digest,
+                                                  "file": content.name}, ensure_ascii=False), encoding="utf-8")
+    for old in versions[: max(0, len(versions) + 1 - MAX_VERSIONS)]:
+        shutil.rmtree(root / VERSIONS / old["id"], ignore_errors=True)
+    return folder.name
 
 
 def starter_slides(title: str) -> str:

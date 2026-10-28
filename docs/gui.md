@@ -224,7 +224,12 @@ any `.html` file can be previewed as a page from the Files panel.
 Pages are a desktop feature. The model learns of them from the same `interactive-cards` skill as
 cards, so the same notes on the skill catalog apply.
 
-## Slide canvases
+## Canvases
+
+A canvas is a work shown beside the conversation, drawn by Astra's own template from what the model
+writes: a slide deck or a document. Every change to its content is kept as a version.
+
+### Slide decks
 
 A slide deck is a canvas: a folder `<name>.canvas` in the workspace with `canvas.json` (its type
 and title), `slides.html` and `assets/` (specs/canvas.md). The model makes one with the `canvas`
@@ -253,9 +258,34 @@ conversation, presenting and printing are Astra's own code; the model writes onl
 - Slides run under the same rules as a page: no access to Astra, no network, no storage, no
   pop-ups, no navigation.
 
+### Documents
+
+A document canvas holds `doc.md` instead of the slides: an ordinary Markdown document that the model
+writes section by section with the `doc_*` tools (the "documents" family of `tool_search`).
+
+- The Files panel shows it rendered, with its outline above: click a heading to go to it. Open
+  review comments are listed on top.
+- Select a passage and write what should change: **写进文档** writes the comment into `doc.md` as
+  `<!-- @astra: ... -->` right after the passage (at the end of its line when the Markdown spells
+  it differently, at the end of the document when it cannot be found; never inside a heading or a
+  code block). Ask Astra to handle the comments; `doc_comments` lists them and the model resolves
+  each one with `doc_edit`.
+- Export with `doc_export` (Word, PDF or HTML), as for any Markdown document. `canvas_look` and the
+  canvas's own export are for decks.
+
+### Versions
+
+The content file (`slides.html` or `doc.md`) is copied to `.versions/NNNN/` with a `meta.json`
+(time, what made it, its SHA-256) when the canvas is made, after each successful write into it
+by a tool, after a comment and after a restore. A version identical to the last one is not kept
+again; the 30 newest are kept. **版本** lists them, newest first; click one to see it in place
+of the current content, then **恢复成这个版本** or **回到现在**. A restore writes the old content back
+as a new version, after keeping the current content if no version holds it yet, so nothing is lost
+by restoring. Images in `assets/` are not versioned.
+
 Canvases are a desktop feature; the `canvas` and `canvas_look` tools are offered only to the
 desktop's backends, as tools loaded on demand (the "canvas" family of `tool_search`). On a paired
-phone a canvas is not shown yet.
+phone a canvas is not shown yet, and comments and versions are desktop-only.
 
 ## Command help while typing
 

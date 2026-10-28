@@ -1,10 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { composeDeck, inlineAssets, slideCount } from "../src/main/canvas-deck.js";
-import { canvasVersion, exportTarget, isCanvasManifest, readCanvas, slidesTarget } from "../src/main/canvas-files.js";
+import { canvasVersion, commentOnDocument, exportTarget, isCanvasManifest, listVersions, readCanvas, recordVersion, restoreVersion, slidesTarget } from "../src/main/canvas-files.js";
+import { insertComment } from "../src/main/canvas-doc.js";
+import { canvasPreview } from "../src/main/file-preview.js";
+import { docPathFromTool, openComments, outline } from "../src/renderer/doc-preview.js";
 import { PRINT_POLICY, cardFrameResponse, printAddress } from "../src/main/card-frame.js";
 import { canvasManifestFor, pagePathFromTool } from "../src/renderer/page-state.js";
 
@@ -13,10 +16,10 @@ const slides = `<section class="slide title"><h1>Deck</h1></section>
 <section data-x class="big slide"><p style="background:url('assets/dot.png')">x</p></section>`;
 const png = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
-function canvas(files: Record<string, string | Uint8Array>): string {
+function canvas(files: Record<string, string | Uint8Array>, type = "slides"): string {
   const folder = join(mkdtempSync(join(tmpdir(), "astra-canvas-")), "deck.canvas");
   mkdirSync(join(folder, "assets"), { recursive: true });
-  writeFileSync(join(folder, "canvas.json"), JSON.stringify({ type: "slides", title: "季度回顾", version: 1 }));
+  writeFileSync(join(folder, "canvas.json"), JSON.stringify({ type, title: "季度回顾", version: 1 }));
   for (const [name, content] of Object.entries(files)) writeFileSync(join(folder, name), content);
   return join(folder, "canvas.json");
 }
@@ -107,4 +110,97 @@ test("writing into a canvas, or the canvas tool, opens the canvas", () => {
   assert.equal(tool("Canvas: /w/deck.canvas/canvas.json\nEdit: /w/deck.canvas/slides.html\n\n# Slides canvas"), "/w/deck.canvas/canvas.json");
   assert.equal(tool(JSON.stringify({ success: true, type: "image_attachment", canvas: "/w/deck.canvas/canvas.json", slide: 2 }), "canvas_look"), "/w/deck.canvas/canvas.json");
   assert.equal(tool("Canvas types: slides"), undefined);
+});
+
+const doc = `# 季度回顾
+
+开篇一段，说明**本季度**的重点。
+
+## 收入
+
+收入增长了 12%，主要来自新客户。
+
+` + "```" + `
+收入增长了 12%，在代码里
+` + "```" + `
+
+## 风险 #
+
+- 供应链 [延迟](https://example.com) 两周
+`;
+
+test("a comment goes right after the passage it is about, never into a heading or code, else at the end", () => {
+  const after = insertComment(doc, "收入增长了 12%", "补一个对比");
+  assert.match(after, /收入增长了 12% <!-- @astra: 补一个对比 -->，主要来自新客户。/);
+  assert.match(after, /```\n收入增长了 12%，在代码里\n```/, "the code block is left alone");
+  assert.deepEqual(openComments(after), ["补一个对比"]);
+  // Selected as rendered: the emphasis and the link are not in the selection, so the line is found without them.
+  assert.match(insertComment(doc, "说明本季度的重点", "x"), /说明\*\*本季度\*\*的重点。 <!-- @astra: x -->\n/);
+  assert.match(insertComment(doc, "供应链 延迟 两周", "x"), /- 供应链 \[延迟\]\(https:\/\/example\.com\) 两周 <!-- @astra: x -->\n/);
+  assert.match(insertComment(doc, "收入", "x"), /\n## 收入\n<!-- @astra: x -->\n/, "a heading keeps its text");
+  const nowhere = insertComment(doc, "不在文中的一句话", "这里 -- 要改");
+  assert.ok(nowhere.endsWith("<!-- @astra: 这里 — 要改（关于：「不在文中的一句话」） -->\n"), "two hyphens would end the comment");
+  assert.throws(() => insertComment(doc, "收入", "  "), /空/);
+  assert.throws(() => insertComment(doc, " ", "x"), /选中/);
+});
+
+test("a document's outline is its headings outside code, as they read", () => {
+  assert.deepEqual(outline(doc), [{ level: 1, text: "季度回顾" }, { level: 2, text: "收入" }, { level: 2, text: "风险" }]);
+  assert.deepEqual(outline("## **粗** [链](x) `码` <!-- c -->\n```\n# 不是\n```\n#不是标题"), [{ level: 2, text: "粗 链 码" }]);
+});
+
+test("a document canvas reads as its Markdown, and each change, comment and restore is a version", async () => {
+  const manifest = canvas({ "doc.md": doc }, "doc");
+  const shown = await canvasPreview(manifest);
+  assert.deepEqual([shown.kind, shown.text, shown.canvas?.type, shown.canvas?.title], ["text", doc, "doc", "季度回顾"]);
+  assert.equal(await recordVersion(manifest, "create"), "0001");
+  assert.equal(await recordVersion(manifest, "write"), undefined, "the same content is not kept twice");
+  // A change that missed the record is kept before the comment goes in.
+  writeFileSync(join(manifest, "..", "doc.md"), doc + "\n## 下季度\n");
+  assert.equal(await commentOnDocument(manifest, "主要来自新客户", "哪些客户？"), "0003");
+  const versions = await listVersions(manifest);
+  assert.deepEqual(versions.map(version => [version.id, version.source, version.file]), [["0001", "create", "doc.md"], ["0002", "write", "doc.md"], ["0003", "comment", "doc.md"]]);
+  assert.match(readFileSync(join(manifest, "..", "doc.md"), "utf8"), /主要来自新客户 <!-- @astra: 哪些客户？ -->/);
+  const first = await canvasPreview(manifest, "0001");
+  assert.deepEqual([first.text, first.canvas?.version], [doc, "0001"]);
+  assert.equal(await restoreVersion(manifest, "0001"), "0004");
+  assert.equal(readFileSync(join(manifest, "..", "doc.md"), "utf8"), doc);
+  assert.deepEqual((await listVersions(manifest)).map(version => version.source), ["create", "write", "comment", "restore"]);
+  await assert.rejects(restoreVersion(manifest, "../0001"), /没有这个版本/);
+  await assert.rejects(restoreVersion(manifest, "0009"), /没有这个版本/);
+  // A deck takes no comments; its kept version is drawn like the current one.
+  const deck = canvas({ "slides.html": slides });
+  await recordVersion(deck, "create");
+  await assert.rejects(commentOnDocument(deck, "Deck", "x"), /只有文档画布/);
+  const kept = await canvasPreview(deck, "0001");
+  assert.deepEqual([kept.kind, kept.canvas?.slides, kept.canvas?.version], ["page", 3, "0001"]);
+});
+
+test("versions are kept in the runtime's format, the thirty newest of them", async () => {
+  const manifest = canvas({ "doc.md": "# 一\n" }, "doc");
+  // As agent/runtime/canvas.py writes one.
+  mkdirSync(join(manifest, "..", ".versions", "0007"), { recursive: true });
+  writeFileSync(join(manifest, "..", ".versions", "0007", "doc.md"), "# 旧\n");
+  writeFileSync(join(manifest, "..", ".versions", "0007", "meta.json"), JSON.stringify({ at: 1, source: "write", sha256: "x", file: "doc.md" }));
+  mkdirSync(join(manifest, "..", ".versions", "0008"));
+  writeFileSync(join(manifest, "..", ".versions", "0008", "meta.json"), JSON.stringify({ file: "../canvas.json" }));
+  assert.deepEqual((await listVersions(manifest)).map(version => version.id), ["0007"], "a version naming another file is left out");
+  for (let index = 0; index < 31; index++) {
+    writeFileSync(join(manifest, "..", "doc.md"), `# ${index}\n`);
+    await recordVersion(manifest, "write");
+  }
+  const versions = await listVersions(manifest);
+  assert.equal(versions.length, 30);
+  // Numbered past the folder that could not be read.
+  assert.deepEqual([versions[0].id, versions.at(-1)!.id], ["0010", "0039"]);
+  assert.ok(!readdirSync(join(manifest, "..", ".versions")).includes("0007"));
+  const meta = JSON.parse(readFileSync(join(manifest, "..", ".versions", "0039", "meta.json"), "utf8"));
+  assert.deepEqual(Object.keys(meta).sort(), ["at", "file", "sha256", "source"]);
+});
+
+test("the doc_* tools writing a canvas's document open the canvas; its exports open as themselves", () => {
+  const result = (name: string, output: object) => docPathFromTool({ type: "tool_result", name, output: JSON.stringify(output) });
+  assert.equal(result("doc_edit", { path: "/w/plan.canvas/doc.md" }), "/w/plan.canvas/canvas.json");
+  assert.equal(result("doc_edit", { path: "/w/plan.md" }), "/w/plan.md");
+  assert.equal(result("doc_export", { path: "/w/plan.canvas/exports/plan.docx", source: "/w/plan.canvas/doc.md" }), "/w/plan.canvas/exports/plan.docx");
 });

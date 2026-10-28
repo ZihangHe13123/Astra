@@ -179,3 +179,53 @@ def test_a_pptx_is_one_picture_per_slide_with_its_heading_and_notes(tmp_path):
     assert deck.slides[0].notes_slide.notes_text_frame.text == "先讲 营收 。"
     assert not deck.slides[1].has_notes_slide
     assert deck.core_properties.title == "季度回顾"
+
+
+def test_a_document_canvas_is_a_doc_md_written_with_the_doc_tools(tmp_path):
+    call = tool(tmp_path, Desktop(tmp_path))
+    result = call(action="create", type="doc", title="研究计划")
+    folder = tmp_path / "研究计划.canvas"
+    assert result["output"].splitlines()[:2] == [f"Canvas: {folder / 'canvas.json'}", f"Edit: {folder / 'doc.md'}"]
+    assert "# Document canvas" in result["output"] and 'tool_search(family="documents")' in result["output"]
+    assert json.loads((folder / "canvas.json").read_text(encoding="utf-8"))["entry"] == "doc.md"
+    assert (folder / "doc.md").read_text(encoding="utf-8") == "# 研究计划\n\n"
+    # A document is read as text and exported with doc_export, not looked at or printed here.
+    assert "doc_export" in call(action="export", canvas="研究计划.canvas")["error"]
+    assert "read as text" in call(action="look", canvas="研究计划.canvas", slide=1)["error"]
+
+
+def test_every_write_into_a_canvas_is_kept_as_a_version(tmp_path):
+    from agent.runtime.canvas import MAX_VERSIONS, list_versions
+    from agent.runtime.tools.registry import ToolDef
+
+    registry = ToolRegistry()
+    register_canvas_tool(registry, workdir=tmp_path, render=Desktop(tmp_path))
+    asyncio.run(registry.execute("canvas", {"action": "create", "title": "deck"}))
+    folder, slides = tmp_path / "deck.canvas", tmp_path / "deck.canvas" / "slides.html"
+    writer = ToolDef("write_file", "", {"type": "object"}, lambda: "", risk="write")
+    reader = ToolDef("read_file", "", {"type": "object"}, lambda: "", risk="read")
+    after = lambda name, args, tool, result=None: registry.hooks.dispatch_after_tool(name, args, result or {"error": ""}, tool)  # noqa: E731
+    assert [(v["id"], v["source"]) for v in list_versions(folder)] == [("0001", "create")]
+    slides.write_text('<section class="slide"><h1>Two</h1></section>', encoding="utf-8")
+    after("write_file", {"path": "deck.canvas/slides.html"}, writer)
+    # The same content again, a read, a failed write and a write elsewhere keep nothing new.
+    after("write_file", {"path": str(slides)}, writer)
+    after("read_file", {"path": "deck.canvas/slides.html"}, reader)
+    slides.write_text("changed", encoding="utf-8")
+    after("write_file", {"path": "deck.canvas/slides.html"}, writer, {"error": "denied"})
+    after("write_file", {"path": "notes.md"}, writer)
+    versions = list_versions(folder)
+    assert [(v["id"], v["source"]) for v in versions] == [("0001", "create"), ("0002", "write")]
+    assert (folder / ".versions" / "0002" / "slides.html").read_text(encoding="utf-8") == '<section class="slide"><h1>Two</h1></section>'
+    # A patch names the canvas file it changed; only the newest versions are kept.
+    for number in range(MAX_VERSIONS + 3):
+        slides.write_text(f"v{number}", encoding="utf-8")
+        after("apply_patch", {"patch": "*** Begin Patch\n*** Update File: deck.canvas/slides.html\n*** End Patch"}, writer)
+    kept = list_versions(folder)
+    assert len(kept) == MAX_VERSIONS and kept[-1]["id"] == f"{MAX_VERSIONS + 5:04d}"
+    assert (folder / ".versions" / kept[-1]["id"] / "slides.html").read_text(encoding="utf-8") == f"v{MAX_VERSIONS + 2}"
+    # A version folder that cannot be read is numbered past, not written into.
+    (folder / ".versions" / "0099").mkdir()
+    slides.write_text("after a stray folder", encoding="utf-8")
+    after("write_file", {"path": "deck.canvas/slides.html"}, writer)
+    assert list_versions(folder)[-1]["id"] == "0100"

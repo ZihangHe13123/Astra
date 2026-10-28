@@ -17,7 +17,8 @@ import { sessionAction } from "./session-actions.js";
 import { hasOngoingWork, holdsUp } from "./ongoing-work.js";
 import { QuitCoordinator, type QuitReason } from "./quit.js";
 import { PreferenceWriter } from "./preferences.js";
-import { DocumentPreviewService, sourceVersion } from "./file-preview.js";
+import { canvasPreview, DocumentPreviewService, sourceVersion } from "./file-preview.js";
+import { commentOnDocument, isCanvasManifest, listVersions, restoreVersion } from "./canvas-files.js";
 import { configurePackagedRuntime, acquirePackagedLease } from "./packaged-runtime.js";
 import { ClipboardFiles } from "./clipboard-files.js";
 import { DesktopAppshot } from "./appshot.js";
@@ -513,6 +514,15 @@ register("file", async (id, value, action, requestId) => {
   const controller = new AbortController(); previewRequests.set(key, controller);
   try { return await previews.preview(path, controller.signal, () => authorizedFile(id, value)); }
   finally { if (previewRequests.get(key) === controller) previewRequests.delete(key); }
+});
+register("canvas", async (id, value, action, argument) => {
+  const path = authorizedFile(id, value);
+  if (!isCanvasManifest(path)) throw new Error("不是画布。");
+  if (action === "versions") return { versions: await listVersions(path) };
+  if (action === "preview") return { preview: await canvasPreview(path, checkedString(argument, "version", 8)) };
+  if (action === "restore") return { version: await restoreVersion(path, checkedString(argument, "version", 8)) };
+  if (action !== "comment" || !argument || typeof argument !== "object") throw new Error("Unknown canvas action");
+  return { version: await commentOnDocument(path, checkedString(argument.passage, "passage", 4000), checkedString(argument.comment, "comment", 2000)) };
 });
 
 /**

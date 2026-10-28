@@ -1,5 +1,5 @@
 import type { SessionState, UIEvent } from "@astra/ui-core/session-state";
-import type { FilePreview } from "./file-preview-types.js";
+import type { CanvasVersion, FilePreview } from "./file-preview-types.js";
 
 export type SessionEntry = { name: string; mode: string; modified: number };
 export type Preferences = { theme: string; drafts: Record<string, string>; attachments: Record<string, string[]>; workspaces: Record<string, string>; pinned: string[]; projects: string[]; titles: Record<string, string>; timeline: boolean; detailWidth?: number; lastSession?: { session: string; mode: string; workspace: string } | null };
@@ -51,6 +51,8 @@ export interface DesktopBridge {
   openExternal(url: string): Promise<void>;
   file(id: string, path: string, action: "preview" | "open" | "reveal" | "version" | "snapshot", requestId?: string): Promise<FilePreview>;
   cancelPreview(id: string, requestId: string): Promise<void>;
+  /** A canvas's kept versions, one of them shown, an earlier one restored, or the person's comment on a passage of a document canvas. */
+  canvas(id: string, path: string, action: "versions" | "preview" | "restore" | "comment", value?: string | { passage: string; comment: string }): Promise<{ versions?: CanvasVersion[]; preview?: FilePreview; version?: string }>;
   onEvents(handler: (events: DesktopEvent[]) => void): () => void;
 }
 declare global { interface Window { astra: DesktopBridge; } }

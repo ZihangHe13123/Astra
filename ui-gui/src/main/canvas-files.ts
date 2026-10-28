@@ -1,7 +1,9 @@
 import { createHash } from "node:crypto";
-import { readdir, readFile, realpath, stat } from "node:fs/promises";
+import { mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, relative, sep } from "node:path";
+import type { CanvasVersion } from "../file-preview-types.js";
 import { ASSET_TYPES, composeDeck, inlineAssets, slideCount, type Asset, type DeckMode } from "./canvas-deck.js";
+import { insertComment } from "./canvas-doc.js";
 
 /**
  * A canvas on disk (specs/canvas.md): a folder `<name>.canvas` with `canvas.json`, the slides and
@@ -10,6 +12,9 @@ import { ASSET_TYPES, composeDeck, inlineAssets, slideCount, type Asset, type De
  */
 export const CANVAS_MANIFEST = "canvas.json";
 export const SLIDES_FILE = "slides.html";
+export const DOC_FILE = "doc.md";
+const ENTRIES: Record<string, string> = { slides: SLIDES_FILE, doc: DOC_FILE };
+const MAX_VERSIONS = 30;
 export const SLIDES_LIMIT = 2 * 1024 * 1024;
 const ASSET_LIMIT = 8 * 1024 * 1024;
 
@@ -18,13 +23,13 @@ export const isCanvasManifest = (path: string) => basename(path) === CANVAS_MANI
 /** `inlined` is the slides with their images written in, from which each slide's own document is composed. */
 export type CanvasDocument = { title: string; type: string; slides: number; source: string; inlined: string; html: string; missing: string[] };
 
-async function manifestOf(manifestPath: string): Promise<{ title: string; type: string }> {
+export async function manifestOf(manifestPath: string): Promise<{ title: string; type: string }> {
   if (!isCanvasManifest(manifestPath)) throw new Error("不是画布：画布是名为 <名字>.canvas 的文件夹里的 canvas.json。");
   let manifest: unknown;
   try { manifest = JSON.parse(await readFile(manifestPath, "utf8")); }
   catch { throw new Error("canvas.json 读不出来，或不是 JSON。"); }
   const { type, title } = (manifest ?? {}) as { type?: unknown; title?: unknown };
-  if (type !== "slides") throw new Error(`不认识的画布类型：${String(type)}。`);
+  if (type !== "slides" && type !== "doc") throw new Error(`不认识的画布类型：${String(type)}。`);
   return { type, title: typeof title === "string" ? title.slice(0, 200) : "" };
 }
 
@@ -38,14 +43,16 @@ async function assetInside(folder: string, name: string): Promise<string | undef
 }
 
 /** The canvas as one document for `mode`, with the images it names written in. */
-export async function readCanvas(manifestPath: string, mode: DeckMode, slide = 1): Promise<CanvasDocument> {
+export async function readCanvas(manifestPath: string, mode: DeckMode, slide = 1, version = ""): Promise<CanvasDocument> {
   const { type, title } = await manifestOf(manifestPath);
   const folder = dirname(manifestPath);
-  const slidesPath = join(folder, SLIDES_FILE);
-  const info = await stat(slidesPath).catch(() => undefined);
-  if (!info?.isFile()) throw new Error(`画布缺少 ${SLIDES_FILE}。`);
-  if (info.size > SLIDES_LIMIT) throw new Error(`${SLIDES_FILE} 超过 ${SLIDES_LIMIT / 1024 / 1024} MiB，桌面端不渲染。`);
-  const source = await readFile(slidesPath, "utf8");
+  const contentPath = version ? await versionFile(manifestPath, version) : join(folder, ENTRIES[type]);
+  const info = await stat(contentPath).catch(() => undefined);
+  if (!info?.isFile()) throw new Error(`画布缺少 ${ENTRIES[type]}。`);
+  if (info.size > SLIDES_LIMIT) throw new Error(`${ENTRIES[type]} 超过 ${SLIDES_LIMIT / 1024 / 1024} MiB，桌面端不渲染。`);
+  const source = await readFile(contentPath, "utf8");
+  // A document is Markdown, shown by the app's own renderer; only a deck is composed with the template.
+  if (type === "doc") return { title, type, slides: 0, source, inlined: "", html: "", missing: [] };
   // The images are read first, so that writing them in needs nothing but what was read.
   const names = new Set([...source.matchAll(/(?:\b(?:src|href)\s*=\s*["']|url\(\s*["']?)\.?\/?assets\/([^"'#?)]+)/gi)].map(match => {
     try { return decodeURIComponent(match[1]); } catch { return match[1]; }
@@ -69,7 +76,7 @@ export async function canvasVersion(manifestPath: string): Promise<string> {
     const info = await stat(path).catch(() => undefined);
     hash.update(JSON.stringify([relative(folder, path), info?.size ?? -1, info?.mtimeMs ?? 0, info?.ino ?? 0]));
   };
-  await add(manifestPath); await add(join(folder, SLIDES_FILE));
+  await add(manifestPath); await add(join(folder, SLIDES_FILE)); await add(join(folder, DOC_FILE));
   const names = await readdir(join(folder, "assets")).catch(() => [] as string[]);
   for (const name of names.sort()) await add(join(folder, "assets", name));
   return hash.digest("hex");
@@ -86,4 +93,73 @@ export function exportTarget(manifestPath: string, target: string): string {
 export function slidesTarget(manifestPath: string, target: string): string {
   if (target !== join(dirname(manifestPath), "exports", ".slides")) throw new Error("幻灯片图片只能写进画布 exports 里的 .slides 文件夹。");
   return target;
+}
+
+export async function listVersions(manifestPath: string): Promise<CanvasVersion[]> {
+  const root = join(dirname(manifestPath), ".versions");
+  const versions: CanvasVersion[] = [];
+  for (const id of (await readdir(root).catch(() => [] as string[])).filter(name => /^\d{4}$/.test(name)).sort()) {
+    try {
+      const meta = JSON.parse(await readFile(join(root, id, "meta.json"), "utf8"));
+      if (meta && typeof meta === "object" && Object.values(ENTRIES).includes(meta.file))
+        versions.push({ id, at: Number(meta.at) || 0, source: String(meta.source || ""), sha256: String(meta.sha256 || ""), file: meta.file });
+    } catch { /* a version that cannot be read is left out */ }
+  }
+  return versions;
+}
+
+/** The content file of one kept version, by its id. */
+async function versionFile(manifestPath: string, id: string): Promise<string> {
+  if (!/^\d{4}$/.test(id)) throw new Error("没有这个版本。");
+  const version = (await listVersions(manifestPath)).find(item => item.id === id);
+  if (!version) throw new Error("没有这个版本。");
+  return join(dirname(manifestPath), ".versions", id, version.file);
+}
+
+/** Keep the canvas's current content as a new version, unless it is the last one already; drop the oldest. */
+export async function recordVersion(manifestPath: string, source: string): Promise<string | undefined> {
+  const { type } = await manifestOf(manifestPath);
+  const file = ENTRIES[type], data = await readFile(join(dirname(manifestPath), file));
+  const sha256 = createHash("sha256").update(data).digest("hex");
+  const versions = await listVersions(manifestPath);
+  if (versions.at(-1)?.sha256 === sha256) return undefined;
+  // Numbered past every folder there, a version that cannot be read included.
+  const taken = (await readdir(join(dirname(manifestPath), ".versions")).catch(() => [] as string[])).filter(name => /^\d{4}$/.test(name)).map(Number);
+  const id = String(Math.max(0, ...taken) + 1).padStart(4, "0");
+  if (id.length > 4) throw new Error("这个画布的版本号用完了。");
+  const folder = join(dirname(manifestPath), ".versions", id);
+  await mkdir(folder, { recursive: true });
+  await writeFile(join(folder, file), data);
+  await writeFile(join(folder, "meta.json"), JSON.stringify({ at: Date.now() / 1000, source, sha256, file }));
+  for (const old of versions.slice(0, Math.max(0, versions.length + 1 - MAX_VERSIONS)))
+    await rm(join(dirname(manifestPath), ".versions", old.id), { recursive: true, force: true });
+  return id;
+}
+
+/**
+ * Write the canvas's content as `change` makes it from what is there, as a new version labelled `source`. What
+ * was there is kept first, should a write have missed the record; a write that lands meanwhile wins.
+ */
+async function rewrite(manifestPath: string, source: string, change: (current: Buffer) => Buffer | Promise<Buffer>): Promise<string | undefined> {
+  const { type } = await manifestOf(manifestPath);
+  const target = join(dirname(manifestPath), ENTRIES[type]);
+  await recordVersion(manifestPath, "write");
+  const current = await readFile(target);
+  const temporary = `${target}.${source}-${process.pid}`;
+  await writeFile(temporary, await change(current));
+  if (!current.equals(await readFile(target))) { await rm(temporary, { force: true }); throw new Error("画布刚被改过，请再试一次。"); }
+  await rename(temporary, target);
+  return recordVersion(manifestPath, source);
+}
+
+/** Replace the content with a kept version's, as a new version of its own. */
+export async function restoreVersion(manifestPath: string, id: string): Promise<string | undefined> {
+  const kept = await readFile(await versionFile(manifestPath, id));
+  return rewrite(manifestPath, "restore", () => kept);
+}
+
+/** A comment from the person on a passage of a document canvas, written where the doc_* tools read it. */
+export async function commentOnDocument(manifestPath: string, passage: string, comment: string): Promise<string | undefined> {
+  if ((await manifestOf(manifestPath)).type !== "doc") throw new Error("只有文档画布可以批注。");
+  return rewrite(manifestPath, "comment", current => Buffer.from(insertComment(current.toString("utf8"), passage, comment)));
 }

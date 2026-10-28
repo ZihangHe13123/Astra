@@ -157,6 +157,10 @@ const writes = {
   看第二页: { tool: 'call_tool', name: 'canvas_look', arguments: { canvas: 'deck.canvas', slide: 2 } },
   导出幻灯片: { tool: 'call_tool', label: 'export', name: 'canvas', arguments: { action: 'export', canvas: 'deck.canvas' } },
   导出演示文稿: { tool: 'call_tool', label: 'pptx', name: 'canvas', arguments: { action: 'export', canvas: 'deck.canvas', format: 'pptx' } },
+  // A document canvas, written with the doc_* tools, which are loaded the same way.
+  新建文档: { tool: 'call_tool', label: 'doc', name: 'canvas', arguments: { action: 'create', type: 'doc', title: '产品计划', path: 'plan.canvas' } },
+  载入文档工具: { tool: 'tool_search', label: 'doc tools', family: 'documents' },
+  写一节: { tool: 'call_tool', label: 'section', name: 'doc_edit', arguments: { path: 'plan.canvas/doc.md', action: 'add', heading: '路线', content: '第一季度做画布，第二季度做语音。' } },
 };
 const requests = [];
 const model = createServer(async (req, res) => {
@@ -579,6 +583,39 @@ print(json.dumps({"slides": sorted(n for n in names if n.startswith("ppt/slides/
   assert.deepEqual(reached, [], 'nothing the deck tried, on screen, looked at or printed, reached a listener');
   assert.deepEqual(answered, []);
   passed('the model looks at one slide as the desktop draws it, prints the deck to a PDF of its slides and exports a PPTX of its pictures and notes, and nothing the deck tries gets out');
+
+  // A document canvas: the doc_* tools write it, the person comments on a passage, and an earlier version comes back.
+  await step('新建文档', 'doc');
+  await expect(preview.locator('h3')).toHaveText('产品计划');
+  await expect(preview.getByText('文档 · 选中一段文字可以批注')).toBeVisible();
+  await step('载入文档工具', 'doc tools');
+  await step('写一节', 'section');
+  const passage = preview.locator('.doc-preview p', { hasText: '第一季度做画布' });
+  await expect(passage).toBeVisible();
+  await expect(preview.locator('.doc-outline button')).toHaveText(['产品计划', '路线']);
+  const plan = join(workspace, 'plan.canvas');
+  const sources = () => readdirSync(join(plan, '.versions')).sort().map(id => JSON.parse(readFileSync(join(plan, '.versions', id, 'meta.json'), 'utf8')).source);
+  assert.deepEqual(sources(), ['create', 'write'], 'the doc_edit through call_tool is kept as a version');
+  // Selecting the passage opens the comment; it is written after the passage, where doc_comments reads it.
+  await passage.click({ clickCount: 3 });
+  await preview.locator('.canvas-comment textarea').fill('加上月份');
+  await preview.getByRole('button', { name: '写进文档', exact: true }).click();
+  await expect(preview.locator('.doc-comments')).toContainText('加上月份');
+  assert.match(readFileSync(join(plan, 'doc.md'), 'utf8'), /第一季度做画布，第二季度做语音。 <!-- @astra: 加上月份 -->/);
+  assert.deepEqual(sources(), ['create', 'write', 'comment']);
+  // The first version is looked at in place, then restored as a version of its own.
+  await preview.getByRole('button', { name: '版本', exact: true }).click();
+  await expect(preview.locator('.canvas-versions li')).toHaveCount(3);
+  await preview.locator('.canvas-versions button', { hasText: '版本 1' }).click();
+  await expect(preview.getByText('正在看版本 1，不是现在的内容。')).toBeVisible();
+  await expect(preview.locator('.doc-preview p', { hasText: '第一季度做画布' })).toHaveCount(0);
+  await page.screenshot({ path: join(output, 'canvas-doc.png') });
+  await preview.getByRole('button', { name: '恢复成这个版本', exact: true }).click();
+  await expect(preview.getByText(/已恢复成版本 1/)).toBeVisible();
+  await expect(preview.locator('.canvas-versions li')).toHaveCount(4);
+  assert.equal(readFileSync(join(plan, 'doc.md'), 'utf8'), '# 产品计划\n\n');
+  assert.deepEqual(sources(), ['create', 'write', 'comment', 'restore']);
+  passed('the model writes a document canvas with the doc_* tools; the person comments on a passage and restores its first version, each kept as a version');
   // The failing page's own exception is the only one.
   assert.deepEqual([...new Set(errors)], ['PAGE_FIXTURE_FAILURE']);
 } catch (error) {
