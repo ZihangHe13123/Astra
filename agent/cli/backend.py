@@ -1042,6 +1042,9 @@ async def _main(startup_started: float):
     # desktop to open conversations in projects and hand them tasks.
     personal_thread = os.environ.get("ASTRA_PERSONAL_THREAD", "") == "1"
     conversations = ConversationOpener(_send) if personal_thread else None
+    if personal_thread:
+        # Handing work to projects and keeping jobs are what this thread is for (specs/tool-disclosure.md §4.7).
+        tools.add_core_tools({"jobs", "peer_send"})
     # The desktop's answers to what this backend asked it for, by answer type.
     desktop_answers = {"page_snapshot_response": page_snapshots.resolve,
                        **({"open_conversation_response": conversations.resolve} if conversations else {})}
@@ -2465,6 +2468,9 @@ async def _main(startup_started: float):
     # The desktop's channel host takes WeChat over from other backends. Popped so nothing this
     # backend starts inherits the claim.
     channel_host = os.environ.pop("ASTRA_CHANNEL_HOST", "") == "1"
+    if channel_host:
+        # WeChat and QQ turns run here, and they send files back.
+        agent.tools.add_core_tools({"channel_send_file"})
     channel_manager = ChannelManager(load_channels_config(), channel_router.handle, channel_host=channel_host)
     channel_manager_holder["manager"] = channel_manager
     weixin_commands = WeixinCommands(lambda: channel_manager_holder.get("manager"), _send,

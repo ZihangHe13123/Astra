@@ -57,6 +57,7 @@ from .project_instructions import ProjectInstructions, tool_paths
 from .prompts import DEFAULT_SYSTEM_PROMPT, persona_generation_overrides
 from .query_profiler import QueryProfiler
 from .tool_failure import ToolFailure
+from .tools.disclosure import CALL_TOOL, DISPATCH_TOOLS, SEARCH_TOOL, loaded_names, loaded_result, register_dispatch_tools
 from .tools.registry import ToolRegistry
 from .tracing import TraceContext, trace_span
 from .vision_policy import VisionPreprocessPolicy
@@ -199,6 +200,9 @@ class ReActAgent(AgentBase):
             from .tools.hindsight import register_hindsight_tools
 
             register_hindsight_tools(self.tools, self.external_memory_provider)
+        if self.tools.get(SEARCH_TOOL) is None:
+            # Sent only when disclosure is deferred (tools/disclosure.py); harmless otherwise.
+            register_dispatch_tools(self.tools)
         self.context = AgentContext(system_prompt=system_prompt)
         self.context.set_system_prompt(system_prompt)
         self.progressive_tools = (
@@ -1298,8 +1302,12 @@ class ReActAgent(AgentBase):
         return request_id
 
     def _tool_application_key(self) -> dict:
-        return {"allowlist": sorted(self.tool_allowlist) if self.tool_allowlist is not None else None,
-                "code_mode": self.code_mode, "vision": self._vision_tile_tool_enabled()}
+        key = {"allowlist": sorted(self.tool_allowlist) if self.tool_allowlist is not None else None,
+               "code_mode": self.code_mode, "vision": self._vision_tile_tool_enabled()}
+        if self.tools.disclosure == "deferred":
+            # Only then: conversations frozen before disclosure existed keep their applied list.
+            key["disclosure"] = "deferred"
+        return key
 
     def _applied_tool_schemas(self) -> list[dict] | None:
         snapshot = getattr(self.context, "guidance_snapshot", {})
@@ -1882,6 +1890,8 @@ class ReActAgent(AgentBase):
             for tc in tool_calls:
                 arguments = self._persistent_tool_call_arguments(tc)
                 tool = self.tools.get(str(tc.get("name") or ""))
+                if tool is not None and tool.name == CALL_TOOL:
+                    tool = self.tools.get(self._dispatch_target(tc)[0]) or tool
                 self.context.append_raw_tool_call({
                     "type": "raw_tool_call",
                     "call_id": str(tc.get("id") or ""),
@@ -1910,6 +1920,8 @@ class ReActAgent(AgentBase):
         """
         raw = str(tool_call.get("arguments") or "")
         tool = self.tools.get(str(tool_call.get("name") or ""))
+        if tool is not None and tool.name == CALL_TOOL:
+            return self._persistent_dispatch_arguments(raw)
         if tool is None or tool.argument_persistence == "durable":
             return raw
         try:
@@ -1923,6 +1935,119 @@ class ReActAgent(AgentBase):
         else:
             safe = self.tools.persistence_safe_args(tool, parsed)
         return json.dumps(safe, ensure_ascii=False, separators=(",", ":"))
+
+    def _persistent_dispatch_arguments(self, raw: str) -> str:
+        """call_tool's arguments for events and history, its target's arguments redacted as that tool requires."""
+        target, inner, problem = self._dispatch_target({"arguments": raw})
+        tool = self.tools.get(target) if target else None
+        if problem or inner is None or tool is None or tool.argument_persistence == "durable":
+            return raw
+        safe = self.tools.persistence_safe_args(tool, inner)
+        return json.dumps({"name": target, "arguments": safe}, ensure_ascii=False, separators=(",", ":"))
+
+    def _dispatch_target(self, tool_call: dict) -> tuple[str, dict | None, str]:
+        """A call_tool call's target, the target's arguments, and why it cannot run ("" when it can)."""
+        try:
+            args = self._parse_tool_args(tool_call.get("arguments", ""))
+        except ToolArgumentError as exc:
+            return "", None, f"[ToolInputError] {CALL_TOOL}: {exc}"
+        target = str(args.get("name") or "").strip()
+        inner = args.get("arguments")
+        if isinstance(inner, str):
+            try:
+                inner = json.loads(inner) if inner.strip() else {}
+            except json.JSONDecodeError:
+                return target, None, f"[ToolInputError] {CALL_TOOL}: the arguments for {target} are not valid JSON."
+        if inner is None:
+            inner = {}
+        if not target:
+            return "", None, f"[ToolInputError] {CALL_TOOL}: name is required."
+        if not isinstance(inner, dict):
+            return target, None, f"[ToolInputError] {CALL_TOOL}: arguments must be an object."
+        if target in DISPATCH_TOOLS:
+            return target, None, f"[ToolInputError] {CALL_TOOL} cannot call {target}; call {target} directly."
+        return target, inner, ""
+
+    def _sent_tool_names(self) -> set[str]:
+        """The tools this conversation's requests carry."""
+        schemas = self._applied_tool_schemas()
+        if schemas is None:
+            schemas = self._stable_tool_schemas
+        return {str(item.get("function", {}).get("name") or "") for item in schemas or []}
+
+    def _loaded_deferred_tools(self) -> set[str]:
+        """Deferred tools whose definitions a result in this conversation's history handed over.
+
+        Only results of tool_search, call_tool and calls of deferred tools count, so a page or a file
+        cannot mark a tool as loaded. Compaction drops those results, and with them the loaded set.
+        """
+        callers = {
+            str(call.get("id") or "")
+            for message in self.context.messages if message.get("role") == "assistant"
+            for call in message.get("tool_calls") or []
+            if (name := str(call.get("function", {}).get("name") or "")) in DISPATCH_TOOLS
+            or self.tools.is_deferred(name)
+        }
+        loaded: set[str] = set()
+        for message in self.context.messages:
+            if message.get("role") == "tool" and str(message.get("tool_call_id") or "") in callers:
+                content = message.get("content")
+                if isinstance(content, list):
+                    content = "\n".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
+                loaded |= loaded_names(content if isinstance(content, str) else "")
+        return loaded
+
+    def _resolve_tool_dispatch(self, tool_calls: list[dict]) -> tuple[list[dict], dict[str, dict]]:
+        """Run call_tool calls as the tools they name (specs/tool-disclosure.md §4.4).
+
+        History keeps the model's own call; execution, approvals, repeat guards, events and the interface
+        see the named tool. Returns the calls to run and, by call id, the result of each that cannot run:
+        a tool that was not loaded (or was called directly) is handed over, so the next call can run it.
+        """
+        sent = self._sent_tool_names()
+        if CALL_TOOL not in sent:
+            return tool_calls, {}
+        loaded: set[str] | None = None
+        resolved: list[dict] = []
+        refused: dict[str, dict] = {}
+        for tc in tool_calls:
+            name = str(tc.get("name") or "")
+            direct = name != CALL_TOOL and name not in sent and self.tools.is_deferred(name)
+            if name != CALL_TOOL and not direct:
+                resolved.append(tc)
+                continue
+            if direct:
+                target, problem = name, ""
+                try:
+                    inner: dict | None = self._parse_tool_args(tc.get("arguments", ""))
+                except ToolArgumentError:
+                    inner = {}
+            else:
+                target, inner, problem = self._dispatch_target(tc)
+            tool = self.tools.get(target) if target else None
+            if not problem and (tool is None or not tool.expose_by_default):
+                problem = (f"[ToolNotFound] {target} is not a tool you can call. "
+                           f"Use {SEARCH_TOOL} to find one.")
+            call_id = str(tc.get("id") or "")
+            shown = {**tc, "name": target, "arguments": json.dumps(inner or {}, ensure_ascii=False)} if tool else tc
+            if problem:
+                refused[call_id] = {"name": target or CALL_TOOL, "error": problem, "code": "tool_dispatch"}
+                resolved.append(shown)
+                continue
+            assert tool is not None and inner is not None
+            if target not in sent:
+                if loaded is None:
+                    loaded = self._loaded_deferred_tools()
+                if direct or target not in loaded:
+                    note = (f"{target} did not run: it is not in your tool list. Its definition is below; "
+                            f"call it with {CALL_TOOL}." if direct else
+                            f"{target} did not run: it was not loaded yet. Its definition is below; "
+                            f"call it again with {CALL_TOOL}.")
+                    refused[call_id] = {"name": target, "error": loaded_result([tool], note), "code": "tool_not_loaded"}
+                    resolved.append(shown)
+                    continue
+            resolved.append(shown)
+        return resolved, refused
 
     def _parse_tool_args(self, raw_args: str) -> dict:
         try:
@@ -3352,7 +3477,8 @@ class ReActAgent(AgentBase):
     def _note_failure_streak(self, tc: dict, event: dict, refusals: dict | None) -> None:
         """Count one tool's failures in a row this turn; the third is flagged to the model."""
         name = str(tc.get("name") or "")
-        if not name or name == self.tools.ACTIVATE_GROUP_TOOL or str(tc.get("id") or "") in (refusals or {}):
+        if (not name or name == self.tools.ACTIVATE_GROUP_TOOL or str(tc.get("id") or "") in (refusals or {})
+                or event.get("dispatch_refused")):
             return
         streaks = self._failure_streaks
         if not event.get("error"):
@@ -3383,12 +3509,14 @@ class ReActAgent(AgentBase):
         result_callback: Callable[[dict], None] | None = None,
         repeat_notice_ids: frozenset[str] = frozenset(),
         refusals: dict[str, tuple[str, bool]] | None = None,
+        dispatch_refusals: dict[str, dict] | None = None,
     ) -> list[dict]:
         """Run one assistant message's tool calls and record their results.
 
         ``refusals`` maps a call id to why that call is not run and whether it
         may be sent again; such a call gets an error result without reaching
-        the registry.
+        the registry. ``dispatch_refusals`` are call_tool calls (or direct calls
+        of deferred tools) that cannot run, with their results.
         """
         semaphore = asyncio.Semaphore(self.tool_concurrency)
         turn_tool_cache = turn_tool_cache if turn_tool_cache is not None else {}
@@ -3402,6 +3530,14 @@ class ReActAgent(AgentBase):
                     "type": "tool_result", "id": tc["id"], "name": str(tc.get("name") or "tool"),
                     "args": {}, "output": "", "error": reason, "code": "tool_budget_exhausted",
                     "tool_output": reason, "duration_ms": 0, "retryable": may_resend,
+                }
+            dispatch = (dispatch_refusals or {}).get(str(tc.get("id") or ""))
+            if dispatch is not None:
+                # Not run, and not a failure of the tool: no streak, circuit or per-turn count.
+                return {
+                    "type": "tool_result", "id": tc["id"], "name": dispatch["name"], "args": {}, "output": "",
+                    "error": dispatch["error"], "code": dispatch["code"], "tool_output": dispatch["error"],
+                    "duration_ms": 0, "retryable": True, "not_executed": True, "dispatch_refused": True,
                 }
             if progress_callback is not None:
                 progress_callback({
@@ -4523,6 +4659,8 @@ class ReActAgent(AgentBase):
                 last_text = full_content
 
             if tool_calls:
+                # History holds the model's call_tool calls; from here on they are the tools they name.
+                tool_calls, dispatch_refusals = self._resolve_tool_dispatch(tool_calls)
                 repeated, exhausted, repeat_notice_ids, refusals = self._admit_tool_calls(
                     tool_calls,
                     tool_signature_counts=tool_signature_counts,
@@ -4591,6 +4729,7 @@ class ReActAgent(AgentBase):
                         result_callback=enqueue_progress,
                         repeat_notice_ids=frozenset(repeat_notice_ids),
                         refusals=refusals,
+                        dispatch_refusals=dispatch_refusals,
                     ))
                     next_progress: asyncio.Task | None = None
                     try:
@@ -4627,6 +4766,7 @@ class ReActAgent(AgentBase):
                         trace_ctx=trace_ctx,
                         repeat_notice_ids=frozenset(repeat_notice_ids),
                         refusals=refusals,
+                        dispatch_refusals=dispatch_refusals,
                     )
                 call_signatures = {
                     str(tc.get("id") or ""): self._tool_signature(tc)
@@ -4685,7 +4825,7 @@ class ReActAgent(AgentBase):
                     if not error:
                         failure_state.pop(name, None)
                         continue
-                    if str(event.get("id") or "") in refusals:
+                    if str(event.get("id") or "") in refusals or event.get("dispatch_refused"):
                         # The call never ran, and the model may be told to send it again.
                         continue
                     signature = call_signatures.get(str(event.get("id") or ""))

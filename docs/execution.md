@@ -178,6 +178,15 @@ Tool execution uses the following guards and controls:
 - `PROMPT_CACHE_STABLE_TOOLS=1` keeps one provider-visible tool manifest for
   the work session. Tool budgets and circuits remain enforced at execution
   time without deleting schemas between ReAct iterations.
+- `ASTRA_TOOL_DISCLOSURE=deferred` sends a small core set (`CORE_TOOLS` in
+  `agent/runtime/tools/disclosure.py`, plus a few per conversation kind) with
+  `tool_search` and `call_tool`; `full`, the default, sends every default tool.
+  The other tools stay registered and run as before. `tool_search` lists them by
+  family and returns full definitions as its result; `call_tool` then runs one
+  under its own name, so approvals, repeat guards, events and the interface see
+  that tool. Calling a tool whose definition was not handed over in this
+  conversation does not run it; the result hands the definition over instead.
+  The tool list never changes within a conversation (specs/tool-disclosure.md).
 - With `PROMPT_CACHE_STABLE_TOOLS=0`, `TOOL_PROGRESSIVE_EXPOSURE=1` restores
   the legacy core/request-relevant group routing and `activate_tool_group`
   behavior. This reduces the first uncached prompt but causes more prefix-cache

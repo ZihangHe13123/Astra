@@ -106,6 +106,7 @@ macOS 示例：
 - `TOOL_MAX_INLINE_CHARS=12000` 限制持久历史中的首尾预览，完整结果保存到 `TOOL_RESULT_DIR`。新结果在紧接着的一次模型迭代中最多完整展示 `TOOL_MAX_FRESH_RESULT_CHARS=100000` 字符，之后回到预览。base64/data URL 等不透明载荷不会作为大段文字内联。
 - `TOOL_FAILURE_THRESHOLD=3` 在等价错误连续出现后打开单工具熔断，并禁用工具做最后一次综合回答。
 - `PROMPT_CACHE_STABLE_TOOLS=1` 在工作会话中保持一份稳定的模型工具清单；预算和熔断仍在执行阶段检查，不在 ReAct 迭代间删除 schema。
+- `ASTRA_TOOL_DISCLOSURE=deferred` 时只发一小组常驻工具（`agent/runtime/tools/disclosure.py` 里的 `CORE_TOOLS`，个别对话类型再加几个）和 `tool_search`、`call_tool`；默认 `full` 照旧发全部默认工具。其余工具照常注册、照常执行：`tool_search` 按功能族列出它们，并把完整定义作为结果返回；`call_tool` 再以工具本名运行它，审批、重复调用保护、事件和界面看到的都是这个工具。本对话里没拿到定义就调用的工具不会运行，结果里会把定义交给模型。一段对话的工具清单始终不变（见 specs/tool-disclosure.md）。
 - 设为 `PROMPT_CACHE_STABLE_TOOLS=0` 后，可用 `TOOL_PROGRESSIVE_EXPOSURE=1` 恢复旧核心/相关工具组及 `activate_tool_group`，以缩小首次未缓存提示，但会增加前缀缓存失效。
 - `AGENT_TOOL_EXPOSE` 和 `AGENT_TOOL_HIDE` 接受逗号分隔的工具名。前者把默认不开放的工具加入清单：`conclave`（不开放也能用 `/conclave` 命令）、`notebook_execute`、`skills_list`（提示中的 `<available-skills>` 已列出技能）、`project_verifier_init`、`git_pull`、`git_reset`、`git_revert`、`extract_url` 和 `browser_extract`（读网页用 `fetch_url` 和 `web_extract`，渲染页面用浏览器工具）以及 `search_status`；后者从清单中去掉默认工具。同一工具同时出现在两者中时保持隐藏。明确列出这些工具的模式和工作流仍可使用它们。
 - `AGENT_MAX_REACT_ITERATIONS=50` 为整轮设置粗粒度上限；`0` 表示无固定次数上限，重复调用、熔断、提示预算和取消检查仍有效。
