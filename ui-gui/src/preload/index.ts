@@ -50,5 +50,6 @@ function stripPeerConnections() {
   } });
 }
 
-if (window.top !== window) stripPeerConnections();
+// A print of a canvas is a document of its own (card-frame.ts), under the same policy as a frame.
+if (window.top !== window || (location.protocol === "astra:" && location.host === "card")) stripPeerConnections();
 else if (location.protocol === "astra:" && location.host === "app") exposeBridge();

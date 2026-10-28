@@ -1058,6 +1058,11 @@ async def _main(startup_started: float):
         ),
         render_page=page_snapshots.request if os.getenv("ASTRA_UI_SURFACE") == "gui" else None,
     )
+    if os.getenv("ASTRA_UI_SURFACE") == "gui":
+        # Canvases are drawn by the desktop alone, like pages (specs/canvas.md).
+        from agent.runtime.tools.canvas import register_canvas_tool
+
+        register_canvas_tool(tools, workdir=os.getcwd(), render=page_snapshots.request)
     computer_runtime = register_local_computer_runtime(
         tools,
         model_capabilities=lambda: (

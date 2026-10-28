@@ -218,7 +218,7 @@ function openSession(options: { session?: string; mode?: string; workspace?: str
   // Special modes enter their separate namespace after the Work backend is ready.
   if (mode !== "work") rt.initialModeSession = name;
   // The backend reads what it is allowed to on its own; the page it names is only drawn here, in isolation.
-  rt.pageSnapshot = path => snapshots.capture(path);
+  rt.pageSnapshot = (path, options) => snapshots.capture(path, options);
   rt.state.isDraft = !options.session && mode === "work";
   runtimes.set(rt.id, rt);
   if (select) { active = rt.id; appshot.update(); }
@@ -535,7 +535,7 @@ function openPersonal(): HostedBackend {
     if (event.type === "backend_hello") voiceRoutes.delete(r.id);
     if (event.type === "gui_ready") appshot.update();
   }, { ASTRA_CHANNEL_HOST: "1", ASTRA_PERSONAL_THREAD: "1" });
-  rt.pageSnapshot = path => snapshots.capture(path);
+  rt.pageSnapshot = (path, options) => snapshots.capture(path, options);
   // Work in a project goes to a conversation there, which the thread then manages (specs/personal-thread.md D6).
   rt.openConversation = async where => {
     const known = [...preferences.projects, ...Object.values(preferences.workspaces), ...[...runtimes.values()].map(r => r.workspace)]

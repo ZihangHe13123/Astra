@@ -17,6 +17,11 @@ export const SNAPSHOTS_KEPT = 40;
 export const SNAPSHOT_TIME_LIMIT = 15000;
 
 export type PageSnapshot = { path: string; width: number; height: number; pageHeight: number; scriptError: string };
+/** What the backend may ask of a picture: a canvas slide, or a print of a canvas into its exports folder. */
+export type SnapshotOptions = { slide?: number; export?: "pdf"; target?: string };
+/** A slide is drawn at its own size and handed to the model at this width, which reads its text and costs less. */
+export const SLIDE_PICTURE_WIDTH = 1280;
+export const PRINT_TIME_LIMIT = 90000;
 
 /** How much of a page of this height one picture shows. */
 export function shownHeight(pageHeight: number): number {

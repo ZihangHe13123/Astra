@@ -41,7 +41,8 @@ export function FilePreviewPanel({runtime,path,serial,dismiss,fail,wide,onWide,o
   // Only a page takes the whole window; anything else shown next gives the room back.
   useEffect(()=>{ if(wide && preview && !page) onWide?.(false); },[wide,preview,page]);
   return <section className="file-preview-panel" aria-label="文件预览">
-    <button className="text-button" onClick={dismiss}>← 返回</button><h3>{path.split(/[\\/]/).pop()}</h3>
+    <button className="text-button" onClick={dismiss}>← 返回</button><h3>{preview?.canvas?.title || path.split(/[\\/]/).pop()}</h3>
+    {preview?.canvas && <p className="muted small">幻灯片 · {preview.canvas.slides} 页 · 点任一页放映，Esc 退出</p>}
     <div className="actions">
       {(markdown || page) && <button onClick={()=>setDocView(docView==='rendered'?'source':'rendered')}>{docView==='rendered'?<><FileCode size={14}/> 源码</>:<><Eye size={14}/> 预览</>}</button>}
       {page && onWide && <button aria-pressed={!!wide} onClick={()=>onWide(!wide)}>{wide?<><Minimize2 size={14}/> 还原</>:<><Maximize2 size={14}/> 放大</>}</button>}
@@ -68,6 +69,7 @@ export function DocumentPreviewBody({preview,runtime,fail,docView='rendered'}: {
       : preview.kind==='spreadsheet' ? <SpreadsheetPreview sheets={preview.sheets||[]}/>
       : preview.data ? <img className="preview-image" src={preview.data} alt="文件预览"/>
       : preview.kind==='page' && docView==='rendered' ? <PageFrame source={preview.text||''}/>
+      : preview.canvas ? <pre className="file-preview">{preview.canvas.source}</pre>
       : markdown && docView==='rendered' ? <>
         {comments.length>0 && <section className="summary-card doc-comments"><h4>待处理评论 <span className="count">{comments.length}</span></h4>{comments.map((comment,index)=><p key={index} className="small">{comment}</p>)}</section>}
         <div className="doc-preview"><Markdown text={preview.text||''} runtime={runtime} base={dirname(preview.path||'')} fail={fail}/></div>

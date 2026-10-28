@@ -56,6 +56,8 @@ FAMILIES: tuple[tuple[str, str, Callable[[str], bool]], ...] = (
     ("subagents", "follow, read and cancel delegated subagents; agent teams, their messages and tasks",
      _prefixed("delegate_", "team")),
     ("documents", "write, edit, check and export Word/PDF documents written in Markdown", _prefixed("doc_")),
+    ("canvas", "slide decks shown beside the conversation: make one, look at a slide, export it",
+     _prefixed(names=("canvas", "canvas_look"))),
     ("schedule", "scheduled jobs and reminders, and wake-ups of this conversation",
      _prefixed(names=("jobs", "schedule_wakeup", "wakeup_status", "cancel_wakeup", "report_wakeup"))),
     ("calendar", "the user's calendar and reminders", _prefixed(names=("calendar",))),

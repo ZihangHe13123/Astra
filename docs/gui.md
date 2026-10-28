@@ -224,6 +224,35 @@ any `.html` file can be previewed as a page from the Files panel.
 Pages are a desktop feature. The model learns of them from the same `interactive-cards` skill as
 cards, so the same notes on the skill catalog apply.
 
+## Slide canvases
+
+A slide deck is a canvas: a folder `<name>.canvas` in the workspace with `canvas.json` (its type
+and title), `slides.html` and `assets/` (specs/canvas.md). The model makes one with the `canvas`
+tool, which hands it the deck's format, then writes the slides with the ordinary file tools: one
+`<section class="slide">` per slide, a 1920 x 1080 page each, in a few layouts (title, section,
+columns, image, quote) with a theme of CSS variables. The deck's look, the list beside the
+conversation, presenting and printing are Astra's own code; the model writes only the slides.
+
+- When the deck is made, and after each change to any of its files, the Files panel shows it as a
+  list of its slides with their numbers. Click a slide to present: one slide at a time, the arrow
+  keys and Space move, Escape goes back. **放大** gives the deck the whole window first.
+- **源码** shows `slides.html` as the model wrote it.
+- Images go in `assets/` and are named `assets/<file>` in the slides: PNG, JPEG, GIF, WebP or SVG,
+  up to 8 MiB each. Nothing loads from the network. An image that cannot be shown is listed above
+  the deck.
+- The model looks at a slide with `canvas_look`: the desktop draws that slide at its own size, out
+  of sight, in the same isolated frame, and hands the model the picture at 1280 x 720. Looking
+  needs no approval.
+- `canvas` with `action="export"` prints the deck to `<name>.canvas/exports/<name>.pdf`: one
+  16:9 page per slide, with selectable text. The print runs in a window nobody sees, as a
+  document of its own under the frame's policy and in an opaque origin, with WebRTC removed.
+- Slides run under the same rules as a page: no access to Astra, no network, no storage, no
+  pop-ups, no navigation.
+
+Canvases are a desktop feature; the `canvas` and `canvas_look` tools are offered only to the
+desktop's backends, as tools loaded on demand (the "canvas" family of `tool_search`). On a paired
+phone a canvas is not shown yet.
+
 ## Command help while typing
 
 The composer starts at one line, grows with its content, and scrolls internally
