@@ -52,3 +52,12 @@ test('active background work and uncertain submissions block response path chang
     { messages: [{ id: 'unknown', role: 'user', content: 'x', submissionState: 'unknown' as const }] },
   ]) assert.equal(responseControlsBusy({ ...state, ...patch }), true);
 });
+test('named subagents block response path changes only while one works', () => {
+  const event = (fields: Record<string, unknown>) => ({ type: 'agent_team', kind: 'agent_team', team_id: 'crew-1', ...fields });
+  let state = projectEvent(conversation(), event({ event: 'team_created', team_kind: 'crew', name: 'subagents', lead_agent_id: 'parent', status: 'active' }));
+  state = projectEvent(state, event({ event: 'team_agent_created', agent_id: 'reader', parent_agent_id: 'parent', name: 'reader', status: 'starting' }));
+  assert.equal(responseControlsBusy(state), true);
+  state = projectEvent(state, event({ event: 'team_agent_terminal', agent_id: 'reader', status: 'completed' }));
+  // The crew stays active and its parent runs; an idle subagent is not work.
+  assert.equal(responseControlsBusy(state), false);
+});

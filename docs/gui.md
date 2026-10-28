@@ -112,11 +112,12 @@ back and tells you, and the desktop and a paired phone are notified.
   context (including the agent's current plan). Missing/expired snapshots and unconfirmed
   changes are labelled separately. Large text previews are bounded; use **系统打开** for
   the complete file.
-- **子代理** in that panel holds every subagent of the conversation: a Team's members under
-  the Team, each on its latest run (status, time, the tool it is calling, unread messages,
-  its result and full record) with earlier runs folded, the Team's tasks, then one-off
-  delegations. The subagent summary in the conversation opens it, and a dot on the tab
-  means one is still going.
+- **子代理** in that panel holds every subagent of the conversation by name, each on its
+  latest run (status, time, the tool it is calling, its result and full record) with earlier
+  runs folded; those of one group, which may write to each other, are shown together, and an
+  ended one is marked 已结束. Agent Teams of earlier conversations and runs without a name
+  follow. The subagent summary in the conversation opens it, and a dot on the tab means one
+  is still going.
 - **命令与功能** exposes all current TUI command roots with optional parameters.
   `/tool N` and `/gallery N` locate a recorded result. Commands such as `/memory`,
   `/skills`, `/tasks` and `/diagnostics` currently use compatibility forms and the

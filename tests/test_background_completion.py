@@ -159,7 +159,9 @@ def test_a_later_turn_of_the_session_reaches_and_settles_an_earlier_turns_subage
         # The first turn answered; the next one asks after the subagent.
         polled = await call(registry, "second", "delegate_poll", process_id=process_id)
         assert polled["status"] == "running"
-        assert process_id in {item["process_id"] for item in await call(registry, "second", "delegate_list")}
+        # The subagent has a name in the conversation, and later turns list it by that name.
+        listed = await call(registry, "second", "delegate_list")
+        assert process_id in {item["process_id"] for item in listed["subagents"]}
         session["id"] = "other"
         denied = await registry.execute("delegate_poll", {"process_id": process_id}, task_id="third")
         assert "another task" in denied["error"]

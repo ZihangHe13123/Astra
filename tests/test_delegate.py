@@ -245,7 +245,7 @@ def test_worktree_setup_and_cleanup_run_outside_event_loop(
     worker_thread_ids = []
     worktree = tmp_path / "worker"
 
-    def create_worktree(_sandbox):
+    def create_worktree(_sandbox, _name=""):
         worker_thread_ids.append(threading.get_ident())
         return worktree
 

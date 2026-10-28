@@ -3,7 +3,7 @@ import { ChevronRight, Users } from "lucide-react";
 import { delegateActive, delegateStatusLabel, orderedDelegates, type DelegateView } from "@astra/ui-core/delegates";
 import { Markdown } from "./messages.js";
 import type { AgentTeamAgentView, AgentTeamView } from "@astra/ui-core/agent-team-state";
-import { subagentGroups } from "./subagents.js";
+import { byGroup, subagentGroups, type SubagentMember } from "./subagents.js";
 import { RawDetails, statusLabel } from "./raw-details.js";
 
 export function DelegateSummary({ delegates, teams, open }: { delegates: Record<string, DelegateView>; teams?: Record<string, AgentTeamView>; open: () => void }) {
@@ -20,29 +20,35 @@ export function DelegateSummary({ delegates, teams, open }: { delegates: Record<
   </button>;
 }
 
-/** The subagent page: every subagent of the conversation, a team's members under their team, then one-off delegations. */
+/** The subagent page: the conversation's named subagents by group, Agent Teams of earlier versions, then unnamed runs. */
 export function SubagentPanel({ delegates, teams, runtime, fail, openFile }: { delegates: Record<string, DelegateView>; teams?: Record<string, AgentTeamView>; runtime?: string; fail: (e: unknown) => void; openFile?: (path: string) => void }) {
   const [limit, setLimit] = useState(20);
   const groups = subagentGroups(delegates, teams || {});
   const now = useClock(groups.active > 0);
   useEffect(() => setLimit(20), [runtime]);
   const card = (d: DelegateView, member?: AgentTeamAgentView) => <DelegateCard key={d.process_id} item={d} member={member} now={now} runtime={runtime} fail={fail} openFile={openFile}/>;
+  const member = ({ agent, latest, earlier }: SubagentMember) => latest ? <React.Fragment key={agent.id}>{card(latest, agent)}
+    {earlier.length > 0 && <details className="delegate-earlier"><summary>{agent.name} 更早的任务 · {earlier.length} 项</summary>{earlier.map(d => card(d, agent))}</details>}</React.Fragment>
+    : <div className="team-member" key={agent.id}><span className={`status-dot ${agent.status}`}/><span>{agent.name}<small>{agent.role}</small></span><span>{agent.closed ? "已结束" : statusLabel(agent.status)}{agent.unread > 0 && ` · ${agent.unread} 条未读`}</span></div>;
   if (!groups.total && !groups.teams.length) return <section className="subagents" aria-label="子代理"><h3>子代理</h3>
-    <p className="muted">这个对话还没有子代理。主代理委派任务或组建 Team 后，会显示在这里。</p></section>;
+    <p className="muted">这个对话还没有子代理。主代理委派任务后，会显示在这里。</p></section>;
   return <section className="subagents" aria-label="子代理"><h3>子代理 <span className="muted small">{groups.total} 个{groups.active > 0 ? ` · ${groups.active} 个进行中` : ""}</span></h3>
     {groups.solo.some(d => d.history_truncated) && <p className="muted small">仅恢复了最近的部分委派记录。</p>}
+    {byGroup(groups.named).map(([group, members]) => group
+      ? <section className="subagent-team" key={`group:${group}`} aria-label={`小组 ${group}`}>
+          <div className="subagent-team-head"><Users size={14}/><strong>{group}</strong><span className="muted small">小组 · 可以互发消息</span></div>
+          {members.map(member)}</section>
+      : <React.Fragment key="ungrouped">{members.map(member)}</React.Fragment>)}
     {groups.teams.map(({ team, lead, members }) => <section className="subagent-team" key={team.id} aria-label={`Team ${team.name}`}>
       <div className="subagent-team-head"><Users size={14}/><strong>{team.name}</strong><span className="muted small">Team · {statusLabel(team.status)}</span></div>
       {team.goal && <p className="muted small">{team.goal}</p>}
       {!!lead?.unread && <p className="small">主代理有 {lead.unread} 条未读消息</p>}
-      {members.map(({ agent, latest, earlier }) => latest ? <React.Fragment key={agent.id}>{card(latest, agent)}
-        {earlier.length > 0 && <details className="delegate-earlier"><summary>{agent.name} 更早的任务 · {earlier.length} 项</summary>{earlier.map(d => card(d, agent))}</details>}</React.Fragment>
-        : <div className="team-member" key={agent.id}><span className={`status-dot ${agent.status}`}/><span>{agent.name}<small>{agent.role}</small></span><span>{statusLabel(agent.status)}{agent.unread > 0 && ` · ${agent.unread} 条未读`}</span></div>)}
+      {members.map(member)}
       {!members.length && <p className="muted small">还没有成员。</p>}
       {team.tasks.length > 0 && <div className="subagent-tasks"><h4>任务</h4>{team.tasks.map(task => <p className="small" key={task.id}>{task.status === "completed" ? "✓" : "·"} {task.title} <span className="muted">{statusLabel(task.status)}</span></p>)}</div>}
       <RawDetails label={`诊断详情 · ${team.messageCount} 条消息`} value={team}/>
     </section>)}
-    {groups.solo.length > 0 && <section className="subagent-solo" aria-label="单次委派">{groups.teams.length > 0 && <h4>单次委派</h4>}
+    {groups.solo.length > 0 && <section className="subagent-solo" aria-label="单次委派">{(groups.teams.length > 0 || groups.named.length > 0) && <h4>单次委派</h4>}
       {groups.solo.slice(0, limit).map(d => card(d))}
       {groups.solo.length > limit && <button className="text-button" onClick={() => setLimit(n => n + 20)}>显示更多委派（还有 {groups.solo.length - limit} 项）</button>}
     </section>}

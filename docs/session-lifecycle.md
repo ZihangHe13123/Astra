@@ -74,7 +74,7 @@ In a Work session Astra is told when work it left running ends, so it carries on
 without you asking. This covers commands started with `background=true` or still
 running after `foreground_yield_ms`, waits written as a command (for example
 `until curl -fs http://localhost:3000; do sleep 2; done`), and background
-subagents and Team members.
+subagents.
 
 - While Astra is still working, what ended arrives before its next step.
 - Once it has answered, the backend starts a turn for it. The conversation shows
@@ -84,10 +84,9 @@ subagents and Team members.
   `process_read`, `process_list` or `process_cancel` is not reported again.
 - With subagents in the background, Astra answers at once instead of waiting for
   them, so you can keep talking to it while they work. Their reports, and what
-  they send to it, start a turn when they arrive. `delegate_poll` with `wait_ms`
-  and `team_wait` still wait when Astra asks for them. Later turns of the session
-  can poll, read and cancel subagents that earlier turns started; Team members are
-  reached through their Team.
+  they send to it, start a turn when they arrive. `delegate_wait` still waits when
+  Astra asks for it. Later turns of the session can give work to, read and stop
+  the subagents that earlier turns started.
 
 No turn starts while a reply is running, while a question waits for you, during a
 restart, in Bar/Minimal/local modes or in channels; what ended waits until a

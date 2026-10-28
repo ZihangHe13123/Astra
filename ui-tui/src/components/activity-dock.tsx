@@ -169,10 +169,15 @@ export function buildActivitySummary(input: ActivitySummaryInput): string[] {
   if (input.model) segments.push(shorten(input.model, mode === "wide" ? 28 : 20));
   if (total > 0) segments.push(`PLAN ${completed}/${total}`);
   if (input.teams?.length) {
-    const running = input.teams.flatMap((team) => team.agents).filter((agent) =>
+    // A conversation's named subagents (a crew) are subagents, not a Team: SUB counts them, TEAM the Teams.
+    const crews = input.teams.filter((team) => team.kind === "crew");
+    const older = input.teams.filter((team) => team.kind !== "crew");
+    const named = crews.flatMap((team) => team.agents.filter((agent) => agent.id !== team.leadAgentId));
+    if (named.length) segments.push(`SUB ${named.filter((agent) => ["starting", "running"].includes(agent.status)).length}/${named.length}`);
+    const running = older.flatMap((team) => team.agents).filter((agent) =>
       ["starting", "running", "idle", "waiting"].includes(agent.status),
     ).length;
-    segments.push(`TEAM ${input.teams.length}/${running}`);
+    if (older.length) segments.push(`TEAM ${older.length}/${running}`);
   }
   segments.push(`CTX ${input.contextPct.toFixed(0)}%`);
   segments.push(input.showReasoning ? "R" : "r");
@@ -436,9 +441,17 @@ export function ActivityDock({
           )}
           {teams.length > 0 && (
             <>
-              <Text bold={theme.prefixBold} color={theme.accentAlt}>AGENT TEAMS</Text>
+              <Text bold={theme.prefixBold} color={theme.accentAlt}>{teams.every((team) => team.kind === "crew") ? "SUBAGENTS" : "AGENT TEAMS"}</Text>
               {teams.map((team) => {
                 const doneTasks = team.tasks.filter((task) => task.status === "completed").length;
+                if (team.kind === "crew") {
+                  const named = team.agents.filter((agent) => agent.id !== team.leadAgentId);
+                  return named.slice(0, 8).map((agent, index) => (
+                    <Text key={agent.id} color={agent.status === "failed" ? theme.danger : agent.status === "running" ? theme.warning : theme.muted}>
+                      {index === Math.min(named.length, 8) - 1 ? "└─" : "├─"} {shorten(agent.name, Math.max(8, Math.min(24, columns - 50)))} · {agent.role || "agent"}{agent.group ? ` · group ${shorten(agent.group, 16)}` : ""} · {agent.closed ? "closed" : ["starting", "running"].includes(agent.status) ? agent.status : "idle"}
+                    </Text>
+                  ));
+                }
                 return (
                   <React.Fragment key={team.id}>
                     <Text color={theme.text}>

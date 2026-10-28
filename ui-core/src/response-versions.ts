@@ -1,5 +1,6 @@
 import type { SessionState } from './session-state.js';
 import { delegateActive } from './delegates.js';
+import { teamWorking } from './agent-team-state.js';
 export type ResponseSource = { index: number; digest: string };
 export type ResponseVersion = { id: string; branch_id: string; status: string; number: number };
 export type ResponseGroup = { id: string; selected_version: string; user_text: string; response_text: string; source_ref?: ResponseSource; versions: ResponseVersion[] };
@@ -18,5 +19,5 @@ export function responseControlsBusy(state?: SessionState): boolean {
     || state.tools.some(t => t.status === 'running')
     || Object.values(state.delegates).some(delegateActive)
     || Object.values(state.processes).some(p => ['pending', 'queued', 'running', 'cancelling'].includes(p.status))
-    || Object.values(state.teams).some(team => !['completed', 'cancelled', 'failed', 'stopped'].includes(team.status));
+    || Object.values(state.teams).some(teamWorking);
 }

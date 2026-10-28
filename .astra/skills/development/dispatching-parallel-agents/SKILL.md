@@ -24,8 +24,12 @@ Use one `delegate_task` batch with bounded items. Every item states:
 - constraints, required evidence, and a compact result contract.
 
 Do not paste unrelated conversation history or ask two agents to solve the same
-problem. Do useful non-duplicating local work while background tasks run. Poll
-only when interim state is needed; collect every result before final synthesis.
+problem. Name the items you may follow up on. Give agents that must agree on an
+interface the same `group` so they can write to each other; leave the others
+without one. Do useful non-duplicating local work while background tasks run;
+results arrive by themselves, and `delegate_wait` waits for them. Collect every
+result before final synthesis, and send follow-up questions to the agent that
+did the work with `delegate_send`.
 
 ## Integration
 
