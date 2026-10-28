@@ -1,10 +1,10 @@
 """Which tools every request carries, and how the others are found and called (specs/tool-disclosure.md).
 
-With ``ASTRA_TOOL_DISCLOSURE=deferred`` a conversation is sent a small core set plus ``tool_search`` and
+By default (``ASTRA_TOOL_DISCLOSURE=deferred``) a conversation is sent a small core set plus ``tool_search`` and
 ``call_tool``. Every other default tool stays registered and runs as before, but its schema reaches the model
 only inside a ``tool_search`` result, and the model calls it through ``call_tool``. The tools array of a
 conversation therefore never changes, so the provider's cached prefix survives a tool being needed late.
-``full`` (the default) sends every default tool, as before, and neither dispatch tool.
+``full`` sends every default tool, as before, and neither dispatch tool.
 """
 
 from __future__ import annotations
@@ -40,7 +40,7 @@ CORE_TOOLS = frozenset({
 
 
 def disclosure_mode() -> str:
-    return "deferred" if os.getenv(DISCLOSURE_ENV, "").strip().lower() == "deferred" else "full"
+    return "full" if os.getenv(DISCLOSURE_ENV, "").strip().lower() == "full" else "deferred"
 
 
 def _prefixed(*prefixes: str, names: Iterable[str] = ()) -> Callable[[str], bool]:

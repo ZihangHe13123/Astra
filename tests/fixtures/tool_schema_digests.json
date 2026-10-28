@@ -125,6 +125,12 @@
     ],
     "reason": "2026-10-26: new tool (macOS); the person's Calendar and Reminders through the helper's EventKit mode: read events, reminders and lists; add_event, add_reminder and complete_reminder each approved."
   },
+  "call_tool": {
+    "sha256": [
+      "201d1a6ed1c7a585"
+    ],
+    "reason": "2026-10-28: new, sent when disclosure is deferred (the default); runs a tool that tool_search handed over, under its own name."
+  },
   "cancel_wakeup": {
     "sha256": [
       "22ec2237327b6834"
@@ -617,6 +623,13 @@
       "f50dea4bdbaf6891"
     ],
     "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+  },
+  "tool_search": {
+    "sha256": [
+      "0dcb893f6d0f355c",
+      "1f573df01a2b878a"
+    ],
+    "reason": "2026-10-28: new, sent when disclosure is deferred (the default); its description is the catalog of deferred tool families and its family enum their ids. macOS lists computer and calendar; other platforms have neither family."
   },
   "wakeup_status": {
     "sha256": [

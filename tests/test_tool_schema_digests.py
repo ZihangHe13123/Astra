@@ -29,8 +29,12 @@ def digest(tool: dict) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
-def sent_tools(tmp_path) -> list[dict]:
-    """The tool schemas of a real backend's first model request in an ordinary conversation."""
+def sent_tools(tmp_path, disclosure: str = "full") -> list[dict]:
+    """The tool schemas of a real backend's first model request in an ordinary conversation.
+
+    ``full`` sends every default tool, so every schema a model can be told is pinned through it;
+    ``deferred`` (the product default) sends the core set and the tool_search/call_tool pair.
+    """
     seen: list[list[dict]] = []
 
     class Handler(_SlowOpenAIHandler):
@@ -59,7 +63,7 @@ def sent_tools(tmp_path) -> list[dict]:
     proc, _, _, wait_for = _start_question_protocol_backend(
         tmp_path, server.server_port, "schema_digest_session", workdir=workdir,
         env_overrides={"ASTRA_CHANNEL_CONFIG": str(tmp_path / "no-channels.json"),
-                       "ASTRA_CONTEXT_INDEX_EMBEDDING": "off"},
+                       "ASTRA_CONTEXT_INDEX_EMBEDDING": "off", "ASTRA_TOOL_DISCLOSURE": disclosure},
     )
     try:
         wait_for(lambda e: e.get("type") == "startup_banner", timeout=30)
@@ -78,7 +82,18 @@ def sent_tools(tmp_path) -> list[dict]:
 
 
 def test_every_tool_schema_the_model_receives_matches_its_reviewed_digest(tmp_path):
-    tools = sent_tools(tmp_path)
+    check_pinned(sent_tools(tmp_path))
+
+
+def test_deferred_disclosure_sends_the_core_set_and_the_dispatch_pair_as_reviewed(tmp_path):
+    tools = sent_tools(tmp_path, "deferred")
+    names = {tool["function"]["name"] for tool in tools}
+    assert {"tool_search", "call_tool", "read_file", "execute_shell"} <= names
+    assert not names & {"browser_open", "git_status", "jobs"}, "deferred tools travel only as tool_search results"
+    check_pinned(tools)
+
+
+def check_pinned(tools: list[dict]) -> None:
     current = {tool["function"]["name"]: digest(tool) for tool in tools}
     pinned = json.loads(FIXTURE.read_text(encoding="utf-8")) if FIXTURE.exists() else {}
 

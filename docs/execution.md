@@ -178,9 +178,9 @@ Tool execution uses the following guards and controls:
 - `PROMPT_CACHE_STABLE_TOOLS=1` keeps one provider-visible tool manifest for
   the work session. Tool budgets and circuits remain enforced at execution
   time without deleting schemas between ReAct iterations.
-- `ASTRA_TOOL_DISCLOSURE=deferred` sends a small core set (`CORE_TOOLS` in
+- `ASTRA_TOOL_DISCLOSURE=deferred` (the default) sends a small core set (`CORE_TOOLS` in
   `agent/runtime/tools/disclosure.py`, plus a few per conversation kind) with
-  `tool_search` and `call_tool`; `full`, the default, sends every default tool.
+  `tool_search` and `call_tool`; `full` sends every default tool, as before.
   The other tools stay registered and run as before. `tool_search` lists them by
   family and returns full definitions as its result; `call_tool` then runs one
   under its own name, so approvals, repeat guards, events and the interface see
