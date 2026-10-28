@@ -24,6 +24,18 @@ export type SnapshotOptions = { slide?: number; export?: "pdf" | "slides"; targe
 export const SLIDE_PICTURE_WIDTH = 1280;
 export const PRINT_TIME_LIMIT = 90000;
 
+/**
+ * How a 1920x1080 slide is drawn in the window it got. Windows keeps a window inside the screen's
+ * work area, smaller than a slide on most screens (1920x1040 with a taskbar). There the page is
+ * zoomed out to n/120, so the slide covers a whole 16n x 9n of the window, and drawn at 120/n device
+ * pixels a point, so the picture is still 1920x1080 and laid out as on a full-size window.
+ */
+export function slideFit(width: number, height: number): { zoom: number; scale: number; width: number; height: number } {
+  const steps = Math.min(120, Math.floor(Math.min(width / 16, height / 9)));
+  if (steps <= 0) throw new Error("没有地方画幻灯片：窗口的大小是 0。");
+  return { zoom: steps / 120, scale: 120 / steps, width: 16 * steps, height: 9 * steps };
+}
+
 /** How much of a page of this height one picture shows. */
 export function shownHeight(pageHeight: number): number {
   if (!Number.isFinite(pageHeight)) return SNAPSHOT_SCREEN;

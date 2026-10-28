@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { CARD_THEME_COLORS, checkedCardTheme } from "../src/card-theme.js";
 import { CAPTURE_HOST_POLICY, CAPTURE_HOST_URL, PAGE_FRAME_URL, captureHostResponse, cardFrameResponse, isCardFrameAddress } from "../src/main/card-frame.js";
-import { SNAPSHOT_MAX_HEIGHT, SNAPSHOT_SCREEN, SNAPSHOT_WIDTH, growsWithWindow, pngSize, shownHeight, snapshotName, staleSnapshots } from "../src/main/page-snapshot-state.js";
+import { SNAPSHOT_MAX_HEIGHT, SNAPSHOT_SCREEN, SNAPSHOT_WIDTH, growsWithWindow, pngSize, shownHeight, slideFit, snapshotName, staleSnapshots } from "../src/main/page-snapshot-state.js";
 
 test("a picture shows a page whole up to three screens, and never less than one", () => {
   assert.equal(shownHeight(120), SNAPSHOT_SCREEN);
@@ -115,4 +115,19 @@ test("the page tells whoever holds it how tall it is and whether it has loaded",
     { astraPage: true, type: "pong", id: 4, height: 1620, settled: false },
     { astraPage: true, type: "pong", id: 5, height: 1620, settled: true },
   ]);
+});
+
+test("a slide window the system made smaller than a slide is zoomed out to fit and drawn denser, still 1920x1080", () => {
+  assert.deepEqual(slideFit(1920, 1080), { zoom: 1, scale: 1, width: 1920, height: 1080 });
+  assert.deepEqual(slideFit(2560, 1440), { zoom: 1, scale: 1, width: 1920, height: 1080 });
+  // A Windows runner's 1024x768 screen, and a 1080p screen with a taskbar: whole points both ways, 1920x1080 pixels.
+  for (const [width, height] of [[1024, 720], [1920, 1040], [1536, 824], [1366, 728]]) {
+    const fit = slideFit(width, height);
+    assert.ok(fit.width <= width && fit.height <= height, `${width}x${height} holds the slide`);
+    assert.ok(Number.isInteger(fit.width) && Number.isInteger(fit.height) && fit.width * 9 === fit.height * 16);
+    assert.ok(Math.abs(fit.width * fit.scale - 1920) < 1e-9 && Math.abs(fit.height * fit.scale - 1080) < 1e-9);
+    assert.ok(Math.abs(fit.zoom * fit.scale - 1) < 1e-9, "one CSS pixel is one device pixel");
+  }
+  assert.deepEqual(slideFit(1024, 720), { zoom: 64 / 120, scale: 120 / 64, width: 1024, height: 576 });
+  assert.throws(() => slideFit(0, 720), /0/);
 });

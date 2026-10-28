@@ -6,7 +6,7 @@ import { CAPTURE_HOST_URL, PAGE_FRAME_URL, guardCardFrames, printAddress } from 
 import { SLIDE_HEIGHT, SLIDE_WIDTH, composeDeck } from "./canvas-deck.js";
 import { exportTarget, isCanvasManifest, readCanvas, slidesTarget } from "./canvas-files.js";
 import { PAGE_PREVIEW_LIMIT } from "./file-preview.js";
-import { PRINT_TIME_LIMIT, SLIDE_PICTURE_WIDTH, SNAPSHOT_SCREEN, SNAPSHOT_TIME_LIMIT, SNAPSHOT_WIDTH, growsWithWindow, pngSize, shownHeight,
+import { PRINT_TIME_LIMIT, SLIDE_PICTURE_WIDTH, SNAPSHOT_SCREEN, slideFit, SNAPSHOT_TIME_LIMIT, SNAPSHOT_WIDTH, growsWithWindow, pngSize, shownHeight,
   snapshotName, staleSnapshots, type PageSnapshot, type SnapshotOptions } from "./page-snapshot-state.js";
 
 /** Draws a page where nobody sees it and saves its picture. What it decides along the way is in page-snapshot-state. */
@@ -36,17 +36,39 @@ export class PageSnapshots {
   }
 
   /** A window nobody sees, which can open nothing and go nowhere. */
-  private window(width: number, height: number, offscreen: boolean): BrowserWindow {
+  private window(width: number, height: number, offscreen: boolean, fit = { zoom: 1, scale: 1 }): BrowserWindow {
     const window = new BrowserWindow({ show: false, width, height, useContentSize: true, frame: false, skipTaskbar: true, focusable: false,
       // The same preload as the app's window: it strips from the page's frame what a policy cannot, and gives this window no bridge.
-      webPreferences: { ...(offscreen ? { offscreen: { deviceScaleFactor: 1 } } : {}), preload: this.preload, contextIsolation: true, sandbox: true,
-        nodeIntegration: false, nodeIntegrationInSubFrames: true, backgroundThrottling: false } });
+      webPreferences: { ...(offscreen ? { offscreen: { deviceScaleFactor: fit.scale } } : {}), zoomFactor: fit.zoom, preload: this.preload,
+        contextIsolation: true, sandbox: true, nodeIntegration: false, nodeIntegrationInSubFrames: true, backgroundThrottling: false } });
     const contents = window.webContents;
     contents.setAudioMuted(true);
     contents.setWindowOpenHandler(() => ({ action: "deny" }));
     contents.on("will-navigate", event => event.preventDefault());
     guardCardFrames(contents);
     return window;
+  }
+
+  /**
+   * A window to draw slides in, and the part of it one slide covers. A window the system made smaller
+   * than a slide is made again, zoomed out to fit and drawn denser (slideFit).
+   */
+  private slideWindow(): { window: BrowserWindow; area: Electron.Rectangle } {
+    const window = this.window(SLIDE_WIDTH, SLIDE_HEIGHT, true);
+    const [width, height] = window.getContentSize();
+    const fit = slideFit(width, height);
+    if (fit.zoom === 1) return { window, area: { x: 0, y: 0, width: SLIDE_WIDTH, height: SLIDE_HEIGHT } };
+    window.destroy();
+    return { window: this.window(SLIDE_WIDTH, SLIDE_HEIGHT, true, fit), area: { x: 0, y: 0, width: fit.width, height: fit.height } };
+  }
+
+  /** The slide host, loaded, with room for a whole slide; a window too small for one stops here, not in a cut picture. */
+  private async slideHost(window: BrowserWindow): Promise<<T>(call: string) => Promise<T>> {
+    const contents = window.webContents;
+    await contents.loadURL(CAPTURE_HOST_URL);
+    const [width, height] = await contents.executeJavaScript("[innerWidth, innerHeight]") as [number, number];
+    if (width < SLIDE_WIDTH - 1 || height < SLIDE_HEIGHT - 1) throw new Error(`画幻灯片的窗口只有 ${width}×${height}，放不下一页。`);
+    return <T>(call: string): Promise<T> => contents.executeJavaScript(`astraCapture.${call}`);
   }
 
   private async within<T>(window: BrowserWindow, limit: number, message: string, work: (window: BrowserWindow) => Promise<T>): Promise<T> {
@@ -63,15 +85,15 @@ export class PageSnapshots {
     if (!canvas.slides) throw new Error("画布里还没有幻灯片。");
     if (slide > canvas.slides) throw new Error(`画布只有 ${canvas.slides} 页。`);
     const theme = await this.theme().catch(() => undefined);
-    return this.within(this.window(SLIDE_WIDTH, SLIDE_HEIGHT, true), SNAPSHOT_TIME_LIMIT, "幻灯片在限定时间内没有画完。", async window => {
+    const { window, area } = this.slideWindow();
+    return this.within(window, SNAPSHOT_TIME_LIMIT, "幻灯片在限定时间内没有画完。", async window => {
       const contents = window.webContents;
-      const host = <T>(call: string): Promise<T> => contents.executeJavaScript(`astraCapture.${call}`);
-      await contents.loadURL(CAPTURE_HOST_URL);
+      const host = await this.slideHost(window);
       const opened = { html: canvas.html, theme: theme ?? null, address: PAGE_FRAME_URL, width: SLIDE_WIDTH, height: SLIDE_HEIGHT };
       await host<number>(`open(${JSON.stringify(opened)})`);
-      const image = await contents.capturePage({ x: 0, y: 0, width: SLIDE_WIDTH, height: SLIDE_HEIGHT });
+      const image = await contents.capturePage(area);
       if (image.isEmpty()) throw new Error("没有截到幻灯片的画面。");
-      const png = image.resize({ width: SLIDE_PICTURE_WIDTH, quality: "best" }).toPNG();
+      const png = image.resize({ width: SLIDE_PICTURE_WIDTH, height: SLIDE_PICTURE_WIDTH * SLIDE_HEIGHT / SLIDE_WIDTH, quality: "best" }).toPNG();
       const scriptError = String(await host<string>("problem()").catch(() => "") || "").slice(0, 300);
       await mkdir(this.folder, { recursive: true, mode: 0o700 });
       const target = join(this.folder, snapshotName(`${dirname(path)}-${slide}.html`, canvas.html, false));
@@ -90,18 +112,19 @@ export class PageSnapshots {
     await rm(folder, { recursive: true, force: true });
     await mkdir(folder, { recursive: true });
     const limit = Math.min(10 * 60000, SNAPSHOT_TIME_LIMIT + canvas.slides * 8000);
-    return this.within(this.window(SLIDE_WIDTH, SLIDE_HEIGHT, true), limit, "幻灯片在限定时间内没有画完。", async window => {
+    const { window, area } = this.slideWindow();
+    return this.within(window, limit, "幻灯片在限定时间内没有画完。", async window => {
       const contents = window.webContents;
-      const host = <T>(call: string): Promise<T> => contents.executeJavaScript(`astraCapture.${call}`);
-      await contents.loadURL(CAPTURE_HOST_URL);
+      const host = await this.slideHost(window);
       const paths: string[] = [];
       for (let slide = 1; slide <= canvas.slides; slide++) {
         const html = composeDeck(canvas.inlined, { mode: "capture", slide, title: canvas.title });
         await host<number>(`open(${JSON.stringify({ html, theme: theme ?? null, address: PAGE_FRAME_URL, width: SLIDE_WIDTH, height: SLIDE_HEIGHT })})`);
-        const image = await contents.capturePage({ x: 0, y: 0, width: SLIDE_WIDTH, height: SLIDE_HEIGHT });
+        const image = await contents.capturePage(area);
         if (image.isEmpty()) throw new Error(`没有截到第 ${slide} 页的画面。`);
         let png = image.toPNG();
-        if (pngSize(png).width !== SLIDE_WIDTH) png = image.resize({ width: SLIDE_WIDTH, quality: "best" }).toPNG();
+        const size = pngSize(png);
+        if (size.width !== SLIDE_WIDTH || size.height !== SLIDE_HEIGHT) png = image.resize({ width: SLIDE_WIDTH, height: SLIDE_HEIGHT, quality: "best" }).toPNG();
         const target = join(folder, `slide-${String(slide).padStart(3, "0")}.png`);
         await writeFile(target, png);
         paths.push(target);
