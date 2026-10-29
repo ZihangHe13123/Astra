@@ -259,9 +259,9 @@
   },
   "delegate_wait": {
     "sha256": [
-      "cddc9de5a0d22143"
+      "7affd6ee16cb40cf"
     ],
-    "reason": "2026-10-29: Agent Teams merged into delegate_*: every subagent of a conversation has a name, stays, and takes more work through delegate_send; subagents of one group may write to each other. New: waits for a report or a message (replaces delegate_poll, team_wait and team_inbox)."
+    "reason": "2026-10-29: Agent Teams merged into delegate_*: every subagent of a conversation has a name, stays, and takes more work through delegate_send; subagents of one group may write to each other. New: waits for a report or a message (replaces delegate_poll, team_wait and team_inbox). 2026-10-29 review fix: a wait for chosen subagents takes only their reports; others' stay for later."
   },
   "doc_check": {
     "sha256": [

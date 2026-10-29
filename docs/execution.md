@@ -15,7 +15,10 @@ one unchanged. A message to a working subagent reaches it before its next step.
 One whose last step's outcome is unknown, such as an interrupted write, is not
 picked up by a message; `recover=true` brings it back read-only. `delegate_cancel`
 stops its current work and `close=true` ends it for the conversation;
-`delegate_list` shows them all and `delegate_wait` waits for a report or message.
+`delegate_list` shows them all and `delegate_wait` waits for a report or message (given
+`subagents`, for those subagents' reports only, while a message from any subagent still comes
+through; other reports stay for normal delivery). A subagent can be closed after a backend restart
+too, by name, without being run again.
 Later turns of the session reach the subagents earlier turns started.
 
 A subagent writes to its parent with `delegate_send(to="parent")`; that arrives

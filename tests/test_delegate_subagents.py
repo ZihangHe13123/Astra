@@ -131,6 +131,8 @@ def test_subagents_of_one_group_write_to_each_other_and_others_only_to_their_par
         assert "parse(text)" in to_b and "From: a" in to_b
         refused = [m["content"] for m in llm.requests["c"][1] if m["role"] == "tool"]
         assert "not in your group" in refused[0] and "Let me in" not in json.dumps(llm.requests["b"])
+        # Refused before anything was sent: a known outcome, so c's writes are not blocked afterwards.
+        assert "outcome_unknown" not in refused[0] and "recovery_write_blocked" not in refused[0]
         assert "You work in the group parser" in llm.requests["a"][0][0]["content"]
         assert "group" not in llm.requests["c"][0][0]["content"].split("## Your parent", 1)[1]
         waited = await harness.registry.execute("delegate_wait", {"timeout_ms": 5000}, task_id=harness.parent)
@@ -255,6 +257,7 @@ def test_a_worker_in_a_worktree_goes_on_in_the_same_worktree(tmp_path, monkeypat
     root.mkdir()
     asyncio.run(scenario())
 
+
 class ToolCallingLLM:
     """Calls the git and CodeGraph tools once, then reports; remembers the tools it was sent."""
 
@@ -303,3 +306,140 @@ def test_a_subagent_gets_every_tool_it_is_granted_while_the_parent_loads_tools_o
 
     asyncio.run(scenario())
 
+
+class HeldLLM:
+    """Reports at once, except for the subagents whose goal names a held event, which wait for it."""
+
+    def __init__(self):
+        self.held: dict[str, asyncio.Event] = {}
+        self.requests: list[list[dict]] = []
+
+    async def chat(self, **kwargs):
+        self.requests.append(copy.deepcopy(kwargs["messages"]))
+        text = json.dumps(kwargs["messages"], ensure_ascii=False)
+        for word, event in self.held.items():
+            if word in text:
+                await event.wait()
+        return {"content": f"report {len(self.requests)}", "tool_calls": []}
+
+
+def test_an_earlier_turns_subagent_is_polled_in_a_later_turn_of_its_session_and_not_from_another(tmp_path, monkeypatch):
+    async def scenario():
+        manager = ProcessManager(artifact_dir=tmp_path / "processes")
+        monkeypatch.setattr(delegate, "_sub_processes", manager)
+        tasks = TaskStore(tmp_path / "tasks.db")
+        session = {"id": "session"}
+        llm = HeldLLM()
+        llm.held["Survey"] = asyncio.Event()
+        registry = ToolRegistry()
+        registry.yolo = True
+        mailbox = register_delegate_tools(registry, llm_getter=lambda: llm, task_store=tasks,
+                                          session_id_getter=lambda: session["id"])
+
+        async def call(task_id, tool_name, **args):
+            result = await registry.execute(tool_name, args, task_id=task_id)
+            assert not result["error"], result
+            return json.loads(result["output"])
+
+        first = tasks.start_run("a", "first turn", session_id="session")["id"]
+        started = await call(first, "delegate_task", goal="Survey the notes", name="surveyor", background=True, timeout=30)
+        # Turn A ends; turn B of the same conversation asks after the subagent the old way.
+        tasks.finish_run(first, "completed")
+        second = tasks.start_run("b", "second turn", session_id="session")["id"]
+        polled = await call(second, "delegate_poll", process_id=started["process_id"])
+        assert polled["status"] == "running"
+        session["id"] = "other"
+        third = tasks.start_run("c", "another conversation", session_id="other")["id"]
+        denied = await registry.execute("delegate_poll", {"process_id": started["process_id"]}, task_id=third)
+        assert "another task" in denied["error"]
+        session["id"] = "session"
+        llm.held["Survey"].set()
+        await manager.wait(manager.get(started["process_id"]), 3000)
+        polled = await call(second, "delegate_poll", process_id=started["process_id"])
+        assert "report" in json.dumps(polled)
+        # Seen through the poll, the report is not put before the parent again.
+        assert mailbox.undelivered("session") == [] and mailbox.drain_session("session") == []
+
+    asyncio.run(scenario())
+
+
+def test_a_saved_subagent_is_closed_for_good_after_the_backend_restarts(tmp_path, monkeypatch):
+    async def scenario():
+        llm = RecordingLLM()
+        harness = Harness(tmp_path, monkeypatch, llm)
+        await harness.call("delegate_task", goal="Read the parser", name="reader", timeout=30)
+        harness.tasks.finish_run(harness.parent, "completed")
+        requests = len(llm.requests)
+        # A new backend: new processes, the same durable state.
+        restarted = Harness(tmp_path, monkeypatch, llm,
+                            parent=TaskStore(tmp_path / "tasks.db").start_run("b", "after restart", session_id="session-a")["id"])
+        closed = await restarted.call("delegate_cancel", process_id="reader", close=True)
+        assert closed["subagent"] == "reader" and closed["closed"] is True
+        assert [m["status"] for m in (await restarted.call("delegate_list"))["subagents"]] == ["closed"]
+        assert "closed" in await _failed(restarted, "delegate_send", to="reader", message="more")
+        restarted.tasks.finish_run(restarted.parent, "completed")
+        again = Harness(tmp_path, monkeypatch, llm,
+                        parent=TaskStore(tmp_path / "tasks.db").start_run("c", "after another", session_id="session-a")["id"])
+        listed = (await again.call("delegate_list"))["subagents"]
+        assert [(m["name"], m["status"]) for m in listed] == [("reader", "closed")]
+        # Closing asked the model nothing and ran nothing again.
+        assert len(llm.requests) == requests
+
+    asyncio.run(scenario())
+
+
+def test_a_batch_is_named_whole_before_any_of_it_starts_and_reports_each_item(tmp_path, monkeypatch):
+    async def scenario():
+        llm = RecordingLLM()
+        harness = Harness(tmp_path, monkeypatch, llm)
+        await harness.call("delegate_task", goal="first", name="kept", timeout=30)
+        before = len(llm.requests)
+        for tasks in ([{"goal": "a", "name": "valid"}, {"goal": "b", "name": "parent"}],
+                      [{"goal": "a", "name": "two  words"}, {"goal": "b", "name": " two words "}],
+                      [{"goal": "a", "name": "fresh"}, {"goal": "b", "name": "kept"}]):
+            await _failed(harness, "delegate_task", tasks=tasks, background=True, timeout=30)
+        names = [m["name"] for m in (await harness.call("delegate_list"))["subagents"]]
+        assert names == ["kept"] and len(llm.requests) == before, "nothing of a refused batch started"
+        # One item that cannot start leaves the others' handles in the answer.
+        from agent.runtime.agent_team import AgentTeamStore as store
+        register = store.register_agent
+
+        def refuse_boom(self, team_id, **kwargs):
+            if kwargs.get("name") == "boom":
+                raise ValueError("the store refused boom")
+            return register(self, team_id, **kwargs)
+
+        monkeypatch.setattr(store, "register_agent", refuse_boom)
+        batch = await harness.call("delegate_task", tasks=[{"goal": "fine", "name": "fine"}, {"goal": "bad", "name": "boom"}],
+                                   timeout=30)
+        by_name = {item.get("subagent"): item for item in batch["results"]}
+        assert by_name["fine"]["result"] and by_name["boom"]["status"] == "not_started"
+        assert "the store refused boom" in by_name["boom"]["error"]
+
+    asyncio.run(scenario())
+
+
+def test_waiting_for_chosen_subagents_leaves_the_others_reports_for_later(tmp_path, monkeypatch):
+    async def scenario():
+        llm = HeldLLM()
+        llm.held["slow work"] = asyncio.Event()
+        harness = Harness(tmp_path, monkeypatch, llm)
+        started = await harness.call("delegate_task", background=True, timeout=30, tasks=[
+            {"goal": "slow work", "name": "slow"}, {"goal": "fast work", "name": "fast"}])
+        fast = next(item for item in started["results"] if item["subagent"] == "fast")
+        await harness.wait(fast["process_id"])
+        waited = await harness.registry.execute("delegate_wait", {"subagents": ["slow"], "timeout_ms": 600},
+                                                task_id=harness.parent)
+        # fast's report is not taken for slow's, and stays to be delivered.
+        assert "Nothing arrived in time" in waited["output"] and "fast work" not in waited["output"]
+        assert harness.mailbox.undelivered("session-a") == ["fast work"]
+        llm.held["slow work"].set()
+        waited = await harness.registry.execute("delegate_wait", {"subagents": ["slow"], "timeout_ms": 5000},
+                                                task_id=harness.parent)
+        assert "slow work" in waited["output"] and "fast work" not in waited["output"]
+        # Waiting for any subagent then hands over fast's report, once.
+        waited = await harness.registry.execute("delegate_wait", {"timeout_ms": 1000}, task_id=harness.parent)
+        assert waited["output"].count("fast work") == 1
+        assert harness.mailbox.undelivered("session-a") == []
+
+    asyncio.run(scenario())

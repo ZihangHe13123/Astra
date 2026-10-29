@@ -12,7 +12,7 @@
 并在整段对话里一直保留：汇报后空闲等待，不占内存也不占名额；`delegate_send(to=<名字>, message=...)` 给它新任务，它从保存的对话接着做，
 之前的请求原样成为下一次请求的开头。发给正在工作的子代理的消息，会在它下一步之前送到。
 上一步结果未知（比如写到一半被打断）的子代理不会被消息唤起，`recover=true` 让它只读恢复。
-`delegate_cancel` 停下它当前的工作，`close=true` 让它在本对话里结束；`delegate_list` 列出全部子代理，`delegate_wait` 等汇报或消息。
+`delegate_cancel` 停下它当前的工作，`close=true` 让它在本对话里结束；`delegate_list` 列出全部子代理，`delegate_wait` 等汇报或消息（指定 `subagents` 时只等这些子代理的汇报，任何子代理写来的消息照样送到，其他汇报留待正常送达）。后端重启后也能按名字关闭子代理，不会为此再运行它。
 同一会话后面的回合可以继续使用前面回合派出的子代理。
 
 子代理用 `delegate_send(to="parent")` 写给父 agent，消息在父 agent 的两步之间进入它的对话，正在等待的父 agent 也会被唤醒。

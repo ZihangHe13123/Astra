@@ -36,7 +36,9 @@ from ..subagent_resume import (
     restore_conversation, tool_outcome_unknown,
 )
 from ..llm import LLMClient
+from ..tool_failure import ToolFailure
 from ..agent_team import (
+    ACTIVE_AGENT_STATUSES,
     EPISODE_KINDS,
     TERMINAL_AGENT_STATUSES,
     TEAM_INBOX_PAGE_SIZE,
@@ -583,12 +585,14 @@ class DelegateMailbox:
             return dict(entry["payload"])
         return None
 
-    def drain(self, task_id: str, *, exclude: set[str] | None = None) -> list[str]:
+    def drain(self, task_id: str, *, exclude: set[str] | None = None, only: set[str] | None = None) -> list[str]:
         self.sync_owners()
         task_id = str(task_id or "")
         envelopes: list[str] = []
         for entry in self._runs.get(task_id, {}).values():
             if exclude and entry["process_id"] in exclude:
+                continue
+            if only is not None and entry["process_id"] not in only:
                 continue
             if entry["status"] == "running" or entry["delivered"]:
                 continue
@@ -629,8 +633,9 @@ class DelegateMailbox:
             self._event(task_id).clear()
         return envelopes
 
-    def drain_for(self, task_id: str, session_id: str = "") -> list[str]:
-        """Drain this task plus completed workers from earlier turns in-session."""
+    def drain_for(self, task_id: str, session_id: str = "", *, only: set[str] | None = None) -> list[str]:
+        """Drain this task plus completed workers from earlier turns in-session; with `only`, just those
+        processes' reports, the rest left for normal delivery. Messages to the parent always come."""
         task_id = str(task_id or "")
         session_id = str(session_id or "")
         self.sync_owners()
@@ -642,7 +647,7 @@ class DelegateMailbox:
         envelopes: list[str] = []
         for owner_id in owner_ids:
             envelopes.extend(self.drain(
-                owner_id, exclude=self._adopted_processes if owner_id != task_id else None,
+                owner_id, exclude=self._adopted_processes if owner_id != task_id else None, only=only,
             ))
         envelopes.extend(self._lead_envelopes(task_id, session_id))
         return envelopes
@@ -900,6 +905,14 @@ def _stopped_member(runtime: Any, team: dict[str, Any], target: str) -> dict[str
     if not str(agent.get("parent_agent_id") or "") or str(agent.get("status") or "") not in TERMINAL_AGENT_STATUSES:
         return None
     return agent
+
+
+def _subagent_name(raw: Any) -> str:
+    """A subagent's name as it is kept: spaces collapsed, at most 40 characters; refused when it names the parent or a group."""
+    name = " ".join(str(raw or "").split())[:40]
+    if name.lower() in _RESERVED_SUBAGENT_NAMES:
+        raise ValueError(f"{name} names the parent or a group of agents; choose another subagent name")
+    return name
 
 
 def _bring_back(team: dict[str, Any]) -> str:
@@ -2870,14 +2883,34 @@ def register_delegate_tools(
                     "timeout": item_timeout,
                 })
 
-            names = [str(item.get("name") or "").strip() for item in normalized_tasks]
+            names = [_subagent_name(item.get("name")) for item in normalized_tasks]
             if len([name for name in names if name]) != len({name for name in names if name}):
                 raise ValueError("each subagent of a batch needs its own name")
+            crew = None if _team_id or current_team_agent_id() else await _crew(_task_id)
+            if crew is not None:
+                # The whole batch is named before any of it starts: a name already used, or one the batch
+                # would give twice, refuses the batch while nothing runs.
+                agents = (await asyncio.to_thread(crew[0].store.get_team, str(crew[1]["id"])) or crew[1]).get("agents", [])
+                taken = {str(agent.get("name") or "") for agent in agents}
+                used = [name for name in names if name in taken]
+                if used:
+                    raise ValueError(
+                        f"a subagent named {used[0]} already works in this conversation: give it the new work "
+                        f'with delegate_send(to="{used[0]}"), or choose another name'
+                    )
+                taken |= set(names)
+                for index, item in enumerate(normalized_tasks):
+                    if not names[index]:
+                        number = 1
+                        while f"{item['mode']}-{number}" in taken:
+                            number += 1
+                        names[index] = f"{item['mode']}-{number}"
+                        taken.add(names[index])
 
-            async def run_item(item: dict[str, Any]) -> dict:
+            async def run_item(index: int, item: dict[str, Any]) -> dict:
                 raw = await _delegate_task(
                     goal=item["goal"],
-                    name=str(item.get("name") or ""),
+                    name=names[index],
                     role=str(item.get("role") or role),
                     group=str(item.get("group") or group),
                     context=str(item.get("context") or context),
@@ -2895,9 +2928,18 @@ def register_delegate_tools(
                 )
                 return _json.loads(raw)
 
-            batch_results = await asyncio.gather(
-                *(run_item(item) for item in normalized_tasks)
+            outcomes = await asyncio.gather(
+                *(run_item(index, item) for index, item in enumerate(normalized_tasks)), return_exceptions=True,
             )
+            batch_results: list[dict] = []
+            for index, outcome in enumerate(outcomes):
+                if isinstance(outcome, BaseException) and not isinstance(outcome, Exception):
+                    raise outcome
+                # One item that could not start does not hide the handles of those that did.
+                batch_results.append(outcome if not isinstance(outcome, Exception) else {
+                    "goal": normalized_tasks[index]["goal"], **({"subagent": names[index]} if names[index] else {}),
+                    "status": "not_started", "error": f"{type(outcome).__name__}: {outcome}",
+                })
             return _sub_processes.dumps({"results": batch_results, "count": len(batch_results)})
 
         if not _team_id and not current_team_agent_id():
@@ -3469,10 +3511,15 @@ def register_delegate_tools(
         try:
             return await _accessible_team(str(crew["id"]), task_id, read_only=read_only)
         except (ValueError, sqlite3.Error):
-            # The crew cannot change hands now (its turn still runs, or this turn is not durable):
-            # its subagents stay reachable in this session by name for reading; new ones run once.
+            # The crew cannot change hands now (its turn still runs, or this turn is not durable). Its
+            # subagents can still be read in this session; a new one runs once; giving one work or
+            # closing it says why it cannot be done now.
             logger.debug("crew %s not taken over by task %s", crew["id"], task_id, exc_info=True)
-            return (runtime, crew) if read_only else None
+            if read_only:
+                return runtime, crew
+            if create:
+                return None
+            raise
 
     async def _crew_delegate(
         crew: tuple[AgentTeamRuntime, dict[str, Any]], *, goal: str, context: str, mode: str, fork_turns: str,
@@ -3487,10 +3534,8 @@ def register_delegate_tools(
             reasoning_effort=reasoning_effort, timeout=timeout, isolation=isolation, workspace_root=workspace_root,
             foreground_yield_ms=foreground_yield_ms, task_id=_task_id,
         )
-        wanted = " ".join(str(name or "").split())[:40]
+        wanted = _subagent_name(name)
         clean_group = " ".join(str(group or "").split())[:40]
-        if wanted.lower() in _RESERVED_SUBAGENT_NAMES:
-            raise ValueError(f"{wanted} names the parent or a group of agents; choose another subagent name")
         async with crew_lock:
             current = await asyncio.to_thread(runtime.store.get_team, str(team["id"])) or team
             taken = {str(agent.get("name") or "") for agent in current.get("agents", [])}
@@ -3549,7 +3594,7 @@ def register_delegate_tools(
 
     async def _reachable_process(target: str, task_id: str):
         """The process of a subagent named by its name or process id, reachable from this turn."""
-        member = await _crew_member(target, task_id)
+        member = await _crew_member(target, task_id, read_only=True)
         if member is None:
             return _owned_process(str(target), task_id)
         process_id = str(member[2].get("process_id") or "")
@@ -3576,42 +3621,52 @@ def register_delegate_tools(
             **({"workspace_root": str(spec["workspace_root"])} if spec.get("workspace_root") else {}),
         }
 
-    async def _delegate_send(to: str, message: str, recover: bool = False, _task_id: str = "") -> str:
+    def _refused(message: str) -> ToolFailure:
+        # Refused before anything was sent: a known outcome, which never blocks the sender's writes.
+        return ToolFailure(code="delegate_send_refused", message=message, retryable=False)
+
+    async def _delegate_send(to: str, message: str, recover: bool = False, _task_id: str = "") -> str | ToolFailure:
         """Give a subagent more work or a correction; a subagent writes to its parent or its group."""
         text = str(message or "")
         if not text.strip():
-            raise ValueError("message is empty")
+            return _refused("message is empty")
         clean = str(to or "").strip()
         sender_id = current_team_agent_id()
         if sender_id:
             runtime = _team_runtime()
             me = await asyncio.to_thread(runtime.store.get_agent, sender_id)
             if not me:
-                raise ValueError("this agent has no parent to write to")
+                return _refused("this agent has no parent to write to")
             team = await asyncio.to_thread(runtime.store.get_team, str(me["team_id"])) or {}
             if recover:
-                raise ValueError("only the parent brings a subagent back")
+                return _refused("only the parent brings a subagent back")
             if clean.lower() in {"parent", "lead"}:
                 target = "lead"
             else:
-                other = await asyncio.to_thread(runtime.store.resolve_agent, str(team["id"]), clean)
+                try:
+                    other = await asyncio.to_thread(runtime.store.resolve_agent, str(team["id"]), clean)
+                except ValueError as exc:
+                    return _refused(str(exc))
                 mine = str((me.get("spawn_spec") or {}).get("group") or "")
                 theirs = str((other.get("spawn_spec") or {}).get("group") or "")
                 if str(team.get("kind") or "") == "crew" and (not mine or mine != theirs):
-                    raise ValueError(
+                    return _refused(
                         'you write to your parent with to="parent"'
                         + (f" and to the subagents of group {mine} by name" if mine else "")
                         + f"; {other['name']} is not in your group"
                     )
+                if str(other.get("status") or "") not in ACTIVE_AGENT_STATUSES:
+                    return _refused(f"{other['name']} is not working now and reads messages only while it works; "
+                                    "its parent can give it work")
                 target = str(other["id"])
             sent = _json.loads(await _team_send(str(team["id"]), target, text, _task_id=_task_id))
             return _sub_processes.dumps({"to": clean, "sent": sent["sent"]})
         member = await _crew_member(clean, _task_id)
         if member is None:
-            raise ValueError(f"no subagent {clean} in this conversation: delegate_list shows them, delegate_task starts one")
+            return _refused(f"no subagent {clean} in this conversation: delegate_list shows them, delegate_task starts one")
         runtime, team, agent = member
         if _closed(agent):
-            raise ValueError(f"subagent {agent['name']} was closed; start another with delegate_task")
+            return _refused(f"subagent {agent['name']} was closed; start another with delegate_task")
         if recover:
             restarted = _json.loads(await _team_restart(str(team["id"]), str(agent["id"]), instruction=text,
                                                         _task_id=_task_id))
@@ -3644,8 +3699,11 @@ def register_delegate_tools(
 
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_ms / 1000
+        # Chosen subagents: only their reports end the wait (others stay for normal delivery); a message
+        # any subagent writes to the parent is a question for it and ends the wait too.
+        only = {process.process_id for process in watched} if watched else None
         while True:
-            arrived = mailbox.drain_for(_task_id, session)
+            arrived = mailbox.drain_for(_task_id, session, only=only)
             remaining = deadline - loop.time()
             if arrived or not working() or remaining <= 0:
                 break
@@ -3781,9 +3839,16 @@ def register_delegate_tools(
         """Stop a subagent's current work; close ends it for this conversation."""
         member = await _crew_member(process_id, _task_id)
         process = None
-        if member is None or str(member[2].get("process_id") or ""):
+        live = str(member[2].get("process_id") or "") if member is not None else str(process_id)
+        if member is not None and live:
+            try:
+                _sub_processes.get(live)
+            except ValueError:
+                # Its process ended with an earlier backend: only its identity is left to close.
+                live = ""
+        if member is None or live:
             async with mailbox.control_lock:
-                process = await _reachable_process(process_id, _task_id)
+                process = await _reachable_process(live if member is not None else process_id, _task_id)
                 await _sub_processes.cancel(process)
             await asyncio.sleep(0)
             mailbox.acknowledge(_task_id, process.process_id)
@@ -4723,8 +4788,9 @@ def register_delegate_tools(
         name="delegate_wait",
         description=(
             "Wait until a subagent reports or writes to you, or timeout_ms passes, and return what arrived; "
-            "without it, reports and messages reach you between your steps. subagents limits the wait to "
-            "those; by default any that is working."
+            "without it, reports and messages reach you between your steps. subagents waits for those "
+            "subagents' reports only (others' stay for later); a message any subagent writes to you also "
+            "ends the wait. By default it waits for any that is working."
         ),
         parameters={
             "type": "object",
