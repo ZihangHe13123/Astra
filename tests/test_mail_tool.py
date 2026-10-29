@@ -104,3 +104,35 @@ def test_a_turn_that_read_mail_needs_approval_to_save_memory(tmp_path):
     assert outside_content(messages, registry) == "the mail tool"
     for text in ("看看我的邮件", "any new email from my professor?", "收件箱里有什么"):
         assert "mail" in registry.select_groups(text)
+
+
+def test_a_search_result_names_its_folder_so_reading_it_never_opens_another_message(tmp_path):
+    folders = {"INBOX": 7, "[Gmail]/Sent Mail": 8, "项目/报告": 5}
+    subjects = {"INBOX": "Unrelated inbox message", "[Gmail]/Sent Mail": "UNIQUE_LAB_SEARCH_RESULT",
+                "项目/报告": "季度项目报告"}
+    # Every folder has a message number 9: numbers are unique only within a folder.
+    remote = {(name, 9): message(name, generation, 9, subject=subjects[name]) for name, generation in folders.items()}
+    client = ScriptedClient(
+        snapshots={name: FolderSnapshot(name, generation, frozenset({9}), {9: ("\\Seen",)})
+                   for name, generation in folders.items()},
+        messages=remote, folder_names=tuple(folders))
+    factory = ClientFactory(client)
+    settings = replace(config(tmp_path), default_folders=tuple(folders))
+    MailService(settings, client_factory=factory).sync()
+    registry = ToolRegistry()
+    register_mail_tool(registry, project_root=tmp_path, service=lambda: MailService(settings, client_factory=factory))
+
+    found = call(registry, action="search", query="UNIQUE_LAB")["output"]
+    assert 'ref "[Gmail]/Sent Mail:8:9"' in found and found.count("ref ") == 1
+    text = call(registry, action="read", ref="[Gmail]/Sent Mail:8:9")["output"]
+    assert "UNIQUE_LAB_SEARCH_RESULT" in text and "Unrelated" not in text
+    # A folder named in another script reads back the same way.
+    found = call(registry, action="search", query="季度")["output"]
+    assert 'ref "项目/报告:5:9"' in found
+    assert "季度项目报告" in call(registry, action="read", ref="项目/报告:5:9")["output"]
+    # A ref from before the folder was rebuilt (another generation) is reported gone, not read as today's #9.
+    stale = call(registry, action="read", ref="[Gmail]/Sent Mail:3:9")
+    assert "gone" in stale["error"] and not stale["output"]
+    assert "not a ref" in call(registry, action="read", ref="Sent Mail 9")["error"]
+    # The old way still reads a number in a folder, the inbox by default.
+    assert "Unrelated inbox message" in call(registry, action="read", uid=9)["output"]

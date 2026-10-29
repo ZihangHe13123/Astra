@@ -337,7 +337,9 @@ WSL selection.
 
 Astra reads the configured mailbox itself with its read-only `mail` tool: recent
 mail (or only unread), search, and one message's text, in any conversation or a
-scheduled check given `--mail`. Mail is treated as outside text, like a web page:
+scheduled check given `--mail`. Each message it lists carries a ref (its folder, the folder's
+generation and its number, since numbers repeat across folders); reading by ref opens that message
+or reports it gone, never another one. Mail is treated as outside text, like a web page:
 a memory saved in a turn that read mail needs your approval. Any IMAP account
 works, not only 163: set `ASTRA_MAIL_ADDRESS` and `ASTRA_MAIL_PASSWORD` (an app
 password or authorization code) instead of the 163 names below. Gmail, QQ,
