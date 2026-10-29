@@ -1,5 +1,5 @@
-import { createHash } from "node:crypto";
-import { mkdir, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { mkdir, open, readdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, join, relative, sep } from "node:path";
 import type { CanvasVersion } from "../file-preview-types.js";
 import { ASSET_TYPES, composeDeck, inlineAssets, slideCount, type Asset, type DeckMode } from "./canvas-deck.js";
@@ -18,6 +18,8 @@ const ENTRIES: Record<string, string> = { slides: SLIDES_FILE, doc: DOC_FILE };
 const MAX_VERSIONS = 30;
 export const SLIDES_LIMIT = 2 * 1024 * 1024;
 const ASSET_LIMIT = 8 * 1024 * 1024;
+const TOTAL_ASSET_LIMIT = 40 * 1024 * 1024;
+const MAX_ASSETS = 256;
 
 export const isCanvasManifest = (path: string) => basename(path) === CANVAS_MANIFEST && /\.canvas$/i.test(basename(dirname(path)));
 
@@ -86,11 +88,29 @@ export async function readCanvas(manifestPath: string, mode: DeckMode, slide = 1
     try { return decodeURIComponent(match[1]); } catch { return match[1]; }
   }));
   const assets = new Map<string, Asset>();
+  let remaining = TOTAL_ASSET_LIMIT, considered = 0;
   for (const name of names) {
+    if (++considered > MAX_ASSETS || remaining <= 0) break;
     const mime = ASSET_TYPES[extname(name).toLowerCase()];
     const path = mime ? await assetInside(root, name) : undefined;
-    if (!mime || !path || (await stat(path)).size > ASSET_LIMIT) continue;
-    assets.set(name, { mime, data: await readFile(path) });
+    if (!mime || !path) continue;
+    const handle = await open(path, "r");
+    try {
+      const info = await handle.stat();
+      if (!info.isFile() || info.size > ASSET_LIMIT || info.size > remaining) continue;
+      // Reserve before allocating; bounded reads cannot grow with a changing file.
+      remaining -= info.size;
+      const data = Buffer.alloc(info.size);
+      let offset = 0;
+      while (offset < data.length) {
+        const { bytesRead } = await handle.read(data, offset, data.length - offset, offset);
+        if (!bytesRead) break;
+        offset += bytesRead;
+      }
+      const after = await handle.stat();
+      if (offset === data.length && after.size === info.size && after.mtimeMs === info.mtimeMs)
+        assets.set(name, { mime, data });
+    } finally { await handle.close(); }
   }
   const { html, missing } = inlineAssets(source, name => assets.get(name));
   return { title, type, slides: slideCount(source), source, inlined: html, html: composeDeck(html, { mode, slide, title }), missing };
@@ -157,11 +177,18 @@ export async function recordVersion(manifestPath: string, source: string): Promi
   const kept = await canvasFolder(root, ".versions");
   // Numbered past every folder there, a version that cannot be read included.
   const taken = (await readdir(kept).catch(() => [] as string[])).filter(name => /^\d{4}$/.test(name)).map(Number);
-  const id = String(Math.max(0, ...taken) + 1).padStart(4, "0");
-  if (id.length > 4) throw new Error("这个画布的版本号用完了。");
-  const folder = await canvasFolder(root, ".versions", id);
+  let number = Math.max(0, ...taken) + 1, id: string, folder: string;
+  for (;;) {
+    id = String(number++).padStart(4, "0");
+    if (id.length > 4) throw new Error("这个画布的版本号用完了。");
+    folder = join(kept, id);
+    try { await mkdir(folder); break; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  }
+  if (await inside(root, ".versions", id) !== folder) throw new Error("版本文件夹已改变。");
   await writeFile(join(folder, file), data);
-  await writeFile(join(folder, "meta.json"), JSON.stringify({ at: Date.now() / 1000, source, sha256, file }));
+  await writeFile(join(folder, "meta.tmp"), JSON.stringify({ at: Date.now() / 1000, source, sha256, file }));
+  await rename(join(folder, "meta.tmp"), join(folder, "meta.json"));
   for (const old of versions.slice(0, Math.max(0, versions.length + 1 - MAX_VERSIONS)))
     await rm(join(kept, old.id), { recursive: true, force: true });
   return id;
@@ -179,7 +206,7 @@ async function rewrite(manifestPath: string, source: string, change: (current: B
   const target = join(root, ENTRIES[type]);
   await recordVersion(manifestPath, "write");
   const current = await readFile(target);
-  const temporary = `${target}.${source}-${process.pid}`;
+  const temporary = `${target}.${randomUUID()}.tmp`;
   await writeFile(temporary, await change(current));
   if (!current.equals(await readFile(target))) { await rm(temporary, { force: true }); throw new Error("画布刚被改过，请再试一次。"); }
   await rename(temporary, target);

@@ -45,6 +45,7 @@ from ..network import active_proxy_for_url
 from ..tool_execution import PartialResult
 from ..tool_failure import ToolFailure
 from .approval import normalized_origin
+from ..public_fetch import PageTLSContext, fetch_page_text, private_url_origins
 from .registry import ToolDef, ToolRegistry
 from .image_search import register_image_search
 from .search_image_reader import load_search_image
@@ -702,6 +703,25 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         except Exception as e:
             return None, _transport_error(e)
 
+    async def _page_get(url: str, timeout: int = 20, *, require_same_origin: bool = False) -> tuple[str | None, str | None]:
+        if httpx is None:
+            return None, "Safe page fetching requires httpx; install Astra's HTTP dependencies"
+        try:
+            proxy_url = active_proxy_for_url(url)
+            def client_for(target: str):
+                assert httpx is not None
+                key = "page:" + normalized_origin(target) + ":" + (proxy_url or "direct")
+                if key not in shared_clients:
+                    kwargs = _client_kwargs(timeout, proxy_url)
+                    kwargs["follow_redirects"] = False
+                    kwargs["verify"] = PageTLSContext(urllib.parse.urlsplit(target).hostname or "")
+                    shared_clients[key] = httpx.AsyncClient(**kwargs)
+                return shared_clients[key]
+            return await fetch_page_text(client_for, url, timeout=timeout,
+                                         same_origin=require_same_origin), None
+        except Exception as exc:
+            return None, _transport_error(exc)
+
     async def _http_post_json(
         url: str,
         payload: dict,
@@ -878,15 +898,16 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         # An unguarded cache entry has no final-origin evidence. Keep it
         # separate from entries fetched while interactive approval is active.
         cache_key = f"{'guarded' if require_same_origin else 'raw'}:{url}"
-        cached = _cache_get(url_cache, cache_key, url_cache_ttl)
+        private = bool(private_url_origins.get())
+        cached = None if private else _cache_get(url_cache, cache_key, url_cache_ttl)
         if cached is not None:
             return cached, None
-        body, err = await _http_get(
+        body, err = await _page_get(
             url,
             timeout or url_timeout,
             require_same_origin=require_same_origin,
         )
-        if body is not None:
+        if body is not None and not private:
             _cache_set(url_cache, cache_key, body, url_cache_ttl)
         return body, err
 
@@ -1687,7 +1708,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         async def extract_one(url: str) -> dict:
             # Direct fallback must not follow an approved public URL into a
             # different origin where the original SSRF decision no longer applies.
-            body, error = await _http_get(
+            body, error = await _page_get(
                 url,
                 url_timeout,
                 require_same_origin=True,
@@ -2206,6 +2227,25 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             ),
         )
 
+    async def _page_permission(args: dict) -> dict | None:
+        url = str(args.get("url") or "")
+        try:
+            problem = await asyncio.wait_for(_public_url_problem(url), timeout=min(3, url_timeout))
+        except TimeoutError:
+            # The bounded fetch still validates/pins the resolved address; a slow
+            # permission preview must not hang before the tool's request deadline.
+            return None
+        if problem != "private":
+            return None
+        return {"kind": "private_web", "scope": "private-web:" + normalized_origin(url),
+                "operation": "Read a private network page", "target": url,
+                "reason": "This address can access local or private network services",
+                "detail": "Approval covers this origin only; redirects to another origin require separate permission."}
+
+    def _grant_page(args: dict, request: dict, decision: str):
+        token = private_url_origins.set(private_url_origins.get() | {normalized_origin(str(args.get("url") or ""))})
+        return lambda: private_url_origins.reset(token)
+
     async def _fetch_url(url: str, max_length: int = 8000) -> str | ToolFailure:
         """Fetch and extract text from a URL (static HTML only)."""
         if not url.startswith(("http://", "https://")):
@@ -2480,6 +2520,7 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
             "required": ["url"],
         },
         fn=_fetch_url, risk="network", approval="never", idempotent=True,
+        permission_check=_page_permission, permission_grant=_grant_page, permission_authoritative=True,
         sandboxed=True, group="web",
     ))
 

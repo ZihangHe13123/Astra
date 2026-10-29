@@ -16,6 +16,7 @@ from pathlib import Path
 
 from agent.core.msg import ContentBlock, Msg
 from agent.runtime.tools.grants import enter_grant_space, leave_grant_space
+from agent.runtime.tools.access_scope import CHAT_TOOLS, tool_access_scope
 from agent.runtime.usage import reset_usage_context, set_usage_context
 from agent.runtime.prompt_budget import prompt_token_budget
 from agent.runtime.prompts import channel_prompt_profile
@@ -62,7 +63,9 @@ def channel_session_name(message: ChannelMessage) -> str:
     kind = "group" if message.is_group else "private"
     identity = f"{message.channel}:{kind}:{message.conversation_id}"
     digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
-    return f"channel_{message.channel}_{kind}_{digest}"
+    base = f"channel_{message.channel}_{kind}_{digest}"
+    # Revoking local access must never hydrate an old owner conversation containing local data.
+    return base + ("_chat_v1" if message.channel == "qq" and not message.local_tools else "")
 
 
 class AgentChannelRouter:
@@ -194,6 +197,20 @@ class AgentChannelRouter:
                         affect=template.persona_affect)
         context.set_persona(state, profile.system_prompt(state))
 
+    def _chat_context(self, session_name: str) -> AgentContext:
+        """Contacts never inherit the owner's prompt, persona relationship or static suffix."""
+        if session_name not in self._contexts:
+            context = AgentContext(system_prompt=(
+                "You are Astra, a helpful chat assistant. Answer this contact using conversation "
+                "content and available public web tools. Local files, history, memories and system "
+                "operations require the owner's separate authorization."),
+                max_prompt_tokens=self._template.max_prompt_tokens, show_reasoning=False)
+            context.compressor = ContextCompressor(self.agent.llm)
+            context.set_session(str(self.session_root / f"{session_name}.json"))
+            context.load()
+            self._contexts[session_name] = context
+        return self._contexts[session_name]
+
     async def handle(
         self,
         message: ChannelMessage,
@@ -211,7 +228,8 @@ class AgentChannelRouter:
                 return "Astra is preparing a restart. Please retry after it reconnects."
             previous = self.agent.context
             previous_llm = self.agent.llm
-            context = self._context(session_name, message.channel)
+            restricted = message.channel == "qq" and not message.local_tools
+            context = self._chat_context(session_name) if restricted else self._context(session_name, message.channel)
             self.agent.context = context
             llm = self.model_for(message.channel)
             if llm is not None:
@@ -226,6 +244,23 @@ class AgentChannelRouter:
             message_token = active_channel_message.set(message)
             media: list[str] = []
             media_token = channel_turn_media.set(media)
+            saved = {}
+            if restricted:
+                for attribute in ("memory_store", "memory_router", "memory_retainer", "external_memory_provider",
+                                  "context_index_broker", "runtime_context_provider", "runtime_turn_context_provider", "tool_allowlist",
+                                  "minimal_mode",
+                                  "_turn_context_key", "_turn_context_block", "_standing_memory_block"):
+                    if hasattr(self.agent, attribute):
+                        saved[attribute] = getattr(self.agent, attribute)
+                for attribute in saved:
+                    setattr(self.agent, attribute, "" if attribute.startswith("_") else None)
+                previous_tools = saved.get("tool_allowlist")
+                self.agent.tool_allowlist = set(CHAT_TOOLS if previous_tools is None else CHAT_TOOLS & previous_tools)
+                # Reuse the runtime's zero-injection contract: no project/skill guidance from the owner.
+                self.agent.minimal_mode = True
+            ceiling = tool_access_scope.get()
+            allowed = (CHAT_TOOLS if ceiling is None else ceiling & CHAT_TOOLS) if restricted else ceiling
+            access_token = tool_access_scope.set(allowed)
             task_id, outcome = "", "failed"
             try:
                 content = message.text
@@ -284,6 +319,9 @@ class AgentChannelRouter:
                 outcome = "cancelled"
                 raise
             finally:
+                tool_access_scope.reset(access_token)
+                for attribute, value in saved.items():
+                    setattr(self.agent, attribute, value)
                 if task_id:
                     await self._finish_task(task_id, outcome)
                 channel_turn_media.reset(media_token)

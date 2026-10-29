@@ -30,6 +30,7 @@ import os
 import sys
 import time
 import uuid
+from dataclasses import dataclass
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -268,9 +269,7 @@ async def list_models(request: Request) -> JSONResponse:
     denied = _authorize(request)
     if denied is not None:
         return denied
-    model_id = "astra"
-    if _agent and hasattr(_agent, "llm"):
-        model_id = getattr(_agent.llm, "model", "astra")
+    model_id = _served_model()
     return JSONResponse({
         "object": "list",
         "data": [
@@ -282,6 +281,75 @@ async def list_models(request: Request) -> JSONResponse:
             }
         ],
     })
+
+
+def _served_model() -> str:
+    llm = getattr(_agent, "llm", None)
+    value = getattr(llm, "model", None) or getattr(getattr(llm, "config", None), "model", None)
+    return value if isinstance(value, str) and value else "astra"
+
+
+@dataclass(frozen=True)
+class ChatInput:
+    text: str
+    blocks: list
+    history: list[dict]
+
+
+def _chat_input(body: dict, session_id: str | None) -> str | ChatInput:
+    from agent.core.msg import ContentBlock
+
+    options = body.get("stream_options")
+    if options is not None and (not isinstance(options, dict) or
+                                ("include_usage" in options and not isinstance(options["include_usage"], bool))):
+        raise ValueError("stream_options must be an object with an optional boolean include_usage")
+
+    requested = body.get("model", "astra")
+    if requested not in {"astra", _served_model()}:
+        raise ValueError(f"Unknown model {requested!r}; this endpoint serves {_served_model()!r}")
+    messages = body["messages"]
+    if not messages or messages[-1]["role"] != "user":
+        raise ValueError("messages must end with a user message")
+    if session_id is not None and len(messages) != 1:
+        raise ValueError("Astra session_id accepts one new user message; omit session_id to submit full history")
+    clean = []
+    for message in messages:
+        role = message["role"]
+        if role not in {"system", "developer", "user", "assistant"} or message.get("tool_calls") or message.get("function_call"):
+            raise ValueError("Client tool execution history is unsupported; submit text history without tool calls")
+        content = message.get("content")
+        if content is None and role == "assistant":
+            continue
+        if isinstance(content, list):
+            if role != "user":
+                raise ValueError("Only user messages accept multimodal content")
+            parts = []
+            for block in content:
+                if block["type"] == "text":
+                    parts.append({"type": "text", "text": block["text"]})
+                elif block["type"] == "image_url":
+                    image = block.get("image_url")
+                    if not isinstance(image, dict) or not isinstance(image.get("url"), str):
+                        raise ValueError("image_url must contain a URL string")
+                    if not image["url"].startswith(("http://", "https://", "data:image/")):
+                        raise ValueError("Unsupported image URL scheme")
+                    detail = image.get("detail", "auto")
+                    if detail not in {"auto", "low", "high"}:
+                        raise ValueError("Unsupported image detail")
+                    parts.append({"type": "image_url", "image_url": {"url": image["url"], "detail": detail}})
+                else:
+                    raise ValueError(f"Unsupported content part: {block['type']}")
+            content = parts
+        # Whitelist canonical input fields: no imported grants, tool receipts or execution metadata.
+        clean.append({"role": role, "content": content})
+    latest = clean[-1]["content"]
+    blocks = ([ContentBlock.text(latest)] if isinstance(latest, str) else [
+        ContentBlock.text(part["text"]) if part["type"] == "text" else
+        ContentBlock.image_url(part["image_url"]["url"], part["image_url"]["detail"]) for part in latest])
+    if not blocks or not any(block.data.get("text", "").strip() or block.type == "image_url" for block in blocks):
+        raise ValueError("No user content found")
+    text = "\n".join(block.data["text"] for block in blocks if block.type == "text") or "[Image]"
+    return latest if isinstance(latest, str) and len(clean) == 1 else ChatInput(text, blocks, clean[:-1])
 
 
 def _extract_user_text(messages: list[dict]) -> str:
@@ -368,24 +436,17 @@ async def chat_completions(request: Request) -> Any:
     try:
         body = _validate_chat_body(body)
         session_id = _request_session_id(body, request.headers)
+        user_input = _chat_input(body, session_id)
     except (SessionNameError, ValueError) as exc:
         return JSONResponse(
             {"error": {"message": str(exc), "type": "invalid_request_error"}},
             status_code=400,
         )
-    messages = body.get("messages", [])
     stream = body.get("stream", False)
-    user_text = _extract_user_text(messages)
-
-    if not user_text:
-        return JSONResponse(
-            {"error": {"message": "No user message found", "type": "invalid_request_error"}},
-            status_code=400,
-        )
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
-    model = body.get("model", "astra")
+    model = _served_model()
     session_headers = (
         {"X-Astra-Session-Id": quote(session_id, safe="._-")}
         if session_id is not None
@@ -394,7 +455,8 @@ async def chat_completions(request: Request) -> Any:
 
     if stream:
         return StreamingResponse(
-            _stream_response(completion_id, created, model, user_text, session_id),
+            _stream_response(completion_id, created, model, user_input, session_id,
+                             include_usage=bool((body.get("stream_options") or {}).get("include_usage"))),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -406,7 +468,8 @@ async def chat_completions(request: Request) -> Any:
 
     # Non-streaming: collect full response
     try:
-        response_text = await _run_agent(user_text, session_id)
+        usage: dict = {}
+        response_text = await _run_agent(user_input, session_id, usage=usage)
     except Exception as e:
         logger.exception("Agent error")
         return JSONResponse(
@@ -426,7 +489,7 @@ async def chat_completions(request: Request) -> Any:
                 "finish_reason": "stop",
             }
         ],
-        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        "usage": usage or None,
     }
     if session_id is not None:
         response_payload["session_id"] = session_id
@@ -471,7 +534,7 @@ def _context_for_session(session_id: str | None) -> AgentContext:
     return context
 
 
-async def _agent_events(user_text: str, session_id: str | None):
+async def _agent_events(user_text: str | ChatInput, session_id: str | None, usage: dict | None = None):
     """Yield one agent turn while owning context swap and persistence."""
     from agent.core.msg import ContentBlock, Msg
 
@@ -480,6 +543,18 @@ async def _agent_events(user_text: str, session_id: str | None):
             raise RuntimeError("Agent not initialized")
         previous = _agent.context
         context = _context_for_session(session_id)
+        initial_usage = (context.total_prompt_tokens, context.total_completion_tokens)
+        if isinstance(user_text, ChatInput):
+            for message in user_text.history:
+                if message["role"] == "user":
+                    context.add_user(message["content"])
+                else:
+                    context.add_assistant_raw(dict(message))
+            blocks = user_text.blocks
+            log_text = user_text.text
+        else:
+            blocks = [ContentBlock.text(user_text)]
+            log_text = user_text
         previous_memory_state = (
             getattr(_agent, "memory_store", None),
             getattr(_agent, "memory_router", None),
@@ -508,7 +583,7 @@ async def _agent_events(user_text: str, session_id: str | None):
         msg = Msg(
             sender="user",
             role="user",
-            content=[ContentBlock.text(user_text)],
+            content=blocks,
         )
         recall = None
         recall_session_id = ""
@@ -526,7 +601,7 @@ async def _agent_events(user_text: str, session_id: str | None):
                         workspace_key=workspace.key,
                         workspace_root=workspace.root,
                     )
-                    recall.log_message(recall_session_id, "user", user_text)
+                    recall.log_message(recall_session_id, "user", log_text)
                 except Exception:
                     recall = None
                     logger.exception("session recall: API user logging failed")
@@ -547,6 +622,11 @@ async def _agent_events(user_text: str, session_id: str | None):
                         logger.exception("session recall: API assistant logging failed")
             finally:
                 await reply_events.aclose()
+            if usage is not None:
+                prompt = context.total_prompt_tokens - initial_usage[0]
+                completion = context.total_completion_tokens - initial_usage[1]
+                if prompt or completion:
+                    usage.update(prompt_tokens=prompt, completion_tokens=completion, total_tokens=prompt + completion)
         finally:
             try:
                 if session_id is not None:
@@ -561,11 +641,11 @@ async def _agent_events(user_text: str, session_id: str | None):
                 _agent.context = previous
 
 
-async def _run_agent(user_text: str, session_id: str | None = None) -> str:
+async def _run_agent(user_text: str | ChatInput, session_id: str | None = None, *, usage: dict | None = None) -> str:
     """Run user text through the selected API session and collect the response."""
 
     chunks: list[str] = []
-    events = _agent_events(user_text, session_id)
+    events = _agent_events(user_text, session_id, usage)
     try:
         async for event in events:
             etype = event.get("type")
@@ -587,11 +667,13 @@ async def _stream_response(
     completion_id: str,
     created: int,
     model: str,
-    user_text: str,
+    user_text: str | ChatInput,
     session_id: str | None = None,
+    *, include_usage: bool = False,
 ):
     """SSE streaming generator — yields SSE data lines directly."""
-    events = _agent_events(user_text, session_id)
+    usage: dict = {}
+    events = _agent_events(user_text, session_id, usage)
     try:
         async for event in events:
             etype = event.get("type")
@@ -637,6 +719,9 @@ async def _stream_response(
         "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
     }
     yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
+    if include_usage:
+        yield "data: " + json.dumps({"id": completion_id, "object": "chat.completion.chunk", "created": created,
+                                     "model": model, "choices": [], "usage": usage or None}) + "\n\n"
     yield "data: [DONE]\n\n"
 
 

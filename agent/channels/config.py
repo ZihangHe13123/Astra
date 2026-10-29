@@ -53,6 +53,7 @@ class OneBotConfig:
     group_require_mention: bool = True
     wake_prefixes: tuple[str, ...] = ("/",)
     allow_users: tuple[str, ...] = ()
+    owner_users: tuple[str, ...] = ()
     allow_groups: tuple[str, ...] = ()
     max_input_chars: int = 8_000
     max_output_chars: int = 1_800
@@ -83,6 +84,7 @@ class OneBotConfig:
                 preserve_whitespace=True,
             ),
             allow_users=_items(data.get("allow_users")),
+            owner_users=_items(data.get("owner_users")),
             allow_groups=_items(data.get("allow_groups")),
             max_input_chars=max(1, int(data.get("max_input_chars") or 8_000)),
             max_output_chars=max(100, int(data.get("max_output_chars") or 1_800)),

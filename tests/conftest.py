@@ -164,3 +164,17 @@ def warm_native_chrome(request):
     reporter = request.config.pluginmanager.get_plugin("terminalreporter")
     if reporter is not None:
         reporter.write_line(f"headless Chrome first start: {time.perf_counter() - started:.1f}s ({result[:60]!r})")
+
+
+@pytest.fixture
+def stable_browser_checkout(tmp_path):
+    """An isolated source fixture for installer tests, independent of the runner's worktree path."""
+    from pathlib import Path
+    import shutil
+    source = Path(__file__).resolve().parents[1]
+    target = tmp_path / "stable-browser-source"
+    for relative in ("agent/runtime/browser_control_host.py", "browser-control-extension/manifest.json"):
+        destination = target / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source / relative, destination)
+    return target

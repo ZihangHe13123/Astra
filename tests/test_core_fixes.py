@@ -4529,7 +4529,8 @@ def test_search_web_can_route_to_exa(monkeypatch):
             return FakeResponse()
 
     monkeypatch.setenv("EXA_API_KEY", "test-exa-key")
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
 
     async def scenario():
         registry = ToolRegistry()
@@ -6890,7 +6891,8 @@ def test_search_web_auto_routes_new_ai_model_queries_to_exa(monkeypatch):
             raise AssertionError(f"SearXNG should not run first: {url}")
 
     monkeypatch.setenv("EXA_API_KEY", "test-exa-key")
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
 
     async def scenario():
         registry = ToolRegistry()
@@ -6963,7 +6965,8 @@ def test_search_web_auto_falls_back_to_searxng_when_exa_fails(monkeypatch):
 
     monkeypatch.setenv("EXA_API_KEY", "test-exa-key")
     monkeypatch.setenv("WEB_SEARCH_PROVIDER", "auto")
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
 
     async def scenario():
         registry = ToolRegistry()
@@ -7027,7 +7030,8 @@ def test_search_web_inlines_result_content_and_caches(monkeypatch):
                 return FakeResponse("<html><body><article>Inline body from the page with enough useful words.</article></body></html>")
             raise AssertionError(url)
 
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
 
     async def scenario():
         registry = ToolRegistry()
@@ -7077,7 +7081,8 @@ def test_extract_url_can_skip_static_fetch_for_browser(monkeypatch):
         command_seen.append(cmd)
         return FakeProcess()
 
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
     monkeypatch.setattr(web_module.asyncio, "create_subprocess_exec", fake_subprocess_exec)
 
     async def scenario():
@@ -7119,8 +7124,8 @@ def test_web_tools_fall_back_when_httpx_is_missing(monkeypatch):
         register_web_tools(registry, None)
         result = await registry.execute("fetch_url", {"url": "https://example.test/page"})
 
-        assert "Fallback urllib content" in result["output"]
-        assert calls == [("https://example.test/page", 12, None, False)]
+        assert "requires httpx" in result["error"]
+        assert calls == []
 
     run(scenario())
 
@@ -7153,7 +7158,8 @@ def test_web_tools_reuse_httpx_client_and_bound_cache(monkeypatch):
             return FakeResponse(f"<html><body>Cached content for {url} with enough words.</body></html>")
 
     monkeypatch.setenv("WEB_CACHE_MAX_ENTRIES", "2")
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
 
     async def scenario():
         registry = ToolRegistry()
@@ -7193,7 +7199,8 @@ def test_fetch_url_does_not_reuse_unguarded_cache_after_approval_is_enabled(monk
                 final_url,
             )
 
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
 
     async def scenario():
         registry = ToolRegistry()
@@ -7271,7 +7278,8 @@ def test_search_web_auto_falls_back_from_searxng_to_exa(monkeypatch):
             })
 
     monkeypatch.setenv("EXA_API_KEY", "test-exa-key")
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
 
     async def scenario():
         registry = ToolRegistry()
@@ -7322,7 +7330,8 @@ def test_search_web_caps_inline_fetch_total_timeout(monkeypatch):
             return FakeResponse("<html><body>too late</body></html>")
 
     monkeypatch.setenv("WEB_INLINE_FETCH_TIMEOUT", "1")
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
 
     async def scenario():
         registry = ToolRegistry()
@@ -7371,7 +7380,8 @@ def test_search_web_skips_non_html_inline_fetch_and_marks_fetch_time(monkeypatch
                 return FakeResponse("<html><body>Article inline content with enough words for extraction.</body></html>")
             raise AssertionError(f"unexpected fetch: {url}")
 
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
 
     async def scenario():
         registry = ToolRegistry()
@@ -7415,7 +7425,8 @@ def test_search_web_is_lightweight_by_default(monkeypatch):
             }
             return FakeResponse(json.dumps(payload))
 
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
 
     async def scenario():
         registry = ToolRegistry()
@@ -7462,7 +7473,8 @@ def test_web_extract_uses_firecrawl_and_trims_content(monkeypatch):
         return True
 
     monkeypatch.setenv("FIRECRAWL_URL", "http://localhost:3002")
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
     monkeypatch.setattr(web_module, "_is_safe_public_url", safe_url)
 
     async def scenario():
@@ -7528,7 +7540,8 @@ def test_web_extract_auto_prefers_exa_api_before_local_firecrawl(monkeypatch):
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     monkeypatch.delenv("PARALLEL_API_KEY", raising=False)
     monkeypatch.setenv("FIRECRAWL_URL", "http://localhost:3002")
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
     monkeypatch.setattr(web_module, "_is_safe_public_url", safe_url)
 
     async def scenario():
@@ -7582,7 +7595,8 @@ def test_web_extract_auto_prefers_tavily_over_other_configured_apis(monkeypatch)
     monkeypatch.setenv("TAVILY_API_KEY", "tavily-test-key")
     monkeypatch.setenv("EXA_API_KEY", "exa-test-key")
     monkeypatch.setenv("PARALLEL_API_KEY", "parallel-test-key")
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
     monkeypatch.setattr(web_module, "_is_safe_public_url", safe_url)
 
     async def scenario():
@@ -7633,7 +7647,8 @@ def test_web_extract_parallel_accepts_ranked_excerpts(monkeypatch):
         return True
 
     monkeypatch.setenv("PARALLEL_API_KEY", "parallel-test-key")
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
     monkeypatch.setattr(web_module, "_is_safe_public_url", safe_url)
 
     async def scenario():
@@ -7695,7 +7710,8 @@ def test_web_extract_falls_back_from_exa_to_firecrawl_per_url(monkeypatch):
     monkeypatch.delenv("TAVILY_API_KEY", raising=False)
     monkeypatch.delenv("PARALLEL_API_KEY", raising=False)
     monkeypatch.setenv("FIRECRAWL_URL", "http://localhost:3002")
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
     monkeypatch.setattr(web_module, "_is_safe_public_url", safe_url)
 
     async def scenario():
@@ -7748,7 +7764,8 @@ def test_web_extract_http_fallback_preserves_markdown_and_stores_full_text(
         return True
 
     monkeypatch.setenv("WEB_EXTRACT_CACHE_DIR", str(tmp_path))
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
     monkeypatch.setattr(web_module, "_is_safe_public_url", safe_url)
 
     async def scenario():
@@ -7786,7 +7803,8 @@ def test_web_extract_blocks_private_urls_before_firecrawl(monkeypatch):
         async def post(self, url, **kwargs):
             raise AssertionError("blocked URL must not reach Firecrawl")
 
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
 
     async def scenario():
         registry = ToolRegistry()
@@ -7871,7 +7889,8 @@ def test_web_extract_auto_recovers_stale_url_from_search_candidate(monkeypatch):
     monkeypatch.delenv("EXA_API_KEY", raising=False)
     monkeypatch.delenv("PARALLEL_API_KEY", raising=False)
     monkeypatch.setenv("FIRECRAWL_URL", "http://localhost:3002")
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
     monkeypatch.setattr(web_module, "_is_safe_public_url", safe_url)
 
     async def scenario():
@@ -7922,7 +7941,8 @@ def test_fetch_url_prefers_beautifulsoup_article_text(monkeypatch):
                 "<footer>Footer noise should disappear</footer></body></html>"
             )
 
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
 
     async def scenario():
         registry = ToolRegistry()
@@ -7973,7 +7993,8 @@ def _fake_web_transport(monkeypatch, *, get=None, post=None):
                 raise RuntimeError(f"no POST handler: {url}")
             return FakeResponse(post(url, kwargs.get("json")), url)
 
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
     return calls
 
 
@@ -8696,9 +8717,11 @@ def test_fetch_url_reports_a_page_it_could_not_get_as_a_failure(monkeypatch, han
     pytest.param(lambda url: TimeoutError("timed out"), True, id="timeout"),
     pytest.param(lambda url: ValueError("unknown url type"), False, id="bad-url"),
 ])
-def test_fetch_url_keeps_the_retry_flag_when_httpx_is_missing(monkeypatch, failure, retryable):
+def test_configured_search_service_keeps_retry_flags_without_httpx(monkeypatch, failure, retryable):
     import agent.runtime.tools.web as web_module
 
+    _without_web_keys(monkeypatch)
+    monkeypatch.setenv("SEARXNG_URL", "https://example.test")
     opened = []
 
     class Opener:
@@ -8714,11 +8737,11 @@ def test_fetch_url_keeps_the_retry_flag_when_httpx_is_missing(monkeypatch, failu
     async def scenario():
         registry = ToolRegistry()
         register_web_tools(registry, None)
-        result = await registry.execute("fetch_url", {"url": "https://example.test/page"})
+        result = await registry.execute("search_web", {"query": "fixture", "provider": "searxng"})
 
-        assert opened == ["https://example.test/page"]
+        assert len(opened) == 1 and opened[0].startswith("https://example.test/search?")
         assert result["output"] == ""
-        assert result["code"] == "fetch_failed"
+        assert result["code"] == "search_failed"
         assert result["retryable"] is retryable
 
     run(scenario())
@@ -9026,7 +9049,8 @@ def test_search_status_reports_searxng_and_browser(monkeypatch):
     async def fake_subprocess_exec(*cmd, **kwargs):
         return FakeProcess()
 
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", FakeClient)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, FakeClient)
     monkeypatch.setattr(web_module.asyncio, "create_subprocess_exec", fake_subprocess_exec)
 
     async def scenario():
