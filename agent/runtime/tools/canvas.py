@@ -18,7 +18,8 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from agent.runtime.canvas import (
-    DOC_FILE, GUIDES, MANIFEST, SLIDES_FILE, TYPES, CanvasError, build_pptx, canvas_root, create, read_manifest, record_version,
+    DOC_FILE, GUIDES, MANIFEST, SLIDES_FILE, TYPES, CanvasError, build_pptx, canvas_root, create, inside_canvas, read_manifest,
+    record_version,
     slide_count, slide_parts,
 )
 from agent.runtime.page_snapshot import PageSnapshot, PageSnapshotError
@@ -99,7 +100,7 @@ def register_canvas_tool(registry: ToolRegistry, *, workdir: str | Path, render:
                 stem = folder.name[: -len(".canvas")] or "deck"
                 if format == "pptx":
                     return await export_pptx(folder, stem, count, str(manifest.get("title", "")))
-                target = folder / "exports" / f"{stem}.pdf"
+                target = inside_canvas(folder, "exports") / f"{stem}.pdf"
                 printed = await render(folder / MANIFEST, export="pdf", target=str(target), timeout=150)
                 return json.dumps({"success": True, "file": str(printed.image_path), "format": "pdf", "slides": count,
                                    "canvas": str(folder / MANIFEST), "title": manifest.get("title", "")}, ensure_ascii=False)
@@ -115,13 +116,14 @@ def register_canvas_tool(registry: ToolRegistry, *, workdir: str | Path, render:
             import pptx  # noqa: F401
         except ImportError:
             raise CanvasError("PPTX export needs python-pptx (Astra's documents extra), which is not installed.") from None
-        pictures_folder = folder / "exports" / ".slides"
+        # A link out of the canvas is refused before anything is drawn there or removed from there.
+        pictures_folder = inside_canvas(folder, "exports", ".slides")
         drawn = await render(folder / MANIFEST, export="slides", target=str(pictures_folder), timeout=60 + 10 * count)
         try:
             pictures = [path for path in drawn.paths if path.parent == pictures_folder and path.is_file()]
             if len(pictures) != count:
                 raise CanvasError(f"The desktop drew {len(pictures)} of the deck's {count} slides.")
-            target = folder / "exports" / f"{stem}.pptx"
+            target = inside_canvas(folder, "exports") / f"{stem}.pptx"
             await asyncio.to_thread(build_pptx, pictures, slide_parts(folder), target, title)
         finally:
             await asyncio.to_thread(shutil.rmtree, pictures_folder, True)

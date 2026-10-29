@@ -231,3 +231,37 @@ def test_every_write_into_a_canvas_is_kept_as_a_version(tmp_path):
     slides.write_text("after a stray folder", encoding="utf-8")
     after("write_file", {"path": "deck.canvas/slides.html"}, writer)
     assert list_versions(folder)[-1]["id"] == "0100"
+
+
+def test_nothing_of_a_canvas_is_read_or_written_through_a_link_out_of_its_folder(tmp_path):
+    from agent.runtime.canvas import list_versions
+    from agent.runtime.tools.registry import ToolDef
+
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("SYNTHETIC_OUTSIDE_SECRET\n", encoding="utf-8", newline="\n")
+    registry = ToolRegistry()
+    desktop = Desktop(tmp_path)
+    register_canvas_tool(registry, workdir=tmp_path, render=desktop)
+    run = lambda **args: asyncio.run(registry.execute("canvas", args))  # noqa: E731
+    run(action="create", type="doc", title="doc")
+    run(action="create", title="deck")
+    doc, deck = tmp_path / "doc.canvas", tmp_path / "deck.canvas"
+    # A document that is a link out: a write into the canvas keeps no copy of what it points to.
+    (doc / "doc.md").unlink()
+    (doc / "doc.md").symlink_to(outside / "secret.md")
+    writer = ToolDef("write_file", "", {"type": "object"}, lambda: "", risk="write")
+    registry.hooks.dispatch_after_tool("write_file", {"path": "doc.canvas/doc.md"}, {"error": ""}, writer)
+    assert [v["source"] for v in list_versions(doc)] == ["create"]
+    assert not any("SYNTHETIC" in path.read_text(encoding="utf-8", errors="ignore")
+                   for path in (doc / ".versions").rglob("*") if path.is_file())
+    # Exports through a link out: refused before the desktop is asked to draw or anything is removed there.
+    (deck / "exports").symlink_to(outside, target_is_directory=True)
+    (outside / ".slides").mkdir()
+    for fmt in ("pdf", "pptx"):
+        assert "leads out of the canvas" in run(action="export", canvas="deck.canvas", format=fmt)["error"]
+    assert desktop.asked == [] and (outside / ".slides").is_dir()
+    # A deck whose slides are a link out has no slides to count, print or annotate.
+    (deck / "slides.html").unlink()
+    (deck / "slides.html").symlink_to(outside / "secret.md")
+    assert slide_count(deck) == 0
