@@ -185,3 +185,76 @@ def test_the_tool_and_command_line_start_jobs_on_events(tmp_path, monkeypatch):
     assert {job["next_at_utc"] for job in listed if job["spec"].get("trigger")} == {None}
     assert execute_jobs_command(["add", "x", "--reminder", "--prompt", "x", "--on-new-file", "*", "--time", "08:00"],
                                 home=tmp_path / "home", workdir=tmp_path)[1]
+
+
+def queued_events(store: JobStore, job_id: str) -> list[dict]:
+    with store.transaction() as db:
+        rows = db.execute("SELECT payload FROM trigger_events WHERE job_id=? ORDER BY id", (job_id,)).fetchall()
+    return [json.loads(row["payload"]) for row in rows]
+
+
+def test_more_new_files_than_one_look_takes_all_start_a_run_each_once(tmp_path):
+    folder = tmp_path / "Downloads"
+    folder.mkdir()
+    store = JobStore(tmp_path / "home")
+    job = reminder(store, folder, {"type": "file", "pattern": "*.pdf"})
+    watcher = TriggerWatcher(store)
+    watcher.look()
+    later = time.time() + 5
+    # Eight with times of their own, then six sharing one time: a look stops among them and goes on later.
+    for index in range(8):
+        (folder / f"{index}.pdf").write_text("x")
+        os.utime(folder / f"{index}.pdf", (later + index, later + index))
+    for name in "abcdef":
+        (folder / f"same-{name}.pdf").write_text("x")
+        os.utime(folder / f"same-{name}.pdf", (later + 20, later + 20))
+    counts = [watcher.look() for _ in range(5)]
+    assert counts == [MAX_EVENTS, MAX_EVENTS, 4, 0, 0]
+    names = [event["name"] for event in queued_events(store, job["id"])]
+    assert names == [f"{index}.pdf" for index in range(8)] + [f"same-{name}.pdf" for name in "abcdef"]
+
+
+def test_more_new_mail_than_one_look_or_page_takes_all_starts_a_run_each_once(tmp_path):
+    store, box = JobStore(tmp_path / "home"), Mailbox(tmp_path)
+    box.deliver(1, "tan@example.edu", "before")
+    job = reminder(store, tmp_path, {"type": "mail", "from": "tan@", "subject": ""})
+    watcher = TriggerWatcher(store, mail_service=box.service)
+    watcher.look()
+    # Seventy new messages, more than the newest-fifty page; every tenth is from the sender watched for.
+    for uid in range(2, 72):
+        box.deliver(uid, "tan@example.edu" if uid % 10 == 0 else "news@example.com", f"mail {uid}")
+    counts = [watcher.look() for _ in range(3)]
+    assert counts == [MAX_EVENTS, 2, 0]
+    assert [event["uid"] for event in queued_events(store, job["id"])] == [10, 20, 30, 40, 50, 60, 70]
+
+
+def test_an_empty_folder_watched_from_the_start_triggers_on_its_first_mail(tmp_path):
+    store, box = JobStore(tmp_path / "home"), Mailbox(tmp_path)
+    box._publish()  # The inbox exists and is empty.
+    job = reminder(store, tmp_path, {"type": "mail", "from": "tan@", "subject": ""})
+    watcher = TriggerWatcher(store, mail_service=box.service)
+    assert watcher.look() == 0 and store.trigger_cursor(job["id"]) == "7:0"
+    box.deliver(1, "tan@example.edu", "first")
+    box.deliver(2, "tan@example.edu", "second")
+    assert watcher.look() == 2
+    assert [event["subject"] for event in queued_events(store, job["id"])] == ["first", "second"]
+
+
+def test_a_look_that_cannot_reach_the_mailbox_sets_no_baseline_and_loses_nothing(tmp_path):
+    from agent.mail163.imap_client import MailNetworkError
+
+    store, box = JobStore(tmp_path / "home"), Mailbox(tmp_path)
+    job = reminder(store, tmp_path, {"type": "mail", "from": "tan@", "subject": ""})
+    watcher = TriggerWatcher(store, mail_service=box.service)
+    box.client.enter_error = MailNetworkError("IMAP connection failed")
+    assert watcher.look() == 0 and store.trigger_cursor(job["id"]) is None
+    box.client.enter_error = None
+    box.deliver(1, "tan@example.edu", "there when the first look succeeds")
+    # The first look that succeeds notes where things stand: what was there is not new to the job.
+    assert watcher.look() == 0 and store.trigger_cursor(job["id"]) == "7:1"
+    box.client.enter_error = MailNetworkError("IMAP connection failed")
+    box.deliver(2, "tan@example.edu", "while unreachable")
+    assert watcher.look() == 0
+    box.client.enter_error = None
+    assert watcher.look() == 1
+    assert [event["subject"] for event in queued_events(store, job["id"])] == ["while unreachable"]
