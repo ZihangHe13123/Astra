@@ -114,6 +114,9 @@ and export and names `doc_export`.
   without following a link out of it, up to 8 MiB each and 40 MiB in all; nothing loads from the
   network.
 - Prints and slide pictures are written only to the canvas's own `exports/` folder.
+- Every path of a canvas is held to the canvas folder's real location: content, the assets folder and
+  each image, versions and exports reached through a link out of the folder are refused, on the
+  desktop and in the backend (which checks `exports/.slides` before drawing there or removing it).
 - Comments and restores are the person's acts in the desktop window, through its file
   authorization; a canvas frame cannot ask for them.
 

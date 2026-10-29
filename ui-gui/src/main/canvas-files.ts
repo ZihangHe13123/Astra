@@ -8,7 +8,8 @@ import { insertComment } from "./canvas-doc.js";
 /**
  * A canvas on disk (specs/canvas.md): a folder `<name>.canvas` with `canvas.json`, the slides and
  * `assets/`. The desktop names a canvas by its `canvas.json`, an ordinary file the usual file
- * authorization accepts; everything it reads is inside that folder.
+ * authorization accepts; everything it reads or writes is inside that folder, where it really is: a
+ * link out of it, of a file or of a folder on the way (assets, .versions, exports), is refused.
  */
 export const CANVAS_MANIFEST = "canvas.json";
 export const SLIDES_FILE = "slides.html";
@@ -33,22 +34,49 @@ export async function manifestOf(manifestPath: string): Promise<{ title: string;
   return { type, title: typeof title === "string" ? title.slice(0, 200) : "" };
 }
 
-/** An asset's name inside the folder, or undefined when it would leave it. */
-async function assetInside(folder: string, name: string): Promise<string | undefined> {
+/** The canvas folder where it really is: the boundary every path of the canvas is held to. */
+const canvasRoot = (manifestPath: string) => realpath(dirname(manifestPath));
+const within = (root: string, path: string) => path === root || path.startsWith(root + sep);
+
+/** Where `parts` really are, if that exists and is inside `root`; undefined otherwise. */
+async function inside(root: string, ...parts: string[]): Promise<string | undefined> {
   try {
-    const root = await realpath(join(folder, "assets"));
-    const path = await realpath(join(root, name));
-    return path.startsWith(root + sep) && (await stat(path)).isFile() ? path : undefined;
+    const path = await realpath(join(root, ...parts));
+    return within(root, path) ? path : undefined;
+  } catch { return undefined; }
+}
+
+/** A file of the canvas to read: refused when it is missing, not a file, or a link out of the canvas. */
+async function canvasFile(root: string, ...parts: string[]): Promise<string> {
+  const path = await inside(root, ...parts);
+  if (!path || !(await stat(path)).isFile()) throw new Error(`画布的 ${parts.join("/")} 不在画布文件夹里，或不是文件。`);
+  return path;
+}
+
+/** A folder of the canvas to write into, made when missing; refused when a link leads it out of the canvas. */
+async function canvasFolder(root: string, ...parts: string[]): Promise<string> {
+  await mkdir(join(root, ...parts), { recursive: true });
+  const path = await inside(root, ...parts);
+  if (!path || !(await stat(path)).isDirectory()) throw new Error(`画布的 ${parts.join("/")} 不在画布文件夹里。`);
+  return path;
+}
+
+/** An asset's name inside the canvas's own assets folder, or undefined when it, or the folder, would leave it. */
+async function assetInside(root: string, name: string): Promise<string | undefined> {
+  const assets = await inside(root, "assets");
+  if (!assets) return undefined;
+  try {
+    const path = await realpath(join(assets, name));
+    return path.startsWith(assets + sep) && (await stat(path)).isFile() ? path : undefined;
   } catch { return undefined; }
 }
 
 /** The canvas as one document for `mode`, with the images it names written in. */
 export async function readCanvas(manifestPath: string, mode: DeckMode, slide = 1, version = ""): Promise<CanvasDocument> {
   const { type, title } = await manifestOf(manifestPath);
-  const folder = dirname(manifestPath);
-  const contentPath = version ? await versionFile(manifestPath, version) : join(folder, ENTRIES[type]);
-  const info = await stat(contentPath).catch(() => undefined);
-  if (!info?.isFile()) throw new Error(`画布缺少 ${ENTRIES[type]}。`);
+  const root = await canvasRoot(manifestPath);
+  const contentPath = version ? await versionFile(manifestPath, version) : await canvasFile(root, ENTRIES[type]);
+  const info = await stat(contentPath);
   if (info.size > SLIDES_LIMIT) throw new Error(`${ENTRIES[type]} 超过 ${SLIDES_LIMIT / 1024 / 1024} MiB，桌面端不渲染。`);
   const source = await readFile(contentPath, "utf8");
   // A document is Markdown, shown by the app's own renderer; only a deck is composed with the template.
@@ -60,7 +88,7 @@ export async function readCanvas(manifestPath: string, mode: DeckMode, slide = 1
   const assets = new Map<string, Asset>();
   for (const name of names) {
     const mime = ASSET_TYPES[extname(name).toLowerCase()];
-    const path = mime ? await assetInside(folder, name) : undefined;
+    const path = mime ? await assetInside(root, name) : undefined;
     if (!mime || !path || (await stat(path)).size > ASSET_LIMIT) continue;
     assets.set(name, { mime, data: await readFile(path) });
   }
@@ -83,24 +111,26 @@ export async function canvasVersion(manifestPath: string): Promise<string> {
 }
 
 /** Where a print of the canvas may be written: its own exports folder, nowhere else. */
-export function exportTarget(manifestPath: string, target: string): string {
+export async function exportTarget(manifestPath: string, target: string): Promise<string> {
   const exports = join(dirname(manifestPath), "exports");
   if (dirname(target) !== exports || !/^[^\\/]+\.pdf$/i.test(basename(target))) throw new Error("导出只能写进画布自己的 exports 文件夹。");
-  return target;
+  return join(await canvasFolder(await canvasRoot(manifestPath), "exports"), basename(target));
 }
 
 /** Where the slides' pictures for a PPTX may be written: the `.slides` folder in its exports, nowhere else. */
-export function slidesTarget(manifestPath: string, target: string): string {
+export async function slidesTarget(manifestPath: string, target: string): Promise<string> {
   if (target !== join(dirname(manifestPath), "exports", ".slides")) throw new Error("幻灯片图片只能写进画布 exports 里的 .slides 文件夹。");
-  return target;
+  return join(await canvasFolder(await canvasRoot(manifestPath), "exports"), ".slides");
 }
 
 export async function listVersions(manifestPath: string): Promise<CanvasVersion[]> {
-  const root = join(dirname(manifestPath), ".versions");
+  const root = await canvasRoot(manifestPath);
+  const kept = await inside(root, ".versions");
   const versions: CanvasVersion[] = [];
-  for (const id of (await readdir(root).catch(() => [] as string[])).filter(name => /^\d{4}$/.test(name)).sort()) {
+  if (!kept) return versions;
+  for (const id of (await readdir(kept).catch(() => [] as string[])).filter(name => /^\d{4}$/.test(name)).sort()) {
     try {
-      const meta = JSON.parse(await readFile(join(root, id, "meta.json"), "utf8"));
+      const meta = JSON.parse(await readFile(await canvasFile(root, ".versions", id, "meta.json"), "utf8"));
       if (meta && typeof meta === "object" && Object.values(ENTRIES).includes(meta.file))
         versions.push({ id, at: Number(meta.at) || 0, source: String(meta.source || ""), sha256: String(meta.sha256 || ""), file: meta.file });
     } catch { /* a version that cannot be read is left out */ }
@@ -113,26 +143,27 @@ async function versionFile(manifestPath: string, id: string): Promise<string> {
   if (!/^\d{4}$/.test(id)) throw new Error("没有这个版本。");
   const version = (await listVersions(manifestPath)).find(item => item.id === id);
   if (!version) throw new Error("没有这个版本。");
-  return join(dirname(manifestPath), ".versions", id, version.file);
+  return canvasFile(await canvasRoot(manifestPath), ".versions", id, version.file);
 }
 
 /** Keep the canvas's current content as a new version, unless it is the last one already; drop the oldest. */
 export async function recordVersion(manifestPath: string, source: string): Promise<string | undefined> {
   const { type } = await manifestOf(manifestPath);
-  const file = ENTRIES[type], data = await readFile(join(dirname(manifestPath), file));
+  const root = await canvasRoot(manifestPath);
+  const file = ENTRIES[type], data = await readFile(await canvasFile(root, file));
   const sha256 = createHash("sha256").update(data).digest("hex");
   const versions = await listVersions(manifestPath);
   if (versions.at(-1)?.sha256 === sha256) return undefined;
+  const kept = await canvasFolder(root, ".versions");
   // Numbered past every folder there, a version that cannot be read included.
-  const taken = (await readdir(join(dirname(manifestPath), ".versions")).catch(() => [] as string[])).filter(name => /^\d{4}$/.test(name)).map(Number);
+  const taken = (await readdir(kept).catch(() => [] as string[])).filter(name => /^\d{4}$/.test(name)).map(Number);
   const id = String(Math.max(0, ...taken) + 1).padStart(4, "0");
   if (id.length > 4) throw new Error("这个画布的版本号用完了。");
-  const folder = join(dirname(manifestPath), ".versions", id);
-  await mkdir(folder, { recursive: true });
+  const folder = await canvasFolder(root, ".versions", id);
   await writeFile(join(folder, file), data);
   await writeFile(join(folder, "meta.json"), JSON.stringify({ at: Date.now() / 1000, source, sha256, file }));
   for (const old of versions.slice(0, Math.max(0, versions.length + 1 - MAX_VERSIONS)))
-    await rm(join(dirname(manifestPath), ".versions", old.id), { recursive: true, force: true });
+    await rm(join(kept, old.id), { recursive: true, force: true });
   return id;
 }
 
@@ -142,7 +173,10 @@ export async function recordVersion(manifestPath: string, source: string): Promi
  */
 async function rewrite(manifestPath: string, source: string, change: (current: Buffer) => Buffer | Promise<Buffer>): Promise<string | undefined> {
   const { type } = await manifestOf(manifestPath);
-  const target = join(dirname(manifestPath), ENTRIES[type]);
+  const root = await canvasRoot(manifestPath);
+  // The file as it is named in the canvas: renaming over it replaces a link there, never what it points to.
+  await canvasFile(root, ENTRIES[type]);
+  const target = join(root, ENTRIES[type]);
   await recordVersion(manifestPath, "write");
   const current = await readFile(target);
   const temporary = `${target}.${source}-${process.pid}`;

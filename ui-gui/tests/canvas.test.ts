@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync, symlinkSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, rmdirSync, writeFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { composeDeck, inlineAssets, slideCount } from "../src/main/canvas-deck.js";
@@ -64,12 +64,13 @@ test("a canvas on disk reads as its document, its version follows its slides and
   writeFileSync(join(manifest, "..", "assets", "more.png"), png);
   assert.notEqual(await canvasVersion(manifest), afterSlides);
   const exports = join(manifest, "..", "exports");
-  assert.equal(exportTarget(manifest, join(exports, "deck.pdf")), join(exports, "deck.pdf"));
+  // Where the file really goes: the canvas's own exports folder, made when missing.
+  assert.equal(await exportTarget(manifest, join(exports, "deck.pdf")), join(realpathSync(exports), "deck.pdf"));
   for (const target of [join(manifest, "..", "deck.pdf"), join(exports, "deck.html"), join(exports, "x", "deck.pdf")])
-    assert.throws(() => exportTarget(manifest, target), /exports/);
+    await assert.rejects(exportTarget(manifest, target), /exports/);
   // The pictures for a PPTX go to one folder of its own, and nowhere else.
-  assert.equal(slidesTarget(manifest, join(exports, ".slides")), join(exports, ".slides"));
-  for (const target of [exports, join(exports, ".slides", "x"), join(manifest, "..", ".slides")]) assert.throws(() => slidesTarget(manifest, target), /\.slides/);
+  assert.equal(await slidesTarget(manifest, join(exports, ".slides")), join(realpathSync(exports), ".slides"));
+  for (const target of [exports, join(exports, ".slides", "x"), join(manifest, "..", ".slides")]) await assert.rejects(slidesTarget(manifest, target), /\.slides/);
   assert.equal((await readCanvas(manifest, "capture", 2)).inlined.includes("data:image/png;base64,"), true);
 });
 
@@ -203,4 +204,50 @@ test("the doc_* tools writing a canvas's document open the canvas; its exports o
   assert.equal(result("doc_edit", { path: "/w/plan.canvas/doc.md" }), "/w/plan.canvas/canvas.json");
   assert.equal(result("doc_edit", { path: "/w/plan.md" }), "/w/plan.md");
   assert.equal(result("doc_export", { path: "/w/plan.canvas/exports/plan.docx", source: "/w/plan.canvas/doc.md" }), "/w/plan.canvas/exports/plan.docx");
+});
+
+test("nothing of a canvas is read or written through a link out of its folder", async () => {
+  const outside = mkdtempSync(join(tmpdir(), "astra-outside-"));
+  writeFileSync(join(outside, "secret.md"), "SYNTHETIC_OUTSIDE_SECRET\n");
+  writeFileSync(join(outside, "dot.png"), png);
+  const linked = (name: string, target: string, type = "doc") => {
+    const manifest = canvas({}, type);
+    symlinkSync(target, join(manifest, "..", name));
+    return manifest;
+  };
+  // The content file, a document's or a deck's, pointing out of the canvas.
+  await assert.rejects(readCanvas(linked("doc.md", join(outside, "secret.md")), "view"), /不在画布文件夹里/);
+  await assert.rejects(readCanvas(linked("slides.html", join(outside, "secret.md"), "slides"), "view"), /不在画布文件夹里/);
+  // The whole assets folder pointing out: its images are not written in.
+  const deck = canvas({ "slides.html": `<section class="slide"><img src="assets/dot.png"></section>` });
+  rmdirSync(join(deck, "..", "assets"));
+  symlinkSync(outside, join(deck, "..", "assets"));
+  const shown = await readCanvas(deck, "view");
+  assert.deepEqual(shown.missing, ["dot.png"]);
+  assert.doesNotMatch(shown.html, /data:image\/png/);
+  // Versions kept through a link out are neither listed nor written there.
+  const doc = canvas({ "doc.md": "# 一\n" }, "doc");
+  symlinkSync(outside, join(doc, "..", ".versions"));
+  assert.deepEqual(await listVersions(doc), []);
+  await assert.rejects(recordVersion(doc, "write"), /不在画布文件夹里/);
+  assert.deepEqual(readdirSync(outside).sort(), ["dot.png", "secret.md"]);
+  // A version's own file pointing out is not shown or restored.
+  const own = canvas({ "doc.md": "# 一\n" }, "doc");
+  await recordVersion(own, "create");
+  const keptFile = join(own, "..", ".versions", "0001", "doc.md");
+  rmSync(keptFile);
+  symlinkSync(join(outside, "secret.md"), keptFile);
+  await assert.rejects(canvasPreview(own, "0001"), /不在画布文件夹里/);
+  await assert.rejects(restoreVersion(own, "0001"), /不在画布文件夹里/);
+  assert.equal(readFileSync(join(own, "..", "doc.md"), "utf8"), "# 一\n");
+  // A comment on a document that is a link out: refused, and the outside file is untouched.
+  await assert.rejects(commentOnDocument(linked("doc.md", join(outside, "secret.md")), "SYNTHETIC", "x"), /不在画布文件夹里/);
+  assert.equal(readFileSync(join(outside, "secret.md"), "utf8"), "SYNTHETIC_OUTSIDE_SECRET\n");
+  // Exports through a link out are refused before anything is written or removed there.
+  const printed = canvas({ "slides.html": slides });
+  symlinkSync(outside, join(printed, "..", "exports"));
+  const exports = join(printed, "..", "exports");
+  await assert.rejects(exportTarget(printed, join(exports, "deck.pdf")), /不在画布文件夹里/);
+  await assert.rejects(slidesTarget(printed, join(exports, ".slides")), /不在画布文件夹里/);
+  assert.ok(!existsSync(join(outside, ".slides")));
 });

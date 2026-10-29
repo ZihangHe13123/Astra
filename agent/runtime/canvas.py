@@ -108,6 +108,15 @@ def canvas_root(path: Path) -> Path:
     raise CanvasError(f"{path} is not in a canvas: a canvas is a folder named <name>{SUFFIX} with a {MANIFEST}.")
 
 
+def inside_canvas(root: Path, *parts: str) -> Path:
+    """Where `parts` of the canvas really are; refused when a link leads out of the canvas folder."""
+    root = root.resolve()
+    path = root.joinpath(*parts).resolve()
+    if path != root and root not in path.parents:
+        raise CanvasError(f"{'/'.join(parts)} in {root} leads out of the canvas folder.")
+    return path
+
+
 def read_manifest(root: Path) -> dict:
     try:
         manifest = json.loads((root / MANIFEST).read_text(encoding="utf-8"))
@@ -156,17 +165,21 @@ def create(workdir: Path, kind: str, title: str, path: str = "") -> Path:
 
 
 def content_file(root: Path) -> Path:
-    """The file a canvas's template renders: slides.html or doc.md."""
-    return root / ENTRIES[read_manifest(root)["type"]]
+    """The file a canvas's template renders: slides.html or doc.md, where it really is inside the canvas."""
+    return inside_canvas(root, ENTRIES[read_manifest(root)["type"]])
 
 
 def list_versions(root: Path) -> list[dict]:
     """The kept versions of a canvas's content, oldest first."""
     versions = []
-    for folder in sorted((root / VERSIONS).glob("[0-9][0-9][0-9][0-9]")):
+    try:
+        kept = inside_canvas(root, VERSIONS)
+    except CanvasError:
+        return versions
+    for folder in sorted(kept.glob("[0-9][0-9][0-9][0-9]")):
         try:
-            meta = json.loads((folder / "meta.json").read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
+            meta = json.loads(inside_canvas(root, VERSIONS, folder.name, "meta.json").read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, CanvasError):
             continue
         if isinstance(meta, dict):
             versions.append({**meta, "id": folder.name})
@@ -181,18 +194,20 @@ def record_version(root: Path, source: str) -> str | None:
     versions = list_versions(root)
     if versions and versions[-1].get("sha256") == digest:
         return None
+    kept = inside_canvas(root, VERSIONS)
     # Numbered past every folder there, a version that cannot be read included.
-    taken = [int(folder.name) for folder in (root / VERSIONS).glob("[0-9][0-9][0-9][0-9]")]
+    taken = [int(folder.name) for folder in kept.glob("[0-9][0-9][0-9][0-9]")]
     number = max(taken, default=0) + 1
     if number > 9999:
         raise CanvasError("This canvas has used up its version numbers.")
-    folder = root / VERSIONS / f"{number:04d}"
+    folder = kept / f"{number:04d}"
     folder.mkdir(parents=True)
+    folder = inside_canvas(root, VERSIONS, folder.name)
     (folder / content.name).write_bytes(data)
     (folder / "meta.json").write_text(json.dumps({"at": time.time(), "source": source, "sha256": digest,
                                                   "file": content.name}, ensure_ascii=False), encoding="utf-8")
     for old in versions[: max(0, len(versions) + 1 - MAX_VERSIONS)]:
-        shutil.rmtree(root / VERSIONS / old["id"], ignore_errors=True)
+        shutil.rmtree(kept / old["id"], ignore_errors=True)
     return folder.name
 
 
@@ -211,8 +226,8 @@ def _text(markup: str) -> str:
 def slide_parts(root: Path) -> list[tuple[str, str]]:
     """Each slide's first heading and its speaker notes, as plain text, in order."""
     try:
-        source = (root / SLIDES_FILE).read_text(encoding="utf-8")
-    except OSError:
+        source = inside_canvas(root, SLIDES_FILE).read_text(encoding="utf-8")
+    except (OSError, CanvasError):
         return []
     starts = [match.start() for match in _SLIDE.finditer(source)]
     parts = []
@@ -252,7 +267,7 @@ def build_pptx(pictures: list[Path], parts: list[tuple[str, str]], target: Path,
 def slide_count(root: Path) -> int:
     """How many slides slides.html holds."""
     try:
-        source = (root / SLIDES_FILE).read_text(encoding="utf-8")
-    except OSError:
+        source = inside_canvas(root, SLIDES_FILE).read_text(encoding="utf-8")
+    except (OSError, CanvasError):
         return 0
     return len(_SLIDE.findall(source))

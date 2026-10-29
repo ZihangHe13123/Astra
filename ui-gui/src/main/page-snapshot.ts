@@ -105,7 +105,7 @@ export class PageSnapshots {
 
   /** Every slide of a deck at its own size, one window drawing them in turn, into the canvas's exports/.slides (for a PPTX). */
   private async slides(path: string, requested: string): Promise<PageSnapshot> {
-    const folder = slidesTarget(path, resolve(requested));
+    const folder = await slidesTarget(path, resolve(requested));
     const canvas = await readCanvas(path, "capture", 1);
     if (!canvas.slides) throw new Error("画布里还没有幻灯片。");
     const theme = await this.theme().catch(() => undefined);
@@ -139,7 +139,7 @@ export class PageSnapshots {
    * policy and in an opaque origin of its own, in a window nobody sees.
    */
   private async print(path: string, requested: string): Promise<PageSnapshot> {
-    const target = exportTarget(path, resolve(requested));
+    const target = await exportTarget(path, resolve(requested));
     const canvas = await readCanvas(path, "print");
     if (!canvas.slides) throw new Error("画布里还没有幻灯片。");
     const { address, forget } = printAddress(canvas.html);

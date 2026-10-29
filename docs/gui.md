@@ -258,6 +258,8 @@ conversation, presenting and printing are Astra's own code; the model writes onl
   This needs python-pptx (the `documents` extra, included in the desktop package).
 - Slides run under the same rules as a page: no access to Astra, no network, no storage, no
   pop-ups, no navigation.
+- Everything of a canvas is read and written inside its folder, where that really is: content,
+  images, versions or exports reached through a link out of the folder are refused.
 
 ### Documents
 
