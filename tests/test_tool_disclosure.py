@@ -200,3 +200,36 @@ def test_the_catalog_names_each_family_once_and_mcp_servers_by_name():
     assert lines.count("- browser:") == 1
     assert "- mcp:notes: tools of the notes MCP server" in lines
     assert "- other: other tools: odd_tool" in lines
+
+
+@pytest.mark.parametrize("saved, default", [("full", "deferred"), ("deferred", "full")])
+def test_a_restored_conversation_keeps_the_disclosure_its_tool_list_was_applied_with(tmp_path, monkeypatch, saved, default):
+    monkeypatch.setenv("ASTRA_TOOL_DISCLOSURE", saved)
+    first = ScriptedLLM([])
+    agent = agent_with(registry_with([]), first)
+    agent.context.set_session(str(tmp_path / "conversation.json"))
+    reply(agent)
+    applied = first.calls[0][1]
+    agent.context.save()
+
+    # Another backend, started under the other default, restores the conversation from disk.
+    monkeypatch.setenv("ASTRA_TOOL_DISCLOSURE", default)
+    ran: list[tuple[str, dict]] = []
+    url = {"url": "https://example.com"}
+    script = ([calls(("d1", "browser_open", url))] if saved == "full" else
+              [calls(("s1", "tool_search", {"family": "browser"})),
+               calls(("c1", "call_tool", {"name": "browser_open", "arguments": url}))])
+    later = ScriptedLLM(script)
+    restored = agent_with(registry_with(ran), later)
+    restored.context.set_session(str(tmp_path / "conversation.json"))
+    assert restored.context.load()
+    reply(restored)
+    # The same list is sent, and calls are read as that list's disclosure reads them.
+    assert all(tools == applied for _, tools in later.calls)
+    assert ran == [("browser_open", url)]
+
+    # A new conversation in that backend takes the backend's own default.
+    restored.context.set_session(str(tmp_path / "new.json"))
+    reply(restored)
+    dispatch = {"tool_search", "call_tool"}
+    assert (dispatch <= set(names(later.calls[-1][1]))) == (default == "deferred")

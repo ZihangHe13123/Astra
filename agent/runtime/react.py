@@ -235,6 +235,8 @@ class ReActAgent(AgentBase):
         self._active_vision_prompt_overlays: list[tuple[dict, object, object]] = []
         self._active_vision_attachment_occurrences: set[str] = set()
         self._request_local_image_overlay_messages: list[dict] = []
+        # The registry's own disclosure while a restored conversation's applied one stands in for it.
+        self._process_disclosure: str | None = None
         self.context.set_tools_token_cost(self._estimate_tools_cost())
         self._tool_cost_revision = self.tools.schema_revision
         self.context.compressor = ContextCompressor(llm_client, hooks=self.tools.hooks)
@@ -1152,6 +1154,7 @@ class ReActAgent(AgentBase):
                 # charged to its prompt.
                 return 0
             from .token_estimator import estimate_value_tokens
+            self._keep_conversation_disclosure()
             applied = self._applied_tool_schemas()
             if applied is not None:
                 return estimate_value_tokens(applied)
@@ -1301,13 +1304,37 @@ class ReActAgent(AgentBase):
         msg.metadata["request_id"] = request_id
         return request_id
 
-    def _tool_application_key(self) -> dict:
+    def _tool_application_key(self, disclosure: str | None = None) -> dict:
         key = {"allowlist": sorted(self.tool_allowlist) if self.tool_allowlist is not None else None,
                "code_mode": self.code_mode, "vision": self._vision_tile_tool_enabled()}
-        if self.tools.disclosure == "deferred":
+        if (disclosure or self.tools.disclosure) == "deferred":
             # Only then: conversations frozen before disclosure existed keep their applied list.
             key["disclosure"] = "deferred"
         return key
+
+    def _applied_disclosure(self) -> str | None:
+        """The disclosure this conversation's tool list was applied with; full for one applied before
+        disclosure existed. None when no list has been applied yet: the registry's own then holds."""
+        applied = getattr(self.context, "guidance_snapshot", {}).get("tools")
+        if not isinstance(applied, dict) or "schemas" not in applied or not isinstance(applied.get("key"), dict):
+            return None
+        return "deferred" if applied["key"].get("disclosure") == "deferred" else "full"
+
+    def _keep_conversation_disclosure(self) -> None:
+        """A conversation keeps the disclosure its tool list was applied with (agent/runtime/AGENTS.md).
+
+        Restoring one applied under another default changes neither the list it is sent nor how its calls
+        are read (tool_search, call_tool, direct calls); a new conversation takes the registry's own.
+        """
+        applied = self._applied_disclosure()
+        if applied is None:
+            if self._process_disclosure is not None:
+                self.tools.disclosure, self._process_disclosure = self._process_disclosure, None
+            return
+        if self.tools.disclosure != applied:
+            if self._process_disclosure is None:
+                self._process_disclosure = self.tools.disclosure
+            self.tools.disclosure = applied
 
     def _applied_tool_schemas(self) -> list[dict] | None:
         snapshot = getattr(self.context, "guidance_snapshot", {})
@@ -1317,7 +1344,8 @@ class ReActAgent(AgentBase):
         if self.tool_allowlist is not None and not self.minimal_mode:
             return None
         schemas = applied.get("schemas")
-        if (not isinstance(schemas, list) or applied.get("key") != self._tool_application_key()
+        if (not isinstance(schemas, list)
+                or applied.get("key") != self._tool_application_key(self._applied_disclosure())
                 or not all(isinstance(item, dict) and item.get("type") == "function"
                            and isinstance(item.get("function"), dict)
                            and isinstance(item["function"].get("name"), str) for item in schemas)):
@@ -1333,6 +1361,7 @@ class ReActAgent(AgentBase):
     ) -> list[dict]:
         if not self.tools_enabled:
             return []
+        self._keep_conversation_disclosure()
         if self.prompt_cache_stable_tools and (
             self.tool_allowlist is None or self.minimal_mode
         ):
