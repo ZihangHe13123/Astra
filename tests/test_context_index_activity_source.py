@@ -1019,6 +1019,29 @@ def test_vector_cache_refreshes_after_index_update(tmp_path, monkeypatch, initia
     assert reader._embed_hits('q') == []
 
 
+def test_vector_refresh_does_not_depend_on_filesystem_timestamp_resolution(tmp_path, monkeypatch):
+    from agent.runtime.context_index.vector_index import VectorStore
+    path = tmp_path / "coarse-clock.db"
+    monkeypatch.setenv("ASTRA_CONTEXT_INDEX_VECTORS_DB", str(path))
+    class Embedder:
+        def encode(self, texts):
+            return [[1., 0.]]
+    monkeypatch.setattr(embedder_module, "ready_embedder", lambda: Embedder())
+    store = VectorStore(path)
+    store.upsert("old", "h1", [1., 0.])
+    store.close()
+    reader = ActivityRecommendationReader(tmp_path / "unused.db")
+    assert [hit[0] for hit in reader._embed_hits("q")] == ["old"]
+    original_stat, frozen = Path.stat, path.stat()
+    monkeypatch.setattr(Path, "stat", lambda file, *args, **kwargs:
+                        frozen if file == path else original_stat(file, *args, **kwargs))
+    store = VectorStore(path)
+    store.upsert("old", "h2", [0., 1.])
+    store.upsert("new", "h3", [1., 0.])
+    store.close()
+    assert [hit[0] for hit in reader._embed_hits("q")] == ["new"]
+
+
 def test_vector_hit_rejects_changed_summary_hash(tmp_path, monkeypatch):
     from agent.runtime.context_index.vector_index import VectorStore
 

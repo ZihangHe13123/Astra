@@ -195,17 +195,24 @@ def record_version(root: Path, source: str) -> str | None:
     if versions and versions[-1].get("sha256") == digest:
         return None
     kept = inside_canvas(root, VERSIONS)
+    kept.mkdir(parents=True, exist_ok=True)
     # Numbered past every folder there, a version that cannot be read included.
     taken = [int(folder.name) for folder in kept.glob("[0-9][0-9][0-9][0-9]")]
     number = max(taken, default=0) + 1
-    if number > 9999:
-        raise CanvasError("This canvas has used up its version numbers.")
-    folder = kept / f"{number:04d}"
-    folder.mkdir(parents=True)
+    while True:
+        if number > 9999:
+            raise CanvasError("This canvas has used up its version numbers.")
+        folder = kept / f"{number:04d}"
+        try:
+            folder.mkdir()
+            break
+        except FileExistsError:
+            number += 1
     folder = inside_canvas(root, VERSIONS, folder.name)
     (folder / content.name).write_bytes(data)
-    (folder / "meta.json").write_text(json.dumps({"at": time.time(), "source": source, "sha256": digest,
+    (folder / "meta.tmp").write_text(json.dumps({"at": time.time(), "source": source, "sha256": digest,
                                                   "file": content.name}, ensure_ascii=False), encoding="utf-8")
+    (folder / "meta.tmp").replace(folder / "meta.json")
     for old in versions[: max(0, len(versions) + 1 - MAX_VERSIONS)]:
         shutil.rmtree(kept / old["id"], ignore_errors=True)
     return folder.name

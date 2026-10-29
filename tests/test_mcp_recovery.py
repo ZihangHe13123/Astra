@@ -25,6 +25,9 @@ class Session:
 
 def setup(tmp_path, session, risk="network", hint=None):
     manager, registry = MCPManager(tmp_path / "mcp.json"), ToolRegistry()
+    async def approve(request):
+        return "once"
+    registry.set_approval_handler(approve)
     tool = NS(name="action", description="fixture", inputSchema={"type": "object", "properties": {}},
               annotations=NS(readOnlyHint=hint))
     config = {"risk": risk, "timeout": 0.02}

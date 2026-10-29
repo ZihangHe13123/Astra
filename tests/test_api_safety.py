@@ -62,7 +62,7 @@ def test_valid_bearer_key_allows_existing_chat_behavior(monkeypatch, isolated_ap
         authorization="bearer private-key",
     )))
     assert response.status_code == 200
-    isolated_api.assert_awaited_once_with("hello", None)
+    isolated_api.assert_awaited_once_with("hello", None, usage={})
 
 
 def test_external_asgi_binding_without_key_cannot_bypass_main(isolated_api):
@@ -130,7 +130,9 @@ def test_valid_text_parts_and_assistant_tool_history_remain_accepted(isolated_ap
         ]},
     ]})))
     assert response.status_code == 200
-    isolated_api.assert_awaited_once_with("first\nsecond", None)
+    call = isolated_api.await_args
+    assert call.args[0].text == "first\nsecond" and call.args[0].history == []
+    assert [block.data["text"] for block in call.args[0].blocks] == ["first", "second"]
 
 
 def test_main_defaults_to_loopback(monkeypatch):

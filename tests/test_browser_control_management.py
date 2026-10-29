@@ -50,25 +50,25 @@ def test_windows_discovery_uses_registration_without_launching(monkeypatch, tmp_
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='native POSIX shell modes')
-def test_mac_legacy_registration_is_discovered_and_adopted_on_explicit_repair(tmp_path, monkeypatch):
+def test_mac_legacy_registration_is_discovered_and_adopted_on_explicit_repair(tmp_path, monkeypatch, stable_browser_checkout):
     monkeypatch.setattr(sys, 'platform', 'darwin')
-    paths = installer.install(extension_id='a' * 32, home=tmp_path, repo=ROOT)
+    paths = installer.install(extension_id='a' * 32, home=tmp_path, repo=stable_browser_checkout)
     paths['record'].unlink()
-    assert installer.status(home=tmp_path, repo=ROOT)['state'] == 'configured'
+    assert installer.status(home=tmp_path, repo=stable_browser_checkout)['state'] == 'configured'
     assert not paths['record'].exists()
-    installer.repair(home=tmp_path, repo=ROOT)
+    installer.repair(home=tmp_path, repo=stable_browser_checkout)
     assert json.loads(paths['record'].read_text())['extension_id'] == 'a' * 32
-    installer.uninstall(home=tmp_path, repo=ROOT)
+    installer.uninstall(home=tmp_path, repo=stable_browser_checkout)
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='native POSIX shell modes')
-def test_mac_changed_legacy_launcher_is_preserved(tmp_path, monkeypatch):
+def test_mac_changed_legacy_launcher_is_preserved(tmp_path, monkeypatch, stable_browser_checkout):
     monkeypatch.setattr(sys, 'platform', 'darwin')
-    paths = installer.install(extension_id='a' * 32, home=tmp_path, repo=ROOT)
+    paths = installer.install(extension_id='a' * 32, home=tmp_path, repo=stable_browser_checkout)
     paths['record'].unlink()
     paths['launcher'].write_text('#!/bin/sh\nexit 0\n')
     with pytest.raises(ValueError):
-        installer.repair(home=tmp_path, repo=ROOT)
+        installer.repair(home=tmp_path, repo=stable_browser_checkout)
     assert paths['launcher'].read_text() == '#!/bin/sh\nexit 0\n'
 
 

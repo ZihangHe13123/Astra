@@ -21,9 +21,10 @@ from ..metrics import runtime_metrics
 from ..tool_failure import ToolFailure
 from ..tool_execution import ExecutionFailure, ExecutionResult, PartialResult, StateChanged
 from ..tracing import trace_span
-from .disclosure import CORE_TOOLS, DISPATCH_TOOLS, SEARCH_TOOL, catalog, disclosure_mode
+from .disclosure import CORE_TOOLS, DISPATCH_TOOLS, SEARCH_TOOL, DisclosureResult, catalog, disclosure_mode
 from .grants import DECISIONS, GrantLedger, granted_keys, request_keys, rule_key
 from .policy import VALID_RISKS, ToolPolicy, policy_call_scope
+from .access_scope import tool_access_scope
 
 logger = logging.getLogger(__name__)
 
@@ -1137,6 +1138,10 @@ class ToolRegistry:
             except Exception:
                 logger.exception("tool progress callback failed name=%s stage=%s", name, stage)
 
+        allowed = tool_access_scope.get()
+        if allowed is not None and name not in allowed:
+            return {"output": "", "error": f"[ToolScopeDenied] {name} is unavailable to this caller",
+                    "code": "caller_scope_denied", "not_executed": True, "recoverable": False}
         tool = self._tools.get(name)
         if not tool:
             visible = sorted(item.name for item in self._tools.values() if item.expose_by_default)
@@ -1582,6 +1587,8 @@ class ToolRegistry:
                             result_persistence=tool.result_persistence,
                         )
                         success_result = {**shaped, "error": "", "duration_ms": duration_ms, "risk": tool.risk}
+                        if isinstance(result, DisclosureResult):
+                            success_result["_tool_disclosures"] = list(result.names)
                         if isinstance(result, ExecutionResult):
                             success_result["execution"] = dict(result.execution)
                         if isinstance(result, PartialResult):

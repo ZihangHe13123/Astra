@@ -48,6 +48,10 @@ class VectorStore:
                )"""
         )
         self._connection.commit()
+        self._connection.execute("CREATE TABLE IF NOT EXISTS vector_revision (revision INTEGER NOT NULL)")
+        if self._connection.execute("SELECT 1 FROM vector_revision LIMIT 1").fetchone() is None:
+            self._connection.execute("INSERT INTO vector_revision VALUES (0)")
+        self._connection.commit()
         from .embedder import embedding_identity
 
         self._connection.execute("CREATE TABLE IF NOT EXISTS embedding_metadata (identity TEXT NOT NULL)")
@@ -77,6 +81,7 @@ class VectorStore:
                    vec = excluded.vec""",
             (summary_id, content_hash, len(vec), blob),
         )
+        self._connection.execute("UPDATE vector_revision SET revision = revision + 1")
         self._connection.commit()
 
     def hashes(self) -> dict[str, str]:
@@ -112,6 +117,21 @@ def matrix_from_blobs(blobs: Sequence[bytes]):
     if not np.all(np.isfinite(matrix)):
         raise ValueError("Nonfinite vector snapshot")
     return matrix
+
+
+def read_vector_revision(path: Path) -> int | None:
+    """A transaction-visible revision, without retaining handles that prevent replacement on Windows.
+
+    Legacy indexes have no revision; readers conservatively refresh until a writer upgrades them.
+    """
+    uri = f"file:{quote(str(path.resolve()), safe='/')}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True, timeout=0.05)
+    try:
+        present = connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vector_revision'").fetchone()
+        row = connection.execute("SELECT revision FROM vector_revision LIMIT 1").fetchone() if present else None
+        return int(row[0]) if row else None
+    finally:
+        connection.close()
 
 
 def read_vector_snapshot(path: Path) -> tuple[list[str], object, dict[str, str]]:

@@ -58,7 +58,7 @@ from .project_instructions import ProjectInstructions, tool_paths
 from .prompts import DEFAULT_SYSTEM_PROMPT, persona_generation_overrides
 from .query_profiler import QueryProfiler
 from .tool_failure import ToolFailure
-from .tools.disclosure import CALL_TOOL, DISPATCH_TOOLS, SEARCH_TOOL, loaded_names, loaded_result, register_dispatch_tools
+from .tools.disclosure import CALL_TOOL, DISPATCH_TOOLS, SEARCH_TOOL, loaded_result, register_dispatch_tools
 from .tools.registry import ToolRegistry
 from .tracing import TraceContext, trace_span
 from .vision_policy import VisionPreprocessPolicy
@@ -2008,23 +2008,17 @@ class ReActAgent(AgentBase):
     def _loaded_deferred_tools(self) -> set[str]:
         """Deferred tools whose definitions a result in this conversation's history handed over.
 
-        Only results of tool_search, call_tool and calls of deferred tools count, so a page or a file
-        cannot mark a tool as loaded. Compaction drops those results, and with them the loaded set.
+        Results carry an internal receipt, kept outside the provider projection. Legacy
+        deferred histories without receipts redisclose on first use without rewriting history.
+        Compaction drops a result and its receipt together.
         """
-        callers = {
-            str(call.get("id") or "")
-            for message in self.context.messages if message.get("role") == "assistant"
-            for call in message.get("tool_calls") or []
-            if (name := str(call.get("function", {}).get("name") or "")) in DISPATCH_TOOLS
-            or self.tools.is_deferred(name)
-        }
         loaded: set[str] = set()
         for message in self.context.messages:
-            if message.get("role") == "tool" and str(message.get("tool_call_id") or "") in callers:
-                content = message.get("content")
-                if isinstance(content, list):
-                    content = "\n".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
-                loaded |= loaded_names(content if isinstance(content, str) else "")
+            if message.get("role") != "tool":
+                continue
+            receipt = message.get("_tool_disclosures")
+            if isinstance(receipt, list):
+                loaded.update(name for name in receipt if isinstance(name, str))
         return loaded
 
     def _resolve_tool_dispatch(self, tool_calls: list[dict]) -> tuple[list[dict], dict[str, dict]]:
@@ -2073,7 +2067,8 @@ class ReActAgent(AgentBase):
                             f"call it with {CALL_TOOL}." if direct else
                             f"{target} did not run: it was not loaded yet. Its definition is below; "
                             f"call it again with {CALL_TOOL}.")
-                    refused[call_id] = {"name": target, "error": loaded_result([tool], note), "code": "tool_not_loaded"}
+                    refused[call_id] = {"name": target, "error": loaded_result([tool], note),
+                                        "code": "tool_not_loaded", "_tool_disclosures": [target]}
                     resolved.append(shown)
                     continue
             resolved.append(shown)
@@ -3318,6 +3313,7 @@ class ReActAgent(AgentBase):
             "execution",
             "request_local_placeholder",
             "_private_result",
+            "_tool_disclosures",
         ):
             if key in result:
                 event[key] = result[key]
@@ -3568,6 +3564,7 @@ class ReActAgent(AgentBase):
                     "type": "tool_result", "id": tc["id"], "name": dispatch["name"], "args": {}, "output": "",
                     "error": dispatch["error"], "code": dispatch["code"], "tool_output": dispatch["error"],
                     "duration_ms": 0, "retryable": True, "not_executed": True, "dispatch_refused": True,
+                    "_tool_disclosures": dispatch.get("_tool_disclosures", []),
                 }
             if progress_callback is not None:
                 progress_callback({
@@ -3710,6 +3707,8 @@ class ReActAgent(AgentBase):
                 self._note_failure_streak(tc, event, refusals)
                 context_result = self._tool_result_context(event)
             self.context.add_tool(tc["id"], context_result)
+            if event.get("_tool_disclosures"):
+                self.context.messages[-1]["_tool_disclosures"] = list(event["_tool_disclosures"])
             fresh_output = event.pop("_fresh_output", None)
             if fresh_output is not None:
                 fresh_event = dict(event)

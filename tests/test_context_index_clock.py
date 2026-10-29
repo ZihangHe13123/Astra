@@ -56,7 +56,7 @@ def test_read_budget_uses_precise_clock_without_extending_deadline(monkeypatch):
         with budget.stage("before_cutoff"):
             _checkpoint(db)
         now[0] = budget.deadline
-        with pytest.raises(sqlite3.OperationalError, match="interrupted"), budget.stage("at_cutoff"):
+        with pytest.raises(sqlite_reader.ReadDeadlineExceeded), budget.stage("at_cutoff"):
             _checkpoint(db)
     assert budget.deadline == .015 + .075
     assert [stage.error_category for stage in budget.stages] == ["", "deadline"]

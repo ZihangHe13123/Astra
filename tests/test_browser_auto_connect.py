@@ -2,7 +2,6 @@ import asyncio
 import json
 import os
 import sys
-from pathlib import Path
 
 import pytest
 
@@ -101,11 +100,11 @@ def test_auto_wait_cancel_does_not_navigate_or_change_default():
 
 
 @pytest.mark.skipif(os.name != 'posix', reason='macOS native host installation requires POSIX ownership')
-def test_automatic_config_requires_matching_installed_host(tmp_path,monkeypatch):
+def test_automatic_config_requires_matching_installed_host(tmp_path,monkeypatch, stable_browser_checkout):
     from scripts.install_browser_control_host import install
     from agent.runtime.browser_autoconnect import auto_browser_options
     monkeypatch.setattr(sys,'platform','darwin')
-    repo=Path(__file__).resolve().parents[1]
+    repo=stable_browser_checkout
     assert auto_browser_options(home=tmp_path,repo=repo,environ={})['auto_connect'] is False
     paths=install(extension_id='a'*32,browser='edge',home=tmp_path,repo=repo)
     config=auto_browser_options(home=tmp_path,repo=repo,environ={})

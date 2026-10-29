@@ -127,14 +127,28 @@ def tool_schema(tool: ToolDef) -> dict:
     return {"name": tool.name, "description": tool.description, "parameters": tool.parameters}
 
 
-def loaded_result(tools: list[ToolDef], note: str = "") -> str:
+class DisclosureResult(str):
+    """An internal disclosure receipt; remote tool text cannot construct this value."""
+
+    names: tuple[str, ...]
+
+    def __new__(cls, text: str, names: tuple[str, ...]):
+        result = super().__new__(cls, text)
+        result.names = names
+        return result
+
+    def __reduce__(self):
+        return type(self), (str(self), self.names)
+
+
+def loaded_result(tools: list[ToolDef], note: str = "") -> DisclosureResult:
     """A result that hands the model these definitions; its first line marks them as loaded."""
     lines = [LOADED_PREFIX + ", ".join(tool.name for tool in tools)]
     if note:
         lines.append(note)
     lines.append('Call them with call_tool(name="<tool>", arguments={...}). Definitions:')
     lines += [json.dumps(tool_schema(tool), ensure_ascii=False, separators=(",", ":")) for tool in tools]
-    return "\n".join(lines)
+    return DisclosureResult("\n".join(lines), tuple(tool.name for tool in tools))
 
 
 def loaded_names(text: str) -> set[str]:

@@ -18,7 +18,7 @@ from .session_source import (
     SessionRecommendationSource, _IncompatibleSchema, _eligible_rows, _validate_schema,
     content_fingerprint, session_revision,
 )
-from .sqlite_reader import observe_stage, open_readonly, set_read_window
+from .sqlite_reader import database_error_category, observe_stage, open_readonly, set_read_window
 from .vector_index import default_vectors_db_path, vector_search
 from .workspace import WorkspaceIdentity
 from ..activity_store import _redact_text
@@ -94,7 +94,7 @@ class SemanticReader:
             # Old activity-only vector DBs have no evidence table yet.
             if "no such table" in str(exc):
                 return SourceResult("absent")
-            return SourceResult("error", error_category="deadline" if "interrupt" in str(exc) else "database_error")
+            return SourceResult("error", error_category=database_error_category(exc))
         except (sqlite3.DatabaseError, _IncompatibleSchema, ValueError, TypeError, ImportError):
             return SourceResult("error", error_category="database_error")
 

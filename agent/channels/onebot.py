@@ -85,6 +85,7 @@ class OneBotAdapter(ChannelAdapter):
         self._connections: set[ServerConnection] = set()
         self._send_locks: dict[int, asyncio.Lock] = {}
         self._pending_actions: dict[str, asyncio.Future[dict[str, Any]]] = {}
+        self._pending_connections: dict[str, ServerConnection] = {}
 
     @property
     def running(self) -> bool:
@@ -93,6 +94,8 @@ class OneBotAdapter(ChannelAdapter):
     async def start(self) -> None:
         if self._server is not None:
             return
+        if not self.config.allow_users and not self.config.owner_users:
+            logger.warning("QQ has no admitted users; configure allow_users for chat or owner_users for private local control")
         self._server = await serve(
             self._connection,
             self.config.host,
@@ -145,19 +148,24 @@ class OneBotAdapter(ChannelAdapter):
                     continue
                 if isinstance(payload, dict):
                     echo = str(payload.get("echo") or "")
-                    pending = self._pending_actions.pop(echo, None)
-                    # Some NapCat versions return a valid action response but
-                    # erase its echo. In the single-connection, low-concurrency
-                    # channel path, resolve the oldest action instead of
-                    # reporting a false timeout after the action succeeded.
+                    pending = (self._pending_actions.get(echo)
+                               if self._pending_connections.get(echo) is connection else None)
+                    # Missing echoes can match only one unambiguous request on this connection.
                     if (
                         pending is None
                         and not echo
                         and "retcode" in payload
                         and self._pending_actions
                     ):
-                        oldest_echo = next(iter(self._pending_actions))
-                        pending = self._pending_actions.pop(oldest_echo, None)
+                        candidates = [future for key, future in self._pending_actions.items()
+                                      if self._pending_connections.get(key) is connection and not future.done()]
+                        if len(candidates) == 1:
+                            pending = candidates[0]
+                        elif candidates:
+                            for future in candidates:
+                                future.set_exception(RuntimeError(
+                                    "Ambiguous OneBot receipt: action outcome unknown; do not resend automatically"))
+                            continue
                     if pending is not None:
                         if not pending.done():
                             pending.set_result(payload)
@@ -168,6 +176,9 @@ class OneBotAdapter(ChannelAdapter):
         except Exception:
             logger.exception("OneBot connection failed")
         finally:
+            for key, future in list(self._pending_actions.items()):
+                if self._pending_connections.get(key) is connection and not future.done():
+                    future.set_exception(RuntimeError("OneBot disconnected: action outcome unknown; do not resend automatically"))
             self._connections.discard(connection)
             self._send_locks.pop(id(connection), None)
             logger.info("OneBot client disconnected")
@@ -189,7 +200,7 @@ class OneBotAdapter(ChannelAdapter):
         self_id = str(payload.get("self_id") or "")
         if not sender_id or sender_id == self_id:
             return
-        if self.config.allow_users and sender_id not in self.config.allow_users:
+        if sender_id not in {*self.config.allow_users, *self.config.owner_users}:
             return
         if is_group and self.config.allow_groups and group_id not in self.config.allow_groups:
             return
@@ -216,6 +227,7 @@ class OneBotAdapter(ChannelAdapter):
             sender_name=str(sender.get("card") or sender.get("nickname") or ""),
             images=images,
             raw=payload,
+            local_tools=not is_group and sender_id in self.config.owner_users,
         )
         action = "send_group_msg" if is_group else "send_private_msg"
         target_id = int(group_id if is_group else sender_id)
@@ -311,15 +323,20 @@ class OneBotAdapter(ChannelAdapter):
         echo = f"astra-{uuid.uuid4().hex}"
         future = asyncio.get_running_loop().create_future()
         self._pending_actions[echo] = future
+        self._pending_connections[echo] = connection
         try:
             await self._send(connection, {
                 "action": action,
                 "params": params,
                 "echo": echo,
             })
-            response = await asyncio.wait_for(future, timeout=30)
+            try:
+                response = await asyncio.wait_for(future, timeout=30)
+            except TimeoutError as exc:
+                raise RuntimeError("OneBot response timed out: action outcome unknown; do not resend automatically") from exc
         finally:
             self._pending_actions.pop(echo, None)
+            self._pending_connections.pop(echo, None)
         if response.get("status") != "ok" or int(response.get("retcode") or 0) != 0:
             raise RuntimeError(
                 str(response.get("message") or response.get("wording") or "OneBot action failed")
