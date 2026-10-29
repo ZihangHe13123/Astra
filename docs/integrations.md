@@ -221,8 +221,8 @@ storing credentials in JSON. See [the complete example](../config/mcp.example.js
 MCP failures after dispatch distinguish reads from actions: a lost response or timeout
 from a potentially mutating tool returns `mcp_unknown_outcome` and forbids automatic
 replay. Reconnect, observe the target, and obtain fresh references before deciding
-what to do next. Explicit `tool_risks` / `risk` set to `read`, or `readOnlyHint=true`
-on a network tool, allow read recovery hints; unannotated tools are conservative.
+what to do next. Only explicit local `tool_risks` / `risk` set to `read` allow read recovery hints.
+Server `readOnlyHint` annotations do not establish permission or replay safety.
 These hints do not reduce configured approval requirements. Old tool definitions
 cannot dispatch on a replacement connection.
 
