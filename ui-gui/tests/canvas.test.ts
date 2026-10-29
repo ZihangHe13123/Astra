@@ -64,12 +64,13 @@ test("a canvas on disk reads as its document, its version follows its slides and
   writeFileSync(join(manifest, "..", "assets", "more.png"), png);
   assert.notEqual(await canvasVersion(manifest), afterSlides);
   const exports = join(manifest, "..", "exports");
-  // Where the file really goes: the canvas's own exports folder, made when missing.
-  assert.equal(await exportTarget(manifest, join(exports, "deck.pdf")), join(realpathSync(exports), "deck.pdf"));
+  // Where the file really goes: the canvas's own exports folder, made when missing. The real path as the
+  // system gives it (native: on Windows a short 8.3 name such as RUNNER~1 is spelled out, as the code does).
+  assert.equal(await exportTarget(manifest, join(exports, "deck.pdf")), join(realpathSync.native(exports), "deck.pdf"));
   for (const target of [join(manifest, "..", "deck.pdf"), join(exports, "deck.html"), join(exports, "x", "deck.pdf")])
     await assert.rejects(exportTarget(manifest, target), /exports/);
   // The pictures for a PPTX go to one folder of its own, and nowhere else.
-  assert.equal(await slidesTarget(manifest, join(exports, ".slides")), join(realpathSync(exports), ".slides"));
+  assert.equal(await slidesTarget(manifest, join(exports, ".slides")), join(realpathSync.native(exports), ".slides"));
   for (const target of [exports, join(exports, ".slides", "x"), join(manifest, "..", ".slides")]) await assert.rejects(slidesTarget(manifest, target), /\.slides/);
   assert.equal((await readCanvas(manifest, "capture", 2)).inlined.includes("data:image/png;base64,"), true);
 });
