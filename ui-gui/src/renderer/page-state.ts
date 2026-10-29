@@ -10,6 +10,17 @@ export const isPagePath = (path: string) => /\.html?$/i.test(path);
  */
 export const isCanvasPath = (path: string) => /\.page\.html?$/i.test(path);
 
+/**
+ * The canvas a path belongs to (specs/canvas.md), named by its canvas.json: the first folder on the
+ * path whose name ends in `.canvas`. A canvas is drawn whole, so writing any of its files shows it.
+ */
+export function canvasManifestFor(path: string): string | undefined {
+  const match = /^(.*?\.canvas)(?=[\\/]|$)/i.exec(path.trim());
+  if (!match) return undefined;
+  const separator = path.includes("\\") && !path.includes("/") ? "\\" : "/";
+  return `${match[1]}${separator}canvas.json`;
+}
+
 export type PageMessage = { type: "ready" } | { type: "pong"; id: number } | { type: "error"; message: string };
 /** A page's script can post anything to the host. Only these three reports mean something, and none grants anything. */
 export function pageMessage(data: unknown): PageMessage | undefined {
@@ -25,18 +36,30 @@ export function pageMessage(data: unknown): PageMessage | undefined {
 type ToolLike = { readonly [key: string]: unknown };
 const WRITERS = /^(?:write_file|edit_file|apply_patch|commit_file|str_replace\w*|multi_edit)$/;
 
-/** The canvas page a finished write refers to: what the call was asked to write, if it wrote it. */
+/** What the canvas tool made, looked at or printed: the canvas, by its canvas.json. */
+function canvasFromTool(tool: ToolLike): string | undefined {
+  if (typeof tool.output !== "string") return undefined;
+  const created = /^Canvas: (.+canvas\.json)$/m.exec(tool.output);
+  if (created) return created[1].trim();
+  try { const result = JSON.parse(tool.output); return typeof result?.canvas === "string" ? result.canvas : undefined; }
+  catch { return undefined; }
+}
+
+/** The page or canvas a finished write refers to: what the call was asked to write, if it wrote it. */
 export function pagePathFromTool(tool: ToolLike): string | undefined {
   const name = typeof tool.name === "string" ? tool.name : "";
-  if (!WRITERS.test(name) || tool.error || tool.type !== "tool_result") return undefined;
+  if (tool.error || tool.type !== "tool_result") return undefined;
+  if (name === "canvas" || name === "canvas_look") return canvasFromTool(tool);
+  if (!WRITERS.test(name)) return undefined;
   let args: unknown = tool.arguments;
   if (typeof args === "string") { try { args = JSON.parse(args); } catch { return undefined; } }
   if (!args || typeof args !== "object") return undefined;
   const { path, file_path, patch } = args as { path?: unknown; file_path?: unknown; patch?: unknown };
-  const named = [path, file_path].find((value): value is string => typeof value === "string" && isCanvasPath(value));
+  const shown = (value: unknown) => typeof value !== "string" ? undefined : isCanvasPath(value) ? value : canvasManifestFor(value);
+  const named = shown(path) ?? shown(file_path);
   if (named) return named;
   if (typeof patch !== "string") return undefined;
-  // A patch names its files; the last page it adds or updates is the one to look at.
-  const files = [...patch.matchAll(/^\*\*\* (?:Add|Update) File: (.+)$/gm)].map(match => match[1].trim()).filter(isCanvasPath);
+  // A patch names its files; the last page or canvas it adds or updates is the one to look at.
+  const files = [...patch.matchAll(/^\*\*\* (?:Add|Update) File: (.+)$/gm)].map(match => shown(match[1].trim())).filter(Boolean);
   return files.at(-1);
 }

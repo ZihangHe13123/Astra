@@ -67,7 +67,7 @@ def test_onebot_private_message_routes_and_replies():
             seen.append(message)
             return "pong"
 
-        adapter = OneBotAdapter(OneBotConfig(), handler)
+        adapter = OneBotAdapter(OneBotConfig(allow_users=("10001",)), handler)
         connection = FakeConnection()
         await adapter._handle_payload(connection, {
             "post_type": "message",
@@ -106,7 +106,7 @@ def test_onebot_downloads_image_segments_for_the_agent(monkeypatch):
             "agent.channels.onebot.download_image_data_url",
             fake_download,
         )
-        adapter = OneBotAdapter(OneBotConfig(max_image_bytes=12345), handler)
+        adapter = OneBotAdapter(OneBotConfig(max_image_bytes=12345, allow_users=("10001",)), handler)
         connection = FakeConnection()
         await adapter._handle_payload(connection, {
             "post_type": "message",
@@ -151,7 +151,7 @@ def test_onebot_group_requires_mention_or_prefix():
             return "ok"
 
         adapter = OneBotAdapter(
-            OneBotConfig(group_require_mention=True, wake_prefixes=("/",)),
+            OneBotConfig(group_require_mention=True, wake_prefixes=("/",), allow_users=("10001",)),
             handler,
         )
         connection = FakeConnection()
@@ -185,7 +185,7 @@ def test_onebot_server_accepts_a_real_reverse_websocket():
         async def handler(message, reply_sink=None):
             return f"reply:{message.text}"
 
-        adapter = OneBotAdapter(OneBotConfig(host="127.0.0.1", port=0), handler)
+        adapter = OneBotAdapter(OneBotConfig(host="127.0.0.1", port=0, allow_users=("10001",)), handler)
         await adapter.start()
         try:
             port = adapter._server.sockets[0].getsockname()[1]
@@ -217,7 +217,7 @@ def test_onebot_sends_reply_phases_before_handler_finishes():
             await reply_sink("after tool")
             return ""
 
-        adapter = OneBotAdapter(OneBotConfig(host="127.0.0.1", port=0), handler)
+        adapter = OneBotAdapter(OneBotConfig(host="127.0.0.1", port=0, allow_users=("10001",)), handler)
         await adapter.start()
         try:
             port = adapter._server.sockets[0].getsockname()[1]
@@ -245,7 +245,7 @@ def test_onebot_uploads_a_private_file_and_waits_for_action_result(tmp_path):
         async def handler(message, reply_sink=None):
             return "unused"
 
-        adapter = OneBotAdapter(OneBotConfig(host="127.0.0.1", port=0), handler)
+        adapter = OneBotAdapter(OneBotConfig(host="127.0.0.1", port=0, allow_users=("10001",)), handler)
         await adapter.start()
         try:
             port = adapter._server.sockets[0].getsockname()[1]
@@ -279,7 +279,7 @@ def test_onebot_file_action_accepts_napcat_response_with_empty_echo(tmp_path):
         async def handler(message, reply_sink=None):
             return "unused"
 
-        adapter = OneBotAdapter(OneBotConfig(host="127.0.0.1", port=0), handler)
+        adapter = OneBotAdapter(OneBotConfig(host="127.0.0.1", port=0, allow_users=("10001",)), handler)
         await adapter.start()
         try:
             port = adapter._server.sockets[0].getsockname()[1]
@@ -312,7 +312,7 @@ def test_onebot_file_action_preserves_failure_with_empty_echo(tmp_path):
         async def handler(message, reply_sink=None):
             return "unused"
 
-        adapter = OneBotAdapter(OneBotConfig(host="127.0.0.1", port=0), handler)
+        adapter = OneBotAdapter(OneBotConfig(host="127.0.0.1", port=0, allow_users=("10001",)), handler)
         await adapter.start()
         try:
             port = adapter._server.sockets[0].getsockname()[1]

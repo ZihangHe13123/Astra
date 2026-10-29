@@ -57,6 +57,16 @@ def _isolate_local_personas(tmp_path, monkeypatch, _isolate_application_environm
 
 
 @pytest.fixture(autouse=True)
+def _full_tool_disclosure(request, monkeypatch, _isolate_application_environment):
+    # Fixtures script models that call tools by name, as when every tool was sent. Deferred disclosure,
+    # the product default, has its own tests (test_tool_disclosure.py, the deferred schema digests);
+    # a test that wants it sets ASTRA_TOOL_DISCLOSURE itself.
+    if request.node.get_closest_marker("allow_application_environment") is not None:
+        return
+    monkeypatch.setenv("ASTRA_TOOL_DISCLOSURE", "full")
+
+
+@pytest.fixture(autouse=True)
 def _isolate_filesystem_policy(request, tmp_path, monkeypatch, _isolate_application_environment):
     # The default policy is the installation's. A source checkout must not give
     # tests, or the backends they start, the developer's real host roots.
@@ -154,3 +164,17 @@ def warm_native_chrome(request):
     reporter = request.config.pluginmanager.get_plugin("terminalreporter")
     if reporter is not None:
         reporter.write_line(f"headless Chrome first start: {time.perf_counter() - started:.1f}s ({result[:60]!r})")
+
+
+@pytest.fixture
+def stable_browser_checkout(tmp_path):
+    """An isolated source fixture for installer tests, independent of the runner's worktree path."""
+    from pathlib import Path
+    import shutil
+    source = Path(__file__).resolve().parents[1]
+    target = tmp_path / "stable-browser-source"
+    for relative in ("agent/runtime/browser_control_host.py", "browser-control-extension/manifest.json"):
+        destination = target / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source / relative, destination)
+    return target

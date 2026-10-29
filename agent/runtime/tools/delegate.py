@@ -1303,6 +1303,9 @@ def _build_subagent_registry(
     """
     mode = _normalize_mode(mode)
     sub = ToolRegistry(policy=main_registry.policy)
+    # A subagent's loop has no tool_search or call_tool: the tools its mode grants are sent whole,
+    # whatever the parent's disclosure (tools/disclosure.py).
+    sub.disclosure = "full"
     sub.share_session_with(main_registry)
     sub.filesystem_policy = main_registry.filesystem_policy
     all_names: set[str] = set()
@@ -1431,6 +1434,7 @@ def _create_workspace_registry(
         else {"read", "network", "write", "execute"}
     )
     scoped = ToolRegistry(policy=main_registry.policy)
+    scoped.disclosure = "full"  # As _build_subagent_registry: no dispatch loop to load tools with.
     scoped.share_session_with(main_registry)
     scoped.filesystem_policy = rebound.filesystem_policy
     parent = _build_subagent_registry(main_registry, mode)

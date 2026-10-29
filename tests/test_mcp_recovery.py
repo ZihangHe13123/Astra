@@ -25,6 +25,9 @@ class Session:
 
 def setup(tmp_path, session, risk="network", hint=None):
     manager, registry = MCPManager(tmp_path / "mcp.json"), ToolRegistry()
+    async def approve(request):
+        return "once"
+    registry.set_approval_handler(approve)
     tool = NS(name="action", description="fixture", inputSchema={"type": "object", "properties": {}},
               annotations=NS(readOnlyHint=hint))
     config = {"risk": risk, "timeout": 0.02}
@@ -48,7 +51,7 @@ def test_mutating_failure_never_retries_or_suggests_replay(tmp_path, mode, risk)
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("risk,hint,can_retry", [("read", None, True), ("network", True, True),
+@pytest.mark.parametrize("risk,hint,can_retry", [("read", None, True), ("network", True, False),
                                               ("write", True, False), ("network", None, False)])
 def test_read_recovery_does_not_override_configured_side_effects(tmp_path, risk, hint, can_retry):
     session = Session()

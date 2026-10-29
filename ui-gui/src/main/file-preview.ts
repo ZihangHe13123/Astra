@@ -3,6 +3,7 @@ import { constants } from 'node:fs';
 import { open, stat } from 'node:fs/promises';
 import { extname } from 'node:path';
 import type { DocumentCheck, FilePreview } from '../file-preview-types.js';
+import { canvasVersion, isCanvasManifest, readCanvas } from './canvas-files.js';
 import { inspectOffice, spreadsheetPreview } from './office-inspection.js';
 import { convertOffice, type OfficeConversion } from './office-converter.js';
 
@@ -16,7 +17,7 @@ const cancelled = () => new Error('文件预览已取消。');
 const changed = () => new Error('源文件已变化，请重新预览。');
 function version(info: {dev: number; ino: number; size: number; mtimeMs: number; ctimeMs: number}) { return createHash('sha256').update(JSON.stringify([info.dev, info.ino, info.size, info.mtimeMs, info.ctimeMs])).digest('hex'); }
 /** Call only after ordinary session file authorization. */
-export async function sourceVersion(path: string) { return version(await stat(path)); }
+export async function sourceVersion(path: string) { return isCanvasManifest(path) ? canvasVersion(path) : version(await stat(path)); }
 function checkSignal(signal?: AbortSignal) { if (signal?.aborted) throw cancelled(); }
 function assertPDF(bytes: Uint8Array) { if (!Buffer.from(bytes).subarray(0, 1024).includes(Buffer.from('%PDF-')) || !Buffer.from(bytes).subarray(-1024).includes(Buffer.from('%%EOF'))) throw new Error('PDF 文件损坏或转换未产生完整 PDF。'); }
 
@@ -63,6 +64,7 @@ export class DocumentPreviewService {
 
   private async run(path: string, signal: AbortSignal, authorize: () => void): Promise<FilePreview> {
     checkSignal(signal);
+    if (isCanvasManifest(path)) return this.canvas(path, signal, authorize);
     const extension = extname(path).toLowerCase();
     const office = extension === '.docx' || extension === '.pptx';
     // Admission happens before opening/reading the source, so queued requests hold metadata only.
@@ -118,6 +120,14 @@ export class DocumentPreviewService {
       return {...base, kind:'text', text, truncated, ...oversized};
     } finally { release?.(); }
   }
+  /** A canvas is read afresh each time, since its content and images change apart from canvas.json. */
+  private async canvas(path: string, signal: AbortSignal, authorize: () => void): Promise<FilePreview> {
+    authorize();
+    const initialVersion = await canvasVersion(path);
+    const preview = await canvasPreview(path); checkSignal(signal);
+    if (await canvasVersion(path) !== initialVersion) throw changed();
+    return { ...preview, sourceVersion: initialVersion };
+  }
   private remember(key: string, result: FilePreview) {
     const bytes = (result.data?.length ?? 0) * 2;
     const maximum = this.options.maxCachedBytes ?? 64 * 1024 * 1024;
@@ -130,3 +140,15 @@ export class DocumentPreviewService {
 const defaultPreviews = new DocumentPreviewService();
 /** Call only after the host has authorized the real file path. */
 export const filePreview = (path: string, signal?: AbortSignal) => defaultPreviews.preview(path, signal);
+
+/**
+ * A canvas as the panel shows it: a deck drawn by its template, as a page; a document as its Markdown, its
+ * images found next to canvas.json. With `version`, that kept version instead of the current content.
+ */
+export async function canvasPreview(path: string, version = ''): Promise<FilePreview> {
+  const canvas = await readCanvas(path, 'view', 1, version);
+  const meta = { title: canvas.title, type: canvas.type as 'slides' | 'doc', slides: canvas.slides, source: canvas.source, ...(version ? { version } : {}) };
+  if (canvas.type === 'doc') return { path, kind: 'text', text: canvas.source, canvas: meta };
+  return { path, kind: 'page', text: canvas.html, canvas: meta,
+    ...(canvas.missing.length ? { warnings: [`有图片没有显示：${canvas.missing.join('、')}（放在 assets 文件夹里、8 MiB 以内的 png、jpg、gif、webp、svg 才能显示）。`] } : {}) };
+}

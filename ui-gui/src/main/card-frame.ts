@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { WebContents } from "electron";
 
 /**
@@ -150,7 +151,7 @@ const captureDocument = `<!doctype html><html lang="zh-CN"><head><meta charset="
   const loadTimeout = 5000, answerTimeout = 3000, settleTime = 400, drawTimeout = 8000;
   let frame, asks = 0, problem = "", ready;
   const waiting = new Map();
-  const becameReady = new Promise(resolve => { ready = resolve; });
+  let becameReady = new Promise(resolve => { ready = resolve; });
   const pause = ms => new Promise(resolve => setTimeout(resolve, ms));
   // Two frames, so that what was laid out has also been drawn; a window that draws nothing must not hold the picture up.
   const painted = () => Promise.race([new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))), pause(300)]);
@@ -172,6 +173,8 @@ const captureDocument = `<!doctype html><html lang="zh-CN"><head><meta charset="
   const tall = data => { const value = Number(data.height); return Number.isFinite(value) ? Math.min(100000, Math.max(0, Math.ceil(value))) : 0; };
   window.astraCapture = {
     async open({ html, theme, address, width, height }) {
+      // One page at a time: drawing the next one (a deck's next slide) replaces the frame before it.
+      if (frame) { frame.remove(); becameReady = new Promise(resolve => { ready = resolve; }); problem = ""; }
       frame = document.createElement("iframe");
       frame.setAttribute("sandbox", "allow-scripts"); frame.referrerPolicy = "no-referrer";
       frame.style.width = width + "px"; frame.style.height = height + "px";
@@ -213,7 +216,30 @@ export function captureHostResponse(pathname: string): Response {
   } });
 }
 
+/**
+ * A print of a canvas (canvas-deck.ts). Chromium prints only a window's own document, so for this
+ * the deck cannot stay in a frame: it is served as the document of a window nobody sees, under the
+ * frame's policy plus `sandbox allow-scripts`, which gives it the opaque origin a frame has; the
+ * preload strips from it what it strips from a frame. Each is served only while its print runs.
+ */
+export const PRINT_POLICY = `${CARD_FRAME_POLICY}; sandbox allow-scripts`;
+const prints = new Map<string, string>();
+export function printAddress(html: string): { address: string; forget: () => void } {
+  const token = randomUUID();
+  prints.set(token, html);
+  return { address: `astra://card/print/${token}.html`, forget: () => { prints.delete(token); } };
+}
+
 export function cardFrameResponse(pathname: string): Response {
+  const print = /^\/print\/([0-9a-f-]{36})\.html$/.exec(pathname);
+  if (print) {
+    const html = prints.get(print[1]);
+    if (html === undefined) return new Response("Not found", { status: 404 });
+    return new Response(html, { headers: {
+      "Content-Type": "text/html; charset=utf-8", "Content-Security-Policy": PRINT_POLICY,
+      "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store",
+    } });
+  }
   const body = pathname === "/frame.html" ? frameDocument : pathname === "/page.html" ? pageDocument : undefined;
   if (body === undefined) return new Response("Not found", { status: 404 });
   return new Response(body, { headers: {

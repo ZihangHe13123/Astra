@@ -28,6 +28,16 @@ bridge exposes Astra's local tools to authenticated callers; use a trusted
 network or a TLS reverse proxy for remote access. Native messaging channels
 remain a separate integration.
 
+The endpoint serves the configured model (`astra` is an alias); unknown model
+names return 400. Stateless requests use submitted system/developer and
+user/assistant text history, plus user `image_url` parts (including image-only
+messages). Client tool-call/result history and unknown content parts return
+400. With Astra's `session_id` extension, send only one new user message; full
+client history and stored session history cannot be combined implicitly.
+Responses identify the actual model and aggregate available provider usage;
+unknown usage is `null`. Streaming clients can request
+`stream_options: {"include_usage": true}` for the final usage chunk.
+
 ## Native messaging channels
 
 The Ink backend owns optional messaging adapters in the same process. Incoming
@@ -60,6 +70,15 @@ value in `ASTRA_QQ_ACCESS_TOKEN`—the token itself is never stored in the JSON
 file. Private messages are accepted by default. Group messages require either
 an @mention or a configured wake prefix (default `/`) to avoid unsolicited
 replies.
+
+Configure `qq.allow_users` with the QQ IDs permitted to chat; an empty list no
+longer accepts everyone. These contacts receive public web/chat tools only,
+without local files, history, memory, project instructions or delegation.
+For private remote control, explicitly list trusted owner IDs in
+`qq.owner_users`; owners need not also appear in allow_users. Group messages
+always use chat capabilities, including those sent by an owner. Revoking owner
+access starts a separate restricted conversation; old owner history remains on
+disk and is never loaded into that chat.
 
 Only one service may own port 2280. Stop or reconfigure AstrBot before enabling
 the native QQ adapter. Adapter startup failure is reported without taking down
@@ -167,6 +186,13 @@ Protocol details follow Hermes Agent's adapter (MIT License, Nous Research).
 
 ## MCP
 
+MCP operations without an explicit local `risk: "read"` / `tool_risks` read-only
+classification require approval, even in permissive mode. The default network
+label, tool names and a server's `readOnlyHint` do not grant permission. Without
+an approval handler, unapproved operations fail before dispatch. Explicit
+read-only configuration retains approval-free reads, while consequential
+operations such as sending or deleting still require their action approval.
+
 Install the `mcp` extra and create `.astra/mcp.json`:
 
 ```json
@@ -195,12 +221,21 @@ storing credentials in JSON. See [the complete example](../config/mcp.example.js
 MCP failures after dispatch distinguish reads from actions: a lost response or timeout
 from a potentially mutating tool returns `mcp_unknown_outcome` and forbids automatic
 replay. Reconnect, observe the target, and obtain fresh references before deciding
-what to do next. Explicit `tool_risks` / `risk` set to `read`, or `readOnlyHint=true`
-on a network tool, allow read recovery hints; unannotated tools are conservative.
+what to do next. Only explicit local `tool_risks` / `risk` set to `read` allow read recovery hints.
+Server `readOnlyHint` annotations do not establish permission or replay safety.
 These hints do not reduce configured approval requirements. Old tool definitions
 cannot dispatch on a replacement connection.
 
 ## Web search
+
+Untrusted page downloads validate each redirect and resolved address before
+requesting it, pin DNS for the connection, and bound wire/decompressed content.
+Public pages require no approval; `fetch_url` requests explicit approval for a
+private origin. This grant does not cover another redirect origin, and private
+responses are not put in the shared URL cache. Configured model/search/MCP
+service endpoints keep their separate connection configuration. Missing the
+required `httpx` dependency fails page fetching closed; service diagnostics may
+still use their own fallback transports.
 
 `search_web` supports `provider=auto|exa|searxng|deepseek`. Use `/search` to inspect the
 default and `/search auto|exa|searxng|deepseek` to switch it persistently. In `auto`

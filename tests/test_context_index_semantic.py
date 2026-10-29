@@ -529,13 +529,14 @@ def test_model_encoding_is_nonblocking_while_background_batch_is_busy():
 @pytest.mark.parametrize("stage,target", [("snapshot", "read_snapshot"), ("search", "vector_search"), ("validate", "_sessions")])
 def test_semantic_failure_reports_stage_and_category_without_exception_text(archive, monkeypatch, stage, target):
     from agent.runtime.context_index import semantic_reader
+    from agent.runtime.context_index.sqlite_reader import ReadDeadlineExceeded
 
     # This verifies failure classification, not the production 200 ms SLA.
     # Leave time for the injected fault to run on a loaded Windows CI worker.
     monkeypatch.setenv("ASTRA_CONTEXT_INDEX_SOURCE_MS", "2000")
 
     def interrupted(*_args, **_kwargs):
-        raise sqlite3.OperationalError("interrupted private SQL /archive/path")
+        raise ReadDeadlineExceeded("private SQL /archive/path")
 
     owner = SemanticReader if target == "_sessions" else semantic_reader
     monkeypatch.setattr(owner, target, staticmethod(interrupted) if target == "_sessions" else interrupted)

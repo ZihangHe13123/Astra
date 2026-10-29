@@ -6,6 +6,7 @@ Read the repository's `AGENTS.md` first. These rules also apply when changing th
 - `SessionStore` owns durable session storage. Preserve legacy reads, complete tool-call/result boundaries, cancellation draining, and branch-specific artifacts. Stage and validate session/branch changes before replacing the active context.
 - `SessionLease` protects writable sessions. A preview or copied context must not release the live owner's lease. Use the existing ownership mechanism.
 - Root and discovered project instructions share `ProjectInstructions`, its trust boundary, and its byte budget. Cached instructions never grant tool permissions. Minimal and Local modes retain their zero-injection behavior.
+- A conversation's tool list is fixed once applied. With deferred disclosure, other tools reach the model only as `tool_search` results and run through `call_tool` under their own names; never add a schema to the list to load one.
 - Static guidance and skill catalogs are applied per conversation. Ordinary disk edits are pending until a new conversation or explicit application. Append new regional guidance through the existing projection/tool-result boundary; preserve already-sent history.
 - Main agents, delegates, worker continuation, CLI, GUI, and channels must agree on the contract being changed. Inspect sibling entry points before calling a fix complete.
 - A timed-out or disconnected write can have an unknown outcome. Observe and report it; do not replay it automatically.

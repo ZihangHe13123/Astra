@@ -59,12 +59,14 @@ const server = createServer(async (req, res) => {
       return;
     }
   }
-  // A document is written in two tool steps; the Files panel must follow it.
+  // A document is written in two tool steps; the Files panel must follow it. The document tools are
+  // loaded first and run through call_tool, as the backend sends them by default.
   const docStep = !delegateGoal && text.includes('写文档') ? payload.messages.slice(lastUser + 1).filter(m => m.role === 'tool').length : -1;
-  const call = docStep === 0 ? ['doc_create', { path: report, title: '评测报告', lead: '规则在侧对时准确率下降。',
-      sections: [{ heading: '结果', intent: '各朝向的准确率' }, { heading: '方法', intent: '对比的模型' }] }]
-    : docStep === 1 ? ['doc_edit', { path: report, action: 'write', section_id: '结果',
-      content: '| 朝向 | 规则 F1 |\n| --- | --- |\n| 正对 | 0.95 |\n| 侧对 | 0.71 |\n\n**侧对**时下降明显。' }]
+  const call = docStep === 0 ? ['tool_search', { family: 'documents' }]
+    : docStep === 1 ? ['call_tool', { name: 'doc_create', arguments: { path: report, title: '评测报告', lead: '规则在侧对时准确率下降。',
+      sections: [{ heading: '结果', intent: '各朝向的准确率' }, { heading: '方法', intent: '对比的模型' }] } }]
+    : docStep === 2 ? ['call_tool', { name: 'doc_edit', arguments: { path: report, action: 'write', section_id: '结果',
+      content: '| 朝向 | 规则 F1 |\n| --- | --- |\n| 正对 | 0.95 |\n| 侧对 | 0.71 |\n\n**侧对**时下降明显。' } }]
     : delegateGoal && !delegateRead ? ['read_file', { path: target }]
     : !answered && delegateParent ? ['delegate_task', { tasks: delegateGoals.map(goal => ({
       goal, mode: 'explorer', fork_turns: 'none', tools: ['read_file'],

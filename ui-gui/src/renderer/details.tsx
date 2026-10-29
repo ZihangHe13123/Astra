@@ -99,7 +99,7 @@ export function Details({ state, changeTarget, panel, setPanel, selection, width
           {changes.sides.truncated && <p className="muted small">较大快照仅显示开头；增减行数仍取自原始账本。</p>}</div></>}
       </> : panel === "files" ? <>
         <h3>文件与图片</h3>{!window.astra.remote && <div className="actions"><button onClick={() => { void window.astra.choose("files").then(paths => { if (paths[0]) openFile(paths[0]); }).catch(fail); }}>选择文件预览</button></div>}
-        {artifacts.map(path => <button className="file-row" key={path} onClick={() => openFile(path)}><FolderOpen size={15}/><span>{path.split(/[\\/]/).pop()}</span></button>)}
+        {artifacts.map(path => <button className="file-row" key={path} onClick={() => openFile(path)}><FolderOpen size={15}/><span>{(/[\\/]canvas\.json$/.test(path) ? path.replace(/[\\/]canvas\.json$/, "") : path).split(/[\\/]/).pop()}</span></button>)}
         {galleries.map(g => <section key={g.index} className="gallery" data-result-index={g.index}><h4>搜图 · 工具结果 {g.index}</h4>{g.images.slice(0, 10).map((image: UIEvent, i: number) => <article key={image.id || i}>
           {/^https:\/\//.test(image.image_url) && <img loading="lazy" src={image.image_url} alt={image.title || "搜索结果"}/>}
           <p>{i + 1}. {image.title}</p><button onClick={() => { void window.astra.openExternal(image.source_url).catch(fail); }}>查看来源</button></article>)}</section>)}

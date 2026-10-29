@@ -2,7 +2,8 @@
 
 A page is an HTML file the model wrote to be looked at. Only the desktop renders one, in an
 isolated frame of its own, so the runtime cannot draw it: it asks the client for a picture and
-waits for the answer. The request is an event like any other; the answer is a command.
+waits for the answer. The request is an event like any other; the answer is a command. A canvas
+(agent/runtime/canvas.py) is drawn the same way: one slide's picture, or a print of the whole deck.
 """
 
 from __future__ import annotations
@@ -25,7 +26,7 @@ class PageSnapshotError(Exception):
 
 @dataclass(frozen=True)
 class PageSnapshot:
-    """Where the client saved the picture, and what the picture leaves out."""
+    """Where the client saved the picture (or the print), and what the picture leaves out."""
 
     image_path: Path
     # How much of the page the picture shows, and how tall the page is; zero when the client did not say.
@@ -33,6 +34,8 @@ class PageSnapshot:
     page_height: int = 0
     # What a script on the page raised while it was drawn, in the page's own words.
     script_error: str = ""
+    # Every slide's picture, when a whole deck was drawn for a PPTX.
+    paths: tuple[Path, ...] = ()
 
 
 def _pixels(value: object) -> int:
@@ -51,14 +54,18 @@ class PageSnapshotBroker:
         self._timeout = timeout
         self._pending: dict[str, asyncio.Future[PageSnapshot]] = {}
 
-    async def request(self, path: Path) -> PageSnapshot:
-        """Ask for a picture of the page at ``path``; return what the client saved."""
+    async def request(self, path: Path, *, timeout: float | None = None, **options: object) -> PageSnapshot:
+        """Ask for a picture of the page at ``path``; return what the client saved.
+
+        ``options`` travel with the request: a canvas slide (``slide``), or a print of a canvas
+        (``export="pdf"`` and its ``target`` file).
+        """
         request_id = uuid.uuid4().hex
         future: asyncio.Future[PageSnapshot] = asyncio.get_running_loop().create_future()
         self._pending[request_id] = future
         try:
-            self._send({"type": "page_snapshot_request", "request_id": request_id, "path": str(path)})
-            return await asyncio.wait_for(future, self._timeout)
+            self._send({"type": "page_snapshot_request", "request_id": request_id, "path": str(path), **options})
+            return await asyncio.wait_for(future, timeout or self._timeout)
         except asyncio.TimeoutError:
             raise PageSnapshotError("The desktop did not return a picture of the page in time.") from None
         finally:
@@ -70,16 +77,19 @@ class PageSnapshotBroker:
         if future is None or future.done():
             return False
         error = command.get("error")
-        image_path = command.get("image_path")
+        # A print is answered with the file it wrote.
+        image_path = command.get("image_path") or command.get("file_path")
         if isinstance(error, str) and error.strip():
             future.set_exception(PageSnapshotError(error.strip()[:500]))
         elif isinstance(image_path, str) and image_path.strip():
             script_error = command.get("script_error")
+            paths = command.get("paths")
             future.set_result(PageSnapshot(
                 image_path=Path(image_path.strip()),
                 height=_pixels(command.get("height")),
                 page_height=_pixels(command.get("page_height")),
                 script_error=script_error.strip()[:300] if isinstance(script_error, str) else "",
+                paths=tuple(Path(item) for item in paths if isinstance(item, str) and item) if isinstance(paths, list) else (),
             ))
         else:
             future.set_exception(PageSnapshotError("The desktop returned no picture of the page."))

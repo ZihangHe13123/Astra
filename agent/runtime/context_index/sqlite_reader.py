@@ -1,6 +1,7 @@
 """Small read-only SQLite connection primitive for context-index sources."""
 
 import sqlite3
+import logging
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -9,12 +10,25 @@ from urllib.parse import quote
 
 from .models import RetrievalStage
 
+logger = logging.getLogger(__name__)
+
+
+class ReadDeadlineExceeded(sqlite3.OperationalError):
+    """A budget expiration has the same machine-readable category as SQLite's progress interrupt."""
+    sqlite_errorcode = sqlite3.SQLITE_INTERRUPT
+    sqlite_errorname = "SQLITE_INTERRUPT"
+
 
 def database_error_category(exc: BaseException) -> str:
     if isinstance(exc, TimeoutError):
         return "deadline"
     if isinstance(exc, sqlite3.DatabaseError):
-        return "deadline" if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT or "interrupt" in str(exc).lower() else "database_error"
+        if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT:
+            return "deadline"
+        logger.warning("Context Index database error sqlite_errorcode=%s sqlite_errorname=%s",
+                       getattr(exc, "sqlite_errorcode", None), getattr(exc, "sqlite_errorname", None),
+                       exc_info=(type(exc), exc, exc.__traceback__))
+        return "database_error"
     return "source_error"
 
 
@@ -63,7 +77,7 @@ class ReadBudget:
         try:
             with observe_stage(self.stages, name):
                 if started >= self.deadline:
-                    raise sqlite3.OperationalError("interrupted")
+                    raise ReadDeadlineExceeded("Context Index read budget expired")
                 yield
         finally:
             # A stage timeout is local. Unused/reserved time remains usable,

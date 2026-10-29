@@ -805,7 +805,7 @@ class MCPManager:
             else set()
         )
         side_effect_approvals = ScopedApprovalStore(
-            enabled=lambda: registry.approval_handler is not None,
+            enabled=lambda: True,
             approved_scopes=registry.approved_permission_scopes,
         )
         # One unusable tool is left out with a note; the server keeps its other tools.
@@ -861,10 +861,8 @@ class MCPManager:
                 description += f"\n[Tool {_quoted(remote_name, 200)} of MCP server {_quoted(server)}]"
                 notes.append(f"{_quoted(remote_name)} is registered as {local_name}: {altered}")
             risk = str(risk_overrides.get(remote_name, default_risk)) if isinstance(risk_overrides, dict) else default_risk
-            annotations = getattr(remote, "annotations", None)
-            read_hint = (annotations.get("readOnlyHint") if isinstance(annotations, dict)
-                         else getattr(annotations, "readOnlyHint", None))
-            read_only = risk == "read" or (risk == "network" and read_hint is True)
+            # Server hints cannot establish replay safety for an otherwise unknown action.
+            read_only = risk == "read"
             call_timeout = float(config.get("timeout", 60))
 
             async def invoke(
@@ -1025,11 +1023,15 @@ class MCPManager:
                 return PartialResult(text) if omitted else text
 
             category = tool_category(remote_name)
+            display_server = server.encode("utf-8", "backslashreplace").decode("utf-8")
+            display_remote = remote_name.encode("utf-8", "backslashreplace").decode("utf-8")
+            permission_scope = "mcp-side-effect:" + json.dumps([server, remote_name], ensure_ascii=True)
 
             def permission_check(
                 args: dict,
-                _server=server,
-                _remote_name=remote_name,
+                _server=display_server,
+                _remote_name=display_remote,
+                _scope=permission_scope,
                 _risk=risk,
                 _category=category,
             ) -> dict | None:
@@ -1037,7 +1039,7 @@ class MCPManager:
                     # A tool named for sending, paying, deleting or publishing: asked per call, whatever risk
                     # its server declares, with what it would send shown as a draft.
                     request = side_effect_approvals.request(
-                        scope=f"mcp-side-effect:{_server}:{_remote_name}",
+                        scope=_scope,
                         kind="mcp_side_effect",
                         operation=f"Call MCP tool {_remote_name}",
                         target=f"{_server}/{_remote_name}",
@@ -1051,7 +1053,9 @@ class MCPManager:
                         if draft:
                             request["draft"] = {**draft, "via": f"{_server}/{_remote_name}"}
                     return request
-                if _risk not in {"write", "execute", "secret"}:
+                # Only local configuration can classify a remote operation as read-only.
+                # A network label, a name, and server annotations are not authorization.
+                if _risk == "read":
                     return None
                 argument_preview = None
                 if _risk == "secret":
@@ -1060,11 +1064,11 @@ class MCPManager:
                         for key in args
                     }
                 return side_effect_approvals.request(
-                    scope=f"mcp-side-effect:{_server}:{_remote_name}",
+                    scope=_scope,
                     kind="mcp_side_effect",
                     operation=f"Call MCP tool {_remote_name}",
                     target=f"{_server}/{_remote_name}",
-                    reason=f"MCP tool declares {_risk} side effects",
+                    reason=f"MCP tool is not locally classified read-only ({_risk})",
                     detail=(
                         "Session approval is limited to this exact server/tool pair. "
                         "The MCP server remains responsible for its advertised operation."
