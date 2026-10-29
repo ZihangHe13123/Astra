@@ -254,3 +254,52 @@ def test_a_worker_in_a_worktree_goes_on_in_the_same_worktree(tmp_path, monkeypat
     root = tmp_path / "repo"
     root.mkdir()
     asyncio.run(scenario())
+
+class ToolCallingLLM:
+    """Calls the git and CodeGraph tools once, then reports; remembers the tools it was sent."""
+
+    def __init__(self):
+        self.sent: list[list[str]] = []
+        self.requests: list[list[dict]] = []
+
+    async def chat(self, **kwargs):
+        self.sent.append(sorted(tool["function"]["name"] for tool in kwargs.get("tools") or []))
+        self.requests.append(copy.deepcopy(kwargs["messages"]))
+        if len(self.requests) == 1:
+            return {"content": "", "tool_calls": [
+                {"id": "git", "name": "git_status", "arguments": "{}"},
+                {"id": "graph", "name": "mcp__codegraph__search", "arguments": "{}"}]}
+        return {"content": "looked", "tool_calls": []}
+
+
+def test_a_subagent_gets_every_tool_it_is_granted_while_the_parent_loads_tools_on_demand(tmp_path, monkeypatch):
+    monkeypatch.setenv("ASTRA_TOOL_DISCLOSURE", "deferred")
+
+    async def scenario():
+        registry = ToolRegistry()
+        registry.yolo = True
+        for name, group, risk in (("git_status", "git", "read"), ("mcp__codegraph__search", "mcp:codegraph", "read"),
+                                  ("read_file", "files", "read"), ("write_file", "files", "write")):
+            registry.register(ToolDef(name, name, {"type": "object", "properties": {}}, lambda name=name: f"{name} ran",
+                                      group=group, risk=risk, approval="never"))
+        llm = ToolCallingLLM()
+        harness = Harness(tmp_path, monkeypatch, llm, registry=registry)
+        # The parent loads git and CodeGraph on demand...
+        assert registry.disclosure == "deferred" and registry.is_deferred("git_status")
+        reported = await harness.call("delegate_task", goal="Look around", timeout=30)
+        assert reported["result"] == "looked"
+        # ...but its subagent, which has no tool_search, is sent the tools its mode grants, and runs them.
+        sent = set(llm.sent[0])
+        assert {"git_status", "mcp__codegraph__search", "read_file", "delegate_send"} <= sent
+        assert not sent & {"write_file", "tool_search", "call_tool", "delegate_task"}
+        results = [m["content"] for m in llm.requests[1] if m["role"] == "tool"]
+        assert any("git_status ran" in r for r in results) and any("mcp__codegraph__search ran" in r for r in results)
+        # A worker bound to a workspace (or a worktree) is sent its tools whole too.
+        root = tmp_path / "workspace"
+        root.mkdir()
+        scoped = delegate._create_workspace_registry(registry, LocalSandbox(workdir=str(tmp_path)), root, mode="worker")
+        offered = {tool["function"]["name"] for tool in scoped.to_openai_tools()}
+        assert scoped.disclosure == "full" and {"git_status", "write_file", "read_file"} <= offered
+
+    asyncio.run(scenario())
+
