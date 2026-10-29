@@ -71,3 +71,19 @@ doing one thing.
   function's signature, got two replies, and wrote documentation that matched the code.
 - Not covered: going on after a backend restart in a live run (covered by tests), a live worktree
   worker, and the Claude Code provider.
+
+## 5. Fixes after review
+
+An independent review of the merge found these, each now covered by a test that fails without its fix:
+
+- A later turn of the session reaches an earlier turn's named subagent (also through the old
+  `delegate_poll`); another session cannot. When the crew cannot change hands, giving work or
+  closing says why; only `delegate_task` falls back to a one-off run.
+- A saved subagent can be closed after a restart, by its identity, without its old process and
+  without running it.
+- A batch is named whole before anything starts; one item that cannot start does not hide the others.
+- `delegate_wait` for chosen subagents takes only their reports, leaving others for normal delivery.
+- A `delegate_send` refused before anything was sent is a known outcome; it no longer puts the
+  sender into read-only recovery (found in a live run).
+- A subagent is sent every tool its mode grants even while the parent loads tools on demand.
+
