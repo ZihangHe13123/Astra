@@ -39,6 +39,7 @@ from .context_open_history import (
     without_context_open_placeholders,
 )
 from .core_rules import CORE_SKILL_NAME
+from .agent_team import MESSAGE_ENVELOPE_START
 from .deepseek import DEEPSEEK_VISION_MODELS
 from .llm import LLMClient, LLMIdleTimeout, LLMOverallTimeout, LLMResponseError
 from .turn_budget import TurnBudgetExceeded, budgeted_events, check_work_budget, parse_turn_budget
@@ -5019,12 +5020,12 @@ class ReActAgent(AgentBase):
                         "conclusions you cite, then give one clean final answer. Do not "
                         "repeat the dispatch acknowledgement."
                     )
-                    if any(envelope.startswith("[SYSTEM-DELIVERED TEAM MESSAGE") for envelope in envelopes):
-                        # A teammate wrote while the parent waited: a question to answer or news
+                    if any(envelope.startswith(MESSAGE_ENVELOPE_START) for envelope in envelopes):
+                        # A subagent wrote while the parent waited: a question to answer or news
                         # to act on, not only results to reconcile.
                         recovery_overlay = (
-                            "A teammate wrote to you while you waited. Read the message; answer or "
-                            "redirect it with team_send when it asks or needs a decision, then go on. "
+                            "A subagent wrote to you while you waited. Read the message; answer or "
+                            "redirect it with delegate_send when it asks or needs a decision, then go on. "
                             "Give the final answer only when the work you are waiting for is done."
                         )
                     # Final synthesis is bookkeeping for completed parallel

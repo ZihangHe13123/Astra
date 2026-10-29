@@ -71,6 +71,8 @@ class WorkerSpec:
     team_agent_id: str = ""
     parent_agent_id: str = ""
     agent_name: str = ""
+    # The group a subagent works in: it may write to the other subagents of its group.
+    agent_group: str = ""
     keep_alive: bool = False
     workspace_root: str = ""
     resume_conv_path: str = ""
@@ -127,6 +129,7 @@ class WorkerSpec:
             "team_agent_id": self.team_agent_id,
             "parent_agent_id": self.parent_agent_id,
             "agent_name": self.agent_name,
+            **({"agent_group": self.agent_group} if self.agent_group else {}),
             "keep_alive": self.keep_alive,
             "workspace_root": self.workspace_root,
             **({"resume_conv_path": self.resume_conv_path} if self.resume_conv_path else {}),

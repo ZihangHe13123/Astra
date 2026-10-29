@@ -64,3 +64,34 @@ test("the page shows the team, each member by name on its latest run, the tasks,
   assert.match(html, /<h4>单次委派<\/h4>/);
   assert.ok(html.indexOf("单次委派") > html.indexOf("资料组"));
 });
+
+const crew: AgentTeamView = {
+  id: "c1", kind: "crew", name: "subagents", status: "active", leadAgentId: "parent", messageCount: 0, tasks: [],
+  agents: [
+    { id: "parent", name: "lead", status: "running", unread: 0 },
+    { id: "p", name: "parser", role: "写解析器", group: "core", status: "running", unread: 0 },
+    { id: "q", name: "tester", role: "写测试", group: "core", status: "completed", unread: 0 },
+    { id: "r", name: "docs", role: "写文档", status: "completed", closed: true, unread: 0 },
+  ],
+};
+const crewRuns = Object.fromEntries([
+  run("p-p1", { team_id: "c1", agent_id: "p", started_at: 100, updated_at: 110 }),
+  run("p-p2", { team_id: "c1", agent_id: "p", status: "running", started_at: 200, updated_at: 220 }),
+  run("p-q1", { team_id: "c1", agent_id: "q", started_at: 150, updated_at: 160 }),
+].map(d => [d.process_id, d]));
+
+test("a conversation's named subagents stand on their own, by group, and only their work counts as going on", () => {
+  const groups = subagentGroups(crewRuns, { c1: crew, t1: team });
+  assert.deepEqual(groups.named.map(m => [m.agent.name, m.latest?.process_id, m.earlier.map(d => d.process_id)]),
+    [["parser", "p-p2", ["p-p1"]], ["tester", "p-q1", []], ["docs", undefined, []]]);
+  assert.deepEqual(groups.teams.map(group => group.team.id), ["t1"], "the crew is not shown as a Team");
+  // parser works; tester waits idle at no cost; docs is closed.
+  assert.equal(groups.named.filter(m => m.latest?.status === "running").length, 1);
+  const html = renderToStaticMarkup(React.createElement(SubagentPanel, { delegates: crewRuns, teams: { c1: crew }, fail: () => {} }));
+  assert.match(html, /<h3>子代理 <span class="muted small">3 个 · 1 个进行中<\/span><\/h3>/);
+  // The ungrouped subagent comes first, then the group, whose members may write to each other.
+  assert.ok(html.indexOf("docs") < html.indexOf('aria-label="小组 core"'));
+  assert.match(html, /aria-label="小组 core".*<strong>parser<\/strong>.*<strong>tester<\/strong>/s);
+  assert.match(html, /class="team-member".*docs.*已结束/s);
+  assert.doesNotMatch(html, /aria-label="Team /);
+});

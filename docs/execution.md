@@ -4,33 +4,43 @@
 
 Configure where tools run, which files they can access and how execution is approved.
 
-## Team status and retained workers
+## Subagents
 
-Teams in the same session can be inspected with `team(action="status", team_id=...)`
-without a separate resume. Sending work or configuring a Team automatically adopts
-an inactive earlier turn using the same ownership and workspace checks as explicit
-`resume`; an active parent cannot be displaced. Reads never transfer control.
+`delegate_task` starts subagents, one or a batch (`tasks`). Each has a name in its
+conversation, given with `name` or generated (`explorer-1`, `worker-2`), and
+stays for the whole conversation: after its report it waits idle, holding no
+memory or slot, and `delegate_send(to=<name>, message=...)` gives it more work,
+which it does from its saved conversation, so its earlier requests start the next
+one unchanged. A message to a working subagent reaches it before its next step.
+One whose last step's outcome is unknown, such as an interrupted write, is not
+picked up by a message; `recover=true` brings it back read-only. `delegate_cancel`
+stops its current work and `close=true` ends it for the conversation;
+`delegate_list` shows them all and `delegate_wait` waits for a report or message (given
+`subagents`, for those subagents' reports only, while a message from any subagent still comes
+through; other reports stay for normal delivery). A subagent can be closed after a backend restart
+too, by name, without being run again.
+Later turns of the session reach the subagents earlier turns started.
 
-Status is compact by default. `detail=true` on `team` or `team_wait` includes full
-spawn context, task text and the available episode history. `team(action="create",
-keep_alive_limit=5)` or `team(action="configure", team_id=..., keep_alive_limit=5)`
-sets how many of this Team's members wait idle in memory, immediately and
-durably. Omission inherits `ASTRA_TEAM_KEEP_ALIVE_LIMIT` (default 2); zero
-disables new idle admissions. Reducing capacity does not evict members already
-idle. A member that does not fit, or that idles past
-`ASTRA_TEAM_IDLE_TIMEOUT_SECONDS` (default 1,800), stops running but keeps its
-conversation: the lead's next message to it picks it up where it left off, as
-it does after a backend restart. Members last as long as the session.
+A subagent writes to its parent with `delegate_send(to="parent")`; that arrives
+in the parent's conversation between its steps and wakes a parent waiting for
+it. Subagents given the same `group` may also write to each other by name; one
+without a group writes only to its parent, and a subagent reads messages only
+while it works. A worker with `isolation=worktree` keeps its own worktree,
+`.astra/delegate-worktrees/<id>`, from one assignment to the next: a clean one is
+removed after an assignment and made again at the same path.
 
 Subagents have no turn limit. A run ends when its model answers without a tool
 call, when it is stopped, or when its time limit passes (`timeout`, 1,800
-seconds by default, 14,400 at most, counted while it holds a slot; for a Team
-member, per assignment). Sixteen run at once (`ASTRA_DELEGATE_CONCURRENCY`).
-A subagent's history is compacted like the main agent's. A message reaches a
-working member before its next step; what members send to `lead` arrives in
-the parent's conversation between its steps and wakes a parent waiting for
-them. In a Work session the parent does not wait for them at the end of its
-turn; see [When background work finishes](session-lifecycle.md#when-background-work-finishes).
+seconds by default, 14,400 at most, per assignment, counted while it holds a
+slot). Sixteen run at once (`ASTRA_DELEGATE_CONCURRENCY`). A subagent's history
+is compacted like the main agent's. In a Work session the parent does not wait
+for them at the end of its turn; see
+[When background work finishes](session-lifecycle.md#when-background-work-finishes).
+
+Agent Teams of earlier versions (`team`, `team_spawn`, `team_send`, `team_wait`,
+`team_inbox`, `team_task`, `team_restart`) and `delegate_poll` were merged into
+these tools. A conversation whose tool list has them still runs them; new
+conversations are not offered them.
 
 Worker `lifecycle` records identify the completion reason, actual limits, last idle
 entry/deadline, active and idle monotonic seconds, and wall elapsed seconds.
@@ -38,9 +48,8 @@ entry/deadline, active and idle monotonic seconds, and wall elapsed seconds.
 at transitions. Host sleep can advance wall time without advancing monotonic time.
 After a crash, `recovered_at` is the detection time and timings remain the last
 durable observation, not an invented time of death. Reasons survive process-log
-pruning. `team_restart` clears old decisions and goes on from the member's saved
-conversation, read-only when its last step's outcome is unknown; a member
-without one starts from a bounded checkpoint instead.
+pruning. A subagent without a saved conversation starts again from a bounded
+checkpoint of its transcript (`delegate_send` with `recover=true`).
 
 ## Shell results and full output
 

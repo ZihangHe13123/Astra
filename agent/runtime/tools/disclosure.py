@@ -35,6 +35,7 @@ CORE_TOOLS = frozenset({
     "execute_shell", "execute_python", "process_poll", "process_read", "process_cancel", "process_list",
     "ask_user_question", "plan_update", "goal", "memory", "skill_view", "session_search", "activity_search",
     "context_open", "search_web", "web_extract", "fetch_url", "read_image", "current_time", "delegate_task",
+    "delegate_send",
     "run_code", "read_image_tiles",
 })
 
@@ -53,8 +54,8 @@ FAMILIES: tuple[tuple[str, str, Callable[[str], bool]], ...] = (
     ("browser", "drive the user's browser: open, read, click, fill and upload on web pages", _prefixed("browser_")),
     ("computer", "operate apps and windows on this Mac: look, click, type, take over", _prefixed("computer_")),
     ("git", "repository status, diffs, commits, branches and push", _prefixed("git_")),
-    ("subagents", "follow, read and cancel delegated subagents; agent teams, their messages and tasks",
-     _prefixed("delegate_", "team")),
+    ("subagents", "wait for, list, read and stop this conversation's subagents",
+     _prefixed("delegate_")),
     ("documents", "write, edit, check and export Word/PDF documents written in Markdown", _prefixed("doc_")),
     ("canvas", "slide decks and documents shown beside the conversation: make one, look at a slide, export a deck",
      _prefixed(names=("canvas", "canvas_look"))),

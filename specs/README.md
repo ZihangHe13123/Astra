@@ -13,6 +13,8 @@ It is not a list of shipped features or permission to start implementation.
 - [Loading tools on demand](tool-disclosure.md): a small core set in every request, the
   other tools found by family with `tool_search` and run through `call_tool`; shorter core
   descriptions remain open.
+- [Subagents](subagents.md): one kind of subagent, named and kept for the conversation;
+  Agent Teams merged into `delegate_*`, with optional groups that write to each other.
 - [Canvases](canvas.md): slide decks and documents beside the conversation, with export,
   comments and kept versions; the phone view and more templates remain open.
 - [Outbound request byte budget](llm-request-byte-budget.md): measure serialized

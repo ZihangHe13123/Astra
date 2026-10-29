@@ -7,13 +7,13 @@ import re
 
 import pytest
 
-from agent.runtime.agent_team import TEAM_MESSAGE_CHARS, AgentTeamStore
+from agent.runtime.agent_team import MESSAGE_ENVELOPE_START, TEAM_MESSAGE_CHARS, AgentTeamStore
 from agent.runtime.tools.registry import ToolDef
 from test_delegate_conversation_resume import Harness, RecordingLLM
 
 
 def _envelopes(request):
-    return [m for m in request if str(m.get("content") or "").startswith("[SYSTEM-DELIVERED TEAM MESSAGE")]
+    return [m for m in request if str(m.get("content") or "").startswith(MESSAGE_ENVELOPE_START)]
 
 
 async def _wait_status(harness, agent_id, *statuses):

@@ -71,3 +71,24 @@ teams = reduceAgentTeamEvent(teams, {
 assert.equal(teams[0].status, "active");
 assert.equal(teams[0].agents.find((agent) => agent.id === "lead-1")?.status, "running");
 assert.equal(teams[0].agents.find((agent) => agent.id === "agent-1")?.status, "cancelled");
+
+// A conversation's named subagents arrive as a crew: each with its group, and closed when ended for good.
+let crew = reduceAgentTeamEvent([], {
+  type: "agent_team", kind: "agent_team", event: "team_created", team_id: "crew-1", team_kind: "crew",
+  name: "subagents", lead_agent_id: "parent-1", status: "active",
+});
+crew = reduceAgentTeamEvent(crew, {
+  type: "agent_team", kind: "agent_team", event: "team_agent_created", team_id: "crew-1", agent_id: "a-1",
+  parent_agent_id: "parent-1", name: "parser", role: "worker", group: "core", status: "starting",
+});
+crew = reduceAgentTeamEvent(crew, {
+  type: "agent_team", kind: "agent_team", event: "team_agent_terminal", team_id: "crew-1", agent_id: "a-1",
+  status: "completed",
+});
+crew = reduceAgentTeamEvent(crew, {
+  type: "agent_team", kind: "agent_team", event: "team_agent_closed", team_id: "crew-1", agent_id: "a-1",
+});
+const parser = crew[0].agents.find((agent) => agent.id === "a-1");
+assert.equal(crew[0].kind, "crew");
+assert.deepEqual([parser?.group, parser?.status, parser?.closed], ["core", "completed", true]);
+assert.equal(teams[0].kind, undefined, "an Agent Team of earlier versions stays a Team");
