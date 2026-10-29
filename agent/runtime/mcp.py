@@ -861,10 +861,8 @@ class MCPManager:
                 description += f"\n[Tool {_quoted(remote_name, 200)} of MCP server {_quoted(server)}]"
                 notes.append(f"{_quoted(remote_name)} is registered as {local_name}: {altered}")
             risk = str(risk_overrides.get(remote_name, default_risk)) if isinstance(risk_overrides, dict) else default_risk
-            annotations = getattr(remote, "annotations", None)
-            read_hint = (annotations.get("readOnlyHint") if isinstance(annotations, dict)
-                         else getattr(annotations, "readOnlyHint", None))
-            read_only = risk == "read" or (risk == "network" and read_hint is True)
+            # Server hints cannot establish replay safety for an otherwise unknown action.
+            read_only = risk == "read"
             call_timeout = float(config.get("timeout", 60))
 
             async def invoke(
