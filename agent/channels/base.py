@@ -32,6 +32,8 @@ class ChannelMessage:
     sender_name: str = ""
     images: tuple[ChannelImage, ...] = ()
     raw: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
+    # Set only by the transport from explicit local configuration, never from message text.
+    local_tools: bool = False
 
 
 @dataclass(frozen=True)

@@ -1,5 +1,6 @@
 import type { SessionState } from "@astra/ui-core/session-state";
 import { delegateActive } from "@astra/ui-core/delegates";
+import { teamWorking } from "@astra/ui-core/agent-team-state";
 
 /** One lifecycle predicate for closing a session, deleting it and closing the window. */
 export function hasOngoingWork(state: SessionState): boolean {
@@ -9,7 +10,7 @@ export function hasOngoingWork(state: SessionState): boolean {
     || ["pending", "running", "cancelling"].includes(state.info.task_status?.task?.status)
     || Object.values(state.processes).some(process => process.status === "running")
     || Object.values(state.delegates).some(delegateActive)
-    || Object.values(state.teams).some(team => !["completed", "cancelled", "failed", "stopped"].includes(team.status))
+    || Object.values(state.teams).some(teamWorking)
     || ["scheduled", "running", "active"].includes(state.info.wakeup_status?.plan?.state);
 }
 

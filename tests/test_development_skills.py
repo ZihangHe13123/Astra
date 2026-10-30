@@ -38,13 +38,15 @@ ASTRA_TOOLS = {
     "skills_list",
     "skill_view",
     "delegate_task",
-    "team",
-    "team_spawn",
-    "team_restart",
-    "team_send",
-    "team_wait",
-    "team_task",
+    "delegate_send",
+    "delegate_wait",
+    "delegate_list",
+    "delegate_read",
+    "delegate_cancel",
 }
+# The Agent Team tools were merged into delegate_*; a skill that names one sends the model to a tool it lacks.
+RETIRED_TOOLS = ("team(", "team_spawn", "team_restart", "team_send", "team_wait", "team_inbox", "team_task",
+                 "delegate_poll", "keep_alive")
 FORBIDDEN_TEXT = {
     "request_user_input",
     "functions.",
@@ -132,7 +134,7 @@ def test_multi_step_execution_routes_to_team_tdd():
 def test_team_tdd_sizes_each_assignment_by_time_not_turns():
     content = SkillStore(SKILLS_ROOT).view("team-tdd-development")
 
-    assert "team_spawn" in content
+    assert "delegate_task" in content
     assert "timeout" in content
     assert "1800" in content and "14400" in content
     assert "no turn limit" in content
@@ -142,22 +144,21 @@ def test_team_tdd_sizes_each_assignment_by_time_not_turns():
         assert retired not in content, retired
 
 
-def test_team_tdd_checks_member_status_before_every_assignment():
+def test_team_tdd_reuses_its_two_subagents_and_checks_them_before_every_assignment():
     content = SkillStore(SKILLS_ROOT).view("team-tdd-development")
 
-    assert "team(action=status)" in content
-    assert "before every" in content.lower()
-    assert "team_task_id" in content and "episode_kind" in content
+    assert "name=worker" in content and "name=reviewer" in content
+    assert 'delegate_send(to="worker"' in content and 'delegate_send(to="reviewer"' in content
+    assert "delegate_list" in content and "before every" in content.lower()
+    assert "neither a `group`" in content
 
 
 def test_team_tdd_binds_and_verifies_the_lead_workspace_root():
     content = SkillStore(SKILLS_ROOT).view("team-tdd-development")
 
-    assert "team_spawn" in content
     assert "workspace_root" in content
     assert "both" in content.lower()
     assert "absolute" in content.lower()
-    assert "team(action=status)" in content
     assert "actual git root" in content.lower()
     assert "do not assign" in content.lower()
 
@@ -166,7 +167,6 @@ def test_team_tdd_does_not_trust_forced_or_readiness_reports_as_review():
     content = SkillStore(SKILLS_ROOT).view("team-tdd-development")
 
     assert "forced-finalization" in content.lower()
-    assert "task board" in content.lower()
     assert "transcript" in content.lower()
     assert "readiness report" in content.lower()
     assert "cannot satisfy" in content.lower()
@@ -174,32 +174,21 @@ def test_team_tdd_does_not_trust_forced_or_readiness_reports_as_review():
     assert "CHANGES_REQUIRED" in content
 
 
-def test_team_tdd_claims_mirrored_task_and_preserves_board_state():
-    content = SkillStore(SKILLS_ROOT).view("team-tdd-development")
-
-    assert "team_task(action=claim" in content
-    assert "agent=worker" in content
-    assert "team_send(kind=task_assignment" in content
-    assert "review" in content.lower() and "running" in content.lower()
-    assert "status=completed" in content
-    assert "result=" in content
-    assert "status=failed" in content
-    assert "status=cancelled" in content
-
-
-def test_team_tdd_cleans_up_every_retained_member_on_all_exit_paths():
+def test_team_tdd_stops_every_working_subagent_on_all_exit_paths():
     content = SkillStore(SKILLS_ROOT).view("team-tdd-development")
 
     assert "finally" in content.lower()
-    assert "blocker" in content.lower()
-    assert "quota_rejected" in content
-    assert "timeout" in content.lower()
-    assert "cancellation" in content.lower()
-    assert "unsafe recovery" in content.lower()
-    assert "team_send(kind=shutdown_request" in content
-    assert "every still-active retained member" in content
-    assert "wait for terminal" in content.lower()
-    assert "only for forced cancellation" in content
+    for path in ("blocker", "timeout", "cancellation", "unsafe recovery"):
+        assert path in content.lower(), path
+    assert "delegate_cancel" in content and "close=true" in content
+    assert "recover=true" in content
+
+
+@pytest.mark.parametrize("name", sorted(DELEGATION_SKILLS | PLANNING_SKILLS))
+def test_skills_name_no_retired_team_tool(name: str):
+    content = SkillStore(SKILLS_ROOT).view(name)
+    for retired in RETIRED_TOOLS:
+        assert retired not in content, (name, retired)
 
 
 def test_one_shot_subagent_skill_does_not_compete_with_team_default():

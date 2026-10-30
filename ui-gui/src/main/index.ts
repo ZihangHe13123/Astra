@@ -17,7 +17,8 @@ import { sessionAction } from "./session-actions.js";
 import { hasOngoingWork, holdsUp } from "./ongoing-work.js";
 import { QuitCoordinator, type QuitReason } from "./quit.js";
 import { PreferenceWriter } from "./preferences.js";
-import { DocumentPreviewService, sourceVersion } from "./file-preview.js";
+import { canvasPreview, DocumentPreviewService, sourceVersion } from "./file-preview.js";
+import { commentOnDocument, isCanvasManifest, listVersions, restoreVersion } from "./canvas-files.js";
 import { configurePackagedRuntime, acquirePackagedLease } from "./packaged-runtime.js";
 import { ClipboardFiles } from "./clipboard-files.js";
 import { DesktopAppshot } from "./appshot.js";
@@ -218,7 +219,7 @@ function openSession(options: { session?: string; mode?: string; workspace?: str
   // Special modes enter their separate namespace after the Work backend is ready.
   if (mode !== "work") rt.initialModeSession = name;
   // The backend reads what it is allowed to on its own; the page it names is only drawn here, in isolation.
-  rt.pageSnapshot = path => snapshots.capture(path);
+  rt.pageSnapshot = (path, options) => snapshots.capture(path, options);
   rt.state.isDraft = !options.session && mode === "work";
   runtimes.set(rt.id, rt);
   if (select) { active = rt.id; appshot.update(); }
@@ -514,6 +515,15 @@ register("file", async (id, value, action, requestId) => {
   try { return await previews.preview(path, controller.signal, () => authorizedFile(id, value)); }
   finally { if (previewRequests.get(key) === controller) previewRequests.delete(key); }
 });
+register("canvas", async (id, value, action, argument) => {
+  const path = authorizedFile(id, value);
+  if (!isCanvasManifest(path)) throw new Error("不是画布。");
+  if (action === "versions") return { versions: await listVersions(path) };
+  if (action === "preview") return { preview: await canvasPreview(path, checkedString(argument, "version", 8)) };
+  if (action === "restore") return { version: await restoreVersion(path, checkedString(argument, "version", 8)) };
+  if (action !== "comment" || !argument || typeof argument !== "object") throw new Error("Unknown canvas action");
+  return { version: await commentOnDocument(path, checkedString(argument.passage, "passage", 4000), checkedString(argument.comment, "comment", 2000)) };
+});
 
 /**
  * The personal thread (specs/personal-thread.md): the background host's own conversation, shown in the window
@@ -535,7 +545,7 @@ function openPersonal(): HostedBackend {
     if (event.type === "backend_hello") voiceRoutes.delete(r.id);
     if (event.type === "gui_ready") appshot.update();
   }, { ASTRA_CHANNEL_HOST: "1", ASTRA_PERSONAL_THREAD: "1" });
-  rt.pageSnapshot = path => snapshots.capture(path);
+  rt.pageSnapshot = (path, options) => snapshots.capture(path, options);
   // Work in a project goes to a conversation there, which the thread then manages (specs/personal-thread.md D6).
   rt.openConversation = async where => {
     const known = [...preferences.projects, ...Object.values(preferences.workspaces), ...[...runtimes.values()].map(r => r.workspace)]

@@ -166,6 +166,7 @@ export type PyEvent =
         | "team_agent_awakened"
         | "team_agent_terminal"
         | "team_agent_cancelled"
+        | "team_agent_closed"
         | "team_message"
         | "team_inbox_read"
         | "team_task_created"
@@ -174,6 +175,10 @@ export type PyEvent =
         | "team_stopped";
       kind: "agent_team";
       team_id: string;
+      /** "crew": the subagents delegate_task names in one conversation; an Agent Team of earlier versions has none. */
+      team_kind?: "crew";
+      /** The group a subagent works in; subagents of one group may write to each other. */
+      group?: string;
       name?: string;
       goal?: string;
       status?: string;

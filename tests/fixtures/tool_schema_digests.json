@@ -125,6 +125,12 @@
     ],
     "reason": "2026-10-26: new tool (macOS); the person's Calendar and Reminders through the helper's EventKit mode: read events, reminders and lists; add_event, add_reminder and complete_reminder each approved."
   },
+  "call_tool": {
+    "sha256": [
+      "201d1a6ed1c7a585"
+    ],
+    "reason": "2026-10-28: new, sent when disclosure is deferred (the default); runs a tool that tool_search handed over, under its own name."
+  },
   "cancel_wakeup": {
     "sha256": [
       "22ec2237327b6834"
@@ -223,33 +229,39 @@
   },
   "delegate_cancel": {
     "sha256": [
-      "05e6a4e928bffcd0"
+      "6cb638be1a5afa04"
     ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+    "reason": "2026-10-29: Agent Teams merged into delegate_*: every subagent of a conversation has a name, stays, and takes more work through delegate_send; subagents of one group may write to each other. Takes a subagent's name; close ends it."
   },
   "delegate_list": {
     "sha256": [
-      "1dcdf4cf701d4053"
+      "587f14544d82a3eb"
     ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
-  },
-  "delegate_poll": {
-    "sha256": [
-      "4ec66fa81c88c464"
-    ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+    "reason": "2026-10-29: Agent Teams merged into delegate_*: every subagent of a conversation has a name, stays, and takes more work through delegate_send; subagents of one group may write to each other. Lists the conversation's subagents by name."
   },
   "delegate_read": {
     "sha256": [
-      "219642cd4d0dfebd"
+      "83a9ed98398f3804"
     ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+    "reason": "2026-10-29: Agent Teams merged into delegate_*: every subagent of a conversation has a name, stays, and takes more work through delegate_send; subagents of one group may write to each other. Takes a subagent's name."
+  },
+  "delegate_send": {
+    "sha256": [
+      "86ac7e62566a8e13"
+    ],
+    "reason": "2026-10-29: Agent Teams merged into delegate_*: every subagent of a conversation has a name, stays, and takes more work through delegate_send; subagents of one group may write to each other. New: more work, answers or corrections for a subagent; a subagent writes to its parent or group."
   },
   "delegate_task": {
     "sha256": [
-      "ac1ff1d110ef6d0a"
+      "d4c15e33a3d95b0b"
     ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+    "reason": "2026-10-29: Agent Teams merged into delegate_*: every subagent of a conversation has a name, stays, and takes more work through delegate_send; subagents of one group may write to each other. delegate_task takes name, role and group."
+  },
+  "delegate_wait": {
+    "sha256": [
+      "7affd6ee16cb40cf"
+    ],
+    "reason": "2026-10-29: Agent Teams merged into delegate_*: every subagent of a conversation has a name, stays, and takes more work through delegate_send; subagents of one group may write to each other. New: waits for a report or a message (replaces delegate_poll, team_wait and team_inbox). 2026-10-29 review fix: a wait for chosen subagents takes only their reports; others' stay for later."
   },
   "doc_check": {
     "sha256": [
@@ -576,47 +588,12 @@
     ],
     "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
   },
-  "team": {
+  "tool_search": {
     "sha256": [
-      "8f3362b8688fc948"
+      "cba0eb28c40548fe",
+      "8cf81d3c8bb6dcef"
     ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
-  },
-  "team_inbox": {
-    "sha256": [
-      "700e543693bbd8be"
-    ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
-  },
-  "team_restart": {
-    "sha256": [
-      "7b1aed37cda55914"
-    ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
-  },
-  "team_send": {
-    "sha256": [
-      "b708571af95fbf7a"
-    ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
-  },
-  "team_spawn": {
-    "sha256": [
-      "65b668fddc527d5b"
-    ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
-  },
-  "team_task": {
-    "sha256": [
-      "6b05168a76c0e168"
-    ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
-  },
-  "team_wait": {
-    "sha256": [
-      "f50dea4bdbaf6891"
-    ],
-    "reason": "2026-10-18 baseline: schema as of the digest test's introduction."
+    "reason": " 2026-10-29: the subagents family lost the Agent Team tools."
   },
   "wakeup_status": {
     "sha256": [

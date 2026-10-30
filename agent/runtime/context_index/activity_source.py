@@ -301,8 +301,9 @@ class ActivityRecommendationReader:
                 return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
             main = signature(path)
-            version = (str(path.resolve()), main, signature(Path(str(path) + "-wal")))
-            if version != self._vector_version:
+            revision = _vector_index.read_vector_revision(path) if main is not None else None
+            version = (str(path.resolve()), main, signature(Path(str(path) + "-wal")), revision)
+            if version != self._vector_version or (main is not None and revision is None):
                 ids, matrix, hashes = (
                     _vector_index.read_vector_snapshot(path)
                     if main is not None else ([], None, {})

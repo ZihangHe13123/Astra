@@ -54,7 +54,7 @@ def initial_conversation(
 
 def recovery_tool_risk(registry: ToolRegistry, name: str, arguments: Any = None) -> str:
     """Coordination tools use read for approval, but can still mutate state."""
-    if name in {"team_send", "team_inbox"}:
+    if name in {"team_send", "team_inbox", "delegate_send"}:
         return "write"
     if name in {"team_task", "team"}:
         if isinstance(arguments, str):

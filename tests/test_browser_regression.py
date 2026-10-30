@@ -82,8 +82,10 @@ LOCAL_DYNAMIC_FORM_URL = "data:text/html," + quote(
 # A live page's wording is not ours: the heading "Example Domain" left example.com's
 # text, so these checks ask only for the word the page is about.
 STATIC_URLS = [
-    ("https://example.com", "example", 50),
-    ("https://news.ycombinator.com", "Hacker News", 200),
+    pytest.param("https://example.com", "example", 50, marks=pytest.mark.skipif(
+        os.getenv("ASTRA_RUN_BROWSER_NETWORK") != "1", reason="opt-in external-site acceptance")),
+    pytest.param("https://news.ycombinator.com", "Hacker News", 200, marks=pytest.mark.skipif(
+        os.getenv("ASTRA_RUN_BROWSER_NETWORK") != "1", reason="opt-in external-site acceptance")),
     (LOCAL_MELVILLE_URL, "Herman Melville", 200),
 ]
 

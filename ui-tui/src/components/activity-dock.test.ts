@@ -169,6 +169,15 @@ assert.deepEqual(buildActivitySummary({
   columns: 130,
   lastTool: { id: 3, name: "read_file", output: "ok", error: "", durationMs: 42 },
 }), ["READY", "Qwen3.6-35B-A3B", "PLAN 1/2", "CTX 38%", "R", "LAST ✓ READ 42ms"]);
+// A conversation's named subagents count as subagents, working ones first; an Agent Team of earlier versions as a Team.
+const crewTeam = { id: "c", kind: "crew" as const, name: "subagents", status: "active", leadAgentId: "p", tasks: [], messageCount: 0,
+  agents: [{ id: "p", name: "lead", status: "running", unread: 0 }, { id: "a", name: "parser", status: "running", unread: 0 },
+    { id: "b", name: "tester", status: "completed", unread: 0 }] };
+const olderTeam = { id: "t", name: "reviewers", status: "active", leadAgentId: "l", tasks: [], messageCount: 0,
+  agents: [{ id: "l", name: "lead", status: "running", unread: 0 }, { id: "r", name: "reviewer", status: "idle", unread: 0 }] };
+assert.deepEqual(buildActivitySummary({ ...base, teams: [crewTeam] }), ["READY", "Qwen3.6-35B-A3B", "PLAN 1/2", "SUB 1/2", "CTX 38%", "R"]);
+assert.deepEqual(buildActivitySummary({ ...base, teams: [crewTeam, olderTeam] }),
+  ["READY", "Qwen3.6-35B-A3B", "PLAN 1/2", "SUB 1/2", "TEAM 1/2", "CTX 38%", "R"]);
 
 assert.deepEqual(buildActivitySummary({
   ...base,

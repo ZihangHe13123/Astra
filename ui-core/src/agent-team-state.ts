@@ -8,6 +8,10 @@ export type AgentTeamAgentView = {
   status: string;
   processId?: string;
   unread: number;
+  /** The group it works in: subagents of one group may write to each other. */
+  group?: string;
+  /** Ended for the conversation: it takes no more work. */
+  closed?: boolean;
 };
 
 export type AgentTeamTaskView = {
@@ -19,6 +23,8 @@ export type AgentTeamTaskView = {
 
 export type AgentTeamView = {
   id: string;
+  /** "crew": a conversation's named subagents, shown as subagents rather than as a Team. */
+  kind?: "crew";
   name: string;
   goal?: string;
   status: string;
@@ -74,6 +80,7 @@ export function reduceAgentTeamEvent(
   if (event.event === "team_created") {
     next = {
       ...next,
+      ...(event.team_kind === "crew" ? { kind: "crew" as const } : {}),
       name: event.name || next.name,
       goal: event.goal || next.goal,
       status: event.status || "active",
@@ -99,8 +106,11 @@ export function reduceAgentTeamEvent(
         status: "running",
       });
     }
+  } else if (event.event === "team_agent_closed" && event.agent_id) {
+    next.agents = upsertAgent(next.agents, event.agent_id, { closed: true });
   } else if (event.event.startsWith("team_agent_") && event.agent_id) {
     next.agents = upsertAgent(next.agents, event.agent_id, {
+      ...(event.group ? { group: event.group } : {}),
       ...(event.name ? { name: event.name } : {}),
       ...(event.parent_agent_id ? { parentId: event.parent_agent_id } : {}),
       ...(event.role ? { role: event.role } : {}),
@@ -133,4 +143,15 @@ export function reduceAgentTeamEvent(
   return existing
     ? teams.map((team) => team.id === event.team_id ? next : team)
     : [...teams, next];
+}
+
+/**
+ * Whether a team still has work that can change the conversation. A conversation's named subagents (a crew)
+ * wait idle between assignments at no cost, so only a member at work counts; an Agent Team counts until it ends.
+ */
+export function teamWorking(team: AgentTeamView): boolean {
+  if (team.kind === "crew") {
+    return team.agents.some((agent) => agent.id !== team.leadAgentId && ["starting", "running", "waiting"].includes(agent.status));
+  }
+  return !["completed", "cancelled", "failed", "stopped"].includes(team.status);
 }

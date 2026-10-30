@@ -1,6 +1,6 @@
 ---
 name: subagent-driven-development
-description: Use when the user explicitly requests disposable one-shot delegates for a written implementation plan and does not need retained Team context.
+description: Use when the user explicitly requests disposable one-shot delegates for a written implementation plan and does not need a retained worker and reviewer.
 ---
 
 # Subagent-Driven Development
@@ -22,7 +22,9 @@ task state.
    unless `dispatching-parallel-agents` confirms disjoint ownership.
 2. Call `delegate_task` with `mode=worker`, preferably
    `isolation=worktree`, and only the task's requirements, interfaces,
-   constraints, exact files, and expected test evidence.
+   constraints, exact files, and expected test evidence. Start a fresh
+   subagent for each task; a correction to the task just reported goes to the
+   same subagent with `delegate_send`.
 3. Require the worker to follow `test-driven-development`, inspect existing
    code first, preserve unrelated changes, and report changed files, commands,
    results, concerns, and commit state.

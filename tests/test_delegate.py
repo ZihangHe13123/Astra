@@ -245,7 +245,7 @@ def test_worktree_setup_and_cleanup_run_outside_event_loop(
     worker_thread_ids = []
     worktree = tmp_path / "worker"
 
-    def create_worktree(_sandbox):
+    def create_worktree(_sandbox, _name=""):
         worker_thread_ids.append(threading.get_ident())
         return worktree
 
@@ -2592,5 +2592,40 @@ def test_manual_terminal_poll_acknowledges_mailbox_result(process_manager):
 
         assert json.loads(polled["output"])["status"] == "completed"
         assert mailbox.drain("manual-task") == []
+
+    asyncio.run(scenario())
+
+
+def test_a_subagent_without_a_name_gets_its_granted_tools_while_the_parent_loads_tools_on_demand(
+    process_manager, monkeypatch, tmp_path,
+):
+    """Without a durable store, so without a crew: the tools a subagent's mode grants are sent whole."""
+    monkeypatch.setenv("ASTRA_TOOL_DISCLOSURE", "deferred")
+    sent: list[list[str]] = []
+
+    class Recorder:
+        async def chat(self, **kwargs):
+            sent.append(sorted(tool["function"]["name"] for tool in kwargs.get("tools") or []))
+            if len(sent) == 1:
+                return {"content": "", "tool_calls": [{"id": "git", "name": "git_status", "arguments": "{}"}]}
+            return {"content": "looked", "tool_calls": []}
+
+    async def scenario():
+        registry = ToolRegistry()
+        registry.yolo = True
+        for name, group, risk in (("git_status", "git", "read"), ("mcp__codegraph__search", "mcp:codegraph", "read"),
+                                  ("read_file", "files", "read"), ("write_file", "files", "write")):
+            registry.register(ToolDef(name, name, {"type": "object", "properties": {}}, lambda name=name: f"{name} ran",
+                                      group=group, risk=risk, approval="never"))
+        register_delegate_tools(registry, llm_getter=Recorder)
+        assert registry.disclosure == "deferred" and registry.is_deferred("git_status")
+        result = await registry.execute("delegate_task", {"goal": "Look around", "timeout": 30}, task_id="task-1")
+        assert not result["error"], result
+        assert {"git_status", "mcp__codegraph__search", "read_file"} <= set(sent[0])
+        assert not set(sent[0]) & {"write_file", "tool_search", "call_tool", "delegate_task"}
+        root = tmp_path / "workspace"
+        root.mkdir()
+        scoped = delegate._create_workspace_registry(registry, LocalSandbox(workdir=str(tmp_path)), root, mode="worker")
+        assert {"git_status", "write_file"} <= {tool["function"]["name"] for tool in scoped.to_openai_tools()}
 
     asyncio.run(scenario())

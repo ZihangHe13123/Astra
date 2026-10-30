@@ -3,6 +3,7 @@ import { launchElectron } from './electron-launch.mjs';
 import { clickInFrame } from './frame-click.mjs';
 import { expect } from '@playwright/test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { createServer } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
 import { createSocket } from 'node:dgram';
@@ -125,6 +126,10 @@ const watched = `<!doctype html><title>watched</title><body style="margin: 0"><s
 </script></body>`;
 // It leaves at once, before any picture can be taken.
 const leaver = `<!doctype html><title>leaver</title><p>leaving</p><script>location.href = '${out}/leaver-navigation';</script>`;
+// A deck (specs/canvas.md): a title, a full-bleed image from its assets, and a slide that tries every way out.
+const deckSlides = `<section class="slide title"><h1>季度回顾</h1><p>2026</p><aside class="notes">先讲营收。</aside></section>
+<section class="slide image"><img id="swatch" src="assets/swatch.png" alt=""><h1>颜色</h1></section>
+<section class="slide"><h1>出口</h1>${escapeBody}</section>`;
 // What the model does when asked: one call that writes or edits a file, then a line of text.
 const writes = {
   画布: { path: 'demo.page.html', content: demo('V1') },
@@ -143,6 +148,19 @@ const writes = {
   瞧瞧一屏: { tool: 'read_image', path: 'screen.page.html' },
   瞧瞧旁观: { tool: 'read_image', path: 'watched.page.html' },
   瞧瞧出走: { tool: 'read_image', path: 'leaver.page.html' },
+  // A canvas: its tool is loaded, then called through call_tool, as the backend sends it by default.
+  载入画布工具: { tool: 'tool_search', label: 'canvas tools', family: 'canvas' },
+  新建幻灯片: { tool: 'call_tool', label: 'deck', name: 'canvas', arguments: { action: 'create', title: '季度回顾', path: 'deck.canvas' } },
+  // The deck starts with a title slide; replacing it whole names the content it replaces, as write_file asks.
+  写幻灯片: () => ({ label: 'slides', path: 'deck.canvas/slides.html', content: deckSlides, overwrite: true,
+    expected_sha256: createHash('sha256').update(readFileSync(join(workspace, 'deck.canvas', 'slides.html'))).digest('hex') }),
+  看第二页: { tool: 'call_tool', name: 'canvas_look', arguments: { canvas: 'deck.canvas', slide: 2 } },
+  导出幻灯片: { tool: 'call_tool', label: 'export', name: 'canvas', arguments: { action: 'export', canvas: 'deck.canvas' } },
+  导出演示文稿: { tool: 'call_tool', label: 'pptx', name: 'canvas', arguments: { action: 'export', canvas: 'deck.canvas', format: 'pptx' } },
+  // A document canvas, written with the doc_* tools, which are loaded the same way.
+  新建文档: { tool: 'call_tool', label: 'doc', name: 'canvas', arguments: { action: 'create', type: 'doc', title: '产品计划', path: 'plan.canvas' } },
+  载入文档工具: { tool: 'tool_search', label: 'doc tools', family: 'documents' },
+  写一节: { tool: 'call_tool', label: 'section', name: 'doc_edit', arguments: { path: 'plan.canvas/doc.md', action: 'add', heading: '路线', content: '第一季度做画布，第二季度做语音。' } },
 };
 const requests = [];
 const model = createServer(async (req, res) => {
@@ -153,15 +171,16 @@ const model = createServer(async (req, res) => {
   const lastUser = payload.messages.findLastIndex(message => message.role === 'user');
   const text = JSON.stringify(payload.messages[lastUser]?.content ?? '');
   const answered = payload.messages.slice(lastUser + 1).some(message => message.role === 'tool');
-  const write = Object.entries(writes).sort(([a], [b]) => b.length - a.length).find(([word]) => text.includes(word))?.[1];
+  const found = Object.entries(writes).sort(([a], [b]) => b.length - a.length).find(([word]) => text.includes(word))?.[1];
+  const write = typeof found === 'function' ? found() : found;
   const sawPicture = text.includes('data:image/png;base64,');
   res.setHeader('Content-Type', 'text/event-stream');
   const chunk = (delta, finish_reason = null) => res.write('data: ' + JSON.stringify({ id: 'page-' + requests.length, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: 'page-test', choices: [{ index: 0, delta, finish_reason }] }) + '\n\n');
   if (write && !answered) {
-    const { tool = 'write_file', ...args } = write;
+    const { tool = 'write_file', label, ...args } = write;
     chunk({ role: 'assistant', tool_calls: [{ index: 0, id: 'page-call-' + requests.length, type: 'function', function: { name: tool, arguments: JSON.stringify(args) } }] });
     chunk({}, 'tool_calls');
-  } else { chunk({ role: 'assistant', content: sawPicture ? 'SAW_PICTURE' : write ? `${write.tool === 'read_image' ? 'NO_PICTURE' : 'WROTE'} ${write.path}` : 'PLAIN_REPLY' }); chunk({}, 'stop'); }
+  } else { chunk({ role: 'assistant', content: sawPicture ? 'SAW_PICTURE' : write?.label ? `DONE ${write.label}` : write ? `${write.tool === 'read_image' ? 'NO_PICTURE' : 'WROTE'} ${write.path}` : 'PLAIN_REPLY' }); chunk({}, 'stop'); }
   res.end('data: [DONE]\n\n');
 });
 const port = await listen(model);
@@ -500,6 +519,105 @@ try {
   assert.deepEqual(answered, []);
   assert.equal(await page.evaluate(() => location.href), 'astra://app/index.html');
   passed('a failing page reports its error, and a hostile page cannot see the bridge or the host page, store anything, open anything, or reach the network by any route it tried');
+
+  // A canvas. The model loads the canvas tool and makes a deck; the panel opens on it. A step that writes asks first.
+  const step = async (text, label) => {
+    await composer.fill(text); await page.getByRole('button', { name: '发送', exact: true }).click();
+    const allow = page.getByRole('button', { name: '允许一次', exact: true });
+    const done = page.locator('.message.assistant').filter({ hasText: `DONE ${label}` }).last();
+    await expect.poll(async () => { if (await allow.isVisible()) await allow.click(); return done.isVisible(); }, { timeout: 40000 }).toBe(true);
+    await idle();
+  };
+  await step('载入画布工具', 'canvas tools');
+  await step('新建幻灯片', 'deck');
+  await expect(preview.locator('h3')).toHaveText('季度回顾');
+  await expect(preview.getByText('幻灯片 · 1 页 · 点任一页放映，Esc 退出')).toBeVisible();
+  await expect(inside.locator('.astra-slide-frame')).toHaveCount(1);
+  // Its image is a file in its assets; the model writes the slides, and the panel follows.
+  const swatch = await app.evaluate(({ nativeImage }) => {
+    const pixels = Buffer.alloc(16 * 16 * 4);
+    for (let at = 0; at < pixels.length; at += 4) { pixels[at] = 80; pixels[at + 1] = 150; pixels[at + 2] = 0; pixels[at + 3] = 255; }
+    return nativeImage.createFromBitmap(pixels, { width: 16, height: 16 }).toPNG().toString('base64');
+  });
+  writeFileSync(join(workspace, 'deck.canvas', 'assets', 'swatch.png'), Buffer.from(swatch, 'base64'));
+  await step('写幻灯片', 'slides');
+  await expect(preview.getByText('幻灯片 · 3 页 · 点任一页放映，Esc 退出')).toBeVisible();
+  await expect(inside.locator('.astra-slide-frame')).toHaveCount(3);
+  assert.match(await inside.locator('#swatch').getAttribute('src'), /^data:image\/png;base64,/);
+  // The slide that tries every way out gets as little as a page does.
+  await checkHostileProbes();
+  // Presenting: one slide fills the frame; Escape goes back to the list.
+  await clickInFrame(inside.locator('.astra-slide-frame').first());
+  await expect(inside.locator('body')).toHaveClass(/astra-present/);
+  await inside.locator('body').press('Escape');
+  await expect(inside.locator('body')).not.toHaveClass(/astra-present/);
+  await page.screenshot({ path: join(output, 'canvas.png') });
+  passed('the model loads the canvas tool and makes a deck; the panel opens on it, follows its slides and images, presents it, and its slides get as little as a page');
+
+  // The model looks at one slide: drawn at its own size out of sight, handed over at the width it reads.
+  const lookedSlide = await look('看第二页');
+  assert.equal(lookedSlide.reply, 'SAW_PICTURE');
+  assert.deepEqual([lookedSlide.result.type, lookedSlide.result.slide, lookedSlide.result.slides], ['image_attachment', 2, 3]);
+  const slidePicture = await seen(lookedSlide.pictures[0], [[640, 300]]);
+  assert.deepEqual([slidePicture.width, slidePicture.height], [1280, 720]);
+  near(slidePicture.colours[0], [0, 150, 80], 'the full-bleed image');
+  // Then it prints the deck: a PDF of three 16:9 pages in the canvas's own exports folder.
+  await step('导出幻灯片', 'export');
+  const pdf = readFileSync(join(workspace, 'deck.canvas', 'exports', 'deck.pdf')).toString('latin1');
+  assert.ok(pdf.startsWith('%PDF-'), 'a PDF');
+  assert.equal(pdf.match(/\/Type\s*\/Page[^s]/g)?.length, 3);
+  assert.deepEqual([...new Set(pdf.match(/\/MediaBox\s*\[[^\]]+\]/g))], ['/MediaBox [0 0 1440 810]']);
+  // And as a PPTX: one full picture per slide at its own size, the notes kept, the pictures' folder gone.
+  await step('导出演示文稿', 'pptx');
+  const { stdout: pptx } = await runFile(env.AGENT_PYTHON, ['-c', `import json, struct, sys, zipfile
+z = zipfile.ZipFile(sys.argv[1]); names = z.namelist()
+media = [n for n in names if n.startswith("ppt/media/")]
+print(json.dumps({"slides": sorted(n for n in names if n.startswith("ppt/slides/slide") and n.endswith(".xml")),
+  "sizes": sorted({struct.unpack(">II", z.read(n)[16:24]) for n in media}),
+  "notes": [n for n in names if n.startswith("ppt/notesSlides/") and n.endswith(".xml") and "先讲营收" in z.read(n).decode()]}))`,
+    join(workspace, 'deck.canvas', 'exports', 'deck.pptx')]);
+  assert.deepEqual(JSON.parse(pptx), { slides: ['ppt/slides/slide1.xml', 'ppt/slides/slide2.xml', 'ppt/slides/slide3.xml'], sizes: [[1920, 1080]], notes: ['ppt/notesSlides/notesSlide1.xml'] });
+  assert.equal(readdirSync(join(workspace, 'deck.canvas', 'exports')).includes('.slides'), false);
+  assert.equal(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length), 1, 'the picture and print windows are gone');
+  await new Promise(done => setTimeout(done, 1500));
+  assert.deepEqual(reached, [], 'nothing the deck tried, on screen, looked at or printed, reached a listener');
+  assert.deepEqual(answered, []);
+  passed('the model looks at one slide as the desktop draws it, prints the deck to a PDF of its slides and exports a PPTX of its pictures and notes, and nothing the deck tries gets out');
+
+  // A document canvas: the doc_* tools write it, the person comments on a passage, and an earlier version comes back.
+  await step('新建文档', 'doc');
+  await expect(preview.locator('h3')).toHaveText('产品计划');
+  await expect(preview.getByText('文档 · 选中一段文字可以批注')).toBeVisible();
+  await step('载入文档工具', 'doc tools');
+  await step('写一节', 'section');
+  const passage = preview.locator('.doc-preview p', { hasText: '第一季度做画布' });
+  await expect(passage).toBeVisible();
+  await expect(preview.locator('.doc-outline button')).toHaveText(['产品计划', '路线']);
+  const plan = join(workspace, 'plan.canvas');
+  const sources = () => readdirSync(join(plan, '.versions')).sort().map(id => JSON.parse(readFileSync(join(plan, '.versions', id, 'meta.json'), 'utf8')).source);
+  assert.deepEqual(sources(), ['create', 'write'], 'the doc_edit through call_tool is kept as a version');
+  // Selecting the passage opens the comment; it is written after the passage, where doc_comments reads it.
+  // The paragraph is selected whole, as a drag across it would; a triple click stops before the full stop on some platforms.
+  await passage.evaluate(node => { const range = document.createRange(); range.selectNodeContents(node); getSelection().removeAllRanges(); getSelection().addRange(range); });
+  await passage.dispatchEvent('mouseup');
+  await preview.locator('.canvas-comment textarea').fill('加上月份');
+  await preview.getByRole('button', { name: '写进文档', exact: true }).click();
+  await expect(preview.locator('.doc-comments')).toContainText('加上月份');
+  assert.match(readFileSync(join(plan, 'doc.md'), 'utf8'), /第一季度做画布，第二季度做语音。 <!-- @astra: 加上月份 -->/);
+  assert.deepEqual(sources(), ['create', 'write', 'comment']);
+  // The first version is looked at in place, then restored as a version of its own.
+  await preview.getByRole('button', { name: '版本', exact: true }).click();
+  await expect(preview.locator('.canvas-versions li')).toHaveCount(3);
+  await preview.locator('.canvas-versions button', { hasText: '版本 1' }).click();
+  await expect(preview.getByText('正在看版本 1，不是现在的内容。')).toBeVisible();
+  await expect(preview.locator('.doc-preview p', { hasText: '第一季度做画布' })).toHaveCount(0);
+  await page.screenshot({ path: join(output, 'canvas-doc.png') });
+  await preview.getByRole('button', { name: '恢复成这个版本', exact: true }).click();
+  await expect(preview.getByText(/已恢复成版本 1/)).toBeVisible();
+  await expect(preview.locator('.canvas-versions li')).toHaveCount(4);
+  assert.equal(readFileSync(join(plan, 'doc.md'), 'utf8'), '# 产品计划\n\n');
+  assert.deepEqual(sources(), ['create', 'write', 'comment', 'restore']);
+  passed('the model writes a document canvas with the doc_* tools; the person comments on a passage and restores its first version, each kept as a version');
   // The failing page's own exception is the only one.
   assert.deepEqual([...new Set(errors)], ['PAGE_FIXTURE_FAILURE']);
 } catch (error) {

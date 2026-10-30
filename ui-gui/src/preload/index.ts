@@ -27,6 +27,7 @@ function exposeBridge() {
     droppedPaths: files => files.map(file => webUtils.getPathForFile(file)).filter(Boolean),
     openExternal: url => invoke("openExternal", url), file: (id, path, action, requestId) => invoke("file", id, path, action, requestId),
     cancelPreview: (id, requestId) => invoke("cancelPreview", id, requestId),
+    canvas: (id, path, action, value) => invoke("canvas", id, path, action, value),
     onEvents: handler => {
       const listener = (_: unknown, events: DesktopEvent[]) => handler(events);
       ipcRenderer.on("astra:events", listener);
@@ -50,5 +51,6 @@ function stripPeerConnections() {
   } });
 }
 
-if (window.top !== window) stripPeerConnections();
+// A print of a canvas is a document of its own (card-frame.ts), under the same policy as a frame.
+if (window.top !== window || (location.protocol === "astra:" && location.host === "card")) stripPeerConnections();
 else if (location.protocol === "astra:" && location.host === "app") exposeBridge();

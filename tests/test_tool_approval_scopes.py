@@ -1219,7 +1219,7 @@ def test_network_reads_do_not_request_approval_across_browser_and_web(tmp_path):
         assert tool is not None
         assert tool.risk == "network"
         assert tool.approval == "never"
-        assert tool.permission_check is None
+        assert (tool.permission_check is not None) == (name == "fetch_url")
 
 
 def test_browser_write_requires_distinct_scope_and_denial_has_no_side_effect(tmp_path):
@@ -1364,8 +1364,8 @@ def test_web_and_browser_network_tools_do_not_expose_permission_hooks(tmp_path):
     ):
         tool = registry.get(name)
         assert tool is not None
-        assert tool.permission_check is None
-        assert tool.permission_grant is None
+        assert (tool.permission_check is not None) == (name == "fetch_url")
+        assert (tool.permission_grant is not None) == (name == "fetch_url")
 
 
 @dataclass

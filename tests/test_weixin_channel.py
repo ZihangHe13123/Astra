@@ -342,7 +342,7 @@ def test_only_wechat_conversations_are_told_to_talk_like_a_chat(tmp_path):
     async def scenario():
         router = AgentChannelRouter(Agent(), asyncio.Lock(), tmp_path)
         await router.handle(ChannelMessage("weixin", OWNER, OWNER, "在吗"))
-        await router.handle(ChannelMessage("qq", "peer", "peer", "hi"))
+        await router.handle(ChannelMessage("qq", "peer", "peer", "hi", local_tools=True))
 
     asyncio.run(scenario())
     assert CHAT_STYLE in prompts["weixin"] and "project guidance" in prompts["weixin"]
@@ -591,7 +591,7 @@ def test_a_wechat_turn_runs_on_the_channel_model_and_hands_the_window_its_own_ba
 
     async def scenario():
         await router.handle(ChannelMessage("weixin", OWNER, OWNER, "在吗"))
-        await router.handle(ChannelMessage("qq", "peer", "peer", "hi"))
+        await router.handle(ChannelMessage("qq", "peer", "peer", "hi", local_tools=True))
 
     asyncio.run(scenario())
     assert seen["weixin"][:2] == (chat_llm, chat_llm) and seen["weixin"][2] == 16_384
@@ -823,7 +823,7 @@ def test_wechat_conversations_use_the_wechat_version_of_the_persona_and_keep_it(
 
     async def talk(router):
         await router.handle(ChannelMessage("weixin", OWNER, OWNER, "在吗"))
-        await router.handle(ChannelMessage("qq", "peer", "peer", "hi"))
+        await router.handle(ChannelMessage("qq", "peer", "peer", "hi", local_tools=True))
 
     window = Agent()
     asyncio.run(talk(AgentChannelRouter(window, asyncio.Lock(), tmp_path)))

@@ -831,7 +831,7 @@ def test_worktree_delegate_child_edits_stay_out_of_parent_ledger(tmp_path, monke
     worktree.mkdir()
     note = worktree / "note.txt"
     note.write_text("old\n", encoding="utf-8")
-    monkeypatch.setattr(delegate_tools, "_create_detached_worktree", lambda _sandbox: worktree)
+    monkeypatch.setattr(delegate_tools, "_create_detached_worktree", lambda _sandbox, _name="": worktree)
     monkeypatch.setattr(
         delegate_tools, "_finalize_detached_worktree", lambda _root, _worktree: False
     )

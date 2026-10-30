@@ -159,6 +159,8 @@ async def run_case(case: TurnCase, root: Path, *, emit: Callable[[dict], None] |
         raise ValueError("Replay requires a fresh artifact directory; existing sessions must not affect its oracle")
     started = time.monotonic()
     registry = ToolRegistry(artifact_dir=root / "artifacts")
+    # Recorded responses call the fixture tools by name, as when every tool was sent.
+    registry.disclosure = "full"
     writes: list[str] = []
     reads: list[str] = []
     tool_started = asyncio.Event()

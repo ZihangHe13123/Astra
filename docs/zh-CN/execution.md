@@ -6,23 +6,30 @@
 
 配置工具运行位置、文件访问范围及审批方式。
 
-## Team 状态与待命成员
+## 子代理
 
-同一 session 可以直接用 `team(action="status", team_id=...)` 查看旧回合的 Team，无需先 resume。
-发送任务或配置 Team 时，会复用原有的所有权和工作区检查，自动接管已结束的旧回合；仍在运行的父任务不能被抢占，查看状态不会转移控制权。
+`delegate_task` 派出子代理，一个或一批（`tasks`）。每个子代理在对话里有名字，用 `name` 指定或自动生成（`explorer-1`、`worker-2`），
+并在整段对话里一直保留：汇报后空闲等待，不占内存也不占名额；`delegate_send(to=<名字>, message=...)` 给它新任务，它从保存的对话接着做，
+之前的请求原样成为下一次请求的开头。发给正在工作的子代理的消息，会在它下一步之前送到。
+上一步结果未知（比如写到一半被打断）的子代理不会被消息唤起，`recover=true` 让它只读恢复。
+`delegate_cancel` 停下它当前的工作，`close=true` 让它在本对话里结束；`delegate_list` 列出全部子代理，`delegate_wait` 等汇报或消息（指定 `subagents` 时只等这些子代理的汇报，任何子代理写来的消息照样送到，其他汇报留待正常送达）。后端重启后也能按名字关闭子代理，不会为此再运行它。
+同一会话后面的回合可以继续使用前面回合派出的子代理。
 
-状态默认精简返回；`team` 和 `team_wait` 可加 `detail=true` 展开完整初始上下文、任务文字和可用的 episode 历史。
-创建时指定 `keep_alive_limit=5`，或调用 `team(action="configure", team_id=..., keep_alive_limit=5)`，即可即时、持久地设置该 Team 有多少成员留在内存里待机。
-未设置时继承 `ASTRA_TEAM_KEEP_ALIVE_LIMIT`（默认 2）；零表示不再接纳待机成员，降低容量不会强退已经待机的成员。
-放不下的成员，或待机超过 `ASTRA_TEAM_IDLE_TIMEOUT_SECONDS`（默认 1800 秒）的成员，会停止运行，但对话保留：lead 下次给它发消息，它就从停下的地方接着做，后端重启后也一样。成员在整个会话内有效。
+子代理用 `delegate_send(to="parent")` 写给父 agent，消息在父 agent 的两步之间进入它的对话，正在等待的父 agent 也会被唤醒。
+同一 `group` 的子代理可以按名字互发消息；没有 group 的只能写给父 agent。子代理只在工作时读消息。
+`isolation=worktree` 的 worker 在多次任务之间保留自己的 worktree（`.astra/delegate-worktrees/<id>`）：
+没有改动的会在任务结束后移除，下次在同一路径重新建出。
 
-子 agent 没有回合上限。模型不再调用工具而直接回答、被停止、或时间用完时，一次运行才结束（`timeout` 默认 1800 秒、最多 14400 秒，从拿到执行名额起计；团队成员按每个任务分别计）。同时最多运行 16 个（`ASTRA_DELEGATE_CONCURRENCY`）。
-子 agent 的历史和主 agent 一样压缩。发给正在工作的成员的消息，会在它下一步之前送到；成员发给 `lead` 的消息会在父 agent 的两步之间进入它的对话，正在等成员的父 agent 也会被唤醒。在 Work 会话里，父 agent 一轮结束时不再等后台成员，见[后台工作结束时](session-lifecycle.md#后台工作结束时)。
+子 agent 没有回合上限。模型不再调用工具而直接回答、被停止、或时间用完时，一次运行才结束（`timeout` 默认 1800 秒、最多 14400 秒，每个任务分别计，从拿到执行名额起计）。同时最多运行 16 个（`ASTRA_DELEGATE_CONCURRENCY`）。
+子 agent 的历史和主 agent 一样压缩。在 Work 会话里，父 agent 一轮结束时不再等后台子代理，见[后台工作结束时](session-lifecycle.md#后台工作结束时)。
+
+早期版本的 Agent Team（`team`、`team_spawn`、`team_send`、`team_wait`、`team_inbox`、`team_task`、`team_restart`）和 `delegate_poll` 已并入以上工具。
+工具清单里已有它们的旧对话仍能调用；新对话不再提供。
 
 成员的 `lifecycle` 记录退出原因、实际限额、最近待机起点与截止值，以及单调时钟的活跃/待机时长和实际经过的时间。
 `observed_at` 标识诊断快照时间，运行和待机期间在状态切换时保存。主机睡眠可能让实际时间继续经过，而单调时钟暂停。
 异常恢复后的 `recovered_at` 是发现时间，计时保留最后一次持久记录，不推测实际死亡时间。清理进程日志不会删除这些诊断。
-`team_restart` 清空旧轮的运行决定，从成员保存的对话接着做；上一步结果未知时只能读取和汇报。没有保存对话的成员从有限检查点重新开始。
+没有保存对话的子代理从执行记录的有限检查点重新开始（`delegate_send` 加 `recover=true`）。
 
 ## Shell 结果与完整输出
 
@@ -106,6 +113,7 @@ macOS 示例：
 - `TOOL_MAX_INLINE_CHARS=12000` 限制持久历史中的首尾预览，完整结果保存到 `TOOL_RESULT_DIR`。新结果在紧接着的一次模型迭代中最多完整展示 `TOOL_MAX_FRESH_RESULT_CHARS=100000` 字符，之后回到预览。base64/data URL 等不透明载荷不会作为大段文字内联。
 - `TOOL_FAILURE_THRESHOLD=3` 在等价错误连续出现后打开单工具熔断，并禁用工具做最后一次综合回答。
 - `PROMPT_CACHE_STABLE_TOOLS=1` 在工作会话中保持一份稳定的模型工具清单；预算和熔断仍在执行阶段检查，不在 ReAct 迭代间删除 schema。
+- `ASTRA_TOOL_DISCLOSURE=deferred`（默认）时只发一小组常驻工具（`agent/runtime/tools/disclosure.py` 里的 `CORE_TOOLS`，个别对话类型再加几个）和 `tool_search`、`call_tool`；设为 `full` 则照旧发全部默认工具。其余工具照常注册、照常执行：`tool_search` 按功能族列出它们，并把完整定义作为结果返回；`call_tool` 再以工具本名运行它，审批、重复调用保护、事件和界面看到的都是这个工具。本对话里没拿到定义就调用的工具不会运行，结果里会把定义交给模型。一段对话的工具清单始终不变（见 specs/tool-disclosure.md）。
 - 设为 `PROMPT_CACHE_STABLE_TOOLS=0` 后，可用 `TOOL_PROGRESSIVE_EXPOSURE=1` 恢复旧核心/相关工具组及 `activate_tool_group`，以缩小首次未缓存提示，但会增加前缀缓存失效。
 - `AGENT_TOOL_EXPOSE` 和 `AGENT_TOOL_HIDE` 接受逗号分隔的工具名。前者把默认不开放的工具加入清单：`conclave`（不开放也能用 `/conclave` 命令）、`notebook_execute`、`skills_list`（提示中的 `<available-skills>` 已列出技能）、`project_verifier_init`、`git_pull`、`git_reset`、`git_revert`、`extract_url` 和 `browser_extract`（读网页用 `fetch_url` 和 `web_extract`，渲染页面用浏览器工具）以及 `search_status`；后者从清单中去掉默认工具。同一工具同时出现在两者中时保持隐藏。明确列出这些工具的模式和工作流仍可使用它们。
 - `AGENT_MAX_REACT_ITERATIONS=50` 为整轮设置粗粒度上限；`0` 表示无固定次数上限，重复调用、熔断、提示预算和取消检查仍有效。

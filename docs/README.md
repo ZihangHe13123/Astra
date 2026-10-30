@@ -49,7 +49,7 @@ The source preview is available; full feature and native platform acceptance rem
 | Tool order, turn deadlines and fault replay | [Turn reliability](runtime/turn-reliability.md) |
 | Provider streams, prompt reuse and client recovery | [Provider reliability](provider-reliability.md) |
 | Shared capture logic and platform adapters | [Appshot architecture](appshot-architecture.md) |
-| Delegation, Team budgets and lifecycle | [Worker runtime](design/worker-runtime-v1.md) |
+| Delegation and subagent lifecycle | [Worker runtime](design/worker-runtime-v1.md) |
 | Isolated minimal sessions | [Minimal mode](design/minimal-mode.md) |
 | Approval requests inside programmatic tool calls | [PTC approval bridge](design/ptc-approval-bridge.md) |
 

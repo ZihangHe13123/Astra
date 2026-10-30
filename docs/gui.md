@@ -112,11 +112,12 @@ back and tells you, and the desktop and a paired phone are notified.
   context (including the agent's current plan). Missing/expired snapshots and unconfirmed
   changes are labelled separately. Large text previews are bounded; use **系统打开** for
   the complete file.
-- **子代理** in that panel holds every subagent of the conversation: a Team's members under
-  the Team, each on its latest run (status, time, the tool it is calling, unread messages,
-  its result and full record) with earlier runs folded, the Team's tasks, then one-off
-  delegations. The subagent summary in the conversation opens it, and a dot on the tab
-  means one is still going.
+- **子代理** in that panel holds every subagent of the conversation by name, each on its
+  latest run (status, time, the tool it is calling, its result and full record) with earlier
+  runs folded; those of one group, which may write to each other, are shown together, and an
+  ended one is marked 已结束. Agent Teams of earlier conversations and runs without a name
+  follow. The subagent summary in the conversation opens it, and a dot on the tab means one
+  is still going.
 - **命令与功能** exposes all current TUI command roots with optional parameters.
   `/tool N` and `/gallery N` locate a recorded result. Commands such as `/memory`,
   `/skills`, `/tasks` and `/diagnostics` currently use compatibility forms and the
@@ -223,6 +224,71 @@ any `.html` file can be previewed as a page from the Files panel.
 
 Pages are a desktop feature. The model learns of them from the same `interactive-cards` skill as
 cards, so the same notes on the skill catalog apply.
+
+## Canvases
+
+A canvas is a work shown beside the conversation, drawn by Astra's own template from what the model
+writes: a slide deck or a document. Every change to its content is kept as a version.
+
+### Slide decks
+
+A slide deck is a canvas: a folder `<name>.canvas` in the workspace with `canvas.json` (its type
+and title), `slides.html` and `assets/` (specs/canvas.md). The model makes one with the `canvas`
+tool, which hands it the deck's format, then writes the slides with the ordinary file tools: one
+`<section class="slide">` per slide, a 1920 x 1080 page each, in a few layouts (title, section,
+columns, image, quote) with a theme of CSS variables. The deck's look, the list beside the
+conversation, presenting and printing are Astra's own code; the model writes only the slides.
+
+- When the deck is made, and after each change to any of its files, the Files panel shows it as a
+  list of its slides with their numbers. Click a slide to present: one slide at a time, the arrow
+  keys and Space move, Escape goes back. **放大** gives the deck the whole window first.
+- **源码** shows `slides.html` as the model wrote it.
+- Images go in `assets/` and are named `assets/<file>` in the slides: PNG, JPEG, GIF, WebP or SVG,
+  up to 8 MiB each. Nothing loads from the network. An image that cannot be shown is listed above
+  the deck.
+- The model looks at a slide with `canvas_look`: the desktop draws that slide at its own size, out
+  of sight, in the same isolated frame, and hands the model the picture at 1280 x 720. Looking
+  needs no approval.
+- `canvas` with `action="export"` prints the deck to `<name>.canvas/exports/<name>.pdf`: one
+  16:9 page per slide, with selectable text. The print runs in a window nobody sees, as a
+  document of its own under the frame's policy and in an opaque origin, with WebRTC removed.
+- With `format="pptx"` it writes `<name>.pptx` there instead: one full-slide picture per slide at
+  1920 x 1080, each slide's heading as the picture's description for screen readers, and the
+  slide's `<aside class="notes">` as its speaker notes. The text cannot be edited in PowerPoint.
+  This needs python-pptx (the `documents` extra, included in the desktop package).
+- Slides run under the same rules as a page: no access to Astra, no network, no storage, no
+  pop-ups, no navigation.
+- Everything of a canvas is read and written inside its folder, where that really is: content,
+  images, versions or exports reached through a link out of the folder are refused.
+
+### Documents
+
+A document canvas holds `doc.md` instead of the slides: an ordinary Markdown document that the model
+writes section by section with the `doc_*` tools (the "documents" family of `tool_search`).
+
+- The Files panel shows it rendered, with its outline above: click a heading to go to it. Open
+  review comments are listed on top.
+- Select a passage and write what should change: **写进文档** writes the comment into `doc.md` as
+  `<!-- @astra: ... -->` right after the passage (at the end of its line when the Markdown spells
+  it differently, at the end of the document when it cannot be found; never inside a heading or a
+  code block). Ask Astra to handle the comments; `doc_comments` lists them and the model resolves
+  each one with `doc_edit`.
+- Export with `doc_export` (Word, PDF or HTML), as for any Markdown document. `canvas_look` and the
+  canvas's own export are for decks.
+
+### Versions
+
+The content file (`slides.html` or `doc.md`) is copied to `.versions/NNNN/` with a `meta.json`
+(time, what made it, its SHA-256) when the canvas is made, after each successful write into it
+by a tool, after a comment and after a restore. A version identical to the last one is not kept
+again; the 30 newest are kept. **版本** lists them, newest first; click one to see it in place
+of the current content, then **恢复成这个版本** or **回到现在**. A restore writes the old content back
+as a new version, after keeping the current content if no version holds it yet, so nothing is lost
+by restoring. Images in `assets/` are not versioned.
+
+Canvases are a desktop feature; the `canvas` and `canvas_look` tools are offered only to the
+desktop's backends, as tools loaded on demand (the "canvas" family of `tool_search`). On a paired
+phone a canvas is not shown yet, and comments and versions are desktop-only.
 
 ## Command help while typing
 

@@ -9,6 +9,7 @@
     "group_require_mention": true,
     "wake_prefixes": ["/"],
     "allow_users": [],
+    "owner_users": [],
     "allow_groups": [],
     "max_input_chars": 8000,
     "max_output_chars": 1800,

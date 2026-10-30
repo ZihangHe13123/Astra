@@ -8,6 +8,7 @@ import { initialSession, projectEvent, type UIEvent, type SessionState } from "@
 import { createBackendEventReceiver, EventDeliveryState } from "@astra/ui-core/backend-protocol";
 import { modeCommand } from "../local-mode.js";
 import { createBackendHandshake } from "@astra/ui-core/backend-handshake";
+import type { SnapshotOptions } from "./page-snapshot-state.js";
 
 /** A local preflight refusal proves that no bytes for this request were written. */
 class BackendWriteRefused extends Error {}
@@ -18,8 +19,8 @@ export class Runtime {
   initialModeSession = "";
   /** Opens a conversation in a project for the personal thread to hand a task to. Set for that thread alone. */
   openConversation?: (where: string) => Promise<{ session: string; workspace: string }>;
-  /** Draws the page at a path and says where its picture is. Set by the host; the backend asks through it. */
-  pageSnapshot?: (path: string) => Promise<{ path: string; width: number; height: number; pageHeight: number; scriptError: string }>;
+  /** Draws the page at a path and says where its picture is; for a canvas, one slide, or a print of it. Set by the host; the backend asks through it. */
+  pageSnapshot?: (path: string, options?: SnapshotOptions) => Promise<{ path: string; width: number; height: number; pageHeight: number; scriptError: string; paths?: string[] }>;
   private child?: ChildProcessWithoutNullStreams;
   private scope = `gui-${randomUUID()}`;
   private delivery = new EventDeliveryState();
@@ -133,8 +134,13 @@ export class Runtime {
     let answer: Record<string, unknown>;
     try {
       if (!this.pageSnapshot || typeof request.path !== "string") throw new Error("桌面端现在不能渲染页面。");
-      const picture = await this.pageSnapshot(request.path);
-      answer = { image_path: picture.path, width: picture.width, height: picture.height, page_height: picture.pageHeight, script_error: picture.scriptError };
+      const options: SnapshotOptions = {
+        ...(Number.isSafeInteger(request.slide) && request.slide > 0 ? { slide: request.slide } : {}),
+        ...((request.export === "pdf" || request.export === "slides") && typeof request.target === "string" ? { export: request.export as "pdf" | "slides", target: request.target } : {}),
+      };
+      const picture = await this.pageSnapshot(request.path, options);
+      answer = options.export === "slides" ? { file_path: picture.path, paths: picture.paths ?? [] } : options.export ? { file_path: picture.path }
+        : { image_path: picture.path, width: picture.width, height: picture.height, page_height: picture.pageHeight, script_error: picture.scriptError };
     } catch (error) { answer = { error: error instanceof Error ? error.message : String(error) }; }
     // A backend that has gone is no longer waiting for the answer.
     try { this.write({ type: "page_snapshot_response", request_id: request.request_id, ...answer }); } catch { /* nothing waits */ }

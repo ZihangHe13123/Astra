@@ -126,7 +126,8 @@ def test_web_tools_recheck_proxy_route_per_request(monkeypatch):
 
     monkeypatch.setenv("WEB_URL_CACHE_TTL", "0")
     monkeypatch.setattr(web_module, "active_proxy_for_url", lambda _url: next(routes))
-    monkeypatch.setattr(web_module.httpx, "AsyncClient", Client)
+    from http_page_fixture import install_page_client
+    install_page_client(monkeypatch, web_module, Client)
     monkeypatch.setattr(web_module, "_is_safe_public_url", safe_url)
 
     async def scenario():

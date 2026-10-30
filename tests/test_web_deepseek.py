@@ -57,9 +57,21 @@ def _mock_transport(monkeypatch, handler):
     seen: list[_Seen] = []
     real_client = httpx.AsyncClient
 
+    async def fixture_target(url):
+        parsed = httpx.URL(url)
+        return "93.184.216.34", parsed.netloc.decode()
+
+    monkeypatch.setattr("agent.runtime.public_fetch.resolve_page_target", fixture_target)
+
     def answer(request: httpx.Request) -> httpx.Response:
+        if request.extensions.get("sni_hostname"):
+            request.url = request.url.copy_with(host=request.extensions["sni_hostname"])
         seen.append(_Seen(request))
-        return handler(request)
+        response = handler(request)
+        if response.is_stream_consumed:
+            return httpx.Response(response.status_code, headers=response.headers,
+                                  stream=httpx.ByteStream(response.content))
+        return response
 
     def client(*args, **kwargs):
         kwargs.pop("proxy", None)

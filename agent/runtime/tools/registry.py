@@ -21,8 +21,10 @@ from ..metrics import runtime_metrics
 from ..tool_failure import ToolFailure
 from ..tool_execution import ExecutionFailure, ExecutionResult, PartialResult, StateChanged
 from ..tracing import trace_span
+from .disclosure import CORE_TOOLS, DISPATCH_TOOLS, SEARCH_TOOL, DisclosureResult, catalog, disclosure_mode
 from .grants import DECISIONS, GrantLedger, granted_keys, request_keys, rule_key
 from .policy import VALID_RISKS, ToolPolicy, policy_call_scope
+from .access_scope import tool_access_scope
 
 logger = logging.getLogger(__name__)
 
@@ -307,6 +309,10 @@ class ToolRegistry:
         # AGENT_TOOL_HIDE removes default ones (hide wins when both name a tool).
         self._exposed_tool_names = self._tool_names_env("AGENT_TOOL_EXPOSE")
         self._hidden_tool_names = self._tool_names_env("AGENT_TOOL_HIDE")
+        # ``deferred`` sends only the core set plus tool_search and call_tool (tools/disclosure.py); a
+        # conversation kind may keep a few more tools at hand (add_core_tools).
+        self.disclosure = disclosure_mode()
+        self._extra_core: set[str] = set()
 
     def set_approval_handler(self, handler: ApprovalHandler | None) -> None:
         """Attach an interactive approval broker supplied by a frontend."""
@@ -920,6 +926,29 @@ class ToolRegistry:
     def schema_revision(self) -> int:
         return self._schema_revision
 
+    def add_core_tools(self, names: AbstractSet[str]) -> None:
+        """Keep these tools in every request of this process's conversations when disclosure is deferred."""
+        added = set(names) - self._extra_core
+        if added:
+            self._extra_core |= added
+            self._schema_revision += 1
+
+    def is_deferred(self, name: str) -> bool:
+        """A default tool whose schema reaches the model only through tool_search."""
+        tool = self._tools.get(name)
+        return (
+            self.disclosure == "deferred"
+            and tool is not None
+            and tool.expose_by_default
+            and name not in DISPATCH_TOOLS
+            and name not in CORE_TOOLS
+            and name not in self._extra_core
+        )
+
+    def deferred_tools(self) -> list[ToolDef]:
+        return sorted((tool for tool in self._tools.values() if self.is_deferred(tool.name)),
+                      key=lambda tool: tool.name)
+
     def get(self, name: str) -> ToolDef | None:
         return self._tools.get(name)
 
@@ -943,6 +972,9 @@ class ToolRegistry:
         names: AbstractSet[str] | None = None,
         groups: AbstractSet[str] | None = None,
     ) -> list[dict]:
+        hidden = self.deferred_tools() if self.disclosure == "deferred" and names is None else []
+        # Without anything to load, there is nothing for the dispatch pair to stand in for.
+        deferred = bool(hidden)
         tools = [
             tool for tool in self._tools.values()
             if (
@@ -951,6 +983,8 @@ class ToolRegistry:
                     names is None
                     and tool.expose_by_default
                     and (groups is None or tool.group in groups)
+                    # The dispatch pair stands in for the deferred tools, and only then.
+                    and (deferred if tool.name in DISPATCH_TOOLS else not self.is_deferred(tool.name))
                 )
             )
         ]
@@ -958,7 +992,7 @@ class ToolRegistry:
         # byte-stable across plugin/MCP/skill registration order, matching
         # dsh's prompt-cache discipline.
         tools.sort(key=lambda tool: tool.name)
-        return [
+        schemas = [
             {
                 "type": "function",
                 "function": {
@@ -969,6 +1003,17 @@ class ToolRegistry:
             }
             for tool in tools
         ]
+        if deferred:
+            # tool_search names the families it can load: the catalog is part of its schema, so it is
+            # frozen with the conversation's tool list.
+            lines, families = catalog(hidden)
+            for schema in schemas:
+                function = schema["function"]
+                if function["name"] == SEARCH_TOOL:
+                    function["description"] = function["description"] + lines
+                    function["parameters"] = copy.deepcopy(function["parameters"])
+                    function["parameters"]["properties"]["family"]["enum"] = families
+        return schemas
 
     def activation_tool_schema(self) -> dict | None:
         groups = [group for group in self.groups if group != "core"]
@@ -1093,6 +1138,10 @@ class ToolRegistry:
             except Exception:
                 logger.exception("tool progress callback failed name=%s stage=%s", name, stage)
 
+        allowed = tool_access_scope.get()
+        if allowed is not None and name not in allowed:
+            return {"output": "", "error": f"[ToolScopeDenied] {name} is unavailable to this caller",
+                    "code": "caller_scope_denied", "not_executed": True, "recoverable": False}
         tool = self._tools.get(name)
         if not tool:
             visible = sorted(item.name for item in self._tools.values() if item.expose_by_default)
@@ -1538,6 +1587,8 @@ class ToolRegistry:
                             result_persistence=tool.result_persistence,
                         )
                         success_result = {**shaped, "error": "", "duration_ms": duration_ms, "risk": tool.risk}
+                        if isinstance(result, DisclosureResult):
+                            success_result["_tool_disclosures"] = list(result.names)
                         if isinstance(result, ExecutionResult):
                             success_result["execution"] = dict(result.execution)
                         if isinstance(result, PartialResult):

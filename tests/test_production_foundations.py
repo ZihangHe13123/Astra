@@ -546,9 +546,19 @@ class FakeSession:
         return FakeResult()
 
 
+def _approved_mcp_registry(*args, **kwargs):
+    # Namespace/content fixtures intentionally authorize their synthetic remote operations.
+    # Unknown-operation denial is verified separately by test_mcp_unknown_permissions.
+    registry = ToolRegistry(*args, **kwargs)
+    async def approve(request):
+        return "once"
+    registry.set_approval_handler(approve)
+    return registry
+
+
 def test_mcp_tools_are_namespaced_and_execute_through_registry():
     assert mcp_tool_name("demo server", "lookup/item") == "mcp__demo_server__lookup_item"
-    registry = ToolRegistry(ToolPolicy(mode="permissive"))
+    registry = _approved_mcp_registry(ToolPolicy(mode="permissive"))
     manager = MCPManager(max_output_chars=100)
     manager._register_tools(registry, "demo server", FakeSession(), [FakeRemoteTool()], {})
 
@@ -568,7 +578,7 @@ class FakeErrorSession:
 
 
 def test_mcp_is_error_becomes_structured_tool_failure():
-    registry = ToolRegistry(ToolPolicy(mode="permissive"))
+    registry = _approved_mcp_registry(ToolPolicy(mode="permissive"))
     manager = MCPManager(max_output_chars=100)
     manager._register_tools(registry, "demo server", FakeErrorSession(), [FakeRemoteTool()], {"risk": "read"})
 
@@ -600,7 +610,7 @@ class FakeImageSession:
 
 
 def test_mcp_image_content_becomes_astra_image_attachment(tmp_path):
-    registry = ToolRegistry(ToolPolicy(mode="permissive"), artifact_dir=tmp_path)
+    registry = _approved_mcp_registry(ToolPolicy(mode="permissive"), artifact_dir=tmp_path)
     manager = MCPManager(max_output_chars=100)
     manager._register_tools(registry, "demo server", FakeImageSession(), [FakeRemoteTool()], {})
 
@@ -624,7 +634,7 @@ class _OneResultSession:
 
 
 def _mcp_call(tmp_path, content, **result):
-    registry = ToolRegistry(ToolPolicy(mode="permissive"), artifact_dir=tmp_path)
+    registry = _approved_mcp_registry(ToolPolicy(mode="permissive"), artifact_dir=tmp_path)
     manager = MCPManager(tmp_path / "mcp.json", max_output_chars=1000)
     manager._register_tools(
         registry, "demo server", _OneResultSession(content, **result), [FakeRemoteTool()], {"risk": "read"},
@@ -738,7 +748,7 @@ def test_mcp_error_names_the_tool_the_model_can_call(tmp_path):
 
 
 def test_mcp_include_and_exclude_tools_limit_registration():
-    registry = ToolRegistry(ToolPolicy(mode="permissive"))
+    registry = _approved_mcp_registry(ToolPolicy(mode="permissive"))
     manager = MCPManager()
     tools = [FakeRemoteTool(name="allowed"), FakeRemoteTool(name="blocked"), FakeRemoteTool(name="other")]
 
@@ -796,7 +806,7 @@ class _ListedSession:
 
 def _mcp_listing(tmp_path, server, tools, *, manager=None, registry=None, config=None):
     """List, register and publish the status the way a server's tool-list change does."""
-    registry = registry or ToolRegistry(ToolPolicy(mode="permissive"), artifact_dir=tmp_path)
+    registry = registry or _approved_mcp_registry(ToolPolicy(mode="permissive"), artifact_dir=tmp_path)
     manager = manager or MCPManager(tmp_path / "mcp.json")
     session = _ListedSession(tools)
     manager._registry = registry
@@ -873,7 +883,7 @@ def test_mcp_long_tool_name_is_shortened_to_the_same_valid_name_every_time(tmp_p
 
 
 def test_mcp_error_from_a_shortened_tool_names_the_registered_tool(tmp_path):
-    registry = ToolRegistry(ToolPolicy(mode="permissive"), artifact_dir=tmp_path)
+    registry = _approved_mcp_registry(ToolPolicy(mode="permissive"), artifact_dir=tmp_path)
     manager = MCPManager(tmp_path / "mcp.json")
     failing = _OneResultSession([type("ErrorText", (), {"text": "No such thread"})()], is_error=True)
     manager._register_tools(
@@ -996,7 +1006,7 @@ def test_mcp_text_added_for_an_altered_name_can_be_sent_to_a_model(tmp_path):
 
 
 def test_mcp_approval_of_one_colliding_tool_does_not_cover_the_other(tmp_path):
-    registry = ToolRegistry()
+    registry = _approved_mcp_registry()
     manager = MCPManager(tmp_path / "mcp.json")
     session = _ListedSession()
     manager._register_tools(
@@ -1019,12 +1029,12 @@ def test_mcp_approval_of_one_colliding_tool_does_not_cover_the_other(tmp_path):
 
 
 def test_mcp_tools_that_send_or_delete_are_asked_every_call_and_show_their_draft(tmp_path):
-    registry = ToolRegistry()
+    registry = _approved_mcp_registry()
     manager = MCPManager(tmp_path / "mcp.json")
     session = _ListedSession()
     manager._register_tools(registry, "mail", session, [FakeRemoteTool(name="send_email"),
                                                          FakeRemoteTool(name="delete_thread"),
-                                                         FakeRemoteTool(name="list_threads")], {})
+                                                         FakeRemoteTool(name="list_threads")], {"tool_risks": {"list_threads": "read"}})
     requests = []
 
     async def decide(request):
@@ -1086,7 +1096,7 @@ def test_mcp_startup_and_reconnect_keep_a_server_with_flawed_tool_names(tmp_path
     config = tmp_path / "mcp.json"
     config.write_text(json.dumps({"servers": {name: {"command": "demo"} for name in offered}}), encoding="utf-8")
     manager = FakeServers(config)
-    registry = ToolRegistry(ToolPolicy(mode="permissive"), artifact_dir=tmp_path)
+    registry = _approved_mcp_registry(ToolPolicy(mode="permissive"), artifact_dir=tmp_path)
 
     run(manager.load(registry))
 
@@ -1183,7 +1193,7 @@ def test_mcp_report_bounds_the_list_of_renamed_and_skipped_tools(tmp_path):
 
 def test_mcp_image_from_a_tool_with_a_long_name_is_saved(tmp_path):
     name = "render/" + "chart." * 60
-    registry = ToolRegistry(ToolPolicy(mode="permissive"), artifact_dir=tmp_path)
+    registry = _approved_mcp_registry(ToolPolicy(mode="permissive"), artifact_dir=tmp_path)
     manager = MCPManager(tmp_path / "mcp.json")
     manager._register_tools(registry, "demo", FakeImageSession(), [FakeRemoteTool(name=name)], {})
 
