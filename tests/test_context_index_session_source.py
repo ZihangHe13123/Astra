@@ -15,6 +15,8 @@ from agent.runtime.context_index.sqlite_reader import open_readonly, set_read_wi
 from agent.runtime.context_index.workspace import WorkspaceIdentity
 from agent.runtime.session_recall import SessionRecall
 
+pytestmark = pytest.mark.usefixtures("unhurried_context_readers")
+
 NOW = 1_800_000_000.0
 WORKSPACE = WorkspaceIdentity(
     key="/work/astra-master",

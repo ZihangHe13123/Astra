@@ -11,6 +11,8 @@ from agent.runtime.context_index.activity_source import ActivityRecommendationRe
 from agent.runtime.context_index.habits import HabitAggregator
 from agent.runtime.context_index.workspace import WorkspaceIdentity
 
+pytestmark = pytest.mark.usefixtures("unhurried_context_readers")
+
 UTC_WORKSPACE = WorkspaceIdentity(
     key="/users/test/astra-master",
     root="/Users/test/astra-master",

@@ -6,6 +6,8 @@ import json
 import sqlite3
 from dataclasses import replace
 
+import pytest
+
 from agent.runtime.context_index.broker import ContextIndexBroker
 from agent.runtime.context_index.feedback import FeedbackStore, item_key, scope_key
 from agent.runtime.context_index.record_source import RecordSource
@@ -16,6 +18,7 @@ from agent.runtime.context_index.models import RecommendationCandidate, SourceLo
 from agent.runtime.context_index.query import plan_query
 from agent.runtime.context_index.selection import select_rows
 
+pytestmark = pytest.mark.usefixtures("unhurried_context_readers")
 
 NOW = datetime(2026, 9, 8, 10, tzinfo=UTC)
 

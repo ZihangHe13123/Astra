@@ -12,6 +12,7 @@ from agent.runtime.context_index.lexical import LexicalQuery
 from tests.test_context_index_lexical import NOW, _read_source
 from tests.test_context_index_native import candidate
 
+pytestmark = pytest.mark.usefixtures("unhurried_context_readers")
 
 @pytest.mark.parametrize("text", [
     "早上好", "早上好呀～", "早安", "早安呀！", "上午好", "中午好", "午安",
