@@ -188,6 +188,32 @@ class MailService:
             raise MailError("message_not_found", "Cached message was not found", 4)
         return {"item": item, **self._result_metadata(report, canonical)}
 
+    def folder_state(self, folder: str) -> Any:
+        """What the last look at one folder found (its generation, and whether that look succeeded), from the cache."""
+        self._require_cache()
+        try:
+            return self.store.folder_state(self._account(), resolve_folder(folder, self.config.sent_folder))
+        except sqlite3.Error as error:
+            raise self._mail_error(error) from None
+
+    def after(self, folder: str, uid: int, *, uidvalidity: int, limit: int = 100) -> list[dict[str, object]]:
+        """Cached messages of one folder generation numbered above `uid`, oldest first."""
+        self._require_cache()
+        try:
+            return self.store.after(self._account(), resolve_folder(folder, self.config.sent_folder), uidvalidity, uid,
+                                    limit=limit)
+        except sqlite3.Error as error:
+            raise self._mail_error(error) from None
+
+    def newest_uid(self, folder: str, *, uidvalidity: int) -> int:
+        """The highest message number cached for one folder generation; 0 for an empty folder."""
+        self._require_cache()
+        try:
+            uids = self.store.known_uids(self._account(), resolve_folder(folder, self.config.sent_folder), uidvalidity)
+        except sqlite3.Error as error:
+            raise self._mail_error(error) from None
+        return max(uids, default=0)
+
     def folders(self, *, refresh: bool = True) -> dict[str, object]:
         if not refresh:
             states = self._folder_states()

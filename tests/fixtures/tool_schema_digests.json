@@ -404,9 +404,9 @@
   },
   "mail": {
     "sha256": [
-      "66adf4068775754c"
+      "069ceea32f0928d4"
     ],
-    "reason": "2026-10-25: new tool; the person's own mailbox, read-only (recent, search, read, status)."
+    "reason": "2026-10-29 review fix: search and recent give each message a ref (folder, generation, number) and read takes it, since numbers repeat across folders; a stale ref is reported, never read as another message."
   },
   "memory": {
     "sha256": [

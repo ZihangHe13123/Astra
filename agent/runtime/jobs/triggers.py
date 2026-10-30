@@ -1,8 +1,9 @@
 """Event-started jobs: new mail that matches a filter, or a new file in a folder.
 
-The background host looks every few minutes. A trigger's first look only notes where things stand, so
-mail and files that were already there never start a run. Each look queues at most ``MAX_EVENTS``
-runs per job, oldest first, and moves the job's cursor past what it saw in the same transaction.
+The background host looks every few minutes. A trigger's first successful look only notes where things
+stand, an empty folder included, so mail and files that were already there never start a run. Each look
+queues at most ``MAX_EVENTS`` runs per job, oldest first, and moves the job's cursor past what it queued
+or passed over in the same transaction; what is left waits for the next look, so nothing new is dropped.
 """
 
 from __future__ import annotations
@@ -20,6 +21,10 @@ logger = logging.getLogger(__name__)
 
 MAX_EVENTS = 5
 LOOK_SECONDS = 300.0
+# Mail is read past the cursor this many messages at a time, oldest first.
+MAIL_PAGE = 100
+# A file cursor before files were told apart by name: every file at its time counted as seen.
+_EVERY_NAME = "\U0010ffff"
 
 
 def _matches(item: dict[str, Any], trigger: dict[str, str]) -> bool:
@@ -62,11 +67,16 @@ class TriggerWatcher:
             return 0
         if cursor is None:
             return self.store.fire(job["id"], [], repr(now), now=now)
-        since = float(cursor)
-        fresh = sorted((when, entry) for when, entry in files if when > since)[-MAX_EVENTS:]
-        newest = max([since, *(when for when, _ in fresh)])
-        events = [{"type": "file", "path": str(entry), "name": entry.name} for _, entry in fresh]
-        return self.store.fire(job["id"], events, repr(newest), now=now)
+        # Files in (time, name) order: those sharing a time are told apart, so a look that stops among
+        # them goes on from the right one next time.
+        since_text, _, since_name = cursor.partition("|")
+        since = (float(since_text), since_name if "|" in cursor else _EVERY_NAME)
+        fresh = sorted((when, entry.name, entry) for when, entry in files if (when, entry.name) > since)[:MAX_EVENTS]
+        if not fresh:
+            return self.store.fire(job["id"], [], cursor, now=now)
+        events = [{"type": "file", "path": str(entry), "name": name} for _, name, entry in fresh]
+        last_when, last_name, _ = fresh[-1]
+        return self.store.fire(job["id"], events, f"{last_when!r}|{last_name}", now=now)
 
     def _look_at_mail(self, jobs: list[dict], now: float) -> int:
         try:
@@ -78,27 +88,39 @@ class TriggerWatcher:
             return 0
         queued = 0
         for job in jobs:
-            trigger = job["spec"]["trigger"]
             try:
-                items = list(service.recent(folder=trigger["folder"], limit=50, refresh=False)["items"])
-            except Exception:  # noqa: BLE001
-                continue
-            if not items:
-                continue
-            validity = str(items[0].get("uidvalidity"))
-            newest = max(int(item["uid"]) for item in items)
-            cursor = self.store.trigger_cursor(job["id"])
-            seen_validity, _, seen_uid = (cursor or "").partition(":")
-            if cursor is None or seen_validity != validity:
-                # The first look, or a mailbox that renumbered its messages: start from here.
-                queued += self.store.fire(job["id"], [], f"{validity}:{newest}", now=now)
-                continue
-            fresh = sorted((item for item in items if int(item["uid"]) > int(seen_uid or 0) and _matches(item, trigger)),
-                           key=lambda item: int(item["uid"]))[-MAX_EVENTS:]
-            events = [{"type": "mail", "folder": item.get("folder") or trigger["folder"], "uid": int(item["uid"]),
-                       "from": str(item.get("sender") or ""), "subject": str(item.get("subject") or "")} for item in fresh]
-            queued += self.store.fire(job["id"], events, f"{validity}:{max(newest, int(seen_uid or 0))}", now=now)
+                queued += self._look_at_folder_mail(service, job, now)
+            except Exception:  # noqa: BLE001 - this folder could not be read now: look again next time
+                logger.info("mail trigger %s could not look at its folder", job["id"], exc_info=True)
         return queued
+
+    def _look_at_folder_mail(self, service: Any, job: dict, now: float) -> int:
+        trigger = job["spec"]["trigger"]
+        state = service.folder_state(trigger["folder"])
+        cursor = self.store.trigger_cursor(job["id"])
+        seen_validity, _, seen_uid = (cursor or "").partition(":")
+        if state is None or not state.uidvalidity:
+            return 0  # Never looked at successfully: no baseline yet, and nothing taken for new.
+        validity = str(state.uidvalidity)
+        if cursor is None or seen_validity != validity:
+            if state.last_error_code:
+                return 0  # Its last look failed: a baseline waits for one that succeeds.
+            # The first look, or a mailbox that renumbered its messages: start from where it stands, empty or not.
+            newest = service.newest_uid(trigger["folder"], uidvalidity=state.uidvalidity)
+            return self.store.fire(job["id"], [], f"{validity}:{newest}", now=now)
+        last, events = int(seen_uid or 0), []
+        while len(events) < MAX_EVENTS:
+            page = service.after(trigger["folder"], last, uidvalidity=state.uidvalidity, limit=MAIL_PAGE)
+            for item in page:
+                last = int(item["uid"])
+                if _matches(item, trigger):
+                    events.append({"type": "mail", "folder": item.get("folder") or trigger["folder"], "uid": last,
+                                   "from": str(item.get("sender") or ""), "subject": str(item.get("subject") or "")})
+                    if len(events) == MAX_EVENTS:
+                        break
+            if len(page) < MAIL_PAGE:
+                break
+        return self.store.fire(job["id"], events, f"{validity}:{last}", now=now)
 
 
 def _default_mail_service() -> Any:

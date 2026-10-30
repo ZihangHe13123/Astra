@@ -39,7 +39,9 @@ PARAMETERS = {"type": "object", "properties": {
     "sender": {"type": "string", "description": "search: part of the sender's name or address."},
     "unread_only": {"type": "boolean", "description": "recent: only messages not yet read."},
     "limit": {"type": "integer", "minimum": 1, "maximum": 30, "default": 10},
-    "uid": {"type": "integer", "description": "read: the message number from recent or search."},
+    "ref": {"type": "string", "description": "read: a message's ref exactly as recent or search showed it."},
+    "uid": {"type": "integer", "description": "read: a message number in folder (inbox by default); "
+                                             "numbers repeat across folders, so prefer ref."},
 }, "required": ["action"]}
 
 
@@ -50,9 +52,24 @@ def _when(item: dict[str, Any]) -> str:
     return str(item.get("sent_at") or "")
 
 
+def _ref(item: dict[str, Any]) -> str:
+    """Which message this is: a number is unique only within its folder and that folder's generation."""
+    return f"{item.get('folder', '')}:{item.get('uidvalidity', '')}:{item['uid']}"
+
+
+def _parse_ref(ref: str) -> tuple[str, int, int]:
+    folder, _, rest = ref.strip().rpartition(":")
+    folder, _, generation = folder.rpartition(":")
+    try:
+        return folder, int(generation), int(rest)
+    except ValueError:
+        raise ValueError(f"ref {ref!r} is not a ref from recent or search.") from None
+
+
 def _line(item: dict[str, Any]) -> str:
     mark = "unread " if item.get("unread") else ""
-    return f"- #{item['uid']} {_when(item)} {mark}From: {item.get('sender', '')} | Subject: {item.get('subject', '')}"
+    return (f'- #{item["uid"]} ref "{_ref(item)}" {_when(item)} {mark}From: {item.get("sender", "")} | '
+            f'Subject: {item.get("subject", "")}')
 
 
 def _rows(value: object) -> list[dict[str, Any]]:
@@ -70,7 +87,7 @@ def register_mail_tool(registry: ToolRegistry, *, project_root: Path,
     def open_service() -> MailService:
         return service() if service is not None else MailService(load_mail_config(project_root))
 
-    def run(action: str, folder: str, query: str, sender: str, unread_only: bool, limit: int, uid: int) -> str:
+    def run(action: str, folder: str, query: str, sender: str, unread_only: bool, limit: int, uid: int, ref: str) -> str:
         mailbox = open_service()
         folder = folder.strip()
         if action == "status":
@@ -88,10 +105,23 @@ def register_mail_tool(registry: ToolRegistry, *, project_root: Path,
                 raise ValueError("search needs query or sender.")
             result = mailbox.search(query, sender=sender, folder=folder or None, limit=limit)
             found = _rows(result.get("items"))
-            return "\n".join([f"{OUTSIDE}\n{len(found)} match(es).", *(_line(item) for item in found)]) + _stale(result)
-        if not uid:
-            raise ValueError("read needs uid from recent or search.")
-        item = next(iter(_rows([mailbox.read(folder or "INBOX", uid).get("item")])), {})
+            head = f"{OUTSIDE}\n{len(found)} match(es). Read one with its ref: mail(action=\"read\", ref=...)."
+            return "\n".join([head, *(_line(item) for item in found)]) + _stale(result)
+        if ref.strip():
+            # The message the ref names, or none: never another one that has its number now.
+            ref_folder, generation, ref_uid = _parse_ref(ref)
+            try:
+                read = mailbox.read(ref_folder, ref_uid, uidvalidity=generation)
+            except MailError as exc:
+                if exc.code != "message_not_found":
+                    raise
+                raise ValueError(f"The message {ref} is gone from its folder, or the folder was rebuilt; "
+                                 "search again.") from None
+        elif uid:
+            read = mailbox.read(folder or "INBOX", uid)
+        else:
+            raise ValueError("read needs the ref of a message from recent or search.")
+        item = next(iter(_rows([read.get("item")])), {})
         body = str(item.get("body_text") or "")
         clipped = len(body) > BODY_CHARS or item.get("body_truncated")
         attachments = _rows(item.get("attachments"))
@@ -103,11 +133,12 @@ def register_mail_tool(registry: ToolRegistry, *, project_root: Path,
         return "\n".join(lines)
 
     async def mail(action: str, folder: str = "", query: str = "", sender: str = "", unread_only: bool = False,
-                   limit: int = 10, uid: int = 0) -> str:
+                   limit: int = 10, uid: int = 0, ref: str = "") -> str:
         if action not in ACTIONS:
             raise ValueError("Unknown action.")
         try:
-            return await asyncio.to_thread(run, action, folder, query, sender, unread_only, max(1, min(30, limit)), uid)
+            return await asyncio.to_thread(run, action, folder, query, sender, unread_only, max(1, min(30, limit)),
+                                           uid, ref)
         except MailConfigurationError:
             raise ValueError(SETUP) from None
         except MailError as exc:

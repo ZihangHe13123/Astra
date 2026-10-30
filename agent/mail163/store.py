@@ -184,6 +184,20 @@ class MailStore:
             ).fetchall()
         return [self._message_dict(row) for row in rows]
 
+    def after(self, account: str, folder: str, uidvalidity: int, uid: int, *, limit: int) -> list[dict[str, object]]:
+        """Messages of one folder generation numbered above `uid`, oldest first (removed ones left out)."""
+        with self._session() as db:
+            rows = db.execute(
+                f"""
+                SELECT {_MESSAGE_COLUMNS} FROM messages
+                WHERE account = ? AND folder = ? AND uidvalidity = ? AND uid > ? AND remote_removed = 0
+                ORDER BY uid
+                LIMIT ?
+                """,
+                (account, folder, uidvalidity, uid, limit),
+            ).fetchall()
+        return [self._message_dict(row) for row in rows]
+
     def search(
         self,
         account: str,
