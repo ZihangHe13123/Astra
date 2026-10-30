@@ -12,9 +12,11 @@ import uuid
 from pathlib import Path
 
 from . import dependencies
-from .common import LauncherError
+from .common import LauncherError, stop_tree
 from .installation import Installation, discover, runtime_environment
 from .locking import RuntimeLease
+
+STARTUP_SECONDS = 90
 
 
 def launch_gui(install: Installation) -> int:
@@ -41,17 +43,24 @@ def launch_gui(install: Installation) -> int:
                                   "--ready", str(ready)], cwd=install.root, env=env,
                                  stdin=subprocess.DEVNULL, stdout=output, stderr=output,
                                  creationflags=creationflags, start_new_session=os.name != "nt")
-    deadline = time.monotonic() + 20
-    while time.monotonic() < deadline:
+    started = time.monotonic()
+    waiting = False
+    while time.monotonic() < started + STARTUP_SECONDS:
         if ready.is_file():
             ready.unlink(missing_ok=True)
             print("Astra desktop opened. Closing this terminal will not stop the window.")
             return 0
         if child.poll() is not None:
             break
+        if not waiting and time.monotonic() > started + 15:
+            # A first start after an update can be slow, more so on Windows.
+            print("Astra desktop is still starting...", flush=True)
+            waiting = True
         time.sleep(0.1)
     if child.poll() is None:
-        child.terminate()
+        # The supervisor has started Electron and its backends; ending it alone
+        # left them running on Windows.
+        stop_tree(child)
     raise LauncherError(f"Desktop startup did not complete. See {log}")
 
 
