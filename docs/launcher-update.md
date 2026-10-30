@@ -137,6 +137,11 @@ removes that ref. It does not replace working files, synchronize dependencies or
 restart a session. Git object storage may change. Checks can run while Astra is
 active. `--json` provides structured results.
 
+A checkout many updates behind may need a long fetch. In a terminal, Git shows its
+progress; a transfer slower than 1 KB/s for two minutes ends with Git's own error,
+and the whole fetch has 30 minutes. Every command the updater runs has a deadline,
+and one past it is stopped together with every process it started.
+
 Applying an update requires a fast-forward upstream. Local edits to files
 untouched by that upstream change are kept automatically, as are local files
 already identical to the incoming content. When both sides change a file,

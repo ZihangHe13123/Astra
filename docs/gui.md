@@ -38,7 +38,8 @@ future updates. A standalone installer is not included. Linux desktop use is
 experimental; existing Python and TUI platform support is unchanged.
 
 The start command returns after opening the window. Closing the launching terminal
-does not stop the desktop. A second launch for the same installation/data directory
+does not stop the desktop. If the window has not opened within 90 seconds, the
+command ends the desktop and everything it started, and names the startup log. A second launch for the same installation/data directory
 focuses the existing window. Relaunching restores the last active conversation and
 unsent draft without issuing a model request. The project directory is shown in the header; adding
 a project starts its backend with that directory as the tool workspace.

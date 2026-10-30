@@ -9,12 +9,14 @@ from collections.abc import Callable
 from pathlib import Path
 
 from . import dependencies
-from .common import LauncherError, git, run
+from .common import LauncherError, git, git_environment, run
 from .installation import Installation
 from .locking import exclusive, require_idle
 from .local_changes import LocalChanges
 from .services import ServiceMaintenance, pending_services
 from .transaction import Transaction, receipt
+
+FETCH_SECONDS = 1800
 
 
 def require_source(install: Installation) -> None:
@@ -68,7 +70,11 @@ def fetch_target(install: Installation) -> tuple[str, str]:
     remote, ref = configured_target(install)
     temporary_ref = "refs/astra/updates/" + uuid.uuid4().hex
     try:
-        git(install.root, "fetch", "--no-tags", "--no-write-fetch-head", "--", remote, f"{ref}:{temporary_ref}")
+        # A checkout many updates behind, on a slow link, can take many minutes.
+        # Git shows its own progress, and ends a transfer that has stalled.
+        run(["git", "-C", str(install.root), "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=120",
+             "fetch", "--no-tags", "--no-write-fetch-head", "--", remote, f"{ref}:{temporary_ref}"],
+            cwd=install.root, env=git_environment(), timeout=FETCH_SECONDS, capture=False)
         target = git(install.root, "rev-parse", "--verify", f"{temporary_ref}^{{commit}}")
         return target, f"{remote}/{ref.removeprefix('refs/heads/')}"
     finally:
