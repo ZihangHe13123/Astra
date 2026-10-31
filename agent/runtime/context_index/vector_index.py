@@ -70,6 +70,10 @@ class VectorStore:
     def close(self) -> None:
         self._connection.close()
 
+    def _bump_revision(self) -> None:
+        """Run in the writer's transaction: a same-size commit can leave every file stat equal."""
+        self._connection.execute("UPDATE vector_revision SET revision = revision + 1")
+
     def upsert(self, summary_id: str, content_hash: str, vec: Sequence[float]) -> None:
         blob = struct.pack(f"<{len(vec)}f", *vec)
         self._connection.execute(
@@ -81,7 +85,7 @@ class VectorStore:
                    vec = excluded.vec""",
             (summary_id, content_hash, len(vec), blob),
         )
-        self._connection.execute("UPDATE vector_revision SET revision = revision + 1")
+        self._bump_revision()
         self._connection.commit()
 
     def hashes(self) -> dict[str, str]:

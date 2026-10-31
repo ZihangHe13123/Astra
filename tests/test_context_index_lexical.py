@@ -17,6 +17,7 @@ from agent.runtime.context_index.workspace import WorkspaceIdentity
 from agent.runtime.memory import MemoryStore
 from tests.test_context_index_session_source import _add_session, _create_recall_database
 
+pytestmark = pytest.mark.usefixtures("unhurried_context_readers")
 
 NOW = datetime(2026, 9, 8, 10, tzinfo=UTC)
 WORKSPACE = WorkspaceIdentity("astra", "", "astra")

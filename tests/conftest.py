@@ -167,6 +167,23 @@ def warm_native_chrome(request):
 
 
 @pytest.fixture
+def unhurried_context_readers(monkeypatch):
+    """Default Context Index read budgets for tests of what a read returns, not how fast.
+
+    A long pytest process has gen-2 GC pauses past the production 75 ms (79 ms measured on a
+    fast Mac), and one inside a 3 ms read expires its budget and empties the recommendation.
+    The 100 ms vector wait is as tight: a process's first numpy import took about 70 ms of it.
+    Tests of these limits set them explicitly or use a fake clock, and are unaffected.
+    """
+    from agent.runtime.context_index import activity_source
+    from agent.runtime.context_index.session_source import SessionRecommendationSource
+
+    for reader in (activity_source.ActivityRecommendationReader, SessionRecommendationSource):
+        monkeypatch.setitem(reader.__init__.__kwdefaults__, "deadline_ms", 5000)
+    monkeypatch.setattr(activity_source, "_VECTOR_WAIT_SECONDS", 5.0)
+
+
+@pytest.fixture
 def stable_browser_checkout(tmp_path):
     """An isolated source fixture for installer tests, independent of the runner's worktree path."""
     from pathlib import Path

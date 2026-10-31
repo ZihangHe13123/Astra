@@ -1,7 +1,9 @@
 import json
 import sqlite3
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +15,8 @@ from agent.runtime.context_index.activity_source import ActivityRecommendationRe
 from agent.runtime.context_index.models import SourceLocator
 from agent.runtime.context_index.workspace import WorkspaceIdentity
 from agent.runtime.tools import activity as activity_tool
+
+pytestmark = pytest.mark.usefixtures("unhurried_context_readers")
 
 
 @pytest.fixture(autouse=True)
@@ -345,6 +349,29 @@ def test_fts_relevance_keeps_later_workspace_match_ahead_of_global_crowding(tmp_
     assert result.relevance[0].native_query_rank != 0.0
 
 
+def test_stall_past_the_read_budget_is_a_reported_deadline_outside_these_ranking_tests(
+    activity_db: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Ubuntu gate 2026-10-29: a stall in a 3 ms read left relevance empty. The product
+    # reports that as a deadline; tests of ranking must not depend on it happening.
+    clock = [0.0]
+    monkeypatch.setattr(sqlite_reader, "time", SimpleNamespace(perf_counter=lambda: clock[0]))
+    cache_state = ActivityRecommendationReader._cache_state
+
+    def stalled(*args):
+        clock[0] += 0.08
+        return cache_state(*args)
+
+    monkeypatch.setattr(ActivityRecommendationReader, "_cache_state", staticmethod(stalled))
+
+    production = ActivityRecommendationReader(activity_db, deadline_ms=75).recommend("Astra", WORKSPACE, NOW)
+    assert production.availability == "available"
+    assert production.error_category == "deadline"
+    assert production.relevance == ()
+
+    assert ActivityRecommendationReader(activity_db).recommend("Astra", WORKSPACE, NOW).relevance
+
+
 def test_mixed_language_query_recovers_partial_term_hits(tmp_path: Path) -> None:
     # 生产实测（2026-09-04）："ranking override 实验" 这类中英混词 query 对英文语料
     # 因 AND-join 必 0 命中——单个落空的 token 拖垮整条查询。AND→OR 后由 bm25
@@ -453,6 +480,7 @@ def test_embedding_channel_contributes_semantic_candidates(tmp_path: Path, monke
     connection.commit()
     connection.close()
 
+    from agent.runtime.context_index import vector_index
     from agent.runtime.context_index.vector_index import VectorStore
 
     vectors_db = tmp_path / "vectors.db"
@@ -469,6 +497,12 @@ def test_embedding_channel_contributes_semantic_candidates(tmp_path: Path, monke
     monkeypatch.setenv("ASTRA_CONTEXT_INDEX_EMBEDDING", "on")
     monkeypatch.setenv("ASTRA_CONTEXT_INDEX_VECTORS_DB", str(vectors_db))
     monkeypatch.setattr(embedder_module, "ready_embedder", lambda: FakeEmbedder())
+    # A process's first load can outlast the 100 ms production wait (numpy's import took
+    # ~70 ms of it on a fast Mac), and that turn then has no vectors. This test checks
+    # what the channel contributes, so a slow load must not decide it.
+    load_snapshot = vector_index.read_vector_snapshot
+    monkeypatch.setattr(vector_index, "read_vector_snapshot",
+                        lambda vectors: (time.sleep(0.12), load_snapshot(vectors))[1])
 
     result = ActivityRecommendationReader(path).recommend("ranking", WORKSPACE, NOW)
     identities = [row.locator.primary for row in result.relevance]
@@ -523,6 +557,7 @@ def test_embedding_timeout_abandons_vectors_keeps_lexical(tmp_path: Path, monkey
     monkeypatch.setenv("ASTRA_CONTEXT_INDEX_EMBEDDING", "on")
     monkeypatch.setenv("ASTRA_CONTEXT_INDEX_VECTORS_DB", str(vectors_db))
     monkeypatch.setattr(embedder_module, "ready_embedder", lambda: SlowEmbedder())
+    monkeypatch.setattr("agent.runtime.context_index.activity_source._VECTOR_WAIT_SECONDS", 0.1)
 
     reader = ActivityRecommendationReader(path)
     t0 = _time.monotonic()

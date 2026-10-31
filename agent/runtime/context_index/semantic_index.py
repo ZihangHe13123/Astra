@@ -23,7 +23,7 @@ from . import embedder
 from .record_source import _eligible_metadata, _epoch, _revision
 from .session_source import session_revision
 from .sqlite_reader import open_readonly
-from .vector_index import VectorStore, matrix_from_blobs
+from .vector_index import VectorStore, matrix_from_blobs, read_vector_revision
 
 ENCODE_CHARS = 900
 ARCHIVE_LIMIT = 5000
@@ -44,6 +44,13 @@ def file_version(path: Path) -> tuple:
         except OSError:
             return ()
     return stat(path), stat(Path(str(path) + "-wal"))
+
+
+def _index_version(path: Path) -> tuple:
+    """File stats plus the committed revision. Windows stamps files from a ~15.6 ms
+    tick and st_ctime is the creation time, so stats alone miss a quick same-size commit."""
+    stats = file_version(path)
+    return stats, (read_vector_revision(path) if stats[0] else None)
 
 
 @dataclass(frozen=True)
@@ -142,16 +149,19 @@ class EvidenceVectorStore(VectorStore):
                 "layout=excluded.layout, timestamp=excluded.timestamp, "
                 "available_at=excluded.available_at, vec=excluded.vec", rows,
             )
+            self._bump_revision()
 
     def prune(self, source: str, archive: str, retained: set[str]) -> int:
         ids = [row[0] for row in self._connection.execute(
             "SELECT item_id FROM context_memory_vectors WHERE source=? AND archive=?", (source, archive),
         ) if row[0] not in retained]
-        with self._connection:
-            self._connection.executemany(
-                "DELETE FROM context_memory_vectors WHERE source=? AND archive=? AND item_id=?",
-                ((source, archive, item) for item in ids),
-            )
+        if ids:
+            with self._connection:
+                self._connection.executemany(
+                    "DELETE FROM context_memory_vectors WHERE source=? AND archive=? AND item_id=?",
+                    ((source, archive, item) for item in ids),
+                )
+                self._bump_revision()
         return len(ids)
 
 
@@ -183,7 +193,7 @@ def rebuild_source(path: Path, vectors_db: Path, source: str, *, backend=None,
 
 
 def read_snapshot(vectors_db: Path, source: str, archive_path: Path) -> tuple:
-    """Cache at most four immutable archive snapshots; WAL commits invalidate it."""
+    """Cache at most four immutable archive snapshots; any commit invalidates it."""
     return _read_snapshot(vectors_db, source, archive_path, deadline_ms=75)[0]
 
 
@@ -212,7 +222,7 @@ def _read_snapshot(vectors_db: Path, source: str, archive_path: Path, *, deadlin
     identity = embedder.embedding_identity()
     archive = archive_key(archive_path)
     scope = (str(vectors_db.resolve()), source, archive, identity)
-    version = file_version(vectors_db)
+    version = _index_version(vectors_db)
     with _cache_lock:
         previous = _cache.get(scope)
         if previous is not None and previous[0] == version:
@@ -239,12 +249,17 @@ def _read_snapshot(vectors_db: Path, source: str, archive_path: Path, *, deadlin
     matrix.flags.writeable = False
     result = (tuple((str(row["item_id"]), str(row["revision"]), float(row["timestamp"]),
                      float(row["available_at"])) for row in rows), matrix)
+    try:
+        current = _index_version(vectors_db)
+    except sqlite3.Error:
+        current = None  # A writer holds the file: these rows stand, but are not cached.
     published = False
     with _cache_lock:
         _check_cancelled(cancelled)
-        # A slower read must not replace a snapshot published after a WAL
-        # commit or file replacement. Recheck while holding the publication lock.
-        if file_version(vectors_db) == version:
+        # A slower read must not replace a snapshot published after a WAL commit
+        # or file replacement. The recheck opens SQLite, so it runs before this
+        # lock; an entry that still slips through fails the next version check.
+        if current == version:
             _cache[scope] = (version, result)
             _cache.move_to_end(scope)
             while len(_cache) > 4:

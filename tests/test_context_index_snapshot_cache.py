@@ -18,6 +18,7 @@ from agent.runtime.context_index import embedder, semantic_index, semantic_index
 from agent.runtime.context_index.factory import create_context_index_broker
 from agent.runtime.instance_lock import InstanceLock
 from tests.test_context_index_semantic import NOW, QUERY, TEXT, WORKSPACE, archive as archive
+from tests.test_context_index_session_source import _add_session
 
 
 class OneCycle:
@@ -276,6 +277,52 @@ def test_slow_snapshot_cannot_replace_a_newer_cached_version(archive, monkeypatc
     finally:
         release.set()
         writer.close()
+
+
+@pytest.mark.parametrize("change", ["added", "removed"])
+def test_snapshot_sees_a_commit_that_leaves_every_file_stat_unchanged(archive, monkeypatch, change):
+    def snapshot_ids():
+        return {row[0] for row in semantic_index.read_snapshot(archive.vectors, "session", archive.session)[0]}
+
+    def index(statement):
+        with closing(sqlite3.connect(archive.session)) as db, db:
+            statement(db)
+        semantic_index.rebuild_source(archive.session, archive.vectors, "session", backend=archive.encoder)
+
+    index(lambda db: _add_session(db, "first", "第一", WORKSPACE.key, [("user", "第一条记录", NOW.timestamp() - 30)]))
+    before = snapshot_ids()
+    original, frozen = Path.stat, archive.vectors.stat()
+    monkeypatch.setattr(Path, "stat", lambda file, *args, **kwargs:
+                        frozen if file == archive.vectors else original(file, *args, **kwargs))
+    if change == "added":
+        index(lambda db: _add_session(db, "second", "第二", WORKSPACE.key, [("user", "第二条记录", NOW.timestamp() - 20)]))
+        assert snapshot_ids() > before
+    else:
+        index(lambda db: db.execute("DELETE FROM messages WHERE session_id='first'"))
+        assert snapshot_ids() < before
+
+
+def test_legacy_index_without_a_revision_keeps_its_stat_cache(archive, monkeypatch):
+    with closing(sqlite3.connect(archive.vectors)) as db, db:
+        db.execute("DROP TABLE vector_revision")
+    first = semantic_index.read_snapshot(archive.vectors, "session", archive.session)
+    monkeypatch.setattr(semantic_index, "open_readonly", lambda *_args, **_kwargs: pytest.fail("reloaded a cached snapshot"))
+    assert semantic_index.read_snapshot(archive.vectors, "session", archive.session) is first
+
+
+def test_rows_survive_a_writer_locking_the_version_recheck(archive, monkeypatch):
+    original, reads = semantic_index.read_vector_revision, []
+
+    def locked_on_recheck(path):
+        reads.append(path)
+        if len(reads) == 2:
+            raise sqlite3.OperationalError("database is locked")
+        return original(path)
+
+    monkeypatch.setattr(semantic_index, "read_vector_revision", locked_on_recheck)
+    rows, _matrix = semantic_index.read_snapshot(archive.vectors, "session", archive.session)
+    assert rows and len(reads) == 2
+    assert not semantic_index._cache
 
 
 def test_background_refills_evicted_cache_without_archive_changes(archive, monkeypatch):

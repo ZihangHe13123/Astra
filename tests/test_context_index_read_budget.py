@@ -82,6 +82,7 @@ def test_activity_summary_timeout_does_not_starve_events(tmp_path, monkeypatch):
     assert [(s.name, s.error_category) for s in result.stages] == [("summary", "deadline"), ("event", "")]
 
 
+@pytest.mark.usefixtures("unhurried_context_readers")
 @pytest.mark.parametrize("kind", ["summary", "event"])
 def test_activity_ranks_independent_coverage_before_limit_and_excludes_future(tmp_path, kind, monkeypatch):
     path = tmp_path / "activity.db"
