@@ -260,6 +260,29 @@ def test_a_link_in_the_astra_folder_is_never_followed_by_export_or_wipe(tmp_path
     assert not (home / "memory.db").exists() and not (home / "sessions").exists()
 
 
+@pytest.mark.skipif(os.name == "nt", reason="making links needs extra rights on Windows")
+def test_a_path_configured_elsewhere_is_checked_from_the_top(tmp_path):
+    home, root = tmp_path / "home", install_root(tmp_path)
+    seed(home).close()
+    real = tmp_path / "real"
+    real.mkdir()
+    shutil.move(home / "sessions", real / "sessions")
+    (tmp_path / "linkdir").symlink_to(real, target_is_directory=True)
+    before = present(real)
+    # The conversations are configured outside the state folder, below a folder that is a link.
+    env = {**environment(home), "AGENT_SESSION_DIR": str(tmp_path / "linkdir" / "sessions")}
+    code, result = data(env, "wipe", "--root", str(root), "--confirm", "清除")
+    failed = {item["key"]: item["error"] for item in result["failed"]}
+    assert code == 1 and f"{tmp_path / 'linkdir'} is a link" in failed["sessions"]
+    assert present(real) == before
+    # The system's own links on the way do not count: macOS reaches its temporary folders through /var.
+    through_var = Path(str(real).replace("/private/var/", "/var/", 1))
+    if through_var != real and Path("/var").is_symlink():
+        env["AGENT_SESSION_DIR"] = str(through_var / "sessions")
+        code, result = data(env, "wipe", "--root", str(root), "--confirm", "清除")
+        assert code == 0 and not result["failed"] and not (real / "sessions").exists()
+
+
 def test_a_misconfigured_path_never_takes_the_installation_with_it(tmp_path):
     home, root = tmp_path / "home", install_root(tmp_path)
     seed(home).close()

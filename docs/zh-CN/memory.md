@@ -71,7 +71,8 @@ USER.md，设置安静时段，并提议定时任务（每个都要你批准）�
 关掉那个程序后再清除一次。在终端里对应
 `astra data plan`、`astra data export --out 文件.zip` 和 `astra data wipe --confirm 清除 [--browser-data] [--personal-files]`；
 还有其他 Astra 在运行时不会清除，没删掉的会列在 `failed` 里，命令以状态 1 退出。源码安装中被 git 跟踪的文件（例如自带的技能）永远不会删除。
-两个命令都不会跟着 Astra 数据文件夹里的符号链接（或 Windows 的目录联接）走：链接后面可能是任何地方，
+两个命令都不会跟着 Astra 数据文件夹里的符号链接（或 Windows 的目录联接）走；单独设置在别处的路径（例如
+`AGENT_SESSION_DIR`）从最上层起每一级都检查，只认系统自己的、属于 root 的链接（例如 macOS 的 `/tmp` 和 `/var`）。链接后面可能是任何地方，
 所以既不导出（导出结果列在 `skipped` 里），也不删除（清除结果列在 `failed` 里）。
 导出的 zip 先写进目标旁边一个新建的文件，再一步换到你选的文件名上，所以那个名字上即使有链接，也只会被替换，不会顺着它写到别处。
 

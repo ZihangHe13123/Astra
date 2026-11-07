@@ -197,8 +197,10 @@ is `astra data plan`, `astra data export --out FILE.zip` and `astra data wipe --
 [--browser-data] [--personal-files]`; a wipe refuses while any other Astra runs, and one that
 left something lists it under `failed` and exits with status 1. In a source checkout, files tracked by git
 (such as bundled skills) are never deleted. Neither command follows a symbolic link (or a
-Windows junction) inside Astra's data folder: what lies behind one could be anywhere, so it is
-neither exported (the export lists it under `skipped`) nor deleted (the wipe lists it under
+Windows junction) inside Astra's data folder, nor anywhere on the way to a path set elsewhere
+(such as `AGENT_SESSION_DIR`), where only the system's own links, owned by root like macOS's
+`/tmp` and `/var`, are accepted. What lies behind a link could be anywhere, so it is neither
+exported (the export lists it under `skipped`) nor deleted (the wipe lists it under
 `failed`). The zip is written to a new file of its own beside the chosen name and then moved
 into place, so a link at that name is replaced, never written through.
 

@@ -66,8 +66,6 @@ class Item:
     personal: bool = False
     # Folders directly inside ``path`` that are items of their own: export and sizes leave them to those.
     apart: tuple[str, ...] = ()
-    # Where a path configured outside the state folder was set: no link below it is followed either.
-    base: Path | None = None
 
     @property
     def sqlite(self) -> bool:
@@ -100,14 +98,13 @@ def items() -> list[Item]:
     # The personal thread's own workspace (the desktop's <ASTRA_HOME>/personal, specs/personal-thread.md D6).
     personal = state_path("personal")
     result = [
-        Item("core-user", "核心记忆：关于你（USER.md）", memory.parent / "memory" / "USER.md", True, base=memory.parent),
-        Item("core-memory", "核心记忆：Astra 的笔记（MEMORY.md）", memory.parent / "memory" / "MEMORY.md", True,
-             base=memory.parent),
+        Item("core-user", "核心记忆：关于你（USER.md）", memory.parent / "memory" / "USER.md", True),
+        Item("core-memory", "核心记忆：Astra 的笔记（MEMORY.md）", memory.parent / "memory" / "MEMORY.md", True),
         Item("memory", "已保存的记忆", memory, True),
         Item("sessions", "对话记录", _env_path("AGENT_SESSION_DIR", sessions_dir()), True),
         Item("recall", "对话搜索索引", recall, True),
         Item("jobs", "定时任务和结果", state_path("jobs"), True),
-        Item("skills", "学到的技能", skills / "learned", True, base=skills),
+        Item("skills", "学到的技能", skills / "learned", True),
         Item("skills-journal", "技能学习记录", learning_home(skills), True),
         Item("learning", "技能学习建议", default_learning_path(), True),
         Item("personal", PERSONAL_LABEL, personal, True, apart=("uploads", ".astra"), personal=True),
@@ -130,8 +127,7 @@ def items() -> list[Item]:
         Item("phone-audio", "读给手机听的语音", _env_path("ASTRA_PHONE_AUDIO_DIR", state_path("gui", "phone-audio")), False),
         # Which phone did what, with its commands and the names of the files it sent.
         Item("phone-audit", "手机的操作记录", state_path("gui", "phone-audit.jsonl"), False),
-        Item("browser-profiles", "Astra 浏览器的登录和 Cookie", browser.parent / "browser-profiles", False, browser=True,
-             base=browser.parent),
+        Item("browser-profiles", "Astra 浏览器的登录和 Cookie", browser.parent / "browser-profiles", False, browser=True),
         Item("browser-sessions", "Astra 浏览器的标签页记录", browser, False, browser=True),
     ]
     vectors = os.environ.get("ASTRA_CONTEXT_INDEX_VECTORS_DB", "").strip()
@@ -164,23 +160,35 @@ def _is_link(path: Path) -> bool:
     return False
 
 
-def _reach(item: Item, state: Path) -> None:
-    """Refuses an item reached through a link: what lies behind it may be outside Astra's folder.
+def _system_link(path: Path) -> bool:
+    """A link of the system's own layout (macOS /tmp, /var and /etc, Linux /bin and /lib): owned by root, in a
+    folder owned by root, so neither the person nor a program of theirs made it or can change it. Windows has
+    no such links in the places Astra keeps data, so there none counts."""
+    if sys.platform == "win32":
+        return False
+    try:
+        return os.lstat(path).st_uid == 0 and os.lstat(path.parent).st_uid == 0
+    except OSError:
+        return False
 
-    The item's root is the state folder when the item lies in it, else the place its path was configured
-    (``base``), else the item's own location. No step below that root may be a link or junction, and the
-    real path must stay inside the root's real path.
+
+def _reach(item: Item, state: Path) -> None:
+    """Refuses an item reached through a link: what lies behind it may be anywhere.
+
+    Inside the state folder (Astra's own, resolved when configured) no step below it may be a link or junction,
+    and the real path must stay inside it. A path configured elsewhere is checked as given, every step from the
+    top: only the system's own links may lie on the way.
     """
     path = Path(os.path.abspath(item.path))
-    roots = [Path(os.path.abspath(root)) for root in (state, item.base) if root is not None]
-    root = next((root for root in roots if path != root and path.is_relative_to(root)), path.parent)
-    current = root
-    for step in path.relative_to(root).parts:
+    home = Path(os.path.abspath(state))
+    inside = path != home and path.is_relative_to(home)
+    current = home if inside else Path(path.anchor)
+    for step in path.relative_to(current).parts:
         current = current / step
-        if _is_link(current):
+        if _is_link(current) and (inside or not _system_link(current)):
             raise OSError(f"{current} is a link; nothing is read or deleted through it")
-    if not Path(os.path.realpath(path)).is_relative_to(Path(os.path.realpath(root))):
-        raise OSError(f"{item.path} leads outside {root}; nothing is read or deleted there")
+    if inside and not Path(os.path.realpath(path)).is_relative_to(Path(os.path.realpath(home))):
+        raise OSError(f"{item.path} leads outside {home}; nothing is read or deleted there")
 
 
 def _guard(path: Path, root: Path) -> None:
