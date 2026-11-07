@@ -111,8 +111,8 @@ def spawn(args: list[str], *, own_group: bool, **options: Any) -> subprocess.Pop
     """Start a command so that `stop_tree` can end all it starts, even a process whose parent has exited.
 
     On Windows every command gets a Job object. Elsewhere `own_group` gives it a process group of its own;
-    leave it off for a command that may ask at the terminal (an SSH passphrase), which a group in the
-    background could not read.
+    leave it off only for a command that may ask at the terminal (an SSH passphrase), which a group in the
+    background could not read. Writing to the terminal works from either.
     """
     if os.name != "nt" and own_group and not options.get("start_new_session"):
         options["process_group"] = 0
@@ -148,12 +148,14 @@ def stop_tree(process: subprocess.Popen) -> None:
         except (OSError, subprocess.TimeoutExpired):
             pass
     else:
+        # Found first, while the command still holds them: once its group is gone, a child that left the
+        # group (a session of its own) would be handed to the system and no longer descend from it.
+        descendants = _descendants(process.pid)
         if process in _GROUPS:
             _GROUPS.discard(process)
             with contextlib.suppress(OSError):
                 os.killpg(process.pid, signal.SIGKILL)
-        # A process that left the group, or a command without one: what still descends from it.
-        for pid in _descendants(process.pid):
+        for pid in descendants:
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
     if process.poll() is None:
@@ -164,7 +166,7 @@ def stop_tree(process: subprocess.Popen) -> None:
 
 
 def _execute(args: list[str], *, cwd: Path, env: dict[str, str] | None, timeout: float,
-             capture: bool, data: bytes | None = None) -> tuple[int, bytes, bytes]:
+             capture: bool, data: bytes | None = None, terminal: bool = False) -> tuple[int, bytes, bytes]:
     """Run a command to its end or its deadline.
 
     Output goes to files, not pipes. Reading a pipe to its end also waits for
@@ -181,8 +183,7 @@ def _execute(args: list[str], *, cwd: Path, env: dict[str, str] | None, timeout:
         stdout = files.enter_context(tempfile.TemporaryFile())
         stderr = files.enter_context(tempfile.TemporaryFile())
         try:
-            # A captured command never talks to the terminal, so it can have a process group of its own.
-            process = spawn(args, own_group=capture, cwd=cwd, env=env, stdin=stdin,
+            process = spawn(args, own_group=not terminal, cwd=cwd, env=env, stdin=stdin,
                             stdout=stdout if capture else sys.stderr, stderr=stderr if capture else None)
         except OSError as exc:
             raise LauncherError(f"Could not run {name}: {exc}") from exc
@@ -211,9 +212,10 @@ def _text(raw: bytes) -> str:
 
 def run(
     args: list[str], *, cwd: Path, env: dict[str, str] | None = None,
-    timeout: int = 120, capture: bool = True,
+    timeout: int = 120, capture: bool = True, terminal: bool = False,
 ) -> str:
-    code, stdout, stderr = _execute(args, cwd=cwd, env=env, timeout=timeout, capture=capture)
+    """`terminal`: the command may ask at the terminal, so it stays in the terminal's process group."""
+    code, stdout, stderr = _execute(args, cwd=cwd, env=env, timeout=timeout, capture=capture, terminal=terminal)
     if code:
         # Do not echo arguments: remote URLs and environment values may contain secrets.
         raise LauncherError(f"{Path(args[0]).name} failed (exit {code})."

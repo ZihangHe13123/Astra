@@ -97,6 +97,38 @@ def test_a_command_past_its_deadline_stops_a_child_whose_parent_already_exited(t
             stop(int(marker.read_text()))
 
 
+def test_a_command_writing_to_the_terminal_past_its_deadline_stops_what_it_started_too(tmp_path):
+    # uv sync, npm ci and the builds show their output instead of having it captured.
+    marker = tmp_path / "orphan.pid"
+    try:
+        with pytest.raises(LauncherError, match="did not finish within 5 seconds and was stopped"):
+            run([sys.executable, "-c", ORPHANING, str(marker)], cwd=tmp_path, timeout=5, capture=False)
+        assert ends(started_pid(marker))
+    finally:
+        if marker.is_file():
+            stop(int(marker.read_text()))
+
+
+# Starts a child in a session of its own (outside the command's process group), records its pid, keeps running.
+SESSION = """
+import os, subprocess, sys, time
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=os.name != "nt")
+open(sys.argv[1], "w").write(str(child.pid))
+time.sleep(60)
+"""
+
+
+def test_a_child_in_a_session_of_its_own_is_stopped_with_the_command(tmp_path):
+    marker = tmp_path / "session.pid"
+    try:
+        with pytest.raises(LauncherError, match="did not finish within 5 seconds and was stopped"):
+            run([sys.executable, "-c", SESSION, str(marker)], cwd=tmp_path, timeout=5)
+        assert ends(started_pid(marker))
+    finally:
+        if marker.is_file():
+            stop(int(marker.read_text()))
+
+
 def test_git_input_and_failure_still_reach_the_caller(tmp_path):
     subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
     blob = git_bytes(tmp_path, "hash-object", "-w", "--stdin", data=b"payload\n")

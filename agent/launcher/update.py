@@ -74,7 +74,7 @@ def fetch_target(install: Installation) -> tuple[str, str]:
         # Git shows its own progress, and ends a transfer that has stalled.
         run(["git", "-C", str(install.root), "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=120",
              "fetch", "--no-tags", "--no-write-fetch-head", "--", remote, f"{ref}:{temporary_ref}"],
-            cwd=install.root, env=git_environment(), timeout=FETCH_SECONDS, capture=False)
+            cwd=install.root, env=git_environment(), timeout=FETCH_SECONDS, capture=False, terminal=True)
         target = git(install.root, "rev-parse", "--verify", f"{temporary_ref}^{{commit}}")
         return target, f"{remote}/{ref.removeprefix('refs/heads/')}"
     finally:
