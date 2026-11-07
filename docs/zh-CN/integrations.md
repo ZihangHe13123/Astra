@@ -46,7 +46,9 @@ mkdir -p .astra
 cp config/channels.example.json .astra/channels.json
 ```
 
-设置 `qq.enabled=true`，默认监听 `127.0.0.1:2280`，NapCat 反向 WebSocket 地址为 `ws://127.0.0.1:2280`。若 NapCat 配有 access token，将相同值放入 `ASTRA_QQ_ACCESS_TOKEN`，不写入 JSON。默认接收私聊，群消息需 @提及或配置的唤醒前缀（默认 `/`）。
+设置 `qq.enabled=true`，默认监听 `127.0.0.1:2280`，NapCat 反向 WebSocket 地址为 `ws://127.0.0.1:2280`。在 NapCat 里设置 access token，并把相同的值放入 `ASTRA_QQ_ACCESS_TOKEN`，不写入 JSON。没有 token 时 Astra 分不清 NapCat 和这台电脑上的其他程序：仍回复已准入的联系人，但 `owner_users` 只按普通联系人对待，并在日志里警告。带 `Origin` 头的握手一律拒绝，网页打不开这个连接（NapCat 不发这个头）。`host` 不是回环地址时也会警告，因为其他电脑能连上这个端口。默认接收私聊，群消息需 @提及或配置的唤醒前缀（默认 `/`）。
+
+`qq.allow_users` 列出允许聊天的 QQ 号，列表为空时谁都不接收。这些联系人只能用公开的网页和聊天工具，用不到本地文件、历史、记忆、项目说明和委派。要私聊远程控制，在 `qq.owner_users` 里明确列出可信的主人 QQ 号并配好 access token；主人不必同时列在 allow_users 里。群消息一律只有聊天能力，主人发的也一样。撤销主人权限后会开始一段单独的受限对话；旧的主人历史留在磁盘上，不会载入这段聊天。
 
 2280 端口只能有一个服务占用，启用前先停用或改配 AstrBot。适配器启动失败会报告但不关闭 TUI；后端退出时关闭全部适配器。消息渠道中需要交互授权的操作会被拒绝，不等待不可见提示。
 

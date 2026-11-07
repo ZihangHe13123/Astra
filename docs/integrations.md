@@ -65,17 +65,23 @@ cp config/channels.example.json .astra/channels.json
 
 Then set `qq.enabled` to `true`. The safe default listens on
 `127.0.0.1:2280`; configure NapCat's reverse WebSocket URL as
-`ws://127.0.0.1:2280`. If an access token is configured in NapCat, put the same
-value in `ASTRA_QQ_ACCESS_TOKEN`—the token itself is never stored in the JSON
-file. Private messages are accepted by default. Group messages require either
-an @mention or a configured wake prefix (default `/`) to avoid unsolicited
-replies.
+`ws://127.0.0.1:2280`. Set an access token in NapCat and put the same value in
+`ASTRA_QQ_ACCESS_TOKEN`—the token itself is never stored in the JSON file.
+Without a token Astra cannot tell NapCat from any other program on the
+computer, so it still answers admitted contacts but treats `owner_users` as
+ordinary contacts and logs a warning. Handshakes that carry an `Origin` header
+are refused, so a web page cannot open the socket (NapCat sends none). A `host`
+other than a loopback address is logged as a warning, since other computers can
+then reach the port. Private messages are accepted by default. Group messages
+require either an @mention or a configured wake prefix (default `/`) to avoid
+unsolicited replies.
 
 Configure `qq.allow_users` with the QQ IDs permitted to chat; an empty list no
 longer accepts everyone. These contacts receive public web/chat tools only,
 without local files, history, memory, project instructions or delegation.
 For private remote control, explicitly list trusted owner IDs in
-`qq.owner_users`; owners need not also appear in allow_users. Group messages
+`qq.owner_users` and configure the access token; owners need not also appear in
+allow_users. Group messages
 always use chat capabilities, including those sent by an owner. Revoking owner
 access starts a separate restricted conversation; old owner history remains on
 disk and is never loaded into that chat.

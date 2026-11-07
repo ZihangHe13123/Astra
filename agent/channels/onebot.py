@@ -8,6 +8,8 @@ the ReAct agent router.
 from __future__ import annotations
 
 import asyncio
+import hmac
+import ipaddress
 import json
 import logging
 import re
@@ -68,6 +70,15 @@ def _strip_prefix(text: str, prefixes: tuple[str, ...]) -> tuple[str, bool]:
     return stripped, False
 
 
+def _loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def _chunks(text: str, limit: int) -> list[str]:
     text = text.strip()
     if not text:
@@ -96,10 +107,20 @@ class OneBotAdapter(ChannelAdapter):
             return
         if not self.config.allow_users and not self.config.owner_users:
             logger.warning("QQ has no admitted users; configure allow_users for chat or owner_users for private local control")
+        token = self.config.access_token
+        if self.config.owner_users and not token:
+            logger.warning("QQ owner_users need an access token: set %s and the same token in NapCat; "
+                           "until then owners are answered as ordinary contacts", self.config.access_token_env)
+        if not _loopback(self.config.host):
+            logger.warning("QQ listens on %s, which other computers can reach%s", self.config.host,
+                           "" if token else f"; without {self.config.access_token_env} any of them can "
+                           "write as an admitted QQ user")
         self._server = await serve(
             self._connection,
             self.config.host,
             self.config.port,
+            # NapCat sends no Origin header and a browser always does: no web page can open this socket.
+            origins=[None],
             ping_interval=20,
             ping_timeout=20,
             max_size=2 * 1024 * 1024,
@@ -119,23 +140,24 @@ class OneBotAdapter(ChannelAdapter):
             server.close()
             await server.wait_closed()
 
-    def _authorized(self, connection: ServerConnection) -> bool:
-        expected = self.config.access_token
-        if not expected:
-            return True
+    def _authorized(self, connection: ServerConnection, expected: str) -> bool:
         request = getattr(connection, "request", None)
         headers = getattr(request, "headers", {})
         authorization = str(headers.get("Authorization", ""))
         if authorization.lower().startswith("bearer "):
-            return authorization[7:].strip() == expected
-        path = str(getattr(request, "path", "") or "")
-        supplied = parse_qs(urlparse(path).query).get("access_token", [""])[0]
-        return supplied == expected
+            supplied = authorization[7:].strip()
+        else:
+            path = str(getattr(request, "path", "") or "")
+            supplied = parse_qs(urlparse(path).query).get("access_token", [""])[0]
+        return hmac.compare_digest(supplied.encode(), expected.encode())
 
     async def _connection(self, connection: ServerConnection) -> None:
-        if not self._authorized(connection):
+        token = self.config.access_token
+        if token and not self._authorized(connection, token):
             await connection.close(code=1008, reason="Invalid OneBot access token")
             return
+        # Without a token any local program can claim to be NapCat and use an owner's QQ ID.
+        authenticated = bool(token)
         self._connections.add(connection)
         self._send_locks[id(connection)] = asyncio.Lock()
         logger.info("OneBot client connected remote=%s", connection.remote_address)
@@ -170,7 +192,7 @@ class OneBotAdapter(ChannelAdapter):
                         if not pending.done():
                             pending.set_result(payload)
                         continue
-                    await self._handle_payload(connection, payload)
+                    await self._handle_payload(connection, payload, authenticated)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -183,7 +205,8 @@ class OneBotAdapter(ChannelAdapter):
             self._send_locks.pop(id(connection), None)
             logger.info("OneBot client disconnected")
 
-    async def _handle_payload(self, connection: ServerConnection, payload: dict[str, Any]) -> None:
+    async def _handle_payload(self, connection: ServerConnection, payload: dict[str, Any],
+                              authenticated: bool = False) -> None:
         if payload.get("post_type") != "message":
             return
         message_type = str(payload.get("message_type") or "")
@@ -227,7 +250,7 @@ class OneBotAdapter(ChannelAdapter):
             sender_name=str(sender.get("card") or sender.get("nickname") or ""),
             images=images,
             raw=payload,
-            local_tools=not is_group and sender_id in self.config.owner_users,
+            local_tools=authenticated and not is_group and sender_id in self.config.owner_users,
         )
         action = "send_group_msg" if is_group else "send_private_msg"
         target_id = int(group_id if is_group else sender_id)
