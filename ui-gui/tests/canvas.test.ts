@@ -136,8 +136,8 @@ test("a comment goes right after the passage it is about, never into a heading o
   assert.match(after, /收入增长了 12% <!-- @astra: 补一个对比 -->，主要来自新客户。/);
   assert.match(after, /```\n收入增长了 12%，在代码里\n```/, "the code block is left alone");
   assert.deepEqual(openComments(after), ["补一个对比"]);
-  // Selected as rendered: the emphasis and the link are not in the selection, so the line is found without them.
-  assert.match(insertComment(doc, "说明本季度的重点", "x"), /说明\*\*本季度\*\*的重点。 <!-- @astra: x -->\n/);
+  // Selected as rendered: the emphasis and the link are not in the selection, and the text is found as it reads.
+  assert.match(insertComment(doc, "说明本季度的重点", "x"), /说明\*\*本季度\*\*的重点 <!-- @astra: x -->。\n/);
   assert.match(insertComment(doc, "供应链 延迟 两周", "x"), /- 供应链 \[延迟\]\(https:\/\/example\.com\) 两周 <!-- @astra: x -->\n/);
   assert.match(insertComment(doc, "收入", "x"), /\n## 收入\n<!-- @astra: x -->\n/, "a heading keeps its text");
   const nowhere = insertComment(doc, "不在文中的一句话", "这里 -- 要改");
@@ -166,6 +166,17 @@ test("a comment lands on the occurrence that was selected, and after code, never
   assert.equal(listed, "前言\n\n    make all\n\n- 步骤\n\n  ```\n  make test\n  ```\n  <!-- @astra: y -->\n\n结尾\n");
   assert.deepEqual(openComments(indented), ["x"]);
   assert.deepEqual(openComments(listed), ["y"]);
+  // Counted as the text reads: an entity, an escape or emphasis does not change which one was selected.
+  const spelled = "研发 &amp; 测试先行。\n\n然后研发 & 测试收尾。\n";
+  assert.equal(insertComment(spelled, "研发 & 测试", "x", 1), "研发 &amp; 测试先行。\n\n然后研发 & 测试 <!-- @astra: x -->收尾。\n");
+  assert.equal(insertComment(spelled, "研发 & 测试", "x"), "研发 &amp; 测试先行。 <!-- @astra: x -->\n\n然后研发 & 测试收尾。\n");
+  assert.equal(insertComment("说明**本季度**的重点，再说明**本季度**的重点。\n", "说明本季度的重点", "x", 1),
+    "说明**本季度**的重点，再说明**本季度**的重点 <!-- @astra: x -->。\n");
+  // After a link or an autolink, never inside its brackets; a pipe in a table's row would split it.
+  assert.equal(insertComment("地址 <https://example.com/预算> 见上。\n", "预算", "x"), "地址 <https://example.com/预算> <!-- @astra: x --> 见上。\n");
+  assert.equal(insertComment("见[预算表](https://example.com)。\n", "预算", "x"), "见[预算表](https://example.com) <!-- @astra: x -->。\n");
+  assert.equal(insertComment("| 项 | 说明 |\n|---|---|\n| 预算 | 见附件 |\n", "预算", "a|b"),
+    "| 项 | 说明 |\n|---|---|\n| 预算 <!-- @astra: a｜b --> | 见附件 |\n");
 });
 
 test("a comment on a document changed since it was selected is refused", async () => {
