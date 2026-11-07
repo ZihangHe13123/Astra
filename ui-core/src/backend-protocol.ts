@@ -15,8 +15,19 @@ const errorTypes = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "
 
 type Envelope = {
   type?: string; event_id?: string; cursor?: number; replayable?: boolean; replayed?: boolean; sequence?: number; generation?: string;
-  request_id?: unknown; retryable?: unknown;
+  request_id?: unknown; retryable?: unknown; process_id?: unknown; task?: unknown;
 };
+
+/**
+ * The background run or task a journaled event describes. Only journaled events carry their own
+ * cursor, so only they can be ordered; a task resumed under its id later in the journal is newer.
+ */
+function lifecycleEntity(event: Envelope): string | undefined {
+  if (!event.replayable || !Number.isSafeInteger(event.cursor)) return undefined;
+  if (event.type === "process_status" && typeof event.process_id === "string" && event.process_id) return `process:${event.process_id}`;
+  const id = (event.task as { id?: unknown } | null | undefined)?.id;
+  return (event.type === "task_started" || event.type === "task_status") && typeof id === "string" && id ? `task:${id}` : undefined;
+}
 
 /** The approval or question a request opens. */
 const controlRequests: Record<string, string> = { tool_approval_request: "approval", user_question_request: "question" };
@@ -31,6 +42,8 @@ export class EventDeliveryState {
   private seen = new Set<string>();
   /** Approvals and questions already ended: a lost live request replayed after its resolution is stale. */
   private settled = new Set<string>();
+  /** The newest journal cursor applied to each run and task: a replayed older event cannot undo a newer one. */
+  private latest = new Map<string, number>();
   private failed = new Set<number>();
   private highWater = 0;
   private generation = "";
@@ -47,10 +60,12 @@ export class EventDeliveryState {
   }
   duplicate(event: Envelope): boolean {
     const control = controlRequests[event.type ?? ""];
+    const entity = lifecycleEntity(event);
     return Boolean(event.event_id && this.seen.has(event.event_id))
       || Boolean(event.replayed && typeof event.cursor === "number"
         && (event.cursor <= this.cursor || event.cursor < this.completedThrough))
-      || Boolean(control && typeof event.request_id === "string" && this.settled.has(`${control}:${event.request_id}`));
+      || Boolean(control && typeof event.request_id === "string" && this.settled.has(`${control}:${event.request_id}`))
+      || (entity !== undefined && event.cursor! < (this.latest.get(entity) ?? 0));
   }
   gap(event: Envelope): boolean {
     if (event.replayed || !event.generation || !Number.isSafeInteger(event.sequence)) return false;
@@ -75,6 +90,13 @@ export class EventDeliveryState {
     if (settled) {
       this.settled.add(settled);
       if (this.settled.size > 1024) this.settled.delete(this.settled.values().next().value!);
+    }
+    const entity = success ? lifecycleEntity(event) : undefined;
+    if (entity) {
+      const newest = Math.max(this.latest.get(entity) ?? 0, event.cursor!);
+      this.latest.delete(entity);
+      this.latest.set(entity, newest);
+      if (this.latest.size > 1024) this.latest.delete(this.latest.keys().next().value!);
     }
     // Volatile text frames carry the latest journal cursor too. They cannot
     // acknowledge lifecycle events that the renderer has never applied.

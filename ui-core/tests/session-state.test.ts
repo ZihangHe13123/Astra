@@ -279,3 +279,37 @@ test("a finished task's own approvals and waiting questions end with it; a worke
   assert.deepEqual(c.state.questions.map(q => q.request_id), ["q2"]);
   assert.equal(c.state.busy, false);
 });
+
+test("a finished background run stays finished when its older running event is replayed", () => {
+  const c = connection();
+  const run = (status: string, event: string) =>
+    ({ type: "process_status", event, process_id: "p1", kind: "shell", label: "npm test", status, started_at: 1 });
+  c.live(8, { type: "task_started", task: { id: "t1", status: "running" } });
+  c.live(9, run("running", "process_started"), { lost: true });
+  c.live(10, run("running", "process_output"), { lost: true });
+  c.live(11, run("completed", "process_completed"));
+  assert.deepEqual(c.gaps, [8]);
+  c.replay(9, 2, run("running", "process_started"));
+  c.replay(10, 3, run("running", "process_output"));
+  c.replay(11, 4, run("completed", "process_completed"));
+  c.receive(JSON.stringify({ type: "event_replay_complete", after_cursor: 8, next_cursor: 11, has_more: false }));
+  assert.equal(c.state.processes.p1.status, "completed");
+  // Neither client is handed the older events, so the terminal client's own list stays right too.
+  assert.equal(c.handled.filter(event => event.startsWith("process_status")).length, 1);
+});
+
+test("an ended task is not restarted by its replayed start, while a later resume of the same task is", () => {
+  const c = connection();
+  c.live(7, { type: "gui_ready" }, { replayable: false });
+  c.live(8, { type: "task_started", task: { id: "t1", status: "running" } }, { lost: true });
+  c.live(9, { type: "task_status", task: { id: "t1", status: "interrupted" } });
+  assert.deepEqual(c.gaps, [0]);
+  c.replay(8, 2, { type: "task_started", task: { id: "t1", status: "running" } });
+  c.replay(9, 3, { type: "task_status", task: { id: "t1", status: "interrupted" } });
+  c.receive(JSON.stringify({ type: "event_replay_complete", after_cursor: 0, next_cursor: 9, has_more: false }));
+  assert.equal(c.state.info.task_status.task.status, "interrupted");
+  assert.equal(c.state.busy, false);
+  // /resume continues the same task id later in the journal: that start is newer and applies.
+  c.live(10, { type: "task_started", task: { id: "t1", status: "running" } });
+  assert.equal(c.state.busy, true);
+});
