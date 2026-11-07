@@ -172,6 +172,12 @@ def build_fixture() -> Path:
     return (Path(binary_directory) / "AstraComputerProtocolFixture").resolve(strict=True)
 
 
+@pytest.fixture(scope="module")
+def protocol_fixture() -> Path:
+    """Build the Swift protocol fixture once; each test still starts its own fixture process."""
+    return build_fixture()
+
+
 def build_native_harness() -> Path:
     environment = {**os.environ, "ASTRA_MACOS_COMPUTER_HELPER_HARNESS": "1"}
     subprocess.run(
@@ -468,8 +474,8 @@ def test_signed_production_helper_contains_no_test_backdoor(isolated_signed_help
 
 
 @pytest.mark.skipif(platform.system() != "Darwin", reason="native helper is macOS-only")
-def test_real_transport_returns_snapshot_schema_through_held_directory_fd(tmp_path):
-    fixture = build_fixture()
+def test_real_transport_returns_snapshot_schema_through_held_directory_fd(tmp_path, protocol_fixture):
+    fixture = protocol_fixture
     cache_root = tmp_path / "cache"
     cache_root.mkdir(mode=0o700)
     directory_fd = os.open(cache_root, os.O_RDONLY)
@@ -507,8 +513,8 @@ def test_real_transport_returns_snapshot_schema_through_held_directory_fd(tmp_pa
 
 
 @pytest.mark.skipif(platform.system() != "Darwin", reason="native helper is macOS-only")
-def test_real_transport_keeps_registry_across_apps_select_snapshot(tmp_path):
-    fixture = build_fixture()
+def test_real_transport_keeps_registry_across_apps_select_snapshot(tmp_path, protocol_fixture):
+    fixture = protocol_fixture
 
     async def scenario():
         transport = HelperTransport(fixture)
@@ -527,8 +533,8 @@ def test_real_transport_keeps_registry_across_apps_select_snapshot(tmp_path):
 
 
 @pytest.mark.skipif(platform.system() != "Darwin", reason="native helper is macOS-only")
-def test_protocol_fixture_snapshot_off_emits_v4_default_button_shape(tmp_path):
-    fixture = build_fixture()
+def test_protocol_fixture_snapshot_off_emits_v4_default_button_shape(tmp_path, protocol_fixture):
+    fixture = protocol_fixture
     artifact_root = tmp_path / "artifacts"
     artifact_root.mkdir(mode=0o700)
     directory_fd = os.open(artifact_root, os.O_RDONLY)
@@ -564,8 +570,8 @@ def test_protocol_fixture_snapshot_off_emits_v4_default_button_shape(tmp_path):
 
 
 @pytest.mark.skipif(platform.system() != "Darwin", reason="native helper is macOS-only")
-def test_protocol_fixture_snapshot_on_round_trips_paired_schema_one_metadata(tmp_path):
-    fixture = build_fixture()
+def test_protocol_fixture_snapshot_on_round_trips_paired_schema_one_metadata(tmp_path, protocol_fixture):
+    fixture = protocol_fixture
     artifact_root = tmp_path / "artifacts"
     artifact_root.mkdir(mode=0o700)
     directory_fd = os.open(artifact_root, os.O_RDONLY)
@@ -651,8 +657,8 @@ def test_swift_text_detail_identity_vector_is_accepted_by_python_decoder():
 
 
 @pytest.mark.skipif(platform.system() != "Darwin", reason="native helper is macOS-only")
-def test_protocol_fixture_rejects_duplicate_keys_and_noninteger_v3():
-    fixture = build_fixture()
+def test_protocol_fixture_rejects_duplicate_keys_and_noninteger_v3(protocol_fixture):
+    fixture = protocol_fixture
     requests = """{"protocol_version":4,"request_id":"first","request_id":"duplicate","operation":"ping","payload":{}}
 {"protocol_version":4.0,"request_id":"float","operation":"ping","payload":{}}
 {"protocol_version":4,"request_id":"close","operation":"close","payload":{}}
@@ -674,8 +680,8 @@ def test_protocol_fixture_rejects_duplicate_keys_and_noninteger_v3():
 
 
 @pytest.mark.skipif(platform.system() != "Darwin", reason="native helper is macOS-only")
-def test_protocol_fixture_apps_returns_generation_bound_catalog():
-    fixture = build_fixture()
+def test_protocol_fixture_apps_returns_generation_bound_catalog(protocol_fixture):
+    fixture = protocol_fixture
     request = json.dumps({
         "protocol_version": 4,
         "request_id": "apps",
@@ -714,8 +720,8 @@ def test_protocol_fixture_apps_returns_generation_bound_catalog():
 
 
 @pytest.mark.skipif(platform.system() != "Darwin", reason="native helper is macOS-only")
-def test_protocol_fixture_get_app_state_matches_the_catalog_bound_wire_contract():
-    fixture = build_fixture()
+def test_protocol_fixture_get_app_state_matches_the_catalog_bound_wire_contract(protocol_fixture):
+    fixture = protocol_fixture
     off = {
         "app_ref": "app_a",
         "window_ref": "win_a",
@@ -780,8 +786,8 @@ def test_protocol_fixture_get_app_state_matches_the_catalog_bound_wire_contract(
 
 
 @pytest.mark.skipif(platform.system() != "Darwin", reason="native helper is macOS-only")
-def test_protocol_fixture_matches_shared_artifact_filename_vectors(tmp_path):
-    fixture = build_fixture()
+def test_protocol_fixture_matches_shared_artifact_filename_vectors(tmp_path, protocol_fixture):
+    fixture = protocol_fixture
     artifact_root = tmp_path / "artifacts"
     artifact_root.mkdir(mode=0o700)
     directory_fd = os.open(artifact_root, os.O_RDONLY)
@@ -843,8 +849,8 @@ def test_protocol_fixture_matches_shared_artifact_filename_vectors(tmp_path):
 
 
 @pytest.mark.skipif(platform.system() != "Darwin", reason="native helper is macOS-only")
-def test_protocol_fixture_rejects_oversized_frames_and_unbounded_headers_before_dispatch():
-    fixture = build_fixture()
+def test_protocol_fixture_rejects_oversized_frames_and_unbounded_headers_before_dispatch(protocol_fixture):
+    fixture = protocol_fixture
     oversized_padding = "x" * (4 * 1024 * 1024)
     requests = [
         json.dumps({
@@ -884,8 +890,8 @@ def test_protocol_fixture_rejects_oversized_frames_and_unbounded_headers_before_
 
 
 @pytest.mark.skipif(platform.system() != "Darwin", reason="native helper is macOS-only")
-def test_swift_fixture_reaches_public_snapshot_attachment_with_strict_bounds(tmp_path):
-    fixture = build_fixture()
+def test_swift_fixture_reaches_public_snapshot_attachment_with_strict_bounds(tmp_path, protocol_fixture):
+    fixture = protocol_fixture
 
     async def scenario():
         transport = HelperTransport(fixture)
@@ -918,8 +924,8 @@ def test_swift_fixture_reaches_public_snapshot_attachment_with_strict_bounds(tmp
 
 
 @pytest.mark.skipif(platform.system() != "Darwin", reason="native helper is macOS-only")
-def test_swift_fixture_display_metadata_reaches_public_snapshot_attachment(tmp_path):
-    fixture = build_fixture()
+def test_swift_fixture_display_metadata_reaches_public_snapshot_attachment(tmp_path, protocol_fixture):
+    fixture = protocol_fixture
 
     async def scenario():
         transport = HelperTransport(fixture)
@@ -957,8 +963,8 @@ def test_swift_fixture_display_metadata_reaches_public_snapshot_attachment(tmp_p
 
 
 @pytest.mark.skipif(platform.system() != "Darwin", reason="native helper is macOS-only")
-def test_protocol_fixture_plan_response_includes_exact_pid_action_classes():
-    fixture = build_fixture()
+def test_protocol_fixture_plan_response_includes_exact_pid_action_classes(protocol_fixture):
+    fixture = protocol_fixture
 
     async def scenario():
         transport = HelperTransport(fixture)
@@ -1008,8 +1014,8 @@ def test_protocol_fixture_plan_response_includes_exact_pid_action_classes():
         ("malicious_unknown_missing_outcome", {"outcomes": [], "last_acknowledged_action": -1}),
     ],
 )
-def test_independent_protocol_fixture_malicious_action_results_fail_closed(fixture_case, expected_result):
-    fixture = build_fixture()
+def test_independent_protocol_fixture_malicious_action_results_fail_closed(fixture_case, expected_result, protocol_fixture):
+    fixture = protocol_fixture
     action = {"type": "click", "element_ref": fixture_case}
 
     async def scenario():
@@ -1055,8 +1061,8 @@ def test_independent_protocol_fixture_malicious_action_results_fail_closed(fixtu
 
 
 @pytest.mark.skipif(platform.system() != "Darwin", reason="native helper is macOS-only")
-def test_protocol_fixture_consumes_cooperative_plan_exactly_once():
-    fixture = build_fixture()
+def test_protocol_fixture_consumes_cooperative_plan_exactly_once(protocol_fixture):
+    fixture = protocol_fixture
     action = {"type": "click", "element_ref": "ordinary"}
 
     async def scenario():
