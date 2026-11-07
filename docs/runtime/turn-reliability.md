@@ -4,7 +4,10 @@ Astra keeps model-issued tool calls in their original dependency order. Adjacent
 eligible reads may overlap up to `tool_concurrency`; writes and other exclusive
 operations wait for earlier work and block later reads. Queued calls are checked
 against the current registry again before admission. Cancellation drains work
-already started and stops further dispatch.
+already started and stops further dispatch. The conversation keeps the whole
+call chain: a call that returned keeps its result, a call that started without
+returning is recorded as outcome unknown and is not replayed, and a call that
+never started is recorded as not started.
 
 ## Using a turn budget
 

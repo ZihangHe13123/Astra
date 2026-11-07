@@ -42,7 +42,13 @@ from .core_rules import CORE_SKILL_NAME
 from .agent_team import MESSAGE_ENVELOPE_START
 from .deepseek import DEEPSEEK_VISION_MODELS
 from .llm import LLMClient, LLMIdleTimeout, LLMOverallTimeout, LLMResponseError
-from .turn_budget import TurnBudgetExceeded, budgeted_events, check_work_budget, parse_turn_budget
+from .turn_budget import (
+    TurnBudgetExceeded,
+    budgeted_events,
+    check_work_budget,
+    current_turn_budget,
+    parse_turn_budget,
+)
 from .turn_change_store import (
     TurnChangeStore,
     current_turn_change_store,
@@ -3544,6 +3550,10 @@ class ReActAgent(AgentBase):
         """
         semaphore = asyncio.Semaphore(self.tool_concurrency)
         turn_tool_cache = turn_tool_cache if turn_tool_cache is not None else {}
+        # Which calls reached their tool and which returned, so an interrupted
+        # batch can still record what happened to each call (see below).
+        started: set[int] = set()
+        finished: dict[int, dict] = {}
 
         async def run_one(tc: dict) -> dict:
             check_work_budget()
@@ -3650,6 +3660,7 @@ class ReActAgent(AgentBase):
                 return event
             async with semaphore:
                 check_work_budget()
+                started.add(id(tc))
                 event = await self._execute_tool_call(
                     tc,
                     task_id=task_id,
@@ -3672,6 +3683,7 @@ class ReActAgent(AgentBase):
         async def run_and_publish(tc: dict) -> dict:
             async def execute() -> dict:
                 event = await run_one(tc)
+                finished[id(tc)] = event
                 if result_callback is not None:
                     result_callback(self._public_tool_event(event))
                 return event
@@ -3692,31 +3704,87 @@ class ReActAgent(AgentBase):
             tool = self.tools.get(str(tc.get("name") or ""))
             return tool is not None and (tool.risk == "read" or tool.parallel_safe)
 
-        events = await execute_ordered(
-            tool_calls, run_and_publish, can_overlap, self.tool_concurrency,
-        )
+        try:
+            events = await execute_ordered(
+                tool_calls, run_and_publish, can_overlap, self.tool_concurrency,
+            )
+        except BaseException as exc:
+            # Cancellation, the turn budget or a failure stopped the batch; the
+            # scheduler has drained every started call. Keep the call chain
+            # complete instead of leaving it to be stripped as incomplete:
+            # returned calls keep their real result, a started call that did
+            # not return has an unknown outcome (never replayed), and a call
+            # that never started says so.
+            budget = current_turn_budget()
+            reason = (
+                # An expired turn budget reaches the batch as a cancellation.
+                "the turn ran out of time" if isinstance(exc, TurnBudgetExceeded)
+                or (budget is not None and _time.monotonic() >= budget.deadline)
+                else "the turn was cancelled" if isinstance(exc, asyncio.CancelledError)
+                else "the turn stopped on an error"
+            )
+            for tc in tool_calls:
+                event = finished.get(id(tc))
+                if event is not None:
+                    self._record_tool_result(tc, event, repeat_notice_ids, refusals)
+                else:
+                    self.context.add_tool(tc["id"], self._tool_result_context(
+                        self._interrupted_tool_event(tc, started=id(tc) in started, reason=reason)
+                    ))
+            raise
         for tc, event in zip(tool_calls, events):
-            tool_def = self.tools.get(str(tc.get("name") or ""))
-            if tool_def is not None and tool_def.return_direct and not event.get("error"):
-                context_result = "[Atomic interaction committed successfully.]"
-            else:
-                if str(tc.get("id") or "") in repeat_notice_ids:
-                    event["_repeat_limit_reached"] = True
-                self._note_failure_streak(tc, event, refusals)
-                context_result = self._tool_result_context(event)
-            self.context.add_tool(tc["id"], context_result)
-            if event.get("_tool_disclosures"):
-                self.context.messages[-1]["_tool_disclosures"] = list(event["_tool_disclosures"])
-            fresh_output = event.pop("_fresh_output", None)
-            if fresh_output is not None:
-                fresh_event = dict(event)
-                fresh_event["tool_output"] = fresh_output
-                fresh_event["output_truncated"] = False
-                fresh_event["request_local_placeholder"] = False
-                self._fresh_tool_context[tc["id"]] = self._tool_result_context(fresh_event)
-                if tool_def is not None and tool_def.result_persistence == "request_local":
-                    self._request_local_tool_context_ids.add(tc["id"])
+            self._record_tool_result(tc, event, repeat_notice_ids, refusals)
         return events
+
+    def _record_tool_result(
+        self,
+        tc: dict,
+        event: dict,
+        repeat_notice_ids: frozenset[str],
+        refusals: dict[str, tuple[str, bool]] | None,
+    ) -> None:
+        """Append one call's result to history, in the model's call order."""
+        tool_def = self.tools.get(str(tc.get("name") or ""))
+        if tool_def is not None and tool_def.return_direct and not event.get("error"):
+            context_result = "[Atomic interaction committed successfully.]"
+        else:
+            if str(tc.get("id") or "") in repeat_notice_ids:
+                event["_repeat_limit_reached"] = True
+            self._note_failure_streak(tc, event, refusals)
+            context_result = self._tool_result_context(event)
+        self.context.add_tool(tc["id"], context_result)
+        if event.get("_tool_disclosures"):
+            self.context.messages[-1]["_tool_disclosures"] = list(event["_tool_disclosures"])
+        fresh_output = event.pop("_fresh_output", None)
+        if fresh_output is not None:
+            fresh_event = dict(event)
+            fresh_event["tool_output"] = fresh_output
+            fresh_event["output_truncated"] = False
+            fresh_event["request_local_placeholder"] = False
+            self._fresh_tool_context[tc["id"]] = self._tool_result_context(fresh_event)
+            if tool_def is not None and tool_def.result_persistence == "request_local":
+                self._request_local_tool_context_ids.add(tc["id"])
+
+    @staticmethod
+    def _interrupted_tool_event(tc: dict, *, started: bool, reason: str) -> dict:
+        """The result of a call an interrupted batch left without one of its own."""
+        name = str(tc.get("name") or "tool")
+        if started:
+            error = (
+                f"[ToolOutcomeUnknown] {name} started, but {reason} before its result arrived. "
+                "It may have taken effect in part or in full; it was not run again."
+            )
+            details: dict[str, Any] = {
+                "code": "outcome_unknown", "outcome_unknown": True,
+                "recovery_hint": "Check the current state before running it again; do not repeat it blindly.",
+            }
+        else:
+            error = f"[ToolNotStarted] {name} did not start: {reason} first, so it had no effect."
+            details = {"code": "not_started", "not_executed": True, "retryable": True}
+        return {
+            "type": "tool_result", "id": tc.get("id", ""), "name": name, "args": {}, "output": "",
+            "error": error, "tool_output": error, "duration_ms": 0, **details,
+        }
 
     @staticmethod
     def _separate_vision_tile_attachment(event: dict) -> dict:
@@ -3883,6 +3951,8 @@ class ReActAgent(AgentBase):
                     "This is a bounded preview. If omitted details are needed, "
                     f"inspect the complete result at: {artifact_path}"
                 )
+        elif event.get("outcome_unknown"):
+            lines.append("Result completeness: none. No result arrived, so what the call did is unknown.")
         elif event.get("partial"):
             lines.append(
                 "Result completeness: partial. The tool stopped before finishing; "
