@@ -8,7 +8,9 @@ show the model what actually happened.
 
 import asyncio
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -408,3 +410,95 @@ def test_a_call_that_started_without_a_result_is_never_replayed(tmp_path):
 async def _collect(stream) -> list[dict]:
     return [event async for event in stream]
 
+
+def test_a_synchronous_tool_still_queued_for_a_thread_is_not_started(tmp_path):
+    calls = [CALLS[0], {"id": "call-sync", "name": "sync_write", "arguments": json.dumps({"text": "x"})}]
+    note = tmp_path / "note.txt"
+    ran: list[str] = []
+    release = threading.Event()
+    occupied: list[asyncio.Future] = []
+
+    def sync_write(text: str):
+        ran.append(text)
+        return "written"
+
+    def occupy_the_worker(name, args, tool_def):
+        # Runs on the loop after the durable claim: the pool's only worker is
+        # now busy, so the tool's own thread call has to wait in the queue.
+        del args, tool_def
+        if name == "sync_write":
+            occupied.append(asyncio.get_running_loop().run_in_executor(None, release.wait))
+
+    registry = _registry(note, asyncio.Event())
+    registry.register(ToolDef(
+        name="sync_write", description="blocking write", fn=sync_write, risk="write",
+        parameters={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+    ))
+    registry.hooks.on_before_tool(occupy_the_worker)
+    store = TaskStore(tmp_path / "tasks.db")
+    task = store.start_run("req-1", "write", session_id="sync", model="fake")
+    agent = ReActAgent("agent", BatchLLM(calls=calls), registry, system_prompt="base", task_store=store)
+    agent.context.set_session(str(tmp_path / "sessions" / "sync.json"))
+
+    async def scenario():
+        pool = ThreadPoolExecutor(max_workers=1)
+        asyncio.get_running_loop().set_default_executor(pool)
+        message = Msg(content=[ContentBlock.text("write")], metadata={"task_id": task["id"]})
+
+        async def consume():
+            async for _ in agent.reply_stream(message):
+                pass
+
+        turn = asyncio.create_task(consume())
+        try:
+            for _ in range(500):
+                if occupied:
+                    break
+                await asyncio.sleep(0.01)
+            assert occupied, "the tool call never reached its thread"
+            await asyncio.sleep(0.1)
+            turn.cancel()
+            await asyncio.sleep(0.1)
+        finally:
+            # Cancellation's own bookkeeping waits behind the busy worker too.
+            release.set()
+        await asyncio.wait_for(asyncio.gather(turn, *occupied, return_exceptions=True), timeout=10)
+        pool.shutdown(wait=True)
+
+    asyncio.run(scenario())
+
+    assert ran == []
+    assert _tool_steps(store, task["id"]) == {"write_note": "completed", "sync_write": "not_started"}
+    chain = dict(_chain(agent.context.messages, calls))
+    assert chain["call-sync"].startswith(
+        "[Tool result: sync_write | status: error]\n[ToolNotStarted] sync_write did not start"
+    )
+
+
+def test_a_synchronous_tool_timed_out_in_the_thread_queue_did_not_execute():
+    ran: list[str] = []
+    release = threading.Event()
+    registry = ToolRegistry()
+    registry.register(ToolDef(
+        name="sync_write", description="blocking write", fn=lambda: ran.append("x") or "written",
+        risk="read", timeout=0.2, parameters={"type": "object", "properties": {}},
+    ))
+
+    async def scenario():
+        pool = ThreadPoolExecutor(max_workers=1)
+        loop = asyncio.get_running_loop()
+        loop.set_default_executor(pool)
+        blocker = loop.run_in_executor(None, release.wait)
+        try:
+            return await registry.execute("sync_write", {})
+        finally:
+            release.set()
+            await blocker
+            pool.shutdown(wait=True)
+
+    result = asyncio.run(scenario())
+
+    # The registry's own deadline passed while the call waited for a thread.
+    assert "[ToolTimeout]" in result["error"]
+    assert result.get("not_executed") is True
+    assert ran == []

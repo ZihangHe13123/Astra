@@ -8,7 +8,8 @@ already started and stops further dispatch. The conversation keeps the whole
 call chain: a call that returned keeps its result, a call that started without
 returning is recorded as outcome unknown and is not replayed, and a call that
 never started is recorded as not started. A call starts when its tool function
-is entered, after its checks and approval. The
+is entered, after its checks and approval; a synchronous tool starts only when
+a worker thread runs it, not while it waits in the thread pool's queue. The
 task store records the same outcome; a not-started step may run later as a
 first execution.
 
