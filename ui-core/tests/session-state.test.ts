@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { initialSession, projectEvent } from "../src/session-state.js";
-import { createBackendEventReceiver } from "../src/backend-protocol.js";
+import { createBackendEventReceiver, EventDeliveryState } from "../src/backend-protocol.js";
 
 test("partial output survives an error; history replaces instead of appending", () => {
   let state = initialSession("a");
@@ -217,4 +217,65 @@ test("a job's result joins the personal thread as Astra's message, the way histo
   // Reloaded, the thread shows the same words: the backend stored them as an assistant message.
   const reloaded = projectEvent(state, { type: "history", session_id: "personal", messages: [{ role: "assistant", content: "【定时任务：AI 晚报】\n三条新闻" }] });
   assert.equal(reloaded.messages.at(-1)?.content, state.messages.at(-1)?.content);
+});
+
+// One backend connection as the clients receive it: live frames carry a sequence, and a skipped
+// sequence makes the receiver ask for the event_stream.replay page of journaled events.
+function connection() {
+  let state = projectEvent(initialSession("a"), { type: "gui_ready" });
+  const gaps: number[] = [];
+  const handled: string[] = [];
+  const receive = createBackendEventReceiver(event => {
+    handled.push(`${event.type}:${(event as { request_id?: string }).request_id ?? ""}`);
+    state = projectEvent(state, event);
+  }, () => assert.fail(), { delivery: new EventDeliveryState(), onGap: cursor => gaps.push(cursor) });
+  let sequence = 0;
+  const live = (cursor: number, event: object, { lost = false, replayable = true } = {}) => {
+    sequence++;
+    if (!lost) receive(JSON.stringify({ ...event, generation: "g", sequence, cursor, replayable, event_id: `E${sequence}` }));
+  };
+  const replay = (cursor: number, sequence: number, event: object) =>
+    receive(JSON.stringify({ ...event, cursor, sequence: cursor, replayable: true, replayed: true, event_id: `E${sequence}` }));
+  return { live, replay, gaps, handled, receive, get state() { return state; } };
+}
+
+test("a lost approval request replayed after its live resolution stays resolved", () => {
+  const c = connection();
+  const request = { type: "tool_approval_request", request_id: "r1", tool_name: "bash", choices: ["once", "deny"] };
+  c.live(9, { type: "task_started", task: { id: "t1", status: "running" } });
+  c.live(10, request, { lost: true });
+  c.live(11, { type: "approval_resolved", request_id: "r1", decision: "once" });
+  assert.deepEqual(c.gaps, [9]);
+  c.replay(10, 2, request);
+  c.replay(11, 3, { type: "approval_resolved", request_id: "r1", decision: "once" });
+  c.receive(JSON.stringify({ type: "event_replay_complete", after_cursor: 9, next_cursor: 11, has_more: false }));
+  assert.deepEqual(c.state.approvals, []);
+  // No client is handed the stale request; the terminal client keeps its own list from these events.
+  assert.equal(c.handled.includes("tool_approval_request:r1"), false);
+  c.live(12, { type: "task_status", task: { id: "t1", status: "completed" } });
+  c.live(13, { type: "done" });
+  assert.deepEqual(c.state.approvals, []);
+  assert.equal(c.state.busy, false);
+});
+
+test("a finished task's own approvals and waiting questions end with it; a worker's approval and a pending question remain", () => {
+  const c = connection();
+  c.live(8, { type: "task_started", task: { id: "t1", status: "running" } });
+  c.live(9, { type: "tool_calls", calls: [{ id: "call-1", name: "bash" }] });
+  c.live(10, { type: "tool_approval_request", request_id: "r1", call_id: "call-1", tool_name: "bash" });
+  // A subagent asks for a call of its own, which is not in the conversation's tool list.
+  c.live(11, { type: "tool_approval_request", request_id: "r2", call_id: "worker-call", tool_name: "bash" });
+  c.live(11, { type: "user_question_request", request_id: "q1", task_id: "t1", state: "waiting", questions: [] }, { replayable: false });
+  c.live(11, { type: "user_question_request", request_id: "q2", task_id: "t1", state: "waiting", mode: "timed", questions: [] }, { replayable: false });
+  c.live(11, { type: "user_question_pending", request_id: "q2", task_id: "t1", state: "pending" }, { replayable: false });
+  // r1's resolution is lost and the turn's end arrives first, so the replayed resolution is superseded.
+  c.live(12, { type: "approval_resolved", request_id: "r1", decision: "deny" }, { lost: true });
+  c.live(13, { type: "task_status", task: { id: "t1", status: "cancelled" } });
+  c.live(14, { type: "done" });
+  assert.deepEqual(c.gaps, [11]);
+  c.replay(12, 8, { type: "approval_resolved", request_id: "r1", decision: "deny" });
+  c.receive(JSON.stringify({ type: "event_replay_complete", after_cursor: 11, next_cursor: 12, has_more: false }));
+  assert.deepEqual(c.state.approvals.map(a => a.request_id), ["r2"]);
+  assert.deepEqual(c.state.questions.map(q => q.request_id), ["q2"]);
+  assert.equal(c.state.busy, false);
 });

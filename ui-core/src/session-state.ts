@@ -30,6 +30,8 @@ export type SessionState = {
   /** The personal thread: the desktop background host's own conversation (specs/personal-thread.md). */
   personal?: boolean;
 };
+/** A task run that has ended (agent.runtime.task_store); a blocked or scheduled task has not. */
+const finalTaskStatuses = ["completed", "failed", "cancelled", "interrupted", "done_verified"];
 export function initialSession(id: string, workspace = ""): SessionState {
   return { id, workspace, session: "", mode: "work", status: "connecting", busy: false, isDraft: false,
     messages: [], tools: [], approvals: [], questions: [], processes: {}, delegates: {}, teams: {},
@@ -160,6 +162,12 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
       state.info = { ...state.info, task_status: event };
       state.busy = ["pending", "running", "cancelling"].includes(event.task?.status);
       if (!state.busy && event.task?.id === previous.info.task_status?.task?.id) state.preparation = undefined;
+      // A finished task cannot be waiting for its own approvals or questions, even if their resolution
+      // never arrived. A timed question it left pending stays answerable until the backend expires it.
+      if (finalTaskStatuses.includes(event.task?.status) && event.task?.id) {
+        state.approvals = state.approvals.filter(a => a.owner_task !== event.task.id);
+        state.questions = state.questions.filter(q => q.task_id !== event.task.id || q.state === "pending");
+      }
       break;
     case "chunk":
     case "reasoning": {
@@ -196,8 +204,15 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
       if (!event.call_id) append(event.error ? "error" : "tool", plainText(event.error || event.output || ""));
       break;
     }
-    case "tool_approval_request":
-      state.approvals = [...state.approvals.filter(a => a.request_id !== event.request_id), event]; break;
+    case "tool_approval_request": {
+      // A call of the running turn belongs to its task. A background worker's call is not in the
+      // conversation's tool list and may outlive the turn, so it is ended only by its own resolution.
+      const task = state.info.task_status?.task;
+      const owned = ["pending", "running", "cancelling"].includes(task?.status) && event.call_id
+        && state.tools.some(t => t.call_id === event.call_id && !t.historical);
+      state.approvals = [...state.approvals.filter(a => a.request_id !== event.request_id), owned ? { ...event, owner_task: task.id } : event];
+      break;
+    }
     case "approval_resolved": state.approvals = state.approvals.filter(a => a.request_id !== event.request_id); break;
     case "user_question_request": state.questions = [...state.questions.filter(a => a.request_id !== event.request_id), event]; break;
     case "user_question_pending":

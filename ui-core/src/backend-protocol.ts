@@ -13,10 +13,24 @@ const diagnosticEvents = new Set([
 ]);
 const errorTypes = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "URIError", "EvalError"]);
 
-type Envelope = { type?: string; event_id?: string; cursor?: number; replayable?: boolean; replayed?: boolean; sequence?: number; generation?: string };
+type Envelope = {
+  type?: string; event_id?: string; cursor?: number; replayable?: boolean; replayed?: boolean; sequence?: number; generation?: string;
+  request_id?: unknown; retryable?: unknown;
+};
+
+/** The approval or question a request opens. */
+const controlRequests: Record<string, string> = { tool_approval_request: "approval", user_question_request: "question" };
+/** The approval or question an event ends for good; a retryable question rejection leaves it open. */
+function settledControl(event: Envelope): string | undefined {
+  const kind = { approval_resolved: "approval", approval_response_rejected: "approval", user_question_resolved: "question" }[event.type ?? ""]
+    ?? (event.type === "user_question_response_rejected" && !event.retryable ? "question" : undefined);
+  return kind && typeof event.request_id === "string" && event.request_id ? `${kind}:${event.request_id}` : undefined;
+}
 
 export class EventDeliveryState {
   private seen = new Set<string>();
+  /** Approvals and questions already ended: a lost live request replayed after its resolution is stale. */
+  private settled = new Set<string>();
   private failed = new Set<number>();
   private highWater = 0;
   private generation = "";
@@ -32,9 +46,11 @@ export class EventDeliveryState {
     return this.failed.size > 0 || this.gapFloor !== undefined;
   }
   duplicate(event: Envelope): boolean {
+    const control = controlRequests[event.type ?? ""];
     return Boolean(event.event_id && this.seen.has(event.event_id))
       || Boolean(event.replayed && typeof event.cursor === "number"
-        && (event.cursor <= this.cursor || event.cursor < this.completedThrough));
+        && (event.cursor <= this.cursor || event.cursor < this.completedThrough))
+      || Boolean(control && typeof event.request_id === "string" && this.settled.has(`${control}:${event.request_id}`));
   }
   gap(event: Envelope): boolean {
     if (event.replayed || !event.generation || !Number.isSafeInteger(event.sequence)) return false;
@@ -54,6 +70,11 @@ export class EventDeliveryState {
     if (success && event.event_id) {
       this.seen.add(event.event_id);
       if (this.seen.size > 4096) this.seen.delete(this.seen.values().next().value!);
+    }
+    const settled = success ? settledControl(event) : undefined;
+    if (settled) {
+      this.settled.add(settled);
+      if (this.settled.size > 1024) this.settled.delete(this.settled.values().next().value!);
     }
     // Volatile text frames carry the latest journal cursor too. They cannot
     // acknowledge lifecycle events that the renderer has never applied.
@@ -100,8 +121,9 @@ export function createBackendEventReceiver(
     }
     const envelope = event as PyEvent & Envelope;
     if (delivery.duplicate(envelope)) {
-      // A completed turn supersedes its replayed transient controls. Retire
-      // their failed delivery slots without resurrecting tools or approvals.
+      // A completed turn supersedes its replayed transient controls, and a
+      // resolution supersedes its request. Retire their failed delivery slots
+      // without resurrecting tools, approvals or questions.
       delivery.acknowledge(envelope, true);
       return;
     }
