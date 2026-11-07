@@ -86,7 +86,8 @@ phones have notifications on; 移除 also stops them.
   the time and the decision; message text is not kept, only its length.
 - Wiping your data (**清除…** on the memory page, see [memory](memory.md)) deletes the
   uploads, the speech made for phones and `phone-audit.jsonl`, and reloads every phone;
-  none is shown anything from before. Paired phones stay paired, like other logins;
+  none is shown anything from before. While it runs a phone can send nothing: a file or a
+  message is refused with 正在清除数据, and a file still on its way is not kept. Paired phones stay paired, like other logins;
   remove them in Settings.
 - While a phone is away the Mac keeps what it missed (up to a few MB) so it can catch up;
   after a longer absence it reloads instead. Turning off 允许配对的手机连接 stops the

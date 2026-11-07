@@ -15,6 +15,7 @@ const STREAM_BACKLOG_LIMIT = 8 * 1024 * 1024;
 const REPLAY_EVENTS = 4000;
 const REPLAY_BYTES = STREAM_BACKLOG_LIMIT;
 const HEARTBEAT_MS = 20_000;
+const WIPING = "正在清除数据，请稍后再试。";
 const TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8", ".json": "application/json", ".webmanifest": "application/manifest+json",
@@ -65,6 +66,10 @@ export class PhoneGateway {
   private instance = randomUUID();
   private recent: { seq: number; text: string; bytes: number }[] = [];
   private recentBytes = 0;
+  /** A wipe is running: phones' uploads and calls are refused until it ends. */
+  private held = false;
+  /** Changed when a wipe starts or ends: an upload begun before then is not kept. */
+  private epoch = 0;
   private stopRevoked: () => void;
 
   constructor(private readonly devices: PhoneDevices, private readonly options: PhoneGatewayOptions) {
@@ -123,7 +128,16 @@ export class PhoneGateway {
   reset() {
     for (const stream of [...this.streams]) { stream.response.write(control({ reload: true })); this.close(stream); }
     this.forget();
+    this.epoch++;
   }
+
+  /**
+   * A wipe is starting: until `release()`, phones' uploads and calls are refused, and an upload still arriving
+   * is not kept, so nothing lands in (or is read from) the folders being deleted.
+   */
+  hold() { this.held = true; this.epoch++; }
+
+  release() { this.held = false; }
 
   /** Drops what was kept for replay and names a new run, so no phone resumes from a position before it. */
   private forget() {
@@ -159,13 +173,16 @@ export class PhoneGateway {
       const deviceId = this.bearer(request);
       if (!deviceId) return send(response, 401, { error: "Sign in again" });
       if (!this.options.uploadRoot) return send(response, 404, { error: "Not found" });
+      if (this.held) { request.resume(); return send(response, 503, { error: WIPING }); }
       const saved = await this.saveUpload(request, uploadName(request.headers["x-astra-file-name"]));
+      if (!saved) return send(response, 503, { error: WIPING });
       this.options.uploaded?.(deviceId, saved.path, saved.bytes);
       return send(response, 200, { path: saved.path });
     }
     if (path === "/api/invoke") {
       const deviceId = this.bearer(request);
       if (!deviceId) return send(response, 401, { error: "Sign in again" });
+      if (this.held) { request.resume(); return send(response, 503, { error: WIPING }); }
       const body = await readJson(request, INVOKE_BODY_LIMIT);
       const method = body.method as PhoneInvokeMethod;
       if (!PHONE_INVOKE_METHODS.includes(method)) return send(response, 400, { error: "Unsupported call" });
@@ -183,14 +200,20 @@ export class PhoneGateway {
     return send(response, 404, { error: "Not found" });
   }
 
-  /** Keeps what a phone sent under the day's folder, readable by this user alone, and says where. */
-  private async saveUpload(request: IncomingMessage, name: string): Promise<{ path: string; bytes: number }> {
+  /**
+   * Keeps what a phone sent under the day's folder, readable by this user alone, and says where; nothing
+   * when a wipe started or ended while it arrived.
+   */
+  private async saveUpload(request: IncomingMessage, name: string): Promise<{ path: string; bytes: number } | undefined> {
+    const epoch = this.epoch;
     let size = 0; const chunks: Buffer[] = [];
     for await (const chunk of request) {
       size += chunk.length;
       if (size > UPLOAD_LIMIT) throw new Error(`文件太大：一次最多 ${UPLOAD_LIMIT / 1024 / 1024} MB。`);
       chunks.push(chunk);
     }
+    // Checked right before the write, which runs to its end before anything else can.
+    if (this.held || epoch !== this.epoch) return undefined;
     const now = new Date(), pad = (value: number) => String(value).padStart(2, "0");
     const folder = join(this.options.uploadRoot!, `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`);
     mkdirSync(folder, { recursive: true, mode: 0o700 });

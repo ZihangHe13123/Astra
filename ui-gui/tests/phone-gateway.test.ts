@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { request } from "node:http";
-import { readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PhoneClient } from "../src/phone/client.js";
 import type { PhoneStreamPosition } from "../src/phone-protocol.js";
@@ -247,6 +247,56 @@ test("speech handed to the phone is served to a signed-in phone only, by its id 
       assert.equal((await fetch(`${base}/api/voice/${bad}`, { headers: { Authorization: `Bearer ${token}` } })).status, 404, bad);
     }
   } finally { await gateway.dispose(); }
+});
+
+/** An upload sent in two halves: the second goes when `finish` is called. */
+function halfSent(port: number, token: string, name: string) {
+  let finish = () => {};
+  const answer = new Promise<{ status: number; body: any }>((resolve, reject) => {
+    const outgoing = request({ host: "127.0.0.1", port, path: "/api/upload", method: "POST",
+      headers: { Host: `127.0.0.1:${port}`, Authorization: `Bearer ${token}`, "X-Astra-File-Name": name } }, response => {
+      let text = ""; response.setEncoding("utf8");
+      response.on("data", chunk => { text += chunk; });
+      response.on("end", () => resolve({ status: response.statusCode ?? 0, body: JSON.parse(text || "{}") }));
+    });
+    outgoing.on("error", reject);
+    outgoing.write(Buffer.alloc(1024, 1));
+    finish = () => { outgoing.end(Buffer.alloc(1024, 2)); };
+  });
+  return { answer, finish: () => finish() };
+}
+
+const kept = (folder: string): string[] => existsSync(folder) ? readdirSync(folder, { recursive: true, encoding: "utf8" })
+  .filter(name => statSync(join(folder, name)).isFile()) : [];
+
+test("while a wipe runs, a phone's uploads and calls are refused and an upload still arriving is not kept", async () => {
+  const { devices, gateway, port, base, uploads, uploadRoot } = await setup();
+  let arriving: ReturnType<typeof halfSent> | undefined;
+  try {
+    const { client, token } = await pairedClient(devices, base);
+    arriving = halfSent(port, token, "before.jpg");
+    // The gateway has begun to read it before the wipe starts.
+    await new Promise(resolve => setTimeout(resolve, 200));
+    gateway.hold();
+    arriving.finish();
+    const late = await arriving.answer;
+    assert.equal(late.status, 503);
+    assert.match(late.body.error, /清除/);
+    await assert.rejects(client.upload(token, new Blob([new Uint8Array([1])]), "during.jpg"), /清除/);
+    await assert.rejects(client.invoke(token, "bootstrap", []), /清除/);
+    assert.deepEqual(kept(uploadRoot), []);
+    assert.deepEqual(uploads, []);
+
+    // Once the wipe has ended, phones send again.
+    gateway.reset(); gateway.release();
+    const path = await client.upload(token, new Blob([new Uint8Array([2])]), "after.jpg");
+    assert.ok(path.startsWith(uploadRoot), path);
+    assert.equal(kept(uploadRoot).length, 1);
+  } finally {
+    // A half-sent upload would keep the gateway from closing.
+    arriving?.finish(); await arriving?.answer.catch(() => undefined);
+    await gateway.dispose();
+  }
 });
 
 test("a signed-in phone hands photos and files to the Mac, kept under the day's folder for this user alone", async () => {
