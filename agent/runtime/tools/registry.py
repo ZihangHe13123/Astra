@@ -1100,7 +1100,13 @@ class ToolRegistry:
         call_id: str = "",
         task_id: str = "",
         execution_origin: str = "",
+        on_start: Callable[[], None] | None = None,
     ) -> dict:
+        """Run one tool call through scope, hooks, policy and approval.
+
+        ``on_start`` is called when the tool's own function is entered, after
+        every check and approval; a call stopped before then did not run.
+        """
         def report(
             stage: str,
             *,
@@ -1527,6 +1533,8 @@ class ToolRegistry:
                             nonlocal handler_started
                             check_work_budget()
                             handler_started = True
+                            if on_start is not None:
+                                on_start()
                             if asyncio.iscoroutinefunction(tool.fn):
                                 raw_result = await tool.fn(**bound_call_args)
                             else:

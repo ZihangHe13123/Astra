@@ -8,6 +8,7 @@ show the model what actually happened.
 
 import asyncio
 import json
+import time
 
 import pytest
 
@@ -16,6 +17,7 @@ from agent.runtime.react import ReActAgent
 from agent.runtime.session_store import SessionStore
 from agent.runtime.task_store import TaskStore
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
+from agent.runtime.turn_budget import current_turn_budget
 
 CALLS = [
     {"id": "call-write", "name": "write_note", "arguments": json.dumps({"text": "hello"})},
@@ -29,8 +31,9 @@ class BatchLLM:
         model = "fake"
         capabilities = frozenset()
 
-    def __init__(self, *, batch: bool = True):
+    def __init__(self, *, batch: bool = True, calls: list[dict] = CALLS):
         self.batch = batch
+        self.calls = calls
         self.requests: list[list[dict]] = []
 
     @staticmethod
@@ -42,7 +45,7 @@ class BatchLLM:
         self.requests.append(messages)
         if self.batch and len(self.requests) == 1:
             yield {
-                "type": "tool_calls", "calls": [dict(call) for call in CALLS], "content": "Writing then reading.",
+                "type": "tool_calls", "calls": [dict(call) for call in self.calls], "content": "Writing then reading.",
                 "reasoning_content": "", "finish_reason": "tool_calls", "usage": None,
             }
             return
@@ -72,14 +75,14 @@ def _registry(note, read_started: asyncio.Event) -> ToolRegistry:
     return registry
 
 
-def _chain(messages: list[dict]) -> list[tuple[str, str]]:
+def _chain(messages: list[dict], expected: list[dict] = CALLS) -> list[tuple[str, str]]:
     """The batch's tool-call chain, as (call id, result) pairs in history order."""
     with_calls = [message for message in messages if message.get("tool_calls")]
     assert len(with_calls) == 1, "the batch's tool calls must stay in history"
     calls = with_calls[0]
     index = messages.index(calls)
     results = messages[index + 1:index + 1 + len(calls["tool_calls"])]
-    assert [call["id"] for call in calls["tool_calls"]] == [call["id"] for call in CALLS]
+    assert [call["id"] for call in calls["tool_calls"]] == [call["id"] for call in expected]
     assert all(message["role"] == "tool" for message in results)
     return [(message["tool_call_id"], message["content"]) for message in results]
 
@@ -173,3 +176,100 @@ def test_interrupted_batch_keeps_completed_results_and_marks_the_rest(tmp_path, 
         [message for message in resumed_llm.requests[-1] if message["role"] in {"assistant", "tool"}], reason,
     )
     assert (tmp_path / "note.txt").read_text(encoding="utf-8") == "hello\n"
+
+
+def test_a_call_cancelled_while_awaiting_approval_is_recorded_as_not_started(tmp_path):
+    calls = [CALLS[0], {"id": "call-guarded", "name": "guarded_write", "arguments": json.dumps({"text": "x"})}]
+    note = tmp_path / "note.txt"
+    session = tmp_path / "sessions" / "approval.json"
+    asked = asyncio.Event()
+    entered: list[str] = []
+
+    async def wait_for_person(request: dict) -> str:
+        del request
+        asked.set()
+        await asyncio.Event().wait()
+        return "once"
+
+    def guarded_write(text: str):
+        entered.append(text)
+        return "written"
+
+    registry = _registry(note, asyncio.Event())
+    registry.register(ToolDef(
+        name="guarded_write", description="write after approval", fn=guarded_write, risk="write",
+        parameters={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+        permission_check=lambda args: {"kind": "fixture_write", "scope": "fixture:x", "target": "x"},
+        permission_grant=lambda args, request, decision: None,
+    ))
+    registry.set_approval_handler(wait_for_person)
+    agent = ReActAgent("agent", BatchLLM(calls=calls), registry, system_prompt="base")
+    agent.context.set_session(str(session))
+
+    async def scenario():
+        async def consume():
+            async for _ in agent.reply_stream(Msg(content=[ContentBlock.text("write twice")])):
+                pass
+
+        turn = asyncio.create_task(consume())
+        await asyncio.wait_for(asked.wait(), timeout=5)
+        turn.cancel()
+        await asyncio.wait_for(asyncio.gather(turn, return_exceptions=True), timeout=10)
+
+    asyncio.run(scenario())
+
+    # The guarded tool was never entered: the person had not answered yet.
+    assert entered == []
+    assert note.read_text(encoding="utf-8") == "hello\n"
+    for messages in (agent.context.messages, SessionStore(session).load(readonly=True)["messages"]):
+        chain = dict(_chain(messages, calls))
+        assert chain["call-write"].startswith("[Tool result: write_note | status: success]")
+        assert chain["call-guarded"].startswith(
+            "[Tool result: guarded_write | status: error]\n[ToolNotStarted] guarded_write did not start: "
+            "the turn was cancelled first"
+        )
+        assert "ToolOutcomeUnknown" not in chain["call-guarded"]
+
+
+def test_refusals_and_the_budget_check_before_a_call_keep_their_own_labels(tmp_path):
+    calls = [
+        {"id": "call-invalid", "name": "write_note", "arguments": "{}"},
+        {"id": "call-wait", "name": "wait_past_work_deadline", "arguments": "{}"},
+        {"id": "call-late", "name": "write_note", "arguments": json.dumps({"text": "late"})},
+    ]
+    note = tmp_path / "note.txt"
+    session = tmp_path / "sessions" / "budget.json"
+
+    async def wait_past_work_deadline():
+        budget = current_turn_budget()
+        assert budget is not None
+        await asyncio.sleep(max(0.0, budget.work_deadline - time.monotonic()) + 0.02)
+        return "waited"
+
+    registry = _registry(note, asyncio.Event())
+    registry.register(ToolDef(
+        name="wait_past_work_deadline", description="wait", fn=wait_past_work_deadline, risk="write",
+        parameters={"type": "object", "properties": {}},
+    ))
+    agent = ReActAgent(
+        "agent", BatchLLM(calls=calls), registry, system_prompt="base", turn_timeout_seconds=1.0,
+    )
+    agent.context.set_session(str(session))
+
+    async def scenario():
+        return [event async for event in agent.reply_stream(Msg(content=[ContentBlock.text("go")]))]
+
+    events = asyncio.run(scenario())
+
+    assert [event.get("code") for event in events if event.get("type") == "error"] == ["turn_budget_exhausted"]
+    assert not note.exists()
+    for messages in (agent.context.messages, SessionStore(session).load(readonly=True)["messages"]):
+        chain = dict(_chain(messages, calls))
+        # Refused by argument validation: its own result, not a relabel.
+        assert chain["call-invalid"].startswith("[Tool result: write_note | status: error]\n[ToolInputError]")
+        assert chain["call-wait"].startswith("[Tool result: wait_past_work_deadline | status: success]\nwaited")
+        # Stopped by the budget check before its tool was entered.
+        assert chain["call-late"].startswith(
+            "[Tool result: write_note | status: error]\n[ToolNotStarted] write_note did not start: "
+            "the turn ran out of time first"
+        )

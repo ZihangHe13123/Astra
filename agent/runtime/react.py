@@ -19,6 +19,7 @@ import shlex
 import sys
 import time as _time
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -83,6 +84,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Set by a tool batch around each call: told when the call's tool function is
+# entered, so an interrupted batch knows which calls actually started.
+_TOOL_ENTERED: ContextVar[Callable[[], None] | None] = ContextVar("astra_tool_entered", default=None)
 
 
 # Request-local screenshots may be recompressed by the capture tool to stay inside the
@@ -3126,6 +3130,7 @@ class ReActAgent(AgentBase):
                     call_id=str(tc.get("id") or ""),
                     task_id=task_id or "",
                     execution_origin="model",
+                    on_start=_TOOL_ENTERED.get(),
                 )
             except (asyncio.CancelledError, TurnBudgetExceeded):
                 # A cancelled run_code request may have already claimed a
@@ -3550,8 +3555,9 @@ class ReActAgent(AgentBase):
         """
         semaphore = asyncio.Semaphore(self.tool_concurrency)
         turn_tool_cache = turn_tool_cache if turn_tool_cache is not None else {}
-        # Which calls reached their tool and which returned, so an interrupted
-        # batch can still record what happened to each call (see below).
+        # Which calls entered their tool function (after policy, approval and
+        # argument checks) and which returned, so an interrupted batch can
+        # still record what happened to each call (see below).
         started: set[int] = set()
         finished: dict[int, dict] = {}
 
@@ -3660,13 +3666,16 @@ class ReActAgent(AgentBase):
                 return event
             async with semaphore:
                 check_work_budget()
-                started.add(id(tc))
-                event = await self._execute_tool_call(
-                    tc,
-                    task_id=task_id,
-                    progress_callback=progress_callback,
-                    trace_ctx=trace_ctx,
-                )
+                entered = _TOOL_ENTERED.set(lambda: started.add(id(tc)))
+                try:
+                    event = await self._execute_tool_call(
+                        tc,
+                        task_id=task_id,
+                        progress_callback=progress_callback,
+                        trace_ctx=trace_ctx,
+                    )
+                finally:
+                    _TOOL_ENTERED.reset(entered)
                 if cacheable and not event.get("error"):
                     turn_tool_cache[signature] = dict(event)
                 elif tool is None or not tool.idempotent:
