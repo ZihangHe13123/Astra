@@ -6,6 +6,7 @@ import type { PyEvent } from "./types.js";
 import { delegateActive, reduceDelegateEvent, type DelegateView } from "./delegates.js";
 import { reduceToolPreparation, type ToolPreparation } from "./tool-preparation.js";
 import type { TurnChangesEventData } from "./turn-changes.js";
+import { earlierTaskEvent, taskStartOf, type TaskStart } from "./backend-protocol.js";
 
 /** Platform-independent projection. The backend remains the execution authority. */
 export type UIEvent = { type: string; [key: string]: any };
@@ -27,6 +28,8 @@ export type SessionState = {
   preparation?: ToolPreparation;
   responseVersions?: ResponseVersions; responseOperation?: ResponseOperation; regeneration?: ResponseRegeneration;
   branchId?: string;
+  /** The current task's start in the event journal, for telling an earlier task's late replay apart. */
+  taskStart?: TaskStart;
   /** The personal thread: the desktop background host's own conversation (specs/personal-thread.md). */
   personal?: boolean;
 };
@@ -47,8 +50,10 @@ export function plainText(text: string): string {
 }
 export function projectEvent(previous: SessionState, event: UIEvent): SessionState {
   const state: SessionState = { ...previous, revision: previous.revision + 1 };
+  // An earlier task's late replay leaves the current task, its turn and its preview alone.
+  const earlierTask = earlierTaskEvent(previous.taskStart, event);
   // Unscoped side-command completion must not erase another running turn's preview.
-  if (!(event.type === "done" && !event.request_id && ["pending", "running", "cancelling"].includes(previous.info.task_status?.task?.status))) {
+  if (!earlierTask && !(event.type === "done" && !event.request_id && ["pending", "running", "cancelling"].includes(previous.info.task_status?.task?.status))) {
     state.preparation = reduceToolPreparation(previous.preparation, event);
   }
   // Configuration and diagnostics do not turn a blank page into a conversation.
@@ -157,11 +162,15 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
       state.delegates = (event.delegates || []).reduce(reduceDelegateEvent, {});
       state.turnChanges = [];
       state.session = event.session_id || state.session; state.stream = ""; break;
-    case "task_started": state.busy = true; state.stream = ""; state.info = { ...state.info, task_status: event }; break;
+    case "task_started":
+      if (earlierTask) break;
+      state.busy = true; state.stream = ""; state.info = { ...state.info, task_status: event }; state.taskStart = taskStartOf(event); break;
     case "task_status":
-      state.info = { ...state.info, task_status: event };
-      state.busy = ["pending", "running", "cancelling"].includes(event.task?.status);
-      if (!state.busy && event.task?.id === previous.info.task_status?.task?.id) state.preparation = undefined;
+      if (!earlierTask) {
+        state.info = { ...state.info, task_status: event };
+        state.busy = ["pending", "running", "cancelling"].includes(event.task?.status);
+        if (!state.busy && event.task?.id === previous.info.task_status?.task?.id) state.preparation = undefined;
+      }
       // A finished task cannot be waiting for its own approvals or questions, even if their resolution
       // never arrived. A timed question it left pending stays answerable until the backend expires it.
       if (finalTaskStatuses.includes(event.task?.status) && event.task?.id) {

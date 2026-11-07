@@ -313,3 +313,34 @@ test("an ended task is not restarted by its replayed start, while a later resume
   c.live(10, { type: "task_started", task: { id: "t1", status: "running" } });
   assert.equal(c.state.busy, true);
 });
+
+test("an earlier task's replayed end closes its own approval but not the turn that started after it", () => {
+  const c = connection();
+  c.live(8, { type: "task_started", task: { id: "A", status: "running" } });
+  c.live(9, { type: "tool_calls", calls: [{ id: "call-a", name: "bash" }] });
+  c.live(10, { type: "tool_approval_request", request_id: "ra", call_id: "call-a", tool_name: "bash" });
+  c.live(11, { type: "task_status", task: { id: "A", status: "cancelled" } }, { lost: true });
+  c.live(12, { type: "task_started", task: { id: "B", status: "running" } });
+  assert.deepEqual(c.gaps, [10]);
+  c.replay(11, 4, { type: "task_status", task: { id: "A", status: "cancelled" } });
+  c.replay(12, 5, { type: "task_started", task: { id: "B", status: "running" } });
+  c.receive(JSON.stringify({ type: "event_replay_complete", after_cursor: 10, next_cursor: 12, has_more: false }));
+  assert.equal(c.state.info.task_status.task.id, "B");
+  assert.equal(c.state.busy, true);
+  assert.deepEqual(c.state.approvals, [], "A's own record still ends");
+  c.live(13, { type: "task_status", task: { id: "B", status: "completed" } });
+  assert.equal(c.state.busy, false);
+});
+
+test("an earlier task's start and end replayed after the next task began leave that task current", () => {
+  const c = connection();
+  c.live(7, { type: "done" });
+  c.live(8, { type: "task_started", task: { id: "A", status: "running" } }, { lost: true });
+  c.live(9, { type: "task_status", task: { id: "A", status: "completed" } }, { lost: true });
+  c.live(10, { type: "task_started", task: { id: "B", status: "running" } });
+  c.replay(8, 2, { type: "task_started", task: { id: "A", status: "running" } });
+  c.replay(9, 3, { type: "task_status", task: { id: "A", status: "completed" } });
+  c.receive(JSON.stringify({ type: "event_replay_complete", after_cursor: 7, next_cursor: 10, has_more: false }));
+  assert.equal(c.state.info.task_status.task.id, "B");
+  assert.equal(c.state.busy, true);
+});

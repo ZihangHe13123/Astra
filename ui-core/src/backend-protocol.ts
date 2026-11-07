@@ -25,8 +25,33 @@ type Envelope = {
 function lifecycleEntity(event: Envelope): string | undefined {
   if (!event.replayable || !Number.isSafeInteger(event.cursor)) return undefined;
   if (event.type === "process_status" && typeof event.process_id === "string" && event.process_id) return `process:${event.process_id}`;
+  const id = journaledTaskId(event);
+  return id ? `task:${id}` : undefined;
+}
+
+function journaledTaskId(event: Envelope): string | undefined {
+  if (!event.replayable || !Number.isSafeInteger(event.cursor) || (event.type !== "task_started" && event.type !== "task_status")) return undefined;
   const id = (event.task as { id?: unknown } | null | undefined)?.id;
-  return (event.type === "task_started" || event.type === "task_status") && typeof id === "string" && id ? `task:${id}` : undefined;
+  return typeof id === "string" && id ? id : undefined;
+}
+
+/** Where the current task's start sits in the journal. */
+export type TaskStart = { id: string; cursor: number };
+
+/** The journal position of a task start; undefined when the event carries none. */
+export function taskStartOf(event: Envelope): TaskStart | undefined {
+  const id = event.type === "task_started" ? journaledTaskId(event) : undefined;
+  return id ? { id, cursor: event.cursor! } : undefined;
+}
+
+/**
+ * An event about another task that the journal recorded before the current task started, as a
+ * replay page delivers it late. It may update that task's own record, but not which task is
+ * current or whether a turn is running.
+ */
+export function earlierTaskEvent(current: TaskStart | undefined, event: Envelope): boolean {
+  const id = journaledTaskId(event);
+  return Boolean(current && id && id !== current.id && event.cursor! < current.cursor);
 }
 
 /** The approval or question a request opens. */
