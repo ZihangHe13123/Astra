@@ -17,6 +17,7 @@ from agent.runtime.llm import LLMClient, LLMConfig
 from agent.runtime.react import ReActAgent
 from agent.runtime.skills import SkillStore
 from agent.runtime.tools.registry import ToolRegistry
+from agent.runtime.vision_policy import VisionPreprocessPolicy
 
 ANSWER = (
     b'data: {"id":"u","object":"chat.completion.chunk","created":0,"model":"fake-model",'
@@ -99,7 +100,7 @@ def frames(response: httpx.Response) -> list:
     return [item if item == "[DONE]" else json.loads(item) for item in data]
 
 
-def assert_failed_stream(response: httpx.Response, code: str) -> None:
+def assert_failed_stream(response: httpx.Response, code: str) -> dict:
     assert response.status_code == 200
     sent = frames(response)
     assert sent[-1] == "[DONE]"
@@ -111,6 +112,7 @@ def assert_failed_stream(response: httpx.Response, code: str) -> None:
     # The failure is not presented as assistant text, and the usage chunk still follows it.
     assert "[Error:" not in response.text
     assert sent.index(errors[0]) < len(sent) - 2 and "usage" in sent[-2]
+    return errors[0]["error"]
 
 
 def test_answers_keep_the_openai_shape(api):
@@ -166,3 +168,63 @@ def test_invalid_input_is_a_400_before_the_model(api, body):
     (response,) = api("500", body)
     assert response.status_code == 400
     assert response.json()["error"]["type"] == "invalid_request_error"
+
+
+class VisionModel:
+    """A model that tiles images, so the request's image is prepared before any model request."""
+    model = "deepseek-v4-flash-vision-exp"
+
+    def __init__(self):
+        self.config = LLMConfig(model=self.model, capabilities=frozenset({"vision", "tools"}),
+                                vision_detail="original", vision_preprocess=VisionPreprocessPolicy())
+        self.calls = 0
+
+    def estimate_tokens(self, messages):
+        return 1
+
+    async def chat_stream(self, messages, tools):
+        self.calls += 1
+        yield {"type": "chunk", "content": "seen"}
+        yield {"type": "done", "content": "seen", "usage": None}
+
+
+def test_an_image_that_cannot_be_prepared_is_invalid_input_not_an_answer(api):
+    image = {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "look"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,not-valid-%%%"}}]}]}
+    model = VisionModel()
+    plain, streamed = api("500", image, {**image, "stream": True, "stream_options": {"include_usage": True}}, model=model)
+    assert model.calls == 0
+    assert plain.status_code == 400
+    assert plain.json()["error"]["type"] == "invalid_request_error"
+    assert plain.json()["error"]["code"] == "vision_preprocess_failed"
+    assert "choices" not in plain.json()
+    assert assert_failed_stream(streamed, "vision_preprocess_failed")["type"] == "invalid_request_error"
+
+
+NOTE = {"type": "error", "code": "tool_budget", "message": "Stopping: per-turn tool budget exhausted.", "recoverable": True}
+
+
+@pytest.mark.parametrize(("events", "answer"), [
+    ([NOTE, {"type": "done"}], None),
+    ([{"type": "done"}], None),
+    ([{"type": "chunk", "content": "part"}, NOTE, {"type": "chunk", "content": " final"}, {"type": "done"}],
+     "part\n[Error: Stopping: per-turn tool budget exhausted.] final"),
+])
+def test_a_turn_without_an_answer_is_not_a_success(api, monkeypatch, events, answer):
+    async def turn(_text, _session, usage=None):
+        for event in events:
+            yield event
+    monkeypatch.setattr(api_server, "_agent_events", turn)
+    plain, streamed = api("500", HELLO, STREAM)
+    if answer is None:
+        assert plain.status_code == 502
+        assert plain.json()["error"]["code"] == ("tool_budget" if NOTE in events else "no_answer")
+        assert_failed_stream(streamed, plain.json()["error"]["code"])
+    else:
+        # A note the turn went on from stays in the answer, in both modes.
+        assert plain.json()["choices"][0]["message"]["content"] == answer
+        assert plain.json()["choices"][0]["finish_reason"] == "stop"
+        sent = frames(streamed)
+        assert "".join(c["delta"].get("content", "") for f in sent[:-1] for c in f.get("choices", [])) == answer
+        assert sent[-3]["choices"][0]["finish_reason"] == "stop"

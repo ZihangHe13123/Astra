@@ -650,21 +650,60 @@ _TIMEOUT_CODES = frozenset({"idle_timeout", "overall_timeout", "turn_budget_exha
 class TurnFailed(Exception):
     """A turn that ended without an answer, reported as an OpenAI-style error rather than assistant text."""
 
-    def __init__(self, status: int, message: str, code: str):
+    def __init__(self, status: int, message: str, code: str, kind: str = "server_error"):
         super().__init__(message)
         self.status = status
         self.code = code
+        self.kind = kind
 
     def payload(self) -> dict[str, Any]:
-        return {"error": {"message": str(self), "type": "server_error", "code": self.code}}
+        return {"error": {"message": str(self), "type": self.kind, "code": self.code}}
 
 
-def _failed_turn(event: Mapping[str, Any]) -> TurnFailed | None:
-    """The error event a turn does not recover from (react.reply_stream); recoverable ones are notes in the answer."""
+def _failed_turn(event: Mapping[str, Any], started: bool) -> TurnFailed | None:
+    """The error event that ends a turn (react.reply_stream); other recoverable ones are notes in the answer."""
+    code = str(event.get("code") or "")
+    message = str(event.get("message") or "The turn failed.")
+    if code == "vision_preprocess_failed":
+        # The turn stops here even though the event is "recoverable". Before any model output it
+        # was the request's own image, which never reached the model; later, a tool's image.
+        return TurnFailed(502, message, code) if started else TurnFailed(400, message, code, "invalid_request_error")
     if event.get("recoverable") is not False:
         return None
-    code = str(event.get("code") or "turn_failed")
-    return TurnFailed(504 if code in _TIMEOUT_CODES else 502, str(event.get("message") or "The turn failed."), code)
+    code = code or "turn_failed"
+    return TurnFailed(504 if code in _TIMEOUT_CODES else 502, message, code)
+
+
+class _TurnOutcome:
+    """Whether a turn's events end in an answer or in the failure to report instead of one."""
+
+    def __init__(self) -> None:
+        self.started = False
+        self.answered = False
+        self.failure: TurnFailed | None = None
+        self.note: Mapping[str, Any] | None = None
+
+    def is_note(self, event: Mapping[str, Any]) -> bool:
+        """Record one event; True for an error the turn went on from, shown in the answer as before."""
+        etype = event.get("type")
+        if etype in {"chunk", "tool_calls"}:
+            self.started = True
+            self.answered = self.answered or (etype == "chunk" and bool(event.get("content")))
+        elif etype == "error":
+            failed = _failed_turn(event, self.started)
+            if failed is None:
+                self.note = event
+                return True
+            self.failure = self.failure or failed
+        return False
+
+    def result(self) -> TurnFailed | None:
+        """The failure, if any; a turn that produced no answer at all is one too."""
+        if self.failure is not None or self.answered:
+            return self.failure
+        note = self.note or {}
+        return TurnFailed(502, str(note.get("message") or "The turn ended without an answer."),
+                          str(note.get("code") or "no_answer"))
 
 
 def _raised_failure(exc: Exception) -> TurnFailed:
@@ -687,28 +726,25 @@ async def _run_agent(user_text: str | ChatInput, session_id: str | None = None, 
     """Run user text through the selected API session and collect the response."""
 
     chunks: list[str] = []
-    failure: TurnFailed | None = None
+    outcome = _TurnOutcome()
     events = _agent_events(user_text, session_id, usage)
     try:
         async for event in events:
             etype = event.get("type")
-            if etype == "chunk":
-                chunks.append(event.get("content", ""))
-            elif etype == "error":
-                if (failed := _failed_turn(event)) is not None:
-                    failure = failure or failed
-                    continue
+            if outcome.is_note(event):
                 error_msg = event.get("message", "Unknown error")
                 if chunks:
                     chunks.append(f"\n[Error: {error_msg}]")
                 else:
                     chunks.append(f"[Error: {error_msg}]")
+            elif etype == "chunk":
+                chunks.append(event.get("content", ""))
     finally:
         await events.aclose()
 
-    if failure is not None:
+    if (failure := outcome.result()) is not None:
         raise failure
-    return "".join(chunks) or "(no response)"
+    return "".join(chunks)
 
 
 async def _stream_response(
@@ -726,13 +762,32 @@ async def _stream_response(
     """
     usage: dict = {}
     failure: TurnFailed | None = None
+    outcome = _TurnOutcome()
+    # A note is sent with the answer text that follows it; a turn that ends without one reports an error instead.
+    notes: list[str] = []
     events = _agent_events(user_text, session_id, usage)
     try:
         async for event in events:
             etype = event.get("type")
-            if etype == "error" and (failed := _failed_turn(event)) is not None:
-                failure = failure or failed
+            if outcome.is_note(event):
+                error_chunk = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": f"\n[Error: {event.get('message', '')}]"},
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+                notes.append(f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n")
             elif etype == "chunk":
+                for note in notes:
+                    yield note
+                notes.clear()
                 chunk_data = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
@@ -747,21 +802,7 @@ async def _stream_response(
                     ],
                 }
                 yield f"data: {json.dumps(chunk_data, ensure_ascii=False)}\n\n"
-            elif etype == "error":
-                error_chunk = {
-                    "id": completion_id,
-                    "object": "chat.completion.chunk",
-                    "created": created,
-                    "model": model,
-                    "choices": [
-                        {
-                            "index": 0,
-                            "delta": {"content": f"\n[Error: {event.get('message', '')}]"},
-                            "finish_reason": None,
-                        }
-                    ],
-                }
-                yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+        failure = outcome.result()
     except Exception as exc:
         # Raised mid-stream: report it in the stream instead of cutting the connection.
         logger.exception("Agent error")
@@ -771,6 +812,9 @@ async def _stream_response(
 
     if failure is not None:
         yield f"data: {json.dumps(failure.payload(), ensure_ascii=False)}\n\n"
+    else:
+        for note in notes:
+            yield note
     # Final chunk with finish_reason
     final = {
         "id": completion_id,

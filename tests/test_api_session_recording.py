@@ -329,11 +329,13 @@ def test_error_event_restores_context_before_non_streaming_return(
     monkeypatch.setattr(api_server, "_agent", failing)
 
     async def run_and_inspect():
-        response = await api_server._run_agent("hello", "sister")
-        return response, failing.context is parked, api_server._agent_lock.locked()
+        # A turn that ends on an error with no answer is a failure, not the error as answer text.
+        with pytest.raises(api_server.TurnFailed, match="synthetic event error") as failed:
+            await api_server._run_agent("hello", "sister")
+        return failed.value, failing.context is parked, api_server._agent_lock.locked()
 
-    response, restored, locked = _run(run_and_inspect())
-    assert response == "[Error: synthetic event error]"
+    failure, restored, locked = _run(run_and_inspect())
+    assert failure.status == 502
     assert restored is True
     assert locked is False
     assert len(

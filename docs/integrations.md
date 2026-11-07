@@ -24,14 +24,16 @@ also require configured bearer authentication, even on loopback.
 
 `POST /v1/chat/completions` supports streaming and non-streaming responses.
 Malformed consumed fields, including a missing `messages`, return HTTP 400
-with an OpenAI-style `error` object before session or Agent work. A turn that
-fails without an answer is not returned as assistant text: non-streaming
+with an OpenAI-style `error` object before session or Agent work. An image
+Astra cannot prepare for the model (for example invalid inline data) is also
+invalid input: HTTP 400 with `code` `vision_preprocess_failed`. A turn that
+ends without an answer is not returned as assistant text: non-streaming
 requests get HTTP 504 when the model provider or the turn timed out and 502
-for other provider failures, each with an `error` object (`code` names the
-cause, such as `idle_timeout` or `upstream_error`). A stream has already sent
+otherwise, each with an `error` object (`code` names the cause, such as
+`idle_timeout`, `upstream_error` or `no_answer`). A stream has already sent
 HTTP 200, so it ends with a `data: {"error": ...}` frame, a final chunk whose
-`finish_reason` is `"error"`, and `[DONE]`. Notes the Agent recovers from, such
-as a tool budget stop, stay in the answer text. This
+`finish_reason` is `"error"`, and `[DONE]`. Notes the Agent went on from, such
+as a tool budget stop followed by its summary, stay in the answer text. This
 bridge exposes Astra's local tools to authenticated callers; use a trusted
 network or a TLS reverse proxy for remote access. Native messaging channels
 remain a separate integration.

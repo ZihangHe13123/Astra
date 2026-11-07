@@ -20,7 +20,7 @@ uv run --locked --extra server python -m agent.cli.api_server
 
 绑定非回环地址必须设置此 Key，否则启动被拒绝。携带浏览器 `Origin` 的请求即使访问回环地址，也要求配置 bearer 认证。
 
-`POST /v1/chat/completions` 支持流式和非流式响应。已消费字段格式错误（包括缺少 `messages`）时，在创建会话或执行 Agent 前返回 HTTP 400 和 OpenAI 格式的 `error` 对象。未产生回答而失败的回合不会作为助手文本返回：非流式请求在模型服务或本回合超时时返回 HTTP 504，其他模型服务故障返回 502，均附 `error` 对象（`code` 说明原因，如 `idle_timeout`、`upstream_error`）。流式响应已发出 HTTP 200，因此以 `data: {"error": ...}` 帧、`finish_reason` 为 `"error"` 的最后一个分块和 `[DONE]` 结束。Agent 能自行恢复的提示（如工具预算停止）仍保留在回答文本中。该桥接把 Astra 本地工具开放给认证调用方，远程访问应使用可信网络或 TLS 反向代理。原生消息渠道是另一项独立集成。
+`POST /v1/chat/completions` 支持流式和非流式响应。已消费字段格式错误（包括缺少 `messages`）时，在创建会话或执行 Agent 前返回 HTTP 400 和 OpenAI 格式的 `error` 对象。Astra 无法为模型准备的图片（如无效的内联数据）同样属于无效输入：返回 HTTP 400，`code` 为 `vision_preprocess_failed`。未产生回答就结束的回合不会作为助手文本返回：非流式请求在模型服务或本回合超时时返回 HTTP 504，其他情况返回 502，均附 `error` 对象（`code` 说明原因，如 `idle_timeout`、`upstream_error`、`no_answer`）。流式响应已发出 HTTP 200，因此以 `data: {"error": ...}` 帧、`finish_reason` 为 `"error"` 的最后一个分块和 `[DONE]` 结束。Agent 之后继续完成回答的提示（如工具预算停止后的总结）仍保留在回答文本中。该桥接把 Astra 本地工具开放给认证调用方，远程访问应使用可信网络或 TLS 反向代理。原生消息渠道是另一项独立集成。
 
 <a id="native-messaging-channels"></a>
 
