@@ -81,16 +81,18 @@ longer accepts everyone. These contacts receive public web/chat tools only,
 without local files, history, memory, project instructions or delegation.
 For private remote control, explicitly list trusted owner IDs in
 `qq.owner_users` and configure the access token; owners need not also appear in
-allow_users. Group messages
-always use chat capabilities, including those sent by an owner. Revoking owner
-access starts a separate restricted conversation; old owner history remains on
-disk and is never loaded into that chat.
+allow_users. Group messages always use chat capabilities, including those sent
+by an owner. Revoking owner access starts a separate restricted conversation;
+old owner history remains on disk and is never loaded into that chat.
 
 Only one service may own port 2280. Stop or reconfigure AstrBot before enabling
 the native QQ adapter. Adapter startup failure is reported without taking down
-the TUI, and all adapters are closed when the Astra backend exits. Tool
-operations that would normally require an interactive approval are denied on
-messaging channels rather than waiting forever for a hidden prompt.
+the TUI, and all adapters are closed when the Astra backend exits. A QQ turn's
+step that needs approval is not asked in the chat: it goes to Astra's approval
+inbox and to the open window of the backend that runs the channel, which can
+approve it, and what is allowed there applies to that QQ chat only. No answer
+within five minutes counts as a denial, so a request nobody sees never holds
+the channel; without a working approval inbox the step is denied at once.
 
 QQ image segments are downloaded with public-URL checks and bounded size, then
 passed to vision-capable models as native multimodal content. Local file sending
@@ -102,7 +104,7 @@ folders, application data and common credential files even when requested by
 the model. A file goes back over the NapCat connection the request came from;
 an upload NapCat does not confirm within 30 seconds is reported to the model as
 unconfirmed (it may or may not have arrived) and is never resent automatically.
-When NapCat disconnects, the turn it was waiting for is cancelled.
+When NapCat disconnects, the turn answering it is cancelled.
 
 ### WeChat
 
