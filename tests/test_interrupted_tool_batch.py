@@ -13,6 +13,7 @@ import time
 import pytest
 
 from agent.core.msg import ContentBlock, Msg
+from agent.runtime.context import AgentContext
 from agent.runtime.react import ReActAgent
 from agent.runtime.session_store import SessionStore
 from agent.runtime.task_store import TaskStore
@@ -229,6 +230,33 @@ def test_a_call_cancelled_while_awaiting_approval_is_recorded_as_not_started(tmp
             "the turn was cancelled first"
         )
         assert "ToolOutcomeUnknown" not in chain["call-guarded"]
+
+
+def test_a_cancelled_non_streaming_reply_saves_the_same_chain(tmp_path):
+    note = tmp_path / "note.txt"
+    session = tmp_path / "sessions" / "reply.json"
+    read_started = asyncio.Event()
+    agent = ReActAgent("agent", BatchLLM(), _registry(note, read_started), system_prompt="base")
+    agent.context.set_session(str(session))
+
+    async def scenario():
+        turn = asyncio.create_task(agent.reply(Msg(content=[ContentBlock.text("write then read")])))
+        await asyncio.wait_for(read_started.wait(), timeout=5)
+        await asyncio.sleep(0.05)
+        turn.cancel()
+        outcome = await asyncio.wait_for(asyncio.gather(turn, return_exceptions=True), timeout=10)
+        # The caller still sees its cancellation.
+        assert isinstance(outcome[0], asyncio.CancelledError)
+
+    asyncio.run(scenario())
+
+    assert note.read_text(encoding="utf-8") == "hello\n"
+    # Read back from disk by a fresh context, as the next process would.
+    restored = AgentContext()
+    restored.set_session(str(session))
+    assert restored.load()
+    _assert_truthful_chain(restored.messages, "the turn was cancelled")
+    assert restored.messages == json.loads(json.dumps(agent.context.messages))
 
 
 def test_refusals_and_the_budget_check_before_a_call_keep_their_own_labels(tmp_path):

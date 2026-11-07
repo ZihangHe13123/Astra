@@ -5642,6 +5642,13 @@ class ReActAgent(AgentBase):
         except TurnBudgetExceeded as exc:
             await self._record_turn_budget_exhaustion(msg, exc)
             raise
+        except asyncio.CancelledError:
+            # Persist what the turn recorded before stopping, as reply_stream
+            # does: completed results and unknown outcomes reach the session.
+            logger.warning("react reply cancelled request_id=%s", msg.metadata.get("request_id") or msg.id)
+            self.context.sanitize_tool_history()
+            await self.context.save_async()
+            raise
         finally:
             try:
                 await react_events.aclose()
