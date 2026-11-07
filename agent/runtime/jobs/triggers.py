@@ -4,14 +4,16 @@ The background host looks every few minutes. A trigger's first successful look o
 stand, an empty folder included, so mail and files that were already there never start a run. Each look
 queues at most ``MAX_EVENTS`` runs per job, oldest first, and moves the job's cursor past what it queued
 or passed over in the same transaction; what is left waits for the next look, so nothing new is dropped.
+A file is new when its name was not in the folder at the last look, whatever its time says.
 """
 
 from __future__ import annotations
 
 import fnmatch
+import json
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +25,9 @@ MAX_EVENTS = 5
 LOOK_SECONDS = 300.0
 # Mail is read past the cursor this many messages at a time, oldest first.
 MAIL_PAGE = 100
-# A file cursor before files were told apart by name: every file at its time counted as seen.
+# A file cursor is the names in the folder at the last look. Earlier cursors were a time, or a time and a
+# name, with every file at or before it seen; one before names were kept counted every file at its time.
+_NAMES = "names:"
 _EVERY_NAME = "\U0010ffff"
 
 
@@ -61,22 +65,20 @@ class TriggerWatcher:
         folder, pattern = Path(job["spec"]["workdir"]), job["spec"]["trigger"]["pattern"]
         cursor = self.store.trigger_cursor(job["id"])
         try:
-            files = [(entry.stat().st_mtime, entry) for entry in folder.iterdir()
-                     if entry.is_file() and not entry.name.startswith(".") and fnmatch.fnmatch(entry.name, pattern)]
+            files = {entry.name: entry.stat().st_mtime for entry in folder.iterdir()
+                     if entry.is_file() and not entry.name.startswith(".") and fnmatch.fnmatch(entry.name, pattern)}
         except OSError:
             return 0
         if cursor is None:
-            return self.store.fire(job["id"], [], repr(now), now=now)
-        # Files in (time, name) order: those sharing a time are told apart, so a look that stops among
-        # them goes on from the right one next time.
-        since_text, _, since_name = cursor.partition("|")
-        since = (float(since_text), since_name if "|" in cursor else _EVERY_NAME)
-        fresh = sorted((when, entry.name, entry) for when, entry in files if (when, entry.name) > since)[:MAX_EVENTS]
-        if not fresh:
-            return self.store.fire(job["id"], [], cursor, now=now)
-        events = [{"type": "file", "path": str(entry), "name": name} for _, name, entry in fresh]
-        last_when, last_name, _ = fresh[-1]
-        return self.store.fire(job["id"], events, f"{last_when!r}|{last_name}", now=now)
+            return self.store.fire(job["id"], [], _names_cursor(files), now=now)
+        seen = _seen(cursor, files)
+        # A copy, a move or an unpacked file keeps an old time and is still new; a change to a file already
+        # there is not. Oldest first, by time and then name.
+        fresh = sorted((when, name) for name, when in files.items() if name not in seen)[:MAX_EVENTS]
+        events = [{"type": "file", "path": str(folder / name), "name": name} for _, name in fresh]
+        # A file removed since is forgotten, so one that comes back is new again.
+        kept = (seen & files.keys()) | {name for _, name in fresh}
+        return self.store.fire(job["id"], events, _names_cursor(kept), now=now)
 
     def _look_at_mail(self, jobs: list[dict], now: float) -> int:
         try:
@@ -121,6 +123,18 @@ class TriggerWatcher:
             if len(page) < MAIL_PAGE:
                 break
         return self.store.fire(job["id"], events, f"{validity}:{last}", now=now)
+
+
+def _names_cursor(names: Iterable[str]) -> str:
+    return _NAMES + json.dumps(sorted(names), ensure_ascii=False)
+
+
+def _seen(cursor: str, files: dict[str, float]) -> set[str]:
+    if cursor.startswith(_NAMES):
+        return set(json.loads(cursor[len(_NAMES):]))
+    since_text, _, since_name = cursor.partition("|")
+    since = (float(since_text), since_name if "|" in cursor else _EVERY_NAME)
+    return {name for name, when in files.items() if (when, name) <= since}
 
 
 def _default_mail_service() -> Any:

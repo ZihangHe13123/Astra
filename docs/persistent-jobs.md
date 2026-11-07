@@ -130,6 +130,8 @@ arrives whose sender or subject contains the text; `--on-new-file PATTERN` start
 file matching the pattern (such as `'*.pdf'`) appears directly in `--workdir`. The desktop's
 background host looks every five minutes; its first look that reaches the folder or mailbox only
 notes where things stand (an empty folder included), so mail and files already there never start
+a run. A file is new when its name was not in the folder at the previous look, so a copied, moved
+or unpacked file counts even with an old date, and changing a file already there does not start
 a run. One look starts at most five runs per job, oldest first; the rest wait for the next look,
 so none is lost. Mail is read from the local cache, which takes up to 100 new messages per folder
 at each look. A
