@@ -242,16 +242,24 @@ export async function restoreVersion(manifestPath: string, id: string): Promise<
   return rewrite(manifestPath, "restore", () => kept);
 }
 
+/** What a document's text was, as the preview showed it and as a comment is checked against. */
+export function documentDigest(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
 /**
  * A comment from the person on a passage of a document canvas, written where the doc_* tools read it:
- * `occurrence` is which of the same text they selected, and `version` the canvas version the preview showed,
- * so a document changed since they selected is not commented on in a place they did not see.
+ * `occurrence` is which of the same text they selected, and `digest` the document's text when they selected
+ * it. That is checked against the very text being rewritten, so a document changed since, even a moment
+ * before it is read here, is not commented on in a place they did not see.
  */
 export async function commentOnDocument(manifestPath: string, passage: string, comment: string,
-  selected: { occurrence?: number; version?: string } = {}): Promise<string | undefined> {
+  selected: { occurrence?: number; digest?: string } = {}): Promise<string | undefined> {
   if ((await manifestOf(manifestPath)).type !== "doc") throw new Error("只有文档画布可以批注。");
-  if (selected.version !== undefined && selected.version !== await canvasVersion(manifestPath))
-    throw new Error("文档在你选中之后改过了，请刷新预览后重新选择。");
-  return rewrite(manifestPath, "comment", current =>
-    Buffer.from(insertComment(current.toString("utf8"), passage, comment, selected.occurrence ?? 0)));
+  return rewrite(manifestPath, "comment", current => {
+    const text = current.toString("utf8");
+    if (selected.digest !== undefined && documentDigest(text) !== selected.digest)
+      throw new Error("文档在你选中之后改过了，请刷新预览后重新选择。");
+    return Buffer.from(insertComment(text, passage, comment, selected.occurrence ?? 0));
+  });
 }

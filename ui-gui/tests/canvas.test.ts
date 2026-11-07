@@ -181,11 +181,14 @@ test("a comment lands on the occurrence that was selected, and after code, never
 
 test("a comment on a document changed since it was selected is refused", async () => {
   const manifest = canvas({ "doc.md": "# 一\n\n原来的一段。\n" }, "doc");
-  const seen = await canvasVersion(manifest);
+  // The text as the preview showed it when the passage was selected.
+  const seen = (await canvasPreview(manifest)).canvas?.digest;
+  assert.match(seen ?? "", /^[0-9a-f]{64}$/);
+  // A paragraph added afterwards, even one that lands as the comment is being written, is not commented on.
   writeFileSync(join(manifest, "..", "doc.md"), "# 一\n\n改过的一段，原来的一段。\n");
-  await assert.rejects(commentOnDocument(manifest, "原来的一段", "x", { version: seen }), /改过了/);
+  await assert.rejects(commentOnDocument(manifest, "原来的一段", "x", { digest: seen }), /改过了/);
   assert.equal(readFileSync(join(manifest, "..", "doc.md"), "utf8"), "# 一\n\n改过的一段，原来的一段。\n");
-  await commentOnDocument(manifest, "原来的一段", "x", { version: await canvasVersion(manifest) });
+  await commentOnDocument(manifest, "原来的一段", "x", { digest: (await canvasPreview(manifest)).canvas?.digest });
   assert.match(readFileSync(join(manifest, "..", "doc.md"), "utf8"), /原来的一段 <!-- @astra: x -->。/);
 });
 

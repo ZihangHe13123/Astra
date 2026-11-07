@@ -9,7 +9,7 @@ export type FilePreview = {
    * A canvas (specs/canvas.md): its title, its type, how many slides, and the content as the model wrote it.
    * A deck is shown as a page, a document as its Markdown; `version` names a kept version shown instead of the current one.
    */
-  canvas?: { title: string; type: 'slides' | 'doc'; slides: number; source: string; version?: string };
+  canvas?: { title: string; type: 'slides' | 'doc'; slides: number; source: string; version?: string; digest?: string };
 };
 /** A kept version of a canvas's content (agent/runtime/canvas.py writes them too): when, from what, and its hash. */
 export type CanvasVersion = { id: string; at: number; source: string; sha256: string; file: string };

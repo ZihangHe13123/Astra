@@ -531,7 +531,7 @@ register("canvas", async (id, value, action, argument) => {
   const occurrence = argument.occurrence ?? 0;
   if (!Number.isInteger(occurrence) || occurrence < 0 || occurrence > 100000) throw new Error("Invalid occurrence");
   return { version: await commentOnDocument(path, checkedString(argument.passage, "passage", 4000), checkedString(argument.comment, "comment", 2000),
-    { occurrence, version: argument.version === undefined ? undefined : checkedString(argument.version, "version", 200) }) };
+    { occurrence, digest: argument.digest === undefined ? undefined : checkedString(argument.digest, "digest", 64) }) };
 });
 
 /**

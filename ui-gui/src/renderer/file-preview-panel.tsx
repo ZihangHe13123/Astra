@@ -21,7 +21,7 @@ export function FilePreviewPanel({runtime,path,serial,dismiss,fail,wide,onWide,o
   // A canvas's kept versions (the list is open while set), the one being looked at, and the person's comment on a passage.
   const [versions,setVersions]=useState<CanvasVersion[]>();
   const [viewing,setViewing]=useState<{id:string; preview:FilePreview}>();
-  const [passage,setPassage]=useState(''); const [occurrence,setOccurrence]=useState(0); const [note,setNote]=useState('');
+  const [passage,setPassage]=useState(''); const [occurrence,setOccurrence]=useState(0); const [seen,setSeen]=useState<string>(); const [note,setNote]=useState('');
   const [busy,setBusy]=useState(false); const [notice,setNotice]=useState('');
   const pending=useRef<{id:string; cancelled:boolean}>();
   const body=useRef<HTMLDivElement>(null);
@@ -53,8 +53,8 @@ export function FilePreviewPanel({runtime,path,serial,dismiss,fail,wide,onWide,o
   const view=(id:string)=>{void window.astra.canvas(runtime,path,'preview',id).then(value=>{if(value.preview)setViewing({id,preview:value.preview});}).catch(fail);};
   const change=(work:Promise<unknown>,done:string)=>{setBusy(true);void work.then(()=>{setViewing(undefined);setPassage('');setNote('');setNotice(done);setRevision(value=>value+1);}).catch(fail).finally(()=>setBusy(false));};
   const restore=(id:string)=>change(window.astra.canvas(runtime,path,'restore',id),`已恢复成版本 ${Number(id)}；恢复前的内容也留了一个版本。`);
-  // Which of the same text was selected, and the version shown, so the comment lands where it was seen or not at all.
-  const comment=()=>change(window.astra.canvas(runtime,path,'comment',{passage,comment:note,occurrence,version:preview?.sourceVersion}),'批注已写进文档。在对话里让 Astra 处理批注即可。');
+  // Which of the same text was selected, and the text shown when it was, so the comment lands where it was seen or not at all.
+  const comment=()=>change(window.astra.canvas(runtime,path,'comment',{passage,comment:note,occurrence,digest:seen}),'批注已写进文档。在对话里让 Astra 处理批注即可。');
   // What the person selects in a document canvas is the passage a comment is about.
   const pick=()=>{
     if(canvas?.type!=='doc' || viewing || docView!=='rendered')return;
@@ -64,7 +64,7 @@ export function FilePreviewPanel({runtime,path,serial,dismiss,fail,wide,onWide,o
     const doc=(start instanceof Element ? start : start.parentElement)?.closest('.doc-preview');
     if(!doc)return;
     const before=document.createRange(); before.selectNodeContents(doc); before.setEnd(start,range.startOffset);
-    setPassage(text.slice(0,1000)); setOccurrence(occurrences(before.toString().split(/\s+/).filter(Boolean).join(' '),text));
+    setPassage(text.slice(0,1000)); setSeen(preview?.canvas?.digest); setOccurrence(occurrences(before.toString().split(/\s+/).filter(Boolean).join(' '),text));
   };
   // The picture is of the saved page, drawn afresh; it lands in the message being written, which the enlarged panel covers.
   const picture=()=>{setPicturing(true);void window.astra.file(runtime,path,'snapshot').then(value=>{if(value.path){onAttach?.([value.path]);onWide?.(false);}}).catch(fail).finally(()=>setPicturing(false));};
