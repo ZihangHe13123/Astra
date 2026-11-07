@@ -117,7 +117,7 @@ function DataSection({ fail }: { fail: (error: unknown) => void }) {
       <p className="small"><strong>会永久删除（{summary.size}）：</strong>{summary.labels.join("、") || "没有可删除的数据"}。删除后无法恢复，建议先导出。</p>
       <p className="muted small">保留：{summary.kept.join("、")}。</p>
       <label className="activity-toggle small"><input type="checkbox" checked={browserData} onChange={event => setBrowserData(event.target.checked)}/> 同时清除 Astra 浏览器里的登录和 Cookie</label>
-      <label className="activity-toggle small"><input type="checkbox" checked={personalFiles} onChange={event => setPersonalFiles(event.target.checked)}/> 同时清除个人对话在自己文件夹里写的文件</label>
+      <label className="activity-toggle small"><input type="checkbox" checked={personalFiles} onChange={event => setPersonalFiles(event.target.checked)}/> 同时清除个人对话在自己文件夹里写的文件（其中的 .env 和密钥文件保留）</label>
       <p className="muted small">清除时会先关掉所有对话和后台任务，完成后窗口重新载入。</p>
       <div className="memory-actions">
         <input aria-label="输入清除两个字确认" placeholder={`输入「${plan.confirmation}」确认`} value={typed} onChange={event => setTyped(event.target.value)}/>

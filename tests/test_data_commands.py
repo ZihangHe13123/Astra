@@ -192,8 +192,12 @@ def test_wipe_needs_the_word_and_takes_the_data_and_its_copies_but_not_logins(tm
     assert code == 0 and not set(BROWSER) & present(home) and not (home / "browser.db").exists()
     assert set(KEPT) | set(PERSONAL) <= present(home)
     code, result = data(env, "wipe", "--root", str(root), "--confirm", "清除", "--personal-files")
-    assert code == 0 and not set(PERSONAL) & present(home) and not (home / "personal").exists()
-    assert [item["key"] for item in result["removed"]] == ["personal"] and not any("个人对话" in k for k in result["kept"])
+    # The work files go; keys left among them stay, and the answer says so.
+    keys = {"personal/.env", "personal/notes/.env.local", "personal/keys/server.pem"}
+    assert code == 0 and set(PERSONAL) & present(home) == keys
+    assert [item["key"] for item in result["removed"]] == ["personal"]
+    assert "个人对话写的文件（选了一起清除才删）" not in result["kept"]
+    assert any(".env" in entry and "个人对话文件夹里的也保留" in entry for entry in result["kept"])
     assert set(KEPT) <= present(home)
 
 

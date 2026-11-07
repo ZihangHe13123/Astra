@@ -51,7 +51,7 @@ NOT_EXPORTED = (".env 和其他密钥", "模型和服务商连接", "微信登�
                 "设置", "邮件缓存", "活动记录")
 PERSONAL_LABEL = "个人对话写的文件"
 PERSONAL_KEPT = f"{PERSONAL_LABEL}（选了一起清除才删）"
-KEPT = ("设置和模型", ".env 和其他密钥、服务商连接", "微信登录", "配对的手机（在设置里移除）", "邮件缓存（可以重新同步）",
+KEPT = ("设置和模型", ".env 和其他密钥（个人对话文件夹里的也保留）、服务商连接", "微信登录", "配对的手机（在设置里移除）", "邮件缓存（可以重新同步）",
         "活动记录（在活动页单独清除）", "Hindsight 服务器上的记忆（如果用了，要在那边清）")
 
 
@@ -64,6 +64,8 @@ class Item:
     browser: bool = False
     # The personal thread's own work files: wiped only when the person chooses it too.
     personal: bool = False
+    # Keys among the files (.env, id_rsa, *.pem, as export leaves out) stay when the rest goes.
+    spare_keys: bool = False
     # Folders directly inside ``path`` that are items of their own: export and sizes leave them to those.
     apart: tuple[str, ...] = ()
 
@@ -107,7 +109,7 @@ def items() -> list[Item]:
         Item("skills", "学到的技能", skills / "learned", True),
         Item("skills-journal", "技能学习记录", learning_home(skills), True),
         Item("learning", "技能学习建议", default_learning_path(), True),
-        Item("personal", PERSONAL_LABEL, personal, True, apart=("uploads", ".astra"), personal=True),
+        Item("personal", PERSONAL_LABEL, personal, True, apart=("uploads", ".astra"), personal=True, spare_keys=True),
         # Copies made from conversations: wiped with them, not worth exporting.
         Item("feedback", "对话检索反馈", _env_path("ASTRA_CONTEXT_INDEX_FEEDBACK_DB",
                                                recall.with_name("context-index-feedback.db")), False),
@@ -328,8 +330,9 @@ def _others_running(install, *, desktop: bool) -> list[dict]:
     return [item for item in active_instances(install) if not (desktop and item.get("role") == "desktop")]
 
 
-def _remove(path: Path, tracked: set[Path]) -> int:
-    """Delete ``path`` (with SQLite's side files), keeping tracked files; return how many files went."""
+def _remove(path: Path, tracked: set[Path], *, spare_keys: bool = False) -> int:
+    """Delete ``path`` (with SQLite's side files), keeping tracked files, and key files when asked; return how
+    many files went."""
     removed = 0
     if path.is_symlink():
         path.unlink()
@@ -343,13 +346,13 @@ def _remove(path: Path, tracked: set[Path]) -> int:
         return 1
     if not path.is_dir():
         return 0
-    if not tracked:
+    if not tracked and not spare_keys:
         removed = sum(1 for _ in path.rglob("*") if _.is_file())
         shutil.rmtree(path)
         return removed
     for entry in sorted(path.rglob("*"), key=lambda value: len(value.parts), reverse=True):
         if entry.is_symlink() or entry.is_file():
-            if entry.resolve() not in tracked:
+            if entry.resolve() not in tracked and not (spare_keys and _credential(entry)):
                 entry.unlink()
                 removed += 1
         elif entry.is_dir() and not any(entry.iterdir()):
@@ -382,7 +385,7 @@ def wipe(confirmation: str, *, browser_data: bool = False, personal_files: bool 
             try:
                 _reach(item, state_dir())
                 _guard(item.path, install.root)
-                count = _remove(item.path, _tracked(install.root, item.path))
+                count = _remove(item.path, _tracked(install.root, item.path), spare_keys=item.spare_keys)
             except OSError as exc:
                 failed.append({"key": item.key, "label": item.label, "error": str(exc)})
                 continue

@@ -187,7 +187,8 @@ data plus every copy made from it (search and vector indexes, task, event and ap
 the desktop's history cache and pasted images, photos and files sent from a phone, the edit
 snapshots and caches in the personal folder, speech made for a phone and the phone audit log).
 The files the personal thread wrote in its folder are its work, like the files in a project,
-and go only if you tick that box; so do the logins in Astra's own browser. Settings, models,
+and go only if you tick that box; even then any `.env` or key file among them (the same names
+an export leaves out) stays. The logins in Astra's own browser also go only if ticked. Settings, models,
 keys, the WeChat login, paired phones (remove them in Settings), the mail cache and activity
 history stay, and a Hindsight server keeps its own memories. The desktop closes every conversation and its background host
 first and reloads afterwards, and so does every paired phone. If something could not be
