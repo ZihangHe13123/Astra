@@ -65,7 +65,9 @@ export function proposalLabel(proposal: Proposal) {
 }
 
 /** What `astra data plan` lists: each place export and wipe act on, and what stays. */
-export type DataItem = { key: string; label: string; path: string; present: boolean; bytes: number; export: boolean; browser: boolean };
+export type DataItem = { key: string; label: string; path: string; present: boolean; bytes: number; export: boolean; browser: boolean;
+  /** The personal thread's own work files, wiped only when chosen too. */
+  personal?: boolean };
 export type DataPlan = { items: DataItem[]; not_exported: string[]; kept: string[]; confirmation: string };
 
 export function sizeLabel(bytes: number) {
@@ -76,8 +78,13 @@ export function sizeLabel(bytes: number) {
   return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
 }
 
-/** What a wipe would delete, by name, once each, with the total size; browser logins only when chosen. */
-export function wipeSummary(plan: DataPlan, browserData: boolean) {
-  const items = plan.items.filter(item => item.present && (browserData || !item.browser));
-  return { labels: [...new Set(items.map(item => item.label))], size: sizeLabel(items.reduce((sum, item) => sum + item.bytes, 0)) };
+/**
+ * What a wipe would delete, by name, once each, with the total size, and what stays. Browser logins and the
+ * personal thread's own files go only when chosen; once chosen, they are no longer named among what stays.
+ */
+export function wipeSummary(plan: DataPlan, browserData: boolean, personalFiles = false) {
+  const items = plan.items.filter(item => item.present && (browserData || !item.browser) && (personalFiles || !item.personal));
+  const chosen = plan.items.filter(item => personalFiles && item.personal).map(item => item.label);
+  return { labels: [...new Set(items.map(item => item.label))], size: sizeLabel(items.reduce((sum, item) => sum + item.bytes, 0)),
+    kept: plan.kept.filter(entry => !chosen.some(label => entry.startsWith(label))) };
 }

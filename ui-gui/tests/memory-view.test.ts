@@ -36,13 +36,19 @@ test("sizes read in the unit that fits", () => {
     ["0 B", "900 B", "2.0 KB", "5.0 MB", "300 MB", "3.0 GB"]);
 });
 
-test("a wipe lists what is there once each, and browser logins only when chosen", () => {
+test("a wipe lists what is there once each, and browser logins and the personal thread's files only when chosen", () => {
   const item = (key: string, label: string, bytes: number, fields = {}) =>
     ({ key, label, path: `/x/${key}`, present: true, bytes, export: true, browser: false, ...fields });
-  const plan: DataPlan = { confirmation: "清除", kept: [], not_exported: [], items: [
+  const kept = ["设置和模型", "个人对话写的文件（选了一起清除才删）"];
+  const plan: DataPlan = { confirmation: "清除", kept, not_exported: [], items: [
     item("memory", "已保存的记忆", 1024), item("vectors:a", "对话的向量索引", 512), item("vectors:b", "对话的向量索引", 512),
     item("tasks", "任务和步骤记录", 0, { present: false }), item("browser-profiles", "Astra 浏览器的登录和 Cookie", 1024, { browser: true }),
+    item("personal", "个人对话写的文件", 2048, { personal: true }),
   ] };
-  assert.deepEqual(wipeSummary(plan, false), { labels: ["已保存的记忆", "对话的向量索引"], size: "2.0 KB" });
+  assert.deepEqual(wipeSummary(plan, false), { labels: ["已保存的记忆", "对话的向量索引"], size: "2.0 KB", kept });
   assert.deepEqual(wipeSummary(plan, true).labels.at(-1), "Astra 浏览器的登录和 Cookie");
+  const all = wipeSummary(plan, false, true);
+  assert.equal(all.labels.at(-1), "个人对话写的文件");
+  assert.equal(all.size, "4.0 KB");
+  assert.deepEqual(all.kept, ["设置和模型"]);
 });

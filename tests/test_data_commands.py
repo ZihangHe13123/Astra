@@ -27,9 +27,11 @@ OWNED = {
     "sessions/bar/session_2.json": "{}",
     "jobs/preferences.json": '{"quiet_hours": null}', "jobs/runs/r1/session.json": "{}",
     "skills/learned/lab-notes/SKILL.md": "# Lab notes\n", "skills-learning/journal.json": "{}",
-    # What the personal thread wrote in its own folder.
+}
+# What the personal thread wrote in its own folder, its work like a project's: exported, and wiped only when
+# chosen too. Keys a conversation left there are never exported.
+PERSONAL = {
     "personal/notes/plan.md": "周末计划\n",
-    # Keys a conversation left in the personal folder: wiped with it, never exported.
     "personal/.env": "ASTRA_MAIL_PASSWORD=personal-secret\n", "personal/notes/.env.local": "TOKEN=personal-token\n",
     "personal/keys/server.pem": "-----BEGIN PRIVATE KEY-----\n",
 }
@@ -56,7 +58,7 @@ DATABASES = ("memory.db", "sessions.db", "jobs/jobs.sqlite3", "learning.db", "ta
 
 
 def seed(home: Path) -> sqlite3.Connection:
-    for name, text in {**OWNED, **DERIVED, **KEPT, **BROWSER}.items():
+    for name, text in {**OWNED, **PERSONAL, **DERIVED, **KEPT, **BROWSER}.items():
         (home / name).parent.mkdir(parents=True, exist_ok=True)
         (home / name).write_text(text, newline="\n")
     (home / "sessions" / ".writers").mkdir()
@@ -141,8 +143,9 @@ def test_plan_names_what_each_choice_takes(tmp_path):
     assert not by_key["tasks"]["export"] and by_key["browser-profiles"]["browser"]
     assert by_key["vectors:context-vectors-abc.db"]["present"]
     # The phone's uploads and the edit snapshots sit inside the personal folder but are counted once, as themselves.
-    own = sum(len(text.encode()) for name, text in OWNED.items() if name.startswith("personal/"))
-    assert by_key["personal"]["export"] and by_key["personal"]["bytes"] == own
+    own = sum(len(text.encode()) for text in PERSONAL.values())
+    assert by_key["personal"]["export"] and by_key["personal"]["personal"] and by_key["personal"]["bytes"] == own
+    assert not by_key["phone-uploads"]["personal"] and "个人对话写的文件（选了一起清除才删）" in result["kept"]
     assert by_key["phone-uploads"]["present"] and not by_key["phone-uploads"]["export"]
     assert by_key["phone-audit"]["present"] and by_key["phone-audio"]["present"]
     listed = {Path(item["path"]).resolve() for item in result["items"]}
@@ -159,13 +162,18 @@ def test_wipe_needs_the_word_and_takes_the_data_and_its_copies_but_not_logins(tm
     code, result = data(env, "wipe", "--root", str(root), "--confirm", "清除")
     assert code == 0 and not result["failed"]
     left = present(home)
-    assert set(KEPT) | set(BROWSER) | {"browser.db"} <= left
+    assert set(KEPT) | set(BROWSER) | set(PERSONAL) | {"browser.db"} <= left
     assert not (set(OWNED) | set(DERIVED)) & left
+    assert "个人对话写的文件（选了一起清除才删）" in result["kept"]
     assert not {name for name in left if name.endswith(("-wal", "-shm"))} - {"browser.db-wal", "browser.db-shm"}
     assert {item["key"] for item in result["removed"]} >= {"memory", "sessions", "recall", "jobs", "skills", "tasks",
                                                            "vectors:context-vectors-abc.db", "history-cache"}
     code, result = data(env, "wipe", "--root", str(root), "--confirm", "清除", "--browser-data")
     assert code == 0 and not set(BROWSER) & present(home) and not (home / "browser.db").exists()
+    assert set(KEPT) | set(PERSONAL) <= present(home)
+    code, result = data(env, "wipe", "--root", str(root), "--confirm", "清除", "--personal-files")
+    assert code == 0 and not set(PERSONAL) & present(home) and not (home / "personal").exists()
+    assert [item["key"] for item in result["removed"]] == ["personal"] and not any("个人对话" in k for k in result["kept"])
     assert set(KEPT) <= present(home)
 
 

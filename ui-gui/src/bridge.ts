@@ -41,8 +41,9 @@ export interface DesktopBridge {
   usage(action: "budget" | "price", ...values: string[]): Promise<unknown>;
   /** The person's "以后都允许" rules: list them, or remove one by its key. */
   approvalRules(action: "list" | "remove", key?: string): Promise<{ rules?: { key: string; label: string; tool: string; created_at: string }[] }>;
-  /** The person's whole data, from the memory page: what export and wipe take, an export to a zip, or a wipe after 清除 is typed. */
-  data(action: "plan" | "export" | "wipe", confirmation?: string, browserData?: boolean): Promise<any>;
+  /** The person's whole data, from the memory page: what export and wipe take, an export to a zip, or a wipe after 清除 is typed
+   *  (Astra's browser logins and the personal thread's own files only when chosen too). */
+  data(action: "plan" | "export" | "wipe", confirmation?: string, browserData?: boolean, personalFiles?: boolean): Promise<any>;
   preferences(value: Partial<Preferences>): Promise<Preferences>;
   flushPreferences(value: Partial<Preferences>): void;
   choose(kind: "files" | "folder"): Promise<string[]>;

@@ -357,7 +357,7 @@ let staleRenderer = false;
 let wipeNotice = "";
 let wiping = false;
 /** The person's whole data, from the memory page: what export and wipe take, an export to a zip, or a wipe. */
-async function runData(action: unknown, confirmation?: unknown, browserData?: unknown) {
+async function runData(action: unknown, confirmation?: unknown, browserData?: unknown, personalFiles?: unknown) {
   if (action === "plan") return dataCommand(["plan"], 60_000);
   if (action === "export") {
     const day = new Date().toISOString().slice(0, 10);
@@ -379,7 +379,8 @@ async function runData(action: unknown, confirmation?: unknown, browserData?: un
     await channelHost.stop();
     await queries.close();
     let result: WipeAnswer | undefined, incomplete: DataCommandIncomplete | undefined;
-    try { result = await dataCommand(["wipe", "--confirm", "清除", "--desktop", ...(browserData === true ? ["--browser-data"] : [])], 10 * 60_000); }
+    const chosen = [...(browserData === true ? ["--browser-data"] : []), ...(personalFiles === true ? ["--personal-files"] : [])];
+    try { result = await dataCommand(["wipe", "--confirm", "清除", "--desktop", ...chosen], 10 * 60_000); }
     catch (error) { if (!(error instanceof DataCommandIncomplete)) throw error; incomplete = error; }
     // Past its refusals the command deletes. Even when some items stayed, part of the data is gone and every
     // conversation is closed, so the window and the phones reload rather than keep (and write back) what they hold.

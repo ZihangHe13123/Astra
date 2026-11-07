@@ -7,11 +7,12 @@ Credentials and logins (.env, provider connections, the WeChat login, browser pr
 never exported, nor is any .env file or file named like a key inside the exported folders.
 
 ``wipe`` deletes the same data and every copy made from it (search and vector indexes, task, event and
-approval records, the desktop's history cache and pasted images, photos and files sent from a phone, speech
-made for a phone and the phone's audit log). It runs only while no other Astra runs, and only when the person
-types 清除. Browser profiles (logins inside Astra's own browser) go only with --browser-data. Settings, models,
-credentials and logins (paired phones among them), the mail cache and activity history stay. In a source
-checkout, files tracked by git are never deleted.
+approval records, the desktop's history cache and pasted images, photos and files sent from a phone, the edit
+snapshots and caches in the personal folder, speech made for a phone and the phone's audit log). It runs only
+while no other Astra runs, and only when the person types 清除. The files the personal thread wrote, its work
+like any project's, go only with --personal-files, and browser profiles (logins inside Astra's own browser)
+only with --browser-data. Settings, models, credentials and logins (paired phones among them), the mail cache
+and activity history stay. In a source checkout, files tracked by git are never deleted.
 """
 
 from __future__ import annotations
@@ -48,6 +49,8 @@ _CREDENTIAL_NAMES = {"credentials", "credentials.json", "id_dsa", "id_ecdsa", "i
 _CREDENTIAL_SUFFIXES = {".key", ".pem", ".pfx", ".p12"}
 NOT_EXPORTED = (".env 和其他密钥", "模型和服务商连接", "微信登录", "浏览器登录（Astra 浏览器的配置文件）", "配对的手机",
                 "设置", "邮件缓存", "活动记录")
+PERSONAL_LABEL = "个人对话写的文件"
+PERSONAL_KEPT = f"{PERSONAL_LABEL}（选了一起清除才删）"
 KEPT = ("设置和模型", ".env 和其他密钥、服务商连接", "微信登录", "配对的手机（在设置里移除）", "邮件缓存（可以重新同步）",
         "活动记录（在活动页单独清除）", "Hindsight 服务器上的记忆（如果用了，要在那边清）")
 
@@ -59,6 +62,8 @@ class Item:
     path: Path
     export: bool
     browser: bool = False
+    # The personal thread's own work files: wiped only when the person chooses it too.
+    personal: bool = False
     # Folders directly inside ``path`` that are items of their own: export and sizes leave them to those.
     apart: tuple[str, ...] = ()
     # Where a path configured outside the state folder was set: no link below it is followed either.
@@ -105,7 +110,7 @@ def items() -> list[Item]:
         Item("skills", "学到的技能", skills / "learned", True, base=skills),
         Item("skills-journal", "技能学习记录", learning_home(skills), True),
         Item("learning", "技能学习建议", default_learning_path(), True),
-        Item("personal", "个人对话文件夹里的文件", personal, True, apart=("uploads", ".astra")),
+        Item("personal", PERSONAL_LABEL, personal, True, apart=("uploads", ".astra"), personal=True),
         # Copies made from conversations: wiped with them, not worth exporting.
         Item("feedback", "对话检索反馈", _env_path("ASTRA_CONTEXT_INDEX_FEEDBACK_DB",
                                                recall.with_name("context-index-feedback.db")), False),
@@ -238,8 +243,14 @@ def plan() -> dict:
         refused = _refusal(item, state_dir())
         listed.append({"key": item.key, "label": item.label, "path": str(item.path),
                        "present": not refused and item.path.exists(), "bytes": 0 if refused else _size(item.path, item.apart),
-                       "export": item.export, "browser": item.browser, **({"refused": refused} if refused else {})})
-    return {"items": listed, "not_exported": list(NOT_EXPORTED), "kept": list(KEPT), "confirmation": CONFIRMATION}
+                       "export": item.export, "browser": item.browser, "personal": item.personal,
+                       **({"refused": refused} if refused else {})})
+    return {"items": listed, "not_exported": list(NOT_EXPORTED), "kept": _kept(personal_files=False),
+            "confirmation": CONFIRMATION}
+
+
+def _kept(*, personal_files: bool) -> list[str]:
+    return list(KEPT) if personal_files else [*KEPT, PERSONAL_KEPT]
 
 
 def _copy_sqlite(source: Path, target: Path) -> None:
@@ -337,7 +348,8 @@ def _remove(path: Path, tracked: set[Path]) -> int:
     return removed
 
 
-def wipe(confirmation: str, *, browser_data: bool = False, desktop: bool = False, root: Path | None = None) -> dict:
+def wipe(confirmation: str, *, browser_data: bool = False, personal_files: bool = False, desktop: bool = False,
+         root: Path | None = None) -> dict:
     from agent.launcher.installation import discover
     from agent.launcher.locking import exclusive
     from agent.runtime.paths import state_dir
@@ -354,7 +366,7 @@ def wipe(confirmation: str, *, browser_data: bool = False, desktop: bool = False
             raise ValueError(f"先关掉正在运行的 Astra（{roles}），再清除。")
         # A folder inside another item's folder goes first, so it is counted (or fails) as itself.
         for item in sorted(items(), key=lambda item: -len(item.path.parts)):
-            if item.browser and not browser_data:
+            if (item.browser and not browser_data) or (item.personal and not personal_files):
                 continue
             try:
                 _reach(item, state_dir())
@@ -365,7 +377,7 @@ def wipe(confirmation: str, *, browser_data: bool = False, desktop: bool = False
                 continue
             if count:
                 removed.append({"key": item.key, "label": item.label, "files": count})
-    return {"removed": removed, "failed": failed, "kept": list(KEPT)}
+    return {"removed": removed, "failed": failed, "kept": _kept(personal_files=personal_files)}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -377,6 +389,7 @@ def main(argv: list[str] | None = None) -> int:
     erase = commands.add_parser("wipe", help="delete the data; needs --confirm 清除")
     erase.add_argument("--confirm", default="")
     erase.add_argument("--browser-data", action="store_true", help="also delete Astra's browser profiles")
+    erase.add_argument("--personal-files", action="store_true", help="also delete the files the personal thread wrote")
     erase.add_argument("--desktop", action="store_true", help=argparse.SUPPRESS)
     erase.add_argument("--root", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -386,7 +399,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.action == "export":
             value = export(args.out)
         else:
-            value = wipe(args.confirm, browser_data=args.browser_data, desktop=args.desktop, root=args.root)
+            value = wipe(args.confirm, browser_data=args.browser_data, personal_files=args.personal_files,
+                         desktop=args.desktop, root=args.root)
     except (ValueError, OSError, LauncherError) as exc:
         print(json.dumps({"error": str(exc)}))
         return 1
