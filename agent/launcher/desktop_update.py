@@ -1,11 +1,15 @@
 """Explicit offline desktop updates with verified staging and retained rollback.
 
-Run from a copied updater outside the app on Windows. The running application
-is never mutated, and source checkout update transactions remain independent.
+The installed application's updater stages a candidate: trusted code checks it
+before any of its code runs. apply, recover and finalize then run from the
+verified updater copy that staging leaves outside both application trees. The
+running application is never mutated, and source checkout update transactions
+remain independent.
 """
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -20,13 +24,29 @@ from pathlib import Path
 from agent.runtime.instance_lock import InstanceAlreadyRunning, InstanceLock
 
 from .common import LauncherError, read_json, write_json
-from .desktop_distribution import resources_for, sha256, verify_tree
+from .desktop_distribution import resources_for, verify_tree
 from .installation import discover
 from .locking import exclusive, require_idle
+
+# Each application bundles its updater entry point in <resources>/runtime.
+UPDATER = {'darwin-arm64': 'astra-desktop-update', 'win32-x64': 'astra-desktop-update.cmd'}
 
 
 def _journal(control: Path) -> Path:
     return control / 'desktop-update.json'
+
+
+def _runtime_part(application: Path) -> str:
+    # Staging and backup names drop the .app suffix; their layout follows the application's.
+    return (resources_for(application) / 'runtime').relative_to(application).as_posix()
+
+
+def _discard_updater(state: dict) -> None:
+    # Windows cannot delete the interpreter running this process; a copy kept
+    # for that reason is removed by the next stage.
+    path = Path(state['updater']) if state.get('updater') else None
+    if path is not None and not Path(sys.executable).resolve().is_relative_to(path.resolve()):
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def _finish_recovery(control: Path, install) -> None:
@@ -46,6 +66,9 @@ def _state(application: Path, control: Path) -> dict:
         path = Path(state[key])
         if path.parent != application.resolve().parent or not path.name.startswith('.astra-update-'):
             raise LauncherError('Invalid desktop update recovery path.')
+    updater = Path(state['updater']) if state.get('updater') else None
+    if updater is not None and (updater.parent != control.resolve() or not updater.name.startswith('updater-')):
+        raise LauncherError('Invalid desktop update recovery path.')
     return state
 
 
@@ -72,35 +95,55 @@ def _pending_install(application: Path, state: dict):
 
 
 def stage(candidate: Path, application: Path, control: Path, *, expected_sha256: str, target: str) -> dict:
+    """Verify a candidate with this already installed code before any candidate code runs."""
     application = application.resolve()
-    manifest_path = candidate / 'release.json'
-    if sha256(manifest_path) != expected_sha256:
+    # Hash and parse the same bytes so the checked manifest is the one used.
+    data = (candidate / 'release.json').read_bytes()
+    if hashlib.sha256(data).hexdigest() != expected_sha256:
         raise LauncherError('Desktop release manifest digest mismatch.')
-    manifest = read_json(manifest_path)
-    name = manifest.get('application')
+    try:
+        manifest = json.loads(data)
+    except ValueError as exc:
+        raise LauncherError(f'Invalid desktop release manifest: {exc}') from exc
+    name = manifest.get('application') if isinstance(manifest, dict) else None
     if not isinstance(name, str) or Path(name).name != name or name != application.name:
         raise LauncherError('Desktop application identity does not match the update.')
     verify_tree(candidate / name, manifest, target=target)
+    runtime, entry = _runtime_part(application), UPDATER.get(target)
+    if entry is None or f'{runtime}/{entry}' not in manifest['files']:
+        raise LauncherError('Desktop release has no bundled updater for this target.')
+    # apply and recover rename the installed and staged applications, so the
+    # interpreter performing them must live in neither: Windows cannot rename
+    # a directory whose executable is running.
+    updater_manifest = {**manifest, 'files': {key[len(runtime) + 1:]: value for key, value in manifest['files'].items()
+                                              if key.startswith(runtime + '/')}}
     control.mkdir(parents=True, exist_ok=True)
     with InstanceLock(control / 'desktop-update.lock'):
         if _journal(control).exists():
             raise LauncherError('A desktop update already exists; recover or finalize it first.')
+        for previous in control.glob('updater-*'):
+            _discard_updater({'updater': str(previous)})
         token = uuid.uuid4().hex
         staging = application.parent / f'.astra-update-{token}-staged'
         backup = application.parent / f'.astra-update-{token}-previous'
+        updater = control.resolve() / f'updater-{token}'
         state = {'schema': 1, 'application': str(application), 'staging': str(staging), 'backup': str(backup),
-                 'phase': 'preparing', 'manifest': manifest, 'manifest_sha256': expected_sha256}
+                 'updater': str(updater), 'phase': 'preparing', 'manifest': manifest,
+                 'manifest_sha256': expected_sha256}
         write_json(_journal(control), state)
         try:
             shutil.copytree(candidate / name, staging, symlinks=True)
             verify_tree(staging, manifest, target=target)
+            shutil.copytree(staging / runtime, updater, symlinks=True)
+            verify_tree(updater, updater_manifest, target=target)
         except BaseException:
             shutil.rmtree(staging, ignore_errors=True)
+            shutil.rmtree(updater, ignore_errors=True)
             _journal(control).unlink(missing_ok=True)
             raise
         state['phase'] = 'staged'
         write_json(_journal(control), state)
-        return {'phase': 'staged', 'version': manifest['version']}
+        return {'phase': 'staged', 'version': manifest['version'], 'updater': str(updater / entry)}
 
 
 def _health(application: Path) -> None:
@@ -157,6 +200,7 @@ def apply(application: Path, control: Path, *, validate=None) -> dict:
                         os.replace(application, staging)
                     os.replace(backup, application)
                 shutil.rmtree(staging, ignore_errors=True)
+                _discard_updater(state)
                 _finish_recovery(control, install)
                 raise LauncherError(f'Desktop update failed; previous application restored: {exc}') from exc
             state['phase'] = 'applied'
@@ -203,6 +247,7 @@ def _recover(application: Path, control: Path, state: dict, install) -> dict:
     # Also clears a displaced tree left by a recovery interrupted after its restore.
     shutil.rmtree(displaced, ignore_errors=True)
     shutil.rmtree(staging, ignore_errors=True)
+    _discard_updater(state)
     _finish_recovery(control, install)
     return {'phase': 'restored'}
 
@@ -211,6 +256,7 @@ def _finish_finalize(control: Path, state: dict, install) -> dict:
     backup = Path(state['backup'])
     if backup.exists():
         shutil.rmtree(backup)
+    _discard_updater(state)
     # An apply interrupted after validation can still hold the launch fence.
     _finish_recovery(control, install)
     return {'phase': 'finalized'}
@@ -244,11 +290,21 @@ def main() -> int:
     # Stable sibling location survives a rename interrupted between app versions.
     control = application.parent / ('.' + application.name + '.astra-updater')
     try:
-        if options.action in {'apply', 'recover'} and Path(sys.executable).resolve().is_relative_to(application):
-            raise LauncherError('Run the updater from the external candidate release; the installed application must be closed.')
+        running = Path(sys.executable).resolve()
+        journal = read_json(_journal(control))
+        # apply/recover rename the application and staged copy; finalize deletes the backup.
+        busy = [Path(journal[key]) for key in ('staging', 'backup') if isinstance(journal.get(key), str)]
+        if options.action in {'apply', 'recover'}:
+            busy.append(application)
+        if options.action != 'stage' and any(running.is_relative_to(path) for path in busy):
+            raise LauncherError('Run this action with the updater printed by stage, outside the installed and '
+                                'staged applications; the installed application must be closed.')
         if options.action == 'stage':
             if not options.candidate or not options.manifest_sha256 or not options.target:
                 parser.error('stage requires --candidate, --manifest-sha256 and --target')
+            if running.is_relative_to(options.candidate.resolve()):
+                raise LauncherError("Stage with the installed application's updater; a candidate's own code "
+                                    'runs only after it has been staged and verified.')
             result = stage(options.candidate, application, control,
                            expected_sha256=options.manifest_sha256, target=options.target)
         elif options.action == 'apply':

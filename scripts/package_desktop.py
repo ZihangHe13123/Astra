@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from agent.launcher.common import LauncherError, git, read_json, write_json  # noqa: E402
 from agent.launcher.desktop_distribution import resources_for, seal_tree, sha256, verify_tree  # noqa: E402
+from agent.launcher.desktop_update import UPDATER  # noqa: E402
 
 BACKEND_RESOURCES = (
     'agent/runtime/astra.md', 'agent/runtime/interactive_cards.md', 'agent/ui/commands.json',
@@ -75,6 +76,25 @@ def prune_runtime_launchers(python: Path) -> None:
             else:
                 path.unlink()
     shutil.rmtree(python / 'Scripts', ignore_errors=True)
+
+
+def write_updater(runtime: Path, target: str) -> Path:
+    """Sealed with the app. The installed copy stages and verifies a candidate;
+    stage copies the candidate's verified runtime out to run apply/recover."""
+    updater = runtime / UPDATER[target]
+    if target.startswith('win32'):
+        updater.write_text('@echo off\nsetlocal\nset "PYTHONHOME="\nset "VIRTUAL_ENV="\n'
+                           'set "PYTHONPATH=%~dp0backend"\n'
+                           'set "PYTHONNOUSERSITE=1"\nset "PYTHONDONTWRITEBYTECODE=1"\n'
+                           '"%~dp0python\\python.exe" -P -m agent.launcher.desktop_update %*\n')
+    else:
+        updater.write_text('#!/bin/sh\nset -eu\n'
+                           'runtime="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"\n'
+                           'unset PYTHONHOME VIRTUAL_ENV\n'
+                           'export PYTHONPATH="$runtime/backend" PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1\n'
+                           'exec "$runtime/python/bin/python3" -P -m agent.launcher.desktop_update "$@"\n')
+        updater.chmod(0o755)
+    return updater
 
 
 def copy_node_package(name: str, target: Path, copied: set[str], platform_name: str, arch: str) -> None:
@@ -186,6 +206,7 @@ def bundle(options) -> Path:
         marker = {'schema': 1, 'distribution': 'astra-desktop', 'version': version, 'target': options.target,
                   'python': '../' + lock['targets'][options.target]['python']}
         write_json(backend / 'desktop-installation.json', marker)
+        write_updater(runtime, options.target)
         helper = None
         if options.native_helper:
             source = options.native_helper.resolve(strict=True)
@@ -227,23 +248,8 @@ def bundle(options) -> Path:
         write_json(staging / 'release.json', manifest)
         verify_tree(application, manifest, target=options.target)
         (staging / 'release.sha256').write_text(sha256(staging / 'release.json') + '  release.json\n')
-        # Updates run from the downloaded candidate's independent interpreter,
-        # so replacing the installed directory never locks the updater itself.
-        if sys.platform == 'darwin':
-            updater = staging / 'astra-desktop-update'
-            updater.write_text('#!/bin/sh\nset -eu\n'
-                               'release_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"\n'
-                               'runtime="$release_dir/Astra.app/Contents/Resources/runtime"\n'
-                               'unset PYTHONHOME VIRTUAL_ENV\n'
-                               'export PYTHONPATH="$runtime/backend" PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1\n'
-                               'exec "$runtime/python/bin/python3" -P -m agent.launcher.desktop_update "$@"\n')
-            updater.chmod(0o755)
-        else:
-            (staging / 'astra-desktop-update.cmd').write_text(
-                '@echo off\nsetlocal\nset "PYTHONHOME="\nset "VIRTUAL_ENV="\n'
-                'set "PYTHONPATH=%~dp0Astra\\resources\\runtime\\backend"\n'
-                'set "PYTHONNOUSERSITE=1"\nset "PYTHONDONTWRITEBYTECODE=1"\n'
-                '"%~dp0Astra\\resources\\runtime\\python\\python.exe" -P -m agent.launcher.desktop_update %*\n')
+        # No updater sits beside the release: running a candidate's own code
+        # before trusted code has verified it would defeat the digest check.
         os.replace(staging, output)
         return output / application.name
     except BaseException:

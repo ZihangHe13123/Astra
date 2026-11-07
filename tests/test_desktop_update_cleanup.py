@@ -22,6 +22,7 @@ def make_application(app, version):
     python.parent.mkdir(parents=True)
     python.write_bytes(b"fixture interpreter")
     python.chmod(0o755)
+    (backend.parent / "astra-desktop-update").write_text("fixture updater")
     write_json(backend / "desktop-installation.json", {
         "schema": 1, "distribution": "astra-desktop", "version": version,
         "target": "darwin-arm64", "python": "../python/bin/python3",
@@ -144,6 +145,7 @@ def test_interrupted_finalize_completes_and_never_restores_partial_previous_vers
     assert result["phase"] == "finalized"
     assert (app / "version.txt").read_text() == "new"
     assert not list(app.parent.glob(".astra-update-*"))
+    assert not list(control.glob("updater-*"))
     assert not (control / "desktop-update.json").exists()
     with RuntimeLease(install, "finalized fixture"):
         assert (app / "version.txt").read_text() == "new"
@@ -166,5 +168,6 @@ def test_rollback_interrupted_after_moving_new_version_aside_restores_without_re
     assert desktop_update.recover(app, control)["phase"] == "restored"
     assert (app / "version.txt").read_text() == "old"
     assert not list(app.parent.glob(".astra-update-*"))
+    assert not list(control.glob("updater-*"))
     with RuntimeLease(install, "recovered fixture"):
         assert (app / "version.txt").read_text() == "old"
