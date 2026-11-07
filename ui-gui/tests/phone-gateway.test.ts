@@ -132,6 +132,45 @@ test("after the desktop restarts, a phone resuming from before reloads instead o
   } finally { await next?.dispose(); }
 });
 
+test("what is kept for a phone to catch up is bounded in bytes, and nothing is kept while the gateway is stopped", async () => {
+  const { devices, gateway, base } = await setup();
+  try {
+    const { client, token } = await pairedClient(devices, base);
+    const first = listen(client, token);
+    await until(() => first.seen.length === 1, "ready");
+    const { instance } = first.seen[0].data;
+    first.stop(); await first.done;
+
+    // Away while long replies came in: a few events, but far more bytes than one stream may hold unread.
+    const long = "字".repeat(512 * 1024);
+    for (let revision = 1; revision <= 40; revision++) gateway.publish({ runtime: "rt-1", revision, event: { type: "chunk", content: long } as any });
+    const late = listen(client, token, { seq: 0, instance });
+    await until(() => late.seen.length > 0, "answer to a long absence");
+    late.stop(); await late.done;
+    assert.deepEqual(late.seen.map(item => item.data), [{ reload: true }]);
+    // Away for the last of them only: still caught up.
+    const recent = listen(client, token, { seq: 39, instance });
+    await until(() => recent.seen.some(item => item.data.ready), "caught up");
+    assert.deepEqual(recent.seen.map(item => item.id ?? item.data), [40, { ready: true, seq: 40, instance }]);
+    recent.stop(); await recent.done;
+
+    // Turned off, the window's events go on, but none is numbered or kept for a phone.
+    await gateway.stop();
+    gateway.publish({ runtime: "rt-1", revision: 41, event: { type: "chunk", content: "while stopped" } as any });
+    const port = await gateway.start();
+    const phone = new PhoneClient(memory(), `http://127.0.0.1:${port}`);
+    const resumed = listen(phone, token, { seq: 40, instance });
+    await until(() => resumed.seen.length > 0, "answer after starting again");
+    resumed.stop(); await resumed.done;
+    assert.deepEqual(resumed.seen.map(item => item.data), [{ reload: true }]);
+    const fresh = listen(phone, token);
+    await until(() => fresh.seen.length === 1, "fresh ready");
+    assert.notEqual(fresh.seen[0].data.instance, instance);
+    assert.equal(fresh.seen[0].data.seq, 0, "nothing was numbered while stopped");
+    fresh.stop(); await fresh.done;
+  } finally { await gateway.dispose(); }
+});
+
 test("removing the phone ends its stream at once, and the gateway listens on loopback only", async () => {
   const { devices, gateway, base, port } = await setup();
   try {

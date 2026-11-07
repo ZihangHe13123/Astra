@@ -11,7 +11,9 @@ const INVOKE_BODY_LIMIT = 2 * 1024 * 1024;
 /** One photo or file a phone hands over for a conversation. */
 export const UPLOAD_LIMIT = 25 * 1024 * 1024;
 const STREAM_BACKLOG_LIMIT = 8 * 1024 * 1024;
+/** What is kept for a phone to catch up: a count, and bytes, since one `history` event can be several MiB. */
 const REPLAY_EVENTS = 4000;
+const REPLAY_BYTES = STREAM_BACKLOG_LIMIT;
 const HEARTBEAT_MS = 20_000;
 const TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8",
@@ -59,9 +61,10 @@ export class PhoneGateway {
   private heartbeat?: ReturnType<typeof setInterval>;
   private boundPort = 0;
   private seq = 0;
-  /** Names this run of the gateway: after the desktop restarts, numbers from before mean nothing. */
-  private readonly instance = randomUUID();
-  private recent: { seq: number; text: string }[] = [];
+  /** Names this run of the gateway: after the desktop restarts or the gateway stops, numbers from before mean nothing. */
+  private instance = randomUUID();
+  private recent: { seq: number; text: string; bytes: number }[] = [];
+  private recentBytes = 0;
   private stopRevoked: () => void;
 
   constructor(private readonly devices: PhoneDevices, private readonly options: PhoneGatewayOptions) {
@@ -91,6 +94,8 @@ export class PhoneGateway {
     clearInterval(this.heartbeat); this.heartbeat = undefined;
     for (const stream of [...this.streams]) this.close(stream);
     const server = this.server; this.server = undefined; this.boundPort = 0;
+    // Nothing is kept for a phone while none can connect; one resuming from before reloads.
+    this.forget();
     if (server) await new Promise<void>(done => server.close(() => done()));
   }
 
@@ -98,13 +103,23 @@ export class PhoneGateway {
 
   /** Called with every event the window gets. Appshot state is the window's own and is not sent. */
   publish(event: DesktopEvent) {
-    if ("appshot" in event) return;
+    if ("appshot" in event || !this.running) return;
     const seq = ++this.seq;
     const text = `id: ${seq}\ndata: ${JSON.stringify(event)}\n\n`;
+    const bytes = Buffer.byteLength(text);
     // Kept so a phone that briefly lost its connection gets what it missed instead of starting over.
-    this.recent.push({ seq, text });
-    if (this.recent.length > REPLAY_EVENTS) this.recent.splice(0, this.recent.length - REPLAY_EVENTS);
+    this.recent.push({ seq, text, bytes });
+    this.recentBytes += bytes;
+    let drop = 0;
+    while (this.recent.length - drop > REPLAY_EVENTS || this.recentBytes > REPLAY_BYTES) this.recentBytes -= this.recent[drop++].bytes;
+    if (drop) this.recent.splice(0, drop);
     for (const stream of this.streams) this.write(stream, text);
+  }
+
+  /** Drops what was kept for replay and names a new run, so no phone resumes from a position before it. */
+  private forget() {
+    this.recent = []; this.recentBytes = 0; this.seq = 0;
+    this.instance = randomUUID();
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse) {

@@ -84,5 +84,7 @@ phones have notifications on; 移除 also stops them.
 - Every message, command, approval and question answer sent from a phone is
   recorded in `phone-audit.jsonl` in Astra's desktop data folder, with the phone,
   the time and the decision; message text is not kept, only its length.
-- Turning off 允许配对的手机连接 stops the gateway. The desktop app must be running
+- While a phone is away the Mac keeps what it missed (up to a few MB) so it can catch up;
+  after a longer absence it reloads instead. Turning off 允许配对的手机连接 stops the
+  gateway and keeps nothing for phones. The desktop app must be running
   for the phone to connect; the tray icon keeps it running without a window.
