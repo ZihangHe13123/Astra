@@ -92,6 +92,11 @@ For private remote control, explicitly list trusted owner IDs in
 allow_users. Group messages always use chat capabilities, including those sent
 by an owner. Revoking owner access starts a separate restricted conversation;
 old owner history remains on disk and is never loaded into that chat.
+Messages are answered one at a time in the order NapCat delivered them. While a
+turn runs, up to 32 more messages per NapCat connection wait for theirs; later
+ones are dropped and logged. Frames Astra would not answer (heartbeats,
+notices, senders who are not admitted, group chat without a mention) are
+discarded on arrival.
 
 Only one service may own port 2280. Stop or reconfigure AstrBot before enabling
 the native QQ adapter. Adapter startup failure is reported without taking down

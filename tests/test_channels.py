@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 from websockets.asyncio.client import connect
 
+from agent.channels import onebot
 from agent.channels.base import ChannelAdapter, ChannelImage, ChannelMessage
 from agent.channels.config import ChannelsConfig, OneBotConfig, load_channels_config
 from agent.channels.manager import ChannelManager, is_address_in_use
@@ -703,6 +704,70 @@ def test_onebot_turn_upload_is_never_confirmed_by_a_receipt_without_its_echo(tmp
 
     asyncio.run(scenario())
     assert results[0].get("code") == "channel_send_unconfirmed"
+
+
+def test_onebot_waits_only_with_messages_it_answers_and_keeps_their_order(caplog):
+    async def scenario():
+        release, handled = asyncio.Event(), []
+
+        async def handler(message, reply_sink=None):
+            handled.append(message.text)
+            await release.wait()
+            return ""
+
+        def private(user, text):
+            return json.dumps({"post_type": "message", "message_type": "private", "self_id": 42, "user_id": user,
+                               "message": text})
+
+        ignored = [
+            json.dumps({"post_type": "meta_event", "meta_event_type": "heartbeat", "self_id": 42, "interval": 30000}),
+            json.dumps({"post_type": "notice", "notice_type": "group_increase", "self_id": 42, "group_id": 20002}),
+            json.dumps({"post_type": "message", "message_type": "group", "self_id": 42, "user_id": 10001,
+                        "group_id": 20002, "message": "chat without a mention"}),
+            private(99999, "not admitted"),
+            json.dumps({"status": "ok", "retcode": 0, "data": {}, "echo": "astra-not-waited-for"}),
+        ]
+        adapter = OneBotAdapter(OneBotConfig(host="127.0.0.1", port=0, allow_users=("10001",)), handler)
+        await adapter.start()
+        try:
+            async with connect(f"ws://127.0.0.1:{adapter._server.sockets[0].getsockname()[1]}") as bridge:
+                await bridge.send(private(10001, "first"))
+                while not handled:
+                    await asyncio.sleep(0.01)
+                # While that turn runs: a flood of frames there is nothing to answer, then more messages.
+                for _ in range(40):
+                    for frame in ignored:
+                        await bridge.send(frame)
+                sent = [f"m{index}" for index in range(40)]
+                for text in sent:
+                    await bridge.send(private(10001, text))
+
+                def drops():
+                    return sum("dropped" in record.getMessage() for record in caplog.records)
+
+                for _ in range(200):
+                    if drops():
+                        break
+                    await asyncio.sleep(0.01)
+                assert drops(), "the waiting messages had no limit"
+                limit = onebot._INBOX_LIMIT
+                for _ in range(200):
+                    if drops() >= len(sent) - limit:
+                        break
+                    await asyncio.sleep(0.01)
+                # The ignored frames took no place in the queue: only the messages beyond it were dropped.
+                assert drops() == len(sent) - limit
+                release.set()
+                for _ in range(200):
+                    if len(handled) == 1 + limit:
+                        break
+                    await asyncio.sleep(0.01)
+                assert handled == ["first", *sent[:limit]]
+        finally:
+            await adapter.stop()
+
+    with caplog.at_level("WARNING", logger="agent.channels.onebot"):
+        asyncio.run(scenario())
 
 
 def test_onebot_disconnect_cancels_the_turn_in_progress():

@@ -15,6 +15,7 @@ import json
 import logging
 import re
 import uuid
+from dataclasses import replace
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -28,6 +29,8 @@ from .media import download_image_data_url
 logger = logging.getLogger(__name__)
 _CQ_AT_RE = re.compile(r"\[CQ:at,qq=([^,\]]+)[^\]]*\]")
 _ACTION_SECONDS = 30.0
+# Messages that may wait on one connection while a turn runs; later ones are dropped.
+_INBOX_LIMIT = 32
 # The connection whose message a turn answers: its uploads go back over it.
 _origin: contextvars.ContextVar[ServerConnection | None] = contextvars.ContextVar("astra_onebot_origin", default=None)
 
@@ -169,10 +172,10 @@ class OneBotAdapter(ChannelAdapter):
         authenticated = bool(token)
         self._connections.add(connection)
         self._send_locks[id(connection)] = asyncio.Lock()
-        # Events wait for a worker of their own, so this loop keeps reading the receipts
+        # Messages wait for a worker of their own, so this loop keeps reading the receipts
         # that a turn's actions (a file upload) wait for.
-        inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        worker = asyncio.create_task(self._work(connection, inbox, authenticated), name="onebot-inbox")
+        inbox: asyncio.Queue[ChannelMessage] = asyncio.Queue(maxsize=_INBOX_LIMIT)
+        worker = asyncio.create_task(self._work(connection, inbox), name="onebot-inbox")
         logger.info("OneBot client connected remote=%s", connection.remote_address)
         try:
             async for raw in connection:
@@ -196,7 +199,13 @@ class OneBotAdapter(ChannelAdapter):
                             if self._pending_connections.get(key) is connection and not future.done():
                                 future.set_exception(_unknown("OneBot receipt without echo"))
                         continue
-                    inbox.put_nowait(payload)
+                    event = self._message(payload, authenticated)
+                    if event is None:
+                        continue
+                    if inbox.full():
+                        logger.warning("OneBot inbox is full (%d waiting): a QQ message was dropped", inbox.qsize())
+                        continue
+                    inbox.put_nowait(event)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -212,14 +221,13 @@ class OneBotAdapter(ChannelAdapter):
             await asyncio.wait({worker}, timeout=5.0)
             logger.info("OneBot client disconnected")
 
-    async def _work(self, connection: ServerConnection, inbox: asyncio.Queue[dict[str, Any]],
-                    authenticated: bool) -> None:
-        # One event at a time, in the order NapCat sent them.
+    async def _work(self, connection: ServerConnection, inbox: asyncio.Queue[ChannelMessage]) -> None:
+        # One message at a time, in the order NapCat sent them.
         _origin.set(connection)
         while True:
-            payload = await inbox.get()
+            event = await inbox.get()
             try:
-                await self._handle_payload(connection, payload, authenticated)
+                await self._answer(connection, event)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -227,40 +235,45 @@ class OneBotAdapter(ChannelAdapter):
 
     async def _handle_payload(self, connection: ServerConnection, payload: dict[str, Any],
                               authenticated: bool = False) -> None:
+        event = self._message(payload, authenticated)
+        if event is not None:
+            await self._answer(connection, event)
+
+    def _message(self, payload: dict[str, Any], authenticated: bool) -> ChannelMessage | None:
+        """The message this event asks Astra to answer, before its images load; None for anything else."""
         if payload.get("post_type") != "message":
-            return
+            return None
         message_type = str(payload.get("message_type") or "")
         is_group = message_type == "group"
         if message_type not in {"group", "private"}:
-            return
+            return None
         if is_group and not self.config.group_enabled:
-            return
+            return None
         if not is_group and not self.config.private_enabled:
-            return
+            return None
 
         sender_id = str(payload.get("user_id") or "")
         group_id = str(payload.get("group_id") or "")
         self_id = str(payload.get("self_id") or "")
         if not sender_id or sender_id == self_id:
-            return
+            return None
         if sender_id not in {*self.config.allow_users, *self.config.owner_users}:
-            return
+            return None
         if is_group and self.config.allow_groups and group_id not in self.config.allow_groups:
-            return
+            return None
 
         text = _text_from_segments(payload.get("message", payload.get("raw_message", "")))
         text, mentioned = _strip_self_mention(text, self_id)
         text, prefixed = _strip_prefix(text, self.config.wake_prefixes)
         if is_group and self.config.group_require_mention and not (mentioned or prefixed):
-            return
+            return None
         text = text.strip()[:self.config.max_input_chars]
         if not text:
-            return
-        images = await self._load_images(payload.get("message"))
+            return None
 
         raw_sender = payload.get("sender")
         sender: dict[str, Any] = raw_sender if isinstance(raw_sender, dict) else {}
-        event = ChannelMessage(
+        return ChannelMessage(
             channel=self.name,
             conversation_id=group_id if is_group else sender_id,
             sender_id=sender_id,
@@ -268,12 +281,17 @@ class OneBotAdapter(ChannelAdapter):
             is_group=is_group,
             message_id=str(payload.get("message_id") or ""),
             sender_name=str(sender.get("card") or sender.get("nickname") or ""),
-            images=images,
             raw=payload,
             local_tools=authenticated and not is_group and sender_id in self.config.owner_users,
         )
+
+    async def _answer(self, connection: ServerConnection, event: ChannelMessage) -> None:
+        images = await self._load_images(event.raw.get("message"))
+        if images:
+            event = replace(event, images=images)
+        is_group = event.is_group
         action = "send_group_msg" if is_group else "send_private_msg"
-        target_id = int(group_id if is_group else sender_id)
+        target_id = int(event.conversation_id)
 
         async def send_reply(response: str) -> None:
             for chunk in _chunks(response, self.config.max_output_chars):
