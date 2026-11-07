@@ -104,7 +104,7 @@ function DataSection({ fail }: { fail: (error: unknown) => void }) {
   const summary = plan && wipeSummary(plan, browserData);
   return <section className="memory-data">
     <h3>你的数据</h3>
-    <p className="muted small">导出成一个 zip：核心记忆、已保存的记忆、对话记录、定时任务和学到的技能。不含密钥、登录和设置。</p>
+    <p className="muted small">导出成一个 zip：核心记忆、已保存的记忆、对话记录、定时任务、学到的技能和个人对话写的文件。不含密钥、登录和设置。</p>
     {notice && <p className="small" role="status">{notice}</p>}
     <div className="memory-actions">
       <button disabled={busy} onClick={() => { void exportAll(); }}>导出…</button>

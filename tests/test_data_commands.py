@@ -24,16 +24,23 @@ OWNED = {
     "sessions/bar/session_2.json": "{}",
     "jobs/preferences.json": '{"quiet_hours": null}', "jobs/runs/r1/session.json": "{}",
     "skills/learned/lab-notes/SKILL.md": "# Lab notes\n", "skills-learning/journal.json": "{}",
+    # What the personal thread wrote in its own folder.
+    "personal/notes/plan.md": "周末计划\n",
 }
 # Copies made from the person's conversations: wiped, not exported.
 DERIVED = {
     "gui/history-index/v1.sqlite3": "x", "gui/attachments/a.png": "png", "channels/conversations.json": "{}",
+    # From a paired phone: a photo it sent, speech made for it, and what it did.
+    "personal/uploads/2026-11-07/101500-abc123-照片.jpg": "jpg",
+    "gui/phone-audio/0123456789abcdef0123456789abcdef.wav": "RIFF",
+    "gui/phone-audit.jsonl": '{"device": "d1", "method": "upload", "name": "照片.jpg"}\n',
+    "personal/.astra/checkpoints/c1/manifest.json": "{}",
 }
 # Never exported and never wiped: credentials, logins, settings and other apps' state.
 KEPT = {
     ".env": "ASTRA_MAIL_PASSWORD=secret\n", "connections/openai.json": '{"api_key": "sk-test"}',
     "auth/codex.json": '{"token": "t"}', "channels/weixin/account.json": '{"token": "t"}',
-    "settings.json": "{}", "gui/preferences.json": "{}", "gui/phone-devices.json": "{}",
+    "settings.json": "{}", "gui/preferences.json": "{}", "gui/phone-devices.json": "{}", "gui/phone-push-key.json": "{}",
     "skills/creative/bundled/SKILL.md": "# bundled\n", "activity-history.sqlite3": "x",
     "launcher/marker": "x",
 }
@@ -108,7 +115,7 @@ def test_export_holds_the_persons_data_consistently_and_no_credentials(tmp_path)
                 "astra-export/sessions/bar/session_2.json", "astra-export/jobs/jobs.sqlite3",
                 "astra-export/jobs/preferences.json", "astra-export/jobs/runs/r1/session.json",
                 "astra-export/skills/lab-notes/SKILL.md", "astra-export/skills-journal/journal.json",
-                "astra-export/manifest.json"}
+                "astra-export/personal/notes/plan.md", "astra-export/manifest.json"}
     assert names == expected
     with sqlite3.connect(tmp_path / "x" / "astra-export" / "memory" / "memory.db") as copy:
         assert {row[0] for row in copy.execute("SELECT text FROM notes")} == {"committed memory.db", "only in the wal"}
@@ -126,6 +133,10 @@ def test_plan_names_what_each_choice_takes(tmp_path):
     assert by_key["memory"]["export"] and by_key["memory"]["present"] and by_key["memory"]["bytes"] > 0
     assert not by_key["tasks"]["export"] and by_key["browser-profiles"]["browser"]
     assert by_key["vectors:context-vectors-abc.db"]["present"]
+    # The phone's uploads and the edit snapshots sit inside the personal folder but are counted once, as themselves.
+    assert by_key["personal"]["export"] and by_key["personal"]["bytes"] == len("周末计划\n".encode())
+    assert by_key["phone-uploads"]["present"] and not by_key["phone-uploads"]["export"]
+    assert by_key["phone-audit"]["present"] and by_key["phone-audio"]["present"]
     listed = {Path(item["path"]).resolve() for item in result["items"]}
     assert not {(home / name).resolve() for name in KEPT} & listed
 

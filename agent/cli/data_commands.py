@@ -1,15 +1,17 @@
 """The person's own data: export it as one zip, or wipe it (``astra data``).
 
 ``export`` copies what Astra keeps about the person: the two core memory files, saved memories,
-conversations and their search index, scheduled jobs, and learned skills. SQLite files go through SQLite's
-backup API, so an export is consistent while Astra runs. Credentials and logins (.env, provider connections,
-the WeChat login, browser profiles) are never exported.
+conversations and their search index, scheduled jobs, learned skills, and the files the personal thread wrote
+in its own folder. SQLite files go through SQLite's backup API, so an export is consistent while Astra runs.
+Credentials and logins (.env, provider connections, the WeChat login, browser profiles, paired phones) are
+never exported.
 
 ``wipe`` deletes the same data and every copy made from it (search and vector indexes, task, event and
-approval records, the desktop's history cache and pasted images). It runs only while no other Astra runs,
-and only when the person types 清除. Browser profiles (logins inside Astra's own browser) go only with
---browser-data. Settings, models, credentials and logins, the mail cache and activity history stay. In a
-source checkout, files tracked by git are never deleted.
+approval records, the desktop's history cache and pasted images, photos and files sent from a phone, speech
+made for a phone and the phone's audit log). It runs only while no other Astra runs, and only when the person
+types 清除. Browser profiles (logins inside Astra's own browser) go only with --browser-data. Settings, models,
+credentials and logins (paired phones among them), the mail cache and activity history stay. In a source
+checkout, files tracked by git are never deleted.
 """
 
 from __future__ import annotations
@@ -38,9 +40,9 @@ _SQLITE_SUFFIXES = (".db", ".sqlite3")
 _SQLITE_SIDES = ("-wal", "-shm", "-journal")
 # Locks and markers belong to running processes, not to the person.
 _SKIP_NAMES = {".writers", "owners", "scheduler.lock", "active", "last-interaction"}
-NOT_EXPORTED = (".env 和其他密钥", "模型和服务商连接", "微信登录", "浏览器登录（Astra 浏览器的配置文件）", "设置",
-                "邮件缓存", "活动记录")
-KEPT = ("设置和模型", ".env 和其他密钥、服务商连接", "微信登录", "邮件缓存（可以重新同步）",
+NOT_EXPORTED = (".env 和其他密钥", "模型和服务商连接", "微信登录", "浏览器登录（Astra 浏览器的配置文件）", "配对的手机",
+                "设置", "邮件缓存", "活动记录")
+KEPT = ("设置和模型", ".env 和其他密钥、服务商连接", "微信登录", "配对的手机（在设置里移除）", "邮件缓存（可以重新同步）",
         "活动记录（在活动页单独清除）", "Hindsight 服务器上的记忆（如果用了，要在那边清）")
 
 
@@ -51,6 +53,8 @@ class Item:
     path: Path
     export: bool
     browser: bool = False
+    # Folders directly inside ``path`` that are items of their own: export and sizes leave them to those.
+    apart: tuple[str, ...] = ()
 
     @property
     def sqlite(self) -> bool:
@@ -79,6 +83,8 @@ def items() -> list[Item]:
     recall = configured_session_recall_path()
     skills = default_skills_path()
     browser = browser_db_path()
+    # The personal thread's own workspace (the desktop's <ASTRA_HOME>/personal, specs/personal-thread.md D6).
+    personal = state_path("personal")
     result = [
         Item("core-user", "核心记忆：关于你（USER.md）", memory.parent / "memory" / "USER.md", True),
         Item("core-memory", "核心记忆：Astra 的笔记（MEMORY.md）", memory.parent / "memory" / "MEMORY.md", True),
@@ -89,6 +95,7 @@ def items() -> list[Item]:
         Item("skills", "学到的技能", skills / "learned", True),
         Item("skills-journal", "技能学习记录", learning_home(skills), True),
         Item("learning", "技能学习建议", default_learning_path(), True),
+        Item("personal", "个人对话文件夹里的文件", personal, True, apart=("uploads", ".astra")),
         # Copies made from conversations: wiped with them, not worth exporting.
         Item("feedback", "对话检索反馈", _env_path("ASTRA_CONTEXT_INDEX_FEEDBACK_DB",
                                                recall.with_name("context-index-feedback.db")), False),
@@ -101,6 +108,13 @@ def items() -> list[Item]:
              False),
         Item("attachments", "粘贴过的图片", state_path("gui", "attachments"), False),
         Item("page-snapshots", "页面截图", state_path("gui", "page-snapshots"), False),
+        # Copies of what the phone keeps: the originals stay on it.
+        Item("phone-uploads", "手机发来的照片和文件", personal / "uploads", False),
+        # Snapshots taken before the personal thread changed a file, and its image cache.
+        Item("personal-copies", "个人对话改文件前留的副本", personal / ".astra", False),
+        Item("phone-audio", "读给手机听的语音", _env_path("ASTRA_PHONE_AUDIO_DIR", state_path("gui", "phone-audio")), False),
+        # Which phone did what, with its commands and the names of the files it sent.
+        Item("phone-audit", "手机的操作记录", state_path("gui", "phone-audit.jsonl"), False),
         Item("browser-profiles", "Astra 浏览器的登录和 Cookie", browser.parent / "browser-profiles", False, browser=True),
         Item("browser-sessions", "Astra 浏览器的标签页记录", browser, False, browser=True),
     ]
@@ -130,14 +144,15 @@ def _guard(path: Path, root: Path) -> None:
             raise OSError(f"{path} holds {protected}; it was not deleted")
 
 
-def _files(path: Path) -> Iterator[Path]:
+def _files(path: Path, apart: tuple[str, ...] = ()) -> Iterator[Path]:
     if path.is_symlink() or not path.exists():
         return
     if path.is_file():
         yield path
         return
     for current, folders, names in os.walk(path):
-        folders[:] = sorted(name for name in folders if name not in _SKIP_NAMES
+        top = Path(current) == path
+        folders[:] = sorted(name for name in folders if name not in _SKIP_NAMES and not (top and name in apart)
                             and not (Path(current) / name).is_symlink())
         for name in sorted(names):
             entry = Path(current) / name
@@ -146,9 +161,9 @@ def _files(path: Path) -> Iterator[Path]:
             yield entry
 
 
-def _size(path: Path) -> int:
+def _size(path: Path, apart: tuple[str, ...] = ()) -> int:
     total = 0
-    for entry in _files(path):
+    for entry in _files(path, apart):
         try:
             total += entry.stat().st_size + sum(Path(f"{entry}{side}").stat().st_size
                                                 for side in _SQLITE_SIDES if Path(f"{entry}{side}").exists())
@@ -160,7 +175,7 @@ def _size(path: Path) -> int:
 def plan() -> dict:
     """What export and wipe would take, for the person to read before choosing."""
     listed = [{"key": item.key, "label": item.label, "path": str(item.path), "present": item.path.exists(),
-               "bytes": _size(item.path), "export": item.export, "browser": item.browser} for item in items()]
+               "bytes": _size(item.path, item.apart), "export": item.export, "browser": item.browser} for item in items()]
     return {"items": listed, "not_exported": list(NOT_EXPORTED), "kept": list(KEPT), "confirmation": CONFIRMATION}
 
 
@@ -187,7 +202,7 @@ def export(out: Path, *, now: float | None = None) -> dict:
                 if not item.export or not item.path.exists():
                     continue
                 count = size = 0
-                for entry in _files(item.path):
+                for entry in _files(item.path, item.apart):
                     relative = entry.name if entry == item.path else entry.relative_to(item.path).as_posix()
                     name = f"{ARCHIVE_ROOT}/{item.key}/{relative}"
                     source = entry
@@ -264,7 +279,8 @@ def wipe(confirmation: str, *, browser_data: bool = False, desktop: bool = False
         if running:
             roles = "、".join(sorted({str(item.get("role") or "Astra") for item in running}))
             raise ValueError(f"先关掉正在运行的 Astra（{roles}），再清除。")
-        for item in items():
+        # A folder inside another item's folder goes first, so it is counted (or fails) as itself.
+        for item in sorted(items(), key=lambda item: -len(item.path.parts)):
             if item.browser and not browser_data:
                 continue
             try:
