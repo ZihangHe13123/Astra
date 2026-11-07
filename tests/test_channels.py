@@ -275,7 +275,9 @@ def test_onebot_uploads_a_private_file_and_waits_for_action_result(tmp_path):
     asyncio.run(scenario())
 
 
-def test_onebot_file_action_with_a_receipt_without_echo_has_an_unknown_outcome(tmp_path):
+def test_onebot_file_action_ignores_a_receipt_without_echo_until_it_times_out(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent.channels.onebot._ACTION_SECONDS", 0.3)
+
     async def scenario():
         async def handler(message, reply_sink=None):
             return "unused"
@@ -300,7 +302,9 @@ def test_onebot_file_action_with_a_receipt_without_echo_has_an_unknown_outcome(t
                     "data": {},
                     "echo": "",
                 }))
-                # It may be this upload's receipt or another request's: never a confirmation.
+                # It may be this upload's receipt or another request's: it settles nothing.
+                await asyncio.sleep(0.1)
+                assert not task.done()
                 with pytest.raises(TimeoutError, match="outcome unknown"):
                     await asyncio.wait_for(task, timeout=2)
         finally:
@@ -679,7 +683,11 @@ def test_onebot_turn_upload_without_a_receipt_is_reported_unconfirmed(tmp_path, 
     assert results[0]["code"] == "channel_send_unconfirmed"
 
 
-def test_onebot_turn_upload_is_never_confirmed_by_a_receipt_without_its_echo(tmp_path, monkeypatch):
+@pytest.mark.parametrize("own_receipt", [
+    {"status": "failed", "retcode": 1400, "message": "file upload failed"},
+    {"status": "ok", "retcode": 0, "data": {}},
+])
+def test_onebot_turn_upload_is_settled_by_its_own_receipt_not_one_without_echo(tmp_path, monkeypatch, own_receipt):
     manager, _source, results = _owner_upload_stack(tmp_path, monkeypatch, phase="我先发给你。")
     adapter = manager.adapter("qq")
 
@@ -693,17 +701,19 @@ def test_onebot_turn_upload_is_never_confirmed_by_a_receipt_without_its_echo(tmp
                 assert text["action"] == "send_private_msg" and text["echo"].startswith("astra-")
                 upload = json.loads(await asyncio.wait_for(bridge.recv(), 2))
                 assert upload["action"] == "upload_private_file" and upload["echo"] != text["echo"]
-                # The text's receipt comes back without its echo, then the upload's own failure.
+                # The text's receipt comes back without its echo, then the upload's own.
                 await bridge.send(json.dumps({"status": "ok", "retcode": 0, "data": {"message_id": 7}}))
-                await bridge.send(json.dumps({"status": "failed", "retcode": 1400, "message": "file upload failed",
-                                              "echo": upload["echo"]}))
+                await bridge.send(json.dumps({**own_receipt, "echo": upload["echo"]}))
                 reply = json.loads(await asyncio.wait_for(bridge.recv(), 2))
                 assert reply["params"]["message"] == "sent"
         finally:
             await manager.stop()
 
     asyncio.run(scenario())
-    assert results[0].get("code") == "channel_send_unconfirmed"
+    if own_receipt["status"] == "ok":
+        assert not results[0].get("error") and "'status': 'sent'" in results[0]["output"]
+    else:
+        assert results[0]["code"] == "execution_failed" and "file upload failed" in results[0]["error"]
 
 
 def test_onebot_waits_only_with_messages_it_answers_and_keeps_their_order(caplog):

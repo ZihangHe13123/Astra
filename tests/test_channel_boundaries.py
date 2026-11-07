@@ -141,7 +141,7 @@ def test_chat_scope_blocks_tools_and_automatic_owner_context_and_restores_owner(
     assert not (tmp_path / "bad.txt").exists()
 
 
-def test_no_echo_receipt_leaves_its_connection_unknown_and_others_waiting(monkeypatch):
+def test_a_receipt_settles_only_the_action_with_its_echo(monkeypatch):
     from websockets.asyncio.client import connect
     monkeypatch.delenv("ASTRA_QQ_ACCESS_TOKEN", raising=False)
     async def run():
@@ -164,14 +164,14 @@ def test_no_echo_receipt_leaves_its_connection_unknown_and_others_waiting(monkey
                     first = asyncio.create_task(adapter._call_action(server_a, "fixture", {"for": "A"}))
                     second = asyncio.create_task(adapter._call_action(server_b, "fixture", {"for": "B"}))
                     req_a = json.loads(await asyncio.wait_for(a.recv(), 2))
-                    await asyncio.wait_for(b.recv(), 2)
-                    await b.send(json.dumps({"status": "ok", "retcode": 0, "data": "B"}))
-                    try:
-                        await asyncio.wait_for(second, 2)
-                    except TimeoutError as exc:
-                        assert "outcome unknown" in str(exc)
-                    else:
-                        raise AssertionError("a receipt without an echo confirmed an action")
+                    req_b = json.loads(await asyncio.wait_for(b.recv(), 2))
+                    # Without an echo, or with another connection's, a receipt settles nothing.
+                    await b.send(json.dumps({"status": "ok", "retcode": 0, "data": "not B"}))
+                    await b.send(json.dumps({"status": "ok", "retcode": 0, "echo": req_a["echo"], "data": "not A"}))
+                    await asyncio.sleep(0.1)
+                    assert not first.done() and not second.done()
+                    await b.send(json.dumps({"status": "ok", "retcode": 0, "echo": req_b["echo"], "data": "B"}))
+                    assert (await asyncio.wait_for(second, 2))["data"] == "B"
                     assert not first.done()
                     await a.send(json.dumps({"status": "ok", "retcode": 0, "echo": req_a["echo"], "data": "A"}))
                     assert (await asyncio.wait_for(first, 2))["data"] == "A"
@@ -180,9 +180,10 @@ def test_no_echo_receipt_leaves_its_connection_unknown_and_others_waiting(monkey
     asyncio.run(run())
 
 
-def test_ambiguous_no_echo_is_unknown_for_all_candidates_and_never_replayed(monkeypatch):
+def test_actions_without_their_receipt_time_out_unknown_and_are_never_replayed(monkeypatch):
     from websockets.asyncio.client import connect
     monkeypatch.delenv("ASTRA_QQ_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr("agent.channels.onebot._ACTION_SECONDS", 0.3)
     async def run():
         async def unused(*args):
             return ""

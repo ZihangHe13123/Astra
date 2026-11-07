@@ -193,11 +193,9 @@ class OneBotAdapter(ChannelAdapter):
                             pending.set_result(payload)
                         continue
                     if not echo and "retcode" in payload:
-                        # Any request on this connection may own a receipt without an echo, a reply
-                        # included: what waits here has an unknown outcome, never a confirmation.
-                        for key, future in self._pending_actions.items():
-                            if self._pending_connections.get(key) is connection and not future.done():
-                                future.set_exception(_unknown("OneBot receipt without echo"))
+                        # Any request on this connection may own it, a reply included, so it settles
+                        # nothing: an action waits for its own echo until it times out.
+                        logger.debug("OneBot receipt without echo ignored")
                         continue
                     event = self._message(payload, authenticated)
                     if event is None:

@@ -117,11 +117,11 @@ sender QQ IDs in `file_allow_users` (or `allow_users`), and restrict
 `channel_send_file` tool rejects paths outside those roots, hidden files and
 folders, application data and common credential files even when requested by
 the model. A file goes back over the NapCat connection the request came from,
-and only a receipt carrying the upload's echo confirms it. An upload with no
-such receipt within 30 seconds, or one waiting when a receipt without an echo
-arrives, is reported to the model as unconfirmed (it may or may not have
-arrived) and is never resent automatically. When NapCat disconnects, the turn
-answering it is cancelled.
+and only a receipt carrying the upload's echo settles it; receipts without an
+echo are ignored. An upload with no such receipt within 30 seconds, or cut off
+by a disconnect, is reported to the model as unconfirmed (it may or may not
+have arrived) and is never resent automatically. When NapCat disconnects, the
+turn answering it is cancelled.
 
 ### WeChat
 
