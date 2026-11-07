@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import weakref
 from pathlib import Path
 from typing import Any
 
@@ -63,20 +64,95 @@ def _descendants(root: int) -> list[int]:
     return found
 
 
+# What a started command and its descendants belong to, so all of them can be ended later, even one whose
+# parent has exited: a Job object on Windows, the command's own process group elsewhere.
+_JOBS: weakref.WeakKeyDictionary[subprocess.Popen, int] = weakref.WeakKeyDictionary()
+_GROUPS: weakref.WeakSet[subprocess.Popen] = weakref.WeakSet()
+
+
+def _windows_job(process: subprocess.Popen) -> int:
+    """A Job object holding the process and everything it starts; 0 when Windows cannot give one."""
+    if sys.platform != "win32":
+        return 0
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return 0
+    if not kernel32.AssignProcessToJobObject(job, wintypes.HANDLE(int(getattr(process, "_handle")))):
+        kernel32.CloseHandle(job)
+        return 0
+    return int(job)
+
+
+def _close_job(job: int, *, terminate: bool) -> bool:
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+    kernel32.TerminateJobObject.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    ended = bool(kernel32.TerminateJobObject(wintypes.HANDLE(job), 1)) if terminate else False
+    kernel32.CloseHandle(wintypes.HANDLE(job))
+    return ended
+
+
+def spawn(args: list[str], *, own_group: bool, **options: Any) -> subprocess.Popen:
+    """Start a command so that `stop_tree` can end all it starts, even a process whose parent has exited.
+
+    On Windows every command gets a Job object. Elsewhere `own_group` gives it a process group of its own;
+    leave it off for a command that may ask at the terminal (an SSH passphrase), which a group in the
+    background could not read.
+    """
+    if os.name != "nt" and own_group and not options.get("start_new_session"):
+        options["process_group"] = 0
+    process = subprocess.Popen(args, **options)
+    if job := _windows_job(process):
+        _JOBS[process] = job
+    elif os.name != "nt" and own_group:
+        _GROUPS.add(process)
+    return process
+
+
+def release(process: subprocess.Popen) -> None:
+    """Let go of a command that ended by itself; what it left running is not stopped."""
+    if job := _JOBS.pop(process, 0):
+        _close_job(job, terminate=False)
+    _GROUPS.discard(process)
+
+
 def stop_tree(process: subprocess.Popen) -> None:
     """End a command and every process it started.
 
     Killing only the command leaves its children running: Git's HTTPS helper,
     a package build, or the desktop's Electron and backends.
     """
-    if os.name == "nt":
-        # taskkill follows parent links, so it runs while the command is alive.
+    job = _JOBS.pop(process, 0)
+    if job and _close_job(job, terminate=True):
+        pass
+    elif os.name == "nt":
+        # Without a Job object, taskkill follows parent links, so it runs while the command is alive.
         try:
             subprocess.run(["taskkill.exe", "/PID", str(process.pid), "/T", "/F"], stdin=subprocess.DEVNULL,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10, check=False)
         except (OSError, subprocess.TimeoutExpired):
             pass
     else:
+        if process in _GROUPS:
+            _GROUPS.discard(process)
+            with contextlib.suppress(OSError):
+                os.killpg(process.pid, signal.SIGKILL)
+        # A process that left the group, or a command without one: what still descends from it.
         for pid in _descendants(process.pid):
             with contextlib.suppress(OSError):
                 os.kill(pid, signal.SIGKILL)
@@ -105,24 +181,25 @@ def _execute(args: list[str], *, cwd: Path, env: dict[str, str] | None, timeout:
         stdout = files.enter_context(tempfile.TemporaryFile())
         stderr = files.enter_context(tempfile.TemporaryFile())
         try:
-            process = subprocess.Popen(args, cwd=cwd, env=env, stdin=stdin, stdout=stdout if capture else sys.stderr,
-                                       stderr=stderr if capture else None)
+            # A captured command never talks to the terminal, so it can have a process group of its own.
+            process = spawn(args, own_group=capture, cwd=cwd, env=env, stdin=stdin,
+                            stdout=stdout if capture else sys.stderr, stderr=stderr if capture else None)
         except OSError as exc:
             raise LauncherError(f"Could not run {name}: {exc}") from exc
-        deadline = time.monotonic() + timeout
+        deadline, overdue = time.monotonic() + timeout, False
         try:
             # Short waits keep Ctrl+C responsive on Windows, where one long wait is not interruptible.
-            while process.poll() is None:
-                if time.monotonic() >= deadline:
-                    stop_tree(process)
-                    raise LauncherError(f"{name} did not finish within {timeout:g} seconds; "
-                                        "it was stopped with every process it started.")
+            while process.poll() is None and not overdue:
+                overdue = time.monotonic() >= deadline
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=0.2)
         except BaseException:
-            if process.poll() is None:
-                stop_tree(process)
+            stop_tree(process)
             raise
+        if overdue and process.poll() is None:
+            stop_tree(process)
+            raise LauncherError(f"{name} did not finish within {timeout:g} seconds and was stopped.")
+        release(process)
         stdout.seek(0)
         stderr.seek(0)
         return process.returncode, stdout.read(), stderr.read()

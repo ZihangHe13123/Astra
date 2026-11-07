@@ -140,7 +140,10 @@ active. `--json` provides structured results.
 A checkout many updates behind may need a long fetch. In a terminal, Git shows its
 progress; a transfer slower than 1 KB/s for two minutes ends with Git's own error,
 and the whole fetch has 30 minutes. Every command the updater runs has a deadline,
-and one past it is stopped together with every process it started.
+and one past it, or interrupted with Ctrl+C, is stopped together with the processes it
+started, also those whose own parent already exited. The exception is the fetch on macOS
+and Linux: it stays at the terminal for a possible SSH passphrase, so only processes still
+descending from it are stopped.
 
 Applying an update requires a fast-forward upstream. Local edits to files
 untouched by that upstream change are kept automatically, as are local files
