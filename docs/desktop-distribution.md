@@ -6,10 +6,13 @@ This is a local packaging and recovery foundation. macOS local builds use an ad-
 
 ## Build
 
-Build on the same OS and architecture as the target. The checked-in runtime lock supports `darwin-arm64` and `win32-x64` and pins CPython 3.12.14 from python-build-standalone release 20260924 by URL and SHA-256. `uv.lock`, both npm lockfiles and the runtime lock are recorded in the runtime descriptor. uv 0.11.27 is required; Node 22.19+ is required for building the GUI. Runtime dependencies are installed using a hashed export of `uv.lock`, with binary wheels only.
+Build on the same OS and architecture as the target. The checked-in runtime lock supports `darwin-arm64` and `win32-x64` and pins CPython 3.12.14 from python-build-standalone release 20260924 by URL and SHA-256. `uv.lock`, the `ui-core`, `ui-tui` and `ui-gui` npm lockfiles and the runtime lock are recorded in the runtime descriptor. uv 0.11.27 is required; Node 22.19+ is required for building the GUI. Runtime dependencies are installed using a hashed export of `uv.lock`, with binary wheels only.
+
+The GUI build compiles the Appshot client modules from `ui-tui/src` (`ui-gui/src/main/appshot.ts`), and their `string-width`, `strip-ansi` and `@astra/ui-core` imports resolve from `ui-tui/node_modules`. Install all three lockfiles before building:
 
 ```sh
 npm --prefix ui-core ci
+npm --prefix ui-tui ci
 npm --prefix ui-gui ci
 npm --prefix ui-gui run build
 bash scripts/build_macos_computer_helper.sh --output-root /absolute/path/native-build

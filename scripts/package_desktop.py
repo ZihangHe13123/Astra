@@ -237,7 +237,9 @@ def bundle(options) -> Path:
                                  'surface': 'desktop-preview', 'cli_available': False},
                       'helper': helper, 'helper_policy': 'bundled' if helper else 'unavailable',
                       'locks': {name: sha256(ROOT / name) for name in
-                                ['uv.lock', 'ui-gui/package-lock.json', 'ui-core/package-lock.json', 'packaging/desktop-runtime.lock.json']}}
+                                ['uv.lock', 'ui-gui/package-lock.json', 'ui-core/package-lock.json',
+                                 # The GUI bundle compiles ui-tui Appshot modules and their dependencies.
+                                 'ui-tui/package-lock.json', 'packaging/desktop-runtime.lock.json']}}
         write_json(runtime / 'runtime.json', descriptor)
         # Runtime never writes __pycache__ in the immutable app. Clean the
         # upstream archive caches so no build-machine paths enter new bytecode.
