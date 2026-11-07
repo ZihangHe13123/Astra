@@ -141,7 +141,7 @@ def test_chat_scope_blocks_tools_and_automatic_owner_context_and_restores_owner(
     assert not (tmp_path / "bad.txt").exists()
 
 
-def test_no_echo_matches_only_the_unique_request_on_its_connection(monkeypatch):
+def test_no_echo_receipt_leaves_its_connection_unknown_and_others_waiting(monkeypatch):
     from websockets.asyncio.client import connect
     monkeypatch.delenv("ASTRA_QQ_ACCESS_TOKEN", raising=False)
     async def run():
@@ -166,7 +166,12 @@ def test_no_echo_matches_only_the_unique_request_on_its_connection(monkeypatch):
                     req_a = json.loads(await asyncio.wait_for(a.recv(), 2))
                     await asyncio.wait_for(b.recv(), 2)
                     await b.send(json.dumps({"status": "ok", "retcode": 0, "data": "B"}))
-                    assert (await asyncio.wait_for(second, 2))["data"] == "B"
+                    try:
+                        await asyncio.wait_for(second, 2)
+                    except TimeoutError as exc:
+                        assert "outcome unknown" in str(exc)
+                    else:
+                        raise AssertionError("a receipt without an echo confirmed an action")
                     assert not first.done()
                     await a.send(json.dumps({"status": "ok", "retcode": 0, "echo": req_a["echo"], "data": "A"}))
                     assert (await asyncio.wait_for(first, 2))["data"] == "A"
@@ -194,7 +199,7 @@ def test_ambiguous_no_echo_is_unknown_for_all_candidates_and_never_replayed(monk
                 assert len({request["echo"] for request in requests}) == 2
                 await client.send(json.dumps({"status": "ok", "retcode": 0}))
                 results = await asyncio.wait_for(asyncio.gather(*actions, return_exceptions=True), 2)
-                assert all(isinstance(result, RuntimeError) and "outcome unknown" in str(result) for result in results)
+                assert all(isinstance(result, TimeoutError) and "outcome unknown" in str(result) for result in results)
                 assert not adapter._pending_actions
                 try:
                     await asyncio.wait_for(client.recv(), .02)

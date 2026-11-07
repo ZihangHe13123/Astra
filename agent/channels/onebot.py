@@ -32,6 +32,11 @@ _ACTION_SECONDS = 30.0
 _origin: contextvars.ContextVar[ServerConnection | None] = contextvars.ContextVar("astra_onebot_origin", default=None)
 
 
+def _unknown(reason: str) -> TimeoutError:
+    # A TimeoutError: channel_send_file reports it as unconfirmed, not as failed.
+    return TimeoutError(f"{reason}: action outcome unknown; do not resend automatically")
+
+
 def _text_from_segments(value: Any) -> str:
     if isinstance(value, str):
         return value
@@ -180,25 +185,16 @@ class OneBotAdapter(ChannelAdapter):
                     echo = str(payload.get("echo") or "")
                     pending = (self._pending_actions.get(echo)
                                if self._pending_connections.get(echo) is connection else None)
-                    # Missing echoes can match only one unambiguous request on this connection.
-                    if (
-                        pending is None
-                        and not echo
-                        and "retcode" in payload
-                        and self._pending_actions
-                    ):
-                        candidates = [future for key, future in self._pending_actions.items()
-                                      if self._pending_connections.get(key) is connection and not future.done()]
-                        if len(candidates) == 1:
-                            pending = candidates[0]
-                        elif candidates:
-                            for future in candidates:
-                                future.set_exception(RuntimeError(
-                                    "Ambiguous OneBot receipt: action outcome unknown; do not resend automatically"))
-                            continue
                     if pending is not None:
                         if not pending.done():
                             pending.set_result(payload)
+                        continue
+                    if not echo and "retcode" in payload:
+                        # Any request on this connection may own a receipt without an echo, a reply
+                        # included: what waits here has an unknown outcome, never a confirmation.
+                        for key, future in self._pending_actions.items():
+                            if self._pending_connections.get(key) is connection and not future.done():
+                                future.set_exception(_unknown("OneBot receipt without echo"))
                         continue
                     inbox.put_nowait(payload)
         except asyncio.CancelledError:
@@ -208,7 +204,7 @@ class OneBotAdapter(ChannelAdapter):
         finally:
             for key, future in list(self._pending_actions.items()):
                 if self._pending_connections.get(key) is connection and not future.done():
-                    future.set_exception(RuntimeError("OneBot disconnected: action outcome unknown; do not resend automatically"))
+                    future.set_exception(_unknown("OneBot disconnected"))
             # A turn for this connection can no longer answer over it.
             worker.cancel()
             self._connections.discard(connection)
@@ -383,8 +379,7 @@ class OneBotAdapter(ChannelAdapter):
             try:
                 response = await asyncio.wait_for(future, timeout=_ACTION_SECONDS)
             except TimeoutError as exc:
-                # Still a TimeoutError: channel_send_file reports it as unconfirmed, not as failed.
-                raise TimeoutError("OneBot response timed out: action outcome unknown; do not resend automatically") from exc
+                raise _unknown("OneBot response timed out") from exc
         finally:
             self._pending_actions.pop(echo, None)
             self._pending_connections.pop(echo, None)
