@@ -137,6 +137,21 @@ export async function exportTarget(manifestPath: string, target: string): Promis
   return join(await canvasFolder(await canvasRoot(manifestPath), "exports"), basename(target));
 }
 
+/**
+ * Write an export at a target `exportTarget` gave: a new file of its own beside it, renamed over the name, so a
+ * link already at the name is replaced and never written through.
+ */
+export async function writeExport(target: string, data: Uint8Array): Promise<void> {
+  await mkdir(dirname(target), { recursive: true });
+  const temporary = join(dirname(target), `.${basename(target)}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(temporary, data, { flag: "wx" });
+    await rename(temporary, target);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
 /** Where the slides' pictures for a PPTX may be written: the `.slides` folder in its exports, nowhere else. */
 export async function slidesTarget(manifestPath: string, target: string): Promise<string> {
   if (target !== join(dirname(manifestPath), "exports", ".slides")) throw new Error("幻灯片图片只能写进画布 exports 里的 .slides 文件夹。");

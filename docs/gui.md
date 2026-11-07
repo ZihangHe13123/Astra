@@ -260,7 +260,9 @@ conversation, presenting and printing are Astra's own code; the model writes onl
 - Slides run under the same rules as a page: no access to Astra, no network, no storage, no
   pop-ups, no navigation.
 - Everything of a canvas is read and written inside its folder, where that really is: content,
-  images, versions or exports reached through a link out of the folder are refused.
+  images, versions or exports reached through a link out of the folder are refused. An export is
+  written as a new file and renamed over its name, so a link already at that name is replaced,
+  never written through.
 
 ### Documents
 

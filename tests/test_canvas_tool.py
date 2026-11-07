@@ -265,3 +265,21 @@ def test_nothing_of_a_canvas_is_read_or_written_through_a_link_out_of_its_folder
     (deck / "slides.html").unlink()
     (deck / "slides.html").symlink_to(outside / "secret.md")
     assert slide_count(deck) == 0
+
+
+def test_an_export_replaces_a_link_at_its_name_and_never_writes_through_it(tmp_path):
+    from pptx import Presentation
+
+    victim = tmp_path.parent / f"{tmp_path.name}-outside.txt"
+    victim.write_text("SYNTHETIC_OUTSIDE_FILE\n", encoding="utf-8")
+    call = tool(tmp_path, Desktop(tmp_path))
+    call(action="create", title="deck")
+    exports = tmp_path / "deck.canvas" / "exports"
+    exports.mkdir(exist_ok=True)
+    (exports / "deck.pptx").symlink_to(victim)
+    result = json.loads(call(action="export", canvas="deck.canvas", format="pptx")["output"])
+    assert victim.read_text(encoding="utf-8") == "SYNTHETIC_OUTSIDE_FILE\n"
+    target = exports / "deck.pptx"
+    assert result["file"] == str(target) and not target.is_symlink()
+    assert len(Presentation(str(target)).slides) == slide_count(tmp_path / "deck.canvas")
+    assert [path.name for path in exports.iterdir()] == ["deck.pptx"]

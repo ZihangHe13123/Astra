@@ -113,7 +113,9 @@ and export and names `doc_export`.
 - Images are inlined as data URLs by the main process, only from the canvas's own `assets/` folder,
   without following a link out of it, up to 8 MiB each and 40 MiB in all; nothing loads from the
   network.
-- Prints and slide pictures are written only to the canvas's own `exports/` folder.
+- Prints and slide pictures are written only to the canvas's own `exports/` folder. An export is written
+  as a new file of its own and renamed over its name, so a link already at that name is replaced, never
+  written through (the desktop's PDF and the backend's PPTX alike).
 - Every path of a canvas is held to the canvas folder's real location: content, the assets folder and
   each image, versions and exports reached through a link out of the folder are refused, on the
   desktop and in the backend (which checks `exports/.slides` before drawing there or removing it).

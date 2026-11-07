@@ -13,8 +13,10 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import os
 import re
 import shutil
+import tempfile
 import time
 from pathlib import Path
 
@@ -268,7 +270,14 @@ def build_pptx(pictures: list[Path], parts: list[tuple[str, str]], target: Path,
             frame.text = notes
     deck.core_properties.title = title
     target.parent.mkdir(parents=True, exist_ok=True)
-    deck.save(str(target))
+    # A new file of its own, renamed over the name: a link already at the name is replaced, never written through.
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            deck.save(stream)
+        os.replace(temporary, target)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def slide_count(root: Path) -> int:

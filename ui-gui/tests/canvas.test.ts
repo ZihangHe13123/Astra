@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, rmdirSync, writeFileSync, symlinkSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, rmdirSync, writeFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { composeDeck, inlineAssets, slideCount } from "../src/main/canvas-deck.js";
-import { canvasVersion, commentOnDocument, exportTarget, isCanvasManifest, listVersions, readCanvas, recordVersion, restoreVersion, slidesTarget } from "../src/main/canvas-files.js";
+import { canvasVersion, commentOnDocument, exportTarget, isCanvasManifest, listVersions, readCanvas, recordVersion, restoreVersion, slidesTarget, writeExport } from "../src/main/canvas-files.js";
 import { insertComment } from "../src/main/canvas-doc.js";
 import { canvasPreview } from "../src/main/file-preview.js";
 import { docPathFromTool, openComments, outline } from "../src/renderer/doc-preview.js";
@@ -251,4 +251,22 @@ test("nothing of a canvas is read or written through a link out of its folder", 
   await assert.rejects(exportTarget(printed, join(exports, "deck.pdf")), /不在画布文件夹里/);
   await assert.rejects(slidesTarget(printed, join(exports, ".slides")), /不在画布文件夹里/);
   assert.ok(!existsSync(join(outside, ".slides")));
+});
+
+test("a print replaces a link at its name and never writes through it", async () => {
+  const outside = mkdtempSync(join(tmpdir(), "astra-outside-"));
+  writeFileSync(join(outside, "victim.txt"), "SYNTHETIC_OUTSIDE_FILE\n");
+  const manifest = canvas({ "slides.html": slides });
+  const exports = join(manifest, "..", "exports");
+  mkdirSync(exports);
+  symlinkSync(join(outside, "victim.txt"), join(exports, "deck.pdf"));
+  symlinkSync(join(outside, "created.pdf"), join(exports, "new.pdf"));
+  for (const name of ["deck.pdf", "new.pdf"]) await writeExport(await exportTarget(manifest, join(exports, name)), new TextEncoder().encode("%PDF-1.7 fixture"));
+  assert.equal(readFileSync(join(outside, "victim.txt"), "utf8"), "SYNTHETIC_OUTSIDE_FILE\n");
+  assert.deepEqual(readdirSync(outside), ["victim.txt"]);
+  for (const name of ["deck.pdf", "new.pdf"]) {
+    assert.ok(!lstatSync(join(exports, name)).isSymbolicLink());
+    assert.equal(readFileSync(join(exports, name), "utf8"), "%PDF-1.7 fixture");
+  }
+  assert.deepEqual(readdirSync(exports).sort(), ["deck.pdf", "new.pdf"]);
 });

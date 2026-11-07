@@ -4,7 +4,7 @@ import { dirname, join, resolve } from "node:path";
 import type { CardTheme } from "../card-theme.js";
 import { CAPTURE_HOST_URL, PAGE_FRAME_URL, guardCardFrames, printAddress } from "./card-frame.js";
 import { SLIDE_HEIGHT, SLIDE_WIDTH, composeDeck } from "./canvas-deck.js";
-import { exportTarget, isCanvasManifest, readCanvas, slidesTarget } from "./canvas-files.js";
+import { exportTarget, isCanvasManifest, readCanvas, slidesTarget, writeExport } from "./canvas-files.js";
 import { PAGE_PREVIEW_LIMIT } from "./file-preview.js";
 import { PRINT_TIME_LIMIT, SLIDE_PICTURE_WIDTH, SNAPSHOT_SCREEN, slideFit, SNAPSHOT_TIME_LIMIT, SNAPSHOT_WIDTH, growsWithWindow, pngSize, shownHeight,
   snapshotName, staleSnapshots, type PageSnapshot, type SnapshotOptions } from "./page-snapshot-state.js";
@@ -159,8 +159,7 @@ export class PageSnapshots {
         // What the deck draws as it loads (fonts, images, a script) is drawn before it is printed.
         await contents.executeJavaScript("(document.fonts ? document.fonts.ready : Promise.resolve()).then(() => new Promise(r => setTimeout(r, 300)))");
         const pdf = await contents.printToPDF({ printBackground: true, preferCSSPageSize: true, margins: { top: 0, bottom: 0, left: 0, right: 0 } });
-        await mkdir(dirname(target), { recursive: true });
-        await writeFile(target, pdf);
+        await writeExport(target, pdf);
         return { path: target, width: SLIDE_WIDTH, height: SLIDE_HEIGHT, pageHeight: SLIDE_HEIGHT, scriptError: "" };
       });
     } finally { forget(); }
