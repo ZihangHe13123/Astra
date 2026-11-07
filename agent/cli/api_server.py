@@ -334,7 +334,7 @@ def _chat_input(body: dict, session_id: str | None) -> str | ChatInput:
                     if not image["url"].startswith(("http://", "https://", "data:image/")):
                         raise ValueError("Unsupported image URL scheme")
                     detail = image.get("detail", "auto")
-                    if detail not in {"auto", "low", "high"}:
+                    if not isinstance(detail, str) or detail not in {"auto", "low", "high"}:
                         raise ValueError("Unsupported image detail")
                     parts.append({"type": "image_url", "image_url": {"url": image["url"], "detail": detail}})
                 else:
@@ -378,7 +378,9 @@ def _validate_chat_body(body: Any) -> dict[str, Any]:
         raise ValueError("stream must be a boolean")
     if not isinstance(body.get("model", "astra"), str):
         raise ValueError("model must be a string")
-    messages = body.get("messages", [])
+    if "messages" not in body:
+        raise ValueError("messages is required")
+    messages = body["messages"]
     if not isinstance(messages, list):
         raise ValueError("messages must be an array")
     for message in messages:
@@ -470,12 +472,13 @@ async def chat_completions(request: Request) -> Any:
     try:
         usage: dict = {}
         response_text = await _run_agent(user_input, session_id, usage=usage)
+    except TurnFailed as failure:
+        logger.warning("API turn failed code=%s status=%d", failure.code, failure.status)
+        return JSONResponse(failure.payload(), status_code=failure.status, headers=session_headers)
     except Exception as e:
         logger.exception("Agent error")
-        return JSONResponse(
-            {"error": {"message": str(e), "type": "server_error"}},
-            status_code=500,
-        )
+        failure = _raised_failure(e)
+        return JSONResponse(failure.payload(), status_code=failure.status, headers=session_headers)
 
     response_payload = {
         "id": completion_id,
@@ -641,10 +644,50 @@ async def _agent_events(user_text: str | ChatInput, session_id: str | None, usag
                 _agent.context = previous
 
 
+_TIMEOUT_CODES = frozenset({"idle_timeout", "overall_timeout", "turn_budget_exhausted"})
+
+
+class TurnFailed(Exception):
+    """A turn that ended without an answer, reported as an OpenAI-style error rather than assistant text."""
+
+    def __init__(self, status: int, message: str, code: str):
+        super().__init__(message)
+        self.status = status
+        self.code = code
+
+    def payload(self) -> dict[str, Any]:
+        return {"error": {"message": str(self), "type": "server_error", "code": self.code}}
+
+
+def _failed_turn(event: Mapping[str, Any]) -> TurnFailed | None:
+    """The error event a turn does not recover from (react.reply_stream); recoverable ones are notes in the answer."""
+    if event.get("recoverable") is not False:
+        return None
+    code = str(event.get("code") or "turn_failed")
+    return TurnFailed(504 if code in _TIMEOUT_CODES else 502, str(event.get("message") or "The turn failed."), code)
+
+
+def _raised_failure(exc: Exception) -> TurnFailed:
+    """Classify an exception that escaped the turn without echoing provider text."""
+    from agent.runtime.llm import TRANSPORT_REQUEST_ERRORS, APIError, LLMResponseError
+    from agent.runtime.provider_errors import summarize_provider_error
+
+    summary = summarize_provider_error(exc)
+    if summary.category == "timeout" or summary.status_code == 504:
+        own = str(exc) if isinstance(exc, TimeoutError) else ""
+        return TurnFailed(504, own or "The model provider did not respond in time.", "upstream_timeout")
+    if (summary.status_code is not None or summary.category in {"rate_limit", "rejected", "transport"}
+            or isinstance(exc, (APIError, LLMResponseError, *TRANSPORT_REQUEST_ERRORS))):
+        status = f" (HTTP {summary.status_code})" if summary.status_code is not None else ""
+        return TurnFailed(502, f"The model provider request failed{status}.", "upstream_error")
+    return TurnFailed(500, str(exc) or type(exc).__name__, "internal_error")
+
+
 async def _run_agent(user_text: str | ChatInput, session_id: str | None = None, *, usage: dict | None = None) -> str:
     """Run user text through the selected API session and collect the response."""
 
     chunks: list[str] = []
+    failure: TurnFailed | None = None
     events = _agent_events(user_text, session_id, usage)
     try:
         async for event in events:
@@ -652,6 +695,9 @@ async def _run_agent(user_text: str | ChatInput, session_id: str | None = None, 
             if etype == "chunk":
                 chunks.append(event.get("content", ""))
             elif etype == "error":
+                if (failed := _failed_turn(event)) is not None:
+                    failure = failure or failed
+                    continue
                 error_msg = event.get("message", "Unknown error")
                 if chunks:
                     chunks.append(f"\n[Error: {error_msg}]")
@@ -660,6 +706,8 @@ async def _run_agent(user_text: str | ChatInput, session_id: str | None = None, 
     finally:
         await events.aclose()
 
+    if failure is not None:
+        raise failure
     return "".join(chunks) or "(no response)"
 
 
@@ -671,13 +719,20 @@ async def _stream_response(
     session_id: str | None = None,
     *, include_usage: bool = False,
 ):
-    """SSE streaming generator — yields SSE data lines directly."""
+    """SSE streaming generator — yields SSE data lines directly.
+
+    The 200 status is sent before the turn runs, so a failed turn ends with an error frame and
+    finish_reason "error" instead of an answer, and the stream still closes with [DONE].
+    """
     usage: dict = {}
+    failure: TurnFailed | None = None
     events = _agent_events(user_text, session_id, usage)
     try:
         async for event in events:
             etype = event.get("type")
-            if etype == "chunk":
+            if etype == "error" and (failed := _failed_turn(event)) is not None:
+                failure = failure or failed
+            elif etype == "chunk":
                 chunk_data = {
                     "id": completion_id,
                     "object": "chat.completion.chunk",
@@ -707,16 +762,22 @@ async def _stream_response(
                     ],
                 }
                 yield f"data: {json.dumps(error_chunk, ensure_ascii=False)}\n\n"
+    except Exception as exc:
+        # Raised mid-stream: report it in the stream instead of cutting the connection.
+        logger.exception("Agent error")
+        failure = _raised_failure(exc)
     finally:
         await events.aclose()
 
+    if failure is not None:
+        yield f"data: {json.dumps(failure.payload(), ensure_ascii=False)}\n\n"
     # Final chunk with finish_reason
     final = {
         "id": completion_id,
         "object": "chat.completion.chunk",
         "created": created,
         "model": model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop" if failure is None else "error"}],
     }
     yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
     if include_usage:

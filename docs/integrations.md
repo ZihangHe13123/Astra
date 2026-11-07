@@ -23,7 +23,15 @@ unauthenticated public binding. Requests carrying a browser `Origin` header
 also require configured bearer authentication, even on loopback.
 
 `POST /v1/chat/completions` supports streaming and non-streaming responses.
-Malformed consumed fields return HTTP 400 before session or Agent work. This
+Malformed consumed fields, including a missing `messages`, return HTTP 400
+with an OpenAI-style `error` object before session or Agent work. A turn that
+fails without an answer is not returned as assistant text: non-streaming
+requests get HTTP 504 when the model provider or the turn timed out and 502
+for other provider failures, each with an `error` object (`code` names the
+cause, such as `idle_timeout` or `upstream_error`). A stream has already sent
+HTTP 200, so it ends with a `data: {"error": ...}` frame, a final chunk whose
+`finish_reason` is `"error"`, and `[DONE]`. Notes the Agent recovers from, such
+as a tool budget stop, stay in the answer text. This
 bridge exposes Astra's local tools to authenticated callers; use a trusted
 network or a TLS reverse proxy for remote access. Native messaging channels
 remain a separate integration.
