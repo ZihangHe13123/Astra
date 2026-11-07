@@ -249,19 +249,20 @@ test("speech handed to the phone is served to a signed-in phone only, by its id 
   } finally { await gateway.dispose(); }
 });
 
-/** An upload sent in two halves: the second goes when `finish` is called. */
-function halfSent(port: number, token: string, name: string) {
+/** A request sent in two halves: the second goes when `finish` is called. */
+function halfSent(port: number, token: string, path: string, [first, second]: [Buffer | string, Buffer | string],
+  headers: Record<string, string> = {}) {
   let finish = () => {};
   const answer = new Promise<{ status: number; body: any }>((resolve, reject) => {
-    const outgoing = request({ host: "127.0.0.1", port, path: "/api/upload", method: "POST",
-      headers: { Host: `127.0.0.1:${port}`, Authorization: `Bearer ${token}`, "X-Astra-File-Name": name } }, response => {
+    const outgoing = request({ host: "127.0.0.1", port, path, method: "POST",
+      headers: { Host: `127.0.0.1:${port}`, Authorization: `Bearer ${token}`, ...headers } }, response => {
       let text = ""; response.setEncoding("utf8");
       response.on("data", chunk => { text += chunk; });
       response.on("end", () => resolve({ status: response.statusCode ?? 0, body: JSON.parse(text || "{}") }));
     });
     outgoing.on("error", reject);
-    outgoing.write(Buffer.alloc(1024, 1));
-    finish = () => { outgoing.end(Buffer.alloc(1024, 2)); };
+    outgoing.write(first);
+    finish = () => { outgoing.end(second); };
   });
   return { answer, finish: () => finish() };
 }
@@ -274,10 +275,10 @@ test("while a wipe runs, a phone's uploads and calls are refused and an upload s
   let arriving: ReturnType<typeof halfSent> | undefined;
   try {
     const { client, token } = await pairedClient(devices, base);
-    arriving = halfSent(port, token, "before.jpg");
+    arriving = halfSent(port, token, "/api/upload", [Buffer.alloc(1024, 1), Buffer.alloc(1024, 2)], { "X-Astra-File-Name": "before.jpg" });
     // The gateway has begun to read it before the wipe starts.
     await new Promise(resolve => setTimeout(resolve, 200));
-    gateway.hold();
+    await gateway.hold();
     arriving.finish();
     const late = await arriving.answer;
     assert.equal(late.status, 503);
@@ -295,6 +296,51 @@ test("while a wipe runs, a phone's uploads and calls are refused and an upload s
   } finally {
     // A half-sent upload would keep the gateway from closing.
     arriving?.finish(); await arriving?.answer.catch(() => undefined);
+    await gateway.dispose();
+  }
+});
+
+test("a wipe waits for a phone's call already running, and one whose body arrives after it starts never runs", async () => {
+  let answer = (_value: unknown) => {};
+  const { devices, gateway, port, base, calls } = await setup((_device, method) =>
+    method === "jobs" ? new Promise(done => { answer = done; }) : { ok: true });
+  let late: ReturnType<typeof halfSent> | undefined;
+  try {
+    const { client, token } = await pairedClient(devices, base);
+    // A call the desktop is still answering when the wipe starts: the wipe waits for it.
+    const running = client.invoke(token, "jobs", ["list"]);
+    await until(() => calls.length === 1, "call handed to the desktop");
+    let held = false;
+    const holding = gateway.hold().then(() => { held = true; });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(held, false, "the wipe waits while the call runs");
+    answer({ jobs: [] });
+    await holding;
+    assert.deepEqual(await running, { jobs: [] });
+    gateway.release();
+
+    // A call begun before the wipe whose body comes in after it started is refused, never handed over.
+    const body = JSON.stringify({ method: "memory", args: ["forget", "m1"] });
+    late = halfSent(port, token, "/api/invoke", [body.slice(0, 10), body.slice(10)], { "Content-Type": "application/json" });
+    await new Promise(resolve => setTimeout(resolve, 200));
+    await gateway.hold();
+    late.finish();
+    const refused = await late.answer;
+    assert.equal(refused.status, 503);
+    assert.match(refused.body.error, /清除/);
+    assert.deepEqual(calls.map(call => call.method), ["jobs"]);
+    gateway.release();
+
+    // A call that does not finish in time keeps the wipe from starting.
+    const stuck = client.invoke(token, "jobs", ["list"]);
+    await until(() => calls.length === 2, "second call handed to the desktop");
+    await assert.rejects(gateway.hold(50), /还没做完/);
+    gateway.release();
+    answer({ jobs: [] });
+    await stuck;
+  } finally {
+    // Calls left unanswered or half sent would keep the gateway from closing.
+    answer({ jobs: [] }); late?.finish(); await late?.answer.catch(() => undefined);
     await gateway.dispose();
   }
 });

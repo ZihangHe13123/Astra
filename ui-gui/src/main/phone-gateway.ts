@@ -16,6 +16,8 @@ const REPLAY_EVENTS = 4000;
 const REPLAY_BYTES = STREAM_BACKLOG_LIMIT;
 const HEARTBEAT_MS = 20_000;
 const WIPING = "正在清除数据，请稍后再试。";
+/** How long a wipe waits for phones' calls already running before it gives up. */
+const HOLD_WAIT_MS = 30_000;
 const TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8", ".json": "application/json", ".webmanifest": "application/manifest+json",
@@ -70,6 +72,8 @@ export class PhoneGateway {
   private held = false;
   /** Changed when a wipe starts or ends: an upload begun before then is not kept. */
   private epoch = 0;
+  /** Phones' calls handed to the desktop and not yet answered: a wipe waits for them. */
+  private calls = new Set<Promise<unknown>>();
   private stopRevoked: () => void;
 
   constructor(private readonly devices: PhoneDevices, private readonly options: PhoneGatewayOptions) {
@@ -133,9 +137,17 @@ export class PhoneGateway {
 
   /**
    * A wipe is starting: until `release()`, phones' uploads and calls are refused, and an upload still arriving
-   * is not kept, so nothing lands in (or is read from) the folders being deleted.
+   * is not kept, so nothing lands in (or is read from) the folders being deleted. Resolves once the calls
+   * already handed to the desktop have finished; rejects if they take longer than `wait`.
    */
-  hold() { this.held = true; this.epoch++; }
+  async hold(wait = HOLD_WAIT_MS) {
+    this.held = true; this.epoch++;
+    const running = Promise.all([...this.calls].map(call => call.then(() => undefined, () => undefined)));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<boolean>(done => { timer = setTimeout(() => done(true), wait); });
+    try { if (await Promise.race([running.then(() => false), late])) throw new Error("手机上的操作还没做完，请稍后再清除。"); }
+    finally { clearTimeout(timer); }
+  }
 
   release() { this.held = false; }
 
@@ -187,8 +199,13 @@ export class PhoneGateway {
       const method = body.method as PhoneInvokeMethod;
       if (!PHONE_INVOKE_METHODS.includes(method)) return send(response, 400, { error: "Unsupported call" });
       const args = Array.isArray(body.args) ? body.args : [];
-      try { return send(response, 200, { result: (await this.options.invoke(deviceId, method, args)) ?? null }); }
+      // Asked again once the body is in: a wipe may have started while it arrived.
+      if (this.held) return send(response, 503, { error: WIPING });
+      const call = (async () => this.options.invoke(deviceId, method, args))();
+      this.calls.add(call);
+      try { return send(response, 200, { result: (await call) ?? null }); }
       catch (error) { return send(response, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      finally { this.calls.delete(call); }
     }
     const body = await readJson(request, AUTH_BODY_LIMIT);
     if (path === "/api/pair") {

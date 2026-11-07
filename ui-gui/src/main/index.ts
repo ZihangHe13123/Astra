@@ -373,8 +373,10 @@ async function runData(action: unknown, confirmation?: unknown, browserData?: un
   if (wiping) throw new Error("正在清除，请稍候。");
   if ([...runtimes.values()].some(rt => holdsUp(rt.state))) throw new Error("还有对话在运行任务或等你回答，请先停止它们。");
   wiping = true;
-  // Phones send nothing while the data goes: an upload still arriving is not kept, and calls wait for the reload.
-  phone.hold();
+  // Phones send nothing while the data goes: an upload still arriving is not kept, new calls wait for the reload,
+  // and a call of theirs already running finishes before anything is deleted (or the wipe does not start).
+  try { await phone.hold(); }
+  catch (error) { phone.release(); wiping = false; throw error; }
   try {
     // Nothing of Astra's may hold the data open: every session, the background host and the query helper close first.
     for (const rt of [...runtimes.values()]) { await rt.close(); forgetRuntime(rt); }
