@@ -188,9 +188,12 @@ files sent from a phone, speech made for a phone and the phone audit log). Login
 own browser go only if you tick that box. Settings, models, keys, the WeChat login, paired
 phones (remove them in Settings), the mail cache and activity history stay, and a Hindsight
 server keeps its own memories. The desktop closes every conversation and its background host
-first and reloads afterwards, and so does every paired phone. In a terminal the same is `astra data plan`, `astra data export --out
-FILE.zip` and `astra data wipe --confirm 清除 [--browser-data]`; a wipe refuses while any other
-Astra runs. In a source checkout, files tracked by git (such as bundled skills) are never deleted.
+first and reloads afterwards, and so does every paired phone. If something could not be
+deleted (say a file another program holds), the window still reloads, since the rest is gone,
+and then says what stayed and why; close that program and wipe again. In a terminal the same
+is `astra data plan`, `astra data export --out FILE.zip` and `astra data wipe --confirm 清除
+[--browser-data]`; a wipe refuses while any other Astra runs, and one that left something
+lists it under `failed` and exits with status 1. In a source checkout, files tracked by git (such as bundled skills) are never deleted.
 
 ## Memory commands
 

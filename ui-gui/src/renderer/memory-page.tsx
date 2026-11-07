@@ -97,7 +97,8 @@ function DataSection({ fail }: { fail: (error: unknown) => void }) {
   const close = () => { setPlan(undefined); setTyped(""); setBrowserData(false); };
   const wipe = async () => {
     setBusy(true);
-    // On success the desktop reloads this window; it stays busy until then.
+    // Once the wipe has run the desktop reloads this window, also when something stayed (it says what after
+    // the reload); it stays busy until then. A refusal deletes nothing and leaves the page as it is.
     try { await window.astra.data("wipe", typed, browserData); }
     catch (error) { fail(error); setBusy(false); }
   };

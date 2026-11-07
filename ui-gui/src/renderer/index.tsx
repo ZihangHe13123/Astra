@@ -171,6 +171,7 @@ function App() {
     void window.astra.bootstrap().then(boot => {
       setStates(Object.fromEntries(boot.sessions.map(s => [s.id, s]))); setActive(boot.active); setWorkspace(boot.workspace); setNativeCapture(boot.appshot); setPrefs(migrateBlankDraft(boot.preferences, boot.workspace));
       loaded.current = true; if (buffered.length) apply(buffered); refresh();
+      if (boot.notice) setToast(boot.notice);
       if (!boot.active && boot.preferences.lastSession) void create(boot.preferences.lastSession).catch(fail);
     }).catch(fail);
     void window.astra.query("commands").then(setCatalog).catch(fail);
