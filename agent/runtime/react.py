@@ -3119,6 +3119,15 @@ class ReActAgent(AgentBase):
                 )
 
         logger.info("tool call start name=%s id=%s", name, tc.get("id", ""))
+        entered = False
+        batch_entered = _TOOL_ENTERED.get()
+
+        def on_start() -> None:
+            nonlocal entered
+            entered = True
+            if batch_entered is not None:
+                batch_entered()
+
         tool_trace_ctx = trace_ctx.with_tool_call(str(tc.get("id") or "")) if trace_ctx else None
         with trace_span("agent.react.tool", {"agent.tool.name": name}, ctx=tool_trace_ctx) as tool_span:
             try:
@@ -3130,21 +3139,33 @@ class ReActAgent(AgentBase):
                     call_id=str(tc.get("id") or ""),
                     task_id=task_id or "",
                     execution_origin="model",
-                    on_start=_TOOL_ENTERED.get(),
+                    on_start=on_start,
                 )
             except (asyncio.CancelledError, TurnBudgetExceeded):
-                # A cancelled run_code request may have already claimed a
-                # durable step. Mark it unknown so a later resume cannot
-                # mistake an interrupted side effect for a completed call.
+                # A cancelled call may already hold a durable step. Once its
+                # tool was entered the step is unknown, so a later resume cannot
+                # mistake an interrupted side effect for a completed call or
+                # replay it. Stopped before then (approval wait, policy, budget
+                # check, a queued thread), nothing ran: not_started, which a
+                # later claim may run as a first execution.
                 if step_id and self.task_store is not None:
                     try:
-                        await durable_io(
-                            self.task_store.finish_step,
-                            step_id,
-                            status="unknown",
-                            output={"cancelled": True, "name": name},
-                            error="Tool execution cancelled before completion could be confirmed",
-                        )
+                        if entered:
+                            await durable_io(
+                                self.task_store.finish_step,
+                                step_id,
+                                status="unknown",
+                                output={"cancelled": True, "name": name},
+                                error="Tool execution cancelled before completion could be confirmed",
+                            )
+                        else:
+                            await durable_io(
+                                self.task_store.finish_step,
+                                step_id,
+                                status="not_started",
+                                output={"cancelled": True, "name": name, "not_executed": True},
+                                error="Tool cancelled before it started; it did not run",
+                            )
                     except Exception:
                         logger.exception("task store cancellation finish failed task_id=%s name=%s", task_id, name)
                 raise

@@ -54,6 +54,29 @@ class BatchLLM:
         yield {"type": "done", "content": "ok", "usage": None}
 
 
+class ScriptLLM(BatchLLM):
+    """Each turn's first request issues the next scripted batch; later ones answer."""
+
+    def __init__(self, batches: list[list[dict]]):
+        super().__init__(batch=False)
+        self.batches = list(batches)
+
+    async def chat_stream(self, messages, tools):
+        if self.batches and messages[-1]["role"] == "user":
+            self.requests.append(messages)
+            yield {
+                "type": "tool_calls", "calls": [dict(call) for call in self.batches.pop(0)], "content": "",
+                "reasoning_content": "", "finish_reason": "tool_calls", "usage": None,
+            }
+            return
+        async for event in super().chat_stream(messages, tools):
+            yield event
+
+
+def _tool_steps(store: TaskStore, task_id: str) -> dict[str, str]:
+    return {step["name"]: step["status"] for step in store.get_task(task_id)["steps"] if step["kind"] == "tool"}
+
+
 def _registry(note, read_started: asyncio.Event) -> ToolRegistry:
     async def write_note(text: str):
         with note.open("a", encoding="utf-8") as handle:
@@ -301,3 +324,87 @@ def test_refusals_and_the_budget_check_before_a_call_keep_their_own_labels(tmp_p
             "[Tool result: write_note | status: error]\n[ToolNotStarted] write_note did not start: "
             "the turn ran out of time first"
         )
+
+
+def test_a_call_that_never_ran_is_not_started_in_the_task_store_and_may_run_later(tmp_path):
+    calls = [CALLS[0], {"id": "call-guarded", "name": "guarded_write", "arguments": json.dumps({"text": "x"})}]
+    note = tmp_path / "note.txt"
+    asked = asyncio.Event()
+    answers = ["wait", "once"]
+    entered: list[str] = []
+
+    async def decide(request: dict) -> str:
+        del request
+        asked.set()
+        if answers.pop(0) == "wait":
+            await asyncio.Event().wait()
+        return "once"
+
+    def guarded_write(text: str):
+        entered.append(text)
+        return "written"
+
+    registry = _registry(note, asyncio.Event())
+    registry.register(ToolDef(
+        name="guarded_write", description="write after approval", fn=guarded_write, risk="write",
+        parameters={"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]},
+        permission_check=lambda args: {"kind": "fixture_write", "scope": "fixture:x", "target": "x"},
+        permission_grant=lambda args, request, decision: None,
+    ))
+    registry.set_approval_handler(decide)
+    store = TaskStore(tmp_path / "tasks.db")
+    task = store.start_run("req-1", "write twice", session_id="approval", model="fake")
+    # The second turn sends the very same calls again, as a replay of the turn would.
+    agent = ReActAgent("agent", ScriptLLM([calls, calls]), registry, system_prompt="base", task_store=store)
+    agent.context.set_session(str(tmp_path / "sessions" / "approval.json"))
+    message = {"task_id": task["id"]}
+
+    async def scenario():
+        async def consume():
+            async for _ in agent.reply_stream(Msg(content=[ContentBlock.text("write twice")], metadata=message)):
+                pass
+
+        turn = asyncio.create_task(consume())
+        await asyncio.wait_for(asked.wait(), timeout=5)
+        turn.cancel()
+        await asyncio.wait_for(asyncio.gather(turn, return_exceptions=True), timeout=10)
+        # History and the task store agree: the guarded call never started.
+        assert _tool_steps(store, task["id"]) == {"write_note": "completed", "guarded_write": "not_started"}
+        assert "[ToolNotStarted] guarded_write" in dict(_chain(agent.context.messages, calls))["call-guarded"]
+
+        events = [event async for event in agent.reply_stream(
+            Msg(content=[ContentBlock.text("again")], metadata=message))]
+        return {event["id"]: event for event in events if event.get("type") == "tool_result"}
+
+    results = asyncio.run(scenario())
+
+    # The completed write is not repeated; the call that never ran is no
+    # possible duplicate, so it runs now (after its approval).
+    assert results["call-write"].get("cached") is True
+    assert note.read_text(encoding="utf-8") == "hello\n"
+    assert not results["call-guarded"]["error"] and entered == ["x"]
+    assert _tool_steps(store, task["id"]) == {"write_note": "completed", "guarded_write": "completed"}
+
+
+def test_a_call_that_started_without_a_result_is_never_replayed(tmp_path):
+    async def scenario():
+        agent, llm, store, task, session, note, events = await _run_interrupted(tmp_path, cancel=True)
+        assert _tool_steps(store, task["id"]) == {"write_note": "completed", "slow_read": "unknown"}
+        agent.llm = ScriptLLM([CALLS])
+        replay = Msg(content=[ContentBlock.text("again")], metadata={"task_id": task["id"]})
+        events = await asyncio.wait_for(_collect(agent.reply_stream(replay)), timeout=10)
+        return {event["id"]: event for event in events if event.get("type") == "tool_result"}, note
+
+    results, note = asyncio.run(scenario())
+
+    assert results["call-write"].get("cached") is True
+    assert results["call-read"].get("recovery_blocked") is True
+    assert "[ToolRecoveryBlocked]" in results["call-read"]["error"]
+    # The queued write was never claimed before, so it runs once now.
+    assert not results["call-second-write"]["error"]
+    assert note.read_text(encoding="utf-8") == "hello\nsecond\n"
+
+
+async def _collect(stream) -> list[dict]:
+    return [event async for event in stream]
+
