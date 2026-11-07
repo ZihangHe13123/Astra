@@ -272,9 +272,11 @@ writes section by section with the `doc_*` tools (the "documents" family of `too
 - The Files panel shows it rendered, with its outline above: click a heading to go to it. Open
   review comments are listed on top.
 - Select a passage and write what should change: **写进文档** writes the comment into `doc.md` as
-  `<!-- @astra: ... -->` right after the passage (at the end of its line when the Markdown spells
-  it differently, at the end of the document when it cannot be found; never inside a heading or a
-  code block). Ask Astra to handle the comments; `doc_comments` lists them and the model resolves
+  `<!-- @astra: ... -->` right after the passage you selected, even when the same text appears
+  earlier (at the end of its line when the Markdown spells it differently, at the end of the
+  document when it cannot be found). It never goes inside a heading, a code span or a code block:
+  it follows them. If the document changed after you selected, the comment is refused and you are
+  asked to refresh and select again. Ask Astra to handle the comments; `doc_comments` lists them and the model resolves
   each one with `doc_edit`.
 - Export with `doc_export` (Word, PDF or HTML), as for any Markdown document. `canvas_look` and the
   canvas's own export are for decks.

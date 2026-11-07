@@ -52,7 +52,7 @@ export interface DesktopBridge {
   file(id: string, path: string, action: "preview" | "open" | "reveal" | "version" | "snapshot", requestId?: string): Promise<FilePreview>;
   cancelPreview(id: string, requestId: string): Promise<void>;
   /** A canvas's kept versions, one of them shown, an earlier one restored, or the person's comment on a passage of a document canvas. */
-  canvas(id: string, path: string, action: "versions" | "preview" | "restore" | "comment", value?: string | { passage: string; comment: string }): Promise<{ versions?: CanvasVersion[]; preview?: FilePreview; version?: string }>;
+  canvas(id: string, path: string, action: "versions" | "preview" | "restore" | "comment", value?: string | { passage: string; comment: string; occurrence?: number; version?: string }): Promise<{ versions?: CanvasVersion[]; preview?: FilePreview; version?: string }>;
   onEvents(handler: (events: DesktopEvent[]) => void): () => void;
 }
 declare global { interface Window { astra: DesktopBridge; } }

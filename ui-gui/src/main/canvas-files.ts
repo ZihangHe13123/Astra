@@ -234,8 +234,16 @@ export async function restoreVersion(manifestPath: string, id: string): Promise<
   return rewrite(manifestPath, "restore", () => kept);
 }
 
-/** A comment from the person on a passage of a document canvas, written where the doc_* tools read it. */
-export async function commentOnDocument(manifestPath: string, passage: string, comment: string): Promise<string | undefined> {
+/**
+ * A comment from the person on a passage of a document canvas, written where the doc_* tools read it:
+ * `occurrence` is which of the same text they selected, and `version` the canvas version the preview showed,
+ * so a document changed since they selected is not commented on in a place they did not see.
+ */
+export async function commentOnDocument(manifestPath: string, passage: string, comment: string,
+  selected: { occurrence?: number; version?: string } = {}): Promise<string | undefined> {
   if ((await manifestOf(manifestPath)).type !== "doc") throw new Error("只有文档画布可以批注。");
-  return rewrite(manifestPath, "comment", current => Buffer.from(insertComment(current.toString("utf8"), passage, comment)));
+  if (selected.version !== undefined && selected.version !== await canvasVersion(manifestPath))
+    throw new Error("文档在你选中之后改过了，请刷新预览后重新选择。");
+  return rewrite(manifestPath, "comment", current =>
+    Buffer.from(insertComment(current.toString("utf8"), passage, comment, selected.occurrence ?? 0)));
 }

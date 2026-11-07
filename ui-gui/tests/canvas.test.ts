@@ -146,6 +146,38 @@ test("a comment goes right after the passage it is about, never into a heading o
   assert.throws(() => insertComment(doc, " ", "x"), /选中/);
 });
 
+test("a comment lands on the occurrence that was selected, and after code, never inside it", () => {
+  const twice = "第一段提到预算。\n\n第二段也提到预算。\n";
+  assert.equal(insertComment(twice, "提到预算", "x", 1), "第一段提到预算。\n\n第二段也提到预算 <!-- @astra: x -->。\n");
+  assert.equal(insertComment(twice, "提到预算", "x"), "第一段提到预算 <!-- @astra: x -->。\n\n第二段也提到预算。\n");
+  // An address or an earlier comment is not text a person could have selected.
+  const hidden = "看[链接](https://example.com/预算) <!-- @astra: 预算 -->\n\n预算表在这里。\n";
+  assert.match(insertComment(hidden, "预算", "x"), /\n预算 <!-- @astra: x -->表在这里。\n$/);
+  // A code span, all of it or a part: after the span, so the command stays one to copy.
+  const command = "构建用 `npm run build` 即可。\n";
+  for (const passage of ["npm run build", "run"])
+    assert.equal(insertComment(command, passage, "x"), "构建用 `npm run build` <!-- @astra: x --> 即可。\n");
+  // Code blocks, fenced or indented, at the top or in a list item: on the line after the block, indented
+  // as the block is, so the comment is not code and stays in its item.
+  const blocks = "前言\n\n    make all\n\n- 步骤\n\n  ```\n  make test\n  ```\n\n结尾\n";
+  const indented = insertComment(blocks, "make all", "x");
+  assert.equal(indented, "前言\n\n    make all\n<!-- @astra: x -->\n\n- 步骤\n\n  ```\n  make test\n  ```\n\n结尾\n");
+  const listed = insertComment(blocks, "make test", "y");
+  assert.equal(listed, "前言\n\n    make all\n\n- 步骤\n\n  ```\n  make test\n  ```\n  <!-- @astra: y -->\n\n结尾\n");
+  assert.deepEqual(openComments(indented), ["x"]);
+  assert.deepEqual(openComments(listed), ["y"]);
+});
+
+test("a comment on a document changed since it was selected is refused", async () => {
+  const manifest = canvas({ "doc.md": "# 一\n\n原来的一段。\n" }, "doc");
+  const seen = await canvasVersion(manifest);
+  writeFileSync(join(manifest, "..", "doc.md"), "# 一\n\n改过的一段，原来的一段。\n");
+  await assert.rejects(commentOnDocument(manifest, "原来的一段", "x", { version: seen }), /改过了/);
+  assert.equal(readFileSync(join(manifest, "..", "doc.md"), "utf8"), "# 一\n\n改过的一段，原来的一段。\n");
+  await commentOnDocument(manifest, "原来的一段", "x", { version: await canvasVersion(manifest) });
+  assert.match(readFileSync(join(manifest, "..", "doc.md"), "utf8"), /原来的一段 <!-- @astra: x -->。/);
+});
+
 test("a document's outline is its headings outside code, as they read", () => {
   assert.deepEqual(outline(doc), [{ level: 1, text: "季度回顾" }, { level: 2, text: "收入" }, { level: 2, text: "风险" }]);
   assert.deepEqual(outline("## **粗** [链](x) `码` <!-- c -->\n```\n# 不是\n```\n#不是标题"), [{ level: 2, text: "粗 链 码" }]);
