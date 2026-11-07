@@ -133,6 +133,26 @@ def test_export_holds_the_persons_data_consistently_and_no_credentials(tmp_path)
                                                              b"personal-secret", b"personal-token", b"PRIVATE KEY"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="making links needs extra rights on Windows")
+def test_an_export_never_writes_through_a_link_at_its_name(tmp_path):
+    home = tmp_path / "home"
+    seed(home).close()
+    outside = {name: tmp_path / name for name in ("notes.txt", "old.zip")}
+    for path in outside.values():
+        path.write_text("someone else's file")
+    folder = tmp_path / "out"
+    folder.mkdir()
+    # A link where the half-written archive used to go, and one at the chosen name itself.
+    (folder / "astra.zip.partial").symlink_to(outside["notes.txt"])
+    (folder / "linked.zip").symlink_to(outside["old.zip"])
+    for name in ("astra.zip", "linked.zip"):
+        code, result = data(environment(home), "export", "--out", str(folder / name))
+        assert code == 0, result
+        assert not (folder / name).is_symlink() and zipfile.is_zipfile(folder / name)
+    assert all(path.read_text() == "someone else's file" for path in outside.values())
+    assert sorted(path.name for path in folder.iterdir()) == ["astra.zip", "astra.zip.partial", "linked.zip"]
+
+
 def test_plan_names_what_each_choice_takes(tmp_path):
     home = tmp_path / "home"
     seed(home).close()

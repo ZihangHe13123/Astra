@@ -199,7 +199,8 @@ left something lists it under `failed` and exits with status 1. In a source chec
 (such as bundled skills) are never deleted. Neither command follows a symbolic link (or a
 Windows junction) inside Astra's data folder: what lies behind one could be anywhere, so it is
 neither exported (the export lists it under `skipped`) nor deleted (the wipe lists it under
-`failed`).
+`failed`). The zip is written to a new file of its own beside the chosen name and then moved
+into place, so a link at that name is replaced, never written through.
 
 ## Memory commands
 

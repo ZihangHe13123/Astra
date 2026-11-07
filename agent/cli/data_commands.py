@@ -260,20 +260,23 @@ def _copy_sqlite(source: Path, target: Path) -> None:
 
 
 def export(out: Path, *, now: float | None = None) -> dict:
-    out = out.expanduser().resolve()
+    from agent.runtime.paths import state_dir
+
+    # The folder as it really is; the name itself is not resolved, so a link there is replaced, never written through.
+    out = out.expanduser()
+    out = Path(os.path.realpath(out.parent)) / out.name
     if out.suffix != ".zip":
         raise ValueError("导出文件要以 .zip 结尾。")
     if not out.parent.is_dir():
         raise ValueError(f"找不到文件夹：{out.parent}")
     when = datetime.fromtimestamp(time.time() if now is None else now, timezone.utc)
-    from agent.runtime.paths import state_dir
-
-    partial = out.with_name(out.name + ".partial")
+    # Written to a new file of its own (created exclusively, readable by this user alone) beside the target,
+    # then moved over the target's name in one step.
+    handle, partial = tempfile.mkstemp(prefix=f".{out.name}.", suffix=".partial", dir=out.parent)
     exported, skipped = [], []
     try:
-        with tempfile.TemporaryDirectory(prefix="astra-export-") as scratch, \
-                zipfile.ZipFile(partial, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
-            os.chmod(partial, 0o600)
+        with tempfile.TemporaryDirectory(prefix="astra-export-") as scratch, os.fdopen(handle, "w+b") as file, \
+                zipfile.ZipFile(file, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
             for item in items():
                 if not item.export:
                     continue
@@ -303,9 +306,9 @@ def export(out: Path, *, now: float | None = None) -> dict:
                 "format": "astra-export", "version": 1, "created_at": when.isoformat(timespec="seconds"),
                 "items": exported, "not_included": list(NOT_EXPORTED), "skipped": skipped,
             }, ensure_ascii=False, indent=2))
-        partial.replace(out)
+        os.replace(partial, out)
     except BaseException:
-        partial.unlink(missing_ok=True)
+        Path(partial).unlink(missing_ok=True)
         raise
     return {"path": str(out), "bytes": out.stat().st_size, "items": exported, "skipped": skipped}
 
