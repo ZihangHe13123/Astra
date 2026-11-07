@@ -103,6 +103,25 @@ def test_a_reloaded_session_does_not_send_core_memory_again(tmp_path):
     assert sum(_text(message).count(CORE) for message in request) == 1
 
 
+def test_a_reloaded_session_replays_every_core_memory_copy_it_sent(tmp_path):
+    llm = RecordingLLM()
+    agent, store = _agent(tmp_path, llm)
+    store.add_core("user", CORE)
+    _turn(agent, "first")
+    store.add_core("memory", ADDED)
+    _turn(agent, "second")
+    sent = llm.requests[-1]
+    assert [ADDED in _text(m) for m in sent if _text(m).startswith(STANDING_MEMORY_MARKER)] == [False, True]
+
+    resumed_llm = RecordingLLM()
+    resumed, _ = _agent(tmp_path, resumed_llm)
+    assert resumed.context.load()
+    _turn(resumed, "after restart")
+    # Both copies keep their places, so the request after a restart extends
+    # exactly what was sent before it and its cached prefix still applies.
+    assert resumed_llm.requests[-1][:len(sent)] == sent
+
+
 def test_compaction_keeps_only_the_latest_core_memory_copy():
     context = AgentContext(system_prompt="system")
     context.add_user("first")
