@@ -1,4 +1,5 @@
 """A killed rollback must leave a recoverable journal or an unblocked app."""
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -7,7 +8,7 @@ import sys
 import pytest
 
 from agent.launcher import desktop_update, installation
-from agent.launcher.common import write_json
+from agent.launcher.common import LauncherError, read_json, write_json
 from agent.launcher.desktop_distribution import seal_tree, sha256
 from agent.launcher.locking import RuntimeLease
 
@@ -171,3 +172,91 @@ def test_rollback_interrupted_after_moving_new_version_aside_restores_without_re
     assert not list(control.glob("updater-*"))
     with RuntimeLease(install, "recovered fixture"):
         assert (app / "version.txt").read_text() == "old"
+
+
+STAGE_KILLED = """
+import os, shutil, sys
+from pathlib import Path
+from agent.launcher import desktop_update, installation
+candidate, app, control, profile, digest = sys.argv[1:6]
+installation.user_home = lambda: Path(profile)
+copy = shutil.copytree
+def terminate_before_updater_copy(source, destination, *args, **kwargs):
+    if Path(destination).name.startswith('updater-'):
+        os._exit(77)
+    return copy(source, destination, *args, **kwargs)
+shutil.copytree = terminate_before_updater_copy
+desktop_update.stage(Path(candidate), Path(app), Path(control), expected_sha256=digest, target='darwin-arm64')
+"""
+
+
+def installed_update(tmp_path):
+    app = tmp_path / "installed/Astra.app"
+    install = installation.discover(make_application(app, "old"))
+    candidate = tmp_path / "candidate"
+    make_application(candidate / "Astra.app", "new")
+    manifest = seal_tree(candidate / "Astra.app", version="new", target="darwin-arm64")
+    manifest["application"] = "Astra.app"
+    write_json(candidate / "release.json", manifest)
+    stage = ["stage", "--candidate", str(candidate), "--target", "darwin-arm64",
+             "--manifest-sha256", sha256(candidate / "release.json")]
+    # The CLI keeps its journal beside the application.
+    return app, app.parent / ".Astra.app.astra-updater", install, stage
+
+
+def installed_updater(monkeypatch, capsys, app, *args):
+    """Run the CLI as the installed application's own updater."""
+    monkeypatch.setattr(desktop_update.sys, "executable", str(app / "Contents/Resources/runtime/python/bin/python3"))
+    monkeypatch.setattr(desktop_update.sys, "argv", ["desktop_update", *args, "--application", str(app)])
+    code = desktop_update.main()
+    return code, capsys.readouterr()
+
+
+@pytest.mark.parametrize("interrupted", [True, False], ids=["killed-while-preparing", "staged-not-applied"])
+def test_installed_updater_discards_stage_that_never_touched_the_application(tmp_path, monkeypatch, capsys,
+                                                                            interrupted):
+    profile = tmp_path / "profile"
+    monkeypatch.setattr(installation, "user_home", lambda: profile)
+    app, control, install, stage = installed_update(tmp_path)
+    if interrupted:
+        killed = subprocess.run([sys.executable, "-c", STAGE_KILLED, stage[2], str(app), str(control), str(profile),
+                                 stage[-1]], cwd=ROOT, env={**os.environ, "PYTHONPATH": str(ROOT)},
+                                capture_output=True, timeout=30)
+        assert killed.returncode == 77, killed.stderr
+        assert read_json(control / "desktop-update.json")["phase"] == "preparing"
+        assert installed_updater(monkeypatch, capsys, app, *stage)[0] == 1
+    else:
+        assert installed_updater(monkeypatch, capsys, app, *stage)[0] == 0
+        # An apply killed after fencing launches but before recording 'replacing'.
+        write_json(install.control / "desktop-pending.json", {"journal": str(control / "desktop-update.json")})
+    code, output = installed_updater(monkeypatch, capsys, app, "recover")
+    assert code == 0, output.err
+    assert json.loads(output.out)["phase"] == "discarded"
+    assert (app / "version.txt").read_text() == "old"
+    assert not list(app.parent.glob(".astra-update-*"))
+    assert not list(control.glob("updater-*"))
+    assert not (control / "desktop-update.json").exists()
+    with RuntimeLease(install, "untouched fixture"):
+        assert (app / "version.txt").read_text() == "old"
+    assert installed_updater(monkeypatch, capsys, app, *stage)[0] == 0
+
+
+def test_installed_updater_cannot_skip_recovery_once_apply_moved_the_application(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(installation, "user_home", lambda: tmp_path / "profile")
+    app, control, _, stage = installed_update(tmp_path)
+    assert installed_updater(monkeypatch, capsys, app, *stage)[0] == 0
+    desktop_update.apply(app, control, validate=lambda _: None)
+    code, output = installed_updater(monkeypatch, capsys, app, "recover")
+    assert code == 1 and "updater printed by stage" in output.err
+    with pytest.raises(LauncherError, match="already started"):
+        desktop_update.recover(app, control, untouched_only=True)
+    # A journal claiming an untouched phase must not discard a moved-aside original.
+    state = read_json(control / "desktop-update.json")
+    write_json(control / "desktop-update.json", {**state, "phase": "staged"})
+    code, output = installed_updater(monkeypatch, capsys, app, "recover")
+    assert code == 1 and "does not match" in output.err
+    assert (app / "version.txt").read_text() == "new"
+    assert (Path(state["backup"]) / "version.txt").read_text() == "old"
+    write_json(control / "desktop-update.json", state)
+    assert desktop_update.recover(app, control)["phase"] == "restored"
+    assert (app / "version.txt").read_text() == "old"

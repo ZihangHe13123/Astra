@@ -30,6 +30,8 @@ from .locking import exclusive, require_idle
 
 # Each application bundles its updater entry point in <resources>/runtime.
 UPDATER = {'darwin-arm64': 'astra-desktop-update', 'win32-x64': 'astra-desktop-update.cmd'}
+# Journal phases in which the installed application has not been touched.
+UNTOUCHED = {'preparing', 'staged'}
 
 
 def _journal(control: Path) -> Path:
@@ -210,11 +212,18 @@ def apply(application: Path, control: Path, *, validate=None) -> dict:
             return {'phase': 'applied', 'version': state['manifest']['version'], 'rollback_available': True}
 
 
-def recover(application: Path, control: Path) -> dict:
+def recover(application: Path, control: Path, *, untouched_only: bool = False) -> dict:
     application = application.resolve()
     with InstanceLock(control / 'desktop-update.lock'):
         state = _state(application, control)
         install = _pending_install(application, state)
+        if state['phase'] in UNTOUCHED:
+            return _discard_staged(application, control, state, install)
+        if untouched_only:
+            # The installed updater may only drop copies; once apply has begun,
+            # recovery renames the installation and must run from outside it.
+            raise LauncherError('The desktop update has already started replacing the application; run recover '
+                                'with the updater printed by stage.')
         if state['phase'] == 'finalizing':
             # Finalization had begun deleting the previous application, so it
             # is no longer a rollback target. Finish discarding it instead.
@@ -250,6 +259,18 @@ def _recover(application: Path, control: Path, state: dict, install) -> dict:
     _discard_updater(state)
     _finish_recovery(control, install)
     return {'phase': 'restored'}
+
+
+def _discard_staged(application: Path, control: Path, state: dict, install) -> dict:
+    # apply records 'replacing' before its first rename, so in these phases the
+    # installed application is untouched and only the update's copies exist.
+    if Path(state['backup']).exists() or not application.exists():
+        raise LauncherError('Desktop update journal does not match its files; recovery left all files intact.')
+    shutil.rmtree(Path(state['staging']), ignore_errors=True)
+    _discard_updater(state)
+    # Also clears a fence left by an apply killed before it recorded 'replacing'.
+    _finish_recovery(control, install)
+    return {'phase': 'discarded', 'version': state['manifest'].get('version')}
 
 
 def _finish_finalize(control: Path, state: dict, install) -> dict:
@@ -294,7 +315,10 @@ def main() -> int:
         journal = read_json(_journal(control))
         # apply/recover rename the application and staged copy; finalize deletes the backup.
         busy = [Path(journal[key]) for key in ('staging', 'backup') if isinstance(journal.get(key), str)]
-        if options.action in {'apply', 'recover'}:
+        # The installed updater may still discard an update that never touched
+        # the installation, such as an interrupted stage; recover re-checks the
+        # phase under the transaction lock.
+        if options.action == 'apply' or (options.action == 'recover' and journal.get('phase') not in UNTOUCHED):
             busy.append(application)
         if options.action != 'stage' and any(running.is_relative_to(path) for path in busy):
             raise LauncherError('Run this action with the updater printed by stage, outside the installed and '
@@ -310,7 +334,7 @@ def main() -> int:
         elif options.action == 'apply':
             result = apply(application, control)
         elif options.action == 'recover':
-            result = recover(application, control)
+            result = recover(application, control, untouched_only=running.is_relative_to(application))
         else:
             result = finalize(application, control)
         print(json.dumps(result))
