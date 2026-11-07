@@ -99,7 +99,10 @@ sender QQ IDs in `file_allow_users` (or `allow_users`), and restrict
 `send_file_roots` to output directories that are safe to share. The
 `channel_send_file` tool rejects paths outside those roots, hidden files and
 folders, application data and common credential files even when requested by
-the model.
+the model. A file goes back over the NapCat connection the request came from;
+an upload NapCat does not confirm within 30 seconds is reported to the model as
+unconfirmed (it may or may not have arrived) and is never resent automatically.
+When NapCat disconnects, the turn it was waiting for is cancelled.
 
 ### WeChat
 

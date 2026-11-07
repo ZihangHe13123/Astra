@@ -8,6 +8,7 @@ the ReAct agent router.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import hmac
 import ipaddress
 import json
@@ -26,6 +27,9 @@ from .media import download_image_data_url
 
 logger = logging.getLogger(__name__)
 _CQ_AT_RE = re.compile(r"\[CQ:at,qq=([^,\]]+)[^\]]*\]")
+_ACTION_SECONDS = 30.0
+# The connection whose message a turn answers: its uploads go back over it.
+_origin: contextvars.ContextVar[ServerConnection | None] = contextvars.ContextVar("astra_onebot_origin", default=None)
 
 
 def _text_from_segments(value: Any) -> str:
@@ -160,6 +164,10 @@ class OneBotAdapter(ChannelAdapter):
         authenticated = bool(token)
         self._connections.add(connection)
         self._send_locks[id(connection)] = asyncio.Lock()
+        # Events wait for a worker of their own, so this loop keeps reading the receipts
+        # that a turn's actions (a file upload) wait for.
+        inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        worker = asyncio.create_task(self._work(connection, inbox, authenticated), name="onebot-inbox")
         logger.info("OneBot client connected remote=%s", connection.remote_address)
         try:
             async for raw in connection:
@@ -192,7 +200,7 @@ class OneBotAdapter(ChannelAdapter):
                         if not pending.done():
                             pending.set_result(payload)
                         continue
-                    await self._handle_payload(connection, payload, authenticated)
+                    inbox.put_nowait(payload)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -201,9 +209,25 @@ class OneBotAdapter(ChannelAdapter):
             for key, future in list(self._pending_actions.items()):
                 if self._pending_connections.get(key) is connection and not future.done():
                     future.set_exception(RuntimeError("OneBot disconnected: action outcome unknown; do not resend automatically"))
+            # A turn for this connection can no longer answer over it.
+            worker.cancel()
             self._connections.discard(connection)
             self._send_locks.pop(id(connection), None)
+            await asyncio.wait({worker}, timeout=5.0)
             logger.info("OneBot client disconnected")
+
+    async def _work(self, connection: ServerConnection, inbox: asyncio.Queue[dict[str, Any]],
+                    authenticated: bool) -> None:
+        # One event at a time, in the order NapCat sent them.
+        _origin.set(connection)
+        while True:
+            payload = await inbox.get()
+            try:
+                await self._handle_payload(connection, payload, authenticated)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("OneBot message handling failed")
 
     async def _handle_payload(self, connection: ServerConnection, payload: dict[str, Any],
                               authenticated: bool = False) -> None:
@@ -332,8 +356,11 @@ class OneBotAdapter(ChannelAdapter):
                 "file": path,
                 "name": name,
             }
-        connection = next(iter(self._connections), None)
-        if connection is None:
+        # The connection the message came from; outside a QQ turn only an unambiguous one.
+        connection = _origin.get()
+        if connection is None and len(self._connections) == 1:
+            connection = next(iter(self._connections))
+        if connection is None or connection not in self._connections:
             raise ConnectionError("NapCat is not connected")
         return await self._call_action(connection, action, params)
 
@@ -354,9 +381,10 @@ class OneBotAdapter(ChannelAdapter):
                 "echo": echo,
             })
             try:
-                response = await asyncio.wait_for(future, timeout=30)
+                response = await asyncio.wait_for(future, timeout=_ACTION_SECONDS)
             except TimeoutError as exc:
-                raise RuntimeError("OneBot response timed out: action outcome unknown; do not resend automatically") from exc
+                # Still a TimeoutError: channel_send_file reports it as unconfirmed, not as failed.
+                raise TimeoutError("OneBot response timed out: action outcome unknown; do not resend automatically") from exc
         finally:
             self._pending_actions.pop(echo, None)
             self._pending_connections.pop(echo, None)

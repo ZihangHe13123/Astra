@@ -52,7 +52,7 @@ cp config/channels.example.json .astra/channels.json
 
 2280 端口只能有一个服务占用，启用前先停用或改配 AstrBot。适配器启动失败会报告但不关闭 TUI；后端退出时关闭全部适配器。消息渠道中需要交互授权的操作会被拒绝，不等待不可见提示。
 
-QQ 图片经公开 URL 检查与大小限制后下载，再作为原生多模态内容传给视觉模型。发本地文件需启用 `send_files_enabled`、用 `file_allow_users`（或 `allow_users`）列出可信 QQ ID，并把 `send_file_roots` 限定为可分享的输出目录。`channel_send_file` 拒绝越界路径、隐藏文件和目录、应用数据和常见凭据文件。
+QQ 图片经公开 URL 检查与大小限制后下载，再作为原生多模态内容传给视觉模型。发本地文件需启用 `send_files_enabled`、用 `file_allow_users`（或 `allow_users`）列出可信 QQ ID，并把 `send_file_roots` 限定为可分享的输出目录。`channel_send_file` 拒绝越界路径、隐藏文件和目录、应用数据和常见凭据文件。文件从请求来的那条 NapCat 连接发回；NapCat 30 秒内没确认的上传会告诉模型“未确认”（可能到了，也可能没到），不会自动重发。NapCat 断开时，它在等的那一轮回答会被取消。
 
 ### 微信
 
