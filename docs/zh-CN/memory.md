@@ -70,6 +70,8 @@ Astra 浏览器里的登录只有勾选后才删除。设置、模型、密钥�
 关掉那个程序后再清除一次。在终端里对应
 `astra data plan`、`astra data export --out 文件.zip` 和 `astra data wipe --confirm 清除 [--browser-data]`；
 还有其他 Astra 在运行时不会清除，没删掉的会列在 `failed` 里，命令以状态 1 退出。源码安装中被 git 跟踪的文件（例如自带的技能）永远不会删除。
+两个命令都不会跟着 Astra 数据文件夹里的符号链接（或 Windows 的目录联接）走：链接后面可能是任何地方，
+所以既不导出（导出结果列在 `skipped` 里），也不删除（清除结果列在 `failed` 里）。
 
 <a id="memory-commands"></a>
 

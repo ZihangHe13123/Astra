@@ -193,7 +193,11 @@ deleted (say a file another program holds), the window still reloads, since the 
 and then says what stayed and why; close that program and wipe again. In a terminal the same
 is `astra data plan`, `astra data export --out FILE.zip` and `astra data wipe --confirm 清除
 [--browser-data]`; a wipe refuses while any other Astra runs, and one that left something
-lists it under `failed` and exits with status 1. In a source checkout, files tracked by git (such as bundled skills) are never deleted.
+lists it under `failed` and exits with status 1. In a source checkout, files tracked by git
+(such as bundled skills) are never deleted. Neither command follows a symbolic link (or a
+Windows junction) inside Astra's data folder: what lies behind one could be anywhere, so it is
+neither exported (the export lists it under `skipped`) nor deleted (the wipe lists it under
+`failed`).
 
 ## Memory commands
 

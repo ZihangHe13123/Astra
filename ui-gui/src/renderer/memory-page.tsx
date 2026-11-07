@@ -85,7 +85,8 @@ function DataSection({ fail }: { fail: (error: unknown) => void }) {
     setBusy(true); setNotice("");
     try {
       const result = await window.astra.data("export");
-      if (!result?.cancelled) setNotice(`已导出到 ${result.path}（${sizeLabel(result.bytes)}）。`);
+      const skipped = (result?.skipped ?? []).map((item: { label: string }) => item.label).join("、");
+      if (!result?.cancelled) setNotice(`已导出到 ${result.path}（${sizeLabel(result.bytes)}）。${skipped ? `没有导出（在链接后面，不会跟着读）：${skipped}。` : ""}`);
     } catch (error) { fail(error); }
     finally { setBusy(false); }
   };

@@ -5,12 +5,15 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
 import zipfile
 from contextlib import closing
 from pathlib import Path
+
+import pytest
 
 from agent.launcher.installation import discover
 from agent.launcher.locking import RuntimeLease
@@ -190,6 +193,38 @@ def test_a_source_checkout_keeps_what_git_tracks(tmp_path):
     assert code == 0 and not result["failed"]
     assert (home / "skills" / "learned" / "shared-skill" / "SKILL.md").exists()
     assert not (home / "skills" / "learned" / "lab-notes").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="making links needs extra rights on Windows")
+def test_a_link_in_the_astra_folder_is_never_followed_by_export_or_wipe(tmp_path):
+    home, root = tmp_path / "home", install_root(tmp_path)
+    seed(home).close()
+    env = environment(home)
+    # The personal folder and the pasted images lead elsewhere: a parent folder and an item that are links.
+    elsewhere, pictures = tmp_path / "elsewhere", tmp_path / "pictures"
+    shutil.move(home / "personal", elsewhere)
+    (home / "personal").symlink_to(elsewhere, target_is_directory=True)
+    shutil.move(home / "gui" / "attachments", pictures)
+    (home / "gui" / "attachments").symlink_to(pictures, target_is_directory=True)
+    kept = present(elsewhere) | {f"pictures/{name}" for name in present(pictures)}
+
+    code, result = data(env, "plan")
+    by_key = {item["key"]: item for item in result["items"]}
+    assert "is a link" in by_key["phone-uploads"]["refused"] and not by_key["phone-uploads"]["present"]
+    out = tmp_path / "astra.zip"
+    code, result = data(env, "export", "--out", str(out))
+    assert code == 0 and [item["key"] for item in result["skipped"]] == ["personal"]
+    with zipfile.ZipFile(out) as archive:
+        assert not [name for name in archive.namelist() if name.startswith("astra-export/personal/")]
+
+    code, result = data(env, "wipe", "--root", str(root), "--confirm", "清除")
+    failed = {item["key"]: item["error"] for item in result["failed"]}
+    assert code == 1 and {"phone-uploads", "personal-copies", "attachments"} <= set(failed)
+    assert all("is a link" in error for error in failed.values())
+    assert present(elsewhere) | {f"pictures/{name}" for name in present(pictures)} == kept
+    assert (home / "personal").is_symlink() and (home / "gui" / "attachments").is_symlink()
+    # Everything not behind a link went as usual.
+    assert not (home / "memory.db").exists() and not (home / "sessions").exists()
 
 
 def test_a_misconfigured_path_never_takes_the_installation_with_it(tmp_path):

@@ -21,6 +21,7 @@ import json
 import os
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -55,6 +56,8 @@ class Item:
     browser: bool = False
     # Folders directly inside ``path`` that are items of their own: export and sizes leave them to those.
     apart: tuple[str, ...] = ()
+    # Where a path configured outside the state folder was set: no link below it is followed either.
+    base: Path | None = None
 
     @property
     def sqlite(self) -> bool:
@@ -82,24 +85,26 @@ def items() -> list[Item]:
     memory = default_memory_path()
     recall = configured_session_recall_path()
     skills = default_skills_path()
-    browser = browser_db_path()
+    # As configured, before any link in it is resolved away, so a link is seen and not followed.
+    browser = _env_path("AGENT_BROWSER_DB", browser_db_path())
     # The personal thread's own workspace (the desktop's <ASTRA_HOME>/personal, specs/personal-thread.md D6).
     personal = state_path("personal")
     result = [
-        Item("core-user", "核心记忆：关于你（USER.md）", memory.parent / "memory" / "USER.md", True),
-        Item("core-memory", "核心记忆：Astra 的笔记（MEMORY.md）", memory.parent / "memory" / "MEMORY.md", True),
+        Item("core-user", "核心记忆：关于你（USER.md）", memory.parent / "memory" / "USER.md", True, base=memory.parent),
+        Item("core-memory", "核心记忆：Astra 的笔记（MEMORY.md）", memory.parent / "memory" / "MEMORY.md", True,
+             base=memory.parent),
         Item("memory", "已保存的记忆", memory, True),
-        Item("sessions", "对话记录", sessions_dir(), True),
+        Item("sessions", "对话记录", _env_path("AGENT_SESSION_DIR", sessions_dir()), True),
         Item("recall", "对话搜索索引", recall, True),
         Item("jobs", "定时任务和结果", state_path("jobs"), True),
-        Item("skills", "学到的技能", skills / "learned", True),
+        Item("skills", "学到的技能", skills / "learned", True, base=skills),
         Item("skills-journal", "技能学习记录", learning_home(skills), True),
         Item("learning", "技能学习建议", default_learning_path(), True),
         Item("personal", "个人对话文件夹里的文件", personal, True, apart=("uploads", ".astra")),
         # Copies made from conversations: wiped with them, not worth exporting.
         Item("feedback", "对话检索反馈", _env_path("ASTRA_CONTEXT_INDEX_FEEDBACK_DB",
                                                recall.with_name("context-index-feedback.db")), False),
-        Item("tasks", "任务和步骤记录", task_db_path(), False),
+        Item("tasks", "任务和步骤记录", _env_path("AGENT_TASK_DB", task_db_path()), False),
         Item("events", "运行事件", event_db_path(), False),
         Item("approvals", "审批记录", approval_db_path(), False),
         Item("peers", "会话之间的消息", _env_path("ASTRA_PEER_DB", state_path("peers.db")), False),
@@ -115,7 +120,8 @@ def items() -> list[Item]:
         Item("phone-audio", "读给手机听的语音", _env_path("ASTRA_PHONE_AUDIO_DIR", state_path("gui", "phone-audio")), False),
         # Which phone did what, with its commands and the names of the files it sent.
         Item("phone-audit", "手机的操作记录", state_path("gui", "phone-audit.jsonl"), False),
-        Item("browser-profiles", "Astra 浏览器的登录和 Cookie", browser.parent / "browser-profiles", False, browser=True),
+        Item("browser-profiles", "Astra 浏览器的登录和 Cookie", browser.parent / "browser-profiles", False, browser=True,
+             base=browser.parent),
         Item("browser-sessions", "Astra 浏览器的标签页记录", browser, False, browser=True),
     ]
     vectors = os.environ.get("ASTRA_CONTEXT_INDEX_VECTORS_DB", "").strip()
@@ -134,6 +140,37 @@ def _tracked(root: Path, path: Path) -> set[Path]:
     except (OSError, subprocess.SubprocessError) as exc:
         raise OSError("git could not say which files belong to the checkout; nothing here was deleted") from exc
     return {(root / name).resolve() for name in listed.decode().split("\0") if name}
+
+
+def _is_link(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    if sys.platform == "win32":
+        # A junction redirects a folder like a link, and Python 3.11 does not call it one.
+        try:
+            return os.lstat(path).st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+        except OSError:
+            return False
+    return False
+
+
+def _reach(item: Item, state: Path) -> None:
+    """Refuses an item reached through a link: what lies behind it may be outside Astra's folder.
+
+    The item's root is the state folder when the item lies in it, else the place its path was configured
+    (``base``), else the item's own location. No step below that root may be a link or junction, and the
+    real path must stay inside the root's real path.
+    """
+    path = Path(os.path.abspath(item.path))
+    roots = [Path(os.path.abspath(root)) for root in (state, item.base) if root is not None]
+    root = next((root for root in roots if path != root and path.is_relative_to(root)), path.parent)
+    current = root
+    for step in path.relative_to(root).parts:
+        current = current / step
+        if _is_link(current):
+            raise OSError(f"{current} is a link; nothing is read or deleted through it")
+    if not Path(os.path.realpath(path)).is_relative_to(Path(os.path.realpath(root))):
+        raise OSError(f"{item.path} leads outside {root}; nothing is read or deleted there")
 
 
 def _guard(path: Path, root: Path) -> None:
@@ -172,10 +209,25 @@ def _size(path: Path, apart: tuple[str, ...] = ()) -> int:
     return total
 
 
+def _refusal(item: Item, state: Path) -> str:
+    try:
+        _reach(item, state)
+    except OSError as exc:
+        return str(exc)
+    return ""
+
+
 def plan() -> dict:
     """What export and wipe would take, for the person to read before choosing."""
-    listed = [{"key": item.key, "label": item.label, "path": str(item.path), "present": item.path.exists(),
-               "bytes": _size(item.path, item.apart), "export": item.export, "browser": item.browser} for item in items()]
+    from agent.runtime.paths import state_dir
+
+    listed = []
+    for item in items():
+        # Behind a link nothing is measured, exported or deleted; the wipe reports it.
+        refused = _refusal(item, state_dir())
+        listed.append({"key": item.key, "label": item.label, "path": str(item.path),
+                       "present": not refused and item.path.exists(), "bytes": 0 if refused else _size(item.path, item.apart),
+                       "export": item.export, "browser": item.browser, **({"refused": refused} if refused else {})})
     return {"items": listed, "not_exported": list(NOT_EXPORTED), "kept": list(KEPT), "confirmation": CONFIRMATION}
 
 
@@ -192,14 +244,21 @@ def export(out: Path, *, now: float | None = None) -> dict:
     if not out.parent.is_dir():
         raise ValueError(f"找不到文件夹：{out.parent}")
     when = datetime.fromtimestamp(time.time() if now is None else now, timezone.utc)
+    from agent.runtime.paths import state_dir
+
     partial = out.with_name(out.name + ".partial")
-    exported = []
+    exported, skipped = [], []
     try:
         with tempfile.TemporaryDirectory(prefix="astra-export-") as scratch, \
                 zipfile.ZipFile(partial, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
             os.chmod(partial, 0o600)
             for item in items():
-                if not item.export or not item.path.exists():
+                if not item.export:
+                    continue
+                if refused := _refusal(item, state_dir()):
+                    skipped.append({"key": item.key, "label": item.label, "error": refused})
+                    continue
+                if not item.path.exists():
                     continue
                 count = size = 0
                 for entry in _files(item.path, item.apart):
@@ -218,13 +277,13 @@ def export(out: Path, *, now: float | None = None) -> dict:
                 exported.append({"key": item.key, "label": item.label, "files": count, "bytes": size})
             archive.writestr(f"{ARCHIVE_ROOT}/manifest.json", json.dumps({
                 "format": "astra-export", "version": 1, "created_at": when.isoformat(timespec="seconds"),
-                "items": exported, "not_included": list(NOT_EXPORTED),
+                "items": exported, "not_included": list(NOT_EXPORTED), "skipped": skipped,
             }, ensure_ascii=False, indent=2))
         partial.replace(out)
     except BaseException:
         partial.unlink(missing_ok=True)
         raise
-    return {"path": str(out), "bytes": out.stat().st_size, "items": exported}
+    return {"path": str(out), "bytes": out.stat().st_size, "items": exported, "skipped": skipped}
 
 
 def _others_running(install, *, desktop: bool) -> list[dict]:
@@ -268,6 +327,7 @@ def _remove(path: Path, tracked: set[Path]) -> int:
 def wipe(confirmation: str, *, browser_data: bool = False, desktop: bool = False, root: Path | None = None) -> dict:
     from agent.launcher.installation import discover
     from agent.launcher.locking import exclusive
+    from agent.runtime.paths import state_dir
 
     if confirmation != CONFIRMATION:
         raise ValueError(f"要清除，请准确输入「{CONFIRMATION}」。")
@@ -284,6 +344,7 @@ def wipe(confirmation: str, *, browser_data: bool = False, desktop: bool = False
             if item.browser and not browser_data:
                 continue
             try:
+                _reach(item, state_dir())
                 _guard(item.path, install.root)
                 count = _remove(item.path, _tracked(install.root, item.path))
             except OSError as exc:
