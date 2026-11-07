@@ -4,7 +4,7 @@
 conversations and their search index, scheduled jobs, learned skills, and the files the personal thread wrote
 in its own folder. SQLite files go through SQLite's backup API, so an export is consistent while Astra runs.
 Credentials and logins (.env, provider connections, the WeChat login, browser profiles, paired phones) are
-never exported.
+never exported, nor is any .env file or file named like a key inside the exported folders.
 
 ``wipe`` deletes the same data and every copy made from it (search and vector indexes, task, event and
 approval records, the desktop's history cache and pasted images, photos and files sent from a phone, speech
@@ -41,6 +41,11 @@ _SQLITE_SUFFIXES = (".db", ".sqlite3")
 _SQLITE_SIDES = ("-wal", "-shm", "-journal")
 # Locks and markers belong to running processes, not to the person.
 _SKIP_NAMES = {".writers", "owners", "scheduler.lock", "active", "last-interaction"}
+# Never exported, wherever they sit (the personal folder is a workspace): .env files, and files named or
+# shaped like credentials, the same ones a channel never sends (agent/channels/tools.py).
+_CREDENTIAL_NAMES = {"credentials", "credentials.json", "id_dsa", "id_ecdsa", "id_ed25519", "id_rsa", "cookies",
+                     "login data"}
+_CREDENTIAL_SUFFIXES = {".key", ".pem", ".pfx", ".p12"}
 NOT_EXPORTED = (".env 和其他密钥", "模型和服务商连接", "微信登录", "浏览器登录（Astra 浏览器的配置文件）", "配对的手机",
                 "设置", "邮件缓存", "活动记录")
 KEPT = ("设置和模型", ".env 和其他密钥、服务商连接", "微信登录", "配对的手机（在设置里移除）", "邮件缓存（可以重新同步）",
@@ -198,6 +203,12 @@ def _files(path: Path, apart: tuple[str, ...] = ()) -> Iterator[Path]:
             yield entry
 
 
+def _credential(path: Path) -> bool:
+    name = path.name.lower()
+    return (name == ".env" or name.startswith(".env.") or name in _CREDENTIAL_NAMES
+            or path.suffix.lower() in _CREDENTIAL_SUFFIXES)
+
+
 def _size(path: Path, apart: tuple[str, ...] = ()) -> int:
     total = 0
     for entry in _files(path, apart):
@@ -262,6 +273,8 @@ def export(out: Path, *, now: float | None = None) -> dict:
                     continue
                 count = size = 0
                 for entry in _files(item.path, item.apart):
+                    if _credential(entry):
+                        continue
                     relative = entry.name if entry == item.path else entry.relative_to(item.path).as_posix()
                     name = f"{ARCHIVE_ROOT}/{item.key}/{relative}"
                     source = entry

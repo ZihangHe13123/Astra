@@ -180,7 +180,8 @@ of which you approve. Run it again any time.
 **你的数据** at the end of the memory page saves everything Astra keeps about you as one zip:
 the two core files, saved memories, conversations and their search index, scheduled jobs and
 their results, learned skills, and the files the personal thread wrote in its own folder. It
-never includes `.env` or other keys, provider connections, the WeChat login, browser logins,
+never includes `.env` files (wherever they sit, the personal folder too) or other keys,
+provider connections, the WeChat login, browser logins,
 paired phones or settings. **清除…** lists what a wipe would delete and what stays, and deletes
 only after you type 清除: the same data plus every copy made from it (search and vector indexes,
 task, event and approval records, the desktop's history cache and pasted images, photos and

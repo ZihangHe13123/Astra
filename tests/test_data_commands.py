@@ -29,6 +29,9 @@ OWNED = {
     "skills/learned/lab-notes/SKILL.md": "# Lab notes\n", "skills-learning/journal.json": "{}",
     # What the personal thread wrote in its own folder.
     "personal/notes/plan.md": "周末计划\n",
+    # Keys a conversation left in the personal folder: wiped with it, never exported.
+    "personal/.env": "ASTRA_MAIL_PASSWORD=personal-secret\n", "personal/notes/.env.local": "TOKEN=personal-token\n",
+    "personal/keys/server.pem": "-----BEGIN PRIVATE KEY-----\n",
 }
 # Copies made from the person's conversations: wiped, not exported.
 DERIVED = {
@@ -124,7 +127,8 @@ def test_export_holds_the_persons_data_consistently_and_no_credentials(tmp_path)
         assert {row[0] for row in copy.execute("SELECT text FROM notes")} == {"committed memory.db", "only in the wal"}
     assert [item["key"] for item in manifest["items"]][:3] == ["core-user", "core-memory", "memory"]
     assert "微信登录" in manifest["not_included"]
-    assert not any(secret in out.read_bytes() for secret in (b"sk-test", b"ASTRA_MAIL_PASSWORD", b"cookie"))
+    assert not any(secret in out.read_bytes() for secret in (b"sk-test", b"ASTRA_MAIL_PASSWORD", b"cookie",
+                                                             b"personal-secret", b"personal-token", b"PRIVATE KEY"))
 
 
 def test_plan_names_what_each_choice_takes(tmp_path):
@@ -137,7 +141,8 @@ def test_plan_names_what_each_choice_takes(tmp_path):
     assert not by_key["tasks"]["export"] and by_key["browser-profiles"]["browser"]
     assert by_key["vectors:context-vectors-abc.db"]["present"]
     # The phone's uploads and the edit snapshots sit inside the personal folder but are counted once, as themselves.
-    assert by_key["personal"]["export"] and by_key["personal"]["bytes"] == len("周末计划\n".encode())
+    own = sum(len(text.encode()) for name, text in OWNED.items() if name.startswith("personal/"))
+    assert by_key["personal"]["export"] and by_key["personal"]["bytes"] == own
     assert by_key["phone-uploads"]["present"] and not by_key["phone-uploads"]["export"]
     assert by_key["phone-audit"]["present"] and by_key["phone-audio"]["present"]
     listed = {Path(item["path"]).resolve() for item in result["items"]}
