@@ -103,6 +103,9 @@ export class Runtime {
     const lines = createInterface({ input: child.stdout });
     lines.on("line", receiver);
     child.on("error", error => this.accept({ type: "error", message: `无法启动后端：${error.message}` }));
+    // A write the backend can no longer read (EPIPE once it has gone) is a disconnect, not an unhandled
+    // error: end the backend so the close receipt below reports it, exactly as if it had exited.
+    child.stdin.on("error", () => { if (!this.closing) child.kill(); });
     child.on("close", code => {
       handshake(); lines.close();
       for (const pending of this.queries.values()) { clearTimeout(pending.timer); pending.reject(new Error("Backend disconnected")); }
@@ -204,7 +207,7 @@ export class Runtime {
         catch (error) { clearTimeout(pending.timer); this.modelSelection = undefined; reject(error); }
       });
     }
-    if (!["message", "image"].includes(command.type)) { this.write(command); return; }
+    if (!["message", "image"].includes(command.type)) { await this.write(command); return; }
     const sid = command.submission_id;
     if (!sid || this.submissions.has(sid)) throw new Error("Invalid or pending submission ID");
     return new Promise<void>((resolve, reject) => {
@@ -228,10 +231,20 @@ export class Runtime {
       }
     });
   }
-  write(command: UIEvent) {
+  /**
+   * Throws when the write cannot start; the promise settles once the line reaches the backend's input.
+   * Callers that do not wait for it rely on the stdin error handler.
+   */
+  write(command: UIEvent): Promise<void> {
     if (!this.child || this.child.stdin.destroyed || this.child.stdin.writableEnded) throw new BackendWriteRefused("Backend disconnected; request was not sent");
     if (this.child.stdin.writableLength > 4 * 1024 * 1024) throw new BackendWriteRefused("Backend input is busy; request was not sent");
-    this.child.stdin.write(JSON.stringify(command) + "\n");
+    let settle!: (error?: Error | null) => void;
+    const written = new Promise<void>((resolve, reject) => {
+      settle = error => error ? reject(new Error("Backend disconnected; request was not delivered")) : resolve();
+    });
+    written.catch(() => undefined);
+    this.child.stdin.write(JSON.stringify(command) + "\n", error => settle(error));
+    return written;
   }
   query(method: string, params: Record<string, unknown>): Promise<any> {
     const request_id = randomUUID();
