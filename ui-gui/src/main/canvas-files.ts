@@ -142,10 +142,18 @@ export async function exportTarget(manifestPath: string, target: string): Promis
  * link already at the name is replaced and never written through.
  */
 export async function writeExport(target: string, data: Uint8Array): Promise<void> {
-  await mkdir(dirname(target), { recursive: true });
-  const temporary = join(dirname(target), `.${basename(target)}.${randomUUID()}.tmp`);
+  const folder = dirname(target);
+  // `exportTarget` gave the folder's real location; a print takes a while, and a folder swapped for a link
+  // meanwhile is no longer where it was checked. Looked at again right before each write.
+  const unmoved = async () => {
+    if (await realpath(folder).catch(() => "") !== folder) throw new Error("导出文件夹在导出期间被换成了别处，没有写入。");
+  };
+  await mkdir(folder, { recursive: true });
+  await unmoved();
+  const temporary = join(folder, `.${basename(target)}.${randomUUID()}.tmp`);
   try {
     await writeFile(temporary, data, { flag: "wx" });
+    await unmoved();
     await rename(temporary, target);
   } finally {
     await rm(temporary, { force: true });

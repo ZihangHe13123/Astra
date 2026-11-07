@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, rmdirSync, writeFileSync, symlinkSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, rmdirSync, writeFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { composeDeck, inlineAssets, slideCount } from "../src/main/canvas-deck.js";
@@ -301,4 +301,10 @@ test("a print replaces a link at its name and never writes through it", async ()
     assert.equal(readFileSync(join(exports, name), "utf8"), "%PDF-1.7 fixture");
   }
   assert.deepEqual(readdirSync(exports).sort(), ["deck.pdf", "new.pdf"]);
+  // The exports folder swapped for a link out while the deck prints: nothing is written there.
+  const target = await exportTarget(manifest, join(exports, "deck.pdf"));
+  renameSync(exports, `${exports}-moved`);
+  symlinkSync(outside, exports);
+  await assert.rejects(writeExport(target, new TextEncoder().encode("%PDF-1.7 late")), /换成了别处/);
+  assert.deepEqual(readdirSync(outside), ["victim.txt"]);
 });

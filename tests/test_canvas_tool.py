@@ -283,3 +283,26 @@ def test_an_export_replaces_a_link_at_its_name_and_never_writes_through_it(tmp_p
     assert result["file"] == str(target) and not target.is_symlink()
     assert len(Presentation(str(target)).slides) == slide_count(tmp_path / "deck.canvas")
     assert [path.name for path in exports.iterdir()] == ["deck.pptx"]
+
+
+def test_an_exports_folder_swapped_for_a_link_while_the_pptx_is_built_gets_nothing(tmp_path, monkeypatch):
+    from pptx.presentation import Presentation as Deck
+
+    outside = tmp_path.parent / f"{tmp_path.name}-outside"
+    outside.mkdir()
+    call = tool(tmp_path, Desktop(tmp_path))
+    call(action="create", title="deck")
+    exports = tmp_path / "deck.canvas" / "exports"
+    save = Deck.save
+
+    def swapped_then_saved(deck, stream):
+        # The pictures are read; the folder the file goes to is swapped for a link out before it is written.
+        if exports.is_dir() and not exports.is_symlink():
+            exports.rename(exports.with_name("exports-moved"))
+            exports.symlink_to(outside, target_is_directory=True)
+        return save(deck, stream)
+
+    monkeypatch.setattr(Deck, "save", swapped_then_saved)
+    result = call(action="export", canvas="deck.canvas", format="pptx")
+    assert "moved" in result["error"] or "leads out of the canvas" in result["error"]
+    assert list(outside.iterdir()) == []

@@ -262,7 +262,7 @@ conversation, presenting and printing are Astra's own code; the model writes onl
 - Everything of a canvas is read and written inside its folder, where that really is: content,
   images, versions or exports reached through a link out of the folder are refused. An export is
   written as a new file and renamed over its name, so a link already at that name is replaced,
-  never written through.
+  never written through; an exports folder swapped for a link while it is made gets nothing.
 
 ### Documents
 
