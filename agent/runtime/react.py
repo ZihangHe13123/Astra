@@ -232,7 +232,6 @@ class ReActAgent(AgentBase):
             )
         self._context_index_request_id = ""
         self._active_vision_request_id: str | None = None
-        self._active_vision_storage_replacements: list[tuple[int, object]] = []
         self._active_vision_prompt_overlays: list[tuple[dict, object, object]] = []
         self._active_vision_attachment_occurrences: set[str] = set()
         self._request_local_image_overlay_messages: list[dict] = []
@@ -1894,11 +1893,10 @@ class ReActAgent(AgentBase):
         if storage_content == chat_content:
             storage_content = None
         if storage_content is not None:
+            # History already holds the placeholder; the image reaches the
+            # provider only through this overlay, resolved by message identity.
             self._active_vision_prompt_overlays.append(
                 (self.context.messages[user_index], storage_content, chat_content)
-            )
-            self._active_vision_storage_replacements.append(
-                (user_index, storage_content)
             )
         return True, user_index, storage_content, vision_event
 
@@ -3936,7 +3934,6 @@ class ReActAgent(AgentBase):
         if self._active_vision_request_id is not None:
             raise RuntimeError("A vision request is already active for this agent.")
         self._active_vision_request_id = vision_request_id
-        self._active_vision_storage_replacements = []
         self._active_vision_prompt_overlays = []
         self._active_vision_attachment_occurrences = set()
         self._request_local_image_overlay_messages = []
@@ -3983,13 +3980,13 @@ class ReActAgent(AgentBase):
                     )
             if self._context_index_request_id == context_index_request_id:
                 self._context_index_request_id = ""
+            carried_images = bool(self._active_vision_prompt_overlays)
             self._clear_request_local_tool_context()
             self._clear_request_local_image_overlays()
-            replacements = list(self._active_vision_storage_replacements)
             try:
-                for message_index, storage_content in replacements:
-                    self.context.replace_message_content(message_index, storage_content)
-                if replacements:
+                if carried_images:
+                    # History holds only placeholders, so nothing is rewritten:
+                    # a turn that ends on an error still keeps them durable.
                     await self.context.save_async()
             finally:
                 try:
@@ -4002,7 +3999,6 @@ class ReActAgent(AgentBase):
                     )
                 finally:
                     self._active_vision_request_id = None
-                    self._active_vision_storage_replacements = []
                     self._active_vision_prompt_overlays = []
                     self._active_vision_attachment_occurrences = set()
                     self._request_local_image_overlay_messages = []
@@ -4052,7 +4048,7 @@ class ReActAgent(AgentBase):
                 bind_source({"stream_id": f"{stream_scope}:{stream_phase or step}"}, message)
 
         _turn_prepare_started = _time.perf_counter()
-        has_content, user_index, storage_content, vision_event = await self._prepare_turn(msg)
+        has_content, user_index, _, vision_event = await self._prepare_turn(msg)
         _turn_prepare_ms = (_time.perf_counter() - _turn_prepare_started) * 1000
         if not has_content:
             yield with_request({"type": "done", "content": ""})
@@ -4076,7 +4072,6 @@ class ReActAgent(AgentBase):
         budget_warned: set[str] = set()
         turn_tool_cache: dict[str, dict] = {}
         completed_tool_events: list[dict] = []
-        auto_image_messages: list[tuple[int, object]] = []
         active_groups = {"core"}
         blocked_tools: set[str] = set()
         # Per tool, the circuit counts consecutive failures of the exact same
@@ -4948,10 +4943,6 @@ class ReActAgent(AgentBase):
                         self._request_local_image_overlay_messages.append(
                             self.context.messages[image_index]
                         )
-                    auto_image_messages.append((image_index, image_storage_content))
-                    self._active_vision_storage_replacements.append(
-                        (image_index, image_storage_content)
-                    )
                     if occurrence_id:
                         self._active_vision_attachment_occurrences.add(occurrence_id)
                     if emit_events and image_status is not None:
@@ -5122,11 +5113,6 @@ class ReActAgent(AgentBase):
                     yield with_request({"type": "chunk", "content": final_text})
             append_assistant(self._assistant_message(final_text, None, final_reasoning, final_provider_state))
             last_text = final_text
-
-        if user_index is not None and storage_content is not None:
-            self.context.replace_message_content(user_index, storage_content)
-        for image_index, image_storage_content in auto_image_messages:
-            self.context.replace_message_content(image_index, image_storage_content)
 
         if task_id and self.task_store is not None:
             try:
