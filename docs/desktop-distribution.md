@@ -41,7 +41,7 @@ The updater runs from the downloaded candidate release, using that candidate's b
 1. Obtain the candidate release and its manifest SHA-256 through a trusted channel. The digest from a file shipped beside an untrusted download only checks consistency; it is not publisher authentication.
 2. Stage the candidate, verifying the expected digest, application name, target and complete payload. Staging copies to a sibling of the installed app and verifies the copied bytes again.
 3. Close the desktop normally, using the shared task/approval/question quit checks. Apply refuses any remaining runtime leases. It records a recovery journal, renames the original aside, swaps in the staged application and runs backend import/stdlib health checks. Any failed replacement or health check attempts to restore the original. An interrupted replacement blocks new leases until recovery.
-4. Launch and verify the updated application. The previous version remains available until explicit finalization. `recover` rolls back it without altering user data; `finalize` deletes only the saved previous application after successful verification.
+4. Launch and verify the updated application. The previous version remains available until explicit finalization. `recover` rolls back it without altering user data; `finalize` deletes only the saved previous application after successful verification. Finalization records its decision before deleting anything, so once it starts the previous version is no longer a rollback target: if it is interrupted, running `finalize` or `recover` again finishes removing the saved copy and keeps the updated application. Finalization also clears a launch block left by an apply interrupted after its health check.
 
 ```sh
 /path/to/candidate/astra-desktop-update stage \
@@ -58,6 +58,6 @@ On Windows use `astra-desktop-update.cmd` and the application directory (for exa
 
 ## Qualification
 
-`tests/test_desktop_distribution.py` covers target/hash/mode validation, external symlinks and traversal, profile separation, active leases, failed health checks, interruption after the first rename, rollback, finalization and backend content allowlisting. `ui-gui/tests/packaged-runtime.test.ts` covers fixed entry points, environment cleanup, source compatibility and bounded lease shutdown.
+`tests/test_desktop_distribution.py` covers target/hash/mode validation, external symlinks and traversal, profile separation, active leases, failed health checks, interruption after the first rename, rollback, finalization and backend content allowlisting. `tests/test_desktop_update_cleanup.py` kills rollback, recovery and finalization at their file boundaries and checks that the application stays launchable or recoverable. `ui-gui/tests/packaged-runtime.test.ts` covers fixed entry points, environment cleanup, source compatibility and bounded lease shutdown.
 
 The manual `desktop-package.yml` workflow builds on macOS and Windows and retains artifacts without publishing them. Windows native computer-use and a real Windows installation/upgrade run require a Windows host. A successful workflow configuration or local Python simulation does not establish those acceptance results.

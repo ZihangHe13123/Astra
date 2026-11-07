@@ -171,6 +171,10 @@ def recover(application: Path, control: Path) -> dict:
     with InstanceLock(control / 'desktop-update.lock'):
         state = _state(application, control)
         install = _pending_install(application, state)
+        if state['phase'] == 'finalizing':
+            # Finalization had begun deleting the previous application, so it
+            # is no longer a rollback target. Finish discarding it instead.
+            return {**_finish_finalize(control, state, install), 'rollback_available': False}
         with exclusive(install, allow_pending=True) if install else nullcontext():
             if install:
                 require_idle(install)
@@ -179,38 +183,53 @@ def recover(application: Path, control: Path) -> dict:
 
 def _recover(application: Path, control: Path, state: dict, install) -> dict:
     staging, backup = Path(state['staging']), Path(state['backup'])
+    # Retain the failed/new tree here until the original is back in place.
+    displaced = staging.with_name(staging.name + '-displaced')
     if backup.exists():
-        if application.exists():
-            # Retain the failed/new tree until the original is back in place.
-            displaced = staging.with_name(staging.name + '-displaced')
+        # Only apply moves the previous application aside, always atomically.
+        if state['phase'] not in {'replacing', 'validating', 'applied'}:
+            raise LauncherError('Desktop update journal does not match its files; recovery left all files intact.')
+        moved = application.exists()
+        if moved:
             os.replace(application, displaced)
-        else:
-            displaced = None
         try:
             os.replace(backup, application)
         except BaseException:
-            if displaced is not None:
+            if moved:
                 os.replace(displaced, application)
             raise
-        if displaced is not None:
-            shutil.rmtree(displaced)
     elif not application.exists():
         raise LauncherError('Original desktop application is missing; recovery left all files intact.')
+    # Also clears a displaced tree left by a recovery interrupted after its restore.
+    shutil.rmtree(displaced, ignore_errors=True)
     shutil.rmtree(staging, ignore_errors=True)
     _finish_recovery(control, install)
     return {'phase': 'restored'}
+
+
+def _finish_finalize(control: Path, state: dict, install) -> dict:
+    backup = Path(state['backup'])
+    if backup.exists():
+        shutil.rmtree(backup)
+    # An apply interrupted after validation can still hold the launch fence.
+    _finish_recovery(control, install)
+    return {'phase': 'finalized'}
+
 
 def finalize(application: Path, control: Path) -> dict:
     """Explicitly discard a validated version's rollback before the next update."""
     application = application.resolve()
     with InstanceLock(control / 'desktop-update.lock'):
         state = _state(application, control)
-        if state['phase'] != 'applied':
+        if state['phase'] not in {'applied', 'finalizing'}:
             raise LauncherError('Only an applied desktop update can be finalized.')
-        verify_tree(application, state['manifest'])
-        shutil.rmtree(Path(state['backup']))
-        _journal(control).unlink()
-        return {'phase': 'finalized'}
+        if state['phase'] == 'applied':
+            verify_tree(application, state['manifest'])
+            # Record the decision before deleting anything: recovery must never
+            # move a partly deleted previous application over the new one.
+            state['phase'] = 'finalizing'
+            write_json(_journal(control), state)
+        return _finish_finalize(control, state, _pending_install(application, state))
 
 
 def main() -> int:

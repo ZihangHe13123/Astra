@@ -82,3 +82,89 @@ else:
     with RuntimeLease(install, "recovered fixture"):
         assert (app / "version.txt").read_text() == "old"
     assert not (control / "desktop-update.json").exists()
+
+
+INTERRUPT = """
+import os, shutil, sys
+from pathlib import Path
+from agent.launcher import desktop_update, installation
+app, control, profile = map(Path, sys.argv[1:4])
+installation.user_home = lambda: profile
+if sys.argv[4] == 'finalize':
+    original = shutil.rmtree
+    def terminate_mid_delete(path, *args, **kwargs):
+        if Path(path).name.endswith('-previous'):
+            # Model a kill after rmtree removed only part of the saved version.
+            next(item for item in Path(path).rglob('*') if item.is_file()).unlink()
+            os._exit(77)
+        return original(path, *args, **kwargs)
+    shutil.rmtree = terminate_mid_delete
+    desktop_update.finalize(app, control)
+else:
+    replace = os.replace
+    def terminate_after_move_aside(source, destination):
+        replace(source, destination)
+        if Path(destination).name.endswith('-displaced'):
+            os._exit(77)
+    os.replace = terminate_after_move_aside
+    desktop_update.recover(app, control)
+"""
+
+
+def applied_update(tmp_path, monkeypatch):
+    app = tmp_path / "installed/Astra.app"
+    backend = make_application(app, "old")
+    profile = tmp_path / "profile"
+    monkeypatch.setattr(installation, "user_home", lambda: profile)
+    install = installation.discover(backend)
+    candidate = tmp_path / "candidate"
+    make_application(candidate / "Astra.app", "new")
+    manifest = seal_tree(candidate / "Astra.app", version="new", target="darwin-arm64")
+    manifest["application"] = "Astra.app"
+    write_json(candidate / "release.json", manifest)
+    control = tmp_path / "updater"
+    desktop_update.stage(candidate, app, control, expected_sha256=sha256(candidate / "release.json"),
+                         target="darwin-arm64")
+    desktop_update.apply(app, control, validate=lambda _: None)
+    return app, control, profile, install
+
+
+def interrupt(app, control, profile, action):
+    result = subprocess.run([sys.executable, "-c", INTERRUPT, str(app), str(control), str(profile), action],
+                            cwd=ROOT, env={**os.environ, "PYTHONPATH": str(ROOT)}, capture_output=True, timeout=30)
+    assert result.returncode == 77, result.stderr
+
+
+@pytest.mark.parametrize("follow_up", ["recover", "finalize"])
+def test_interrupted_finalize_completes_and_never_restores_partial_previous_version(tmp_path, monkeypatch, follow_up):
+    app, control, profile, install = applied_update(tmp_path, monkeypatch)
+    interrupt(app, control, profile, "finalize")
+    assert list(app.parent.glob(".astra-update-*-previous"))
+    result = getattr(desktop_update, follow_up)(app, control)
+    assert result["phase"] == "finalized"
+    assert (app / "version.txt").read_text() == "new"
+    assert not list(app.parent.glob(".astra-update-*"))
+    assert not (control / "desktop-update.json").exists()
+    with RuntimeLease(install, "finalized fixture"):
+        assert (app / "version.txt").read_text() == "new"
+
+
+def test_finalize_clears_launch_fence_left_by_interrupted_apply(tmp_path, monkeypatch):
+    app, control, _, install = applied_update(tmp_path, monkeypatch)
+    # Apply recorded success but was killed before it cleared the fence.
+    write_json(install.control / "desktop-pending.json", {"journal": str(control / "desktop-update.json")})
+    assert desktop_update.finalize(app, control)["phase"] == "finalized"
+    assert not (install.control / "desktop-pending.json").exists()
+    with RuntimeLease(install, "finalized fixture"):
+        assert (app / "version.txt").read_text() == "new"
+
+
+def test_rollback_interrupted_after_moving_new_version_aside_restores_without_remnants(tmp_path, monkeypatch):
+    app, control, profile, install = applied_update(tmp_path, monkeypatch)
+    interrupt(app, control, profile, "recover")
+    assert not app.exists()
+    assert desktop_update.recover(app, control)["phase"] == "restored"
+    assert (app / "version.txt").read_text() == "old"
+    assert not list(app.parent.glob(".astra-update-*"))
+    with RuntimeLease(install, "recovered fixture"):
+        assert (app / "version.txt").read_text() == "old"
