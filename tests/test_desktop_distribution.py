@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
@@ -444,6 +445,24 @@ def test_desktop_cli_rejects_profile_inside_bundle_and_ignores_source_session_ov
     assert inst.sessions == tmp_path / 'profile/sessions'
     env = installation.runtime_environment(inst, tmp_path)
     assert env['AGENT_LOG_DIR'] == str(tmp_path / 'profile/logs')
+
+
+@pytest.mark.skipif(shutil.which('uv') is None, reason='reads uv.lock with uv')
+def test_bundled_runtime_includes_wechat_login_dependencies(tmp_path):
+    from agent.launcher.common import read_json
+    output = tmp_path / 'requirements.lock.txt'
+    export = packager().requirements_export(read_json(ROOT / 'packaging/desktop-runtime.lock.json'), output)
+    subprocess.run([*export, '--offline'], cwd=ROOT, check=True, stdout=subprocess.DEVNULL, timeout=120)
+    hashes, current = {}, None
+    for line in output.read_text().splitlines():
+        if not line[:1].isspace() and '==' in line:
+            current = line.split('==')[0]
+            hashes[current] = []
+        elif current and '--hash=sha256:' in line:
+            hashes[current].append(line.strip())
+    # The desktop offers WeChat login: segno draws its QR code, cryptography handles channel media.
+    # The packager installs with --require-hashes, so each must arrive pinned by hash.
+    assert hashes.get('segno') and hashes.get('cryptography')
 
 
 def test_runtime_provenance_records_revision_and_uncommitted_source(monkeypatch):

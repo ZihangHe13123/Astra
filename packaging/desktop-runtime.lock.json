@@ -3,7 +3,7 @@
   "python_version": "3.12.14",
   "python_release": "20260924",
   "uv_version": "0.11.27",
-  "extras": ["documents", "mcp", "tracing"],
+  "extras": ["documents", "mcp", "tracing", "weixin"],
   "targets": {
     "darwin-arm64": {
       "url": "https://github.com/astral-sh/python-build-standalone/releases/download/20260924/cpython-3.12.14%2B20260924-aarch64-apple-darwin-install_only_stripped.tar.gz",

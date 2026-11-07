@@ -34,7 +34,7 @@ User settings, model keys, sessions, logs and Electron data use the normal Astra
 
 Packaged startup replaces inherited source/interpreter paths, disables user site packages and bytecode writes, and resolves the helper from the bundle. Both the desktop host and backend processes retain the existing installation runtime leases. An idle desktop window therefore prevents an update from replacing its application.
 
-The read-only `load_workspace_dependencies` tool returns the bundle's Python path, library path and exact distribution versions, plus the Office preview engine's availability. It does not install packages. Source installations report that no bundled runtime is available. `python-docx`, `python-pptx`, `openpyxl`, Pillow and pypdf are included through the selected locked runtime dependencies. Structural checks, rendered-page checks and formula recalculation remain separate evidence.
+The read-only `load_workspace_dependencies` tool returns the bundle's Python path, library path and exact distribution versions, plus the Office preview engine's availability. It does not install packages. Source installations report that no bundled runtime is available. `python-docx`, `python-pptx`, `openpyxl`, Pillow and pypdf are included through the selected locked runtime dependencies. The `weixin` extra is selected too, because the desktop offers WeChat login: `segno` draws its QR code and `cryptography` encrypts and decrypts channel media. Structural checks, rendered-page checks and formula recalculation remain separate evidence.
 
 ## Explicit updates and recovery
 

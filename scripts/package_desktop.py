@@ -78,6 +78,14 @@ def prune_runtime_launchers(python: Path) -> None:
     shutil.rmtree(python / 'Scripts', ignore_errors=True)
 
 
+def requirements_export(lock: dict, output: Path) -> list[str]:
+    """The hashed uv.lock export for the runtime lock's extras; the install takes wheels only."""
+    export = ['uv', 'export', '--quiet', '--no-header', '--locked', '--no-emit-project', '--format', 'requirements-txt', '--output-file', str(output)]
+    for extra in lock['extras']:
+        export += ['--extra', extra]
+    return export
+
+
 def write_updater(runtime: Path, target: str) -> Path:
     """Sealed with the app. The installed copy stages and verifies a candidate;
     stage copies the candidate's verified runtime out to run apply/recover."""
@@ -192,10 +200,7 @@ def bundle(options) -> Path:
         backend = runtime / 'backend'
         copy_backend(ROOT, backend)
         requirements = runtime / 'requirements.lock.txt'
-        export = ['uv', 'export', '--quiet', '--no-header', '--locked', '--no-emit-project', '--format', 'requirements-txt', '--output-file', str(requirements)]
-        for extra in lock['extras']:
-            export += ['--extra', extra]
-        subprocess.run(export, cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(requirements_export(lock, requirements), cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
         command(['uv', 'pip', 'install', '--python', python, '--require-hashes', '--no-deps', '--only-binary', ':all:',
                  '--requirements', requirements], env=clean_environment())
         installed = json.loads(subprocess.check_output([str(python), '-I', '-c',
