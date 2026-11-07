@@ -171,6 +171,38 @@ test("what is kept for a phone to catch up is bounded in bytes, and nothing is k
   } finally { await gateway.dispose(); }
 });
 
+test("after a wipe no phone is shown what came before: a connected one reloads, and so does one resuming later", async () => {
+  const { devices, gateway, base } = await setup();
+  try {
+    const away = await pairedClient(devices, base);
+    const before = listen(away.client, away.token);
+    await until(() => before.seen.length === 1, "ready");
+    const { instance } = before.seen[0].data;
+    before.stop(); await before.done;
+    const open = await pairedClient(devices, base);
+    const connected = listen(open.client, open.token);
+    await until(() => connected.seen.length === 1, "second phone ready");
+    gateway.publish({ runtime: "rt-1", revision: 1, event: { type: "chunk", content: "before the wipe" } as any });
+    gateway.publish({ removed: "rt-1" });
+    await until(() => connected.seen.length === 3, "events before the wipe");
+
+    gateway.reset();
+    await until(() => connected.seen.length === 4, "answer to the wipe");
+    await connected.done;
+    assert.deepEqual(connected.seen.at(-1)?.data, { reload: true });
+    const resumed = listen(away.client, away.token, { seq: 0, instance });
+    await until(() => resumed.seen.length > 0, "answer to a phone resuming from before the wipe");
+    resumed.stop(); await resumed.done;
+    assert.deepEqual(resumed.seen.map(item => item.data), [{ reload: true }]);
+    // The reloaded page follows a new run that holds nothing from before.
+    const fresh = listen(away.client, away.token);
+    await until(() => fresh.seen.length === 1, "fresh ready");
+    assert.notEqual(fresh.seen[0].data.instance, instance);
+    assert.equal(fresh.seen[0].data.seq, 0);
+    fresh.stop(); await fresh.done;
+  } finally { await gateway.dispose(); }
+});
+
 test("removing the phone ends its stream at once, and the gateway listens on loopback only", async () => {
   const { devices, gateway, base, port } = await setup();
   try {

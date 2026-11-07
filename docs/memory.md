@@ -187,8 +187,8 @@ task, event and approval records, the desktop's history cache and pasted images,
 files sent from a phone, speech made for a phone and the phone audit log). Logins in Astra's
 own browser go only if you tick that box. Settings, models, keys, the WeChat login, paired
 phones (remove them in Settings), the mail cache and activity history stay, and a Hindsight
-server keeps its own memories. The desktop closes every conversation and its background host first and
-reloads afterwards. In a terminal the same is `astra data plan`, `astra data export --out
+server keeps its own memories. The desktop closes every conversation and its background host
+first and reloads afterwards, and so does every paired phone. In a terminal the same is `astra data plan`, `astra data export --out
 FILE.zip` and `astra data wipe --confirm 清除 [--browser-data]`; a wipe refuses while any other
 Astra runs. In a source checkout, files tracked by git (such as bundled skills) are never deleted.
 

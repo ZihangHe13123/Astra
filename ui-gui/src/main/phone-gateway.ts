@@ -116,6 +116,15 @@ export class PhoneGateway {
     for (const stream of this.streams) this.write(stream, text);
   }
 
+  /**
+   * The person's data was wiped (`astra data wipe`): nothing from before is replayed, and every phone,
+   * connected now or resuming later, reloads.
+   */
+  reset() {
+    for (const stream of [...this.streams]) { stream.response.write(control({ reload: true })); this.close(stream); }
+    this.forget();
+  }
+
   /** Drops what was kept for replay and names a new run, so no phone resumes from a position before it. */
   private forget() {
     this.recent = []; this.recentBytes = 0; this.seq = 0;

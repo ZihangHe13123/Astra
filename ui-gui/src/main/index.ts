@@ -386,7 +386,9 @@ async function runData(action: unknown, confirmation?: unknown, browserData?: un
     await queries.close();
     const result = await dataCommand(["wipe", "--confirm", "清除", "--desktop", ...(browserData === true ? ["--browser-data"] : [])],
       10 * 60_000);
-    preferences = { ...preferences, drafts: {}, attachments: {}, workspaces: {}, titles: {}, pinned: [], lastSession: null };
+    // What paired phones were sent goes too: none is replayed, and they reload with the window. Pairings stay, like other logins.
+    phone.reset();
+    preferences ={ ...preferences, drafts: {}, attachments: {}, workspaces: {}, titles: {}, pinned: [], lastSession: null };
     preferenceWriter.flushSync(preferences);
     staleRenderer = true;
     // The window blocks navigation it starts itself, so the reload comes from here, after this answer.
