@@ -144,6 +144,19 @@ def download_python(lock: dict, target: str, cache: Path, runtime: Path):
     return runtime / entry['python']
 
 
+def electron_distribution(gui: Path, version: str) -> Path:
+    """npm ci installs the electron package only; its binary is a separate download."""
+    package = gui / 'node_modules/electron'
+    if not (package / 'package.json').is_file():
+        raise LauncherError('GUI dependencies are missing. Run: npm --prefix ui-gui ci')
+    marker = package / 'dist/version'
+    if not marker.is_file():
+        raise LauncherError('The Electron binary is not installed. Run: node ui-gui/node_modules/electron/install.js')
+    if marker.read_text().strip() != version:
+        raise LauncherError('Electron distribution differs from the locked GUI version.')
+    return package / 'dist'
+
+
 def bundle(options) -> Path:
     lock = read_json(ROOT / 'packaging/desktop-runtime.lock.json')
     host = f"{sys.platform}-{'arm64' if platform.machine().lower() in ('arm64', 'aarch64') else 'x64'}"
@@ -156,9 +169,7 @@ def bundle(options) -> Path:
     provenance = source_provenance(ROOT)
     gui_manifest = read_json(ROOT / 'ui-gui/package.json')
     electron_version = gui_manifest['devDependencies']['electron']
-    electron = ROOT / 'ui-gui/node_modules/electron/dist'
-    if (electron / 'version').read_text().strip() != electron_version:
-        raise LauncherError('Electron distribution differs from the locked GUI version.')
+    electron = electron_distribution(ROOT / 'ui-gui', electron_version)
     if not (ROOT / 'ui-gui/dist/main.cjs').is_file():
         raise LauncherError('Build ui-gui before packaging.')
     output = options.output.resolve()

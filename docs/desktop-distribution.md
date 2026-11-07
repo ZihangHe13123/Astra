@@ -8,12 +8,13 @@ This is a local packaging and recovery foundation. macOS local builds use an ad-
 
 Build on the same OS and architecture as the target. The checked-in runtime lock supports `darwin-arm64` and `win32-x64` and pins CPython 3.12.14 from python-build-standalone release 20260924 by URL and SHA-256. `uv.lock`, the `ui-core`, `ui-tui` and `ui-gui` npm lockfiles and the runtime lock are recorded in the runtime descriptor. uv 0.11.27 is required; Node 22.19+ is required for building the GUI. Runtime dependencies are installed using a hashed export of `uv.lock`, with binary wheels only.
 
-The GUI build compiles the Appshot client modules from `ui-tui/src` (`ui-gui/src/main/appshot.ts`), and their `string-width`, `strip-ansi` and `@astra/ui-core` imports resolve from `ui-tui/node_modules`. Install all three lockfiles before building:
+The GUI build compiles the Appshot client modules from `ui-tui/src` (`ui-gui/src/main/appshot.ts`), and their `string-width`, `strip-ansi` and `@astra/ui-core` imports resolve from `ui-tui/node_modules`. Install all three lockfiles before building. `npm ci` installs the `electron` package but not its binary, which the packager copies; Electron's own `install.js` downloads the binary for the locked version. These are the steps the `desktop-package.yml` workflow runs (it also runs `uv sync --locked --extra dev` for its regression tests):
 
 ```sh
 npm --prefix ui-core ci
 npm --prefix ui-tui ci
 npm --prefix ui-gui ci
+node ui-gui/node_modules/electron/install.js
 npm --prefix ui-gui run build
 bash scripts/build_macos_computer_helper.sh --output-root /absolute/path/native-build
 python scripts/package_desktop.py --target darwin-arm64 \

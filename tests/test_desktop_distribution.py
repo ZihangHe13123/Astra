@@ -465,6 +465,24 @@ def test_bundled_runtime_includes_wechat_login_dependencies(tmp_path):
     assert hashes.get('segno') and hashes.get('cryptography')
 
 
+def test_packager_names_the_missing_electron_install_step(tmp_path):
+    module = packager()
+    with pytest.raises(LauncherError, match='npm --prefix ui-gui ci'):
+        module.electron_distribution(tmp_path, '44.4.3')
+    package = tmp_path / 'node_modules/electron'
+    package.mkdir(parents=True)
+    (package / 'package.json').write_text('{}')
+    # npm ci leaves only the package; the binary comes from its install script.
+    with pytest.raises(LauncherError, match='electron/install.js'):
+        module.electron_distribution(tmp_path, '44.4.3')
+    (package / 'dist').mkdir()
+    (package / 'dist/version').write_text('44.4.2\n')
+    with pytest.raises(LauncherError, match='differs'):
+        module.electron_distribution(tmp_path, '44.4.3')
+    (package / 'dist/version').write_text('44.4.3\n')
+    assert module.electron_distribution(tmp_path, '44.4.3') == package / 'dist'
+
+
 def test_runtime_provenance_records_revision_and_uncommitted_source(monkeypatch):
     module = packager()
     monkeypatch.setattr(module, 'git', lambda root,*args:'abcdef123456' if args[0]=='rev-parse' else ' M agent/launcher/installation.py',raising=False)
