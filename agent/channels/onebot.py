@@ -8,10 +8,14 @@ the ReAct agent router.
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import hmac
+import ipaddress
 import json
 import logging
 import re
 import uuid
+from dataclasses import replace
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
@@ -24,6 +28,16 @@ from .media import download_image_data_url
 
 logger = logging.getLogger(__name__)
 _CQ_AT_RE = re.compile(r"\[CQ:at,qq=([^,\]]+)[^\]]*\]")
+_ACTION_SECONDS = 30.0
+# Messages that may wait on one connection while a turn runs; later ones are dropped.
+_INBOX_LIMIT = 32
+# The connection whose message a turn answers: its uploads go back over it.
+_origin: contextvars.ContextVar[ServerConnection | None] = contextvars.ContextVar("astra_onebot_origin", default=None)
+
+
+def _unknown(reason: str) -> TimeoutError:
+    # A TimeoutError: channel_send_file reports it as unconfirmed, not as failed.
+    return TimeoutError(f"{reason}: action outcome unknown; do not resend automatically")
 
 
 def _text_from_segments(value: Any) -> str:
@@ -68,6 +82,15 @@ def _strip_prefix(text: str, prefixes: tuple[str, ...]) -> tuple[str, bool]:
     return stripped, False
 
 
+def _loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
 def _chunks(text: str, limit: int) -> list[str]:
     text = text.strip()
     if not text:
@@ -96,10 +119,20 @@ class OneBotAdapter(ChannelAdapter):
             return
         if not self.config.allow_users and not self.config.owner_users:
             logger.warning("QQ has no admitted users; configure allow_users for chat or owner_users for private local control")
+        token = self.config.access_token
+        if self.config.owner_users and not token:
+            logger.warning("QQ owner_users need an access token: set %s and the same token in NapCat; "
+                           "until then owners are answered as ordinary contacts", self.config.access_token_env)
+        if not _loopback(self.config.host):
+            logger.warning("QQ listens on %s, which other computers can reach%s", self.config.host,
+                           "" if token else f"; without {self.config.access_token_env} any of them can "
+                           "write as an admitted QQ user")
         self._server = await serve(
             self._connection,
             self.config.host,
             self.config.port,
+            # NapCat sends no Origin header and a browser always does: no web page can open this socket.
+            origins=[None],
             ping_interval=20,
             ping_timeout=20,
             max_size=2 * 1024 * 1024,
@@ -119,25 +152,30 @@ class OneBotAdapter(ChannelAdapter):
             server.close()
             await server.wait_closed()
 
-    def _authorized(self, connection: ServerConnection) -> bool:
-        expected = self.config.access_token
-        if not expected:
-            return True
+    def _authorized(self, connection: ServerConnection, expected: str) -> bool:
         request = getattr(connection, "request", None)
         headers = getattr(request, "headers", {})
         authorization = str(headers.get("Authorization", ""))
         if authorization.lower().startswith("bearer "):
-            return authorization[7:].strip() == expected
-        path = str(getattr(request, "path", "") or "")
-        supplied = parse_qs(urlparse(path).query).get("access_token", [""])[0]
-        return supplied == expected
+            supplied = authorization[7:].strip()
+        else:
+            path = str(getattr(request, "path", "") or "")
+            supplied = parse_qs(urlparse(path).query).get("access_token", [""])[0]
+        return hmac.compare_digest(supplied.encode(), expected.encode())
 
     async def _connection(self, connection: ServerConnection) -> None:
-        if not self._authorized(connection):
+        token = self.config.access_token
+        if token and not self._authorized(connection, token):
             await connection.close(code=1008, reason="Invalid OneBot access token")
             return
+        # Without a token any local program can claim to be NapCat and use an owner's QQ ID.
+        authenticated = bool(token)
         self._connections.add(connection)
         self._send_locks[id(connection)] = asyncio.Lock()
+        # Messages wait for a worker of their own, so this loop keeps reading the receipts
+        # that a turn's actions (a file upload) wait for.
+        inbox: asyncio.Queue[ChannelMessage] = asyncio.Queue(maxsize=_INBOX_LIMIT)
+        worker = asyncio.create_task(self._work(connection, inbox), name="onebot-inbox")
         logger.info("OneBot client connected remote=%s", connection.remote_address)
         try:
             async for raw in connection:
@@ -150,27 +188,22 @@ class OneBotAdapter(ChannelAdapter):
                     echo = str(payload.get("echo") or "")
                     pending = (self._pending_actions.get(echo)
                                if self._pending_connections.get(echo) is connection else None)
-                    # Missing echoes can match only one unambiguous request on this connection.
-                    if (
-                        pending is None
-                        and not echo
-                        and "retcode" in payload
-                        and self._pending_actions
-                    ):
-                        candidates = [future for key, future in self._pending_actions.items()
-                                      if self._pending_connections.get(key) is connection and not future.done()]
-                        if len(candidates) == 1:
-                            pending = candidates[0]
-                        elif candidates:
-                            for future in candidates:
-                                future.set_exception(RuntimeError(
-                                    "Ambiguous OneBot receipt: action outcome unknown; do not resend automatically"))
-                            continue
                     if pending is not None:
                         if not pending.done():
                             pending.set_result(payload)
                         continue
-                    await self._handle_payload(connection, payload)
+                    if not echo and "retcode" in payload:
+                        # Any request on this connection may own it, a reply included, so it settles
+                        # nothing: an action waits for its own echo until it times out.
+                        logger.debug("OneBot receipt without echo ignored")
+                        continue
+                    event = self._message(payload, authenticated)
+                    if event is None:
+                        continue
+                    if inbox.full():
+                        logger.warning("OneBot inbox is full (%d waiting): a QQ message was dropped", inbox.qsize())
+                        continue
+                    inbox.put_nowait(event)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -178,46 +211,67 @@ class OneBotAdapter(ChannelAdapter):
         finally:
             for key, future in list(self._pending_actions.items()):
                 if self._pending_connections.get(key) is connection and not future.done():
-                    future.set_exception(RuntimeError("OneBot disconnected: action outcome unknown; do not resend automatically"))
+                    future.set_exception(_unknown("OneBot disconnected"))
+            # A turn for this connection can no longer answer over it.
+            worker.cancel()
             self._connections.discard(connection)
             self._send_locks.pop(id(connection), None)
+            await asyncio.wait({worker}, timeout=5.0)
             logger.info("OneBot client disconnected")
 
-    async def _handle_payload(self, connection: ServerConnection, payload: dict[str, Any]) -> None:
+    async def _work(self, connection: ServerConnection, inbox: asyncio.Queue[ChannelMessage]) -> None:
+        # One message at a time, in the order NapCat sent them.
+        _origin.set(connection)
+        while True:
+            event = await inbox.get()
+            try:
+                await self._answer(connection, event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("OneBot message handling failed")
+
+    async def _handle_payload(self, connection: ServerConnection, payload: dict[str, Any],
+                              authenticated: bool = False) -> None:
+        event = self._message(payload, authenticated)
+        if event is not None:
+            await self._answer(connection, event)
+
+    def _message(self, payload: dict[str, Any], authenticated: bool) -> ChannelMessage | None:
+        """The message this event asks Astra to answer, before its images load; None for anything else."""
         if payload.get("post_type") != "message":
-            return
+            return None
         message_type = str(payload.get("message_type") or "")
         is_group = message_type == "group"
         if message_type not in {"group", "private"}:
-            return
+            return None
         if is_group and not self.config.group_enabled:
-            return
+            return None
         if not is_group and not self.config.private_enabled:
-            return
+            return None
 
         sender_id = str(payload.get("user_id") or "")
         group_id = str(payload.get("group_id") or "")
         self_id = str(payload.get("self_id") or "")
         if not sender_id or sender_id == self_id:
-            return
+            return None
         if sender_id not in {*self.config.allow_users, *self.config.owner_users}:
-            return
+            return None
         if is_group and self.config.allow_groups and group_id not in self.config.allow_groups:
-            return
+            return None
 
         text = _text_from_segments(payload.get("message", payload.get("raw_message", "")))
         text, mentioned = _strip_self_mention(text, self_id)
         text, prefixed = _strip_prefix(text, self.config.wake_prefixes)
         if is_group and self.config.group_require_mention and not (mentioned or prefixed):
-            return
+            return None
         text = text.strip()[:self.config.max_input_chars]
         if not text:
-            return
-        images = await self._load_images(payload.get("message"))
+            return None
 
         raw_sender = payload.get("sender")
         sender: dict[str, Any] = raw_sender if isinstance(raw_sender, dict) else {}
-        event = ChannelMessage(
+        return ChannelMessage(
             channel=self.name,
             conversation_id=group_id if is_group else sender_id,
             sender_id=sender_id,
@@ -225,12 +279,17 @@ class OneBotAdapter(ChannelAdapter):
             is_group=is_group,
             message_id=str(payload.get("message_id") or ""),
             sender_name=str(sender.get("card") or sender.get("nickname") or ""),
-            images=images,
             raw=payload,
-            local_tools=not is_group and sender_id in self.config.owner_users,
+            local_tools=authenticated and not is_group and sender_id in self.config.owner_users,
         )
+
+    async def _answer(self, connection: ServerConnection, event: ChannelMessage) -> None:
+        images = await self._load_images(event.raw.get("message"))
+        if images:
+            event = replace(event, images=images)
+        is_group = event.is_group
         action = "send_group_msg" if is_group else "send_private_msg"
-        target_id = int(group_id if is_group else sender_id)
+        target_id = int(event.conversation_id)
 
         async def send_reply(response: str) -> None:
             for chunk in _chunks(response, self.config.max_output_chars):
@@ -309,8 +368,11 @@ class OneBotAdapter(ChannelAdapter):
                 "file": path,
                 "name": name,
             }
-        connection = next(iter(self._connections), None)
-        if connection is None:
+        # The connection the message came from; outside a QQ turn only an unambiguous one.
+        connection = _origin.get()
+        if connection is None and len(self._connections) == 1:
+            connection = next(iter(self._connections))
+        if connection is None or connection not in self._connections:
             raise ConnectionError("NapCat is not connected")
         return await self._call_action(connection, action, params)
 
@@ -331,9 +393,9 @@ class OneBotAdapter(ChannelAdapter):
                 "echo": echo,
             })
             try:
-                response = await asyncio.wait_for(future, timeout=30)
+                response = await asyncio.wait_for(future, timeout=_ACTION_SECONDS)
             except TimeoutError as exc:
-                raise RuntimeError("OneBot response timed out: action outcome unknown; do not resend automatically") from exc
+                raise _unknown("OneBot response timed out") from exc
         finally:
             self._pending_actions.pop(echo, None)
             self._pending_connections.pop(echo, None)

@@ -416,6 +416,7 @@ class SessionStore:
             "system_prompt_migration": data.get("system_prompt_migration", {}),
             "system_prompt_projection": data.get("system_prompt_projection", {}),
             "runtime_context_projection": data.get("runtime_context_projection", {}),
+            "standing_memory_projection": data.get("standing_memory_projection", {}),
             "guidance_snapshot": data.get("guidance_snapshot", {}),
             "persona_id": data.get("persona_id", ""),
             "persona_definition_version": data.get("persona_definition_version", 0),

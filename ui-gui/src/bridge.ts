@@ -12,7 +12,9 @@ export type DesktopEvent = { removed: string } | { runtime: string; revision: nu
 export const PERSONAL_SESSION = "personal";
 /** The personal thread's name among the conversations it hands work to (agent/runtime/peer_link.py). */
 export const PERSONAL_PEER_NAME = "个人对话";
-export type Bootstrap = { sessions: SessionState[]; active: string; workspace: string; preferences: Preferences; appshot: { connection: string; enabled: boolean } };
+export type Bootstrap = { sessions: SessionState[]; active: string; workspace: string; preferences: Preferences; appshot: { connection: string; enabled: boolean };
+  /** Told once, to the window that loads next: a wipe that left something, and why. */
+  notice?: string };
 export type CommandDescription = { id: string; command: string; description: string; takes_args: boolean; group: string; options: { command: string; description: string; completion: string; submitValue?: string }[] };
 import type { PhoneAction, PhoneNotificationState, PhoneStatus } from "./phone-protocol.js";
 export interface DesktopBridge {
@@ -39,8 +41,9 @@ export interface DesktopBridge {
   usage(action: "budget" | "price", ...values: string[]): Promise<unknown>;
   /** The person's "以后都允许" rules: list them, or remove one by its key. */
   approvalRules(action: "list" | "remove", key?: string): Promise<{ rules?: { key: string; label: string; tool: string; created_at: string }[] }>;
-  /** The person's whole data, from the memory page: what export and wipe take, an export to a zip, or a wipe after 清除 is typed. */
-  data(action: "plan" | "export" | "wipe", confirmation?: string, browserData?: boolean): Promise<any>;
+  /** The person's whole data, from the memory page: what export and wipe take, an export to a zip, or a wipe after 清除 is typed
+   *  (Astra's browser logins and the personal thread's own files only when chosen too). */
+  data(action: "plan" | "export" | "wipe", confirmation?: string, browserData?: boolean, personalFiles?: boolean): Promise<any>;
   preferences(value: Partial<Preferences>): Promise<Preferences>;
   flushPreferences(value: Partial<Preferences>): void;
   choose(kind: "files" | "folder"): Promise<string[]>;
@@ -52,7 +55,7 @@ export interface DesktopBridge {
   file(id: string, path: string, action: "preview" | "open" | "reveal" | "version" | "snapshot", requestId?: string): Promise<FilePreview>;
   cancelPreview(id: string, requestId: string): Promise<void>;
   /** A canvas's kept versions, one of them shown, an earlier one restored, or the person's comment on a passage of a document canvas. */
-  canvas(id: string, path: string, action: "versions" | "preview" | "restore" | "comment", value?: string | { passage: string; comment: string }): Promise<{ versions?: CanvasVersion[]; preview?: FilePreview; version?: string }>;
+  canvas(id: string, path: string, action: "versions" | "preview" | "restore" | "comment", value?: string | { passage: string; comment: string; occurrence?: number; digest?: string }): Promise<{ versions?: CanvasVersion[]; preview?: FilePreview; version?: string }>;
   onEvents(handler: (events: DesktopEvent[]) => void): () => void;
 }
 declare global { interface Window { astra: DesktopBridge; } }

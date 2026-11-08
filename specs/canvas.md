@@ -79,17 +79,24 @@ and export and names `doc_export`.
   16:9 deck with python-pptx (the `documents` extra), one full-slide picture per slide, the slide's
   heading as the picture's description for screen readers and its notes as speaker notes, then
   removes the pictures. Text cannot be edited in PowerPoint.
-- Comments: selecting a passage of a document opens a comment form. The desktop writes
+- Comments: selecting a passage of a document opens a comment form. With the passage the panel sends
+  which occurrence of that text was selected, counted in the rendered document, and a digest of the
+  document's text as the preview showed it when the passage was selected. The desktop writes
   `<!-- @astra: ... -->` into `doc.md`:
-  1. right after the passage when it is found as written (runs of spaces read as one), outside code
-     blocks;
+  1. in the text as it renders (the Markdown parsed with GFM: entities and escapes as shown, emphasis
+     not in the way, link addresses, images and HTML comments left out), at that occurrence: right
+     after it in plain text (exactly when the source reads as shown, else after that piece of text);
+     after a code span, link or autolink it ends in; on the line after a code block, fenced or
+     indented, list items included, indented as the block so it is not code; on the line below a
+     heading. In a table a pipe in the comment becomes a full-width one;
   2. otherwise at the end of the line that holds the passage, or its first 24 characters, once
-     inline Markdown (emphasis, code, links) is removed;
+     inline Markdown (emphasis, code, links) is removed, outside code blocks;
   3. otherwise at the end of the document, quoting the passage.
-  A comment never goes inside a heading (it goes on the line below) and two hyphens become a dash,
-  so the comment cannot end early. The write is refused, and asked again, if the file changed
-  meanwhile. `doc_comments` lists the comments; the model resolves each with `doc_edit`. The model
-  is not told automatically; the person asks for the comments to be handled.
+  Two hyphens become a dash, so the comment cannot end early. The digest is checked against the very
+  text being rewritten: a document changed since the selection, even a moment before it is read, is
+  refused and the person is asked to refresh and select again. `doc_comments` lists the comments; the
+  model resolves each with `doc_edit`. The model is not told automatically; the person asks for the
+  comments to be handled.
 
 ## 7. Versions
 
@@ -113,7 +120,9 @@ and export and names `doc_export`.
 - Images are inlined as data URLs by the main process, only from the canvas's own `assets/` folder,
   without following a link out of it, up to 8 MiB each and 40 MiB in all; nothing loads from the
   network.
-- Prints and slide pictures are written only to the canvas's own `exports/` folder.
+- Prints and slide pictures are written only to the canvas's own `exports/` folder. An export is written
+  as a new file of its own and renamed over its name, so a link already at that name is replaced, never
+  written through (the desktop's PDF and the backend's PPTX alike).
 - Every path of a canvas is held to the canvas folder's real location: content, the assets folder and
   each image, versions and exports reached through a link out of the folder are refused, on the
   desktop and in the backend (which checks `exports/.slides` before drawing there or removing it).

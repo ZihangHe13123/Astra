@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -12,6 +13,9 @@ import zipfile
 from contextlib import closing
 from pathlib import Path
 
+import pytest
+
+from agent.cli import data_commands
 from agent.launcher.installation import discover
 from agent.launcher.locking import RuntimeLease
 
@@ -25,15 +29,27 @@ OWNED = {
     "jobs/preferences.json": '{"quiet_hours": null}', "jobs/runs/r1/session.json": "{}",
     "skills/learned/lab-notes/SKILL.md": "# Lab notes\n", "skills-learning/journal.json": "{}",
 }
+# What the personal thread wrote in its own folder, its work like a project's: exported, and wiped only when
+# chosen too. Keys a conversation left there are never exported.
+PERSONAL = {
+    "personal/notes/plan.md": "周末计划\n",
+    "personal/.env": "ASTRA_MAIL_PASSWORD=personal-secret\n", "personal/notes/.env.local": "TOKEN=personal-token\n",
+    "personal/keys/server.pem": "-----BEGIN PRIVATE KEY-----\n",
+}
 # Copies made from the person's conversations: wiped, not exported.
 DERIVED = {
     "gui/history-index/v1.sqlite3": "x", "gui/attachments/a.png": "png", "channels/conversations.json": "{}",
+    # From a paired phone: a photo it sent, speech made for it, and what it did.
+    "personal/uploads/2026-11-07/101500-abc123-照片.jpg": "jpg",
+    "gui/phone-audio/0123456789abcdef0123456789abcdef.wav": "RIFF",
+    "gui/phone-audit.jsonl": '{"device": "d1", "method": "upload", "name": "照片.jpg"}\n',
+    "personal/.astra/checkpoints/c1/manifest.json": "{}",
 }
 # Never exported and never wiped: credentials, logins, settings and other apps' state.
 KEPT = {
     ".env": "ASTRA_MAIL_PASSWORD=secret\n", "connections/openai.json": '{"api_key": "sk-test"}',
     "auth/codex.json": '{"token": "t"}', "channels/weixin/account.json": '{"token": "t"}',
-    "settings.json": "{}", "gui/preferences.json": "{}", "gui/phone-devices.json": "{}",
+    "settings.json": "{}", "gui/preferences.json": "{}", "gui/phone-devices.json": "{}", "gui/phone-push-key.json": "{}",
     "skills/creative/bundled/SKILL.md": "# bundled\n", "activity-history.sqlite3": "x",
     "launcher/marker": "x",
 }
@@ -43,7 +59,7 @@ DATABASES = ("memory.db", "sessions.db", "jobs/jobs.sqlite3", "learning.db", "ta
 
 
 def seed(home: Path) -> sqlite3.Connection:
-    for name, text in {**OWNED, **DERIVED, **KEPT, **BROWSER}.items():
+    for name, text in {**OWNED, **PERSONAL, **DERIVED, **KEPT, **BROWSER}.items():
         (home / name).parent.mkdir(parents=True, exist_ok=True)
         (home / name).write_text(text, newline="\n")
     (home / "sessions" / ".writers").mkdir()
@@ -108,13 +124,34 @@ def test_export_holds_the_persons_data_consistently_and_no_credentials(tmp_path)
                 "astra-export/sessions/bar/session_2.json", "astra-export/jobs/jobs.sqlite3",
                 "astra-export/jobs/preferences.json", "astra-export/jobs/runs/r1/session.json",
                 "astra-export/skills/lab-notes/SKILL.md", "astra-export/skills-journal/journal.json",
-                "astra-export/manifest.json"}
+                "astra-export/personal/notes/plan.md", "astra-export/manifest.json"}
     assert names == expected
     with sqlite3.connect(tmp_path / "x" / "astra-export" / "memory" / "memory.db") as copy:
         assert {row[0] for row in copy.execute("SELECT text FROM notes")} == {"committed memory.db", "only in the wal"}
     assert [item["key"] for item in manifest["items"]][:3] == ["core-user", "core-memory", "memory"]
     assert "微信登录" in manifest["not_included"]
-    assert not any(secret in out.read_bytes() for secret in (b"sk-test", b"ASTRA_MAIL_PASSWORD", b"cookie"))
+    assert not any(secret in out.read_bytes() for secret in (b"sk-test", b"ASTRA_MAIL_PASSWORD", b"cookie",
+                                                             b"personal-secret", b"personal-token", b"PRIVATE KEY"))
+
+
+@pytest.mark.skipif(os.name == "nt", reason="making links needs extra rights on Windows")
+def test_an_export_never_writes_through_a_link_at_its_name(tmp_path):
+    home = tmp_path / "home"
+    seed(home).close()
+    outside = {name: tmp_path / name for name in ("notes.txt", "old.zip")}
+    for path in outside.values():
+        path.write_text("someone else's file")
+    folder = tmp_path / "out"
+    folder.mkdir()
+    # A link where the half-written archive used to go, and one at the chosen name itself.
+    (folder / "astra.zip.partial").symlink_to(outside["notes.txt"])
+    (folder / "linked.zip").symlink_to(outside["old.zip"])
+    for name in ("astra.zip", "linked.zip"):
+        code, result = data(environment(home), "export", "--out", str(folder / name))
+        assert code == 0, result
+        assert not (folder / name).is_symlink() and zipfile.is_zipfile(folder / name)
+    assert all(path.read_text() == "someone else's file" for path in outside.values())
+    assert sorted(path.name for path in folder.iterdir()) == ["astra.zip", "astra.zip.partial", "linked.zip"]
 
 
 def test_plan_names_what_each_choice_takes(tmp_path):
@@ -126,6 +163,12 @@ def test_plan_names_what_each_choice_takes(tmp_path):
     assert by_key["memory"]["export"] and by_key["memory"]["present"] and by_key["memory"]["bytes"] > 0
     assert not by_key["tasks"]["export"] and by_key["browser-profiles"]["browser"]
     assert by_key["vectors:context-vectors-abc.db"]["present"]
+    # The phone's uploads and the edit snapshots sit inside the personal folder but are counted once, as themselves.
+    own = sum(len(text.encode()) for text in PERSONAL.values())
+    assert by_key["personal"]["export"] and by_key["personal"]["personal"] and by_key["personal"]["bytes"] == own
+    assert not by_key["phone-uploads"]["personal"] and "个人对话写的文件（选了一起清除才删）" in result["kept"]
+    assert by_key["phone-uploads"]["present"] and not by_key["phone-uploads"]["export"]
+    assert by_key["phone-audit"]["present"] and by_key["phone-audio"]["present"]
     listed = {Path(item["path"]).resolve() for item in result["items"]}
     assert not {(home / name).resolve() for name in KEPT} & listed
 
@@ -140,13 +183,22 @@ def test_wipe_needs_the_word_and_takes_the_data_and_its_copies_but_not_logins(tm
     code, result = data(env, "wipe", "--root", str(root), "--confirm", "清除")
     assert code == 0 and not result["failed"]
     left = present(home)
-    assert set(KEPT) | set(BROWSER) | {"browser.db"} <= left
+    assert set(KEPT) | set(BROWSER) | set(PERSONAL) | {"browser.db"} <= left
     assert not (set(OWNED) | set(DERIVED)) & left
+    assert "个人对话写的文件（选了一起清除才删）" in result["kept"]
     assert not {name for name in left if name.endswith(("-wal", "-shm"))} - {"browser.db-wal", "browser.db-shm"}
     assert {item["key"] for item in result["removed"]} >= {"memory", "sessions", "recall", "jobs", "skills", "tasks",
                                                            "vectors:context-vectors-abc.db", "history-cache"}
     code, result = data(env, "wipe", "--root", str(root), "--confirm", "清除", "--browser-data")
     assert code == 0 and not set(BROWSER) & present(home) and not (home / "browser.db").exists()
+    assert set(KEPT) | set(PERSONAL) <= present(home)
+    code, result = data(env, "wipe", "--root", str(root), "--confirm", "清除", "--personal-files")
+    # The work files go; keys left among them stay, and the answer says so.
+    keys = {"personal/.env", "personal/notes/.env.local", "personal/keys/server.pem"}
+    assert code == 0 and set(PERSONAL) & present(home) == keys
+    assert [item["key"] for item in result["removed"]] == ["personal"]
+    assert "个人对话写的文件（选了一起清除才删）" not in result["kept"]
+    assert any(".env" in entry and "个人对话文件夹里的也保留" in entry for entry in result["kept"])
     assert set(KEPT) <= present(home)
 
 
@@ -179,6 +231,165 @@ def test_a_source_checkout_keeps_what_git_tracks(tmp_path):
     assert code == 0 and not result["failed"]
     assert (home / "skills" / "learned" / "shared-skill" / "SKILL.md").exists()
     assert not (home / "skills" / "learned" / "lab-notes").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="making links needs extra rights on Windows")
+def test_a_link_in_the_astra_folder_is_never_followed_by_export_or_wipe(tmp_path):
+    home, root = tmp_path / "home", install_root(tmp_path)
+    seed(home).close()
+    env = environment(home)
+    # The personal folder and the pasted images lead elsewhere: a parent folder and an item that are links.
+    elsewhere, pictures = tmp_path / "elsewhere", tmp_path / "pictures"
+    shutil.move(home / "personal", elsewhere)
+    (home / "personal").symlink_to(elsewhere, target_is_directory=True)
+    shutil.move(home / "gui" / "attachments", pictures)
+    (home / "gui" / "attachments").symlink_to(pictures, target_is_directory=True)
+    kept = present(elsewhere) | {f"pictures/{name}" for name in present(pictures)}
+
+    code, result = data(env, "plan")
+    by_key = {item["key"]: item for item in result["items"]}
+    assert "is a link" in by_key["phone-uploads"]["refused"] and not by_key["phone-uploads"]["present"]
+    out = tmp_path / "astra.zip"
+    code, result = data(env, "export", "--out", str(out))
+    assert code == 0 and [item["key"] for item in result["skipped"]] == ["personal"]
+    with zipfile.ZipFile(out) as archive:
+        assert not [name for name in archive.namelist() if name.startswith("astra-export/personal/")]
+
+    code, result = data(env, "wipe", "--root", str(root), "--confirm", "清除")
+    failed = {item["key"]: item["error"] for item in result["failed"]}
+    assert code == 1 and {"phone-uploads", "personal-copies", "attachments"} <= set(failed)
+    assert all("is a link" in error for error in failed.values())
+    assert present(elsewhere) | {f"pictures/{name}" for name in present(pictures)} == kept
+    assert (home / "personal").is_symlink() and (home / "gui" / "attachments").is_symlink()
+    # Everything not behind a link went as usual.
+    assert not (home / "memory.db").exists() and not (home / "sessions").exists()
+
+
+def test_a_link_deep_inside_a_folder_is_left_out_of_every_walk(tmp_path, monkeypatch):
+    """On Windows os.walk enters a directory junction like any folder; here a real folder plays one."""
+    home, root = tmp_path / "home", install_root(tmp_path)
+    seed(home).close()
+    for name in [name for name in os.environ if name.startswith(("AGENT_", "ASTRA_"))]:
+        monkeypatch.delenv(name)
+    # Every path set for this run, the recall index too (its default is fixed when the runtime is first imported).
+    monkeypatch.setenv("ASTRA_HOME", str(home))
+    monkeypatch.setenv("AGENT_SESSION_DIR", str(home / "sessions"))
+    monkeypatch.setenv("ASTRA_SESSION_RECALL_DB", str(home / "sessions.db"))
+    linked = home / "personal" / "notes" / "linked"
+    linked.mkdir()
+    (linked / "elsewhere.md").write_text("someone else's file")
+    real = data_commands._is_link
+    monkeypatch.setattr(data_commands, "_is_link", lambda path: Path(path) == linked or real(path))
+
+    plan = data_commands.plan()
+    assert all(item["path"].startswith(str(home)) for item in plan["items"])
+    by_key = {item["key"]: item for item in plan["items"]}
+    assert by_key["personal"]["bytes"] == sum(len(text.encode()) for text in PERSONAL.values())
+    exported = data_commands.export(tmp_path / "astra.zip")
+    with zipfile.ZipFile(tmp_path / "astra.zip") as archive:
+        assert "astra-export/personal/notes/plan.md" in archive.namelist()
+        assert not [name for name in archive.namelist() if "elsewhere.md" in name]
+    assert [item["key"] for item in exported["skipped"]] == ["personal"] and "is a link" in exported["skipped"][0]["error"]
+
+    result = data_commands.wipe("清除", personal_files=True, root=root)
+    failed = {item["key"]: item["error"] for item in result["failed"]}
+    assert set(failed) == {"personal"} and f"{linked} is a link" in failed["personal"]
+    assert (linked / "elsewhere.md").read_text() == "someone else's file"
+    assert not (home / "personal" / "notes" / "plan.md").exists() and not (home / "memory.db").exists()
+
+
+def junction(link: Path, target: Path) -> None:
+    """A directory junction: Windows makes one without extra rights, and Python 3.11 does not call it a link."""
+    subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True)
+
+
+def is_junction(path: Path) -> bool:
+    if sys.platform != "win32":
+        return False
+    import stat
+    return os.lstat(path).st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+
+
+@pytest.mark.skipif(os.name != "nt", reason="directory junctions exist only on Windows")
+def test_a_junction_in_the_astra_folder_is_never_followed_by_export_or_wipe(tmp_path):
+    home, root = tmp_path / "home", install_root(tmp_path)
+    seed(home).close()
+    env = environment(home)
+    # The personal folder and the pasted images lead elsewhere through junctions, a parent folder and an item.
+    elsewhere, pictures = tmp_path / "elsewhere", tmp_path / "pictures"
+    shutil.move(home / "personal", elsewhere)
+    junction(home / "personal", elsewhere)
+    shutil.move(home / "gui" / "attachments", pictures)
+    junction(home / "gui" / "attachments", pictures)
+    assert is_junction(home / "personal") and not (home / "personal").is_symlink()
+    kept = present(elsewhere) | {f"pictures/{name}" for name in present(pictures)}
+
+    code, result = data(env, "plan")
+    by_key = {item["key"]: item for item in result["items"]}
+    assert "is a link" in by_key["phone-uploads"]["refused"] and not by_key["phone-uploads"]["present"]
+    out = tmp_path / "astra.zip"
+    code, result = data(env, "export", "--out", str(out))
+    assert code == 0 and [item["key"] for item in result["skipped"]] == ["personal"]
+    with zipfile.ZipFile(out) as archive:
+        assert not [name for name in archive.namelist() if name.startswith("astra-export/personal/")]
+
+    code, result = data(env, "wipe", "--root", str(root), "--confirm", "清除", "--personal-files")
+    failed = {item["key"]: item["error"] for item in result["failed"]}
+    assert code == 1 and {"personal", "phone-uploads", "personal-copies", "attachments"} <= set(failed)
+    assert all("is a link" in error for error in failed.values())
+    assert present(elsewhere) | {f"pictures/{name}" for name in present(pictures)} == kept
+    assert is_junction(home / "personal") and is_junction(home / "gui" / "attachments")
+    # Everything not behind a junction went as usual.
+    assert not (home / "memory.db").exists() and not (home / "sessions").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="directory junctions exist only on Windows")
+def test_a_junction_deep_inside_an_ordinary_folder_is_never_entered(tmp_path):
+    home, root = tmp_path / "home", install_root(tmp_path)
+    seed(home).close()
+    env = environment(home)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "theirs.md").write_text("someone else's file")
+    # personal and personal/notes are ordinary folders; only personal/notes/linked is a junction.
+    junction(home / "personal" / "notes" / "linked", elsewhere)
+    assert is_junction(home / "personal" / "notes" / "linked") and not is_junction(home / "personal")
+
+    out = tmp_path / "astra.zip"
+    code, result = data(env, "export", "--out", str(out))
+    assert code == 0 and [item["key"] for item in result["skipped"]] == ["personal"]
+    with zipfile.ZipFile(out) as archive:
+        assert "astra-export/personal/notes/plan.md" in archive.namelist()
+        assert not [name for name in archive.namelist() if "theirs.md" in name]
+    code, result = data(env, "wipe", "--root", str(root), "--confirm", "清除", "--personal-files")
+    failed = {item["key"]: item["error"] for item in result["failed"]}
+    assert code == 1 and set(failed) == {"personal"} and "is a link" in failed["personal"]
+    assert (elsewhere / "theirs.md").read_text() == "someone else's file"
+    assert is_junction(home / "personal" / "notes" / "linked")
+    assert not (home / "personal" / "notes" / "plan.md").exists() and not (home / "memory.db").exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="making links needs extra rights on Windows")
+def test_a_path_configured_elsewhere_is_checked_from_the_top(tmp_path):
+    home, root = tmp_path / "home", install_root(tmp_path)
+    seed(home).close()
+    real = tmp_path / "real"
+    real.mkdir()
+    shutil.move(home / "sessions", real / "sessions")
+    (tmp_path / "linkdir").symlink_to(real, target_is_directory=True)
+    before = present(real)
+    # The conversations are configured outside the state folder, below a folder that is a link.
+    env = {**environment(home), "AGENT_SESSION_DIR": str(tmp_path / "linkdir" / "sessions")}
+    code, result = data(env, "wipe", "--root", str(root), "--confirm", "清除")
+    failed = {item["key"]: item["error"] for item in result["failed"]}
+    assert code == 1 and f"{tmp_path / 'linkdir'} is a link" in failed["sessions"]
+    assert present(real) == before
+    # The system's own links on the way do not count: macOS reaches its temporary folders through /var.
+    through_var = Path(str(real).replace("/private/var/", "/var/", 1))
+    if through_var != real and Path("/var").is_symlink():
+        env["AGENT_SESSION_DIR"] = str(through_var / "sessions")
+        code, result = data(env, "wipe", "--root", str(root), "--confirm", "清除")
+        assert code == 0 and not result["failed"] and not (real / "sessions").exists()
 
 
 def test_a_misconfigured_path_never_takes_the_installation_with_it(tmp_path):

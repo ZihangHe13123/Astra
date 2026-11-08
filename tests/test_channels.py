@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 from websockets.asyncio.client import connect
 
+from agent.channels import onebot
 from agent.channels.base import ChannelAdapter, ChannelImage, ChannelMessage
 from agent.channels.config import ChannelsConfig, OneBotConfig, load_channels_config
 from agent.channels.manager import ChannelManager, is_address_in_use
@@ -274,7 +275,9 @@ def test_onebot_uploads_a_private_file_and_waits_for_action_result(tmp_path):
     asyncio.run(scenario())
 
 
-def test_onebot_file_action_accepts_napcat_response_with_empty_echo(tmp_path):
+def test_onebot_file_action_ignores_a_receipt_without_echo_until_it_times_out(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent.channels.onebot._ACTION_SECONDS", 0.3)
+
     async def scenario():
         async def handler(message, reply_sink=None):
             return "unused"
@@ -299,15 +302,18 @@ def test_onebot_file_action_accepts_napcat_response_with_empty_echo(tmp_path):
                     "data": {},
                     "echo": "",
                 }))
-                result = await asyncio.wait_for(task, timeout=2)
-                assert result["status"] == "ok"
+                # It may be this upload's receipt or another request's: it settles nothing.
+                await asyncio.sleep(0.1)
+                assert not task.done()
+                with pytest.raises(TimeoutError, match="outcome unknown"):
+                    await asyncio.wait_for(task, timeout=2)
         finally:
             await adapter.stop()
 
     asyncio.run(scenario())
 
 
-def test_onebot_file_action_preserves_failure_with_empty_echo(tmp_path):
+def test_onebot_file_action_preserves_failure_with_its_echo(tmp_path):
     async def scenario():
         async def handler(message, reply_sink=None):
             return "unused"
@@ -324,12 +330,12 @@ def test_onebot_file_action_preserves_failure_with_empty_echo(tmp_path):
                     str(tmp_path / "report.txt"),
                     "report.txt",
                 ))
-                await asyncio.wait_for(websocket.recv(), timeout=2)
+                request = json.loads(await asyncio.wait_for(websocket.recv(), timeout=2))
                 await websocket.send(json.dumps({
                     "status": "failed",
                     "retcode": 1400,
                     "message": "file upload failed",
-                    "echo": "",
+                    "echo": request["echo"],
                 }))
                 with pytest.raises(RuntimeError, match="file upload failed"):
                     await asyncio.wait_for(task, timeout=2)
@@ -588,6 +594,219 @@ def test_channel_send_file_reports_an_unconfirmed_upload_and_the_path_it_could_n
     assert unconfirmed["retryable"] is False and "Do not send it again" in unconfirmed["recovery_hint"]
     # The whole path that was asked for, not its first missing directory.
     assert str(missing) in not_found["error"]
+
+
+_BRIDGE = {"Authorization": "Bearer fixture-token"}
+_OWNER_ASKS = json.dumps({"post_type": "message", "message_type": "private", "self_id": 42, "user_id": 10001,
+                          "message": "send me the report"})
+
+
+def _owner_upload_stack(tmp_path, monkeypatch, phase=""):
+    """The real channel manager, QQ adapter, router and tool, with a turn that calls channel_send_file
+    (after saying ``phase``, when given)."""
+    monkeypatch.setenv("ASTRA_HOME", str(tmp_path / "state"))
+    monkeypatch.setenv("ASTRA_QQ_ACCESS_TOKEN", "fixture-token")
+    source = tmp_path / "out" / "report.txt"
+    source.parent.mkdir()
+    source.write_text("report", encoding="utf-8")
+    config = OneBotConfig(enabled=True, host="127.0.0.1", port=0, owner_users=("10001",), send_files_enabled=True,
+                          file_allow_users=("10001",), send_file_roots=(str(source.parent),))
+    registry = ToolRegistry(ToolPolicy(mode="permissive"))
+    results = []
+
+    class UploadingAgent(FakeAgent):
+        async def reply_stream(self, message):
+            if phase:
+                yield {"type": "chunk", "content": phase}
+                yield {"type": "tool_calls", "calls": [{"id": "call-1", "name": "channel_send_file", "arguments": {}}]}
+            results.append(await registry.execute("channel_send_file", {"path": str(source)}))
+            yield {"type": "chunk", "content": "sent"}
+
+    router = AgentChannelRouter(UploadingAgent(tmp_path / "tui.json"), asyncio.Lock(), tmp_path / "sessions")
+    manager = ChannelManager(ChannelsConfig(onebot=config), router.handle)
+    register_channel_tools(registry, lambda: manager)
+    return manager, source, results
+
+
+def test_onebot_turn_upload_is_confirmed_through_the_receive_loop_on_its_own_connection(tmp_path, monkeypatch):
+    manager, source, results = _owner_upload_stack(tmp_path, monkeypatch)
+    adapter = manager.adapter("qq")
+
+    async def scenario():
+        await manager.start()
+        try:
+            url = f"ws://127.0.0.1:{adapter._server.sockets[0].getsockname()[1]}"
+            async with connect(url, additional_headers=_BRIDGE) as first, \
+                    connect(url, additional_headers=_BRIDGE) as second:
+                while len(adapter._connections) < 2:
+                    await asyncio.sleep(0)
+                # The message arrives on the connection the adapter does not list first.
+                listed = next(iter(adapter._connections)).remote_address[1]
+                bridge, other = (second, first) if first.local_address[1] == listed else (first, second)
+                await bridge.send(_OWNER_ASKS)
+                request = json.loads(await asyncio.wait_for(bridge.recv(), 2))
+                assert request["action"] == "upload_private_file"
+                assert request["params"] == {"user_id": 10001, "file": str(source.resolve()), "name": "report.txt"}
+                await bridge.send(json.dumps({"status": "ok", "retcode": 0, "data": {}, "echo": request["echo"]}))
+                # The receipt is read while the turn waits for it, long before the 30 s limit.
+                reply = json.loads(await asyncio.wait_for(bridge.recv(), 2))
+                assert reply["params"]["message"] == "sent"
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(other.recv(), 0.1)
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+    assert not results[0].get("error") and "'status': 'sent'" in results[0]["output"]
+
+
+def test_onebot_turn_upload_without_a_receipt_is_reported_unconfirmed(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent.channels.onebot._ACTION_SECONDS", 0.2)
+    manager, _source, results = _owner_upload_stack(tmp_path, monkeypatch)
+    adapter = manager.adapter("qq")
+
+    async def scenario():
+        await manager.start()
+        try:
+            url = f"ws://127.0.0.1:{adapter._server.sockets[0].getsockname()[1]}"
+            async with connect(url, additional_headers=_BRIDGE) as bridge:
+                await bridge.send(_OWNER_ASKS)
+                request = json.loads(await asyncio.wait_for(bridge.recv(), 2))
+                assert request["action"] == "upload_private_file"
+                # NapCat took the upload and never confirmed it.
+                reply = json.loads(await asyncio.wait_for(bridge.recv(), 2))
+                assert reply["params"]["message"] == "sent"
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+    assert results[0]["code"] == "channel_send_unconfirmed"
+
+
+@pytest.mark.parametrize("own_receipt", [
+    {"status": "failed", "retcode": 1400, "message": "file upload failed"},
+    {"status": "ok", "retcode": 0, "data": {}},
+])
+def test_onebot_turn_upload_is_settled_by_its_own_receipt_not_one_without_echo(tmp_path, monkeypatch, own_receipt):
+    manager, _source, results = _owner_upload_stack(tmp_path, monkeypatch, phase="我先发给你。")
+    adapter = manager.adapter("qq")
+
+    async def scenario():
+        await manager.start()
+        try:
+            url = f"ws://127.0.0.1:{adapter._server.sockets[0].getsockname()[1]}"
+            async with connect(url, additional_headers=_BRIDGE) as bridge:
+                await bridge.send(_OWNER_ASKS)
+                text = json.loads(await asyncio.wait_for(bridge.recv(), 2))
+                assert text["action"] == "send_private_msg" and text["echo"].startswith("astra-")
+                upload = json.loads(await asyncio.wait_for(bridge.recv(), 2))
+                assert upload["action"] == "upload_private_file" and upload["echo"] != text["echo"]
+                # The text's receipt comes back without its echo, then the upload's own.
+                await bridge.send(json.dumps({"status": "ok", "retcode": 0, "data": {"message_id": 7}}))
+                await bridge.send(json.dumps({**own_receipt, "echo": upload["echo"]}))
+                reply = json.loads(await asyncio.wait_for(bridge.recv(), 2))
+                assert reply["params"]["message"] == "sent"
+        finally:
+            await manager.stop()
+
+    asyncio.run(scenario())
+    if own_receipt["status"] == "ok":
+        assert not results[0].get("error") and "'status': 'sent'" in results[0]["output"]
+    else:
+        assert results[0]["code"] == "execution_failed" and "file upload failed" in results[0]["error"]
+
+
+def test_onebot_waits_only_with_messages_it_answers_and_keeps_their_order(caplog):
+    async def scenario():
+        release, handled = asyncio.Event(), []
+
+        async def handler(message, reply_sink=None):
+            handled.append(message.text)
+            await release.wait()
+            return ""
+
+        def private(user, text):
+            return json.dumps({"post_type": "message", "message_type": "private", "self_id": 42, "user_id": user,
+                               "message": text})
+
+        ignored = [
+            json.dumps({"post_type": "meta_event", "meta_event_type": "heartbeat", "self_id": 42, "interval": 30000}),
+            json.dumps({"post_type": "notice", "notice_type": "group_increase", "self_id": 42, "group_id": 20002}),
+            json.dumps({"post_type": "message", "message_type": "group", "self_id": 42, "user_id": 10001,
+                        "group_id": 20002, "message": "chat without a mention"}),
+            private(99999, "not admitted"),
+            json.dumps({"status": "ok", "retcode": 0, "data": {}, "echo": "astra-not-waited-for"}),
+        ]
+        adapter = OneBotAdapter(OneBotConfig(host="127.0.0.1", port=0, allow_users=("10001",)), handler)
+        await adapter.start()
+        try:
+            async with connect(f"ws://127.0.0.1:{adapter._server.sockets[0].getsockname()[1]}") as bridge:
+                await bridge.send(private(10001, "first"))
+                while not handled:
+                    await asyncio.sleep(0.01)
+                # While that turn runs: a flood of frames there is nothing to answer, then more messages.
+                for _ in range(40):
+                    for frame in ignored:
+                        await bridge.send(frame)
+                sent = [f"m{index}" for index in range(40)]
+                for text in sent:
+                    await bridge.send(private(10001, text))
+
+                def drops():
+                    return sum("dropped" in record.getMessage() for record in caplog.records)
+
+                for _ in range(200):
+                    if drops():
+                        break
+                    await asyncio.sleep(0.01)
+                assert drops(), "the waiting messages had no limit"
+                limit = onebot._INBOX_LIMIT
+                for _ in range(200):
+                    if drops() >= len(sent) - limit:
+                        break
+                    await asyncio.sleep(0.01)
+                # The ignored frames took no place in the queue: only the messages beyond it were dropped.
+                assert drops() == len(sent) - limit
+                release.set()
+                for _ in range(200):
+                    if len(handled) == 1 + limit:
+                        break
+                    await asyncio.sleep(0.01)
+                assert handled == ["first", *sent[:limit]]
+        finally:
+            await adapter.stop()
+
+    with caplog.at_level("WARNING", logger="agent.channels.onebot"):
+        asyncio.run(scenario())
+
+
+def test_onebot_disconnect_cancels_the_turn_in_progress():
+    async def scenario():
+        started, cancelled = asyncio.Event(), asyncio.Event()
+
+        async def handler(message, reply_sink=None):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+            return ""
+
+        adapter = OneBotAdapter(OneBotConfig(host="127.0.0.1", port=0, allow_users=("10001",)), handler)
+        await adapter.start()
+        try:
+            async with connect(f"ws://127.0.0.1:{adapter._server.sockets[0].getsockname()[1]}") as bridge:
+                await bridge.send(json.dumps({"post_type": "message", "message_type": "private", "self_id": 42,
+                                              "user_id": 10001, "message": "ping"}))
+                await asyncio.wait_for(started.wait(), 2)
+            await asyncio.wait_for(cancelled.wait(), 2)
+            assert not adapter._connections
+        finally:
+            # Bounded: a turn that outlived its connection fails the test here instead of hanging it.
+            await asyncio.wait_for(adapter.stop(), 5)
+
+    asyncio.run(scenario())
 
 
 def test_channel_send_file_states_its_turn_limit():

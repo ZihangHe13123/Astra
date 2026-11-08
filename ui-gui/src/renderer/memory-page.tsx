@@ -79,13 +79,15 @@ function DataSection({ fail }: { fail: (error: unknown) => void }) {
   const [plan, setPlan] = React.useState<DataPlan>();
   const [typed, setTyped] = React.useState("");
   const [browserData, setBrowserData] = React.useState(false);
+  const [personalFiles, setPersonalFiles] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [notice, setNotice] = React.useState("");
   const exportAll = async () => {
     setBusy(true); setNotice("");
     try {
       const result = await window.astra.data("export");
-      if (!result?.cancelled) setNotice(`已导出到 ${result.path}（${sizeLabel(result.bytes)}）。`);
+      const skipped = (result?.skipped ?? []).map((item: { label: string }) => item.label).join("、");
+      if (!result?.cancelled) setNotice(`已导出到 ${result.path}（${sizeLabel(result.bytes)}）。${skipped ? `没有导出（在链接后面，不会跟着读）：${skipped}。` : ""}`);
     } catch (error) { fail(error); }
     finally { setBusy(false); }
   };
@@ -94,17 +96,18 @@ function DataSection({ fail }: { fail: (error: unknown) => void }) {
     try { setPlan(await window.astra.data("plan") as DataPlan); } catch (error) { fail(error); }
     finally { setBusy(false); }
   };
-  const close = () => { setPlan(undefined); setTyped(""); setBrowserData(false); };
+  const close = () => { setPlan(undefined); setTyped(""); setBrowserData(false); setPersonalFiles(false); };
   const wipe = async () => {
     setBusy(true);
-    // On success the desktop reloads this window; it stays busy until then.
-    try { await window.astra.data("wipe", typed, browserData); }
+    // Once the wipe has run the desktop reloads this window, also when something stayed (it says what after
+    // the reload); it stays busy until then. A refusal deletes nothing and leaves the page as it is.
+    try { await window.astra.data("wipe", typed, browserData, personalFiles); }
     catch (error) { fail(error); setBusy(false); }
   };
-  const summary = plan && wipeSummary(plan, browserData);
+  const summary = plan && wipeSummary(plan, browserData, personalFiles);
   return <section className="memory-data">
     <h3>你的数据</h3>
-    <p className="muted small">导出成一个 zip：核心记忆、已保存的记忆、对话记录、定时任务和学到的技能。不含密钥、登录和设置。</p>
+    <p className="muted small">导出成一个 zip：核心记忆、已保存的记忆、对话记录、定时任务、学到的技能和个人对话写的文件。不含密钥、登录和设置。</p>
     {notice && <p className="small" role="status">{notice}</p>}
     <div className="memory-actions">
       <button disabled={busy} onClick={() => { void exportAll(); }}>导出…</button>
@@ -112,8 +115,9 @@ function DataSection({ fail }: { fail: (error: unknown) => void }) {
     </div>
     {plan && summary && <div className="data-wipe" role="group" aria-label="清除数据">
       <p className="small"><strong>会永久删除（{summary.size}）：</strong>{summary.labels.join("、") || "没有可删除的数据"}。删除后无法恢复，建议先导出。</p>
-      <p className="muted small">保留：{plan.kept.join("、")}。</p>
+      <p className="muted small">保留：{summary.kept.join("、")}。</p>
       <label className="activity-toggle small"><input type="checkbox" checked={browserData} onChange={event => setBrowserData(event.target.checked)}/> 同时清除 Astra 浏览器里的登录和 Cookie</label>
+      <label className="activity-toggle small"><input type="checkbox" checked={personalFiles} onChange={event => setPersonalFiles(event.target.checked)}/> 同时清除个人对话在自己文件夹里写的文件（其中的 .env 和密钥文件保留）</label>
       <p className="muted small">清除时会先关掉所有对话和后台任务，完成后窗口重新载入。</p>
       <div className="memory-actions">
         <input aria-label="输入清除两个字确认" placeholder={`输入「${plan.confirmation}」确认`} value={typed} onChange={event => setTyped(event.target.value)}/>

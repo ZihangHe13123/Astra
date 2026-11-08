@@ -84,5 +84,15 @@ phones have notifications on; 移除 also stops them.
 - Every message, command, approval and question answer sent from a phone is
   recorded in `phone-audit.jsonl` in Astra's desktop data folder, with the phone,
   the time and the decision; message text is not kept, only its length.
-- Turning off 允许配对的手机连接 stops the gateway. The desktop app must be running
+- Wiping your data (**清除…** on the memory page, see [memory](memory.md)) deletes the
+  uploads, the speech made for phones and `phone-audit.jsonl`, and reloads every phone;
+  none is shown anything from before. While it runs a phone can send nothing: a file or a
+  message is refused with 正在清除数据, and a file still on its way is not kept. One whose
+  sending began before the wipe and ended after it is refused too (数据刚清除过). Something a
+  phone asked for just before finishes first; if it takes longer than 30 seconds, the wipe does
+  not start and says to try again. Paired phones stay paired, like other logins;
+  remove them in Settings.
+- While a phone is away the Mac keeps what it missed (up to a few MB) so it can catch up;
+  after a longer absence it reloads instead. Turning off 允许配对的手机连接 stops the
+  gateway and keeps nothing for phones. The desktop app must be running
   for the phone to connect; the tray icon keeps it running without a window.

@@ -6,6 +6,7 @@ import type { PyEvent } from "./types.js";
 import { delegateActive, reduceDelegateEvent, type DelegateView } from "./delegates.js";
 import { reduceToolPreparation, type ToolPreparation } from "./tool-preparation.js";
 import type { TurnChangesEventData } from "./turn-changes.js";
+import { earlierTaskEvent, taskStartOf, type TaskStart } from "./backend-protocol.js";
 
 /** Platform-independent projection. The backend remains the execution authority. */
 export type UIEvent = { type: string; [key: string]: any };
@@ -27,9 +28,13 @@ export type SessionState = {
   preparation?: ToolPreparation;
   responseVersions?: ResponseVersions; responseOperation?: ResponseOperation; regeneration?: ResponseRegeneration;
   branchId?: string;
+  /** The current task's start in the event journal, for telling an earlier task's late replay apart. */
+  taskStart?: TaskStart;
   /** The personal thread: the desktop background host's own conversation (specs/personal-thread.md). */
   personal?: boolean;
 };
+/** A task run that has ended (agent.runtime.task_store); a blocked or scheduled task has not. */
+const finalTaskStatuses = ["completed", "failed", "cancelled", "interrupted", "done_verified"];
 export function initialSession(id: string, workspace = ""): SessionState {
   return { id, workspace, session: "", mode: "work", status: "connecting", busy: false, isDraft: false,
     messages: [], tools: [], approvals: [], questions: [], processes: {}, delegates: {}, teams: {},
@@ -45,8 +50,10 @@ export function plainText(text: string): string {
 }
 export function projectEvent(previous: SessionState, event: UIEvent): SessionState {
   const state: SessionState = { ...previous, revision: previous.revision + 1 };
+  // An earlier task's late replay leaves the current task, its turn and its preview alone.
+  const earlierTask = earlierTaskEvent(previous.taskStart, event);
   // Unscoped side-command completion must not erase another running turn's preview.
-  if (!(event.type === "done" && !event.request_id && ["pending", "running", "cancelling"].includes(previous.info.task_status?.task?.status))) {
+  if (!earlierTask && !(event.type === "done" && !event.request_id && ["pending", "running", "cancelling"].includes(previous.info.task_status?.task?.status))) {
     state.preparation = reduceToolPreparation(previous.preparation, event);
   }
   // Configuration and diagnostics do not turn a blank page into a conversation.
@@ -155,11 +162,21 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
       state.delegates = (event.delegates || []).reduce(reduceDelegateEvent, {});
       state.turnChanges = [];
       state.session = event.session_id || state.session; state.stream = ""; break;
-    case "task_started": state.busy = true; state.stream = ""; state.info = { ...state.info, task_status: event }; break;
+    case "task_started":
+      if (earlierTask) break;
+      state.busy = true; state.stream = ""; state.info = { ...state.info, task_status: event }; state.taskStart = taskStartOf(event); break;
     case "task_status":
-      state.info = { ...state.info, task_status: event };
-      state.busy = ["pending", "running", "cancelling"].includes(event.task?.status);
-      if (!state.busy && event.task?.id === previous.info.task_status?.task?.id) state.preparation = undefined;
+      if (!earlierTask) {
+        state.info = { ...state.info, task_status: event };
+        state.busy = ["pending", "running", "cancelling"].includes(event.task?.status);
+        if (!state.busy && event.task?.id === previous.info.task_status?.task?.id) state.preparation = undefined;
+      }
+      // A finished task cannot be waiting for its own approvals or questions, even if their resolution
+      // never arrived. A timed question it left pending stays answerable until the backend expires it.
+      if (finalTaskStatuses.includes(event.task?.status) && event.task?.id) {
+        state.approvals = state.approvals.filter(a => a.owner_task !== event.task.id);
+        state.questions = state.questions.filter(q => q.task_id !== event.task.id || q.state === "pending");
+      }
       break;
     case "chunk":
     case "reasoning": {
@@ -196,8 +213,15 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
       if (!event.call_id) append(event.error ? "error" : "tool", plainText(event.error || event.output || ""));
       break;
     }
-    case "tool_approval_request":
-      state.approvals = [...state.approvals.filter(a => a.request_id !== event.request_id), event]; break;
+    case "tool_approval_request": {
+      // A call of the running turn belongs to its task. A background worker's call is not in the
+      // conversation's tool list and may outlive the turn, so it is ended only by its own resolution.
+      const task = state.info.task_status?.task;
+      const owned = ["pending", "running", "cancelling"].includes(task?.status) && event.call_id
+        && state.tools.some(t => t.call_id === event.call_id && !t.historical);
+      state.approvals = [...state.approvals.filter(a => a.request_id !== event.request_id), owned ? { ...event, owner_task: task.id } : event];
+      break;
+    }
     case "approval_resolved": state.approvals = state.approvals.filter(a => a.request_id !== event.request_id); break;
     case "user_question_request": state.questions = [...state.questions.filter(a => a.request_id !== event.request_id), event]; break;
     case "user_question_pending":
@@ -222,7 +246,7 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
     }
     // A command's done/error can arrive while an independently running turn
     // still owns the backend. Only its task status can terminate that turn.
-    case "done": state.busy = ["pending", "running", "cancelling"].includes(state.info.task_status?.task?.status); state.stream = ""; break;
+    case "done": if (earlierTask) break; state.busy = ["pending", "running", "cancelling"].includes(state.info.task_status?.task?.status); state.stream = ""; break;
     case "error": append("error", event.message || "请求失败"); state.busy = ["pending", "running", "cancelling"].includes(state.info.task_status?.task?.status); state.stream = ""; notice(); break;
     case "turn_changes": {
       // The newest report stays where the details panel reads it; each turn's report keeps its place too.

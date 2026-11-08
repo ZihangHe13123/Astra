@@ -1,12 +1,33 @@
 """Standalone artifacts are relocatable, private-state-free and recoverable."""
 import hashlib
 import json
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import sys
 
 import pytest
 
 from agent.launcher import installation
 from agent.launcher.common import LauncherError
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(autouse=True)
+def private_launcher_state(tmp_path, monkeypatch):
+    # Installed fixtures discover lease and lock directories under user_home().
+    monkeypatch.setattr(installation, 'user_home', lambda: tmp_path / 'profile')
+
+
+def packager():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('package_desktop', ROOT / 'scripts/package_desktop.py')
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def runtime(tmp_path):
@@ -75,11 +96,13 @@ def test_manifest_rejects_external_symlink_and_path_traversal(tmp_path):
         verify_tree(root, descriptor)
 
 
-def release(path, version):
+def release(path, version, *, updater=True):
     from agent.launcher.desktop_distribution import seal_tree
     app = path / 'Astra.app'
-    root = runtime(app)
+    root = runtime(app / 'Contents/Resources')
     (root / 'backend/version.txt').write_text(version)
+    if updater:
+        (root / 'astra-desktop-update').write_text('bundled updater')
     descriptor = seal_tree(app, version=version, target='darwin-arm64')
     descriptor['application'] = 'Astra.app'
     manifest = path / 'release.json'
@@ -122,17 +145,13 @@ def test_update_refuses_running_installation_and_retains_recovery(tmp_path, monk
     assert (installed / 'old.txt').is_file()
     monkeypatch.setattr(desktop_update, 'ensure_idle', lambda *args: None)
     assert desktop_update.apply(installed, control, validate=lambda _: None)['phase'] == 'applied'
-    assert (installed / 'runtime/backend/version.txt').read_text() == '0.3.0'
+    assert (installed / 'Contents/Resources/runtime/backend/version.txt').read_text() == '0.3.0'
     assert desktop_update.recover(installed, control)['phase'] == 'restored'
     assert (installed / 'old.txt').is_file()
 
 
 def test_packager_allowlist_excludes_checkout_state_and_untracked_secrets(tmp_path):
-    import importlib.util
-    script = Path(__file__).resolve().parents[1] / 'scripts/package_desktop.py'
-    spec = importlib.util.spec_from_file_location('package_desktop', script)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = packager()
     source = tmp_path / 'source'
     for relative in ['agent/__init__.py', 'agent/runtime/session_recall.py', 'agent/runtime/astra.md', 'agent/ui/commands.json',
                      'agent/nu', 'agent/api_key.json', 'agent/secret.env', '.env', '.astra/settings.json',
@@ -215,8 +234,164 @@ def test_finalize_removes_only_saved_rollback_after_success(tmp_path):
         desktop_update.finalize(installed, control)
     desktop_update.apply(installed, control, validate=lambda _:None)
     assert desktop_update.finalize(installed, control)['phase'] == 'finalized'
-    assert (installed / 'runtime/backend/version.txt').read_text() == '0.3.0'
+    assert (installed / 'Contents/Resources/runtime/backend/version.txt').read_text() == '0.3.0'
     assert not list(installed.parent.glob('.astra-update-*'))
+    assert not list(control.glob('updater-*'))
+
+
+def test_stage_copies_verified_updater_outside_both_application_trees(tmp_path):
+    from agent.launcher import desktop_update
+    from agent.launcher.common import read_json
+    installed = tmp_path / 'installed/Astra.app'
+    installed.mkdir(parents=True)
+    (installed / 'old.txt').write_text('previous app')
+    candidate = tmp_path / 'candidate'
+    candidate.mkdir()
+    digest = release(candidate, '0.3.0')
+    control = tmp_path / 'control'
+    updater = Path(desktop_update.stage(candidate, installed, control, expected_sha256=digest,
+                                        target='darwin-arm64')['updater'])
+    state = read_json(control / 'desktop-update.json')
+    bundled = candidate / 'Astra.app/Contents/Resources/runtime'
+    assert updater.read_bytes() == (bundled / 'astra-desktop-update').read_bytes()
+    assert (updater.parent / 'backend/version.txt').read_text() == '0.3.0'
+    assert updater.parent.parent == control.resolve()
+    for tree in (installed, Path(state['staging']), Path(state['backup']), candidate):
+        assert not updater.is_relative_to(tree)
+    desktop_update.apply(installed, control, validate=lambda _: None)
+    assert updater.is_file()
+    desktop_update.recover(installed, control)
+    assert (installed / 'old.txt').is_file()
+    assert not updater.parent.exists()
+
+
+def test_stage_refuses_release_without_bundled_updater(tmp_path):
+    from agent.launcher import desktop_update
+    installed = tmp_path / 'installed/Astra.app'
+    installed.mkdir(parents=True)
+    candidate = tmp_path / 'candidate'
+    candidate.mkdir()
+    digest = release(candidate, '0.3.0', updater=False)
+    control = tmp_path / 'control'
+    with pytest.raises(LauncherError, match='bundled updater'):
+        desktop_update.stage(candidate, installed, control, expected_sha256=digest, target='darwin-arm64')
+    assert not (control / 'desktop-update.json').exists()
+    assert not list(installed.parent.glob('.astra-update-*'))
+
+
+def bundled_application(app, version, interpreter):
+    """A packaged layout whose interpreter is a shell shim around this test's Python."""
+    from agent.launcher.common import write_json
+    module = packager()
+    root = app / 'Contents/Resources/runtime'
+    module.copy_backend(ROOT, root / 'backend')
+    write_json(root / 'backend/desktop-installation.json', {
+        'schema': 1, 'distribution': 'astra-desktop', 'version': version,
+        'target': 'darwin-arm64', 'python': '../python/bin/python3'})
+    python = root / 'python/bin/python3'
+    python.parent.mkdir(parents=True)
+    python.write_text(interpreter)
+    python.chmod(0o755)
+    (app / 'version.txt').write_text(version)
+    module.write_updater(root, 'darwin-arm64')
+    return root
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='runs the POSIX updater entry point')
+def test_installed_updater_verifies_candidate_before_any_candidate_code_runs(tmp_path):
+    from agent.launcher.common import write_json
+    from agent.launcher.desktop_distribution import seal_tree, sha256
+    ran = tmp_path / 'candidate-code-ran.log'
+    installed = tmp_path / 'installed/Astra.app'
+    trusted = bundled_application(installed, 'old', f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    candidate = tmp_path / 'candidate'
+    honest = f'#!/bin/sh\necho candidate >> "{ran}"\nexec "{sys.executable}" "$@"\n'
+    bundled_application(candidate / 'Astra.app', 'new', honest)
+    manifest = seal_tree(candidate / 'Astra.app', version='new', target='darwin-arm64')
+    manifest['application'] = 'Astra.app'
+    write_json(candidate / 'release.json', manifest)
+    digest = sha256(candidate / 'release.json')
+    (tmp_path / 'tmp').mkdir()
+    env = {'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(tmp_path / 'home'),
+           'TMPDIR': str(tmp_path / 'tmp')}
+
+    def update(updater, *args):
+        return subprocess.run([str(updater), *args, '--application', str(installed)], env=env,
+                              capture_output=True, text=True, timeout=120)
+
+    stage = ['stage', '--candidate', str(candidate), '--target', 'darwin-arm64', '--manifest-sha256', digest]
+    interpreter = candidate / 'Astra.app/Contents/Resources/runtime/python/bin/python3'
+    interpreter.write_text(f'#!/bin/sh\necho tampered >> "{ran}"\nexec "{sys.executable}" "$@"\n')
+    refused = update(trusted / 'astra-desktop-update', *stage)
+    assert refused.returncode == 1 and 'hash mismatch' in refused.stderr
+    assert not ran.exists()
+    assert not list(installed.parent.glob('.astra-update-*'))
+    assert not list(installed.parent.glob('.Astra.app.astra-updater/*.json'))
+
+    interpreter.write_text(honest)
+    staged = update(trusted / 'astra-desktop-update', *stage)
+    assert staged.returncode == 0, staged.stderr
+    assert not ran.exists()
+    updater = Path(json.loads(staged.stdout)['updater'])
+    assert not updater.is_relative_to(installed) and not updater.is_relative_to(candidate)
+    applied = update(updater, 'apply')
+    assert applied.returncode == 0, applied.stderr
+    assert (installed / 'version.txt').read_text() == 'new'
+    assert ran.exists()
+    finalized = update(updater, 'finalize')
+    assert finalized.returncode == 0, finalized.stderr
+    assert not list(installed.parent.glob('.astra-update-*'))
+
+
+def test_round_trip_counts_only_a_stage_killed_while_preparing(tmp_path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('desktop_update_roundtrip', ROOT / 'scripts/desktop_update_roundtrip.py')
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    journal = tmp_path / 'desktop-update.json'
+
+    def stage(phase, linger):
+        code = ('import json, pathlib, sys, time; pathlib.Path(sys.argv[1]).write_text(json.dumps({"phase": sys.argv[2]}));'
+                ' time.sleep(float(sys.argv[3]))')
+        return lambda: subprocess.Popen([sys.executable, '-c', code, str(journal), phase, str(linger)])
+
+    discarded = []
+
+    def discard():
+        discarded.append(module.journal_phase(journal))
+        journal.unlink()
+
+    # A stage that finishes before it can be killed proves nothing, however often it is retried.
+    with pytest.raises(AssertionError, match='proved nothing'):
+        module.interrupt_stage(stage('staged', 0), journal, discard, attempts=2)
+    assert discarded == ['staged', 'staged']
+    assert module.interrupt_stage(stage('preparing', 60), journal, discard) == 1
+    assert module.journal_phase(journal) == 'preparing'
+
+
+@pytest.mark.skipif(os.name == 'nt', reason='the fixture interpreter is a POSIX shell shim')
+def test_update_round_trip_script_passes_on_a_fixture_release_and_leaves_it_untouched(tmp_path):
+    from agent.launcher.common import write_json
+    from agent.launcher.desktop_distribution import seal_tree, sha256
+    release = tmp_path / 'release'
+    bundled_application(release / 'Astra.app', '0.3.0', f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    manifest = seal_tree(release / 'Astra.app', version='0.3.0', target='darwin-arm64')
+    manifest['application'] = 'Astra.app'
+    write_json(release / 'release.json', manifest)
+    (release / 'release.sha256').write_text(sha256(release / 'release.json') + '  release.json\n')
+    before = {path.relative_to(release): path.read_bytes() for path in release.rglob('*') if path.is_file()}
+    work = tmp_path / 'work'
+    result = subprocess.run([sys.executable, str(ROOT / 'scripts/desktop_update_roundtrip.py'), str(release),
+                             '--work', str(work)], capture_output=True, text=True, timeout=300,
+                            env={'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(tmp_path / 'home'),
+                                 'TMPDIR': str(tmp_path)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    summary = json.loads(result.stdout[result.stdout.index('{'):])
+    assert summary['ok'] and summary['interrupt_attempts'] >= 1
+    assert 'UPDATE_ROUNDTRIP staged-update-discarded' in result.stdout
+    assert {path.relative_to(release): path.read_bytes() for path in release.rglob('*') if path.is_file()} == before
+    assert not work.exists()
 
 
 def test_workspace_dependencies_uses_manifest_and_reports_unavailable_source(tmp_path):
@@ -260,11 +435,7 @@ def test_desktop_supervisor_runs_packaged_executable_without_node(tmp_path, monk
 
 
 def test_packager_removes_nonrelocatable_console_scripts(tmp_path):
-    import importlib.util
-    script = Path(__file__).resolve().parents[1] / 'scripts/package_desktop.py'
-    spec = importlib.util.spec_from_file_location('package_desktop', script)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = packager()
     python = tmp_path / 'python'
     (python / 'bin').mkdir(parents=True)
     for name in ['python3.12','pip','dotenv','python3.12-config']:
@@ -283,7 +454,34 @@ def test_recovery_refuses_to_rename_its_own_running_interpreter(tmp_path, monkey
     monkeypatch.setattr(desktop_update.sys, 'executable', str(application / 'Contents/python'))
     monkeypatch.setattr(desktop_update.sys, 'argv', ['desktop_update','recover','--application',str(application)])
     assert desktop_update.main() == 1
-    assert 'external candidate release' in capsys.readouterr().err
+    assert 'updater printed by stage' in capsys.readouterr().err
+
+
+def test_updater_refuses_candidate_interpreter_for_stage_and_staged_interpreter_for_apply(tmp_path, monkeypatch, capsys):
+    from agent.launcher import desktop_update
+    installed = tmp_path / 'installed/Astra.app'
+    installed.mkdir(parents=True)
+    candidate = tmp_path / 'candidate'
+    candidate.mkdir()
+    digest = release(candidate, '0.3.0')
+    stage = ['desktop_update', 'stage', '--candidate', str(candidate), '--application', str(installed),
+             '--target', 'darwin-arm64', '--manifest-sha256', digest]
+    monkeypatch.setattr(desktop_update.sys, 'executable',
+                        str(candidate / 'Astra.app/Contents/Resources/runtime/python/bin/python3'))
+    monkeypatch.setattr(desktop_update.sys, 'argv', stage)
+    assert desktop_update.main() == 1
+    assert "installed application's updater" in capsys.readouterr().err
+    assert not list(installed.parent.glob('.astra-update-*'))
+    monkeypatch.setattr(desktop_update.sys, 'executable', str(installed / 'Contents/Resources/runtime/python/bin/python3'))
+    assert desktop_update.main() == 0
+    staging = Path(json.loads(capsys.readouterr().out.strip())['updater']).parents[1]
+    staged = next(installed.parent.glob('.astra-update-*-staged'))
+    assert staging == installed.parent / '.Astra.app.astra-updater'
+    monkeypatch.setattr(desktop_update.sys, 'executable', str(staged / 'Contents/Resources/runtime/python/bin/python3'))
+    monkeypatch.setattr(desktop_update.sys, 'argv', ['desktop_update', 'apply', '--application', str(installed)])
+    assert desktop_update.main() == 1
+    assert 'updater printed by stage' in capsys.readouterr().err
+    assert staged.is_dir()
 
 
 def test_desktop_cli_rejects_profile_inside_bundle_and_ignores_source_session_override(tmp_path, monkeypatch):
@@ -300,12 +498,44 @@ def test_desktop_cli_rejects_profile_inside_bundle_and_ignores_source_session_ov
     assert env['AGENT_LOG_DIR'] == str(tmp_path / 'profile/logs')
 
 
+@pytest.mark.skipif(shutil.which('uv') is None, reason='reads uv.lock with uv')
+def test_bundled_runtime_includes_wechat_login_dependencies(tmp_path):
+    from agent.launcher.common import read_json
+    output = tmp_path / 'requirements.lock.txt'
+    export = packager().requirements_export(read_json(ROOT / 'packaging/desktop-runtime.lock.json'), output)
+    subprocess.run([*export, '--offline'], cwd=ROOT, check=True, stdout=subprocess.DEVNULL, timeout=120)
+    hashes, current = {}, None
+    for line in output.read_text().splitlines():
+        if not line[:1].isspace() and '==' in line:
+            current = line.split('==')[0]
+            hashes[current] = []
+        elif current and '--hash=sha256:' in line:
+            hashes[current].append(line.strip())
+    # The desktop offers WeChat login: segno draws its QR code, cryptography handles channel media.
+    # The packager installs with --require-hashes, so each must arrive pinned by hash.
+    assert hashes.get('segno') and hashes.get('cryptography')
+
+
+def test_packager_names_the_missing_electron_install_step(tmp_path):
+    module = packager()
+    with pytest.raises(LauncherError, match='npm --prefix ui-gui ci'):
+        module.electron_distribution(tmp_path, '44.4.3')
+    package = tmp_path / 'node_modules/electron'
+    package.mkdir(parents=True)
+    (package / 'package.json').write_text('{}')
+    # npm ci leaves only the package; the binary comes from its install script.
+    with pytest.raises(LauncherError, match='electron/install.js'):
+        module.electron_distribution(tmp_path, '44.4.3')
+    (package / 'dist').mkdir()
+    (package / 'dist/version').write_text('44.4.2\n')
+    with pytest.raises(LauncherError, match='differs'):
+        module.electron_distribution(tmp_path, '44.4.3')
+    (package / 'dist/version').write_text('44.4.3\n')
+    assert module.electron_distribution(tmp_path, '44.4.3') == package / 'dist'
+
+
 def test_runtime_provenance_records_revision_and_uncommitted_source(monkeypatch):
-    import importlib.util
-    script = Path(__file__).resolve().parents[1] / 'scripts/package_desktop.py'
-    spec = importlib.util.spec_from_file_location('package_desktop', script)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = packager()
     monkeypatch.setattr(module, 'git', lambda root,*args:'abcdef123456' if args[0]=='rev-parse' else ' M agent/launcher/installation.py',raising=False)
     assert module.source_provenance(Path('/source')) == {'source_revision':'abcdef123456','source_dirty':True}
 

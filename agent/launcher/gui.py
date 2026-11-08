@@ -12,7 +12,7 @@ import uuid
 from pathlib import Path
 
 from . import dependencies
-from .common import LauncherError, stop_tree
+from .common import LauncherError, release, spawn, stop_tree
 from .installation import Installation, discover, runtime_environment
 from .locking import RuntimeLease
 
@@ -39,28 +39,30 @@ def launch_gui(install: Installation) -> int:
     with log.open("xb") as output:
         if os.name != "nt":
             log.chmod(0o600)
-        child = subprocess.Popen([str(install.python), "-m", "agent.launcher.gui", "--root", str(install.root),
-                                  "--ready", str(ready)], cwd=install.root, env=env,
-                                 stdin=subprocess.DEVNULL, stdout=output, stderr=output,
-                                 creationflags=creationflags, start_new_session=os.name != "nt")
+        child = spawn([str(install.python), "-m", "agent.launcher.gui", "--root", str(install.root),
+                       "--ready", str(ready)], own_group=True, cwd=install.root, env=env,
+                      stdin=subprocess.DEVNULL, stdout=output, stderr=output,
+                      creationflags=creationflags, start_new_session=os.name != "nt")
     started = time.monotonic()
     waiting = False
     while time.monotonic() < started + STARTUP_SECONDS:
+        # A second launch writes the file as it focuses the open window and exits: look once more after an exit.
+        exited = child.poll() is not None
         if ready.is_file():
             ready.unlink(missing_ok=True)
+            release(child)
             print("Astra desktop opened. Closing this terminal will not stop the window.")
             return 0
-        if child.poll() is not None:
+        if exited:
             break
         if not waiting and time.monotonic() > started + 15:
             # A first start after an update can be slow, more so on Windows.
             print("Astra desktop is still starting...", flush=True)
             waiting = True
         time.sleep(0.1)
-    if child.poll() is None:
-        # The supervisor has started Electron and its backends; ending it alone
-        # left them running on Windows.
-        stop_tree(child)
+    # The supervisor may have started Electron and its backends, and may have exited before them; ending it
+    # alone left them running on Windows.
+    stop_tree(child)
     raise LauncherError(f"Desktop startup did not complete. See {log}")
 
 

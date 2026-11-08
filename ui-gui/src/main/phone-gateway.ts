@@ -11,8 +11,14 @@ const INVOKE_BODY_LIMIT = 2 * 1024 * 1024;
 /** One photo or file a phone hands over for a conversation. */
 export const UPLOAD_LIMIT = 25 * 1024 * 1024;
 const STREAM_BACKLOG_LIMIT = 8 * 1024 * 1024;
+/** What is kept for a phone to catch up: a count, and bytes, since one `history` event can be several MiB. */
 const REPLAY_EVENTS = 4000;
+const REPLAY_BYTES = STREAM_BACKLOG_LIMIT;
 const HEARTBEAT_MS = 20_000;
+const WIPING = "正在清除数据，请稍后再试。";
+const WIPED = "数据刚清除过，这一步没有执行。请在重新载入后再试。";
+/** How long a wipe waits for phones' calls already running before it gives up. */
+const HOLD_WAIT_MS = 30_000;
 const TYPES: Record<string, string> = {
   ".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8", ".mjs": "text/javascript; charset=utf-8",
   ".css": "text/css; charset=utf-8", ".json": "application/json", ".webmanifest": "application/manifest+json",
@@ -59,9 +65,16 @@ export class PhoneGateway {
   private heartbeat?: ReturnType<typeof setInterval>;
   private boundPort = 0;
   private seq = 0;
-  /** Names this run of the gateway: after the desktop restarts, numbers from before mean nothing. */
-  private readonly instance = randomUUID();
-  private recent: { seq: number; text: string }[] = [];
+  /** Names this run of the gateway: after the desktop restarts or the gateway stops, numbers from before mean nothing. */
+  private instance = randomUUID();
+  private recent: { seq: number; text: string; bytes: number }[] = [];
+  private recentBytes = 0;
+  /** A wipe is running: phones' uploads and calls are refused until it ends. */
+  private held = false;
+  /** Changed when a wipe starts or ends: an upload or call begun before then is not carried out. */
+  private epoch = 0;
+  /** Phones' calls handed to the desktop and not yet answered: a wipe waits for them. */
+  private calls = new Set<Promise<unknown>>();
   private stopRevoked: () => void;
 
   constructor(private readonly devices: PhoneDevices, private readonly options: PhoneGatewayOptions) {
@@ -91,6 +104,8 @@ export class PhoneGateway {
     clearInterval(this.heartbeat); this.heartbeat = undefined;
     for (const stream of [...this.streams]) this.close(stream);
     const server = this.server; this.server = undefined; this.boundPort = 0;
+    // Nothing is kept for a phone while none can connect; one resuming from before reloads.
+    this.forget();
     if (server) await new Promise<void>(done => server.close(() => done()));
   }
 
@@ -98,13 +113,49 @@ export class PhoneGateway {
 
   /** Called with every event the window gets. Appshot state is the window's own and is not sent. */
   publish(event: DesktopEvent) {
-    if ("appshot" in event) return;
+    if ("appshot" in event || !this.running) return;
     const seq = ++this.seq;
     const text = `id: ${seq}\ndata: ${JSON.stringify(event)}\n\n`;
+    const bytes = Buffer.byteLength(text);
     // Kept so a phone that briefly lost its connection gets what it missed instead of starting over.
-    this.recent.push({ seq, text });
-    if (this.recent.length > REPLAY_EVENTS) this.recent.splice(0, this.recent.length - REPLAY_EVENTS);
+    this.recent.push({ seq, text, bytes });
+    this.recentBytes += bytes;
+    let drop = 0;
+    while (this.recent.length - drop > REPLAY_EVENTS || this.recentBytes > REPLAY_BYTES) this.recentBytes -= this.recent[drop++].bytes;
+    if (drop) this.recent.splice(0, drop);
     for (const stream of this.streams) this.write(stream, text);
+  }
+
+  /**
+   * The person's data was wiped (`astra data wipe`): nothing from before is replayed, and every phone,
+   * connected now or resuming later, reloads.
+   */
+  reset() {
+    for (const stream of [...this.streams]) { stream.response.write(control({ reload: true })); this.close(stream); }
+    this.forget();
+    this.epoch++;
+  }
+
+  /**
+   * A wipe is starting: until `release()`, phones' uploads and calls are refused, and an upload still arriving
+   * is not kept, so nothing lands in (or is read from) the folders being deleted. Resolves once the calls
+   * already handed to the desktop have finished; rejects if they take longer than `wait`.
+   */
+  async hold(wait = HOLD_WAIT_MS) {
+    this.held = true; this.epoch++;
+    const running = Promise.all([...this.calls].map(call => call.then(() => undefined, () => undefined)));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const late = new Promise<boolean>(done => { timer = setTimeout(() => done(true), wait); });
+    try { if (await Promise.race([running.then(() => false), late])) throw new Error("手机上的操作还没做完，请稍后再清除。"); }
+    finally { clearTimeout(timer); }
+  }
+
+  release() { this.held = false; }
+
+  /** Drops what was kept for replay and names a new run, so no phone resumes from a position before it. */
+  private forget() {
+    this.recent = []; this.recentBytes = 0; this.seq = 0;
+    this.instance = randomUUID();
   }
 
   private async handle(request: IncomingMessage, response: ServerResponse) {
@@ -135,19 +186,28 @@ export class PhoneGateway {
       const deviceId = this.bearer(request);
       if (!deviceId) return send(response, 401, { error: "Sign in again" });
       if (!this.options.uploadRoot) return send(response, 404, { error: "Not found" });
+      if (this.held) { request.resume(); return send(response, 503, { error: WIPING }); }
       const saved = await this.saveUpload(request, uploadName(request.headers["x-astra-file-name"]));
+      if (!saved) return this.wipedMeanwhile(response);
       this.options.uploaded?.(deviceId, saved.path, saved.bytes);
       return send(response, 200, { path: saved.path });
     }
     if (path === "/api/invoke") {
       const deviceId = this.bearer(request);
       if (!deviceId) return send(response, 401, { error: "Sign in again" });
+      if (this.held) { request.resume(); return send(response, 503, { error: WIPING }); }
+      const epoch = this.epoch;
       const body = await readJson(request, INVOKE_BODY_LIMIT);
       const method = body.method as PhoneInvokeMethod;
       if (!PHONE_INVOKE_METHODS.includes(method)) return send(response, 400, { error: "Unsupported call" });
       const args = Array.isArray(body.args) ? body.args : [];
-      try { return send(response, 200, { result: (await this.options.invoke(deviceId, method, args)) ?? null }); }
+      // Asked again once the body is in: a wipe may have started, or even run to its end, while it arrived.
+      if (this.held || epoch !== this.epoch) return this.wipedMeanwhile(response);
+      const call = (async () => this.options.invoke(deviceId, method, args))();
+      this.calls.add(call);
+      try { return send(response, 200, { result: (await call) ?? null }); }
       catch (error) { return send(response, 400, { error: error instanceof Error ? error.message : String(error) }); }
+      finally { this.calls.delete(call); }
     }
     const body = await readJson(request, AUTH_BODY_LIMIT);
     if (path === "/api/pair") {
@@ -159,20 +219,31 @@ export class PhoneGateway {
     return send(response, 404, { error: "Not found" });
   }
 
-  /** Keeps what a phone sent under the day's folder, readable by this user alone, and says where. */
-  private async saveUpload(request: IncomingMessage, name: string): Promise<{ path: string; bytes: number }> {
+  /**
+   * Keeps what a phone sent under the day's folder, readable by this user alone, and says where; nothing
+   * when a wipe started or ended while it arrived.
+   */
+  private async saveUpload(request: IncomingMessage, name: string): Promise<{ path: string; bytes: number } | undefined> {
+    const epoch = this.epoch;
     let size = 0; const chunks: Buffer[] = [];
     for await (const chunk of request) {
       size += chunk.length;
       if (size > UPLOAD_LIMIT) throw new Error(`文件太大：一次最多 ${UPLOAD_LIMIT / 1024 / 1024} MB。`);
       chunks.push(chunk);
     }
+    // Checked right before the write, which runs to its end before anything else can.
+    if (this.held || epoch !== this.epoch) return undefined;
     const now = new Date(), pad = (value: number) => String(value).padStart(2, "0");
     const folder = join(this.options.uploadRoot!, `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`);
     mkdirSync(folder, { recursive: true, mode: 0o700 });
     const path = join(folder, `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}-${randomUUID().slice(0, 6)}-${name}`);
     writeFileSync(path, Buffer.concat(chunks), { mode: 0o600, flag: "wx" });
     return { path, bytes: size };
+  }
+
+  /** A request that arrived across a wipe: refused while it runs (503), and as stale once it has ended (409). */
+  private wipedMeanwhile(response: ServerResponse) {
+    return this.held ? send(response, 503, { error: WIPING }) : send(response, 409, { error: WIPED });
   }
 
   /** Whether this phone has the app open: its event stream is connected, so it needs no push. */

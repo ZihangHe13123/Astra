@@ -13,10 +13,65 @@ const diagnosticEvents = new Set([
 ]);
 const errorTypes = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "ReferenceError", "URIError", "EvalError"]);
 
-type Envelope = { type?: string; event_id?: string; cursor?: number; replayable?: boolean; replayed?: boolean; sequence?: number; generation?: string };
+type Envelope = {
+  type?: string; event_id?: string; cursor?: number; replayable?: boolean; replayed?: boolean; sequence?: number; generation?: string;
+  request_id?: unknown; retryable?: unknown; process_id?: unknown; task?: unknown;
+};
+
+/**
+ * The background run or task a journaled event describes. Only journaled events carry their own
+ * cursor, so only they can be ordered; a task resumed under its id later in the journal is newer.
+ */
+function lifecycleEntity(event: Envelope): string | undefined {
+  if (!event.replayable || !Number.isSafeInteger(event.cursor)) return undefined;
+  if (event.type === "process_status" && typeof event.process_id === "string" && event.process_id) return `process:${event.process_id}`;
+  const id = journaledTaskId(event);
+  return id ? `task:${id}` : undefined;
+}
+
+function journaledTaskId(event: Envelope): string | undefined {
+  if (!event.replayable || !Number.isSafeInteger(event.cursor) || (event.type !== "task_started" && event.type !== "task_status")) return undefined;
+  const id = (event.task as { id?: unknown } | null | undefined)?.id;
+  return typeof id === "string" && id ? id : undefined;
+}
+
+/** Where the current task's start sits in the journal. */
+export type TaskStart = { id: string; cursor: number };
+
+/** The journal position of a task start; undefined when the event carries none. */
+export function taskStartOf(event: Envelope): TaskStart | undefined {
+  const id = event.type === "task_started" ? journaledTaskId(event) : undefined;
+  return id ? { id, cursor: event.cursor! } : undefined;
+}
+
+/**
+ * An event of an earlier task or turn that the journal recorded before the current task started,
+ * as a replay page delivers it late. It may update that task's own record, but not which task is
+ * current, whether a turn is running, or the running turn's display.
+ */
+export function earlierTaskEvent(current: TaskStart | undefined, event: Envelope): boolean {
+  if (!current || !event.replayable || !Number.isSafeInteger(event.cursor) || event.cursor! >= current.cursor) return false;
+  // A journaled done keeps no task id; one recorded before this task started ended an earlier turn.
+  if (event.type === "done") return true;
+  const id = journaledTaskId(event);
+  return Boolean(id && id !== current.id);
+}
+
+/** The approval or question a request opens. */
+const controlRequests: Record<string, string> = { tool_approval_request: "approval", user_question_request: "question" };
+/** The approval or question an event ends for good; a retryable question rejection leaves it open. */
+function settledControl(event: Envelope): string | undefined {
+  const kind = { approval_resolved: "approval", approval_response_rejected: "approval", user_question_resolved: "question" }[event.type ?? ""]
+    ?? (event.type === "user_question_response_rejected" && !event.retryable ? "question" : undefined);
+  return kind && typeof event.request_id === "string" && event.request_id ? `${kind}:${event.request_id}` : undefined;
+}
 
 export class EventDeliveryState {
   private seen = new Set<string>();
+  /** Approvals and questions already ended: a lost live request replayed after its resolution is stale. */
+  private settled = new Set<string>();
+  /** The newest journal cursor applied to each run and task: a replayed older event cannot undo a newer one. */
+  private latest = new Map<string, number>();
   private failed = new Set<number>();
   private highWater = 0;
   private generation = "";
@@ -32,9 +87,13 @@ export class EventDeliveryState {
     return this.failed.size > 0 || this.gapFloor !== undefined;
   }
   duplicate(event: Envelope): boolean {
+    const control = controlRequests[event.type ?? ""];
+    const entity = lifecycleEntity(event);
     return Boolean(event.event_id && this.seen.has(event.event_id))
       || Boolean(event.replayed && typeof event.cursor === "number"
-        && (event.cursor <= this.cursor || event.cursor < this.completedThrough));
+        && (event.cursor <= this.cursor || event.cursor < this.completedThrough))
+      || Boolean(control && typeof event.request_id === "string" && this.settled.has(`${control}:${event.request_id}`))
+      || (entity !== undefined && event.cursor! < (this.latest.get(entity) ?? 0));
   }
   gap(event: Envelope): boolean {
     if (event.replayed || !event.generation || !Number.isSafeInteger(event.sequence)) return false;
@@ -54,6 +113,18 @@ export class EventDeliveryState {
     if (success && event.event_id) {
       this.seen.add(event.event_id);
       if (this.seen.size > 4096) this.seen.delete(this.seen.values().next().value!);
+    }
+    const settled = success ? settledControl(event) : undefined;
+    if (settled) {
+      this.settled.add(settled);
+      if (this.settled.size > 1024) this.settled.delete(this.settled.values().next().value!);
+    }
+    const entity = success ? lifecycleEntity(event) : undefined;
+    if (entity) {
+      const newest = Math.max(this.latest.get(entity) ?? 0, event.cursor!);
+      this.latest.delete(entity);
+      this.latest.set(entity, newest);
+      if (this.latest.size > 1024) this.latest.delete(this.latest.keys().next().value!);
     }
     // Volatile text frames carry the latest journal cursor too. They cannot
     // acknowledge lifecycle events that the renderer has never applied.
@@ -100,8 +171,9 @@ export function createBackendEventReceiver(
     }
     const envelope = event as PyEvent & Envelope;
     if (delivery.duplicate(envelope)) {
-      // A completed turn supersedes its replayed transient controls. Retire
-      // their failed delivery slots without resurrecting tools or approvals.
+      // A completed turn supersedes its replayed transient controls, and a
+      // resolution supersedes its request. Retire their failed delivery slots
+      // without resurrecting tools, approvals or questions.
       delivery.acknowledge(envelope, true);
       return;
     }

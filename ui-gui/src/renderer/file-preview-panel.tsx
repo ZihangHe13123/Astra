@@ -9,6 +9,9 @@ const PDFPreview = lazy(()=>import('./pdf-preview.js'));
 type Props = {runtime:string; path:string; serial:number; dismiss:()=>void; fail:(error:unknown)=>void; wide?:boolean; onWide?:(wide:boolean)=>void; onAttach?:(paths:string[])=>void};
 
 /** Each mounted selection owns its request. Dismissal/session changes cancel the host conversion. */
+/** How many times `part` reads in `text`, one after another. */
+function occurrences(text:string, part:string){let count=0;for(let at=text.indexOf(part);at>=0;at=text.indexOf(part,at+part.length))count++;return count;}
+
 export function FilePreviewPanel({runtime,path,serial,dismiss,fail,wide,onWide,onAttach}: Props) {
   const [preview,setPreview]=useState<FilePreview>();
   const [error,setError]=useState(''); const [loading,setLoading]=useState(true);
@@ -18,7 +21,7 @@ export function FilePreviewPanel({runtime,path,serial,dismiss,fail,wide,onWide,o
   // A canvas's kept versions (the list is open while set), the one being looked at, and the person's comment on a passage.
   const [versions,setVersions]=useState<CanvasVersion[]>();
   const [viewing,setViewing]=useState<{id:string; preview:FilePreview}>();
-  const [passage,setPassage]=useState(''); const [note,setNote]=useState('');
+  const [passage,setPassage]=useState(''); const [occurrence,setOccurrence]=useState(0); const [seen,setSeen]=useState<string>(); const [note,setNote]=useState('');
   const [busy,setBusy]=useState(false); const [notice,setNotice]=useState('');
   const pending=useRef<{id:string; cancelled:boolean}>();
   const body=useRef<HTMLDivElement>(null);
@@ -50,12 +53,18 @@ export function FilePreviewPanel({runtime,path,serial,dismiss,fail,wide,onWide,o
   const view=(id:string)=>{void window.astra.canvas(runtime,path,'preview',id).then(value=>{if(value.preview)setViewing({id,preview:value.preview});}).catch(fail);};
   const change=(work:Promise<unknown>,done:string)=>{setBusy(true);void work.then(()=>{setViewing(undefined);setPassage('');setNote('');setNotice(done);setRevision(value=>value+1);}).catch(fail).finally(()=>setBusy(false));};
   const restore=(id:string)=>change(window.astra.canvas(runtime,path,'restore',id),`已恢复成版本 ${Number(id)}；恢复前的内容也留了一个版本。`);
-  const comment=()=>change(window.astra.canvas(runtime,path,'comment',{passage,comment:note}),'批注已写进文档。在对话里让 Astra 处理批注即可。');
+  // Which of the same text was selected, and the text shown when it was, so the comment lands where it was seen or not at all.
+  const comment=()=>change(window.astra.canvas(runtime,path,'comment',{passage,comment:note,occurrence,digest:seen}),'批注已写进文档。在对话里让 Astra 处理批注即可。');
   // What the person selects in a document canvas is the passage a comment is about.
   const pick=()=>{
     if(canvas?.type!=='doc' || viewing || docView!=='rendered')return;
     const selection=window.getSelection(); const text=selection?.toString().split(/\s+/).filter(Boolean).join(' ')||'';
-    if(text && selection?.anchorNode && body.current?.contains(selection.anchorNode))setPassage(text.slice(0,1000));
+    if(!text || !selection?.rangeCount || !selection.anchorNode || !body.current?.contains(selection.anchorNode))return;
+    const range=selection.getRangeAt(0); const start=range.startContainer;
+    const doc=(start instanceof Element ? start : start.parentElement)?.closest('.doc-preview');
+    if(!doc)return;
+    const before=document.createRange(); before.selectNodeContents(doc); before.setEnd(start,range.startOffset);
+    setPassage(text.slice(0,1000)); setSeen(preview?.canvas?.digest); setOccurrence(occurrences(before.toString().split(/\s+/).filter(Boolean).join(' '),text));
   };
   // The picture is of the saved page, drawn afresh; it lands in the message being written, which the enlarged panel covers.
   const picture=()=>{setPicturing(true);void window.astra.file(runtime,path,'snapshot').then(value=>{if(value.path){onAttach?.([value.path]);onWide?.(false);}}).catch(fail).finally(()=>setPicturing(false));};

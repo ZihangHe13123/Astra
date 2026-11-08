@@ -289,6 +289,53 @@ test("backend-started retry enters busy even after a legacy command acknowledgem
   } finally { process.exit = originalExit; h.app.unmount(); }
 });
 
+test("an earlier task replayed after the next one began neither replaces nor ends it", async () => {
+  const h = await setup(130, 32);
+  try {
+    const live = (sequence: number, event: object) =>
+      h.child.event({ ...event, generation: "g", sequence, cursor: sequence + 6, replayable: true, event_id: `E${sequence}` });
+    const replayed = (sequence: number, event: object) =>
+      h.child.event({ ...event, sequence: sequence + 6, cursor: sequence + 6, replayable: true, replayed: true, event_id: `E${sequence}` });
+    live(1, { type: "done" });
+    // The earlier task's start and end are lost live; the next task's start reveals the gap.
+    live(4, { type: "task_started", task: { id: "bbbbbb-task", status: "running" } });
+    await settle();
+    assert.deepEqual(h.child.commands.filter((c) => c.type === "event_replay").map((c) => c.after_cursor), [7]);
+    replayed(2, { type: "task_started", task: { id: "aaaaaa-task", status: "running" } });
+    replayed(3, { type: "task_status", task: { id: "aaaaaa-task", status: "completed" } });
+    replayed(4, { type: "task_started", task: { id: "bbbbbb-task", status: "running" } });
+    h.child.event({ type: "event_replay_complete", after_cursor: 7, next_cursor: 10, has_more: false });
+    await settle();
+    assert.match(h.frame(), /TASK BBBBBB.*RUNNING/);
+    live(5, { type: "task_status", task: { id: "bbbbbb-task", status: "completed" } });
+    await settle();
+    assert.doesNotMatch(h.frame(), /TASK.*RUNNING/);
+  } finally { h.app.unmount(); }
+});
+
+test("an earlier turn's replayed done does not end the turn that started after it", async () => {
+  const h = await setup(130, 32);
+  try {
+    const live = (sequence: number, event: object) =>
+      h.child.event({ ...event, generation: "g", sequence, cursor: sequence + 6, replayable: true, event_id: `E${sequence}` });
+    live(1, { type: "done" });
+    live(2, { type: "task_started", task: { id: "aaaaaa-task", status: "running" } });
+    // The earlier turn's done is lost live; the next task's start reveals the gap.
+    live(4, { type: "task_started", task: { id: "bbbbbb-task", status: "running" } });
+    h.child.event({ type: "chunk", content: "second answer streaming" });
+    await settle();
+    assert.deepEqual(h.child.commands.filter((c) => c.type === "event_replay").map((c) => c.after_cursor), [8]);
+    // The journal keeps only the type of a done: no task id, just its place.
+    h.child.event({ type: "done", sequence: 9, cursor: 9, replayable: true, replayed: true, event_id: "E3" });
+    h.child.event({ type: "event_replay_complete", after_cursor: 8, next_cursor: 10, has_more: false });
+    await settle();
+    assert.match(h.frame(), /TASK BBBBBB.*RUNNING/);
+    live(5, { type: "done" });
+    await settle();
+    assert.doesNotMatch(h.frame(), /TASK.*RUNNING/);
+  } finally { h.app.unmount(); }
+});
+
 test("replayed task starts do not lock an idle composer", async () => {
   const h = await setup();
   try {

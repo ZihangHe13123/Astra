@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { request } from "node:http";
-import { readFileSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PhoneClient } from "../src/phone/client.js";
 import type { PhoneStreamPosition } from "../src/phone-protocol.js";
@@ -132,6 +132,77 @@ test("after the desktop restarts, a phone resuming from before reloads instead o
   } finally { await next?.dispose(); }
 });
 
+test("what is kept for a phone to catch up is bounded in bytes, and nothing is kept while the gateway is stopped", async () => {
+  const { devices, gateway, base } = await setup();
+  try {
+    const { client, token } = await pairedClient(devices, base);
+    const first = listen(client, token);
+    await until(() => first.seen.length === 1, "ready");
+    const { instance } = first.seen[0].data;
+    first.stop(); await first.done;
+
+    // Away while long replies came in: a few events, but far more bytes than one stream may hold unread.
+    const long = "字".repeat(512 * 1024);
+    for (let revision = 1; revision <= 40; revision++) gateway.publish({ runtime: "rt-1", revision, event: { type: "chunk", content: long } as any });
+    const late = listen(client, token, { seq: 0, instance });
+    await until(() => late.seen.length > 0, "answer to a long absence");
+    late.stop(); await late.done;
+    assert.deepEqual(late.seen.map(item => item.data), [{ reload: true }]);
+    // Away for the last of them only: still caught up.
+    const recent = listen(client, token, { seq: 39, instance });
+    await until(() => recent.seen.some(item => item.data.ready), "caught up");
+    assert.deepEqual(recent.seen.map(item => item.id ?? item.data), [40, { ready: true, seq: 40, instance }]);
+    recent.stop(); await recent.done;
+
+    // Turned off, the window's events go on, but none is numbered or kept for a phone.
+    await gateway.stop();
+    gateway.publish({ runtime: "rt-1", revision: 41, event: { type: "chunk", content: "while stopped" } as any });
+    const port = await gateway.start();
+    const phone = new PhoneClient(memory(), `http://127.0.0.1:${port}`);
+    const resumed = listen(phone, token, { seq: 40, instance });
+    await until(() => resumed.seen.length > 0, "answer after starting again");
+    resumed.stop(); await resumed.done;
+    assert.deepEqual(resumed.seen.map(item => item.data), [{ reload: true }]);
+    const fresh = listen(phone, token);
+    await until(() => fresh.seen.length === 1, "fresh ready");
+    assert.notEqual(fresh.seen[0].data.instance, instance);
+    assert.equal(fresh.seen[0].data.seq, 0, "nothing was numbered while stopped");
+    fresh.stop(); await fresh.done;
+  } finally { await gateway.dispose(); }
+});
+
+test("after a wipe no phone is shown what came before: a connected one reloads, and so does one resuming later", async () => {
+  const { devices, gateway, base } = await setup();
+  try {
+    const away = await pairedClient(devices, base);
+    const before = listen(away.client, away.token);
+    await until(() => before.seen.length === 1, "ready");
+    const { instance } = before.seen[0].data;
+    before.stop(); await before.done;
+    const open = await pairedClient(devices, base);
+    const connected = listen(open.client, open.token);
+    await until(() => connected.seen.length === 1, "second phone ready");
+    gateway.publish({ runtime: "rt-1", revision: 1, event: { type: "chunk", content: "before the wipe" } as any });
+    gateway.publish({ removed: "rt-1" });
+    await until(() => connected.seen.length === 3, "events before the wipe");
+
+    gateway.reset();
+    await until(() => connected.seen.length === 4, "answer to the wipe");
+    await connected.done;
+    assert.deepEqual(connected.seen.at(-1)?.data, { reload: true });
+    const resumed = listen(away.client, away.token, { seq: 0, instance });
+    await until(() => resumed.seen.length > 0, "answer to a phone resuming from before the wipe");
+    resumed.stop(); await resumed.done;
+    assert.deepEqual(resumed.seen.map(item => item.data), [{ reload: true }]);
+    // The reloaded page follows a new run that holds nothing from before.
+    const fresh = listen(away.client, away.token);
+    await until(() => fresh.seen.length === 1, "fresh ready");
+    assert.notEqual(fresh.seen[0].data.instance, instance);
+    assert.equal(fresh.seen[0].data.seq, 0);
+    fresh.stop(); await fresh.done;
+  } finally { await gateway.dispose(); }
+});
+
 test("removing the phone ends its stream at once, and the gateway listens on loopback only", async () => {
   const { devices, gateway, base, port } = await setup();
   try {
@@ -176,6 +247,115 @@ test("speech handed to the phone is served to a signed-in phone only, by its id 
       assert.equal((await fetch(`${base}/api/voice/${bad}`, { headers: { Authorization: `Bearer ${token}` } })).status, 404, bad);
     }
   } finally { await gateway.dispose(); }
+});
+
+/** A request sent in two halves: the second goes when `finish` is called. */
+function halfSent(port: number, token: string, path: string, [first, second]: [Buffer | string, Buffer | string],
+  headers: Record<string, string> = {}) {
+  let finish = () => {};
+  const answer = new Promise<{ status: number; body: any }>((resolve, reject) => {
+    const outgoing = request({ host: "127.0.0.1", port, path, method: "POST",
+      headers: { Host: `127.0.0.1:${port}`, Authorization: `Bearer ${token}`, ...headers } }, response => {
+      let text = ""; response.setEncoding("utf8");
+      response.on("data", chunk => { text += chunk; });
+      response.on("end", () => resolve({ status: response.statusCode ?? 0, body: JSON.parse(text || "{}") }));
+    });
+    outgoing.on("error", reject);
+    outgoing.write(first);
+    finish = () => { outgoing.end(second); };
+  });
+  return { answer, finish: () => finish() };
+}
+
+const kept = (folder: string): string[] => existsSync(folder) ? readdirSync(folder, { recursive: true, encoding: "utf8" })
+  .filter(name => statSync(join(folder, name)).isFile()) : [];
+
+test("while a wipe runs, a phone's uploads and calls are refused and an upload still arriving is not kept", async () => {
+  const { devices, gateway, port, base, uploads, uploadRoot } = await setup();
+  let arriving: ReturnType<typeof halfSent> | undefined;
+  try {
+    const { client, token } = await pairedClient(devices, base);
+    arriving = halfSent(port, token, "/api/upload", [Buffer.alloc(1024, 1), Buffer.alloc(1024, 2)], { "X-Astra-File-Name": "before.jpg" });
+    // The gateway has begun to read it before the wipe starts.
+    await new Promise(resolve => setTimeout(resolve, 200));
+    await gateway.hold();
+    arriving.finish();
+    const late = await arriving.answer;
+    assert.equal(late.status, 503);
+    assert.match(late.body.error, /清除/);
+    await assert.rejects(client.upload(token, new Blob([new Uint8Array([1])]), "during.jpg"), /清除/);
+    await assert.rejects(client.invoke(token, "bootstrap", []), /清除/);
+    assert.deepEqual(kept(uploadRoot), []);
+    assert.deepEqual(uploads, []);
+
+    // Once the wipe has ended, phones send again.
+    gateway.reset(); gateway.release();
+    const path = await client.upload(token, new Blob([new Uint8Array([2])]), "after.jpg");
+    assert.ok(path.startsWith(uploadRoot), path);
+    assert.equal(kept(uploadRoot).length, 1);
+  } finally {
+    // A half-sent upload would keep the gateway from closing.
+    arriving?.finish(); await arriving?.answer.catch(() => undefined);
+    await gateway.dispose();
+  }
+});
+
+test("a wipe waits for a phone's call already running, and one whose body arrives after it starts never runs", async () => {
+  let answer = (_value: unknown) => {};
+  const { devices, gateway, port, base, calls, uploadRoot } = await setup((_device, method) =>
+    method === "jobs" ? new Promise(done => { answer = done; }) : { ok: true });
+  let late: ReturnType<typeof halfSent> | undefined;
+  try {
+    const { client, token } = await pairedClient(devices, base);
+    // A call the desktop is still answering when the wipe starts: the wipe waits for it.
+    const running = client.invoke(token, "jobs", ["list"]);
+    await until(() => calls.length === 1, "call handed to the desktop");
+    let held = false;
+    const holding = gateway.hold().then(() => { held = true; });
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.equal(held, false, "the wipe waits while the call runs");
+    answer({ jobs: [] });
+    await holding;
+    assert.deepEqual(await running, { jobs: [] });
+    gateway.release();
+
+    // A call begun before the wipe whose body comes in after it started is refused, never handed over.
+    const body = JSON.stringify({ method: "memory", args: ["forget", "m1"] });
+    late = halfSent(port, token, "/api/invoke", [body.slice(0, 10), body.slice(10)], { "Content-Type": "application/json" });
+    await new Promise(resolve => setTimeout(resolve, 200));
+    await gateway.hold();
+    late.finish();
+    const refused = await late.answer;
+    assert.equal(refused.status, 503);
+    assert.match(refused.body.error, /清除/);
+    assert.deepEqual(calls.map(call => call.method), ["jobs"]);
+    gateway.release();
+
+    // Nor does one whose body is finished only after a whole wipe has come and gone, a call or an upload.
+    const across = halfSent(port, token, "/api/invoke", [body.slice(0, 10), body.slice(10)], { "Content-Type": "application/json" });
+    const file = halfSent(port, token, "/api/upload", [Buffer.alloc(1024, 1), Buffer.alloc(1024, 2)], { "X-Astra-File-Name": "across.jpg" });
+    await new Promise(resolve => setTimeout(resolve, 200));
+    await gateway.hold(); gateway.reset(); gateway.release();
+    across.finish(); file.finish();
+    for (const stale of [await across.answer, await file.answer]) {
+      assert.equal(stale.status, 409);
+      assert.match(stale.body.error, /刚清除过/);
+    }
+    assert.deepEqual(calls.map(call => call.method), ["jobs"]);
+    assert.deepEqual(kept(uploadRoot), []);
+
+    // A call that does not finish in time keeps the wipe from starting.
+    const stuck = client.invoke(token, "jobs", ["list"]);
+    await until(() => calls.length === 2, "second call handed to the desktop");
+    await assert.rejects(gateway.hold(50), /还没做完/);
+    gateway.release();
+    answer({ jobs: [] });
+    await stuck;
+  } finally {
+    // Calls left unanswered or half sent would keep the gateway from closing.
+    answer({ jobs: [] }); late?.finish(); await late?.answer.catch(() => undefined);
+    await gateway.dispose();
+  }
 });
 
 test("a signed-in phone hands photos and files to the Mac, kept under the day's folder for this user alone", async () => {

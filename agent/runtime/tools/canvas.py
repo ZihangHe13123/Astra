@@ -124,7 +124,12 @@ def register_canvas_tool(registry: ToolRegistry, *, workdir: str | Path, render:
             if len(pictures) != count:
                 raise CanvasError(f"The desktop drew {len(pictures)} of the deck's {count} slides.")
             target = inside_canvas(folder, "exports") / f"{stem}.pptx"
-            await asyncio.to_thread(build_pptx, pictures, slide_parts(folder), target, title)
+
+            def unmoved() -> None:
+                if inside_canvas(folder, "exports") != target.parent:
+                    raise CanvasError(f"{folder}/exports was moved while the PPTX was built; nothing was written.")
+
+            await asyncio.to_thread(build_pptx, pictures, slide_parts(folder), target, title, unmoved)
         finally:
             await asyncio.to_thread(shutil.rmtree, pictures_folder, True)
         return json.dumps({"success": True, "file": str(target), "format": "pptx", "slides": count,

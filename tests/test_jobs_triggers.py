@@ -193,6 +193,51 @@ def queued_events(store: JobStore, job_id: str) -> list[dict]:
     return [json.loads(row["payload"]) for row in rows]
 
 
+def test_a_file_is_new_by_its_name_appearing_not_by_its_time(tmp_path):
+    folder = tmp_path / "Downloads"
+    folder.mkdir()
+    (folder / "existing.pdf").write_text("x")
+    store = JobStore(tmp_path / "home")
+    job = reminder(store, folder, {"type": "file", "pattern": "*.pdf"})
+    watcher = TriggerWatcher(store)
+    assert watcher.look() == 0
+    # Copied, moved or unpacked: the file keeps a time from a month ago and is still new.
+    month_ago = time.time() - 30 * 86400
+    (folder / "copied.pdf").write_text("x")
+    os.utime(folder / "copied.pdf", (month_ago, month_ago))
+    assert watcher.look() == 1
+    # Changing a file that was already there is not a new file, however often.
+    for edit in ("y", "z"):
+        later = time.time() + 60
+        (folder / "existing.pdf").write_text(edit)
+        os.utime(folder / "existing.pdf", (later, later))
+        assert watcher.look() == 0
+    # Removed and back again is new again.
+    (folder / "copied.pdf").unlink()
+    assert watcher.look() == 0
+    (folder / "copied.pdf").write_text("x")
+    os.utime(folder / "copied.pdf", (month_ago, month_ago))
+    assert watcher.look() == 1
+    assert [event["name"] for event in queued_events(store, job["id"])] == ["copied.pdf", "copied.pdf"]
+
+
+def test_a_time_cursor_from_before_names_were_kept_still_starts_the_files_after_it(tmp_path):
+    folder = tmp_path / "Downloads"
+    folder.mkdir()
+    store = JobStore(tmp_path / "home")
+    job = reminder(store, folder, {"type": "file", "pattern": "*.pdf"})
+    base = time.time() - 100
+    for index, name in enumerate(("seen.pdf", "same-a.pdf", "same-b.pdf", "after.pdf")):
+        (folder / name).write_text("x")
+        when = base + (10 if name.startswith("same") else index * 20)
+        os.utime(folder / name, (when, when))
+    # Written by the earlier watcher: everything up to same-a.pdf at its time was taken.
+    store.fire(job["id"], [], f"{base + 10!r}|same-a.pdf")
+    assert TriggerWatcher(store).look() == 2
+    assert [event["name"] for event in queued_events(store, job["id"])] == ["same-b.pdf", "after.pdf"]
+    assert TriggerWatcher(store).look() == 0
+
+
 def test_more_new_files_than_one_look_takes_all_start_a_run_each_once(tmp_path):
     folder = tmp_path / "Downloads"
     folder.mkdir()

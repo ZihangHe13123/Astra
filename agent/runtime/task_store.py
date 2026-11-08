@@ -316,7 +316,9 @@ class TaskStore:
                 step = self._step_dict(existing)
                 if step["status"] == "completed":
                     return ToolClaim("cached", step["id"], step.get("output"))
-                if (step["status"] == "unknown" and replay == "safe") or (
+                # A not_started step never entered its tool: running it now is
+                # its first execution, not a possible duplicate.
+                if (step["status"] == "unknown" and replay == "safe") or step["status"] == "not_started" or (
                     rerun_failed and step["status"] == "failed"
                 ):
                     now = _now()

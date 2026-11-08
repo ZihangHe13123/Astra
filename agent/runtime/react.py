@@ -19,6 +19,7 @@ import shlex
 import sys
 import time as _time
 import uuid
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Optional
@@ -42,7 +43,13 @@ from .core_rules import CORE_SKILL_NAME
 from .agent_team import MESSAGE_ENVELOPE_START
 from .deepseek import DEEPSEEK_VISION_MODELS
 from .llm import LLMClient, LLMIdleTimeout, LLMOverallTimeout, LLMResponseError
-from .turn_budget import TurnBudgetExceeded, budgeted_events, check_work_budget, parse_turn_budget
+from .turn_budget import (
+    TurnBudgetExceeded,
+    budgeted_events,
+    check_work_budget,
+    current_turn_budget,
+    parse_turn_budget,
+)
 from .turn_change_store import (
     TurnChangeStore,
     current_turn_change_store,
@@ -77,6 +84,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Set by a tool batch around each call: told when the call's tool function is
+# entered, so an interrupted batch knows which calls actually started.
+_TOOL_ENTERED: ContextVar[Callable[[], None] | None] = ContextVar("astra_tool_entered", default=None)
 
 
 # Request-local screenshots may be recompressed by the capture tool to stay inside the
@@ -232,7 +242,6 @@ class ReActAgent(AgentBase):
             )
         self._context_index_request_id = ""
         self._active_vision_request_id: str | None = None
-        self._active_vision_storage_replacements: list[tuple[int, object]] = []
         self._active_vision_prompt_overlays: list[tuple[dict, object, object]] = []
         self._active_vision_attachment_occurrences: set[str] = set()
         self._request_local_image_overlay_messages: list[dict] = []
@@ -1894,11 +1903,10 @@ class ReActAgent(AgentBase):
         if storage_content == chat_content:
             storage_content = None
         if storage_content is not None:
+            # History already holds the placeholder; the image reaches the
+            # provider only through this overlay, resolved by message identity.
             self._active_vision_prompt_overlays.append(
                 (self.context.messages[user_index], storage_content, chat_content)
-            )
-            self._active_vision_storage_replacements.append(
-                (user_index, storage_content)
             )
         return True, user_index, storage_content, vision_event
 
@@ -3111,6 +3119,15 @@ class ReActAgent(AgentBase):
                 )
 
         logger.info("tool call start name=%s id=%s", name, tc.get("id", ""))
+        entered = False
+        batch_entered = _TOOL_ENTERED.get()
+
+        def on_start() -> None:
+            nonlocal entered
+            entered = True
+            if batch_entered is not None:
+                batch_entered()
+
         tool_trace_ctx = trace_ctx.with_tool_call(str(tc.get("id") or "")) if trace_ctx else None
         with trace_span("agent.react.tool", {"agent.tool.name": name}, ctx=tool_trace_ctx) as tool_span:
             try:
@@ -3122,20 +3139,33 @@ class ReActAgent(AgentBase):
                     call_id=str(tc.get("id") or ""),
                     task_id=task_id or "",
                     execution_origin="model",
+                    on_start=on_start,
                 )
             except (asyncio.CancelledError, TurnBudgetExceeded):
-                # A cancelled run_code request may have already claimed a
-                # durable step. Mark it unknown so a later resume cannot
-                # mistake an interrupted side effect for a completed call.
+                # A cancelled call may already hold a durable step. Once its
+                # tool was entered the step is unknown, so a later resume cannot
+                # mistake an interrupted side effect for a completed call or
+                # replay it. Stopped before then (approval wait, policy, budget
+                # check, a queued thread), nothing ran: not_started, which a
+                # later claim may run as a first execution.
                 if step_id and self.task_store is not None:
                     try:
-                        await durable_io(
-                            self.task_store.finish_step,
-                            step_id,
-                            status="unknown",
-                            output={"cancelled": True, "name": name},
-                            error="Tool execution cancelled before completion could be confirmed",
-                        )
+                        if entered:
+                            await durable_io(
+                                self.task_store.finish_step,
+                                step_id,
+                                status="unknown",
+                                output={"cancelled": True, "name": name},
+                                error="Tool execution cancelled before completion could be confirmed",
+                            )
+                        else:
+                            await durable_io(
+                                self.task_store.finish_step,
+                                step_id,
+                                status="not_started",
+                                output={"cancelled": True, "name": name, "not_executed": True},
+                                error="Tool cancelled before it started; it did not run",
+                            )
                     except Exception:
                         logger.exception("task store cancellation finish failed task_id=%s name=%s", task_id, name)
                 raise
@@ -3546,6 +3576,11 @@ class ReActAgent(AgentBase):
         """
         semaphore = asyncio.Semaphore(self.tool_concurrency)
         turn_tool_cache = turn_tool_cache if turn_tool_cache is not None else {}
+        # Which calls entered their tool function (after policy, approval and
+        # argument checks) and which returned, so an interrupted batch can
+        # still record what happened to each call (see below).
+        started: set[int] = set()
+        finished: dict[int, dict] = {}
 
         async def run_one(tc: dict) -> dict:
             check_work_budget()
@@ -3652,12 +3687,16 @@ class ReActAgent(AgentBase):
                 return event
             async with semaphore:
                 check_work_budget()
-                event = await self._execute_tool_call(
-                    tc,
-                    task_id=task_id,
-                    progress_callback=progress_callback,
-                    trace_ctx=trace_ctx,
-                )
+                entered = _TOOL_ENTERED.set(lambda: started.add(id(tc)))
+                try:
+                    event = await self._execute_tool_call(
+                        tc,
+                        task_id=task_id,
+                        progress_callback=progress_callback,
+                        trace_ctx=trace_ctx,
+                    )
+                finally:
+                    _TOOL_ENTERED.reset(entered)
                 if cacheable and not event.get("error"):
                     turn_tool_cache[signature] = dict(event)
                 elif tool is None or not tool.idempotent:
@@ -3674,6 +3713,7 @@ class ReActAgent(AgentBase):
         async def run_and_publish(tc: dict) -> dict:
             async def execute() -> dict:
                 event = await run_one(tc)
+                finished[id(tc)] = event
                 if result_callback is not None:
                     result_callback(self._public_tool_event(event))
                 return event
@@ -3694,31 +3734,87 @@ class ReActAgent(AgentBase):
             tool = self.tools.get(str(tc.get("name") or ""))
             return tool is not None and (tool.risk == "read" or tool.parallel_safe)
 
-        events = await execute_ordered(
-            tool_calls, run_and_publish, can_overlap, self.tool_concurrency,
-        )
+        try:
+            events = await execute_ordered(
+                tool_calls, run_and_publish, can_overlap, self.tool_concurrency,
+            )
+        except BaseException as exc:
+            # Cancellation, the turn budget or a failure stopped the batch; the
+            # scheduler has drained every started call. Keep the call chain
+            # complete instead of leaving it to be stripped as incomplete:
+            # returned calls keep their real result, a started call that did
+            # not return has an unknown outcome (never replayed), and a call
+            # that never started says so.
+            budget = current_turn_budget()
+            reason = (
+                # An expired turn budget reaches the batch as a cancellation.
+                "the turn ran out of time" if isinstance(exc, TurnBudgetExceeded)
+                or (budget is not None and _time.monotonic() >= budget.deadline)
+                else "the turn was cancelled" if isinstance(exc, asyncio.CancelledError)
+                else "the turn stopped on an error"
+            )
+            for tc in tool_calls:
+                event = finished.get(id(tc))
+                if event is not None:
+                    self._record_tool_result(tc, event, repeat_notice_ids, refusals)
+                else:
+                    self.context.add_tool(tc["id"], self._tool_result_context(
+                        self._interrupted_tool_event(tc, started=id(tc) in started, reason=reason)
+                    ))
+            raise
         for tc, event in zip(tool_calls, events):
-            tool_def = self.tools.get(str(tc.get("name") or ""))
-            if tool_def is not None and tool_def.return_direct and not event.get("error"):
-                context_result = "[Atomic interaction committed successfully.]"
-            else:
-                if str(tc.get("id") or "") in repeat_notice_ids:
-                    event["_repeat_limit_reached"] = True
-                self._note_failure_streak(tc, event, refusals)
-                context_result = self._tool_result_context(event)
-            self.context.add_tool(tc["id"], context_result)
-            if event.get("_tool_disclosures"):
-                self.context.messages[-1]["_tool_disclosures"] = list(event["_tool_disclosures"])
-            fresh_output = event.pop("_fresh_output", None)
-            if fresh_output is not None:
-                fresh_event = dict(event)
-                fresh_event["tool_output"] = fresh_output
-                fresh_event["output_truncated"] = False
-                fresh_event["request_local_placeholder"] = False
-                self._fresh_tool_context[tc["id"]] = self._tool_result_context(fresh_event)
-                if tool_def is not None and tool_def.result_persistence == "request_local":
-                    self._request_local_tool_context_ids.add(tc["id"])
+            self._record_tool_result(tc, event, repeat_notice_ids, refusals)
         return events
+
+    def _record_tool_result(
+        self,
+        tc: dict,
+        event: dict,
+        repeat_notice_ids: frozenset[str],
+        refusals: dict[str, tuple[str, bool]] | None,
+    ) -> None:
+        """Append one call's result to history, in the model's call order."""
+        tool_def = self.tools.get(str(tc.get("name") or ""))
+        if tool_def is not None and tool_def.return_direct and not event.get("error"):
+            context_result = "[Atomic interaction committed successfully.]"
+        else:
+            if str(tc.get("id") or "") in repeat_notice_ids:
+                event["_repeat_limit_reached"] = True
+            self._note_failure_streak(tc, event, refusals)
+            context_result = self._tool_result_context(event)
+        self.context.add_tool(tc["id"], context_result)
+        if event.get("_tool_disclosures"):
+            self.context.messages[-1]["_tool_disclosures"] = list(event["_tool_disclosures"])
+        fresh_output = event.pop("_fresh_output", None)
+        if fresh_output is not None:
+            fresh_event = dict(event)
+            fresh_event["tool_output"] = fresh_output
+            fresh_event["output_truncated"] = False
+            fresh_event["request_local_placeholder"] = False
+            self._fresh_tool_context[tc["id"]] = self._tool_result_context(fresh_event)
+            if tool_def is not None and tool_def.result_persistence == "request_local":
+                self._request_local_tool_context_ids.add(tc["id"])
+
+    @staticmethod
+    def _interrupted_tool_event(tc: dict, *, started: bool, reason: str) -> dict:
+        """The result of a call an interrupted batch left without one of its own."""
+        name = str(tc.get("name") or "tool")
+        if started:
+            error = (
+                f"[ToolOutcomeUnknown] {name} started, but {reason} before its result arrived. "
+                "It may have taken effect in part or in full; it was not run again."
+            )
+            details: dict[str, Any] = {
+                "code": "outcome_unknown", "outcome_unknown": True,
+                "recovery_hint": "Check the current state before running it again; do not repeat it blindly.",
+            }
+        else:
+            error = f"[ToolNotStarted] {name} did not start: {reason} first, so it had no effect."
+            details = {"code": "not_started", "not_executed": True, "retryable": True}
+        return {
+            "type": "tool_result", "id": tc.get("id", ""), "name": name, "args": {}, "output": "",
+            "error": error, "tool_output": error, "duration_ms": 0, **details,
+        }
 
     @staticmethod
     def _separate_vision_tile_attachment(event: dict) -> dict:
@@ -3885,6 +3981,8 @@ class ReActAgent(AgentBase):
                     "This is a bounded preview. If omitted details are needed, "
                     f"inspect the complete result at: {artifact_path}"
                 )
+        elif event.get("outcome_unknown"):
+            lines.append("Result completeness: none. No result arrived, so what the call did is unknown.")
         elif event.get("partial"):
             lines.append(
                 "Result completeness: partial. The tool stopped before finishing; "
@@ -3936,7 +4034,6 @@ class ReActAgent(AgentBase):
         if self._active_vision_request_id is not None:
             raise RuntimeError("A vision request is already active for this agent.")
         self._active_vision_request_id = vision_request_id
-        self._active_vision_storage_replacements = []
         self._active_vision_prompt_overlays = []
         self._active_vision_attachment_occurrences = set()
         self._request_local_image_overlay_messages = []
@@ -3983,13 +4080,13 @@ class ReActAgent(AgentBase):
                     )
             if self._context_index_request_id == context_index_request_id:
                 self._context_index_request_id = ""
+            carried_images = bool(self._active_vision_prompt_overlays)
             self._clear_request_local_tool_context()
             self._clear_request_local_image_overlays()
-            replacements = list(self._active_vision_storage_replacements)
             try:
-                for message_index, storage_content in replacements:
-                    self.context.replace_message_content(message_index, storage_content)
-                if replacements:
+                if carried_images:
+                    # History holds only placeholders, so nothing is rewritten:
+                    # a turn that ends on an error still keeps them durable.
                     await self.context.save_async()
             finally:
                 try:
@@ -4002,7 +4099,6 @@ class ReActAgent(AgentBase):
                     )
                 finally:
                     self._active_vision_request_id = None
-                    self._active_vision_storage_replacements = []
                     self._active_vision_prompt_overlays = []
                     self._active_vision_attachment_occurrences = set()
                     self._request_local_image_overlay_messages = []
@@ -4052,7 +4148,7 @@ class ReActAgent(AgentBase):
                 bind_source({"stream_id": f"{stream_scope}:{stream_phase or step}"}, message)
 
         _turn_prepare_started = _time.perf_counter()
-        has_content, user_index, storage_content, vision_event = await self._prepare_turn(msg)
+        has_content, user_index, _, vision_event = await self._prepare_turn(msg)
         _turn_prepare_ms = (_time.perf_counter() - _turn_prepare_started) * 1000
         if not has_content:
             yield with_request({"type": "done", "content": ""})
@@ -4076,7 +4172,6 @@ class ReActAgent(AgentBase):
         budget_warned: set[str] = set()
         turn_tool_cache: dict[str, dict] = {}
         completed_tool_events: list[dict] = []
-        auto_image_messages: list[tuple[int, object]] = []
         active_groups = {"core"}
         blocked_tools: set[str] = set()
         # Per tool, the circuit counts consecutive failures of the exact same
@@ -4948,10 +5043,6 @@ class ReActAgent(AgentBase):
                         self._request_local_image_overlay_messages.append(
                             self.context.messages[image_index]
                         )
-                    auto_image_messages.append((image_index, image_storage_content))
-                    self._active_vision_storage_replacements.append(
-                        (image_index, image_storage_content)
-                    )
                     if occurrence_id:
                         self._active_vision_attachment_occurrences.add(occurrence_id)
                     if emit_events and image_status is not None:
@@ -5122,11 +5213,6 @@ class ReActAgent(AgentBase):
                     yield with_request({"type": "chunk", "content": final_text})
             append_assistant(self._assistant_message(final_text, None, final_reasoning, final_provider_state))
             last_text = final_text
-
-        if user_index is not None and storage_content is not None:
-            self.context.replace_message_content(user_index, storage_content)
-        for image_index, image_storage_content in auto_image_messages:
-            self.context.replace_message_content(image_index, image_storage_content)
 
         if task_id and self.task_store is not None:
             try:
@@ -5576,6 +5662,13 @@ class ReActAgent(AgentBase):
             await self._seal_turn_changes_async(turn_store)
         except TurnBudgetExceeded as exc:
             await self._record_turn_budget_exhaustion(msg, exc)
+            raise
+        except asyncio.CancelledError:
+            # Persist what the turn recorded before stopping, as reply_stream
+            # does: completed results and unknown outcomes reach the session.
+            logger.warning("react reply cancelled request_id=%s", msg.metadata.get("request_id") or msg.id)
+            self.context.sanitize_tool_history()
+            await self.context.save_async()
             raise
         finally:
             try:

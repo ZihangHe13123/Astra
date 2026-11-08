@@ -179,16 +179,32 @@ of which you approve. Run it again any time.
 
 **你的数据** at the end of the memory page saves everything Astra keeps about you as one zip:
 the two core files, saved memories, conversations and their search index, scheduled jobs and
-their results, and learned skills. It never includes `.env` or other keys, provider
-connections, the WeChat login, browser logins or settings. **清除…** lists what a wipe would
-delete and what stays, and deletes only after you type 清除: the same data plus every copy made
-from it (search and vector indexes, task, event and approval records, the desktop's history cache
-and pasted images). Logins in Astra's own browser go only if you tick that box. Settings,
-models, keys, the WeChat login, the mail cache and activity history stay, and a Hindsight server
-keeps its own memories. The desktop closes every conversation and its background host first and
-reloads afterwards. In a terminal the same is `astra data plan`, `astra data export --out
-FILE.zip` and `astra data wipe --confirm 清除 [--browser-data]`; a wipe refuses while any other
-Astra runs. In a source checkout, files tracked by git (such as bundled skills) are never deleted.
+their results, learned skills, and the files the personal thread wrote in its own folder. It
+never includes `.env` files (wherever they sit, the personal folder too) or other keys,
+provider connections, the WeChat login, browser logins, paired phones or settings. **清除…**
+lists what a wipe would delete and what stays, and deletes only after you type 清除: the same
+data plus every copy made from it (search and vector indexes, task, event and approval records,
+the desktop's history cache and pasted images, photos and files sent from a phone, the edit
+snapshots and caches in the personal folder, speech made for a phone and the phone audit log).
+The files the personal thread wrote in its folder are its work, like the files in a project,
+and go only if you tick that box; even then any `.env` or key file among them (the same names
+an export leaves out) stays. The logins in Astra's own browser also go only if ticked. Settings, models,
+keys, the WeChat login, paired phones (remove them in Settings), the mail cache and activity
+history stay, and a Hindsight server keeps its own memories. The desktop closes every conversation and its background host
+first and reloads afterwards, and so does every paired phone. If something could not be
+deleted (say a file another program holds), the window still reloads, since the rest is gone,
+and then says what stayed and why; close that program and wipe again. In a terminal the same
+is `astra data plan`, `astra data export --out FILE.zip` and `astra data wipe --confirm 清除
+[--browser-data] [--personal-files]`; a wipe refuses while any other Astra runs, and one that
+left something lists it under `failed` and exits with status 1. In a source checkout, files tracked by git
+(such as bundled skills) are never deleted. Neither command follows a symbolic link (or a
+Windows junction) inside Astra's data folder, nor anywhere on the way to a path set elsewhere
+(such as `AGENT_SESSION_DIR`), where only the system's own links, owned by root like macOS's
+`/tmp` and `/var`, are accepted. The same holds for a link found at any depth inside the
+folders they go through, such as a junction deep in the personal folder: it is left as it is.
+What lies behind a link could be anywhere, so it is neither exported (the export lists it
+under `skipped`) nor deleted (the wipe lists it under `failed`). The zip is written to a new file of its own beside the chosen name and then moved
+into place, so a link at that name is replaced, never written through.
 
 ## Memory commands
 

@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { initialSession, projectEvent } from "../src/session-state.js";
-import { createBackendEventReceiver } from "../src/backend-protocol.js";
+import { createBackendEventReceiver, EventDeliveryState } from "../src/backend-protocol.js";
 
 test("partial output survives an error; history replaces instead of appending", () => {
   let state = initialSession("a");
@@ -217,4 +217,145 @@ test("a job's result joins the personal thread as Astra's message, the way histo
   // Reloaded, the thread shows the same words: the backend stored them as an assistant message.
   const reloaded = projectEvent(state, { type: "history", session_id: "personal", messages: [{ role: "assistant", content: "【定时任务：AI 晚报】\n三条新闻" }] });
   assert.equal(reloaded.messages.at(-1)?.content, state.messages.at(-1)?.content);
+});
+
+// One backend connection as the clients receive it: live frames carry a sequence, and a skipped
+// sequence makes the receiver ask for the event_stream.replay page of journaled events.
+function connection() {
+  let state = projectEvent(initialSession("a"), { type: "gui_ready" });
+  const gaps: number[] = [];
+  const handled: string[] = [];
+  const receive = createBackendEventReceiver(event => {
+    handled.push(`${event.type}:${(event as { request_id?: string }).request_id ?? ""}`);
+    state = projectEvent(state, event);
+  }, () => assert.fail(), { delivery: new EventDeliveryState(), onGap: cursor => gaps.push(cursor) });
+  let sequence = 0;
+  const live = (cursor: number, event: object, { lost = false, replayable = true } = {}) => {
+    sequence++;
+    if (!lost) receive(JSON.stringify({ ...event, generation: "g", sequence, cursor, replayable, event_id: `E${sequence}` }));
+  };
+  const replay = (cursor: number, sequence: number, event: object) =>
+    receive(JSON.stringify({ ...event, cursor, sequence: cursor, replayable: true, replayed: true, event_id: `E${sequence}` }));
+  return { live, replay, gaps, handled, receive, get state() { return state; } };
+}
+
+test("a lost approval request replayed after its live resolution stays resolved", () => {
+  const c = connection();
+  const request = { type: "tool_approval_request", request_id: "r1", tool_name: "bash", choices: ["once", "deny"] };
+  c.live(9, { type: "task_started", task: { id: "t1", status: "running" } });
+  c.live(10, request, { lost: true });
+  c.live(11, { type: "approval_resolved", request_id: "r1", decision: "once" });
+  assert.deepEqual(c.gaps, [9]);
+  c.replay(10, 2, request);
+  c.replay(11, 3, { type: "approval_resolved", request_id: "r1", decision: "once" });
+  c.receive(JSON.stringify({ type: "event_replay_complete", after_cursor: 9, next_cursor: 11, has_more: false }));
+  assert.deepEqual(c.state.approvals, []);
+  // No client is handed the stale request; the terminal client keeps its own list from these events.
+  assert.equal(c.handled.includes("tool_approval_request:r1"), false);
+  c.live(12, { type: "task_status", task: { id: "t1", status: "completed" } });
+  c.live(13, { type: "done" });
+  assert.deepEqual(c.state.approvals, []);
+  assert.equal(c.state.busy, false);
+});
+
+test("a finished task's own approvals and waiting questions end with it; a worker's approval and a pending question remain", () => {
+  const c = connection();
+  c.live(8, { type: "task_started", task: { id: "t1", status: "running" } });
+  c.live(9, { type: "tool_calls", calls: [{ id: "call-1", name: "bash" }] });
+  c.live(10, { type: "tool_approval_request", request_id: "r1", call_id: "call-1", tool_name: "bash" });
+  // A subagent asks for a call of its own, which is not in the conversation's tool list.
+  c.live(11, { type: "tool_approval_request", request_id: "r2", call_id: "worker-call", tool_name: "bash" });
+  c.live(11, { type: "user_question_request", request_id: "q1", task_id: "t1", state: "waiting", questions: [] }, { replayable: false });
+  c.live(11, { type: "user_question_request", request_id: "q2", task_id: "t1", state: "waiting", mode: "timed", questions: [] }, { replayable: false });
+  c.live(11, { type: "user_question_pending", request_id: "q2", task_id: "t1", state: "pending" }, { replayable: false });
+  // r1's resolution is lost and the turn's end arrives first, so the replayed resolution is superseded.
+  c.live(12, { type: "approval_resolved", request_id: "r1", decision: "deny" }, { lost: true });
+  c.live(13, { type: "task_status", task: { id: "t1", status: "cancelled" } });
+  c.live(14, { type: "done" });
+  assert.deepEqual(c.gaps, [11]);
+  c.replay(12, 8, { type: "approval_resolved", request_id: "r1", decision: "deny" });
+  c.receive(JSON.stringify({ type: "event_replay_complete", after_cursor: 11, next_cursor: 12, has_more: false }));
+  assert.deepEqual(c.state.approvals.map(a => a.request_id), ["r2"]);
+  assert.deepEqual(c.state.questions.map(q => q.request_id), ["q2"]);
+  assert.equal(c.state.busy, false);
+});
+
+test("a finished background run stays finished when its older running event is replayed", () => {
+  const c = connection();
+  const run = (status: string, event: string) =>
+    ({ type: "process_status", event, process_id: "p1", kind: "shell", label: "npm test", status, started_at: 1 });
+  c.live(8, { type: "task_started", task: { id: "t1", status: "running" } });
+  c.live(9, run("running", "process_started"), { lost: true });
+  c.live(10, run("running", "process_output"), { lost: true });
+  c.live(11, run("completed", "process_completed"));
+  assert.deepEqual(c.gaps, [8]);
+  c.replay(9, 2, run("running", "process_started"));
+  c.replay(10, 3, run("running", "process_output"));
+  c.replay(11, 4, run("completed", "process_completed"));
+  c.receive(JSON.stringify({ type: "event_replay_complete", after_cursor: 8, next_cursor: 11, has_more: false }));
+  assert.equal(c.state.processes.p1.status, "completed");
+  // Neither client is handed the older events, so the terminal client's own list stays right too.
+  assert.equal(c.handled.filter(event => event.startsWith("process_status")).length, 1);
+});
+
+test("an ended task is not restarted by its replayed start, while a later resume of the same task is", () => {
+  const c = connection();
+  c.live(7, { type: "gui_ready" }, { replayable: false });
+  c.live(8, { type: "task_started", task: { id: "t1", status: "running" } }, { lost: true });
+  c.live(9, { type: "task_status", task: { id: "t1", status: "interrupted" } });
+  assert.deepEqual(c.gaps, [0]);
+  c.replay(8, 2, { type: "task_started", task: { id: "t1", status: "running" } });
+  c.replay(9, 3, { type: "task_status", task: { id: "t1", status: "interrupted" } });
+  c.receive(JSON.stringify({ type: "event_replay_complete", after_cursor: 0, next_cursor: 9, has_more: false }));
+  assert.equal(c.state.info.task_status.task.status, "interrupted");
+  assert.equal(c.state.busy, false);
+  // /resume continues the same task id later in the journal: that start is newer and applies.
+  c.live(10, { type: "task_started", task: { id: "t1", status: "running" } });
+  assert.equal(c.state.busy, true);
+});
+
+test("an earlier task's replayed end closes its own approval but not the turn that started after it", () => {
+  const c = connection();
+  c.live(8, { type: "task_started", task: { id: "A", status: "running" } });
+  c.live(9, { type: "tool_calls", calls: [{ id: "call-a", name: "bash" }] });
+  c.live(10, { type: "tool_approval_request", request_id: "ra", call_id: "call-a", tool_name: "bash" });
+  c.live(11, { type: "task_status", task: { id: "A", status: "cancelled" } }, { lost: true });
+  c.live(12, { type: "task_started", task: { id: "B", status: "running" } });
+  assert.deepEqual(c.gaps, [10]);
+  c.replay(11, 4, { type: "task_status", task: { id: "A", status: "cancelled" } });
+  c.replay(12, 5, { type: "task_started", task: { id: "B", status: "running" } });
+  c.receive(JSON.stringify({ type: "event_replay_complete", after_cursor: 10, next_cursor: 12, has_more: false }));
+  assert.equal(c.state.info.task_status.task.id, "B");
+  assert.equal(c.state.busy, true);
+  assert.deepEqual(c.state.approvals, [], "A's own record still ends");
+  c.live(13, { type: "task_status", task: { id: "B", status: "completed" } });
+  assert.equal(c.state.busy, false);
+});
+
+test("an earlier turn's replayed done leaves the running turn and its streaming answer alone", () => {
+  const c = connection();
+  c.live(8, { type: "task_started", task: { id: "A", status: "running" } });
+  c.live(9, { type: "done" }, { lost: true });
+  c.live(10, { type: "task_started", task: { id: "B", status: "running" } });
+  c.live(10, { type: "chunk", content: "second " }, { replayable: false });
+  assert.deepEqual(c.gaps, [8]);
+  // The journal keeps only the type of a done: no task id, just its place.
+  c.replay(9, 2, { type: "done" });
+  c.receive(JSON.stringify({ type: "event_replay_complete", after_cursor: 8, next_cursor: 10, has_more: false }));
+  c.live(10, { type: "chunk", content: "answer" }, { replayable: false });
+  assert.equal(c.state.busy, true);
+  assert.deepEqual(c.state.messages.filter(m => m.role === "assistant").map(m => m.content), ["second answer"]);
+});
+
+test("an earlier task's start and end replayed after the next task began leave that task current", () => {
+  const c = connection();
+  c.live(7, { type: "done" });
+  c.live(8, { type: "task_started", task: { id: "A", status: "running" } }, { lost: true });
+  c.live(9, { type: "task_status", task: { id: "A", status: "completed" } }, { lost: true });
+  c.live(10, { type: "task_started", task: { id: "B", status: "running" } });
+  c.replay(8, 2, { type: "task_started", task: { id: "A", status: "running" } });
+  c.replay(9, 3, { type: "task_status", task: { id: "A", status: "completed" } });
+  c.receive(JSON.stringify({ type: "event_replay_complete", after_cursor: 7, next_cursor: 10, has_more: false }));
+  assert.equal(c.state.info.task_status.task.id, "B");
+  assert.equal(c.state.busy, true);
 });

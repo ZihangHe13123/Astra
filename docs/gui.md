@@ -260,7 +260,9 @@ conversation, presenting and printing are Astra's own code; the model writes onl
 - Slides run under the same rules as a page: no access to Astra, no network, no storage, no
   pop-ups, no navigation.
 - Everything of a canvas is read and written inside its folder, where that really is: content,
-  images, versions or exports reached through a link out of the folder are refused.
+  images, versions or exports reached through a link out of the folder are refused. An export is
+  written as a new file and renamed over its name, so a link already at that name is replaced,
+  never written through; an exports folder swapped for a link while it is made gets nothing.
 
 ### Documents
 
@@ -270,9 +272,11 @@ writes section by section with the `doc_*` tools (the "documents" family of `too
 - The Files panel shows it rendered, with its outline above: click a heading to go to it. Open
   review comments are listed on top.
 - Select a passage and write what should change: **写进文档** writes the comment into `doc.md` as
-  `<!-- @astra: ... -->` right after the passage (at the end of its line when the Markdown spells
-  it differently, at the end of the document when it cannot be found; never inside a heading or a
-  code block). Ask Astra to handle the comments; `doc_comments` lists them and the model resolves
+  `<!-- @astra: ... -->` right after the passage you selected, even when the same text appears
+  earlier (at the end of its line when the Markdown spells it differently, at the end of the
+  document when it cannot be found). It never goes inside a heading, a code span or a code block:
+  it follows them. If the document changed after you selected, the comment is refused and you are
+  asked to refresh and select again. Ask Astra to handle the comments; `doc_comments` lists them and the model resolves
   each one with `doc_edit`.
 - Export with `doc_export` (Word, PDF or HTML), as for any Markdown document. `canvas_look` and the
   canvas's own export are for decks.

@@ -29,11 +29,71 @@ def test_qq_admission_and_owner_authority_are_explicit():
         await OneBotAdapter(OneBotConfig(enabled=True), handler)._handle_payload(Connection(), payload)
         assert seen == []
         adapter = OneBotAdapter(OneBotConfig(allow_users=("1",), owner_users=("2",)), handler)
-        await adapter._handle_payload(Connection(), payload)
+        await adapter._handle_payload(Connection(), payload, True)
+        await adapter._handle_payload(Connection(), {**payload, "user_id": 2}, True)
+        await adapter._handle_payload(Connection(), {**payload, "user_id": 2, "message_type": "group", "group_id": 3, "message": "/ hi"}, True)
+        # The owner's ID on a connection that presented no access token is an ordinary contact.
         await adapter._handle_payload(Connection(), {**payload, "user_id": 2})
-        await adapter._handle_payload(Connection(), {**payload, "user_id": 2, "message_type": "group", "group_id": 3, "message": "/ hi"})
-        assert [message.local_tools for message in seen] == [False, True, False]
+        assert [message.local_tools for message in seen] == [False, True, False, False]
     asyncio.run(run())
+
+
+def test_qq_owner_control_needs_the_access_token_and_no_web_page_can_connect(tmp_path, monkeypatch, caplog):
+    from websockets.asyncio.client import connect
+    from websockets.exceptions import ConnectionClosedError, InvalidStatus
+    from agent.runtime.context import AgentContext
+    from agent.runtime.tools.access_scope import tool_access_scope
+
+    monkeypatch.setenv("ASTRA_HOME", str(tmp_path / "state"))
+    scopes = []
+
+    class Agent:
+        def __init__(self):
+            self.context = AgentContext(system_prompt="OWNER_PROMPT_MARKER")
+            self.llm = None
+
+        async def reply_stream(self, msg):
+            scopes.append(tool_access_scope.get())
+            yield {"type": "chunk", "content": "OWNER_ANSWER" if tool_access_scope.get() is None else "chat"}
+
+    async def owner_turn(headers=None, origin=None):
+        router = AgentChannelRouter(Agent(), asyncio.Lock(), tmp_path / "sessions")
+        adapter = OneBotAdapter(OneBotConfig(host="127.0.0.1", port=0, owner_users=("2",)), router.handle)
+        await adapter.start()
+        try:
+            url = f"ws://127.0.0.1:{adapter._server.sockets[0].getsockname()[1]}"
+            async with connect(url, origin=origin, additional_headers=headers or {}) as bridge:
+                await bridge.send(json.dumps({"post_type": "message", "message_type": "private", "self_id": 42,
+                                              "user_id": 2, "message": "list my files"}))
+                return json.loads(await asyncio.wait_for(bridge.recv(), 5))["params"]["message"]
+        finally:
+            await adapter.stop()
+
+    monkeypatch.delenv("ASTRA_QQ_ACCESS_TOKEN", raising=False)
+    with caplog.at_level("WARNING", logger="agent.channels.onebot"):
+        # A web page's socket carries its Origin; the handshake is refused before any message.
+        try:
+            asyncio.run(owner_turn(origin="https://attacker.example"))
+        except InvalidStatus as exc:
+            assert exc.response.status_code == 403
+        else:
+            raise AssertionError("a browser origin was accepted")
+        assert scopes == []
+        # Without a token the owner's ID gets what a contact gets.
+        assert asyncio.run(owner_turn()) == "chat"
+    assert scopes[-1] is not None and "write_file" not in scopes[-1]
+    assert any("ASTRA_QQ_ACCESS_TOKEN" in record.getMessage() and "ordinary contacts" in record.getMessage()
+               for record in caplog.records)
+
+    monkeypatch.setenv("ASTRA_QQ_ACCESS_TOKEN", "fixture-token")
+    try:
+        asyncio.run(owner_turn({"Authorization": "Bearer wrong-token"}))
+    except ConnectionClosedError as exc:
+        assert exc.rcvd is not None and exc.rcvd.code == 1008
+    else:
+        raise AssertionError("a wrong token was accepted")
+    assert asyncio.run(owner_turn({"Authorization": "Bearer fixture-token"})) == "OWNER_ANSWER"
+    assert scopes[-1] is None
 
 
 def test_chat_scope_blocks_tools_and_automatic_owner_context_and_restores_owner(tmp_path, monkeypatch):
@@ -81,7 +141,7 @@ def test_chat_scope_blocks_tools_and_automatic_owner_context_and_restores_owner(
     assert not (tmp_path / "bad.txt").exists()
 
 
-def test_no_echo_matches_only_the_unique_request_on_its_connection(monkeypatch):
+def test_a_receipt_settles_only_the_action_with_its_echo(monkeypatch):
     from websockets.asyncio.client import connect
     monkeypatch.delenv("ASTRA_QQ_ACCESS_TOKEN", raising=False)
     async def run():
@@ -104,8 +164,13 @@ def test_no_echo_matches_only_the_unique_request_on_its_connection(monkeypatch):
                     first = asyncio.create_task(adapter._call_action(server_a, "fixture", {"for": "A"}))
                     second = asyncio.create_task(adapter._call_action(server_b, "fixture", {"for": "B"}))
                     req_a = json.loads(await asyncio.wait_for(a.recv(), 2))
-                    await asyncio.wait_for(b.recv(), 2)
-                    await b.send(json.dumps({"status": "ok", "retcode": 0, "data": "B"}))
+                    req_b = json.loads(await asyncio.wait_for(b.recv(), 2))
+                    # Without an echo, or with another connection's, a receipt settles nothing.
+                    await b.send(json.dumps({"status": "ok", "retcode": 0, "data": "not B"}))
+                    await b.send(json.dumps({"status": "ok", "retcode": 0, "echo": req_a["echo"], "data": "not A"}))
+                    await asyncio.sleep(0.1)
+                    assert not first.done() and not second.done()
+                    await b.send(json.dumps({"status": "ok", "retcode": 0, "echo": req_b["echo"], "data": "B"}))
                     assert (await asyncio.wait_for(second, 2))["data"] == "B"
                     assert not first.done()
                     await a.send(json.dumps({"status": "ok", "retcode": 0, "echo": req_a["echo"], "data": "A"}))
@@ -115,9 +180,10 @@ def test_no_echo_matches_only_the_unique_request_on_its_connection(monkeypatch):
     asyncio.run(run())
 
 
-def test_ambiguous_no_echo_is_unknown_for_all_candidates_and_never_replayed(monkeypatch):
+def test_actions_without_their_receipt_time_out_unknown_and_are_never_replayed(monkeypatch):
     from websockets.asyncio.client import connect
     monkeypatch.delenv("ASTRA_QQ_ACCESS_TOKEN", raising=False)
+    monkeypatch.setattr("agent.channels.onebot._ACTION_SECONDS", 0.3)
     async def run():
         async def unused(*args):
             return ""
@@ -134,7 +200,7 @@ def test_ambiguous_no_echo_is_unknown_for_all_candidates_and_never_replayed(monk
                 assert len({request["echo"] for request in requests}) == 2
                 await client.send(json.dumps({"status": "ok", "retcode": 0}))
                 results = await asyncio.wait_for(asyncio.gather(*actions, return_exceptions=True), 2)
-                assert all(isinstance(result, RuntimeError) and "outcome unknown" in str(result) for result in results)
+                assert all(isinstance(result, TimeoutError) and "outcome unknown" in str(result) for result in results)
                 assert not adapter._pending_actions
                 try:
                     await asyncio.wait_for(client.recv(), .02)

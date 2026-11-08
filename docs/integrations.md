@@ -23,7 +23,17 @@ unauthenticated public binding. Requests carrying a browser `Origin` header
 also require configured bearer authentication, even on loopback.
 
 `POST /v1/chat/completions` supports streaming and non-streaming responses.
-Malformed consumed fields return HTTP 400 before session or Agent work. This
+Malformed consumed fields, including a missing `messages`, return HTTP 400
+with an OpenAI-style `error` object before session or Agent work. An image
+Astra cannot prepare for the model (for example invalid inline data) is also
+invalid input: HTTP 400 with `code` `vision_preprocess_failed`. A turn that
+ends without an answer is not returned as assistant text: non-streaming
+requests get HTTP 504 when the model provider or the turn timed out and 502
+otherwise, each with an `error` object (`code` names the cause, such as
+`idle_timeout`, `upstream_error` or `no_answer`). A stream has already sent
+HTTP 200, so it ends with a `data: {"error": ...}` frame, a final chunk whose
+`finish_reason` is `"error"`, and `[DONE]`. Notes the Agent went on from, such
+as a tool budget stop followed by its summary, stay in the answer text. This
 bridge exposes Astra's local tools to authenticated callers; use a trusted
 network or a TLS reverse proxy for remote access. Native messaging channels
 remain a separate integration.
@@ -65,26 +75,39 @@ cp config/channels.example.json .astra/channels.json
 
 Then set `qq.enabled` to `true`. The safe default listens on
 `127.0.0.1:2280`; configure NapCat's reverse WebSocket URL as
-`ws://127.0.0.1:2280`. If an access token is configured in NapCat, put the same
-value in `ASTRA_QQ_ACCESS_TOKEN`—the token itself is never stored in the JSON
-file. Private messages are accepted by default. Group messages require either
-an @mention or a configured wake prefix (default `/`) to avoid unsolicited
-replies.
+`ws://127.0.0.1:2280`. Set an access token in NapCat and put the same value in
+`ASTRA_QQ_ACCESS_TOKEN`—the token itself is never stored in the JSON file.
+Without a token Astra cannot tell NapCat from any other program on the
+computer, so it still answers admitted contacts but treats `owner_users` as
+ordinary contacts and logs a warning. Handshakes that carry an `Origin` header
+are refused, so a web page cannot open the socket (NapCat sends none). A `host`
+other than a loopback address is logged as a warning, since other computers can
+then reach the port. Private messages are accepted by default. Group messages
+require either an @mention or a configured wake prefix (default `/`) to avoid
+unsolicited replies.
 
 Configure `qq.allow_users` with the QQ IDs permitted to chat; an empty list no
 longer accepts everyone. These contacts receive public web/chat tools only,
 without local files, history, memory, project instructions or delegation.
 For private remote control, explicitly list trusted owner IDs in
-`qq.owner_users`; owners need not also appear in allow_users. Group messages
-always use chat capabilities, including those sent by an owner. Revoking owner
-access starts a separate restricted conversation; old owner history remains on
-disk and is never loaded into that chat.
+`qq.owner_users` and configure the access token; owners need not also appear in
+allow_users. Group messages always use chat capabilities, including those sent
+by an owner. Revoking owner access starts a separate restricted conversation;
+old owner history remains on disk and is never loaded into that chat.
+Messages are answered one at a time in the order NapCat delivered them. While a
+turn runs, up to 32 more messages per NapCat connection wait for theirs; later
+ones are dropped and logged. Frames Astra would not answer (heartbeats,
+notices, senders who are not admitted, group chat without a mention) are
+discarded on arrival.
 
 Only one service may own port 2280. Stop or reconfigure AstrBot before enabling
 the native QQ adapter. Adapter startup failure is reported without taking down
-the TUI, and all adapters are closed when the Astra backend exits. Tool
-operations that would normally require an interactive approval are denied on
-messaging channels rather than waiting forever for a hidden prompt.
+the TUI, and all adapters are closed when the Astra backend exits. A QQ turn's
+step that needs approval is not asked in the chat: it goes to Astra's approval
+inbox and to the open window of the backend that runs the channel, which can
+approve it, and what is allowed there applies to that QQ chat only. No answer
+within five minutes counts as a denial, so a request nobody sees never holds
+the channel; without a working approval inbox the step is denied at once.
 
 QQ image segments are downloaded with public-URL checks and bounded size, then
 passed to vision-capable models as native multimodal content. Local file sending
@@ -93,7 +116,12 @@ sender QQ IDs in `file_allow_users` (or `allow_users`), and restrict
 `send_file_roots` to output directories that are safe to share. The
 `channel_send_file` tool rejects paths outside those roots, hidden files and
 folders, application data and common credential files even when requested by
-the model.
+the model. A file goes back over the NapCat connection the request came from,
+and only a receipt carrying the upload's echo settles it; receipts without an
+echo are ignored. An upload with no such receipt within 30 seconds, or cut off
+by a disconnect, is reported to the model as unconfirmed (it may or may not
+have arrived) and is never resent automatically. When NapCat disconnects, the
+turn answering it is cancelled.
 
 ### WeChat
 

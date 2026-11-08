@@ -137,6 +137,29 @@ export async function exportTarget(manifestPath: string, target: string): Promis
   return join(await canvasFolder(await canvasRoot(manifestPath), "exports"), basename(target));
 }
 
+/**
+ * Write an export at a target `exportTarget` gave: a new file of its own beside it, renamed over the name, so a
+ * link already at the name is replaced and never written through.
+ */
+export async function writeExport(target: string, data: Uint8Array): Promise<void> {
+  const folder = dirname(target);
+  // `exportTarget` gave the folder's real location; a print takes a while, and a folder swapped for a link
+  // meanwhile is no longer where it was checked. Looked at again right before each write.
+  const unmoved = async () => {
+    if (await realpath(folder).catch(() => "") !== folder) throw new Error("导出文件夹在导出期间被换成了别处，没有写入。");
+  };
+  await mkdir(folder, { recursive: true });
+  await unmoved();
+  const temporary = join(folder, `.${basename(target)}.${randomUUID()}.tmp`);
+  try {
+    await writeFile(temporary, data, { flag: "wx" });
+    await unmoved();
+    await rename(temporary, target);
+  } finally {
+    await rm(temporary, { force: true });
+  }
+}
+
 /** Where the slides' pictures for a PPTX may be written: the `.slides` folder in its exports, nowhere else. */
 export async function slidesTarget(manifestPath: string, target: string): Promise<string> {
   if (target !== join(dirname(manifestPath), "exports", ".slides")) throw new Error("幻灯片图片只能写进画布 exports 里的 .slides 文件夹。");
@@ -219,8 +242,24 @@ export async function restoreVersion(manifestPath: string, id: string): Promise<
   return rewrite(manifestPath, "restore", () => kept);
 }
 
-/** A comment from the person on a passage of a document canvas, written where the doc_* tools read it. */
-export async function commentOnDocument(manifestPath: string, passage: string, comment: string): Promise<string | undefined> {
+/** What a document's text was, as the preview showed it and as a comment is checked against. */
+export function documentDigest(text: string): string {
+  return createHash("sha256").update(text, "utf8").digest("hex");
+}
+
+/**
+ * A comment from the person on a passage of a document canvas, written where the doc_* tools read it:
+ * `occurrence` is which of the same text they selected, and `digest` the document's text when they selected
+ * it. That is checked against the very text being rewritten, so a document changed since, even a moment
+ * before it is read here, is not commented on in a place they did not see.
+ */
+export async function commentOnDocument(manifestPath: string, passage: string, comment: string,
+  selected: { occurrence?: number; digest?: string } = {}): Promise<string | undefined> {
   if ((await manifestOf(manifestPath)).type !== "doc") throw new Error("只有文档画布可以批注。");
-  return rewrite(manifestPath, "comment", current => Buffer.from(insertComment(current.toString("utf8"), passage, comment)));
+  return rewrite(manifestPath, "comment", current => {
+    const text = current.toString("utf8");
+    if (selected.digest !== undefined && documentDigest(text) !== selected.digest)
+      throw new Error("文档在你选中之后改过了，请刷新预览后重新选择。");
+    return Buffer.from(insertComment(text, passage, comment, selected.occurrence ?? 0));
+  });
 }

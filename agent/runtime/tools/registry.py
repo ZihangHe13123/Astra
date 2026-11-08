@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from collections.abc import Awaitable, Callable
@@ -51,6 +52,39 @@ _OMISSION_MARKER = "\n\n... [middle omitted] ...\n\n"
 _REQUEST_LOCAL_RESULT_PLACEHOLDER = (
     "[Request-local tool result omitted after its one permitted model request.]"
 )
+
+
+async def _run_sync_tool(fn: Callable[..., Any], kwargs: dict[str, Any], entered: Callable[[], None]) -> Any:
+    """Run a synchronous tool in a worker thread; ``entered`` fires once ``fn`` is entered.
+
+    The worker thread and the loop settle under one lock whether the function
+    was entered. If the caller gives up first (cancellation or a timeout while
+    the call still waits for a thread), the worker returns without calling it,
+    so a call that never ran is never reported as started.
+    """
+    loop = asyncio.get_running_loop()
+    lock = threading.Lock()
+    state = {"entered": False, "abandoned": False}
+
+    def run() -> Any:
+        with lock:
+            if state["abandoned"]:
+                return None
+            state["entered"] = True
+        loop.call_soon_threadsafe(entered)
+        return fn(**kwargs)
+
+    try:
+        result = await asyncio.to_thread(run)
+    except BaseException:
+        with lock:
+            ran = state["entered"]
+            state["abandoned"] = not ran
+        if ran:
+            entered()
+        raise
+    entered()
+    return result
 
 
 def approval_justification_schema() -> dict[str, dict[str, str]]:
@@ -1100,7 +1134,13 @@ class ToolRegistry:
         call_id: str = "",
         task_id: str = "",
         execution_origin: str = "",
+        on_start: Callable[[], None] | None = None,
     ) -> dict:
+        """Run one tool call through scope, hooks, policy and approval.
+
+        ``on_start`` is called when the tool's own function is entered, after
+        every check and approval; a call stopped before then did not run.
+        """
         def report(
             stage: str,
             *,
@@ -1523,16 +1563,23 @@ class ToolRegistry:
                             call_args["_progress"] = report
                         if "_task_id" in params:
                             call_args["_task_id"] = task_id
-                        async def invoke_tool(bound_call_args: dict[str, Any] = call_args) -> Any:
+                        def entered() -> None:
                             nonlocal handler_started
-                            check_work_budget()
+                            if handler_started:
+                                return
                             handler_started = True
+                            if on_start is not None:
+                                on_start()
+
+                        async def invoke_tool(bound_call_args: dict[str, Any] = call_args) -> Any:
+                            check_work_budget()
                             if asyncio.iscoroutinefunction(tool.fn):
+                                entered()
                                 raw_result = await tool.fn(**bound_call_args)
                             else:
-                                raw_result = await asyncio.to_thread(
-                                    tool.fn, **bound_call_args
-                                )
+                                # Entered only once a worker thread runs it, not
+                                # while the call still waits in the pool's queue.
+                                raw_result = await _run_sync_tool(tool.fn, bound_call_args, entered)
                             if not isinstance(raw_result, ToolPrivateResult):
                                 return raw_result
                             slot = _PRIVATE_RESULT_SLOT.get()

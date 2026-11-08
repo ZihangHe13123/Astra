@@ -1,15 +1,18 @@
 """The person's own data: export it as one zip, or wipe it (``astra data``).
 
 ``export`` copies what Astra keeps about the person: the two core memory files, saved memories,
-conversations and their search index, scheduled jobs, and learned skills. SQLite files go through SQLite's
-backup API, so an export is consistent while Astra runs. Credentials and logins (.env, provider connections,
-the WeChat login, browser profiles) are never exported.
+conversations and their search index, scheduled jobs, learned skills, and the files the personal thread wrote
+in its own folder. SQLite files go through SQLite's backup API, so an export is consistent while Astra runs.
+Credentials and logins (.env, provider connections, the WeChat login, browser profiles, paired phones) are
+never exported, nor is any .env file or file named like a key inside the exported folders.
 
 ``wipe`` deletes the same data and every copy made from it (search and vector indexes, task, event and
-approval records, the desktop's history cache and pasted images). It runs only while no other Astra runs,
-and only when the person types 清除. Browser profiles (logins inside Astra's own browser) go only with
---browser-data. Settings, models, credentials and logins, the mail cache and activity history stay. In a
-source checkout, files tracked by git are never deleted.
+approval records, the desktop's history cache and pasted images, photos and files sent from a phone, the edit
+snapshots and caches in the personal folder, speech made for a phone and the phone's audit log). It runs only
+while no other Astra runs, and only when the person types 清除. The files the personal thread wrote, its work
+like any project's, go only with --personal-files, and browser profiles (logins inside Astra's own browser)
+only with --browser-data. Settings, models, credentials and logins (paired phones among them), the mail cache
+and activity history stay. In a source checkout, files tracked by git are never deleted.
 """
 
 from __future__ import annotations
@@ -17,8 +20,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -38,9 +41,16 @@ _SQLITE_SUFFIXES = (".db", ".sqlite3")
 _SQLITE_SIDES = ("-wal", "-shm", "-journal")
 # Locks and markers belong to running processes, not to the person.
 _SKIP_NAMES = {".writers", "owners", "scheduler.lock", "active", "last-interaction"}
-NOT_EXPORTED = (".env 和其他密钥", "模型和服务商连接", "微信登录", "浏览器登录（Astra 浏览器的配置文件）", "设置",
-                "邮件缓存", "活动记录")
-KEPT = ("设置和模型", ".env 和其他密钥、服务商连接", "微信登录", "邮件缓存（可以重新同步）",
+# Never exported, wherever they sit (the personal folder is a workspace): .env files, and files named or
+# shaped like credentials, the same ones a channel never sends (agent/channels/tools.py).
+_CREDENTIAL_NAMES = {"credentials", "credentials.json", "id_dsa", "id_ecdsa", "id_ed25519", "id_rsa", "cookies",
+                     "login data"}
+_CREDENTIAL_SUFFIXES = {".key", ".pem", ".pfx", ".p12"}
+NOT_EXPORTED = (".env 和其他密钥", "模型和服务商连接", "微信登录", "浏览器登录（Astra 浏览器的配置文件）", "配对的手机",
+                "设置", "邮件缓存", "活动记录")
+PERSONAL_LABEL = "个人对话写的文件"
+PERSONAL_KEPT = f"{PERSONAL_LABEL}（选了一起清除才删）"
+KEPT = ("设置和模型", ".env 和其他密钥（个人对话文件夹里的也保留）、服务商连接", "微信登录", "配对的手机（在设置里移除）", "邮件缓存（可以重新同步）",
         "活动记录（在活动页单独清除）", "Hindsight 服务器上的记忆（如果用了，要在那边清）")
 
 
@@ -51,6 +61,12 @@ class Item:
     path: Path
     export: bool
     browser: bool = False
+    # The personal thread's own work files: wiped only when the person chooses it too.
+    personal: bool = False
+    # Keys among the files (.env, id_rsa, *.pem, as export leaves out) stay when the rest goes.
+    spare_keys: bool = False
+    # Folders directly inside ``path`` that are items of their own: export and sizes leave them to those.
+    apart: tuple[str, ...] = ()
 
     @property
     def sqlite(self) -> bool:
@@ -78,21 +94,25 @@ def items() -> list[Item]:
     memory = default_memory_path()
     recall = configured_session_recall_path()
     skills = default_skills_path()
-    browser = browser_db_path()
+    # As configured, before any link in it is resolved away, so a link is seen and not followed.
+    browser = _env_path("AGENT_BROWSER_DB", browser_db_path())
+    # The personal thread's own workspace (the desktop's <ASTRA_HOME>/personal, specs/personal-thread.md D6).
+    personal = state_path("personal")
     result = [
         Item("core-user", "核心记忆：关于你（USER.md）", memory.parent / "memory" / "USER.md", True),
         Item("core-memory", "核心记忆：Astra 的笔记（MEMORY.md）", memory.parent / "memory" / "MEMORY.md", True),
         Item("memory", "已保存的记忆", memory, True),
-        Item("sessions", "对话记录", sessions_dir(), True),
+        Item("sessions", "对话记录", _env_path("AGENT_SESSION_DIR", sessions_dir()), True),
         Item("recall", "对话搜索索引", recall, True),
         Item("jobs", "定时任务和结果", state_path("jobs"), True),
         Item("skills", "学到的技能", skills / "learned", True),
         Item("skills-journal", "技能学习记录", learning_home(skills), True),
         Item("learning", "技能学习建议", default_learning_path(), True),
+        Item("personal", PERSONAL_LABEL, personal, True, apart=("uploads", ".astra"), personal=True, spare_keys=True),
         # Copies made from conversations: wiped with them, not worth exporting.
         Item("feedback", "对话检索反馈", _env_path("ASTRA_CONTEXT_INDEX_FEEDBACK_DB",
                                                recall.with_name("context-index-feedback.db")), False),
-        Item("tasks", "任务和步骤记录", task_db_path(), False),
+        Item("tasks", "任务和步骤记录", _env_path("AGENT_TASK_DB", task_db_path()), False),
         Item("events", "运行事件", event_db_path(), False),
         Item("approvals", "审批记录", approval_db_path(), False),
         Item("peers", "会话之间的消息", _env_path("ASTRA_PEER_DB", state_path("peers.db")), False),
@@ -101,6 +121,13 @@ def items() -> list[Item]:
              False),
         Item("attachments", "粘贴过的图片", state_path("gui", "attachments"), False),
         Item("page-snapshots", "页面截图", state_path("gui", "page-snapshots"), False),
+        # Copies of what the phone keeps: the originals stay on it.
+        Item("phone-uploads", "手机发来的照片和文件", personal / "uploads", False),
+        # Snapshots taken before the personal thread changed a file, and its image cache.
+        Item("personal-copies", "个人对话改文件前留的副本", personal / ".astra", False),
+        Item("phone-audio", "读给手机听的语音", _env_path("ASTRA_PHONE_AUDIO_DIR", state_path("gui", "phone-audio")), False),
+        # Which phone did what, with its commands and the names of the files it sent.
+        Item("phone-audit", "手机的操作记录", state_path("gui", "phone-audit.jsonl"), False),
         Item("browser-profiles", "Astra 浏览器的登录和 Cookie", browser.parent / "browser-profiles", False, browser=True),
         Item("browser-sessions", "Astra 浏览器的标签页记录", browser, False, browser=True),
     ]
@@ -122,6 +149,49 @@ def _tracked(root: Path, path: Path) -> set[Path]:
     return {(root / name).resolve() for name in listed.decode().split("\0") if name}
 
 
+def _is_link(path: Path) -> bool:
+    if path.is_symlink():
+        return True
+    if sys.platform == "win32":
+        # A junction redirects a folder like a link, and Python 3.11 does not call it one.
+        try:
+            return os.lstat(path).st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+        except OSError:
+            return False
+    return False
+
+
+def _system_link(path: Path) -> bool:
+    """A link of the system's own layout (macOS /tmp, /var and /etc, Linux /bin and /lib): owned by root, in a
+    folder owned by root, so neither the person nor a program of theirs made it or can change it. Windows has
+    no such links in the places Astra keeps data, so there none counts."""
+    if sys.platform == "win32":
+        return False
+    try:
+        return os.lstat(path).st_uid == 0 and os.lstat(path.parent).st_uid == 0
+    except OSError:
+        return False
+
+
+def _reach(item: Item, state: Path) -> None:
+    """Refuses an item reached through a link: what lies behind it may be anywhere.
+
+    Inside the state folder (Astra's own, resolved when configured) no step below it may be a link or junction,
+    and the real path must stay inside it. A path configured elsewhere is checked as given, every step from the
+    top: only the system's own links may lie on the way.
+    """
+    path = Path(os.path.abspath(item.path))
+    home = Path(os.path.abspath(state))
+    inside = path != home and path.is_relative_to(home)
+    current = home if inside else Path(path.anchor)
+    for step in path.relative_to(current).parts:
+        current = current / step
+        if _is_link(current) and (inside or not _system_link(current)):
+            raise OSError(f"{current} is a link; nothing is read or deleted through it")
+    if inside and not Path(os.path.realpath(path)).is_relative_to(Path(os.path.realpath(home))):
+        raise OSError(f"{item.path} leads outside {home}; nothing is read or deleted there")
+
+
 def _guard(path: Path, root: Path) -> None:
     """A misconfigured path must never take the home folder, a disk or the installation with it."""
     target = path.resolve()
@@ -130,25 +200,54 @@ def _guard(path: Path, root: Path) -> None:
             raise OSError(f"{path} holds {protected}; it was not deleted")
 
 
-def _files(path: Path) -> Iterator[Path]:
-    if path.is_symlink() or not path.exists():
+def _raise(error: OSError) -> None:
+    raise error
+
+
+def _walk(path: Path, links: list[Path] | None = None, *, strict: bool = False
+          ) -> Iterator[tuple[Path, list[str], list[str]]]:
+    """``os.walk`` that never enters or lists a link: on Windows it walks into a directory junction as into any
+    folder (Python 3.11 does not call a junction a link). Each link met is left out and added to ``links``.
+    ``strict``: a folder that cannot be read is an error, not passed over."""
+    for current, folders, names in os.walk(path, onerror=_raise if strict else None):
+        here = Path(current)
+        met = [name for name in folders + names if _is_link(here / name)]
+        if links is not None:
+            links.extend(here / name for name in met)
+        folders[:] = sorted(name for name in folders if name not in met)
+        names[:] = sorted(name for name in names if name not in met)
+        yield here, folders, names
+
+
+def _files(path: Path, apart: tuple[str, ...] = (), links: list[Path] | None = None) -> Iterator[Path]:
+    if _is_link(path) or not path.exists():
         return
     if path.is_file():
         yield path
         return
-    for current, folders, names in os.walk(path):
-        folders[:] = sorted(name for name in folders if name not in _SKIP_NAMES
-                            and not (Path(current) / name).is_symlink())
-        for name in sorted(names):
-            entry = Path(current) / name
-            if name in _SKIP_NAMES or name.endswith(".lock") or name.endswith(_SQLITE_SIDES) or entry.is_symlink():
+    for current, folders, names in _walk(path, links):
+        top = current == path
+        folders[:] = [name for name in folders if name not in _SKIP_NAMES and not (top and name in apart)]
+        for name in names:
+            if name in _SKIP_NAMES or name.endswith(".lock") or name.endswith(_SQLITE_SIDES):
                 continue
-            yield entry
+            yield current / name
 
 
-def _size(path: Path) -> int:
+def _linked(links: list[Path], done: str) -> str:
+    more = f" (and {len(links) - 1} more)" if len(links) > 1 else ""
+    return f"{links[0]} is a link{more}; nothing was {done} through it"
+
+
+def _credential(path: Path) -> bool:
+    name = path.name.lower()
+    return (name == ".env" or name.startswith(".env.") or name in _CREDENTIAL_NAMES
+            or path.suffix.lower() in _CREDENTIAL_SUFFIXES)
+
+
+def _size(path: Path, apart: tuple[str, ...] = ()) -> int:
     total = 0
-    for entry in _files(path):
+    for entry in _files(path, apart):
         try:
             total += entry.stat().st_size + sum(Path(f"{entry}{side}").stat().st_size
                                                 for side in _SQLITE_SIDES if Path(f"{entry}{side}").exists())
@@ -157,11 +256,32 @@ def _size(path: Path) -> int:
     return total
 
 
+def _refusal(item: Item, state: Path) -> str:
+    try:
+        _reach(item, state)
+    except OSError as exc:
+        return str(exc)
+    return ""
+
+
 def plan() -> dict:
     """What export and wipe would take, for the person to read before choosing."""
-    listed = [{"key": item.key, "label": item.label, "path": str(item.path), "present": item.path.exists(),
-               "bytes": _size(item.path), "export": item.export, "browser": item.browser} for item in items()]
-    return {"items": listed, "not_exported": list(NOT_EXPORTED), "kept": list(KEPT), "confirmation": CONFIRMATION}
+    from agent.runtime.paths import state_dir
+
+    listed = []
+    for item in items():
+        # Behind a link nothing is measured, exported or deleted; the wipe reports it.
+        refused = _refusal(item, state_dir())
+        listed.append({"key": item.key, "label": item.label, "path": str(item.path),
+                       "present": not refused and item.path.exists(), "bytes": 0 if refused else _size(item.path, item.apart),
+                       "export": item.export, "browser": item.browser, "personal": item.personal,
+                       **({"refused": refused} if refused else {})})
+    return {"items": listed, "not_exported": list(NOT_EXPORTED), "kept": _kept(personal_files=False),
+            "confirmation": CONFIRMATION}
+
+
+def _kept(*, personal_files: bool) -> list[str]:
+    return list(KEPT) if personal_files else [*KEPT, PERSONAL_KEPT]
 
 
 def _copy_sqlite(source: Path, target: Path) -> None:
@@ -171,23 +291,36 @@ def _copy_sqlite(source: Path, target: Path) -> None:
 
 
 def export(out: Path, *, now: float | None = None) -> dict:
-    out = out.expanduser().resolve()
+    from agent.runtime.paths import state_dir
+
+    # The folder as it really is; the name itself is not resolved, so a link there is replaced, never written through.
+    out = out.expanduser()
+    out = Path(os.path.realpath(out.parent)) / out.name
     if out.suffix != ".zip":
         raise ValueError("导出文件要以 .zip 结尾。")
     if not out.parent.is_dir():
         raise ValueError(f"找不到文件夹：{out.parent}")
     when = datetime.fromtimestamp(time.time() if now is None else now, timezone.utc)
-    partial = out.with_name(out.name + ".partial")
-    exported = []
+    # Written to a new file of its own (created exclusively, readable by this user alone) beside the target,
+    # then moved over the target's name in one step.
+    handle, partial = tempfile.mkstemp(prefix=f".{out.name}.", suffix=".partial", dir=out.parent)
+    exported, skipped = [], []
     try:
-        with tempfile.TemporaryDirectory(prefix="astra-export-") as scratch, \
-                zipfile.ZipFile(partial, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
-            os.chmod(partial, 0o600)
+        with tempfile.TemporaryDirectory(prefix="astra-export-") as scratch, os.fdopen(handle, "w+b") as file, \
+                zipfile.ZipFile(file, "w", compression=zipfile.ZIP_DEFLATED, allowZip64=True) as archive:
             for item in items():
-                if not item.export or not item.path.exists():
+                if not item.export:
+                    continue
+                if refused := _refusal(item, state_dir()):
+                    skipped.append({"key": item.key, "label": item.label, "error": refused})
+                    continue
+                if not item.path.exists():
                     continue
                 count = size = 0
-                for entry in _files(item.path):
+                links: list[Path] = []
+                for entry in _files(item.path, item.apart, links):
+                    if _credential(entry):
+                        continue
                     relative = entry.name if entry == item.path else entry.relative_to(item.path).as_posix()
                     name = f"{ARCHIVE_ROOT}/{item.key}/{relative}"
                     source = entry
@@ -201,15 +334,17 @@ def export(out: Path, *, now: float | None = None) -> dict:
                     count += 1
                     size += source.stat().st_size
                 exported.append({"key": item.key, "label": item.label, "files": count, "bytes": size})
+                if links:
+                    skipped.append({"key": item.key, "label": item.label, "error": _linked(links, "read")})
             archive.writestr(f"{ARCHIVE_ROOT}/manifest.json", json.dumps({
                 "format": "astra-export", "version": 1, "created_at": when.isoformat(timespec="seconds"),
-                "items": exported, "not_included": list(NOT_EXPORTED),
+                "items": exported, "not_included": list(NOT_EXPORTED), "skipped": skipped,
             }, ensure_ascii=False, indent=2))
-        partial.replace(out)
+        os.replace(partial, out)
     except BaseException:
-        partial.unlink(missing_ok=True)
+        Path(partial).unlink(missing_ok=True)
         raise
-    return {"path": str(out), "bytes": out.stat().st_size, "items": exported}
+    return {"path": str(out), "bytes": out.stat().st_size, "items": exported, "skipped": skipped}
 
 
 def _others_running(install, *, desktop: bool) -> list[dict]:
@@ -219,40 +354,40 @@ def _others_running(install, *, desktop: bool) -> list[dict]:
     return [item for item in active_instances(install) if not (desktop and item.get("role") == "desktop")]
 
 
-def _remove(path: Path, tracked: set[Path]) -> int:
-    """Delete ``path`` (with SQLite's side files), keeping tracked files; return how many files went."""
-    removed = 0
-    if path.is_symlink():
-        path.unlink()
-        return 1
+def _remove(path: Path, tracked: set[Path], *, spare_keys: bool = False) -> tuple[int, list[Path]]:
+    """Delete ``path`` (with SQLite's side files), keeping tracked files, and key files when asked. Links inside,
+    junctions included, are neither followed nor removed. Returns how many files went and the links left."""
+    if _is_link(path):
+        return 0, [path]
     if path.is_file():
         if path.resolve() in tracked:
-            return 0
+            return 0, []
         path.unlink()
         for side in _SQLITE_SIDES:
             Path(f"{path}{side}").unlink(missing_ok=True)
-        return 1
+        return 1, []
     if not path.is_dir():
-        return 0
-    if not tracked:
-        removed = sum(1 for _ in path.rglob("*") if _.is_file())
-        shutil.rmtree(path)
-        return removed
-    for entry in sorted(path.rglob("*"), key=lambda value: len(value.parts), reverse=True):
-        if entry.is_symlink() or entry.is_file():
-            if entry.resolve() not in tracked:
+        return 0, []
+    removed, links, folders = 0, [], []
+    for current, _folders, names in _walk(path, links, strict=True):
+        folders.append(current)
+        for name in names:
+            entry = current / name
+            if entry.resolve() not in tracked and not (spare_keys and _credential(entry)):
                 entry.unlink()
                 removed += 1
-        elif entry.is_dir() and not any(entry.iterdir()):
-            entry.rmdir()
-    if path.is_dir() and not any(path.iterdir()):
-        path.rmdir()
-    return removed
+    # Deepest first; a folder that still holds something (a kept file, a link) stays.
+    for folder in reversed(folders):
+        if not any(folder.iterdir()):
+            folder.rmdir()
+    return removed, links
 
 
-def wipe(confirmation: str, *, browser_data: bool = False, desktop: bool = False, root: Path | None = None) -> dict:
+def wipe(confirmation: str, *, browser_data: bool = False, personal_files: bool = False, desktop: bool = False,
+         root: Path | None = None) -> dict:
     from agent.launcher.installation import discover
     from agent.launcher.locking import exclusive
+    from agent.runtime.paths import state_dir
 
     if confirmation != CONFIRMATION:
         raise ValueError(f"要清除，请准确输入「{CONFIRMATION}」。")
@@ -264,18 +399,22 @@ def wipe(confirmation: str, *, browser_data: bool = False, desktop: bool = False
         if running:
             roles = "、".join(sorted({str(item.get("role") or "Astra") for item in running}))
             raise ValueError(f"先关掉正在运行的 Astra（{roles}），再清除。")
-        for item in items():
-            if item.browser and not browser_data:
+        # A folder inside another item's folder goes first, so it is counted (or fails) as itself.
+        for item in sorted(items(), key=lambda item: -len(item.path.parts)):
+            if (item.browser and not browser_data) or (item.personal and not personal_files):
                 continue
             try:
+                _reach(item, state_dir())
                 _guard(item.path, install.root)
-                count = _remove(item.path, _tracked(install.root, item.path))
+                count, links = _remove(item.path, _tracked(install.root, item.path), spare_keys=item.spare_keys)
             except OSError as exc:
                 failed.append({"key": item.key, "label": item.label, "error": str(exc)})
                 continue
+            if links:
+                failed.append({"key": item.key, "label": item.label, "error": _linked(links, "deleted")})
             if count:
                 removed.append({"key": item.key, "label": item.label, "files": count})
-    return {"removed": removed, "failed": failed, "kept": list(KEPT)}
+    return {"removed": removed, "failed": failed, "kept": _kept(personal_files=personal_files)}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -287,6 +426,7 @@ def main(argv: list[str] | None = None) -> int:
     erase = commands.add_parser("wipe", help="delete the data; needs --confirm 清除")
     erase.add_argument("--confirm", default="")
     erase.add_argument("--browser-data", action="store_true", help="also delete Astra's browser profiles")
+    erase.add_argument("--personal-files", action="store_true", help="also delete the files the personal thread wrote")
     erase.add_argument("--desktop", action="store_true", help=argparse.SUPPRESS)
     erase.add_argument("--root", type=Path, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
@@ -296,7 +436,8 @@ def main(argv: list[str] | None = None) -> int:
         elif args.action == "export":
             value = export(args.out)
         else:
-            value = wipe(args.confirm, browser_data=args.browser_data, desktop=args.desktop, root=args.root)
+            value = wipe(args.confirm, browser_data=args.browser_data, personal_files=args.personal_files,
+                         desktop=args.desktop, root=args.root)
     except (ValueError, OSError, LauncherError) as exc:
         print(json.dumps({"error": str(exc)}))
         return 1

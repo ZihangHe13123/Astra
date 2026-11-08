@@ -20,7 +20,7 @@ uv run --locked --extra server python -m agent.cli.api_server
 
 绑定非回环地址必须设置此 Key，否则启动被拒绝。携带浏览器 `Origin` 的请求即使访问回环地址，也要求配置 bearer 认证。
 
-`POST /v1/chat/completions` 支持流式和非流式响应。已消费字段格式错误时，在创建会话或执行 Agent 前返回 HTTP 400。该桥接把 Astra 本地工具开放给认证调用方，远程访问应使用可信网络或 TLS 反向代理。原生消息渠道是另一项独立集成。
+`POST /v1/chat/completions` 支持流式和非流式响应。已消费字段格式错误（包括缺少 `messages`）时，在创建会话或执行 Agent 前返回 HTTP 400 和 OpenAI 格式的 `error` 对象。Astra 无法为模型准备的图片（如无效的内联数据）同样属于无效输入：返回 HTTP 400，`code` 为 `vision_preprocess_failed`。未产生回答就结束的回合不会作为助手文本返回：非流式请求在模型服务或本回合超时时返回 HTTP 504，其他情况返回 502，均附 `error` 对象（`code` 说明原因，如 `idle_timeout`、`upstream_error`、`no_answer`）。流式响应已发出 HTTP 200，因此以 `data: {"error": ...}` 帧、`finish_reason` 为 `"error"` 的最后一个分块和 `[DONE]` 结束。Agent 之后继续完成回答的提示（如工具预算停止后的总结）仍保留在回答文本中。该桥接把 Astra 本地工具开放给认证调用方，远程访问应使用可信网络或 TLS 反向代理。原生消息渠道是另一项独立集成。
 
 <a id="native-messaging-channels"></a>
 
@@ -46,11 +46,13 @@ mkdir -p .astra
 cp config/channels.example.json .astra/channels.json
 ```
 
-设置 `qq.enabled=true`，默认监听 `127.0.0.1:2280`，NapCat 反向 WebSocket 地址为 `ws://127.0.0.1:2280`。若 NapCat 配有 access token，将相同值放入 `ASTRA_QQ_ACCESS_TOKEN`，不写入 JSON。默认接收私聊，群消息需 @提及或配置的唤醒前缀（默认 `/`）。
+设置 `qq.enabled=true`，默认监听 `127.0.0.1:2280`，NapCat 反向 WebSocket 地址为 `ws://127.0.0.1:2280`。在 NapCat 里设置 access token，并把相同的值放入 `ASTRA_QQ_ACCESS_TOKEN`，不写入 JSON。没有 token 时 Astra 分不清 NapCat 和这台电脑上的其他程序：仍回复已准入的联系人，但 `owner_users` 只按普通联系人对待，并在日志里警告。带 `Origin` 头的握手一律拒绝，网页打不开这个连接（NapCat 不发这个头）。`host` 不是回环地址时也会警告，因为其他电脑能连上这个端口。默认接收私聊，群消息需 @提及或配置的唤醒前缀（默认 `/`）。
 
-2280 端口只能有一个服务占用，启用前先停用或改配 AstrBot。适配器启动失败会报告但不关闭 TUI；后端退出时关闭全部适配器。消息渠道中需要交互授权的操作会被拒绝，不等待不可见提示。
+`qq.allow_users` 列出允许聊天的 QQ 号，列表为空时谁都不接收。这些联系人只能用公开的网页和聊天工具，用不到本地文件、历史、记忆、项目说明和委派。要私聊远程控制，在 `qq.owner_users` 里明确列出可信的主人 QQ 号并配好 access token；主人不必同时列在 allow_users 里。群消息一律只有聊天能力，主人发的也一样。撤销主人权限后会开始一段单独的受限对话；旧的主人历史留在磁盘上，不会载入这段聊天。消息按 NapCat 送达的顺序逐条回答；一轮回答进行时，每条 NapCat 连接最多再排 32 条消息，之后的丢弃并记入日志。Astra 不会回答的帧（心跳、通知、未准入的发送者、没有 @ 的群聊）收到即丢弃。
 
-QQ 图片经公开 URL 检查与大小限制后下载，再作为原生多模态内容传给视觉模型。发本地文件需启用 `send_files_enabled`、用 `file_allow_users`（或 `allow_users`）列出可信 QQ ID，并把 `send_file_roots` 限定为可分享的输出目录。`channel_send_file` 拒绝越界路径、隐藏文件和目录、应用数据和常见凭据文件。
+2280 端口只能有一个服务占用，启用前先停用或改配 AstrBot。适配器启动失败会报告但不关闭 TUI；后端退出时关闭全部适配器。QQ 对话里需要批准的操作不在聊天里问：请求进入 Astra 的审批收件箱，并显示在运行这个渠道的后端打开的窗口里，在那里可以批准；那里允许的只对这个 QQ 聊天有效。五分钟没回复按拒绝处理，所以没人看到的请求不会一直卡住渠道；审批收件箱不可用时直接拒绝。
+
+QQ 图片经公开 URL 检查与大小限制后下载，再作为原生多模态内容传给视觉模型。发本地文件需启用 `send_files_enabled`、用 `file_allow_users`（或 `allow_users`）列出可信 QQ ID，并把 `send_file_roots` 限定为可分享的输出目录。`channel_send_file` 拒绝越界路径、隐藏文件和目录、应用数据和常见凭据文件。文件从请求来的那条 NapCat 连接发回，只有带着这次上传 echo 的回执才算数，不带 echo 的回执一律忽略。30 秒内没等到这样的回执，或者中途连接断开，上传都会告诉模型“未确认”（可能到了，也可能没到），不会自动重发。NapCat 断开时，正在回答它的那一轮会被取消。
 
 ### 微信
 

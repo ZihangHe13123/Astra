@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, rmdirSync, writeFileSync, symlinkSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, rmdirSync, writeFileSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { composeDeck, inlineAssets, slideCount } from "../src/main/canvas-deck.js";
-import { canvasVersion, commentOnDocument, exportTarget, isCanvasManifest, listVersions, readCanvas, recordVersion, restoreVersion, slidesTarget } from "../src/main/canvas-files.js";
+import { canvasVersion, commentOnDocument, exportTarget, isCanvasManifest, listVersions, readCanvas, recordVersion, restoreVersion, slidesTarget, writeExport } from "../src/main/canvas-files.js";
 import { insertComment } from "../src/main/canvas-doc.js";
 import { canvasPreview } from "../src/main/file-preview.js";
 import { docPathFromTool, openComments, outline } from "../src/renderer/doc-preview.js";
@@ -136,14 +136,60 @@ test("a comment goes right after the passage it is about, never into a heading o
   assert.match(after, /收入增长了 12% <!-- @astra: 补一个对比 -->，主要来自新客户。/);
   assert.match(after, /```\n收入增长了 12%，在代码里\n```/, "the code block is left alone");
   assert.deepEqual(openComments(after), ["补一个对比"]);
-  // Selected as rendered: the emphasis and the link are not in the selection, so the line is found without them.
-  assert.match(insertComment(doc, "说明本季度的重点", "x"), /说明\*\*本季度\*\*的重点。 <!-- @astra: x -->\n/);
+  // Selected as rendered: the emphasis and the link are not in the selection, and the text is found as it reads.
+  assert.match(insertComment(doc, "说明本季度的重点", "x"), /说明\*\*本季度\*\*的重点 <!-- @astra: x -->。\n/);
   assert.match(insertComment(doc, "供应链 延迟 两周", "x"), /- 供应链 \[延迟\]\(https:\/\/example\.com\) 两周 <!-- @astra: x -->\n/);
   assert.match(insertComment(doc, "收入", "x"), /\n## 收入\n<!-- @astra: x -->\n/, "a heading keeps its text");
   const nowhere = insertComment(doc, "不在文中的一句话", "这里 -- 要改");
   assert.ok(nowhere.endsWith("<!-- @astra: 这里 — 要改（关于：「不在文中的一句话」） -->\n"), "two hyphens would end the comment");
   assert.throws(() => insertComment(doc, "收入", "  "), /空/);
   assert.throws(() => insertComment(doc, " ", "x"), /选中/);
+});
+
+test("a comment lands on the occurrence that was selected, and after code, never inside it", () => {
+  const twice = "第一段提到预算。\n\n第二段也提到预算。\n";
+  assert.equal(insertComment(twice, "提到预算", "x", 1), "第一段提到预算。\n\n第二段也提到预算 <!-- @astra: x -->。\n");
+  assert.equal(insertComment(twice, "提到预算", "x"), "第一段提到预算 <!-- @astra: x -->。\n\n第二段也提到预算。\n");
+  // An address or an earlier comment is not text a person could have selected.
+  const hidden = "看[链接](https://example.com/预算) <!-- @astra: 预算 -->\n\n预算表在这里。\n";
+  assert.match(insertComment(hidden, "预算", "x"), /\n预算 <!-- @astra: x -->表在这里。\n$/);
+  // A code span, all of it or a part: after the span, so the command stays one to copy.
+  const command = "构建用 `npm run build` 即可。\n";
+  for (const passage of ["npm run build", "run"])
+    assert.equal(insertComment(command, passage, "x"), "构建用 `npm run build` <!-- @astra: x --> 即可。\n");
+  // Code blocks, fenced or indented, at the top or in a list item: on the line after the block, indented
+  // as the block is, so the comment is not code and stays in its item.
+  const blocks = "前言\n\n    make all\n\n- 步骤\n\n  ```\n  make test\n  ```\n\n结尾\n";
+  const indented = insertComment(blocks, "make all", "x");
+  assert.equal(indented, "前言\n\n    make all\n<!-- @astra: x -->\n\n- 步骤\n\n  ```\n  make test\n  ```\n\n结尾\n");
+  const listed = insertComment(blocks, "make test", "y");
+  assert.equal(listed, "前言\n\n    make all\n\n- 步骤\n\n  ```\n  make test\n  ```\n  <!-- @astra: y -->\n\n结尾\n");
+  assert.deepEqual(openComments(indented), ["x"]);
+  assert.deepEqual(openComments(listed), ["y"]);
+  // Counted as the text reads: an entity, an escape or emphasis does not change which one was selected.
+  const spelled = "研发 &amp; 测试先行。\n\n然后研发 & 测试收尾。\n";
+  assert.equal(insertComment(spelled, "研发 & 测试", "x", 1), "研发 &amp; 测试先行。\n\n然后研发 & 测试 <!-- @astra: x -->收尾。\n");
+  assert.equal(insertComment(spelled, "研发 & 测试", "x"), "研发 &amp; 测试先行。 <!-- @astra: x -->\n\n然后研发 & 测试收尾。\n");
+  assert.equal(insertComment("说明**本季度**的重点，再说明**本季度**的重点。\n", "说明本季度的重点", "x", 1),
+    "说明**本季度**的重点，再说明**本季度**的重点 <!-- @astra: x -->。\n");
+  // After a link or an autolink, never inside its brackets; a pipe in a table's row would split it.
+  assert.equal(insertComment("地址 <https://example.com/预算> 见上。\n", "预算", "x"), "地址 <https://example.com/预算> <!-- @astra: x --> 见上。\n");
+  assert.equal(insertComment("见[预算表](https://example.com)。\n", "预算", "x"), "见[预算表](https://example.com) <!-- @astra: x -->。\n");
+  assert.equal(insertComment("| 项 | 说明 |\n|---|---|\n| 预算 | 见附件 |\n", "预算", "a|b"),
+    "| 项 | 说明 |\n|---|---|\n| 预算 <!-- @astra: a｜b --> | 见附件 |\n");
+});
+
+test("a comment on a document changed since it was selected is refused", async () => {
+  const manifest = canvas({ "doc.md": "# 一\n\n原来的一段。\n" }, "doc");
+  // The text as the preview showed it when the passage was selected.
+  const seen = (await canvasPreview(manifest)).canvas?.digest;
+  assert.match(seen ?? "", /^[0-9a-f]{64}$/);
+  // A paragraph added afterwards, even one that lands as the comment is being written, is not commented on.
+  writeFileSync(join(manifest, "..", "doc.md"), "# 一\n\n改过的一段，原来的一段。\n");
+  await assert.rejects(commentOnDocument(manifest, "原来的一段", "x", { digest: seen }), /改过了/);
+  assert.equal(readFileSync(join(manifest, "..", "doc.md"), "utf8"), "# 一\n\n改过的一段，原来的一段。\n");
+  await commentOnDocument(manifest, "原来的一段", "x", { digest: (await canvasPreview(manifest)).canvas?.digest });
+  assert.match(readFileSync(join(manifest, "..", "doc.md"), "utf8"), /原来的一段 <!-- @astra: x -->。/);
 });
 
 test("a document's outline is its headings outside code, as they read", () => {
@@ -251,4 +297,28 @@ test("nothing of a canvas is read or written through a link out of its folder", 
   await assert.rejects(exportTarget(printed, join(exports, "deck.pdf")), /不在画布文件夹里/);
   await assert.rejects(slidesTarget(printed, join(exports, ".slides")), /不在画布文件夹里/);
   assert.ok(!existsSync(join(outside, ".slides")));
+});
+
+test("a print replaces a link at its name and never writes through it", async () => {
+  const outside = mkdtempSync(join(tmpdir(), "astra-outside-"));
+  writeFileSync(join(outside, "victim.txt"), "SYNTHETIC_OUTSIDE_FILE\n");
+  const manifest = canvas({ "slides.html": slides });
+  const exports = join(manifest, "..", "exports");
+  mkdirSync(exports);
+  symlinkSync(join(outside, "victim.txt"), join(exports, "deck.pdf"));
+  symlinkSync(join(outside, "created.pdf"), join(exports, "new.pdf"));
+  for (const name of ["deck.pdf", "new.pdf"]) await writeExport(await exportTarget(manifest, join(exports, name)), new TextEncoder().encode("%PDF-1.7 fixture"));
+  assert.equal(readFileSync(join(outside, "victim.txt"), "utf8"), "SYNTHETIC_OUTSIDE_FILE\n");
+  assert.deepEqual(readdirSync(outside), ["victim.txt"]);
+  for (const name of ["deck.pdf", "new.pdf"]) {
+    assert.ok(!lstatSync(join(exports, name)).isSymbolicLink());
+    assert.equal(readFileSync(join(exports, name), "utf8"), "%PDF-1.7 fixture");
+  }
+  assert.deepEqual(readdirSync(exports).sort(), ["deck.pdf", "new.pdf"]);
+  // The exports folder swapped for a link out while the deck prints: nothing is written there.
+  const target = await exportTarget(manifest, join(exports, "deck.pdf"));
+  renameSync(exports, `${exports}-moved`);
+  symlinkSync(outside, exports);
+  await assert.rejects(writeExport(target, new TextEncoder().encode("%PDF-1.7 late")), /换成了别处/);
+  assert.deepEqual(readdirSync(outside), ["victim.txt"]);
 });

@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from agent.launcher.common import LauncherError, git, read_json, write_json  # noqa: E402
 from agent.launcher.desktop_distribution import resources_for, seal_tree, sha256, verify_tree  # noqa: E402
+from agent.launcher.desktop_update import UPDATER  # noqa: E402
 
 BACKEND_RESOURCES = (
     'agent/runtime/astra.md', 'agent/runtime/interactive_cards.md', 'agent/ui/commands.json',
@@ -77,6 +78,33 @@ def prune_runtime_launchers(python: Path) -> None:
     shutil.rmtree(python / 'Scripts', ignore_errors=True)
 
 
+def requirements_export(lock: dict, output: Path) -> list[str]:
+    """The hashed uv.lock export for the runtime lock's extras; the install takes wheels only."""
+    export = ['uv', 'export', '--quiet', '--no-header', '--locked', '--no-emit-project', '--format', 'requirements-txt', '--output-file', str(output)]
+    for extra in lock['extras']:
+        export += ['--extra', extra]
+    return export
+
+
+def write_updater(runtime: Path, target: str) -> Path:
+    """Sealed with the app. The installed copy stages and verifies a candidate;
+    stage copies the candidate's verified runtime out to run apply/recover."""
+    updater = runtime / UPDATER[target]
+    if target.startswith('win32'):
+        updater.write_text('@echo off\nsetlocal\nset "PYTHONHOME="\nset "VIRTUAL_ENV="\n'
+                           'set "PYTHONPATH=%~dp0backend"\n'
+                           'set "PYTHONNOUSERSITE=1"\nset "PYTHONDONTWRITEBYTECODE=1"\n'
+                           '"%~dp0python\\python.exe" -P -m agent.launcher.desktop_update %*\n')
+    else:
+        updater.write_text('#!/bin/sh\nset -eu\n'
+                           'runtime="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"\n'
+                           'unset PYTHONHOME VIRTUAL_ENV\n'
+                           'export PYTHONPATH="$runtime/backend" PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1\n'
+                           'exec "$runtime/python/bin/python3" -P -m agent.launcher.desktop_update "$@"\n')
+        updater.chmod(0o755)
+    return updater
+
+
 def copy_node_package(name: str, target: Path, copied: set[str], platform_name: str, arch: str) -> None:
     if name in copied:
         return
@@ -116,6 +144,19 @@ def download_python(lock: dict, target: str, cache: Path, runtime: Path):
     return runtime / entry['python']
 
 
+def electron_distribution(gui: Path, version: str) -> Path:
+    """npm ci installs the electron package only; its binary is a separate download."""
+    package = gui / 'node_modules/electron'
+    if not (package / 'package.json').is_file():
+        raise LauncherError('GUI dependencies are missing. Run: npm --prefix ui-gui ci')
+    marker = package / 'dist/version'
+    if not marker.is_file():
+        raise LauncherError('The Electron binary is not installed. Run: node ui-gui/node_modules/electron/install.js')
+    if marker.read_text().strip() != version:
+        raise LauncherError('Electron distribution differs from the locked GUI version.')
+    return package / 'dist'
+
+
 def bundle(options) -> Path:
     lock = read_json(ROOT / 'packaging/desktop-runtime.lock.json')
     host = f"{sys.platform}-{'arm64' if platform.machine().lower() in ('arm64', 'aarch64') else 'x64'}"
@@ -128,9 +169,7 @@ def bundle(options) -> Path:
     provenance = source_provenance(ROOT)
     gui_manifest = read_json(ROOT / 'ui-gui/package.json')
     electron_version = gui_manifest['devDependencies']['electron']
-    electron = ROOT / 'ui-gui/node_modules/electron/dist'
-    if (electron / 'version').read_text().strip() != electron_version:
-        raise LauncherError('Electron distribution differs from the locked GUI version.')
+    electron = electron_distribution(ROOT / 'ui-gui', electron_version)
     if not (ROOT / 'ui-gui/dist/main.cjs').is_file():
         raise LauncherError('Build ui-gui before packaging.')
     output = options.output.resolve()
@@ -172,10 +211,7 @@ def bundle(options) -> Path:
         backend = runtime / 'backend'
         copy_backend(ROOT, backend)
         requirements = runtime / 'requirements.lock.txt'
-        export = ['uv', 'export', '--quiet', '--no-header', '--locked', '--no-emit-project', '--format', 'requirements-txt', '--output-file', str(requirements)]
-        for extra in lock['extras']:
-            export += ['--extra', extra]
-        subprocess.run(export, cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
+        subprocess.run(requirements_export(lock, requirements), cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
         command(['uv', 'pip', 'install', '--python', python, '--require-hashes', '--no-deps', '--only-binary', ':all:',
                  '--requirements', requirements], env=clean_environment())
         installed = json.loads(subprocess.check_output([str(python), '-I', '-c',
@@ -186,6 +222,7 @@ def bundle(options) -> Path:
         marker = {'schema': 1, 'distribution': 'astra-desktop', 'version': version, 'target': options.target,
                   'python': '../' + lock['targets'][options.target]['python']}
         write_json(backend / 'desktop-installation.json', marker)
+        write_updater(runtime, options.target)
         helper = None
         if options.native_helper:
             source = options.native_helper.resolve(strict=True)
@@ -211,7 +248,9 @@ def bundle(options) -> Path:
                                  'surface': 'desktop-preview', 'cli_available': False},
                       'helper': helper, 'helper_policy': 'bundled' if helper else 'unavailable',
                       'locks': {name: sha256(ROOT / name) for name in
-                                ['uv.lock', 'ui-gui/package-lock.json', 'ui-core/package-lock.json', 'packaging/desktop-runtime.lock.json']}}
+                                ['uv.lock', 'ui-gui/package-lock.json', 'ui-core/package-lock.json',
+                                 # The GUI bundle compiles ui-tui Appshot modules and their dependencies.
+                                 'ui-tui/package-lock.json', 'packaging/desktop-runtime.lock.json']}}
         write_json(runtime / 'runtime.json', descriptor)
         # Runtime never writes __pycache__ in the immutable app. Clean the
         # upstream archive caches so no build-machine paths enter new bytecode.
@@ -227,23 +266,8 @@ def bundle(options) -> Path:
         write_json(staging / 'release.json', manifest)
         verify_tree(application, manifest, target=options.target)
         (staging / 'release.sha256').write_text(sha256(staging / 'release.json') + '  release.json\n')
-        # Updates run from the downloaded candidate's independent interpreter,
-        # so replacing the installed directory never locks the updater itself.
-        if sys.platform == 'darwin':
-            updater = staging / 'astra-desktop-update'
-            updater.write_text('#!/bin/sh\nset -eu\n'
-                               'release_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"\n'
-                               'runtime="$release_dir/Astra.app/Contents/Resources/runtime"\n'
-                               'unset PYTHONHOME VIRTUAL_ENV\n'
-                               'export PYTHONPATH="$runtime/backend" PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1\n'
-                               'exec "$runtime/python/bin/python3" -P -m agent.launcher.desktop_update "$@"\n')
-            updater.chmod(0o755)
-        else:
-            (staging / 'astra-desktop-update.cmd').write_text(
-                '@echo off\nsetlocal\nset "PYTHONHOME="\nset "VIRTUAL_ENV="\n'
-                'set "PYTHONPATH=%~dp0Astra\\resources\\runtime\\backend"\n'
-                'set "PYTHONNOUSERSITE=1"\nset "PYTHONDONTWRITEBYTECODE=1"\n'
-                '"%~dp0Astra\\resources\\runtime\\python\\python.exe" -P -m agent.launcher.desktop_update %*\n')
+        # No updater sits beside the release: running a candidate's own code
+        # before trusted code has verified it would defeat the digest check.
         os.replace(staging, output)
         return output / application.name
     except BaseException:

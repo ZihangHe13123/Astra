@@ -13,9 +13,12 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import os
 import re
 import shutil
+import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 MANIFEST = "canvas.json"
@@ -246,7 +249,8 @@ def slide_parts(root: Path) -> list[tuple[str, str]]:
     return parts
 
 
-def build_pptx(pictures: list[Path], parts: list[tuple[str, str]], target: Path, title: str) -> None:
+def build_pptx(pictures: list[Path], parts: list[tuple[str, str]], target: Path, title: str,
+               unmoved: Callable[[], None] = lambda: None) -> None:
     """A 16:9 deck of one full-slide picture each, the slide's heading as the picture's text for screen readers, its notes as notes."""
     from pptx import Presentation
     from pptx.util import Emu
@@ -268,7 +272,17 @@ def build_pptx(pictures: list[Path], parts: list[tuple[str, str]], target: Path,
             frame.text = notes
     deck.core_properties.title = title
     target.parent.mkdir(parents=True, exist_ok=True)
-    deck.save(str(target))
+    # A new file of its own, renamed over the name: a link already at the name is replaced, never written through.
+    # `unmoved` checks the folder is still where it was found, right before each write: building takes a while.
+    unmoved()
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            deck.save(stream)
+        unmoved()
+        os.replace(temporary, target)
+    finally:
+        Path(temporary).unlink(missing_ok=True)
 
 
 def slide_count(root: Path) -> int:

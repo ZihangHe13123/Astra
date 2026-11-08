@@ -66,9 +66,63 @@ def test_a_command_past_its_deadline_is_stopped_with_every_process_it_started(tm
     marker = tmp_path / "child.pid"
     try:
         started = time.monotonic()
-        with pytest.raises(LauncherError, match="did not finish within 5 seconds"):
+        with pytest.raises(LauncherError, match="did not finish within 5 seconds and was stopped"):
             run([sys.executable, "-c", STARTER, str(marker), "stay"], cwd=tmp_path, timeout=5)
         assert time.monotonic() - started < 20
+        assert ends(started_pid(marker))
+    finally:
+        if marker.is_file():
+            stop(int(marker.read_text()))
+
+
+# Starts a middle process that starts a long-lived child and exits at once, records the child's pid,
+# then keeps running: the child's parent is gone before the deadline.
+ORPHANING = """
+import subprocess, sys, time
+middle = (f"import subprocess, sys; child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+          f"open({sys.argv[1]!r}, 'w').write(str(child.pid))")
+subprocess.run([sys.executable, "-c", middle])
+time.sleep(60)
+"""
+
+
+def test_a_command_past_its_deadline_stops_a_child_whose_parent_already_exited(tmp_path):
+    marker = tmp_path / "orphan.pid"
+    try:
+        with pytest.raises(LauncherError, match="did not finish within 5 seconds and was stopped"):
+            run([sys.executable, "-c", ORPHANING, str(marker)], cwd=tmp_path, timeout=5)
+        assert ends(started_pid(marker))
+    finally:
+        if marker.is_file():
+            stop(int(marker.read_text()))
+
+
+def test_a_command_writing_to_the_terminal_past_its_deadline_stops_what_it_started_too(tmp_path):
+    # uv sync, npm ci and the builds show their output instead of having it captured.
+    marker = tmp_path / "orphan.pid"
+    try:
+        with pytest.raises(LauncherError, match="did not finish within 5 seconds and was stopped"):
+            run([sys.executable, "-c", ORPHANING, str(marker)], cwd=tmp_path, timeout=5, capture=False)
+        assert ends(started_pid(marker))
+    finally:
+        if marker.is_file():
+            stop(int(marker.read_text()))
+
+
+# Starts a child in a session of its own (outside the command's process group), records its pid, keeps running.
+SESSION = """
+import os, subprocess, sys, time
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], start_new_session=os.name != "nt")
+open(sys.argv[1], "w").write(str(child.pid))
+time.sleep(60)
+"""
+
+
+def test_a_child_in_a_session_of_its_own_is_stopped_with_the_command(tmp_path):
+    marker = tmp_path / "session.pid"
+    try:
+        with pytest.raises(LauncherError, match="did not finish within 5 seconds and was stopped"):
+            run([sys.executable, "-c", SESSION, str(marker)], cwd=tmp_path, timeout=5)
         assert ends(started_pid(marker))
     finally:
         if marker.is_file():
@@ -87,18 +141,22 @@ SUPERVISOR = """
 import subprocess, sys, time
 child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
 open(sys.argv[1], "w").write(str(child.pid))
+subprocess.run([sys.executable, "-c", sys.argv[3], sys.argv[2]])
 time.sleep(60)
 """
+# A helper of Electron's whose parent already exited.
+ORPHAN = ("import subprocess, sys; child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+          "open(sys.argv[1], 'w').write(str(child.pid))")
 
 
 def test_a_desktop_that_does_not_open_in_time_is_ended_with_what_it_started(tmp_path, monkeypatch):
     # The supervisor never reports ready; its child stands in for Electron and the backends.
-    marker = tmp_path / "electron.pid"
+    marker, orphan = tmp_path / "electron.pid", tmp_path / "helper.pid"
     real = subprocess.Popen
 
     def popen(args, **kwargs):
         if "agent.launcher.gui" in args:
-            args = [sys.executable, "-c", SUPERVISOR, str(marker)]
+            args = [sys.executable, "-c", SUPERVISOR, str(marker), str(orphan), ORPHAN]
         return real(args, **kwargs)
 
     monkeypatch.setattr(gui.subprocess, "Popen", popen)
@@ -109,7 +167,8 @@ def test_a_desktop_that_does_not_open_in_time_is_ended_with_what_it_started(tmp_
     try:
         with pytest.raises(LauncherError, match="Desktop startup did not complete"):
             gui.launch_gui(install)  # type: ignore[arg-type]
-        assert ends(started_pid(marker))
+        assert ends(started_pid(marker)) and ends(started_pid(orphan))
     finally:
-        if marker.is_file():
-            stop(int(marker.read_text()))
+        for file in (marker, orphan):
+            if file.is_file():
+                stop(int(file.read_text()))

@@ -3,7 +3,7 @@ import { constants } from 'node:fs';
 import { open, stat } from 'node:fs/promises';
 import { extname } from 'node:path';
 import type { DocumentCheck, FilePreview } from '../file-preview-types.js';
-import { canvasVersion, isCanvasManifest, readCanvas } from './canvas-files.js';
+import { canvasVersion, documentDigest, isCanvasManifest, readCanvas } from './canvas-files.js';
 import { inspectOffice, spreadsheetPreview } from './office-inspection.js';
 import { convertOffice, type OfficeConversion } from './office-converter.js';
 
@@ -148,7 +148,7 @@ export const filePreview = (path: string, signal?: AbortSignal) => defaultPrevie
 export async function canvasPreview(path: string, version = ''): Promise<FilePreview> {
   const canvas = await readCanvas(path, 'view', 1, version);
   const meta = { title: canvas.title, type: canvas.type as 'slides' | 'doc', slides: canvas.slides, source: canvas.source, ...(version ? { version } : {}) };
-  if (canvas.type === 'doc') return { path, kind: 'text', text: canvas.source, canvas: meta };
+  if (canvas.type === 'doc') return { path, kind: 'text', text: canvas.source, canvas: { ...meta, digest: documentDigest(canvas.source) } };
   return { path, kind: 'page', text: canvas.html, canvas: meta,
     ...(canvas.missing.length ? { warnings: [`有图片没有显示：${canvas.missing.join('、')}（放在 assets 文件夹里、8 MiB 以内的 png、jpg、gif、webp、svg 才能显示）。`] } : {}) };
 }

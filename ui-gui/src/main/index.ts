@@ -32,6 +32,7 @@ import { PhoneGateway } from "./phone-gateway.js";
 import { PhonePush, phonePushRequest } from "./phone-push.js";
 import { VapidKey, webPushSender } from "./web-push.js";
 import { tailscaleName } from "./phone-tailscale.js";
+import { dataCommand as runDataCommand, DataCommandIncomplete, type WipeAnswer } from "./data-command.js";
 
 const packaged = configurePackagedRuntime({ isPackaged: app.isPackaged, resourcesPath: process.resourcesPath,
   appData: app.getPath("appData"), platform: process.platform, arch: process.arch });
@@ -179,7 +180,9 @@ ipcMain.on("astra:flushPreferences", (event, value) => {
 });
 register("bootstrap", () => {
   staleRenderer = false;
-  return { sessions: [...runtimes.values()].map(r => r.state), active, workspace, preferences, appshot: { connection: appshot.client.state.connection, enabled: appshot.client.state.enabled } };
+  const notice = wipeNotice; wipeNotice = "";
+  return { sessions: [...runtimes.values()].map(r => r.state), active, workspace, preferences, appshot: { connection: appshot.client.state.connection, enabled: appshot.client.state.enabled },
+    ...(notice ? { notice } : {}) };
 });
 /** Opens a session or a fresh draft. The window's call selects it; a phone's call leaves the window's selection alone. */
 function openSession(options: { session?: string; mode?: string; workspace?: string } = {}, select = true): SessionState {
@@ -347,23 +350,14 @@ function runUsage(action: unknown, ...values: unknown[]): Promise<unknown> {
     }));
 }
 register("usage", runUsage);
-/** One run of `astra data` (agent/cli/data_commands.py); it answers with a JSON line, an error included. */
-function dataCommand(args: string[], timeout: number): Promise<any> {
-  return new Promise((done, fail) => execFile(python, ["-m", "agent.cli.data_commands", ...args],
-    { cwd: root, env: process.env, timeout, windowsHide: true, encoding: "utf8", maxBuffer: 16 * 1024 * 1024 },
-    (error, stdout) => {
-      let result: any;
-      try { result = JSON.parse(String(stdout).trim().split("\n").at(-1) || "null"); } catch { /* reported below */ }
-      if (result?.error) fail(new Error(result.error));
-      else if (result && typeof result === "object") done(result);
-      else fail(new Error(error?.message || "没有得到结果。"));
-    }));
-}
+const dataCommand = (args: string[], timeout: number) => runDataCommand(python, root, args, timeout);
 /** After a wipe the window reloads; what it still holds about the old conversations is not written back. */
 let staleRenderer = false;
+/** A wipe that left something: told to the window once, when it has reloaded. */
+let wipeNotice = "";
 let wiping = false;
 /** The person's whole data, from the memory page: what export and wipe take, an export to a zip, or a wipe. */
-async function runData(action: unknown, confirmation?: unknown, browserData?: unknown) {
+async function runData(action: unknown, confirmation?: unknown, browserData?: unknown, personalFiles?: unknown) {
   if (action === "plan") return dataCommand(["plan"], 60_000);
   if (action === "export") {
     const day = new Date().toISOString().slice(0, 10);
@@ -379,22 +373,36 @@ async function runData(action: unknown, confirmation?: unknown, browserData?: un
   if (wiping) throw new Error("正在清除，请稍候。");
   if ([...runtimes.values()].some(rt => holdsUp(rt.state))) throw new Error("还有对话在运行任务或等你回答，请先停止它们。");
   wiping = true;
+  // Phones send nothing while the data goes: an upload still arriving is not kept, new calls wait for the reload,
+  // and a call of theirs already running finishes before anything is deleted (or the wipe does not start).
+  try { await phone.hold(); }
+  catch (error) { phone.release(); wiping = false; throw error; }
   try {
     // Nothing of Astra's may hold the data open: every session, the background host and the query helper close first.
     for (const rt of [...runtimes.values()]) { await rt.close(); forgetRuntime(rt); }
     await channelHost.stop();
     await queries.close();
-    const result = await dataCommand(["wipe", "--confirm", "清除", "--desktop", ...(browserData === true ? ["--browser-data"] : [])],
-      10 * 60_000);
+    let result: WipeAnswer | undefined, incomplete: DataCommandIncomplete | undefined;
+    const chosen = [...(browserData === true ? ["--browser-data"] : []), ...(personalFiles === true ? ["--personal-files"] : [])];
+    try { result = await dataCommand(["wipe", "--confirm", "清除", "--desktop", ...chosen], 10 * 60_000); }
+    catch (error) { if (!(error instanceof DataCommandIncomplete)) throw error; incomplete = error; }
+    // Past its refusals the command deletes. Even when some items stayed, part of the data is gone and every
+    // conversation is closed, so the window and the phones reload rather than keep (and write back) what they hold.
+    // What paired phones were sent goes too: none is replayed. Pairings stay, like other logins.
+    phone.reset();
     preferences = { ...preferences, drafts: {}, attachments: {}, workspaces: {}, titles: {}, pinned: [], lastSession: null };
     preferenceWriter.flushSync(preferences);
     staleRenderer = true;
+    // What stayed, and why, is shown once the window has reloaded; the answer below is lost with the old page.
+    if (incomplete) wipeNotice = incomplete.message;
     // The window blocks navigation it starts itself, so the reload comes from here, after this answer.
     setTimeout(() => { if (window && !window.isDestroyed()) window.webContents.reload(); }, 0);
+    if (incomplete) throw incomplete;
     return result;
   } finally {
     queries = new QueryClient(root, python);
     channelHost.resume();
+    phone.release();
     wiping = false;
   }
 }
@@ -522,7 +530,10 @@ register("canvas", async (id, value, action, argument) => {
   if (action === "preview") return { preview: await canvasPreview(path, checkedString(argument, "version", 8)) };
   if (action === "restore") return { version: await restoreVersion(path, checkedString(argument, "version", 8)) };
   if (action !== "comment" || !argument || typeof argument !== "object") throw new Error("Unknown canvas action");
-  return { version: await commentOnDocument(path, checkedString(argument.passage, "passage", 4000), checkedString(argument.comment, "comment", 2000)) };
+  const occurrence = argument.occurrence ?? 0;
+  if (!Number.isInteger(occurrence) || occurrence < 0 || occurrence > 100000) throw new Error("Invalid occurrence");
+  return { version: await commentOnDocument(path, checkedString(argument.passage, "passage", 4000), checkedString(argument.comment, "comment", 2000),
+    { occurrence, digest: argument.digest === undefined ? undefined : checkedString(argument.digest, "digest", 64) }) };
 });
 
 /**

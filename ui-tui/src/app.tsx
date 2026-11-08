@@ -18,7 +18,9 @@ import { memoryNoticeText, memoryRecallText } from "@astra/ui-core/memory-notice
 import { maskSecrets } from "@astra/ui-core/secret-mask";
 import { processRowCells, toolRowCells } from "./tool-row.js";
 import { gapLine, noticeItem, TranscriptFlow, type FlowGap, type FlowItem } from "./transcript-flow.js";
-import { createBackendEventReceiver, EventDeliveryState, writeProtocolDiagnostic } from "./backend-protocol.js";
+import {
+  createBackendEventReceiver, earlierTaskEvent, EventDeliveryState, taskStartOf, writeProtocolDiagnostic, type TaskStart,
+} from "./backend-protocol.js";
 import { RuntimeTiming } from "./runtime-timing.js";
 import { ControlledBackendRestart } from "./controlled-restart.js";
 import { randomUUID } from "node:crypto";
@@ -745,6 +747,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   const [modelList, setModelList] = useState<ModelMenuItem[]>(DEFAULT_MODEL_LIST);
   const [activeTask, setActiveTask] = useState<TaskInfo | null>(null);
   const activeTaskRef = useRef<TaskInfo | null>(null);
+  /** The current task's start in the event journal, for telling an earlier task's late replay apart. */
+  const taskStartRef = useRef<TaskStart | undefined>(undefined);
   const updateActiveTask = useCallback((task: TaskInfo | null) => {
     activeTaskRef.current = task;
     setActiveTask(task);
@@ -1387,6 +1391,9 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         }
         break;
       case "task_started":
+        // An earlier task replayed after this one began cannot become current again.
+        if (earlierTaskEvent(taskStartRef.current, envelope)) break;
+        taskStartRef.current = taskStartOf(envelope);
         setPreparation(undefined);
         updateActiveTask(event.task);
         setGenerationStats(null);
@@ -1399,6 +1406,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         }
         break;
       case "task_status":
+        if (earlierTaskEvent(taskStartRef.current, envelope)) break;
         if (event.task && !["completed", "failed", "cancelled", "done_verified", "interrupted"].includes(event.task.status)) {
           if (!activeTaskRef.current || activeTaskRef.current.id === event.task.id) updateActiveTask(event.task);
         } else if (event.task && activeTaskRef.current?.id === event.task.id) {
@@ -1643,6 +1651,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         break;
       }
       case "done":
+        // An earlier turn's done replayed after this task began cannot end it.
+        if (earlierTaskEvent(taskStartRef.current, envelope)) break;
         finishTurn();
         break;
       case "error":

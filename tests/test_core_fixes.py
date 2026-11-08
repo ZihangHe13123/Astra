@@ -2812,7 +2812,7 @@ def test_react_agent_turns_stream_cancel_into_error_event():
     run(scenario())
 
 
-def test_react_cancel_during_tool_repairs_history_before_next_turn():
+def test_react_cancel_during_tool_completes_history_before_next_turn():
     class ToolThenReplyLLM:
         def __init__(self):
             self.calls = 0
@@ -2867,8 +2867,13 @@ def test_react_cancel_during_tool_repairs_history_before_next_turn():
         await execution
 
         assert any(event.get("code") == "cancelled" for event in first_events)
-        assert not any(message.get("role") == "tool" for message in agent.context.messages)
-        assert not any(message.get("tool_calls") for message in agent.context.messages)
+        # The started call keeps its place in a complete chain, with an
+        # unknown outcome rather than being removed as if it never ran.
+        roles = [message["role"] for message in agent.context.messages]
+        assert roles == ["user", "assistant", "tool"]
+        assert [call["id"] for call in agent.context.messages[1]["tool_calls"]] == ["slow-1"]
+        assert agent.context.messages[2]["tool_call_id"] == "slow-1"
+        assert "[ToolOutcomeUnknown] slow_tool started" in agent.context.messages[2]["content"]
 
         second_events = [
             event async for event in agent.reply_stream(
@@ -2877,7 +2882,9 @@ def test_react_cancel_during_tool_repairs_history_before_next_turn():
         ]
         assert second_events[-1]["type"] == "done"
         assert llm.calls == 2
-        assert not any(message.get("role") == "tool" for message in llm.prompts[-1])
+        replay = [message for message in llm.prompts[-1] if message["role"] in {"assistant", "tool"}]
+        assert [message["role"] for message in replay] == ["assistant", "tool"]
+        assert replay[1]["tool_call_id"] == "slow-1"
 
     run(scenario())
 

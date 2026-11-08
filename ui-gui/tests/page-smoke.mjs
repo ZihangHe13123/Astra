@@ -596,14 +596,18 @@ print(json.dumps({"slides": sorted(n for n in names if n.startswith("ppt/slides/
   const plan = join(workspace, 'plan.canvas');
   const sources = () => readdirSync(join(plan, '.versions')).sort().map(id => JSON.parse(readFileSync(join(plan, '.versions', id, 'meta.json'), 'utf8')).source);
   assert.deepEqual(sources(), ['create', 'write'], 'the doc_edit through call_tool is kept as a version');
-  // Selecting the passage opens the comment; it is written after the passage, where doc_comments reads it.
-  // The paragraph is selected whole, as a drag across it would; a triple click stops before the full stop on some platforms.
-  await passage.evaluate(node => { const range = document.createRange(); range.selectNodeContents(node); getSelection().removeAllRanges(); getSelection().addRange(range); });
+  // Selecting a passage opens the comment; it is written after the very text selected, where doc_comments reads it:
+  // here the second of two 季度 in the paragraph, which a comment by the text alone would put after the first.
+  await passage.evaluate(node => {
+    const text = node.firstChild; const at = text.data.indexOf('季度', text.data.indexOf('季度') + 1);
+    const range = document.createRange(); range.setStart(text, at); range.setEnd(text, at + 2);
+    getSelection().removeAllRanges(); getSelection().addRange(range);
+  });
   await passage.dispatchEvent('mouseup');
   await preview.locator('.canvas-comment textarea').fill('加上月份');
   await preview.getByRole('button', { name: '写进文档', exact: true }).click();
   await expect(preview.locator('.doc-comments')).toContainText('加上月份');
-  assert.match(readFileSync(join(plan, 'doc.md'), 'utf8'), /第一季度做画布，第二季度做语音。 <!-- @astra: 加上月份 -->/);
+  assert.match(readFileSync(join(plan, 'doc.md'), 'utf8'), /第一季度做画布，第二季度 <!-- @astra: 加上月份 -->做语音。/);
   assert.deepEqual(sources(), ['create', 'write', 'comment']);
   // The first version is looked at in place, then restored as a version of its own.
   await preview.getByRole('button', { name: '版本', exact: true }).click();
