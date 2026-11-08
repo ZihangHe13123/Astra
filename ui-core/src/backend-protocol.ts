@@ -45,13 +45,16 @@ export function taskStartOf(event: Envelope): TaskStart | undefined {
 }
 
 /**
- * An event about another task that the journal recorded before the current task started, as a
- * replay page delivers it late. It may update that task's own record, but not which task is
- * current or whether a turn is running.
+ * An event of an earlier task or turn that the journal recorded before the current task started,
+ * as a replay page delivers it late. It may update that task's own record, but not which task is
+ * current, whether a turn is running, or the running turn's display.
  */
 export function earlierTaskEvent(current: TaskStart | undefined, event: Envelope): boolean {
+  if (!current || !event.replayable || !Number.isSafeInteger(event.cursor) || event.cursor! >= current.cursor) return false;
+  // A journaled done keeps no task id; one recorded before this task started ended an earlier turn.
+  if (event.type === "done") return true;
   const id = journaledTaskId(event);
-  return Boolean(current && id && id !== current.id && event.cursor! < current.cursor);
+  return Boolean(id && id !== current.id);
 }
 
 /** The approval or question a request opens. */

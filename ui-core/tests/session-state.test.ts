@@ -332,6 +332,21 @@ test("an earlier task's replayed end closes its own approval but not the turn th
   assert.equal(c.state.busy, false);
 });
 
+test("an earlier turn's replayed done leaves the running turn and its streaming answer alone", () => {
+  const c = connection();
+  c.live(8, { type: "task_started", task: { id: "A", status: "running" } });
+  c.live(9, { type: "done" }, { lost: true });
+  c.live(10, { type: "task_started", task: { id: "B", status: "running" } });
+  c.live(10, { type: "chunk", content: "second " }, { replayable: false });
+  assert.deepEqual(c.gaps, [8]);
+  // The journal keeps only the type of a done: no task id, just its place.
+  c.replay(9, 2, { type: "done" });
+  c.receive(JSON.stringify({ type: "event_replay_complete", after_cursor: 8, next_cursor: 10, has_more: false }));
+  c.live(10, { type: "chunk", content: "answer" }, { replayable: false });
+  assert.equal(c.state.busy, true);
+  assert.deepEqual(c.state.messages.filter(m => m.role === "assistant").map(m => m.content), ["second answer"]);
+});
+
 test("an earlier task's start and end replayed after the next task began leave that task current", () => {
   const c = connection();
   c.live(7, { type: "done" });

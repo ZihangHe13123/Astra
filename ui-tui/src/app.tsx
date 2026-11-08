@@ -1651,6 +1651,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         break;
       }
       case "done":
+        // An earlier turn's done replayed after this task began cannot end it.
+        if (earlierTaskEvent(taskStartRef.current, envelope)) break;
         finishTurn();
         break;
       case "error":

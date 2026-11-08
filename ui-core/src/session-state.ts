@@ -246,7 +246,7 @@ export function projectEvent(previous: SessionState, event: UIEvent): SessionSta
     }
     // A command's done/error can arrive while an independently running turn
     // still owns the backend. Only its task status can terminate that turn.
-    case "done": state.busy = ["pending", "running", "cancelling"].includes(state.info.task_status?.task?.status); state.stream = ""; break;
+    case "done": if (earlierTask) break; state.busy = ["pending", "running", "cancelling"].includes(state.info.task_status?.task?.status); state.stream = ""; break;
     case "error": append("error", event.message || "请求失败"); state.busy = ["pending", "running", "cancelling"].includes(state.info.task_status?.task?.status); state.stream = ""; notice(); break;
     case "turn_changes": {
       // The newest report stays where the details panel reads it; each turn's report keeps its place too.
