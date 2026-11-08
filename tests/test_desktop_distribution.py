@@ -343,6 +343,29 @@ def test_installed_updater_verifies_candidate_before_any_candidate_code_runs(tmp
     assert not list(installed.parent.glob('.astra-update-*'))
 
 
+@pytest.mark.skipif(os.name == 'nt', reason='the fixture interpreter is a POSIX shell shim')
+def test_update_round_trip_script_passes_on_a_fixture_release_and_leaves_it_untouched(tmp_path):
+    from agent.launcher.common import write_json
+    from agent.launcher.desktop_distribution import seal_tree, sha256
+    release = tmp_path / 'release'
+    bundled_application(release / 'Astra.app', '0.3.0', f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    manifest = seal_tree(release / 'Astra.app', version='0.3.0', target='darwin-arm64')
+    manifest['application'] = 'Astra.app'
+    write_json(release / 'release.json', manifest)
+    (release / 'release.sha256').write_text(sha256(release / 'release.json') + '  release.json\n')
+    before = {path.relative_to(release): path.read_bytes() for path in release.rglob('*') if path.is_file()}
+    work = tmp_path / 'work'
+    result = subprocess.run([sys.executable, str(ROOT / 'scripts/desktop_update_roundtrip.py'), str(release),
+                             '--work', str(work)], capture_output=True, text=True, timeout=300,
+                            env={'PATH': os.environ.get('PATH', '/usr/bin:/bin'), 'HOME': str(tmp_path / 'home'),
+                                 'TMPDIR': str(tmp_path)})
+    assert result.returncode == 0, result.stdout + result.stderr
+    summary = json.loads(result.stdout[result.stdout.index('{'):])
+    assert summary['ok'] and summary['interrupted_phase'] in {'preparing', 'staged'}
+    assert {path.relative_to(release): path.read_bytes() for path in release.rglob('*') if path.is_file()} == before
+    assert not work.exists()
+
+
 def test_workspace_dependencies_uses_manifest_and_reports_unavailable_source(tmp_path):
     from agent.runtime.tools.workspace_dependencies import workspace_dependencies
     assert workspace_dependencies(tmp_path)['status'] == 'unavailable'
