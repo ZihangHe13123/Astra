@@ -41,8 +41,7 @@ def test_goal_without_task_storage_reports_error_and_accepts_next_command(tmp_pa
         capture_output=True,
         text=True,
         timeout=30,
-        cwd=Path(__file__).resolve().parents[1],
-        env=env,
+        env={**env, "PYTHONPATH": str(Path(__file__).resolve().parents[1])},
     )
     assert result.returncode == 0, result.stderr
     events = [json.loads(line) for line in result.stdout.splitlines() if line.startswith("{")]

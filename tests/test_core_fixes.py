@@ -1032,7 +1032,7 @@ def test_session_path_rejects_directory_escape():
 
 
 def test_gitignore_excludes_runtime_artifacts():
-    ignore = Path(".gitignore").read_text(encoding="utf-8")
+    ignore = (Path(__file__).resolve().parents[1] / ".gitignore").read_text(encoding="utf-8")
 
     assert ".sessions/" in ignore
     assert "\nnul\n" in f"\n{ignore}\n"

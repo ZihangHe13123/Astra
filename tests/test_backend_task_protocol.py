@@ -94,8 +94,7 @@ def test_backend_exposes_tasks_command_without_blocking_protocol(tmp_path: Path)
         input=commands,
         text=True,
         capture_output=True,
-        cwd=root,
-        env=env,
+        env={**env, "PYTHONPATH": str(root)},
         timeout=60,
         check=False,
     )
@@ -259,8 +258,7 @@ def test_backend_history_preserves_message_timestamps_and_tool_activity(tmp_path
         input=json.dumps({"type": "exit"}) + "\n",
         text=True,
         capture_output=True,
-        cwd=Path(__file__).parents[1],
-        env=env,
+        env={**env, "PYTHONPATH": str(Path(__file__).parents[1])},
         timeout=60,
         check=False,
     )
@@ -327,8 +325,7 @@ def test_backend_loads_saved_vision_tiles_off_at_startup(tmp_path: Path):
         input=commands,
         text=True,
         capture_output=True,
-        cwd=Path(__file__).parents[1],
-        env=env,
+        env={**env, "PYTHONPATH": str(Path(__file__).parents[1])},
         timeout=60,
         check=False,
     )
@@ -841,8 +838,7 @@ def test_goal_resume_launches_work_but_verifier_failure_does_not_spend_round(tmp
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        cwd=root,
-        env=env,
+        env={**env, "PYTHONPATH": str(root)},
         bufsize=1,
     )
     assert proc.stdin is not None
@@ -966,8 +962,7 @@ def _start_question_protocol_backend(
     })
     env.update(env_overrides or {})
     repo_root = Path(__file__).resolve().parents[1]
-    if workdir is not None:
-        env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(repo_root), env.get("PYTHONPATH", "")]))
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(repo_root), env.get("PYTHONPATH", "")]))
     # Startup diagnostics must be drained too: a full stderr pipe can prevent
     # a child from ever publishing model_info. Keep a bounded tail for failures.
     # A watchdog dumps stacks concurrently with imports and changes the child
@@ -982,7 +977,8 @@ def _start_question_protocol_backend(
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        cwd=workdir if workdir is not None else repo_root,
+        # Without a workdir the backend's workspace is the test's own directory, never the checkout.
+        cwd=workdir,
         env=env,
         bufsize=1,
     )
@@ -1216,8 +1212,7 @@ def test_backend_resumes_same_turn_with_structured_question_tool_result(tmp_path
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        cwd=root,
-        env=env,
+        env={**env, "PYTHONPATH": str(root)},
         bufsize=1,
     )
     assert proc.stdin is not None
@@ -1586,8 +1581,7 @@ def test_backend_pauses_tool_call_for_frontend_approval_and_resumes_same_argumen
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        cwd=root,
-        env=env,
+        env={**env, "PYTHONPATH": str(root)},
         bufsize=1,
     )
     assert proc.stdin is not None
@@ -1861,8 +1855,7 @@ def test_backend_can_cancel_an_active_stream_and_persist_status(tmp_path: Path):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        cwd=root,
-        env=env,
+        env={**env, "PYTHONPATH": str(root)},
         bufsize=1,
     )
     assert proc.stdin is not None

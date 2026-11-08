@@ -13,6 +13,7 @@ with an increasing delay, giving transient locks time to clear.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -23,6 +24,8 @@ import pytest
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+_COLLECTION_DIR = pytest.StashKey[str]()
 
 
 @pytest.fixture(autouse=True)
@@ -103,6 +106,25 @@ def _isolate_session_recall_db(request, tmp_path, monkeypatch, _isolate_applicat
     )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_runtime_state(request, tmp_path, tmp_path_factory, monkeypatch, _isolate_application_environment):
+    # Without ASTRA_HOME a source checkout keeps its private state (browser.db, usage, jobs) in
+    # <checkout>/.astra, and a backend logs to <checkout>/.logs. An agent whose sandbox names no
+    # workdir uses the current directory as its workspace: turn-change snapshots, process logs, image
+    # tiles and handoffs land there. The directory is apart from tmp_path, which tests lay out themselves.
+    if request.node.get_closest_marker("allow_application_environment") is not None:
+        return
+    monkeypatch.setenv("ASTRA_HOME", str(tmp_path / "astra-home"))
+    monkeypatch.setenv("AGENT_LOG_DIR", str(tmp_path / "logs"))
+    monkeypatch.chdir(tmp_path_factory.mktemp("cwd"))
+
+
+@pytest.fixture
+def without_astra_home(monkeypatch):
+    """For tests of a checkout's own layout, <root>/.astra, which ASTRA_HOME replaces."""
+    monkeypatch.delenv("ASTRA_HOME", raising=False)
+
+
 def _patch_win32_scandir_retry() -> None:
     if sys.platform != "win32":
         return
@@ -142,6 +164,22 @@ def pytest_configure(config: pytest.Config) -> None:
     patch.setenv("ASTRA_LOCAL_MODE_FILE", os.path.join(persona_state.name, "missing-local-mode.py"))
     config.add_cleanup(patch.undo)
     _patch_win32_scandir_retry()
+    # Collected modules import agent code that acts before any fixture runs: agent.cli.backend opens
+    # its log file under AGENT_LOG_DIR or ./.logs, and the delegate tools create ./.astra/processes.
+    scratch = tempfile.mkdtemp(prefix="astra-pytest-")
+    config.stash[_COLLECTION_DIR] = scratch
+    os.environ["AGENT_LOG_DIR"] = os.path.join(scratch, "logs")
+    config.add_cleanup(lambda: shutil.rmtree(scratch, ignore_errors=True))
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_collection(session: pytest.Session):
+    previous = os.getcwd()
+    os.chdir(session.config.stash[_COLLECTION_DIR])
+    try:
+        return (yield)
+    finally:
+        os.chdir(previous)
 
 
 @pytest.fixture(scope="session")

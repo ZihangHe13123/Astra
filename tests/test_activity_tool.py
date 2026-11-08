@@ -354,7 +354,7 @@ def test_activity_registration_is_local_and_after_session_search():
 
 
 def test_context_reader_has_no_sync_or_store_construction_dependency():
-    source = Path("agent/runtime/context_index/activity_source.py").read_text()
+    source = (Path(__file__).resolve().parents[1] / "agent/runtime/context_index/activity_source.py").read_text()
     assert "ActivityStore(" not in source
     assert "activity_search" not in source
     assert "activity_sync" not in source

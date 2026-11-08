@@ -9,7 +9,7 @@ import pytest
 from agent.runtime.context_index import vector_index as mod
 
 
-def test_default_db_path_resolution(monkeypatch, tmp_path) -> None:
+def test_default_db_path_resolution(monkeypatch, tmp_path, without_astra_home) -> None:
     monkeypatch.setenv(mod.ENV_DB_PATH, str(tmp_path / "custom-vectors.db"))
     assert mod.default_vectors_db_path() == tmp_path / "custom-vectors.db"
     monkeypatch.delenv(mod.ENV_DB_PATH, raising=False)
