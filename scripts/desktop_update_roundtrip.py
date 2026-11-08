@@ -8,7 +8,8 @@ only read. Steps:
 
 1. A copy of the candidate with one altered file is refused by the installed
    updater before any of its code runs.
-2. A stage killed partway is discarded by the installed updater's recover.
+2. A stage killed while its journal says preparing, and a staged update that
+   was never applied, are each discarded by the installed updater's recover.
 3. The release is staged with the installed updater and its manifest digest,
    applied and finalized with the updater copy that stage printed.
 """
@@ -18,10 +19,12 @@ import argparse
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -31,6 +34,8 @@ from agent.launcher.desktop_distribution import resources_for, sha256, verify_tr
 from agent.launcher.desktop_update import UPDATER  # noqa: E402
 
 TIMEOUT = 900
+# A stage that outruns the journal poll is retried, never counted as interrupted.
+INTERRUPT_ATTEMPTS = 3
 
 
 def phase(name: str) -> None:
@@ -69,6 +74,45 @@ class Updater:
         if result.returncode:
             raise AssertionError(f'{args[0]} failed ({result.returncode}): {result.stderr.strip()}')
         return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def journal_phase(journal: Path) -> str | None:
+    try:
+        return json.loads(journal.read_text(encoding='utf-8')).get('phase')
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def interrupt_stage(start: Callable[[], subprocess.Popen], journal: Path, discard: Callable[[], None],
+                    attempts: int = INTERRUPT_ATTEMPTS) -> int:
+    """Kill a running stage while its journal says preparing; return the attempt that did.
+
+    A stage that finishes, or fails, before it is caught proves nothing: it is
+    discarded and retried, and after the last attempt the check fails.
+    """
+    for attempt in range(1, attempts + 1):
+        process = start()
+        try:
+            deadline = time.monotonic() + TIMEOUT
+            while process.poll() is None and journal_phase(journal) != 'preparing':
+                if time.monotonic() > deadline:
+                    raise AssertionError('stage neither started copying nor finished')
+                time.sleep(0.001)
+            if process.poll() is None:
+                process.kill()
+                code = process.wait(timeout=60)
+                # A stage that ends by itself writes "staged" or removes the journal.
+                killed = os.name == 'nt' or code == -signal.SIGKILL
+                if killed and journal_phase(journal) == 'preparing':
+                    return attempt
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=60)
+        if journal.exists():
+            discard()
+    raise AssertionError(f'stage finished before it could be killed while preparing in {attempts} attempts; '
+                         'the interrupted-stage check proved nothing')
 
 
 def link_or_copy(source: str, destination: str) -> None:
@@ -132,23 +176,28 @@ def round_trip(release: Path, work: Path) -> dict:
         raise AssertionError('A refused candidate ran or left update state behind.')
     shutil.rmtree(tampered)
 
+    journal = control / 'desktop-update.json'
+
+    def discard(label: str) -> None:
+        discarded = updater.ok(installed, 'recover')
+        if discarded['phase'] != 'discarded' or leftovers(application) or journal.exists():
+            raise AssertionError(f'{label} was not discarded: {discarded}')
+        verify_tree(application, manifest, target=target)
+
     phase('interrupted-stage-discarded')
     interpreter, env = installed_interpreter(application, runtime, updater.env)
-    process = subprocess.Popen([*interpreter, *updater.command(installed, *stage, '--candidate', str(release))[1:]],
-                               cwd=work, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    deadline = time.monotonic() + TIMEOUT
-    while process.poll() is None and not any(item.endswith('-staged') for item in leftovers(application)):
-        if time.monotonic() > deadline:
-            process.kill()
-            raise AssertionError('stage did not start copying')
-        time.sleep(0.01)
-    process.kill()  # A no-op if stage already finished; then the journal says "staged".
-    process.wait(timeout=60)
-    interrupted = json.loads((control / 'desktop-update.json').read_text(encoding='utf-8'))['phase']
-    discarded = updater.ok(installed, 'recover')
-    if discarded['phase'] != 'discarded' or leftovers(application) or (control / 'desktop-update.json').exists():
-        raise AssertionError(f'Interrupted stage was not discarded: {discarded}')
-    verify_tree(application, manifest, target=target)
+    attempts = interrupt_stage(
+        lambda: subprocess.Popen([*interpreter, *updater.command(installed, *stage, '--candidate', str(release))[1:]],
+                                 cwd=work, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+        journal, lambda: discard('A stage that finished before it could be killed'))
+    if journal_phase(journal) != 'preparing':
+        raise AssertionError('The interrupted stage journal no longer says preparing.')
+    discard('A stage killed while preparing')
+
+    phase('staged-update-discarded')
+    if updater.ok(installed, *stage, '--candidate', str(release))['phase'] != 'staged':
+        raise AssertionError('stage did not report a staged update')
+    discard('A staged update that was never applied')
 
     phase('stage')
     staged = updater.ok(installed, *stage, '--candidate', str(release))
@@ -167,7 +216,7 @@ def round_trip(release: Path, work: Path) -> dict:
     verify_tree(application, manifest, target=target)
     verify_tree(release / name, manifest, target=target)
     phase('passed')
-    return {'ok': True, 'target': target, 'version': manifest['version'], 'interrupted_phase': interrupted,
+    return {'ok': True, 'target': target, 'version': manifest['version'], 'interrupt_attempts': attempts,
             'applied': applied['phase'], 'finalized': finalized['phase']}
 
 

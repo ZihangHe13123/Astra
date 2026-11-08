@@ -343,6 +343,33 @@ def test_installed_updater_verifies_candidate_before_any_candidate_code_runs(tmp
     assert not list(installed.parent.glob('.astra-update-*'))
 
 
+def test_round_trip_counts_only_a_stage_killed_while_preparing(tmp_path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('desktop_update_roundtrip', ROOT / 'scripts/desktop_update_roundtrip.py')
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    journal = tmp_path / 'desktop-update.json'
+
+    def stage(phase, linger):
+        code = ('import json, pathlib, sys, time; pathlib.Path(sys.argv[1]).write_text(json.dumps({"phase": sys.argv[2]}));'
+                ' time.sleep(float(sys.argv[3]))')
+        return lambda: subprocess.Popen([sys.executable, '-c', code, str(journal), phase, str(linger)])
+
+    discarded = []
+
+    def discard():
+        discarded.append(module.journal_phase(journal))
+        journal.unlink()
+
+    # A stage that finishes before it can be killed proves nothing, however often it is retried.
+    with pytest.raises(AssertionError, match='proved nothing'):
+        module.interrupt_stage(stage('staged', 0), journal, discard, attempts=2)
+    assert discarded == ['staged', 'staged']
+    assert module.interrupt_stage(stage('preparing', 60), journal, discard) == 1
+    assert module.journal_phase(journal) == 'preparing'
+
+
 @pytest.mark.skipif(os.name == 'nt', reason='the fixture interpreter is a POSIX shell shim')
 def test_update_round_trip_script_passes_on_a_fixture_release_and_leaves_it_untouched(tmp_path):
     from agent.launcher.common import write_json
@@ -361,7 +388,8 @@ def test_update_round_trip_script_passes_on_a_fixture_release_and_leaves_it_unto
                                  'TMPDIR': str(tmp_path)})
     assert result.returncode == 0, result.stdout + result.stderr
     summary = json.loads(result.stdout[result.stdout.index('{'):])
-    assert summary['ok'] and summary['interrupted_phase'] in {'preparing', 'staged'}
+    assert summary['ok'] and summary['interrupt_attempts'] >= 1
+    assert 'UPDATE_ROUNDTRIP staged-update-discarded' in result.stdout
     assert {path.relative_to(release): path.read_bytes() for path in release.rglob('*') if path.is_file()} == before
     assert not work.exists()
 
