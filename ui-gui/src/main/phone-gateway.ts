@@ -16,6 +16,7 @@ const REPLAY_EVENTS = 4000;
 const REPLAY_BYTES = STREAM_BACKLOG_LIMIT;
 const HEARTBEAT_MS = 20_000;
 const WIPING = "正在清除数据，请稍后再试。";
+const WIPED = "数据刚清除过，这一步没有执行。请在重新载入后再试。";
 /** How long a wipe waits for phones' calls already running before it gives up. */
 const HOLD_WAIT_MS = 30_000;
 const TYPES: Record<string, string> = {
@@ -70,7 +71,7 @@ export class PhoneGateway {
   private recentBytes = 0;
   /** A wipe is running: phones' uploads and calls are refused until it ends. */
   private held = false;
-  /** Changed when a wipe starts or ends: an upload begun before then is not kept. */
+  /** Changed when a wipe starts or ends: an upload or call begun before then is not carried out. */
   private epoch = 0;
   /** Phones' calls handed to the desktop and not yet answered: a wipe waits for them. */
   private calls = new Set<Promise<unknown>>();
@@ -187,7 +188,7 @@ export class PhoneGateway {
       if (!this.options.uploadRoot) return send(response, 404, { error: "Not found" });
       if (this.held) { request.resume(); return send(response, 503, { error: WIPING }); }
       const saved = await this.saveUpload(request, uploadName(request.headers["x-astra-file-name"]));
-      if (!saved) return send(response, 503, { error: WIPING });
+      if (!saved) return this.wipedMeanwhile(response);
       this.options.uploaded?.(deviceId, saved.path, saved.bytes);
       return send(response, 200, { path: saved.path });
     }
@@ -195,12 +196,13 @@ export class PhoneGateway {
       const deviceId = this.bearer(request);
       if (!deviceId) return send(response, 401, { error: "Sign in again" });
       if (this.held) { request.resume(); return send(response, 503, { error: WIPING }); }
+      const epoch = this.epoch;
       const body = await readJson(request, INVOKE_BODY_LIMIT);
       const method = body.method as PhoneInvokeMethod;
       if (!PHONE_INVOKE_METHODS.includes(method)) return send(response, 400, { error: "Unsupported call" });
       const args = Array.isArray(body.args) ? body.args : [];
-      // Asked again once the body is in: a wipe may have started while it arrived.
-      if (this.held) return send(response, 503, { error: WIPING });
+      // Asked again once the body is in: a wipe may have started, or even run to its end, while it arrived.
+      if (this.held || epoch !== this.epoch) return this.wipedMeanwhile(response);
       const call = (async () => this.options.invoke(deviceId, method, args))();
       this.calls.add(call);
       try { return send(response, 200, { result: (await call) ?? null }); }
@@ -237,6 +239,11 @@ export class PhoneGateway {
     const path = join(folder, `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}-${randomUUID().slice(0, 6)}-${name}`);
     writeFileSync(path, Buffer.concat(chunks), { mode: 0o600, flag: "wx" });
     return { path, bytes: size };
+  }
+
+  /** A request that arrived across a wipe: refused while it runs (503), and as stale once it has ended (409). */
+  private wipedMeanwhile(response: ServerResponse) {
+    return this.held ? send(response, 503, { error: WIPING }) : send(response, 409, { error: WIPED });
   }
 
   /** Whether this phone has the app open: its event stream is connected, so it needs no push. */

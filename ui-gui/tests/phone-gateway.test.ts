@@ -302,7 +302,7 @@ test("while a wipe runs, a phone's uploads and calls are refused and an upload s
 
 test("a wipe waits for a phone's call already running, and one whose body arrives after it starts never runs", async () => {
   let answer = (_value: unknown) => {};
-  const { devices, gateway, port, base, calls } = await setup((_device, method) =>
+  const { devices, gateway, port, base, calls, uploadRoot } = await setup((_device, method) =>
     method === "jobs" ? new Promise(done => { answer = done; }) : { ok: true });
   let late: ReturnType<typeof halfSent> | undefined;
   try {
@@ -330,6 +330,19 @@ test("a wipe waits for a phone's call already running, and one whose body arrive
     assert.match(refused.body.error, /清除/);
     assert.deepEqual(calls.map(call => call.method), ["jobs"]);
     gateway.release();
+
+    // Nor does one whose body is finished only after a whole wipe has come and gone, a call or an upload.
+    const across = halfSent(port, token, "/api/invoke", [body.slice(0, 10), body.slice(10)], { "Content-Type": "application/json" });
+    const file = halfSent(port, token, "/api/upload", [Buffer.alloc(1024, 1), Buffer.alloc(1024, 2)], { "X-Astra-File-Name": "across.jpg" });
+    await new Promise(resolve => setTimeout(resolve, 200));
+    await gateway.hold(); gateway.reset(); gateway.release();
+    across.finish(); file.finish();
+    for (const stale of [await across.answer, await file.answer]) {
+      assert.equal(stale.status, 409);
+      assert.match(stale.body.error, /刚清除过/);
+    }
+    assert.deepEqual(calls.map(call => call.method), ["jobs"]);
+    assert.deepEqual(kept(uploadRoot), []);
 
     // A call that does not finish in time keeps the wipe from starting.
     const stuck = client.invoke(token, "jobs", ["list"]);
