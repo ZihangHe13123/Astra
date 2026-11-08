@@ -27,7 +27,7 @@ from agent.core.msg import ContentBlock, Msg
 from agent.cli.turn_changes_command import execute_changes_command
 from agent.runtime import turn_change_store as tcs
 from agent.runtime import turn_changes_view as changes_view
-from agent.runtime.llm import LLMConfig, LLMResponseError
+from agent.runtime.llm import LLMConfig, LLMIdleTimeout, LLMOverallTimeout, LLMResponseError
 from agent.runtime.react import ReActAgent
 from agent.runtime.token_estimator import estimate_messages_tokens
 from agent.runtime.tools import delegate as delegate_tools
@@ -35,6 +35,7 @@ from agent.runtime.tools.delegate import register_delegate_tools
 from agent.runtime.tools.files import register_file_tools
 from agent.runtime.tools.processes import ProcessManager
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
+from agent.runtime.turn_budget import TurnBudgetExceeded
 
 
 def run(coro):
@@ -435,6 +436,96 @@ def test_model_error_path_still_publishes_once(tmp_path, monkeypatch):
     )
     manifest = stores[0].manifest(0)
     assert manifest is not None
+
+
+# How a turn ends after its write: the second reply, extra agent options, the
+# error reply() raises, and the error code reply_stream() reports.
+TURN_ENDINGS = {
+    "model_error": (
+        lambda: LLMResponseError("stream_closed", "connection dropped"), {}, LLMResponseError, "stream_closed",
+    ),
+    "idle_timeout": (lambda: LLMIdleTimeout("no progress"), {}, LLMIdleTimeout, "idle_timeout"),
+    "overall_timeout": (lambda: LLMOverallTimeout("out of time"), {}, LLMOverallTimeout, "overall_timeout"),
+    "turn_budget": (
+        lambda: DONE, {"turn_timeout_seconds": 0.3, "llm_delays": {2: 1.0}},
+        TurnBudgetExceeded, "turn_budget_exhausted",
+    ),
+}
+
+
+def _sealed_after_error(root, monkeypatch, entry, ending):
+    """Run a write, then end the turn as ``ending``; return the sealed manifest."""
+    second, options, raised, code = TURN_ENDINGS[ending]
+    agent, stores = make_turn_agent(root, [
+        call("write_file", {"path": "saved.txt", "content": "data\n"}),
+        second(),
+    ], monkeypatch, **options)
+    msg = Msg(content=[ContentBlock.text("save it")], id=f"m-{ending}-{entry}")
+    if entry == "reply":
+        # The non-streaming caller still sees the error.
+        with pytest.raises(raised):
+            run(agent.reply(msg))
+    else:
+        events = run(collect_stream(agent, msg))
+        assert [e.get("code") for e in events if e["type"] == "error"] == [code]
+    assert (root / "saved.txt").read_text(encoding="utf-8") == "data\n"
+    manifest = stores[0].manifest(0)
+    assert manifest is not None
+    return manifest
+
+
+@pytest.mark.parametrize("ending", list(TURN_ENDINGS))
+def test_an_error_after_a_write_seals_it_as_added_from_either_entry_point(tmp_path, monkeypatch, ending):
+    """Only a real cancellation stops the seal from reading a completed write."""
+    sealed = {}
+    for entry in ("reply", "reply_stream"):
+        root = tmp_path / entry
+        root.mkdir()
+        manifest = _sealed_after_error(root, monkeypatch, entry, ending)
+        sealed[entry] = (
+            [(c.path, c.state, c.added, c.removed) for c in manifest.files],
+            [(c.path, c.reason) for c in manifest.unknown],
+        )
+    assert sealed["reply_stream"] == ([("saved.txt", "added", 1, 0)], [])
+    assert sealed["reply"] == sealed["reply_stream"]
+
+
+def _sealed_after_cancel(root, monkeypatch, entry):
+    """Run a write, cancel the turn during the next model request; return the sealed manifest."""
+    agent, stores = make_turn_agent(root, [
+        call("write_file", {"path": "saved.txt", "content": "data\n"}),
+        DONE,
+    ], monkeypatch, llm_delays={2: 30})
+    msg = Msg(content=[ContentBlock.text("save it")], id=f"m-cancel-{entry}")
+
+    async def scenario():
+        turn = asyncio.create_task(agent.reply(msg) if entry == "reply" else collect_stream(agent, msg))
+        # The second model request starts only after the write's result is recorded.
+        while agent.llm.calls < 2:
+            await asyncio.sleep(0.01)
+        turn.cancel()
+        return (await asyncio.gather(turn, return_exceptions=True))[0]
+
+    outcome = run(scenario())
+    if entry == "reply":
+        assert isinstance(outcome, asyncio.CancelledError)
+    else:
+        assert any(e.get("cancelled") for e in outcome if e["type"] == "error")
+    assert (root / "saved.txt").read_text(encoding="utf-8") == "data\n"
+    manifest = stores[0].manifest(0)
+    assert manifest is not None
+    return manifest
+
+
+def test_a_real_cancellation_after_a_write_seals_it_as_cancelled_from_either_entry_point(tmp_path, monkeypatch):
+    """Cancelling either entry point leaves the write unread, with its reason."""
+    sealed = {}
+    for entry in ("reply", "reply_stream"):
+        root = tmp_path / entry
+        root.mkdir()
+        manifest = _sealed_after_cancel(root, monkeypatch, entry)
+        sealed[entry] = ([c.path for c in manifest.files], [(c.path, c.reason) for c in manifest.unknown])
+    assert sealed["reply"] == sealed["reply_stream"] == ([], [("saved.txt", "cancelled")])
 
 
 def test_many_edits_net_out_correctly(tmp_path, monkeypatch):

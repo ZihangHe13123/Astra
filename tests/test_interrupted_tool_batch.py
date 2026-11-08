@@ -16,7 +16,7 @@ import pytest
 
 from agent.core.msg import ContentBlock, Msg
 from agent.runtime.context import AgentContext
-from agent.runtime.llm import LLMResponseError
+from agent.runtime.llm import LLMIdleTimeout, LLMOverallTimeout, LLMResponseError
 from agent.runtime.react import ReActAgent
 from agent.runtime.session_store import SessionStore
 from agent.runtime.task_store import TaskStore
@@ -286,37 +286,48 @@ def test_a_cancelled_non_streaming_reply_saves_the_same_chain(tmp_path):
     assert restored.messages == json.loads(json.dumps(agent.context.messages))
 
 
-class ModelErrorLLM(BatchLLM):
-    """The first request completes a write; the next one fails as a model error."""
+# How the model request ends: the error raised, its arguments, and the stream's error code.
+MODEL_ENDINGS = {
+    "model_error": (LLMResponseError, ("stream_closed", "connection dropped"), "stream_closed"),
+    "idle_timeout": (LLMIdleTimeout, ("the model made no progress",), "idle_timeout"),
+    "overall_timeout": (LLMOverallTimeout, ("the model request ran out of time",), "overall_timeout"),
+}
 
-    def __init__(self):
+
+class ModelErrorLLM(BatchLLM):
+    """The first request completes a write; the next one fails with the given model error."""
+
+    def __init__(self, ending: str = "model_error"):
         super().__init__(calls=[CALLS[0]])
+        self.error, self.error_args, _ = MODEL_ENDINGS[ending]
 
     async def chat_stream(self, messages, tools):
         if self.requests:
             self.requests.append(messages)
-            raise LLMResponseError("stream_closed", "connection dropped")
+            raise self.error(*self.error_args)
         async for event in super().chat_stream(messages, tools):
             yield event
 
 
-def _run_to_model_error(root, entry: str) -> list[dict]:
-    """Run one turn that ends on a model error; return its history as saved on disk."""
+def _run_to_model_error(root, entry: str, ending: str = "model_error") -> list[dict]:
+    """Run one turn that ends on a model error or timeout; return its history as saved on disk."""
+    error, _, code = MODEL_ENDINGS[ending]
     note = root / "note.txt"
     session = root / "sessions" / f"{entry}.json"
-    llm = ModelErrorLLM()
+    llm = ModelErrorLLM(ending)
     agent = ReActAgent("agent", llm, _registry(note, asyncio.Event()), system_prompt="base")
     agent.context.set_session(str(session))
     message = Msg(content=[ContentBlock.text("write a note")])
 
     async def scenario():
         if entry == "reply":
-            # The non-streaming caller still sees the model error.
-            with pytest.raises(LLMResponseError):
+            # The non-streaming caller still sees the error.
+            with pytest.raises(error):
                 await agent.reply(message)
         else:
             events = [event async for event in agent.reply_stream(message)]
-            assert [event.get("code") for event in events if event.get("type") == "error"] == ["stream_closed"]
+            assert [event.get("code") for event in events if event.get("type") == "error"] == [code]
+            assert events[-1]["type"] == "done"
 
     asyncio.run(scenario())
 
@@ -330,13 +341,16 @@ def _run_to_model_error(root, entry: str) -> list[dict]:
     return restored.messages
 
 
-def test_a_model_error_after_a_completed_call_saves_the_chain_from_either_entry_point(tmp_path, monkeypatch):
+@pytest.mark.parametrize("ending", list(MODEL_ENDINGS))
+def test_a_model_error_or_timeout_after_a_completed_call_saves_the_chain_from_either_entry_point(
+    tmp_path, monkeypatch, ending,
+):
     monkeypatch.setenv("ASTRA_HOME", str(tmp_path / "home"))
     monkeypatch.setattr(
         ReActAgent, "_make_turn_change_store",
         lambda self, key: TurnChangeStore(tmp_path, key, root=tmp_path / "turn-changes"),
     )
-    saved = {entry: _run_to_model_error(tmp_path / entry, entry) for entry in ("reply", "reply_stream")}
+    saved = {entry: _run_to_model_error(tmp_path / entry, entry, ending) for entry in ("reply", "reply_stream")}
 
     for messages in saved.values():
         assert [message["role"] for message in messages] == ["user", "assistant", "tool"]
