@@ -16,11 +16,13 @@ import pytest
 
 from agent.core.msg import ContentBlock, Msg
 from agent.runtime.context import AgentContext
+from agent.runtime.llm import LLMIdleTimeout, LLMOverallTimeout, LLMResponseError
 from agent.runtime.react import ReActAgent
 from agent.runtime.session_store import SessionStore
 from agent.runtime.task_store import TaskStore
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
 from agent.runtime.turn_budget import current_turn_budget
+from agent.runtime.turn_change_store import TurnChangeStore
 
 CALLS = [
     {"id": "call-write", "name": "write_note", "arguments": json.dumps({"text": "hello"})},
@@ -282,6 +284,84 @@ def test_a_cancelled_non_streaming_reply_saves_the_same_chain(tmp_path):
     assert restored.load()
     _assert_truthful_chain(restored.messages, "the turn was cancelled")
     assert restored.messages == json.loads(json.dumps(agent.context.messages))
+
+
+# How the model request ends: the error raised, its arguments, and the stream's error code.
+MODEL_ENDINGS = {
+    "model_error": (LLMResponseError, ("stream_closed", "connection dropped"), "stream_closed"),
+    "idle_timeout": (LLMIdleTimeout, ("the model made no progress",), "idle_timeout"),
+    "overall_timeout": (LLMOverallTimeout, ("the model request ran out of time",), "overall_timeout"),
+}
+
+
+class ModelErrorLLM(BatchLLM):
+    """The first request completes a write; the next one fails with the given model error."""
+
+    def __init__(self, ending: str = "model_error"):
+        super().__init__(calls=[CALLS[0]])
+        self.error, self.error_args, _ = MODEL_ENDINGS[ending]
+
+    async def chat_stream(self, messages, tools):
+        if self.requests:
+            self.requests.append(messages)
+            raise self.error(*self.error_args)
+        async for event in super().chat_stream(messages, tools):
+            yield event
+
+
+def _run_to_model_error(root, entry: str, ending: str = "model_error") -> list[dict]:
+    """Run one turn that ends on a model error or timeout; return its history as saved on disk."""
+    error, _, code = MODEL_ENDINGS[ending]
+    note = root / "note.txt"
+    session = root / "sessions" / f"{entry}.json"
+    llm = ModelErrorLLM(ending)
+    agent = ReActAgent("agent", llm, _registry(note, asyncio.Event()), system_prompt="base")
+    agent.context.set_session(str(session))
+    message = Msg(content=[ContentBlock.text("write a note")])
+
+    async def scenario():
+        if entry == "reply":
+            # The non-streaming caller still sees the error.
+            with pytest.raises(error):
+                await agent.reply(message)
+        else:
+            events = [event async for event in agent.reply_stream(message)]
+            assert [event.get("code") for event in events if event.get("type") == "error"] == [code]
+            assert events[-1]["type"] == "done"
+
+    asyncio.run(scenario())
+
+    assert note.read_text(encoding="utf-8") == "hello\n"
+    assert len(llm.requests) == 2
+    # Read back from disk by a fresh context, as the next process would.
+    restored = AgentContext()
+    restored.set_session(str(session))
+    assert restored.load()
+    assert restored.messages == json.loads(json.dumps(agent.context.messages))
+    return restored.messages
+
+
+@pytest.mark.parametrize("ending", list(MODEL_ENDINGS))
+def test_a_model_error_or_timeout_after_a_completed_call_saves_the_chain_from_either_entry_point(
+    tmp_path, monkeypatch, ending,
+):
+    monkeypatch.setenv("ASTRA_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(
+        ReActAgent, "_make_turn_change_store",
+        lambda self, key: TurnChangeStore(tmp_path, key, root=tmp_path / "turn-changes"),
+    )
+    saved = {entry: _run_to_model_error(tmp_path / entry, entry, ending) for entry in ("reply", "reply_stream")}
+
+    for messages in saved.values():
+        assert [message["role"] for message in messages] == ["user", "assistant", "tool"]
+        chain = dict(_chain(messages, [CALLS[0]]))
+        assert chain["call-write"].startswith("[Tool result: write_note | status: success]\nwrote 5 bytes to note.txt")
+    # reply() leaves the same history behind as reply_stream().
+    untimed = {
+        entry: [{key: value for key, value in message.items() if key != "timestamp"} for message in messages]
+        for entry, messages in saved.items()
+    }
+    assert untimed["reply"] == untimed["reply_stream"]
 
 
 def test_refusals_and_the_budget_check_before_a_call_keep_their_own_labels(tmp_path):

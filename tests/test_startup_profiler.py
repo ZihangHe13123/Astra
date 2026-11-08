@@ -1,7 +1,11 @@
 import json
 import time
 
+import pytest
+
 from agent.runtime.startup_profiler import StartupProfiler
+
+pytestmark = pytest.mark.usefixtures("without_astra_home")
 
 
 def test_startup_profiler_is_opt_in(tmp_path, monkeypatch):

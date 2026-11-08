@@ -561,8 +561,9 @@ def test_sigkill_after_effect_before_result_blocks_writes_across_two_real_worker
     script.write_text(_CRASH_WORKER, encoding="utf-8")
     log_path = tmp_path / "child.log"
     with log_path.open("w", encoding="utf-8") as log:
+        # The restarts below run in this process, so the worker must share its workspace.
         process = subprocess.Popen(
-            [sys.executable, "-u", str(script), str(tmp_path)], cwd=repo,
+            [sys.executable, "-u", str(script), str(tmp_path)], cwd=Path.cwd(),
             env={**os.environ, "PYTHONPATH": str(repo)}, stdout=log, stderr=subprocess.STDOUT,
         )
         try:

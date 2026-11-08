@@ -5617,6 +5617,8 @@ class ReActAgent(AgentBase):
             yield {"type": "done", "request_id": msg.metadata.get("request_id") or msg.id}
         except LLMIdleTimeout as exc:
             logger.warning("react stream idle timeout request_id=%s", msg.metadata.get("request_id") or msg.id)
+            self.context.sanitize_tool_history()
+            await self.context.save_async()
             payload = await self._degraded_turn_changes_payload_async(cancelled=False)
             if payload is not None:
                 yield payload
@@ -5631,6 +5633,8 @@ class ReActAgent(AgentBase):
             yield {"type": "done", "request_id": msg.metadata.get("request_id") or msg.id}
         except LLMOverallTimeout as exc:
             logger.warning("react stream overall timeout request_id=%s", msg.metadata.get("request_id") or msg.id)
+            self.context.sanitize_tool_history()
+            await self.context.save_async()
             payload = await self._degraded_turn_changes_payload_async(cancelled=False)
             if payload is not None:
                 yield payload
@@ -5662,6 +5666,9 @@ class ReActAgent(AgentBase):
             await self._seal_turn_changes_async(turn_store)
         except TurnBudgetExceeded as exc:
             await self._record_turn_budget_exhaustion(msg, exc)
+            # Not a cancellation: seal as reply_stream does, before the
+            # finally fallback would label completed writes cancelled.
+            await self._degraded_turn_changes_payload_async(cancelled=False)
             raise
         except asyncio.CancelledError:
             # Persist what the turn recorded before stopping, as reply_stream
@@ -5669,6 +5676,14 @@ class ReActAgent(AgentBase):
             logger.warning("react reply cancelled request_id=%s", msg.metadata.get("request_id") or msg.id)
             self.context.sanitize_tool_history()
             await self.context.save_async()
+            raise
+        except (LLMResponseError, LLMIdleTimeout, LLMOverallTimeout):
+            # A model error or timeout ends the turn after any completed
+            # calls; keep their results on disk and seal the turn as
+            # reply_stream does.
+            self.context.sanitize_tool_history()
+            await self.context.save_async()
+            await self._degraded_turn_changes_payload_async(cancelled=False)
             raise
         finally:
             try:

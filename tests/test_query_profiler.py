@@ -10,6 +10,8 @@ from agent.runtime.query_profiler import (
 )
 from agent.runtime.runtime_context_projection import wrap_turn_context
 
+pytestmark = pytest.mark.usefixtures("without_astra_home")
+
 
 @pytest.mark.parametrize("kind", ["append", "rewrite", "shrink"])
 def test_first_prefix_difference_distinguishes_append_from_rewrite(tmp_path, kind):

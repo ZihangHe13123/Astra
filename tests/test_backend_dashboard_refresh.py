@@ -46,8 +46,7 @@ def test_reset_resends_dashboard_snapshot_after_skill_state_changes(tmp_path: Pa
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        cwd=root,
-        env=env,
+        env={**env, "PYTHONPATH": str(root)},
         bufsize=1,
     )
     assert proc.stdin is not None

@@ -10,6 +10,8 @@ import pytest
 from agent.runtime.maintenance import RuntimeMaintenance, format_maintenance_report
 from agent.runtime import maintenance as maintenance_module
 
+pytestmark = pytest.mark.usefixtures("without_astra_home")
+
 
 def _age(path: Path, days: int) -> None:
     timestamp = time.time() - days * 86_400
