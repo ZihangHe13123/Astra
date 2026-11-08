@@ -264,6 +264,51 @@ def test_a_link_in_the_astra_folder_is_never_followed_by_export_or_wipe(tmp_path
     assert not (home / "memory.db").exists() and not (home / "sessions").exists()
 
 
+def junction(link: Path, target: Path) -> None:
+    """A directory junction: Windows makes one without extra rights, and Python 3.11 does not call it a link."""
+    subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True)
+
+
+def is_junction(path: Path) -> bool:
+    if sys.platform != "win32":
+        return False
+    import stat
+    return os.lstat(path).st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+
+
+@pytest.mark.skipif(os.name != "nt", reason="directory junctions exist only on Windows")
+def test_a_junction_in_the_astra_folder_is_never_followed_by_export_or_wipe(tmp_path):
+    home, root = tmp_path / "home", install_root(tmp_path)
+    seed(home).close()
+    env = environment(home)
+    # The personal folder and the pasted images lead elsewhere through junctions, a parent folder and an item.
+    elsewhere, pictures = tmp_path / "elsewhere", tmp_path / "pictures"
+    shutil.move(home / "personal", elsewhere)
+    junction(home / "personal", elsewhere)
+    shutil.move(home / "gui" / "attachments", pictures)
+    junction(home / "gui" / "attachments", pictures)
+    assert is_junction(home / "personal") and not (home / "personal").is_symlink()
+    kept = present(elsewhere) | {f"pictures/{name}" for name in present(pictures)}
+
+    code, result = data(env, "plan")
+    by_key = {item["key"]: item for item in result["items"]}
+    assert "is a link" in by_key["phone-uploads"]["refused"] and not by_key["phone-uploads"]["present"]
+    out = tmp_path / "astra.zip"
+    code, result = data(env, "export", "--out", str(out))
+    assert code == 0 and [item["key"] for item in result["skipped"]] == ["personal"]
+    with zipfile.ZipFile(out) as archive:
+        assert not [name for name in archive.namelist() if name.startswith("astra-export/personal/")]
+
+    code, result = data(env, "wipe", "--root", str(root), "--confirm", "清除", "--personal-files")
+    failed = {item["key"]: item["error"] for item in result["failed"]}
+    assert code == 1 and {"personal", "phone-uploads", "personal-copies", "attachments"} <= set(failed)
+    assert all("is a link" in error for error in failed.values())
+    assert present(elsewhere) | {f"pictures/{name}" for name in present(pictures)} == kept
+    assert is_junction(home / "personal") and is_junction(home / "gui" / "attachments")
+    # Everything not behind a junction went as usual.
+    assert not (home / "memory.db").exists() and not (home / "sessions").exists()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="making links needs extra rights on Windows")
 def test_a_path_configured_elsewhere_is_checked_from_the_top(tmp_path):
     home, root = tmp_path / "home", install_root(tmp_path)
