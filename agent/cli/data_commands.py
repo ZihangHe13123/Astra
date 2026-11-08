@@ -20,7 +20,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import sqlite3
 import stat
 import subprocess
@@ -201,21 +200,43 @@ def _guard(path: Path, root: Path) -> None:
             raise OSError(f"{path} holds {protected}; it was not deleted")
 
 
-def _files(path: Path, apart: tuple[str, ...] = ()) -> Iterator[Path]:
-    if path.is_symlink() or not path.exists():
+def _raise(error: OSError) -> None:
+    raise error
+
+
+def _walk(path: Path, links: list[Path] | None = None, *, strict: bool = False
+          ) -> Iterator[tuple[Path, list[str], list[str]]]:
+    """``os.walk`` that never enters or lists a link: on Windows it walks into a directory junction as into any
+    folder (Python 3.11 does not call a junction a link). Each link met is left out and added to ``links``.
+    ``strict``: a folder that cannot be read is an error, not passed over."""
+    for current, folders, names in os.walk(path, onerror=_raise if strict else None):
+        here = Path(current)
+        met = [name for name in folders + names if _is_link(here / name)]
+        if links is not None:
+            links.extend(here / name for name in met)
+        folders[:] = sorted(name for name in folders if name not in met)
+        names[:] = sorted(name for name in names if name not in met)
+        yield here, folders, names
+
+
+def _files(path: Path, apart: tuple[str, ...] = (), links: list[Path] | None = None) -> Iterator[Path]:
+    if _is_link(path) or not path.exists():
         return
     if path.is_file():
         yield path
         return
-    for current, folders, names in os.walk(path):
-        top = Path(current) == path
-        folders[:] = sorted(name for name in folders if name not in _SKIP_NAMES and not (top and name in apart)
-                            and not (Path(current) / name).is_symlink())
-        for name in sorted(names):
-            entry = Path(current) / name
-            if name in _SKIP_NAMES or name.endswith(".lock") or name.endswith(_SQLITE_SIDES) or entry.is_symlink():
+    for current, folders, names in _walk(path, links):
+        top = current == path
+        folders[:] = [name for name in folders if name not in _SKIP_NAMES and not (top and name in apart)]
+        for name in names:
+            if name in _SKIP_NAMES or name.endswith(".lock") or name.endswith(_SQLITE_SIDES):
                 continue
-            yield entry
+            yield current / name
+
+
+def _linked(links: list[Path], done: str) -> str:
+    more = f" (and {len(links) - 1} more)" if len(links) > 1 else ""
+    return f"{links[0]} is a link{more}; nothing was {done} through it"
 
 
 def _credential(path: Path) -> bool:
@@ -296,7 +317,8 @@ def export(out: Path, *, now: float | None = None) -> dict:
                 if not item.path.exists():
                     continue
                 count = size = 0
-                for entry in _files(item.path, item.apart):
+                links: list[Path] = []
+                for entry in _files(item.path, item.apart, links):
                     if _credential(entry):
                         continue
                     relative = entry.name if entry == item.path else entry.relative_to(item.path).as_posix()
@@ -312,6 +334,8 @@ def export(out: Path, *, now: float | None = None) -> dict:
                     count += 1
                     size += source.stat().st_size
                 exported.append({"key": item.key, "label": item.label, "files": count, "bytes": size})
+                if links:
+                    skipped.append({"key": item.key, "label": item.label, "error": _linked(links, "read")})
             archive.writestr(f"{ARCHIVE_ROOT}/manifest.json", json.dumps({
                 "format": "astra-export", "version": 1, "created_at": when.isoformat(timespec="seconds"),
                 "items": exported, "not_included": list(NOT_EXPORTED), "skipped": skipped,
@@ -330,36 +354,33 @@ def _others_running(install, *, desktop: bool) -> list[dict]:
     return [item for item in active_instances(install) if not (desktop and item.get("role") == "desktop")]
 
 
-def _remove(path: Path, tracked: set[Path], *, spare_keys: bool = False) -> int:
-    """Delete ``path`` (with SQLite's side files), keeping tracked files, and key files when asked; return how
-    many files went."""
-    removed = 0
-    if path.is_symlink():
-        path.unlink()
-        return 1
+def _remove(path: Path, tracked: set[Path], *, spare_keys: bool = False) -> tuple[int, list[Path]]:
+    """Delete ``path`` (with SQLite's side files), keeping tracked files, and key files when asked. Links inside,
+    junctions included, are neither followed nor removed. Returns how many files went and the links left."""
+    if _is_link(path):
+        return 0, [path]
     if path.is_file():
         if path.resolve() in tracked:
-            return 0
+            return 0, []
         path.unlink()
         for side in _SQLITE_SIDES:
             Path(f"{path}{side}").unlink(missing_ok=True)
-        return 1
+        return 1, []
     if not path.is_dir():
-        return 0
-    if not tracked and not spare_keys:
-        removed = sum(1 for _ in path.rglob("*") if _.is_file())
-        shutil.rmtree(path)
-        return removed
-    for entry in sorted(path.rglob("*"), key=lambda value: len(value.parts), reverse=True):
-        if entry.is_symlink() or entry.is_file():
+        return 0, []
+    removed, links, folders = 0, [], []
+    for current, _folders, names in _walk(path, links, strict=True):
+        folders.append(current)
+        for name in names:
+            entry = current / name
             if entry.resolve() not in tracked and not (spare_keys and _credential(entry)):
                 entry.unlink()
                 removed += 1
-        elif entry.is_dir() and not any(entry.iterdir()):
-            entry.rmdir()
-    if path.is_dir() and not any(path.iterdir()):
-        path.rmdir()
-    return removed
+    # Deepest first; a folder that still holds something (a kept file, a link) stays.
+    for folder in reversed(folders):
+        if not any(folder.iterdir()):
+            folder.rmdir()
+    return removed, links
 
 
 def wipe(confirmation: str, *, browser_data: bool = False, personal_files: bool = False, desktop: bool = False,
@@ -385,10 +406,12 @@ def wipe(confirmation: str, *, browser_data: bool = False, personal_files: bool 
             try:
                 _reach(item, state_dir())
                 _guard(item.path, install.root)
-                count = _remove(item.path, _tracked(install.root, item.path), spare_keys=item.spare_keys)
+                count, links = _remove(item.path, _tracked(install.root, item.path), spare_keys=item.spare_keys)
             except OSError as exc:
                 failed.append({"key": item.key, "label": item.label, "error": str(exc)})
                 continue
+            if links:
+                failed.append({"key": item.key, "label": item.label, "error": _linked(links, "deleted")})
             if count:
                 removed.append({"key": item.key, "label": item.label, "files": count})
     return {"removed": removed, "failed": failed, "kept": _kept(personal_files=personal_files)}

@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.cli import data_commands
 from agent.launcher.installation import discover
 from agent.launcher.locking import RuntimeLease
 
@@ -264,6 +265,39 @@ def test_a_link_in_the_astra_folder_is_never_followed_by_export_or_wipe(tmp_path
     assert not (home / "memory.db").exists() and not (home / "sessions").exists()
 
 
+def test_a_link_deep_inside_a_folder_is_left_out_of_every_walk(tmp_path, monkeypatch):
+    """On Windows os.walk enters a directory junction like any folder; here a real folder plays one."""
+    home, root = tmp_path / "home", install_root(tmp_path)
+    seed(home).close()
+    for name in [name for name in os.environ if name.startswith(("AGENT_", "ASTRA_"))]:
+        monkeypatch.delenv(name)
+    # Every path set for this run, the recall index too (its default is fixed when the runtime is first imported).
+    monkeypatch.setenv("ASTRA_HOME", str(home))
+    monkeypatch.setenv("AGENT_SESSION_DIR", str(home / "sessions"))
+    monkeypatch.setenv("ASTRA_SESSION_RECALL_DB", str(home / "sessions.db"))
+    linked = home / "personal" / "notes" / "linked"
+    linked.mkdir()
+    (linked / "elsewhere.md").write_text("someone else's file")
+    real = data_commands._is_link
+    monkeypatch.setattr(data_commands, "_is_link", lambda path: Path(path) == linked or real(path))
+
+    plan = data_commands.plan()
+    assert all(item["path"].startswith(str(home)) for item in plan["items"])
+    by_key = {item["key"]: item for item in plan["items"]}
+    assert by_key["personal"]["bytes"] == sum(len(text.encode()) for text in PERSONAL.values())
+    exported = data_commands.export(tmp_path / "astra.zip")
+    with zipfile.ZipFile(tmp_path / "astra.zip") as archive:
+        assert "astra-export/personal/notes/plan.md" in archive.namelist()
+        assert not [name for name in archive.namelist() if "elsewhere.md" in name]
+    assert [item["key"] for item in exported["skipped"]] == ["personal"] and "is a link" in exported["skipped"][0]["error"]
+
+    result = data_commands.wipe("清除", personal_files=True, root=root)
+    failed = {item["key"]: item["error"] for item in result["failed"]}
+    assert set(failed) == {"personal"} and f"{linked} is a link" in failed["personal"]
+    assert (linked / "elsewhere.md").read_text() == "someone else's file"
+    assert not (home / "personal" / "notes" / "plan.md").exists() and not (home / "memory.db").exists()
+
+
 def junction(link: Path, target: Path) -> None:
     """A directory junction: Windows makes one without extra rights, and Python 3.11 does not call it a link."""
     subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)], check=True, capture_output=True)
@@ -307,6 +341,32 @@ def test_a_junction_in_the_astra_folder_is_never_followed_by_export_or_wipe(tmp_
     assert is_junction(home / "personal") and is_junction(home / "gui" / "attachments")
     # Everything not behind a junction went as usual.
     assert not (home / "memory.db").exists() and not (home / "sessions").exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="directory junctions exist only on Windows")
+def test_a_junction_deep_inside_an_ordinary_folder_is_never_entered(tmp_path):
+    home, root = tmp_path / "home", install_root(tmp_path)
+    seed(home).close()
+    env = environment(home)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (elsewhere / "theirs.md").write_text("someone else's file")
+    # personal and personal/notes are ordinary folders; only personal/notes/linked is a junction.
+    junction(home / "personal" / "notes" / "linked", elsewhere)
+    assert is_junction(home / "personal" / "notes" / "linked") and not is_junction(home / "personal")
+
+    out = tmp_path / "astra.zip"
+    code, result = data(env, "export", "--out", str(out))
+    assert code == 0 and [item["key"] for item in result["skipped"]] == ["personal"]
+    with zipfile.ZipFile(out) as archive:
+        assert "astra-export/personal/notes/plan.md" in archive.namelist()
+        assert not [name for name in archive.namelist() if "theirs.md" in name]
+    code, result = data(env, "wipe", "--root", str(root), "--confirm", "清除", "--personal-files")
+    failed = {item["key"]: item["error"] for item in result["failed"]}
+    assert code == 1 and set(failed) == {"personal"} and "is a link" in failed["personal"]
+    assert (elsewhere / "theirs.md").read_text() == "someone else's file"
+    assert is_junction(home / "personal" / "notes" / "linked")
+    assert not (home / "personal" / "notes" / "plan.md").exists() and not (home / "memory.db").exists()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="making links needs extra rights on Windows")
