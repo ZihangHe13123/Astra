@@ -62,6 +62,7 @@ test("a refused wipe deletes nothing and says why; plan and export answer as bef
     const plan = await run("plan");
     assert.equal(plan.confirmation, "清除");
     const out = join(folder, "astra.zip");
-    assert.equal((await run("export", "--out", out)).path, out);
+    // Compared where they really are: on Windows a temporary folder can be spelled with a short name (RUNNER~1).
+    assert.equal(realpathSync.native((await run("export", "--out", out)).path), realpathSync.native(out));
   } finally { rmSync(folder, { recursive: true, force: true }); }
 });

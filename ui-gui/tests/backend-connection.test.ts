@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,7 +10,10 @@ import { Runtime } from "../src/main/runtime.js";
 
 const root = fileURLToPath(new URL("../../", import.meta.url));
 const venv = join(root, ".venv", process.platform === "win32" ? "Scripts/python.exe" : "bin/python");
-const python = process.env.ASTRA_PYTHON || (existsSync(venv) ? venv : process.platform === "win32" ? "python" : "python3");
+const chosen = process.env.ASTRA_PYTHON || (existsSync(venv) ? venv : process.platform === "win32" ? "python" : "python3");
+// On Windows a virtual environment's python.exe is a launcher that keeps the input handle open while it waits for
+// the real interpreter, so the stand-in closing its input would not reach the desktop: run the base interpreter.
+const python = execFileSync(chosen, ["-c", "import sys; print(sys._base_executable)"], { encoding: "utf8" }).trim() || chosen;
 
 // A stand-in backend that greets the desktop and then stops reading its input while it stays alive:
 // every later write from the desktop meets a closed pipe.
