@@ -5670,6 +5670,12 @@ class ReActAgent(AgentBase):
             self.context.sanitize_tool_history()
             await self.context.save_async()
             raise
+        except LLMResponseError:
+            # A model error ends the turn after any completed calls; keep
+            # their results on disk as reply_stream does.
+            self.context.sanitize_tool_history()
+            await self.context.save_async()
+            raise
         finally:
             try:
                 await react_events.aclose()
