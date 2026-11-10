@@ -67,6 +67,10 @@ PARAMETERS = {"type": "object", "properties": {
                                   "when a check runs out of rounds before it has covered what was asked."},
     "time_limit_minutes": {"type": "number", "minimum": 2, "maximum": 1440,
                            "description": "A check's most minutes per run (default 45 with web, else 15)."},
+    "series": {"type": "string", "maxLength": 60,
+               "description": "A name shared by related checks, such as a morning and an evening digest: each run "
+                              "is given what the others reported in the last 36 hours, so they do not repeat it. "
+                              "Empty on update to leave the series."},
     "catch_up_minutes": {"type": "number", "minimum": 1, "maximum": 1440,
                          "description": "How late a run may still start when Astra was closed or the computer asleep "
                                         "at its time (default 60 for a time of day); later than that it is skipped."},
@@ -195,7 +199,7 @@ def _summary(job: dict) -> dict[str, Any]:
             "read_calendar": spec.get("read_calendar", False), "targets": spec.get("targets", list(PUSH_TARGETS)),
             **({"model": spec.get("model") or "default", "max_rounds": spec.get("max_iterations"),
                 "time_limit_minutes": spec.get("timeout_seconds", 0) / 60} if spec["kind"] == "check" else {}),
-            "catch_up_minutes": job.get("grace_seconds", 0) / 60,
+            "catch_up_minutes": job.get("grace_seconds", 0) / 60, "series": spec.get("series", ""),
             "last_outcome": job.get("last_outcome") or "", "prompt": spec["prompt"]}
 
 
@@ -250,7 +254,9 @@ def _limits_text(args: dict) -> str:
     """A check's new ceilings, and how late a missed run may still start, for the approval card."""
     parts = ([f"最多 {args['max_rounds']} 轮"] if args.get("max_rounds") is not None else []) + (
         [f"每次最多 {float(args['time_limit_minutes']):g} 分钟"] if args.get("time_limit_minutes") is not None else []) + (
-        [f"错过时间 {float(args['catch_up_minutes']):g} 分钟内仍补跑"] if args.get("catch_up_minutes") is not None else [])
+        [f"错过时间 {float(args['catch_up_minutes']):g} 分钟内仍补跑"] if args.get("catch_up_minutes") is not None else []) + (
+        [f"和「{args['series'].strip()}」系列的其他检查互相参考最近的结果"]
+        if isinstance(args.get("series"), str) and args["series"].strip() else [])
     return ("；" + "、".join(parts)) if parts else ""
 
 
@@ -277,6 +283,9 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
         if catch_up is not None and (isinstance(catch_up, bool) or not isinstance(catch_up, (int, float))
                                      or not 1 <= catch_up <= 1440):
             raise ValueError("catch_up_minutes must be between 1 and 1440.")
+        series = args.get("series")
+        if series is not None and (not isinstance(series, str) or len(series.strip()) > 60):
+            raise ValueError("series is a short name, at most 60 characters.")
         now = time.time()
         if action == "quiet":
             _quiet(args.get("quiet_hours"))
@@ -289,6 +298,8 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
                 raise ValueError("A reminder does not use the web, mail or the calendar.")
             if args.get("kind") == "reminder" and _limits(args):
                 raise ValueError("A reminder does not use a model, so it has no rounds or time limit.")
+            if args.get("kind") == "reminder" and series and series.strip():
+                raise ValueError("A reminder does not read earlier results, so it has no series.")
         elif action != "list":
             if not args.get("job_id"):
                 raise ValueError(f"{action} needs a job_id from list.")
@@ -299,6 +310,8 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
                 _schedule(args, now)
                 if job["spec"]["kind"] == "reminder" and _limits(args):
                     raise ValueError("A reminder does not use a model, so it has no rounds or time limit.")
+                if job["spec"]["kind"] == "reminder" and series and series.strip():
+                    raise ValueError("A reminder does not read earlier results, so it has no series.")
 
     def permission(args: dict) -> dict[str, Any] | None:
         action = str(args.get("action") or "")
@@ -331,6 +344,8 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
                 job["spec"], job["interval_seconds"], job["next_at"])
             if action == "update":
                 target += _limits_text(args)
+                if isinstance(args.get("series"), str) and not args["series"].strip() and job["spec"].get("series"):
+                    target += f"；离开「{job['spec']['series']}」系列"
             title, effect, question = {
                 "update": (f"修改定时任务：{name}", "之后的运行按新的设置进行" + (
                     f"，结果{_where(args['targets'])}" if args.get("targets") is not None else "") + "。", "要这样修改吗？"),
@@ -349,7 +364,7 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
                    targets: list[str] | None = None,
                    quiet_hours: str = "", on_new_mail: dict | None = None, on_new_file: dict | None = None,
                    max_rounds: int | None = None, time_limit_minutes: float | None = None,
-                   catch_up_minutes: float | None = None) -> str:
+                   catch_up_minutes: float | None = None, series: str | None = None) -> str:
         args = {"time": time, "days": days, "every_minutes": every_minutes, "at": at, "after_minutes": after_minutes,
                 "on_new_mail": on_new_mail, "on_new_file": on_new_file}
         timeout = time_limit_minutes * 60 if time_limit_minutes is not None else None
@@ -382,7 +397,8 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
                 kind="check" if check else "reminder", model="",
                 web=bool(web) if check else False, mail=bool(mail) if check else False,
                 read_calendar=bool(read_calendar) if check else False,
-                max_iterations=max_rounds if check else None, timeout_seconds=timeout if check else None, now=now)
+                max_iterations=max_rounds if check else None, timeout_seconds=timeout if check else None,
+                series=series or "", now=now)
         elif action == "update":
             schedule = _schedule(args, now) or {}
             job = jobs_store.update(
@@ -390,7 +406,7 @@ def register_jobs_tool(registry: ToolRegistry, *, home: Path, workdir: Callable[
                 interval_seconds=schedule.get("interval_seconds", 0) if schedule else None,
                 calendar=schedule.get("calendar"), at=schedule.get("at"), notify=notify, web=web,
                 targets=targets, mail=mail, read_calendar=read_calendar, max_iterations=max_rounds,
-                timeout_seconds=timeout, grace_seconds=grace, now=now)
+                timeout_seconds=timeout, grace_seconds=grace, series=series, now=now)
         elif action == "run":
             job = jobs_store.request_run(job_id, now=now)
         else:

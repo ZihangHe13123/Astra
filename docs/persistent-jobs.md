@@ -48,6 +48,12 @@ computer's), so 08:00 stays 08:00 across daylight-saving changes. With `--notify
 check is given the last result the person was told and answers `NO_UPDATE` when nothing is new;
 that run is kept as a quiet result. Each run records its token usage.
 
+Checks that cover the same ground can share a series so they do not repeat each other: with
+`--series "AI news"` on a morning and an evening digest, each run is given what every check in
+that series last told the person within 36 hours (up to 3,000 characters each) and is asked to
+leave out what that already covered unless there is news since. `astra jobs update ID --series ""`
+takes a check out of its series; the jobs tool takes `series` too. Reminders have no series.
+
 In a conversation, Astra can manage the same jobs with its `jobs` tool when you ask for something
 at a time or on a schedule ("remind me at 3pm", "every morning…"). Creating, changing, resuming,
 removing or running a job now is shown to you for approval first, in the desktop or in WeChat; the

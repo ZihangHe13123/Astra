@@ -362,6 +362,71 @@ def test_tool_sets_the_catch_up_window_with_approval_and_shows_it(tmp_path, monk
     assert len(asked) == before
 
 
+def test_checks_in_a_series_are_given_what_the_others_last_reported(tmp_path):
+    store = JobStore(tmp_path / "home")
+    now = at("2026-11-10T20:00")
+    morning = daily(store, tmp_path, now=now - 86400, kind="check", series="AI 新闻")
+    evening = daily(store, tmp_path, now=now - 86400, kind="check", series="AI 新闻")
+    weekly = daily(store, tmp_path, now=now - 86400, kind="check", series="AI 新闻")
+    other = daily(store, tmp_path, now=now - 86400, kind="check")
+
+    def reported(job, output, finished, quiet=False):
+        store.request_run(job["id"], now=finished)
+        run = store.claim_due(now=finished)
+        assert run["job_id"] == job["id"]
+        store.finish(run["id"], "completed", output=output, quiet=quiet, now=finished)
+
+    reported(morning, "早报：昨天", at("2026-11-09T08:35"))
+    reported(morning, "早报：今天", at("2026-11-10T08:35"))
+    reported(evening, "晚报：昨天", at("2026-11-09T20:05"))
+    reported(weekly, "周报：两天前", at("2026-11-08T09:00"))
+    reported(other, "别的任务", at("2026-11-10T09:00"))
+    store.request_run(evening["id"], now=now)
+    tonight = store.claim_due(now=now)
+
+    def given():
+        return [item["output"] for item in store.series_outputs(evening["id"], before=tonight["id"], now=now)]
+
+    # The latest of each in the series, oldest first; older than 36 hours or another series is not given.
+    assert given() == ["晚报：昨天", "早报：今天"]
+    assert store.series_outputs(other["id"], before=tonight["id"], now=now) == []
+    # A result the person was not told (quiet) is not given; leaving the series stops it.
+    reported(morning, "早报：没推送", at("2026-11-10T12:00"), quiet=True)
+    assert given() == ["晚报：昨天", "早报：今天"]
+    left = store.update(morning["id"], request="早报不用再参考", series="", now=now)
+    assert "series" not in left["spec"] and given() == ["晚报：昨天"]
+    with pytest.raises(ValueError, match="series"):
+        daily(store, tmp_path, now=now, series="AI 新闻")
+    with pytest.raises(ValueError):
+        store.update(evening["id"], request="x", series="很长" * 40)
+    output, error = execute_jobs_command(["update", other["id"], "--series", "AI 新闻"], home=tmp_path / "home",
+                                         workdir=tmp_path)
+    assert error == "" and json.loads(output)["spec"]["series"] == "AI 新闻"
+
+
+def test_tool_puts_checks_in_a_series_with_approval(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_TIMEZONE", "Asia/Singapore")
+    registry, asked, _answer = tool(tmp_path, request="早报和晚报别重复")
+    job = json.loads(call(registry, action="add", name="AI 晚报", prompt="整理 AI 新闻", time="20:00",
+                          web=True)["output"])["job"]
+    assert job["series"] == ""
+    changed = json.loads(call(registry, action="update", job_id=job["job_id"], series="AI 新闻")["output"])["job"]
+    assert changed["series"] == "AI 新闻"
+    assert asked[-1]["target"] == "每天 20:00（Asia/Singapore）；和「AI 新闻」系列的其他检查互相参考最近的结果"
+    left = json.loads(call(registry, action="update", job_id=job["job_id"], series="")["output"])["job"]
+    assert left["series"] == "" and asked[-1]["target"].endswith("；离开「AI 新闻」系列")
+    # A reminder has no series, and a wrong one is refused before the person is asked.
+    reminder = json.loads(call(registry, action="add", name="喝水", kind="reminder", prompt="喝水",
+                               time="08:00")["output"])["job"]
+    before = len(asked)
+    for wrong in ({"action": "add", "name": "喝水", "kind": "reminder", "prompt": "喝水", "time": "09:00",
+                   "series": "AI 新闻"},
+                  {"action": "update", "job_id": reminder["job_id"], "series": "AI 新闻"},
+                  {"action": "update", "job_id": job["job_id"], "series": "很长" * 40}):
+        assert call(registry, **wrong)["error_type"] == "invalid_input"
+    assert len(asked) == before
+
+
 def test_tool_refuses_without_the_persons_request_and_checks_arguments_before_asking(tmp_path):
     registry, asked, _answer = tool(tmp_path, request="")
     missing = call(registry, action="add", name="x", kind="reminder", prompt="x", after_minutes=5)
