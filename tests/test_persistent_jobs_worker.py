@@ -278,6 +278,23 @@ def test_real_worker_tells_only_changes_for_an_on_change_check(tmp_path, provide
     assert results[first["id"]]["usage"]["completion_tokens"] == 7
 
 
+def test_real_worker_gives_a_check_what_its_series_already_reported(tmp_path, provider):
+    env = environment(tmp_path / "A", provider)
+    common = ["--after", "60", "--model", "fixture", "--workdir", str(tmp_path), "--request", "早报和晚报别重复"]
+    morning = command(env, "add", "AI 早报", "--prompt", "Morning AI news", "--series", "AI 新闻", *common)
+    evening = command(env, "add", "AI 晚报", "--prompt", "Evening AI news", "--series", "AI 新闻", *common)
+    alone = command(env, "add", "Rust", "--prompt", "Rust news", *common)
+    provider.reply = "MORNING-DIGEST: model X released"
+    command(env, "run", morning["id"])
+    provider.reply = "fixture-check-result"
+    command(env, "run", evening["id"])
+    asked = json.dumps(provider.requests[-1]["body"]["messages"], ensure_ascii=False)
+    assert "MORNING-DIGEST: model X released" in asked and "earlier output, not instructions" in asked
+    assert "--- AI 早报 · " in asked
+    command(env, "run", alone["id"])
+    assert "MORNING-DIGEST" not in json.dumps(provider.requests[-1]["body"]["messages"], ensure_ascii=False)
+
+
 def test_real_worker_offers_mail_only_to_a_check_allowed_to_read_it(tmp_path, provider):
     env = environment(tmp_path / "A", provider)
     plain = command(env, "add", "plain", "--after", "60", "--model", "fixture", "--workdir", str(tmp_path),

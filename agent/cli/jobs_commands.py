@@ -47,6 +47,8 @@ def jobs_parser() -> JobParser:
                      help="where results are pushed besides the personal thread and the inbox: desktop "
                           "(default; also notifies a paired phone), weixin, or empty for no push")
     add.add_argument("--catch-up", type=float, help="maximum lateness in seconds, from 1 to 86400")
+    add.add_argument("--series", default="", help="a name shared with related checks: each run is given what the "
+                                                  "others reported in the last 36 hours, so they do not repeat it")
     add.add_argument("--prompt", required=True)
     add.add_argument("--request", help="original user authorization; required for agent checks")
     add.add_argument("--reminder", action="store_true", help="deliver the text without using a model")
@@ -61,13 +63,16 @@ def jobs_parser() -> JobParser:
                      help="hard limit in seconds per run (default 2700 with --web, else 900)")
     add.add_argument("--iterations", type=int, default=None,
                      help="most model rounds per run, 1 to 50 (default 30 with --web, else 10)")
-    update = commands.add_parser("update", help="change a check's rounds or time limit for its later runs")
+    update = commands.add_parser("update", help="change a job's rounds, time limit, model, targets or catch-up window")
     update.add_argument("id")
     update.add_argument("--iterations", type=int, help="most model rounds per run, 1 to 50")
     update.add_argument("--timeout", type=float, help="hard limit in seconds per run")
     update.add_argument("--model", help="configured model key, or 'default' to follow the default model")
     update.add_argument("--targets", help="where results are pushed besides the personal thread: desktop, weixin, "
                                           "both comma-separated, or empty for no push")
+    update.add_argument("--catch-up", type=float,
+                        help="maximum lateness in seconds, from 1 to 86400: a run missed by more is skipped")
+    update.add_argument("--series", help="the series shared with related checks, or empty to leave it")
     update.add_argument("--request", default="", help="why it changed, kept with the job's authorization")
     commands.add_parser("list", help="show jobs and their schedules")
     for action in ("show", "pause", "resume", "remove", "run"):
@@ -185,16 +190,18 @@ def execute_jobs_command(argv: list[str], *, home: Path | None = None,
                               else 3600 if calendar else min(period / 2, 3600) if period else 300,
                               kind="reminder" if args.reminder else "check", model=model, web=args.web, mail=args.mail,
                               read_calendar=args.read_calendar,
-                              idle_seconds=args.idle, timeout_seconds=args.timeout, max_iterations=args.iterations)
+                              idle_seconds=args.idle, timeout_seconds=args.timeout, max_iterations=args.iterations,
+                              series=args.series)
             _with_times(value)
         elif args.action == "update":
-            if args.iterations is None and args.timeout is None and args.model is None and args.targets is None:
-                raise ValueError("Give --iterations, --timeout, --model or --targets.")
+            if (args.iterations is None and args.timeout is None and args.model is None and args.targets is None
+                    and args.catch_up is None and args.series is None):
+                raise ValueError("Give --iterations, --timeout, --model, --targets, --catch-up or --series.")
             model = None if args.model is None else "" if args.model == "default" else job_model_key(args.model)
             targets = None if args.targets is None else [target for target in args.targets.split(",") if target.strip()]
             value = store.update(args.id, request=args.request.strip() or "Changed from the command line.",
                                  max_iterations=args.iterations, timeout_seconds=args.timeout, model=model,
-                                 targets=targets)
+                                 targets=targets, grace_seconds=args.catch_up, series=args.series)
             _with_times(value)
         elif args.action == "list":
             value = store.jobs()

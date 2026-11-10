@@ -43,6 +43,8 @@ ROUNDS_USED_UP = "iteration_budget"
 STOPPED_EARLY = frozenset({ROUNDS_USED_UP, "repeated_tool_call", "tool_budget", "tool_circuit"})
 BUDGET_NOTICE = "今天的模型用量已超过每日预算，这次检查没有运行；明天照常。"
 INACTIVE_SECONDS = 7 * 86400
+# How far back a check in a series looks for what the others in it reported.
+SERIES_WINDOW = 36 * 3600
 INTERACTION_FILE = "last-interaction"
 # Columns added after version 1, with their definitions.
 _V2_COLUMNS = {
@@ -71,6 +73,12 @@ def last_interaction(home: Path) -> float | None:
     except (OSError, ValueError):
         return None
     return value if math.isfinite(value) else None
+
+
+def _series(value: object) -> str:
+    if not isinstance(value, str) or len(value.strip()) > 60:
+        raise ValueError("A series is a short name, at most 60 characters.")
+    return value.strip()
 
 
 def finite(value: float, minimum: float, maximum: float, label: str) -> float:
@@ -215,8 +223,10 @@ class JobStore:
             targets: list[str] | tuple[str, ...] = DEFAULT_TARGETS,
             grace_seconds: float = 300, kind: str = "check", model: str = "",
             web: bool = False, mail: bool = False, read_calendar: bool = False, idle_seconds: float = 120,
-            timeout_seconds: float | None = None, max_iterations: int | None = None, now: float | None = None) -> dict:
+            timeout_seconds: float | None = None, max_iterations: int | None = None, series: str = "",
+            now: float | None = None) -> dict:
         now = time.time() if now is None else now
+        series = _series(series)
         if max_iterations is None:
             max_iterations = WEB_CHECK_ROUNDS if web else CHECK_ROUNDS
         if timeout_seconds is None:
@@ -247,8 +257,8 @@ class JobStore:
         # A check's model is a catalog key, or "" to follow the default model as it is when the check runs.
         if not isinstance(model, str) or len(model) > 200:
             raise ValueError("A check's model is a configured model key, or empty to follow the default.")
-        if kind == "reminder" and (model or web or mail or read_calendar):
-            raise ValueError("A reminder does not use a model, network tools, mail or the calendar.")
+        if kind == "reminder" and (model or web or mail or read_calendar or series):
+            raise ValueError("A reminder does not use a model, network tools, mail, the calendar or a series.")
         spec = {"name": name.strip(), "prompt": prompt.strip(), "original_request": original_request.strip(),
                 "workdir": str(directory), "kind": kind, "model": model, "web": web,
                 "idle_seconds": idle_seconds, "timeout_seconds": timeout_seconds,
@@ -258,6 +268,8 @@ class JobStore:
             spec["calendar"] = calendar
         if trigger:
             spec["trigger"] = trigger
+        if series:
+            spec["series"] = series
         identity = uuid.uuid4().hex
         with self.transaction() as db:
             db.execute("INSERT INTO jobs (id,name,spec,state,next_at,interval_seconds,grace_seconds,created_at,"
@@ -324,7 +336,8 @@ class JobStore:
                interval_seconds: float | None = None, calendar: dict | None = None, at: float | None = None,
                notify: str | None = None, web: bool | None = None, targets: list[str] | None = None,
                mail: bool | None = None, read_calendar: bool | None = None, max_iterations: int | None = None,
-               timeout_seconds: float | None = None, model: str | None = None, now: float | None = None) -> dict:
+               timeout_seconds: float | None = None, model: str | None = None, grace_seconds: float | None = None,
+               series: str | None = None, now: float | None = None) -> dict:
         """Change a job's future runs; ``request`` is the person's words asking for the change."""
         now = time.time() if now is None else now
         if not isinstance(request, str) or not request.strip():
@@ -372,6 +385,15 @@ class JobStore:
                 spec["max_iterations"] = max_iterations
             if timeout_seconds is not None:
                 spec["timeout_seconds"] = finite(timeout_seconds, spec["idle_seconds"], 86400, "Hard budget")
+            grace = row["grace_seconds"] if grace_seconds is None else finite(grace_seconds, 1, 86400, "Catch-up grace")
+            if series is not None:
+                if _series(series) and spec["kind"] == "reminder":
+                    raise ValueError("A reminder does not read earlier results, so it has no series.")
+                # An empty series takes the job out of its series.
+                if series := _series(series):
+                    spec["series"] = series
+                else:
+                    spec.pop("series", None)
             interval, next_at = row["interval_seconds"], row["next_at"]
             if spec.get("trigger") and (interval_seconds or calendar is not None or at is not None):
                 raise ValueError("This job starts on an event; add a new job for a schedule.")
@@ -384,8 +406,8 @@ class JobStore:
                     spec["calendar"] = found
             changed = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
             spec["original_request"] = (f"{spec['original_request']}\n\nChanged {changed}: {request.strip()}")[-8000:]
-            db.execute("UPDATE jobs SET name=?,spec=?,next_at=?,interval_seconds=? WHERE id=?",
-                       (spec["name"], json.dumps(spec), next_at, interval, identity))
+            db.execute("UPDATE jobs SET name=?,spec=?,next_at=?,interval_seconds=?,grace_seconds=? WHERE id=?",
+                       (spec["name"], json.dumps(spec), next_at, interval, grace, identity))
         self._sync_active()
         return self.job(identity)
 
@@ -397,6 +419,28 @@ class JobStore:
                 raise ValueError("Unknown or removed job ID.")
         self._sync_active()
         return self.job(identity)
+
+    def series_outputs(self, job_id: str, *, before: str, now: float | None = None) -> list[dict]:
+        """What the person was last told by each check in this job's series, within ``SERIES_WINDOW``, oldest first.
+
+        Checks in a series (a morning and an evening digest) read these so as not to repeat each other.
+        """
+        now = time.time() if now is None else now
+        with self.connect() as db:
+            job = db.execute("SELECT spec FROM jobs WHERE id=?", (job_id,)).fetchone()
+            series = json.loads(job["spec"]).get("series") if job is not None else ""
+            if not series:
+                return []
+            members = [row for row in db.execute("SELECT id,name,spec FROM jobs WHERE state!='removed'")
+                       if json.loads(row["spec"]).get("series") == series]
+            found = []
+            for member in members:
+                row = db.execute("SELECT output,finished_at FROM runs WHERE job_id=? AND id!=? AND state='completed' "
+                                 "AND quiet=0 AND output!='' AND finished_at>=? ORDER BY finished_at DESC,rowid DESC "
+                                 "LIMIT 1", (member["id"], before, now - SERIES_WINDOW)).fetchone()
+                if row is not None:
+                    found.append({"name": member["name"], "finished_at": row["finished_at"], "output": row["output"]})
+        return sorted(found, key=lambda item: item["finished_at"])
 
     def last_reported_output(self, job_id: str, *, before: str) -> str:
         """The latest result the person was actually told, for an ``on_change`` comparison."""
@@ -588,13 +632,13 @@ class JobStore:
             return db.execute("UPDATE runs SET state='running' WHERE id=? AND state='claimed'", (identity,)).rowcount == 1
 
     def finish(self, identity: str, state: str, *, output: str = "", detail: str = "",
-               quiet: bool = False, usage: dict | None = None) -> bool:
+               quiet: bool = False, usage: dict | None = None, now: float | None = None) -> bool:
         if state not in {"completed", "failed", "unknown"}:
             raise ValueError("Invalid occurrence outcome.")
         with self.transaction() as db:
             changed = db.execute("UPDATE runs SET state=?,finished_at=?,output=?,detail=?,quiet=?,usage=? "
                                  "WHERE id=? AND state IN ('claimed','running')",
-                                 (state, time.time(), output[:MAX_OUTPUT], detail[:1000],
+                                 (state, time.time() if now is None else now, output[:MAX_OUTPUT], detail[:1000],
                                   int(quiet and state == "completed"), json.dumps(usage) if usage else "",
                                   identity)).rowcount
             if changed:
