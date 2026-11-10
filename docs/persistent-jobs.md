@@ -114,7 +114,11 @@ with `--every` for a different first instant. Intervals are elapsed-time periods
 `--every 86400` does not track daylight saving changes, `--time` does. For example, a one-shot time is `--at 2026-10-06T09:00:00+08:00`.
 
 `--catch-up SECONDS` sets the maximum lateness (1–86400). The default is five
-minutes for a one-shot and half the interval, capped at one hour, for repeats.
+minutes for a one-shot, one hour for a time of day, and half the interval, capped at
+one hour, for other repeats. A job made when Astra is often closed or asleep at its
+time can be given more: `astra jobs update ID --catch-up 14400` lets a run start up
+to four hours late; the jobs tool takes `catch_up_minutes` when a job is added or
+changed.
 Missed ranges are explicitly recorded as `skipped` and delivered to the local inbox;
 `list` and `show` also expose `last_outcome`, separately from the schedule state.
 A completed one-shot schedule does not mean its last occurrence succeeded. At

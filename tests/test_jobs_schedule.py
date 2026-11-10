@@ -320,6 +320,48 @@ def test_tool_gives_a_check_more_rounds_and_time_with_approval(tmp_path, monkeyp
     assert refused["error_type"] == "invalid_input" and len(asked) == before + 1
 
 
+def test_a_wider_catch_up_window_runs_a_morning_missed_by_hours(tmp_path):
+    # Astra was closed at 08:00 and opened at 11:20: with the default hour the morning is skipped.
+    store = JobStore(tmp_path / "home")
+    job = daily(store, tmp_path, now=at("2026-10-25T09:30"))
+    assert store.claim_due(now=at("2026-10-26T11:20")) is None
+    assert store.history(job["id"])[0]["state"] == "skipped"
+    # Given four hours, the next morning opened as late still runs, once, for that morning.
+    changed = store.update(job["id"], request="早报晚几个小时也要补", grace_seconds=4 * 3600, now=at("2026-10-26T11:30"))
+    assert changed["grace_seconds"] == 4 * 3600 and changed["next_at"] == at("2026-10-27T08:00")
+    assert changed["spec"]["original_request"].endswith("早报晚几个小时也要补")
+    late = store.claim_due(now=at("2026-10-27T11:20"))
+    assert late is not None and late["scheduled_at"] == at("2026-10-27T08:00")
+    # Past the window it is still skipped, and the window stays within a day.
+    store.finish(late["id"], "completed", output="Good morning")
+    assert store.claim_due(now=at("2026-10-28T12:30")) is None
+    for wrong in (0, 86401):
+        with pytest.raises(ValueError):
+            store.update(job["id"], request="x", grace_seconds=wrong)
+    output, error = execute_jobs_command(["update", job["id"], "--catch-up", "7200"], home=tmp_path / "home",
+                                         workdir=tmp_path)
+    assert error == "" and json.loads(output)["grace_seconds"] == 7200
+
+
+def test_tool_sets_the_catch_up_window_with_approval_and_shows_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_TIMEZONE", "Asia/Singapore")
+    registry, asked, _answer = tool(tmp_path, request="早报错过了也补跑，晚几个小时都行")
+    created = json.loads(call(registry, action="add", name="AI 早报", prompt="整理 AI 新闻", time="08:30", web=True,
+                              catch_up_minutes=240)["output"])["job"]
+    assert created["catch_up_minutes"] == 240 and asked[-1]["target"].endswith("错过时间 240 分钟内仍补跑")
+    default = json.loads(call(registry, action="add", name="喝水", kind="reminder", prompt="喝水",
+                              time="08:00")["output"])["job"]
+    assert default["catch_up_minutes"] == 60
+    changed = call(registry, action="update", job_id=default["job_id"], catch_up_minutes=180)
+    assert changed["error"] == "" and asked[-1]["target"] == "每天 08:00（Asia/Singapore）；错过时间 180 分钟内仍补跑"
+    assert JobStore(tmp_path / "home").job(default["job_id"])["grace_seconds"] == 180 * 60
+    before = len(asked)
+    for wrong in (0, 2000, True):
+        refused = call(registry, action="update", job_id=default["job_id"], catch_up_minutes=wrong)
+        assert refused["error_type"] == "invalid_input"
+    assert len(asked) == before
+
+
 def test_tool_refuses_without_the_persons_request_and_checks_arguments_before_asking(tmp_path):
     registry, asked, _answer = tool(tmp_path, request="")
     missing = call(registry, action="add", name="x", kind="reminder", prompt="x", after_minutes=5)

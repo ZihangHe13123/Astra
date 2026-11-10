@@ -324,7 +324,8 @@ class JobStore:
                interval_seconds: float | None = None, calendar: dict | None = None, at: float | None = None,
                notify: str | None = None, web: bool | None = None, targets: list[str] | None = None,
                mail: bool | None = None, read_calendar: bool | None = None, max_iterations: int | None = None,
-               timeout_seconds: float | None = None, model: str | None = None, now: float | None = None) -> dict:
+               timeout_seconds: float | None = None, model: str | None = None, grace_seconds: float | None = None,
+               now: float | None = None) -> dict:
         """Change a job's future runs; ``request`` is the person's words asking for the change."""
         now = time.time() if now is None else now
         if not isinstance(request, str) or not request.strip():
@@ -372,6 +373,7 @@ class JobStore:
                 spec["max_iterations"] = max_iterations
             if timeout_seconds is not None:
                 spec["timeout_seconds"] = finite(timeout_seconds, spec["idle_seconds"], 86400, "Hard budget")
+            grace = row["grace_seconds"] if grace_seconds is None else finite(grace_seconds, 1, 86400, "Catch-up grace")
             interval, next_at = row["interval_seconds"], row["next_at"]
             if spec.get("trigger") and (interval_seconds or calendar is not None or at is not None):
                 raise ValueError("This job starts on an event; add a new job for a schedule.")
@@ -384,8 +386,8 @@ class JobStore:
                     spec["calendar"] = found
             changed = time.strftime("%Y-%m-%d %H:%M", time.localtime(now))
             spec["original_request"] = (f"{spec['original_request']}\n\nChanged {changed}: {request.strip()}")[-8000:]
-            db.execute("UPDATE jobs SET name=?,spec=?,next_at=?,interval_seconds=? WHERE id=?",
-                       (spec["name"], json.dumps(spec), next_at, interval, identity))
+            db.execute("UPDATE jobs SET name=?,spec=?,next_at=?,interval_seconds=?,grace_seconds=? WHERE id=?",
+                       (spec["name"], json.dumps(spec), next_at, interval, grace, identity))
         self._sync_active()
         return self.job(identity)
 
