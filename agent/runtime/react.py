@@ -63,7 +63,7 @@ from .process_env import hidden_process_creationflags
 from .stream_progress import stream_with_progress
 from .project_instructions import ProjectInstructions, tool_paths
 from .prompts import DEFAULT_SYSTEM_PROMPT, persona_generation_overrides
-from .query_profiler import QueryProfiler
+from .query_profiler import PROVIDER_PHASES_KEY, QueryProfiler
 from .tool_failure import ToolFailure
 from .tools.disclosure import CALL_TOOL, DISPATCH_TOOLS, SEARCH_TOOL, loaded_result, register_dispatch_tools
 from .tools.registry import ToolRegistry
@@ -4493,6 +4493,7 @@ class ReActAgent(AgentBase):
                                 event.get("finish_reason") or event.get("stop_reason") or finish_reason
                             )
                             usage = event.get("usage")
+                            profiler.observe_provider_phases(event.get(PROVIDER_PHASES_KEY))
                         elif event["type"] == "done":
                             provider_state = event.get("_provider_state")
                             full_content = event.get("content", full_content)
@@ -4501,6 +4502,7 @@ class ReActAgent(AgentBase):
                                 event.get("finish_reason") or event.get("stop_reason") or finish_reason
                             )
                             usage = event.get("usage")
+                            profiler.observe_provider_phases(event.get(PROVIDER_PHASES_KEY))
                         elif event["type"] == "generation_recovery":
                             full_content = full_reasoning = ""
                             stream_phase = uuid.uuid4().hex
