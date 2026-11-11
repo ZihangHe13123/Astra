@@ -257,7 +257,10 @@ async def cli_loop(bus: MessageBus, agent: ReActAgent):
             print()
             async for event in bus.send_stream("agent", msg):
                 if event.get("type") == "error":
-                    failed_message = event.get("message", "Request failed")
+                    # A recoverable one is a notice: the runtime asked the model again, or stopped the tools
+                    # and answered from what it had. The turn failed on the error that ended it.
+                    if not event.get("recoverable"):
+                        failed_message = event.get("message", "Request failed")
                     was_cancelled = bool(event.get("cancelled"))
                 await handle_event(event, text_renderer, reasoning_renderer)
             # 刷新两个渲染器的缓冲区
