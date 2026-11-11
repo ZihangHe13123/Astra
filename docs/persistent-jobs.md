@@ -177,7 +177,12 @@ changes them for later runs, and the tool's `update` takes `max_rounds` and
 found: out of rounds, the same call a fourth time in a turn, a tool's calls for the
 turn used up, or a tool failing again and again. That answer is the result, marked
 "rounds used up" or "stopped early", maybe incomplete, in the inbox and the push,
-and it does not count toward the failures that pause a job. If an execution
+and it does not count toward the failures that pause a job. A response the
+runtime had to discard, an empty one or one cut off, with the model asked again
+in the same run, is not a failure either: the check fails only when asking again
+fails too, when the turn itself fails or runs out of time, or when the runtime
+stops it without an answer, as it does when the conversation no longer fits the
+model. If an execution
 owner disappears or a running worker must be terminated, the occurrence becomes
 `unknown` and is never automatically replayed. Inspect its saved session before
 starting another check. A child still alive after its scheduler exits retains its

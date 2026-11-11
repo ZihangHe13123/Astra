@@ -170,7 +170,10 @@ async def run_check(store: JobStore, run: dict) -> None:
                 # Stopped by a guard, the check still answers from what it found; that answer is the result.
                 if code in STOPPED_EARLY:
                     stopped_early = stopped_early or code
-                else:
+                # The runtime names what it discarded, a response or a tool call, and goes on with the turn.
+                # If asking again fails too, the error that ends the turn follows. An error it does not name
+                # is a stop the check has no answer to, such as a prompt that no longer fits.
+                elif not (event.get("recoverable") and event.get("code")):
                     error = code
         current = asyncio.current_task()
         if current is not None and current.cancelling():
