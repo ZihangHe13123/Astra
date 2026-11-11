@@ -58,10 +58,11 @@ from .turn_change_store import (
 )
 from .message_time import filter_message_time_events
 from .metrics import runtime_metrics
-from .micro_compact import micro_compact_tool_results
+from .micro_compact import micro_compact_tool_results, results_at_last_cold_start
 from .process_env import hidden_process_creationflags
 from .stream_progress import stream_with_progress
 from .project_instructions import ProjectInstructions, tool_paths
+from .prompt_budget import prompt_cache_seconds
 from .prompts import DEFAULT_SYSTEM_PROMPT, persona_generation_overrides
 from .query_profiler import PROVIDER_PHASES_KEY, QueryProfiler
 from .tool_failure import ToolFailure
@@ -2847,7 +2848,12 @@ class ReActAgent(AgentBase):
                 tool = self.tools.get(name)
                 return str(getattr(tool, "risk", "read")) if tool is not None else "read"
 
-            prepared, stats = micro_compact_tool_results(prompt, tool_risk=risk_for)
+            clearing: dict[str, Any] = {}
+            cached_for = prompt_cache_seconds(str(getattr(getattr(self.llm, "config", None), "provider", "") or ""))
+            if cached_for is not None:
+                # Whatever is due goes in the one request that is read whole anyway, and nothing in between.
+                clearing = {"only": results_at_last_cold_start(self.context.messages, cached_for), "clear_batch": 1}
+            prepared, stats = micro_compact_tool_results(prompt, tool_risk=risk_for, **clearing)
             if stats.cleared_results and record_metrics:
                 runtime_metrics.increment("tool_result_microcompact_count", stats.cleared_results)
                 runtime_metrics.increment("tool_result_microcompact_saved_chars", stats.saved_chars)

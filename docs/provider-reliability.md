@@ -94,6 +94,11 @@ The CLI can neither switch thinking off nor bound its output. A request that
 asks for no thinking, such as a compaction summary, runs at the CLI's lowest
 effort, `low`, instead of the conversation's.
 
+The CLI reads a request again in full from the first message that changed. Old
+tool results are therefore cleared from a Claude Code conversation only in a
+request that starts an hour or more after the one before it, when nothing is
+cached any more; see [tool policy](execution.md#tool-policy-and-tracing).
+
 ## Client and MCP recovery
 
 The backend sends an IPC hello before optional initialization. A silent process

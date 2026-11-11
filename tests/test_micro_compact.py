@@ -1,4 +1,4 @@
-from agent.runtime.micro_compact import micro_compact_tool_results
+from agent.runtime.micro_compact import micro_compact_tool_results, results_at_last_cold_start
 
 
 def _chain(call_id: str, name: str, content: str):
@@ -201,3 +201,68 @@ def test_poll_stamp_keeps_observed_running_state_and_does_not_invent_output():
     assert stamp["status"] == "running" and stamp["exit_code"] is None
     assert "output_excerpt" not in stamp and "reread" not in stamp
     assert stats.saved_chars > 0
+
+
+def _turn(asked_at: float, *calls: str, answered_after: float = 30.0) -> list[dict]:
+    """A request, the results it read, and its answer, stored with the times they were added."""
+    messages: list[dict] = [{"role": "user", "content": "read", "timestamp": asked_at}]
+    for call in calls:
+        chain = _chain(call, "read_file", call[:1] * 2_000)
+        chain[0]["timestamp"] = asked_at + answered_after / 2
+        messages += chain
+    return [*messages, {"role": "assistant", "content": "done", "timestamp": asked_at + answered_after}]
+
+
+def test_only_the_named_results_count_and_are_cleared():
+    messages = [{"role": "user", "content": "old"}]
+    for call in ("a", "b", "c", "d", "e", "f"):
+        messages += _chain(call, "read_file", call * 2_000)
+    messages += [{"role": "assistant", "content": "done"}, {"role": "user", "content": "current"}]
+
+    # Six results of 2,000 against 5,000: left to itself the rule clears until the rest fits.
+    compacted, stats = micro_compact_tool_results(messages, char_budget=5_000, keep_recent=1, clear_batch=1)
+    assert stats.cleared_results == 5
+    # Told that only the first three were there: those three are measured against the budget, and
+    # the later ones are neither counted nor touched.
+    compacted, stats = micro_compact_tool_results(messages, char_budget=5_000, keep_recent=1, clear_batch=1,
+                                                  only=frozenset({"a", "b", "c"}))
+    by_id = {message["tool_call_id"]: message["content"] for message in compacted if message.get("role") == "tool"}
+    assert [call for call, content in by_id.items() if content.startswith("[Old tool result content cleared")] == ["a"]
+    assert all(by_id[call] == call * 2_000 for call in "bcdef") and stats.cleared_results == 1
+    compacted, stats = micro_compact_tool_results(messages, char_budget=5_000, keep_recent=1, clear_batch=1,
+                                                  only=frozenset())
+    assert compacted is messages and stats.cleared_results == 0
+
+
+def test_the_results_a_cold_start_may_clear_are_those_from_before_the_latest_long_pause():
+    hour = 3600
+    busy = [*_turn(1_000, "a", "b"), *_turn(1_100, "c")]
+    # In use without a long pause: no request has begun with nothing cached.
+    assert results_at_last_cold_start(busy, hour) == frozenset()
+    # Back after an hour: that request is read whole, and everything before it was there.
+    back = [*busy, *_turn(1_130 + hour, "d")]
+    assert results_at_last_cold_start(back, hour) == {"a", "b", "c"}
+    # What the conversation adds within the hour changes nothing, during the turn or in the next ones.
+    assert results_at_last_cold_start(back[:-1], hour) == {"a", "b", "c"}
+    later = [*back, *_turn(1_200 + hour, "e"), *_turn(1_300 + hour, "f")]
+    assert results_at_last_cold_start(later, hour) == {"a", "b", "c"}
+    # The next long pause takes in what was added since the last one.
+    assert results_at_last_cold_start([*later, *_turn(1_400 + 3 * hour)], hour) == {"a", "b", "c", "d", "e", "f"}
+    # A pause is measured from the last answer, not from the request before it.
+    slow = [*_turn(1_000, "a", answered_after=hour - 10), *_turn(1_000 + hour, "b")]
+    assert results_at_last_cold_start(slow, hour) == frozenset()
+
+
+def test_a_conversation_without_times_has_no_cold_start_to_clear_at():
+    hour = 3600
+    untimed = [{key: value for key, value in message.items() if key != "timestamp"}
+               for message in [*_turn(1_000, "a"), *_turn(1_000 + 2 * hour, "b")]]
+    assert results_at_last_cold_start(untimed, hour) == frozenset()
+    # Neither a clock set back nor a time that is not a number makes one.
+    odd = [*_turn(5_000, "a"), *_turn(1_000, "b"), {"role": "user", "content": "x", "timestamp": True}]
+    assert results_at_last_cold_start(odd, hour) == frozenset()
+    # A notice the runtime delivers as a user message starts a request too.
+    notice = [*_turn(1_000, "a"), {"role": "user", "content": "done in the background",
+                                   "provenance": "notification", "timestamp": 1_030 + hour}]
+    assert results_at_last_cold_start(notice, hour) == {"a"}
+
