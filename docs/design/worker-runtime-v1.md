@@ -49,7 +49,8 @@ marked partial.
 
 A subagent's history is compacted the way the main agent's is: at the same
 threshold (`prompt_token_budget`: the model's window less its output reserve,
-its own compaction setting, and for most models half the window), by the same
+its own compaction setting, and for most models half the window, which for a
+Claude Code model is 150,000 tokens at most), by the same
 compressor, and the result replaces the history and is saved, so the summary
 is kept and updated rather than written again for every request.
 `ASTRA_SUBAGENT_MAX_PROMPT_TOKENS` lowers the threshold when set.

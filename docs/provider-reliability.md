@@ -80,6 +80,16 @@ the compaction budget. Choose a window supported by the account/model: local
 configuration does not increase the server's maximum. Neither setting is sent
 as an API generation parameter.
 
+Without a limit of its own, a model's history is compacted at half its window;
+GPT models and the Codex provider wait until the window less the output reserve.
+A Claude Code model is compacted at 150,000 tokens when half its window is more.
+The `claude` CLI is started again for every request and takes the earlier turns
+one by one before it asks, so a long conversation is slow to its first event
+whatever the cache holds, and after an hour's pause all of it is read again
+uncached. This holds for every conversation on such a model: the desktop, a
+channel, a scheduled check and a subagent. Set `auto_compact_token_limit` on
+the model's entry to compact later or earlier.
+
 ## Client and MCP recovery
 
 The backend sends an IPC hello before optional initialization. A silent process
