@@ -823,7 +823,10 @@ class ClaudeCodeProvider:
 
     async def chat_limited(self, messages, tools=None, *, max_tokens, temperature=0.1,
                            disable_thinking=False, reasoning_effort=None, request_timeout=None, max_retries=None):
-        config = replace(self.config, reasoning_effort=reasoning_effort or self.config.reasoning_effort)
+        # The CLI can neither switch thinking off nor bound its output. Its lowest effort is the nearest
+        # thing to a request for no thinking: a summary would otherwise think as hard as the conversation.
+        effort = reasoning_effort or (EFFORTS[0] if disable_thinking else self.config.reasoning_effort)
+        config = replace(self.config, reasoning_effort=effort)
         provider = type(self)(config, command=self.command)
         if request_timeout:
             return await asyncio.wait_for(provider.chat(messages, tools), request_timeout)

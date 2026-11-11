@@ -90,6 +90,10 @@ uncached. This holds for every conversation on such a model: the desktop, a
 channel, a scheduled check and a subagent. Set `auto_compact_token_limit` on
 the model's entry to compact later or earlier.
 
+The CLI can neither switch thinking off nor bound its output. A request that
+asks for no thinking, such as a compaction summary, runs at the CLI's lowest
+effort, `low`, instead of the conversation's.
+
 ## Client and MCP recovery
 
 The backend sends an IPC hello before optional initialization. A silent process
