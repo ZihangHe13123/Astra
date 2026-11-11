@@ -1,8 +1,9 @@
 import asyncio
 import json
 import threading
+import time
 
-from agent.runtime.async_io import durable_io
+from agent.runtime.async_io import durable_io, routine_io
 from agent.runtime.latency import RuntimeProfiler
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
 from test_search_responsiveness import call, make_agent
@@ -46,6 +47,32 @@ def test_tool_timing_accounts_for_scheduler_barriers_and_approval(tmp_path):
         assert tools[0]["metrics_ms"]["execute_ms"] >= 20
         assert tools[0]["metrics_ms"]["total_ms"] >= 40
         assert any(e["kind"] == "io" for e in map(json.loads, raw.splitlines()))
+
+    asyncio.run(scenario())
+
+
+def test_a_poll_on_a_timer_is_recorded_only_when_it_was_slow(tmp_path):
+    async def scenario():
+        profiler = RuntimeProfiler(tmp_path / "profile.jsonl")
+
+        def quick():
+            return "quick"
+
+        def slow():
+            time.sleep(0.08)
+            return "slow"
+
+        def once():
+            return "once"
+
+        with profiler.activate():
+            assert [await routine_io(quick), await routine_io(slow), await durable_io(once)] == ["quick", "slow", "once"]
+        await profiler.close()
+        took = {e["label"].rsplit(".", 1)[-1]: e["metrics_ms"]["total_ms"]
+                for e in map(json.loads, profiler.path.read_text().splitlines()) if e["kind"] == "io"}
+        assert took["slow"] >= 80 and "once" in took
+        # A quick poll is left out; only a machine too busy to run it within 50 ms would record it.
+        assert took.get("quick", 50) >= 50
 
     asyncio.run(scenario())
 
