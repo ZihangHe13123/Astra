@@ -63,7 +63,7 @@ from .process_env import hidden_process_creationflags
 from .stream_progress import stream_with_progress
 from .project_instructions import ProjectInstructions, tool_paths
 from .prompts import DEFAULT_SYSTEM_PROMPT, persona_generation_overrides
-from .query_profiler import QueryProfiler
+from .query_profiler import PROVIDER_PHASES_KEY, QueryProfiler
 from .tool_failure import ToolFailure
 from .tools.disclosure import CALL_TOOL, DISPATCH_TOOLS, SEARCH_TOOL, loaded_result, register_dispatch_tools
 from .tools.registry import ToolRegistry
@@ -2835,13 +2835,6 @@ class ReActAgent(AgentBase):
             if not work_mode:
                 rebuilt = with_turn_context(rebuilt)
             rebuilt = without_context_open_placeholders(rebuilt)
-            if self._fresh_tool_context:
-                for item in rebuilt:
-                    if item.get("role") != "tool":
-                        continue
-                    fresh = self._fresh_tool_context.get(str(item.get("tool_call_id") or ""))
-                    if fresh is not None:
-                        item["content"] = fresh
             return with_transient_context(
                 self._prompt_with_runtime_context(
                     rebuilt,
@@ -2859,6 +2852,16 @@ class ReActAgent(AgentBase):
                 runtime_metrics.increment("tool_result_microcompact_count", stats.cleared_results)
                 runtime_metrics.increment("tool_result_microcompact_saved_chars", stats.saved_chars)
                 runtime_metrics.increment("tool_result_microcompact_saved_tokens", stats.saved_tokens)
+            # Old results are cleared by what the history holds. The complete texts that only this
+            # request carries go in afterwards: counted, one of them could push a batch of old results
+            # out of this request that the next request, without it, would put back.
+            if self._fresh_tool_context:
+                for item in prepared:
+                    if item.get("role") != "tool":
+                        continue
+                    fresh = self._fresh_tool_context.get(str(item.get("tool_call_id") or ""))
+                    if fresh is not None:
+                        item["content"] = fresh
             return prepared
 
         with profile.phase("prompt_copy_and_overlays"):
@@ -4493,6 +4496,7 @@ class ReActAgent(AgentBase):
                                 event.get("finish_reason") or event.get("stop_reason") or finish_reason
                             )
                             usage = event.get("usage")
+                            profiler.observe_provider_phases(event.get(PROVIDER_PHASES_KEY))
                         elif event["type"] == "done":
                             provider_state = event.get("_provider_state")
                             full_content = event.get("content", full_content)
@@ -4501,6 +4505,7 @@ class ReActAgent(AgentBase):
                                 event.get("finish_reason") or event.get("stop_reason") or finish_reason
                             )
                             usage = event.get("usage")
+                            profiler.observe_provider_phases(event.get(PROVIDER_PHASES_KEY))
                         elif event["type"] == "generation_recovery":
                             full_content = full_reasoning = ""
                             stream_phase = uuid.uuid4().hex

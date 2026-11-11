@@ -56,7 +56,8 @@ astra
 The current directory becomes the workspace unless `SANDBOX_WORKDIR` explicitly
 selects another one. The launcher finds its own installation independently of
 your working project. Normal startup checks the environment; it does not fetch
-code or install dependencies.
+code or install dependencies. It does rebuild an interface build that has fallen
+behind its source; see [interface builds](#interface-builds-follow-their-source).
 
 ## Optional Browser Control (Windows/macOS)
 
@@ -118,7 +119,47 @@ Normal startup checks the recorded environment and starts it. It does not fetch
 code or run package installation. After manually changing lockfiles or pulling
 code outside the updater, run `astra setup` when dependencies are unverified.
 First setup is explicit so an ordinary invocation does not silently install
-software or modify the environment.
+software.
+
+### Interface builds follow their source
+
+The terminal interface runs from source but loads the shared core (`ui-core`)
+from its build, and the desktop runs its build (`ui-gui`). A pull, a merge or an
+edit made outside `astra update` changes the source and leaves those builds as
+they were. So `astra` checks the shared core's build before it starts the
+interface, `astra --gui` checks the shared core's and the desktop's, and a build
+that is behind its source is rebuilt first:
+
+```text
+Astra: the build of ui-core does not match its source; rebuilding it…
+```
+
+The rebuild is the package's own `npm run build` with the packages already
+installed. It needs no network and takes a few seconds. `astra --cli` and the
+management commands build nothing.
+
+- **What is compared.** A hash of what the build reads: each package's `src`
+  tree, the desktop's `phone-public`, and the files beside `package.json`. The
+  desktop's build also follows `ui-core` and `ui-tui/src`, which it bundles.
+  Setup, update and startup record that hash in `dist/.astra-build.json` when
+  they have built a package, with a hash of the files that were built. A build
+  is current while its source and its files both have the recorded hashes.
+  File times play no part.
+- **A build that is no longer the recorded one is rebuilt** at the next start:
+  one made by hand from other source, an emptied or deleted `dist`, or a build
+  that the launcher started and did not finish. `npm run build` by hand from
+  the same source produces the same files and changes nothing.
+- **A build without a record**, made by an earlier launcher, is kept when every
+  file it reads is older than the build, and rebuilt otherwise. It then gets its
+  record.
+- **An open desktop window keeps its build.** `astra --gui` then only
+  brings that window forward and says that its build does not match the source.
+  Close it and start it again. A terminal interface started beside it still gets a current
+  shared core, because the desktop carries its own copy.
+- **A failed rebuild stops the start.** The build's own output is above the
+  error, and the next start tries again. Nothing opens on a build that did not
+  finish.
+- **Two starts at once** rebuild once: the second waits for the first.
 
 ## Update from a source checkout
 
@@ -414,6 +455,7 @@ processes.
 | --- | --- |
 | `astra` is missing or starts an old copy | Open a new terminal. Run `where.exe astra` in CMD/PowerShell or `command -v astra` on POSIX. Register the intended checkout with its source wrapper and `setup --command-only`. Another installer's command is not overwritten. |
 | Dependencies are unverified or missing | Close instances using the installation, then run `astra setup`; use `astra setup --repair` if the environment is damaged. |
+| `Could not rebuild ui-core` (or `ui-gui`) at startup | The interface source changed and its [rebuild](#interface-builds-follow-their-source) failed; the build's own output is above the message. Fix what it reports and start again. Use `astra setup --repair` if the installed packages are damaged. `astra --cli` starts without the interface build. |
 | Processes are still using the installation | Close the listed interactive Astra sessions. Recognized companion services are paused and restored automatically; an unknown process still needs to be stopped through its owner. |
 | Code updated, but a service did not restart | Run `astra update --recover`. This retries the recorded service restoration without reverting the successfully installed code. |
 | Local files need a choice | Run `astra update` in a terminal and select Keep, Overwrite or Cancel; scripts can use `--keep-local` or `--overwrite-local`. |
@@ -456,7 +498,8 @@ that belongs to the old platform. Legacy `.agent_system` data can be merged with
 Automated coverage includes isolated management commands without site packages,
 native command forwarding tests per host, real temporary Git remotes, dirty and
 divergent repositories, file collisions, update failure and interruption,
-state preservation, process leases, and installed-wheel import isolation.
+state preservation, process leases, startup rebuilds of interface builds that
+are behind their source, and installed-wheel import isolation.
 The existing maintenance gate additionally runs Python/TUI tests, typing, lint,
 the interface build and optional wheel smoke on its supported OS matrix.
 

@@ -14,9 +14,23 @@ from pathlib import Path
 from . import dependencies
 from .common import LauncherError, release, spawn, stop_tree
 from .installation import Installation, discover, runtime_environment
-from .locking import RuntimeLease
+from .locking import RuntimeLease, active_instances
 
 STARTUP_SECONDS = 90
+
+
+def _refresh_builds(install: Installation) -> None:
+    """Bring the desktop's build up to its source before a window opens."""
+    if not dependencies.outdated_builds(install, dependencies.GUI_BUILDS):
+        return
+    if any(item.get("role") == "desktop" for item in active_instances(install)):
+        # This launch only brings that window forward, and a rebuild would remove files it still loads.
+        print("Astra: the open desktop's build does not match its source. Close it, then run astra --gui "
+              "again to rebuild.", file=sys.stderr, flush=True)
+        return
+    # The lease keeps an update from replacing the checkout during the rebuild.
+    with RuntimeLease(install, "desktop build"):
+        dependencies.refresh_builds(install, dependencies.GUI_BUILDS)
 
 
 def launch_gui(install: Installation) -> int:
@@ -27,6 +41,7 @@ def launch_gui(install: Installation) -> int:
             raise LauncherError("Run astra setup --gui once to prepare this checkout's desktop dependencies.")
         dependencies.python_health(install)
         dependencies.gui_health(install)
+        _refresh_builds(install)
     else:
         dependencies.gui_executable(install)
     directory = install.data / "gui" / "launches"

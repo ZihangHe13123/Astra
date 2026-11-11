@@ -115,6 +115,8 @@ async def run_check(store: JobStore, run: dict) -> None:
     )
     agent.context.set_session(str(root / "session.json"))
     output = ""
+    # The model response whose text ``output`` holds.
+    response = None
     error = ""
     stopped_early = ""
     last_progress = 0.0
@@ -155,7 +157,13 @@ async def run_check(store: JobStore, run: dict) -> None:
                 progress.touch()
                 last_progress = now
             if event.get("type") == "chunk":
+                # The result is the last response alone. Text from an earlier one is not part of it: the model
+                # said it beside tool calls, or the runtime discarded that response and asked again.
+                if event.get("stream_id") != response:
+                    response, output = event.get("stream_id"), ""
                 output = (output + str(event.get("content", "")))[:MAX_OUTPUT]
+            elif event.get("type") == "tool_calls":
+                output = ""
             elif event.get("type") == "error":
                 # Provider errors may embed URLs or secrets; keep the public code only.
                 code = str(event.get("code") or "scheduled_check_failed")[:120]

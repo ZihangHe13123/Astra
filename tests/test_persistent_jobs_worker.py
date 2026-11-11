@@ -47,10 +47,18 @@ class Handler(BaseHTTPRequestHandler):
             delta = {"tool_calls": [{"index": 0, "id": f"look-{len(self.server.requests)}", "type": "function",
                                      "function": {"name": name, "arguments": arguments}}]}
             reason = "tool_calls"
+        elif self.server.cut_off:
+            # The connection ends before an answer is written.
+            self.wfile.write(b"data: [DONE]\n\n")
+            return
         else:
             delta = {"content": getattr(self.server, "reply", "fixture-check-result")}
             reason = "stop"
-        for chunk in ({"choices": [{"index": 0, "delta": delta, "finish_reason": None}]},
+        deltas = [delta]
+        if reason == "tool_calls" and self.server.narration:
+            # Says what it is doing in the same response as the call.
+            deltas.insert(0, {"content": self.server.narration})
+        for chunk in (*({"choices": [{"index": 0, "delta": item, "finish_reason": None}]} for item in deltas),
                       {"choices": [{"index": 0, "delta": {}, "finish_reason": reason}],
                        "usage": {"prompt_tokens": 41, "completion_tokens": 7, "total_tokens": 48}}):
             self.wfile.write(("data: " + json.dumps(chunk) + "\n\n").encode())
@@ -65,6 +73,8 @@ def provider(tmp_path):
     server.try_write = False
     server.tool_rounds = 0
     server.tool_call = ("current_time", "{}")
+    server.narration = ""
+    server.cut_off = False
     server.target = tmp_path / "protected.txt"
     server.target.write_text("ORIGINAL", encoding="utf-8")
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -184,6 +194,49 @@ def test_a_check_stopped_for_repeating_itself_still_delivers_and_the_clock_may_b
     [run] = command(env, "show", clock["id"])["occurrences"]
     assert (run["state"], run["detail"]) == ("completed", "")
     assert len(provider.requests) - before == REPEATED_CALLS_PER_TURN + 3
+
+
+def test_a_check_result_is_its_final_answer_without_what_it_said_between_tool_calls(tmp_path, provider):
+    home = tmp_path / "A"
+    env = environment(home, provider)
+    (tmp_path / "notes.txt").write_text("unchanged notes", encoding="utf-8")
+    provider.tool_rounds, provider.narration = 2, "Checked two sources so far, verifying the dates."
+    provider.reply = "REPORT: one item today."
+    job = command(env, "add", "digest", "--after", "60", "--model", "fixture", "--workdir", str(tmp_path),
+                  "--prompt", "Any news?", "--request", "Send me a digest")
+    run = command(env, "run", job["id"])["executed"][0]
+    assert command(env, "show", job["id"])["occurrences"][0]["output"] == "REPORT: one item today."
+    # The check's own conversation keeps every response as the model gave it.
+    saved = SessionStore(home / "jobs" / "runs" / run["id"] / "session.json").load(readonly=True)
+    assert [message["content"] for message in saved["messages"] if message["role"] == "assistant"] == [
+        provider.narration, provider.narration, "REPORT: one item today."]
+    # Nothing new is still nothing new after saying so on the way.
+    provider.reply = "NO_UPDATE"
+    watch = command(env, "add", "watch", "--after", "60", "--model", "fixture", "--workdir", str(tmp_path),
+                    "--notify", "on_change", "--prompt", "Any new posts?", "--request", "Tell me only about new posts")
+    command(env, "run", watch["id"])
+    [quiet] = command(env, "show", watch["id"])["occurrences"]
+    assert (quiet["state"], quiet["quiet"], quiet["output"]) == ("completed", 1, "NO_UPDATE")
+    # A response whose call is refused as a repeat is followed by the answer; the answer alone is the result.
+    provider.tool_rounds, provider.tool_call = 10, ("read_file", json.dumps({"path": "notes.txt"}))
+    provider.reply = "What the notes say, written up."
+    notes = command(env, "add", "notes", "--after", "60", "--model", "fixture", "--workdir", str(tmp_path),
+                    "--prompt", "Read my notes", "--request", "Check my notes")
+    command(env, "run", notes["id"])
+    [stopped] = command(env, "show", notes["id"])["occurrences"]
+    assert (stopped["state"], stopped["detail"], stopped["output"]) == (
+        "completed", "repeated_tool_call", "What the notes say, written up.")
+
+
+def test_a_check_cut_off_after_using_tools_has_no_result(tmp_path, provider):
+    env = environment(tmp_path / "A", provider)
+    provider.tool_rounds, provider.narration, provider.cut_off = 1, "Looking at the first source.", True
+    job = command(env, "add", "digest", "--after", "60", "--model", "fixture", "--workdir", str(tmp_path),
+                  "--prompt", "Any news?", "--request", "Send me a digest")
+    command(env, "run", job["id"])
+    [run] = command(env, "show", job["id"])["occurrences"]
+    # What it said on the way to an answer it never gave is not a result.
+    assert (run["state"], run["detail"], run["output"]) == ("failed", "stream_closed", "")
 
 
 def test_a_check_follows_the_default_model_unless_given_one(tmp_path, provider):

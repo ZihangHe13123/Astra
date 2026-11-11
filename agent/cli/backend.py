@@ -101,7 +101,7 @@ from agent.runtime.context import _valid_message_timestamp
 from agent.cli.history import history_tool_results
 from agent.runtime.event_stream import RuntimeEventStream
 from agent.runtime.event_writer import OrderedEventWriter
-from agent.runtime.async_io import durable_io
+from agent.runtime.async_io import durable_io, routine_io
 from agent.runtime.latency import RuntimeProfiler, current_profiler, profile_request
 from agent.runtime.user_questions import UserQuestionBroker
 from agent.runtime.tools.jobs import person_words, register_jobs_tool
@@ -3055,11 +3055,11 @@ async def _main(startup_started: float):
                         if first:
                             with suppress(PeerError):
                                 await durable_io(peer_link.rename, default_name(first, session))
-                    await durable_io(peer_link.heartbeat, "idle" if current_idle() else "busy")
+                    await routine_io(peer_link.heartbeat, "idle" if current_idle() else "busy")
                 if not current_idle() or now - peer_clock["inbox"] < 1.0:
                     return
                 peer_clock["inbox"] = now
-                if not await durable_io(peer_link.has_mail) or not current_idle():
+                if not await routine_io(peer_link.has_mail) or not current_idle():
                     return
 
                 def claim() -> None:

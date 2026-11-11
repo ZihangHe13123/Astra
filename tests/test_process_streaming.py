@@ -360,7 +360,7 @@ def test_compacted_read_stamp_replays_same_utf8_page_after_cursor_advanced(tmp_p
         {"role": "tool", "name": "read_file", "content": "x" * 2000},
         {"role": "user", "content": "continue"},
     ]
-    compacted, stats = micro_compact_tool_results(messages, char_budget=1000, keep_recent=1)
+    compacted, stats = micro_compact_tool_results(messages, char_budget=1000, keep_recent=1, clear_batch=1)
     stamp = json.loads(compacted[1]["content"].split("\n", 1)[1])
     args = stamp["reread"]["arguments"].copy()
     assert args.pop("process_id") == process.process_id
@@ -368,6 +368,6 @@ def test_compacted_read_stamp_replays_same_utf8_page_after_cursor_advanced(tmp_p
     assert replay["content"] == original["content"]
     assert replay["byte_offset"] == original["byte_offset"]
     assert replay["next_byte_offset"] == original["next_byte_offset"]
-    again, _ = micro_compact_tool_results(compacted, char_budget=1000, keep_recent=1)
+    again, _ = micro_compact_tool_results(compacted, char_budget=1000, keep_recent=1, clear_batch=1)
     assert again[1] == compacted[1]
     assert stats.saved_chars > 0

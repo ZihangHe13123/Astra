@@ -167,6 +167,21 @@ def test_packager_allowlist_excludes_checkout_state_and_untracked_secrets(tmp_pa
                      'config/models.yaml', 'config/macos_computer_compatibility.json', 'LICENSE'}
 
 
+def test_packaged_interface_leaves_out_the_checkouts_build_record(tmp_path):
+    from agent.launcher import dependencies
+    module = packager()
+    built = tmp_path / 'ui-gui/dist'
+    for relative in ['main.cjs', 'preload.cjs', 'renderer/index.html', 'renderer/assets/index.js', 'phone/bridge.js',
+                     Path(dependencies.BUILD_RECORD).name]:
+        path = built / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('placeholder')
+    assert (tmp_path / 'ui-gui' / dependencies.BUILD_RECORD).is_file()
+    module.copy_interface(built, tmp_path / 'app/dist')
+    paths = {p.relative_to(tmp_path / 'app/dist').as_posix() for p in (tmp_path / 'app/dist').rglob('*') if p.is_file()}
+    assert paths == {'main.cjs', 'preload.cjs', 'renderer/index.html', 'renderer/assets/index.js', 'phone/bridge.js'}
+
+
 def test_update_recovery_holds_installation_lock_and_blocks_new_lease(tmp_path, monkeypatch):
     from agent.launcher.locking import RuntimeLease
     from agent.launcher.common import write_json

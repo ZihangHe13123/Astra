@@ -1008,7 +1008,9 @@ class AgentContext:
         # Cheapest-first: deterministic layers before the expensive LLM summary.
         # Drop completed read/network tool steps (side-effecting and current-turn
         # steps stay), then clear old read tool results in place. When those
-        # sufficed, skip the summary entirely.
+        # sufficed, skip the summary entirely. The history is rewritten here
+        # either way, so results are cleared as they fall due and not held
+        # back for a whole batch as they are in a prompt copy.
         from .deterministic_compact import drop_completed_steps
         from .micro_compact import micro_compact_tool_results
 
@@ -1020,7 +1022,7 @@ class AgentContext:
             tool_request_local=is_request_local,
             keep_recent=self.compact_keep_recent,
         )
-        self.messages, micro_stats = micro_compact_tool_results(self.messages, tool_risk=risk)
+        self.messages, micro_stats = micro_compact_tool_results(self.messages, tool_risk=risk, clear_batch=1)
         report.update(dropped_steps=drop_stats.dropped_steps, cleared_results=micro_stats.cleared_results)
         history_changed = bool(drop_stats.dropped_steps or micro_stats.cleared_results)
         changed = changed or history_changed

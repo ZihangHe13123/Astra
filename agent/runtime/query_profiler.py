@@ -20,6 +20,8 @@ from .token_estimator import estimate_value_tokens
 
 _TURN_CONTEXT_MARKER = "[SYSTEM-SUPPLIED TURN CONTEXT — "
 _STANDING_MEMORY_MARKER = "[SYSTEM-SUPPLIED STANDING MEMORY — "
+# On a provider's final stream event: named stretches of the request it timed itself, in ms.
+PROVIDER_PHASES_KEY = "_phases_ms"
 
 
 def _truthy(name: str) -> bool:
@@ -282,6 +284,14 @@ class QueryProfiler:
     def observe_ms(self, name: str, value: float) -> None:
         if self.enabled:
             self.phases_ms[name] = round(max(0.0, value), 3)
+
+    def observe_provider_phases(self, phases: Any) -> None:
+        """Take what a final stream event carries under ``PROVIDER_PHASES_KEY``, if anything."""
+        if not self.enabled or not isinstance(phases, dict):
+            return
+        for name, value in phases.items():
+            if isinstance(name, str) and isinstance(value, (int, float)) and not isinstance(value, bool):
+                self.observe_ms(name, value)
 
     def set_request(
         self,

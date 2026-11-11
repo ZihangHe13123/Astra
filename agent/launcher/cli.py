@@ -128,6 +128,11 @@ def launch(install: Installation, *, cli: bool = False, activity: list[str] | No
             command.append(str(install.ui / "node_modules/tsx/dist/cli.mjs"))
         command.append(str(entry))
     with RuntimeLease(install, "legacy CLI" if cli else "activity" if activity is not None else "interface"):
+        if install.kind == "source" and not cli and activity is None:
+            # The interface runs from source but loads the shared core from its build. Under the lease, so
+            # that an update cannot replace the checkout during a rebuild; before Ctrl+C goes to the
+            # interface, so that it still cancels one.
+            dependencies.refresh_builds(install, dependencies.TUI_BUILDS)
         previous = signal.getsignal(signal.SIGINT)
         # The foreground interface owns Ctrl+C; the supervisor must not exit
         # and drop its lease while the interface is still handling cancellation.

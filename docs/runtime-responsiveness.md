@@ -26,6 +26,11 @@ unacknowledged samples appear in the final summary; an incomplete run reports
 `complete: false`. Use `--generation ID` to inspect an older backend lifetime.
 Profiling is off by default and does not change model or reasoning settings.
 
+What a backend does on a timer while nothing happens, looking for mail from
+other sessions once a second and reporting in every five, is recorded only when
+it took 50 ms or longer. Recorded every time, those polls filled the files
+within hours and pushed out the requests they are kept for.
+
 ## Reading the results
 
 | Stage | What it helps explain |

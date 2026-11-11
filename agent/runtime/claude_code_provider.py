@@ -28,11 +28,13 @@ import shutil
 import signal
 import sys
 import tempfile
+import time
 from collections.abc import AsyncGenerator
 from dataclasses import replace
 from pathlib import Path
 
 from .llm import LLMIdleTimeout, LLMResponseError, _messages_for_capabilities
+from .query_profiler import PROVIDER_PHASES_KEY
 from .token_estimator import estimate_messages_tokens
 from .tool_preparation import with_tool_preparation
 
@@ -600,6 +602,7 @@ class ClaudeCodeProvider:
                                                 encoding="utf-8")
             if listed:
                 Path(files, "tools.json").write_text(json.dumps(listed, ensure_ascii=False), encoding="utf-8")
+            launched = time.perf_counter()
             process = await asyncio.create_subprocess_exec(
                 *self._arguments(command, files, bool(listed)), cwd=workspace(), env=child_environment(),
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
@@ -607,10 +610,20 @@ class ClaudeCodeProvider:
             try:
                 assert process.stdin is not None and process.stdout is not None
                 lines = _Lines(process.stdout)
-                await self._replay(process, lines, turns[:-1])
+                first_taken = await self._replay(process, lines, turns[:-1])
+                replayed = time.perf_counter()
                 await self._send(process, lines, {"type": "user", "message": {"role": "user", "content": turns[-1][1]}})
                 process.stdin.close()
+                # The wait before Claude could be asked at all: the CLI's start, then every earlier
+                # turn. Timed apart from the model's own, because a long conversation is slow to its
+                # first event (live 2026-11-11: 11 to 41 s at 484 messages) and the request's total
+                # cannot say which of the two it was.
+                phases = None if first_taken is None else {
+                    "claude_code_start": round((first_taken - launched) * 1000, 3),
+                    "claude_code_history_replay": round((replayed - first_taken) * 1000, 3)}
                 async for event in self._events(lines, marked, aliases):
+                    if phases is not None and event.get("type") in {"done", "tool_calls"}:
+                        event = {**event, PROVIDER_PHASES_KEY: phases}
                     yield event
             finally:
                 _terminate(process)
@@ -623,9 +636,11 @@ class ClaudeCodeProvider:
         except (BrokenPipeError, ConnectionResetError):
             raise self._ended(lines, "replay", "Claude Code stopped reading the conversation. " + LOGIN_HINT) from None
 
-    async def _replay(self, process, lines: _Lines, turns: list[tuple[str, list[dict]]]) -> None:
+    async def _replay(self, process, lines: _Lines, turns: list[tuple[str, list[dict]]]) -> float | None:
         """Append earlier turns without a request: each user turn waits for the CLI's zero-turn
-        result, so the following assistant turn cannot land ahead of it."""
+        result, so the following assistant turn cannot land ahead of it. Returns when the CLI took
+        the first of them, which is also when it had finished starting."""
+        first_taken = None
         for role, blocks in turns:
             if role == "assistant":
                 await self._send(process, lines, {"type": "assistant", "message": {"role": "assistant", "content": blocks}})
@@ -633,6 +648,9 @@ class ClaudeCodeProvider:
             await self._send(process, lines, {"type": "user", "message": {"role": "user", "content": blocks},
                                               "shouldQuery": False})
             await self._acknowledged(lines)
+            if first_taken is None:
+                first_taken = time.perf_counter()
+        return first_taken
 
     def _ended(self, lines: _Lines, fallback: str, message: str) -> Exception:
         """The CLI closed its output. Nothing at all means it refused to start, which is how a
@@ -797,6 +815,7 @@ class ClaudeCodeProvider:
         try:
             async for event in stream:
                 if event["type"] in {"done", "tool_calls"}:
+                    event = {key: value for key, value in event.items() if key != PROVIDER_PHASES_KEY}
                     return {**event, "tool_calls": event.get("calls", [])}
         finally:
             await stream.aclose()

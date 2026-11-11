@@ -39,7 +39,7 @@ astra doctor
 astra
 ```
 
-除非明确设置 `SANDBOX_WORKDIR`，当前目录就是工作区。启动器独立定位自己的安装目录，不依赖当前项目。日常启动只检查环境，不拉取代码或安装依赖。
+除非明确设置 `SANDBOX_WORKDIR`，当前目录就是工作区。启动器独立定位自己的安装目录，不依赖当前项目。日常启动只检查环境，不拉取代码或安装依赖；界面构建落后于源码时会先重建，见[界面构建跟随源码](#interface-builds-follow-their-source)。
 
 ## 可选 Browser Control（Windows/macOS）
 
@@ -83,6 +83,25 @@ git pull --ff-only
 在工作项目目录运行 `astra`；当前目录及文件权限、`SANDBOX_WORKDIR` 决定工作区，不决定安装位置。源码包装脚本和已注册命令使用同一套标准库参数解析器：`astra` 启动 Ink，`astra --cli` 显式启动旧文本 CLI，`agent-lab` 保留原兼容行为。
 
 正常启动不联网取代码或安装软件。若手动改过锁文件或绕过更新器拉取源码，环境显示未验证时运行 `astra setup`。
+
+<a id="interface-builds-follow-their-source"></a>
+
+### 界面构建跟随源码
+
+终端界面直接运行源码，但共享核心（`ui-core`）用的是构建产物；桌面端运行的是自己的构建产物（`ui-gui`）。绕过 `astra update` 的拉取、合并或手动修改只改源码，构建产物还是旧的。所以 `astra` 启动界面前检查共享核心的构建，`astra --gui` 检查共享核心和桌面端的构建，落后于源码的先重建：
+
+```text
+Astra: the build of ui-core does not match its source; rebuilding it…
+```
+
+重建执行的就是该包自己的 `npm run build`，用已安装的依赖，不需要联网，只需几秒。`astra --cli` 和管理命令不构建任何东西。
+
+- **比较什么**：构建所读内容的哈希，即各包的 `src` 目录、桌面端的 `phone-public`，以及与 `package.json` 同级的文件。桌面端的构建还跟随它打包进去的 `ui-core` 和 `ui-tui/src`。setup、update 和启动在构建完一个包后，把这个哈希连同构建产物的哈希记在 `dist/.astra-build.json`。源码和构建产物的哈希都与记录一致，这个构建就是最新的，判断不看文件时间。
+- **不再是记录里那一份的构建会重建**：用别的源码手动构建过、`dist` 被清空或删除、启动器自己开始但没完成的构建，下次启动都会重建。用同样的源码手动执行 `npm run build` 得到的文件相同，不算改动。
+- **没有记录的构建**（旧版启动器构建的）：它读取的文件都比它旧就沿用，否则重建；沿用时补上记录。
+- **桌面窗口开着时不重建**：此时 `astra --gui` 只把已打开的窗口调到前面，并提示它的构建与源码不一致；关闭后重新启动即可。在它旁边启动的终端界面仍会得到最新的共享核心，因为桌面端用的是自己打包的那一份。
+- **重建失败则停止启动**：构建自身的输出显示在错误信息上方，下次启动会重试。不会在没完成的构建上打开界面。
+- **同时启动两次**只重建一次：后一个等前一个完成。
 
 <a id="update-from-a-source-checkout"></a>
 
@@ -273,6 +292,7 @@ astra update --recover
 | --- | --- |
 | 找不到 `astra` 或启动旧副本 | 开新终端，用 `where.exe astra` / `command -v astra` 确认路径，再从目标源码执行 `setup --command-only`。 |
 | 依赖缺失或未验证 | 关闭使用安装的实例，执行 `astra setup`；损坏时用 `astra setup --repair`。 |
+| 启动时提示 `Could not rebuild ui-core`（或 `ui-gui`） | 界面源码改过而[重建](#interface-builds-follow-their-source)失败，构建自身的输出在该提示上方。按输出修正后重新启动；已安装的依赖损坏时用 `astra setup --repair`。`astra --cli` 不依赖界面构建。 |
 | 进程仍占用安装 | 关闭列出的交互会话；已识别服务自动处理，未知进程由其拥有者停止。 |
 | 代码更新但服务未恢复 | 用 `astra update --recover` 重试服务恢复。 |
 | 本地文件需要选择 | 在交互终端选保留/覆盖/取消；脚本明确指定策略。 |
@@ -306,6 +326,6 @@ rm -rf .venv ui-tui/node_modules
 
 ## 验收边界
 
-自动检查覆盖无站点包的管理命令、各主机命令转发、临时 Git 远端、脏/分叉仓库、文件冲突、更新中断与恢复、数据保留、进程租约及 wheel 导入隔离。维护检查另含 Python/TUI 测试、类型、lint、构建及可选 wheel smoke。
+自动检查覆盖无站点包的管理命令、各主机命令转发、临时 Git 远端、脏/分叉仓库、文件冲突、更新中断与恢复、数据保留、进程租约、启动时对落后界面构建的重建及 wheel 导入隔离。维护检查另含 Python/TUI 测试、类型、lint、构建及可选 wheel smoke。
 
 macOS 的通过结果不算原生 Windows 验收；CMD、PowerShell、平台辅助程序及真实模型交互须分别报告。

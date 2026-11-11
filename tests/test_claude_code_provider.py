@@ -16,6 +16,7 @@ from agent.runtime.claude_code_provider import ClaudeCodeError, ClaudeCodeProvid
 from agent.runtime.llm import LLMClient, LLMConfig, LLMIdleTimeout
 from agent.runtime.process_env import pid_alive
 from agent.runtime.providers import DEFAULT_PROVIDER_REGISTRY
+from agent.runtime.query_profiler import PROVIDER_PHASES_KEY
 from agent.runtime.react import ReActAgent
 from agent.runtime.subagent_resume import UNKNOWN_RESULT
 
@@ -410,6 +411,22 @@ def test_first_turn_has_no_history_and_no_breakpoint(fake_cli, monkeypatch):
     collect(provider(command).chat_stream(MESSAGES, [READ_FILE]))
     frames = json.loads(record.read_text())["frames"]
     assert len(frames) == 1 and "shouldQuery" not in frames[0] and not cache_markers(frames)
+
+
+def test_a_request_that_replays_history_times_the_cli_before_it_asks(fake_cli, monkeypatch):
+    """Live 2026-11-11: a 484-message thread waited 11 to 41 s for its first event, and nothing told
+    the CLI taking the conversation apart from the model. A replayed request's final event times
+    the CLI's start, up to the first earlier turn it took, and the rest of the replay. A request
+    with nothing to replay has no acknowledgement to time by, and an answer asked for whole is the
+    answer alone."""
+    command, _ = fake_cli
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "text")
+    phases = collect(provider(command).chat_stream(HISTORY, [READ_FILE]))[-1][PROVIDER_PHASES_KEY]
+    assert set(phases) == {"claude_code_start", "claude_code_history_replay"}
+    assert phases["claude_code_start"] > 0 and phases["claude_code_history_replay"] >= 0
+    assert PROVIDER_PHASES_KEY not in collect(provider(command).chat_stream(MESSAGES, [READ_FILE]))[-1]
+    whole = asyncio.run(provider(command).chat(HISTORY, [READ_FILE]))
+    assert whole["content"] == "Hello from Claude." and PROVIDER_PHASES_KEY not in whole
 
 
 @pytest.mark.parametrize("messages", [MESSAGES, HISTORY], ids=["single turn", "replayed history"])

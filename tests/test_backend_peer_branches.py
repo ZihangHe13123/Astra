@@ -12,7 +12,7 @@ import pytest
 
 from agent.cli.images import build_user_message_content  # noqa: F401 - globals used by the executed backend closures
 from agent.core.msg import Msg
-from agent.runtime.async_io import durable_io
+from agent.runtime.async_io import durable_io, routine_io  # noqa: F401 - globals used by the executed backend closures
 from agent.runtime.conversation_branches import ConversationBranches, branch_scope
 from agent.runtime.peer_link import HEARTBEAT_SECONDS, PERSONAL_PEER_NAME, PeerError, PeerLink, default_name, fallback_name, incoming_prompt  # noqa: F401 - globals used by the executed backend closures
 

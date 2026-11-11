@@ -110,7 +110,8 @@ macOS 示例：
 
 `AGENT_TOOL_POLICY` 支持 `permissive`、`safe` 和 `locked`。在 safe/locked 模式下，可用 `/permissions allow <tool-name>` 为当前进程批准被拒绝的工具。
 
-- `TOOL_MAX_INLINE_CHARS=12000` 限制持久历史中的首尾预览，完整结果保存到 `TOOL_RESULT_DIR`。新结果在紧接着的一次模型迭代中最多完整展示 `TOOL_MAX_FRESH_RESULT_CHARS=100000` 字符，之后回到预览。base64/data URL 等不透明载荷不会作为大段文字内联。
+- `TOOL_MAX_INLINE_CHARS=12000` 是工具文字输出的内联长度。不超过它两倍、也不超过 `TOOL_MAX_FRESH_RESULT_CHARS` 的输出完整留在对话里。更长的输出完整保存到 `TOOL_RESULT_DIR`，持久历史中只留一份内联长度的首尾预览；紧接着的一次模型迭代最多能看到其中 `TOOL_MAX_FRESH_RESULT_CHARS=100000` 字符的完整内容，之后回到预览。回到预览会改写已经发出的消息，而被改写的消息之后的全部内容，服务商都要按未缓存价格重读；不到内联长度两倍的输出，预览省下的抵不上这次重读。工具自带上限时规则相同。base64/data URL 等不透明载荷不会作为大段文字内联。
+- 旧结果只在模型请求所带的那份对话副本里清理，会话历史里仍然保留。只有最近一条用户角色消息（用户的请求，或运行时以用户角色送达的通知）之前的结果才计入、才会被清理；把运行状态附在这条消息上的模式，界线再往前一条。这部分结果超过 `TOOL_RESULT_PROMPT_BUDGET_CHARS=24000` 字符时，最早的读取类和联网类结果换成一行说明，直到其余部分不再超出，最近的 `TOOL_RESULT_KEEP_RECENT=5` 条保留。清理同样会改写已经发出的消息，所以要等到期的结果攒够 `TOOL_RESULT_CLEAR_BATCH=10` 条才一起清理。出错的结果、不足 512 字符的结果以及写入类、执行类工具的结果不清理。新结果在一次迭代中完整展示的文字不计入，所以一轮之内的工具调用不会改变哪些结果被清理。历史压缩改写的是历史本身，到期的结果在那里直接清理，不等凑满一批。
 - `TOOL_FAILURE_THRESHOLD=3` 在等价错误连续出现后打开单工具熔断，并禁用工具做最后一次综合回答。
 - `PROMPT_CACHE_STABLE_TOOLS=1` 在工作会话中保持一份稳定的模型工具清单；预算和熔断仍在执行阶段检查，不在 ReAct 迭代间删除 schema。
 - `ASTRA_TOOL_DISCLOSURE=deferred`（默认）时只发一小组常驻工具（`agent/runtime/tools/disclosure.py` 里的 `CORE_TOOLS`，个别对话类型再加几个）和 `tool_search`、`call_tool`；设为 `full` 则照旧发全部默认工具。其余工具照常注册、照常执行：`tool_search` 按功能族列出它们，并把完整定义作为结果返回；`call_tool` 再以工具本名运行它，审批、重复调用保护、事件和界面看到的都是这个工具。本对话里没拿到定义就调用的工具不会运行，结果里会把定义交给模型。一段对话的工具清单始终不变（见 specs/tool-disclosure.md）。

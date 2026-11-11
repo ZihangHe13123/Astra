@@ -49,6 +49,11 @@ _APPROVAL_DESCRIPTOR_FIELDS = (
 _MAX_APPROVAL_JUSTIFICATION_CHARS = 2_000
 
 _OMISSION_MARKER = "\n\n... [middle omitted] ...\n\n"
+# An output over the inline limit reaches the next model request whole and every later one as a
+# preview. That swap changes the conversation at the result, so the provider reads everything from
+# there on again at the uncached price. Up to this many times the limit the preview saves less than
+# half of the output, which seldom pays for that re-read; such an output stays whole instead.
+_WHOLE_RESULT_FACTOR = 2
 _REQUEST_LOCAL_RESULT_PLACEHOLDER = (
     "[Request-local tool result omitted after its one permitted model request.]"
 )
@@ -1841,6 +1846,14 @@ class ToolRegistry:
             "artifact_bytes": size_bytes,
         }
 
+    def whole_result_chars(self, override: int | None = None) -> int:
+        """The longest text output that is never shortened, for a tool with this inline limit.
+
+        Above the limit it is bounded by what one result may put into a request as fresh text.
+        """
+        limit = override or self.max_inline_chars
+        return max(limit, min(limit * _WHOLE_RESULT_FACTOR, self.max_fresh_chars))
+
     def _shape_output(
         self,
         tool_name: str,
@@ -1858,6 +1871,9 @@ class ToolRegistry:
             }
         limit = override or self.max_inline_chars
         if len(output) <= limit:
+            return {"output": output, "output_truncated": False}
+        opaque_payload = re.match(r"^\s*data:[^;,\s]+(?:;[^,\s]+)*;base64,", output, re.IGNORECASE)
+        if not opaque_payload and len(output) <= self.whole_result_chars(override):
             return {"output": output, "output_truncated": False}
 
         safe_name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", tool_name).strip("._") or "tool"
@@ -1888,7 +1904,6 @@ class ToolRegistry:
         # Base64/data-URL payloads are opaque to a text model.  Inlining a
         # 12K slice only consumes attention and can make the next generation
         # ignore the fact that the tool already completed.
-        opaque_payload = re.match(r"^\s*data:[^;,\s]+(?:;[^,\s]+)*;base64,", output, re.IGNORECASE)
         if opaque_payload:
             media_type = output.lstrip()[5:].split(";", 1)[0] or "unknown"
             preview = (

@@ -21,6 +21,8 @@ python scripts/benchmark_runtime_responsiveness.py --samples 50 --lock-ms 0
 
 启用后，`.astra/query-profile.jsonl` 记录模型请求阶段，`.astra/runtime-profile.jsonl` 记录工具、存储和前端阶段。设置 `ASTRA_HOME` 时，文件保存在该目录。运行时记录使用有界队列，单文件上限 5 MiB，并保留两个轮转备份。最终摘要会报告丢弃记录、写入错误和未确认样本；不完整运行标记 `complete: false`。用 `--generation ID` 可查看更早的后端运行周期。
 
+后端空闲时按定时器做的事（每秒查看一次其他会话的来信、每五秒报一次在线）只在耗时达到 50 毫秒时记录。每次都记的话，这些轮询几小时内就会写满文件，把真正要留的请求记录挤掉。
+
 分析默认关闭，不改变模型选择或推理设置。
 
 <a id="reading-the-results"></a>
