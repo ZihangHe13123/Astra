@@ -612,7 +612,7 @@ def register_run_code_tool(registry: ToolRegistry, agent_getter: Callable[[], An
             "work); `description` is a short summary of what the program does. The names `tools`, "
             "`ToolCallError`, and `asyncio` are bound. `await tools.<name>(<keyword args>)` always "
             "returns the tool's text output as a string, so parse JSON yourself with `json.loads`; an "
-            f"output over {registry.max_inline_chars:,} characters arrives as a shortened preview with "
+            f"output over {registry.whole_result_chars():,} characters arrives as a shortened preview with "
             "the middle omitted. A failing call raises `ToolCallError` with the tool's error text, which "
             "you may catch. Use `await tools.gather(tools.a(), tools.b())` or "
             "`await asyncio.gather(*coros)` to fan out independent reads; side-effecting "

@@ -2835,13 +2835,6 @@ class ReActAgent(AgentBase):
             if not work_mode:
                 rebuilt = with_turn_context(rebuilt)
             rebuilt = without_context_open_placeholders(rebuilt)
-            if self._fresh_tool_context:
-                for item in rebuilt:
-                    if item.get("role") != "tool":
-                        continue
-                    fresh = self._fresh_tool_context.get(str(item.get("tool_call_id") or ""))
-                    if fresh is not None:
-                        item["content"] = fresh
             return with_transient_context(
                 self._prompt_with_runtime_context(
                     rebuilt,
@@ -2859,6 +2852,16 @@ class ReActAgent(AgentBase):
                 runtime_metrics.increment("tool_result_microcompact_count", stats.cleared_results)
                 runtime_metrics.increment("tool_result_microcompact_saved_chars", stats.saved_chars)
                 runtime_metrics.increment("tool_result_microcompact_saved_tokens", stats.saved_tokens)
+            # Old results are cleared by what the history holds. The complete texts that only this
+            # request carries go in afterwards: counted, one of them could push a batch of old results
+            # out of this request that the next request, without it, would put back.
+            if self._fresh_tool_context:
+                for item in prepared:
+                    if item.get("role") != "tool":
+                        continue
+                    fresh = self._fresh_tool_context.get(str(item.get("tool_call_id") or ""))
+                    if fresh is not None:
+                        item["content"] = fresh
             return prepared
 
         with profile.phase("prompt_copy_and_overlays"):

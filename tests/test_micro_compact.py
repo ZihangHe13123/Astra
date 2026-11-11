@@ -25,6 +25,7 @@ def test_microcompact_clears_only_old_read_results():
         tool_risk=lambda name: "write" if name == "apply_patch" else "read",
         char_budget=1_000,
         keep_recent=1,
+        clear_batch=1,
     )
 
     by_id = {message.get("tool_call_id"): message for message in compacted if message.get("role") == "tool"}
@@ -48,6 +49,7 @@ def test_microcompact_preserves_error_results_and_protocol():
         messages,
         char_budget=1_000,
         keep_recent=1,
+        clear_batch=1,
     )
 
     tool_ids = [message.get("tool_call_id") for message in compacted if message.get("role") == "tool"]
@@ -65,9 +67,89 @@ def test_microcompact_ignores_transient_system_user_overlay():
         messages,
         char_budget=500,
         keep_recent=1,
+        clear_batch=1,
     )
     assert compacted[2]["content"] == "Z" * 4_000
     assert stats.cleared_results == 0
+
+
+def _reads(finished: int, current: int = 0, size: int = 2_000):
+    """A conversation with this many finished reads, then the current request and its reads."""
+    messages = [{"role": "system", "content": "system"}, {"role": "user", "content": "earlier"}]
+    for number in range(finished):
+        messages += _chain(f"old-{number}", "read_file", f"{number:03d}" + "o" * size)
+    messages.append({"role": "user", "content": "current"})
+    for number in range(current):
+        messages += _chain(f"now-{number}", "read_file", f"{number:03d}" + "n" * size)
+    return messages
+
+
+def _cleared_ids(messages):
+    return [message["tool_call_id"] for message in messages if message.get("role") == "tool"
+            and message["content"].startswith("[Old tool result content cleared")]
+
+
+def test_old_results_wait_until_a_whole_batch_is_due_and_then_go_together():
+    """Each clear makes the provider read the conversation from there on again, so a long
+    conversation that clears one result a turn pays for that on nearly every turn."""
+    cleared_as_it_grew = []
+    for finished in range(1, 13):
+        compacted, stats = micro_compact_tool_results(
+            _reads(finished), char_budget=4_000, keep_recent=2, clear_batch=3)
+        cleared = _cleared_ids(compacted)
+        assert stats.cleared_results == len(cleared)
+        # Oldest first, never the recent tail, and only in whole batches.
+        assert cleared == [f"old-{number}" for number in range(len(cleared))]
+        assert len(cleared) % 3 == 0 and len(cleared) <= max(0, finished - 2)
+        cleared_as_it_grew.append(len(cleared))
+    # What was cleared stays cleared as the conversation grows, and results were over the
+    # budget for a while before the first batch went.
+    assert cleared_as_it_grew == sorted(cleared_as_it_grew)
+    assert cleared_as_it_grew[3] == 0 and cleared_as_it_grew[-1] >= 6
+    # Three changes of the prompt where one result at a time makes one on almost every step.
+    assert len(set(cleared_as_it_grew)) - 1 == cleared_as_it_grew[-1] // 3
+    one_at_a_time = [
+        micro_compact_tool_results(_reads(finished), char_budget=4_000, keep_recent=2, clear_batch=1)[1]
+        .cleared_results for finished in range(1, 13)]
+    assert len(set(one_at_a_time)) - 1 > 2 * (len(set(cleared_as_it_grew)) - 1)
+
+
+def test_what_the_current_request_reads_does_not_clear_older_results():
+    """The budget is for the results before the current request. Counting the current ones
+    too cleared old results in the middle of a turn, one model request after another."""
+    under_budget = _reads(4)
+    for current in range(0, 6):
+        compacted, stats = micro_compact_tool_results(
+            _reads(4, current), char_budget=9_000, keep_recent=2, clear_batch=1)
+        assert stats.cleared_results == 0
+        assert compacted[:len(under_budget)] == under_budget
+    # Once the older results are over it themselves, the same ones go at every step of the turn.
+    over_budget = micro_compact_tool_results(_reads(8), char_budget=9_000, keep_recent=2, clear_batch=3)[0]
+    assert _cleared_ids(over_budget) == ["old-0", "old-1", "old-2"]
+    for current in range(1, 6):
+        compacted, _ = micro_compact_tool_results(
+            _reads(8, current), char_budget=9_000, keep_recent=2, clear_batch=3)
+        assert compacted[:len(over_budget)] == over_budget
+        assert compacted[len(over_budget):] == _reads(8, current)[len(over_budget):]
+
+
+def test_clearing_a_cleared_history_again_changes_nothing():
+    for finished in (5, 6, 9, 12):
+        once, stats = micro_compact_tool_results(
+            _reads(finished), char_budget=4_000, keep_recent=2, clear_batch=3)
+        assert stats.cleared_results
+        again, again_stats = micro_compact_tool_results(once, char_budget=4_000, keep_recent=2, clear_batch=3)
+        assert again == once and again_stats.cleared_results == 0
+
+
+def test_the_batch_size_comes_from_the_environment(monkeypatch):
+    monkeypatch.setenv("TOOL_RESULT_PROMPT_BUDGET_CHARS", "4000")
+    monkeypatch.setenv("TOOL_RESULT_KEEP_RECENT", "2")
+    assert micro_compact_tool_results(_reads(9))[1].cleared_results == 0  # ten at a time by default
+    monkeypatch.setenv("TOOL_RESULT_CLEAR_BATCH", "4")
+    assert micro_compact_tool_results(_reads(9))[1].cleared_results == 4
+    monkeypatch.setenv("TOOL_RESULT_CLEAR_BATCH", "1")
+    assert micro_compact_tool_results(_reads(9))[1].cleared_results == 7
 
 
 def _compact_process(payload, tool="process_read"):
@@ -77,7 +159,7 @@ def _compact_process(payload, tool="process_read"):
     messages += _chain("process", tool, raw)
     messages += _chain("recent", "read_file", "Z" * 2000)
     messages += [{"role": "user", "content": "continue"}]
-    compacted, stats = micro_compact_tool_results(messages, char_budget=1000, keep_recent=1)
+    compacted, stats = micro_compact_tool_results(messages, char_budget=1000, keep_recent=1, clear_batch=1)
     assert messages[2]["content"] == raw
     return compacted[2]["content"], stats
 

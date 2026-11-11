@@ -177,11 +177,33 @@ mode a denied tool can be approved for the current process with
 
 Tool execution uses the following guards and controls:
 
-- `TOOL_MAX_INLINE_CHARS=12000` keeps a bounded head/tail preview in durable
-  history and writes the complete result to `TOOL_RESULT_DIR`. Fresh text up to
-  `TOOL_MAX_FRESH_RESULT_CHARS=100000` is shown in full to the immediately
-  following model iteration, then falls back to the durable preview. Opaque
-  base64/data-URL payloads are never inlined as text noise.
+- `TOOL_MAX_INLINE_CHARS=12000` is the inline size of a tool's text output. An
+  output up to twice that size, and no longer than
+  `TOOL_MAX_FRESH_RESULT_CHARS`, stays in the conversation whole. A longer one
+  is written in full to `TOOL_RESULT_DIR` and kept in durable history as a
+  bounded head/tail preview of the inline size; up to
+  `TOOL_MAX_FRESH_RESULT_CHARS=100000` characters of it are shown in full to
+  the immediately following model iteration, and later ones get the preview.
+  That fallback rewrites an earlier message, and a provider reads everything
+  after a rewritten message again at the uncached price; below twice the
+  inline size the preview saves too little to pay for that. A tool with its
+  own limit follows the same rule. Opaque base64/data-URL payloads are never
+  inlined as text noise.
+- Old results are cleared in the copy of the conversation that a model request
+  carries; the session history keeps them. Only results from before the latest
+  user-role message (a request, or a notice the runtime delivers as one) are
+  counted or cleared; a mode that attaches its state to that message draws the
+  line one such message earlier. When those results hold more than
+  `TOOL_RESULT_PROMPT_BUDGET_CHARS=24000` characters, the oldest results of
+  read and network tools are replaced by a short note until the rest fits,
+  leaving the `TOOL_RESULT_KEEP_RECENT=5` most recent. A clear also rewrites
+  earlier messages, so nothing is cleared until `TOOL_RESULT_CLEAR_BATCH=10`
+  results are due, and then they go together. Errors, results under 512
+  characters and results of tools that write or execute are never cleared. The
+  complete text a fresh result shows for one iteration is not counted, so a
+  turn's own tool calls do not change which results are cleared. History
+  compaction rewrites the history itself and clears there what is due, without
+  waiting for a batch.
 - `TOOL_FAILURE_THRESHOLD=3` opens a per-tool circuit after equivalent
   consecutive failures, then performs one final synthesis with tools disabled.
 - `PROMPT_CACHE_STABLE_TOOLS=1` keeps one provider-visible tool manifest for

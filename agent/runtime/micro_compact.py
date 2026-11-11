@@ -125,14 +125,24 @@ def micro_compact_tool_results(
     tool_risk: Callable[[str], str] | None = None,
     char_budget: int | None = None,
     keep_recent: int | None = None,
+    clear_batch: int | None = None,
 ) -> tuple[list[dict], MicroCompactStats]:
     """Clear old compactable results while preserving protocol and active work.
 
     Only results before the latest real user request are eligible. Error,
     write, execute, and secret-bearing tool results are never cleared.
+
+    The budget is for the results before that request, and they are cleared
+    ``clear_batch`` at a time, oldest first, once that many have to go to meet
+    it. A clear changes the request at the oldest result it touches, and the
+    provider reads everything after that again at the uncached price; cleared
+    one at a time, that is paid on nearly every turn of a long conversation.
+    Nothing after that request counts, so what is cleared stays the same from
+    one model request to the next while a turn adds results.
     """
     budget = char_budget or _positive_env("TOOL_RESULT_PROMPT_BUDGET_CHARS", 24_000)
     keep = keep_recent or _positive_env("TOOL_RESULT_KEEP_RECENT", 5)
+    batch = clear_batch or _positive_env("TOOL_RESULT_CLEAR_BATCH", 10)
     if budget <= 0 or len(messages) < 3:
         return messages, MicroCompactStats()
 
@@ -166,14 +176,14 @@ def micro_compact_tool_results(
 
     candidates: list[tuple[int, str, str]] = []
     total_chars = 0
-    for index, message in enumerate(messages):
+    for index, message in enumerate(messages[:latest_user]):
         if message.get("role") != "tool":
             continue
         content = str(message.get("content") or "")
         total_chars += len(content)
         if content.startswith(("[Historical process result compacted;", "[Old tool result content cleared")):
             continue
-        if index >= latest_user or len(content) < 512 or _ERROR_RE.search(content):
+        if len(content) < 512 or _ERROR_RE.search(content):
             continue
         name = str(message.get("name") or call_names.get(str(message.get("tool_call_id") or ""), ""))
         payload = _process_payload(content, name)
@@ -190,27 +200,34 @@ def micro_compact_tool_results(
     if total_chars <= budget or len(candidates) <= keep:
         return messages, MicroCompactStats()
 
-    prepared = copy.deepcopy(messages)
-    cleared = 0
-    saved = 0
-    shadowed_tokens = 0
-    replacement_tokens = 0
-    # Clear oldest safe results until under budget, but always keep a recent
-    # working tail even if the configured budget is unusually small.
+    # The oldest safe results that have to go to get under budget; a recent
+    # working tail always stays, even if the configured budget is unusually small.
+    due: list[tuple[int, str, str]] = []
     for index, name, content in candidates[:-keep]:
         replacement = _placeholder(content, name)
         if len(replacement) >= len(content):
             continue
-        prepared[index]["content"] = replacement
-        cleared += 1
-        saved += max(0, len(content) - len(replacement))
-        shadowed_tokens += estimate_value_tokens(content)
-        replacement_tokens += estimate_value_tokens(replacement)
-        total_chars -= max(0, len(content) - len(replacement))
+        due.append((index, content, replacement))
+        total_chars -= len(content) - len(replacement)
         if total_chars <= budget:
             break
+    # Whole batches only. As the history grows the number due never falls, so
+    # the cleared results stay cleared and the next batch goes all at once.
+    due = due[:len(due) // batch * batch]
+    if not due:
+        return messages, MicroCompactStats()
+
+    prepared = copy.deepcopy(messages)
+    saved = 0
+    shadowed_tokens = 0
+    replacement_tokens = 0
+    for index, content, replacement in due:
+        prepared[index]["content"] = replacement
+        saved += len(content) - len(replacement)
+        shadowed_tokens += estimate_value_tokens(content)
+        replacement_tokens += estimate_value_tokens(replacement)
     return prepared, MicroCompactStats(
-        cleared_results=cleared,
+        cleared_results=len(due),
         saved_chars=saved,
         shadowed_tokens=shadowed_tokens,
         replacement_tokens=replacement_tokens,
