@@ -24,6 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from agent.launcher.common import LauncherError, git, read_json, write_json  # noqa: E402
+from agent.launcher.dependencies import BUILD_RECORD  # noqa: E402
 from agent.launcher.desktop_distribution import resources_for, seal_tree, sha256, verify_tree  # noqa: E402
 from agent.launcher.desktop_update import UPDATER  # noqa: E402
 
@@ -46,6 +47,11 @@ def copy_backend(source: Path, target: Path) -> None:
         destination = target / name
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source / name, destination)
+
+
+def copy_interface(source: Path, target: Path) -> None:
+    """The built desktop interface, without a source checkout's note of what it was built from."""
+    shutil.copytree(source, target, ignore=shutil.ignore_patterns(Path(BUILD_RECORD).name))
 
 
 def source_provenance(root: Path) -> dict:
@@ -199,7 +205,7 @@ def bundle(options) -> Path:
         (resources / 'default_app.asar').unlink(missing_ok=True)
         app = resources / 'app'
         app.mkdir()
-        shutil.copytree(ROOT / 'ui-gui/dist', app / 'dist')
+        copy_interface(ROOT / 'ui-gui/dist', app / 'dist')
         # Only LO remains external to the compiled main bundle. React, UI core,
         # PDF.js and every other renderer dependency are already built assets.
         if '@deepseek-ai/libreoffice-kit' in gui_manifest.get('dependencies', {}):

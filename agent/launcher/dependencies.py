@@ -9,7 +9,10 @@ import platform
 import re
 import shutil
 import sys
+import time
 from pathlib import Path
+
+from agent.runtime.instance_lock import InstanceAlreadyRunning, InstanceLock
 
 from .common import LauncherError, read_json, run, write_json
 from .installation import Installation, runtime_environment
@@ -18,6 +21,15 @@ PYTHON_PROBE = "import openai, yaml, httpx, mcp, opentelemetry, websockets, PIL"
 LOCK_FILES = ("pyproject.toml", "uv.lock", "ui-tui/package.json", "ui-tui/package-lock.json")
 TUI_NODE_MIN_VERSION = (18, 0, 0)
 GUI_NODE_MIN_VERSION = (22, 19, 0)
+# An interface build and the packages whose sources go into it. The desktop bundles the shared core and
+# modules of the terminal client. The terminal interface runs from source: it has no build of its own to
+# follow, but it loads the shared core from that package's build.
+BUILD_SOURCES = {"ui-core": ("ui-core",), "ui-gui": ("ui-gui", "ui-core", "ui-tui")}
+BUILD_TREES = ("src", "phone-public")
+BUILD_RECORD = "dist/.astra-build.json"
+TUI_BUILDS = ("ui-core",)
+GUI_BUILDS = ("ui-core", "ui-gui")
+BUILD_WAIT_SECONDS = 900
 
 
 def gui_enabled(install: Installation) -> bool:
@@ -82,7 +94,7 @@ def gui_executable(install: Installation) -> str:
             raise LauncherError("The packaged desktop executable is missing. Restore or reinstall the application.")
         return str(path)
     # Requiring Electron 44 can download binaries. Health checks and launches
-    # must remain read-only; only explicit setup/update installs components.
+    # must not install anything; only explicit setup/update installs components.
     package = install.root / "ui-gui/node_modules/electron"
     marker = package / "path.txt"
     path = (package / "dist" / marker.read_text(encoding="utf-8").strip()).resolve() if marker.is_file() else package
@@ -228,7 +240,129 @@ def synchronize(install: Installation, extras: list[str], *, python: bool = True
                 capture=False, timeout=900)
     if build:
         for package in source_ui_packages(install):
-            run([npm, "run", "build"], cwd=package, capture=False, timeout=600)
+            build_package(install, package.name, npm)
+
+
+def _counts(name: str) -> bool:
+    # A file manager's .DS_Store or an editor's swap or backup file is neither a source nor built.
+    return not name.startswith(".") and not name.endswith("~")
+
+
+def _tree(directory: Path) -> list[Path]:
+    files: list[Path] = []
+    for folder, folders, names in os.walk(directory):
+        folders[:] = [item for item in folders if _counts(item)]
+        files.extend(path for path in (Path(folder, item) for item in names if _counts(item)) if path.is_file())
+    return sorted(files)
+
+
+def build_sources(install: Installation, package: str) -> list[Path]:
+    """Every file the package's build reads: the files beside each package.json and the source trees."""
+    files: list[Path] = []
+    for name in BUILD_SOURCES[package]:
+        directory = install.root / name
+        if not directory.is_dir():
+            continue
+        files.extend(path for path in directory.iterdir()
+                     if path.is_file() and _counts(path.name) and path.suffix.lower() != ".md")
+        for tree in BUILD_TREES:
+            files.extend(_tree(directory / tree))
+    return sorted(files)
+
+
+def _build_digest(install: Installation, files: list[Path]) -> str:
+    digest = hashlib.sha256()
+    for path in files:
+        content = path.read_bytes()
+        digest.update(f"{path.relative_to(install.root).as_posix()}\0{len(content)}\0".encode())
+        digest.update(content)
+    return digest.hexdigest()
+
+
+def build_is_current(install: Installation, package: str) -> bool:
+    """Whether the package's build was made from its sources as they are now."""
+    record = install.root / package / BUILD_RECORD
+    sources = build_sources(install, package)
+    digest = _build_digest(install, sources)
+    try:
+        recorded = read_json(record)
+    except LauncherError:
+        return False
+    built = _tree(record.parent)
+    if recorded:
+        # A build of this launcher's: current while its sources and what it built are both as recorded.
+        # One built by hand from other sources, emptied (`rm -rf dist/*` leaves the hidden record) or never
+        # finished is not. Another package's script building it again from the same sources changes nothing.
+        return bool(built) and recorded.get("sources") == digest and recorded.get("built") == _build_digest(install, built)
+    # No record: the build was made before records were kept. It is taken as current when nothing it
+    # reads has changed since it was written.
+    if not built or not sources or (max(path.stat().st_mtime_ns for path in built)
+                                    <= max(path.stat().st_mtime_ns for path in sources)):
+        return False
+    write_json(record, {"schema": 1, "sources": digest, "built": _build_digest(install, built)})
+    return True
+
+
+def build_package(install: Installation, package: str, npm: str) -> None:
+    """Run a package's build. What it was made from is recorded when it has finished, so a build that
+    failed or was interrupted is never taken for a current one."""
+    record = install.root / package / BUILD_RECORD
+    # Read before the build: a source changed while it runs then shows as changed since the build.
+    digest = _build_digest(install, build_sources(install, package)) if package in BUILD_SOURCES else None
+    if digest:
+        write_json(record, {"schema": 1, "sources": None})
+    run([npm, "run", "build"], cwd=install.root / package, capture=False, timeout=600)
+    if digest:
+        write_json(record, {"schema": 1, "sources": digest, "built": _build_digest(install, _tree(record.parent))})
+
+
+def outdated_builds(install: Installation, packages: tuple[str, ...]) -> list[str]:
+    """The builds among `packages` that are not known to be made from their sources as they are now."""
+    found = []
+    for package in packages:
+        directory = install.root / package
+        # A build shared from another checkout is its owner's to rebuild.
+        if ((directory / "package.json").is_file() and not (directory / "dist").is_symlink()
+                and not build_is_current(install, package)):
+            found.append(package)
+    return found
+
+
+def refresh_builds(install: Installation, packages: tuple[str, ...]) -> list[str]:
+    """Rebuild the builds among `packages` that do not match their sources. Returns what was rebuilt.
+
+    A checkout changed outside `astra update` (a pull, a merge, an edit) keeps its old builds. The terminal
+    interface then fails to load the shared core, and the desktop opens with the old code.
+    """
+    if not outdated_builds(install, packages):
+        return []
+    lock = InstanceLock(install.control / "build.lock")
+    deadline, announced = time.monotonic() + BUILD_WAIT_SECONDS, False
+    while True:
+        try:
+            lock.acquire()
+            break
+        except InstanceAlreadyRunning as exc:
+            if time.monotonic() >= deadline:
+                raise LauncherError("Another Astra start is still rebuilding the interface. "
+                                    "Start Astra again when it has finished.") from exc
+            if not announced:
+                print("Astra: another start is rebuilding the interface; waiting for it…", file=sys.stderr, flush=True)
+                announced = True
+            time.sleep(0.2)
+    try:
+        # Looked at again under the lock: the start that held it may have rebuilt them.
+        rebuilt = outdated_builds(install, packages)
+        for package in rebuilt:
+            print(f"Astra: the build of {package} does not match its source; rebuilding it…", file=sys.stderr, flush=True)
+            try:
+                build_package(install, package, npm_command())
+            except LauncherError as exc:
+                raise LauncherError(f"Could not rebuild {package}: {exc}\nFix what the build reported, then start Astra "
+                                    "again. If its dependencies are damaged, run astra setup --repair.") from exc
+        return rebuilt
+    finally:
+        lock.release()
 
 
 def validate(install: Installation) -> None:
