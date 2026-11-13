@@ -266,7 +266,7 @@ extension BrokerSocketClient {
 }
 
 /// Polls a broker-side count until it holds or a bound expires.
-@MainActor private func eventually(timeout: TimeInterval = 2, _ condition: () -> Bool) async -> Bool {
+@MainActor func eventually(timeout: TimeInterval = 2, _ condition: () -> Bool) async -> Bool {
   let deadline = Date().addingTimeInterval(timeout)
   while !condition() {
     if Date() >= deadline { return false }
@@ -377,8 +377,8 @@ extension AppshotBrokerTests {
     #expect(completed == 2)
     #expect(outcomes == [.incorporated, .failed(.attachmentLimitReached)])
     #expect(shutdown(client.fd, SHUT_RDWR) == 0)
-    try await Task.sleep(nanoseconds: 20_000_000)
-    #expect(broker.authenticatedClientCount == 0 && registrar.unregistered == 1)
+    #expect(await eventually { broker.authenticatedClientCount == 0 })
+    #expect(registrar.unregistered == 1)
     #expect(destroyed == 1 && stopped == 0)
     let reconnect = try BrokerSocketClient(path: path)
     _ = try await reconnect.hello(descriptor)
@@ -387,7 +387,8 @@ extension AppshotBrokerTests {
     broker.poll()
     #expect(stopped == 0)
     #expect(shutdown(reconnect.fd, SHUT_RDWR) == 0)
-    try await Task.sleep(nanoseconds: 20_000_000)
+    // The grace period starts when the broker sees the close, so advance the clock only after that.
+    #expect(await eventually { broker.authenticatedClientCount == 0 })
     clock.offset += 2_000_000_001
     broker.poll()
     #expect(stopped == 1 && registrar.unregistered == 2)
@@ -721,8 +722,8 @@ extension AppshotBrokerTests {
       #expect(!release.released && completed == 0)
       stage = "recipient disconnect"
       recipient.terminate()
-      try await Task.sleep(nanoseconds: 20_000_000)
-      #expect(broker.authenticatedClientCount == 1 && registrar.unregistered == 0)
+      #expect(await eventually { broker.authenticatedClientCount == 1 })
+      #expect(registrar.unregistered == 0)
       #expect(completed == 1 && canceled == 1)
       stage = "late capture cleanup"
       captured?(
@@ -1195,7 +1196,7 @@ extension AppshotBrokerTests {
           brokerId: descriptor.instanceID, sessionId: "session", accepted: true, reason: "")))
     _ = try await client.receive()
     try state(offer.requestId)
-    try await Task.sleep(nanoseconds: 20_000_000)
-    #expect(stopped == 1 && destroyed == 1 && registrar.unregistered == 1)
+    #expect(await eventually { stopped == 1 })
+    #expect(destroyed == 1 && registrar.unregistered == 1)
   }
 }
