@@ -1,9 +1,10 @@
 """The backend command protocol remains usable after TaskStore startup fails."""
 import json
-import os
 from pathlib import Path
 import subprocess
 import sys
+
+from test_backend_task_protocol import backend_environment
 
 
 def test_goal_without_task_storage_reports_error_and_accepts_next_command(tmp_path):
@@ -14,7 +15,7 @@ def test_goal_without_task_storage_reports_error_and_accepts_next_command(tmp_pa
     unavailable_db = tmp_path / "database-is-a-directory"
     unavailable_db.mkdir()
     env = {
-        **os.environ,
+        **backend_environment(tmp_path),
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions),
         "AGENT_TASK_DB": str(unavailable_db),
