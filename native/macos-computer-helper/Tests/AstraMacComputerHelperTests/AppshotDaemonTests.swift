@@ -241,7 +241,7 @@ extension AppshotDaemonTests {
     #expect(outcomes.isEmpty && finished == 0 && captures == 1)
     if mode == "disconnect" {
       #expect(shutdown(client.fd, SHUT_RDWR) == 0)
-      try await Task.sleep(nanoseconds: 20_000_000)
+      #expect(await eventually { !outcomes.isEmpty })
       #expect(outcomes == [.failed(.recipientDisconnected)])
     } else if mode == "offer-timeout" {
       clock.offset += 3_000_000_001
