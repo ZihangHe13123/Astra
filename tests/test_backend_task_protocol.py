@@ -34,15 +34,19 @@ BLANK_INTEGRATIONS = dict.fromkeys((
     "ASTRA_CONTEXT_INDEX_EMBEDDING", "ASTRA_EMBEDDING_API_KEY",
     # Hindsight memory.
     "HINDSIGHT_ENABLED", "HINDSIGHT_API_KEY",
+    # QQ: the switch that overrides the channel config, and the access token.
+    "ASTRA_QQ_ENABLED", "ASTRA_QQ_ACCESS_TOKEN",
 ), "")
 
 
-def backend_environment() -> dict[str, str]:
-    """This process's environment for a backend it starts, with the checkout's integrations blank.
+def backend_environment(tmp_path: Path) -> dict[str, str]:
+    """This process's environment for a backend started by a test that keeps its files in ``tmp_path``.
 
-    A test that means to give the backend one of them sets it afterwards, as env_overrides does.
+    The checkout's integrations are blank, and the channel config is the test's own, which does not
+    exist: otherwise the backend reads <checkout>/.astra/channels.json and starts the channels it turns
+    on. A test that means to give the backend any of these sets it afterwards, as env_overrides does.
     """
-    return {**os.environ, **BLANK_INTEGRATIONS}
+    return {**os.environ, **BLANK_INTEGRATIONS, "ASTRA_CHANNEL_CONFIG": str(tmp_path / "missing-channels.json")}
 
 
 def _path_state(path: Path) -> tuple[int, int, int, int] | None:
@@ -62,7 +66,7 @@ def test_backend_exposes_tasks_command_without_blocking_protocol(tmp_path: Path)
     settings.write_text(json.dumps({"selected_model": "Qwen3.6-35B-A3B"}), encoding="utf-8")
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
-    env = backend_environment()
+    env = backend_environment(tmp_path)
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions_dir),
@@ -259,7 +263,7 @@ def test_backend_history_preserves_message_timestamps_and_tool_activity(tmp_path
     claim = task_store.claim_tool(run["id"], "context_open", {}, "read")
     task_store.finish_step(claim.step_id, output={"type": "tool_result", "id": "saved-call", "name": "context_open", "output": "saved context", "error": "", "duration_ms": 18})
     task_store.finish_run(run["id"], "completed")
-    env = backend_environment()
+    env = backend_environment(tmp_path)
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions_dir),
@@ -322,7 +326,7 @@ def test_backend_loads_saved_vision_tiles_off_at_startup(tmp_path: Path):
     )
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
-    env = backend_environment()
+    env = backend_environment(tmp_path)
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions_dir),
@@ -840,7 +844,7 @@ def test_goal_resume_launches_work_but_verifier_failure_does_not_spend_round(tmp
     settings.write_text(json.dumps({"selected_model": "Qwen3.6-35B-A3B"}), encoding="utf-8")
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
-    env = backend_environment()
+    env = backend_environment(tmp_path)
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions_dir),
@@ -967,7 +971,7 @@ def _start_question_protocol_backend(
     )
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
-    env = backend_environment()
+    env = backend_environment(tmp_path)
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions_dir),
@@ -1169,12 +1173,15 @@ CHECKOUT_SERVICES = {
     "ASTRA_EMBEDDING_API_KEY": "checkout-embedding-key",
     "HINDSIGHT_ENABLED": "1",
     "HINDSIGHT_API_KEY": "checkout-hindsight-key",
+    "ASTRA_QQ_ACCESS_TOKEN": "checkout-qq-token",
+    # Never on, even here: a backend it reached would listen on the port the person's QQ bot connects to.
+    "ASTRA_QQ_ENABLED": "off",
 }
 
 
 @pytest.fixture
 def configured_checkout(tmp_path: Path) -> Path:
-    """A source checkout whose .env sets up a mailbox and other services, as a developer's own may."""
+    """A source checkout whose .env and channel config set up services, as a developer's own may."""
     root = Path(__file__).resolve().parents[1]
     checkout = tmp_path / "checkout"
     shutil.copytree(root / "agent", checkout / "agent", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
@@ -1190,25 +1197,29 @@ def configured_checkout(tmp_path: Path) -> Path:
         "ASTRA_EMBEDDING_BACKEND": "llamacpp",
         "ASTRA_EMBEDDING_BASE_URL": "http://127.0.0.1:9/v1",
         "HINDSIGHT_API_URL": "http://127.0.0.1:9",
+        "ASTRA_WEIXIN_BASE_URL": "http://127.0.0.1:9",
+        "ASTRA_WEIXIN_CDN_URL": "http://127.0.0.1:9",
     }
     (checkout / ".env").write_text("".join(f"{name}={value}\n" for name, value in settings.items()), encoding="utf-8")
+    # The checkout's own channel config turns WeChat on.
+    (checkout / ".astra").mkdir()
+    (checkout / ".astra" / "channels.json").write_text(json.dumps({"weixin": {"enabled": True}}), encoding="utf-8")
     return checkout
 
 
 def _one_tool_call_from_checkout(
     tmp_path: Path, checkout: Path, call: tuple[str, dict], env_overrides: dict | None = None,
-) -> tuple[dict, list[str]]:
+) -> tuple[dict, list[str], list[dict]]:
     """Run the shared fixture's backend from ``checkout`` for one turn in which the model makes ``call``.
 
-    Returns that call's result event and the names of the tools the conversation offered.
+    Returns that call's result event, the names of the tools the conversation offered and the events seen.
     """
     server = ThreadingHTTPServer(("127.0.0.1", 0), _OneToolCallHandler)
     server.call = call
     server.offered = []
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    proc, _, _, wait_for = _start_question_protocol_backend(
-        tmp_path, server.server_port, "configured_checkout",
-        env_overrides={"ASTRA_CHANNEL_CONFIG": str(tmp_path / "no-channels.json"), **(env_overrides or {})},
+    proc, _, seen, wait_for = _start_question_protocol_backend(
+        tmp_path, server.server_port, "configured_checkout", env_overrides=env_overrides,
         # The checkout's code, so the backend's installation root and .env are the checkout's.
         bootstrap_code=(
             f"import sys\nsys.path.insert(0, {str(checkout)!r})\n"
@@ -1243,7 +1254,7 @@ def _one_tool_call_from_checkout(
         server.server_close()
     # The backend ran as the checkout's installation: its runtime lease is there.
     assert (checkout / ".astra" / "launcher").is_dir()
-    return result, server.offered
+    return result, server.offered, seen
 
 
 @pytest.mark.parametrize("account", [
@@ -1255,7 +1266,7 @@ def test_protocol_fixture_keeps_the_checkouts_mail_account_from_the_backend(
 ):
     from agent.runtime.tools.mail import SETUP
 
-    result, _ = _one_tool_call_from_checkout(tmp_path, configured_checkout, ("mail", {"action": "status"}), account)
+    result, _, _ = _one_tool_call_from_checkout(tmp_path, configured_checkout, ("mail", {"action": "status"}), account)
     if account:
         # A test still gives the backend an account on purpose; the server is the one the checkout's .env names.
         assert "Mail: " in result["error"] and SETUP not in result["error"]
@@ -1268,13 +1279,17 @@ def test_protocol_fixture_keeps_the_checkouts_mail_account_from_the_backend(
 def test_protocol_fixture_keeps_the_checkouts_other_services_off(tmp_path: Path, configured_checkout: Path):
     names = sorted(CHECKOUT_SERVICES)
     code = f"import json, os\nprint(json.dumps({{name: os.environ.get(name) for name in {names!r}}}))"
-    result, offered = _one_tool_call_from_checkout(tmp_path, configured_checkout, ("execute_python", {"code": code}))
+    result, offered, events = _one_tool_call_from_checkout(
+        tmp_path, configured_checkout, ("execute_python", {"code": code}))
     printed = next(line for line in result["output"].splitlines() if line.startswith("{"))
     # What the backend and the commands it runs have: each setting empty, as if never set up.
     assert json.loads(printed) == dict.fromkeys(names, "")
     # Hindsight is off: none of its tools reaches the model.
     assert "execute_python" in offered
     assert not [name for name in offered if name.startswith("hindsight_")]
+    # The checkout's channel config is not the backend's: WeChat stays off.
+    weixin = next(event for event in events if event.get("type") == "weixin_status")
+    assert (weixin["enabled"], weixin["state"]) == (False, "off")
 
 
 def test_backend_forwards_provider_counted_generation_stats(tmp_path: Path):
@@ -1365,7 +1380,7 @@ def test_backend_resumes_same_turn_with_structured_question_tool_result(tmp_path
     sessions_dir.mkdir()
     session_key = f"backend_question_{uuid.uuid4().hex}"
     production_before = _sqlite_path_state(session_recall.DB_PATH)
-    env = backend_environment()
+    env = backend_environment(tmp_path)
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions_dir),
@@ -1733,7 +1748,7 @@ def test_backend_pauses_tool_call_for_frontend_approval_and_resumes_same_argumen
     )
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
-    env = backend_environment()
+    env = backend_environment(tmp_path)
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions_dir),
@@ -2010,7 +2025,7 @@ def test_backend_can_cancel_an_active_stream_and_persist_status(tmp_path: Path):
     goal = TaskStore(task_db).set_goal("backend_cancel_test", "finish the slow task")
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
-    env = backend_environment()
+    env = backend_environment(tmp_path)
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions_dir),

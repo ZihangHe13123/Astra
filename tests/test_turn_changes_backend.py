@@ -150,7 +150,7 @@ def _start_backend(tmp_path: Path, server_port: int, session_name: str, workdir:
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
     repo_root = Path(__file__).resolve().parents[1]
-    env = backend_environment()
+    env = backend_environment(tmp_path)
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions_dir),

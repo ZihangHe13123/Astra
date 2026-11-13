@@ -22,7 +22,7 @@ def test_reset_resends_dashboard_snapshot_after_skill_state_changes(tmp_path: Pa
     sessions_dir.mkdir()
     learning_path = tmp_path / "learning.db"
     store = LearningStore(learning_path)
-    env = backend_environment()
+    env = backend_environment(tmp_path)
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions_dir),
