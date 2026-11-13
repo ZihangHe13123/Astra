@@ -295,6 +295,8 @@ class AgentChannelRouter:
                     if phase:
                         await reply_sink(phase)
 
+                # What the runtime said about an error the turn went on from.
+                notice = ""
                 async for event in self.agent.reply_stream(msg):
                     if event.get("type") == "chunk":
                         chunk = str(event.get("content") or "")
@@ -305,10 +307,18 @@ class AgentChannelRouter:
                         # Send its prose now instead of holding every phase until
                         # the entire tool/task loop completes.
                         await flush_phase()
-                    elif event.get("type") == "error" and not chunks:
+                    elif event.get("type") == "error":
                         chunk = f"[Error: {event.get('message', 'Request failed')}]"
-                        chunks.append(chunk)
-                        phase_chunks.append(chunk)
+                        if event.get("recoverable"):
+                            # The runtime discarded a response and asked again, or stopped the tools and
+                            # answers from what it has. That is for the person only if no answer follows.
+                            notice = chunk
+                        elif not chunks:
+                            chunks.append(chunk)
+                            phase_chunks.append(chunk)
+                if notice and not chunks:
+                    chunks.append(notice)
+                    phase_chunks.append(notice)
                 await flush_phase()
                 context.save()
                 outcome = "completed"

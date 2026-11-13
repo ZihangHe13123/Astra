@@ -204,6 +204,15 @@ Tool execution uses the following guards and controls:
   turn's own tool calls do not change which results are cleared. History
   compaction rewrites the history itself and clears there what is due, without
   waiting for a batch.
+- A Claude Code conversation keeps the same rule with another moment. The CLI
+  reads a request again in full from the first message that changed, and keeps
+  what it read for an hour. So nothing is cleared while the conversation is in
+  use. A message that comes an hour or more after the one before it starts a
+  request that is read in full anyway: the results the conversation held before
+  that message are cleared there, all that are due and not a batch at a time,
+  and they stay cleared in the requests after it. Results added since then wait
+  for the next such pause, or for history compaction at 150,000 tokens, which
+  clears what is due before it summarizes anything.
 - `TOOL_FAILURE_THRESHOLD=3` opens a per-tool circuit after equivalent
   consecutive failures, then performs one final synthesis with tools disabled.
 - `PROMPT_CACHE_STABLE_TOOLS=1` keeps one provider-visible tool manifest for

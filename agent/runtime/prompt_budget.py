@@ -8,6 +8,19 @@ from __future__ import annotations
 # tokens), and after an hour's pause all of it is read again uncached. Half of a 1M window is
 # far past that, so these models compact here instead.
 CLAUDE_CODE_COMPACT_TOKENS = 150_000
+# The CLI's requests are kept cached for an hour (live 2026-11-11: 97% of the input came from the
+# cache after pauses of 5 to 60 minutes, none of it after longer ones). A request that changes an
+# earlier message is read again from there on at the full price, the cache breakpoint being the
+# newest turns: 13 requests that cleared 28 old tool results, about 47k tokens, read 1.52M tokens
+# uncached to do it.
+CLAUDE_CODE_CACHE_SECONDS = 3600
+
+
+def prompt_cache_seconds(provider: str) -> int | None:
+    """How long a provider keeps a request cached, where a change to an earlier message is paid for
+    by reading everything after it again. There, old tool results are cleared only in a request that
+    begins after the cache has gone. None for the others, which clear them as they come due."""
+    return CLAUDE_CODE_CACHE_SECONDS if provider == "claude-code" else None
 
 
 def prompt_token_budget(context_limit: int, max_tokens: int, *, model: str = "", provider: str = "",

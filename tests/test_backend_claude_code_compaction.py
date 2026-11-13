@@ -88,7 +88,8 @@ for line in sys.stdin:
         continue
     break
 with open(LOG, "a", encoding="utf-8") as log:
-    log.write(json.dumps({"turns": turns, "tools": "--mcp-config" in arguments}) + "\\n")
+    log.write(json.dumps({"turns": turns, "tools": "--mcp-config" in arguments,
+                          "effort": arguments[arguments.index("--effort") + 1]}) + "\\n")
 given = len(system) + sum(len(json.dumps(blocks, ensure_ascii=False)) for _, blocks in turns)
 usage = {"input_tokens": given // 4, "output_tokens": 5}
 asked = json.dumps(turns[-1][1])
@@ -211,6 +212,10 @@ def test_a_conversation_past_150k_is_summarized_through_the_cli_and_goes_on(tmp_
 
     first, second, summary, compacted, after = requests()
     assert [len(request["turns"]) for request in (first, second)] == [1, 3]
+    # The conversation thinks as hard as it is set to. The summary is asked for with thinking off, and
+    # the CLI's nearest thing to that is its lowest effort.
+    assert [request["effort"] for request in (first, second, compacted, after)] == ["high"] * 4
+    assert summary["effort"] == "low"
     # The summary is asked for in a request of its own: one turn, no tools, the earlier notes cut short.
     assert summary["tools"] is False and len(summary["turns"]) == 1
     asked = said(summary["turns"][0])
@@ -252,6 +257,9 @@ def test_a_tool_loop_that_passes_150k_is_summarized_between_two_calls_and_finish
     loop = requests()[before:]
     plain = [index for index, request in enumerate(loop) if not request["tools"]]
     assert len(plain) == 2 and plain[1] == plain[0] + 1 and 0 < plain[0] < len(loop) - 3, "between two calls"
+    # Two summaries stand between the person and the rest of the turn, so neither thinks at length.
+    assert [request["effort"] for request in loop] == [
+        "low" if index in plain else "high" for index in range(len(loop))]
     earlier, start = (said(loop[index]["turns"][0]) for index in plain)
     assert "TURNS TO SUMMARIZE:" in earlier and "NOTE-ONE" in earlier and "NOTE-TWO" in earlier
     assert "TURN PREFIX:" in start and "Read the files, one after another." in start and "NOTE-" not in start

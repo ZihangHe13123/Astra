@@ -28,10 +28,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         if "messages" not in body:
+            # The provider's own count of a prompt, which the runtime asks for before it sends one.
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(b'{"tokens": []}')
+            counted = self.server.prompt_tokens_after_first_request if self.server.requests else 0
+            self.wfile.write(json.dumps({"tokens": [0] * counted}).encode())
             return
         self.server.requests.append({"body": body, "authorization": self.headers.get("Authorization")})
         self.send_response(200)
@@ -51,6 +53,11 @@ class Handler(BaseHTTPRequestHandler):
             # The connection ends before an answer is written.
             self.wfile.write(b"data: [DONE]\n\n")
             return
+        elif self.server.blank_answers:
+            # The response ends properly and holds neither an answer nor a call.
+            self.server.blank_answers -= 1
+            delta = {}
+            reason = "stop"
         else:
             delta = {"content": getattr(self.server, "reply", "fixture-check-result")}
             reason = "stop"
@@ -75,6 +82,8 @@ def provider(tmp_path):
     server.tool_call = ("current_time", "{}")
     server.narration = ""
     server.cut_off = False
+    server.blank_answers = 0
+    server.prompt_tokens_after_first_request = 0
     server.target = tmp_path / "protected.txt"
     server.target.write_text("ORIGINAL", encoding="utf-8")
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -237,6 +246,40 @@ def test_a_check_cut_off_after_using_tools_has_no_result(tmp_path, provider):
     [run] = command(env, "show", job["id"])["occurrences"]
     # What it said on the way to an answer it never gave is not a result.
     assert (run["state"], run["detail"], run["output"]) == ("failed", "stream_closed", "")
+
+
+def test_a_check_whose_model_had_to_be_asked_again_is_not_a_failed_check(tmp_path, provider):
+    env = environment(tmp_path / "A", provider)
+    provider.tool_rounds, provider.blank_answers = 1, 1
+    provider.reply = "REPORT: one item today."
+    job = command(env, "add", "digest", "--every", "3600", "--model", "fixture", "--workdir", str(tmp_path),
+                  "--prompt", "Any news?", "--request", "Send me a digest")
+    command(env, "run", job["id"])
+    [run] = command(env, "show", job["id"])["occurrences"]
+    assert (run["state"], run["detail"], run["output"]) == ("completed", "", "REPORT: one item today.")
+    # The look, the response that said nothing, and the answer to being asked again.
+    assert len(provider.requests) == 3
+    assert "ended without an answer" in provider.requests[-1]["body"]["messages"][-1]["content"]
+    assert command(env, "inbox")[0]["output"] == "REPORT: one item today."
+    # Asked again and still nothing: that is a check without a result.
+    provider.blank_answers = 2
+    command(env, "run", job["id"])
+    runs = command(env, "show", job["id"])["occurrences"]
+    assert sorted((run["state"], run["detail"], run["output"]) for run in runs) == [
+        ("completed", "", "REPORT: one item today."), ("failed", "empty_response", "")]
+
+
+def test_a_check_whose_prompt_no_longer_fits_is_a_failed_check(tmp_path, provider):
+    env = environment(tmp_path / "A", provider)
+    # After its first look the conversation counts as larger than the model's window, compacted or not.
+    provider.tool_rounds, provider.prompt_tokens_after_first_request = 1, 20_000
+    job = command(env, "add", "digest", "--after", "60", "--model", "fixture", "--workdir", str(tmp_path),
+                  "--prompt", "Any news?", "--request", "Send me a digest")
+    command(env, "run", job["id"])
+    [run] = command(env, "show", job["id"])["occurrences"]
+    # The runtime stops the turn and says why in its own words. That is not the report that was asked for.
+    assert (run["state"], run["detail"]) == ("failed", "scheduled_check_failed")
+    assert len(provider.requests) == 1
 
 
 def test_a_check_follows_the_default_model_unless_given_one(tmp_path, provider):

@@ -22,6 +22,10 @@ from agent.channels.tools import register_channel_tools
 from agent.runtime.context import AgentContext
 from agent.runtime.tools.policy import ToolPolicy
 from agent.runtime.tools.registry import ToolRegistry
+from test_persistent_jobs_worker import provider as provider_fixture
+
+# A loopback model whose responses a test sets.
+provider = provider_fixture
 
 
 class FakeConnection:
@@ -440,6 +444,76 @@ def test_agent_channel_router_restores_tui_context_and_isolates_chats(tmp_path):
         assert [item["content"] for item in second_context.messages if item["role"] == "user"] == ["two"]
 
     asyncio.run(scenario())
+
+
+def test_a_reply_the_model_had_to_be_asked_for_again_carries_no_error_notice(tmp_path, provider):
+    """A real agent on a loopback model whose first response says nothing: the runtime discards it and
+    asks again. The router used to open the reply with the notice of that, in brackets."""
+    from agent.runtime.llm import LLMClient, LLMConfig
+    from agent.runtime.react import ReActAgent
+
+    provider.blank_answers, provider.reply = 1, "在的。"
+    config = LLMConfig(model="channel-fixture", api_key="local", base_url=f"http://127.0.0.1:{provider.server_port}/v1",
+                       context_limit=8192, max_tokens=512, max_retries=0)
+    emitted: list[str] = []
+
+    async def scenario():
+        agent = ReActAgent("channel", LLMClient(config), ToolRegistry(), system_prompt="system", max_iterations=3,
+                           progressive_tools=False, query_profile_enabled=False)
+        agent.context.set_session(str(tmp_path / "window.json"))
+        router = AgentChannelRouter(agent, asyncio.Lock(), tmp_path)
+
+        async def reply_sink(text: str):
+            emitted.append(text)
+
+        return await router.handle(ChannelMessage("weixin", "owner", "owner", "在吗"), reply_sink)
+
+    assert asyncio.run(scenario()) == "" and emitted == ["在的。"]
+    assert len(provider.requests) == 2
+    assert "ended without an answer" in provider.requests[1]["body"]["messages"][-1]["content"]
+
+
+def test_an_error_the_turn_went_on_from_is_said_only_when_nothing_else_is(tmp_path):
+    asked_again = {"type": "error", "code": "stream_closed", "recoverable": True,
+                   "message": "Model connection interrupted; retrying the current response (1/2)."}
+    stopped = {"type": "error", "code": "iteration_budget", "recoverable": True,
+               "message": "Stopping: maximum ReAct iterations reached (limit=3)."}
+    no_image = {"type": "error", "code": "vision_preprocess_failed", "recoverable": True,
+                "message": "Vision preprocessing failed; the local image was not sent to the provider."}
+    failed = {"type": "error", "code": "stream_closed", "recoverable": False,
+              "message": "Stream ended without a completion signal."}
+    cases = [
+        # Asked again, and answered: the answer.
+        ([asked_again, {"type": "chunk", "content": "好的。"}], "好的。"),
+        # Stopped by a guard, with the answer the runtime asks for then: that answer.
+        ([stopped, {"type": "chunk", "content": "查到这些。"}], "查到这些。"),
+        # Asked again, and that failed as well: the failure, once.
+        ([asked_again, failed], "[Error: Stream ended without a completion signal.]"),
+        # Nothing came after it at all: what the runtime said is all there is to say.
+        ([no_image], "[Error: Vision preprocessing failed; the local image was not sent to the provider.]"),
+        # A failure after an answer has begun leaves the answer as it is, as before.
+        ([{"type": "chunk", "content": "先说一半"}, failed], "先说一半"),
+    ]
+
+    class Scripted(FakeAgent):
+        events: list[dict] = []
+
+        async def reply_stream(self, message):
+            self.context.add_user(message.get_text())
+            for event in self.events:
+                yield dict(event)
+            yield {"type": "done", "content": ""}
+
+    async def scenario():
+        agent = Scripted(tmp_path / "tui.json")
+        router = AgentChannelRouter(agent, asyncio.Lock(), tmp_path)
+        replies = []
+        for events, _ in cases:
+            agent.events = events
+            replies.append(await router.handle(ChannelMessage("qq", "peer-a", "peer-a", "查一下")))
+        return replies
+
+    assert asyncio.run(scenario()) == [expected for _, expected in cases]
 
 
 def test_agent_channel_router_flushes_at_tool_call_boundary(tmp_path):
