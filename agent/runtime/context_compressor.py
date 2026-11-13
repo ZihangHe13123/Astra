@@ -13,7 +13,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from .llm import LLMClient
 from .token_estimator import estimate_value_tokens
@@ -300,13 +300,19 @@ class ContextCompressor:
         Only from ``replay`` (the conversation's last request repeated, read from the provider's
         cache): a transcript would be read whole at the full price, which is what writing it ahead
         is meant to save. Nothing of this compressor changes until ``apply_prepared``. None when
-        there is nothing to summarize, the history ends inside a turn, or the replay is not used.
+        there is nothing to summarize, the history ends inside a turn, or the replay is not used;
+        the log says which.
         """
         if time.monotonic() < self._failure_cooldown_until:
+            logger.info("Idle summary not written: a summary failed less than %d s ago", _SUMMARY_FAILURE_COOLDOWN)
             return None
         source_messages = self._without_recaps(messages)
         plan = self._plan(source_messages, max_prompt_tokens)
-        if plan is None or plan.split is not None or not plan.turns:
+        if plan is None or not plan.turns:
+            logger.info("Idle summary not written: nothing to summarize before the part kept word for word")
+            return None
+        if plan.split is not None:
+            logger.info("Idle summary not written: the part kept word for word starts inside the last turn")
             return None
         draft = ContextCompressor(self.llm, self.tail_token_budget, self.summary_max_tokens)
         draft._previous_summary = self._previous_summary or plan.existing_summary
@@ -797,7 +803,7 @@ class ContextCompressor:
 
         output_tokens = self.summary_max_tokens if max_tokens is None else max_tokens
         summary = (
-            await self._summary_from_replay(replay, protection_block, output_tokens)
+            await self._summary_from_replay(replay, protection_block, output_tokens, replay_only=replay_only)
             if replay is not None else None
         )
         if summary is None and replay_only:
@@ -834,16 +840,29 @@ class ContextCompressor:
             self._failure_cooldown_until = time.monotonic() + _SUMMARY_FAILURE_COOLDOWN
             return None
 
-    async def _summary_from_replay(self, replay: dict, protection_block: str, max_tokens: int) -> str | None:
+    async def _summary_from_replay(self, replay: dict, protection_block: str, max_tokens: int, *,
+                                   replay_only: bool = False) -> str | None:
         """Ask for the summary right after the conversation itself, as last sent.
 
         The request repeats the last request byte for byte (system, tools, history),
         adds what came after it, and ends with the checkpoint instruction, so the
         provider bills the repeated part at its cached rate and the model reads the
         original messages rather than a transcript. None when the request would not
-        fit the prompt budget, the call fails, or the model answers with a tool call;
-        the caller then summarizes from a transcript as before.
+        fit the replay's ``limit``, the call fails, or the model answers with a tool call;
+        the caller then summarizes from a transcript as before, or, with ``replay_only``
+        (an idle summary), not at all, and says why in a warning.
+
+        A replay that carries ``sent_tokens`` is sized from it: what the provider reported
+        for the repeated request (its tool definitions included, which an estimate
+        calibrated on such reports already counts), plus an estimate of the messages from
+        ``sent_count`` on. Otherwise the messages and the tools are estimated.
         """
+        def not_used(reason: str, *args: Any) -> None:
+            if replay_only:
+                logger.warning("Idle summary not written: " + reason, *args)
+            else:
+                logger.info(reason + "; using a transcript", *args)
+
         carry = (
             "The conversation contains an earlier checkpoint summary: carry forward everything in "
             "it that is still relevant, add what happened since, and move answered questions to "
@@ -864,13 +883,20 @@ class ContextCompressor:
         limit = int(replay.get("limit") or 0)
         estimate = getattr(self.llm, "estimate_tokens", None)
         if estimate is None or limit <= 0:
+            not_used("the request's size cannot be checked")
             return None
+        sent_tokens, sent_count = replay.get("sent_tokens"), replay.get("sent_count")
         try:
-            needed = int(estimate(messages)) + estimate_value_tokens(tools)
+            if (isinstance(sent_tokens, int) and not isinstance(sent_tokens, bool) and sent_tokens > 0
+                    and isinstance(sent_count, int) and 0 <= sent_count <= len(messages)):
+                needed = sent_tokens + int(estimate(messages[sent_count:]))
+            else:
+                needed = int(estimate(messages)) + estimate_value_tokens(tools)
         except Exception:
+            not_used("the request's size could not be estimated")
             return None
         if needed > limit:
-            logger.info("Summary request would not fit replayed (%d > %d tokens); using a transcript", needed, limit)
+            not_used("the summary request would not fit replayed (%d > %d tokens)", needed, limit)
             return None
         try:
             # Thinking stays as the conversation has it: switching it off renders the whole
@@ -882,10 +908,10 @@ class ContextCompressor:
                 temperature=0.1,
             )
         except Exception as exc:
-            logger.info("Replayed summary request failed (%s); using a transcript", exc)
+            not_used("the replayed summary request failed (%s)", exc)
             return None
         if response.get("tool_calls"):
-            logger.info("Replayed summary request answered with a tool call; using a transcript")
+            not_used("the replayed summary request was answered with a tool call")
             return None
         usage = response.get("usage") or {}
         logger.info(

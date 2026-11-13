@@ -231,7 +231,11 @@ Tool execution uses the following guards and controls:
   being written interrupts it, since the model client may have one request
   slot, and one that has not come back in ten minutes is given up. If the CLI
   could not take the request turn by turn with Astra's cache breakpoint, it is
-  not sent at all. The moment it is handed to the CLI counts as a read of the
+  not sent at all. It is sent only if the model's window holds it with room
+  for the answer, sized as the provider reported the last request plus what it
+  adds; it may pass the compaction line. When no summary is written for one of
+  these reasons, a warning in the backend's log says why. The moment it is
+  handed to the CLI counts as a read of the
   cache, whether or not the summary comes back; the message that ends that
   pause records it, so old tool results are not cleared there, also after a
   restart. `ASTRA_IDLE_COMPACT_MIN_TOKENS=off`

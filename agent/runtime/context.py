@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, TYPE_CHECKING, cast
 
-from .prompt_budget import CACHE_READ_OBSERVER, CACHED_PREFIX_ONLY
+from .prompt_budget import CACHE_READ_OBSERVER, CACHED_PREFIX_ONLY, completion_safe_limit
 from .session_store import SessionStore
 from .async_io import durable_io
 from .token_estimator import estimate_value_tokens
@@ -464,6 +464,9 @@ class AgentContext:
         self.total_cache_hit_tokens += cache_hit
         self.total_cache_miss_tokens += cache_miss
         self.last_prompt_tokens = _usage_int(usage.get("last_prompt_tokens", pt))
+        if self._sent_request is not None:
+            # The size the provider reported for the request just sent, which a repeat of it has.
+            self._sent_request["tokens"] = self.last_prompt_tokens
 
     def append_diagnostic(self, event: dict) -> str:
         """Write audit-only data without adding it to model-visible history."""
@@ -964,8 +967,18 @@ class AgentContext:
         mark = self._history_mark()
         self._idle_attempt = mark
         replay = self.summary_replay()
-        if replay is None or self.compressor is None:
+        if replay is None or self.compressor is None or self._sent_request is None:
             return False
+        # The request is the last one, which the provider took, plus a few thousand tokens: it has
+        # to fit the model's window, not the line at which this conversation would be compacted.
+        # Its size is the one the provider reported for the last request (Astra's tool definitions
+        # included) plus an estimate of what is added.
+        config = getattr(self.compressor.llm, "config", None)
+        window = getattr(config, "context_limit", None)
+        replay.update(
+            limit=(completion_safe_limit(window, getattr(config, "max_tokens", 0) or 0)
+                   if isinstance(window, int) and window > 0 else int(self.max_prompt_tokens)),
+            sent_count=len(self._sent_request["messages"]), sent_tokens=self._sent_request.get("tokens"))
         count, last = len(self.messages), copy.deepcopy(self.messages[-1])
         asked = time.time()
 

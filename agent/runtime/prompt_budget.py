@@ -46,15 +46,25 @@ def prompt_token_budget(context_limit: int, max_tokens: int, *, model: str = "",
     scaling the reserve down only when it would consume the entire window.
     """
     limit = max(2, int(context_limit))
-    desired_reserve = max(8_192, int(max_tokens))
-    reserve = desired_reserve if desired_reserve < limit else max(1, limit // 2)
-    completion_safe_limit = max(1, limit - reserve)
+    completion_safe = completion_safe_limit(limit, max_tokens)
     if auto_compact_token_limit is not None:
-        return min(completion_safe_limit, max(1, int(auto_compact_token_limit)))
+        return min(completion_safe, max(1, int(auto_compact_token_limit)))
     model_id = model.strip().lower().rsplit("::", 1)[-1].rsplit("/", 1)[-1]
     if provider == "openai-codex" or model_id.startswith(("gpt-", "chatgpt-")):
-        return completion_safe_limit
+        return completion_safe
     compression_threshold = max(1, limit // 2)
     if provider == "claude-code":
         compression_threshold = min(compression_threshold, CLAUDE_CODE_COMPACT_TOKENS)
-    return min(completion_safe_limit, compression_threshold)
+    return min(completion_safe, compression_threshold)
+
+
+def completion_safe_limit(context_limit: int, max_tokens: int) -> int:
+    """The largest prompt the model's window takes with room left for its answer.
+
+    The configured completion allowance is kept (8K at least) and scaled down only when it
+    would consume the entire window.
+    """
+    limit = max(2, int(context_limit))
+    desired_reserve = max(8_192, int(max_tokens))
+    reserve = desired_reserve if desired_reserve < limit else max(1, limit // 2)
+    return max(1, limit - reserve)

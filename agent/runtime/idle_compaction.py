@@ -12,7 +12,10 @@ Application rules (docs/execution.md, "Idle compaction"):
   lifetime is nearly over: the summary request has to reach the cache in time.
 - The summary is asked for by repeating that conversation's last request, as history compaction
   does, never from a transcript. It is kept beside the history, which does not change. That
-  request reads the cache again, so the cache lasts a lifetime from then.
+  request reads the cache again, so the cache lasts a lifetime from then. It is sent only if the
+  model's window holds it with room for the answer, sized as the provider reported the last
+  request plus what it adds; the compaction line does not apply to it. When no summary is
+  written for that or another refusal, a warning says why.
 - The next turn of that conversation uses the summary only if it starts a whole lifetime or more
   after the last request that read the cache (the summary request included), on a provider with
   a lifetime, and the history still begins with what was summarized. The summary then takes the

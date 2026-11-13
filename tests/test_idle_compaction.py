@@ -10,6 +10,7 @@ each request gave it. Time passes through ``idle_compaction.clock``, the clock t
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import stat
 import time
@@ -25,7 +26,7 @@ from agent.runtime.claude_code_provider import ClaudeCodeProvider
 from agent.runtime.idle_compaction import IdleCompactor
 from agent.runtime.llm import LLMClient, LLMConfig
 from agent.runtime.react import ReActAgent
-from agent.runtime.tools.registry import ToolRegistry
+from agent.runtime.tools.registry import ToolDef, ToolRegistry
 
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="the stand-in claude executable is a shebang script")
 
@@ -59,13 +60,15 @@ for line in sys.stdin:
 with open(LOG, "a", encoding="utf-8") as log:
     log.write(json.dumps({"turns": turns}) + "\\n")
 given = len(system) + sum(len(json.dumps(blocks, ensure_ascii=False)) for _, blocks in turns)
+# What the real CLI counts beyond the turns, Astra's tool definitions among it, when a test says so.
+extra = int(open(LOG + ".extra").read()) if os.path.exists(LOG + ".extra") else 0
 checkpoint = "Context checkpoint request" in json.dumps(turns[-1][1])
 while checkpoint and os.path.exists(LOG + ".hold"):
     time.sleep(0.02)
 answer = SUMMARY if checkpoint else "Noted."
 emit({"type": "assistant", "message": {"content": [{"type": "text", "text": answer}]}})
 emit({"type": "result", "subtype": "success", "is_error": False, "result": answer,
-      "usage": {"input_tokens": given // 4, "output_tokens": 5}})
+      "usage": {"input_tokens": given // 4 + extra, "output_tokens": 5}})
 """
 
 
@@ -73,8 +76,25 @@ def note(n: int) -> str:
     return f"NOTE-{n:02d} " + "".join(f"line {line} of note {n} for the record. " for line in range(60))
 
 
+def catalog() -> ToolRegistry:
+    """Tools whose definitions are a large part of every request, as Astra's are."""
+    async def lookup(q: str = ""):
+        return "found"
+
+    registry = ToolRegistry()
+    for n in range(16):
+        registry.register(ToolDef(name=f"tool_{n:02d}", description=f"Tool {n}. " + "It does one documented thing. " * 70,
+                                  parameters={"type": "object", "properties": {"q": {"type": "string"}}}, fn=lookup))
+    return registry
+
+
+def warnings_of(caplog, logger: str) -> list[str]:
+    return [record.getMessage() for record in caplog.records
+            if record.name == logger and record.levelno == logging.WARNING]
+
+
 class Setup:
-    def __init__(self, tmp_path, monkeypatch):
+    def __init__(self, tmp_path, monkeypatch, registry: ToolRegistry | None = None):
         self.log = tmp_path / "requests.jsonl"
         cli = tmp_path / "claude"
         cli.write_text(STAND_IN % (str(self.log), SUMMARY), encoding="utf-8")
@@ -94,7 +114,7 @@ class Setup:
             "agent", LLMClient(LLMConfig(model="opus", provider="claude-code", base_url=ccp.BASE_URL,
                                          capabilities=frozenset({"streaming", "tools", "reasoning"}),
                                          reasoning_effort="high")),
-            ToolRegistry(), system_prompt="You are Astra.", max_iterations=2,
+            registry or ToolRegistry(), system_prompt="You are Astra.", max_iterations=2,
             progressive_tools=False, query_profile_enabled=False)
         self.agent.context.set_session(str(tmp_path / "conversation.json"))
         # A tail of about two notes stays word for word; what is older is summarized.
@@ -273,15 +293,91 @@ def test_a_chat_waiting_for_its_next_message_is_summarized_and_used_the_same_way
     asyncio.run(scenario())
 
 
-def test_a_conversation_whose_request_cannot_be_repeated_is_not_summarized_from_a_transcript(setup):
-    """A transcript is read whole at the full price: what writing the summary early is meant to save."""
+def test_a_conversation_whose_request_cannot_be_repeated_is_not_summarized_from_a_transcript(setup, caplog):
+    """A transcript is read whole at the full price: what writing the summary early is meant to save.
+    Here the model's window takes the last request again, but without room left for an answer;
+    why no summary was written is a warning, which the backend's log shows."""
     async def scenario():
         await setup.notes(6)
         sent = len(setup.requests())
-        setup.agent.context.max_prompt_tokens = 1_000  # the last request no longer fits
+        config = setup.agent.llm.config
+        config.max_tokens = 4_096  # an answer is given 8K of the window
+        config.context_limit = setup.agent.context.last_prompt_tokens + 8_000
         setup.ahead = 55 * 60
         await idle(setup.compactor())
         assert len(setup.requests()) == sent
+        assert len(warnings_of(caplog, "agent.runtime.context_compressor")) == 1
+    asyncio.run(scenario())
+
+
+def test_a_conversation_just_under_the_compaction_line_is_summarized_with_its_tools_counted_once(
+        tmp_path, monkeypatch):
+    """The summary request, the last request and a few thousand tokens, was held to Claude Code's
+    150,000 compaction line, and its size counted the tools twice: in an estimate calibrated on the
+    provider's reports, which include them, and once more on their own (live, 2026-11-13: the same
+    check put a 151k-token conversation with 111 tools at 184,066). Any conversation above about
+    117k with something to summarize was refused. It has to fit the model's window, sized from what
+    the provider reported for the last request."""
+    setup = Setup(tmp_path, monkeypatch, registry=catalog())
+    setup.log.with_name(setup.log.name + ".extra").write_text("8000", encoding="utf-8")
+
+    async def scenario():
+        await setup.notes(12)
+        context, config = setup.agent.context, setup.agent.llm.config
+        reported = context.last_prompt_tokens
+        # The line 500 tokens above the conversation; the window holds the summary request with
+        # 4,000 tokens to spare (and an answer's 8K), not with the tools counted twice.
+        context.max_prompt_tokens = reported + 500
+        config.max_tokens = 4_096
+        config.context_limit = reported + 4_000 + 8_192
+        sent = setup.requests()
+        setup.ahead = 55 * 60
+        await idle(setup.compactor())
+        asked = setup.requests()[len(sent):]
+        assert len(asked) == 1 and CHECKPOINT in text_of(asked[0])
+        assert asked[0]["turns"][:len(sent[-1]["turns"])] == sent[-1]["turns"]
+        # An hour after the summary request the cache has gone: the next turn starts from it.
+        setup.ahead = 55 * 60 + HOUR + 60
+        await setup.turn("NOTE-LATE one more thing.")
+        request = setup.requests()[-1]
+        assert "CHECKPOINT-4417" in text_of(request) and "NOTE-00" not in text_of(request)
+    asyncio.run(scenario())
+
+
+def test_a_conversation_with_nothing_new_before_its_kept_part_is_not_summarized_again(setup, monkeypatch, caplog):
+    """Live, 2026-11-13 22:09: a long conversation had been compacted an hour before, and all
+    that came after that summary was in the part kept word for word. Nothing is asked for, and the
+    log says why, not only that no summary was written."""
+    from agent.runtime import context as context_module
+
+    real_time = time.time
+
+    class Shifted:
+        """The clock requests are stamped with, moved along with the rules' clock."""
+        def __getattr__(self, name):
+            return getattr(time, name)
+
+        def time(self):
+            return real_time() + setup.ahead
+
+    monkeypatch.setattr(context_module, "time", Shifted())
+    monkeypatch.setenv("ASTRA_IDLE_COMPACT_MIN_TOKENS", "500")
+
+    async def scenario():
+        await setup.notes(6)
+        setup.ahead = 55 * 60
+        await idle(setup.compactor())
+        setup.ahead = 55 * 60 + HOUR + 60
+        await setup.turn("NOTE-LATE one more thing.")
+        assert "CHECKPOINT-4417" in text_of(setup.requests()[-1])
+        sent = len(setup.requests())
+        setup.ahead += 55 * 60
+        with caplog.at_level(logging.INFO, logger="agent.runtime.context_compressor"):
+            await idle(setup.compactor())
+        assert len(setup.requests()) == sent
+        assert [record.levelno for record in caplog.records
+                if record.name == "agent.runtime.context_compressor" and "Idle summary" in record.getMessage()
+                ] == [logging.INFO]
     asyncio.run(scenario())
 
 
@@ -436,9 +532,9 @@ def test_two_returns_within_the_cache_kept_by_summary_requests_both_go_on_from_t
     assert results_at_last_cold_start(stored.messages, HOUR) == frozenset()
 
 
-def test_a_provider_that_would_send_a_transcript_is_not_asked_for_the_summary(setup, monkeypatch):
+def test_a_provider_that_would_send_a_transcript_is_not_asked_for_the_summary(setup, monkeypatch, caplog):
     """The CLI's turn-by-turn replay, switched off for the process after a CLI rejected it: the
-    request would go as one transcript, read in full."""
+    request would go as one transcript, read in full. The refusal is a warning."""
     async def scenario():
         await setup.notes(6)
         before = len(setup.requests())
@@ -446,6 +542,7 @@ def test_a_provider_that_would_send_a_transcript_is_not_asked_for_the_summary(se
         setup.ahead = 55 * 60
         await idle(setup.compactor())
         assert setup.requests()[before:] == []
+        assert len(warnings_of(caplog, "agent.runtime.context_compressor")) == 1
     asyncio.run(scenario())
 
 
