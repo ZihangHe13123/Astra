@@ -524,6 +524,52 @@ def test_rejected_cache_breakpoint_is_dropped_and_the_step_retried(fake_cli, mon
     assert ClaudeCodeProvider.cache_marker is False
 
 
+@pytest.mark.parametrize("scenario", ["answers_history", "marker_rejected"])
+def test_a_request_for_the_cached_conversation_only_is_not_retried_another_way(fake_cli, monkeypatch, scenario):
+    """An idle summary is worth sending only from the cache. A CLI that rejects the turn-by-turn
+    replay or the cache breakpoint still switches this process over, but that request is refused
+    rather than sent again as a transcript or without the breakpoint, both read in full."""
+    from agent.runtime.prompt_budget import CACHE_READ_OBSERVER, CACHED_PREFIX_ONLY
+
+    command, record = fake_cli
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", scenario)
+    reads: list[int] = []
+    prefix_only, observer = CACHED_PREFIX_ONLY.set(True), CACHE_READ_OBSERVER.set(lambda: reads.append(1))
+    try:
+        with pytest.raises(ClaudeCodeError, match="Not sent"):
+            collect(provider(command).chat_stream(HISTORY, [READ_FILE]))
+    finally:
+        CACHE_READ_OBSERVER.reset(observer)
+        CACHED_PREFIX_ONLY.reset(prefix_only)
+    frames = json.loads(record.read_text())["frames"]
+    if scenario == "answers_history":
+        # The CLI answered while the earlier turns were still being given to it: never asked.
+        assert frames[0].get("shouldQuery") is False and not reads
+        assert ClaudeCodeProvider.replay is False
+    else:
+        # Asked with the breakpoint, which was then refused: that request was handed over once.
+        assert cache_markers(frames) and reads == [1]
+        assert ClaudeCodeProvider.cache_marker is False
+
+
+def test_a_request_for_the_cached_conversation_reports_when_it_is_handed_over(fake_cli, monkeypatch):
+    from agent.runtime.prompt_budget import CACHE_READ_OBSERVER, CACHED_PREFIX_ONLY
+
+    command, _ = fake_cli
+    monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "text")
+    reads: list[int] = []
+    prefix_only, observer = CACHED_PREFIX_ONLY.set(True), CACHE_READ_OBSERVER.set(lambda: reads.append(1))
+    try:
+        final = collect(provider(command).chat_stream(HISTORY, [READ_FILE]))[-1]
+        # Too short for a breakpoint (no earlier user turn to put it on): refused, never handed over.
+        with pytest.raises(ClaudeCodeError, match="Not sent"):
+            collect(provider(command).chat_stream(HISTORY[:2], [READ_FILE]))
+    finally:
+        CACHE_READ_OBSERVER.reset(observer)
+        CACHED_PREFIX_ONLY.reset(prefix_only)
+    assert final["content"] == "Hello from Claude." and reads == [1]
+
+
 def test_conversation_keeps_calls_valid_across_providers():
     """History from other models can hold ids Claude rejects, ids reused every turn, calls to
     tools not offered now and calls whose result was lost; each still makes a valid request."""

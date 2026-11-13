@@ -97,7 +97,10 @@ effort, `low`, instead of the conversation's.
 The CLI reads a request again in full from the first message that changed. Old
 tool results are therefore cleared from a Claude Code conversation only in a
 request that starts an hour or more after the one before it, when nothing is
-cached any more; see [tool policy](execution.md#tool-policy-and-tracing).
+cached any more; see [tool policy](execution.md#tool-policy-and-tracing). A
+conversation of 100,000 tokens or more that sits idle is summarized from the
+cache before it goes, and the summary is used if the next turn comes after it
+has gone (idle compaction, same section).
 
 ## Client and MCP recovery
 

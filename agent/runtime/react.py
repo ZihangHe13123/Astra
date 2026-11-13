@@ -58,6 +58,7 @@ from .turn_change_store import (
 )
 from .message_time import filter_message_time_events
 from .metrics import runtime_metrics
+from . import idle_compaction
 from .micro_compact import micro_compact_tool_results, results_at_last_cold_start
 from .process_env import hidden_process_creationflags
 from .stream_progress import stream_with_progress
@@ -1681,7 +1682,7 @@ class ReActAgent(AgentBase):
             profiler.set_request(messages, tools, self._active_skill_names)
         remember = getattr(self.context, "remember_request", None)
         if remember is not None:
-            remember(kwargs["messages"], tools)
+            remember(kwargs["messages"], tools, model=idle_compaction.model_identity(self.llm))
         provider_events = self.llm.chat_stream(**kwargs)
         return filter_message_time_events(stream_with_progress(_stream_with_generation_stats(provider_events)))
 
@@ -1808,6 +1809,12 @@ class ReActAgent(AgentBase):
             "当前已取得的工具结果仍保留在会话中；你可以根据上面的结果继续，或调整条件后让我重试。"
         )
 
+    def _settle_idle_summary(self) -> None:
+        """A summary written while the conversation sat idle replaces its older part if the cache has gone."""
+        settle = getattr(self.context, "apply_idle_summary", None)
+        if settle is not None:
+            settle(idle_compaction.clock(), idle_compaction.cache_seconds_for(self.llm))
+
     async def _prepare_turn(
         self,
         msg: Msg,
@@ -1827,6 +1834,7 @@ class ReActAgent(AgentBase):
             self._task_context_paths.clear()
             self._active_skill_names.clear()
             self._verification_required = False
+        self._settle_idle_summary()
         observed = await self.drain_observed()
         for obs in observed:
             text = obs.get_text()

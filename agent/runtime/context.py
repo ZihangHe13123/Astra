@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, TYPE_CHECKING, cast
 
+from .prompt_budget import CACHE_READ_OBSERVER, CACHED_PREFIX_ONLY
 from .session_store import SessionStore
 from .async_io import durable_io
 from .token_estimator import estimate_value_tokens
@@ -338,6 +339,12 @@ class AgentContext:
     # The last request sent for this conversation, as the provider received it, so a
     # compaction summary can replay it and reuse its cached prefix (see summary_replay).
     _sent_request: dict | None = field(default=None, init=False, repr=False)
+    # A summary written while the conversation sat idle (agent/runtime/idle_compaction.py), kept beside
+    # the history until the next turn uses or drops it; when that summary request read the cache; and
+    # which history its last attempt was made for. All three are this process's own.
+    _idle_summary: dict | None = field(default=None, init=False, repr=False)
+    cache_touched_at: float | None = field(default=None, init=False, repr=False)
+    _idle_attempt: tuple | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.max_prompt_tokens == 100_000:
@@ -373,6 +380,7 @@ class AgentContext:
         else:
             lease = None
         self._sent_request = None
+        self._forget_idle_summary()
         self._system_prompt_migration = {}
         self.guidance_snapshot = {}
         self.system_projection.reset()
@@ -733,6 +741,15 @@ class AgentContext:
     def _append_message(self, msg: dict):
         if msg.get("role") in {"user", "assistant"}:
             msg["timestamp"] = _valid_message_timestamp(msg.get("timestamp")) or time.time()
+        if msg.get("role") == "user" and self.cache_touched_at is not None:
+            # An idle summary request read the cache after the message before this one, so the pause
+            # before this one ends there for the cache (micro_compact.results_at_last_cold_start).
+            # Kept with the message: the next requests decide alike, also after a restart.
+            previous = next((stamp for stamp in map(_valid_message_timestamp,
+                                                    (m.get("timestamp") for m in reversed(self.messages))) if stamp),
+                            None)
+            if previous is not None and previous < self.cache_touched_at:
+                msg["cache_read_at"] = self.cache_touched_at
         self.messages.append(msg)
         self._message_token_costs.append(self._message_cost(msg))
 
@@ -749,6 +766,7 @@ class AgentContext:
         model_message.pop("provenance", None)
         model_message.pop("display_command", None)
         model_message.pop("_tool_disclosures", None)
+        model_message.pop("cache_read_at", None)
         if content_override is not _NO_OVERRIDE:
             model_message["content"] = copy.deepcopy(content_override)
         from .appshot_media import hydrate_content
@@ -891,14 +909,121 @@ class AgentContext:
             + sum(self._message_token_costs) + self._runtime_context_tokens()
         ))
 
-    def remember_request(self, messages: list[dict], tools: list[dict]) -> None:
+    def remember_request(self, messages: list[dict], tools: list[dict], *, model: str = "") -> None:
         """Record the request just sent, and which conversation messages it was built from."""
         self._sent_request = {
             "messages": messages,
             "tools": tools,
             "count": len(self.messages),
             "last": copy.deepcopy(self.messages[-1]) if self.messages else None,
+            "at": time.time(),
+            "model": model,
         }
+
+    def _forget_idle_summary(self) -> None:
+        self._idle_summary = None
+        self.cache_touched_at = None
+        self._idle_attempt = None
+
+    def _history_mark(self) -> tuple:
+        return (self._session_path, self.branch_id, len(self.messages), id(self.messages[-1]) if self.messages else 0)
+
+    def _last_cache_read(self) -> float | None:
+        """When a request of this process last read this conversation's cache, if one did."""
+        sent = self._sent_request.get("at") if self._sent_request is not None else None
+        known = [moment for moment in (sent, self.cache_touched_at) if moment is not None]
+        return max(known) if known else None
+
+    def idle_summary_due(self, now: float, *, idle_after: float, cache_seconds: float, min_tokens: int,
+                         model: str) -> bool:
+        """Whether to write this conversation's summary now, while its cache is still warm.
+
+        The rules are in agent/runtime/idle_compaction.py: a finished turn, a last request of
+        ``min_tokens`` or more on this ``model``, quiet since for ``idle_after`` but for less
+        than ``cache_seconds``, and no summary or attempt for this history yet.
+        """
+        sent = self._sent_request
+        if (min_tokens <= 0 or not self.compaction_enabled or self.compressor is None or sent is None
+                or sent.get("model") != model or self._idle_summary is not None
+                or self.last_prompt_tokens < min_tokens or not self.messages):
+            return False
+        last = self.messages[-1]
+        read = self._last_cache_read()
+        if last.get("role") != "assistant" or last.get("tool_calls") or read is None:
+            return False
+        # The summary request has to reach the provider while the cache is still there.
+        if not idle_after <= now - read < cache_seconds - 30:
+            return False
+        return self._idle_attempt != self._history_mark() and self.summary_replay() is not None
+
+    async def prepare_idle_summary(self, now: float) -> bool:
+        """Write the summary of this conversation's older part from its cached last request; keep it aside.
+
+        Kept only if the conversation is where it was when the summary was asked for.
+        """
+        mark = self._history_mark()
+        self._idle_attempt = mark
+        replay = self.summary_replay()
+        if replay is None or self.compressor is None:
+            return False
+        count, last = len(self.messages), copy.deepcopy(self.messages[-1])
+        asked = time.time()
+
+        def cache_read() -> None:
+            # The request has gone to the model and read the cache, which lasts from now: kept
+            # whatever comes of the summary, so the next message is judged by it.
+            if (self._session_path, self.branch_id) == mark[:2]:
+                self.cache_touched_at = now + max(0.0, time.time() - asked)
+
+        # Read from the cache or not at all: the provider must not send it another way either.
+        prefix_only, observer = CACHED_PREFIX_ONLY.set(True), CACHE_READ_OBSERVER.set(cache_read)
+        try:
+            prepared = await self.compressor.prepare(self._compaction_messages(), self.max_prompt_tokens, replay)
+        except asyncio.CancelledError:
+            # Interrupted (a turn needed the model): a later check may try this history again.
+            self._idle_attempt = None
+            raise
+        finally:
+            CACHE_READ_OBSERVER.reset(observer)
+            CACHED_PREFIX_ONLY.reset(prefix_only)
+        if prepared is None or self._history_mark() != mark:
+            return False
+        self._idle_summary = {"prepared": prepared, "session": mark[:2], "count": count, "last": last}
+        # A provider that does not say when it sent the request did send it.
+        self.cache_touched_at = max(self.cache_touched_at or now, now)
+        return True
+
+    def apply_idle_summary(self, now: float, cache_seconds: float | None) -> bool:
+        """At the start of a turn: use the idle summary if the cache has gone since, else drop it.
+
+        ``cache_seconds`` is how long the current model's provider keeps a request; None drops it.
+        """
+        pending, self._idle_summary = self._idle_summary, None
+        if pending is None or self.compressor is None or cache_seconds is None:
+            return False
+        count = pending["count"]
+        read = self._last_cache_read()
+        if (pending["session"] != (self._session_path, self.branch_id) or not 0 < count <= len(self.messages)
+                or self.messages[count - 1] != pending["last"] or read is None or now - read < cache_seconds):
+            return False
+        before = len(self.messages)
+        tokens_before = self.estimate_compaction_tokens()
+        compressed = self.compressor.apply_prepared(pending["prepared"], self._compaction_messages(),
+                                                    self.max_prompt_tokens)
+        if compressed is None:
+            return False
+        report: dict[str, Any] = {"tokens_before": tokens_before, "target_tokens": self.max_prompt_tokens,
+                                  "method": "summary", "trigger": "idle", "dropped_steps": 0, "cleared_results": 0}
+        self.report_compaction("started", before, details=report)
+        self.messages = compressed[1:] if compressed and compressed[0].get("role") == "system" else compressed
+        self._message_token_costs.clear()
+        self.last_prompt_tokens = 0
+        self._saved_message_count = 0
+        self._sent_request = None
+        report["tokens_after"] = self.estimate_compaction_tokens()
+        self._last_compaction_report = dict(report)
+        self.report_compaction("completed", before, details=report)
+        return True
 
     def summary_replay(self) -> dict | None:
         """The last sent request plus what the conversation gained since, for a summary.
@@ -918,6 +1043,7 @@ class AgentContext:
 
     def reset(self):
         self._sent_request = None
+        self._forget_idle_summary()
         self.guidance_snapshot = {}
         self.system_projection.reset()
         self.runtime_projection.reset()

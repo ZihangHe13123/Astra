@@ -213,6 +213,29 @@ Tool execution uses the following guards and controls:
   and they stay cleared in the requests after it. Results added since then wait
   for the next such pause, or for history compaction at 150,000 tokens, which
   clears what is due before it summarizes anything.
+- Idle compaction: a long Claude Code conversation is summarized before its
+  cache goes. Between turns the backend checks the desktop's conversation and
+  each chat's. One whose last turn has finished, whose last request carried
+  `ASTRA_IDLE_COMPACT_MIN_TOKENS=100000` tokens or more, and whose cache nobody
+  has read for 54 minutes (`ASTRA_IDLE_COMPACT_AFTER_SECONDS=3240`) gets a
+  checkpoint summary. The summary is asked for by repeating that last request,
+  as history compaction does, so the CLI reads it from the cache; never from a
+  transcript, which would be read whole. A model change since that request
+  skips it. The summary is kept beside the history, which does not change, and
+  that request keeps the cache another hour. The next turn uses the summary
+  only if it starts an hour or more after the last request that read the cache,
+  the summary request included, and the history still begins with what was
+  summarized: the summary then replaces that part and the rest stays word for
+  word. Otherwise the summary is dropped and the conversation goes on in full.
+  One summary per pause; a restart drops it. A turn that starts while it is
+  being written interrupts it, since the model client may have one request
+  slot, and one that has not come back in ten minutes is given up. If the CLI
+  could not take the request turn by turn with Astra's cache breakpoint, it is
+  not sent at all. The moment it is handed to the CLI counts as a read of the
+  cache, whether or not the summary comes back; the message that ends that
+  pause records it, so old tool results are not cleared there, also after a
+  restart. `ASTRA_IDLE_COMPACT_MIN_TOKENS=off`
+  turns this off. The text CLI and scheduled checks do not take part.
 - `TOOL_FAILURE_THRESHOLD=3` opens a per-tool circuit after equivalent
   consecutive failures, then performs one final synthesis with tools disabled.
 - `PROMPT_CACHE_STABLE_TOOLS=1` keeps one provider-visible tool manifest for

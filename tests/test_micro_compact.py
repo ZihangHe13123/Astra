@@ -266,3 +266,27 @@ def test_a_conversation_without_times_has_no_cold_start_to_clear_at():
                                    "provenance": "notification", "timestamp": 1_030 + hour}]
     assert results_at_last_cold_start(notice, hour) == {"a"}
 
+
+
+def test_a_request_outside_the_history_that_read_the_cache_moves_the_pause():
+    """An idle summary request reads the conversation's cache 55 minutes into a pause; the cache
+    lasts an hour from then, so a message 70 minutes into the pause does not start cold. The
+    message that ends the pause keeps that moment, so every later request decides alike."""
+    hour = 3600
+    busy = [*_turn(1_000, "a", "b")]
+    back = [*busy, *_turn(1_030 + 70 * 60, "c")]
+    assert results_at_last_cold_start(back, hour) == {"a", "b"}
+    back[len(busy)]["cache_read_at"] = 1_030 + 55 * 60
+    assert results_at_last_cold_start(back, hour) == frozenset()
+    # A second such pause later on leaves the first as it was.
+    again = [*back, *_turn(1_100 + 70 * 60 + 70 * 60, "d")]
+    again[len(back)]["cache_read_at"] = 1_100 + 70 * 60 + 55 * 60
+    assert results_at_last_cold_start(again, hour) == frozenset()
+    # More than an hour after that read, it starts cold all the same.
+    late = [*busy, *_turn(1_030 + 55 * 60 + hour + 60, "c")]
+    late[len(busy)]["cache_read_at"] = 1_030 + 55 * 60
+    assert results_at_last_cold_start(late, hour) == {"a", "b"}
+    # A read before the message ahead of it, or one that is not a time, changes nothing.
+    for odd in (500, True, "soon"):
+        back[len(busy)]["cache_read_at"] = odd
+        assert results_at_last_cold_start(back, hour) == {"a", "b"}

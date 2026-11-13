@@ -12,6 +12,8 @@ import json
 import logging
 import re
 import time
+from dataclasses import dataclass
+from typing import NamedTuple
 
 from .llm import LLMClient
 from .token_estimator import estimate_value_tokens
@@ -163,6 +165,32 @@ _PROTECTED_MAX_ITEMS = 10
 _PROTECTED_MIN_MSG_LEN = 8
 
 
+class _Plan(NamedTuple):
+    """Which compaction-input messages a compaction summarizes and which it keeps."""
+    start: int
+    end: int
+    split: int | None
+    turns: list[dict]
+    turn_prefix: list[dict]
+    existing_summary: str | None
+    summary_budget: int
+    summary_input_chars: int
+
+
+@dataclass(frozen=True)
+class PreparedCompaction:
+    """A summary of a conversation's older part, written ahead of time and not applied yet.
+
+    ``summary`` replaces compaction-input messages ``start`` to ``end`` of the ``size`` the
+    plan was made on; ``carried`` is what later summaries build on once it is applied.
+    """
+    summary: str
+    carried: str
+    start: int
+    end: int
+    size: int
+
+
 class ContextCompressor:
     def __init__(self, llm: LLMClient, tail_token_budget: int = _TAIL_TOKEN_BUDGET,
                  summary_max_tokens: int = _SUMMARY_TOKENS_CEILING,
@@ -197,60 +225,17 @@ class ContextCompressor:
         if force:
             self._failure_cooldown_until = 0.0
 
-        # A recap is a request-local attention aid, not durable conversation
-        # history. Remove a previous recap before recompressing so forced retry
-        # paths cannot accumulate duplicate synthetic user turns.
-        source_messages = [
-            message for message in messages if not self._is_compression_recap(message)
-        ]
-        n = len(source_messages)
-        head_size = self._protect_head_size(source_messages)
-        if n <= head_size + 2:
+        source_messages = self._without_recaps(messages)
+        plan = self._plan(source_messages, max_prompt_tokens)
+        if plan is None:
             return messages
-
-        # Phase 1: Determine boundaries
-        compress_start = head_size
-        head_tokens = self._estimate_head_tokens(source_messages[:compress_start])
-        tail_budget = self._tail_budget_tokens(max_prompt_tokens, head_tokens)
-        summary_budget = self._summary_output_budget(max_prompt_tokens)
-        summary_input_chars = self._summary_input_chars_budget(max_prompt_tokens)
-        compress_end, split_turn_start = self._find_tail_plan(
-            source_messages, compress_start, tail_budget,
-        )
-
-        if compress_start >= compress_end:
-            # There is no safely compressible history before the active user
-            # turn. Never swallow the current request merely to satisfy a
-            # message/token target.
-            return messages
-
-        # Detect iterative update
-        history_end = split_turn_start if split_turn_start is not None else compress_end
-        summary_idx, summary_body = self._find_existing_summary(
-            source_messages, 0, history_end
-        )
-        if summary_idx is not None:
-            if summary_body and not self._previous_summary:
-                self._previous_summary = summary_body
-            turns = source_messages[max(compress_start, summary_idx + 1):history_end]
-        else:
-            turns = source_messages[compress_start:history_end]
-        turn_prefix = (
-            source_messages[split_turn_start:compress_end]
-            if split_turn_start is not None else []
-        )
-
-        logger.info("Compressing turns %d-%d (%d turns), protecting %d head + %d tail",
-                     compress_start + 1, compress_end, len(turns),
-                     compress_start, n - compress_end)
-        if self.hooks is not None:
-            self.hooks.dispatch_pre_compact({
-                "trigger": "manual" if force else "auto",
-                "messages_before": n,
-                "compress_start": compress_start,
-                "compress_end": compress_end,
-                "turns": len(turns),
-            })
+        if plan.existing_summary and not self._previous_summary:
+            self._previous_summary = plan.existing_summary
+        compress_start, compress_end, split_turn_start = plan.start, plan.end, plan.split
+        turns, turn_prefix = plan.turns, plan.turn_prefix
+        summary_budget, summary_input_chars = plan.summary_budget, plan.summary_input_chars
+        trigger = "manual" if force else "auto"
+        self._dispatch_pre_compact(source_messages, plan, trigger)
 
         # Phase 2: Generate summary
         if turns:
@@ -306,7 +291,111 @@ class ContextCompressor:
                 parts.append(f"Active task state:\n{active_task}")
             summary = "\n\n".join(parts)
 
-        # Phase 3: Assemble compressed message list
+        return self._assemble(source_messages, compress_start, compress_end, split_turn_start, summary,
+                              max_prompt_tokens=max_prompt_tokens, trigger=trigger)
+
+    async def prepare(self, messages: list[dict], max_prompt_tokens: int, replay: dict) -> PreparedCompaction | None:
+        """Write now the summary a compaction of ``messages`` would write, without applying it.
+
+        Only from ``replay`` (the conversation's last request repeated, read from the provider's
+        cache): a transcript would be read whole at the full price, which is what writing it ahead
+        is meant to save. Nothing of this compressor changes until ``apply_prepared``. None when
+        there is nothing to summarize, the history ends inside a turn, or the replay is not used.
+        """
+        if time.monotonic() < self._failure_cooldown_until:
+            return None
+        source_messages = self._without_recaps(messages)
+        plan = self._plan(source_messages, max_prompt_tokens)
+        if plan is None or plan.split is not None or not plan.turns:
+            return None
+        draft = ContextCompressor(self.llm, self.tail_token_budget, self.summary_max_tokens)
+        draft._previous_summary = self._previous_summary or plan.existing_summary
+        summary = await draft._generate_summary(plan.turns, max_tokens=plan.summary_budget,
+                                                max_input_chars=plan.summary_input_chars,
+                                                replay=replay, replay_only=True)
+        if not summary:
+            return None
+        return PreparedCompaction(summary, draft._previous_summary or "", plan.start, plan.end, len(source_messages))
+
+    def apply_prepared(self, prepared: PreparedCompaction, messages: list[dict],
+                       max_prompt_tokens: int) -> list[dict] | None:
+        """The compacted ``messages``: the prepared summary in place of the part it summarized.
+
+        ``messages`` must begin with the messages the summary was prepared on; what came after
+        them is kept as it is. None when there are fewer of them.
+        """
+        source_messages = self._without_recaps(messages)
+        if len(source_messages) < prepared.size or self._protect_head_size(source_messages) != prepared.start:
+            return None
+        plan = _Plan(prepared.start, prepared.end, None, source_messages[prepared.start:prepared.end], [],
+                     None, 0, 0)
+        self._dispatch_pre_compact(source_messages, plan, "idle")
+        self._previous_summary = prepared.carried
+        self._failure_cooldown_until = 0.0
+        return self._assemble(source_messages, prepared.start, prepared.end, None, prepared.summary,
+                              max_prompt_tokens=max_prompt_tokens, trigger="idle")
+
+    def _without_recaps(self, messages: list[dict]) -> list[dict]:
+        # A recap is a request-local attention aid, not durable conversation
+        # history. Remove a previous recap before recompressing so forced retry
+        # paths cannot accumulate duplicate synthetic user turns.
+        return [message for message in messages if not self._is_compression_recap(message)]
+
+    def _plan(self, source_messages: list[dict], max_prompt_tokens: int) -> _Plan | None:
+        """Phase 1: the boundaries, or None when nothing before the active user turn can go."""
+        n = len(source_messages)
+        head_size = self._protect_head_size(source_messages)
+        if n <= head_size + 2:
+            return None
+        compress_start = head_size
+        head_tokens = self._estimate_head_tokens(source_messages[:compress_start])
+        tail_budget = self._tail_budget_tokens(max_prompt_tokens, head_tokens)
+        compress_end, split_turn_start = self._find_tail_plan(
+            source_messages, compress_start, tail_budget,
+        )
+        if compress_start >= compress_end:
+            # There is no safely compressible history before the active user
+            # turn. Never swallow the current request merely to satisfy a
+            # message/token target.
+            return None
+
+        # Detect iterative update
+        history_end = split_turn_start if split_turn_start is not None else compress_end
+        summary_idx, summary_body = self._find_existing_summary(
+            source_messages, 0, history_end
+        )
+        if summary_idx is not None:
+            turns = source_messages[max(compress_start, summary_idx + 1):history_end]
+        else:
+            turns = source_messages[compress_start:history_end]
+        turn_prefix = (
+            source_messages[split_turn_start:compress_end]
+            if split_turn_start is not None else []
+        )
+        return _Plan(compress_start, compress_end, split_turn_start, turns, turn_prefix,
+                     summary_body if summary_idx is not None else None,
+                     self._summary_output_budget(max_prompt_tokens),
+                     self._summary_input_chars_budget(max_prompt_tokens))
+
+    def _dispatch_pre_compact(self, source_messages: list[dict], plan: _Plan, trigger: str) -> None:
+        n = len(source_messages)
+        logger.info("Compressing turns %d-%d (%d turns), protecting %d head + %d tail",
+                     plan.start + 1, plan.end, len(plan.turns),
+                     plan.start, n - plan.end)
+        if self.hooks is not None:
+            self.hooks.dispatch_pre_compact({
+                "trigger": trigger,
+                "messages_before": n,
+                "compress_start": plan.start,
+                "compress_end": plan.end,
+                "turns": len(plan.turns),
+            })
+
+    def _assemble(self, source_messages: list[dict], compress_start: int, compress_end: int,
+                  split_turn_start: int | None, summary: str, *, max_prompt_tokens: int,
+                  trigger: str) -> list[dict]:
+        """Phases 3 and 4: the summary in place of the summarized messages, then cleanup."""
+        n = len(source_messages)
         compressed = [msg.copy() for msg in source_messages[:compress_start]]
 
         summary_role = self._choose_summary_role(
@@ -339,7 +428,7 @@ class ContextCompressor:
         self.compression_count += 1
         if self.hooks is not None:
             self.hooks.dispatch_post_compact({
-                "trigger": "manual" if force else "auto",
+                "trigger": trigger,
                 "messages_before": n,
                 "messages_after": len(compressed),
                 "compression_count": self.compression_count,
@@ -653,6 +742,7 @@ class ContextCompressor:
         max_tokens: int | None = None,
         max_input_chars: int | None = None,
         replay: dict | None = None,
+        replay_only: bool = False,
     ) -> str | None:
         # Check cooldown
         if time.monotonic() < self._failure_cooldown_until:
@@ -710,6 +800,8 @@ class ContextCompressor:
             await self._summary_from_replay(replay, protection_block, output_tokens)
             if replay is not None else None
         )
+        if summary is None and replay_only:
+            return None
         try:
             if summary is None:
                 response = await self.llm.chat_limited(

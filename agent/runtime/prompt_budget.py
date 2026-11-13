@@ -2,6 +2,17 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextvars import ContextVar
+
+# Set while a request is worth sending only if the provider reads its earlier part from the cache
+# (an idle summary). A provider that would have to send it another way, such as one transcript,
+# refuses it instead.
+CACHED_PREFIX_ONLY: ContextVar[bool] = ContextVar("astra_cached_prefix_only", default=False)
+# Called by the provider as it hands over a request whose earlier part is read from the cache: the
+# cache lasts from then, whatever comes of the request (an idle summary may be interrupted).
+CACHE_READ_OBSERVER: ContextVar[Callable[[], None] | None] = ContextVar("astra_cache_read_observer", default=None)
+
 # The claude CLI is started again for every request and takes each earlier turn before it asks,
 # so a long conversation is slow to its first event whatever the cache holds (live 2026-11-11:
 # about 5.6 s plus 0.037 s per earlier user turn; 11 to 41 s at 484 messages and 226k prompt

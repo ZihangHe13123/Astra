@@ -98,6 +98,7 @@ from agent.runtime.task_store import (
 )
 from agent.runtime.approval_inbox import ApprovalInbox
 from agent.runtime.context import _valid_message_timestamp
+from agent.runtime.idle_compaction import IdleCompactor
 from agent.cli.history import history_tool_results
 from agent.runtime.event_stream import RuntimeEventStream
 from agent.runtime.event_writer import OrderedEventWriter
@@ -2470,6 +2471,9 @@ async def _main(startup_started: float):
     channel_router = AgentChannelRouter(agent, agent_turn_lock, sessions_dir(PROJECT_ROOT),
                                         admission=lambda: not restart.draining, model_for=channel_models.client,
                                         tasks=task_store)
+    # Between turns: the desktop's conversation and each chat's, with how the ledger attributes them.
+    idle_compactor = IdleCompactor(lambda: [(agent.context, {}), *(
+        (context, {"source": "channel", "session": name}) for name, context in channel_router.parked_contexts())])
     # The desktop's channel host takes WeChat over from other backends. Popped so nothing this
     # backend starts inherits the claim.
     channel_host = os.environ.pop("ASTRA_CHANNEL_HOST", "") == "1"
@@ -2877,6 +2881,8 @@ async def _main(startup_started: float):
                 await _peer_tick()
             await _background_tick()
             consolidation.tick(busy=busy)
+            # Checked again: a chat's turn may have started since, borrowing agent.context.
+            idle_compactor.tick(busy=_turn_busy() or restart.draining)
             weixin_commands.tick()
             if browser_lifecycle is not None:
                 await _browser_handover_tick()
@@ -4751,6 +4757,7 @@ async def _main(startup_started: float):
         lifecycle_task.cancel()
         with suppress(asyncio.CancelledError):
             await lifecycle_task
+        await idle_compactor.close()
         if jobs_host is not None:
             await jobs_host.close()
         await channel_manager.stop()

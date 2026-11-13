@@ -128,6 +128,9 @@ def results_at_last_cold_start(messages: list[dict], cache_seconds: float) -> fr
     that after the message before it begins a request the provider reads whole,
     at the full price, whatever it holds. Clearing old results in that request
     costs nothing, and what it cleared stays cleared in the requests after it.
+    A user message's ``cache_read_at`` is when a request that is not in the
+    history read the cache after the message before it (an idle summary
+    request): the pause before it ends there for the cache.
     """
     previous: float | None = None
     boundary = 0
@@ -135,8 +138,12 @@ def results_at_last_cold_start(messages: list[dict], cache_seconds: float) -> fr
         stamp = message.get("timestamp")
         if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
             continue
-        if message.get("role") == "user" and previous is not None and stamp - previous >= cache_seconds:
-            boundary = index
+        if message.get("role") == "user" and previous is not None:
+            read = message.get("cache_read_at")
+            if not isinstance(read, bool) and isinstance(read, (int, float)) and previous < read < stamp:
+                previous = float(read)
+            if stamp - previous >= cache_seconds:
+                boundary = index
         previous = float(stamp)
     return frozenset(str(message.get("tool_call_id") or "") for message in messages[:boundary]
                      if message.get("role") == "tool")
