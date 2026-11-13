@@ -22,17 +22,27 @@ from agent.runtime.task_store import TaskStore
 
 # A backend started as a script loads its own checkout's .env (protect_backend() pins ASTRA_ENV_FILE
 # there), and the mail tool reads <root>/.env as well. Only a value in the backend's environment beats
-# the file, so a test backend run in a configured checkout would have the person's real mailbox.
-BLANK_MAIL_ACCOUNT = dict.fromkeys(
-    ("ASTRA_MAIL_ADDRESS", "ASTRA_MAIL_PASSWORD", "ASTRA_163_EMAIL", "ASTRA_163_AUTH_CODE"), "")
+# the file, so a test backend run in a configured checkout would use the person's own accounts and
+# services. Empty is "not set up" to each of these. Not here: DEEPSEEK_API_KEY, QWEN38_API_KEY,
+# ZHIPU_API_KEY, LLM_API_KEY and EXA_API_KEY, which load_project_env takes from the .env whenever it has them.
+BLANK_INTEGRATIONS = dict.fromkeys((
+    # The mailbox.
+    "ASTRA_MAIL_ADDRESS", "ASTRA_MAIL_PASSWORD", "ASTRA_163_EMAIL", "ASTRA_163_AUTH_CODE",
+    # web_extract's providers; an empty FIRECRAWL_URL is the unconfigured local default.
+    "TAVILY_API_KEY", "PARALLEL_API_KEY", "FIRECRAWL_API_KEY", "FIRECRAWL_URL",
+    # Context Index embeddings: an empty switch is off, so no embedding endpoint is used.
+    "ASTRA_CONTEXT_INDEX_EMBEDDING", "ASTRA_EMBEDDING_API_KEY",
+    # Hindsight memory.
+    "HINDSIGHT_ENABLED", "HINDSIGHT_API_KEY",
+), "")
 
 
 def backend_environment() -> dict[str, str]:
-    """This process's environment for a backend it starts, with the mail account blank.
+    """This process's environment for a backend it starts, with the checkout's integrations blank.
 
-    A test that means to give the backend a mailbox sets these afterwards, as env_overrides does.
+    A test that means to give the backend one of them sets it afterwards, as env_overrides does.
     """
-    return {**os.environ, **BLANK_MAIL_ACCOUNT}
+    return {**os.environ, **BLANK_INTEGRATIONS}
 
 
 def _path_state(path: Path) -> tuple[int, int, int, int] | None:
@@ -1114,8 +1124,11 @@ def test_protocol_fixture_does_not_schedule_a_traceback_watchdog(tmp_path: Path)
         _stop_protocol_backend(proc)
 
 
-class _MailStatusHandler(_SlowOpenAIHandler):
-    """A model that asks once how the person's mailbox is, then answers."""
+class _OneToolCallHandler(_SlowOpenAIHandler):
+    """A model that makes the server's ``call`` (a tool name and its arguments) once, then answers.
+
+    The server keeps the names of the tools the conversation offered in ``offered``.
+    """
 
     def do_POST(self):
         payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
@@ -1125,12 +1138,14 @@ class _MailStatusHandler(_SlowOpenAIHandler):
                         "choices": [{"index": 0, "finish_reason": "stop",
                                      "message": {"role": "assistant", "content": "ok"}}]})
             return
+        self.server.offered = [tool["function"]["name"] for tool in payload["tools"]]
         if any(message.get("role") == "tool" for message in payload.get("messages") or []):
             delta, finish = {"content": "checked"}, "stop"
         else:
+            name, arguments = self.server.call
             delta, finish = {"content": "", "tool_calls": [{
-                "index": 0, "id": "call-mail-status", "type": "function",
-                "function": {"name": "mail", "arguments": json.dumps({"action": "status"})},
+                "index": 0, "id": f"call-{name}", "type": "function",
+                "function": {"name": name, "arguments": json.dumps(arguments)},
             }]}, "tool_calls"
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -1144,22 +1159,91 @@ class _MailStatusHandler(_SlowOpenAIHandler):
             pass
 
 
+# Keys and switches of services a developer's own checkout may set up, apart from the mailbox.
+CHECKOUT_SERVICES = {
+    "TAVILY_API_KEY": "checkout-tavily-key",
+    "PARALLEL_API_KEY": "checkout-parallel-key",
+    "FIRECRAWL_API_KEY": "checkout-firecrawl-key",
+    "FIRECRAWL_URL": "http://127.0.0.1:9",
+    "ASTRA_CONTEXT_INDEX_EMBEDDING": "on",
+    "ASTRA_EMBEDDING_API_KEY": "checkout-embedding-key",
+    "HINDSIGHT_ENABLED": "1",
+    "HINDSIGHT_API_KEY": "checkout-hindsight-key",
+}
+
+
 @pytest.fixture
 def configured_checkout(tmp_path: Path) -> Path:
-    """A source checkout whose .env names a mailbox, as a developer's own checkout may."""
+    """A source checkout whose .env sets up a mailbox and other services, as a developer's own may."""
     root = Path(__file__).resolve().parents[1]
     checkout = tmp_path / "checkout"
     shutil.copytree(root / "agent", checkout / "agent", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
     shutil.copyfile(root / "pyproject.toml", checkout / "pyproject.toml")
-    # Nothing listens on port 9: a backend that took an account up tries this server and fails at once.
-    (checkout / ".env").write_text(
-        "ASTRA_MAIL_ADDRESS=checkout-account@example.invalid\n"
-        "ASTRA_MAIL_PASSWORD=checkout-password\n"
-        "ASTRA_MAIL_IMAP_HOST=127.0.0.1\n"
-        "ASTRA_MAIL_IMAP_PORT=9\n",
-        encoding="utf-8",
-    )
+    # Every server named here is port 9 on this machine, where nothing listens: a backend that took a
+    # setting up fails at once and reaches nothing.
+    settings = {
+        "ASTRA_MAIL_ADDRESS": "checkout-account@example.invalid",
+        "ASTRA_MAIL_PASSWORD": "checkout-password",
+        "ASTRA_MAIL_IMAP_HOST": "127.0.0.1",
+        "ASTRA_MAIL_IMAP_PORT": "9",
+        **CHECKOUT_SERVICES,
+        "ASTRA_EMBEDDING_BACKEND": "llamacpp",
+        "ASTRA_EMBEDDING_BASE_URL": "http://127.0.0.1:9/v1",
+        "HINDSIGHT_API_URL": "http://127.0.0.1:9",
+    }
+    (checkout / ".env").write_text("".join(f"{name}={value}\n" for name, value in settings.items()), encoding="utf-8")
     return checkout
+
+
+def _one_tool_call_from_checkout(
+    tmp_path: Path, checkout: Path, call: tuple[str, dict], env_overrides: dict | None = None,
+) -> tuple[dict, list[str]]:
+    """Run the shared fixture's backend from ``checkout`` for one turn in which the model makes ``call``.
+
+    Returns that call's result event and the names of the tools the conversation offered.
+    """
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OneToolCallHandler)
+    server.call = call
+    server.offered = []
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    proc, _, _, wait_for = _start_question_protocol_backend(
+        tmp_path, server.server_port, "configured_checkout",
+        env_overrides={"ASTRA_CHANNEL_CONFIG": str(tmp_path / "no-channels.json"), **(env_overrides or {})},
+        # The checkout's code, so the backend's installation root and .env are the checkout's.
+        bootstrap_code=(
+            f"import sys\nsys.path.insert(0, {str(checkout)!r})\n"
+            "runpy.run_module('agent.cli.backend', run_name='__main__')"
+        ),
+    )
+    assert proc.stdin is not None
+    answered: set[str] = set()
+
+    def send(payload: dict) -> None:
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps(payload) + "\n")
+        proc.stdin.flush()
+
+    def until(predicate, timeout: float = 60) -> dict:
+        def check(event: dict) -> bool:
+            # A command runs on the host only once approved; the test approves it.
+            if event.get("type") == "tool_approval_request" and event["request_id"] not in answered:
+                answered.add(event["request_id"])
+                send({"type": "tool_approval_response", "request_id": event["request_id"], "decision": "once"})
+            return predicate(event)
+        return wait_for(check, timeout=timeout)
+
+    try:
+        until(lambda event: event.get("type") == "startup_banner")
+        send({"type": "message", "text": "Go ahead."})
+        result = until(lambda event: event.get("type") == "tool_result" and event.get("name") == call[0])
+        until(lambda event: event.get("type") == "done")
+    finally:
+        _stop_protocol_backend(proc)
+        server.shutdown()
+        server.server_close()
+    # The backend ran as the checkout's installation: its runtime lease is there.
+    assert (checkout / ".astra" / "launcher").is_dir()
+    return result, server.offered
 
 
 @pytest.mark.parametrize("account", [
@@ -1171,35 +1255,7 @@ def test_protocol_fixture_keeps_the_checkouts_mail_account_from_the_backend(
 ):
     from agent.runtime.tools.mail import SETUP
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), _MailStatusHandler)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    proc, _, _, wait_for = _start_question_protocol_backend(
-        tmp_path, server.server_port, "checkout_mail_account",
-        env_overrides={
-            **account,
-            "ASTRA_CHANNEL_CONFIG": str(tmp_path / "no-channels.json"),
-            "ASTRA_CONTEXT_INDEX_EMBEDDING": "off",
-        },
-        # The checkout's code, so the backend's installation root and .env are the checkout's.
-        bootstrap_code=(
-            f"import sys\nsys.path.insert(0, {str(configured_checkout)!r})\n"
-            "runpy.run_module('agent.cli.backend', run_name='__main__')"
-        ),
-    )
-    try:
-        wait_for(lambda event: event.get("type") == "startup_banner", timeout=60)
-        assert proc.stdin is not None
-        proc.stdin.write(json.dumps({"type": "message", "text": "How is my mailbox?"}) + "\n")
-        proc.stdin.flush()
-        result = wait_for(lambda event: event.get("type") == "tool_result" and event.get("name") == "mail",
-                          timeout=60)
-        wait_for(lambda event: event.get("type") == "done")
-    finally:
-        _stop_protocol_backend(proc)
-        server.shutdown()
-        server.server_close()
-    # The backend ran as the checkout's installation: its runtime lease is there.
-    assert (configured_checkout / ".astra" / "launcher").is_dir()
+    result, _ = _one_tool_call_from_checkout(tmp_path, configured_checkout, ("mail", {"action": "status"}), account)
     if account:
         # A test still gives the backend an account on purpose; the server is the one the checkout's .env names.
         assert "Mail: " in result["error"] and SETUP not in result["error"]
@@ -1207,6 +1263,18 @@ def test_protocol_fixture_keeps_the_checkouts_mail_account_from_the_backend(
     else:
         assert SETUP in result["error"]
         assert not (configured_checkout / ".astra" / "mail").exists()
+
+
+def test_protocol_fixture_keeps_the_checkouts_other_services_off(tmp_path: Path, configured_checkout: Path):
+    names = sorted(CHECKOUT_SERVICES)
+    code = f"import json, os\nprint(json.dumps({{name: os.environ.get(name) for name in {names!r}}}))"
+    result, offered = _one_tool_call_from_checkout(tmp_path, configured_checkout, ("execute_python", {"code": code}))
+    printed = next(line for line in result["output"].splitlines() if line.startswith("{"))
+    # What the backend and the commands it runs have: each setting empty, as if never set up.
+    assert json.loads(printed) == dict.fromkeys(names, "")
+    # Hindsight is off: none of its tools reaches the model.
+    assert "execute_python" in offered
+    assert not [name for name in offered if name.startswith("hindsight_")]
 
 
 def test_backend_forwards_provider_counted_generation_stats(tmp_path: Path):
