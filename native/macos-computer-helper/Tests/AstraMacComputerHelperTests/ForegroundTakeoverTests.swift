@@ -438,7 +438,7 @@ import Testing
     let token = try fixture.begin()
 
     fixture.activity.offerPause()
-    Thread.sleep(forTimeInterval: 0.05)
+    try #require(fixture.activity.waitForDisarm(), "the pause never reached terminal cleanup")
 
     #expect(fixture.cursor.hideCount == 1)
     #expect(fixture.cursor.closeCount == 1)
@@ -457,11 +457,13 @@ import Testing
     let fixture = FragmentCoordinatorFixture(wallClockLimitMS: 10)
     _ = try fixture.begin()
 
-    Thread.sleep(forTimeInterval: 0.05)
+    // No further request reaches the coordinator: only its expiry timer can run this cleanup.
+    try #require(fixture.activity.waitForDisarm(), "the expiry never reached terminal cleanup")
 
     #expect(fixture.cursor.hideCount == 1)
     #expect(fixture.cursor.closeCount == 1)
     #expect(fixture.activity.fragmentsEnded == 1)
+    #expect(fixture.activity.disarmCount == 1)
     #expect(fixture.activation.restored.isEmpty)
 }
 
@@ -3223,6 +3225,7 @@ private final class TakeoverActivity: UserActivityMonitoring {
     var offerPauseDuringArm = false
     private let lease = UserActivitySessionLease(marker: 123)
     private let heldInputs = HeldInputRegistry()
+    private let disarmed = DispatchSemaphore(value: 0)
     private var cleanupFailuresRemaining = 0
     private let scope = HeldInputScope.cooperative(marker: 123, generation: UUID())
     private var notification: UserActivityPauseSignal?
@@ -3260,7 +3263,16 @@ private final class TakeoverActivity: UserActivityMonitoring {
     }
     func disarm(lease _: UserActivitySessionLease) throws -> Bool {
         disarmCount += 1
+        defer { disarmed.signal() }
         return terminalInterrupted || isPaused
+    }
+
+    /// Waits, with a bound, for a terminal cleanup that another thread runs: the fragment expiry
+    /// timer and a pause offer both clean up on a global queue, which a starved runner can delay far
+    /// beyond any fixed sleep. Disarm is the last step of that cleanup this fake sees, and the
+    /// semaphore orders the caller's reads after the cleanup's writes.
+    func waitForDisarm(timeout: TimeInterval = 2) -> Bool {
+        disarmed.wait(timeout: .now() + timeout) == .success
     }
 
     func retainHeldInput(cleanupFailures: Int) {
