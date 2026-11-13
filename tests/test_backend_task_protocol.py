@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -19,6 +20,20 @@ from agent.runtime.approval_inbox import ApprovalInbox
 from agent.runtime.session_store import SessionStore
 from agent.runtime.task_store import TaskStore
 
+# A backend started as a script loads its own checkout's .env (protect_backend() pins ASTRA_ENV_FILE
+# there), and the mail tool reads <root>/.env as well. Only a value in the backend's environment beats
+# the file, so a test backend run in a configured checkout would have the person's real mailbox.
+BLANK_MAIL_ACCOUNT = dict.fromkeys(
+    ("ASTRA_MAIL_ADDRESS", "ASTRA_MAIL_PASSWORD", "ASTRA_163_EMAIL", "ASTRA_163_AUTH_CODE"), "")
+
+
+def backend_environment() -> dict[str, str]:
+    """This process's environment for a backend it starts, with the mail account blank.
+
+    A test that means to give the backend a mailbox sets these afterwards, as env_overrides does.
+    """
+    return {**os.environ, **BLANK_MAIL_ACCOUNT}
+
 
 def _path_state(path: Path) -> tuple[int, int, int, int] | None:
     try:
@@ -37,7 +52,7 @@ def test_backend_exposes_tasks_command_without_blocking_protocol(tmp_path: Path)
     settings.write_text(json.dumps({"selected_model": "Qwen3.6-35B-A3B"}), encoding="utf-8")
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
-    env = os.environ.copy()
+    env = backend_environment()
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions_dir),
@@ -234,7 +249,7 @@ def test_backend_history_preserves_message_timestamps_and_tool_activity(tmp_path
     claim = task_store.claim_tool(run["id"], "context_open", {}, "read")
     task_store.finish_step(claim.step_id, output={"type": "tool_result", "id": "saved-call", "name": "context_open", "output": "saved context", "error": "", "duration_ms": 18})
     task_store.finish_run(run["id"], "completed")
-    env = os.environ.copy()
+    env = backend_environment()
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions_dir),
@@ -297,7 +312,7 @@ def test_backend_loads_saved_vision_tiles_off_at_startup(tmp_path: Path):
     )
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
-    env = os.environ.copy()
+    env = backend_environment()
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions_dir),
@@ -815,7 +830,7 @@ def test_goal_resume_launches_work_but_verifier_failure_does_not_spend_round(tmp
     settings.write_text(json.dumps({"selected_model": "Qwen3.6-35B-A3B"}), encoding="utf-8")
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
-    env = os.environ.copy()
+    env = backend_environment()
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions_dir),
@@ -942,7 +957,7 @@ def _start_question_protocol_backend(
     )
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
-    env = os.environ.copy()
+    env = backend_environment()
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions_dir),
@@ -1099,6 +1114,101 @@ def test_protocol_fixture_does_not_schedule_a_traceback_watchdog(tmp_path: Path)
         _stop_protocol_backend(proc)
 
 
+class _MailStatusHandler(_SlowOpenAIHandler):
+    """A model that asks once how the person's mailbox is, then answers."""
+
+    def do_POST(self):
+        payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))) or b"{}")
+        if not (payload.get("stream") and payload.get("tools")):
+            # Not a step of the conversation.
+            self._json({"id": "fixture", "object": "chat.completion", "model": "Qwen3.6-35B-A3B",
+                        "choices": [{"index": 0, "finish_reason": "stop",
+                                     "message": {"role": "assistant", "content": "ok"}}]})
+            return
+        if any(message.get("role") == "tool" for message in payload.get("messages") or []):
+            delta, finish = {"content": "checked"}, "stop"
+        else:
+            delta, finish = {"content": "", "tool_calls": [{
+                "index": 0, "id": "call-mail-status", "type": "function",
+                "function": {"name": "mail", "arguments": json.dumps({"action": "status"})},
+            }]}, "tool_calls"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        chunk = {"id": "fixture", "object": "chat.completion.chunk", "model": "Qwen3.6-35B-A3B",
+                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        try:
+            self.wfile.write(("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode())
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+
+@pytest.fixture
+def configured_checkout(tmp_path: Path) -> Path:
+    """A source checkout whose .env names a mailbox, as a developer's own checkout may."""
+    root = Path(__file__).resolve().parents[1]
+    checkout = tmp_path / "checkout"
+    shutil.copytree(root / "agent", checkout / "agent", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    shutil.copyfile(root / "pyproject.toml", checkout / "pyproject.toml")
+    # Nothing listens on port 9: a backend that took an account up tries this server and fails at once.
+    (checkout / ".env").write_text(
+        "ASTRA_MAIL_ADDRESS=checkout-account@example.invalid\n"
+        "ASTRA_MAIL_PASSWORD=checkout-password\n"
+        "ASTRA_MAIL_IMAP_HOST=127.0.0.1\n"
+        "ASTRA_MAIL_IMAP_PORT=9\n",
+        encoding="utf-8",
+    )
+    return checkout
+
+
+@pytest.mark.parametrize("account", [
+    {},
+    {"ASTRA_MAIL_ADDRESS": "test-account@example.invalid", "ASTRA_MAIL_PASSWORD": "test-password"},
+], ids=["checkout-account", "test-account"])
+def test_protocol_fixture_keeps_the_checkouts_mail_account_from_the_backend(
+    tmp_path: Path, configured_checkout: Path, account: dict,
+):
+    from agent.runtime.tools.mail import SETUP
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _MailStatusHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    proc, _, _, wait_for = _start_question_protocol_backend(
+        tmp_path, server.server_port, "checkout_mail_account",
+        env_overrides={
+            **account,
+            "ASTRA_CHANNEL_CONFIG": str(tmp_path / "no-channels.json"),
+            "ASTRA_CONTEXT_INDEX_EMBEDDING": "off",
+        },
+        # The checkout's code, so the backend's installation root and .env are the checkout's.
+        bootstrap_code=(
+            f"import sys\nsys.path.insert(0, {str(configured_checkout)!r})\n"
+            "runpy.run_module('agent.cli.backend', run_name='__main__')"
+        ),
+    )
+    try:
+        wait_for(lambda event: event.get("type") == "startup_banner", timeout=60)
+        assert proc.stdin is not None
+        proc.stdin.write(json.dumps({"type": "message", "text": "How is my mailbox?"}) + "\n")
+        proc.stdin.flush()
+        result = wait_for(lambda event: event.get("type") == "tool_result" and event.get("name") == "mail",
+                          timeout=60)
+        wait_for(lambda event: event.get("type") == "done")
+    finally:
+        _stop_protocol_backend(proc)
+        server.shutdown()
+        server.server_close()
+    # The backend ran as the checkout's installation: its runtime lease is there.
+    assert (configured_checkout / ".astra" / "launcher").is_dir()
+    if account:
+        # A test still gives the backend an account on purpose; the server is the one the checkout's .env names.
+        assert "Mail: " in result["error"] and SETUP not in result["error"]
+        assert (configured_checkout / ".astra" / "mail" / "127.0.0.1.sqlite3").is_file()
+    else:
+        assert SETUP in result["error"]
+        assert not (configured_checkout / ".astra" / "mail").exists()
+
+
 def test_backend_forwards_provider_counted_generation_stats(tmp_path: Path):
     class UsageHandler(_SlowOpenAIHandler):
         def do_POST(self):
@@ -1187,7 +1297,7 @@ def test_backend_resumes_same_turn_with_structured_question_tool_result(tmp_path
     sessions_dir.mkdir()
     session_key = f"backend_question_{uuid.uuid4().hex}"
     production_before = _sqlite_path_state(session_recall.DB_PATH)
-    env = os.environ.copy()
+    env = backend_environment()
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions_dir),
@@ -1555,7 +1665,7 @@ def test_backend_pauses_tool_call_for_frontend_approval_and_resumes_same_argumen
     )
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
-    env = os.environ.copy()
+    env = backend_environment()
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions_dir),
@@ -1832,7 +1942,7 @@ def test_backend_can_cancel_an_active_stream_and_persist_status(tmp_path: Path):
     goal = TaskStore(task_db).set_goal("backend_cancel_test", "finish the slow task")
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
-    env = os.environ.copy()
+    env = backend_environment()
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions_dir),

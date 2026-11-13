@@ -138,7 +138,7 @@ def test_snapshot_preview_keeps_unknown_and_binary_distinct():
 
 def test_backend_reports_session_conflict_before_initializing_a_model(tmp_path, monkeypatch):
     import json
-    import os
+    from test_backend_task_protocol import backend_environment
     path = tmp_path / 'sessions' / 'owned.json'
     lease = claim_session(path)
     monkeypatch.setenv('AGENT_SESSION', 'owned')
@@ -148,7 +148,7 @@ def test_backend_reports_session_conflict_before_initializing_a_model(tmp_path, 
     monkeypatch.setenv('ASTRA_ENV_FILE', str(tmp_path / 'missing.env'))
     monkeypatch.setenv('ASTRA_UI_SURFACE', 'gui')
     result = subprocess.run([sys.executable, '-m', 'agent.cli.backend'],
-                            env={**os.environ, 'PYTHONPATH': str(ROOT)}, input='', capture_output=True, text=True, timeout=20)
+                            env={**backend_environment(), 'PYTHONPATH': str(ROOT)}, input='', capture_output=True, text=True, timeout=20)
     events = [json.loads(line) for line in result.stdout.splitlines() if line.startswith('{')]
     assert result.returncode == 1, result.stderr
     assert any(e['type'] == 'error' and 'in use by another' in e.get('message', '') for e in events)

@@ -27,6 +27,7 @@ from pathlib import Path
 from queue import Empty, Queue
 
 from agent.runtime import turn_change_store as tcs
+from test_backend_task_protocol import backend_environment
 
 
 class _WriteThenDoneHandler(BaseHTTPRequestHandler):
@@ -149,7 +150,7 @@ def _start_backend(tmp_path: Path, server_port: int, session_name: str, workdir:
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()
     repo_root = Path(__file__).resolve().parents[1]
-    env = os.environ.copy()
+    env = backend_environment()
     env.update({
         "AGENT_SETTINGS_PATH": str(settings),
         "AGENT_SESSION_DIR": str(sessions_dir),
