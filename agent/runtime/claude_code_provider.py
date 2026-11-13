@@ -35,7 +35,7 @@ from pathlib import Path
 
 from .llm import LLMIdleTimeout, LLMResponseError, _messages_for_capabilities
 from .query_profiler import PROVIDER_PHASES_KEY
-from .prompt_budget import CACHE_READ_OBSERVER, CACHED_PREFIX_ONLY
+from .prompt_budget import CACHED_PREFIX_ONLY
 from .token_estimator import estimate_messages_tokens
 from .tool_preparation import with_tool_preparation
 
@@ -619,10 +619,6 @@ class ClaudeCodeProvider:
                 replayed = time.perf_counter()
                 await self._send(process, lines, {"type": "user", "message": {"role": "user", "content": turns[-1][1]}})
                 process.stdin.close()
-                observer = CACHE_READ_OBSERVER.get()
-                if observer is not None and marked:
-                    # The CLI has the whole request and asks the model now, reading the cache.
-                    observer()
                 # The wait before Claude could be asked at all: the CLI's start, then every earlier
                 # turn. Timed apart from the model's own, because a long conversation is slow to its
                 # first event (live 2026-11-11: 11 to 41 s at 484 messages) and the request's total

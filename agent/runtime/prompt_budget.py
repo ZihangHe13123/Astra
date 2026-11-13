@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
 from contextvars import ContextVar
 
 # Set while a request is worth sending only if the provider reads its earlier part from the cache
 # (an idle summary). A provider that would have to send it another way, such as one transcript,
 # refuses it instead.
 CACHED_PREFIX_ONLY: ContextVar[bool] = ContextVar("astra_cached_prefix_only", default=False)
-# Called by the provider as it hands over a request whose earlier part is read from the cache: the
-# cache lasts from then, whatever comes of the request (an idle summary may be interrupted).
-CACHE_READ_OBSERVER: ContextVar[Callable[[], None] | None] = ContextVar("astra_cache_read_observer", default=None)
 
 # The claude CLI is started again for every request and takes each earlier turn before it asks,
 # so a long conversation is slow to its first event whatever the cache holds (live 2026-11-11:
@@ -25,6 +21,16 @@ CLAUDE_CODE_COMPACT_TOKENS = 150_000
 # newest turns: 13 requests that cleared 28 old tool results, about 47k tokens, read 1.52M tokens
 # uncached to do it.
 CLAUDE_CODE_CACHE_SECONDS = 3600
+# How far past its compaction line a request inside a turn may go, within the model's window, before
+# the history is rewritten (AgentContext.compaction_threshold), when a compaction would take off less
+# than WORTHWHILE_GAIN of the line. Live 2026-11-13: a Claude Code turn reached 150k three times in
+# five minutes and rewrote its history each time, reading 249k tokens uncached for 10-20k it took off.
+# A compaction that takes off more is done at the line: carried to a third further, that part is
+# read again in every request of the turn (a scripted turn over 125k of old notes read 69% more).
+# Both are starting points from those two cases, to be checked against live compaction counts and
+# uncached reads, not measured optima.
+TURN_OVERSHOOT = 1 / 3
+WORTHWHILE_GAIN = 1 / 4
 
 
 def prompt_cache_seconds(provider: str) -> int | None:

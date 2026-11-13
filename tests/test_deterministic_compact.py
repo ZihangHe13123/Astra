@@ -130,7 +130,7 @@ def test_default_keep_recent_protects_tail_when_many_old_steps():
 
 
 def test_compress_if_needed_prefers_deterministic_layers():
-    """When deterministic layers bring the context under budget, the LLM
+    """When deterministic layers bring a rebuilt context under budget, the LLM
     summary is never invoked."""
     ctx = AgentContext(system_prompt="sys", max_prompt_tokens=150)
     ctx.tool_risk_provider = lambda name: "read"
@@ -153,6 +153,6 @@ def test_compress_if_needed_prefers_deterministic_layers():
 
     ctx.compressor = FakeCompressor()  # type: ignore[assignment]
     assert ctx.estimate_prompt_tokens() > ctx.max_prompt_tokens
-    asyncio.run(ctx.compress_if_needed())
+    asyncio.run(ctx.compress_if_needed(deterministic=True))
     assert calls == []
     assert ctx.estimate_prompt_tokens() <= ctx.max_prompt_tokens

@@ -26,10 +26,8 @@ Application rules (docs/execution.md, "Idle compaction"):
   that has not come back in ten minutes is given up. The provider refuses to send it another
   way than from the cache (``CACHED_PREFIX_ONLY``), so it is never a transcript.
 - The summary lives in this process only: a restart drops it, and the conversation is then read
-  in full as before. The moment the summary request is handed to the provider counts as a read
-  of the cache whether or not the summary comes back (``CACHE_READ_OBSERVER``); the next user
-  message records it (``cache_read_at``), so the clearing of old tool results counts the pause
-  from there, also after a restart.
+  in full as before. A summary that came back counts as a read of the cache when it was asked
+  for: whether the cache has gone when the person comes back is counted from there.
 """
 
 from __future__ import annotations

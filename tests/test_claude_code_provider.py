@@ -529,45 +529,41 @@ def test_a_request_for_the_cached_conversation_only_is_not_retried_another_way(f
     """An idle summary is worth sending only from the cache. A CLI that rejects the turn-by-turn
     replay or the cache breakpoint still switches this process over, but that request is refused
     rather than sent again as a transcript or without the breakpoint, both read in full."""
-    from agent.runtime.prompt_budget import CACHE_READ_OBSERVER, CACHED_PREFIX_ONLY
+    from agent.runtime.prompt_budget import CACHED_PREFIX_ONLY
 
     command, record = fake_cli
     monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", scenario)
-    reads: list[int] = []
-    prefix_only, observer = CACHED_PREFIX_ONLY.set(True), CACHE_READ_OBSERVER.set(lambda: reads.append(1))
+    prefix_only = CACHED_PREFIX_ONLY.set(True)
     try:
         with pytest.raises(ClaudeCodeError, match="Not sent"):
             collect(provider(command).chat_stream(HISTORY, [READ_FILE]))
     finally:
-        CACHE_READ_OBSERVER.reset(observer)
         CACHED_PREFIX_ONLY.reset(prefix_only)
     frames = json.loads(record.read_text())["frames"]
     if scenario == "answers_history":
         # The CLI answered while the earlier turns were still being given to it: never asked.
-        assert frames[0].get("shouldQuery") is False and not reads
+        assert frames[0].get("shouldQuery") is False
         assert ClaudeCodeProvider.replay is False
     else:
-        # Asked with the breakpoint, which was then refused: that request was handed over once.
-        assert cache_markers(frames) and reads == [1]
+        # Asked with the breakpoint, which was then refused, and not asked again without it.
+        assert cache_markers(frames)
         assert ClaudeCodeProvider.cache_marker is False
 
 
-def test_a_request_for_the_cached_conversation_reports_when_it_is_handed_over(fake_cli, monkeypatch):
-    from agent.runtime.prompt_budget import CACHE_READ_OBSERVER, CACHED_PREFIX_ONLY
+def test_a_request_for_the_cached_conversation_too_short_for_a_breakpoint_is_not_sent(fake_cli, monkeypatch):
+    from agent.runtime.prompt_budget import CACHED_PREFIX_ONLY
 
     command, _ = fake_cli
     monkeypatch.setenv("FAKE_CLAUDE_SCENARIO", "text")
-    reads: list[int] = []
-    prefix_only, observer = CACHED_PREFIX_ONLY.set(True), CACHE_READ_OBSERVER.set(lambda: reads.append(1))
+    prefix_only = CACHED_PREFIX_ONLY.set(True)
     try:
         final = collect(provider(command).chat_stream(HISTORY, [READ_FILE]))[-1]
-        # Too short for a breakpoint (no earlier user turn to put it on): refused, never handed over.
+        # No earlier user turn to put the breakpoint on: nothing of it would be read from the cache.
         with pytest.raises(ClaudeCodeError, match="Not sent"):
             collect(provider(command).chat_stream(HISTORY[:2], [READ_FILE]))
     finally:
-        CACHE_READ_OBSERVER.reset(observer)
         CACHED_PREFIX_ONLY.reset(prefix_only)
-    assert final["content"] == "Hello from Claude." and reads == [1]
+    assert final["content"] == "Hello from Claude."
 
 
 def test_conversation_keeps_calls_valid_across_providers():

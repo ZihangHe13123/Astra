@@ -45,7 +45,7 @@ def test_cleanup_must_meet_calibrated_target_before_skipping_summary(cleanup_tok
     context.compressor = summary
     events = []
     context.compaction_observer = events.append
-    asyncio.run(context.compress_if_needed())
+    asyncio.run(context.compress_if_needed(deterministic=True))
     assert summary.calls == [(900, False)]
     assert [event["status"] for event in events] == ["started", "completed"]
     final = events[-1]
@@ -64,11 +64,38 @@ def test_sufficient_cleanup_keeps_cheap_path_and_reports_same_estimate_basis():
     context.last_prompt_tokens = 1300  # Previous API usage is not the before estimate.
     events = []
     context.compaction_observer = events.append
-    asyncio.run(context.compress_if_needed())
+    asyncio.run(context.compress_if_needed(deterministic=True))
     assert not summary.calls
     assert events[-1]["method"] == "cleanup"
     assert (events[-1]["tokens_before"], events[-1]["tokens_after"]) == (1100, 800)
     assert (events[-1]["messages_before"], events[-1]["messages_after"]) == (4, 3)
+
+
+def test_a_conversation_in_use_is_compacted_by_its_summary_alone():
+    """Dropping a completed step, clearing an old result or moving a runtime snapshot rewrites an
+    earlier message for a few thousand tokens, and the provider then reads everything after it
+    again uncached (live, to 2026-11-13: 4.9M tokens read that way for 0.7M taken off). Outside a
+    rebuild, only the summary rewrites the history; when it declines, nothing is rewritten."""
+    context = context_with_old_step()
+    history = [dict(message) for message in context.messages]
+    summary = Summary(800)  # what dropping the old step alone would have come to: under the target
+    context.compressor = summary
+    events = []
+    context.compaction_observer = events.append
+    asyncio.run(context.compress_if_needed())
+    assert summary.calls == [(900, False)]
+    final = events[-1]
+    assert (final["method"], final["dropped_steps"], final["cleared_results"]) == ("summary", 0, 0)
+
+    declined = context_with_old_step()
+    summary = Summary(800)
+
+    async def unchanged(messages, max_prompt_tokens, force=False):
+        return messages
+    summary.compress = unchanged
+    declined.compressor = summary
+    asyncio.run(declined.compress_if_needed())
+    assert declined.messages == history
 
 
 def test_caller_measurement_keeps_runtime_overhead_in_after_budget():
@@ -100,7 +127,7 @@ def test_micro_cleanup_reports_savings_when_message_count_is_unchanged():
         return max(1, sum(len(m.get("content", "")) for m in context.messages) // 4)
     events = []
     context.compaction_observer = events.append
-    asyncio.run(context.compress_if_needed(measure_tokens=measure))
+    asyncio.run(context.compress_if_needed(measure_tokens=measure, deterministic=True))
     final = events[-1]
     assert final["method"] == "cleanup"
     assert final["messages_before"] == final["messages_after"]
@@ -117,7 +144,7 @@ def test_declined_summary_does_not_claim_sufficient_compaction():
     context.compressor = summary
     events = []
     context.compaction_observer = events.append
-    asyncio.run(context.compress_if_needed())
+    asyncio.run(context.compress_if_needed(deterministic=True))
     final = events[-1]
     assert final["status"] == "completed"  # Cleanup happened, but the target was not met.
     assert final["method"] == "cleanup"

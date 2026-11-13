@@ -97,8 +97,19 @@ def test_malformed_projection_does_not_revive_saved_text(state):
     assert projection.project([{"role": "user", "content": "hello"}]) == {}
 
 
-def test_budget_retires_superseded_snapshots_before_canonical_history():
+class DecliningSummary:
+    """A compressor with nothing it can summarize."""
+
+    async def compress(self, messages, max_prompt_tokens, force=False):
+        return messages
+
+
+@pytest.mark.parametrize("compressor", [None, DecliningSummary()])
+def test_budget_retires_superseded_snapshots_before_canonical_history(compressor):
+    """Superseded snapshots are kept for the cached prefix. Over the budget, with no summary that could
+    shorten the conversation, retiring them is the rewrite that loses nothing of it."""
     context = AgentContext(system_prompt="system")
+    context.compressor = compressor
     context.add_user("keep my complete task")
     context.get_prompt(runtime_context="old " * 4000)
     context.add_assistant("keep my answer")

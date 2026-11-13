@@ -1,6 +1,7 @@
 """Cheapest-first deterministic compaction: drop completed tool steps.
 
-Runs before the expensive LLM summary in the compaction pipeline. A
+Runs before the expensive LLM summary when a conversation is rebuilt to fit
+a budget (a subagent's replay); a conversation in use is only summarized. A
 completed step is an assistant tool-call message followed by its tool
 results; when every result succeeded and every tool is a read/network
 tool (no side effects), the whole step collapses into a one-line marker

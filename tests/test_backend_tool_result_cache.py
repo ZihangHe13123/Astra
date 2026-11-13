@@ -126,9 +126,6 @@ def _converse(tmp_path: Path, model, files: dict[str, str], turns: list[str], **
             # Stated in full: a checkout's own configuration must not decide any of them.
             "TOOL_MAX_INLINE_CHARS": "12000",
             "TOOL_MAX_FRESH_RESULT_CHARS": "100000",
-            "TOOL_RESULT_PROMPT_BUDGET_CHARS": "24000",
-            "TOOL_RESULT_KEEP_RECENT": "5",
-            "TOOL_RESULT_CLEAR_BATCH": "10",
             **limits,
         },
     )
@@ -191,41 +188,17 @@ def test_a_result_up_to_twice_the_inline_limit_is_never_swapped_for_a_preview(tm
         assert _repeats(earlier, later, apart_from={far} if swapped else set())
 
 
-def test_old_results_are_cleared_a_batch_at_a_time_when_a_turn_begins(tmp_path, model):
-    budget, batch = 6_000, 3
-    files = {f"page-{number}.txt": _page(f"page-{number}", 1_500) for number in range(1, 10)}
-    busy = "Read page-4.txt page-5.txt page-6.txt"
-    script = _converse(
-        tmp_path, model, files,
-        ["Read page-1.txt", "Read page-2.txt", "Read page-3.txt", busy,
-         "Read page-7.txt", "Read page-8.txt", "Read page-9.txt", "Read"],
-        TOOL_RESULT_PROMPT_BUDGET_CHARS=str(budget), TOOL_RESULT_KEEP_RECENT="1",
-        TOOL_RESULT_CLEAR_BATCH=str(batch),
-    )
+def test_old_results_are_never_cleared_so_each_request_repeats_the_one_before_it(tmp_path, model):
+    """A clear rewrites an earlier message, and the provider reads everything after it again
+    uncached: live, to 2026-11-13, 44% of what DeepSeek Flash read uncached came from clears, about
+    21k tokens for every 2k a clear took off. Twenty turns hold more than twice what used to be the
+    budget for old results, and each request is the one before it with what came since."""
+    pages = range(1, 21)
+    files = {f"page-{number}.txt": _page(f"page-{number}", 3_000) for number in pages}
+    script = _converse(tmp_path, model, files, [f"Read page-{number}.txt" for number in pages])
     requests = script.requests
 
-    cleared: list[str] = []
-    cleared_in: list[int] = []
-    for number, request in enumerate(requests):
-        results = _results(request)
-        now = [call for call, text in results.items() if text.startswith(CLEARED)]
-        # Oldest first, and a result that was cleared stays cleared.
-        assert now == list(results)[:len(now)] and now[:len(cleared)] == cleared
-        new = now[len(cleared):]
-        if number:
-            assert _repeats(requests[number - 1], request, apart_from=set(new))
-        if new:
-            # Only whole batches, and only before the model has started on the request.
-            assert len(new) % batch == 0
-            assert _asked(request)[0] == max(i for i, m in enumerate(request) if m["role"] != "system")
-            cleared_in.append(number)
-        cleared = now
-
-    # The turn that read three files carried more than the budget by its end, and still every
-    # one of its requests repeated the one before it.
-    during = [request for request in requests if _asked(request)[1] == busy]
-    assert len(during) == 4
-    assert sum(len(text) for text in _results(during[-1]).values()) > budget
-    assert not any(text.startswith(CLEARED) for request in during for text in _results(request).values())
-    # Results went over the budget one at a time, turn after turn; a later batch went the same way.
-    assert len(cleared_in) >= 2
+    assert len(requests) == 2 * len(pages)
+    assert sum(len(text) for text in _results(requests[-1]).values()) > 2 * 24_000
+    assert not any(text.startswith(CLEARED) for request in requests for text in _results(request).values())
+    assert all(_repeats(earlier, later, apart_from=set()) for earlier, later in zip(requests, requests[1:]))

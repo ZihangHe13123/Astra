@@ -59,11 +59,10 @@ from .turn_change_store import (
 from .message_time import filter_message_time_events
 from .metrics import runtime_metrics
 from . import idle_compaction
-from .micro_compact import micro_compact_tool_results, results_at_last_cold_start
 from .process_env import hidden_process_creationflags
 from .stream_progress import stream_with_progress
 from .project_instructions import ProjectInstructions, tool_paths
-from .prompt_budget import prompt_cache_seconds
+from .prompt_budget import completion_safe_limit, prompt_cache_seconds
 from .prompts import DEFAULT_SYSTEM_PROMPT, persona_generation_overrides
 from .query_profiler import PROVIDER_PHASES_KEY, QueryProfiler
 from .tool_failure import ToolFailure
@@ -2631,7 +2630,13 @@ class ReActAgent(AgentBase):
         transient_messages: list[dict] | None = None,
         current_user_index: int | None = None,
         profiler: QueryProfiler | None = None,
+        within_turn: bool = False,
     ) -> tuple[list[dict], int | None]:
+        """The request's messages and their estimate, compacting the history first past its threshold.
+
+        ``within_turn``: a request after the turn's first one, which may pass the compaction line
+        (``AgentContext.compaction_threshold``).
+        """
         # MCP servers may change their tool list between turns. Refresh the
         # schema overhead before deciding whether the context needs compaction.
         self.refresh_tool_token_cost()
@@ -2851,51 +2856,38 @@ class ReActAgent(AgentBase):
                 )
             )
 
-        def compact_prompt_copy(prompt: list[dict], *, record_metrics: bool = True) -> list[dict]:
-            def risk_for(name: str) -> str:
-                tool = self.tools.get(name)
-                return str(getattr(tool, "risk", "read")) if tool is not None else "read"
-
-            clearing: dict[str, Any] = {}
-            cached_for = prompt_cache_seconds(str(getattr(getattr(self.llm, "config", None), "provider", "") or ""))
-            if cached_for is not None:
-                # Whatever is due goes in the one request that is read whole anyway, and nothing in between.
-                clearing = {"only": results_at_last_cold_start(self.context.messages, cached_for), "clear_batch": 1}
-            prepared, stats = micro_compact_tool_results(prompt, tool_risk=risk_for, **clearing)
-            if stats.cleared_results and record_metrics:
-                runtime_metrics.increment("tool_result_microcompact_count", stats.cleared_results)
-                runtime_metrics.increment("tool_result_microcompact_saved_chars", stats.saved_chars)
-                runtime_metrics.increment("tool_result_microcompact_saved_tokens", stats.saved_tokens)
-            # Old results are cleared by what the history holds. The complete texts that only this
-            # request carries go in afterwards: counted, one of them could push a batch of old results
-            # out of this request that the next request, without it, would put back.
-            if self._fresh_tool_context:
-                for item in prepared:
-                    if item.get("role") != "tool":
-                        continue
-                    fresh = self._fresh_tool_context.get(str(item.get("tool_call_id") or ""))
-                    if fresh is not None:
-                        item["content"] = fresh
+        def request_copy(prompt: list[dict]) -> list[dict]:
+            # Old tool results go as the history holds them: clearing one would rewrite an earlier
+            # message, and the provider would read everything after it again uncached. The complete
+            # texts that only this request carries replace their previews here.
+            if not self._fresh_tool_context:
+                return prompt
+            prepared = []
+            for item in prompt:
+                fresh = (self._fresh_tool_context.get(str(item.get("tool_call_id") or ""))
+                         if item.get("role") == "tool" else None)
+                prepared.append(item if fresh is None else {**item, "content": fresh})
             return prepared
 
         with profile.phase("prompt_copy_and_overlays"):
-            prompt = compact_prompt_copy(rebuild_prompt())
+            prompt = request_copy(rebuild_prompt())
         prompt_estimate = None
         if estimate_tokens:
             with profile.phase("token_estimate"):
                 prompt_estimate = estimate_tokens(prompt)
             self.context.last_prompt_tokens = prompt_estimate
-            if prompt_estimate >= self.context.max_prompt_tokens:
+            threshold = self._compaction_threshold(within_turn, prompt_estimate)
+            if prompt_estimate >= threshold:
                 def measure_compaction_tokens() -> int:
-                    return estimate_tokens(compact_prompt_copy(rebuild_prompt(), record_metrics=False))
+                    return estimate_tokens(request_copy(rebuild_prompt()))
 
                 with profile.phase("context_compaction"):
-                    await self.context.compress_if_needed(measure_tokens=measure_compaction_tokens)
+                    await self.context.compress_if_needed(measure_tokens=measure_compaction_tokens, threshold=threshold)
                 with profile.phase("prompt_rebuild_after_compaction"):
-                    prompt = compact_prompt_copy(rebuild_prompt())
+                    prompt = request_copy(rebuild_prompt())
                     prompt_estimate = estimate_tokens(prompt)
                 self.context.last_prompt_tokens = prompt_estimate
-                if prompt_estimate >= self.context.max_prompt_tokens:
+                if prompt_estimate >= threshold:
                     # Mirror the post-tool path: the opportunistic pass can be
                     # a no-op (e.g. a failed summary preserves history), so
                     # give compaction one forced retry before the request is
@@ -2903,10 +2895,20 @@ class ReActAgent(AgentBase):
                     with profile.phase("forced_context_compaction"):
                         await self.context.compress_if_needed(force=True, measure_tokens=measure_compaction_tokens)
                     with profile.phase("prompt_rebuild_after_forced_compaction"):
-                        prompt = compact_prompt_copy(rebuild_prompt())
+                        prompt = request_copy(rebuild_prompt())
                         prompt_estimate = estimate_tokens(prompt)
                     self.context.last_prompt_tokens = prompt_estimate
         return prompt, prompt_estimate
+
+    def _compaction_threshold(self, within_turn: bool, size: int | None = None) -> int:
+        """The size at which a request of ``size`` compacts the history first (AgentContext.compaction_threshold)."""
+        config = getattr(self.llm, "config", None)
+        window = getattr(config, "context_limit", None)
+        window_limit = (completion_safe_limit(window, getattr(config, "max_tokens", 0) or 0)
+                        if isinstance(window, int) and not isinstance(window, bool) and window > 0 else None)
+        return self.context.compaction_threshold(
+            within_turn=within_turn, window_limit=window_limit, size=size,
+            cache_seconds=prompt_cache_seconds(str(getattr(config, "provider", "") or "")))
 
     @staticmethod
     def _repair_json(text: str) -> str:
@@ -4326,6 +4328,7 @@ class ReActAgent(AgentBase):
                 transient_messages=transient_messages,
                 current_user_index=user_index,
                 profiler=profiler,
+                within_turn=step > 1,
             )
             _t_prep_done = _time.perf_counter() - _t_prep_start
             if current_prefill is not None:
@@ -5002,12 +5005,16 @@ class ReActAgent(AgentBase):
                         ))
                     return self.context.estimate_compaction_tokens()
 
-                await self.context.compress_if_needed(measure_tokens=measure_post_tool_tokens)
+                # The next request is inside this turn: it may pass the line (compaction_threshold).
+                # Between the line and that, whether a compaction is worth it is weighed before the
+                # request itself is sent.
+                threshold = self._compaction_threshold(within_turn=True)
+                await self.context.compress_if_needed(measure_tokens=measure_post_tool_tokens, threshold=threshold)
                 if estimate_tokens:
                     self.context.last_prompt_tokens = estimate_tokens(self.context.get_prompt(
                         content_overrides=self._vision_prompt_content_overrides(),
                     ))
-                if self.context.last_prompt_tokens >= self.context.max_prompt_tokens:
+                if self.context.last_prompt_tokens >= threshold:
                     # The provider-aware estimate can still exceed the budget
                     # after the normal context check (for example because tool
                     # schemas or multimodal overhead differ). Give compaction
@@ -5017,11 +5024,11 @@ class ReActAgent(AgentBase):
                         self.context.last_prompt_tokens = estimate_tokens(self.context.get_prompt(
                             content_overrides=self._vision_prompt_content_overrides(),
                         ))
-                if self.context.last_prompt_tokens >= self.context.max_prompt_tokens:
+                if self.context.last_prompt_tokens >= threshold:
                     stop_reason = (
                         "工具调用后，本地提示词估算在强制压缩后仍超出预算"
                         f"（estimated={self.context.last_prompt_tokens:,}, "
-                        f"budget={self.context.max_prompt_tokens:,}）"
+                        f"budget={threshold:,}）"
                     )
                     hard_prompt_stop = True
                     yield with_request({
@@ -5029,7 +5036,7 @@ class ReActAgent(AgentBase):
                         "message": (
                             "Stopping: local prompt token budget still exceeded after compaction "
                             f"(estimated={self.context.last_prompt_tokens:,}, "
-                            f"budget={self.context.max_prompt_tokens:,})."
+                            f"budget={threshold:,})."
                         ),
                         "recoverable": True,
                     })
@@ -5177,6 +5184,7 @@ class ReActAgent(AgentBase):
                         getattr(self.llm, "estimate_tokens", None),
                         trace_ctx=trace_ctx,
                         current_user_index=user_index,
+                        within_turn=True,
                     )
                     final_prompt.append({
                         "role": "user",

@@ -294,6 +294,27 @@ class ContextCompressor:
         return self._assemble(source_messages, compress_start, compress_end, split_turn_start, summary,
                               max_prompt_tokens=max_prompt_tokens, trigger=trigger)
 
+    def planned_gain(self, messages: list[dict], max_prompt_tokens: int) -> int:
+        """About how many tokens a compaction of ``messages`` would take off, from its plan alone.
+
+        What the summary would stand in for (the older turns, and the earlier work of a current
+        turn too long to keep whole, whose request stays), less what the summaries may take; 0 when
+        there is nothing to summarize. No summary is written.
+        """
+        plan = self._plan(self._without_recaps(messages), max_prompt_tokens)
+        if plan is None:
+            return 0
+        replaced = [*plan.turns, *plan.turn_prefix[1:]]
+        if not replaced:
+            return 0
+        estimate = getattr(self.llm, "estimate_tokens", None)
+        try:
+            size = int(estimate(replaced)) if estimate is not None else sum(map(estimate_value_tokens, replaced))
+        except Exception:
+            size = sum(map(estimate_value_tokens, replaced))
+        summaries = plan.summary_budget + (plan.summary_budget // 2 if plan.turn_prefix else 0)
+        return max(0, size - summaries)
+
     async def prepare(self, messages: list[dict], max_prompt_tokens: int, replay: dict) -> PreparedCompaction | None:
         """Write now the summary a compaction of ``messages`` would write, without applying it.
 

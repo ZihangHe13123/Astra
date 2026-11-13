@@ -8,7 +8,6 @@ each request gave it. Time passes through ``idle_compaction.clock``, the clock t
 """
 
 import asyncio
-import contextlib
 import json
 import logging
 import os
@@ -477,13 +476,9 @@ def test_a_turn_that_starts_while_the_summary_is_written_does_not_wait_for_it(se
 
 
 def test_two_returns_within_the_cache_kept_by_summary_requests_both_go_on_from_the_cache(setup, monkeypatch):
-    """Summaries at 55 and 125 minutes, returns at 70 and 140: neither return starts cold, and the
-    second request repeats the first one's earlier part. Old tool results that would be cleared at
-    a cold start stay as they were, also as the stored conversation is read after a restart."""
+    """Summaries at 55 and 125 minutes, returns at 70 and 140: each summary request read the cache, so
+    neither return starts cold, neither summary is used, and the second request repeats the first."""
     from agent.runtime import context as context_module
-    from agent.runtime.context import AgentContext
-    from agent.runtime.micro_compact import results_at_last_cold_start
-    from test_micro_compact import _turn
 
     real_time = time.time
 
@@ -496,40 +491,26 @@ def test_two_returns_within_the_cache_kept_by_summary_requests_both_go_on_from_t
             return real_time() + setup.ahead
 
     monkeypatch.setattr(context_module, "time", Shifted())
-    monkeypatch.setenv("TOOL_RESULT_PROMPT_BUDGET_CHARS", "6000")
-    monkeypatch.setenv("TOOL_RESULT_KEEP_RECENT", "1")
-    history = _turn(real_time() - 30, *[f"old-{i}" for i in range(14)])
-    for message in history:
-        for call in message.get("tool_calls", []):
-            call["type"] = "function"
-            call["function"] = {"name": call.pop("name"), "arguments": call.pop("arguments")}
-    setup.agent.context.messages.extend(history)
 
     async def scenario():
         await setup.notes(6)
+        original = setup.requests()[-1]
         compactor = setup.compactor()
         setup.ahead = 55 * 60
         await idle(compactor)
         setup.ahead = 70 * 60
         await setup.turn("FIRST-WARM-RETURN")
         first = setup.requests()[-1]
-        assert "old-0" in text_of(first) and "Old tool result content cleared" not in text_of(first)
+        assert first["turns"][:len(original["turns"])] == original["turns"]
         setup.ahead = 125 * 60
         await idle(compactor)
         assert CHECKPOINT in text_of(setup.requests()[-1])
         setup.ahead = 140 * 60
         await setup.turn("SECOND-WARM-RETURN")
         second = setup.requests()[-1]
-        assert "Old tool result content cleared" not in text_of(second)
         assert second["turns"][:len(first["turns"])] == first["turns"]
+        assert "CHECKPOINT-4417" not in text_of(second)
     asyncio.run(scenario())
-
-    live = setup.agent.context
-    stored = AgentContext(system_prompt="You are Astra.")
-    stored.set_session(live.session_path)
-    assert stored.load(readonly=True)
-    assert results_at_last_cold_start(stored.messages, HOUR) == results_at_last_cold_start(live.messages, HOUR)
-    assert results_at_last_cold_start(stored.messages, HOUR) == frozenset()
 
 
 def test_a_provider_that_would_send_a_transcript_is_not_asked_for_the_summary(setup, monkeypatch, caplog):
@@ -543,65 +524,4 @@ def test_a_provider_that_would_send_a_transcript_is_not_asked_for_the_summary(se
         await idle(setup.compactor())
         assert setup.requests()[before:] == []
         assert len(warnings_of(caplog, "agent.runtime.context_compressor")) == 1
-    asyncio.run(scenario())
-
-
-def test_a_summary_interrupted_after_its_request_read_the_cache_still_counts_as_that_read(setup, monkeypatch):
-    """The summary request goes out at 59 minutes and reads the cache; the person comes back at
-    60:15, interrupting it. The cache lasts from 59 minutes, so that return is not a cold start
-    and old tool results are not cleared there: the request goes on from the cached prefix."""
-    from agent.runtime import context as context_module
-    from test_micro_compact import _turn
-
-    real_time = time.time
-
-    class Shifted:
-        def __getattr__(self, name):
-            return getattr(time, name)
-
-        def time(self):
-            return real_time() + setup.ahead
-
-    monkeypatch.setattr(context_module, "time", Shifted())
-    monkeypatch.setenv("TOOL_RESULT_PROMPT_BUDGET_CHARS", "6000")
-    monkeypatch.setenv("TOOL_RESULT_KEEP_RECENT", "1")
-    history = _turn(real_time() - 30, *[f"old-{i}" for i in range(14)])
-    for message in history:
-        for call in message.get("tool_calls", []):
-            call["type"] = "function"
-            call["function"] = {"name": call.pop("name"), "arguments": call.pop("arguments")}
-    setup.agent.context.messages.extend(history)
-
-    async def scenario():
-        await setup.notes(6)
-        original = setup.requests()[-1]
-        assert "old-0" in text_of(original) and "Old tool result content cleared" not in text_of(original)
-        hold = setup.log.with_name(setup.log.name + ".hold")
-        hold.touch()
-        compactor = setup.compactor()
-        setup.ahead = 59 * 60  # the last minute in which the summary is still asked for
-        compactor.tick(busy=False)
-        summary = compactor._task
-        assert summary is not None
-        foreground = None
-        try:
-            async with asyncio.timeout(10):
-                while CHECKPOINT not in setup.log.read_text(encoding="utf-8"):
-                    await asyncio.sleep(0.02)
-            setup.ahead = 60 * 60 + 15
-            foreground = asyncio.create_task(setup.turn("RETURN-DURING-SUMMARY"))
-            async with asyncio.timeout(10):
-                while not foreground.done():
-                    compactor.tick(busy=True)
-                    await asyncio.sleep(0.05)
-        finally:
-            hold.unlink(missing_ok=True)
-            with contextlib.suppress(asyncio.CancelledError):
-                await summary
-            if foreground is not None:
-                await foreground
-        assert summary.cancelled()
-        request = setup.requests()[-1]
-        assert "Old tool result content cleared" not in text_of(request)
-        assert request["turns"][:len(original["turns"])] == original["turns"]
     asyncio.run(scenario())

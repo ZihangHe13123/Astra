@@ -162,14 +162,27 @@ def said(turn: list) -> str:
     return "\n".join(block.get("text", "") for block in turn[1])
 
 
-def compaction(seen: list[dict]) -> dict:
-    """The one compaction the backend reported, as it ended."""
+def compaction(seen: list[dict], *, past: int = 150_000) -> dict:
+    """The one compaction the backend reported, as it ended: past that size, by a summary."""
     events = [event for event in seen if event.get("type") == "context_compaction"]
-    assert [event["status"] for event in events] == ["started", "completed"], "one compaction, past 150k"
+    assert [event["status"] for event in events] == ["started", "completed"], f"one compaction, past {past:,}"
     completed = events[1]
     assert completed["method"] == "summary"
-    assert completed["tokens_before"] >= 150_000 > completed["target_tokens"] > completed["tokens_after"]
+    assert completed["tokens_before"] >= past and 150_000 > completed["target_tokens"] > completed["tokens_after"]
     return completed
+
+
+def repeats(earlier: dict, later: dict) -> bool:
+    """Whether the later request begins with everything the earlier one gave the CLI, word for word."""
+    return later["turns"][:len(earlier["turns"])] == earlier["turns"]
+
+
+def files_to_read(tmp_path, count: int, lines: int = 230) -> None:
+    """Files of about 3,200 tokens each (at 230 lines), for a turn that reads them one after another."""
+    for index in range(count):
+        (workspace(tmp_path) / f"file-{index}.txt").write_text(
+            "".join(f"{index:02d}-{line:04d} lorem ipsum dolor sit amet consectetur\n" for line in range(lines)),
+            encoding="utf-8")
 
 
 def test_a_claude_code_model_is_compacted_at_150k_unless_it_has_a_limit_of_its_own(tmp_path):
@@ -232,8 +245,10 @@ def test_a_conversation_past_150k_is_summarized_through_the_cli_and_goes_on(tmp_
 
 def test_a_tool_loop_that_passes_150k_is_summarized_between_two_calls_and_finishes(tmp_path):
     """A turn of many tool calls is where a desktop conversation grows fastest, so the limit is
-    reached between two calls: the earlier turns and the start of this one are summarized in two
-    requests, and the calls kept with their results are still pairs the CLI accepts."""
+    reached between two calls. The earlier turns hold 125k tokens a summary takes off, well over a
+    quarter of the line, so the history is rewritten there rather than carried a third further: the
+    earlier turns and the start of this one are summarized in two requests, and the calls kept with
+    their results are still pairs the CLI accepts."""
     files = 18
     for index in range(files):
         (workspace(tmp_path) / f"file-{index}.txt").write_text(
@@ -275,3 +290,84 @@ def test_a_tool_loop_that_passes_150k_is_summarized_between_two_calls_and_finish
     for (_, calls), (_, answers) in zip(kept[::2], kept[1::2]):
         assert [block["id"] for block in calls] == [block["tool_use_id"] for block in answers if block["type"] == "tool_result"]
     assert kept[-1][1][0]["tool_use_id"] == f"toolu_{plain[0] - 1}", "the call made just before the summaries"
+
+
+# The person's own request of about 130k tokens opens the turn: it is kept word for word, so there is
+# little a summary could take off when the turn reaches 150k (an hour-old conversation's fixed part,
+# its system prompt and tool definitions, behaves the same way).
+BIG_REQUEST = "Read the files, one after another. " + note("CONTEXT", 130_000)
+
+
+def test_a_tool_loop_with_little_to_summarize_goes_on_past_150k_and_is_compacted_once(tmp_path):
+    """Live 2026-11-13: a Claude Code turn whose history had been summarized already reached 150k three
+    times in five minutes and rewrote it each time, reading 249k tokens uncached for 10-20k it took
+    off. With little to take off, the turn goes on past the line, and is compacted once, when the
+    calls it has made are worth summarizing or a third further, between two calls."""
+    files_to_read(tmp_path, 30)
+    proc, seen, turn, requests = recording(tmp_path)
+    try:
+        turn(note("NOTE-ONE", 2_000))
+        before = len(requests())
+        turn(BIG_REQUEST)
+    finally:
+        _stop_protocol_backend(proc)
+
+    events = [event for event in seen if event.get("type") == "context_compaction"]
+    assert [event["status"] for event in events] == ["started", "completed"], "one compaction"
+    done = events[1]
+    # Well past the line; the request it keeps word for word leaves it over the line afterwards too.
+    assert done["method"] == "summary" and done["tokens_before"] >= 180_000 > done["tokens_after"]
+    results = [event for event in seen if event.get("type") == "tool_result"]
+    assert [event["call_id"] for event in results] == [f"toolu_{index}" for index in range(30)]
+    loop = requests()[before:]
+    plain = [index for index, request in enumerate(loop) if not request["tools"]]
+    assert plain and plain == list(range(plain[0], plain[0] + len(plain))), "summaries together, between two calls"
+    # The turn crossed 150k after about six files; up to the summaries every request repeated the
+    # one before it.
+    assert plain[0] > 14, "well past the line"
+    assert all(repeats(earlier, later) for earlier, later in zip(loop[:plain[0] - 1], loop[1:plain[0]]))
+    after = loop[plain[-1] + 1:]
+    assert all(repeats(earlier, later) for earlier, later in zip(after, after[1:]))
+
+
+def test_a_tool_loop_that_ends_past_150k_with_little_to_summarize_is_compacted_when_the_next_turn_begins(tmp_path):
+    """Past the line with little to take off, the turn ends as it went: every request repeats the one
+    before it. The next turn's first request compacts at the line, once, before it is sent."""
+    files_to_read(tmp_path, 12)
+    proc, seen, turn, requests = recording(tmp_path)
+    try:
+        turn(note("NOTE-ONE", 2_000))
+        before = len(requests())
+        turn(BIG_REQUEST)
+        loop = requests()[before:]
+        assert not [event for event in seen if event.get("type") == "context_compaction"]
+        turn("and now?")
+    finally:
+        _stop_protocol_backend(proc)
+
+    assert len(loop) == 13 and all(request["tools"] for request in loop)
+    assert all(repeats(earlier, later) for earlier, later in zip(loop, loop[1:]))
+    compaction(seen)
+    rest = requests()[before + len(loop):]
+    assert not rest[0]["tools"] and rest[-1]["tools"] and "and now?" in said(rest[-1]["turns"][-1])
+    assert "CHECKPOINT-7391" in said(rest[-1]["turns"][0])
+
+
+def test_a_long_tool_loop_whose_own_calls_are_worth_summarizing_is_compacted_at_150k(tmp_path):
+    """A turn that started small and read until it reached the line has its own earlier calls to
+    take off: compacted there, between two calls, not carried a third further."""
+    files_to_read(tmp_path, 30, lines=460)
+    proc, seen, turn, requests = recording(tmp_path)
+    try:
+        turn(note("NOTE-ONE", 2_000))
+        before = len(requests())
+        turn("Read the files, one after another.")
+    finally:
+        _stop_protocol_backend(proc)
+
+    first = [event for event in seen if event.get("type") == "context_compaction"][:2]
+    assert [event["status"] for event in first] == ["started", "completed"]
+    assert first[1]["method"] == "summary" and 150_000 <= first[1]["tokens_before"] < 160_000
+    loop = requests()[before:]
+    plain = [index for index, request in enumerate(loop) if not request["tools"]]
+    assert plain and "TURN PREFIX:" in said(loop[plain[-1]]["turns"][0])

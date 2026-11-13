@@ -245,13 +245,9 @@ def test_next_llm_prompt_marks_tool_result_as_completed_and_actionable(tmp_path:
     assert "bounded preview" in durable_tool_message["content"]
 
 
-def test_a_result_shown_whole_for_one_request_clears_no_older_result_for_that_request(
+def test_a_result_shown_whole_for_one_request_leaves_every_older_result_as_it_was(
     tmp_path: Path, monkeypatch,
 ):
-    budget = 9_000
-    monkeypatch.setenv("TOOL_RESULT_PROMPT_BUDGET_CHARS", str(budget))
-    monkeypatch.setenv("TOOL_RESULT_KEEP_RECENT", "1")
-    monkeypatch.setenv("TOOL_RESULT_CLEAR_BATCH", "3")
     monkeypatch.setenv("TOOL_MAX_FRESH_RESULT_CHARS", "100000")
     ended: list[tuple[str, str]] = []
     notice = "\n".join([
@@ -313,18 +309,11 @@ def test_a_result_shown_whole_for_one_request_clears_no_older_result_for_that_re
     whole = next(i for i, request in enumerate(requests) if "REPORT-MIDDLE" in "".join(results(request).values()))
     with_report, after = requests[whole], requests[whole + 1]
     read = next(call for call, text in results(with_report).items() if "REPORT-MIDDLE" in text)
-    # The run's notice came in right behind the report, so both requests count the report among
-    # what was read before the latest message. As first read, those results are over the budget
-    # with the report whole and within it with the preview the history keeps.
+    # The run's notice came in right behind the report, so the report is among what was read before
+    # the latest message; the next request has the preview the history keeps.
     position = next(i for i, m in enumerate(with_report) if m.get("tool_call_id") == read)
     assert "BACKGROUND RUN ENDED" in str(with_report[position + 1]["content"])
     assert "REPORT-MIDDLE" not in results(after)[read] and "bounded preview" in results(after)[read]
-    first_read: dict[str, str] = {}
-    for request in requests:
-        for call, text in results(request).items():
-            first_read.setdefault(call, text)
-    earlier_pages = sum(len(first_read[call]) for call in results(with_report) if call != read)
-    assert earlier_pages + len(results(after)[read]) <= budget < earlier_pages + len(first_read[read])
 
     # The older results read the same in the request that carries the report whole as before and after.
     for earlier, later in zip(requests, requests[1:]):

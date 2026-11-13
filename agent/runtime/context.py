@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, TYPE_CHECKING, cast
 
-from .prompt_budget import CACHE_READ_OBSERVER, CACHED_PREFIX_ONLY, completion_safe_limit
+from .prompt_budget import CACHED_PREFIX_ONLY, TURN_OVERSHOOT, WORTHWHILE_GAIN, completion_safe_limit
 from .session_store import SessionStore
 from .async_io import durable_io
 from .token_estimator import estimate_value_tokens
@@ -744,15 +744,6 @@ class AgentContext:
     def _append_message(self, msg: dict):
         if msg.get("role") in {"user", "assistant"}:
             msg["timestamp"] = _valid_message_timestamp(msg.get("timestamp")) or time.time()
-        if msg.get("role") == "user" and self.cache_touched_at is not None:
-            # An idle summary request read the cache after the message before this one, so the pause
-            # before this one ends there for the cache (micro_compact.results_at_last_cold_start).
-            # Kept with the message: the next requests decide alike, also after a restart.
-            previous = next((stamp for stamp in map(_valid_message_timestamp,
-                                                    (m.get("timestamp") for m in reversed(self.messages))) if stamp),
-                            None)
-            if previous is not None and previous < self.cache_touched_at:
-                msg["cache_read_at"] = self.cache_touched_at
         self.messages.append(msg)
         self._message_token_costs.append(self._message_cost(msg))
 
@@ -769,6 +760,7 @@ class AgentContext:
         model_message.pop("provenance", None)
         model_message.pop("display_command", None)
         model_message.pop("_tool_disclosures", None)
+        # Sessions from 2026-11-13 recorded when an idle summary request had read the cache.
         model_message.pop("cache_read_at", None)
         if content_override is not _NO_OVERRIDE:
             model_message["content"] = copy.deepcopy(content_override)
@@ -980,16 +972,8 @@ class AgentContext:
                    if isinstance(window, int) and window > 0 else int(self.max_prompt_tokens)),
             sent_count=len(self._sent_request["messages"]), sent_tokens=self._sent_request.get("tokens"))
         count, last = len(self.messages), copy.deepcopy(self.messages[-1])
-        asked = time.time()
-
-        def cache_read() -> None:
-            # The request has gone to the model and read the cache, which lasts from now: kept
-            # whatever comes of the summary, so the next message is judged by it.
-            if (self._session_path, self.branch_id) == mark[:2]:
-                self.cache_touched_at = now + max(0.0, time.time() - asked)
-
         # Read from the cache or not at all: the provider must not send it another way either.
-        prefix_only, observer = CACHED_PREFIX_ONLY.set(True), CACHE_READ_OBSERVER.set(cache_read)
+        prefix_only = CACHED_PREFIX_ONLY.set(True)
         try:
             prepared = await self.compressor.prepare(self._compaction_messages(), self.max_prompt_tokens, replay)
         except asyncio.CancelledError:
@@ -997,12 +981,11 @@ class AgentContext:
             self._idle_attempt = None
             raise
         finally:
-            CACHE_READ_OBSERVER.reset(observer)
             CACHED_PREFIX_ONLY.reset(prefix_only)
         if prepared is None or self._history_mark() != mark:
             return False
         self._idle_summary = {"prepared": prepared, "session": mark[:2], "count": count, "last": last}
-        # A provider that does not say when it sent the request did send it.
+        # The summary request read the cache when it was asked for: it lasts from then.
         self.cache_touched_at = max(self.cache_touched_at or now, now)
         return True
 
@@ -1086,16 +1069,64 @@ class AgentContext:
             except Exception:
                 logger.warning("compaction observer failed")
 
+    def compaction_threshold(self, *, within_turn: bool, cache_seconds: float | None,
+                             window_limit: int | None, size: int | None = None) -> int:
+        """The prompt size at which the next request, of ``size`` tokens, compacts the history first.
+
+        A compaction rewrites the history, and the provider reads the request again at the uncached
+        price from the first message it changed; what it takes off is then not read again, at the
+        cached price, in each request after it. The first request of a turn compacts at the line
+        (``max_prompt_tokens``), and so does one inside a turn whose compaction would take off a
+        good part of it (``WORTHWHILE_GAIN`` of the line, by the compressor's plan). One that would
+        take off little waits until the conversation is a third past the line (``TURN_OVERSHOOT``),
+        within ``window_limit`` (what the model's window takes with room for its answer): a long
+        turn whose history was summarized already then rewrites it once more at most, instead of
+        each time it reaches the line, and the next turn compacts at the line. A provider that keeps
+        a request for ``cache_seconds`` has nothing cached any more after that pause: such a request
+        compacts at the line, which then costs nothing more. Without a known window there is no
+        overshoot.
+        """
+        line = max(1, int(self.max_prompt_tokens))
+        if not within_turn or not window_limit or window_limit <= line:
+            return line
+        read = self._last_cache_read()
+        if cache_seconds is not None and read is not None and time.time() - read >= cache_seconds:
+            return line
+        ceiling = min(int(window_limit), line + int(line * TURN_OVERSHOOT))
+        if size is not None and line <= size < ceiling and self.compaction_gain() >= int(line * WORTHWHILE_GAIN):
+            return line
+        return ceiling
+
+    def compaction_gain(self) -> int:
+        """About how many tokens a compaction now would take off the history (0 when unknown)."""
+        planned = getattr(self.compressor, "planned_gain", None)
+        if planned is None:
+            return 0
+        try:
+            return int(planned(self._compaction_messages(), max(1, int(self.max_prompt_tokens * 0.9))))
+        except Exception:
+            logger.warning("could not plan a compaction", exc_info=True)
+            return 0
+
     async def compress_if_needed(
         self, force: bool = False, *, preserve_on_failure: bool = False,
-        measure_tokens: Callable[[], int] | None = None,
+        measure_tokens: Callable[[], int] | None = None, threshold: int | None = None,
+        deterministic: bool = False,
     ):
-        """Compact history when enabled and the token budget requires it."""
+        """Compact history when enabled and the token budget requires it.
+
+        ``threshold`` is the size that triggers it (``compaction_threshold``; the line by default).
+        A conversation in use is compacted by a summary only: anything else that rewrites earlier
+        messages costs a provider's cached prefix more than it saves. ``deterministic`` (a
+        conversation being rebuilt to fit a budget, with nothing cached to keep) first retires
+        superseded snapshots, drops completed read steps and clears old read results.
+        """
         if not self.compaction_enabled:
             return
         measure = measure_tokens or self.estimate_compaction_tokens
         tokens_before = measure()
-        if not force and max(tokens_before, self.last_prompt_tokens) < self.max_prompt_tokens:
+        trigger = self.max_prompt_tokens if threshold is None else threshold
+        if not force and max(tokens_before, self.last_prompt_tokens) < trigger:
             return
         before = len(self.messages)
         # Leave room for the next tool results instead of stopping just below
@@ -1110,7 +1141,7 @@ class AgentContext:
         try:
             changed = await self._compress_history(
                 force, preserve_on_failure=preserve_on_failure,
-                measure_tokens=measure, target_tokens=target, report=report,
+                measure_tokens=measure, target_tokens=target, report=report, deterministic=deterministic,
             )
             outcome = "completed" if changed else "failed"
         except asyncio.CancelledError:
@@ -1127,52 +1158,64 @@ class AgentContext:
             self._last_compaction_report = dict(report)
             self.report_compaction(outcome, before, details=report)
 
+    def _retire_superseded_snapshots(self, report: dict) -> bool:
+        """When no summary shortened the history: keep only the latest runtime and memory snapshots.
+
+        Superseded snapshots stay in a conversation only so that its cached prefix stays the same.
+        Retiring them rewrites the request from the first one, so it is the last resort, for a
+        prompt over its threshold that no summary could shorten; it loses nothing of the
+        conversation. After a summary the snapshots rebase on their own (``project``).
+        """
+        retired = self.runtime_projection.compact(self.messages)
+        retired = self.memory_projection.compact(self.messages) or retired
+        if retired:
+            report["method"] = "cleanup"
+        return retired
+
     async def _compress_history(
         self, force: bool, *, preserve_on_failure: bool,
-        measure_tokens: Callable[[], int], target_tokens: int, report: dict,
+        measure_tokens: Callable[[], int], target_tokens: int, report: dict, deterministic: bool = False,
     ):
 
-        # Taken before the cleanups below rewrite older messages: the summary may then
+        # Taken before anything below rewrites older messages: the summary may then
         # still replay what was last sent, cached, with everything those cleanups drop.
         replay = self.summary_replay()
-        # Superseded runtime snapshots are useful only for prefix reuse. Retire
-        # them under budget pressure before sacrificing canonical conversation.
-        changed = self.runtime_projection.compact(self.messages)
-        changed = self.memory_projection.compact(self.messages) or changed
-        if changed:
-            report["method"] = "cleanup"
+        changed = False
+        if deterministic:
+            # A conversation rebuilt to fit a budget has no cached prefix to keep: cheapest first,
+            # retire superseded runtime snapshots, drop completed read/network tool steps
+            # (side-effecting and current-turn steps stay), then clear old read tool results in
+            # place. When those sufficed, skip the summary. In a conversation in use each of them
+            # rewrites an earlier message for a few thousand tokens, and the provider then reads
+            # everything after it again uncached, so there only the summary below rewrites it.
+            changed = self.runtime_projection.compact(self.messages)
+            changed = self.memory_projection.compact(self.messages) or changed
+            if changed:
+                report["method"] = "cleanup"
+                if not force and measure_tokens() <= target_tokens:
+                    return True
+            from .deterministic_compact import drop_completed_steps
+            from .micro_compact import micro_compact_tool_results
+
+            risk = self.tool_risk_provider or (lambda name: "read")
+            is_request_local = self.tool_request_local_provider or (lambda name: False)
+            self.messages, drop_stats = drop_completed_steps(
+                self.messages,
+                tool_risk=risk,
+                tool_request_local=is_request_local,
+                keep_recent=self.compact_keep_recent,
+            )
+            self.messages, micro_stats = micro_compact_tool_results(self.messages, tool_risk=risk, clear_batch=1)
+            report.update(dropped_steps=drop_stats.dropped_steps, cleared_results=micro_stats.cleared_results)
+            history_changed = bool(drop_stats.dropped_steps or micro_stats.cleared_results)
+            changed = changed or history_changed
+            if history_changed:
+                self._message_token_costs.clear()
+                self.last_prompt_tokens = 0
+                self._saved_message_count = 0
+                report["method"] = "cleanup"
             if not force and measure_tokens() <= target_tokens:
-                return True
-
-        # Cheapest-first: deterministic layers before the expensive LLM summary.
-        # Drop completed read/network tool steps (side-effecting and current-turn
-        # steps stay), then clear old read tool results in place. When those
-        # sufficed, skip the summary entirely. The history is rewritten here
-        # either way, so results are cleared as they fall due and not held
-        # back for a whole batch as they are in a prompt copy.
-        from .deterministic_compact import drop_completed_steps
-        from .micro_compact import micro_compact_tool_results
-
-        risk = self.tool_risk_provider or (lambda name: "read")
-        is_request_local = self.tool_request_local_provider or (lambda name: False)
-        self.messages, drop_stats = drop_completed_steps(
-            self.messages,
-            tool_risk=risk,
-            tool_request_local=is_request_local,
-            keep_recent=self.compact_keep_recent,
-        )
-        self.messages, micro_stats = micro_compact_tool_results(self.messages, tool_risk=risk, clear_batch=1)
-        report.update(dropped_steps=drop_stats.dropped_steps, cleared_results=micro_stats.cleared_results)
-        history_changed = bool(drop_stats.dropped_steps or micro_stats.cleared_results)
-        changed = changed or history_changed
-        if history_changed:
-            self._message_token_costs.clear()
-            self.last_prompt_tokens = 0
-            self._saved_message_count = 0
-            report["method"] = "cleanup"
-        remaining = measure_tokens()
-        if not force and remaining <= target_tokens:
-            return changed
+                return changed
 
         if self.compressor is not None:
             prompt = self._compaction_messages()
@@ -1186,7 +1229,7 @@ class AgentContext:
                 # Compressor declined (nothing safely compressible, or the
                 # summary failed on a non-forced pass). Keep history and save
                 # bookkeeping untouched; a forced retry may still act.
-                return changed
+                return self._retire_superseded_snapshots(report) or changed
             # The compressor's head is the effective prompt (base + runtime
             # suffix). It is input context, never authority to replace the base.
             if compressed and compressed[0].get("role") == "system":
@@ -1200,11 +1243,15 @@ class AgentContext:
             report["method"] = "summary"
             return True
 
+        if self._retire_superseded_snapshots(report):
+            changed = True
+            if not force and measure_tokens() <= target_tokens:
+                return True
         if preserve_on_failure:
             return changed
 
         # ── Legacy fallback: hard truncation ──
-        token_excess = max(0, remaining - target_tokens)
+        token_excess = max(0, measure_tokens() - target_tokens)
         self._ensure_token_cache()
         spans: list[tuple[int, int, str, int]] = []
         idx = 0
