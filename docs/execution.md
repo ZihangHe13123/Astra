@@ -214,12 +214,17 @@ Tool execution uses the following guards and controls:
   completed read steps are dropped and old read results cleared first, oldest
   first, down to `TOOL_RESULT_PROMPT_BUDGET_CHARS=24000` characters, keeping the
   `TOOL_RESULT_KEEP_RECENT=5` most recent.
-- Idle compaction: a long Claude Code conversation is summarized before its
-  cache goes. Between turns the backend checks the desktop's conversation and
-  each chat's. One whose last turn has finished, whose last request carried
-  `ASTRA_IDLE_COMPACT_MIN_TOKENS=100000` tokens or more, and whose cache nobody
-  has read for 54 minutes (`ASTRA_IDLE_COMPACT_AFTER_SECONDS=3240`) gets a
-  checkpoint summary. The summary is asked for by repeating that last request,
+- Idle compaction: a Claude Code conversation is summarized before its cache
+  goes, so one the person comes back to after that starts shorter. Between
+  turns the backend checks the desktop's conversation and each chat's. One
+  whose last turn has finished and whose cache nobody has read for 54 minutes
+  (`ASTRA_IDLE_COMPACT_AFTER_SECONDS=3240`) gets a checkpoint summary if the
+  compressor's plan says it would take off at least
+  `ASTRA_IDLE_COMPACT_MIN_GAIN=10000` tokens, its budget for the summary
+  already taken off: the summary request reads the whole conversation and
+  writes the summary, and is wasted if the person comes back within the hour.
+  `ASTRA_IDLE_COMPACT_MIN_TOKENS`, when set, also asks for a last request of
+  that size. The summary is asked for by repeating that last request,
   as history compaction does, so the CLI reads it from the cache; never from a
   transcript, which would be read whole. A model change since that request
   skips it. The summary is kept beside the history, which does not change, and
@@ -228,7 +233,15 @@ Tool execution uses the following guards and controls:
   the summary request included, and the history still begins with what was
   summarized: the summary then replaces that part and the rest stays word for
   word. Otherwise the summary is dropped and the conversation goes on in full.
-  One summary per pause; a restart drops it. A turn that starts while it is
+  One summary per pause. It is saved with the conversation, with when its
+  request read the cache, so after a restart the next turn applies the same
+  rules to it. A conversation is opened as it was written (a message of
+  several text parts, such as a text with an attached image's name, keeps
+  them), so after a restart its history and its next request are those the
+  cache was written for. A restart before the conversation has been quiet for
+  54 minutes writes none: the new process does not have the last request to
+  repeat, and a repeat that missed the cache would cost more than the summary
+  saves. A turn that starts while it is
   being written interrupts it, since the model client may have one request
   slot, and one that has not come back in ten minutes is given up. If the CLI
   could not take the request turn by turn with Astra's cache breakpoint, it is
@@ -237,7 +250,7 @@ Tool execution uses the following guards and controls:
   adds; it may pass the compaction line. When no summary is written for one of
   these reasons, a warning in the backend's log says why. A summary that came
   back counts as a read of the cache when it was asked for.
-  `ASTRA_IDLE_COMPACT_MIN_TOKENS=off` turns this off. The text CLI and scheduled checks do not take part.
+  `ASTRA_IDLE_COMPACT_MIN_TOKENS=off` (or `0`) turns this off. The text CLI and scheduled checks do not take part.
 - `TOOL_FAILURE_THRESHOLD=3` opens a per-tool circuit after equivalent
   consecutive failures, then performs one final synthesis with tools disabled.
 - `PROMPT_CACHE_STABLE_TOOLS=1` keeps one provider-visible tool manifest for
