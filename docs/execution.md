@@ -250,7 +250,9 @@ Tool execution uses the following guards and controls:
   adds; it may pass the compaction line. When no summary is written for one of
   these reasons, a warning in the backend's log says why. A summary that came
   back counts as a read of the cache when it was asked for.
-  `ASTRA_IDLE_COMPACT_MIN_TOKENS=off` (or `0`) turns this off. The text CLI and scheduled checks do not take part.
+  `ASTRA_IDLE_COMPACT_MIN_TOKENS=off` (or `0`) turns this off, and a summary
+  written before is then dropped at its conversation's next turn. The text CLI
+  and scheduled checks do not take part.
 - `TOOL_FAILURE_THRESHOLD=3` opens a per-tool circuit after equivalent
   consecutive failures, then performs one final synthesis with tools disabled.
 - `PROMPT_CACHE_STABLE_TOOLS=1` keeps one provider-visible tool manifest for

@@ -654,6 +654,34 @@ def test_a_summary_saved_before_a_restart_is_not_used_once_the_history_under_it_
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("switch", ["off", "0", "conversation"])
+def test_a_summary_saved_before_compaction_was_turned_off_is_dropped_not_used(setup, monkeypatch, switch):
+    """Turned off after the summary was written: by the setting, which a restarted backend reads,
+    or for the conversation itself. The return after the hour goes on in full, and turning it on
+    again later does not bring that summary back."""
+    async def scenario():
+        await setup.notes(6)
+        setup.ahead = 55 * 60
+        await idle(setup.compactor())
+        assert CHECKPOINT in text_of(setup.requests()[-1])
+        if switch != "conversation":
+            monkeypatch.setenv("ASTRA_IDLE_COMPACT_MIN_TOKENS", switch)
+        setup.restart()
+        if switch == "conversation":
+            setup.agent.context.compaction_enabled = False
+        setup.ahead = 55 * 60 + HOUR + 60
+        await setup.turn("NOTE-LATE one more thing.")
+        request = setup.requests()[-1]
+        assert "CHECKPOINT-4417" not in text_of(request) and "NOTE-00" in text_of(request)
+        monkeypatch.setenv("ASTRA_IDLE_COMPACT_MIN_TOKENS", "2000")
+        setup.restart()
+        setup.ahead = 55 * 60 + 3 * HOUR
+        await setup.turn("NOTE-LATER")
+        assert "CHECKPOINT-4417" not in text_of(setup.requests()[-1])
+        assert not setup.events
+    asyncio.run(scenario())
+
+
 PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
 
 

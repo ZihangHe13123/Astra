@@ -1059,10 +1059,11 @@ class AgentContext:
     def apply_idle_summary(self, now: float, cache_seconds: float | None) -> bool:
         """At the start of a turn: use the idle summary if the cache has gone since, else drop it.
 
-        ``cache_seconds`` is how long the current model's provider keeps a request; None drops it.
+        ``cache_seconds`` is how long the current model's provider keeps a request; None (no lifetime,
+        or idle compaction turned off) drops it, as does this conversation's compaction being off.
         """
         pending, self._idle_summary = self._idle_summary, None
-        if pending is None or self.compressor is None or cache_seconds is None:
+        if pending is None or not self.compaction_enabled or self.compressor is None or cache_seconds is None:
             return False
         count = pending["count"]
         read = self._last_cache_read()
