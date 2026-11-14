@@ -1,8 +1,9 @@
-"""Real backend + recording CLI: when a Claude Code conversation's old tool results are cleared.
+"""Real backend + recording CLI: a Claude Code conversation's old tool results are never cleared.
 
 The CLI reads a request again in full from the first message that changed, so a result cleared in the
-middle of a conversation is paid for with everything after it. An hour after the last request the
-CLI's cache is gone and the whole request is read in full anyway: that request is where old results go.
+middle of a conversation is paid for with everything after it. Cleared where the cache had gone anyway,
+after an hour's pause, they took off about 1% of what that request read (live, 2026-11-12 to 11-13),
+and the model could no longer see them. A long conversation is summarized instead.
 """
 
 import json
@@ -21,7 +22,7 @@ pytestmark = pytest.mark.skipif(os.name == "nt", reason="the fake claude executa
 
 CLEARED = "[Old tool result content cleared"
 SESSION = "claude_code_tool_results"
-# Four results of this size are already over the budget for old results.
+# Four results of this size were already over the old budget for old results.
 PAGE, BUDGET = 2_000, 6_000
 
 
@@ -56,11 +57,8 @@ class Conversation:
                 "AGENT_SESSION_DIR": str(self.sessions),
                 "SANDBOX_WORKDIR": str(self.work), "TOOL_RESULT_DIR": str(self.root / "tool-results"),
                 "ASTRA_CHANNEL_CONFIG": str(self.root / "no-channels.json"), "ASTRA_CONTEXT_INDEX_EMBEDDING": "off",
-                # Stated in full: a checkout's own configuration must not decide any of them. One result
-                # at a time is how another provider's conversation would have them cleared.
+                # Stated in full: a checkout's own configuration must not decide any of them.
                 "TOOL_MAX_INLINE_CHARS": "12000", "TOOL_MAX_FRESH_RESULT_CHARS": "100000",
-                "TOOL_RESULT_PROMPT_BUDGET_CHARS": str(BUDGET), "TOOL_RESULT_KEEP_RECENT": "1",
-                "TOOL_RESULT_CLEAR_BATCH": "1",
             })
         self.wait_for(lambda event: event.get("type") == "model_info")
 
@@ -126,14 +124,14 @@ def conversation(tmp_path):
         held.stop()
 
 
-def test_old_results_are_cleared_in_the_request_that_starts_after_the_cache_has_gone(conversation):
+def test_old_results_are_never_cleared_also_in_the_request_after_the_cache_has_gone(conversation):
     """Live Astra 2026-11-11: on Opus through the CLI, 13 requests cleared 28 old results, about 47k
-    tokens, and read 1.52M tokens uncached to do it; only 2 of them came after a pause of an hour."""
+    tokens, and read 1.52M tokens uncached to do it. The results stay as they were read."""
     conversation.start()
     busy = [conversation.read(4), conversation.read(4), conversation.read(4)]
     conversation.stop()
-    # Turn after turn within the hour: the results before the latest request hold several times the
-    # budget, and every request still repeats the one before it. Nothing in it was reworded.
+    # Turn after turn within the hour: the results before the latest request hold several times what
+    # used to be the budget, and every request repeats the one before it.
     used = [request for turn in busy for request in turn]
     assert len(used) == 15 and not any(cleared(request) for request in used)
     assert sum(len(text) for text in results(busy[2][0]).values()) > 2 * BUDGET
@@ -144,16 +142,11 @@ def test_old_results_are_cleared_in_the_request_that_starts_after_the_cache_has_
     back = conversation.read(2)
     again = conversation.read(2)
     conversation.stop()
-    # The first request after the pause is read in full whatever it holds. Everything that is due goes
-    # there, oldest first, down to the budget; the newest of the old results stays.
-    gone = [f"toolu_{number}" for number in range(11)]
-    assert cleared(back[0]) == gone
-    kept = results(back[0])
-    assert list(kept)[:12] == [*gone, "toolu_11"] and "11-000 lorem" in kept["toolu_11"]
-    assert sum(len(text) for text in kept.values()) <= BUDGET
-    # From there on the conversation is repeated word for word again: the turn that followed at once
-    # found the results of the one before it over the budget, and cleared none of them.
+    # After the pause too: every result is there in full, the oldest as much as the newest, and the
+    # conversation goes on word for word.
     later = [*back, *again]
-    assert all(cleared(request) == gone for request in later)
+    assert not any(cleared(request) for request in later)
+    kept = results(back[0])
+    assert list(kept)[:12] == [f"toolu_{number}" for number in range(12)]
+    assert all(f"{number:02d}-000 lorem" in kept[f"toolu_{number}"] for number in range(12))
     assert all(repeats(earlier, later_request) for earlier, later_request in zip(later, later[1:]))
-    assert sum(len(text) for call, text in results(again[0]).items() if call not in gone) > BUDGET

@@ -35,6 +35,7 @@ from pathlib import Path
 
 from .llm import LLMIdleTimeout, LLMResponseError, _messages_for_capabilities
 from .query_profiler import PROVIDER_PHASES_KEY
+from .prompt_budget import CACHED_PREFIX_ONLY
 from .token_estimator import estimate_messages_tokens
 from .tool_preparation import with_tool_preparation
 
@@ -597,6 +598,10 @@ class ClaudeCodeProvider:
         aliases = {definition["name"]: name for name, definition in bridged if definition["name"] != name}
         prepared = _messages_for_capabilities(messages, self.config.capabilities, names, self.config.vision_detail)
         turns, marked = self._turns(prepared, names, tool_choice_note(tool_choice) if listed else "")
+        if CACHED_PREFIX_ONLY.get() and not marked:
+            # Without turn-by-turn replay and Astra's breakpoint the CLI reads all of it uncached,
+            # also when a fallback has just switched one of them off for this request's retry.
+            raise ClaudeCodeError("Not sent: Claude Code would not read this conversation from its cache.")
         with tempfile.TemporaryDirectory(prefix="astra-claude-code-") as files:
             Path(files, "system.md").write_text(system_prompt(prepared, listed) or "You are a helpful assistant.",
                                                 encoding="utf-8")

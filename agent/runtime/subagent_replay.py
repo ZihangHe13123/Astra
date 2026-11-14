@@ -152,8 +152,8 @@ def _prepare_context(
 
     def risk(name: str) -> str:
         tool = registry.get(name)
-        # micro_compact accepts only a risk callback, so request-local tools
-        # also need a non-droppable risk to retain their transient evidence.
+        # The deterministic layers of a compaction accept only a risk callback, so request-local
+        # tools also need a non-droppable risk to retain their transient evidence.
         if tool is None or request_local(name) or name in recorded_risky_names:
             return "write"
         # Compaction callbacks receive a name, not per-call arguments. With
@@ -243,7 +243,7 @@ async def bound_messages(
             f"Subagent replay budget ({budget} tokens) cannot fit schemas, system, and active/recent evidence."
         )
     context.compressor = ContextCompressor(llm)
-    await context.compress_if_needed(preserve_on_failure=True, measure_tokens=measure)
+    await context.compress_if_needed(preserve_on_failure=True, measure_tokens=measure, deterministic=True)
     result = current_messages()
     if not _tool_chains_survived(result, protected_chains):
         raise ReplayBudgetExceeded(
@@ -317,7 +317,7 @@ async def compact_history(
     recent = copy.deepcopy(context.messages[_recent_steps_start(context.messages):])
     request = copy.deepcopy(_latest_request(context.messages))
     context.compressor = compressor
-    await context.compress_if_needed(preserve_on_failure=True, measure_tokens=measure)
+    await context.compress_if_needed(preserve_on_failure=True, measure_tokens=measure, deterministic=True)
     result = current_messages()
     if len(result) >= len(messages):
         return messages

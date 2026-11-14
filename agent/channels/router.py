@@ -86,6 +86,10 @@ class AgentChannelRouter:
         self._contexts: dict[str, AgentContext] = {}
         self._template = agent.context
 
+    def parked_contexts(self) -> list[tuple[str, AgentContext]]:
+        """Each chat's conversation this process holds between its turns, by session name."""
+        return list(self._contexts.items())
+
     @staticmethod
     def _current_sessions() -> dict:
         try:

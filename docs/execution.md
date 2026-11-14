@@ -189,30 +189,55 @@ Tool execution uses the following guards and controls:
   inline size the preview saves too little to pay for that. A tool with its
   own limit follows the same rule. Opaque base64/data-URL payloads are never
   inlined as text noise.
-- Old results are cleared in the copy of the conversation that a model request
-  carries; the session history keeps them. Only results from before the latest
-  user-role message (a request, or a notice the runtime delivers as one) are
-  counted or cleared; a mode that attaches its state to that message draws the
-  line one such message earlier. When those results hold more than
-  `TOOL_RESULT_PROMPT_BUDGET_CHARS=24000` characters, the oldest results of
-  read and network tools are replaced by a short note until the rest fits,
-  leaving the `TOOL_RESULT_KEEP_RECENT=5` most recent. A clear also rewrites
-  earlier messages, so nothing is cleared until `TOOL_RESULT_CLEAR_BATCH=10`
-  results are due, and then they go together. Errors, results under 512
-  characters and results of tools that write or execute are never cleared. The
-  complete text a fresh result shows for one iteration is not counted, so a
-  turn's own tool calls do not change which results are cleared. History
-  compaction rewrites the history itself and clears there what is due, without
-  waiting for a batch.
-- A Claude Code conversation keeps the same rule with another moment. The CLI
-  reads a request again in full from the first message that changed, and keeps
-  what it read for an hour. So nothing is cleared while the conversation is in
-  use. A message that comes an hour or more after the one before it starts a
-  request that is read in full anyway: the results the conversation held before
-  that message are cleared there, all that are due and not a batch at a time,
-  and they stay cleared in the requests after it. Results added since then wait
-  for the next such pause, or for history compaction at 150,000 tokens, which
-  clears what is due before it summarizes anything.
+- Old tool results stay in a conversation in use as they were read: a model
+  request carries each one whole, or as the preview the history keeps. Clearing
+  one would rewrite an earlier message, and a provider with a prompt cache reads
+  everything after the first message that changed again at the uncached price.
+  Live, until 2026-11-13, clears made 44% of what DeepSeek Flash read uncached
+  and nearly a third of what Claude Code did, about 21k tokens re-read for every
+  2k a clear took off. A long conversation is made shorter by history compaction
+  alone, a summary in place of its older part. When no summary can shorten a
+  conversation over its threshold, the superseded runtime and memory snapshots,
+  kept only so that the cached prefix stays the same, are retired as a last
+  resort; the conversation itself is untouched. The first request of a turn
+  compacts at the model's compaction line. A request inside a turn compacts
+  there too when the summary would take off at least a quarter of the line, by
+  the compressor's plan and without writing it; what a compaction takes off is
+  no longer read in each later request. When it would take off less, the
+  request waits until the conversation is a third past the line, within what
+  the model's window takes with room for the answer, so a turn over a history
+  that was summarized already does not rewrite it each time it reaches the line;
+  the next turn compacts at the line. A request that comes after a
+  provider with a known cache lifetime has let the conversation go (Claude Code:
+  an hour) compacts at the line, which then costs nothing more. A subagent's
+  conversation rebuilt to fit a smaller budget has nothing cached to keep: there
+  completed read steps are dropped and old read results cleared first, oldest
+  first, down to `TOOL_RESULT_PROMPT_BUDGET_CHARS=24000` characters, keeping the
+  `TOOL_RESULT_KEEP_RECENT=5` most recent.
+- Idle compaction: a long Claude Code conversation is summarized before its
+  cache goes. Between turns the backend checks the desktop's conversation and
+  each chat's. One whose last turn has finished, whose last request carried
+  `ASTRA_IDLE_COMPACT_MIN_TOKENS=100000` tokens or more, and whose cache nobody
+  has read for 54 minutes (`ASTRA_IDLE_COMPACT_AFTER_SECONDS=3240`) gets a
+  checkpoint summary. The summary is asked for by repeating that last request,
+  as history compaction does, so the CLI reads it from the cache; never from a
+  transcript, which would be read whole. A model change since that request
+  skips it. The summary is kept beside the history, which does not change, and
+  that request keeps the cache another hour. The next turn uses the summary
+  only if it starts an hour or more after the last request that read the cache,
+  the summary request included, and the history still begins with what was
+  summarized: the summary then replaces that part and the rest stays word for
+  word. Otherwise the summary is dropped and the conversation goes on in full.
+  One summary per pause; a restart drops it. A turn that starts while it is
+  being written interrupts it, since the model client may have one request
+  slot, and one that has not come back in ten minutes is given up. If the CLI
+  could not take the request turn by turn with Astra's cache breakpoint, it is
+  not sent at all. It is sent only if the model's window holds it with room
+  for the answer, sized as the provider reported the last request plus what it
+  adds; it may pass the compaction line. When no summary is written for one of
+  these reasons, a warning in the backend's log says why. A summary that came
+  back counts as a read of the cache when it was asked for.
+  `ASTRA_IDLE_COMPACT_MIN_TOKENS=off` turns this off. The text CLI and scheduled checks do not take part.
 - `TOOL_FAILURE_THRESHOLD=3` opens a per-tool circuit after equivalent
   consecutive failures, then performs one final synthesis with tools disabled.
 - `PROMPT_CACHE_STABLE_TOOLS=1` keeps one provider-visible tool manifest for

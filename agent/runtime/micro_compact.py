@@ -1,4 +1,8 @@
-"""Provider-neutral, prompt-copy-only clearing of old tool results."""
+"""Clearing old tool results, for a conversation rebuilt to fit a budget.
+
+A conversation in use never clears them: a clear rewrites an earlier message, and a provider
+then reads everything after it again uncached (AgentContext.compress_if_needed).
+"""
 
 from __future__ import annotations
 
@@ -119,29 +123,6 @@ def _placeholder(content: str, tool_name: str) -> str:
     return "; ".join(details)
 
 
-def results_at_last_cold_start(messages: list[dict], cache_seconds: float) -> frozenset[str]:
-    """The tool results the conversation held the last time a request began with nothing cached.
-
-    ``messages`` is the stored conversation, whose user and assistant messages
-    carry the time they were added. A provider that has just read a request
-    keeps it for ``cache_seconds``; a user-role message that comes later than
-    that after the message before it begins a request the provider reads whole,
-    at the full price, whatever it holds. Clearing old results in that request
-    costs nothing, and what it cleared stays cleared in the requests after it.
-    """
-    previous: float | None = None
-    boundary = 0
-    for index, message in enumerate(messages):
-        stamp = message.get("timestamp")
-        if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
-            continue
-        if message.get("role") == "user" and previous is not None and stamp - previous >= cache_seconds:
-            boundary = index
-        previous = float(stamp)
-    return frozenset(str(message.get("tool_call_id") or "") for message in messages[:boundary]
-                     if message.get("role") == "tool")
-
-
 def micro_compact_tool_results(
     messages: list[dict],
     *,
@@ -149,14 +130,11 @@ def micro_compact_tool_results(
     char_budget: int | None = None,
     keep_recent: int | None = None,
     clear_batch: int | None = None,
-    only: frozenset[str] | None = None,
 ) -> tuple[list[dict], MicroCompactStats]:
     """Clear old compactable results while preserving protocol and active work.
 
     Only results before the latest real user request are eligible. Error,
-    write, execute, and secret-bearing tool results are never cleared. With
-    ``only``, the results of the calls it names are the only ones counted and
-    cleared; the others stay as they are however much they hold.
+    write, execute, and secret-bearing tool results are never cleared.
 
     The budget is for the results before that request, and they are cleared
     ``clear_batch`` at a time, oldest first, once that many have to go to meet
@@ -204,8 +182,6 @@ def micro_compact_tool_results(
     total_chars = 0
     for index, message in enumerate(messages[:latest_user]):
         if message.get("role") != "tool":
-            continue
-        if only is not None and str(message.get("tool_call_id") or "") not in only:
             continue
         content = str(message.get("content") or "")
         total_chars += len(content)
