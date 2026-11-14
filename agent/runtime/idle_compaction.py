@@ -1,15 +1,20 @@
-"""Idle compaction: a long conversation's summary is written while the provider still has it cached.
+"""Idle compaction: a conversation's summary is written while the provider still has it cached.
 
 A provider that keeps a request for a known time (``prompt_cache_seconds``: Claude Code, one
 hour) reads a conversation whole, at the full price, when the person comes back after that.
-A summary asked for just before then is read from the cache instead, at about a tenth of it.
+A summary asked for just before then is read from the cache instead, at a twentieth of it, so
+a conversation the person comes back to after the cache has gone starts shorter.
 Application rules (docs/execution.md, "Idle compaction"):
 
 - The backend checks the conversations it holds (the desktop's and the chats') between turns.
-  A conversation is due when its last turn has finished, its last request carried at least
-  ``ASTRA_IDLE_COMPACT_MIN_TOKENS`` (default 100,000; ``0`` or ``off`` turns this off), and no
-  request of it has read the cache for the lifetime less six minutes. It is not due once the
-  lifetime is nearly over: the summary request has to reach the cache in time.
+  A conversation is due when its last turn has finished, no request of it has read the cache
+  for the lifetime less six minutes, and the compressor's plan says the summary would take off
+  at least ``ASTRA_IDLE_COMPACT_MIN_GAIN`` tokens (default 10,000, the summary's budget already
+  taken off): the summary request reads the whole conversation and writes the summary, and is
+  wasted if the person comes back within the hour. ``ASTRA_IDLE_COMPACT_MIN_TOKENS`` also asks
+  for a last request of at least that size when set; ``0`` or ``off`` turns idle compaction
+  off. It is not due once the lifetime is nearly over: the summary request has to reach the
+  cache in time.
 - The summary is asked for by repeating that conversation's last request, as history compaction
   does, never from a transcript. It is kept beside the history, which does not change. That
   request reads the cache again, so the cache lasts a lifetime from then. It is sent only if the
@@ -25,9 +30,13 @@ Application rules (docs/execution.md, "Idle compaction"):
   conversation's) interrupts it, since the model client may have one request slot; a summary
   that has not come back in ten minutes is given up. The provider refuses to send it another
   way than from the cache (``CACHED_PREFIX_ONLY``), so it is never a transcript.
-- The summary lives in this process only: a restart drops it, and the conversation is then read
-  in full as before. A summary that came back counts as a read of the cache when it was asked
-  for: whether the cache has gone when the person comes back is counted from there.
+- The summary is saved with the conversation, with when its request read the cache: after a
+  restart the next turn applies the same rules to it, the history compared as a saved
+  conversation is loaded. A summary that came back counts as a read of the cache when it was
+  asked for: whether the cache has gone when the person comes back is counted from there. A
+  restart before the conversation has been quiet that long writes none: the new process does
+  not have the last request to repeat, and a repeat that missed the cache would cost more than
+  the summary saves.
 """
 
 from __future__ import annotations
@@ -47,7 +56,8 @@ logger = logging.getLogger(__name__)
 
 # How long before the cache would go the summary is asked for: the request has to reach it in time.
 IDLE_MARGIN_SECONDS = 360
-DEFAULT_MIN_TOKENS = 100_000
+# What a summary must take off to be written (a starting point, to be checked against live data).
+DEFAULT_MIN_GAIN = 10_000
 CHECK_INTERVAL_SECONDS = 1.0
 # A summary that has not come back by then is given up: it holds one of the model client's request slots.
 SUMMARY_TIMEOUT_SECONDS = 600.0
@@ -58,11 +68,20 @@ def clock() -> float:
     return time.time()
 
 
+def enabled() -> bool:
+    return os.getenv("ASTRA_IDLE_COMPACT_MIN_TOKENS", "").strip().lower() not in {"0", "off", "false", "no"}
+
+
 def min_tokens() -> int:
-    raw = os.getenv("ASTRA_IDLE_COMPACT_MIN_TOKENS", "").strip().lower()
-    if raw in {"off", "false", "no"}:
-        return 0
-    return int(raw) if raw.isdigit() else DEFAULT_MIN_TOKENS
+    """The size the last request must have reached; 0 (the default) asks for none."""
+    raw = os.getenv("ASTRA_IDLE_COMPACT_MIN_TOKENS", "").strip()
+    return int(raw) if raw.isdigit() else 0
+
+
+def min_gain() -> int:
+    """How many tokens the summary must take off to be written."""
+    raw = os.getenv("ASTRA_IDLE_COMPACT_MIN_GAIN", "").strip()
+    return int(raw) if raw.isdigit() else DEFAULT_MIN_GAIN
 
 
 def idle_seconds(cache_seconds: float) -> float:
@@ -103,16 +122,16 @@ class IdleCompactor:
         if now - self._checked < CHECK_INTERVAL_SECONDS:
             return
         self._checked = now
-        tokens = min_tokens()
-        if tokens <= 0:
+        if not enabled():
             return
+        tokens, gain = min_tokens(), min_gain()
         for context, attribution in self.conversations():
             llm = getattr(getattr(context, "compressor", None), "llm", None)
             cached_for = cache_seconds_for(llm)
             if cached_for is None:
                 continue
             if context.idle_summary_due(now, idle_after=idle_seconds(cached_for), cache_seconds=cached_for,
-                                        min_tokens=tokens, model=model_identity(llm)):
+                                        min_tokens=tokens, min_gain=gain, model=model_identity(llm)):
                 self._task = asyncio.create_task(self._prepare(context, now, attribution), name="idle-compaction")
                 return
 

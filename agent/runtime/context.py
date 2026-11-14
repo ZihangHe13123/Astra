@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import hashlib
 import inspect
 import json
 import logging
@@ -70,7 +71,7 @@ def _usage_int(value: Any) -> int:
         return 0
 
 
-def _strip_image_content(content) -> str | None:
+def _strip_image_content(content) -> str | list | None:
     """Remove image_url blocks from message content, keeping text only.
 
     Returns the stripped content, or None if nothing meaningful remains.
@@ -78,6 +79,11 @@ def _strip_image_content(content) -> str | None:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
+        if content and all(isinstance(part, dict) and part.get("type") == "text" for part in content):
+            # Nothing to strip (an attached image is stored as its "[Image: name]" text). Kept as it
+            # was added: joined into one text, a reloaded conversation would differ from the one its
+            # snapshots were placed in and its provider's cache was written for.
+            return content
         texts = []
         for part in content:
             if isinstance(part, dict) and part.get("type") == "text":
@@ -166,6 +172,11 @@ def normalize_replay_messages(messages: list[dict], *, validate: Callable[[dict]
     for message in normalized:
         retired_sidecar = message.pop("api_content", None) is not None or retired_sidecar
     return normalized, retired_sidecar
+
+
+def _history_digest(messages: list[dict]) -> str:
+    """A hash of ``messages`` as they are saved, which is how the conversation has them after a restart."""
+    return hashlib.sha256(json.dumps(messages, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
 def _strip_orphan_tool_calls(messages: list[dict]) -> list[dict]:
@@ -569,6 +580,8 @@ class AgentContext:
             "total_cache_hit_tokens": self.total_cache_hit_tokens,
             "total_cache_miss_tokens": self.total_cache_miss_tokens,
             "last_prompt_tokens": self.last_prompt_tokens,
+            # Always written, so a header without one replaces an older snapshot's.
+            "idle_summary": self._idle_summary_state(),
         }
         if self.guidance_snapshot:
             data["guidance_snapshot"] = copy.deepcopy(self.guidance_snapshot)
@@ -681,6 +694,7 @@ class AgentContext:
             # Force one replace event on the next save so legacy dynamic
             # memory sidecars are removed from durable session history too.
             self._saved_message_count = 0 if retired_sidecar else len(self.messages)
+            self._restore_idle_summary(data.get("idle_summary"))
             return True
         except KeyError:
             return False
@@ -924,21 +938,23 @@ class AgentContext:
         return (self._session_path, self.branch_id, len(self.messages), id(self.messages[-1]) if self.messages else 0)
 
     def _last_cache_read(self) -> float | None:
-        """When a request of this process last read this conversation's cache, if one did."""
+        """When a request last read this conversation's cache, if one is known: one of this process,
+        or the idle summary request saved with the conversation before a restart."""
         sent = self._sent_request.get("at") if self._sent_request is not None else None
         known = [moment for moment in (sent, self.cache_touched_at) if moment is not None]
         return max(known) if known else None
 
     def idle_summary_due(self, now: float, *, idle_after: float, cache_seconds: float, min_tokens: int,
-                         model: str) -> bool:
+                         min_gain: int, model: str) -> bool:
         """Whether to write this conversation's summary now, while its cache is still warm.
 
-        The rules are in agent/runtime/idle_compaction.py: a finished turn, a last request of
-        ``min_tokens`` or more on this ``model``, quiet since for ``idle_after`` but for less
-        than ``cache_seconds``, and no summary or attempt for this history yet.
+        The rules are in agent/runtime/idle_compaction.py: a finished turn on this ``model``, quiet
+        since for ``idle_after`` but for less than ``cache_seconds``, a summary that would take off
+        ``min_gain`` tokens or more, a last request of ``min_tokens`` or more (0: any), and no
+        summary or attempt for this history yet.
         """
         sent = self._sent_request
-        if (min_tokens <= 0 or not self.compaction_enabled or self.compressor is None or sent is None
+        if (not self.compaction_enabled or self.compressor is None or sent is None
                 or sent.get("model") != model or self._idle_summary is not None
                 or self.last_prompt_tokens < min_tokens or not self.messages):
             return False
@@ -949,7 +965,30 @@ class AgentContext:
         # The summary request has to reach the provider while the cache is still there.
         if not idle_after <= now - read < cache_seconds - 30:
             return False
-        return self._idle_attempt != self._history_mark() and self.summary_replay() is not None
+        mark = self._history_mark()
+        if self._idle_attempt == mark or self.summary_replay() is None:
+            return False
+        gain = self.idle_summary_gain()
+        if gain < min_gain:
+            # The summary request costs a read of the whole conversation and the summary's own
+            # tokens, and is wasted if the person comes back within the hour. Weighed once for this
+            # history: its plan changes only when the conversation does.
+            self._idle_attempt = mark
+            logger.info("Idle summary not written: it would take off about %d tokens, less than %d",
+                        gain, min_gain)
+            return False
+        return True
+
+    def idle_summary_gain(self) -> int:
+        """About how many tokens the idle summary would take off, from the plan it would be written on."""
+        planned = getattr(self.compressor, "planned_gain", None)
+        if planned is None:
+            return 0
+        try:
+            return int(planned(self._compaction_messages(), self.max_prompt_tokens))
+        except Exception:
+            logger.warning("could not plan an idle summary", exc_info=True)
+            return 0
 
     async def prepare_idle_summary(self, now: float) -> bool:
         """Write the summary of this conversation's older part from its cached last request; keep it aside.
@@ -971,7 +1010,7 @@ class AgentContext:
             limit=(completion_safe_limit(window, getattr(config, "max_tokens", 0) or 0)
                    if isinstance(window, int) and window > 0 else int(self.max_prompt_tokens)),
             sent_count=len(self._sent_request["messages"]), sent_tokens=self._sent_request.get("tokens"))
-        count, last = len(self.messages), copy.deepcopy(self.messages[-1])
+        count, digest = len(self.messages), _history_digest(self.messages)
         # Read from the cache or not at all: the provider must not send it another way either.
         prefix_only = CACHED_PREFIX_ONLY.set(True)
         try:
@@ -984,10 +1023,38 @@ class AgentContext:
             CACHED_PREFIX_ONLY.reset(prefix_only)
         if prepared is None or self._history_mark() != mark:
             return False
-        self._idle_summary = {"prepared": prepared, "session": mark[:2], "count": count, "last": last}
+        self._idle_summary = {"prepared": prepared, "session": mark[:2], "count": count, "digest": digest}
         # The summary request read the cache when it was asked for: it lasts from then.
         self.cache_touched_at = max(self.cache_touched_at or now, now)
+        # Saved with the conversation, so a restart before the person comes back keeps it.
+        await self.save_async()
         return True
+
+    def _idle_summary_state(self) -> dict | None:
+        """The idle summary as the session saves it, with the cache read the next turn counts from."""
+        pending = self._idle_summary
+        if pending is None:
+            return None
+        prepared = pending["prepared"]
+        return {"summary": prepared.summary, "carried": prepared.carried, "start": prepared.start,
+                "end": prepared.end, "size": prepared.size, "count": pending["count"],
+                "digest": pending["digest"], "read_at": self._last_cache_read()}
+
+    def _restore_idle_summary(self, state: Any) -> None:
+        """An idle summary saved before a restart: the next turn applies the same rules to it."""
+        if not isinstance(state, dict):
+            return
+        from .context_compressor import PreparedCompaction
+        try:
+            prepared = PreparedCompaction(str(state["summary"]), str(state.get("carried") or ""),
+                                          int(state["start"]), int(state["end"]), int(state["size"]))
+            count, digest, read_at = int(state["count"]), str(state["digest"]), float(state["read_at"])
+        except (KeyError, TypeError, ValueError):
+            logger.warning("Saved idle summary not restored: it is not in the expected form")
+            return
+        self._idle_summary = {"prepared": prepared, "session": (self._session_path, self.branch_id),
+                              "count": count, "digest": digest}
+        self.cache_touched_at = max(self.cache_touched_at or read_at, read_at)
 
     def apply_idle_summary(self, now: float, cache_seconds: float | None) -> bool:
         """At the start of a turn: use the idle summary if the cache has gone since, else drop it.
@@ -1000,7 +1067,8 @@ class AgentContext:
         count = pending["count"]
         read = self._last_cache_read()
         if (pending["session"] != (self._session_path, self.branch_id) or not 0 < count <= len(self.messages)
-                or self.messages[count - 1] != pending["last"] or read is None or now - read < cache_seconds):
+                or read is None or now - read < cache_seconds
+                or _history_digest(self.messages[:count]) != pending["digest"]):
             return False
         before = len(self.messages)
         tokens_before = self.estimate_compaction_tokens()

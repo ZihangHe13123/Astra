@@ -22,6 +22,7 @@ from agent.core.msg import ContentBlock, Msg
 from agent.runtime import claude_code_provider as ccp
 from agent.runtime import idle_compaction
 from agent.runtime.claude_code_provider import ClaudeCodeProvider
+from agent.runtime.conversation_edits import undo_last_exchanges
 from agent.runtime.idle_compaction import IdleCompactor
 from agent.runtime.llm import LLMClient, LLMConfig
 from agent.runtime.react import ReActAgent
@@ -101,6 +102,8 @@ class Setup:
         monkeypatch.setenv("ASTRA_CLAUDE_CODE_COMMAND", str(cli))
         monkeypatch.setenv("ASTRA_HOME", str(tmp_path / "home"))
         monkeypatch.setenv("ASTRA_IDLE_COMPACT_MIN_TOKENS", "2000")
+        # These conversations are short: any summary is written, unless a test says otherwise.
+        monkeypatch.setenv("ASTRA_IDLE_COMPACT_MIN_GAIN", "0")
         workdir = tmp_path / "claude-code"
         workdir.mkdir()
         monkeypatch.setattr(ccp, "workspace", lambda: str(workdir))
@@ -109,24 +112,38 @@ class Setup:
         # How far the clock is ahead of the moment the test runs.
         self.ahead = 0.0
         monkeypatch.setattr(idle_compaction, "clock", lambda: time.time() + self.ahead)
-        self.agent = ReActAgent(
+        self.registry = registry or ToolRegistry()
+        self.path = str(tmp_path / "conversation.json")
+        self.events: list[dict] = []
+        self.agent = self._agent()
+
+    def _agent(self) -> ReActAgent:
+        agent = ReActAgent(
             "agent", LLMClient(LLMConfig(model="opus", provider="claude-code", base_url=ccp.BASE_URL,
                                          capabilities=frozenset({"streaming", "tools", "reasoning"}),
                                          reasoning_effort="high")),
-            registry or ToolRegistry(), system_prompt="You are Astra.", max_iterations=2,
+            self.registry, system_prompt="You are Astra.", max_iterations=2,
             progressive_tools=False, query_profile_enabled=False)
-        self.agent.context.set_session(str(tmp_path / "conversation.json"))
+        agent.context.set_session(self.path)
         # A tail of about two notes stays word for word; what is older is summarized.
-        assert self.agent.context.compressor is not None
-        self.agent.context.compressor.tail_token_budget = 1_500
-        self.events: list[dict] = []
-        self.agent.context.compaction_observer = self.events.append
+        assert agent.context.compressor is not None
+        agent.context.compressor.tail_token_budget = 1_500
+        agent.context.compaction_observer = self.events.append
+        return agent
+
+    def restart(self) -> None:
+        """A new backend process, which opens the conversation as it was saved."""
+        self.agent = self._agent()
+        assert self.agent.context.load()
 
     def requests(self) -> list[dict]:
         return [json.loads(line) for line in self.log.read_text(encoding="utf-8").splitlines()]
 
     async def turn(self, text: str) -> None:
-        async for _ in self.agent.reply_stream(Msg(content=[ContentBlock.text(text)])):
+        await self.send(Msg(content=[ContentBlock.text(text)]))
+
+    async def send(self, msg: Msg) -> None:
+        async for _ in self.agent.reply_stream(msg):
             pass
 
     async def notes(self, count: int) -> None:
@@ -418,6 +435,7 @@ def test_the_backend_writes_its_idle_conversations_summary_and_goes_on_in_full_w
         tmp_path, 0, "idle_compaction", settings_overrides={"selected_model": "sonnet"}, workdir=work,
         env_overrides={"AGENT_MODELS_FILE": str(models), "ASTRA_CLAUDE_CODE_COMMAND": str(cli),
                        "ASTRA_IDLE_COMPACT_AFTER_SECONDS": "3", "ASTRA_IDLE_COMPACT_MIN_TOKENS": "1",
+                       "ASTRA_IDLE_COMPACT_MIN_GAIN": "0",
                        "ASTRA_CHANNEL_CONFIG": str(tmp_path / "no-channels.json"),
                        "ASTRA_CONTEXT_INDEX_EMBEDDING": "off"})
     try:
@@ -524,4 +542,139 @@ def test_a_provider_that_would_send_a_transcript_is_not_asked_for_the_summary(se
         await idle(setup.compactor())
         assert setup.requests()[before:] == []
         assert len(warnings_of(caplog, "agent.runtime.context_compressor")) == 1
+    asyncio.run(scenario())
+
+
+def test_a_summary_is_written_for_a_conversation_far_under_the_old_floor_when_it_takes_off_enough(
+        tmp_path, monkeypatch):
+    """Live, 2026-11-14: a chat that stayed between 84k and 86k tokens was read whole on both of that
+    day's returns after an hour: summaries were written only for conversations of 100,000 tokens or
+    more. Now one is written when the compressor's plan says it would take off at least 10,000
+    tokens (its budget for the summary already taken off), whatever the conversation's size."""
+    setup = Setup(tmp_path, monkeypatch)
+    monkeypatch.delenv("ASTRA_IDLE_COMPACT_MIN_TOKENS")
+    monkeypatch.delenv("ASTRA_IDLE_COMPACT_MIN_GAIN")
+
+    async def scenario():
+        for n in range(16):
+            await setup.turn(note(n) * 4)
+        assert setup.agent.context.last_prompt_tokens < 50_000
+        sent = setup.requests()
+        setup.ahead = 55 * 60
+        await idle(setup.compactor())
+        asked = setup.requests()[len(sent):]
+        assert len(asked) == 1 and CHECKPOINT in text_of(asked[0])
+        assert asked[0]["turns"][:len(sent[-1]["turns"])] == sent[-1]["turns"]
+        setup.ahead = 55 * 60 + HOUR + 60
+        await setup.turn("NOTE-LATE one more thing.")
+        request = setup.requests()[-1]
+        assert "CHECKPOINT-4417" in text_of(request) and "NOTE-00" not in text_of(request)
+    asyncio.run(scenario())
+
+
+def test_a_summary_that_would_take_off_less_than_the_minimum_is_not_asked_for(setup, monkeypatch, caplog):
+    """The summary request reads the whole conversation and writes the summary, and is wasted if the
+    person comes back within the hour. The log says why none was written, once for that history."""
+    monkeypatch.delenv("ASTRA_IDLE_COMPACT_MIN_GAIN")
+
+    async def scenario():
+        await setup.notes(6)
+        sent = len(setup.requests())
+        compactor = setup.compactor()
+        with caplog.at_level(logging.INFO, logger="agent.runtime.context"):
+            for minutes in (55, 57):
+                setup.ahead = minutes * 60
+                await idle(compactor)
+        assert len(setup.requests()) == sent
+        assert len([record for record in caplog.records if record.name == "agent.runtime.context"
+                    and "would take off" in record.getMessage()]) == 1
+    asyncio.run(scenario())
+
+
+def test_a_summary_written_before_a_restart_is_used_when_the_person_comes_back_after_the_cache_has_gone(setup):
+    """Live, 2026-11-14: a chat's summary was written, the desktop restarted before the person came
+    back, and the return read 83.7k tokens uncached: the summary lived in the backend process only.
+    It is saved with the conversation, with when its request read the cache."""
+    async def scenario():
+        await setup.notes(6)
+        setup.ahead = 55 * 60
+        await idle(setup.compactor())
+        assert CHECKPOINT in text_of(setup.requests()[-1])
+        setup.restart()
+        setup.ahead = 55 * 60 + HOUR + 60
+        await setup.turn("NOTE-LATE one more thing.")
+        request = setup.requests()[-1]
+        assert "CHECKPOINT-4417" in text_of(request) and "NOTE-00" not in text_of(request)
+        assert "NOTE-05" in text_of(request)
+        completed = [event for event in setup.events if event["status"] == "completed"]
+        assert len(completed) == 1 and completed[0]["trigger"] == "idle"
+    asyncio.run(scenario())
+
+
+def test_after_a_restart_a_return_within_the_hour_repeats_the_cached_request_and_drops_the_summary(setup):
+    """The restarted process sends the request the cache was written for, word for word. The summary
+    is dropped, and saved so: a later restart and a return hours after do not bring it back."""
+    async def scenario():
+        await setup.notes(6)
+        conversation = setup.requests()[-1]
+        setup.ahead = 55 * 60
+        await idle(setup.compactor())
+        setup.restart()
+        setup.ahead = 70 * 60
+        await setup.turn("NOTE-LATE one more thing.")
+        request = setup.requests()[-1]
+        assert request["turns"][:len(conversation["turns"])] == conversation["turns"]
+        assert "CHECKPOINT-4417" not in text_of(request)
+        setup.restart()
+        setup.ahead = 6 * HOUR
+        await setup.turn("NOTE-LATER")
+        assert "CHECKPOINT-4417" not in text_of(setup.requests()[-1])
+        assert not setup.events
+    asyncio.run(scenario())
+
+
+def test_a_summary_saved_before_a_restart_is_not_used_once_the_history_under_it_has_changed(setup):
+    """After the restart the person took the last exchange back (/undo) and two of Astra's own
+    messages came in (a job's reports in a chat): as many messages as the summary was written on,
+    not the same ones."""
+    async def scenario():
+        await setup.notes(6)
+        setup.ahead = 55 * 60
+        await idle(setup.compactor())
+        setup.restart()
+        context = setup.agent.context
+        undo_last_exchanges(context, 1)
+        context.add_assistant("A report.")
+        context.add_assistant("Another report.")
+        setup.ahead = 55 * 60 + HOUR + 60
+        await setup.turn("NOTE-LATE one more thing.")
+        request = setup.requests()[-1]
+        assert "CHECKPOINT-4417" not in text_of(request) and "NOTE-00" in text_of(request)
+        assert not setup.events
+    asyncio.run(scenario())
+
+
+PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+
+
+def test_a_conversation_opened_after_a_restart_sends_the_request_its_cache_was_written_for(setup, tmp_path):
+    """Live, 2026-11-14: two of a chat's messages, each a short text with an image (kept in history as
+    its "[Image: name]" text), were joined into one text when the conversation was opened after a
+    restart. The history no longer matched what its runtime and memory snapshots had been placed
+    after, so all of them were dropped and the request changed from the first one on: read again
+    in full, had the cache still been there. A conversation is opened as it was written."""
+    async def scenario():
+        photo = tmp_path / "photo.png"
+        photo.write_bytes(__import__("base64").b64decode(PNG))
+        await setup.send(Msg(content=[ContentBlock.text("Look at this."),
+                                      ContentBlock.image_url(f"data:image/png;base64,{PNG}", source_path=str(photo))]))
+        await setup.notes(2)
+        history = [dict(message) for message in setup.agent.context.messages]
+        assert isinstance(history[0]["content"], list)
+        conversation = setup.requests()[-1]
+        setup.restart()
+        assert setup.agent.context.messages == history
+        await setup.turn("NOTE-LATE")
+        request = setup.requests()[-1]
+        assert request["turns"][:len(conversation["turns"])] == conversation["turns"]
     asyncio.run(scenario())

@@ -428,6 +428,8 @@ class SessionStore:
             "total_cache_hit_tokens": data.get("total_cache_hit_tokens", 0),
             "total_cache_miss_tokens": data.get("total_cache_miss_tokens", 0),
             "last_prompt_tokens": data.get("last_prompt_tokens", 0),
+            # A summary written while the conversation sat idle, not applied yet (AgentContext).
+            "idle_summary": data.get("idle_summary"),
         }
 
     def _replay_jsonl(self, data: dict[str, Any]) -> None:

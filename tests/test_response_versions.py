@@ -201,7 +201,9 @@ def test_regeneration_freezes_runtime_replay_shape_before_model_execution(tmp_pa
     assert store.load(readonly=True)["messages"] == raw
     assert all((path.read_bytes(), path.stat().st_mtime_ns) == contents for path, contents in before.items())
     if shape == "image_placeholder":
-        assert "[Image: fixture.png]" in model.requests[0]["messages"][1]["content"]
+        # The parts as stored, after the request's time marker: the attached image is its name.
+        texts = [part["text"] for part in model.requests[0]["messages"][1]["content"] if part.get("type") == "text"]
+        assert texts[1:] == ["change a file and explain", "[Image: fixture.png]"]
     if shape == "legacy_reasoning":
         assert model.requests[0]["messages"][2]["reasoning_content"] == "Saved tool reasoning"
 
