@@ -19,6 +19,7 @@ from agent.runtime import session_recall
 from agent.runtime.approval_inbox import ApprovalInbox
 from agent.runtime.session_store import SessionStore
 from agent.runtime.task_store import TaskStore
+from agent.runtime.tools import delegate
 
 # A backend started as a script loads its own checkout's .env (protect_backend() pins ASTRA_ENV_FILE
 # there), and the mail tool reads <root>/.env as well. Only a value in the backend's environment beats
@@ -37,16 +38,24 @@ BLANK_INTEGRATIONS = dict.fromkeys((
     # QQ: the switch that overrides the channel config, and the access token.
     "ASTRA_QQ_ENABLED", "ASTRA_QQ_ACCESS_TOKEN",
 ), "")
+# Settings a checkout's .env may give that change what the model is told: delegate_task states the
+# subagent slot limits (.env.example sets them). A test backend has the code's defaults.
+MODEL_FACING_DEFAULTS = {
+    "ASTRA_DELEGATE_CONCURRENCY": str(delegate._DELEGATE_CONCURRENCY_DEFAULT),
+    "ASTRA_DELEGATE_OWNER_CONCURRENCY": str(delegate._DELEGATE_CONCURRENCY_DEFAULT),
+}
 
 
 def backend_environment(tmp_path: Path) -> dict[str, str]:
     """This process's environment for a backend started by a test that keeps its files in ``tmp_path``.
 
-    The checkout's integrations are blank, and the channel config is the test's own, which does not
+    The checkout's integrations are blank, the settings that change the tool schemas are the code's
+    defaults unless this process sets them, and the channel config is the test's own, which does not
     exist: otherwise the backend reads <checkout>/.astra/channels.json and starts the channels it turns
     on. A test that means to give the backend any of these sets it afterwards, as env_overrides does.
     """
-    return {**os.environ, **BLANK_INTEGRATIONS, "ASTRA_CHANNEL_CONFIG": str(tmp_path / "missing-channels.json")}
+    return {**MODEL_FACING_DEFAULTS, **os.environ, **BLANK_INTEGRATIONS,
+            "ASTRA_CHANNEL_CONFIG": str(tmp_path / "missing-channels.json")}
 
 
 def _path_state(path: Path) -> tuple[int, int, int, int] | None:
