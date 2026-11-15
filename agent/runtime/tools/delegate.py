@@ -2075,15 +2075,23 @@ def register_delegate_tools(
                 return False
             if has_messages:
                 return True
-            idle_result = await asyncio.to_thread(
-                team_runtime.store.try_enter_idle,
-                spec.team_agent_id,
-                limit=_team_keep_alive_limit(),
-            )
+            idle_result: dict[str, Any] = {}
+            idle_limit = _team_keep_alive_limit()
+            team_store = team_runtime.store
+
+            def _arbitrate_idle() -> None:
+                idle_result.update(team_store.try_enter_idle(spec.team_agent_id, limit=idle_limit))
+
+            try:
+                await durable_io(_arbitrate_idle)
+            finally:
+                # durable_io drains cancellation, so the store's grant or refusal is settled here:
+                # a member stopped before resuming still records the capacity it was decided against.
+                if "idle_limit" in idle_result:
+                    lifecycle.limits["idle_capacity"] = idle_result["idle_limit"]
             keep_alive_state = str(
                 idle_result.get("keep_alive_state") or keep_alive_state
             )
-            lifecycle.limits["idle_capacity"] = idle_result["idle_limit"]
             keep_alive_reason = str(
                 idle_result.get("keep_alive_reason") or ""
             )
