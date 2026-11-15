@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import signal
 import subprocess
@@ -46,6 +47,13 @@ def launch_gui(install: Installation) -> int:
         dependencies.gui_executable(install)
     directory = install.data / "gui" / "launches"
     directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    # A start waits at most STARTUP_SECONDS for its ready file: an older one was left by a start that could not
+    # remove it (below), and no start is still waiting for it.
+    waited = time.time() - STARTUP_SECONDS
+    for stale in directory.glob("*.json"):
+        with contextlib.suppress(OSError):
+            if stale.stat().st_mtime < waited:
+                stale.unlink()
     request = uuid.uuid4().hex
     ready = directory / f"{request}.json"
     log = directory / f"{request}.log"
@@ -64,7 +72,10 @@ def launch_gui(install: Installation) -> int:
         # A second launch writes the file as it focuses the open window and exits: look once more after an exit.
         exited = child.poll() is not None
         if ready.is_file():
-            ready.unlink(missing_ok=True)
+            # The window is open; removing the file only tidies up. On Windows it stays while another process
+            # has it open, such as a virus scanner looking at the new file, and a later start removes it.
+            with contextlib.suppress(OSError):
+                ready.unlink(missing_ok=True)
             release(child)
             print("Astra desktop opened. Closing this terminal will not stop the window.")
             return 0

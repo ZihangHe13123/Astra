@@ -6,6 +6,7 @@ The checkout here is a stand-in with the real layout. The launcher is the real o
 
 from __future__ import annotations
 
+import errno
 import os
 import subprocess
 import sys
@@ -14,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from agent.launcher import cli, dependencies
+from agent.launcher import cli, dependencies, gui
 from agent.launcher.common import write_json
 from agent.launcher.installation import discover
 from agent.launcher.locking import RuntimeLease, active_instances
@@ -56,11 +57,17 @@ appendFileSync("interface-started.log", readFileSync("ui-core/dist/protocol.js",
 """
 # Stands in for the desktop: it notes the build it was started with, then reports its window open.
 DESKTOP = """
-import sys
+import sys, time
 from pathlib import Path
 with open("desktop-started.log", "a", encoding="utf-8") as log:
     log.write(Path("ui-gui/dist/main.cjs").read_text(encoding="utf-8"))
-Path(sys.argv[1]).write_text("{}", encoding="utf-8")
+with open(sys.argv[1], "w", encoding="utf-8") as ready:
+    ready.write("{}")
+    ready.flush()
+    # A test keeps the report open here, as a virus scanner looking at the new file may on Windows.
+    deadline = time.monotonic() + 60
+    while Path("hold-ready").exists() and time.monotonic() < deadline:
+        time.sleep(0.05)
 """
 # The launcher in a process of its own. Only the probe of the Python environment is left out: the
 # stand-in checkout has no packages installed.
@@ -450,6 +457,51 @@ def test_a_failed_desktop_rebuild_opens_no_window(desktop, capfd):
     write(desktop.root / "ui-gui/index.html", "page 1\n")
     assert cli.main(["--gui"], root=desktop.root) == 0
     assert started(desktop, "desktop") == desktop_bundle(desktop=2)
+
+
+def test_a_window_reported_open_is_a_start_even_while_its_report_cannot_be_removed(desktop, capfd, monkeypatch):
+    """Windows keeps a file in place while another process has it open, as a virus scanner may a new one."""
+    hold, launches = desktop.root / "hold-ready", desktop.data / "gui" / "launches"
+    desktops: list[subprocess.Popen] = []
+    stand_in = subprocess.Popen
+
+    def popen(args, **options):
+        process = stand_in(args, **options)
+        if "agent.launcher.gui" in args:
+            desktops.append(process)
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    if os.name != "nt":
+        # Elsewhere an open file can be removed: the launcher is refused here as Windows refuses it.
+        unlink = Path.unlink
+
+        def refused(path: Path, missing_ok: bool = False) -> None:
+            if path.parent == launches and hold.exists():
+                raise PermissionError(errno.EACCES, "The process cannot access the file because it is being "
+                                      "used by another process", str(path))
+            unlink(path, missing_ok=missing_ok)
+
+        monkeypatch.setattr(Path, "unlink", refused)
+    hold.touch()
+    try:
+        assert cli.main(["--gui"], root=desktop.root) == 0
+        assert "Astra desktop opened" in capfd.readouterr().out
+        assert desktops[0].poll() is None  # The window stays open.
+        [left] = launches.glob("*.json")
+        hold.unlink()
+        desktops[0].wait(timeout=30)
+        # A later start keeps it while a start could still be waiting for it, and removes it after.
+        assert cli.main(["--gui"], root=desktop.root) == 0
+        assert left.is_file()
+        waited = time.time() - gui.STARTUP_SECONDS - 1
+        os.utime(left, (waited, waited))
+        assert cli.main(["--gui"], root=desktop.root) == 0
+        assert not left.exists()
+    finally:
+        hold.unlink(missing_ok=True)
+        for process in desktops:
+            process.wait(timeout=30)
 
 
 def test_every_tracked_interface_source_is_one_the_launcher_follows():
