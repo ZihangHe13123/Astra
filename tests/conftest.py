@@ -221,6 +221,49 @@ def unhurried_context_readers(monkeypatch):
     monkeypatch.setattr(activity_source, "_VECTOR_WAIT_SECONDS", 5.0)
 
 
+_HOLD_OPEN = "import sys\nwith open(sys.argv[1], 'rb'):\n    print('open', flush=True)\n    sys.stdin.readline()\n"
+
+
+@pytest.fixture
+def opened_elsewhere(monkeypatch):
+    """Keep a file open in another process, opened as Python opens files: without sharing deletion.
+
+    Windows refuses to remove such a file until that process lets go of it, as it does while another Astra
+    process reads the file, and may while a virus scanner looks at it. Elsewhere an open file can be removed,
+    so here its removal is refused the same way. ``opened_elsewhere(path)`` returns ``let_go``, which closes it.
+    """
+    import errno
+    import subprocess
+    from pathlib import Path
+
+    holders: dict[Path, subprocess.Popen] = {}
+    if os.name != "nt":
+        unlink = os.unlink
+
+        def refused(path, *, dir_fd=None):
+            name = os.fspath(path)
+            holder = holders.get(Path(name).resolve()) if dir_fd is None and isinstance(name, str) else None
+            if holder is not None and holder.poll() is None:
+                raise PermissionError(errno.EACCES, "The process cannot access the file because it is being used "
+                                      "by another process", name)
+            return unlink(path, dir_fd=dir_fd)
+
+        monkeypatch.setattr(os, "unlink", refused)
+        monkeypatch.setattr(os, "remove", refused)
+
+    def hold(path: Path):
+        holder = subprocess.Popen([sys.executable, "-c", _HOLD_OPEN, str(path)], stdin=subprocess.PIPE,
+                                  stdout=subprocess.PIPE, text=True)
+        holders[Path(path).resolve()] = holder
+        assert holder.stdout is not None and holder.stdout.readline() == "open\n", f"could not open {path}"
+        return lambda: holder.communicate("\n", timeout=30)
+
+    yield hold
+    for holder in holders.values():
+        if holder.poll() is None:
+            holder.communicate("\n", timeout=30)
+
+
 @pytest.fixture
 def stable_browser_checkout(tmp_path):
     """An isolated source fixture for installer tests, independent of the runner's worktree path."""
