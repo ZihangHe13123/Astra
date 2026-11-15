@@ -14,6 +14,7 @@ then write the reason for every entry it left without one.
 import hashlib
 import json
 import os
+import shutil
 import threading
 from http.server import ThreadingHTTPServer
 from pathlib import Path
@@ -29,11 +30,12 @@ def digest(tool: dict) -> str:
     return hashlib.sha256(text.encode()).hexdigest()[:16]
 
 
-def sent_tools(tmp_path, disclosure: str = "full") -> list[dict]:
+def sent_tools(tmp_path, disclosure: str = "full", checkout: Path | None = None) -> list[dict]:
     """The tool schemas of a real backend's first model request in an ordinary conversation.
 
     ``full`` sends every default tool, so every schema a model can be told is pinned through it;
     ``deferred`` (the product default) sends the core set and the tool_search/call_tool pair.
+    With ``checkout`` the backend runs that checkout's code, so it loads that checkout's .env.
     """
     seen: list[list[dict]] = []
 
@@ -64,6 +66,10 @@ def sent_tools(tmp_path, disclosure: str = "full") -> list[dict]:
         tmp_path, server.server_port, "schema_digest_session", workdir=workdir,
         env_overrides={"ASTRA_CHANNEL_CONFIG": str(tmp_path / "no-channels.json"),
                        "ASTRA_CONTEXT_INDEX_EMBEDDING": "off", "ASTRA_TOOL_DISCLOSURE": disclosure},
+        bootstrap_code=None if checkout is None else (
+            f"import sys\nsys.path.insert(0, {str(checkout)!r})\n"
+            "runpy.run_module('agent.cli.backend', run_name='__main__')"
+        ),
     )
     try:
         wait_for(lambda e: e.get("type") == "startup_banner", timeout=30)
@@ -91,6 +97,19 @@ def test_deferred_disclosure_sends_the_core_set_and_the_dispatch_pair_as_reviewe
     assert {"tool_search", "call_tool", "read_file", "execute_shell"} <= names
     assert not names & {"browser_open", "git_status", "jobs"}, "deferred tools travel only as tool_search results"
     check_pinned(tools)
+
+
+def test_a_checkout_set_up_from_the_example_config_is_told_the_reviewed_schemas(tmp_path):
+    """A test backend loads its checkout's .env. One set up from .env.example (which sets the subagent
+    slot limits that delegate_task states) is told the same reviewed schemas as a bare one."""
+    root = Path(__file__).resolve().parents[1]
+    checkout = tmp_path / "checkout"
+    shutil.copytree(root / "agent", checkout / "agent", ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    shutil.copyfile(root / "pyproject.toml", checkout / "pyproject.toml")
+    shutil.copyfile(root / ".env.example", checkout / ".env")
+    check_pinned(sent_tools(tmp_path, checkout=checkout))
+    # The backend ran as the checkout's installation: its runtime lease is there.
+    assert (checkout / ".astra" / "launcher").is_dir()
 
 
 def check_pinned(tools: list[dict]) -> None:
