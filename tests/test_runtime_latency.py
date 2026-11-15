@@ -15,17 +15,29 @@ def test_runtime_profiler_is_opt_in(tmp_path, monkeypatch):
     assert not list(tmp_path.iterdir())
 
 
+async def last(seconds):
+    """Wait until `seconds` have passed on perf_counter, the profiler's clock.
+
+    asyncio times a sleep on loop.time(). On Windows before Python 3.13 that is
+    a 15.6 ms tick clock and a timer may fire up to a tick early, so a 20 ms
+    sleep can end after a few milliseconds as perf_counter sees it.
+    """
+    deadline = time.perf_counter() + seconds
+    while (left := deadline - time.perf_counter()) > 0:
+        await asyncio.sleep(left)
+
+
 def test_tool_timing_accounts_for_scheduler_barriers_and_approval(tmp_path):
     async def scenario():
         profiler = RuntimeProfiler(tmp_path / "profile.jsonl")
         registry = ToolRegistry(artifact_dir=tmp_path / "artifacts")
 
         async def tool():
-            await asyncio.sleep(0.025)
+            await last(0.025)
             return "PRIVATE OUTPUT"
 
         async def approve(request):
-            await asyncio.sleep(0.02)
+            await last(0.02)
             return "once"
 
         registry.register(ToolDef("first", "first", {"type": "object"}, tool, risk="write", approval="always"))
