@@ -21,9 +21,10 @@ Application rules (docs/execution.md, "Idle compaction"):
   model's window holds it with room for the answer, sized as the provider reported the last
   request plus what it adds; the compaction line does not apply to it. When no summary is
   written for that or another refusal, a warning says why.
-- The next turn of that conversation uses the summary only if it starts a whole lifetime or more
-  after the last request that read the cache (the summary request included), on a provider with
-  a lifetime, and the history still begins with what was summarized. The summary then takes the
+- The next turn of that conversation uses the summary only if idle compaction and the
+  conversation's compaction are still on, the turn starts a whole lifetime or more after the
+  last request that read the cache (the summary request included), on a provider with a
+  lifetime, and the history still begins with what was summarized. The summary then takes the
   place of the part it covers and everything after that part stays word for word, as in history
   compaction. Otherwise the summary is dropped and the conversation goes on in full.
 - One summary per pause, one conversation at a time. A turn that starts meanwhile (any

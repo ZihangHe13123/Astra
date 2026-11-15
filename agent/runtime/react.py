@@ -1812,7 +1812,9 @@ class ReActAgent(AgentBase):
         """A summary written while the conversation sat idle replaces its older part if the cache has gone."""
         settle = getattr(self.context, "apply_idle_summary", None)
         if settle is not None:
-            settle(idle_compaction.clock(), idle_compaction.cache_seconds_for(self.llm))
+            # Idle compaction turned off since the summary was written: it is dropped, not used.
+            cached_for = idle_compaction.cache_seconds_for(self.llm) if idle_compaction.enabled() else None
+            settle(idle_compaction.clock(), cached_for)
 
     async def _prepare_turn(
         self,
