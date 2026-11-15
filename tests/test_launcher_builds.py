@@ -504,6 +504,28 @@ def test_a_window_reported_open_is_a_start_even_while_its_report_cannot_be_remov
             process.wait(timeout=30)
 
 
+def test_a_rebuilt_desktop_opens_while_another_process_reads_the_lease_of_its_rebuild(desktop, capfd, monkeypatch,
+                                                                                       opened_elsewhere):
+    """Another Astra process reads the rebuild's lease as it ends, as one does that finds the lease held."""
+    instances, let_go = desktop.control / "instances", []
+    rebuild = dependencies.refresh_builds
+
+    def refresh_builds(install, packages):
+        rebuilt = rebuild(install, packages)
+        [metadata] = instances.glob("*.json")
+        let_go.append(opened_elsewhere(metadata))
+        return rebuilt
+
+    monkeypatch.setattr(dependencies, "refresh_builds", refresh_builds)
+    write(desktop.root / "ui-gui/src/main.ts", "desktop 2\n")
+    assert cli.main(["--gui"], root=desktop.root) == 0
+    assert "Astra desktop opened" in capfd.readouterr().out
+    assert started(desktop, "desktop") == desktop_bundle(desktop=2)
+    assert active_instances(desktop) == []  # The rebuild's lease ended, although its files could not go yet.
+    let_go[0]()
+    assert active_instances(desktop) == [] and list(instances.iterdir()) == []
+
+
 def test_every_tracked_interface_source_is_one_the_launcher_follows():
     """A file added beside the sources is either read by a build, and followed, or named here as not read."""
     if not (ROOT / ".git").exists():

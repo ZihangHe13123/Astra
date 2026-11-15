@@ -385,6 +385,30 @@ def test_runtime_rechecks_pending_after_waiting_for_installation_lock(source, ma
             child.communicate("\n", timeout=10)
 
 
+def running(inst, capsys) -> list[dict]:
+    """What `astra version` reports running."""
+    assert cli.main(["version", "--json"], root=inst.root) == 0
+    return json.loads(capsys.readouterr().out)["running"]
+
+
+@pytest.mark.parametrize("held", [".json", ".lock"])
+def test_a_lease_ends_while_another_process_has_its_files_open(source, opened_elsewhere, capsys, held):
+    """Another Astra process reads a lease's metadata, or probes its lock, as the lease closes.
+
+    Windows refuses to remove a file while another process has it open. The lease ends all the same, and its
+    files are removed once they are let go.
+    """
+    inst, _ = source
+    with RuntimeLease(inst, "closing runtime") as lease:
+        let_go = opened_elsewhere(lease.path.with_suffix(held))
+    # Its lock is free. A command that finds it so is refused the removal too, and still answers.
+    assert running(inst, capsys) == []
+    assert lease.path.is_file()  # Kept, with its metadata when that stayed, so that a later command finds it.
+    let_go()
+    assert running(inst, capsys) == []
+    assert list((inst.control / "instances").iterdir()) == []
+
+
 def test_waiting_exclusive_does_not_retry_business_body(source):
     inst, _ = source
     calls = []

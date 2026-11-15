@@ -7,7 +7,7 @@ import json
 import os
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 
 from agent.runtime.instance_lock import InstanceAlreadyRunning, InstanceLock
@@ -33,11 +33,23 @@ def active_instances(install: Installation) -> list[dict]:
             active.append(metadata or {"role": "unknown Astra process", "pid": "unknown"})
         else:
             lock.release()
-            path.with_suffix(".json").unlink(missing_ok=True)
-            # Runtime lease names are unique and never reused. The shared
-            # update.lock inode, in contrast, must never be unlinked.
-            path.unlink(missing_ok=True)
+            _remove_lease(path)
     return active
+
+
+def _remove_lease(path: Path) -> None:
+    """Remove a free lease's files: its metadata first, then the lock file through which it is found.
+
+    Windows refuses to remove a file while another process has it open without sharing deletion, as Python
+    opens files. Another Astra process has them open that way while its active_instances probes this lock or
+    reads this metadata, and a virus scanner may. A refused file stays, and so does the lock file beside
+    metadata that could not go: a later active_instances finds the lease free and removes them.
+    """
+    with suppress(OSError):
+        path.with_suffix(".json").unlink(missing_ok=True)
+        # Runtime lease names are unique and never reused. The shared
+        # update.lock inode, in contrast, must never be unlinked.
+        path.unlink(missing_ok=True)
 
 
 @contextmanager
@@ -87,9 +99,9 @@ class RuntimeLease:
                 raise
 
     def close(self) -> None:
-        self.path.with_suffix(".json").unlink(missing_ok=True)
+        # The lease ends with its lock. Removing its files only tidies up, and may be refused.
         self.lock.release()
-        self.path.unlink(missing_ok=True)
+        _remove_lease(self.path)
 
     def __enter__(self):
         return self
