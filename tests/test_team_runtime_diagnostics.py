@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 
 import pytest
 
@@ -87,6 +88,61 @@ def test_worker_reasons_and_actual_limits_survive_process_artifacts(tmp_path, mo
         assert restarted["lifecycle"] == {}
         assert restarted["keep_alive_reason"] == ""
         assert restarted["keep_alive_state"] == ("disabled" if reason == "reported" else "pending")
+
+    asyncio.run(scenario())
+
+
+def test_a_member_cancelled_as_the_store_grants_its_idle_slot_keeps_that_capacity(tmp_path, monkeypatch):
+    # The store decides in a worker thread. Holding that thread after its commit stops the
+    # member where a slow runner did (macOS release gate, 2026-11-15): the store already says
+    # idle, and the member has not resumed when the cancellation lands.
+    decide = AgentTeamStore.try_enter_idle
+    release = threading.Event()
+
+    def decided_then_held(self, agent_id, *, limit):
+        decision = decide(self, agent_id, limit=limit)
+        release.wait(5)
+        return decision
+
+    class Reporter:
+        async def chat(self, **kwargs):
+            return {"content": "ready", "tool_calls": []}
+
+    async def scenario():
+        monkeypatch.setenv("ASTRA_TEAM_IDLE_TIMEOUT_SECONDS", "20")
+        monkeypatch.setenv("ASTRA_TEAM_KEEP_ALIVE_LIFETIME_SECONDS", "0")
+        monkeypatch.setattr(AgentTeamStore, "try_enter_idle", decided_then_held)
+        manager = ProcessManager(artifact_dir=tmp_path / "processes")
+        monkeypatch.setattr(delegate, "_sub_processes", manager)
+        tasks = TaskStore(tmp_path / "tasks.db")
+        parent = tasks.start_run("request", "diagnostics", session_id="session")
+        registry = ToolRegistry()
+        register_delegate_tools(registry, llm_getter=Reporter, task_store=tasks, session_id_getter=lambda: "session")
+        # Not the default capacity (2): the record must be the one the store applied.
+        team = await call(registry, parent, "team", action="create", keep_alive_limit=3)
+        handle = await call(registry, parent, "team_spawn", team_id=team["id"], name="reporter",
+                            goal="report readiness", keep_alive=True, timeout=10)
+        store = AgentTeamStore(tasks.path)
+        agent_id = handle["agent"]["id"]
+        process = manager.get(handle["process"]["process_id"])
+        try:
+            await wait_status(store, agent_id, "idle")
+            assert store.get_agent(agent_id)["keep_alive_state"] == "effective"
+            cancelling = asyncio.create_task(manager.cancel(process))
+            async with asyncio.timeout(3):
+                while not process.task.cancelling():
+                    await asyncio.sleep(0)
+        finally:
+            release.set()
+        await cancelling
+        assert manager.status(process) == "cancelled"
+        member = store.get_agent(agent_id)
+        assert member["status"] == "cancelled"
+        assert member["lifecycle"]["state"] == "terminal"
+        assert member["lifecycle"]["completion_reason"] == "cancelled"
+        assert member["lifecycle"]["limits"]["idle_capacity"] == 3
+        status = await call(registry, parent, "team", action="status", team_id=team["id"])
+        assert next(a for a in status["agents"] if a["id"] == agent_id)["lifecycle"] == member["lifecycle"]
 
     asyncio.run(scenario())
 
