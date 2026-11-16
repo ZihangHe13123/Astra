@@ -27,8 +27,8 @@ from agent.runtime.tools import delegate
 # services. Empty is "not set up" to each of these. Not here: DEEPSEEK_API_KEY, QWEN38_API_KEY,
 # ZHIPU_API_KEY, LLM_API_KEY and EXA_API_KEY, which load_project_env takes from the .env whenever it has them.
 BLANK_INTEGRATIONS = dict.fromkeys((
-    # The mailbox.
-    "ASTRA_MAIL_ADDRESS", "ASTRA_MAIL_PASSWORD", "ASTRA_163_EMAIL", "ASTRA_163_AUTH_CODE",
+    # The mailboxes: main, and the list that names every other one.
+    "ASTRA_MAIL_ADDRESS", "ASTRA_MAIL_PASSWORD", "ASTRA_163_EMAIL", "ASTRA_163_AUTH_CODE", "ASTRA_MAIL_ACCOUNTS",
     # web_extract's providers; an empty FIRECRAWL_URL is the unconfigured local default.
     "TAVILY_API_KEY", "PARALLEL_API_KEY", "FIRECRAWL_API_KEY", "FIRECRAWL_URL",
     # Context Index embeddings: an empty switch is off, so no embedding endpoint is used.
@@ -1202,6 +1202,12 @@ def configured_checkout(tmp_path: Path) -> Path:
         "ASTRA_MAIL_PASSWORD": "checkout-password",
         "ASTRA_MAIL_IMAP_HOST": "127.0.0.1",
         "ASTRA_MAIL_IMAP_PORT": "9",
+        # A second mailbox, on the same unanswered port.
+        "ASTRA_MAIL_ACCOUNTS": "work",
+        "ASTRA_MAIL_WORK_ADDRESS": "checkout-work@example.invalid",
+        "ASTRA_MAIL_WORK_PASSWORD": "checkout-work-password",
+        "ASTRA_MAIL_WORK_IMAP_HOST": "127.0.0.1",
+        "ASTRA_MAIL_WORK_IMAP_PORT": "9",
         **CHECKOUT_SERVICES,
         "ASTRA_EMBEDDING_BACKEND": "llamacpp",
         "ASTRA_EMBEDDING_BASE_URL": "http://127.0.0.1:9/v1",
@@ -1280,6 +1286,8 @@ def test_protocol_fixture_keeps_the_checkouts_mail_account_from_the_backend(
         # A test still gives the backend an account on purpose; the server is the one the checkout's .env names.
         assert "Mail: " in result["error"] and SETUP not in result["error"]
         assert (configured_checkout / ".astra" / "mail" / "127.0.0.1.sqlite3").is_file()
+        # The checkout's other mailboxes stay out: only the one the test gives was opened.
+        assert not (configured_checkout / ".astra" / "mail" / "accounts").exists()
     else:
         assert SETUP in result["error"]
         assert not (configured_checkout / ".astra" / "mail").exists()

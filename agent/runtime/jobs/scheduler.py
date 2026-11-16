@@ -170,7 +170,8 @@ def event_line(event: dict | None) -> str:
     if not event:
         return ""
     if event.get("type") == "mail":
-        return f"新邮件：{event.get('from', '')} — {event.get('subject', '')}"
+        where = f"（{event['account']}）" if event.get("account") else ""
+        return f"新邮件{where}：{event.get('from', '')} — {event.get('subject', '')}"
     return f"新文件：{event.get('name') or event.get('path', '')}"
 
 

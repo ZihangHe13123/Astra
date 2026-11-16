@@ -22,6 +22,10 @@ class MailConfig:
     # A folder's first sync caches only its newest messages; later syncs fetch what arrived
     # since, never older history.
     sync_limit: int = 100
+    # Which configured mailbox this is: "main", or its name in ASTRA_MAIL_ACCOUNTS; and its address,
+    # known even offline, when ``account`` (the login) is left empty.
+    name: str = "main"
+    address: str = ""
 
 
 @dataclass(frozen=True)

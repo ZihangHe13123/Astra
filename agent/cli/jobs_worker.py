@@ -130,9 +130,12 @@ async def run_check(store: JobStore, run: dict) -> None:
         text = f"Original user request:\n{spec['original_request']}\n\nScheduled check:\n{spec['prompt']}"
         event = spec.get("event")
         if event and event.get("type") == "mail":
-            text += (f"\n\nThis run was started by new mail in {event.get('folder')}: #{event.get('uid')} "
+            mailbox, account = ((f" of the {event['account']} mailbox", f", account {event['account']}")
+                                if event.get("account") else ("", ""))
+            text += (f"\n\nThis run was started by new mail in {event.get('folder')}{mailbox}: #{event.get('uid')} "
                      f"From: {event.get('from')} | Subject: {event.get('subject')}. Read it with the mail tool "
-                     f"(action read, uid {event.get('uid')}, folder {event.get('folder')}) when the check needs it.")
+                     f"(action read, uid {event.get('uid')}, folder {event.get('folder')}{account}) when the check "
+                     "needs it.")
         elif event:
             text += f"\n\nThis run was started by a new file: {event.get('path')}. Read it with read_file when needed."
         on_change = spec.get("notify") == "on_change"

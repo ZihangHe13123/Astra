@@ -31,11 +31,14 @@ def mail_config(tmp_path: Path) -> MailConfig:
 
 
 class Mailbox:
-    def __init__(self, tmp_path: Path):
+    def __init__(self, tmp_path: Path, name: str = "main"):
         self.messages: dict[int, object] = {}
         self.validity = 7
         self.client = ScriptedClient(snapshots={}, messages={})
-        self.service = lambda: MailService(mail_config(tmp_path), client_factory=ClientFactory(self.client))
+        config = mail_config(tmp_path)
+        if name != "main":
+            config = replace(config, name=name, account=f"me@{name}.example", database_path=tmp_path / "mail" / name)
+        self.service = lambda: MailService(config, client_factory=ClientFactory(self.client))
 
     def deliver(self, uid: int, sender: str, subject: str) -> None:
         self.messages[uid] = replace(message("INBOX", self.validity, uid, subject=subject), sender=sender)
@@ -303,3 +306,69 @@ def test_a_look_that_cannot_reach_the_mailbox_sets_no_baseline_and_loses_nothing
     box.client.enter_error = None
     assert watcher.look() == 1
     assert [event["subject"] for event in queued_events(store, job["id"])] == ["while unreachable"]
+
+
+def test_a_mail_trigger_watches_every_mailbox_unless_it_names_one(tmp_path):
+    store, main, work = JobStore(tmp_path / "home"), Mailbox(tmp_path), Mailbox(tmp_path, "work")
+    main.deliver(1, "tan@example.edu", "old in main")
+    work.deliver(1, "tan@example.edu", "old at work")
+    every = reminder(store, tmp_path, {"type": "mail", "from": "tan@", "subject": ""})
+    only_work = reminder(store, tmp_path, {"type": "mail", "from": "tan@", "subject": "", "account": "work"})
+    watcher = TriggerWatcher(store, mail_service=lambda: [main.service(), work.service()])
+    assert watcher.look() == 0  # Each mailbox's first look notes where it stands.
+    main.deliver(2, "tan@example.edu", "new in main")
+    work.deliver(2, "tan@example.edu", "new at work")
+    assert watcher.look() == 3
+    assert [(event["account"], event["subject"]) for event in queued_events(store, every["id"])] == [
+        ("main", "new in main"), ("work", "new at work")]
+    assert [(event["account"], event["subject"]) for event in queued_events(store, only_work["id"])] == [
+        ("work", "new at work")]
+    assert json.loads(store.trigger_cursor(every["id"]).partition(":")[2]) == {"main": "7:2", "work": "7:2"}
+    tick(store)
+    assert "导师来信了\n新邮件（work）：tan@example.edu — new at work" in outputs(store)
+    assert watcher.look() == 0
+
+
+def test_a_mail_trigger_from_one_mailbox_keeps_its_place_when_more_are_added(tmp_path):
+    store, main, work = JobStore(tmp_path / "home"), Mailbox(tmp_path), Mailbox(tmp_path, "work")
+    main.deliver(1, "tan@example.edu", "before")
+    job = reminder(store, tmp_path, {"type": "mail", "from": "tan@", "subject": ""})
+    assert TriggerWatcher(store, mail_service=main.service).look() == 0
+    assert store.trigger_cursor(job["id"]) == "7:1"  # One mailbox: the cursor it always had.
+    # A second mailbox is set up, with mail from before; main gets one new message meanwhile.
+    for uid in (1, 2, 3):
+        work.deliver(uid, "tan@example.edu", f"already at work {uid}")
+    main.deliver(2, "tan@example.edu", "while adding a mailbox")
+    both = TriggerWatcher(store, mail_service=lambda: [main.service(), work.service()])
+    assert both.look() == 1
+    assert [event["subject"] for event in queued_events(store, job["id"])] == ["while adding a mailbox"]
+    work.deliver(4, "tan@example.edu", "new at work")
+    assert both.look() == 1 and queued_events(store, job["id"])[-1]["subject"] == "new at work"
+    # And back to main alone: its place is kept, and so is work's for when it returns.
+    main.deliver(3, "tan@example.edu", "main alone again")
+    assert TriggerWatcher(store, mail_service=main.service).look() == 1
+    work.deliver(5, "tan@example.edu", "work returns")
+    assert both.look() == 1 and queued_events(store, job["id"])[-1]["subject"] == "work returns"
+
+
+def test_jobs_name_the_mailbox_a_mail_trigger_watches(tmp_path):
+    registry = ToolRegistry()
+    asked: list[dict] = []
+
+    async def approve(request):
+        asked.append(request)
+        return "once"
+
+    registry.set_approval_handler(approve)
+    register_jobs_tool(registry, home=tmp_path / "home", workdir=lambda: tmp_path,
+                       request=lambda: "工作邮箱里导师来信就提醒我", model_key=lambda: "fixture")
+    made = asyncio.run(registry.execute("jobs", {"action": "add", "name": "导师来信", "kind": "reminder", "prompt": "x",
+                                                 "on_new_mail": {"from": "tan@", "account": "work"}}, call_id="c"))
+    job = json.loads(made["output"])["job"]
+    assert job["schedule"] == "on new mail from 'tan@' in mailbox 'work'"
+    assert asked[-1]["target"].startswith("有新邮件时（work）：发件人含「tan@」")
+    output, error = execute_jobs_command(["add", "news", "--reminder", "--prompt", "x", "--on-mail-subject", "deadline",
+                                          "--on-mail-account", "work", "--on-mail-folder", "Projects"],
+                                         home=tmp_path / "home", workdir=tmp_path)
+    assert error == "" and json.loads(output)["spec"]["trigger"] == {
+        "type": "mail", "from": "", "subject": "deadline", "folder": "Projects", "account": "work"}

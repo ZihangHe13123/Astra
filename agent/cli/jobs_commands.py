@@ -41,6 +41,8 @@ def jobs_parser() -> JobParser:
     add.add_argument("--on-mail-from", default=None, help="start on new mail whose sender contains this")
     add.add_argument("--on-mail-subject", default=None, help="start on new mail whose subject contains this")
     add.add_argument("--on-mail-folder", default="INBOX", help="with --on-mail-*: the folder to watch")
+    add.add_argument("--on-mail-account", default="", help="with --on-mail-*: the mailbox to watch, by name or "
+                                                          "address (default: every configured mailbox)")
     add.add_argument("--on-new-file", metavar="PATTERN", default=None,
                      help="start when a new file matching PATTERN (such as '*.pdf') appears in --workdir")
     add.add_argument("--targets", default=",".join(DEFAULT_TARGETS),
@@ -55,7 +57,7 @@ def jobs_parser() -> JobParser:
     add.add_argument("--workdir", type=Path)
     add.add_argument("--model", default="", help="configured model key; without it a check follows the default model")
     add.add_argument("--web", action="store_true", help="allow existing web search/fetch tools for this check")
-    add.add_argument("--mail", action="store_true", help="let this check read the configured mailbox (read-only)")
+    add.add_argument("--mail", action="store_true", help="let this check read the configured mailboxes (read-only)")
     add.add_argument("--read-calendar", action="store_true",
                      help="let this check read Calendar and Reminders on macOS (read-only)")
     add.add_argument("--idle", type=float, default=120)
@@ -152,7 +154,7 @@ def execute_jobs_command(argv: list[str], *, home: Path | None = None,
             trigger = None
             if args.on_mail_from is not None or args.on_mail_subject is not None:
                 trigger = {"type": "mail", "from": args.on_mail_from or "", "subject": args.on_mail_subject or "",
-                           "folder": args.on_mail_folder}
+                           "folder": args.on_mail_folder, "account": args.on_mail_account}
             elif args.on_new_file is not None:
                 trigger = {"type": "file", "pattern": args.on_new_file}
             if trigger and (args.time or args.at or args.after is not None or period):
