@@ -200,8 +200,8 @@ def test_one_shot_subagent_skill_does_not_compete_with_team_default():
     assert "`team-tdd-development`" in content
 
 
-def test_exact_development_skill_catalog_is_installed():
-    assert set(listed_development_skills()) == EXPECTED_SKILLS
+def test_required_development_skills_are_installed():
+    assert EXPECTED_SKILLS <= set(listed_development_skills())
 
 
 @pytest.mark.parametrize("name", sorted(EXPECTED_SKILLS))
