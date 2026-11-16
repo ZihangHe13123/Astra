@@ -38,6 +38,11 @@ Application rules (docs/execution.md, "Idle compaction"):
   restart before the conversation has been quiet that long writes none: the new process does
   not have the last request to repeat, and a repeat that missed the cache would cost more than
   the summary saves.
+- What becomes of each summary is logged at INFO (``idle compaction: summary``): ready, with an
+  id saved with it, then used or dropped and why under that id; or not written, or cancelled and
+  why. A summary is ready once it is kept, even if the attempt is cut short while saving it. One
+  dropped because the cache was still there says whether the summary request kept it or the last
+  turn did.
 """
 
 from __future__ import annotations
@@ -111,11 +116,14 @@ class IdleCompactor:
         self.conversations = conversations
         self._task: asyncio.Task | None = None
         self._checked = 0.0
+        # Why the running summary was cancelled, for its log line.
+        self._cancelled_for = ""
 
     def tick(self, *, busy: bool) -> None:
         running = self._task is not None and not self._task.done()
         if busy and running and self._task is not None:
             # A turn needs the model, and the client may have one request slot: the summary gives way.
+            self._cancelled_for = "a turn needs the model"
             self._task.cancel()
         if busy or running:
             return
@@ -133,22 +141,32 @@ class IdleCompactor:
                 continue
             if context.idle_summary_due(now, idle_after=idle_seconds(cached_for), cache_seconds=cached_for,
                                         min_tokens=tokens, min_gain=gain, model=model_identity(llm)):
+                self._cancelled_for = ""
                 self._task = asyncio.create_task(self._prepare(context, now, attribution), name="idle-compaction")
                 return
 
     async def _prepare(self, context: Any, now: float, attribution: dict) -> None:
+        # A summary kept is ready, and logged so, even when the attempt is cut short while saving it.
+        kept = getattr(context, "kept_idle_summary_id", None)
         try:
             with usage_context(**attribution):
                 ready = await asyncio.wait_for(context.prepare_idle_summary(now), SUMMARY_TIMEOUT_SECONDS)
-            logger.info("idle compaction: summary %s", "ready" if ready else "not written")
+            if not ready:
+                logger.info("idle compaction: summary not written")
+        except asyncio.CancelledError:
+            if getattr(context, "kept_idle_summary_id", None) == kept:
+                logger.info("idle compaction: summary cancelled: %s", self._cancelled_for or "interrupted")
+            raise
         except asyncio.TimeoutError:
-            logger.info("idle compaction: no summary within %.0f s; given up", SUMMARY_TIMEOUT_SECONDS)
+            if getattr(context, "kept_idle_summary_id", None) == kept:
+                logger.info("idle compaction: no summary within %.0f s; given up", SUMMARY_TIMEOUT_SECONDS)
         except Exception:
             logger.exception("idle compaction failed")
 
     async def close(self) -> None:
         task, self._task = self._task, None
         if task is not None and not task.done():
+            self._cancelled_for = "the backend is closing"
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task
