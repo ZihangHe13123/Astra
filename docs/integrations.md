@@ -426,7 +426,8 @@ ASTRA_MAIL_QQ_PASSWORD=authorization-code
 
 `ASTRA_MAIL_<NAME>_IMAP_PORT` and `ASTRA_MAIL_<NAME>_SENT_FOLDER` work the same way. The `mail`
 tool's recent and search then look in every mailbox at once, newest first; each message names
-its mailbox, and so does its ref. Its `account` (a name or an address) limits a call to one
+its mailbox, and so does its ref: `main`'s keep their old form, and every other mailbox's end
+with `@` and its name (`INBOX:7:4@work`), so a ref keeps naming the same message as mailboxes come and go. Its `account` (a name or an address) limits a call to one
 mailbox. A mailbox that cannot be read is reported while the others still answer. Each named
 mailbox keeps its own cache and attachments under `.astra/mail/accounts/<name>/`; `main` keeps
 the files it always had. `checkmail --account NAME` works with one mailbox, the first by default.

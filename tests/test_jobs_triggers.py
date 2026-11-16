@@ -20,6 +20,7 @@ from agent.runtime.jobs.scheduler import tick
 from agent.runtime.jobs.store import INACTIVE_SECONDS, JobStore, note_interaction
 from agent.runtime.jobs.triggers import MAX_EVENTS, TriggerWatcher
 from agent.runtime.tools.jobs import register_jobs_tool
+from agent.runtime.tools.mail import register_mail_tool
 from agent.runtime.tools.registry import ToolRegistry
 
 
@@ -40,8 +41,9 @@ class Mailbox:
             config = replace(config, name=name, account=f"me@{name}.example", database_path=tmp_path / "mail" / name)
         self.service = lambda: MailService(config, client_factory=ClientFactory(self.client))
 
-    def deliver(self, uid: int, sender: str, subject: str) -> None:
-        self.messages[uid] = replace(message("INBOX", self.validity, uid, subject=subject), sender=sender)
+    def deliver(self, uid: int, sender: str, subject: str, received_at: float | None = None) -> None:
+        self.messages[uid] = replace(message("INBOX", self.validity, uid, subject=subject, received_at=received_at),
+                                     sender=sender)
         self._publish()
 
     def renumber(self, validity: int) -> None:
@@ -372,3 +374,114 @@ def test_jobs_name_the_mailbox_a_mail_trigger_watches(tmp_path):
                                          home=tmp_path / "home", workdir=tmp_path)
     assert error == "" and json.loads(output)["spec"]["trigger"] == {
         "type": "mail", "from": "", "subject": "deadline", "folder": "Projects", "account": "work"}
+
+
+def test_a_mailbox_gets_its_place_even_when_another_fills_the_look(tmp_path):
+    store, main, work = JobStore(tmp_path / "home"), Mailbox(tmp_path), Mailbox(tmp_path, "work")
+    main.deliver(1, "tan@example.edu", "old in main")
+    job = reminder(store, tmp_path, {"type": "mail", "from": "tan@", "subject": ""})
+    assert TriggerWatcher(store, mail_service=main.service).look() == 0
+    work.deliver(1, "tan@example.edu", "old at work")
+    for uid in range(2, 2 + MAX_EVENTS):
+        main.deliver(uid, "tan@example.edu", f"new in main {uid}")
+    watcher = TriggerWatcher(store, mail_service=lambda: [main.service(), work.service()])
+    assert watcher.look() == MAX_EVENTS
+    # work was looked at in that full look, and its place taken there: what arrives next is new.
+    work.deliver(2, "tan@example.edu", "new at work")
+    assert watcher.look() == 1
+    assert queued_events(store, job["id"])[-1]["subject"] == "new at work"
+
+
+def test_an_event_from_a_mailbox_other_than_main_names_it_even_alone(tmp_path):
+    store, main, work = JobStore(tmp_path / "home"), Mailbox(tmp_path), Mailbox(tmp_path, "work")
+    work.deliver(1, "tan@example.edu", "old at work")
+    job = reminder(store, tmp_path, {"type": "mail", "from": "tan@", "subject": ""})
+    watcher = TriggerWatcher(store, mail_service=work.service)
+    assert watcher.look() == 0
+    work.deliver(2, "tan@example.edu", "new at work")
+    assert watcher.look() == 1
+    [event] = queued_events(store, job["id"])
+    assert event["account"] == "work"
+    # main is set up before the run reads it: the event still means work's message 2, not main's.
+    main.deliver(2, "tan@example.edu", "main's message 2")
+    registry = ToolRegistry()
+    register_mail_tool(registry, project_root=tmp_path, service=lambda: [main.service(), work.service()])
+    text = asyncio.run(registry.execute("mail", {"action": "read", "uid": event["uid"], "folder": event["folder"],
+                                                 "account": event["account"]}, call_id="m"))["output"]
+    assert "new at work" in text and "main's message" not in text
+
+
+def test_a_mailbox_whose_cache_cannot_be_opened_does_not_stop_the_others_triggers(tmp_path, monkeypatch):
+    import agent.mail163.config as mail_config_module
+    import agent.mail163.service as mail_service_module
+
+    store, main = JobStore(tmp_path / "home"), Mailbox(tmp_path)
+    main.deliver(1, "tan@example.edu", "old in main")
+    job = reminder(store, tmp_path, {"type": "mail", "from": "tan@", "subject": ""})
+    work = replace(mail_config(tmp_path), name="work", account="me@work.example",
+                   database_path=tmp_path / "mail" / "broken.sqlite3")
+    work.database_path.parent.mkdir(parents=True, exist_ok=True)
+    work.database_path.write_bytes(b"not a sqlite database")
+    # The configured mailboxes as the watcher loads them, each opened on a scripted server.
+    monkeypatch.setattr(mail_config_module, "load_mail_accounts", lambda root: [mail_config(tmp_path), work])
+    real = mail_service_module.MailService
+    monkeypatch.setattr(mail_service_module, "MailService",
+                        lambda config: real(config, client_factory=ClientFactory(main.client)))
+    watcher = TriggerWatcher(store)
+    assert watcher.look() == 0
+    main.deliver(2, "tan@example.edu", "new in main")
+    assert watcher.look() == 1 and queued_events(store, job["id"])[-1]["subject"] == "new in main"
+
+
+def test_a_busy_mailbox_does_not_keep_another_mailboxs_older_mail_waiting(tmp_path):
+    store, main, work = JobStore(tmp_path / "home"), Mailbox(tmp_path), Mailbox(tmp_path, "work")
+    for box in (main, work):
+        box.deliver(1, "tan@example.edu", "old", received_at=1.0)
+    job = reminder(store, tmp_path, {"type": "mail", "from": "tan@", "subject": ""})
+    watcher = TriggerWatcher(store, mail_service=lambda: [main.service(), work.service()])
+    assert watcher.look() == 0
+    work.deliver(2, "tan@example.edu", "at work, before the rush", received_at=100.0)
+    # main, looked at first, has a full look's worth of newer matching mail every time.
+    for rush in range(3):
+        for uid in range(2 + rush * MAX_EVENTS, 2 + (rush + 1) * MAX_EVENTS):
+            main.deliver(uid, "tan@example.edu", f"rush {uid}", received_at=200.0 + uid)
+        assert watcher.look() == MAX_EVENTS
+    subjects = [event["subject"] for event in queued_events(store, job["id"])]
+    # The oldest first, across mailboxes: work's message in the first look, and nothing of main's skipped.
+    assert subjects[0] == "at work, before the rush"
+    assert subjects[1:] == [f"rush {uid}" for uid in range(2, 2 + 3 * MAX_EVENTS - 1)]
+    assert watcher.look() == 1 and queued_events(store, job["id"])[-1]["subject"] == f"rush {1 + 3 * MAX_EVENTS}"
+
+
+def test_backlogs_in_several_mailboxes_drain_once_each_and_in_order(tmp_path):
+    store, main, work = JobStore(tmp_path / "home"), Mailbox(tmp_path), Mailbox(tmp_path, "work")
+    for box in (main, work):
+        box.deliver(1, "tan@example.edu", "old")
+    job = reminder(store, tmp_path, {"type": "mail", "from": "tan@", "subject": ""})
+    watcher = TriggerWatcher(store, mail_service=lambda: [main.service(), work.service()])
+    assert watcher.look() == 0
+    for uid in range(2, 8):
+        main.deliver(uid, "news@example.com" if uid == 4 else "tan@example.edu", f"main {uid}", received_at=10.0 * uid)
+    for uid in (2, 3):
+        work.deliver(uid, "tan@example.edu", f"work {uid}", received_at=10.0 * uid + 5)
+    assert [watcher.look() for _ in range(3)] == [MAX_EVENTS, 2, 0]
+    assert [event["subject"] for event in queued_events(store, job["id"])] == [
+        "main 2", "work 2", "main 3", "work 3", "main 5", "main 6", "main 7"]
+
+
+def test_newer_mail_left_out_of_a_full_look_is_taken_by_the_next(tmp_path):
+    store, main, work = JobStore(tmp_path / "home"), Mailbox(tmp_path), Mailbox(tmp_path, "work")
+    for box in (main, work):
+        box.deliver(1, "tan@example.edu", "old", received_at=1.0)
+    job = reminder(store, tmp_path, {"type": "mail", "from": "tan@", "subject": ""})
+    watcher = TriggerWatcher(store, mail_service=lambda: [main.service(), work.service()])
+    assert watcher.look() == 0
+    for uid in range(2, 2 + MAX_EVENTS):
+        main.deliver(uid, "tan@example.edu", f"main {uid}", received_at=10.0 + uid)
+    work.deliver(2, "news@example.com", "not watched for", received_at=50.0)
+    work.deliver(3, "tan@example.edu", "newer at work", received_at=60.0)
+    # main's five fill the look; work's message, newer than all of them, keeps its place for the next one.
+    assert watcher.look() == MAX_EVENTS
+    assert "newer at work" not in [event["subject"] for event in queued_events(store, job["id"])]
+    assert watcher.look() == 1 and queued_events(store, job["id"])[-1]["subject"] == "newer at work"
+    assert watcher.look() == 0

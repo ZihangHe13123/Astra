@@ -181,7 +181,8 @@ ASTRA_MAIL_QQ_PASSWORD=authorization-code
 ```
 
 `ASTRA_MAIL_<名字>_IMAP_PORT`、`ASTRA_MAIL_<名字>_SENT_FOLDER` 同理。这样 `mail` 工具的最近邮件和搜索会同时看
-所有邮箱，按时间从新到旧排列，每封邮件和它的 ref 都标明来自哪个邮箱；用 `account`（名字或地址）只看其中一个。
+所有邮箱，按时间从新到旧排列，每封邮件和它的 ref 都标明来自哪个邮箱（`main` 的 ref 保持原样，其他邮箱的 ref 以 `@名字`
+结尾，如 `INBOX:7:4@work`，所以之后增减邮箱，ref 指的仍是同一封邮件）；用 `account`（名字或地址）只看其中一个。
 某个邮箱读不到时会单独说明，其他邮箱照常返回。每个命名的邮箱有自己的缓存和附件目录
 `.astra/mail/accounts/<名字>/`，`main` 沿用原来的文件。`checkmail --account 名字` 操作其中一个邮箱，默认第一个。
 

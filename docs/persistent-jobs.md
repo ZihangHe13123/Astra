@@ -143,7 +143,8 @@ background host looks every five minutes; its first look that reaches the folder
 notes where things stand (an empty folder included), so mail and files already there never start
 a run; so does the first look at a mailbox set up later. A file is new when its name was not in the folder at the previous look, so a copied, moved
 or unpacked file counts even with an old date, and changing a file already there does not start
-a run. One look starts at most five runs per job, oldest first; the rest wait for the next look,
+a run. One look starts at most five runs per job, oldest first (across mailboxes, so a busy one does not keep
+another's mail waiting); the rest wait for the next look,
 so none is lost. Mail is read from the local cache, which takes up to 100 new messages per folder
 at each look. A
 reminder started this way delivers its text with the mail's sender and subject or the file's

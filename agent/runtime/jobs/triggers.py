@@ -5,7 +5,8 @@ stand, an empty folder included, so mail and files that were already there never
 queues at most ``MAX_EVENTS`` runs per job, oldest first, and moves the job's cursor past what it queued
 or passed over in the same transaction; what is left waits for the next look, so nothing new is dropped.
 A file is new when its name was not in the folder at the last look, whatever its time says.
-A mail trigger watches its folder in one mailbox, or in every configured mailbox, each with its own place.
+A mail trigger watches its folder in one mailbox, or in every configured mailbox, each with its own place;
+a look takes the oldest new mail across them, so a busy mailbox does not keep another's waiting.
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import json
 import logging
 import time
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -123,26 +125,98 @@ class TriggerWatcher:
         from agent.mail163.service import MailService
 
         configs = load_mail_accounts(Path(__file__).resolve().parents[3])
-        boxes = [MailService(config) for config in configs if any(_watches(job, config) for job in jobs)]
+        boxes = []
+        for config in configs:
+            if not any(_watches(job, config) for job in jobs):
+                continue
+            try:
+                boxes.append(MailService(config))
+            except Exception:  # noqa: BLE001 - this mailbox's cache cannot be opened: the others are still looked at
+                logger.info("mail triggers could not open mailbox %s", config.name, exc_info=True)
         return boxes, len(configs) > 1
 
     def _look_at_job_mail(self, boxes: list[Any], job: dict, now: float, several: bool) -> int:
+        trigger = job["spec"]["trigger"]
         marks = _mail_marks(self.store.trigger_cursor(job["id"]))
-        events: list[dict] = []
-        moved = False
+        scans: list[_Scan] = []
         for box in boxes:
-            if len(events) >= MAX_EVENTS:
-                break  # The rest wait for the next look, where they stand.
             try:
-                mark = _look_at_mailbox(box, job["spec"]["trigger"], marks.get(box.config.name), events, several)
+                scan = _scan(box, trigger, marks.get(box.config.name))
             except Exception:  # noqa: BLE001 - this mailbox's folder could not be read now: look again next time
                 logger.info("mail trigger %s could not look at mailbox %s", job["id"], box.config.name, exc_info=True)
                 continue
-            if mark is not None:
-                marks[box.config.name], moved = mark, True
-        if not moved:
+            if scan is not None:
+                scans.append(scan)
+        if not scans:
             return 0
+        # The oldest new mail first, across mailboxes, each mailbox's in its own order.
+        events: list[dict] = []
+        while len(events) < MAX_EVENTS:
+            waiting = [scan for scan in scans if scan.taken < len(scan.candidates)]
+            if not waiting:
+                break
+            scan = min(waiting, key=lambda each: (_received(each.candidates[each.taken]), scans.index(each)))
+            events.append(_event(scan.box, scan.candidates[scan.taken], trigger, several))
+            scan.taken += 1
+        for scan in scans:
+            if scan.taken == len(scan.candidates):
+                place = scan.reached  # Everything it looked at is passed: the first place, or all its new mail.
+            elif scan.taken:
+                place = int(scan.candidates[scan.taken - 1]["uid"])  # Up to the last one taken; the rest wait.
+            else:
+                continue  # None of its new mail was taken: it stays where it was.
+            marks[scan.box.config.name] = f"{scan.validity}:{place}"
         return self.store.fire(job["id"], events, _mail_cursor(marks), now=now)
+
+
+@dataclass
+class _Scan:
+    """What one look found in one mailbox's folder: matching mail after its place, oldest first (at most
+    ``MAX_EVENTS``), and the newest number it looked at; a first place has no candidates."""
+
+    box: Any
+    validity: str
+    reached: int
+    candidates: list[dict] = field(default_factory=list)
+    taken: int = 0
+
+
+def _scan(box: Any, trigger: dict, seen: str | None) -> _Scan | None:
+    """None when the mailbox has no place to start from yet and cannot be given one now."""
+    state = box.folder_state(trigger["folder"])
+    seen_validity, _, seen_uid = (seen or "").partition(":")
+    if state is None or not state.uidvalidity:
+        return None  # Never looked at successfully: no baseline yet, and nothing taken for new.
+    validity = str(state.uidvalidity)
+    if seen is None or seen_validity != validity:
+        if state.last_error_code:
+            return None  # Its last look failed: a baseline waits for one that succeeds.
+        # The first look, or a mailbox that renumbered its messages: start from where it stands, empty or not.
+        return _Scan(box, validity, box.newest_uid(trigger["folder"], uidvalidity=state.uidvalidity))
+    last, candidates = int(seen_uid or 0), []
+    while len(candidates) < MAX_EVENTS:
+        page = box.after(trigger["folder"], last, uidvalidity=state.uidvalidity, limit=MAIL_PAGE)
+        for item in page:
+            last = int(item["uid"])
+            if _matches(item, trigger):
+                candidates.append(item)
+                if len(candidates) == MAX_EVENTS:
+                    break
+        if len(page) < MAIL_PAGE:
+            break
+    return _Scan(box, validity, last, candidates)
+
+
+def _received(item: dict) -> float:
+    received = item.get("received_at")
+    return float(received) if isinstance(received, (int, float)) else 0.0
+
+
+def _event(box: Any, item: dict, trigger: dict, several: bool) -> dict:
+    return {"type": "mail", "folder": item.get("folder") or trigger["folder"], "uid": int(item["uid"]),
+            "from": str(item.get("sender") or ""), "subject": str(item.get("subject") or ""),
+            # Every mailbox but main is named, so the event means the same mailbox later.
+            **({"account": box.config.name} if several or box.config.name != MAIN_ACCOUNT else {})}
 
 
 def _watches(job: dict, config: Any) -> bool:
@@ -162,34 +236,6 @@ def _mail_cursor(marks: dict[str, str]) -> str:
     if set(marks) == {MAIN_ACCOUNT}:
         return marks[MAIN_ACCOUNT]
     return _MAILBOXES + json.dumps(marks, sort_keys=True)
-
-
-def _look_at_mailbox(box: Any, trigger: dict, seen: str | None, events: list[dict], several: bool) -> str | None:
-    """Add what is new in one mailbox's folder to ``events`` and return its new mark, or None to keep the old one."""
-    state = box.folder_state(trigger["folder"])
-    seen_validity, _, seen_uid = (seen or "").partition(":")
-    if state is None or not state.uidvalidity:
-        return None  # Never looked at successfully: no baseline yet, and nothing taken for new.
-    validity = str(state.uidvalidity)
-    if seen is None or seen_validity != validity:
-        if state.last_error_code:
-            return None  # Its last look failed: a baseline waits for one that succeeds.
-        # The first look, or a mailbox that renumbered its messages: start from where it stands, empty or not.
-        return f"{validity}:{box.newest_uid(trigger['folder'], uidvalidity=state.uidvalidity)}"
-    last = int(seen_uid or 0)
-    while len(events) < MAX_EVENTS:
-        page = box.after(trigger["folder"], last, uidvalidity=state.uidvalidity, limit=MAIL_PAGE)
-        for item in page:
-            last = int(item["uid"])
-            if _matches(item, trigger):
-                events.append({"type": "mail", "folder": item.get("folder") or trigger["folder"], "uid": last,
-                               "from": str(item.get("sender") or ""), "subject": str(item.get("subject") or ""),
-                               **({"account": box.config.name} if several else {})})
-                if len(events) == MAX_EVENTS:
-                    break
-        if len(page) < MAIL_PAGE:
-            break
-    return f"{validity}:{last}"
 
 
 def _names_cursor(names: Iterable[str]) -> str:

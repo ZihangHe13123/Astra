@@ -1,7 +1,8 @@
 """The person's own mailboxes, read-only: recent mail, search and reading one message. It never sends,
 moves, deletes or marks anything; reading uses BODY.PEEK, so the server's unread flags stay as they were.
-With several mailboxes set up, recent and search look in all of them unless the call names one, and
-every message carries its mailbox's name in its ref.
+With several mailboxes set up, recent and search look in all of them unless the call names one. A ref
+names its message for good: one without a mailbox is main's, and every other mailbox's ref ends with
+"@" and its name, however many mailboxes are set up when it is read.
 
 Mail is outside text. Its results say so, and the memory tool treats a turn that read mail like one that
 read a web page: saving a memory afterwards needs the person's approval.
@@ -10,6 +11,8 @@ read a web page: saving a memory afterwards needs the person's approval.
 from __future__ import annotations
 
 import asyncio
+import re
+import sqlite3
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -17,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.mail163.config import (
+    MAIN_ACCOUNT,
     MailConfigurationError,
     MailNotSetUpError,
     find_account,
@@ -65,39 +69,36 @@ def _when(item: dict[str, Any]) -> str:
     return str(item.get("sent_at") or "")
 
 
-def _ref(item: dict[str, Any], mailbox: str = "") -> str:
-    """Which message this is: a number is unique only within its folder and that folder's generation,
-    and, with several mailboxes, within its mailbox."""
-    return f"{mailbox + ':' if mailbox else ''}{item.get('folder', '')}:{item.get('uidvalidity', '')}:{item['uid']}"
+# Folder, the folder's generation and the message number, then "@" and the mailbox unless it is main. Refs
+# from before several mailboxes have no "@" and always end in a number, so the two never read alike.
+_REF = re.compile(r"(.*):(\d+):(\d+)(?:@([A-Za-z0-9]+))?", re.DOTALL)
 
 
-def _split_ref(ref: str) -> tuple[str, int, int]:
-    folder, _, rest = ref.strip().rpartition(":")
-    folder, _, generation = folder.rpartition(":")
-    try:
-        return folder, int(generation), int(rest)
-    except ValueError:
-        raise ValueError(f"ref {ref!r} is not a ref from recent or search.") from None
+def _ref(item: dict[str, Any], mailbox: str) -> str:
+    """Which message this is: a number is unique only within its folder, that folder's generation and its mailbox."""
+    place = f"{item.get('folder', '')}:{item.get('uidvalidity', '')}:{item['uid']}"
+    return place if mailbox == MAIN_ACCOUNT else f"{place}@{mailbox}"
 
 
-def _parse_ref(ref: str, configs: list[MailConfig], default: MailConfig) -> tuple[MailConfig, str, int, int]:
-    """The mailbox, folder, generation and number a ref names; a ref without a mailbox is the default one's."""
-    head, colon, rest = ref.strip().partition(":")
-    named = next((config for config in configs if config.name == head.casefold()), None) if colon else None
-    if named is not None:
-        try:
-            folder, generation, uid = _split_ref(rest)
-        except ValueError:
-            pass
-        else:
-            if folder:
-                return named, folder, generation, uid
-    return default, *_split_ref(ref)
+def _parse_ref(ref: str) -> tuple[str, str, int, int]:
+    """The mailbox, folder, generation and number a ref names."""
+    match = _REF.fullmatch(ref.strip())
+    if match is None or not match.group(1):
+        raise ValueError(f"ref {ref!r} is not a ref from recent or search.")
+    return (match.group(4) or MAIN_ACCOUNT).casefold(), match.group(1), int(match.group(2)), int(match.group(3))
 
 
-def _line(item: dict[str, Any], mailbox: str = "") -> str:
+def _named(configs: list[MailConfig], name: str, whose: str) -> MailConfig:
+    found = next((config for config in configs if config.name == name), None)
+    if found is None:
+        raise ValueError(f"{whose}, which is not set up; the configured mailboxes are "
+                         f"{', '.join(config.name for config in configs)}.")
+    return found
+
+
+def _line(item: dict[str, Any], mailbox: str, labelled: bool) -> str:
     mark = "unread " if item.get("unread") else ""
-    where = f"[{mailbox}] " if mailbox else ""
+    where = f"[{mailbox}] " if labelled else ""
     return (f'- {where}#{item["uid"]} ref "{_ref(item, mailbox)}" {_when(item)} {mark}From: {item.get("sender", "")} | '
             f'Subject: {item.get("subject", "")}')
 
@@ -114,38 +115,50 @@ def _stale(result: dict[str, Any], mailbox: str = "") -> str:
     return "\n(The mail server could not be reached; this is the cached copy.)"
 
 
-def _newest_first(pair: tuple[MailService, dict[str, Any]]) -> tuple[float, int]:
+def _newest_first(pair: tuple[MailConfig, dict[str, Any]]) -> tuple[float, int]:
     item = pair[1]
     received = item.get("received_at")
     return (float(received) if isinstance(received, (int, float)) else 0.0, int(item["uid"]))
 
 
-def _each(boxes: list[MailService], look: Callable[[MailService], dict[str, Any]],
-          ) -> list[tuple[MailService, dict[str, Any] | MailError]]:
-    """``look`` in every mailbox at once; a mailbox that fails is reported, unless every one does."""
-    if len(boxes) == 1:
-        return [(boxes[0], look(boxes[0]))]
-    with ThreadPoolExecutor(max_workers=len(boxes)) as pool:
-        futures = [pool.submit(look, box) for box in boxes]
-    outcomes: list[tuple[MailService, dict[str, Any] | MailError]] = []
-    for box, future in zip(boxes, futures):
+def _opened(open_box: Callable[[MailConfig], MailService], config: MailConfig) -> MailService:
+    """One mailbox's service: a cache that cannot be opened is that mailbox's error, not every mailbox's."""
+    try:
+        return open_box(config)
+    except (sqlite3.Error, OSError):
+        raise MailError("storage_error", "The local mail cache could not be opened", 5) from None
+
+
+Outcome = tuple[MailConfig, dict[str, Any] | MailError]
+
+
+def _each(configs: list[MailConfig], open_box: Callable[[MailConfig], MailService],
+          look: Callable[[MailService], dict[str, Any]]) -> list[Outcome]:
+    """Open each mailbox and ``look`` in it, all at once; one that fails is reported, unless every one does."""
+    if len(configs) == 1:
+        return [(configs[0], look(_opened(open_box, configs[0])))]
+
+    def guarded(config: MailConfig) -> dict[str, Any] | MailError:
         try:
-            outcomes.append((box, future.result()))
+            return look(_opened(open_box, config))
         except MailError as exc:
-            outcomes.append((box, exc))
+            return exc
+
+    with ThreadPoolExecutor(max_workers=len(configs)) as pool:
+        outcomes: list[Outcome] = list(zip(configs, pool.map(guarded, configs)))
     failures = [result for _, result in outcomes if isinstance(result, MailError)]
     if len(failures) == len(outcomes):
         raise failures[0]
     return outcomes
 
 
-def _notes(outcomes: list[tuple[MailService, dict[str, Any] | MailError]], several: bool) -> str:
+def _notes(outcomes: list[Outcome], several: bool) -> str:
     notes = []
-    for box, result in outcomes:
+    for config, result in outcomes:
         if isinstance(result, MailError):
-            notes.append(f"\n({box.config.name} could not be read: {result})")
+            notes.append(f"\n({config.name} could not be read: {result})")
         else:
-            notes.append(_stale(result, box.config.name if several else ""))
+            notes.append(_stale(result, config.name if several else ""))
     return "".join(notes)
 
 
@@ -164,23 +177,21 @@ def register_mail_tool(registry: ToolRegistry, *, project_root: Path,
             account: str) -> str:
         configs, open_box = accounts()
         several = len(configs) > 1
+        folder = folder.strip()
+        if action == "read":
+            return read(configs, open_box, several, folder, uid, ref, account)
         try:
             chosen = [find_account(configs, account)] if account.strip() else configs
         except MailConfigurationError as exc:
             raise ValueError(str(exc)) from None
-        folder = folder.strip()
-        if action == "read":
-            return read(configs, open_box, chosen[0], several, folder, uid, ref)
-        boxes = [open_box(config) for config in chosen]
-        label = (lambda box: box.config.name) if several else (lambda _box: "")
         if action == "status":
             def look_status(box: MailService) -> dict[str, Any]:
                 return box.folders(refresh=True)
 
             lines = []
-            for box, result in _each(boxes, look_status):
-                config = box.config
-                where = f"Mailbox {config.name}: {config.account}" if several else f"Mailbox {config.account}"
+            for config, result in _each(chosen, open_box, look_status):
+                named = several or config.name != MAIN_ACCOUNT
+                where = f"Mailbox {config.name}: {config.account}" if named else f"Mailbox {config.account}"
                 if isinstance(result, MailError):
                     lines.append(f"{where} on {config.host} could not be read: {result}.")
                     continue
@@ -192,51 +203,61 @@ def register_mail_tool(registry: ToolRegistry, *, project_root: Path,
                 name = resolve_folder(folder or "INBOX", box.config.sent_folder)
                 return box.recent(folder=name, limit=30 if unread_only else limit)
 
-            outcomes = _each(boxes, look_recent)
-            found = [(box, item) for box, result in outcomes if not isinstance(result, MailError)
+            outcomes = _each(chosen, open_box, look_recent)
+            found = [(config, item) for config, result in outcomes if not isinstance(result, MailError)
                      for item in _rows(result.get("items")) if item.get("unread") or not unread_only]
             items = sorted(found, key=_newest_first, reverse=True)[:limit]
-            shown = {resolve_folder(folder or "INBOX", box.config.sent_folder) for box in boxes}
+            shown = {resolve_folder(folder or "INBOX", config.sent_folder) for config in chosen}
             where = shown.pop() if len(shown) == 1 else folder
             head = f"{OUTSIDE}\n{where}: {len(items)} {'unread ' if unread_only else ''}message(s), newest first"
-            head += f", in {', '.join(box.config.name for box in boxes)}." if several else "."
-            return "\n".join([head, *(_line(item, label(box)) for box, item in items)]) + _notes(outcomes, several)
+            head += f", in {', '.join(config.name for config in chosen)}." if several else "."
+            lines = [_line(item, config.name, several) for config, item in items]
+            return "\n".join([head, *lines]) + _notes(outcomes, several)
         if not query.strip() and not sender.strip():
             raise ValueError("search needs query or sender.")
 
         def look_search(box: MailService) -> dict[str, Any]:
             return box.search(query, sender=sender, folder=folder or None, limit=limit)
 
-        outcomes = _each(boxes, look_search)
-        found = sorted(((box, item) for box, result in outcomes if not isinstance(result, MailError)
+        outcomes = _each(chosen, open_box, look_search)
+        found = sorted(((config, item) for config, result in outcomes if not isinstance(result, MailError)
                         for item in _rows(result.get("items"))), key=_newest_first, reverse=True)[:limit]
         head = f"{OUTSIDE}\n{len(found)} match(es)"
-        head += f" in {', '.join(box.config.name for box in boxes)}" if several else ""
+        head += f" in {', '.join(config.name for config in chosen)}" if several else ""
         head += ". Read one with its ref: mail(action=\"read\", ref=...)."
-        return "\n".join([head, *(_line(item, label(box)) for box, item in found)]) + _notes(outcomes, several)
+        lines = [_line(item, config.name, several) for config, item in found]
+        return "\n".join([head, *lines]) + _notes(outcomes, several)
 
-    def read(configs: list[MailConfig], open_box: Callable[[MailConfig], MailService], default: MailConfig,
-             several: bool, folder: str, uid: int, ref: str) -> str:
+    def read(configs: list[MailConfig], open_box: Callable[[MailConfig], MailService], several: bool, folder: str,
+             uid: int, ref: str, account: str) -> str:
         if ref.strip():
-            # The message the ref names, or none: never another one that has its number now.
-            config, ref_folder, generation, ref_uid = _parse_ref(ref, configs, default)
+            # The message the ref names, in the mailbox it names, or none: never another one that has its number now.
+            name, ref_folder, generation, ref_uid = _parse_ref(ref)
+            config = _named(configs, name, f"The ref {ref.strip()} is from the {name} mailbox")
             try:
-                opened = open_box(config).read(ref_folder, ref_uid, uidvalidity=generation)
+                opened = _opened(open_box, config).read(ref_folder, ref_uid, uidvalidity=generation)
             except MailError as exc:
                 if exc.code != "message_not_found":
                     raise
                 raise ValueError(f"The message {ref} is gone from its folder, or the folder was rebuilt; "
                                  "search again.") from None
         elif uid:
-            config = default
-            opened = open_box(config).read(folder or "INBOX", uid)
+            if account.strip():
+                try:
+                    config = find_account(configs, account)
+                except MailConfigurationError as exc:
+                    raise ValueError(str(exc)) from None
+            else:
+                config = _named(configs, MAIN_ACCOUNT, "A number without a mailbox is the main mailbox's")
+            opened = _opened(open_box, config).read(folder or "INBOX", uid)
         else:
             raise ValueError("read needs the ref of a message from recent or search.")
         item = next(iter(_rows([opened.get("item")])), {})
         body = str(item.get("body_text") or "")
         clipped = len(body) > BODY_CHARS or item.get("body_truncated")
         attachments = _rows(item.get("attachments"))
-        lines = [OUTSIDE, *([f"Mailbox: {config.name} ({config.account})"] if several else []),
+        named = several or config.name != MAIN_ACCOUNT
+        lines = [OUTSIDE, *([f"Mailbox: {config.name} ({config.account})"] if named else []),
                  f"From: {item.get('sender', '')}", f"To: {item.get('recipients', '')}", f"Date: {_when(item)}",
                  f"Subject: {item.get('subject', '')}", "", body[:BODY_CHARS] + ("\n…(cut)" if clipped else "")]
         if attachments:
