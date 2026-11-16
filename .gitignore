@@ -87,6 +87,7 @@ nul
 !.astra/skills/development/team-tdd-development/
 .astra/skills/development/team-tdd-development/*
 !.astra/skills/development/team-tdd-development/SKILL.md
+!.astra/skills/development/web-product-debug/
 .agent_system/
 .astra.db
 astra.bak

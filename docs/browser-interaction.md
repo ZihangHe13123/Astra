@@ -7,6 +7,22 @@ The CDP backend returns structured page observations and supports
 supported. Restart Astra to load the updated tools. Safari control is not part of
 this Chromium integration.
 
+## Web product debugging (Windows, macOS, Linux)
+
+Use [`web-product-debug`](../.astra/skills/development/web-product-debug/SKILL.md)
+for frontend reproduction, layout checks and regression testing in an independent
+Playwright CLI session. It provides pointer interactions, screenshots, console and
+network diagnostics, and traces. Keep Browser Control for everyday authenticated tabs.
+Only the skill description is disclosed in the catalog; load its workflow and
+setup/debugging references when needed. The Python launcher keeps artifacts under
+the target project's `output/playwright/<session>/` and requires Python, Node/npm
+and a supported browser; headed Linux also requires a graphical session.
+
+Source installations discover `.astra/skills`; custom installations use their
+configured `AGENT_SKILLS_PATH`. Copy the entire skill, including scripts and
+references. The wheel/standalone desktop package does not bundle this source skill
+directory. Restart Astra and start a new conversation to pick up the new catalog.
+
 <a id="everyday-browser-setup-macos-edge"></a>
 
 ## Everyday browser setup (Windows and macOS)

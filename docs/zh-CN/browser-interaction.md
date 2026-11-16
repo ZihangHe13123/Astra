@@ -6,6 +6,14 @@
 
 CDP 后端返回结构化页面观察，支持最新快照中的 `ref:<id>` 目标，也保留唯一 CSS 选择器。更新工具后重启 Astra。此 Chromium 集成不包含 Safari 控制。
 
+## Web 产品调试（Windows、macOS、Linux）
+
+调试本地网站、检查布局或复现前端问题时，使用 [`web-product-debug`](../../.astra/skills/development/web-product-debug/SKILL.md)。它通过独立的 Playwright CLI 命名会话提供真实指针交互、截图、控制台/网络诊断和 trace，日常已登录网页仍使用下方的 Browser Control 通道。
+
+技能目录只披露简短说明；选中后读取核心流程，平台启动和诊断参考按需加载。Python 启动器统一三平台参数传递，产物保存到目标项目 `output/playwright/<session>/`。需要可运行的 Python、Node/npm 和相应浏览器；Linux 有界面模式还需要图形会话。
+
+源码安装读取 `.astra/skills`，自定义安装使用实际的 `AGENT_SKILLS_PATH`。复制技能时需包含 scripts 和 references；当前 wheel/独立桌面包不会自动携带此源码技能目录。已运行的对话保留原技能目录快照，重启 Astra 并新建对话后再使用新增技能。
+
 <a id="everyday-browser-setup-macos-edge"></a>
 
 ## 日常浏览器配置：Windows 和 macOS

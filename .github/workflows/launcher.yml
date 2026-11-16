@@ -64,6 +64,10 @@ on:
       - 'browser-control-extension/**'
       - 'tests/test_browser*.py'
       - 'tests/test_cdp_backend.py'
+      - '.astra/skills/development/web-product-debug/**'
+      - 'tests/test_playwright_skill_launcher.py'
+      - 'tests/test_web_product_debug_skill.py'
+      - 'tests/test_playwright_product_e2e.py'
       - 'tests/test_mcp*.py'
       - 'tests/test_self_protection.py'
       - 'tests/test_runtime_maintenance.py'
@@ -149,6 +153,10 @@ on:
       - 'browser-control-extension/**'
       - 'tests/test_browser*.py'
       - 'tests/test_cdp_backend.py'
+      - '.astra/skills/development/web-product-debug/**'
+      - 'tests/test_playwright_skill_launcher.py'
+      - 'tests/test_web_product_debug_skill.py'
+      - 'tests/test_playwright_product_e2e.py'
       - 'tests/test_mcp*.py'
       - 'tests/test_self_protection.py'
       - 'tests/test_runtime_maintenance.py'
@@ -256,6 +264,7 @@ jobs:
           tests/test_subagent_replay.py tests/test_delegate_conversation_resume.py
           tests/test_browser_lifecycle.py tests/test_browser_child_environment.py tests/test_mcp_recovery.py
           tests/test_cdp_backend.py
+          tests/test_playwright_skill_launcher.py tests/test_web_product_debug_skill.py
           tests/test_browser_backend_router.py tests/test_browser_control_transport.py
           tests/test_extension_browser_backend.py tests/test_browser_auto_connect.py
           tests/test_browser_control_installer.py tests/test_browser_control_windows.py
