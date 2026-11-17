@@ -9,6 +9,7 @@ import logging
 import math
 import os
 import time
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Callable, TYPE_CHECKING, cast
@@ -177,6 +178,10 @@ def normalize_replay_messages(messages: list[dict], *, validate: Callable[[dict]
 def _history_digest(messages: list[dict]) -> str:
     """A hash of ``messages`` as they are saved, which is how the conversation has them after a restart."""
     return hashlib.sha256(json.dumps(messages, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _minutes(seconds: float) -> str:
+    return f"{max(0.0, seconds) / 60:.0f} min"
 
 
 def _strip_orphan_tool_calls(messages: list[dict]) -> list[dict]:
@@ -356,6 +361,8 @@ class AgentContext:
     _idle_summary: dict | None = field(default=None, init=False, repr=False)
     cache_touched_at: float | None = field(default=None, init=False, repr=False)
     _idle_attempt: tuple | None = field(default=None, init=False, repr=False)
+    # The id of the last idle summary kept, which every log line about it names.
+    kept_idle_summary_id: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.max_prompt_tokens == 100_000:
@@ -1023,9 +1030,17 @@ class AgentContext:
             CACHED_PREFIX_ONLY.reset(prefix_only)
         if prepared is None or self._history_mark() != mark:
             return False
-        self._idle_summary = {"prepared": prepared, "session": mark[:2], "count": count, "digest": digest}
+        # When the last turn's request read the cache too: the log of what became of the summary
+        # tells a cache kept by the summary request from one the turn left.
+        summary_id = uuid.uuid4().hex[:8]
+        self._idle_summary = {"prepared": prepared, "session": mark[:2], "count": count, "digest": digest,
+                              "turn_at": self._sent_request.get("at"), "id": summary_id}
         # The summary request read the cache when it was asked for: it lasts from then.
         self.cache_touched_at = max(self.cache_touched_at or now, now)
+        # Ready from here, whatever becomes of the save: a cancellation that reaches it there (a turn
+        # needs the model) leaves it kept, and the next turn uses or drops it.
+        self.kept_idle_summary_id = summary_id
+        logger.info("idle compaction: summary %s ready (session=%s)", summary_id, self.session_scope)
         # Saved with the conversation, so a restart before the person comes back keeps it.
         await self.save_async()
         return True
@@ -1038,7 +1053,8 @@ class AgentContext:
         prepared = pending["prepared"]
         return {"summary": prepared.summary, "carried": prepared.carried, "start": prepared.start,
                 "end": prepared.end, "size": prepared.size, "count": pending["count"],
-                "digest": pending["digest"], "read_at": self._last_cache_read()}
+                "digest": pending["digest"], "read_at": self._last_cache_read(), "turn_at": pending.get("turn_at"),
+                "id": pending["id"]}
 
     def _restore_idle_summary(self, state: Any) -> None:
         """An idle summary saved before a restart: the next turn applies the same rules to it."""
@@ -1049,11 +1065,14 @@ class AgentContext:
             prepared = PreparedCompaction(str(state["summary"]), str(state.get("carried") or ""),
                                           int(state["start"]), int(state["end"]), int(state["size"]))
             count, digest, read_at = int(state["count"]), str(state["digest"]), float(state["read_at"])
+            # Neither saved by the versions before 2026-11-17.
+            turn_at = None if state.get("turn_at") is None else float(state["turn_at"])
+            summary_id = str(state.get("id") or "untagged")
         except (KeyError, TypeError, ValueError):
             logger.warning("Saved idle summary not restored: it is not in the expected form")
             return
         self._idle_summary = {"prepared": prepared, "session": (self._session_path, self.branch_id),
-                              "count": count, "digest": digest}
+                              "count": count, "digest": digest, "turn_at": turn_at, "id": summary_id}
         self.cache_touched_at = max(self.cache_touched_at or read_at, read_at)
 
     def apply_idle_summary(self, now: float, cache_seconds: float | None) -> bool:
@@ -1063,19 +1082,19 @@ class AgentContext:
         or idle compaction turned off) drops it, as does this conversation's compaction being off.
         """
         pending, self._idle_summary = self._idle_summary, None
-        if pending is None or not self.compaction_enabled or self.compressor is None or cache_seconds is None:
+        if pending is None:
             return False
-        count = pending["count"]
-        read = self._last_cache_read()
-        if (pending["session"] != (self._session_path, self.branch_id) or not 0 < count <= len(self.messages)
-                or read is None or now - read < cache_seconds
-                or _history_digest(self.messages[:count]) != pending["digest"]):
+        # Each outcome is logged, so the summaries' cost can be weighed against what they saved.
+        dropped = self._idle_summary_unusable(pending, now, cache_seconds)
+        if dropped or self.compressor is None:
+            logger.info("idle compaction: summary %s dropped: %s", pending["id"], dropped)
             return False
         before = len(self.messages)
         tokens_before = self.estimate_compaction_tokens()
         compressed = self.compressor.apply_prepared(pending["prepared"], self._compaction_messages(),
                                                     self.max_prompt_tokens)
         if compressed is None:
+            logger.info("idle compaction: summary %s dropped: the history no longer starts as it did", pending["id"])
             return False
         report: dict[str, Any] = {"tokens_before": tokens_before, "target_tokens": self.max_prompt_tokens,
                                   "method": "summary", "trigger": "idle", "dropped_steps": 0, "cleared_results": 0}
@@ -1088,7 +1107,36 @@ class AgentContext:
         report["tokens_after"] = self.estimate_compaction_tokens()
         self._last_compaction_report = dict(report)
         self.report_compaction("completed", before, details=report)
+        turn_at = pending.get("turn_at")
+        logger.info("idle compaction: summary %s used: %d -> %d messages, about %d -> %d tokens, last turn %s",
+                    pending["id"], before, len(self.messages), tokens_before, report["tokens_after"],
+                    "at an unknown time" if turn_at is None else _minutes(now - turn_at) + " ago")
         return True
+
+    def _idle_summary_unusable(self, pending: dict, now: float, cache_seconds: float | None) -> str:
+        """Why the idle summary cannot be used by a turn starting ``now``; empty when it can."""
+        if not self.compaction_enabled or self.compressor is None:
+            return "compaction is off for this conversation"
+        if cache_seconds is None:
+            return "idle compaction is off, or this model keeps no cache for a known time"
+        count = pending["count"]
+        if (pending["session"] != (self._session_path, self.branch_id) or not 0 < count <= len(self.messages)
+                or _history_digest(self.messages[:count]) != pending["digest"]):
+            return "the history it was written on has changed"
+        read = self._last_cache_read()
+        if read is None:
+            return "when the cache was last read is not known"
+        if now - read >= cache_seconds:
+            return ""
+        # A return within the lifetime of the summary request's read but after that of the last
+        # turn's found the cache only because the summary request read it.
+        turn_at = pending.get("turn_at")
+        if turn_at is None:
+            return f"the cache is still warm (read {_minutes(now - read)} ago; when the last turn was is not known)"
+        if now - turn_at >= cache_seconds:
+            return (f"the cache was kept warm by the summary request (last turn {_minutes(now - turn_at)} ago, "
+                    f"summary {_minutes(now - read)} ago)")
+        return f"the cache is still warm from the last turn ({_minutes(now - turn_at)} ago)"
 
     def summary_replay(self) -> dict | None:
         """The last sent request plus what the conversation gained since, for a summary.

@@ -8,10 +8,13 @@ each request gave it. Time passes through ``idle_compaction.clock``, the clock t
 """
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
+import re
 import stat
+import threading
 import time
 
 import pytest
@@ -91,6 +94,30 @@ def catalog() -> ToolRegistry:
 def warnings_of(caplog, logger: str) -> list[str]:
     return [record.getMessage() for record in caplog.records
             if record.name == logger and record.levelno == logging.WARNING]
+
+
+def outcomes(caplog, *, sessions: bool = False) -> list[str]:
+    """What became of the idle summaries, as the backend's log says: each summary's id as #1, #2...
+    in the order first seen, and the session of a ready one only when asked for."""
+    ids: dict[str, str] = {}
+    lines = []
+    for record in caplog.records:
+        message = record.getMessage()
+        if record.levelno != logging.INFO or not message.startswith("idle compaction: summary "):
+            continue
+        line = message.removeprefix("idle compaction: summary ")
+        head, _, rest = line.partition(" ")
+        if re.fullmatch(r"[0-9a-f]{8}", head):
+            line = f"{ids.setdefault(head, f'#{len(ids) + 1}')} {rest}"
+        lines.append(line if sessions else re.sub(r" \(session=[^)]*\)$", "", line))
+    return lines
+
+
+@pytest.fixture
+def logged(caplog):
+    for name in ("agent.runtime.context", "agent.runtime.idle_compaction"):
+        caplog.set_level(logging.INFO, logger=name)
+    return caplog
 
 
 class Setup:
@@ -203,7 +230,7 @@ def test_the_summary_is_written_from_the_cached_request_before_the_hour_is_over(
     asyncio.run(scenario())
 
 
-def test_a_turn_after_the_cache_has_gone_starts_from_the_summary(setup):
+def test_a_turn_after_the_cache_has_gone_starts_from_the_summary(setup, logged):
     async def scenario():
         await setup.notes(6)
         setup.ahead = 55 * 60
@@ -221,6 +248,32 @@ def test_a_turn_after_the_cache_has_gone_starts_from_the_summary(setup):
         assert "NOTE-LATE" in str([m.get("content") for m in messages if m["role"] == "user"][-1])
         completed = [event for event in setup.events if event["status"] == "completed"]
         assert len(completed) == 1 and completed[0]["trigger"] == "idle" and completed[0]["method"] == "summary"
+        done = completed[0]
+        # The log says it was used, with what it took off, and how long the person was away.
+        assert outcomes(logged) == [
+            "#1 ready",
+            f"#1 used: {done['messages_before']} -> {done['messages_after']} messages, "
+            f"about {done['tokens_before']} -> {done['tokens_after']} tokens, last turn 116 min ago"]
+        assert done["messages_after"] < done["messages_before"]
+        assert outcomes(logged, sessions=True)[0] == f"#1 ready (session={setup.agent.context.session_scope})"
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("back_after, why", [
+    # Within the hour of the last turn's request: the summary request was not needed for the cache.
+    (58, "the cache is still warm from the last turn (58 min ago)"),
+    # Past it: the cache was there only because the summary request read it at 55 minutes.
+    (70, "the cache was kept warm by the summary request (last turn 70 min ago, summary 15 min ago)"),
+])
+def test_a_summary_dropped_for_a_warm_cache_says_which_request_kept_it(setup, logged, back_after, why):
+    async def scenario():
+        await setup.notes(6)
+        setup.ahead = 55 * 60
+        await idle(setup.compactor())
+        setup.ahead = back_after * 60
+        await setup.turn("NOTE-LATE one more thing.")
+        assert "CHECKPOINT-4417" not in text_of(setup.requests()[-1])
+        assert outcomes(logged) == ["#1 ready", f"#1 dropped: {why}"]
     asyncio.run(scenario())
 
 
@@ -462,7 +515,7 @@ def test_the_backend_writes_its_idle_conversations_summary_and_goes_on_in_full_w
         _stop_protocol_backend(proc)
 
 
-def test_a_turn_that_starts_while_the_summary_is_written_does_not_wait_for_it(setup):
+def test_a_turn_that_starts_while_the_summary_is_written_does_not_wait_for_it(setup, logged):
     """The model client has one request slot by default: a summary still being written would hold
     the person's request back until it came back. The backend checks four times a second."""
     async def scenario():
@@ -490,6 +543,83 @@ def test_a_turn_that_starts_while_the_summary_is_written_does_not_wait_for_it(se
         assert summary.done()
         assert setup.agent.context.messages[-1]["content"] == "Noted."
         assert "CHECKPOINT-4417" not in text_of(setup.requests()[-1])
+        # Once, though the backend went on checking while the cancelled summary wound down.
+        assert outcomes(logged) == ["cancelled: a turn needs the model"]
+    asyncio.run(scenario())
+
+
+def test_a_summary_being_written_when_the_backend_closes_is_logged_as_cancelled(setup, logged):
+    async def scenario():
+        await setup.notes(6)
+        hold = setup.log.with_name(setup.log.name + ".hold")
+        hold.touch()
+        compactor = setup.compactor()
+        setup.ahead = 55 * 60
+        compactor.tick(busy=False)
+        try:
+            async with asyncio.timeout(10):
+                while CHECKPOINT not in setup.log.read_text(encoding="utf-8"):
+                    await asyncio.sleep(0.02)
+            await compactor.close()
+        finally:
+            hold.unlink(missing_ok=True)
+        assert outcomes(logged) == ["cancelled: the backend is closing"]
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cut_short_by", ["turn", "close"])
+def test_a_summary_kept_before_its_attempt_is_cut_short_while_saving_is_ready_not_cancelled(
+        setup, monkeypatch, logged, tmp_path, cut_short_by):
+    """Review, 2026-11-17: the summary had come back and was kept, and the attempt was cancelled
+    while saving it (another conversation's turn, or the backend closing). The save finishes, a
+    return after the cache has gone uses the summary, and the log said "cancelled"."""
+    started, release = threading.Event(), threading.Event()
+
+    async def scenario():
+        await setup.notes(6)
+        context = setup.agent.context
+        store = context._session_store
+        save, prepare = store.save, context.prepare_idle_summary
+        attempts: list[asyncio.Task] = []
+
+        async def tracked(now):
+            attempts.append(asyncio.current_task())
+            return await prepare(now)
+
+        def held(data, **kwargs):
+            if data.get("idle_summary") is not None:
+                started.set()
+                assert release.wait(10)
+            return save(data, **kwargs)
+
+        monkeypatch.setattr(context, "prepare_idle_summary", tracked)
+        monkeypatch.setattr(store, "save", held)
+        compactor = setup.compactor()
+        setup.ahead = 55 * 60
+        compactor.tick(busy=False)
+        summary, closing = compactor._task, None
+        try:
+            assert await asyncio.to_thread(started.wait, 10)
+            if cut_short_by == "turn":
+                compactor.tick(busy=True)
+            else:
+                closing = asyncio.create_task(compactor.close())
+            async with asyncio.timeout(5):
+                while not attempts[0].cancelling():
+                    await asyncio.sleep(0)
+            release.set()
+            with contextlib.suppress(asyncio.CancelledError):
+                await summary
+            if closing is not None:
+                await closing
+        finally:
+            release.set()
+        assert outcomes(logged) == ["#1 ready"]
+        setup.restart()
+        setup.ahead = 55 * 60 + HOUR + 60
+        await setup.turn("NOTE-LATE one more thing.")
+        assert "CHECKPOINT-4417" in text_of(setup.requests()[-1])
+        assert [line.split(":")[0] for line in outcomes(logged)] == ["#1 ready", "#1 used"]
     asyncio.run(scenario())
 
 
@@ -591,7 +721,8 @@ def test_a_summary_that_would_take_off_less_than_the_minimum_is_not_asked_for(se
     asyncio.run(scenario())
 
 
-def test_a_summary_written_before_a_restart_is_used_when_the_person_comes_back_after_the_cache_has_gone(setup):
+def test_a_summary_written_before_a_restart_is_used_when_the_person_comes_back_after_the_cache_has_gone(
+        setup, logged):
     """Live, 2026-11-14: a chat's summary was written, the desktop restarted before the person came
     back, and the return read 83.7k tokens uncached: the summary lived in the backend process only.
     It is saved with the conversation, with when its request read the cache."""
@@ -608,10 +739,13 @@ def test_a_summary_written_before_a_restart_is_used_when_the_person_comes_back_a
         assert "NOTE-05" in text_of(request)
         completed = [event for event in setup.events if event["status"] == "completed"]
         assert len(completed) == 1 and completed[0]["trigger"] == "idle"
+        # The summary's id and when the last turn was are saved with it.
+        ready, used = outcomes(logged)
+        assert ready == "#1 ready" and used.startswith("#1 used: ") and used.endswith(", last turn 116 min ago")
     asyncio.run(scenario())
 
 
-def test_after_a_restart_a_return_within_the_hour_repeats_the_cached_request_and_drops_the_summary(setup):
+def test_after_a_restart_a_return_within_the_hour_repeats_the_cached_request_and_drops_the_summary(setup, logged):
     """The restarted process sends the request the cache was written for, word for word. The summary
     is dropped, and saved so: a later restart and a return hours after do not bring it back."""
     async def scenario():
@@ -630,10 +764,31 @@ def test_after_a_restart_a_return_within_the_hour_repeats_the_cached_request_and
         await setup.turn("NOTE-LATER")
         assert "CHECKPOINT-4417" not in text_of(setup.requests()[-1])
         assert not setup.events
+        assert outcomes(logged) == [
+            "#1 ready", "#1 dropped: the cache was kept warm by the summary request (last turn 70 min ago, summary 15 min ago)"]
     asyncio.run(scenario())
 
 
-def test_a_summary_saved_before_a_restart_is_not_used_once_the_history_under_it_has_changed(setup):
+def test_a_summary_saved_without_its_last_turn_time_is_restored_and_its_drop_logged(
+        setup, logged, tmp_path):
+    """Saved by a version before 2026-11-17, without when the last turn was."""
+    async def scenario():
+        await setup.notes(6)
+        setup.ahead = 55 * 60
+        await idle(setup.compactor())
+        header, = [path for path in tmp_path.glob("*.header.json") if "idle_summary" in path.read_text(encoding="utf-8")]
+        saved = json.loads(header.read_text(encoding="utf-8"))
+        del saved["idle_summary"]["turn_at"], saved["idle_summary"]["id"]
+        header.write_text(json.dumps(saved), encoding="utf-8")
+        setup.restart()
+        setup.ahead = 70 * 60
+        await setup.turn("NOTE-LATE")
+        assert outcomes(logged)[-1] == (
+            "untagged dropped: the cache is still warm (read 15 min ago; when the last turn was is not known)")
+    asyncio.run(scenario())
+
+
+def test_a_summary_saved_before_a_restart_is_not_used_once_the_history_under_it_has_changed(setup, logged):
     """After the restart the person took the last exchange back (/undo) and two of Astra's own
     messages came in (a job's reports in a chat): as many messages as the summary was written on,
     not the same ones."""
@@ -651,11 +806,12 @@ def test_a_summary_saved_before_a_restart_is_not_used_once_the_history_under_it_
         request = setup.requests()[-1]
         assert "CHECKPOINT-4417" not in text_of(request) and "NOTE-00" in text_of(request)
         assert not setup.events
+        assert outcomes(logged) == ["#1 ready", "#1 dropped: the history it was written on has changed"]
     asyncio.run(scenario())
 
 
 @pytest.mark.parametrize("switch", ["off", "0", "conversation"])
-def test_a_summary_saved_before_compaction_was_turned_off_is_dropped_not_used(setup, monkeypatch, switch):
+def test_a_summary_saved_before_compaction_was_turned_off_is_dropped_not_used(setup, monkeypatch, logged, switch):
     """Turned off after the summary was written: by the setting, which a restarted backend reads,
     or for the conversation itself. The return after the hour goes on in full, and turning it on
     again later does not bring that summary back."""
@@ -679,6 +835,9 @@ def test_a_summary_saved_before_compaction_was_turned_off_is_dropped_not_used(se
         await setup.turn("NOTE-LATER")
         assert "CHECKPOINT-4417" not in text_of(setup.requests()[-1])
         assert not setup.events
+        why = ("compaction is off for this conversation" if switch == "conversation"
+               else "idle compaction is off, or this model keeps no cache for a known time")
+        assert outcomes(logged) == ["#1 ready", f"#1 dropped: {why}"]
     asyncio.run(scenario())
 
 

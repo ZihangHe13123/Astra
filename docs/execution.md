@@ -249,7 +249,16 @@ Tool execution uses the following guards and controls:
   for the answer, sized as the provider reported the last request plus what it
   adds; it may pass the compaction line. When no summary is written for one of
   these reasons, a warning in the backend's log says why. A summary that came
-  back counts as a read of the cache when it was asked for.
+  back counts as a read of the cache when it was asked for. The backend's log
+  says what became of each summary, after `idle compaction: summary`: `not
+  written`, `cancelled` and why, or an id (saved with the summary, so it
+  survives a restart) and `ready` with the conversation's session, then under
+  the same id `used` (messages and tokens before and after) or `dropped` and
+  why. A summary is ready once it is kept, even if the attempt is cut short
+  while it is being saved. One dropped because the cache was still there says
+  whether the summary request kept it (the last turn was an hour or more
+  before) or the last turn did, so what the summaries cost can be weighed
+  against what they saved.
   `ASTRA_IDLE_COMPACT_MIN_TOKENS=off` (or `0`) turns this off, and a summary
   written before is then dropped at its conversation's next turn. The text CLI
   and scheduled checks do not take part.
