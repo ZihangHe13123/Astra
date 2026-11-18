@@ -178,9 +178,9 @@ try {
   const regeneratedPayload = assertPayload('regenerate-b', ['ROOT_BRANCH_QUESTION', imageMarker, 'original-write', 'ORIGINAL_EFFECT'], [answers.a]);
   const regeneratedUsers = regeneratedPayload.messages.filter(message => message.role === 'user');
   assert.equal(regeneratedUsers.length, 1, 'normalizing an image seed must not duplicate or lose the original user');
-  assert.equal(typeof regeneratedUsers[0].content, 'string', 'regeneration uses the normalized saved image placeholder');
-  assert.ok(regeneratedUsers[0].content.includes(imageMarker));
-  assert.ok(!regeneratedUsers[0].content.includes('data:image/'), 'regeneration must not invent a second image admission');
+  assert.ok(Array.isArray(regeneratedUsers[0].content) && regeneratedUsers[0].content.every(part => part.type === 'text'));
+  assert.equal(regeneratedUsers[0].content.filter(part => part.text === imageMarker).length, 1);
+  assert.ok(!JSON.stringify(regeneratedUsers[0].content).includes('data:image/'), 'regeneration must not invent a second image admission');
   assert.equal(regeneratedPayload.tools?.length || 0, 0, 'reply regeneration must not advertise executable tools');
   releaseRegeneration(); await completed(answers.b);
   assert.equal((await state()).id, originalState.id);
