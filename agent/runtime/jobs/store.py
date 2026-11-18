@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -708,11 +709,22 @@ class JobStore:
                 "WHERE pushes.state='pending' AND pushes.next_try<=? ORDER BY pushes.next_try,pushes.run_id LIMIT ?",
                 (time.time() if now is None else now, min(100, max(1, limit))))]
 
-    def reserve_piece(self, run_id: str, plan: str, index: int) -> bool:
+    @staticmethod
+    def _recipient_plan(recipient: str) -> str:
+        return "recipient:" + hashlib.sha256(recipient.encode()).hexdigest()
+
+    def bind_weixin_recipient(self, run_id: str, recipient: str) -> None:
+        """Remember an offline push's known destination without changing an existing plan."""
+        with self.transaction() as db:
+            db.execute("UPDATE pushes SET piece_plan=? WHERE run_id=? AND target='weixin' "
+                       "AND state='pending' AND piece_plan=''", (self._recipient_plan(recipient), run_id))
+
+    def reserve_piece(self, run_id: str, plan: str, index: int, recipient: str) -> bool:
         """Fence each WeChat write. After an uncertain send, never start that piece again."""
         with self.transaction() as db:
             row = db.execute("SELECT * FROM pushes WHERE run_id=? AND target='weixin'", (run_id,)).fetchone()
-            if row is None or row["state"] != "pending" or row["piece_plan"] not in {"", plan}:
+            if row is None or row["state"] != "pending" or row["piece_plan"] not in {
+                    "", plan, self._recipient_plan(recipient)}:
                 raise LookupError("WeChat delivery or recipient changed; inspect the local inbox")
             if index < row["next_piece"]:
                 return False
@@ -722,10 +734,13 @@ class JobStore:
                        (plan, run_id))
             return True
 
-    def settle_piece(self, run_id: str, index: int, accepted: bool) -> None:
+    def settle_piece(self, run_id: str, index: int, accepted: bool, recipient: str) -> None:
+        """Only a known-unsent first piece may use a different sender or split, for the same person."""
+        rebind = self._recipient_plan(recipient) if not accepted and index == 0 else None
         with self.transaction() as db:
-            db.execute("UPDATE pushes SET sending_piece=0,next_piece=? WHERE run_id=? AND target='weixin' "
-                       "AND next_piece=? AND sending_piece=1", (index + int(accepted), run_id, index))
+            db.execute("UPDATE pushes SET sending_piece=0,next_piece=?,piece_plan=COALESCE(?,piece_plan) "
+                       "WHERE run_id=? AND target='weixin' AND next_piece=? AND sending_piece=1",
+                       (index + int(accepted), rebind, run_id, index))
 
     def mark_push(self, run_id: str, target: str, state: str, *, detail: str = "",
                   next_try: float | None = None, attempted: bool = True, now: float | None = None) -> None:

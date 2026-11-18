@@ -1021,15 +1021,19 @@ class WeixinAdapter(ChannelAdapter):
             raise ConnectionError("WeChat is not online")
         pieces = split_reply(plain_text(text), self.config.max_output_chars)
         plan = hashlib.sha256(json.dumps([account.account_id, to, pieces]).encode()).hexdigest()
+        sent_this_attempt = False
         for index, piece in enumerate(pieces):
-            if not await asyncio.to_thread(store.reserve_piece, run_id, plan, index):
+            if sent_this_attempt:
+                await asyncio.sleep(self._pause(piece))
+            if not await asyncio.to_thread(store.reserve_piece, run_id, plan, index, to):
                 continue
             try:
                 await self._send_piece(client, account, to, piece)
             except (WeixinRejected, httpx.PoolTimeout, httpx.ConnectTimeout, httpx.ConnectError):
-                await asyncio.to_thread(store.settle_piece, run_id, index, False)
+                await asyncio.to_thread(store.settle_piece, run_id, index, False, to)
                 raise
-            await asyncio.to_thread(store.settle_piece, run_id, index, True)
+            await asyncio.to_thread(store.settle_piece, run_id, index, True, to)
+            sent_this_attempt = True
 
     async def send_file(self, message: ChannelMessage, path: str, name: str) -> dict[str, Any]:
         """Send a local file to the person in ``message``: an image or a video as one, anything else as a file."""

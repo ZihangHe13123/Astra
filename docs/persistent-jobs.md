@@ -73,6 +73,9 @@ the desktop notification shows its start. `--targets` chooses
 `astra jobs update ID --targets ...` changes it later. Every result stays in the inbox. Quiet
 results and records of missed slots are not pushed. A push that fails is tried again after 1, 5,
 15 and 30 minutes, then given up; one whose run started more than 12 hours ago is not sent.
+WeChat pauses between chunks. Once the recipient is known, a pending delivery cannot switch
+people. A new bot login for the same person can retry if the first chunk was definitely not sent;
+after a chunk is accepted or its outcome is uncertain, a changed login cannot repeat the delivery.
 
 Check results and pause notices wait out the quiet hours, 23:00–08:00 unless changed with
 `astra jobs quiet START END` or `astra jobs quiet off`; a reminder is sent at the time it was set
