@@ -11,11 +11,19 @@ from weixin_fixture import OWNER, FakeIlink
 from agent.channels.job_push import weixin_job_push
 from agent.channels.config import WeixinConfig
 from agent.channels.weixin import IlinkClient, WeixinAccount, WeixinAdapter, WeixinStore
+from agent.runtime.jobs.calendar import set_quiet_hours
 from agent.runtime.jobs.delivery import JobDelivery, RETRY_SECONDS
 from agent.runtime.jobs.store import JobStore
 
 
-def test_retry_never_resends_an_already_acknowledged_wechat_piece(tmp_path):
+@pytest.fixture
+def store(tmp_path):
+    jobs = JobStore(tmp_path / "jobs")
+    set_quiet_hours(jobs.home, None)
+    return jobs
+
+
+def test_retry_never_resends_an_already_acknowledged_wechat_piece(tmp_path, store):
     async def scenario():
         server = FakeIlink()
         channel = None
@@ -25,7 +33,6 @@ def test_retry_never_resends_an_already_acknowledged_wechat_piece(tmp_path):
             channel = adapter(server, config_store, AsyncMock(), max_output_chars=200)
             await channel.start()
             await until(lambda: channel.running, "local fixture online")
-            store = JobStore(tmp_path / "job-state")
             now = at("2026-11-18T12:01")
             check(store, tmp_path, next_at=now, targets=["weixin"])
             run = finish(store, now, output="111111" * 26 + "\n\n" + "222222" * 26)
@@ -52,7 +59,7 @@ def test_retry_never_resends_an_already_acknowledged_wechat_piece(tmp_path):
     (httpx.PoolTimeout, True), (httpx.ConnectTimeout, True), (httpx.ConnectError, True),
     (httpx.ReadTimeout, False), (httpx.WriteError, False),
 ])
-def test_job_push_replays_only_failures_before_the_request_was_sent(tmp_path, error, safe_to_retry):
+def test_job_push_replays_only_failures_before_the_request_was_sent(tmp_path, store, error, safe_to_retry):
     async def scenario():
         requests = []
         async def respond(request):
@@ -67,7 +74,6 @@ def test_job_push_replays_only_failures_before_the_request_was_sent(tmp_path, er
                                     client=client)
             channel._account = WeixinAccount("account", "test-token", "https://fixture.invalid", OWNER)
             channel._state = "online"
-            store = JobStore(tmp_path / "jobs")
             now = at("2026-11-18T12:01")
             check(store, tmp_path, next_at=now, targets=["weixin"])
             run = finish(store, now, output="delivery under test")
