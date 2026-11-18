@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 # Format after interpolating arguments and exceptions, so all handler outputs are safe.
-_URL_QUERY = re.compile(r"""(https?://[^\s?#'"<>]+)\?[^\s'"<>]*""", re.IGNORECASE)
+_URL_QUERY = re.compile(r"""(https?://[^\s?#"<>]+)\?[^\s"<>]*""", re.IGNORECASE)
 
 
 class _SafeFormatter(logging.Formatter):

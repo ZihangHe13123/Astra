@@ -80,9 +80,13 @@ def test_real_http_logs_redact_queries_and_keep_failed_polls(tmp_path, monkeypat
             code = 503 if request.url.params.get("fail") else 200
             return httpx.Response(code)
         with httpx.Client(transport=httpx.MockTransport(answer)) as client:
-            client.get("https://cdn.invalid/upload?encrypted_query_param=private-fixture")
+            client.get("https://cdn.invalid/upload?author=O'Brien&encrypted_query_param=private-fixture")
             client.post("https://example.invalid/ilink/bot/getupdates")
             client.post("https://example.invalid/ilink/bot/getupdates?fail=private-fixture")
+        try:
+            raise ValueError("failed at https://cdn.invalid/get?author=O'Brien&sig=private-fixture")
+        except ValueError:
+            logging.getLogger("channel").exception("download failed")
         output = (tmp_path / "requests.log").read_text()
         assert "private-fixture" not in output
         assert "cdn.invalid/upload" in output and "503" in output
