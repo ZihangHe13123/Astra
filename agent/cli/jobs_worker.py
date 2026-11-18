@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import os
 import signal
 import sys
@@ -130,9 +131,14 @@ async def run_check(store: JobStore, run: dict) -> None:
         text = f"Original user request:\n{spec['original_request']}\n\nScheduled check:\n{spec['prompt']}"
         event = spec.get("event")
         if event and event.get("type") == "mail":
-            text += (f"\n\nThis run was started by new mail in {event.get('folder')}: #{event.get('uid')} "
-                     f"From: {event.get('from')} | Subject: {event.get('subject')}. Read it with the mail tool "
-                     f"(action read, uid {event.get('uid')}, folder {event.get('folder')}) when the check needs it.")
+            mailbox = f" of the {event['account']} mailbox" if event.get("account") else ""
+            text += (f"\n\nThis run was started by new mail in {event.get('folder')}{mailbox}: #{event.get('uid')} "
+                     f"From: {event.get('from')} | Subject: {event.get('subject')}.")
+            if event.get("ref"):
+                args = json.dumps({"action": "read", "ref": event["ref"]}, ensure_ascii=False)
+                text += f" When needed, read the original message with the mail tool: {args}."
+            else:
+                text += " This older event has no verifiable message reference. Use the recorded metadata only."
         elif event:
             text += f"\n\nThis run was started by a new file: {event.get('path')}. Read it with read_file when needed."
         on_change = spec.get("notify") == "on_change"

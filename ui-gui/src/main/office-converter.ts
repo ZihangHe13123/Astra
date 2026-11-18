@@ -1,25 +1,27 @@
 import { mkdtemp, open, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
+import { createRequire } from 'node:module';
+import { runOfficeProcess } from './office-process.js';
 
 export type OfficeConversion = { pdf: Uint8Array; missingFonts: string[] };
 const MAX_PDF_BYTES = 32 * 1024 * 1024;
 /** The engine receives a private snapshot only. It can never save over the user's source. */
 export async function convertOffice(bytes: Uint8Array, extension: 'docx' | 'pptx', signal: AbortSignal): Promise<OfficeConversion> {
   let directory: string | undefined;
-  let converter: Awaited<ReturnType<typeof import('@deepseek-ai/libreoffice-kit').createConverter>> | undefined;
   try {
     signal.throwIfAborted();
-    const { createConverter } = await import('@deepseek-ai/libreoffice-kit');
-    converter = await createConverter({
-      timeoutMs:60_000, maxInputBytes:32*1024*1024, maxOutputBytes:MAX_PDF_BYTES,
-      maxArchiveEntries:5000, maxUncompressedBytes:64*1024*1024, maxImageResolution:192,
-    });
-    signal.throwIfAborted();
+    const engine = createRequire(typeof __filename === 'string' ? __filename : import.meta.url).resolve('@deepseek-ai/libreoffice-kit/cli');
     directory = await mkdtemp(join(tmpdir(), 'astra-office-preview-'));
     const inputPath = join(directory, `source.${extension}`); const outputPath = join(directory, 'preview.pdf');
     await writeFile(inputPath, bytes, {flag:'wx', mode:0o600, signal});
-    const result = await converter.render({inputPath, outputPath}, signal);
+    const fontDirs = process.platform === 'darwin' ? ['/System/Library/Fonts', '/Library/Fonts', join(homedir(), 'Library/Fonts')] : [];
+    const receipt = await runOfficeProcess([engine,'convert','--input',inputPath,'--output',outputPath,
+      '--timeout-ms','60000','--max-input-bytes',String(32*1024*1024),'--max-output-bytes',String(MAX_PDF_BYTES),
+      '--max-archive-entries','5000','--max-uncompressed-bytes',String(64*1024*1024),'--max-image-resolution','192',
+      ...fontDirs.flatMap(path => ['--font-directory', path])], directory, signal, 60_000);
+    const result = JSON.parse(receipt);
+    if (!Array.isArray(result.missingFonts) || !result.missingFonts.every((name: unknown) => typeof name === 'string')) throw new Error('Office 转换回执无效。');
     signal.throwIfAborted();
     const output = await open(outputPath, 'r');
     try {
@@ -37,7 +39,6 @@ export async function convertOffice(bytes: Uint8Array, extension: 'docx' | 'pptx
     if (code === 'timeout') throw new Error('文档转换超过 60 秒，请使用系统打开。');
     throw new Error(`Office 转换失败：${error instanceof Error ? error.message : String(error)}`);
   } finally {
-    try { await converter?.dispose(); }
-    finally { if (directory) await rm(directory, {recursive:true, force:true}); }
+    if (directory) await rm(directory, {recursive:true, force:true});
   }
 }

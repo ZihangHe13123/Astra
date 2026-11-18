@@ -7,6 +7,7 @@ export type AgentTeamAgentView = {
   role?: string;
   status: string;
   processId?: string;
+  statusCursor?: number;
   unread: number;
   /** The group it works in: subagents of one group may write to each other. */
   group?: string;
@@ -34,7 +35,7 @@ export type AgentTeamView = {
   messageCount: number;
 };
 
-type AgentTeamEvent = Extract<PyEvent, { type: "agent_team" }>;
+type AgentTeamEvent = Extract<PyEvent, { type: "agent_team" }> & {cursor?: number};
 
 function upsertAgent(
   agents: AgentTeamAgentView[],
@@ -109,13 +110,16 @@ export function reduceAgentTeamEvent(
   } else if (event.event === "team_agent_closed" && event.agent_id) {
     next.agents = upsertAgent(next.agents, event.agent_id, { closed: true });
   } else if (event.event.startsWith("team_agent_") && event.agent_id) {
+    const prior = next.agents.find(agent => agent.id === event.agent_id);
+    const older = event.cursor !== undefined && prior?.statusCursor !== undefined && event.cursor < prior.statusCursor;
     next.agents = upsertAgent(next.agents, event.agent_id, {
-      ...(event.group ? { group: event.group } : {}),
-      ...(event.name ? { name: event.name } : {}),
-      ...(event.parent_agent_id ? { parentId: event.parent_agent_id } : {}),
-      ...(event.role ? { role: event.role } : {}),
-      status: event.status || (event.event === "team_agent_created" ? "starting" : "running"),
-      ...(event.process_id ? { processId: event.process_id } : {}),
+      ...(event.group && (!older || !prior.group) ? { group: event.group } : {}),
+      ...(event.name && (!older || prior.name === event.agent_id.slice(0, 8)) ? { name: event.name } : {}),
+      ...(event.parent_agent_id && (!older || !prior.parentId) ? { parentId: event.parent_agent_id } : {}),
+      ...(event.role && (!older || !prior.role) ? { role: event.role } : {}),
+      ...(!older ? { status: event.status || (event.event === "team_agent_created" ? "starting" : "running"),
+        ...(event.cursor !== undefined ? {statusCursor: event.cursor} : {}) } : {}),
+      ...(event.process_id && (!older || !prior.processId) ? { processId: event.process_id } : {}),
     });
   } else if (event.event === "team_message") {
     next.messageCount += event.message_count ?? event.recipient_agent_ids?.length ?? 1;

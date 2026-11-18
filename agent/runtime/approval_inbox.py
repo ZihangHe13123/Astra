@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from agent.runtime.paths import state_path
+from agent.runtime.sqlite_wal import enable_wal
 
 import json
 import os
@@ -216,7 +217,7 @@ class ApprovalInbox:
 
     def _initialize(self) -> None:
         with self._lock, self._connection() as db:
-            db.execute("PRAGMA journal_mode = WAL")
+            enable_wal(db)
             db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS approval_requests (

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Awaitable, Callable
+from agent.runtime.jobs.delivery import WeixinPush
+from agent.runtime.jobs.store import JobStore
 
 from .manager import ChannelManager
 from .router import AgentChannelRouter
@@ -11,12 +12,12 @@ from .router import AgentChannelRouter
 logger = logging.getLogger(__name__)
 
 
-def weixin_job_push(manager: ChannelManager, router: AgentChannelRouter) -> Callable[[str], Awaitable[None]]:
+def weixin_job_push(manager: ChannelManager, router: AgentChannelRouter) -> WeixinPush:
     """A sender for job results. WeChat is looked up at each push: it can be logged in after start."""
 
-    async def push(text: str) -> None:
+    async def push(text: str, store: JobStore, run_id: str) -> None:
         adapter = manager.adapter("weixin")
-        send = getattr(adapter, "send_text", None)
+        send = getattr(adapter, "send_job_text", None)
         owner = getattr(adapter, "owner", None)
         if adapter is None or send is None or owner is None:
             # Not given up on a transient state: WeChat is not set up in this Astra at all.
@@ -26,7 +27,7 @@ def weixin_job_push(manager: ChannelManager, router: AgentChannelRouter) -> Call
             # Tried again later: WeChat may still be logging in or handing over.
             raise ConnectionError("WeChat is not online")
         # One message where it fits, not chat bubbles: each message spends what WeChat lets the bot send.
-        await send(to, text, bubbles=False)
+        await send(to, text, store, run_id)
         try:
             await router.record_outbound("weixin", to, text)
         except Exception:

@@ -98,6 +98,17 @@ def test_replay_approval_drops_unknown_and_raw_fields():
     assert safe["choices"] == ["once", "session", "deny"]
 
 
+def test_replay_keeps_the_crew_and_its_members_group(tmp_path):
+    stream = RuntimeEventStream(tmp_path / "events.db")
+    stream.publish({"type": "agent_team", "event": "team_created", "team_kind": "crew", "team_id": "one"})
+    stream.publish({"type": "agent_team", "event": "team_agent_created", "group": "editors",
+                    "agent_id": "worker", "team_id": "one", "message": "not public metadata"})
+    created, member = stream.replay(0)
+    assert created["team_kind"] == "crew"
+    assert member["group"] == "editors"
+    assert "message" not in member
+
+
 def test_replay_agent_team_keeps_only_frontend_safe_coordination_fields():
     safe = safe_replay_event(
         {

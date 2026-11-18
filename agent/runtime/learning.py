@@ -7,6 +7,7 @@ the stored proposals.
 from __future__ import annotations
 
 from agent.runtime.paths import state_path
+from agent.runtime.sqlite_wal import enable_wal
 
 import json
 import logging
@@ -51,7 +52,7 @@ class LearningStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         with self._connection() as db:
-            db.execute("PRAGMA journal_mode=WAL")
+            enable_wal(db)
             db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS learning_proposals (

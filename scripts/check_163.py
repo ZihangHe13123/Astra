@@ -71,6 +71,8 @@ def _add_output_options(parser: argparse.ArgumentParser, *, child: bool = False)
     default: bool | str = argparse.SUPPRESS if child else False
     parser.add_argument("--offline", action="store_true", default=default, help="query only the existing local cache")
     parser.add_argument("--json", action="store_true", default=default, help="emit a stable JSON envelope")
+    parser.add_argument("--account", default=argparse.SUPPRESS if child else "",
+                        help="the mailbox, by name (main, or one in ASTRA_MAIL_ACCOUNTS) or address; default the first")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -139,15 +141,26 @@ def _legacy_parser() -> argparse.ArgumentParser:
     parser.add_argument("--window", type=_nonnegative_int, default=0)
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--account", default="")
     return parser
 
 
+def _leading(argv: Sequence[str]) -> list[str]:
+    """The arguments after the options that may come before a command (--json, --offline, --account)."""
+    values, index = list(argv), 0
+    while index < len(values):
+        if values[index] in {"--json", "--offline"} or values[index].startswith("--account="):
+            index += 1
+        elif values[index] == "--account":
+            index += 2
+        else:
+            break
+    return values[index:]
+
+
 def _uses_primary_command(argv: Sequence[str]) -> bool:
-    for value in argv:
-        if value in {"--json", "--offline"}:
-            continue
-        return value in _COMMANDS
-    return False
+    rest = _leading(argv)
+    return bool(rest) and rest[0] in _COMMANDS
 
 
 def _translate_legacy(argv: Sequence[str]) -> list[str]:
@@ -160,6 +173,8 @@ def _translate_legacy(argv: Sequence[str]) -> list[str]:
 
     legacy = _legacy_parser().parse_args(values)
     output_flags = [flag for flag, enabled in (("--offline", legacy.offline), ("--json", legacy.json)) if enabled]
+    if legacy.account:
+        output_flags += ["--account", legacy.account]
     if legacy.folders:
         return ["folders", *output_flags]
     if legacy.read is not None:
@@ -182,12 +197,9 @@ def _translate_legacy(argv: Sequence[str]) -> list[str]:
 
 
 def _requested_command(argv: Sequence[str]) -> str:
-    for value in argv:
-        if value in {"--json", "--offline"}:
-            continue
-        if value in _COMMANDS:
-            return value
-        break
+    rest = _leading(argv)
+    if rest and rest[0] in _COMMANDS:
+        return rest[0]
     if "--folders" in argv:
         return "folders"
     if _has_option(argv, "--read", "-R"):
@@ -216,9 +228,9 @@ def _resolve_cli_folder(value: str) -> str:
     return resolve_folder(legacy)
 
 
-def create_service(offline: bool = False) -> MailService:
-    """Create the mail service without loading credentials for offline queries."""
-    config = load_mail_config(PROJECT_ROOT, require_credentials=not offline)
+def create_service(offline: bool = False, account: str = "") -> MailService:
+    """Create the service of one mailbox (the first unless named) without loading credentials for offline queries."""
+    config = load_mail_config(PROJECT_ROOT, require_credentials=not offline, account=account)
     return MailService(config)
 
 
@@ -481,7 +493,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return error.exit_code
 
     try:
-        service = create_service(offline=bool(args.offline) or args.command == "status")
+        service = create_service(offline=bool(args.offline) or args.command == "status", account=args.account)
         result = _execute(args, service)
         envelope, exit_code = (
             _sync_envelope(result) if isinstance(result, SyncReport) else _query_envelope(args.command, result)

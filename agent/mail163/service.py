@@ -84,7 +84,14 @@ class MailService:
                         # and nothing older than the oldest cached message is fetched later.
                         floor = min(known) if known else 0
                         wanted = sorted(uid for uid in set(snapshot.uids) - known if uid > floor)
-                        messages = client.fetch_messages(folder, snapshot, set(wanted[-self.config.sync_limit:]))
+                        prior = self.store.folder_state(self._account(), folder)
+                        continuing = bool(known) or (prior is not None and prior.uidvalidity == snapshot.uidvalidity
+                                                     and prior.last_success is not None)
+                        batch = wanted[:self.config.sync_limit] if continuing else wanted[-self.config.sync_limit:]
+                        messages = client.fetch_messages(folder, snapshot, set(batch))
+                        newest_uid = max(snapshot.uids, default=0)
+                        remaining = wanted[len(batch):] if continuing else []
+                        complete_through_uid = remaining[0] - 1 if remaining else newest_uid
                         synced_at = self.clock()
                         fetched, updated_flags, remote_removed = self.store.apply_folder_sync(
                             self._account(),
@@ -105,6 +112,9 @@ class MailService:
                                 synced_at=synced_at,
                                 error_code="",
                                 error_message="",
+                                uidvalidity=snapshot.uidvalidity,
+                                newest_uid=newest_uid,
+                                complete_through_uid=complete_through_uid,
                             )
                         )
                     except Exception as error:  # noqa: BLE001 - service boundary sanitizes client failures
@@ -120,6 +130,7 @@ class MailService:
         limit: int = 30,
         refresh: bool = True,
         include_removed: bool = False,
+        unread_only: bool = False,
     ) -> dict[str, object]:
         canonical = resolve_folder(folder, self.config.sent_folder)
         report = self._refresh(canonical) if refresh else None
@@ -130,6 +141,7 @@ class MailService:
                 folder=canonical,
                 limit=limit,
                 include_removed=include_removed,
+                unread_only=unread_only,
             )
         except sqlite3.Error as error:
             raise self._mail_error(error) from None

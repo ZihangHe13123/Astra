@@ -23,6 +23,8 @@ Open the displayed `https://auth.openai.com/codex/device` address, enter the
 one-time code and approve the login. Then start Astra and choose
 **ChatGPT / Codex** in `/model`. The model list comes from your account's catalog.
 Signing in saves the connection; selecting a model saves your startup default.
+Accounts with GPT-6.2 access can select `codex::gpt-6.2-sol` or
+`codex::gpt-6.2-astra`. Refreshing the catalog does not switch models.
 
 Sign in separately on each computer. `astra update` preserves the current
 installation's credentials but does not sign in or copy a login from another

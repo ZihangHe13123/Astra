@@ -37,9 +37,9 @@ const root = process.argv[2];
 const sessionRoot = mkdtempSync("/private/tmp/as-python-");
 const worker = process.argv.includes("--worker");
 const pause = (ms = 30) => new Promise((r) => setTimeout(r, ms));
-async function until(test: () => boolean, label: string) {
+async function until(test: () => boolean | Promise<boolean>, label: string) {
   const end = Date.now() + 6000;
-  while (!test()) {
+  while (!(await test())) {
     if (Date.now() > end) throw Error(`deadline: ${label}`);
     await pause(10);
   }
@@ -284,7 +284,10 @@ async function run() {
     process.on("message", async (m: any) => {
       if (m.kind !== "command") return;
       try {
-        if (m.op === "activity") update(BigInt(m.value));
+        if (m.op === "activity") {
+          update(BigInt(m.value));
+          assert.ok((await client.command("status", "")).ok, "broker received worker activity");
+        }
         if (m.op === "remove") remove();
         if (m.op === "close") client.close();
         process.send!({
@@ -468,17 +471,17 @@ async function run() {
     (await native("identity", { pid: process.pid })).monotonic_ns,
   );
   update(stamp);
+  assert.ok((await client.command("status", "")).ok, "broker received first client activity");
   await ask("activity", (stamp + 1n).toString());
-  await pause();
   await native("capture");
-  await pause(100);
+  await until(async () => (await ask("inspect")).count === 1, "second client committed the capture");
   assert.equal(appshotCount(state), 0);
   assert.equal((await ask("inspect")).count, 1);
   await ask("remove");
   await noArtifacts();
   update(stamp + 2n);
+  assert.ok((await client.command("status", "")).ok);
   await ask("activity", (stamp + 2n).toString());
-  await pause();
   const tie = await native("inspect");
   await native("capture");
   await pause();

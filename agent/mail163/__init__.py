@@ -2,6 +2,7 @@ from .config import (
     MailConfigurationError,
     decode_mailbox_name,
     encode_mailbox_name,
+    load_mail_accounts,
     load_mail_config,
     resolve_folder,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "SyncReport",
     "decode_mailbox_name",
     "encode_mailbox_name",
+    "load_mail_accounts",
     "load_mail_config",
     "resolve_folder",
 ]

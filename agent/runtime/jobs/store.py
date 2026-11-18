@@ -14,9 +14,10 @@ from typing import Iterator
 
 from agent.runtime.instance_lock import InstanceLock
 from agent.runtime.jobs.calendar import calendar_schedule, next_slot
+from agent.runtime.sqlite_wal import enable_wal
 
 MAX_OUTPUT = 64_000
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 # A job started by events (new mail, a new file) has no time of its own.
 NEVER = 253402300799.0
 TRIGGER_TYPES = frozenset({"mail", "file"})
@@ -90,7 +91,8 @@ def finite(value: float, minimum: float, maximum: float, label: str) -> float:
 
 
 def normalize_trigger(value: dict) -> dict:
-    """A validated trigger: new mail matching from/subject in a folder, or a new file matching a pattern."""
+    """A validated trigger: new mail matching from/subject in a folder (of one mailbox, or of every one),
+    or a new file matching a pattern."""
     kind = str(value.get("type") or "")
     if kind not in TRIGGER_TYPES:
         raise ValueError("A trigger is new mail or a new file.")
@@ -98,6 +100,10 @@ def normalize_trigger(value: dict) -> dict:
         folder = str(value.get("folder") or "").strip()
         fields = {"from": str(value.get("from") or "").strip(), "subject": str(value.get("subject") or "").strip(),
                   "folder": "INBOX" if folder.casefold() in {"", "inbox", "收件箱", "received"} else folder}
+        # One mailbox by its name or address; without one, every configured mailbox.
+        account = str(value.get("account") or "").strip()
+        if account:
+            fields["account"] = account
     else:
         fields = {"pattern": str(value.get("pattern") or "*").strip() or "*"}
     if any(len(text) > 200 for text in fields.values()):
@@ -120,7 +126,7 @@ class JobStore:
         self.path = self.root / "jobs.sqlite3"
         with self.connect() as db:
             version = db.execute("PRAGMA user_version").fetchone()[0]
-            if version not in {0, 1, 2, 3, SCHEMA_VERSION}:
+            if version not in {0, 1, 2, 3, 4, SCHEMA_VERSION}:
                 raise ValueError("Unsupported jobs database version; preserve it for inspection.")
             if version == SCHEMA_VERSION:
                 return
@@ -177,6 +183,10 @@ class JobStore:
                     db.execute("CREATE INDEX IF NOT EXISTS trigger_events_waiting ON trigger_events(run_id, job_id)")
                     db.execute("""CREATE TABLE IF NOT EXISTS trigger_cursors (
                         job_id TEXT PRIMARY KEY REFERENCES jobs(id), cursor TEXT NOT NULL, checked_at REAL NOT NULL)""")
+                if current < 5:
+                    db.execute("ALTER TABLE pushes ADD COLUMN piece_plan TEXT NOT NULL DEFAULT ''")
+                    db.execute("ALTER TABLE pushes ADD COLUMN next_piece INTEGER NOT NULL DEFAULT 0")
+                    db.execute("ALTER TABLE pushes ADD COLUMN sending_piece INTEGER NOT NULL DEFAULT 0")
                 if current < SCHEMA_VERSION:
                     db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             except BaseException:
@@ -190,7 +200,7 @@ class JobStore:
         db.row_factory = sqlite3.Row
         try:
             db.execute("PRAGMA foreign_keys=ON")
-            db.execute("PRAGMA journal_mode=WAL")
+            enable_wal(db)
             db.execute("PRAGMA synchronous=FULL")
             yield db
         finally:
@@ -320,7 +330,7 @@ class JobStore:
             row = db.execute("SELECT * FROM jobs WHERE id=?", (identity,)).fetchone()
             if row is None:
                 raise ValueError("Unknown job ID.")
-            if row["state"] == "removed" or (state == "enabled" and row["state"] == "completed"):
+            if row["state"] == "removed" or (state != "removed" and row["state"] == "completed"):
                 raise ValueError("A removed or completed one-shot cannot be resumed; create a new job.")
             next_at = row["next_at"]
             calendar = json.loads(row["spec"]).get("calendar")
@@ -571,6 +581,12 @@ class JobStore:
                 continue
             period = job["interval_seconds"]
             calendar = spec.get("calendar")
+            # Older versions could reactivate a completed one-shot via pause/resume.
+            # Its occurrence already exists; retire it and keep looking at other jobs.
+            if not (period or calendar or spec.get("trigger")) and db.execute(
+                    "SELECT 1 FROM runs WHERE job_id=? AND scheduled_at=?", (job["id"], job["next_at"])).fetchone():
+                db.execute("UPDATE jobs SET state='completed' WHERE id=?", (job["id"],))
+                continue
             if (period or calendar) and last_interaction is not None and (
                     now - max(last_interaction, job["active_since"]) > INACTIVE_SECONDS):
                 # Nobody has talked to Astra for a week: stop spending on a
@@ -657,7 +673,8 @@ class JobStore:
         if len(recent) < FAILURES_BEFORE_PAUSE or any(state not in {"failed", "unknown"} for state in recent):
             return
         if db.execute("UPDATE jobs SET state='paused',paused_reason='failures' WHERE id=? AND state='enabled' "
-                      "AND (interval_seconds>0 OR json_extract(spec,'$.calendar') IS NOT NULL)", (job_id,)).rowcount:
+                      "AND (interval_seconds>0 OR json_extract(spec,'$.calendar') IS NOT NULL "
+                      "OR json_extract(spec,'$.trigger') IS NOT NULL)", (job_id,)).rowcount:
             db.execute("UPDATE runs SET detail=substr(? || detail,1,1000) WHERE id=?", (
                 f"Paused after {FAILURES_BEFORE_PAUSE} failed runs in a row; resume it once the cause is fixed. ",
                 run_id))
@@ -690,6 +707,25 @@ class JobStore:
                 "FROM pushes JOIN runs ON runs.id=pushes.run_id JOIN jobs ON jobs.id=runs.job_id "
                 "WHERE pushes.state='pending' AND pushes.next_try<=? ORDER BY pushes.next_try,pushes.run_id LIMIT ?",
                 (time.time() if now is None else now, min(100, max(1, limit))))]
+
+    def reserve_piece(self, run_id: str, plan: str, index: int) -> bool:
+        """Fence each WeChat write. After an uncertain send, never start that piece again."""
+        with self.transaction() as db:
+            row = db.execute("SELECT * FROM pushes WHERE run_id=? AND target='weixin'", (run_id,)).fetchone()
+            if row is None or row["state"] != "pending" or row["piece_plan"] not in {"", plan}:
+                raise LookupError("WeChat delivery or recipient changed; inspect the local inbox")
+            if index < row["next_piece"]:
+                return False
+            if row["sending_piece"] or index != row["next_piece"]:
+                raise LookupError("Previous WeChat delivery was not confirmed; inspect the local inbox")
+            db.execute("UPDATE pushes SET piece_plan=?,sending_piece=1 WHERE run_id=? AND target='weixin'",
+                       (plan, run_id))
+            return True
+
+    def settle_piece(self, run_id: str, index: int, accepted: bool) -> None:
+        with self.transaction() as db:
+            db.execute("UPDATE pushes SET sending_piece=0,next_piece=? WHERE run_id=? AND target='weixin' "
+                       "AND next_piece=? AND sending_piece=1", (index + int(accepted), run_id, index))
 
     def mark_push(self, run_id: str, target: str, state: str, *, detail: str = "",
                   next_try: float | None = None, attempted: bool = True, now: float | None = None) -> None:

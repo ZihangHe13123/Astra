@@ -298,6 +298,42 @@ test("a finished background run stays finished when its older running event is r
   assert.equal(c.handled.filter(event => event.startsWith("process_status")).length, 1);
 });
 
+test("a foreground done does not hide a background run's missed receipt", () => {
+  const c = connection();
+  const run = {type:"process_status", process_id:"run", event:"process_started", status:"running"};
+  const end = {...run, event:"process_completed", status:"completed"};
+  c.live(8, run); c.live(9, end, {lost:true}); c.live(10, {type:"done"});
+  c.replay(9, 2, end);
+  assert.deepEqual(c.gaps, [8]);
+  assert.equal(c.state.processes.run.status, "completed");
+});
+
+test("late member registration restores the group without rolling back a newer idle receipt", () => {
+  const c = connection();
+  const team = {type:"agent_team", kind:"agent_team", team_id:"crew"};
+  const member = {...team, event:"team_agent_created", agent_id:"worker", name:"reviewer", status:"starting", group:"checks"};
+  c.live(1, {...team, event:"team_created", team_kind:"crew"});
+  c.live(2, member, {lost:true});
+  c.live(3, {...team, event:"team_agent_idle", agent_id:"worker", status:"idle"});
+  c.replay(2, 2, member);
+  const worker = c.state.teams.crew.agents[0];
+  assert.deepEqual([worker.name, worker.group, worker.status], ["reviewer","checks","idle"]);
+  c.live(4, {...team, event:"team_agent_awakened", agent_id:"worker", status:"running"});
+  assert.equal(c.state.teams.crew.agents[0].status, "running");
+});
+
+test("a recovered tool batch restores only calls that have not already returned", () => {
+  const c = connection();
+  const calls = {type:"tool_calls", calls:[{id:"a",name:"read_file"},{id:"b",name:"read_file"}]};
+  c.live(10, {type:"task_started",task:{id:"t",status:"running"}});
+  c.live(11, calls,{lost:true});
+  c.live(11, {type:"tool_result", call_id:"a", name:"read_file", output:"saved"}, {replayable:false});
+  c.replay(11, 2, calls);
+  assert.deepEqual(c.state.tools.map(tool => [tool.call_id,tool.status]), [["a","completed"],["b","running"]]);
+  c.live(11, {type:"tool_result",call_id:"b",name:"read_file",output:"done"}, {replayable:false});
+  assert.ok(c.state.tools.every(tool => tool.status === "completed"));
+});
+
 test("an ended task is not restarted by its replayed start, while a later resume of the same task is", () => {
   const c = connection();
   c.live(7, { type: "gui_ready" }, { replayable: false });

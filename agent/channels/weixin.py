@@ -39,6 +39,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
 
+from agent.runtime.jobs.store import JobStore
+
 import httpx
 
 from agent.runtime.instance_lock import InstanceAlreadyRunning, InstanceLock
@@ -102,6 +104,10 @@ CHAT_STYLE = """[微信聊天]
 
 class WeixinError(RuntimeError):
     """An iLink request failed; the message never contains the bot token."""
+
+
+class WeixinRejected(WeixinError):
+    """The server explicitly declined a send; the piece may be tried later."""
 
 
 class WeixinLoginError(WeixinError):
@@ -1009,6 +1015,22 @@ class WeixinAdapter(ChannelAdapter):
                 await asyncio.sleep(self._pause(piece))
             await self._send_piece(client, account, to, piece)
 
+    async def send_job_text(self, to: str, text: str, store: JobStore, run_id: str) -> None:
+        account, client = self._account, self._client
+        if account is None or client is None:
+            raise ConnectionError("WeChat is not online")
+        pieces = split_reply(plain_text(text), self.config.max_output_chars)
+        plan = hashlib.sha256(json.dumps([account.account_id, to, pieces]).encode()).hexdigest()
+        for index, piece in enumerate(pieces):
+            if not await asyncio.to_thread(store.reserve_piece, run_id, plan, index):
+                continue
+            try:
+                await self._send_piece(client, account, to, piece)
+            except (WeixinRejected, httpx.PoolTimeout, httpx.ConnectTimeout, httpx.ConnectError):
+                await asyncio.to_thread(store.settle_piece, run_id, index, False)
+                raise
+            await asyncio.to_thread(store.settle_piece, run_id, index, True)
+
     async def send_file(self, message: ChannelMessage, path: str, name: str) -> dict[str, Any]:
         """Send a local file to the person in ``message``: an image or a video as one, anything else as a file."""
         data = await asyncio.to_thread(Path(path).read_bytes)
@@ -1067,6 +1089,6 @@ class WeixinAdapter(ChannelAdapter):
                 await asyncio.sleep(1.5 * (attempt + 1))
                 continue
             if code == _RATE_LIMITED:
-                raise WeixinError("WeChat will not take a reply until this person writes to the bot again")
-            raise WeixinError(f"WeChat refused the reply (ret={response.get('ret')}, errcode={response.get('errcode')})")
-        raise WeixinError("WeChat kept rate-limiting the reply")
+                raise WeixinRejected("WeChat will not take a reply until this person writes to the bot again")
+            raise WeixinRejected(f"WeChat refused the reply (ret={response.get('ret')}, errcode={response.get('errcode')})")
+        raise WeixinRejected("WeChat kept rate-limiting the reply")

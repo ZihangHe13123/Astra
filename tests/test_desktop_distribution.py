@@ -154,6 +154,7 @@ def test_packager_allowlist_excludes_checkout_state_and_untracked_secrets(tmp_pa
     module = packager()
     source = tmp_path / 'source'
     for relative in ['agent/__init__.py', 'agent/runtime/session_recall.py', 'agent/runtime/astra.md', 'agent/ui/commands.json',
+                     'browser-control-extension/page.js', 'browser-control-extension/worker.mjs',
                      'agent/nu', 'agent/api_key.json', 'agent/secret.env', '.env', '.astra/settings.json',
                      '.sessions/private.json', 'config/models.yaml', 'config/macos_computer_compatibility.json',
                      'session_recall.py', 'LICENSE']:
@@ -163,7 +164,8 @@ def test_packager_allowlist_excludes_checkout_state_and_untracked_secrets(tmp_pa
     target = tmp_path / 'backend'
     module.copy_backend(source, target)
     paths = {p.relative_to(target).as_posix() for p in target.rglob('*') if p.is_file()}
-    assert paths == {'agent/__init__.py', 'agent/runtime/session_recall.py', 'agent/runtime/astra.md', 'agent/ui/commands.json',
+    assert paths == {'browser-control-extension/page.js', 'agent/__init__.py', 'agent/runtime/session_recall.py',
+                     'agent/runtime/astra.md', 'agent/ui/commands.json',
                      'config/models.yaml', 'config/macos_computer_compatibility.json', 'LICENSE'}
 
 

@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from agent.runtime.sqlite_wal import enable_wal
+
 
 
 ACTIVE_AGENT_STATUSES = frozenset({"starting", "running", "idle", "waiting"})
@@ -170,7 +172,7 @@ class AgentTeamStore:
 
     def _initialize(self) -> None:
         with self._lock, self._connection() as db:
-            db.execute("PRAGMA journal_mode = WAL")
+            enable_wal(db)
             db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS agent_teams (

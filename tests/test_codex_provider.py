@@ -241,19 +241,30 @@ def test_account_catalog_normalizes_capabilities_and_scopes_cache(monkeypatch):
     async def fetch():
         def handler(request):
             assert request.headers["ChatGPT-Account-ID"] == "test-account"
-            assert tuple(map(int, request.url.params["client_version"].split("."))) >= (0, 159, 1)
-            return httpx.Response(200, json={"models": [
+            current = tuple(map(int, request.url.params["client_version"].split("."))) >= (0, 169, 0)
+            models = [
                 {"slug": "gpt-6.1-sol", "context_window": 272000, "input_modalities": ["text", "image"],
                  "supported_reasoning_levels": [{"effort": effort} for effort in
                     ("low", "medium", "high", "xhigh", "max", "ultra")], "supported_in_api": False},
-                {"slug": "hidden", "visibility": "hide"}]})
+                {"slug": "hidden", "visibility": "hide"}]
+            if current:
+                models.extend([
+                    {"slug": "gpt-6.2-sol", "context_window": 500000, "input_modalities": ["text", "image", "audio"]},
+                    {"slug": "gpt-6.2-astra", "context_window": 272000, "input_modalities": ["text", "image"]},
+                ])
+            return httpx.Response(200, json={"models": models})
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             return await real_fetch(client=client)
     monkeypatch.setattr(codex_auth, "fetch_models", fetch)
     provider_id, catalog = asyncio.run(connections.connect_provider("codex"))
-    assert provider_id == "codex" and len(catalog.entries) == 1
-    profile = catalog.entries[0].profile
-    assert catalog.entries[0].key == "codex::gpt-6.1-sol"
+    assert provider_id == "codex"
+    profiles = {entry.key: entry.profile for entry in catalog.entries}
+    assert set(profiles) == {"codex::gpt-6.1-sol", "codex::gpt-6.2-sol", "codex::gpt-6.2-astra"}
+    profile = profiles["codex::gpt-6.1-sol"]
+    for name, limit in (("codex::gpt-6.2-sol", 500000), ("codex::gpt-6.2-astra", 272000)):
+        restored = model_catalog.configured_model_catalog().resolve_persisted(name)
+        assert restored and restored.profile.provider == "openai-codex"
+        assert restored.profile.context_limit == profiles[name].context_limit == limit
     assert profile.provider == "openai-codex"
     assert profile.context_limit == 272000
     assert {"vision", "tools", "reasoning"} <= profile.capabilities

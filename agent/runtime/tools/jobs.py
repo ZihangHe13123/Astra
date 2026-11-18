@@ -45,9 +45,10 @@ PARAMETERS = {"type": "object", "properties": {
                                             "time, or ISO 8601 with an offset."},
     "after_minutes": {"type": "number", "minimum": 1, "description": "One run this many minutes from now."},
     "on_new_mail": {"type": "object", "description": "Run whenever new mail arrives that matches: from and subject "
-                    "are parts of the sender and subject (either may be empty); folder defaults to inbox.",
+                    "are parts of the sender and subject (either may be empty); folder defaults to inbox; account "
+                    "names one mailbox, else every configured one is watched.",
                     "properties": {"from": {"type": "string"}, "subject": {"type": "string"},
-                                   "folder": {"type": "string"}}},
+                                   "folder": {"type": "string"}, "account": {"type": "string"}}},
     "on_new_file": {"type": "object", "description": "Run whenever a new file matching pattern (such as *.pdf) "
                     "appears directly in folder.",
                     "properties": {"folder": {"type": "string"}, "pattern": {"type": "string"}}, "required": ["folder"]},
@@ -171,7 +172,8 @@ def _when(job: dict) -> str:
     spec = job["spec"]
     trigger = spec.get("trigger")
     if trigger and trigger["type"] == "mail":
-        return "on new mail" + "".join(f" {key} {trigger[key]!r}" for key in ("from", "subject") if trigger[key])
+        return ("on new mail" + "".join(f" {key} {trigger[key]!r}" for key in ("from", "subject") if trigger[key])
+                + (f" in mailbox {trigger['account']!r}" if trigger.get("account") else ""))
     if trigger:
         return f"on a new file matching {trigger['pattern']!r} in {spec['workdir']}"
     if spec.get("calendar"):
@@ -208,7 +210,9 @@ def trigger_text(trigger: dict, folder: str = "") -> str:
     if trigger["type"] == "mail":
         parts = [f"发件人含「{trigger['from']}」" if trigger.get("from") else "",
                  f"标题含「{trigger['subject']}」" if trigger.get("subject") else ""]
-        where = "" if trigger.get("folder", "INBOX") == "INBOX" else f"（{trigger['folder']}）"
+        places = [trigger["account"] if trigger.get("account") else "",
+                  "" if trigger.get("folder", "INBOX") == "INBOX" else trigger["folder"]]
+        where = f"（{' '.join(place for place in places if place)}）" if any(places) else ""
         return f"有新邮件时{where}" + (f"：{'、'.join(part for part in parts if part)}" if any(parts) else "")
     return f"「{folder}」里出现新的 {trigger.get('pattern', '*')} 文件时"
 

@@ -29,6 +29,7 @@ from agent.launcher.desktop_distribution import resources_for, seal_tree, sha256
 from agent.launcher.desktop_update import UPDATER  # noqa: E402
 
 BACKEND_RESOURCES = (
+    'browser-control-extension/page.js',
     'agent/runtime/astra.md', 'agent/runtime/interactive_cards.md', 'agent/ui/commands.json',
     'agent/evals/context_index_benchmark/data/quality-v1.json',
     'config/models.yaml', 'config/macos_computer_compatibility.json', 'LICENSE',

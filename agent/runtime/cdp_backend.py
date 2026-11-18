@@ -86,6 +86,12 @@ def interactive_dependency_available() -> bool:
     return importlib.util.find_spec("websockets") is not None
 
 
+def page_helper_path() -> Path:
+    package = Path(__file__).resolve().parents[1]
+    bundled = package / "_data" / "browser-page.js"
+    return bundled if bundled.is_file() else package.parent / "browser-control-extension" / "page.js"
+
+
 def _make_temp_profile() -> str:
     """Create an ephemeral Chrome profile outside the project tree.
 
@@ -988,7 +994,7 @@ class CdpConnection:
                 "frameId": frame_id, "worldName": "astra-browser-control",
             })
             context_id = world["executionContextId"]
-            source = (Path(__file__).resolve().parents[2] / "browser-control-extension" / "page.js").read_text(encoding="utf-8")
+            source = page_helper_path().read_text(encoding="utf-8")
             injected = await self.send("Runtime.evaluate", {
                 "expression": source, "contextId": context_id,
                 "returnByValue": True, "awaitPromise": True,

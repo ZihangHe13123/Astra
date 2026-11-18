@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS attachments (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_recent ON messages(account, folder, received_at DESC, uid DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_subject ON messages(account, subject);
+CREATE TABLE IF NOT EXISTS legacy_ref_bindings (
+  folder TEXT NOT NULL, uidvalidity INTEGER NOT NULL, uid INTEGER NOT NULL, account TEXT NOT NULL,
+  PRIMARY KEY (folder, uidvalidity, uid, account)
+) WITHOUT ROWID;
 """
 
 _MESSAGE_COLUMNS = """
@@ -170,17 +174,20 @@ class MailStore:
         folder: str,
         limit: int,
         include_removed: bool = False,
+        unread_only: bool = False,
     ) -> list[dict[str, object]]:
         removed_clause = "" if include_removed else "AND remote_removed = 0"
+        unread_clause = ("AND NOT EXISTS (SELECT 1 FROM json_each(flags_json) WHERE value = ? COLLATE NOCASE)"
+                         if unread_only else "")
         with self._session() as db:
             rows = db.execute(
                 f"""
                 SELECT {_MESSAGE_COLUMNS} FROM messages
-                WHERE account = ? AND folder = ? {removed_clause}
+                WHERE account = ? AND folder = ? {removed_clause} {unread_clause}
                 ORDER BY received_at DESC, uid DESC
                 LIMIT ?
                 """,
-                (account, folder, limit),
+                (account, folder, *((r"\Seen",) if unread_only else ()), limit),
             ).fetchall()
         return [self._message_dict(row) for row in rows]
 
@@ -285,6 +292,12 @@ class MailStore:
         result["attachments"] = [self._attachment_dict(attachment_row) for attachment_row in attachments]
         return result
 
+    def legacy_ref_owner(self, folder: str, uidvalidity: int, uid: int) -> str | None:
+        with self._session() as db:
+            rows = db.execute("SELECT account FROM legacy_ref_bindings WHERE folder=? AND uidvalidity=? AND uid=?",
+                              (folder, uidvalidity, uid)).fetchall()
+        return rows[0]["account"] if len(rows) == 1 else None
+
     def attachment(
         self,
         account: str,
@@ -354,6 +367,8 @@ class MailStore:
     def _initialize_schema(self) -> None:
         with self._session() as db:
             db.executescript(_SCHEMA)
+            if db.execute("INSERT OR IGNORE INTO schema_meta (key,value) VALUES ('bound_refs','1')").rowcount:
+                db.execute("INSERT INTO legacy_ref_bindings SELECT folder,uidvalidity,uid,account FROM messages")
             db.execute(
                 "INSERT OR IGNORE INTO schema_meta (key, value) VALUES (?, ?)",
                 ("schema_version", "1"),
@@ -574,7 +589,7 @@ class MailStore:
             "sent_at": row["sent_at"],
             "received_at": row["received_at"],
             "flags": flags,
-            "unread": "\\Seen" not in flags,
+            "unread": not any(flag.casefold() == r"\seen" for flag in flags),
             "size": row["size"],
             "body_text": row["body_text"],
             "body_truncated": bool(row["body_truncated"]),

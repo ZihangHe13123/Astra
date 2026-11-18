@@ -88,6 +88,9 @@ const paste = async (chunks: string[]) => {
 };
 const wrap = (text: string) => `\u001b[200~${text}\u001b[201~`;
 const url = "https://provider.example/v1", secret = "secret-test-123";
+const middle = await paste(["\r", "\r", wrap(url), "\r", "\r", "abcdef", "\u001b[D", "\u001b[D", "\u001b[D", wrap("X"), "Y", "\r"]);
+assert.deepEqual(middle.saved, [[url, "abcXYdef", ""]]);
+assert.equal(middle.frames.some(frame => frame.includes("abcX")), false);
 for (const key of [
   [wrap(secret)],
   ["\u001b[200~", secret, "\u001b[201~"],

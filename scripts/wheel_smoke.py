@@ -61,6 +61,11 @@ def check_source_distribution(path: Path) -> None:
                 raise SystemExit(f"Source distribution contains a non-public path: {relative}")
             names.add(relative)
     required = {
+        ".astra/skills/development/web-product-debug/SKILL.md",
+        ".astra/skills/development/web-product-debug/references/debugging.md",
+        ".astra/skills/development/web-product-debug/references/setup.md",
+        ".astra/skills/development/web-product-debug/scripts/playwright_cli.py",
+        ".astra/skills/operations/onboarding/SKILL.md",
         "AGENTS.md", "CLAUDE.md", "agent/runtime/AGENTS.md",
         "agent/cli/jobs_commands.py", "agent/cli/jobs_worker.py",
         "agent/runtime/jobs/store.py", "agent/runtime/jobs/scheduler.py",
@@ -123,6 +128,8 @@ for name in ("agent.runtime.session_recall", "agent.cli.main", "agent.cli.backen
 assert "mlx.core" not in sys.modules, "importing the client must not load MLX"
 catalog = importlib.resources.files("agent").joinpath("_data/models.yaml")
 assert catalog.is_file(), "wheel is missing its model catalog"
+page_helper = importlib.import_module("agent.runtime.cdp_backend").page_helper_path()
+assert page_helper.resolve().is_relative_to(installed) and page_helper.read_bytes(), "wheel is missing its CDP page helper"
 contract = importlib.resources.files("agent.runtime").joinpath("astra.md")
 assert contract.is_file(), "wheel is missing its core rules"
 prompts = importlib.import_module("agent.runtime.prompts")
