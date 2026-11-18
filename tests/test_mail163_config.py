@@ -126,6 +126,17 @@ def test_a_named_mailbox_that_is_not_fully_set_up_says_what_is_missing(tmp_path:
     assert not (tmp_path / ".astra").exists()
 
 
+def test_default_ignores_incomplete_later_mailbox_but_not_missing_first_password(tmp_path: Path) -> None:
+    environ = {"ASTRA_MAIL_ACCOUNTS": "work,other", "ASTRA_MAIL_WORK_ADDRESS": "me@qq.com",
+               "ASTRA_MAIL_WORK_PASSWORD": "work-code", "ASTRA_MAIL_OTHER_ADDRESS": "other@163.com"}
+    assert load_mail_config(tmp_path, environ=environ).name == "work"
+    environ["ASTRA_MAIL_ACCOUNTS"] = "other,work"
+    with pytest.raises(MailConfigurationError, match="ASTRA_MAIL_OTHER_PASSWORD"):
+        load_mail_config(tmp_path, environ=environ)
+    assert load_mail_config(tmp_path, environ=environ, account="work").name == "work"
+    assert load_mail_config(tmp_path, environ=environ, require_credentials=False).name == "other"
+
+
 def test_without_main_the_first_named_mailbox_comes_first(tmp_path: Path) -> None:
     configs = load_mail_accounts(tmp_path, environ={
         "ASTRA_MAIL_ACCOUNTS": "qq,work", "ASTRA_MAIL_QQ_ADDRESS": "1@qq.com", "ASTRA_MAIL_QQ_PASSWORD": "x",

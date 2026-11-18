@@ -72,14 +72,10 @@ def load_mail_accounts(
     under ``ASTRA_MAIL_<NAME>_``, and their own cache and attachments under ``.astra/mail/accounts/<name>``.
     """
     values = _settings(project_root, environ)
-    names = _account_names(values)
-    has_main = bool(values.get("ASTRA_MAIL_ADDRESS") or values.get("ASTRA_163_EMAIL"))
-    configured = ([MAIN_ACCOUNT] if has_main or not names else []) + names
     configs = []
-    for name in configured:
+    for name in _configured_names(values):
         try:
-            config = (_main_config(project_root, values, require_credentials) if name == MAIN_ACCOUNT
-                      else _named_config(project_root, values, name, require_credentials))
+            config = _config_for_name(project_root, values, name, require_credentials)
         except MailConfigurationError as error:
             if problems is None:
                 raise
@@ -99,14 +95,15 @@ def load_mail_config(
     account: str = "",
 ) -> MailConfig:
     """One mailbox: the one ``account`` names (its name or address), else the first configured."""
+    if not account.strip():
+        values = _settings(project_root, environ)
+        return _config_for_name(project_root, values, _configured_names(values)[0], require_credentials)
     problems: AccountProblems = {}
     configs = load_mail_accounts(project_root, environ=environ, require_credentials=require_credentials,
                                  problems=problems)
     check_account_problems(problems, account)
     if not configs:
         raise next(iter(problems.values()))
-    if not account.strip():
-        return configs[0]
     return find_account(configs, account)
 
 
@@ -126,7 +123,7 @@ def _settings(project_root: Path, environ: Mapping[str, str] | None) -> dict[str
     return {**dotenv, **environment}
 
 
-def _account_names(values: Mapping[str, str]) -> list[str]:
+def _configured_names(values: Mapping[str, str]) -> list[str]:
     names: list[str] = []
     for part in values.get("ASTRA_MAIL_ACCOUNTS", "").split(","):
         name = part.strip().casefold()
@@ -140,7 +137,14 @@ def _account_names(values: Mapping[str, str]) -> list[str]:
         if name in names:
             raise MailConfigurationError(f"ASTRA_MAIL_ACCOUNTS names {name} twice")
         names.append(name)
-    return names
+    has_main = bool(values.get("ASTRA_MAIL_ADDRESS") or values.get("ASTRA_163_EMAIL"))
+    return ([MAIN_ACCOUNT] if has_main or not names else []) + names
+
+
+def _config_for_name(root: Path, values: Mapping[str, str], name: str, require_credentials: bool) -> MailConfig:
+    if name == MAIN_ACCOUNT:
+        return _main_config(root, values, require_credentials)
+    return _named_config(root, values, name, require_credentials)
 
 
 def _main_config(project_root: Path, values: Mapping[str, str], require_credentials: bool) -> MailConfig:

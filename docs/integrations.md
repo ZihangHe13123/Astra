@@ -433,6 +433,7 @@ only if their original account is unambiguous; otherwise search again. Its `acco
 limits a call to one mailbox. A mailbox with incomplete settings or an unreadable cache is reported while the others still answer. Each named
 mailbox keeps its own cache and attachments under `.astra/mail/accounts/<name>/`; `main` keeps
 the files it always had. `checkmail --account NAME` works with one mailbox, the first by default.
+If that default is misconfigured, the command reports its error. Name a different mailbox to read it.
 
 The optional 163 integration incrementally caches mail for local queries. Put
 your account and a 163 client authorization code (not the web password) in the

@@ -803,3 +803,27 @@ def test_account_picks_one_mailbox_in_every_form_of_the_command(tmp_path, monkey
     assert check_163.main(["recent", "--offline", "--json", "--account", "school"]) == 2
     failure = json_output(capsys)
     assert failure["errors"][0]["code"] == "configuration_error" and "main, work" in failure["errors"][0]["message"]
+
+
+@pytest.mark.parametrize(("default_settings", "bad_setting"), [
+    ("ASTRA_MAIL_ADDRESS=default@gmail.com\nASTRA_MAIL_ACCOUNTS=work\n", "ASTRA_MAIL_IMAP_PORT"),
+    ("ASTRA_MAIL_ACCOUNTS=first,work\nASTRA_MAIL_FIRST_ADDRESS=default@gmail.com\n", "ASTRA_MAIL_FIRST_IMAP_PORT"),
+])
+def test_invalid_default_fails_without_reading_the_next_mailbox(tmp_path, monkeypatch, capsys, default_settings, bad_setting):
+    from agent.mail163.config import load_mail_config
+    from agent.mail163.store import MailStore
+    from test_mail163_service import message
+
+    (tmp_path / ".env").write_text(default_settings + f"{bad_setting}=invalid\nASTRA_MAIL_WORK_ADDRESS=me@qq.com\n",
+                                   encoding="utf-8")
+    work = load_mail_config(tmp_path, account="work", require_credentials=False)
+    receipt = message("INBOX", 7, 4, subject="Only in work")
+    MailStore(work.database_path).apply_folder_sync(work.address, "INBOX", 7, {4}, [receipt], {4: ()}, 100)
+    monkeypatch.setattr(check_163, "PROJECT_ROOT", tmp_path)
+    args = ["recent", "--offline", "--json"]
+    assert check_163.main(args) == 2
+    failure = json_output(capsys)
+    assert failure["errors"] == [{"code": "configuration_error", "message": f"{bad_setting} must be a positive integer"}]
+    assert "Only in work" not in str(failure)
+    assert check_163.main([*args, "--account", "me@qq.com"]) == 0
+    assert [item["subject"] for item in json_output(capsys)["data"]["items"]] == ["Only in work"]
