@@ -149,7 +149,7 @@ class MailService:
         unread_only: bool = False,
     ) -> dict[str, object]:
         canonical = resolve_folder(folder, self.config.sent_folder)
-        report = self._refresh(canonical) if refresh else None
+        report = self._refresh(canonical, newest_first=True) if refresh else None
         self._require_cache()
         try:
             items = self.store.recent(
@@ -176,7 +176,7 @@ class MailService:
         include_removed: bool = False,
     ) -> dict[str, object]:
         canonical = resolve_folder(folder, self.config.sent_folder) if folder is not None else None
-        report = self._refresh(canonical) if refresh else None
+        report = self._refresh(canonical, newest_first=True) if refresh else None
         self._require_cache()
         try:
             items = self.store.search(
@@ -375,10 +375,9 @@ class MailService:
     ) -> dict[str, object]:
         return {"items": items, **self._result_metadata(report, folder)}
 
-    def _refresh(self, folder: str | None) -> SyncReport:
-        if folder is None or folder in self.config.default_folders:
-            return self.sync(newest_first=True)
-        return self.sync([folder], newest_first=True)
+    def _refresh(self, folder: str | None, *, newest_first: bool = False) -> SyncReport:
+        folders = None if folder is None or folder in self.config.default_folders else [folder]
+        return self.sync(folders, newest_first=newest_first)
 
     def _result_metadata(self, report: SyncReport | None, folder: str | None) -> dict[str, object]:
         if report is None:

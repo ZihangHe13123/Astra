@@ -487,6 +487,15 @@ def test_manual_poll_before_watcher_does_not_hide_arrivals_even_when_initially_e
     assert [event["uid"] for event in queued_events(store, job["id"])] == [1, 2, 3]
 
 
+def test_read_by_uid_still_finds_an_early_uncached_message_after_a_burst(tmp_path):
+    box = Mailbox(tmp_path)
+    box.deliver(1, "mail@example.org", "baseline")
+    box.service().sync(["INBOX"])
+    for uid in range(2, 204):
+        box.deliver(uid, "mail@example.org", f"note {uid}")
+    assert box.service().read("INBOX", 2)["item"]["subject"] == "note 2"
+
+
 def test_an_incomplete_fetch_never_publishes_a_cursor_past_a_missing_message(tmp_path, monkeypatch):
     store, box = JobStore(tmp_path / "home"), Mailbox(tmp_path)
     box.deliver(1, "old@example.org", "baseline")
