@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.mail163.config import MAIN_ACCOUNT
+from agent.runtime.instance_lock import InstanceAlreadyRunning, InstanceLock
 
 from .store import INACTIVE_SECONDS, JobStore, last_interaction
 
@@ -52,7 +53,17 @@ class TriggerWatcher:
 
     def look(self, *, now: float | None = None) -> int:
         """Look once at every enabled event-started job; return how many runs were queued."""
-        now = time.time() if now is None else now
+        guard = InstanceLock(self.store.root / "triggers.lock")
+        try:
+            guard.acquire()
+        except InstanceAlreadyRunning:
+            return 0
+        try:
+            return self._look(time.time() if now is None else now)
+        finally:
+            guard.release()
+
+    def _look(self, now: float) -> int:
         jobs = [job for job in self.store.jobs() if job["state"] == "enabled" and job["spec"].get("trigger")]
         if not jobs:
             return 0
