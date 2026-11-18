@@ -40,6 +40,15 @@ def test_source_distribution_refuses_private_or_generated_files(tmp_path, relati
         wheel_smoke.check_source_distribution(path)
 
 
+PUBLIC_SKILL_INPUTS = (
+    ".astra/skills/development/web-product-debug/SKILL.md",
+    ".astra/skills/development/web-product-debug/references/debugging.md",
+    ".astra/skills/development/web-product-debug/references/setup.md",
+    ".astra/skills/development/web-product-debug/scripts/playwright_cli.py",
+    ".astra/skills/operations/onboarding/SKILL.md",
+)
+
+
 def _public_source_inputs():
     return [
         "AGENTS.md", "CLAUDE.md", "agent/runtime/AGENTS.md",
@@ -59,6 +68,7 @@ def _public_source_inputs():
         "ui-gui/build.mjs", "ui-gui/index.html", "ui-gui/src/main/index.ts",
         "ui-gui/src/preload/index.ts", "ui-gui/src/renderer/index.tsx", "ui-gui/src/bridge.ts",
         ".env.example", ".astra/skills/operations/using-computer-use/SKILL.md",
+        *PUBLIC_SKILL_INPUTS,
     ]
 
 
@@ -68,6 +78,7 @@ def test_source_distribution_keeps_public_cli_shared_ui_desktop_and_configuratio
 
 
 @pytest.mark.parametrize("missing", [
+    *PUBLIC_SKILL_INPUTS,
     "ui-core/package-lock.json", "ui-core/src/backend-protocol.ts", "ui-gui/package-lock.json",
     "ui-gui/build.mjs", "ui-gui/src/preload/index.ts", "ui-tui/package-lock.json",
     "packaging/desktop-runtime.lock.json", "scripts/package_desktop.py",
