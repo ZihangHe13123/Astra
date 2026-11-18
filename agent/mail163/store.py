@@ -18,6 +18,10 @@ CREATE TABLE IF NOT EXISTS folders (
   last_success REAL, last_error_code TEXT NOT NULL DEFAULT '', last_error_message TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (account, folder)
 );
+CREATE TABLE IF NOT EXISTS folder_history_floors (
+  account TEXT NOT NULL, folder TEXT NOT NULL, uidvalidity INTEGER NOT NULL, uid INTEGER NOT NULL,
+  PRIMARY KEY (account, folder, uidvalidity)
+) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS messages (
   account TEXT NOT NULL, folder TEXT NOT NULL, uidvalidity INTEGER NOT NULL, uid INTEGER NOT NULL,
   message_id TEXT NOT NULL DEFAULT '', sender TEXT NOT NULL DEFAULT '', recipients TEXT NOT NULL DEFAULT '',
@@ -100,6 +104,13 @@ class MailStore:
             ).fetchall()
         return {row["uid"] for row in rows}
 
+    def history_floor(self, account: str, folder: str, uidvalidity: int) -> int | None:
+        """The last old UID excluded at first sync; zero when the folder started empty or fit in one batch."""
+        with self._session() as db:
+            row = db.execute("SELECT uid FROM folder_history_floors WHERE account=? AND folder=? AND uidvalidity=?",
+                             (account, folder, uidvalidity)).fetchone()
+        return None if row is None else int(row["uid"])
+
     def apply_folder_sync(
         self,
         account: str,
@@ -109,12 +120,18 @@ class MailStore:
         messages: Sequence[RemoteMessage],
         flags: Mapping[int, tuple[str, ...]],
         synced_at: float,
+        *,
+        history_floor: int | None = None,
     ) -> tuple[int, int, int]:
         self._require_writable()
         db = self._connect()
         try:
             db.execute("BEGIN IMMEDIATE")
             remote_removed = self._mark_prior_generations_removed(db, account, folder, uidvalidity)
+            if history_floor is not None:
+                db.execute("INSERT INTO folder_history_floors (account,folder,uidvalidity,uid) VALUES (?,?,?,?) "
+                           "ON CONFLICT(account,folder,uidvalidity) DO UPDATE SET uid=MIN(uid,excluded.uid)",
+                           (account, folder, uidvalidity, history_floor))
 
             for remote_message in messages:
                 if remote_message.folder != folder or remote_message.uidvalidity != uidvalidity:

@@ -450,6 +450,60 @@ def test_existing_cache_holes_and_new_watcher_get_different_bounds(tmp_path):
     assert not queued_events(store, later["id"])
 
 
+@pytest.mark.parametrize("action", ["recent", "search"])
+def test_interactive_mail_returns_the_newest_arrival_on_the_first_query(tmp_path, action):
+    box = Mailbox(tmp_path)
+    box.deliver(1, "mail@example.org", "alert initial")
+    box.service().sync(["INBOX"])
+    for uid in range(2, 204):
+        box.deliver(uid, "mail@example.org", f"alert {uid}")
+    registry = ToolRegistry()
+    register_mail_tool(registry, project_root=tmp_path, service=box.service)
+    args = {"action": action, "limit": 1}
+    if action == "search":
+        args["query"] = "alert"
+    result = asyncio.run(registry.execute("mail", args, call_id="recent"))
+    assert "Subject: alert 203" in result["output"]
+    assert box.client.fetch_calls[-1] == ("INBOX", set(range(104, 204)))
+
+
+def test_manual_poll_before_watcher_does_not_hide_arrivals_even_when_initially_empty(tmp_path):
+    store, box = JobStore(tmp_path / "home"), Mailbox(tmp_path)
+    box._publish()
+    config = replace(box.service().config, sync_limit=1)
+
+    def open_box():
+        return MailService(config, client_factory=ClientFactory(box.client))
+
+    job = reminder(store, tmp_path, {"type": "mail", "from": "wanted@"})
+    watcher = TriggerWatcher(store, mail_service=open_box)
+    assert watcher.look() == 0
+    for uid in range(1, 203):
+        box.deliver(uid, "wanted@example.org" if uid <= 3 else "other@example.org", f"note {uid}")
+    for uid in range(203, 206):
+        box.deliver(uid, "other@example.org", f"note {uid}")
+        assert open_box().recent(limit=1)["items"][0]["uid"] == uid
+        assert watcher.look() == 1
+    assert [event["uid"] for event in queued_events(store, job["id"])] == [1, 2, 3]
+
+
+def test_an_incomplete_fetch_never_publishes_a_cursor_past_a_missing_message(tmp_path, monkeypatch):
+    store, box = JobStore(tmp_path / "home"), Mailbox(tmp_path)
+    box.deliver(1, "old@example.org", "baseline")
+    job = reminder(store, tmp_path, {"type": "mail", "from": "wanted@"})
+    watcher = TriggerWatcher(store, mail_service=box.service)
+    assert watcher.look() == 0
+    box.deliver(2, "wanted@example.org", "matching")
+    box.deliver(3, "other@example.org", "later")
+    fetch = box.client.fetch_messages
+    with monkeypatch.context() as scoped:
+        scoped.setattr(box.client, "fetch_messages",
+                       lambda folder, snapshot, uids: fetch(folder, snapshot, uids - {2}))
+        assert watcher.look() == 0
+    assert watcher.look() == 1
+    assert [event["uid"] for event in queued_events(store, job["id"])] == [2]
+
+
 def test_a_mailbox_whose_cache_cannot_be_opened_does_not_stop_the_others_triggers(tmp_path, monkeypatch):
     import agent.mail163.config as mail_config_module
     import agent.mail163.service as mail_service_module

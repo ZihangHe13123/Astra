@@ -145,8 +145,9 @@ a run; so does the first look at a mailbox set up later. A file is new when its 
 or unpacked file counts even with an old date, and changing a file already there does not start
 a run. One look starts at most five runs per job, oldest first (across mailboxes, so a busy one does not keep
 another's mail waiting); the rest wait for the next look,
-so none is lost. After the first look, each folder's new mail is cached oldest first in batches
-of up to 100; the cursor does not pass a gap. Queued events keep the message's full ref, so a
+so none is lost. After the first look, a notification check fills each folder's oldest gap in batches
+of up to 100, even if a manual query has already cached the newest page. The notification cursor
+does not pass a gap or a failed fetch. Queued events keep the message's full ref, so a
 rebuilt folder or replaced account cannot redirect a worker to another message. Workers use
 only the stored sender and subject for older events without a verifiable ref. A
 reminder started this way delivers its text with the mail's sender and subject or the file's

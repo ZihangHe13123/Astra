@@ -67,7 +67,7 @@ class MailService:
         self._resolved_account = config.account or None
         self._attachment_storage: AttachmentStorage = attachment_storage()
 
-    def sync(self, folders: Sequence[str] | None = None) -> SyncReport:
+    def sync(self, folders: Sequence[str] | None = None, *, newest_first: bool = False) -> SyncReport:
         requested = self._canonical_folders(folders)
         results: list[FolderSyncResult] = []
         try:
@@ -80,18 +80,19 @@ class MailService:
                             folder,
                             snapshot.uidvalidity,
                         )
-                        # Newest first and bounded: a large mailbox's first sync stays quick,
-                        # and nothing older than the oldest cached message is fetched later.
-                        floor = min(known) if known else 0
-                        wanted = sorted(uid for uid in set(snapshot.uids) - known if uid > floor)
-                        prior = self.store.folder_state(self._account(), folder)
-                        continuing = bool(known) or (prior is not None and prior.uidvalidity == snapshot.uidvalidity
-                                                     and prior.last_success is not None)
-                        batch = wanted[:self.config.sync_limit] if continuing else wanted[-self.config.sync_limit:]
-                        messages = client.fetch_messages(folder, snapshot, set(batch))
+                        missing = sorted(snapshot.uids - known)
+                        floor = self._history_floor(folder, snapshot.uidvalidity, known, missing)
+                        wanted = [uid for uid in missing if uid > floor]
+                        limit = self.config.sync_limit
+                        batch = set(wanted[-limit:] if newest_first else wanted[:limit])
+                        messages = client.fetch_messages(folder, snapshot, batch)
+                        if len(messages) != len(batch) or {item.uid for item in messages} != batch:
+                            raise MailProtocolError("IMAP FETCH did not return the requested message numbers")
                         newest_uid = max(snapshot.uids, default=0)
-                        remaining = wanted[len(batch):] if continuing else []
-                        complete_through_uid = remaining[0] - 1 if remaining else newest_uid
+                        complete_through_uid = newest_uid
+                        if len(wanted) > limit:
+                            first_gap = wanted[0] if newest_first else wanted[limit]
+                            complete_through_uid = first_gap - 1
                         synced_at = self.clock()
                         fetched, updated_flags, remote_removed = self.store.apply_folder_sync(
                             self._account(),
@@ -101,6 +102,7 @@ class MailService:
                             messages,
                             snapshot.flags,
                             synced_at,
+                            history_floor=floor,
                         )
                         results.append(
                             FolderSyncResult(
@@ -122,6 +124,20 @@ class MailService:
         except Exception as error:  # noqa: BLE001 - service boundary sanitizes lifecycle failures
             results.extend(self._folder_failure(folder, error) for folder in requested)
         return SyncReport(status=self._report_status(results), folders=tuple(results))
+
+    def _history_floor(self, folder: str, generation: int, known: set[int], missing: list[int]) -> int:
+        """Preserve the original history window even when an interactive read caches a later page first."""
+        account = self._account()
+        floor = self.store.history_floor(account, folder, generation)
+        if floor is not None:
+            return floor
+        if known:
+            return min(known) - 1
+        prior = self.store.folder_state(account, folder)
+        if prior is not None and prior.uidvalidity == generation and prior.last_success is not None:
+            return 0
+        limit = self.config.sync_limit
+        return missing[-limit - 1] if len(missing) > limit else 0
 
     def recent(
         self,
@@ -361,8 +377,8 @@ class MailService:
 
     def _refresh(self, folder: str | None) -> SyncReport:
         if folder is None or folder in self.config.default_folders:
-            return self.sync()
-        return self.sync([folder])
+            return self.sync(newest_first=True)
+        return self.sync([folder], newest_first=True)
 
     def _result_metadata(self, report: SyncReport | None, folder: str | None) -> dict[str, object]:
         if report is None:

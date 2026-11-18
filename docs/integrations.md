@@ -409,8 +409,9 @@ password or authorization code) instead of the 163 names below. Gmail, QQ,
 iCloud and 163/126/yeah are recognised from the address; for another provider
 also set `ASTRA_MAIL_IMAP_HOST` (and `ASTRA_MAIL_IMAP_PORT` or
 `ASTRA_MAIL_SENT_FOLDER` when they differ). A folder's first sync caches its
-newest 100 messages (`ASTRA_MAIL_SYNC_LIMIT`); later syncs fetch what arrived
-since and never older history.
+newest 100 messages (`ASTRA_MAIL_SYNC_LIMIT`). If arrivals exceed one batch, interactive reads
+fetch the newest arrivals first, while notification checks fill the oldest remaining gap.
+Neither fetches history intentionally left out at the first sync.
 
 Several mailboxes: the one above is `main`, and `ASTRA_MAIL_ACCOUNTS` names more,
 comma-separated letters and digits. Each takes the same settings under its own name:
