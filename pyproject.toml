@@ -71,10 +71,15 @@ only-include = [
   ".astra/skills/development/test-driven-development/SKILL.md",
   ".astra/skills/development/using-git-worktrees/SKILL.md",
   ".astra/skills/development/verification-before-completion/SKILL.md",
+  ".astra/skills/development/web-product-debug/SKILL.md",
+  ".astra/skills/development/web-product-debug/references/debugging.md",
+  ".astra/skills/development/web-product-debug/references/setup.md",
+  ".astra/skills/development/web-product-debug/scripts/playwright_cli.py",
   ".astra/skills/development/writing-plans/SKILL.md",
   ".astra/skills/operations/163-email-sync/SKILL.md",
   ".astra/skills/operations/activity-history/SKILL.md",
   ".astra/skills/operations/hermes-memory-sync/SKILL.md",
+  ".astra/skills/operations/onboarding/SKILL.md",
   ".astra/skills/operations/using-computer-use/SKILL.md",
   ".astra/skills/operations/using-computer-use/references/native-file-workflows.md",
   ".astra/skills/operations/visible-browser-cdp/SKILL.md",
@@ -135,6 +140,7 @@ skip-excluded-dirs = true
 packages = ["agent"]
 
 [tool.hatch.build.targets.wheel.force-include]
+"browser-control-extension/page.js" = "agent/_data/browser-page.js"
 "config/models.yaml" = "agent/_data/models.yaml"
 
 [tool.pytest.ini_options]
