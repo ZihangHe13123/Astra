@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Iterator
 
+from agent.runtime.sqlite_wal import enable_wal
+
 
 MEMORY_KINDS = ("persona", "user_fact", "preference", "episode", "observation", "task_ref")
 MEMORY_STATUSES = ("active", "superseded", "expired", "forgotten")
@@ -129,7 +131,7 @@ class MemoryRecordRepository:
 
     def _initialize(self) -> None:
         with self._lock, self._connection() as db:
-            db.execute("PRAGMA journal_mode=WAL")
+            enable_wal(db)
             db.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS memory_records (

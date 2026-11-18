@@ -24,6 +24,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterator
 
+from agent.runtime.sqlite_wal import enable_wal
+
 TASK_STATES = ("submitted", "working", "input-required", "completed", "failed", "canceled", "rejected")
 TERMINAL_STATES = frozenset({"completed", "failed", "canceled", "rejected"})
 # Who may move a task to which state: the assignee reports, the requester can only withdraw.
@@ -124,7 +126,7 @@ class PeerLink:
         db = sqlite3.connect(self.path, timeout=5.0, isolation_level=None)
         db.row_factory = sqlite3.Row
         try:
-            db.execute("PRAGMA journal_mode=WAL")
+            enable_wal(db)
             db.execute("PRAGMA busy_timeout=5000")
             if write:
                 db.execute("BEGIN IMMEDIATE")

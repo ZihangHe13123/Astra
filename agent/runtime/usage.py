@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from agent.runtime.paths import state_path
+from agent.runtime.sqlite_wal import enable_wal
 
 # What the code running now is doing, for the ledger: chat, channel, job, ...
 _SOURCE: contextvars.ContextVar[str] = contextvars.ContextVar("astra_usage_source", default="chat")
@@ -147,7 +148,7 @@ class UsageLedger:
     def _connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, timeout=10)
         db.row_factory = sqlite3.Row
-        db.execute("PRAGMA journal_mode=WAL")
+        enable_wal(db)
         db.execute("PRAGMA busy_timeout=5000")
         return db
 

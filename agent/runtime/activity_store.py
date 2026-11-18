@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from agent.runtime.paths import state_path
+from agent.runtime.sqlite_wal import enable_wal
 
 import os
 from collections import Counter
@@ -340,7 +341,7 @@ class ActivityStore:
         self.connection.create_function("activity_timestamp_us", 1, _timestamp_microseconds, deterministic=True)
         self.connection.create_function("activity_url_host", 1, _url_host, deterministic=True)
         self.connection.execute("PRAGMA foreign_keys=ON")
-        self.connection.execute("PRAGMA journal_mode=WAL")
+        enable_wal(self.connection)
         self.connection.execute("PRAGMA synchronous=NORMAL")
         self.path.chmod(0o600)
         self._create_schema()

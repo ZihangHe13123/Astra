@@ -14,6 +14,7 @@ from typing import Iterator
 
 from agent.runtime.instance_lock import InstanceLock
 from agent.runtime.jobs.calendar import calendar_schedule, next_slot
+from agent.runtime.sqlite_wal import enable_wal
 
 MAX_OUTPUT = 64_000
 SCHEMA_VERSION = 5
@@ -199,7 +200,7 @@ class JobStore:
         db.row_factory = sqlite3.Row
         try:
             db.execute("PRAGMA foreign_keys=ON")
-            db.execute("PRAGMA journal_mode=WAL")
+            enable_wal(db)
             db.execute("PRAGMA synchronous=FULL")
             yield db
         finally:
