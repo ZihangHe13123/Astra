@@ -62,6 +62,8 @@ _TASK_FIELDS = ("id", "status", "step_count", "resume_count", "updated_at")
 _AGENT_TEAM_FIELDS = (
     "event",
     "kind",
+    "team_kind",
+    "group",
     "team_id",
     "name",
     "goal",

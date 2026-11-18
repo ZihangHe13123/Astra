@@ -15,7 +15,7 @@ const errorTypes = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "
 
 type Envelope = {
   type?: string; event_id?: string; cursor?: number; replayable?: boolean; replayed?: boolean; sequence?: number; generation?: string;
-  request_id?: unknown; retryable?: unknown; process_id?: unknown; task?: unknown;
+  request_id?: unknown; retryable?: unknown; process_id?: unknown; task?: unknown; call_id?: string;
 };
 
 /**
@@ -72,6 +72,7 @@ export class EventDeliveryState {
   private settled = new Set<string>();
   /** The newest journal cursor applied to each run and task: a replayed older event cannot undo a newer one. */
   private latest = new Map<string, number>();
+  private toolResults = new Map<string, number>();
   private failed = new Set<number>();
   private highWater = 0;
   private generation = "";
@@ -91,7 +92,7 @@ export class EventDeliveryState {
     const entity = lifecycleEntity(event);
     return Boolean(event.event_id && this.seen.has(event.event_id))
       || Boolean(event.replayed && typeof event.cursor === "number"
-        && (event.cursor <= this.cursor || event.cursor < this.completedThrough))
+        && (event.cursor <= this.cursor || event.cursor < this.completedThrough && event.type !== "process_status"))
       || Boolean(control && typeof event.request_id === "string" && this.settled.has(`${control}:${event.request_id}`))
       || (entity !== undefined && event.cursor! < (this.latest.get(entity) ?? 0));
   }
@@ -109,7 +110,16 @@ export class EventDeliveryState {
   completeReplay(): void {
     this.gapFloor = undefined;
   }
+  pendingCalls(event: Extract<PyEvent, {type: "tool_calls"}> & Envelope) {
+    if (!event.replayed || !Number.isSafeInteger(event.cursor)) return event.calls;
+    return event.calls?.filter(call => !call.id || (this.toolResults.get(call.id) ?? -1) < event.cursor!);
+  }
   acknowledge(event: Envelope, success: boolean): void {
+    if (success && event.type === "tool_result" && event.call_id && Number.isSafeInteger(event.cursor)) {
+      this.toolResults.delete(event.call_id);
+      this.toolResults.set(event.call_id, event.cursor!);
+      if (this.toolResults.size > 4096) this.toolResults.delete(this.toolResults.keys().next().value!);
+    }
     if (success && event.event_id) {
       this.seen.add(event.event_id);
       if (this.seen.size > 4096) this.seen.delete(this.seen.values().next().value!);
@@ -186,7 +196,10 @@ export function createBackendEventReceiver(
       }
     }
     try {
-      handle(event);
+      if (event.type === "tool_calls" && envelope.replayed) {
+        const calls = delivery.pendingCalls(event);
+        if (calls?.length) handle({ ...event, calls });
+      } else handle(event);
       delivery.acknowledge(envelope, true);
       if (event.type === "event_replay_complete" && !event.has_more) {
         delivery.completeReplay();
