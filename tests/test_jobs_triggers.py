@@ -72,7 +72,7 @@ def test_new_mail_that_matches_starts_one_run_each_and_old_mail_none(tmp_path):
     job = reminder(store, tmp_path, {"type": "mail", "from": "tan@", "subject": ""})
     watcher = TriggerWatcher(store, mail_service=box.service)
     assert job["spec"]["mail"] is False and job["next_at"] > 1e11
-    assert watcher.look() == 0 and store.trigger_cursor(job["id"]) == "7:1"
+    assert watcher.look() == 0 and store.trigger_cursor(job["id"]).partition("@")[0] == "7:1"
     box.deliver(2, "Newsletter <news@example.com>", "Weekly digest")
     box.deliver(3, "Prof Tan <tan@example.edu>", "Meeting moved to 3pm")
     assert watcher.look() == 1
@@ -85,7 +85,7 @@ def test_new_mail_that_matches_starts_one_run_each_and_old_mail_none(tmp_path):
     # A mailbox that renumbered its messages starts over from where it stands now.
     box.renumber(8)
     box.deliver(50, "tan@example.edu", "after renumbering")
-    assert watcher.look() == 0 and store.trigger_cursor(job["id"]) == "8:50"
+    assert watcher.look() == 0 and store.trigger_cursor(job["id"]).partition("@")[0] == "8:50"
 
 
 def test_a_new_file_that_matches_starts_a_run_and_others_do_not(tmp_path):
@@ -283,7 +283,7 @@ def test_an_empty_folder_watched_from_the_start_triggers_on_its_first_mail(tmp_p
     box._publish()  # The inbox exists and is empty.
     job = reminder(store, tmp_path, {"type": "mail", "from": "tan@", "subject": ""})
     watcher = TriggerWatcher(store, mail_service=box.service)
-    assert watcher.look() == 0 and store.trigger_cursor(job["id"]) == "7:0"
+    assert watcher.look() == 0 and store.trigger_cursor(job["id"]).partition("@")[0] == "7:0"
     box.deliver(1, "tan@example.edu", "first")
     box.deliver(2, "tan@example.edu", "second")
     assert watcher.look() == 2
@@ -301,7 +301,7 @@ def test_a_look_that_cannot_reach_the_mailbox_sets_no_baseline_and_loses_nothing
     box.client.enter_error = None
     box.deliver(1, "tan@example.edu", "there when the first look succeeds")
     # The first look that succeeds notes where things stand: what was there is not new to the job.
-    assert watcher.look() == 0 and store.trigger_cursor(job["id"]) == "7:1"
+    assert watcher.look() == 0 and store.trigger_cursor(job["id"]).partition("@")[0] == "7:1"
     box.client.enter_error = MailNetworkError("IMAP connection failed")
     box.deliver(2, "tan@example.edu", "while unreachable")
     assert watcher.look() == 0
@@ -325,7 +325,8 @@ def test_a_mail_trigger_watches_every_mailbox_unless_it_names_one(tmp_path):
         ("main", "new in main"), ("work", "new at work")]
     assert [(event["account"], event["subject"]) for event in queued_events(store, only_work["id"])] == [
         ("work", "new at work")]
-    assert json.loads(store.trigger_cursor(every["id"]).partition(":")[2]) == {"main": "7:2", "work": "7:2"}
+    places = json.loads(store.trigger_cursor(every["id"]).partition(":")[2])
+    assert {name: mark.partition("@")[0] for name, mark in places.items()} == {"main": "7:2", "work": "7:2"}
     tick(store)
     assert "导师来信了\n新邮件（work）：tan@example.edu — new at work" in outputs(store)
     assert watcher.look() == 0
@@ -336,7 +337,8 @@ def test_a_mail_trigger_from_one_mailbox_keeps_its_place_when_more_are_added(tmp
     main.deliver(1, "tan@example.edu", "before")
     job = reminder(store, tmp_path, {"type": "mail", "from": "tan@", "subject": ""})
     assert TriggerWatcher(store, mail_service=main.service).look() == 0
-    assert store.trigger_cursor(job["id"]) == "7:1"  # One mailbox: the cursor it always had.
+    assert store.trigger_cursor(job["id"]).partition("@")[0] == "7:1"
+    store.fire(job["id"], [], "7:1")  # A cursor saved before account binding was introduced.
     # A second mailbox is set up, with mail from before; main gets one new message meanwhile.
     for uid in (1, 2, 3):
         work.deliver(uid, "tan@example.edu", f"already at work {uid}")
@@ -409,6 +411,43 @@ def test_an_event_from_a_mailbox_other_than_main_names_it_even_alone(tmp_path):
     text = asyncio.run(registry.execute("mail", {"action": "read", "uid": event["uid"], "folder": event["folder"],
                                                  "account": event["account"]}, call_id="m"))["output"]
     assert "new at work" in text and "main's message" not in text
+    work.renumber(8)
+    work.deliver(2, "other@example.edu", "different message with the same UID")
+    result = asyncio.run(registry.execute("mail", {"action": "read", "ref": event["ref"]}, call_id="original"))
+    assert "new at work" in result["output"] and "different message" not in result["output"]
+
+
+@pytest.mark.parametrize("empty", [True, False])
+def test_a_burst_over_the_sync_limit_advances_only_through_downloaded_mail(tmp_path, empty):
+    store, box = JobStore(tmp_path / "home"), Mailbox(tmp_path)
+    if empty:
+        box._publish()
+    else:
+        box.deliver(1, "old@example.org", "already there")
+    job = reminder(store, tmp_path, {"type": "mail", "from": "wanted@"})
+    watcher = TriggerWatcher(store, mail_service=box.service)
+    assert watcher.look() == 0
+    for uid in range(2, 204):
+        box.deliver(uid, "wanted@example.org" if uid in {2, 103, 203} else "other@example.org", str(uid))
+    assert [watcher.look() for _ in range(4)] == [1, 1, 1, 0]
+    assert [event["uid"] for event in queued_events(store, job["id"])] == [2, 103, 203]
+
+
+def test_existing_cache_holes_and_new_watcher_get_different_bounds(tmp_path):
+    store, box = JobStore(tmp_path / "home"), Mailbox(tmp_path)
+    box.deliver(1, "old@example.org", "already there")
+    original = reminder(store, tmp_path, {"type": "mail", "from": "wanted@"})
+    watcher = TriggerWatcher(store, mail_service=box.service)
+    assert watcher.look() == 0
+    for uid in range(2, 204):
+        box.deliver(uid, "wanted@example.org" if uid in {103, 203} else "other@example.org", str(uid))
+    service = box.service()
+    service.store.apply_folder_sync(service.config.account, "INBOX", 7, set(box.messages),
+                                    (box.messages[203],), {}, time.time())
+    later = reminder(store, tmp_path, {"type": "mail", "from": "wanted@"})
+    assert [watcher.look() for _ in range(3)] == [0, 1, 1]
+    assert [event["uid"] for event in queued_events(store, original["id"])] == [103, 203]
+    assert not queued_events(store, later["id"])
 
 
 def test_a_mailbox_whose_cache_cannot_be_opened_does_not_stop_the_others_triggers(tmp_path, monkeypatch):
@@ -423,7 +462,7 @@ def test_a_mailbox_whose_cache_cannot_be_opened_does_not_stop_the_others_trigger
     work.database_path.parent.mkdir(parents=True, exist_ok=True)
     work.database_path.write_bytes(b"not a sqlite database")
     # The configured mailboxes as the watcher loads them, each opened on a scripted server.
-    monkeypatch.setattr(mail_config_module, "load_mail_accounts", lambda root: [mail_config(tmp_path), work])
+    monkeypatch.setattr(mail_config_module, "load_mail_accounts", lambda root, **kwargs: [mail_config(tmp_path), work])
     real = mail_service_module.MailService
     monkeypatch.setattr(mail_service_module, "MailService",
                         lambda config: real(config, client_factory=ClientFactory(main.client)))

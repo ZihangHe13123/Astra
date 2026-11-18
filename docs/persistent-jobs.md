@@ -145,8 +145,10 @@ a run; so does the first look at a mailbox set up later. A file is new when its 
 or unpacked file counts even with an old date, and changing a file already there does not start
 a run. One look starts at most five runs per job, oldest first (across mailboxes, so a busy one does not keep
 another's mail waiting); the rest wait for the next look,
-so none is lost. Mail is read from the local cache, which takes up to 100 new messages per folder
-at each look. A
+so none is lost. After the first look, each folder's new mail is cached oldest first in batches
+of up to 100; the cursor does not pass a gap. Queued events keep the message's full ref, so a
+rebuilt folder or replaced account cannot redirect a worker to another message. Workers use
+only the stored sender and subject for older events without a verifiable ref. A
 reminder started this way delivers its text with the mail's sender and subject or the file's
 name; a check is told which mail or file started it (and can read the mail). Results of
 event-started jobs wait out the quiet hours like check results. The jobs tool's `on_new_mail` and

@@ -84,6 +84,9 @@ class FolderSyncResult:
     synced_at: float | None
     error_code: str
     error_message: str
+    uidvalidity: int = 0
+    newest_uid: int = 0
+    complete_through_uid: int = 0
 
 
 @dataclass(frozen=True)

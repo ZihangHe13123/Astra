@@ -20,7 +20,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from agent.mail163.config import MAIN_ACCOUNT
+from agent.mail163.config import MAIN_ACCOUNT, resolve_folder
+from agent.mail163.models import FolderSyncResult
+from agent.mail163.refs import mailbox_identity, message_ref
 from agent.runtime.instance_lock import InstanceAlreadyRunning, InstanceLock
 
 from .store import INACTIVE_SECONDS, JobStore, last_interaction
@@ -106,22 +108,24 @@ class TriggerWatcher:
             logger.info("mail triggers could not open the mailboxes", exc_info=True)
             return 0
         watched = {job["id"]: [box for box in boxes if _watches(job, box.config)] for job in jobs}
-        looked = []
+        looks: dict[Any, dict[str, FolderSyncResult]] = {}
         for box in boxes:
             folders = sorted({job["spec"]["trigger"]["folder"] for job in jobs if box in watched[job["id"]]})
             if not folders:
                 continue
             try:
-                box.sync(folders)
+                report = box.sync(folders)
             except Exception:  # noqa: BLE001 - unreachable: look again next time
                 logger.info("mail triggers could not look at mailbox %s", box.config.name, exc_info=True)
                 continue
-            looked.append(box)
+            looks[box] = {result.folder: result for result in report.folders if result.status == "ok"}
         queued = 0
         for job in jobs:
             try:
-                queued += self._look_at_job_mail([box for box in watched[job["id"]] if box in looked], job, now,
-                                                 several)
+                folder = job["spec"]["trigger"]["folder"]
+                results = [(box, result) for box in watched[job["id"]]
+                           if (result := looks.get(box, {}).get(resolve_folder(folder, box.config.sent_folder))) is not None]
+                queued += self._look_at_job_mail(results, job, now, several)
             except Exception:  # noqa: BLE001 - this folder could not be read now: look again next time
                 logger.info("mail trigger %s could not look at its folder", job["id"], exc_info=True)
         return queued
@@ -132,10 +136,13 @@ class TriggerWatcher:
             opened = self._mail_service()
             boxes = list(opened) if isinstance(opened, (list, tuple)) else [opened]
             return boxes, len(boxes) > 1
-        from agent.mail163.config import load_mail_accounts
+        from agent.mail163.config import AccountProblems, load_mail_accounts
         from agent.mail163.service import MailService
 
-        configs = load_mail_accounts(Path(__file__).resolve().parents[3])
+        problems: AccountProblems = {}
+        configs = load_mail_accounts(Path(__file__).resolve().parents[3], problems=problems)
+        for (name, _address), problem in problems.items():
+            logger.info("mail triggers skipped mailbox %s: %s", name, problem)
         boxes = []
         for config in configs:
             if not any(_watches(job, config) for job in jobs):
@@ -146,18 +153,17 @@ class TriggerWatcher:
                 logger.info("mail triggers could not open mailbox %s", config.name, exc_info=True)
         return boxes, len(configs) > 1
 
-    def _look_at_job_mail(self, boxes: list[Any], job: dict, now: float, several: bool) -> int:
+    def _look_at_job_mail(self, boxes: list[tuple[Any, FolderSyncResult]], job: dict, now: float, several: bool) -> int:
         trigger = job["spec"]["trigger"]
         marks = _mail_marks(self.store.trigger_cursor(job["id"]))
         scans: list[_Scan] = []
-        for box in boxes:
+        for box, result in boxes:
             try:
-                scan = _scan(box, trigger, marks.get(box.config.name))
+                scan = _scan(box, trigger, marks.get(box.config.name), result)
             except Exception:  # noqa: BLE001 - this mailbox's folder could not be read now: look again next time
                 logger.info("mail trigger %s could not look at mailbox %s", job["id"], box.config.name, exc_info=True)
                 continue
-            if scan is not None:
-                scans.append(scan)
+            scans.append(scan)
         if not scans:
             return 0
         # The oldest new mail first, across mailboxes, each mailbox's in its own order.
@@ -176,7 +182,7 @@ class TriggerWatcher:
                 place = int(scan.candidates[scan.taken - 1]["uid"])  # Up to the last one taken; the rest wait.
             else:
                 continue  # None of its new mail was taken: it stays where it was.
-            marks[scan.box.config.name] = f"{scan.validity}:{place}"
+            marks[scan.box.config.name] = f"{scan.validity}:{place}@{mailbox_identity(scan.box.config)}"
         return self.store.fire(job["id"], events, _mail_cursor(marks), now=now)
 
 
@@ -192,22 +198,18 @@ class _Scan:
     taken: int = 0
 
 
-def _scan(box: Any, trigger: dict, seen: str | None) -> _Scan | None:
-    """None when the mailbox has no place to start from yet and cannot be given one now."""
-    state = box.folder_state(trigger["folder"])
-    seen_validity, _, seen_uid = (seen or "").partition(":")
-    if state is None or not state.uidvalidity:
-        return None  # Never looked at successfully: no baseline yet, and nothing taken for new.
-    validity = str(state.uidvalidity)
-    if seen is None or seen_validity != validity:
-        if state.last_error_code:
-            return None  # Its last look failed: a baseline waits for one that succeeds.
-        # The first look, or a mailbox that renumbered its messages: start from where it stands, empty or not.
-        return _Scan(box, validity, box.newest_uid(trigger["folder"], uidvalidity=state.uidvalidity))
+def _scan(box: Any, trigger: dict, seen: str | None, result: FolderSyncResult) -> _Scan:
+    mark, _, binding = (seen or "").partition("@")
+    seen_validity, _, seen_uid = mark.partition(":")
+    validity = str(result.uidvalidity)
+    if seen is None or seen_validity != validity or (binding and binding != mailbox_identity(box.config)):
+        return _Scan(box, validity, result.newest_uid)
     last, candidates = int(seen_uid or 0), []
     while len(candidates) < MAX_EVENTS:
-        page = box.after(trigger["folder"], last, uidvalidity=state.uidvalidity, limit=MAIL_PAGE)
+        page = box.after(trigger["folder"], last, uidvalidity=result.uidvalidity, limit=MAIL_PAGE)
         for item in page:
+            if int(item["uid"]) > result.complete_through_uid:
+                return _Scan(box, validity, last, candidates)
             last = int(item["uid"])
             if _matches(item, trigger):
                 candidates.append(item)
@@ -225,6 +227,8 @@ def _received(item: dict) -> float:
 
 def _event(box: Any, item: dict, trigger: dict, several: bool) -> dict:
     return {"type": "mail", "folder": item.get("folder") or trigger["folder"], "uid": int(item["uid"]),
+            "ref": message_ref(box.config, item.get("folder") or trigger["folder"], int(item["uidvalidity"]),
+                               int(item["uid"])),
             "from": str(item.get("sender") or ""), "subject": str(item.get("subject") or ""),
             # Every mailbox but main is named, so the event means the same mailbox later.
             **({"account": box.config.name} if several or box.config.name != MAIN_ACCOUNT else {})}

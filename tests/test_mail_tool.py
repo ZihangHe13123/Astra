@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
@@ -53,6 +55,10 @@ def mailbox(tmp_path: Path, *, fail: bool = False) -> tuple[ToolRegistry, Script
 
 def call(registry: ToolRegistry, **args) -> dict:
     return asyncio.run(registry.execute("mail", args, call_id="mail-call"))
+
+
+def shown_ref(text: str, prefix: str) -> str:
+    return next(ref for ref in re.findall(r' ref "([^"]+)"', text) if ref.startswith(prefix))
 
 
 def test_without_an_account_the_tool_says_how_to_set_it_up_and_creates_nothing(tmp_path, monkeypatch):
@@ -124,13 +130,12 @@ def test_a_search_result_names_its_folder_so_reading_it_never_opens_another_mess
     register_mail_tool(registry, project_root=tmp_path, service=lambda: MailService(settings, client_factory=factory))
 
     found = call(registry, action="search", query="UNIQUE_LAB")["output"]
-    assert 'ref "[Gmail]/Sent Mail:8:9"' in found and found.count("ref ") == 1
-    text = call(registry, action="read", ref="[Gmail]/Sent Mail:8:9")["output"]
+    assert found.count("ref ") == 1
+    text = call(registry, action="read", ref=shown_ref(found, "[Gmail]/Sent Mail:8:9@main~"))["output"]
     assert "UNIQUE_LAB_SEARCH_RESULT" in text and "Unrelated" not in text
     # A folder named in another script reads back the same way.
     found = call(registry, action="search", query="季度")["output"]
-    assert 'ref "项目/报告:5:9"' in found
-    assert "季度项目报告" in call(registry, action="read", ref="项目/报告:5:9")["output"]
+    assert "季度项目报告" in call(registry, action="read", ref=shown_ref(found, "项目/报告:5:9@main~"))["output"]
     # A ref from before the folder was rebuilt (another generation) is reported gone, not read as today's #9.
     stale = call(registry, action="read", ref="[Gmail]/Sent Mail:3:9")
     assert "gone" in stale["error"] and not stale["output"]
@@ -180,15 +185,13 @@ def test_with_several_mailboxes_recent_and_search_look_in_all_and_a_ref_reads_it
     # Newest first across both mailboxes, each line with its mailbox, and a ref that names it.
     assert [line.split(" | Subject: ")[1] for line in recent[2:]] == [
         "Offer letter", "Assignment 2 feedback", "Quarterly report", "Lab meeting moved"]
-    # main's refs keep the form they always had; every other mailbox's ends with its name.
-    assert recent[2].startswith('- [work] #5 ref "INBOX:7:5@work"')
-    assert recent[3].startswith('- [main] #4 ref "INBOX:7:4"')
+    assert recent[2].startswith('- [work] #5 ref "INBOX:7:5@work~')
+    assert recent[3].startswith('- [main] #4 ref "INBOX:7:4@main~')
     # The same folder, generation and number in two mailboxes: the ref reads its own one.
-    work = call(registry, action="read", ref="INBOX:7:4@work")["output"]
+    work = call(registry, action="read", ref=shown_ref(recent[4], "INBOX:7:4@work~"))["output"]
     assert "Mailbox: work (me@qq.com)" in work and "Quarterly report" in work and "Assignment" not in work
-    main = call(registry, action="read", ref="INBOX:7:4")["output"]
+    main = call(registry, action="read", ref=shown_ref(recent[3], "INBOX:7:4@main~"))["output"]
     assert "Assignment 2 feedback" in main and "Quarterly" not in main
-    assert "Assignment 2 feedback" in call(registry, action="read", ref="INBOX:7:4@main")["output"]
     # A number alone is read in the mailbox named, main without one.
     assert "Quarterly report" in call(registry, action="read", uid=4, account="work")["output"]
     assert "Assignment 2 feedback" in call(registry, action="read", uid=4)["output"]
@@ -197,7 +200,7 @@ def test_with_several_mailboxes_recent_and_search_look_in_all_and_a_ref_reads_it
         only = call(registry, action="recent", account=account)["output"]
         assert "in work." in only and "Offer letter" in only and "Assignment" not in only
     found = call(registry, action="search", query="report")["output"].splitlines()
-    assert found[1].startswith("1 match(es) in main, work.") and found[2].startswith('- [work] #4 ref "INBOX:7:4@work"')
+    assert found[1].startswith("1 match(es) in main, work.") and found[2].startswith('- [work] #4 ref "INBOX:7:4@work~')
     assert "[main] #3" in call(registry, action="search", sender="tan@")["output"]
     # sent is each mailbox's own sent folder.
     assert call(registry, action="recent", folder="sent")["output"].splitlines()[1].startswith("sent: 0 message(s)")
@@ -236,10 +239,9 @@ def test_the_mailboxes_set_up_in_env_each_answer_from_their_own_cache(tmp_path):
     registry = ToolRegistry()
     register_mail_tool(registry, project_root=tmp_path)
     recent = call(registry, action="recent")["output"]
-    assert '[main] #4 ref "INBOX:7:4"' in recent and '[work] #4 ref "INBOX:7:4@work"' in recent
     assert recent.count("this is the cached copy") == 2
-    assert subjects["work"] in call(registry, action="read", ref="INBOX:7:4@work")["output"]
-    assert subjects["main"] in call(registry, action="read", ref="INBOX:7:4")["output"]
+    for name, subject in subjects.items():
+        assert subject in call(registry, action="read", ref=shown_ref(recent, f"INBOX:7:4@{name}~"))["output"]
     assert (tmp_path / ".astra" / "mail" / "accounts" / "work" / "mail.sqlite3").is_file()
 
 
@@ -249,7 +251,7 @@ def test_a_mailbox_set_up_halfway_says_which_setting_is_missing(tmp_path):
         "ASTRA_MAIL_ACCOUNTS=work\nASTRA_MAIL_WORK_ADDRESS=me@qq.com\n", encoding="utf-8")
     registry = ToolRegistry()
     register_mail_tool(registry, project_root=tmp_path)
-    error = call(registry, action="recent")["error"]
+    error = call(registry, action="recent", account="work")["error"]
     assert "ASTRA_MAIL_WORK_PASSWORD is required" in error and SETUP not in error and "main-secret" not in error
     assert not (tmp_path / ".astra").exists()
 
@@ -274,9 +276,10 @@ def test_a_ref_names_its_mailbox_for_good_as_mailboxes_come_and_go(tmp_path):
     # work alone: its ref names it, so adding main later does not make it main's #4.
     settings.write_text(WORK, encoding="utf-8")
     listed = call(registry, action="recent")["output"]
-    assert '#4 ref "INBOX:7:4@work"' in listed and "[work]" not in listed
+    saved_work = shown_ref(listed, "INBOX:7:4@work~")
+    assert "[work]" not in listed
     settings.write_text(MAIN + WORK, encoding="utf-8")
-    assert "At work" in call(registry, action="read", ref="INBOX:7:4@work")["output"]
+    assert "At work" in call(registry, action="read", ref=saved_work)["output"]
     # A ref from main alone, in a folder whose name looks like a mailbox's, stays main's once that mailbox exists.
     folder = "work:INBOX"
     clients["main"].snapshots[folder] = FolderSnapshot(folder, 7, frozenset({4}), {4: ()})
@@ -284,9 +287,9 @@ def test_a_ref_names_its_mailbox_for_good_as_mailboxes_come_and_go(tmp_path):
     clients["main"].folder_names = ("INBOX", folder)
     settings.write_text(MAIN, encoding="utf-8")
     listed = call(registry, action="recent", folder=folder)["output"]
-    assert 'ref "work:INBOX:7:4"' in listed
+    saved_main = shown_ref(listed, "work:INBOX:7:4@main~")
     settings.write_text(MAIN + WORK, encoding="utf-8")
-    assert "In main's work:INBOX folder" in call(registry, action="read", ref="work:INBOX:7:4")["output"]
+    assert "In main's work:INBOX folder" in call(registry, action="read", ref=saved_main)["output"]
     # A ref or a number whose mailbox is not set up now is an error, never another mailbox's message.
     settings.write_text(WORK, encoding="utf-8")
     for args in ({"ref": "INBOX:7:4"}, {"uid": 4}, {"ref": "INBOX:7:4@school"}):
@@ -311,3 +314,58 @@ def test_a_mailbox_whose_cache_cannot_be_opened_does_not_hide_the_others(tmp_pat
     recent = call(registry, action="recent")["output"]
     assert "Healthy main" in recent and "(work could not be read: The local mail cache could not be opened)" in recent
     assert "could not be opened" in call(registry, action="recent", account="work")["error"]
+
+
+def test_incomplete_secondary_settings_leave_the_main_mailbox_readable(tmp_path, monkeypatch):
+    from agent.runtime.tools import mail as mail_tool
+
+    (tmp_path / ".env").write_text(MAIN + WORK.split("ASTRA_MAIL_WORK_PASSWORD")[0], encoding="utf-8")
+    client = inbox({4: message("INBOX", 7, 4, subject="Healthy main")}, "[Gmail]/Sent Mail")
+    monkeypatch.setattr(mail_tool, "MailService", lambda item: MailService(item, client_factory=ClientFactory(client)))
+    registry = ToolRegistry()
+    register_mail_tool(registry, project_root=tmp_path)
+    assert "Healthy main" in call(registry, action="recent", account="main")["output"]
+    aggregate = call(registry, action="recent")["output"]
+    assert "Healthy main" in aggregate and "ASTRA_MAIL_WORK_PASSWORD" in aggregate
+    for requested in ("work", "me@qq.com"):
+        assert "ASTRA_MAIL_WORK_PASSWORD" in call(registry, action="recent", account=requested)["error"]
+
+
+def test_unread_filter_precedes_the_per_mailbox_result_limit(tmp_path):
+    config_ = config(tmp_path)
+    mail = {uid: replace(message("INBOX", 7, uid, subject=f"note-{uid}"), flags=(r"\Seen",) if uid > 1 else ())
+            for uid in range(1, 32)}
+    client = inbox(mail, config_.sent_folder)
+    client.snapshots["INBOX"] = replace(client.snapshots["INBOX"], flags={uid: item.flags for uid, item in mail.items()})
+    registry = ToolRegistry()
+    register_mail_tool(registry, project_root=tmp_path, service=lambda: MailService(config_, client_factory=ClientFactory(client)))
+    assert "Subject: note-31" in call(registry, action="recent", limit=1)["output"]
+    result = call(registry, action="recent", unread_only=True, limit=1)["output"]
+    assert "1 unread" in result and "Subject: note-1" in result
+
+
+def test_legacy_refs_require_unambiguous_pre_upgrade_cache_and_bound_refs_reject_rebinding(tmp_path):
+    settings = work_config(tmp_path)
+    original = inbox({4: message("INBOX", 7, 4, subject="Original account")}, settings.sent_folder)
+    replacement = inbox({4: message("INBOX", 7, 4, subject="Replacement account")}, settings.sent_folder)
+    server = original
+
+    def box():
+        return MailService(settings, client_factory=ClientFactory(server))
+
+    box().sync()
+    with sqlite3.connect(settings.database_path) as database:
+        database.execute("DROP TABLE legacy_ref_bindings")
+        database.execute("DELETE FROM schema_meta WHERE key='bound_refs'")
+    registry = ToolRegistry()
+    register_mail_tool(registry, project_root=tmp_path, service=box)
+    legacy = "INBOX:7:4@work"
+    assert "Original account" in call(registry, action="read", ref=legacy)["output"]
+    bound = shown_ref(call(registry, action="recent")["output"], "INBOX:7:4@work~")
+    settings = replace(settings, account="replacement@example.org", address="replacement@example.org")
+    server = replacement
+    new = shown_ref(call(registry, action="recent")["output"], "INBOX:7:4@work~")
+    assert new != bound and "Replacement account" in call(registry, action="read", ref=new)["output"]
+    for old in (legacy, bound):
+        result = call(registry, action="read", ref=old)
+        assert result["error"] and not result["output"]

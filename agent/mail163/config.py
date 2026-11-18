@@ -40,6 +40,16 @@ class MailNotSetUpError(MailConfigurationError):
     """Raised when no mailbox is set up at all."""
 
 
+AccountProblems = dict[tuple[str, str], MailConfigurationError]
+
+
+def check_account_problems(problems: AccountProblems, account: str) -> None:
+    wanted = account.strip().casefold()
+    for (name, address), problem in problems.items():
+        if wanted and wanted in (name, address):
+            raise problem
+
+
 # The mailbox of ASTRA_MAIL_ADDRESS (or the 163 names); every other one is named in ASTRA_MAIL_ACCOUNTS.
 MAIN_ACCOUNT = "main"
 _ACCOUNT_NAME = re.compile(r"[a-z0-9]{1,32}")
@@ -50,6 +60,7 @@ def load_mail_accounts(
     *,
     environ: Mapping[str, str] | None = None,
     require_credentials: bool = True,
+    problems: AccountProblems | None = None,
 ) -> list[MailConfig]:
     """Every configured mailbox, without creating local state: "main" first when it is set up.
 
@@ -63,8 +74,21 @@ def load_mail_accounts(
     values = _settings(project_root, environ)
     names = _account_names(values)
     has_main = bool(values.get("ASTRA_MAIL_ADDRESS") or values.get("ASTRA_163_EMAIL"))
-    configs = [_main_config(project_root, values, require_credentials)] if has_main or not names else []
-    return configs + [_named_config(project_root, values, name, require_credentials) for name in names]
+    configured = ([MAIN_ACCOUNT] if has_main or not names else []) + names
+    configs = []
+    for name in configured:
+        try:
+            config = (_main_config(project_root, values, require_credentials) if name == MAIN_ACCOUNT
+                      else _named_config(project_root, values, name, require_credentials))
+        except MailConfigurationError as error:
+            if problems is None:
+                raise
+            address = (values.get("ASTRA_MAIL_ADDRESS") or values.get("ASTRA_163_EMAIL", "")
+                       if name == MAIN_ACCOUNT else values.get(f"ASTRA_MAIL_{name.upper()}_ADDRESS", ""))
+            problems[name, address.strip().casefold()] = error
+        else:
+            configs.append(config)
+    return configs
 
 
 def load_mail_config(
@@ -75,7 +99,12 @@ def load_mail_config(
     account: str = "",
 ) -> MailConfig:
     """One mailbox: the one ``account`` names (its name or address), else the first configured."""
-    configs = load_mail_accounts(project_root, environ=environ, require_credentials=require_credentials)
+    problems: AccountProblems = {}
+    configs = load_mail_accounts(project_root, environ=environ, require_credentials=require_credentials,
+                                 problems=problems)
+    check_account_problems(problems, account)
+    if not configs:
+        raise next(iter(problems.values()))
     if not account.strip():
         return configs[0]
     return find_account(configs, account)
