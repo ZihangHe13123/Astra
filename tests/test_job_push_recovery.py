@@ -2,11 +2,15 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import httpx
+import pytest
+
 from test_jobs_delivery import at, check, finish
 from test_weixin_channel import adapter, logged_in, until
 from weixin_fixture import OWNER, FakeIlink
 from agent.channels.job_push import weixin_job_push
-from agent.channels.weixin import WeixinStore
+from agent.channels.config import WeixinConfig
+from agent.channels.weixin import IlinkClient, WeixinAccount, WeixinAdapter, WeixinStore
 from agent.runtime.jobs.delivery import JobDelivery, RETRY_SECONDS
 from agent.runtime.jobs.store import JobStore
 
@@ -41,4 +45,43 @@ def test_retry_never_resends_an_already_acknowledged_wechat_piece(tmp_path):
             if channel is not None:
                 await channel.stop()
             server.close()
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("error,safe_to_retry", [
+    (httpx.PoolTimeout, True), (httpx.ConnectTimeout, True), (httpx.ConnectError, True),
+    (httpx.ReadTimeout, False), (httpx.WriteError, False),
+])
+def test_job_push_replays_only_failures_before_the_request_was_sent(tmp_path, error, safe_to_retry):
+    async def scenario():
+        requests = []
+        async def respond(request):
+            requests.append(request)
+            if len(requests) == 1:
+                raise error("fixture", request=request)
+            return httpx.Response(200, json={"ret": 0})
+
+        client = IlinkClient(transport=httpx.MockTransport(respond))
+        try:
+            channel = WeixinAdapter(WeixinConfig(enabled=True), AsyncMock(), store=WeixinStore(tmp_path / "weixin"),
+                                    client=client)
+            channel._account = WeixinAccount("account", "test-token", "https://fixture.invalid", OWNER)
+            channel._state = "online"
+            store = JobStore(tmp_path / "jobs")
+            now = at("2026-11-18T12:01")
+            check(store, tmp_path, next_at=now, targets=["weixin"])
+            run = finish(store, now, output="delivery under test")
+            recorder = AsyncMock()
+            push = weixin_job_push(SimpleNamespace(adapter=lambda _: channel),
+                                   SimpleNamespace(record_outbound=recorder))
+            await JobDelivery(store, desktop=None, weixin=push).deliver_due(now=now)
+            reopened = JobStore(store.home)
+            await JobDelivery(reopened, desktop=None, weixin=push).deliver_due(now=now + RETRY_SECONDS[0])
+            row = next(item for item in reopened.pushes(run["id"]) if item["target"] == "weixin")
+            assert row["state"] == ("sent" if safe_to_retry else "failed")
+            assert len(requests) == (2 if safe_to_retry else 1)
+            assert recorder.await_count == int(safe_to_retry)
+        finally:
+            await client.close()
+
     asyncio.run(scenario())

@@ -1026,7 +1026,7 @@ class WeixinAdapter(ChannelAdapter):
                 continue
             try:
                 await self._send_piece(client, account, to, piece)
-            except WeixinRejected:
+            except (WeixinRejected, httpx.PoolTimeout, httpx.ConnectTimeout, httpx.ConnectError):
                 await asyncio.to_thread(store.settle_piece, run_id, index, False)
                 raise
             await asyncio.to_thread(store.settle_piece, run_id, index, True)
