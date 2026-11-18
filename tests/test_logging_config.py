@@ -65,3 +65,32 @@ def test_setup_logging_invalid_rotation_values_use_defaults(tmp_path, monkeypatc
         root.setLevel(original_level)
         for handler in original_handlers:
             root.addHandler(handler)
+
+
+def test_real_http_logs_redact_queries_and_keep_failed_polls(tmp_path, monkeypatch):
+    import httpx
+
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    monkeypatch.setenv("AGENT_LOG_DIR", str(tmp_path))
+    monkeypatch.delattr(root, "_agent_logging_configured", raising=False)
+    try:
+        setup_logging("requests")
+        def answer(request):
+            code = 503 if request.url.params.get("fail") else 200
+            return httpx.Response(code)
+        with httpx.Client(transport=httpx.MockTransport(answer)) as client:
+            client.get("https://cdn.invalid/upload?encrypted_query_param=private-fixture")
+            client.post("https://example.invalid/ilink/bot/getupdates")
+            client.post("https://example.invalid/ilink/bot/getupdates?fail=private-fixture")
+        output = (tmp_path / "requests.log").read_text()
+        assert "private-fixture" not in output
+        assert "cdn.invalid/upload" in output and "503" in output
+        assert output.count("/ilink/bot/getupdates") == 1
+    finally:
+        for handler in set(root.handlers) - set(handlers):
+            root.removeHandler(handler)
+            handler.close()
+        root.setLevel(level)
+        if getattr(root, "_agent_logging_configured", False):
+            delattr(root, "_agent_logging_configured")

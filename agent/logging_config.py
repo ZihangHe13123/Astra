@@ -2,9 +2,28 @@
 
 import logging
 import os
+import re
 import sys
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+
+
+# Format after interpolating arguments and exceptions, so all handler outputs are safe.
+_URL_QUERY = re.compile(r"""(https?://[^\s?#'"<>]+)\?[^\s'"<>]*""", re.IGNORECASE)
+
+
+class _SafeFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return _URL_QUERY.sub(r"\1?[redacted]", super().format(record))
+
+
+def _useful_request(record: logging.LogRecord) -> bool:
+    if record.name != "httpx" or record.levelno != logging.INFO:
+        return True
+    # HTTPX's access line is emitted independently of application logging.
+    args = record.args
+    return not (isinstance(args, tuple) and len(args) == 5
+                and getattr(args[1], "path", None) == "/ilink/bot/getupdates" and args[3] == 200)
 
 
 def _non_negative_int_env(name: str, default: int) -> int:
@@ -26,7 +45,7 @@ def setup_logging(name: str = "agent") -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{name}.log"
 
-    formatter = logging.Formatter(
+    formatter = _SafeFormatter(
         fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S%z",
     )
@@ -41,6 +60,7 @@ def setup_logging(name: str = "agent") -> None:
         encoding="utf-8",
         delay=True,
     )
+    file_handler.addFilter(_useful_request)
     file_handler.setFormatter(formatter)
     file_handler.setLevel(level)
 
@@ -49,6 +69,7 @@ def setup_logging(name: str = "agent") -> None:
 
     if os.getenv("AGENT_LOG_STDERR", "").lower() in {"1", "true", "yes"}:
         stderr_handler = logging.StreamHandler(sys.stderr)
+        stderr_handler.addFilter(_useful_request)
         stderr_handler.setFormatter(formatter)
         stderr_handler.setLevel(level)
         root.addHandler(stderr_handler)
