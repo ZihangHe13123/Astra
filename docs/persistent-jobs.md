@@ -138,8 +138,8 @@ A job can also start on an event instead of a time. `--on-mail-from TEXT` and
 `--on-mail-subject TEXT` (with `--on-mail-folder`, default the inbox) start it when new mail
 arrives whose sender or subject contains the text, in every configured mailbox unless
 `--on-mail-account` (a name or address) names one; `--on-new-file PATTERN` starts it when a new
-file matching the pattern (such as `'*.pdf'`) appears directly in `--workdir`. The desktop's
-background host looks every five minutes; its first look that reaches the folder or mailbox only
+file matching the pattern (such as `'*.pdf'`) appears directly in `--workdir`. The desktop host and standalone `astra jobs serve` look every five minutes;
+`astra jobs tick` also looks once. The first look that reaches the folder or mailbox only
 notes where things stand (an empty folder included), so mail and files already there never start
 a run; so does the first look at a mailbox set up later. A file is new when its name was not in the folder at the previous look, so a copied, moved
 or unpacked file counts even with an old date, and changing a file already there does not start

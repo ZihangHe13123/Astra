@@ -27,7 +27,7 @@ INBOX_NOTE = "…（完整结果在 Astra 的定时任务收件箱里）"
 
 DesktopNotify = Callable[[dict], None]
 # Sends one text to the person's WeChat and keeps it in that chat's conversation.
-WeixinPush = Callable[[str], Awaitable[None]]
+WeixinPush = Callable[[str, JobStore, str], Awaitable[None]]
 # Writes one result into the personal thread. Returns False while the thread is busy with a turn.
 ThreadRecord = Callable[[dict, str, str], Awaitable[bool]]
 # How long a result waits for the personal thread to finish the turn it is in.
@@ -110,7 +110,7 @@ class JobDelivery:
                 elif self.weixin is None:
                     raise LookupError("WeChat is not set up")
                 else:
-                    await self.weixin(f"【{title}】\n{body}")
+                    await self.weixin(f"【{title}】\n{body}", self.store, run_id)
             except LookupError as exc:
                 await asyncio.to_thread(self.store.mark_push, run_id, target, "failed", detail=str(exc), now=now)
                 continue

@@ -129,7 +129,7 @@ def test_a_mail_started_reminder_waits_out_the_quiet_hours(tmp_path, monkeypatch
     tick(store)
     sent: list[str] = []
 
-    async def push(text: str) -> None:
+    async def push(text: str, _store, _id) -> None:
         sent.append(text)
 
     from datetime import datetime, timedelta

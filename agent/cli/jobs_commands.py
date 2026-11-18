@@ -231,14 +231,23 @@ def execute_jobs_command(argv: list[str], *, home: Path | None = None,
         else:
             from agent.runtime.jobs.scheduler import tick
 
+            from agent.runtime.jobs.triggers import LOOK_SECONDS, TriggerWatcher
+
             if args.action == "serve":
                 poll = finite(args.poll, 1, 60, "Poll interval")
                 print(json.dumps({"scheduler": "serving", "home": str(store.home)}, ensure_ascii=False), flush=True)
+                watcher = TriggerWatcher(store)
+                next_look = 0.0
                 while True:
+                    if time.monotonic() >= next_look:
+                        watcher.look()
+                        next_look = time.monotonic() + LOOK_SECONDS
                     result = tick(store)
                     if result["executed"] or result["recovered_unknown"] or result["delivered"]:
                         print(json.dumps(result, ensure_ascii=False), flush=True)
                     time.sleep(poll)
+            if args.action == "tick":
+                TriggerWatcher(store).look()
             value = tick(store, manual_job=args.id if args.action == "run" else "")
         return json.dumps(value, ensure_ascii=False, indent=2), ""
     except (ValueError, OSError, sqlite3.Error) as exc:

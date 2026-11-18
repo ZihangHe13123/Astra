@@ -64,7 +64,7 @@ class Recorder:
     def notify(self, event: dict) -> None:
         self.desktop.append(event)
 
-    async def send(self, text: str) -> None:
+    async def send(self, text: str, _store, _id) -> None:
         if self.failures:
             self.failures -= 1
             raise ConnectionError("WeChat is not online")
