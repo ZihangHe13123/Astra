@@ -10,6 +10,8 @@ The desktop Files panel can open local PDF, DOCX, PPTX and XLSX files in additio
 
 Office conversion is local and serial, with at most four metadata-only queued requests, a 60-second engine deadline and at most eight cached PDFs within a 64 MiB string-storage budget. Source and PDF sizes are limited to 32 MiB. OOXML checks cap the package at 5,000 entries, 64 MiB declared expanded data and 16 MiB per XML part. ZIP64, encrypted packages, malformed directories, missing internal relationship targets and DTD/entity declarations are rejected. No external relationship is fetched. PDF parsing/rendering failures and unavailable Office engines are shown as failures with a System Open action.
 
+The desktop enforces the deadline and cancellation outside the converter process. On macOS, previews use system, shared and user-installed fonts, without scanning another application's private font cache. To use an Office-specific font, install it through Font Book.
+
 ## Model-visible inspection
 
 `doc_check(path=...)` is a read-only tool in the documents group for saved DOCX/PPTX/XLSX files. It uses the existing filesystem permission policy, reopens the bounded ZIP/XML package, checks required parts and internal relationships, and reports the source SHA-256. It requires only the Python standard library.
