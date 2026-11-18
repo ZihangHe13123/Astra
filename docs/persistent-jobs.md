@@ -23,7 +23,7 @@ A check follows the default model, the one selected when it runs. `--model KEY`
 pins a configured model instead; `astra jobs update ID --model KEY` changes it later
 and `--model default` returns to following the default, as does the model menu on
 the desktop's jobs page. `--web` explicitly enables existing search/fetch tools, and `--mail` lets the check read the
-configured mailbox (read-only; see [mail](integrations.md#read-only-163-mail)). On macOS,
+configured mailboxes (read-only; see [mail](integrations.md#read-only-163-mail)). On macOS,
 `--read-calendar` lets it read Calendar and Reminders, never change them
 ([calendar](integrations.md#calendar-and-reminders-macos)).
 While today's model usage is over the daily budget (`/usage budget`), checks that come
@@ -136,13 +136,15 @@ same accounting policy.
 
 A job can also start on an event instead of a time. `--on-mail-from TEXT` and
 `--on-mail-subject TEXT` (with `--on-mail-folder`, default the inbox) start it when new mail
-arrives whose sender or subject contains the text; `--on-new-file PATTERN` starts it when a new
+arrives whose sender or subject contains the text, in every configured mailbox unless
+`--on-mail-account` (a name or address) names one; `--on-new-file PATTERN` starts it when a new
 file matching the pattern (such as `'*.pdf'`) appears directly in `--workdir`. The desktop's
 background host looks every five minutes; its first look that reaches the folder or mailbox only
 notes where things stand (an empty folder included), so mail and files already there never start
-a run. A file is new when its name was not in the folder at the previous look, so a copied, moved
+a run; so does the first look at a mailbox set up later. A file is new when its name was not in the folder at the previous look, so a copied, moved
 or unpacked file counts even with an old date, and changing a file already there does not start
-a run. One look starts at most five runs per job, oldest first; the rest wait for the next look,
+a run. One look starts at most five runs per job, oldest first (across mailboxes, so a busy one does not keep
+another's mail waiting); the rest wait for the next look,
 so none is lost. Mail is read from the local cache, which takes up to 100 new messages per folder
 at each look. A
 reminder started this way delivers its text with the mail's sender and subject or the file's

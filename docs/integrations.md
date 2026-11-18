@@ -412,6 +412,26 @@ also set `ASTRA_MAIL_IMAP_HOST` (and `ASTRA_MAIL_IMAP_PORT` or
 newest 100 messages (`ASTRA_MAIL_SYNC_LIMIT`); later syncs fetch what arrived
 since and never older history.
 
+Several mailboxes: the one above is `main`, and `ASTRA_MAIL_ACCOUNTS` names more,
+comma-separated letters and digits. Each takes the same settings under its own name:
+
+```dotenv
+ASTRA_MAIL_ACCOUNTS=work,qq
+ASTRA_MAIL_WORK_ADDRESS=you@work.example
+ASTRA_MAIL_WORK_PASSWORD=app-password
+ASTRA_MAIL_WORK_IMAP_HOST=imap.work.example
+ASTRA_MAIL_QQ_ADDRESS=12345@qq.com
+ASTRA_MAIL_QQ_PASSWORD=authorization-code
+```
+
+`ASTRA_MAIL_<NAME>_IMAP_PORT` and `ASTRA_MAIL_<NAME>_SENT_FOLDER` work the same way. The `mail`
+tool's recent and search then look in every mailbox at once, newest first; each message names
+its mailbox, and so does its ref: `main`'s keep their old form, and every other mailbox's end
+with `@` and its name (`INBOX:7:4@work`), so a ref keeps naming the same message as mailboxes come and go. Its `account` (a name or an address) limits a call to one
+mailbox. A mailbox that cannot be read is reported while the others still answer. Each named
+mailbox keeps its own cache and attachments under `.astra/mail/accounts/<name>/`; `main` keeps
+the files it always had. `checkmail --account NAME` works with one mailbox, the first by default.
+
 The optional 163 integration incrementally caches mail for local queries. Put
 your account and a 163 client authorization code (not the web password) in the
 repository `.env`:
@@ -426,7 +446,8 @@ With no subcommand, `checkmail` refreshes the default `INBOX` and `已发送`
 folders and then shows the 30 newest Inbox messages. Subcommands provide an
 explicit `sync --json`, cached `search`, stable-UID `read`, folder listing, and
 status. Add `--offline` to `recent`, `search`, `read`, or `folders` to avoid a
-server connection and use only an existing cache. A failed refresh returns
+server connection and use only an existing cache; offline still finds each mailbox's cache by its
+address. A failed refresh returns
 clearly labelled cached results when available; offline access to a missing
 cache fails without creating a database.
 

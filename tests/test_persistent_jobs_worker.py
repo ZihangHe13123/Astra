@@ -430,3 +430,10 @@ def test_real_worker_is_told_which_mail_started_its_run(tmp_path, provider):
     assert "started by new mail in INBOX: #42 From: Prof Tan <tan@example.edu> | Subject: Meeting moved" in json.dumps(
         request["messages"], ensure_ascii=False)
     assert "mail" in {tool["function"]["name"] for tool in request["tools"]}
+    # With several mailboxes, the event names its own, and so does the way to read it.
+    JobStore(home).fire(job["id"], [{"type": "mail", "folder": "INBOX", "uid": 43, "from": "Prof Tan <tan@example.edu>",
+                                     "subject": "Room changed", "account": "work"}], "mailboxes:{}")
+    assert command(env, "tick")["executed"][0]["state"] == "completed"
+    told = json.dumps(provider.requests[-1]["body"]["messages"], ensure_ascii=False)
+    assert "started by new mail in INBOX of the work mailbox: #43 From: Prof Tan" in told
+    assert "(action read, uid 43, folder INBOX, account work)" in told

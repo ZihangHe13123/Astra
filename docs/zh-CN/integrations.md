@@ -168,6 +168,24 @@ Astra 自己用只读的 `mail` 工具读取已配置的邮箱：最近的邮件
 `ASTRA_MAIL_SENT_FOLDER`）。每个文件夹第一次同步只缓存最新的 100 封（`ASTRA_MAIL_SYNC_LIMIT`），之后只取
 新到的邮件，不回补更早的历史。
 
+多个邮箱：上面这个邮箱叫 `main`，`ASTRA_MAIL_ACCOUNTS` 列出其他邮箱的名字（字母和数字，逗号分隔），
+每个邮箱用自己名字下的同一组设置：
+
+```dotenv
+ASTRA_MAIL_ACCOUNTS=work,qq
+ASTRA_MAIL_WORK_ADDRESS=you@work.example
+ASTRA_MAIL_WORK_PASSWORD=app-password
+ASTRA_MAIL_WORK_IMAP_HOST=imap.work.example
+ASTRA_MAIL_QQ_ADDRESS=12345@qq.com
+ASTRA_MAIL_QQ_PASSWORD=authorization-code
+```
+
+`ASTRA_MAIL_<名字>_IMAP_PORT`、`ASTRA_MAIL_<名字>_SENT_FOLDER` 同理。这样 `mail` 工具的最近邮件和搜索会同时看
+所有邮箱，按时间从新到旧排列，每封邮件和它的 ref 都标明来自哪个邮箱（`main` 的 ref 保持原样，其他邮箱的 ref 以 `@名字`
+结尾，如 `INBOX:7:4@work`，所以之后增减邮箱，ref 指的仍是同一封邮件）；用 `account`（名字或地址）只看其中一个。
+某个邮箱读不到时会单独说明，其他邮箱照常返回。每个命名的邮箱有自己的缓存和附件目录
+`.astra/mail/accounts/<名字>/`，`main` 沿用原来的文件。`checkmail --account 名字` 操作其中一个邮箱，默认第一个。
+
 可选邮件集成增量缓存邮件，用于本地检索。在安装目录 `.env` 填写账号和客户端授权码（不是网页登录密码）：
 
 ```dotenv
@@ -176,7 +194,7 @@ ASTRA_163_AUTH_CODE=your-client-authorization-code
 # ASTRA_163_MAX_BODY_BYTES=5242880
 ```
 
-不带子命令时，`checkmail` 刷新默认 `INBOX` 和 `已发送`，然后显示收件箱最近 30 封。还支持明确同步、缓存搜索、稳定 UID 读取、文件夹列表和状态。对 `recent`、`search`、`read`、`folders` 加 `--offline` 可只读已有缓存；刷新失败且缓存存在时返回明确标注的缓存结果，离线访问缺失缓存会失败且不新建数据库。
+不带子命令时，`checkmail` 刷新默认 `INBOX` 和 `已发送`，然后显示收件箱最近 30 封。还支持明确同步、缓存搜索、稳定 UID 读取、文件夹列表和状态。对 `recent`、`search`、`read`、`folders` 加 `--offline` 可只读已有缓存（离线时也按地址找到各邮箱的缓存）；刷新失败且缓存存在时返回明确标注的缓存结果，离线访问缺失缓存会失败且不新建数据库。
 
 Windows：
 

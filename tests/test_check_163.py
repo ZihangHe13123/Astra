@@ -86,7 +86,7 @@ class FakeService:
 def patch_service(monkeypatch: pytest.MonkeyPatch, service: FakeService) -> list[bool]:
     offline_calls: list[bool] = []
 
-    def factory(offline: bool = False) -> FakeService:
+    def factory(offline: bool = False, account: str = "") -> FakeService:
         offline_calls.append(offline)
         return service
 
@@ -370,7 +370,7 @@ def test_remote_commands_reject_offline_mode_before_service_creation(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     calls: list[bool] = []
-    monkeypatch.setattr(check_163, "create_service", lambda offline=False: calls.append(offline))
+    monkeypatch.setattr(check_163, "create_service", lambda offline=False, account="": calls.append(offline))
 
     assert check_163.main([*command.split(), "--offline", "--json"]) == 2
 
@@ -454,7 +454,7 @@ def test_human_raised_command_error_remains_error_only(
     monkeypatch.setattr(
         check_163,
         "create_service",
-        lambda offline=False: (_ for _ in ()).throw(MailError("network_error", "Unable to reach server", 4)),
+        lambda offline=False, account="": (_ for _ in ()).throw(MailError("network_error", "Unable to reach server", 4)),
     )
 
     assert check_163.main(["sync"]) == 4
@@ -478,7 +478,7 @@ def test_stable_error_exit_codes_and_json_envelope(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    monkeypatch.setattr(check_163, "create_service", lambda offline=False: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(check_163, "create_service", lambda offline=False, account="": (_ for _ in ()).throw(error))
 
     assert check_163.main(["recent", "--json"]) == expected_code
 
@@ -574,7 +574,7 @@ def test_error_output_never_contains_authorization_code(
     monkeypatch.setattr(
         check_163,
         "create_service",
-        lambda offline=False: (_ for _ in ()).throw(
+        lambda offline=False, account="": (_ for _ in ()).throw(
             MailError("auth_failed", "163 authentication failed: do-not-print", 4)
         ),
     )
@@ -594,7 +594,7 @@ def test_unexpected_exception_is_not_rendered_or_leaked(
     monkeypatch.setattr(
         check_163,
         "create_service",
-        lambda offline=False: (_ for _ in ()).throw(RuntimeError("raw secret-value traceback detail")),
+        lambda offline=False, account="": (_ for _ in ()).throw(RuntimeError("raw secret-value traceback detail")),
     )
 
     assert check_163.main(["status", "--json"]) == 5
@@ -769,3 +769,37 @@ def test_guide_documents_complete_read_only_163_mail_workflow() -> None:
     assert "Explicit attachment download currently fails closed on Windows" in section
     assert ".\\scripts\\checkmail.bat attachment" not in section
     assert "no subcommand" in section
+
+
+def test_account_picks_one_mailbox_in_every_form_of_the_command(tmp_path, monkeypatch, capsys) -> None:
+    """Through the real service: each mailbox's cache holds one message, and --account reads that one's."""
+    from test_mail163_service import ClientFactory, ScriptedClient, message
+
+    from agent.mail163.config import load_mail_accounts
+    from agent.mail163.models import FolderSnapshot
+    from agent.mail163.service import MailService
+
+    (tmp_path / ".env").write_text(
+        "ASTRA_MAIL_ADDRESS=me@gmail.com\nASTRA_MAIL_PASSWORD=main-secret\n"
+        "ASTRA_MAIL_ACCOUNTS=work\nASTRA_MAIL_WORK_ADDRESS=me@qq.com\nASTRA_MAIL_WORK_PASSWORD=work-secret\n",
+        encoding="utf-8")
+    for config in load_mail_accounts(tmp_path):
+        item = message("INBOX", 7, 4, subject=f"In the {config.name} mailbox")
+        client = ScriptedClient(snapshots={"INBOX": FolderSnapshot("INBOX", 7, frozenset({4}), {4: ()}),
+                                           config.sent_folder: FolderSnapshot(config.sent_folder, 8, frozenset(), {})},
+                                messages={("INBOX", 4): item})
+        MailService(config, client_factory=ClientFactory(client)).sync()
+    monkeypatch.setattr(check_163, "PROJECT_ROOT", tmp_path)
+
+    def subjects(*argv: str) -> list[str]:
+        assert check_163.main(list(argv)) == 0
+        return [item["subject"] for item in json_output(capsys)["data"]["items"]]
+
+    assert subjects("recent", "--offline", "--json") == ["In the main mailbox"]
+    assert subjects("recent", "--offline", "--json", "--account", "work") == ["In the work mailbox"]
+    assert subjects("--account", "work", "--offline", "search", "mailbox", "--json") == ["In the work mailbox"]
+    assert subjects("--account=me@qq.com", "--offline", "--json") == ["In the work mailbox"]  # The older form.
+    assert subjects("--search", "mailbox", "--account", "work", "--offline", "--json") == ["In the work mailbox"]
+    assert check_163.main(["recent", "--offline", "--json", "--account", "school"]) == 2
+    failure = json_output(capsys)
+    assert failure["errors"][0]["code"] == "configuration_error" and "main, work" in failure["errors"][0]["message"]

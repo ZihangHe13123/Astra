@@ -90,7 +90,8 @@ def finite(value: float, minimum: float, maximum: float, label: str) -> float:
 
 
 def normalize_trigger(value: dict) -> dict:
-    """A validated trigger: new mail matching from/subject in a folder, or a new file matching a pattern."""
+    """A validated trigger: new mail matching from/subject in a folder (of one mailbox, or of every one),
+    or a new file matching a pattern."""
     kind = str(value.get("type") or "")
     if kind not in TRIGGER_TYPES:
         raise ValueError("A trigger is new mail or a new file.")
@@ -98,6 +99,10 @@ def normalize_trigger(value: dict) -> dict:
         folder = str(value.get("folder") or "").strip()
         fields = {"from": str(value.get("from") or "").strip(), "subject": str(value.get("subject") or "").strip(),
                   "folder": "INBOX" if folder.casefold() in {"", "inbox", "收件箱", "received"} else folder}
+        # One mailbox by its name or address; without one, every configured mailbox.
+        account = str(value.get("account") or "").strip()
+        if account:
+            fields["account"] = account
     else:
         fields = {"pattern": str(value.get("pattern") or "*").strip() or "*"}
     if any(len(text) > 200 for text in fields.values()):

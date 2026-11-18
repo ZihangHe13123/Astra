@@ -1,7 +1,8 @@
 import base64
 import binascii
 import os
-from collections.abc import Mapping
+import re
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -35,53 +36,150 @@ class MailConfigurationError(ValueError):
     """Raised when required mail configuration is missing or invalid."""
 
 
+class MailNotSetUpError(MailConfigurationError):
+    """Raised when no mailbox is set up at all."""
+
+
+# The mailbox of ASTRA_MAIL_ADDRESS (or the 163 names); every other one is named in ASTRA_MAIL_ACCOUNTS.
+MAIN_ACCOUNT = "main"
+_ACCOUNT_NAME = re.compile(r"[a-z0-9]{1,32}")
+
+
+def load_mail_accounts(
+    project_root: Path,
+    *,
+    environ: Mapping[str, str] | None = None,
+    require_credentials: bool = True,
+) -> list[MailConfig]:
+    """Every configured mailbox, without creating local state: "main" first when it is set up.
+
+    ``ASTRA_MAIL_ADDRESS`` and ``ASTRA_MAIL_PASSWORD`` (an app password or authorization code) name
+    any IMAP account, "main"; the host and sent folder of known providers follow from the address, and
+    ``ASTRA_MAIL_IMAP_HOST``, ``ASTRA_MAIL_IMAP_PORT`` and ``ASTRA_MAIL_SENT_FOLDER`` set them for
+    others. The older ``ASTRA_163_EMAIL`` and ``ASTRA_163_AUTH_CODE`` still work. More mailboxes are
+    named in ``ASTRA_MAIL_ACCOUNTS`` (comma-separated letters and digits), each with the same settings
+    under ``ASTRA_MAIL_<NAME>_``, and their own cache and attachments under ``.astra/mail/accounts/<name>``.
+    """
+    values = _settings(project_root, environ)
+    names = _account_names(values)
+    has_main = bool(values.get("ASTRA_MAIL_ADDRESS") or values.get("ASTRA_163_EMAIL"))
+    configs = [_main_config(project_root, values, require_credentials)] if has_main or not names else []
+    return configs + [_named_config(project_root, values, name, require_credentials) for name in names]
+
+
 def load_mail_config(
     project_root: Path,
     *,
     environ: Mapping[str, str] | None = None,
     require_credentials: bool = True,
+    account: str = "",
 ) -> MailConfig:
-    """Load mail settings without creating local state.
+    """One mailbox: the one ``account`` names (its name or address), else the first configured."""
+    configs = load_mail_accounts(project_root, environ=environ, require_credentials=require_credentials)
+    if not account.strip():
+        return configs[0]
+    return find_account(configs, account)
 
-    ``ASTRA_MAIL_ADDRESS`` and ``ASTRA_MAIL_PASSWORD`` (an app password or authorization code) name
-    any IMAP account; the host and sent folder of known providers follow from the address, and
-    ``ASTRA_MAIL_IMAP_HOST``, ``ASTRA_MAIL_IMAP_PORT`` and ``ASTRA_MAIL_SENT_FOLDER`` set them for
-    others. The older ``ASTRA_163_EMAIL`` and ``ASTRA_163_AUTH_CODE`` still work.
-    """
+
+def find_account(configs: list[MailConfig], account: str) -> MailConfig:
+    """The mailbox a name or an address names."""
+    wanted = account.strip().casefold()
+    for config in configs:
+        if wanted in {config.name, config.account.casefold(), config.address.casefold()}:
+            return config
+    raise MailConfigurationError(
+        f"No mailbox {account.strip()!r}; the configured ones are {', '.join(config.name for config in configs)}")
+
+
+def _settings(project_root: Path, environ: Mapping[str, str] | None) -> dict[str, str]:
     dotenv = {key: value for key, value in dotenv_values(project_root / ".env").items() if value is not None}
     environment = os.environ if environ is None else environ
-    values = {**dotenv, **environment}
+    return {**dotenv, **environment}
 
-    account = (values.get("ASTRA_MAIL_ADDRESS") or values.get("ASTRA_163_EMAIL", "")) if require_credentials else ""
-    auth_code = (values.get("ASTRA_MAIL_PASSWORD") or values.get("ASTRA_163_AUTH_CODE", "")) if require_credentials else ""
-    if require_credentials and not account:
-        raise MailConfigurationError("ASTRA_MAIL_ADDRESS (or ASTRA_163_EMAIL) is required")
+
+def _account_names(values: Mapping[str, str]) -> list[str]:
+    names: list[str] = []
+    for part in values.get("ASTRA_MAIL_ACCOUNTS", "").split(","):
+        name = part.strip().casefold()
+        if not name:
+            continue
+        if not _ACCOUNT_NAME.fullmatch(name):
+            raise MailConfigurationError(
+                f"ASTRA_MAIL_ACCOUNTS: {part.strip()!r} is not a mailbox name (letters and digits, at most 32)")
+        if name == MAIN_ACCOUNT:
+            raise MailConfigurationError("ASTRA_MAIL_ACCOUNTS: main is the mailbox of ASTRA_MAIL_ADDRESS")
+        if name in names:
+            raise MailConfigurationError(f"ASTRA_MAIL_ACCOUNTS names {name} twice")
+        names.append(name)
+    return names
+
+
+def _main_config(project_root: Path, values: Mapping[str, str], require_credentials: bool) -> MailConfig:
+    address = values.get("ASTRA_MAIL_ADDRESS") or values.get("ASTRA_163_EMAIL", "")
+    auth_code = values.get("ASTRA_MAIL_PASSWORD") or values.get("ASTRA_163_AUTH_CODE", "")
+    if require_credentials and not address:
+        raise MailNotSetUpError("ASTRA_MAIL_ADDRESS (or ASTRA_163_EMAIL) is required")
     if require_credentials and not auth_code:
         raise MailConfigurationError("ASTRA_MAIL_PASSWORD (or ASTRA_163_AUTH_CODE) is required")
-
-    domain = account.rpartition("@")[2].strip().casefold() or "163.com"
-    host, sent_folder, send_id = _PROVIDERS.get(domain, ("", "Sent", False))
-    host = values.get("ASTRA_MAIL_IMAP_HOST", "").strip() or host
-    if not host:
-        raise MailConfigurationError(f"Set ASTRA_MAIL_IMAP_HOST: {domain} is not a known mail provider")
-    port = _read_positive_int(values.get("ASTRA_MAIL_IMAP_PORT"), "ASTRA_MAIL_IMAP_PORT", default=993)
-    sent_folder = values.get("ASTRA_MAIL_SENT_FOLDER", "").strip() or sent_folder
-    max_body_bytes = _read_positive_int(values.get("ASTRA_163_MAX_BODY_BYTES"), "ASTRA_163_MAX_BODY_BYTES")
     mail_dir = project_root / ".astra" / "mail"
+
+    def cache(host: str) -> Path:
+        # 163 keeps its first cache; other hosts get their own.
+        return mail_dir / ("163.sqlite3" if host == "imap.163.com" else f"{host}.sqlite3")
+
+    return _config(project_root, values, MAIN_ACCOUNT, "ASTRA_MAIL_", address, auth_code, require_credentials,
+                   cache, mail_dir / "attachments")
+
+
+def _named_config(project_root: Path, values: Mapping[str, str], name: str, require_credentials: bool) -> MailConfig:
+    prefix = f"ASTRA_MAIL_{name.upper()}_"
+    address = values.get(f"{prefix}ADDRESS", "").strip()
+    auth_code = values.get(f"{prefix}PASSWORD", "")
+    if not address:
+        raise MailConfigurationError(f"{prefix}ADDRESS is required for the mailbox {name} in ASTRA_MAIL_ACCOUNTS")
+    if require_credentials and not auth_code:
+        raise MailConfigurationError(f"{prefix}PASSWORD is required for the mailbox {name} in ASTRA_MAIL_ACCOUNTS")
+    account_dir = project_root / ".astra" / "mail" / "accounts" / name
+    return _config(project_root, values, name, prefix, address, auth_code, require_credentials,
+                   lambda _host: account_dir / "mail.sqlite3", account_dir / "attachments")
+
+
+def _config(
+    project_root: Path,
+    values: Mapping[str, str],
+    name: str,
+    prefix: str,
+    address: str,
+    auth_code: str,
+    require_credentials: bool,
+    cache: Callable[[str], Path],
+    attachments_dir: Path,
+) -> MailConfig:
+    # The address is not a secret: an offline look finds the right cache by it, and reads
+    # whichever account that cache holds.
+    domain = address.rpartition("@")[2].strip().casefold() or "163.com"
+    host, sent_folder, send_id = _PROVIDERS.get(domain, ("", "Sent", False))
+    host = values.get(f"{prefix}IMAP_HOST", "").strip() or host
+    if not host:
+        raise MailConfigurationError(f"Set {prefix}IMAP_HOST: {domain} is not a known mail provider")
+    port = _read_positive_int(values.get(f"{prefix}IMAP_PORT"), f"{prefix}IMAP_PORT", default=993)
+    sent_folder = values.get(f"{prefix}SENT_FOLDER", "").strip() or sent_folder
+    max_body_bytes = _read_positive_int(values.get("ASTRA_163_MAX_BODY_BYTES"), "ASTRA_163_MAX_BODY_BYTES")
     return MailConfig(
         project_root=project_root,
-        account=account,
-        auth_code=auth_code,
+        account=address if require_credentials else "",
+        auth_code=auth_code if require_credentials else "",
         host=host,
         port=port,
-        # 163 keeps its first cache; other hosts get their own.
-        database_path=mail_dir / ("163.sqlite3" if host == "imap.163.com" else f"{host}.sqlite3"),
-        attachments_dir=mail_dir / "attachments",
+        database_path=cache(host),
+        attachments_dir=attachments_dir,
         max_body_bytes=max_body_bytes,
         default_folders=("INBOX", sent_folder),
         sent_folder=sent_folder,
         send_id=send_id,
         sync_limit=_read_positive_int(values.get("ASTRA_MAIL_SYNC_LIMIT"), "ASTRA_MAIL_SYNC_LIMIT", default=100),
+        name=name,
+        address=address,
     )
 
 
