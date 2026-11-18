@@ -409,8 +409,9 @@ password or authorization code) instead of the 163 names below. Gmail, QQ,
 iCloud and 163/126/yeah are recognised from the address; for another provider
 also set `ASTRA_MAIL_IMAP_HOST` (and `ASTRA_MAIL_IMAP_PORT` or
 `ASTRA_MAIL_SENT_FOLDER` when they differ). A folder's first sync caches its
-newest 100 messages (`ASTRA_MAIL_SYNC_LIMIT`); later syncs fetch what arrived
-since and never older history.
+newest 100 messages (`ASTRA_MAIL_SYNC_LIMIT`). If arrivals exceed one batch, recent and search
+fetch the newest arrivals first, while notification checks fill the oldest remaining gap.
+Neither fetches history intentionally left out at the first sync.
 
 Several mailboxes: the one above is `main`, and `ASTRA_MAIL_ACCOUNTS` names more,
 comma-separated letters and digits. Each takes the same settings under its own name:
@@ -433,6 +434,7 @@ only if their original account is unambiguous; otherwise search again. Its `acco
 limits a call to one mailbox. A mailbox with incomplete settings or an unreadable cache is reported while the others still answer. Each named
 mailbox keeps its own cache and attachments under `.astra/mail/accounts/<name>/`; `main` keeps
 the files it always had. `checkmail --account NAME` works with one mailbox, the first by default.
+If that default is misconfigured, the command reports its error. Name a different mailbox to read it.
 
 The optional 163 integration incrementally caches mail for local queries. Put
 your account and a 163 client authorization code (not the web password) in the

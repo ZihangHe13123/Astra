@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from agent.runtime.jobs.delivery import WeixinPush
 from agent.runtime.jobs.store import JobStore
@@ -24,6 +25,8 @@ def weixin_job_push(manager: ChannelManager, router: AgentChannelRouter) -> Weix
             raise LookupError("WeChat is not set up")
         to = owner()
         if not adapter.running or not to:
+            if to:
+                await asyncio.to_thread(store.bind_weixin_recipient, run_id, to)
             # Tried again later: WeChat may still be logging in or handing over.
             raise ConnectionError("WeChat is not online")
         # One message where it fits, not chat bubbles: each message spends what WeChat lets the bot send.
