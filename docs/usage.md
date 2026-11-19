@@ -88,6 +88,50 @@ Its third argument is an environment-variable **name**, never the key value.
 In the plain CLI, `/connect` offers numbered choices and a hidden key prompt;
 `/model <provider>::` lists that provider's models.
 
+To configure a provider in `.env` instead, edit the file in the installation
+directory. For example, the bundled DeepSeek profile reads these existing
+entries; set them with your own API key:
+
+```dotenv
+DEEPSEEK_API_KEY=your-api-key
+LLM_MODEL=deepseek-flash
+LLM_BASE_URL=https://api.deepseek.com
+```
+
+### ChatGPT and Claude subscriptions
+
+**ChatGPT / Codex.** Use the Codex models available to your ChatGPT account
+without an API key or changes to `.env`. In a new terminal, run
+`astra auth login` (if Windows cannot find `astra` yet, run
+`.\astra.bat auth login` from the installation directory), open the displayed
+URL, enter the one-time code and approve the login. Then start Astra and choose
+**ChatGPT / Codex** in `/model`. Inside Astra, `/connect` → **ChatGPT / Codex →
+Subscription** does the same. Connect each computer separately. The
+[Codex login guide](codex-oauth.md) covers the account setting that device-code
+login needs, reasoning summaries, and what to do when GPT models are missing
+after an update.
+
+**Claude / Claude Code.** Use your Claude subscription through your own
+signed-in, unmodified [Claude Code](https://code.claude.com/docs/en/setup) CLI.
+Astra starts `claude` for each model call and never reads, stores or forwards
+your Claude login. Usage counts against your Claude plan at the Claude Code /
+Agent SDK rate. Install the CLI and sign in:
+
+```text
+curl -fsSL https://claude.ai/install.sh | bash
+claude auth login
+```
+
+Then enter `/connect` inside Astra, select **Claude / Claude Code →
+Subscription**, and choose `fable`, `opus`, `sonnet` or `haiku` in `/model`.
+
+Claude calls Astra's tools natively through a local bridge that never runs them;
+Astra runs them with its usual approvals. The CLI runs without its own tools,
+settings files or saved sessions, and `ANTHROPIC_*` variables in Astra's
+environment are not passed to it, so a provider switcher or API key cannot
+redirect or bill the request. If `claude` is not on `PATH`, set
+`ASTRA_CLAUDE_CODE_COMMAND` to its absolute path.
+
 ### DeepSeek model migration
 
 Astra uses `deepseek-flash` (DeepSeek V4.1 Flash) for its built-in DeepSeek

@@ -122,15 +122,11 @@ native command forwarding, real Git updates, process exclusion and recovery on
 all three platforms. A passing local macOS run does not establish Windows CMD,
 PowerShell or Linux acceptance; verify the target commit's completed jobs.
 
-The workflows run only in the public repository (`ZihangHe13123/Astra`); in the
-private development repository every job is skipped, so pushes there use no
-Actions minutes. Private-repository runs consume the account's GitHub Actions allowance. Standard
-GitHub-hosted runners are free for public repositories; larger runners are
-billed separately. See [Actions billing](https://docs.github.com/en/actions/concepts/billing-and-usage).
-When private-repository minutes are exhausted, retain local acceptance results
-and leave unavailable platform checks pending. Buying extra minutes is optional.
-If GitHub reports failed payments as well as a spending limit, check the account's
-billing status before retrying; a blocked job has not executed its tests.
+The workflows run only in the public repository (`ZihangHe13123/Astra`), where
+standard GitHub-hosted runners are free; in the private development repository
+every job is skipped. A job that was skipped or blocked has not executed its
+tests: keep the local acceptance results and report the platforms that did not
+run as pending.
 The Maintenance gate uses `--keep-going` to collect
 independent check failures in one run and still exits unsuccessfully if any
 check fails; local invocations stop at the first failure by default. Native

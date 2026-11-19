@@ -16,7 +16,7 @@
 | 保存定时提醒、只读检查与本地送达回执 | [持久任务](persistent-jobs.md) |
 | 配置沙箱、主机文件访问和工具权限 | [工具执行](execution.md) |
 | 选择 Lyra 或定制本地人格、了解酒吧模式 | [Lyra 人格](persona.md) |
-| 添加搜索、MCP、QQ 消息、图片工具或 163 邮箱 | [可选集成](integrations.md) |
+| 添加搜索、MCP、微信或 QQ 消息、IMAP 邮箱、macOS 日历或图片工具 | [可选集成](integrations.md) |
 | 查找并实际查看图片参考 | [图片搜索](search-images.md) |
 | 执行 Notebook 并保存结果 | [Notebook 执行](notebook-execution.md) |
 | 逐节写文档并导出 Word、PDF 或 HTML | [文档写作](documents.md) |
@@ -53,6 +53,7 @@
 
 | 内容 | 英文参考 |
 | --- | --- |
+| 进程划分、代码目录和设计规则 | [架构概览（英文）](../architecture.md) |
 | 记忆选择、检索预算和质量回放 | [原生记忆推荐（英文）](../native-memory-recommendation.md) |
 | 核心 Skill 加载和提示词边界 | [核心规则（英文）](../runtime/core-rules.md) |
 | 工具顺序、轮次时限和故障回放 | [轮次可靠性（英文）](../runtime/turn-reliability.md) |

@@ -55,6 +55,45 @@
 
 第三个参数是环境变量**名称**，不要填 Key 值。纯 CLI 中，`/connect` 提供编号选择和隐藏 Key 输入；`/model <provider>::` 列出该提供商的模型。
 
+也可以改用 `.env` 配置：编辑安装目录中的 `.env`。例如，使用内置 DeepSeek 配置时，将已有的对应条目设为以下值，并填入你自己的 API Key：
+
+```dotenv
+DEEPSEEK_API_KEY=your-api-key
+LLM_MODEL=deepseek-flash
+LLM_BASE_URL=https://api.deepseek.com
+```
+
+<a id="chatgpt-and-claude-subscriptions"></a>
+
+### ChatGPT 与 Claude 订阅
+
+**ChatGPT / Codex。** 使用 ChatGPT 账号连接账号可用的 Codex 模型，无需填写 API Key 或修改 `.env`。
+
+1. 打开一个**新终端**（Windows CMD / PowerShell、macOS 或 Linux），运行 `astra auth login`。如果 Windows 暂时找不到 `astra` 命令，可在安装目录运行 `.\astra.bat auth login`。
+2. 打开终端显示的网址，输入本次生成的一次性代码，在浏览器中批准登录。
+3. 等终端显示 `Signed in.` 和可用 Codex 模型数量，再运行 `astra`。
+4. 在 **Astra 内部**输入 `/model`，选择 **ChatGPT / Codex**，再选择账号可用的 GPT 模型。这会保存为下次启动的默认模型。
+
+如果已经进入 Astra，也可以输入 `/connect`，选择 **ChatGPT / Codex → Subscription**，按界面提示登录，再通过 `/model` 选模型。
+
+- 如果 OpenAI 提示设备代码授权未启用，请在 ChatGPT 的安全设置中开启相应选项，取消旧的登录尝试后重新发起。参见 [OpenAI 设备代码授权说明](https://learn.chatgpt.com/docs/auth#preferred-device-code-authentication-beta)。
+- **每台电脑都需要单独连接账号。** `astra update` 会保留当前安装的登录状态，但不会自动登录，也不会同步另一台电脑的登录状态。完成账号连接后，`/model` 才会列出 ChatGPT / Codex 的模型。
+- **更新后没有 GPT 模型？** 在终端运行 `astra auth status`：若显示 `sign-in required`，运行 `astra auth login`；若显示 `signed in`，重新启动 Astra，通过 `/connect → ChatGPT / Codex` 刷新并保存连接，再打开 `/model`。
+
+模型返回推理摘要时，Astra 会显示摘要。更多说明见[登录、推理摘要与故障排查](../codex-oauth.md)（英文）。
+
+**Claude / Claude Code。** 通过你自己登录的官方原版 [Claude Code](https://code.claude.com/docs/en/setup) 命令行使用 Claude 订阅。Astra 每次请求模型时启动 `claude`，不会读取、保存或转发你的 Claude 登录凭证。用量按 Claude Code / Agent SDK 的速率计入你的 Claude 套餐。
+
+1. 在终端安装命令行并用 Claude 账号登录：
+
+   ```text
+   curl -fsSL https://claude.ai/install.sh | bash
+   claude auth login
+   ```
+2. 在 **Astra 内部**输入 `/connect`，选择 **Claude / Claude Code → Subscription**，再在 `/model` 中选择 `fable`、`opus`、`sonnet` 或 `haiku`。
+
+Claude 通过本地桥接原生调用 Astra 的工具，桥接从不执行工具，仍由 Astra 按原有审批执行。命令行运行时不带它自己的工具、设置文件或会话记录；Astra 环境中的 `ANTHROPIC_*` 变量不会传给它，因此模型切换工具或 API Key 都不会改变请求的去向或计费方式。若 `claude` 不在 `PATH` 中，请把 `ASTRA_CLAUDE_CODE_COMMAND` 设为它的绝对路径。
+
 <a id="deepseek-model-migration"></a>
 
 ### DeepSeek 模型迁移
