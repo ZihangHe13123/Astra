@@ -138,6 +138,7 @@ def record_profile(provider_id: str, record: dict) -> ModelProfile:
         from agent.runtime.gemini_wire import (
             DEFAULT_CONTEXT_LIMIT,
             DEFAULT_SYNC_MAX_OUTPUT_TOKENS,
+            GEMINI_4_LEVELS,
             PROVIDER_NAME,
         )
         return ModelProfile(
@@ -150,7 +151,7 @@ def record_profile(provider_id: str, record: dict) -> ModelProfile:
             catalog_provider=provider_id,
             provider_label=str(record["label"]),
             capabilities=frozenset({"streaming", "tools", "reasoning", "vision"}),
-            reasoning_levels=("low", "medium", "high", "xhigh"),
+            reasoning_levels=GEMINI_4_LEVELS,
         )
     return ModelProfile(
         base_url=validate_base_url(record["base_url"]), context_limit=32_768,

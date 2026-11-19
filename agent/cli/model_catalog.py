@@ -338,6 +338,7 @@ def provider_endpoints() -> tuple[ProviderEndpoint, ...]:
             from agent.runtime.gemini_wire import (
                 DEFAULT_CONTEXT_LIMIT,
                 DEFAULT_SYNC_MAX_OUTPUT_TOKENS,
+                GEMINI_4_LEVELS,
             )
             generic = ModelProfile(
                 profile.base_url,
@@ -347,7 +348,7 @@ def provider_endpoints() -> tuple[ProviderEndpoint, ...]:
                 api_key_env=profile.api_key_env,
                 api_key_resolver=profile.api_key_resolver,
                 capabilities=frozenset({"streaming", "tools", "reasoning", "vision"}),
-                reasoning_levels=("low", "medium", "high", "xhigh"),
+                reasoning_levels=GEMINI_4_LEVELS,
                 catalog_provider=provider_id,
                 provider_label=profile.provider_label,
             )

@@ -147,6 +147,7 @@ models:
   # Google AI Studio — Gemini 4 family (native v1beta REST transport).
   # Unified 1M context window; synchronous output defaults to 64K tokens.
   # Sampling parameters (temperature/top_p/top_k) are deprecated on Gemini 4.
+  # thinkingLevel xhigh exists only on Neon and Hydrogen; Carbon and Argon stop at high.
   gemini-4-neon:
     provider: google-gemini
     base_url: https://generativelanguage.googleapis.com/v1beta
@@ -182,7 +183,7 @@ models:
     provider_label: Google AI Studio · Gemini API
     context_limit: 1048576
     capabilities: [tools, reasoning, thinking-required, vision, streaming]
-    reasoning_levels: [low, medium, high, xhigh]
+    reasoning_levels: [low, medium, high]
     generation:
       max_tokens: 32768
 
@@ -195,6 +196,6 @@ models:
     provider_label: Google AI Studio · Gemini API
     context_limit: 1048576
     capabilities: [tools, reasoning, thinking-required, vision, streaming]
-    reasoning_levels: [low, medium, high, xhigh]
+    reasoning_levels: [low, medium, high]
     generation:
       max_tokens: 32768
