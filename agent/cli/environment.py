@@ -76,6 +76,7 @@ def load_project_env(project_root: str | Path) -> None:
         "DEEPSEEK_API_KEY",
         "QWEN38_API_KEY",
         "ZHIPU_API_KEY",
+        "GEMINI_API_KEY",
         "LLM_API_KEY",
         "EXA_API_KEY",
     ):

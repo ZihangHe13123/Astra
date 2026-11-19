@@ -334,10 +334,29 @@ def provider_endpoints() -> tuple[ProviderEndpoint, ...]:
             continue
         if not profile.api_key() or any(e.id == provider_id for e in endpoints):
             continue
-        generic = ModelProfile(profile.base_url, 32_768, api_key_env=profile.api_key_env,
-                               api_key_resolver=profile.api_key_resolver,
-                               capabilities=frozenset({"streaming"}),
-                               catalog_provider=provider_id, provider_label=profile.provider_label)
+        if profile.provider == "google-gemini":
+            from agent.runtime.gemini_wire import (
+                DEFAULT_CONTEXT_LIMIT,
+                DEFAULT_SYNC_MAX_OUTPUT_TOKENS,
+            )
+            generic = ModelProfile(
+                profile.base_url,
+                DEFAULT_CONTEXT_LIMIT,
+                max_tokens=DEFAULT_SYNC_MAX_OUTPUT_TOKENS,
+                provider=profile.provider,
+                api_key_env=profile.api_key_env,
+                api_key_resolver=profile.api_key_resolver,
+                capabilities=frozenset({"streaming", "tools", "reasoning", "vision"}),
+                reasoning_levels=("low", "medium", "high", "xhigh"),
+                catalog_provider=provider_id,
+                provider_label=profile.provider_label,
+            )
+        else:
+            generic = ModelProfile(profile.base_url, 32_768, provider=profile.provider,
+                                   api_key_env=profile.api_key_env,
+                                   api_key_resolver=profile.api_key_resolver,
+                                   capabilities=frozenset({"streaming"}),
+                                   catalog_provider=provider_id, provider_label=profile.provider_label)
         route = next((r for r in ROUTES if r.base_url == profile.base_url.rstrip("/")), None)
         label = f"{route.provider} · {route.label}" if route else profile.provider_label
         endpoints.append(ProviderEndpoint(provider_id, label, generic, inferred=True))
@@ -409,15 +428,27 @@ def entries_from_items(endpoint: ProviderEndpoint, items: list[dict], *, source:
                 capabilities.discard("tools")
                 if "tools" in item["supported_parameters"]:
                     capabilities.add("tools")
+                if endpoint.profile.provider == "google-gemini":
+                    capabilities.discard("reasoning")
+                    capabilities.discard("thinking-required")
                 if "reasoning" in item["supported_parameters"]:
                     capabilities.add("reasoning")
+                    if endpoint.profile.provider == "google-gemini":
+                        from agent.runtime.gemini_wire import is_thinking_required_model
+                        if is_thinking_required_model(model_id):
+                            capabilities.add("thinking-required")
             if "image" in item.get("input_modalities", []):
                 capabilities.add("vision")
+        levels = (
+            tuple(item["reasoning_levels"])
+            if "reasoning_levels" in item
+            else (() if endpoint.profile.provider == "google-gemini" and "reasoning" not in capabilities else template.reasoning_levels)
+        )
         profile = replace(template, base_url=endpoint.profile.base_url,
                           api_key_env=endpoint.profile.api_key_env,
                           api_key_resolver=endpoint.profile.api_key_resolver,
                           model_id=model_id, context_limit=context, max_tokens=min(output, max(1, context // 2)),
-                          reasoning_levels=tuple(item.get("reasoning_levels") or template.reasoning_levels),
+                          reasoning_levels=levels,
                           capabilities=frozenset(capabilities), catalog_provider=endpoint.id,
                           provider_label=endpoint.label)
         entries[model_id] = CatalogEntry(f"{endpoint.id}::{model_id}", model_id, endpoint.id,
@@ -464,6 +495,8 @@ def normalize_model_items(payload: Any) -> list[dict]:
 async def discover_endpoint(endpoint: ProviderEndpoint, *, force: bool = False,
                             timeout: float = 4.0) -> ModelCatalog:
     from agent.runtime.codex_auth import CodexAuthError
+    from agent.runtime.gemini_provider import GeminiRequestError
+    from agent.runtime.network import active_proxy_for_url
     cached = model_cache.read_cache(endpoint)
     fresh = model_cache.read_cache(endpoint, fresh=True)
     if fresh is not None and not force:
@@ -479,8 +512,17 @@ async def discover_endpoint(endpoint: ProviderEndpoint, *, force: bool = False,
             elif endpoint.profile.provider == "claude-code":
                 from agent.runtime.claude_code_provider import CONTEXT_WINDOWS, MODELS
                 items = [{"id": model, "context_length": CONTEXT_WINDOWS[model]} for model in MODELS]
+            elif endpoint.profile.provider == "google-gemini":
+                from agent.runtime.gemini_provider import fetch_models as fetch_gemini_models
+                items = await fetch_gemini_models(endpoint.profile.base_url, key, timeout=timeout)
             else:
-                async with httpx.AsyncClient(timeout=timeout) as client:
+                proxy = active_proxy_for_url(endpoint.profile.base_url)
+                client_cm = (
+                    httpx.AsyncClient(timeout=timeout, proxy=proxy)
+                    if proxy
+                    else httpx.AsyncClient(timeout=timeout)
+                )
+                async with client_cm as client:
                     response = await client.get(endpoint.profile.base_url.rstrip("/") + "/models", headers=headers)
                     response.raise_for_status()
                     items = normalize_model_items(response.json())
@@ -492,6 +534,9 @@ async def discover_endpoint(endpoint: ProviderEndpoint, *, force: bool = False,
                             {}, {endpoint.id: "live"})
     except CodexAuthError as exc:
         error_code, reason = "auth_failed", str(exc)
+    except GeminiRequestError as exc:
+        error_code = "auth_failed" if exc.code in {"auth_failed", "gemini_auth_failed"} else "http_error"
+        reason = exc.public_message
     except httpx.HTTPStatusError as exc:
         code = exc.response.status_code
         error_code = "listing_unsupported" if code in {404, 405} else "auth_failed" if code in {401, 403} else "http_error"

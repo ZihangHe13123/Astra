@@ -32,6 +32,8 @@ ROUTES = (
     # The official claude CLI signs its own requests; Astra never sees the Claude login.
     ConnectionRoute("claude-code", "Claude / Claude Code", "Subscription · your signed-in claude CLI",
                     "claude-code://local", "", "oauth"),
+    ConnectionRoute("gemini", "Google AI Studio", "Gemini API",
+                    "https://generativelanguage.googleapis.com/v1beta", "GEMINI_API_KEY"),
     ConnectionRoute("deepseek", "DeepSeek", "API", "https://api.deepseek.com", "DEEPSEEK_API_KEY"),
     ConnectionRoute("qwen38", "Qwen / Model Studio", "Token Plan · Beijing", "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1", "QWEN38_API_KEY"),
     ConnectionRoute("qwen-token-sg", "Qwen / Model Studio", "Token Plan · Singapore", "https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1", "QWEN_TOKEN_SG_API_KEY"),
@@ -132,6 +134,24 @@ def record_profile(provider_id: str, record: dict) -> ModelProfile:
             api_key_env="", api_key_resolver=credential_hint,
             catalog_provider=provider_id, provider_label=str(record["label"]),
             capabilities=frozenset({"streaming", "tools", "reasoning"}))
+    if record.get("route_id") == "gemini":
+        from agent.runtime.gemini_wire import (
+            DEFAULT_CONTEXT_LIMIT,
+            DEFAULT_SYNC_MAX_OUTPUT_TOKENS,
+            PROVIDER_NAME,
+        )
+        return ModelProfile(
+            base_url=validate_base_url(record["base_url"]),
+            context_limit=DEFAULT_CONTEXT_LIMIT,
+            max_tokens=DEFAULT_SYNC_MAX_OUTPUT_TOKENS,
+            provider=PROVIDER_NAME,
+            api_key_env=record.get("api_key_env", ""),
+            api_key_resolver=lambda: str(record.get("api_key", "")),
+            catalog_provider=provider_id,
+            provider_label=str(record["label"]),
+            capabilities=frozenset({"streaming", "tools", "reasoning", "vision"}),
+            reasoning_levels=("low", "medium", "high", "xhigh"),
+        )
     return ModelProfile(
         base_url=validate_base_url(record["base_url"]), context_limit=32_768,
         api_key_env=record.get("api_key_env", ""),
