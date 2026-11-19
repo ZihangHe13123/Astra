@@ -62,13 +62,15 @@ def test_registry_and_bundled_gemini_4_presets(monkeypatch, tmp_path):
     monkeypatch.setenv("AGENT_MODELS_FILE", str(models.DEFAULT_MODELS_PATH))
     monkeypatch.setenv("AGENT_USER_MODELS_FILE", str(tmp_path / "absent.yaml"))
     profiles = models.model_profiles()
-    expected_outputs = {
-        "gemini-4-neon": 65_536,
-        "gemini-4-hydrogen": 65_536,
-        "gemini-4-carbon": 32_768,
-        "gemini-4-argon": 32_768,
+    with_xhigh = ("low", "medium", "high", "xhigh")
+    without_xhigh = ("low", "medium", "high")
+    expected = {
+        "gemini-4-neon": (65_536, with_xhigh),
+        "gemini-4-hydrogen": (65_536, with_xhigh),
+        "gemini-4-carbon": (32_768, without_xhigh),
+        "gemini-4-argon": (32_768, without_xhigh),
     }
-    for name, expected_out in expected_outputs.items():
+    for name, (expected_out, expected_levels) in expected.items():
         profile = profiles[name]
         assert profile.provider == PROVIDER_NAME
         assert profile.base_url == BASE_URL
@@ -77,11 +79,11 @@ def test_registry_and_bundled_gemini_4_presets(monkeypatch, tmp_path):
         assert profile.context_limit == 1_048_576
         assert profile.max_tokens == expected_out
         assert {"tools", "reasoning", "thinking-required", "vision", "streaming"} <= profile.capabilities
-        assert profile.reasoning_levels == ("low", "medium", "high", "xhigh")
+        assert profile.reasoning_levels == expected_levels
         assert profile.temperature is None
         assert profile.top_p is None
         assert profile.top_k is None
-        assert profile.generation_settings()["reasoning_levels"] == ("low", "medium", "high", "xhigh")
+        assert profile.generation_settings()["reasoning_levels"] == expected_levels
 
     client = LLMClient(config())
     assert isinstance(client.provider, GeminiProvider)
@@ -371,6 +373,40 @@ def test_xhigh_rejection_retries_once_with_high():
     assert result["content"] == "Recovered"
 
 
+@pytest.mark.parametrize("effort", ["xhigh", "max"])
+def test_only_neon_and_hydrogen_are_asked_for_xhigh(monkeypatch, tmp_path, effort):
+    """Google lists xhigh for Neon and Hydrogen; Carbon and Argon stop at high, as presets or discovered."""
+    monkeypatch.setenv("AGENT_MODELS_FILE", str(models.DEFAULT_MODELS_PATH))
+    monkeypatch.setenv("AGENT_USER_MODELS_FILE", str(tmp_path / "absent.yaml"))
+    presets = models.model_profiles()
+    names = ("gemini-4-neon", "gemini-4-hydrogen", "gemini-4-carbon", "gemini-4-argon")
+    discovered = {
+        item["id"]: tuple(item["reasoning_levels"])
+        for item in normalize_discovery_models({"models": [
+            {"name": f"models/{name}", "supportedGenerationMethods": ["generateContent"]} for name in names
+        ]})
+    }
+    sent = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(json.loads(request.content)["generationConfig"]["thinkingConfig"]["thinkingLevel"])
+        return httpx.Response(200, content=sse(
+            {"candidates": [{"content": {"role": "model", "parts": [{"text": "ok"}]}, "finishReason": "STOP"}]}
+        ))
+
+    expected = {"gemini-4-neon": "xhigh", "gemini-4-hydrogen": "xhigh",
+                "gemini-4-carbon": "high", "gemini-4-argon": "high"}
+    for name, level in expected.items():
+        for levels in (presets[name].generation_settings()["reasoning_levels"], discovered[name]):
+            sent.clear()
+            provider = GeminiProvider(
+                config(model=name, reasoning_effort=effort, reasoning_levels=levels, max_retries=0),
+                transport=httpx.MockTransport(handler),
+            )
+            assert asyncio.run(provider.chat([{"role": "user", "content": "Hi"}]))["content"] == "ok"
+            assert sent == [level], (name, levels)
+
+
 def test_http_errors_classify_overflow_and_redact_upstream_text():
     def overflow_handler(_request: httpx.Request) -> httpx.Response:
         return httpx.Response(400, json={
@@ -443,6 +479,13 @@ def test_discovery_connect_and_env_only_setup(monkeypatch):
                     "thinking": True,
                 },
                 {
+                    "name": "models/gemini-4-carbon",
+                    "inputTokenLimit": 1_048_576,
+                    "outputTokenLimit": 1_048_576,
+                    "supportedGenerationMethods": ["generateContent"],
+                    "thinking": True,
+                },
+                {
                     "name": "models/gemini-4-future-preview",
                     "inputTokenLimit": 1_048_576,
                     "outputTokenLimit": 65_536,
@@ -483,13 +526,16 @@ def test_discovery_connect_and_env_only_setup(monkeypatch):
     assert provider_id == "gemini"
     assert seen == [(BASE_URL, "AIza-private-test")]
     by_id = {entry.model_id: entry for entry in catalog.entries}
-    assert set(by_id) == {"gemini-4-neon", "gemini-4-future-preview", "gemini-2.0-flash"}
+    assert set(by_id) == {"gemini-4-neon", "gemini-4-carbon", "gemini-4-future-preview", "gemini-2.0-flash"}
     future = by_id["gemini-4-future-preview"].profile
     assert future.provider == PROVIDER_NAME
     assert future.context_limit == 1_048_576
     assert future.max_tokens == 65_536
     assert {"tools", "reasoning", "thinking-required", "vision", "streaming"} <= future.capabilities
-    assert future.reasoning_levels == ("low", "medium", "high", "xhigh")
+    # A Gemini 4 model outside Google's table gets only the levels every Gemini 4 model takes.
+    assert future.reasoning_levels == ("low", "medium", "high")
+    assert by_id["gemini-4-neon"].profile.reasoning_levels == ("low", "medium", "high", "xhigh")
+    assert by_id["gemini-4-carbon"].profile.reasoning_levels == ("low", "medium", "high")
 
     flash20 = by_id["gemini-2.0-flash"].profile
     assert "reasoning" not in flash20.capabilities

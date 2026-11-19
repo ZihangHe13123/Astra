@@ -15,6 +15,11 @@ STATE_KEY = "_provider_state"
 SKIP_THOUGHT_SIGNATURE = "skip_thought_signature_validator"
 DEFAULT_CONTEXT_LIMIT = 1_048_576
 DEFAULT_SYNC_MAX_OUTPUT_TOKENS = 65_536
+# Google's per-model table (Gemini API thinking guide, read 2026-11-19): every Gemini 4 model takes
+# low, medium and high; only Neon and Hydrogen also take xhigh. Carbon and Argon do not list it.
+GEMINI_4_LEVELS = ("low", "medium", "high")
+GEMINI_4_XHIGH_LEVELS = (*GEMINI_4_LEVELS, "xhigh")
+_GEMINI_4_XHIGH_MODELS = ("gemini-4-neon", "gemini-4-hydrogen")
 
 _DATA_URL_RE = re.compile(r"^data:([^;,]+);base64,(.+)$", re.DOTALL)
 _NON_CHAT_MODEL_RE = re.compile(
@@ -61,7 +66,8 @@ def is_thinking_required_model(model: str) -> bool:
 def default_reasoning_levels(model: str) -> tuple[str, ...]:
     lowered = normalize_model_id(model).lower()
     if lowered.startswith("gemini-4"):
-        return ("low", "medium", "high", "xhigh")
+        # A Gemini 4 model outside the table gets the levels they all share.
+        return GEMINI_4_XHIGH_LEVELS if lowered.startswith(_GEMINI_4_XHIGH_MODELS) else GEMINI_4_LEVELS
     if lowered.startswith("gemini-3"):
         if "flash" in lowered:
             return ("minimal", "low", "medium", "high")
