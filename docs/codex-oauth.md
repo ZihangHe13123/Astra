@@ -19,6 +19,9 @@ From a terminal:
 astra auth login
 ```
 
+If Windows cannot find `astra` yet, run `.\astra.bat auth login` from the
+installation directory.
+
 Open the displayed `https://auth.openai.com/codex/device` address, enter the
 one-time code and approve the login. Then start Astra and choose
 **ChatGPT / Codex** in `/model`. The model list comes from your account's catalog.

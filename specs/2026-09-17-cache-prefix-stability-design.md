@@ -58,10 +58,8 @@ are specified; no new provider dependencies or architecture approval are needed.
 
 - 413 related tests passed across projection, memory, Context Index, session
   handoff, Appshot admission/rollback, compaction, runtime faults, provider
-  adapters, and interaction-mode isolation. Two writing-prompt wording tests
-  were excluded after reproducing the same failures on untouched main 689f883a9:
-  `test_writing_prompt_keeps_the_adult_only_premise_and_leave_hint` and
-  `test_writing_prompt_ships_no_bypass_vocabulary`.
+  adapters, and interaction-mode isolation. Two unrelated prompt-wording tests
+  that also failed on the untouched base were excluded.
 - Ruff, Pyright (zero errors/warnings), and `git diff --check` passed.
 - No live provider requests, active-session edits or configuration changes.
   Cloud hit-rate improvement is not measured by these offline tests.

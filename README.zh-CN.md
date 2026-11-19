@@ -2,33 +2,38 @@
 
 [English](README.md) · **简体中文**
 
-**面向日常任务的个人 AI Agent，具备电脑操作、记忆和终端交互能力。**
+**运行在你自己电脑上的个人 AI Agent。** Astra 能处理文件、操作浏览器和应用，跨对话记住重要的事，按计划替你做定时检查，也可以通过微信、QQ 或 iPhone 找到它。
 
-Astra 主要通过模型 API 帮你查资料、处理文件和操作应用。对话和运行状态保存在你的机器上，也支持连接可选的本地模型服务。
+对话、记忆和历史保存在你的电脑上。请求发送给你选择的模型：ChatGPT 或 Claude 订阅、API 服务，或本地模型服务。可以在终端里使用，也可以用桌面版（预览）。
 
-[快速开始](#快速开始) · [ChatGPT 登录](#chatgpt--codex) · [桌面预览版](docs/zh-CN/gui.md) · [常用命令](#常用命令) · [更新与数据](#更新与数据) · [文档导航](#文档导航)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/desktop-dark.webp">
+  <img src="docs/images/desktop-light.webp" alt="Astra 桌面版：在个人对话里，Astra 创建每天 08:00 的新闻检查之前先请你批准。">
+</picture>
 
-## 可以做什么
+<sub>桌面版在创建定时检查之前会先请你批准。截图里的模型回复和数据都是演示用的。</sub>
 
-| 能力 | 用途 |
+[能做什么](#能做什么) · [快速开始](#快速开始) · [工作原理](#工作原理) · [测试与评测](#测试与评测) · [文档导航](#文档导航)
+
+## 能做什么
+
+| 能力 | Astra 做什么 |
 | --- | --- |
-| **电脑操作（Computer Use）** | 操作浏览器页面和选定的 macOS 应用窗口，详见[浏览器操作](docs/zh-CN/browser-interaction.md)和 [Mac 指南](docs/zh-CN/macos-computer-use.md)。 |
-| **把窗口带入对话** | [Appshot](docs/zh-CN/appshot.md) 可在 macOS 和 Windows 上将窗口截图及可用的界面文字加入草稿，补充问题后再发送。 |
-| **资料研究与日常工作** | 搜索网页、读写文件、运行代码和执行 Notebook，并按需配置工具权限。 |
-| **文档写作** | 逐节写 Markdown 文档，处理写在文件里的审阅评论，并导出 Word、PDF 或 HTML。见[文档写作](docs/zh-CN/documents.md)。 |
-| **记忆与技能** | 保存偏好、检索相关历史、积累可复用的方法；手动检查自动总结的技能，用户加入的技能不参与这类检查。 |
-| **继续已有工作** | 查看任务记录、取消执行，并通过保存的检查点恢复符合条件的任务。 |
-| **自选模型与工具** | 切换模型配置、连接本地服务，或启用 MCP、QQ 消息等可选集成。 |
+| **日常工作** | 搜索网页、读写文件、运行代码和 Notebook，逐节撰写[文档](docs/zh-CN/documents.md)并导出 Word、PDF 或 HTML。 |
+| **电脑操作** | 操作[浏览器页面](docs/zh-CN/browser-interaction.md)和选定的 [macOS 应用窗口](docs/zh-CN/macos-computer-use.md)。[Appshot](docs/zh-CN/appshot.md) 在 macOS 和 Windows 上把窗口截图和界面文字带进你的消息。 |
+| **记忆与技能** | 维护一份可以直接编辑的小型核心记忆，在本地检索过往对话，并积累由你检查的可复用技能。见[记忆概览](docs/zh-CN/memory.md)。 |
+| **定时任务** | 运行[提醒和周期性只读检查](docs/zh-CN/persistent-jobs.md)，例如早晚各一次的新闻简报，结果以桌面通知或微信消息送达。 |
+| **邮件与日历** | 只读访问任意 IMAP 邮箱；在 macOS 上读取日历和提醒事项，新增日程或提醒前会请你批准。 |
+| **消息与手机** | 在[微信或 QQ](docs/zh-CN/integrations.md) 里回复你。[配对的 iPhone](docs/zh-CN/phone.md) 可以查看和审批 Mac 上的会话。 |
+| **任务分派** | 把任务的一部分交给有名字的子代理。中断的任务保留检查点，可以继续执行。 |
+| **桌面版（预览）** | 后台会话、审批、文件改动、交互卡片与页面，以及用于幻灯片和文档的画布。见[桌面指南](docs/zh-CN/gui.md)。 |
+| **模型与工具** | ChatGPT / Codex 与 Claude 订阅，DeepSeek、Qwen、OpenRouter 等 OpenAI 兼容 API，或本地模型服务。可以接入 MCP 服务器扩展工具，也可以让语音模型[朗读回复](docs/zh-CN/voice.md)。 |
 
-Lyra 是 Astra 的默认人格。想体验一个终端小彩蛋，可以试试 `/bar`。
+Lyra 是 Astra 的默认人格。想看终端小彩蛋，可以试试 `/bar`。
 
 ## 快速开始
 
-**当前为预发布版本：**请从 Git 仓库安装。暂未提供完整的独立安装包；仅安装 Python wheel 不包含完整终端界面和原生辅助程序。
-
-### 1. 安装
-
-需要 **Python 3.11+**、**Node.js 18+（含 npm）** 和 **Git**。
+Astra 目前是预发布版本，请从 Git 仓库安装。需要 **Python 3.11+**、**Node.js 18+（含 npm）** 和 **Git**。
 
 **Windows — CMD 或 PowerShell**
 
@@ -46,148 +51,70 @@ cd Astra
 ./astra.sh setup --install-command
 ```
 
-安装会准备 Python 环境和终端界面，将 `astra` 注册到用户 PATH，并在缺少 `.env` 时创建它。已有配置会保留。
+安装会准备 Python 环境和终端界面，把 `astra` 注册到用户 PATH，并在缺少 `.env` 时创建它。已有配置会保留。
 
-### 可选：桌面预览版
+**连接模型。** 打开一个新终端，任选一种方式：
 
-源码中提供了 Electron 桌面预览版，需要 **Node.js 22.19+**：
+| 使用 | 连接方式 |
+| --- | --- |
+| ChatGPT / Codex 订阅 | 运行 `astra auth login`，在浏览器中输入一次性代码并批准。见[订阅连接与排障](docs/zh-CN/usage.md#chatgpt-and-claude-subscriptions)。 |
+| Claude 订阅 | 先用 `claude auth login` 登录你自己的 [Claude Code](https://code.claude.com/docs/en/setup) 命令行，再在 `/connect` 中选择 **Claude / Claude Code → Subscription**。见[连接方式说明](docs/zh-CN/usage.md#chatgpt-and-claude-subscriptions)。 |
+| API 服务或本地模型 | 在 Astra 内用 `/connect` 选择，或写入 `.env`。见[模型连接](docs/zh-CN/usage.md#model-connections)。 |
 
-```text
-astra setup --gui
-astra --gui
-```
-
-要一次安装桌面组件并注册全局命令，在源码目录运行 macOS/Linux 的
-`./astra.sh setup --gui --install-command`，或 Windows 的
-`.\astra.bat setup --gui --install-command`。随后打开新终端，即可在项目目录运行
-`astra --gui`；直接运行 `astra` 仍进入终端界面。安装前请先退出正在运行的 Astra 会话，以便更新依赖环境。
-启用 GUI 后才下载对应组件。目前可使用对话、模型登录、后台会话、审批与文件差异；
-完整 TUI 功能对等和跨平台原生验收仍在进行。详见[桌面指南及当前边界](docs/zh-CN/gui.md)。
-
-### 2. 连接模型
-
-可以选择 ChatGPT 账号登录、API 服务或本地模型中的任一种方式。
-
-#### ChatGPT / Codex
-
-使用 ChatGPT 账号连接账号可用的 Codex 模型，无需填写 API Key 或修改 `.env`。
-
-1. 打开一个**新终端**（Windows CMD / PowerShell、macOS 或 Linux），运行：
-
-   ```text
-   astra auth login
-   ```
-
-   如果 Windows 暂时找不到 `astra` 命令，可在安装目录运行 `.\astra.bat auth login`。
-2. 打开终端显示的网址，输入本次生成的一次性代码，在浏览器中批准登录。
-3. 等终端显示 `Signed in.` 和可用 Codex 模型数量，再运行 `astra`。
-4. 在 **Astra 内部**输入 `/model`，选择 **ChatGPT / Codex**，再选择账号可用的 GPT 模型。这会保存为下次启动的默认模型。
-
-如果已经进入 Astra，也可以输入 `/connect`，选择 **ChatGPT / Codex → Subscription**，
-按界面提示登录，再通过 `/model` 选模型。
-
-如果 OpenAI 提示设备代码授权未启用，请在 ChatGPT 的安全设置中开启相应选项，取消旧的登录尝试后重新发起。
-参见 [OpenAI 设备代码授权说明](https://learn.chatgpt.com/docs/auth#preferred-device-code-authentication-beta)。
-
-**每台电脑都需要单独连接账号。** `astra update` 会保留当前安装的登录状态，但不会自动登录，也不会同步另一台电脑的登录状态。
-完成账号连接后，`/model` 才会列出 ChatGPT / Codex 的模型。
-
-**更新后没有 GPT 模型？** 在终端运行 `astra auth status`：
-若显示 `sign-in required`，运行 `astra auth login`；
-若显示 `signed in`，重新启动 Astra，通过 `/connect → ChatGPT / Codex` 刷新并保存连接，再打开 `/model`。
-
-模型返回推理摘要时，Astra 会显示摘要。更多说明见[登录、推理摘要与故障排查](docs/codex-oauth.md)。
-
-#### Claude / Claude Code
-
-通过你自己登录的官方原版 [Claude Code](https://code.claude.com/docs/en/setup) 命令行使用 Claude 订阅。
-Astra 每次请求模型时启动 `claude`，不会读取、保存或转发你的 Claude 登录凭证。
-用量按 Claude Code / Agent SDK 的速率计入你的 Claude 套餐。
-
-1. 在终端安装命令行并用 Claude 账号登录：
-
-   ```text
-   curl -fsSL https://claude.ai/install.sh | bash
-   claude auth login
-   ```
-2. 在 **Astra 内部**输入 `/connect`，选择 **Claude / Claude Code → Subscription**，再在 `/model` 中选择 `fable`、`opus`、`sonnet` 或 `haiku`。
-
-Claude 通过本地桥接原生调用 Astra 的工具，桥接从不执行工具，仍由 Astra 按原有审批执行。命令行运行时不带它自己的工具、设置文件或会话记录；Astra 环境中的 `ANTHROPIC_*` 变量不会传给它，
-因此模型切换工具或 API Key 都不会改变请求的去向或计费方式。若 `claude` 不在 `PATH` 中，
-请把 `ASTRA_CLAUDE_CODE_COMMAND` 设为它的绝对路径。
-
-#### API 服务与本地模型
-
-编辑安装目录中的 `.env`。例如，使用内置 DeepSeek 配置时，将已有的对应条目设为以下值，并填入你自己的 API Key：
-
-```dotenv
-DEEPSEEK_API_KEY=your-api-key
-LLM_MODEL=deepseek-flash
-LLM_BASE_URL=https://api.deepseek.com
-```
-
-其他 API 服务和本地模型的配置方式见[模型配置与 `/connect`](docs/zh-CN/usage.md#model-connections)。
-
-### 3. 启动
-
-打开一个**新终端**，进入准备工作的文件夹，再运行：
+**启动。** 进入准备工作的文件夹，运行：
 
 ```text
 astra doctor
 astra
 ```
 
-进入 Astra 后，用 `/connect` 添加提供商，用 `/model` 浏览其模型，用 `/help` 查看命令。当前文件夹会作为工作区，除非设置了 `SANDBOX_WORKDIR`。
+![终端界面：在工作文件夹里执行一条命令，然后给出回答。](docs/images/terminal.webp)
 
-已经装过旧版？请看[旧版本升级指南](docs/zh-CN/launcher-update.md#upgrade-an-older-checkout)。
+用 `/model` 选择模型，`/help` 查看其他命令。桌面版先运行一次 `astra setup --gui`（需要 Node.js 22.19+），之后用 `astra --gui` 启动。更新时先退出正在运行的会话，再运行 `astra update`。详见[桌面指南](docs/zh-CN/gui.md)、[日常使用](docs/zh-CN/usage.md)和[更新与恢复](docs/zh-CN/launcher-update.md)。
 
-## 常用命令
+## 工作原理
 
-以下命令在 **Astra 内部**输入：
+Astra 由 Python 编写的 agent 运行时、两个共用一套 TypeScript 核心的客户端（Ink 终端界面和 Electron 桌面版），以及 macOS 和 Windows 的原生辅助程序组成。终端界面和桌面版的每个活跃会话各自运行一个后端进程，用逐行 JSON 与它通信。大部分代码遵循下面几条规则：
 
-| 命令 | 用途 |
-| --- | --- |
-| `/help` · `/doctor` | 查看命令和运行时连接状态。 |
-| `/connect` | 连接 ChatGPT 账号、API 服务或本地模型。 |
-| `/model` · `/mode high` | 选择模型，调整受支持的推理强度。 |
-| `/memory` · `/skills` | 查看记忆和技能库。 |
-| `/learn review` | 讨论自动技能的改进建议，再选择修改和验证范围。 |
-| `/tasks` · `/resume <task-id>` | 查看任务记录，或恢复符合条件的任务。 |
-| `/restart` · `/restart cancel` | 等当前工作完成后重启本次后端，或取消等待。 |
-| `/wakeup` · `/wakeup cancel` | 查看或停止[会话内唤醒](docs/zh-CN/session-lifecycle.md)。 |
-| `/appshot enable` | 安装原生辅助程序后，启用窗口捕获。 |
+- **结果未知的工具调用从不自动重放。** 相邻的只读调用可以并行；写操作等之前的工作完成，并挡住之后的读取。已经开始、却因超时或断线没有返回的调用记为“结果未知”，再次尝试之前先检查它的实际效果。见[轮次可靠性](docs/runtime/turn-reliability.md)（英文）。
+- **发给模型的内容保持原样。** 对话的工具列表在开始时就确定；指引和技能的修改在新对话中生效，或以追加方式加入；仅用于显示的数据不进入模型历史。请求前缀保持稳定，所以提供商的提示缓存可以持续复用，直到压缩或更换模型时才开始新的前缀。见[提供商可靠性](docs/provider-reliability.md#system-prompt-prefix-reuse)（英文）。
+- **检索在本地完成。** 过往对话、活动记录和保存的记忆都用 SQLite 全文索引检索（包括面向中文等 CJK 文字的索引），再用倒数排名融合（RRF）合并、用 MMR 去除重复。可选的本地嵌入模型补充语义检索，不依赖托管的向量数据库。见[原生记忆](docs/native-memory-recommendation.md)（英文）。
+- **有后果的操作要先审批。** 代码默认在 Docker 沙箱中运行，文件访问遵循明确的路径规则。在按需审批模式下，付款、发送、删除和发布每次都单独询问，之前的授权不能覆盖。定时检查以只读方式运行。见[工具执行](docs/zh-CN/execution.md)。
 
-`Ctrl+L` 打开活动详情，`Ctrl+O` 打开最近一次工具结果，`Ctrl+C` 请求取消执行。更多操作见[日常使用指南](docs/zh-CN/usage.md)。
+[架构概览](docs/architecture.md)（英文）介绍进程划分、代码目录和各篇设计文档。
 
-## 更新与数据
+## 测试与评测
 
-以下命令在**终端中**运行。应用更新前先退出交互式 Astra 会话；更新器会自动暂停并恢复已识别的配套服务。
+测试通过真实入口和隔离的状态目录运行，覆盖 Python 运行时与命令行、两个客户端（桌面端测试会启动真实的 Electron 窗口），以及 macOS 辅助程序的 Swift 测试。发布检查在 macOS、Windows 和 Linux 上运行。以下评测离线运行，不调用模型：
 
-```text
-astra update --check
-astra update
-```
+| 评测 | 检查内容 | 命令 |
+| --- | --- | --- |
+| 轮次故障回放 | 脚本化的故障，例如流提前结束、工具参数被截断、工具执行期间预算耗尽、取消；检查调用顺序、文件状态和“结果未知”的记录。 | `python -m agent.evals.turn_replay` |
+| 对话回放 | 经过上下文压缩和旧会话迁移后，人格与上下文的不变量是否保持。 | `python -m agent.evals.replay` |
+| 记忆 | 在预置的合成历史上评分：能否正确回忆、该放弃时是否放弃，以及每次请求注入了什么。 | `python -m agent.evals.memory.run` |
 
-更新后重新运行 `astra` 即可使用新版本。更新跟随当前仓库的 Git 上游。源码安装默认将配置保存在 `.env`、私人运行状态保存在 `.astra/`、对话保存在 `.sessions/`，更新时会保留这些数据。处理本地改动、备份或恢复中断的更新，请看[更新指南](docs/zh-CN/launcher-update.md)。
+SWE-bench Verified 小子集的运行器（`python -m agent.evals.swebench`）用真实模型衡量编程任务，报告逐题结果，不代表排行榜成绩。发布检查和各项评测见[开发指南](docs/zh-CN/development.md)。
 
-本地存储不代表本地推理：请求中包含的内容会发送给所选模型服务。电脑操作需要相应辅助程序、模型能力和系统权限。Windows 的 Appshot 辅助程序目前不提供通用原生鼠标键盘控制，详见[平台限制](docs/zh-CN/appshot.md)。
+## 数据与边界
+
+源码安装把配置保存在 `.env`，私人运行状态保存在 `.astra/`，对话保存在 `.sessions/`；`astra update` 会保留这些数据。本地存储不代表本地推理：请求中包含的内容会发送给你选择的模型服务。电脑操作需要相应的辅助程序、模型能力和系统权限。Windows 上暂不提供通用的原生应用控制，详见[平台限制](docs/zh-CN/appshot.md)。
 
 ## 文档导航
-
-常用指南均提供中文版本；底层设计和历史验收材料保留英文，并在文档索引中标注。
 
 | 我想要…… | 查看 |
 | --- | --- |
 | 安装、更新或恢复 | [启动与更新](docs/zh-CN/launcher-update.md) |
-| 配置模型、使用终端界面 | [日常使用](docs/zh-CN/usage.md) |
-| 登录 ChatGPT、选择 GPT 模型 | [快速教程](#chatgpt--codex) · [Codex 登录说明](docs/codex-oauth.md) |
-| 操作浏览器或桌面应用 | [浏览器操作](docs/zh-CN/browser-interaction.md) · [macOS 电脑操作](docs/zh-CN/macos-computer-use.md) · [Appshot](docs/zh-CN/appshot.md) |
-| 了解记忆和学习机制 | [记忆概览](docs/zh-CN/memory.md) · [技能检查](docs/zh-CN/skill-learning.md) |
-| 配置搜索、MCP、消息或绘图服务 | [可选集成](docs/zh-CN/integrations.md) |
+| 连接模型、使用终端界面 | [日常使用](docs/zh-CN/usage.md) |
+| 使用桌面版或手机 | [桌面版](docs/zh-CN/gui.md) · [手机随身端](docs/zh-CN/phone.md) |
+| 操作浏览器或 Mac 应用 | [浏览器操作](docs/zh-CN/browser-interaction.md) · [macOS 电脑操作](docs/zh-CN/macos-computer-use.md) · [Appshot](docs/zh-CN/appshot.md) |
+| 设置定时提醒和检查 | [持久任务](docs/zh-CN/persistent-jobs.md) |
+| 接入微信、QQ、邮箱、MCP 或网页搜索 | [可选集成](docs/zh-CN/integrations.md) |
+| 了解记忆和技能 | [记忆概览](docs/zh-CN/memory.md) · [技能检查](docs/zh-CN/skill-learning.md) |
 | 配置沙箱和文件访问范围 | [工具执行](docs/zh-CN/execution.md) |
+| 了解设计 | [架构概览](docs/architecture.md)（英文） |
 | 开发、测试或维护 Astra | [开发指南](docs/zh-CN/development.md) |
 
-架构、活动历史、Notebook 和故障排查等内容，可继续浏览[完整文档索引](docs/zh-CN/README.md)。
+其他指南见[完整文档索引](docs/zh-CN/README.md)。
 
 ## 许可证
 
