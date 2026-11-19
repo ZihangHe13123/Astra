@@ -84,6 +84,9 @@ def reasoning_effort_status(config: LLMConfig) -> str:
                  "and xhigh the highest one up to xhigh.")
     elif config.provider == "claude-code":
         text += "\nClaude Code applies it as --effort (low, medium, high, xhigh, max)."
+    elif config.provider == "google-gemini":
+        text += ("\nGoogle AI Studio applies it as thinkingLevel (low, medium, high, xhigh on Gemini 4; "
+                 "max uses the model's highest supported level).")
     elif not is_deepseek_model(config.model):
         text += "\nSaved preference only; the current model adapter does not apply reasoning effort."
     elif config.reasoning_effort == "xhigh":

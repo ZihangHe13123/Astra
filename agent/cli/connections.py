@@ -41,14 +41,31 @@ async def probe_profile(
             return ConnectionProbe(True, "Connected to ChatGPT / Codex", tuple(m["id"] for m in models))
         except (ValueError, httpx.HTTPError) as exc:
             return ConnectionProbe(False, str(exc))
+    if profile.provider == "google-gemini":
+        from agent.runtime.gemini_provider import GeminiRequestError, fetch_models as fetch_gemini_models
+        resolved_key = profile.api_key() if api_key is None else api_key
+        resolved_url = base_url or profile.base_url
+        if not resolved_key:
+            return ConnectionProbe(False, f"Missing API key environment variable: {profile.api_key_env or 'GEMINI_API_KEY'}")
+        try:
+            items = await fetch_gemini_models(resolved_url, resolved_key, timeout=timeout)
+            models = tuple(str(item["id"]) for item in items if item.get("id"))
+            visible = ", ".join(models[:5]) if models else "endpoint returned no chat models"
+            return ConnectionProbe(True, f"Connected to {name} @ {resolved_url}; {visible}", models)
+        except (GeminiRequestError, ValueError, httpx.HTTPError) as exc:
+            message = exc.public_message if isinstance(exc, GeminiRequestError) else f"{type(exc).__name__}: {exc}"
+            return ConnectionProbe(False, message)
     resolved_key = profile.api_key() if api_key is None else api_key
     resolved_url = base_url or profile.base_url
     if not resolved_key and not is_local_url(resolved_url):
         return ConnectionProbe(False, f"Missing API key environment variable: {profile.api_key_env}")
     headers = {"Authorization": f"Bearer {resolved_key}"} if resolved_key else {}
     url = resolved_url.rstrip("/") + "/models"
+    from agent.runtime.network import active_proxy_for_url
+    proxy = active_proxy_for_url(resolved_url)
     try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        client_cm = httpx.AsyncClient(timeout=timeout, proxy=proxy) if proxy else httpx.AsyncClient(timeout=timeout)
+        async with client_cm as client:
             response = await client.get(url, headers=headers)
             response.raise_for_status()
             payload = response.json()

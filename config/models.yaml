@@ -143,3 +143,58 @@ models:
       # HY4 Preview: 64K output; https://www.tencentcloud.com/document/product/1300/78934
       max_tokens: 65536
       top_p: 0.95
+
+  # Google AI Studio — Gemini 4 family (native v1beta REST transport).
+  # Unified 1M context window; synchronous output defaults to 64K tokens.
+  # Sampling parameters (temperature/top_p/top_k) are deprecated on Gemini 4.
+  gemini-4-neon:
+    provider: google-gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    base_url_env: GEMINI_BASE_URL
+    api_key_env: GEMINI_API_KEY
+    catalog_provider: gemini
+    provider_label: Google AI Studio · Gemini API
+    context_limit: 1048576
+    capabilities: [tools, reasoning, thinking-required, vision, streaming]
+    reasoning_levels: [low, medium, high, xhigh]
+    generation:
+      max_tokens: 65536
+
+  gemini-4-hydrogen:
+    provider: google-gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    base_url_env: GEMINI_BASE_URL
+    api_key_env: GEMINI_API_KEY
+    catalog_provider: gemini
+    provider_label: Google AI Studio · Gemini API
+    context_limit: 1048576
+    capabilities: [tools, reasoning, thinking-required, vision, streaming]
+    reasoning_levels: [low, medium, high, xhigh]
+    generation:
+      max_tokens: 65536
+
+  gemini-4-carbon:
+    provider: google-gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    base_url_env: GEMINI_BASE_URL
+    api_key_env: GEMINI_API_KEY
+    catalog_provider: gemini
+    provider_label: Google AI Studio · Gemini API
+    context_limit: 1048576
+    capabilities: [tools, reasoning, thinking-required, vision, streaming]
+    reasoning_levels: [low, medium, high, xhigh]
+    generation:
+      max_tokens: 32768
+
+  gemini-4-argon:
+    provider: google-gemini
+    base_url: https://generativelanguage.googleapis.com/v1beta
+    base_url_env: GEMINI_BASE_URL
+    api_key_env: GEMINI_API_KEY
+    catalog_provider: gemini
+    provider_label: Google AI Studio · Gemini API
+    context_limit: 1048576
+    capabilities: [tools, reasoning, thinking-required, vision, streaming]
+    reasoning_levels: [low, medium, high, xhigh]
+    generation:
+      max_tokens: 32768

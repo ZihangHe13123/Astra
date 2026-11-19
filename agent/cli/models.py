@@ -77,7 +77,7 @@ class ModelProfile:
         settings["vision_preprocess"] = self.vision_preprocess
         if self.auto_compact_token_limit is not None:
             settings["auto_compact_token_limit"] = self.auto_compact_token_limit
-        if self.provider == "openai-codex":
+        if self.provider in {"openai-codex", "google-gemini"} or self.reasoning_levels:
             settings["reasoning_levels"] = self.reasoning_levels
         return settings
 
@@ -130,6 +130,12 @@ def _profile_from_data(name: str, raw: dict[str, Any]) -> ModelProfile:
     capabilities = raw.get("capabilities", [])
     if not isinstance(capabilities, list) or not all(isinstance(item, str) for item in capabilities):
         raise ValueError(f"Model '{name}' capabilities must be a string list")
+    raw_reasoning_levels = raw.get("reasoning_levels", [])
+    if not isinstance(raw_reasoning_levels, list) or not all(
+        isinstance(item, str) and item.strip() for item in raw_reasoning_levels
+    ):
+        raise ValueError(f"Model '{name}' reasoning_levels must be a string list")
+    reasoning_levels = tuple(item.strip() for item in raw_reasoning_levels)
     vision_preprocess = parse_vision_preprocess_policy(name, raw.get("vision_preprocess"))
     if vision_preprocess is not None:
         if name not in DEEPSEEK_VISION_MODELS:
@@ -156,6 +162,7 @@ def _profile_from_data(name: str, raw: dict[str, Any]) -> ModelProfile:
         catalog_provider=str(raw.get("catalog_provider", "configured")),
         provider_label=str(raw.get("provider_label", "Configured")),
         vision_detail=_vision_detail(raw.get("vision_detail", "auto")),
+        reasoning_levels=reasoning_levels,
         vision_preprocess=vision_preprocess,
         temperature=_optional_float(generation.get("temperature")),
         max_tokens=int(generation.get("max_tokens", 4096)),

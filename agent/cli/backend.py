@@ -2217,7 +2217,7 @@ async def _main(startup_started: float):
                "model_key": current_model_key,
                "reasoning_effort": (agent.llm.config.reasoning_effort
                                     if is_deepseek_model(agent.llm.config.model)
-                                    or agent.llm.config.provider in {"openai-codex", "claude-code"} else None),
+                                    or agent.llm.config.provider in {"openai-codex", "claude-code", "google-gemini"} else None),
                "code_mode": agent.code_mode,
                "personas": personas,
                "models": [entry.to_event(current=entry.key == current_model_key)

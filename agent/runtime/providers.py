@@ -64,3 +64,11 @@ def _claude_code_factory(config):
 
 
 DEFAULT_PROVIDER_REGISTRY.register("claude-code", _claude_code_factory)
+
+
+def _gemini_factory(config):
+    from .gemini_provider import GeminiProvider
+    return GeminiProvider(config)
+
+
+DEFAULT_PROVIDER_REGISTRY.register("google-gemini", _gemini_factory)

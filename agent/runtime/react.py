@@ -2936,6 +2936,7 @@ class ReActAgent(AgentBase):
         r"|context (?:length|window|limit|size) (?:is )?(?:too (?:long|large)|exceeded)"
         r"|prompt is too long"
         r"|input (?:is )?too long"
+        r"|input token count .*?exceeds (?:the )?(?:maximum |max )?number of tokens allowed"
         r"|too many (?:input|prompt) tokens"
         r"|too many tokens in (?:the )?(?:request|prompt|input)"
         r"|exceeds? (?:the |your )?(?:model'?s? )?(?:maximum |max )?context",
