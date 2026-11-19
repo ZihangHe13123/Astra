@@ -63,7 +63,7 @@ from .mode_preferences import (
 )
 from .connections import create_probe_and_switch, is_local_url, switch_to_profile
 from .diagnostics import build_doctor_report
-from .environment import load_project_env
+from .environment import enter_workspace, load_project_env
 from .persona_preferences import save_selected_persona, startup_persona
 from .sandbox_preferences import execute_sandbox_command, resolve_startup_sandbox_mode
 from .vision_tile_preferences import (
@@ -1088,7 +1088,6 @@ def main():
     )
     config = apply_reasoning_effort(config)
     sandbox_timeout = _int_env("SANDBOX_TIMEOUT", 30)
-    workdir = os.getenv("SANDBOX_WORKDIR", os.getenv("HOME", os.getcwd()))
 
     if ink_mode:
         import subprocess
@@ -1102,6 +1101,9 @@ def main():
             print("\033[31m[Error] tsx not found. Run: cd ui-tui && npm install\033[0m")
             sys.exit(1)
     else:
+        # The launcher starts this CLI in the installation, not in the workspace.
+        enter_workspace()
+        workdir = os.getenv("SANDBOX_WORKDIR", os.getenv("HOME", os.getcwd()))
         asyncio.run(_async_init(config, sandbox_timeout, workdir))
 
 

@@ -82,3 +82,24 @@ def load_project_env(project_root: str | Path) -> None:
         key = values.get(key_name)
         if key is not None:
             os.environ[key_name] = str(key).strip()
+
+
+def enter_workspace() -> None:
+    """Make the workspace the current directory, as the desktop does when it starts a backend.
+
+    Call after load_project_env: the workspace is SANDBOX_WORKDIR, set explicitly in the .env or
+    filled in from the launcher's ASTRA_WORKSPACE. The launcher starts the terminal interfaces in the
+    installation, and everything that takes the current directory for the workspace (file, git and
+    image tools, project memories, the Context Index, project trust) would otherwise work there.
+    """
+    configured = os.environ.get("SANDBOX_WORKDIR", "")
+    if not configured.strip():
+        return
+    workspace = os.path.abspath(os.path.expanduser(configured))
+    try:
+        os.chdir(workspace)
+    except OSError as exc:
+        raise SystemExit(f"Astra cannot work in {workspace}: {exc.strerror or exc}. "
+                         "Set SANDBOX_WORKDIR to an existing folder.") from exc
+    # A relative setting was relative to the starting directory, which is no longer the current one.
+    os.environ["SANDBOX_WORKDIR"] = workspace

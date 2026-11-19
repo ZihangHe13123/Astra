@@ -188,7 +188,7 @@ from agent.cli.connections import (
     sync_context_budget,
 )
 from agent.cli.diagnostics import build_doctor_report, build_runtime_diagnostics
-from agent.cli.environment import load_project_env
+from agent.cli.environment import enter_workspace, load_project_env
 from agent.cli.persona_preferences import save_selected_persona, startup_persona
 from agent.cli.voice_preferences import VoicePreferences, execute_voice_command
 from agent.speech.player import PhonePlayer
@@ -754,6 +754,8 @@ async def main():
         _handshake()
         startup_started = time.perf_counter()
     load_project_env(PROJECT_ROOT)
+    # The terminal interface starts this backend in the installation, not in the workspace.
+    enter_workspace()
     profile = RuntimeProfiler.from_env(PROJECT_ROOT)
     with profile.activate() if profile is not None else nullcontext():
         try:
