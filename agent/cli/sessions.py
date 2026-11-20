@@ -16,8 +16,178 @@ SESSION_DEFAULT = SESSION_DIR / "default.json"
 SESSION_EXPORT_DIR = SESSION_DIR / "exports"
 
 _SESSION_NAME_RE = re.compile(r"^[\w\u4e00-\u9fff.-]+$", re.UNICODE)
+_ARTIFACT_SUFFIXES = (
+    ".tool-failures.jsonl",
+    ".context-index-feedback.jsonl",
+    ".hindsight-sync.json",
+    ".subagents.jsonl",
+    ".raw-tool-calls.jsonl",
+    ".approvals.jsonl",
+)
+_SUBAGENT_CONV_RE = re.compile(r"^(.+)\.[A-Za-z0-9][A-Za-z0-9_-]{0,127}\.conv\.")
 API_SESSION_ID_MAX_LENGTH = 64
 API_SESSION_ID_MAX_UTF8_BYTES = 192
+
+
+def _entry_mtime(entry: os.DirEntry[str]) -> float | None:
+    try:
+        return entry.stat(follow_symlinks=entry.is_symlink()).st_mtime
+    except OSError:
+        return None
+
+
+def _scan_session_mtimes(
+    root: Path,
+    *,
+    include_header: bool = False,
+    include_artifacts: bool = False,
+    path_for_branch=None,
+) -> dict[str, float]:
+    """Scan one session mode directory in a single os.scandir pass."""
+    modified: dict[str, float] = {}
+    header_mtimes: dict[str, float] = {}
+    has_branches = False
+    has_artifacts = False
+
+    try:
+        with os.scandir(root) as entries:
+            for entry in entries:
+                name = entry.name
+                match_name = name.lower() if os.name == "nt" else name
+                if match_name == ".branches":
+                    has_branches = entry.is_dir(follow_symlinks=False)
+                    continue
+                if match_name == ".artifacts":
+                    has_artifacts = entry.is_dir(follow_symlinks=False)
+                    continue
+                if entry.is_dir(follow_symlinks=False):
+                    continue
+                stem = ""
+                is_header = False
+                if match_name.endswith(".snapshot.json"):
+                    stem = name[:-14]
+                elif match_name.endswith(".header.json"):
+                    if not include_header:
+                        continue
+                    stem = name[:-12]
+                    is_header = True
+                elif match_name.endswith(".jsonl"):
+                    stem = name[:-6]
+                elif match_name.endswith(".json"):
+                    stem = name[:-5]
+                else:
+                    continue
+                if not stem:
+                    continue
+                mtime = _entry_mtime(entry)
+                if mtime is None:
+                    continue
+                if is_header:
+                    if stem not in header_mtimes or mtime > header_mtimes[stem]:
+                        header_mtimes[stem] = mtime
+                elif stem not in modified or mtime > modified[stem]:
+                    modified[stem] = mtime
+    except OSError:
+        return {}
+
+    if not modified:
+        return modified
+
+    def _stem_key(value: str) -> str:
+        # Match Windows NTFS 1-to-1 case insensitivity (normcase/lower) rather than
+        # Unicode casefold(), so distinct NTFS names like "Straße" and "Strasse" do not collide.
+        return os.path.normcase(value) if os.name == "nt" else value
+
+    stems_by_key: dict[str, list[str]] = {}
+    for stem in modified:
+        stems_by_key.setdefault(_stem_key(stem), []).append(stem)
+
+    if os.name == "nt":
+        for group in stems_by_key.values():
+            if len(group) > 1:
+                shared_mtime = max(modified[stem] for stem in group)
+                for stem in group:
+                    modified[stem] = shared_mtime
+
+    if include_header and header_mtimes:
+        for stem, mtime in header_mtimes.items():
+            for canonical in stems_by_key.get(_stem_key(stem), ()):
+                if mtime > modified[canonical]:
+                    modified[canonical] = mtime
+
+    if include_artifacts and has_artifacts:
+        artifacts_dir = root / ".artifacts"
+        has_nested_artifacts = False
+        try:
+            with os.scandir(artifacts_dir) as artifacts:
+                for entry in artifacts:
+                    name = entry.name
+                    match_name = name.lower() if os.name == "nt" else name
+                    if entry.is_dir(follow_symlinks=False):
+                        if match_name == ".artifacts":
+                            has_nested_artifacts = True
+                        continue
+                    stem = ""
+                    for suffix in _ARTIFACT_SUFFIXES:
+                        if match_name.endswith(suffix):
+                            stem = name[:-len(suffix)]
+                            break
+                    if not stem:
+                        match = _SUBAGENT_CONV_RE.match(name)
+                        if match:
+                            stem = match.group(1)
+                    if not stem:
+                        continue
+                    targets = stems_by_key.get(_stem_key(stem))
+                    if targets:
+                        mtime = _entry_mtime(entry)
+                        if mtime is not None:
+                            for canonical in targets:
+                                if mtime > modified[canonical]:
+                                    modified[canonical] = mtime
+        except OSError:
+            pass
+        if has_nested_artifacts:
+            try:
+                with os.scandir(artifacts_dir / ".artifacts") as nested:
+                    for entry in nested:
+                        if entry.is_dir(follow_symlinks=False):
+                            continue
+                        match = _SUBAGENT_CONV_RE.match(entry.name)
+                        if not match:
+                            continue
+                        targets = stems_by_key.get(_stem_key(match.group(1)))
+                        if targets:
+                            mtime = _entry_mtime(entry)
+                            if mtime is not None:
+                                for canonical in targets:
+                                    if mtime > modified[canonical]:
+                                        modified[canonical] = mtime
+            except OSError:
+                pass
+
+    if has_branches and path_for_branch is not None:
+        try:
+            with os.scandir(root / ".branches") as branches:
+                for entry in branches:
+                    targets = stems_by_key.get(_stem_key(entry.name))
+                    if not targets:
+                        continue
+                    for canonical in targets:
+                        store = SessionStore(path_for_branch(canonical))
+                        paths = (
+                            store.related_paths()
+                            if include_artifacts
+                            else (store.jsonl_path, store.legacy_path, store.snapshot_path)
+                        )
+                        modified[canonical] = max(
+                            (p.stat().st_mtime for p in paths if p.exists()),
+                            default=0.0,
+                        )
+        except OSError:
+            pass
+
+    return modified
 
 
 class SessionNameError(ValueError):
@@ -104,22 +274,13 @@ def bar_session_path(name: str) -> Path:
 
 
 def list_bar_sessions() -> list[str]:
-    root = SESSION_DIR / "bar"
-    if not root.exists():
-        return []
-    sessions = set()
-    for path in root.glob("*.json"):
-        if not path.name.endswith((".snapshot.json", ".header.json")):
-            sessions.add(path.stem)
-    for path in root.glob("*.jsonl"):
-        sessions.add(path.stem)
-    for path in root.glob("*.snapshot.json"):
-        sessions.add(path.name.removesuffix(".snapshot.json"))
-    def modified_at(name: str) -> float:
-        paths = SessionStore(bar_session_path(name)).related_paths()
-        return max((path.stat().st_mtime for path in paths if path.exists()), default=0.0)
-
-    return sorted(sessions, key=modified_at, reverse=True)
+    mtimes = _scan_session_mtimes(
+        SESSION_DIR / "bar",
+        include_header=True,
+        include_artifacts=True,
+        path_for_branch=bar_session_path,
+    )
+    return sorted(mtimes, key=mtimes.__getitem__, reverse=True)
 
 
 def bar_session_msg_count(name: str) -> int:
@@ -157,23 +318,13 @@ def minimal_session_path(name: str = "minimal") -> Path:
 
 
 def list_minimal_sessions() -> list[str]:
-    root = SESSION_DIR / "minimal"
-    if not root.exists():
-        return []
-    sessions = set()
-    for path in root.glob("*.json"):
-        if not path.name.endswith((".snapshot.json", ".header.json")):
-            sessions.add(path.stem)
-    for path in root.glob("*.jsonl"):
-        sessions.add(path.stem)
-    for path in root.glob("*.snapshot.json"):
-        sessions.add(path.name.removesuffix(".snapshot.json"))
-
-    def modified_at(name: str) -> float:
-        paths = SessionStore(minimal_session_path(name)).related_paths()
-        return max((path.stat().st_mtime for path in paths if path.exists()), default=0.0)
-
-    return sorted(sessions, key=modified_at, reverse=True)
+    mtimes = _scan_session_mtimes(
+        SESSION_DIR / "minimal",
+        include_header=True,
+        include_artifacts=True,
+        path_for_branch=minimal_session_path,
+    )
+    return sorted(mtimes, key=mtimes.__getitem__, reverse=True)
 
 
 def minimal_session_msg_count(name: str) -> int:
@@ -191,18 +342,10 @@ def minimal_session_exists(name: str) -> bool:
 
 
 def list_sessions() -> list[str]:
-    sessions = set()
+    names = set(_scan_session_mtimes(SESSION_DIR, include_header=False, include_artifacts=False))
     if SESSION_DEFAULT.exists():
-        sessions.add("default")
-    if SESSION_DIR.exists():
-        for f in SESSION_DIR.glob("*.json"):
-            if not f.name.endswith((".snapshot.json", ".header.json")):
-                sessions.add(f.stem)
-        for f in SESSION_DIR.glob("*.jsonl"):
-            sessions.add(f.stem)
-        for f in SESSION_DIR.glob("*.snapshot.json"):
-            sessions.add(f.name.removesuffix(".snapshot.json"))
-    return sorted(sessions, key=lambda x: (x != "default", x))
+        names.add("default")
+    return sorted(names, key=lambda x: (x != "default", x))
 
 
 def session_msg_count(name: str) -> int:

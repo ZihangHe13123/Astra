@@ -91,6 +91,7 @@ def test_llm_provider_switches_between_live_proxy_and_direct(monkeypatch):
     provider = OpenAICompatibleProvider(
         LLMConfig(base_url="https://api.deepseek.com", api_key="test-key")
     )
+    asyncio.run(provider._ensure_client_route())
     assert http_clients[0] == {"trust_env": False, "proxy": "http://127.0.0.1:7890"}
 
     route[0] = None

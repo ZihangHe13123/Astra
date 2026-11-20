@@ -708,15 +708,16 @@ class _TurnOutcome:
 
 def _raised_failure(exc: Exception) -> TurnFailed:
     """Classify an exception that escaped the turn without echoing provider text."""
-    from agent.runtime.llm import TRANSPORT_REQUEST_ERRORS, APIError, LLMResponseError
+    from agent.runtime import llm as llm_module
     from agent.runtime.provider_errors import summarize_provider_error
 
+    llm_module._ensure_openai_loaded(only_if_imported=True)
     summary = summarize_provider_error(exc)
     if summary.category == "timeout" or summary.status_code == 504:
         own = str(exc) if isinstance(exc, TimeoutError) else ""
         return TurnFailed(504, own or "The model provider did not respond in time.", "upstream_timeout")
     if (summary.status_code is not None or summary.category in {"rate_limit", "rejected", "transport"}
-            or isinstance(exc, (APIError, LLMResponseError, *TRANSPORT_REQUEST_ERRORS))):
+            or isinstance(exc, (llm_module.APIError, llm_module.LLMResponseError, *llm_module.TRANSPORT_REQUEST_ERRORS))):
         status = f" (HTTP {summary.status_code})" if summary.status_code is not None else ""
         return TurnFailed(502, f"The model provider request failed{status}.", "upstream_error")
     return TurnFailed(500, str(exc) or type(exc).__name__, "internal_error")

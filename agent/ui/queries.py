@@ -29,12 +29,23 @@ def _session_path(name: str, mode: str = "work") -> Path:
 
 def list_sessions() -> list[dict]:
     result = []
-    for mode, names in (("work", sessions.list_sessions), ("bar", sessions.list_bar_sessions),
-                        ("minimal", sessions.list_minimal_sessions)):
-        for name in names():
-            store = SessionStore(_session_path(name, mode))
+    for mode, root, path_resolver in (
+        ("work", sessions.SESSION_DIR, sessions.session_path),
+        ("bar", sessions.SESSION_DIR / "bar", sessions.bar_session_path),
+        ("minimal", sessions.SESSION_DIR / "minimal", sessions.minimal_session_path),
+    ):
+        mtimes = sessions._scan_session_mtimes(
+            root,
+            include_header=False,
+            include_artifacts=False,
+            path_for_branch=path_resolver,
+        )
+        if mode == "work" and "default" not in mtimes and sessions.SESSION_DEFAULT.exists():
+            store = SessionStore(sessions.session_path("default"))
             files = [p for p in (store.jsonl_path, store.legacy_path, store.snapshot_path) if p.exists()]
-            result.append({"name": name, "mode": mode, "modified": max((p.stat().st_mtime for p in files), default=0)})
+            mtimes["default"] = max((p.stat().st_mtime for p in files), default=0.0)
+        for name, modified in mtimes.items():
+            result.append({"name": name, "mode": mode, "modified": modified})
     return sorted(result, key=lambda s: s["modified"], reverse=True)
 
 

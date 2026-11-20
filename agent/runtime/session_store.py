@@ -1,6 +1,7 @@
 """Append-only session storage with legacy JSON compatibility."""
 
 import json
+import mmap
 import os
 import re
 import sys
@@ -26,8 +27,18 @@ DEFAULT_SESSION_DATA = {
     "last_prompt_tokens": 0,
 }
 
+_LIFECYCLE_TYPES = frozenset({"session_started", "session_ended", "session_interrupted"})
+_LIFECYCLE_MARKERS = (b"session_started", b"session_ended", b"session_interrupted")
+_MESSAGE_PREFIXES = (b'{"type": "message"', b'{"type":"message"')
+_REPLACE_PREFIXES = (b'{"type": "replace"', b'{"type":"replace"')
+_STATE_PREFIXES = (b'{"type": "state"', b'{"type":"state"')
+
 
 class SessionStore:
+    # Use read-only mmap + reverse-search for journals at or above 256 KiB so
+    # both append-only and multi-replace journals avoid redundant disk reads.
+    _MMAP_MIN_BYTES = 256 * 1024
+
     @classmethod
     def for_subagent(cls, session_path: str | Path, key: str, *, branch_id: str | None = None) -> "SessionStore":
         """Return an isolated canonical journal for one worker identity."""
@@ -80,6 +91,14 @@ class SessionStore:
         )
         self._run_id = ""
         self._closed = False
+        self._cached_signature: tuple[
+            tuple[int, int, int] | None,
+            tuple[int, int, int] | None,
+            tuple[int, int, int] | None,
+        ] | None = None
+        self._cached_message_count: int | None = None
+        self._recovered_jsonl_signature: tuple[int, int, int] | None = None
+        self._last_start_bytes: int | None = None
         if self.branch_id != "main":
             for related in self.related_paths(include_branches=False):
                 self._branches._safe(related)
@@ -202,25 +221,101 @@ class SessionStore:
         os.replace(tmp, self.hindsight_sync_path)
         return self.hindsight_sync_path
 
+    @staticmethod
+    def _file_signature(path: Path) -> tuple[int, int, int] | None:
+        try:
+            st = path.stat()
+        except OSError:
+            return None
+        return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+    @staticmethod
+    def _same_file_grew_by(
+        before: tuple[int, int, int] | None,
+        after: tuple[int, int, int] | None,
+        delta: int,
+    ) -> bool:
+        if after is None:
+            return False
+        if before is None:
+            return after[1] == delta
+        if before[0] and after[0] and before[0] != after[0]:
+            return False
+        return after[1] == before[1] + delta
+
+    def _storage_signature(
+        self,
+    ) -> tuple[tuple[int, int, int] | None, tuple[int, int, int] | None, tuple[int, int, int] | None]:
+        return (
+            self._file_signature(self.jsonl_path),
+            self._file_signature(self.legacy_path),
+            self._file_signature(self.snapshot_path),
+        )
+
+    def _invalidate_message_count_cache(self) -> None:
+        self._cached_message_count = None
+        self._cached_signature = None
+
+    def _read_json_checked(self, path: Path) -> tuple[dict[str, Any] | None, bool]:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f), True
+        except json.JSONDecodeError:
+            return None, True
+        except OSError:
+            return None, False
+
     def load(self, *, readonly: bool = False) -> dict[str, Any]:
-        if not readonly:
+        custom_recover = type(self).recover_interrupted is not SessionStore.recover_interrupted
+        if not readonly and custom_recover:
             self.recover_interrupted()
+        sig_before = self._storage_signature()
+        complete = True
         data = dict(DEFAULT_SESSION_DATA)
         data["messages"] = []
 
-        if self.snapshot_path.exists():
-            loaded = self._read_json(self.snapshot_path)
-            if loaded:
+        if sig_before[2] is not None or self.snapshot_path.exists():
+            loaded, read_ok = self._read_json_checked(self.snapshot_path)
+            if not read_ok:
+                complete = False
+            elif loaded:
                 data.update(loaded)
                 data["messages"] = list(loaded.get("messages", []))
-        elif self.legacy_path.exists():
-            loaded = self._read_json(self.legacy_path)
-            if loaded:
+        elif sig_before[1] is not None or self.legacy_path.exists():
+            loaded, read_ok = self._read_json_checked(self.legacy_path)
+            if not read_ok:
+                complete = False
+            elif loaded:
                 data.update(loaded)
                 data["messages"] = list(loaded.get("messages", []))
 
-        if self.jsonl_path.exists():
-            self._replay_jsonl(data)
+        last_lifecycle: dict[str, Any] | None = None
+        track_lifecycle = not readonly and not custom_recover
+        jsonl_existed = sig_before[0] is not None or self.jsonl_path.exists()
+        if jsonl_existed:
+            last_lifecycle, replay_ok = self._replay_jsonl_with_lifecycle(
+                data, track_lifecycle=track_lifecycle
+            )
+            if not replay_ok:
+                complete = False
+
+        sig_after_replay = self._storage_signature()
+        stable_read = complete and sig_after_replay == sig_before
+        if stable_read:
+            self._cached_message_count = len(data["messages"])
+            self._cached_signature = sig_after_replay
+        else:
+            self._invalidate_message_count_cache()
+
+        if track_lifecycle:
+            if jsonl_existed and complete:
+                _recovered, live_start, checked_sig = self._recover_from_lifecycle_event_state(
+                    last_lifecycle,
+                    checked_jsonl_sig=sig_after_replay[0] if stable_read else None,
+                )
+                self._recovered_jsonl_signature = None if live_start else checked_sig
+            else:
+                self._recovered_jsonl_signature = None
 
         header = self._read_json(self.header_path)
         if header:
@@ -237,25 +332,73 @@ class SessionStore:
 
     def save(self, data: dict[str, Any], append_from: int = 0, snapshot: bool = False) -> None:
         self.legacy_path.parent.mkdir(parents=True, exist_ok=True)
+        pre_start_sig = self._storage_signature()
         self.ensure_started()
         messages = list(data.get("messages", []))
         append_from = max(0, min(append_from, len(messages)))
 
         # If history shrank or was rewritten, append a replace record so replay is deterministic.
-        existing_count = len(self.load().get("messages", [])) if self.exists else 0
+        post_start_sig = self._storage_signature()
+        baseline_sig: tuple[
+            tuple[int, int, int] | None,
+            tuple[int, int, int] | None,
+            tuple[int, int, int] | None,
+        ] | None
+        if (
+            pre_start_sig == (None, None, None)
+            and self._last_start_bytes is not None
+            and self._same_file_grew_by(None, post_start_sig[0], self._last_start_bytes)
+            and post_start_sig[1:] == (None, None)
+        ):
+            existing_count = 0
+            baseline_sig = post_start_sig
+        elif (
+            self._cached_message_count is not None
+            and self._cached_signature is not None
+            and post_start_sig == self._cached_signature
+        ):
+            existing_count = self._cached_message_count
+            baseline_sig = post_start_sig
+        else:
+            existing_count = len(self.load(readonly=True).get("messages", []))
+            baseline_sig = self._cached_signature
         replace = existing_count > append_from
 
         self._write_header(self._state_without_messages(data))
         if replace:
-            self._append_jsonl([json.dumps({"type": "replace", "messages": messages}, ensure_ascii=False)])
+            written = self._append_jsonl([json.dumps({"type": "replace", "messages": messages}, ensure_ascii=False)])
         else:
-            self._append_jsonl(
+            written = self._append_jsonl(
                 json.dumps({"type": "message", "index": idx, "message": msg}, ensure_ascii=False)
                 for idx, msg in enumerate(messages[append_from:], start=append_from)
             )
 
-        if snapshot or not self.snapshot_path.exists():
+        wrote_snapshot = snapshot or not self.snapshot_path.exists()
+        if wrote_snapshot:
             self.save_snapshot(data)
+            return
+
+        if (
+            baseline_sig is not None
+            and (
+                replace
+                or (
+                    existing_count == append_from
+                    and all(isinstance(msg, dict) for msg in messages[append_from:])
+                )
+            )
+        ):
+            post_write_sig = self._storage_signature()
+            jsonl_exact = self._same_file_grew_by(baseline_sig[0], post_write_sig[0], written)
+            legacy_exact = post_write_sig[1] == baseline_sig[1]
+            snap_exact = post_write_sig[2] == baseline_sig[2]
+            if jsonl_exact and legacy_exact and snap_exact:
+                self._cached_message_count = len(messages)
+                self._cached_signature = post_write_sig
+            else:
+                self._invalidate_message_count_cache()
+        else:
+            self._invalidate_message_count_cache()
 
     def save_snapshot(self, data: dict[str, Any]) -> None:
         self.snapshot_path.parent.mkdir(parents=True, exist_ok=True)
@@ -263,6 +406,7 @@ class SessionStore:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, self.snapshot_path)
+        self._invalidate_message_count_cache()
 
     def _write_header(self, header: dict[str, Any]) -> None:
         """Persist mutable session metadata outside the append-only message stream."""
@@ -272,20 +416,53 @@ class SessionStore:
             json.dump(header, handle, ensure_ascii=False, indent=2)
         os.replace(temporary, self.header_path)
 
-    def _append_lifecycle(self, event_type: str, **payload: Any) -> None:
+    def _append_lifecycle(
+        self,
+        event_type: str,
+        *,
+        expected_jsonl_sig: tuple[int, int, int] | None = None,
+        **payload: Any,
+    ) -> tuple[int, tuple[int, int, int] | None]:
+        pre_sig = self._storage_signature()
+        cache_valid = (
+            self._cached_message_count is not None
+            and self._cached_signature is not None
+            and pre_sig == self._cached_signature
+        )
         event = {"type": event_type, "recorded_at": time.time(), **payload}
-        self._append_jsonl([json.dumps(event, ensure_ascii=False, default=str)])
+        written = self._append_jsonl([json.dumps(event, ensure_ascii=False, default=str)])
+        post_sig = self._storage_signature()
+        if cache_valid:
+            if self._same_file_grew_by(pre_sig[0], post_sig[0], written) and post_sig[1:] == pre_sig[1:]:
+                self._cached_signature = post_sig
+            else:
+                self._invalidate_message_count_cache()
+        verified_jsonl_sig = (
+            post_sig[0]
+            if (
+                expected_jsonl_sig is not None
+                and pre_sig[0] == expected_jsonl_sig
+                and self._same_file_grew_by(expected_jsonl_sig, post_sig[0], written)
+            )
+            else None
+        )
+        return written, verified_jsonl_sig
 
-    def _append_jsonl(self, records: Iterable[str]) -> None:
+    def _append_jsonl(self, records: Iterable[str]) -> int:
         """Keep every new record separate, preserving any torn tail as evidence."""
         self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        bytes_written = 0
         with open(self.jsonl_path, "a+b") as handle:
             if handle.tell():
                 handle.seek(-1, os.SEEK_END)
                 if handle.read(1) != b"\n":
                     handle.write(b"\n")
+                    bytes_written += 1
             for record in records:
-                handle.write(record.encode("utf-8") + b"\n")
+                encoded = record.encode("utf-8") + b"\n"
+                handle.write(encoded)
+                bytes_written += len(encoded)
+        return bytes_written
 
     def _jsonl_events(self) -> Iterator[dict[str, Any]]:
         """Read complete records without changing a damaged journal."""
@@ -301,10 +478,36 @@ class SessionStore:
         except OSError:
             return
 
+    def _read_lifecycle_events_checked(self) -> tuple[list[dict[str, Any]], bool]:
+        events: list[dict[str, Any]] = []
+        try:
+            with open(self.jsonl_path, "rb") as handle:
+                for line in handle:
+                    stripped = line.lstrip()
+                    if (
+                        not stripped
+                        or stripped.startswith(_MESSAGE_PREFIXES)
+                        or stripped.startswith(_REPLACE_PREFIXES)
+                        or stripped.startswith(_STATE_PREFIXES)
+                    ):
+                        continue
+                    if not any(marker in stripped for marker in _LIFECYCLE_MARKERS):
+                        continue
+                    try:
+                        event = json.loads(stripped)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    if isinstance(event, dict) and event.get("type") in _LIFECYCLE_TYPES:
+                        events.append(event)
+        except FileNotFoundError:
+            return [], True
+        except OSError:
+            return [], False
+        return events, True
+
     def lifecycle_events(self) -> list[dict[str, Any]]:
-        return [event for event in self._jsonl_events() if event.get("type") in {
-            "session_started", "session_ended", "session_interrupted",
-        }]
+        events, _ok = self._read_lifecycle_events_checked()
+        return events
 
     @staticmethod
     def _process_alive(pid: int) -> bool:
@@ -334,28 +537,57 @@ class SessionStore:
         except OSError:
             return False
 
-    def recover_interrupted(self) -> dict[str, Any] | None:
-        events = self.lifecycle_events()
-        if not events or events[-1].get("type") != "session_started":
-            return None
-        started = events[-1]
-        pid = int(started.get("pid") or 0)
+    def _recover_from_lifecycle_event_state(
+        self,
+        last_event: dict[str, Any] | None,
+        *,
+        checked_jsonl_sig: tuple[int, int, int] | None,
+    ) -> tuple[dict[str, Any] | None, bool, tuple[int, int, int] | None]:
+        """Recover an unended run and report (recovered, live_start, verified_post_sig)."""
+        if not last_event or last_event.get("type") != "session_started":
+            return None, False, checked_jsonl_sig
+        pid = int(last_event.get("pid") or 0)
         if self._process_alive(pid):
-            return None
+            return None, True, None
         recovered = {
-            "run_id": str(started.get("run_id") or ""),
+            "run_id": str(last_event.get("run_id") or ""),
             "previous_pid": pid,
             "reason": "process_exit_without_session_end",
         }
-        self._append_lifecycle("session_interrupted", **recovered)
+        _written, verified_sig = self._append_lifecycle(
+            "session_interrupted",
+            expected_jsonl_sig=checked_jsonl_sig,
+            **recovered,
+        )
+        return recovered, False, verified_sig
+
+    def recover_interrupted(self) -> dict[str, Any] | None:
+        sig_before = self._file_signature(self.jsonl_path)
+        events, read_ok = self._read_lifecycle_events_checked()
+        sig_after = self._file_signature(self.jsonl_path)
+        stable_sig = sig_after if (read_ok and sig_after == sig_before) else None
+        recovered, live_start, verified_sig = self._recover_from_lifecycle_event_state(
+            events[-1] if events else None,
+            checked_jsonl_sig=stable_sig,
+        )
+        self._recovered_jsonl_signature = None if live_start else verified_sig
         return recovered
 
     def ensure_started(self) -> str:
         if self._run_id or self._closed:
             return self._run_id
-        self.recover_interrupted()
+        custom_recover = type(self).recover_interrupted is not SessionStore.recover_interrupted
+        if (
+            custom_recover
+            or self._recovered_jsonl_signature is None
+            or self._file_signature(self.jsonl_path) != self._recovered_jsonl_signature
+        ):
+            self.recover_interrupted()
         self._run_id = uuid.uuid4().hex
-        self._append_lifecycle("session_started", run_id=self._run_id, pid=os.getpid())
+        self._last_start_bytes, _verified = self._append_lifecycle(
+            "session_started", run_id=self._run_id, pid=os.getpid()
+        )
+        self._recovered_jsonl_signature = None
         return self._run_id
 
     def begin(self) -> None:
@@ -432,24 +664,223 @@ class SessionStore:
             "idle_summary": data.get("idle_summary"),
         }
 
-    def _replay_jsonl(self, data: dict[str, Any]) -> None:
-        messages = list(data.get("messages", []))
-        for event in self._jsonl_events():
-            event_type = event.get("type")
-            if event_type == "state":
-                data.update(event.get("state", {}))
-            elif event_type == "replace":
-                messages = list(event.get("messages", []))
-            elif event_type == "message":
-                idx = event.get("index", len(messages))
-                msg = event.get("message")
-                if not isinstance(msg, dict):
-                    continue
-                if isinstance(idx, int) and idx < len(messages):
-                    continue
-                messages.append(msg)
-            elif event_type == "subagent_checkpoint":
-                from .subagent_conversation import apply_checkpoint
+    @staticmethod
+    def _apply_replay_event(
+        event: dict[str, Any],
+        data: dict[str, Any],
+        messages: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        event_type = event.get("type")
+        if event_type == "state":
+            data.update(event.get("state", {}))
+        elif event_type == "replace":
+            messages = list(event.get("messages", []))
+        elif event_type == "message":
+            idx = event.get("index", len(messages))
+            msg = event.get("message")
+            if not isinstance(msg, dict):
+                return messages
+            if isinstance(idx, int) and idx < len(messages):
+                return messages
+            messages.append(msg)
+        elif event_type == "subagent_checkpoint":
+            from .subagent_conversation import apply_checkpoint
 
-                messages, data["subagent_state"] = apply_checkpoint(event, messages)
+            messages, data["subagent_state"] = apply_checkpoint(event, messages)
+        return messages
+
+    def _replay_lines(
+        self,
+        line_iter: Iterable[bytes],
+        data: dict[str, Any],
+        messages: list[dict[str, Any]],
+        *,
+        track_lifecycle: bool,
+        last_lifecycle: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        """Replay lines into *messages* in place so partial progress survives mid-stream OSError."""
+        loads = json.loads
+        append_msg = messages.append
+        try:
+            for line in line_iter:
+                try:
+                    event = loads(line)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                event_type = event.get("type")
+                if event_type == "message":
+                    msg = event.get("message")
+                    if not isinstance(msg, dict):
+                        continue
+                    idx = event.get("index", len(messages))
+                    if isinstance(idx, int) and idx < len(messages):
+                        continue
+                    append_msg(msg)
+                elif event_type == "replace":
+                    messages[:] = event.get("messages", [])
+                elif event_type == "state":
+                    data.update(event.get("state", {}))
+                elif track_lifecycle and event_type in _LIFECYCLE_TYPES:
+                    last_lifecycle = event
+                elif event_type == "subagent_checkpoint":
+                    updated = self._apply_replay_event(event, data, messages)
+                    if updated is not messages:
+                        messages[:] = updated
+        except OSError:
+            return last_lifecycle, False
+        return last_lifecycle, True
+
+    @staticmethod
+    def _find_last_lifecycle_in_mmap(mm: mmap.mmap) -> dict[str, Any] | None:
+        line_end = len(mm)
+        loads = json.loads
+        while line_end > 0:
+            line_start = mm.rfind(b"\n", 0, line_end) + 1
+            if line_start < line_end:
+                head = mm[line_start : min(line_start + 32, line_end)].lstrip()
+                if (
+                    head
+                    and not head.startswith(_MESSAGE_PREFIXES)
+                    and not head.startswith(_REPLACE_PREFIXES)
+                    and not head.startswith(_STATE_PREFIXES)
+                ):
+                    line = mm[line_start:line_end]
+                    if any(marker in line for marker in _LIFECYCLE_MARKERS):
+                        try:
+                            event = loads(line)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            pass
+                        else:
+                            if isinstance(event, dict) and event.get("type") in _LIFECYCLE_TYPES:
+                                return event
+            line_end = line_start - 1
+        return None
+
+    @staticmethod
+    def _apply_states_before_in_mmap(
+        mm: mmap.mmap,
+        limit: int,
+        data: dict[str, Any],
+    ) -> None:
+        pos = 0
+        loads = json.loads
+        while pos < limit:
+            found = mm.find(b'"state"', pos, limit)
+            if found == -1:
+                return
+            line_start = mm.rfind(b"\n", 0, found) + 1
+            line_end = mm.find(b"\n", found, limit)
+            if line_end == -1:
+                line_end = limit
+            head = mm[line_start : min(line_start + 32, line_end)].lstrip()
+            if head.startswith(_MESSAGE_PREFIXES) or head.startswith(_REPLACE_PREFIXES):
+                pos = line_end + 1
+                continue
+            try:
+                event = loads(mm[line_start:line_end])
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pos = line_end + 1
+                continue
+            if isinstance(event, dict) and event.get("type") == "state":
+                data.update(event.get("state", {}))
+            pos = line_end + 1
+
+    def _replay_jsonl_with_lifecycle(
+        self,
+        data: dict[str, Any],
+        *,
+        track_lifecycle: bool = False,
+    ) -> tuple[dict[str, Any] | None, bool]:
+        messages = list(data.get("messages", []))
+        last_lifecycle: dict[str, Any] | None = None
+
+        try:
+            with open(self.jsonl_path, "rb") as handle:
+                file_size = os.fstat(handle.fileno()).st_size
+                if file_size == 0:
+                    data["messages"] = messages
+                    return None, True
+
+                if file_size >= self._MMAP_MIN_BYTES:
+                    try:
+                        mm = mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ)
+                    except (OSError, ValueError):
+                        mm = None
+                    if mm is not None:
+                        try:
+                            loads = json.loads
+                            chosen_replace_start: int | None = None
+                            chosen_replace_end = 0
+                            if (
+                                mm.rfind(b'"replace"') != -1
+                                and mm.find(b"subagent_checkpoint") == -1
+                            ):
+                                search_end = len(mm)
+                                while search_end > 0:
+                                    pos = mm.rfind(b'"replace"', 0, search_end)
+                                    if pos == -1:
+                                        break
+                                    line_start = mm.rfind(b"\n", 0, pos) + 1
+                                    line_end = mm.find(b"\n", pos)
+                                    if line_end == -1:
+                                        line_end = len(mm)
+                                    head = mm[line_start : min(line_start + 32, line_end)].lstrip()
+                                    if head.startswith(_MESSAGE_PREFIXES) or head.startswith(_STATE_PREFIXES):
+                                        search_end = line_start
+                                        continue
+                                    try:
+                                        event = loads(mm[line_start:line_end])
+                                    except (json.JSONDecodeError, UnicodeDecodeError):
+                                        search_end = line_start
+                                        continue
+                                    if isinstance(event, dict) and event.get("type") == "replace":
+                                        chosen_replace_start = line_start
+                                        chosen_replace_end = (
+                                            line_end + 1 if line_end < len(mm) else len(mm)
+                                        )
+                                        messages[:] = event.get("messages", [])
+                                        break
+                                    search_end = line_start
+
+                            if chosen_replace_start is not None:
+                                if chosen_replace_start > 0:
+                                    self._apply_states_before_in_mmap(mm, chosen_replace_start, data)
+                                if track_lifecycle:
+                                    last_lifecycle = self._find_last_lifecycle_in_mmap(mm)
+                                mm.seek(chosen_replace_end)
+                                _, replay_ok = self._replay_lines(
+                                    iter(mm.readline, b""),
+                                    data,
+                                    messages,
+                                    track_lifecycle=False,
+                                )
+                            else:
+                                mm.seek(0)
+                                last_lifecycle, replay_ok = self._replay_lines(
+                                    iter(mm.readline, b""),
+                                    data,
+                                    messages,
+                                    track_lifecycle=track_lifecycle,
+                                )
+                        finally:
+                            mm.close()
+                        data["messages"] = messages
+                        return last_lifecycle, replay_ok
+
+                last_lifecycle, replay_ok = self._replay_lines(
+                    handle,
+                    data,
+                    messages,
+                    track_lifecycle=track_lifecycle,
+                )
+        except OSError:
+            data["messages"] = messages
+            return last_lifecycle, False
+
         data["messages"] = messages
+        return last_lifecycle, replay_ok
+
+    def _replay_jsonl(self, data: dict[str, Any]) -> None:
+        self._replay_jsonl_with_lifecycle(data, track_lifecycle=False)
