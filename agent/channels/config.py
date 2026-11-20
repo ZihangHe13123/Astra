@@ -130,11 +130,16 @@ class WeixinConfig:
     file_allow_users: tuple[str, ...] = ()
     send_file_roots: tuple[str, ...] = (str(Path.home()),)
     max_send_file_bytes: int = 50 * 1024 * 1024
+    # Files and videos the person sends are saved here, one folder a day; empty is ~/Downloads/Astra/微信.
+    receive_files_dir: str = ""
+    # 0 leaves received files on WeChat's side: the conversation gets only their names.
+    max_receive_file_bytes: int = 50 * 1024 * 1024
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "WeixinConfig":
         # 0 is a valid image limit (text only), so only a missing value takes the default.
         images = data.get("max_images")
+        received = data.get("max_receive_file_bytes")
         return cls(
             enabled=_bool(data.get("enabled")),
             allow_users=_items(data.get("allow_users")),
@@ -150,6 +155,8 @@ class WeixinConfig:
             file_allow_users=_items(data.get("file_allow_users")),
             send_file_roots=_items(data.get("send_file_roots"), (str(Path.home()),)),
             max_send_file_bytes=max(1024, int(data.get("max_send_file_bytes") or 50 * 1024 * 1024)),
+            receive_files_dir=str(data.get("receive_files_dir") or "").strip(),
+            max_receive_file_bytes=max(0, int(50 * 1024 * 1024 if received is None else received)),
         )
 
 

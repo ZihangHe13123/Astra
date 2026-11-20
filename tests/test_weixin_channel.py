@@ -254,6 +254,140 @@ def test_images_are_decrypted_from_the_cdn_and_other_hosts_are_not_fetched(ilink
     asyncio.run(scenario())
 
 
+MEDIA_KEY = bytes(range(16))
+
+
+def _on_cdn(fake: FakeIlink, param: str, data: bytes) -> None:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    pad = 16 - len(data) % 16
+    encryptor = Cipher(algorithms.AES(MEDIA_KEY), modes.ECB()).encryptor()
+    fake.media[param] = encryptor.update(data + bytes([pad]) * pad) + encryptor.finalize()
+
+
+def _media(param: str) -> dict:
+    # WeChat's form of the key: base64 of its hex digits.
+    return {"encrypt_query_param": param, "aes_key": base64.b64encode(MEDIA_KEY.hex().encode()).decode()}
+
+
+def _file(param: str, name: str, size: int | None = None) -> dict:
+    payload: dict = {"media": _media(param), "file_name": name}
+    if size is not None:
+        payload["len"] = str(size)
+    return {"type": 4, "file_item": payload}
+
+
+def _received(fake: FakeIlink, tmp_path, messages: list[list[dict]], **config) -> list[ChannelMessage]:
+    async def scenario():
+        store = WeixinStore(tmp_path / "weixin")
+        await logged_in(fake, store)
+        seen: list[ChannelMessage] = []
+
+        async def handler(message, reply):
+            seen.append(message)
+            return "收到"
+
+        channel = adapter(fake, store, handler, **config)
+        await channel.start()
+        try:
+            for items in messages:
+                fake.inbound.put({**fake.text_message(""), "item_list": items})
+            await until(lambda: len(seen) == len(messages), "received messages")
+        finally:
+            await channel.stop()
+        return seen
+
+    return asyncio.run(scenario())
+
+
+def _saved(inbox) -> dict[str, bytes]:
+    return {str(path.relative_to(inbox)).replace(os.sep, "/"): path.read_bytes()
+            for path in sorted(inbox.rglob("*")) if path.is_file()}
+
+
+def test_a_received_file_is_saved_for_the_person_and_a_short_text_file_is_read_in(ilink, tmp_path):
+    notes = "# 状态机\r\n第一行\r\n第二行\n".encode()
+    again = "同名的另一份".encode()
+    report = b"%PDF-1.7\n" + bytes(range(256))
+    _on_cdn(ilink, "md-1", notes)
+    _on_cdn(ilink, "pdf-1", report)
+    _on_cdn(ilink, "md-2", again)
+    _on_cdn(ilink, "odd-1", b"plain")
+    inbox = tmp_path / "inbox"
+
+    first, second, third = _received(ilink, tmp_path, [
+        [{"type": 1, "text_item": {"text": "看看这两个"}}, _file("md-1", "06_笔记.md", len(notes)),
+         _file("pdf-1", "report.pdf")],
+        [_file("md-2", "06_笔记.md")],
+        [_file("odd-1", "../../.secret\n.md")],
+    ], receive_files_dir=str(inbox), max_input_chars=4)
+
+    day = next(inbox.iterdir()).name
+    assert _saved(inbox) == {f"{day}/06_笔记.md": notes, f"{day}/06_笔记 (2).md": again,
+                             f"{day}/report.pdf": report, f"{day}/secret_.md": b"plain"}
+    folder = inbox / day
+    # What the person typed keeps its limit; the files they sent are told in full after it.
+    assert first.text == "\n".join([
+        "看看这两",
+        f"[文件: 06_笔记.md（{len(notes)} B），已保存到 {folder / '06_笔记.md'}]",
+        "[文件内容开始: 06_笔记.md]", "# 状态机\n第一行\n第二行", "[文件内容结束: 06_笔记.md]",
+        f"[文件: report.pdf（{len(report)} B），已保存到 {folder / 'report.pdf'}]",
+    ])
+    assert second.text.startswith(f"[文件: 06_笔记 (2).md（{len(again)} B），已保存到 {folder / '06_笔记 (2).md'}]\n")
+    assert third.text.startswith(f"[文件: secret_.md（5 B），已保存到 {folder / 'secret_.md'}]\n")
+    assert ilink.media_requests == ["md-1", "pdf-1", "md-2", "odd-1"]
+
+
+def test_a_file_over_the_limit_or_out_of_reach_is_named_and_only_what_arrived_is_saved(ilink, tmp_path):
+    import re
+
+    _on_cdn(ilink, "big-1", bytes(5000))
+    _on_cdn(ilink, "big-2", bytes(2000))
+    _on_cdn(ilink, "vid-1", b"\x00\x00\x00\x18ftypmp42" + bytes(88))
+    inbox = tmp_path / "inbox"
+
+    (message,) = _received(ilink, tmp_path, [[
+        _file("big-1", "big.zip", 5000),
+        _file("big-2", "quiet.bin"),
+        _file("gone-1", "gone.txt"),
+        {"type": 4, "file_item": {"file_name": "nowhere.txt", "media": {"full_url": "https://example.com/x"}}},
+        {"type": 5, "video_item": {"media": _media("vid-1")}},
+    ]], receive_files_dir=str(inbox), max_receive_file_bytes=1024)
+
+    lines = message.text.split("\n")
+    assert lines[:4] == [
+        "[文件: big.zip（4.9 KB），超过 1.0 KB 的上限，没有下载]",
+        "[文件: quiet.bin，超过 1.0 KB 的上限，没有下载]",
+        "[文件: gone.txt，没能下载]",
+        "[文件: nowhere.txt，没能下载]",
+    ]
+    video = re.fullmatch(r"\[视频: (视频-\d{6}\.mp4)（100 B），已保存到 (.+)\]", lines[4])
+    assert video is not None and len(lines) == 5
+    day = next(inbox.iterdir()).name
+    assert _saved(inbox) == {f"{day}/{video.group(1)}": b"\x00\x00\x00\x18ftypmp42" + bytes(88)}
+    assert video.group(2) == str(inbox / day / video.group(1))
+    # A declared size over the limit is never fetched, and no host outside WeChat's CDN is asked.
+    assert ilink.media_requests == ["big-2", "gone-1", "vid-1"]
+
+
+def test_files_can_be_left_on_wechats_side_and_the_default_folder_is_one_the_person_opens(ilink, tmp_path):
+    from pathlib import Path
+
+    from agent.channels.weixin import received_files_root
+
+    _on_cdn(ilink, "md-1", b"notes")
+    inbox = tmp_path / "inbox"
+    (message,) = _received(ilink, tmp_path, [[_file("md-1", "notes.md"), {"type": 5, "video_item": {"media": _media("md-1")}}]],
+                           receive_files_dir=str(inbox), max_receive_file_bytes=0)
+    assert message.text == "[文件: notes.md]\n[视频]"
+    assert ilink.media_requests == [] and not inbox.exists()
+
+    assert WeixinConfig.from_dict({}).max_receive_file_bytes == 50 * 1024 * 1024
+    assert WeixinConfig.from_dict({"max_receive_file_bytes": 0}).max_receive_file_bytes == 0
+    assert received_files_root(WeixinConfig()) == Path.home() / "Downloads" / "Astra" / "微信"
+    assert received_files_root(WeixinConfig.from_dict({"receive_files_dir": " ~/收到的 "})) == Path.home() / "收到的"
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate is macOS")
 def test_on_a_mac_the_channel_holds_off_idle_sleep_only_while_it_polls(ilink, tmp_path):
     from agent.channels.keep_awake import KeepAwake

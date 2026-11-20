@@ -153,8 +153,14 @@ in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on`,
   A closed MacBook lid still sleeps unless an external display and power are
   connected. Set `weixin.keep_awake` to `false` to leave sleep alone.
 - **What arrives.** Text, quoted messages, WeChat's own transcript of a voice
-  message, and up to `max_images` images (decrypted from WeChat's CDN). Files and
-  videos arrive as a placeholder.
+  message, and up to `max_images` images (decrypted from WeChat's CDN). Files
+  and videos are downloaded, decrypted and saved in a folder for each day under
+  `~/Downloads/Astra/微信` (`weixin.receive_files_dir` sets another folder), and
+  the message names each one with its size and saved path. A text file
+  (Markdown, plain text, code, CSV, JSON and the like) of up to 64 KB is added
+  to the message whole; for any other file the model uses its file tools, which
+  ask for approval in WeChat when the folder is outside the workspace. A file larger than `max_receive_file_bytes` (50 MB) is not
+  downloaded, and `0` leaves every file on WeChat's side with only its name.
 - **How it answers.** WeChat conversations are told to talk like a chat: short,
   casual, no Markdown, one thought per message. A reply goes out as several
   short messages the way people text (at most `max_bubbles`; `chat_bubbles:
