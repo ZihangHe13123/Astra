@@ -113,9 +113,9 @@ def test_a_wechat_setting_that_is_not_a_number_is_reported_and_the_backend_keeps
         model.server_close()
 
 
-def test_status_tells_the_receive_limit_in_effect_until_the_channel_is_switched_on_again(tmp_path):
-    """A running channel keeps the settings it started with. /weixin status says so, and what it does now,
-    rather than describing the saved file as if it were already in effect."""
+def test_a_running_channel_follows_saved_settings_and_stops_when_switched_off(tmp_path):
+    """Settings saved in channels.json while WeChat is online apply to the next message, and switching the
+    channel off there stops it: no restart, and no command needed in the backend that has the channel."""
     from test_weixin_channel import _file, _on_cdn
 
     model = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
@@ -137,9 +137,9 @@ def test_status_tells_the_receive_limit_in_effect_until_the_channel_is_switched_
     def status(predicate, timeout: float = 20) -> dict:
         return wait_for(lambda e: e.get("type") == "weixin_status" and predicate(e), timeout=timeout)
 
-    def save(limit) -> None:
+    def save(**changes) -> None:
         saved = json.loads(channels.read_text(encoding="utf-8"))
-        saved["weixin"]["max_receive_file_bytes"] = limit
+        saved["weixin"].update(changes)
         channels.write_text(json.dumps(saved), encoding="utf-8")
 
     def receive(param: str) -> None:
@@ -161,33 +161,90 @@ def test_status_tells_the_receive_limit_in_effect_until_the_channel_is_switched_
         receive("first")
         assert saved_files() == ["first.txt"]
 
-        # Saved but not in effect: the channel still downloads, and status says so.
-        save("50 MB")
+        # What status says is what the channel does: the saved setting applies to the next file.
+        save(max_receive_file_bytes="50 MB")
         send(proc, {"type": "command", "cmd": "/weixin status"})
-        pending = status(lambda e: "还没生效" in e.get("error", ""))
-        assert pending["error"] == (
-            "channels.json 里 weixin.max_receive_file_bytes 的改动还没生效，运行 /weixin on 重新启用微信渠道后生效；"
-            '现在收文件上限是 2.0 KB（重新启用后：weixin.max_receive_file_bytes 应为整数，现在是 "50 MB"；'
-            "收到的文件先不下载，只收文件名；写成字节数（如 52428800）后生效。）")
+        warned = status(lambda e: "max_receive_file_bytes" in e.get("error", ""))
+        assert warned["error"] == ('weixin.max_receive_file_bytes 应为整数，现在是 "50 MB"；'
+                                   "收到的文件先不下载，只收文件名；写成字节数（如 52428800）后生效。")
         receive("second")
-        assert saved_files() == ["first.txt", "second.txt"]
-
-        send(proc, {"type": "command", "cmd": "/weixin on"})
-        applied = status(lambda e: e.get("message") == "微信渠道已启用。")
-        assert applied["error"].startswith('weixin.max_receive_file_bytes 应为整数，现在是 "50 MB"')
-        status(lambda e: e.get("state") == "online", timeout=30)
-        receive("third")
-        assert saved_files() == ["first.txt", "second.txt"]
-
-        # Fixed on disk, still not in effect: the problem in effect stays, beside what is waiting.
-        save(2048)
+        assert saved_files() == ["first.txt"]
+        save(max_receive_file_bytes=2048)
         send(proc, {"type": "command", "cmd": "/weixin status"})
-        waiting = status(lambda e: "还没生效" in e.get("error", ""))
-        assert waiting["error"].endswith("运行 /weixin on 重新启用微信渠道后生效；现在收文件不下载，只收文件名。")
-        assert waiting["error"].startswith('weixin.max_receive_file_bytes 应为整数，现在是 "50 MB"')
-        assert ilink.media_requests == ["first", "second"]
+        status(lambda e: "error" not in e and e.get("state") == "online")
+        receive("third")
+        assert saved_files() == ["first.txt", "third.txt"]
+
+        # Switched off in the file: the channel stops taking messages, and the window hears it.
+        save(enabled=False)
+        off = status(lambda e: e.get("state") == "off")
+        assert off["enabled"] is False
+        polls, answered = len(ilink.polls), len(ilink.replies_to(OWNER))
+        ilink.inbound.put(ilink.text_message("还在吗"))
+        time.sleep(1.5)
+        assert (len(ilink.polls), len(ilink.replies_to(OWNER))) == (polls, answered)
+        assert ilink.media_requests == ["first", "third"]
     finally:
         _stop_protocol_backend(proc)
+        model.shutdown()
+        model.server_close()
+        ilink.close()
+
+
+def test_a_change_made_in_a_waiting_backend_reaches_the_one_that_has_wechat(tmp_path):
+    """Two backends, one receiving WeChat and one waiting (the desktop's channel host and a window, say). A
+    setting saved, or /weixin off run, in the waiting one applies in the one that receives."""
+    from test_weixin_channel import _file, _on_cdn
+
+    model = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
+    threading.Thread(target=model.serve_forever, daemon=True).start()
+    ilink = FakeIlink()
+    inbox = tmp_path / "inbox"
+    channels = tmp_path / "channels.json"
+    channels.write_text(json.dumps({"weixin": {"keep_awake": False, "receive_files_dir": str(inbox)}}),
+                        encoding="utf-8")
+    shared = {"ASTRA_HOME": str(tmp_path / "home"), "ASTRA_CHANNEL_CONFIG": str(channels),
+              "ASTRA_WEIXIN_BASE_URL": ilink.base, "ASTRA_WEIXIN_CDN_URL": ilink.cdn,
+              "ASTRA_CONTEXT_INDEX_EMBEDDING": "off"}
+    backends = []
+
+    def start(name: str):
+        root = tmp_path / name
+        root.mkdir()
+        (root / "work").mkdir()
+        proc, _, _, wait_for = _start_question_protocol_backend(
+            root, model.server_port, f"weixin_{name}", workdir=root / "work", env_overrides=shared)
+        backends.append(proc)
+        return proc, lambda predicate, timeout=20: wait_for(
+            lambda e: e.get("type") == "weixin_status" and predicate(e), timeout=timeout)
+
+    try:
+        receiving, receiving_status = start("receiving")
+        receiving_status(lambda e: True, timeout=30)
+        send(receiving, {"type": "command", "cmd": "/weixin login"})
+        receiving_status(lambda e: e.get("state") == "online", timeout=30)
+        waiting, waiting_status = start("waiting")
+        waiting_status(lambda e: e.get("state") == "standby", timeout=30)
+
+        saved = json.loads(channels.read_text(encoding="utf-8"))
+        saved["weixin"]["max_receive_file_bytes"] = 0
+        channels.write_text(json.dumps(saved), encoding="utf-8")
+        _on_cdn(ilink, "note", b"notes")
+        ilink.inbound.put({**ilink.text_message(""), "item_list": [_file("note", "note.md")]})
+        deadline = time.monotonic() + 30
+        while not ilink.replies_to(OWNER) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert ilink.replies_to(OWNER) and ilink.media_requests == [] and not inbox.exists()
+
+        send(waiting, {"type": "command", "cmd": "/weixin off"})
+        waiting_status(lambda e: e.get("message") == "微信渠道已停用。")
+        receiving_status(lambda e: e.get("state") == "off")
+        polls = len(ilink.polls)
+        time.sleep(1.5)
+        assert len(ilink.polls) == polls
+    finally:
+        for proc in backends:
+            _stop_protocol_backend(proc)
         model.shutdown()
         model.server_close()
         ilink.close()

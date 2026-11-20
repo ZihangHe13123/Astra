@@ -67,10 +67,10 @@ async def logged_in(fake: FakeIlink, store: WeixinStore):
     return account, shown, reports
 
 
-def adapter(fake, store, handler, *, awake=None, **config):
+def adapter(fake, store, handler, *, awake=None, settings=None, **config):
     return WeixinAdapter(WeixinConfig(enabled=True, **config), handler, store=store, client=client(fake),
                          keep_awake=awake or FakeAwake(), owner_retry=0.05, failure_delays=(0.01, 0.01),
-                         pause=lambda _text: 0.0)
+                         pause=lambda _text: 0.0, settings=settings)
 
 
 def test_a_scanned_login_is_kept_privately_and_the_bot_then_answers_its_owner(ilink, tmp_path):
@@ -449,6 +449,108 @@ def test_a_saved_file_never_takes_a_name_windows_would_refuse(ilink, tmp_path):
                              f"{day}/_lpt².tar.gz": b"dev-3", f"{day}/{'a' * 175}": b"long-1",
                              f"{day}/{'b' * 175}.txt": b"long-2", f"{day}/_CON.txt": b"long-3",
                              f"{day}/_LPT1.csv": b"long-4"}
+
+
+def _save(path, **settings) -> None:
+    saved = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+    saved.setdefault("weixin", {}).update(settings)
+    path.write_text(json.dumps(saved), encoding="utf-8")
+
+
+def _following(path):
+    """What the backend gives a channel: the settings saved in channels.json, read when asked."""
+    from agent.channels.config import load_channels_config
+
+    return lambda: load_channels_config(path, strict=True).weixin
+
+
+def test_a_running_channel_follows_channels_json_and_stops_when_switched_off(ilink, tmp_path):
+    saved = tmp_path / "channels.json"
+    inbox = tmp_path / "inbox"
+    _save(saved, enabled=True, keep_awake=True, receive_files_dir=str(inbox), max_receive_file_bytes=2048)
+    _on_cdn(ilink, "a", b"first")
+    _on_cdn(ilink, "b", b"second")
+
+    async def scenario():
+        store = WeixinStore(tmp_path / "weixin")
+        await logged_in(ilink, store)
+        seen: list[ChannelMessage] = []
+
+        async def handler(message, reply):
+            seen.append(message)
+            return "收到"
+
+        awake = FakeAwake()
+        channel = adapter(ilink, store, handler, awake=awake, settings=_following(saved))
+        await channel.start()
+        try:
+            await until(lambda: channel.running and awake.active, "online")
+            ilink.inbound.put({**ilink.text_message(""), "item_list": [_file("a", "a.txt")]})
+            await until(lambda: len(seen) == 1, "first file")
+            # Saved while the channel runs: the next message follows it, with no restart.
+            _save(saved, max_receive_file_bytes=0, keep_awake=False)
+            ilink.inbound.put({**ilink.text_message(""), "item_list": [_file("b", "b.txt")]})
+            await until(lambda: len(seen) == 2, "second file")
+            await until(lambda: not awake.active, "sleep allowed again")
+            # A file being rewritten (not JSON for a moment) leaves the settings as they were.
+            saved.write_text("{", encoding="utf-8")
+            await asyncio.sleep(0.5)
+            assert channel.running
+            saved.write_text(json.dumps({"weixin": {"enabled": True, "keep_awake": False,
+                                                    "receive_files_dir": str(inbox), "max_receive_file_bytes": 0}}),
+                             encoding="utf-8")
+            # Switched off in the file: polling stops, and nothing more is taken from WeChat.
+            _save(saved, enabled=False)
+            await until(lambda: channel.status()["state"] == "off", "switched off")
+            polls = len(ilink.polls)
+            ilink.inbound.put(ilink.text_message("还在吗"))
+            await asyncio.sleep(1.0)
+            assert len(ilink.polls) == polls and len(seen) == 2
+            # Switched on again: the message that waited arrives.
+            _save(saved, enabled=True)
+            await until(lambda: len(seen) == 3, "the message that waited")
+        finally:
+            await channel.stop()
+        return seen
+
+    first, second, third = asyncio.run(scenario())
+    assert first.attachments.startswith("[文件: a.txt（5 B），已保存到")
+    assert (second.attachments, third.text) == ("[文件: b.txt]", "还在吗")
+    assert ilink.media_requests == ["a"]
+
+
+def test_a_channel_switched_off_is_not_taken_over_by_a_backend_that_waits(ilink, tmp_path):
+    saved = tmp_path / "channels.json"
+    _save(saved, enabled=True, keep_awake=False)
+
+    async def scenario():
+        store = WeixinStore(tmp_path / "weixin")
+        await logged_in(ilink, store)
+
+        async def handler(message, reply):
+            return "ok"
+
+        first = adapter(ilink, store, handler, settings=_following(saved))
+        second = adapter(ilink, WeixinStore(tmp_path / "weixin"), handler, settings=_following(saved))
+        await first.start()
+        await until(lambda: first.running, "first online")
+        await second.start()
+        try:
+            await until(lambda: second.status()["state"] == "standby", "second waits")
+            _save(saved, enabled=False)
+            await until(lambda: [first.status()["state"], second.status()["state"]] == ["off", "off"], "both off")
+            polls = len(ilink.polls)
+            await asyncio.sleep(0.5)
+            assert len(ilink.polls) == polls
+            _save(saved, enabled=True)
+            await until(lambda: first.running or second.running, "one polls again")
+            await asyncio.sleep(0.3)
+            assert [first.running, second.running].count(True) == 1
+        finally:
+            await first.stop()
+            await second.stop()
+
+    asyncio.run(scenario())
 
 
 def test_quotes_and_placeholders_never_crowd_out_or_stand_in_for_the_persons_words(ilink, tmp_path):

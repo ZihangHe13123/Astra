@@ -715,9 +715,12 @@ class WeixinAdapter(ChannelAdapter):
     def __init__(self, config: WeixinConfig, handler: MessageHandler, *, store: WeixinStore | None = None,
                  client: IlinkClient | None = None, keep_awake: KeepAwake | None = None,
                  owner_retry: float = 30.0, failure_delays: tuple[float, float] = (2.0, 30.0),
-                 pause: Callable[[str], float] = typing_pause, priority: bool = False) -> None:
+                 pause: Callable[[str], float] = typing_pause, priority: bool = False,
+                 settings: Callable[[], WeixinConfig] | None = None) -> None:
         super().__init__(handler)
         self.config = config
+        # The saved settings (channels.json), followed while the channel runs; None keeps ``config`` as given.
+        self._settings = settings
         self.store = store or WeixinStore()
         self._client = client
         self._keep_awake = keep_awake if keep_awake is not None else KeepAwake("Astra WeChat channel online")
@@ -752,7 +755,31 @@ class WeixinAdapter(ChannelAdapter):
 
     def state_key(self) -> tuple:
         """What a status shows that can change on its own, read without touching the disk."""
-        return (self._state, self._lock is not None, self._keep_awake.active, self._error)
+        return (self._state, self._lock is not None, self._keep_awake.active, self._error, self.config.problems)
+
+    def _refresh(self) -> WeixinConfig:
+        """Follow channels.json: the saved settings replace the ones in use, read before each message and,
+        while the channel waits, every couple of seconds. A change applies without a restart, in whichever
+        backend has the channel; a file that cannot be read leaves the settings as they are."""
+        if self._settings is None:
+            return self.config
+        try:
+            fresh = self._settings()
+        except Exception as exc:
+            logger.warning("weixin settings could not be read, kept as they were: %s", type(exc).__name__)
+            return self.config
+        if fresh != self.config or fresh.problems != self.config.problems:
+            self.config = fresh
+            if self._lock is not None and fresh.keep_awake != self._keep_awake.active:
+                if fresh.keep_awake:
+                    self._keep_awake.start()
+                else:
+                    self._keep_awake.stop()
+        return self.config
+
+    def _switched_off(self) -> bool:
+        """Whether channels.json now switches WeChat off (only for a channel that follows the file)."""
+        return self._settings is not None and not self._refresh().enabled
 
     def status(self) -> dict[str, Any]:
         account = self.store.account()
@@ -822,6 +849,11 @@ class WeixinAdapter(ChannelAdapter):
 
     async def _run_owned(self) -> None:
         while True:
+            if self._switched_off():
+                # Neither polling nor taking over from another backend until it is switched on again.
+                self._state = "off"
+                await asyncio.sleep(min(self._owner_retry, _HOST_CHECK_SECONDS))
+                continue
             account = self.store.account()
             if account is None:
                 self._state = "logged_out"
@@ -850,19 +882,20 @@ class WeixinAdapter(ChannelAdapter):
                 self._account = account
                 self._tokens = self.store.context_tokens()
                 self._state = "online"
-                expired = await self._poll(account, yield_to_host=not hosting)
+                ended = await self._poll(account, yield_to_host=not hosting)
             finally:
                 self._release()
-            if expired:
+            if ended == "expired":
                 self._state = "expired"
                 self._error = "微信登录已失效，请重新扫码登录。"
                 return
+            # Handed to the desktop's channel host, or switched off: round again to wait.
 
-    async def _poll(self, account: WeixinAccount, *, yield_to_host: bool = False) -> bool:
-        """Deliver messages until cancelled; True when WeChat reports the login expired.
-
-        With ``yield_to_host``, polling stops when the desktop's channel host appears: what was
-        already taken from WeChat is answered first, then the host continues from the saved cursor.
+    async def _poll(self, account: WeixinAccount, *, yield_to_host: bool = False) -> str:
+        """Deliver messages until cancelled. Returns "expired" when WeChat reports the login expired,
+        "host" when the desktop's channel host takes over (only with ``yield_to_host``) and "off" when
+        channels.json switches the channel off. Before the last two, what was already taken from WeChat is
+        answered; the next poller continues from the saved cursor.
         """
         assert self._client is not None
         worker = asyncio.create_task(self._work(), name="weixin-inbox")
@@ -871,10 +904,11 @@ class WeixinAdapter(ChannelAdapter):
             while True:
                 try:
                     response = await self._next_updates(account, cursor, timeout_ms, yield_to_host)
-                    if response is None:
-                        logger.info("weixin handed over to the desktop's channel host")
+                    if isinstance(response, str):
+                        logger.info("weixin %s", "handed over to the desktop's channel host" if response == "host"
+                                    else "switched off in channels.json")
                         await self._drain()
-                        return False
+                        return response
                 except (httpx.HTTPError, WeixinError) as exc:
                     if _stop_requested():
                         raise asyncio.CancelledError from exc
@@ -886,7 +920,7 @@ class WeixinAdapter(ChannelAdapter):
                 code = response.get("errcode") or response.get("ret") or 0
                 if code == _SESSION_EXPIRED:
                     logger.warning("weixin login expired; scan the code again")
-                    return True
+                    return "expired"
                 if code:
                     failures += 1
                     logger.warning("weixin poll answered ret=%s errcode=%s", response.get("ret"), response.get("errcode"))
@@ -909,14 +943,17 @@ class WeixinAdapter(ChannelAdapter):
             await _finish(worker, 5.0)
 
     async def _next_updates(self, account: WeixinAccount, cursor: str, timeout_ms: int,
-                            yield_to_host: bool) -> dict | None:
-        """The next long poll; None when the desktop's channel host takes over first.
+                            yield_to_host: bool) -> dict | str:
+        """The next long poll; "host" when the desktop's channel host takes over first, "off" when
+        channels.json switches the channel off first.
 
-        A poll given up early returns nothing and moves no cursor, so the host gets the same messages.
+        A poll given up early returns nothing and moves no cursor, so the next poller gets the same messages.
         """
         assert self._client is not None
         if yield_to_host and self._host_present():
-            return None
+            return "host"
+        if self._switched_off():
+            return "off"
         request = asyncio.create_task(self._client.get_updates(account, cursor, timeout_ms))
         try:
             while True:
@@ -924,7 +961,9 @@ class WeixinAdapter(ChannelAdapter):
                 if done:
                     return request.result()
                 if yield_to_host and self._host_present():
-                    return None
+                    return "host"
+                if self._switched_off():
+                    return "off"
         finally:
             if not request.done():
                 await _finish(request, 5.0)
@@ -1011,6 +1050,8 @@ class WeixinAdapter(ChannelAdapter):
         account = self._account
         if account is None:
             return
+        # The settings saved now apply to this message (who is answered, limits, where files go).
+        self._refresh()
         sender = str(message.get("from_user_id") or "").strip()
         if not sender or sender == account.account_id or self._seen_before(str(message.get("message_id") or "")):
             return

@@ -241,14 +241,22 @@ def set_channel_enabled(section: str, enabled: bool, path: str | Path | None = N
     return set_channel_setting(section, "enabled", enabled, path)
 
 
-def load_channels_config(path: str | Path | None = None) -> ChannelsConfig:
+def load_channels_config(path: str | Path | None = None, *, strict: bool = False) -> ChannelsConfig:
+    """The channels' settings; a missing file switches every channel off.
+
+    A file that cannot be read as a JSON object is also taken as every channel off, unless ``strict``: then
+    it raises, so a running channel that follows the file keeps its settings while an editor rewrites it."""
     source = channels_config_path(path)
     data: dict[str, Any] = {}
     if source.exists():
         try:
             loaded = json.loads(source.read_text(encoding="utf-8"))
-            data = loaded if isinstance(loaded, dict) else {}
+            if not isinstance(loaded, dict):
+                raise ValueError("channels.json does not hold a JSON object")
+            data = loaded
         except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            if strict:
+                raise
             data = {}
 
     onebot_data = data.get("qq") or data.get("onebot") or {}
