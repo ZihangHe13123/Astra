@@ -113,6 +113,86 @@ def test_a_wechat_setting_that_is_not_a_number_is_reported_and_the_backend_keeps
         model.server_close()
 
 
+def test_status_tells_the_receive_limit_in_effect_until_the_channel_is_switched_on_again(tmp_path):
+    """A running channel keeps the settings it started with. /weixin status says so, and what it does now,
+    rather than describing the saved file as if it were already in effect."""
+    from test_weixin_channel import _file, _on_cdn
+
+    model = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
+    threading.Thread(target=model.serve_forever, daemon=True).start()
+    ilink = FakeIlink()
+    inbox = tmp_path / "inbox"
+    channels = tmp_path / "channels.json"
+    settings = {"keep_awake": False, "receive_files_dir": str(inbox), "max_receive_file_bytes": 2048}
+    channels.write_text(json.dumps({"weixin": settings}), encoding="utf-8")
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    proc, _, _, wait_for = _start_question_protocol_backend(
+        tmp_path, model.server_port, "weixin_limits", workdir=workdir,
+        env_overrides={"ASTRA_HOME": str(tmp_path / "home"), "ASTRA_CHANNEL_CONFIG": str(channels),
+                       "ASTRA_WEIXIN_BASE_URL": ilink.base, "ASTRA_WEIXIN_CDN_URL": ilink.cdn,
+                       "ASTRA_CONTEXT_INDEX_EMBEDDING": "off"},
+    )
+
+    def status(predicate, timeout: float = 20) -> dict:
+        return wait_for(lambda e: e.get("type") == "weixin_status" and predicate(e), timeout=timeout)
+
+    def save(limit) -> None:
+        saved = json.loads(channels.read_text(encoding="utf-8"))
+        saved["weixin"]["max_receive_file_bytes"] = limit
+        channels.write_text(json.dumps(saved), encoding="utf-8")
+
+    def receive(param: str) -> None:
+        _on_cdn(ilink, param, param.encode() * 3)
+        answered = len(ilink.replies_to(OWNER))
+        ilink.inbound.put({**ilink.text_message(""), "item_list": [_file(param, f"{param}.txt")]})
+        deadline = time.monotonic() + 30
+        while len(ilink.replies_to(OWNER)) == answered and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert len(ilink.replies_to(OWNER)) > answered
+
+    def saved_files() -> list[str]:
+        return sorted(path.name for path in inbox.rglob("*") if path.is_file())
+
+    try:
+        status(lambda e: True, timeout=30)
+        send(proc, {"type": "command", "cmd": "/weixin login"})
+        status(lambda e: e.get("state") == "online", timeout=30)
+        receive("first")
+        assert saved_files() == ["first.txt"]
+
+        # Saved but not in effect: the channel still downloads, and status says so.
+        save("50 MB")
+        send(proc, {"type": "command", "cmd": "/weixin status"})
+        pending = status(lambda e: "还没生效" in e.get("error", ""))
+        assert pending["error"] == (
+            "channels.json 里 weixin.max_receive_file_bytes 的改动还没生效，运行 /weixin on 重新启用微信渠道后生效；"
+            '现在收文件上限是 2.0 KB（重新启用后：weixin.max_receive_file_bytes 应为整数，现在是 "50 MB"；'
+            "收到的文件先不下载，只收文件名；写成字节数（如 52428800）后生效。）")
+        receive("second")
+        assert saved_files() == ["first.txt", "second.txt"]
+
+        send(proc, {"type": "command", "cmd": "/weixin on"})
+        applied = status(lambda e: e.get("message") == "微信渠道已启用。")
+        assert applied["error"].startswith('weixin.max_receive_file_bytes 应为整数，现在是 "50 MB"')
+        status(lambda e: e.get("state") == "online", timeout=30)
+        receive("third")
+        assert saved_files() == ["first.txt", "second.txt"]
+
+        # Fixed on disk, still not in effect: the problem in effect stays, beside what is waiting.
+        save(2048)
+        send(proc, {"type": "command", "cmd": "/weixin status"})
+        waiting = status(lambda e: "还没生效" in e.get("error", ""))
+        assert waiting["error"].endswith("运行 /weixin on 重新启用微信渠道后生效；现在收文件不下载，只收文件名。")
+        assert waiting["error"].startswith('weixin.max_receive_file_bytes 应为整数，现在是 "50 MB"')
+        assert ilink.media_requests == ["first", "second"]
+    finally:
+        _stop_protocol_backend(proc)
+        model.shutdown()
+        model.server_close()
+        ilink.close()
+
+
 class RecordingModelHandler(ModelHandler):
     models: list[str] = []
 

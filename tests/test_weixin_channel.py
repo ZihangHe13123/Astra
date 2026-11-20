@@ -434,17 +434,21 @@ def test_only_a_file_that_arrived_whole_is_saved_and_the_limit_is_kept(ilink, tm
 
 
 def test_a_saved_file_never_takes_a_name_windows_would_refuse(ilink, tmp_path):
-    for param in ("dev-1", "dev-2", "dev-3", "long-1", "long-2"):
+    for param in ("dev-1", "dev-2", "dev-3", "long-1", "long-2", "long-3", "long-4"):
         _on_cdn(ilink, param, param.encode())
     inbox = tmp_path / "inbox"
     # Cut to the name limit, these would end in spaces.
     _received(ilink, tmp_path, [[_file("dev-1", "CON .txt"), _file("dev-2", "conin$.log"),
                                  _file("dev-3", "lpt².tar.gz"), _file("long-1", "a" * 175 + " " * 10 + "z"),
-                                 _file("long-2", "b" * 175 + " . " * 4 + "z.txt")]], receive_files_dir=str(inbox))
+                                 _file("long-2", "b" * 175 + " . " * 4 + "z.txt"),
+                                 # Cut and trimmed, these would be a device name.
+                                 _file("long-3", "CON" + " " * 200 + "x.txt"),
+                                 _file("long-4", "LPT1" + " " * 200 + "y.csv")]], receive_files_dir=str(inbox))
     day = next(inbox.iterdir()).name
     assert _saved(inbox) == {f"{day}/_CON .txt": b"dev-1", f"{day}/_conin$.log": b"dev-2",
                              f"{day}/_lpt².tar.gz": b"dev-3", f"{day}/{'a' * 175}": b"long-1",
-                             f"{day}/{'b' * 175}.txt": b"long-2"}
+                             f"{day}/{'b' * 175}.txt": b"long-2", f"{day}/_CON.txt": b"long-3",
+                             f"{day}/_LPT1.csv": b"long-4"}
 
 
 def test_quotes_and_placeholders_never_crowd_out_or_stand_in_for_the_persons_words(ilink, tmp_path):

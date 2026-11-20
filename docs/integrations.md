@@ -174,7 +174,10 @@ in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on`,
   of the message still arrives. A number setting that is set but is not a
   whole number (`"50 MB"`, or empty) does not stop Astra: `/weixin status` and the log name it and
   what is used instead, and for `max_receive_file_bytes` that is downloading
-  nothing until it is fixed.
+  nothing until it is fixed. A running channel keeps the settings it started
+  with, apart from `model`: after editing `channels.json`, run `/weixin on`
+  to apply them. Until then `/weixin status` names the changes that are
+  waiting and the receive limit still in effect.
 - **How it answers.** WeChat conversations are told to talk like a chat: short,
   casual, no Markdown, one thought per message. A reply goes out as several
   short messages the way people text (at most `max_bubbles`; `chat_bubbles:

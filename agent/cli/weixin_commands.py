@@ -9,9 +9,10 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from dataclasses import fields
 from typing import TYPE_CHECKING
 
-from agent.channels.config import load_channels_config, set_channel_enabled, set_channel_setting
+from agent.channels.config import WeixinConfig, load_channels_config, set_channel_enabled, set_channel_setting
 from agent.channels.manager import ChannelManager
 from agent.runtime.paths import state_path
 
@@ -27,6 +28,35 @@ USAGE = "用法：/weixin [status|login|logout|on|off|model <模型>|model defau
 
 def is_weixin_command(command: str) -> bool:
     return command.lower().split(maxsplit=1)[:1] == ["/weixin"]
+
+
+# Read for every message, so a change needs no restart of the channel.
+_LIVE_SETTINGS = frozenset({"enabled", "model"})
+
+
+def _receiving(config: WeixinConfig) -> str:
+    limit = config.max_receive_file_bytes
+    if limit <= 0:
+        return "不下载，只收文件名"
+    shown = f"{limit / 1024 / 1024:.1f} MB" if limit >= 1024 * 1024 else f"{limit / 1024:.1f} KB"
+    return f"上限是 {shown}"
+
+
+def settings_notes(running: WeixinConfig | None, saved: WeixinConfig) -> list[str]:
+    """What /weixin status says about settings: problems in the ones in effect, and saved changes a running
+    channel has not picked up yet (it reads most of them when it starts), with the receive limit in effect."""
+    if running is None:
+        return list(saved.problems)
+    notes = list(running.problems)
+    pending = [item.name for item in fields(WeixinConfig)
+               if item.compare and item.name not in _LIVE_SETTINGS
+               and getattr(running, item.name) != getattr(saved, item.name)]
+    if pending:
+        note = (f"channels.json 里 {'、'.join(f'weixin.{name}' for name in pending)} 的改动还没生效，"
+                f"运行 /weixin on 重新启用微信渠道后生效；现在收文件{_receiving(running)}")
+        later = [problem for problem in saved.problems if problem not in running.problems]
+        notes.append(note + (f"（重新启用后：{''.join(later)}）" if later else "。"))
+    return notes
 
 
 class WeixinCommands:
@@ -82,8 +112,10 @@ class WeixinCommands:
             event["qr"] = dict(self._qr)
         if message:
             event["message"] = message
-        # A setting in channels.json that could not be read is said here, with what is used instead.
-        problem = error or str(status.get("error") or "") or "；".join(config.problems)
+        # A setting in channels.json that could not be read is said here, with what is used instead; a running
+        # channel's own settings are the ones in effect.
+        problem = (error or str(status.get("error") or "")
+                   or "；".join(settings_notes(adapter.config if adapter is not None else None, config)))
         if problem:
             event["error"] = problem
         return event

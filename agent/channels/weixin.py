@@ -474,14 +474,21 @@ def _file_name(name: object, fallback: str) -> str:
         return fallback
     path = Path(text)
     stem, suffix = (path.stem, path.suffix) if len(path.suffix) <= 16 else (text, "")
-    # Windows reads "CON .txt" and "con.tar.gz" as the device too: the part before the first dot, spaces trimmed.
-    if stem.split(".")[0].rstrip(" ").upper() in _RESERVED_FILE_NAMES:
+
+    def device(part: str) -> bool:
+        # Windows reads "CON .txt" and "con.tar.gz" as the device too: the part before the first dot, spaces trimmed.
+        return part.split(".")[0].rstrip(" ").upper() in _RESERVED_FILE_NAMES
+
+    if device(stem):
         stem = f"_{stem}"
     if len(f"{stem}{suffix}".encode()) > _MAX_FILE_NAME_BYTES:
         while len(f"{stem}{suffix}".encode()) > _MAX_FILE_NAME_BYTES and len(stem) > 1:
             stem = stem[:-1]
-        # A cut can leave a space or a dot at the end, which Windows does not keep in a name.
+        # A cut can leave a space or a dot at the end, which Windows does not keep in a name, or leave a device
+        # name ("CON" + spaces + more); the name is checked again once it is final.
         stem = stem.rstrip(". ") or "_"
+        if device(stem):
+            stem = f"_{stem}"
     return f"{stem}{suffix}"
 
 
