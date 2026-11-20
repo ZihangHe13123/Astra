@@ -178,14 +178,16 @@ in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on`,
   whichever Astra backend has it: a change applies to the next message, and
   `"enabled": false` (or `/weixin off` in any window) stops the one receiving
   within a few seconds, after it answers what it already took. A file that is
-  not valid JSON (a typo, or an editor midway through saving) changes
-  nothing: running channels keep their settings, `/weixin status` says the
-  file cannot be read, and Astra saves no setting over it until it is fixed.
+  there but empty or not valid JSON (a typo, or an editor midway through
+  saving) changes nothing: running channels keep their settings, the WeChat
+  model included, `/weixin status` says the file cannot be read, and Astra
+  saves no setting over it until it is fixed.
 - **Nothing taken is lost.** Messages already taken from WeChat stay saved
   until they are answered. If the channel stops first (switched off, or Astra
   quitting or restarting), the next backend to receive WeChat answers them.
   The one being answered at that moment is not run again, since what it did
-  may already have happened; WeChat gets a note asking to send it again.
+  may already have happened; WeChat gets a note asking to send it again, or,
+  if WeChat does not take it then, right before the person's next answer.
 - **How it answers.** WeChat conversations are told to talk like a chat: short,
   casual, no Markdown, one thought per message. A reply goes out as several
   short messages the way people text (at most `max_bubbles`; `chat_bubbles:

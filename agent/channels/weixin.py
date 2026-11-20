@@ -36,6 +36,7 @@ import uuid
 import wave
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -83,6 +84,8 @@ _SEND_ATTEMPTS = 4
 # and how long it then keeps answering what it already took from WeChat before handing over.
 _HOST_CHECK_SECONDS = 2.0
 _HANDOVER_DRAIN_SECONDS = 120.0
+# How long a stopping channel waits for its saves to land before it lets the channel go.
+_SETTLE_SECONDS = 10.0
 # The CDN sometimes answers an upload with a passing server error; try it again after a short pause.
 _UPLOAD_ATTEMPTS = 3
 _UPLOAD_PAUSE = 1.0
@@ -147,6 +150,20 @@ def mask(value: str) -> str:
     return f"{value[:4]}…" if len(value) > 4 else value
 
 
+class _StaleSave(Exception):
+    """A save of a poller that is no longer the poller of record."""
+
+
+def _epoch(data: dict) -> int:
+    value = data.get("epoch")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+
+
+def _pending_entries(entries: object) -> list[dict]:
+    return [entry for entry in entries if isinstance(entry, dict) and isinstance(entry.get("message"), dict)
+            ] if isinstance(entries, list) else []
+
+
 class WeixinStore:
     """Login, poll cursor and per-peer reply tokens, private to this installation."""
 
@@ -199,14 +216,39 @@ class WeixinStore:
 
     def pending(self) -> list[dict]:
         """Messages taken from WeChat that were not answered yet, oldest first: {"message": …, "started": …}."""
-        entries = self._read("sync.json").get("pending")
-        return [entry for entry in entries if isinstance(entry, dict) and isinstance(entry.get("message"), dict)
-                ] if isinstance(entries, list) else []
+        return _pending_entries(self._read("sync.json").get("pending"))
 
-    def save_sync(self, cursor: str, pending: list[dict]) -> None:
+    def claim_sync(self) -> tuple[int, str, list[dict]]:
+        """Become the poller of record: in one locked read-modify-write, raise the epoch in sync.json and read
+        the cursor and the unanswered messages. From then on the saves of an earlier poller, which carry an
+        older epoch, are refused (see save_sync)."""
+        claimed: dict[str, Any] = {}
+
+        def change(data: dict) -> None:
+            epoch = _epoch(data) + 1
+            data["epoch"] = epoch
+            claimed.update(epoch=epoch, cursor=str(data.get("get_updates_buf") or ""),
+                           pending=_pending_entries(data.get("pending")))
+
+        update_preferences(self.root / "sync.json", change)
+        return claimed["epoch"], claimed["cursor"], claimed["pending"]
+
+    def save_sync(self, cursor: str, pending: list[dict], epoch: int) -> bool:
         """The cursor and the messages before it still to answer, in one write, so a stop between taking
-        messages from WeChat and answering them loses none."""
-        self._write("sync.json", {"get_updates_buf": cursor, "pending": pending})
+        messages from WeChat and answering them loses none. False, and nothing written, when another poller
+        has claimed the channel since ``epoch``: a late save must not undo what it did."""
+
+        def change(data: dict) -> None:
+            if _epoch(data) != epoch:
+                raise _StaleSave
+            data.clear()
+            data.update({"epoch": epoch, "get_updates_buf": cursor, "pending": pending})
+
+        try:
+            update_preferences(self.root / "sync.json", change)
+        except _StaleSave:
+            return False
+        return True
 
     def context_tokens(self) -> dict[str, str]:
         return {str(k): str(v) for k, v in self._read("context-tokens.json").items() if v}
@@ -750,6 +792,12 @@ class WeixinAdapter(ChannelAdapter):
         self._pending: list[dict] = []
         self._cursor = ""
         self._pending_lock = asyncio.Lock()
+        # Saves go through one thread, so they land in the order they were made even when a turn waiting on one
+        # is cancelled; those still on their way are waited for before the channel is handed over.
+        self._writer: ThreadPoolExecutor | None = None
+        self._writes: set[asyncio.Future] = set()
+        # This poller's claim on sync.json (see WeixinStore.claim_sync).
+        self._epoch = 0
         self._settings_unreadable = False
         self._pause = pause
         self._tickets: dict[str, tuple[str, float]] = {}
@@ -813,7 +861,11 @@ class WeixinAdapter(ChannelAdapter):
         task, self._task = self._task, None
         if task is not None and not task.done():
             await _finish(task, 10.0)
+        await self._settle_writes()
         self._release()
+        if self._writer is not None:
+            self._writer.shutdown(wait=False)
+            self._writer = None
         self._leave_host()
         if self._client is not None:
             await self._client.close()
@@ -901,6 +953,7 @@ class WeixinAdapter(ChannelAdapter):
                 self._state = "online"
                 ended = await self._poll(account, yield_to_host=not hosting)
             finally:
+                await self._settle_writes()
                 self._release()
             if ended == "expired":
                 self._state = "expired"
@@ -967,44 +1020,93 @@ class WeixinAdapter(ChannelAdapter):
     async def _resume_pending(self, account: WeixinAccount) -> None:
         """Take over what the last poller (this backend or another) left: messages it had not started are
         answered now. One it was answering when it stopped is not run again, since its tools may already have
-        acted; the person is told it was not finished."""
-        cursor, pending = await asyncio.to_thread(lambda: (self.store.sync_buf(), self.store.pending()))
+        acted; the person is told it was not finished, and if WeChat refuses that note now, when they next write."""
+        epoch, cursor, pending = await self._in_writer(self.store.claim_sync)
+        self._epoch = epoch
         self._inbox = asyncio.Queue()
-        interrupted = [entry for entry in pending if entry.get("started")]
+        allowed = self.config.allow_users or ((account.user_id,) if account.user_id else ())
         async with self._pending_lock:
             self._cursor = cursor
-            self._pending = [entry for entry in pending if not entry.get("started")]
-            if interrupted:
+            kept: list[dict] = []
+            for entry in pending:
+                if entry.get("started") and not entry.get("notice"):
+                    message = entry["message"]
+                    sender = str(message.get("from_user_id") or "").strip()
+                    if sender not in allowed or message.get("room_id") or message.get("chat_room_id"):
+                        continue
+                    entry = {**entry, "notice": True}
+                kept.append(entry)
+            changed = kept != pending
+            self._pending = kept
+            if changed:
                 await self._save_pending()
-        for entry in self._pending:
+        waiting = [entry for entry in self._pending if not entry.get("started")]
+        for entry in waiting:
             self._inbox.put_nowait(entry)
-        if self._pending:
-            logger.info("weixin resumes %d message(s) taken before the last stop", len(self._pending))
-        allowed = self.config.allow_users or ((account.user_id,) if account.user_id else ())
-        for entry in interrupted:
-            message = entry["message"]
-            sender = str(message.get("from_user_id") or "").strip()
-            if sender not in allowed or message.get("room_id") or message.get("chat_room_id"):
-                continue
-            words = next((str((item.get("text_item") or {}).get("text") or "") for item in message.get("item_list") or []
-                          if isinstance(item, dict) and item.get("type") == _ITEM_TEXT), "").strip()
-            quoted = f"「{words[:20]}{'…' if len(words) > 20 else ''}」这条消息" if words else "上一条消息"
-            try:
-                await self.send_text(sender, f"{quoted}还没处理完，微信渠道就停了，没有接着处理；需要的话请再发一次。",
-                                     bubbles=False)
-            except (httpx.HTTPError, WeixinError) as exc:
-                logger.warning("weixin could not say a message was left unfinished: %s", type(exc).__name__)
+        if waiting:
+            logger.info("weixin resumes %d message(s) taken before the last stop", len(waiting))
+        for entry in [entry for entry in self._pending if entry.get("notice")]:
+            await self._tell_unfinished(entry)
+
+    async def _tell_unfinished(self, entry: dict) -> None:
+        """Say that a message was cut off by a stop; the note stays owed until WeChat takes it."""
+        message = entry["message"]
+        sender = str(message.get("from_user_id") or "").strip()
+        words = next((str((item.get("text_item") or {}).get("text") or "") for item in message.get("item_list") or []
+                      if isinstance(item, dict) and item.get("type") == _ITEM_TEXT), "").strip()
+        quoted = f"「{words[:20]}{'…' if len(words) > 20 else ''}」这条消息" if words else "上一条消息"
+        try:
+            await self.send_text(sender, f"{quoted}还没处理完，微信渠道就停了，没有接着处理；需要的话请再发一次。",
+                                 bubbles=False)
+        except (httpx.HTTPError, WeixinError) as exc:
+            logger.warning("weixin could not say a message was left unfinished, kept for later: %s",
+                           type(exc).__name__)
+            return
+        async with self._pending_lock:
+            self._pending = [each for each in self._pending if each is not entry]
+            await self._save_pending()
 
     async def _save_pending(self) -> None:
         """Write the cursor and the unanswered messages; called with _pending_lock held, and only by the backend
-        that polls (a stopped one no longer owns them). A failed write is logged: the messages are still answered."""
-        if self._lock is None:
+        that polls. A save that lands after another backend claimed the channel is refused, so it cannot undo
+        what that one did. A failed write is logged: the messages are still answered."""
+        lock = self._lock
+        if lock is None:
             return
-        snapshot = [dict(entry) for entry in self._pending]
+        cursor, snapshot, epoch = self._cursor, [dict(entry) for entry in self._pending], self._epoch
+
+        def write() -> bool:
+            return self._lock is not lock or self.store.save_sync(cursor, snapshot, epoch)
+
         try:
-            await asyncio.to_thread(self.store.save_sync, self._cursor, snapshot)
+            if not await self._in_writer(write):
+                logger.info("weixin left a save unwritten: another backend has taken the channel since")
         except OSError as exc:
             logger.warning("weixin could not save the messages it is answering: %s", type(exc).__name__)
+
+    async def _in_writer(self, call: Callable[[], Any]) -> Any:
+        """Run a store call on the one writer thread, in order; one already on its way when the waiting turn
+        is cancelled still runs, and the handover waits for it (see _settle_writes)."""
+        if self._writer is None:
+            self._writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="weixin-store")
+        future = asyncio.get_running_loop().run_in_executor(self._writer, call)
+        self._writes.add(future)
+        future.add_done_callback(self._written)
+        return await asyncio.shield(future)
+
+    def _written(self, future: asyncio.Future) -> None:
+        self._writes.discard(future)
+        if not future.cancelled() and future.exception() is not None:
+            logger.debug("weixin store write failed: %s", type(future.exception()).__name__)
+
+    async def _settle_writes(self) -> None:
+        """Let the saves already on their way land before the channel is let go, so the next poller starts from
+        them. One that lands later is refused by its epoch (see WeixinStore.save_sync)."""
+        if not self._writes:
+            return
+        _, waiting = await asyncio.wait(set(self._writes), timeout=_SETTLE_SECONDS)
+        if waiting:
+            logger.warning("weixin: %d save(s) still unfinished when the channel was let go", len(waiting))
 
     async def _mark_started(self, entry: dict) -> None:
         async with self._pending_lock:
@@ -1141,6 +1243,10 @@ class WeixinAdapter(ChannelAdapter):
             logger.info("weixin message from a sender who is not allowed: %s", mask(sender))
             return
         await self._remember_token(sender, message)
+        # The person wrote, so WeChat takes a note it refused before: first say what a stop left unfinished.
+        for entry in [entry for entry in self._pending if entry.get("notice")
+                      and str(entry["message"].get("from_user_id") or "").strip() == sender]:
+            await self._tell_unfinished(entry)
         text, context, images = await self._content(message.get("item_list") or [], config)
         # The limit is for what the person typed or said. What came with it (a quote, a file) is bounded by its
         # own limits and passed beside their words, never as them, so it never stands in for a request.

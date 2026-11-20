@@ -43,14 +43,24 @@ class ChannelModels:
         # The catalog key of the model this backend answers its window with.
         self._current = current
         self._clients: dict[str, tuple[CatalogEntry, LLMClient]] = {}
+        # The WeChat model last read from channels.json, kept while the file cannot be read.
+        self._saved: str | None = None
 
     def resolve(self, key: str) -> CatalogEntry | None:
         catalog = self._catalog()
         return catalog.resolve(key) or catalog.resolve_persisted(key)
 
-    @staticmethod
-    def configured(channel: str) -> str:
-        return load_channels_config().weixin.model if channel == "weixin" else ""
+    def configured(self, channel: str) -> str:
+        """The model saved for the channel. While channels.json cannot be read, the one read last stands, as it
+        does for the rest of the channel's settings and in /weixin status."""
+        if channel != "weixin":
+            return ""
+        try:
+            self._saved = load_channels_config(strict=True).weixin.model
+        except (OSError, ValueError):
+            if self._saved is None:
+                self._saved = load_channels_config().weixin.model
+        return self._saved
 
     def default(self) -> CatalogEntry | None:
         return self.resolve(read_selected_model() or "") or self.resolve(self._current())

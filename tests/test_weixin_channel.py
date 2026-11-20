@@ -698,12 +698,125 @@ def test_a_channel_setting_is_never_saved_over_a_file_that_is_not_json(tmp_path)
     with pytest.raises(UnreadablePreferences):
         set_channel_enabled("weixin", True, path)
     assert path.read_text(encoding="utf-8") == broken
-    # Nothing to lose: an empty file, or none, is written as usual.
+    # An empty file is refused too: running channels read it as unreadable and keep their settings, and a
+    # setting written over it would switch them off. Only a missing file starts a new one.
     path.write_text("\n", encoding="utf-8")
-    set_channel_enabled("weixin", True, path)
+    with pytest.raises(UnreadablePreferences):
+        set_channel_enabled("weixin", True, path)
+    assert path.read_text(encoding="utf-8") == "\n"
     path.unlink()
     set_channel_enabled("weixin", True, path)
     assert json.loads(path.read_text(encoding="utf-8")) == {"weixin": {"enabled": True}}
+
+
+def test_a_save_still_on_its_way_at_a_handover_never_undoes_the_next_pollers(ilink, tmp_path, monkeypatch):
+    """A save of the backend handing over lands late: it must not put back a message the next one answered."""
+    import threading
+
+    from agent.channels import weixin
+
+    monkeypatch.setattr(weixin, "_SETTLE_SECONDS", 0.3)
+    held, go = threading.Event(), threading.Event()
+    answered: list[str] = []
+
+    async def scenario():
+        store = WeixinStore(tmp_path / "weixin")
+        await logged_in(ilink, store)
+
+        async def handler(message, reply):
+            answered.append(message.text)
+            return "好"
+
+        slow = WeixinStore(tmp_path / "weixin")
+
+        def late_save(cursor, pending, epoch):
+            held.set()
+            go.wait(10)
+            return WeixinStore.save_sync(slow, cursor, pending, epoch)
+
+        slow.save_sync = late_save  # type: ignore[method-assign]
+        first = adapter(ilink, slow, handler)
+        await first.start()
+        await until(lambda: first.running, "first online")
+        ilink.inbound.put(ilink.text_message("第一条"))
+        await until(held.is_set, "the first backend's save is on its way")
+        await first.stop()
+        second = adapter(ilink, WeixinStore(tmp_path / "weixin"), handler)
+        await second.start()
+        try:
+            await until(lambda: answered == ["第一条"] and store.pending() == [], "answered by the next poller")
+        finally:
+            await second.stop()
+        go.set()
+        await asyncio.sleep(0.3)
+        third = adapter(ilink, WeixinStore(tmp_path / "weixin"), handler)
+        await third.start()
+        try:
+            await until(lambda: third.running, "third online")
+            ilink.inbound.put(ilink.text_message("第二条"))
+            await until(lambda: "第二条" in answered, "a new message")
+        finally:
+            await third.stop()
+
+    asyncio.run(scenario())
+    assert answered == ["第一条", "第二条"]
+
+
+def test_a_note_wechat_refuses_is_sent_when_the_person_next_writes(ilink, tmp_path):
+    seen: list[str] = []
+
+    async def scenario():
+        store = WeixinStore(tmp_path / "weixin")
+        await logged_in(ilink, store)
+        never = asyncio.Event()
+
+        async def slow(message, reply):
+            seen.append(message.text)
+            await never.wait()
+            return "好"
+
+        first = adapter(ilink, store, slow)
+        await first.start()
+        await until(lambda: first.running, "online")
+        ilink.inbound.put(ilink.text_message("第一条"))
+        await until(lambda: seen == ["第一条"], "the first is being answered")
+        await first.stop()
+
+        async def quick(message, reply):
+            seen.append(message.text)
+            return "好"
+
+        # WeChat takes no message from the bot until the person writes again.
+        ilink.send_answers.put({"ret": -2, "errmsg": "prepare failed"})
+        second = adapter(ilink, WeixinStore(tmp_path / "weixin"), quick)
+        await second.start()
+        try:
+            await until(lambda: second.running and len(ilink.sent) == 1, "the note was tried")
+            assert [entry.get("notice") for entry in store.pending()] == [True]
+            ilink.inbound.put(ilink.text_message("在吗"))
+            await until(lambda: seen == ["第一条", "在吗"] and store.pending() == [], "the note, then the answer")
+        finally:
+            await second.stop()
+
+    asyncio.run(scenario())
+    # The first note is the one WeChat refused.
+    assert ilink.replies_to(OWNER) == [NOT_FINISHED, NOT_FINISHED, "好"]
+
+
+def test_while_channels_json_cannot_be_read_wechat_keeps_its_model(tmp_path, monkeypatch):
+    from agent.cli.channel_models import ChannelModels
+
+    path = tmp_path / "channels.json"
+    monkeypatch.setenv("ASTRA_CHANNEL_CONFIG", str(path))
+    path.write_text(json.dumps({"weixin": {"enabled": True, "model": "test::chat-small"}}), encoding="utf-8")
+    models = ChannelModels(lambda: None)  # type: ignore[arg-type,return-value]
+    assert models.configured("weixin") == "test::chat-small"
+    path.write_text('{"weixin": {"enabled": true, "model": "test::chat-small",}}', encoding="utf-8")
+    assert models.configured("weixin") == "test::chat-small"
+    path.write_text("", encoding="utf-8")
+    assert models.configured("weixin") == "test::chat-small"
+    path.write_text(json.dumps({"weixin": {"enabled": True, "model": ""}}), encoding="utf-8")
+    assert models.configured("weixin") == ""
 
 
 def test_quotes_and_placeholders_never_crowd_out_or_stand_in_for_the_persons_words(ilink, tmp_path):

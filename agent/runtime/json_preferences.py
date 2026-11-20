@@ -18,8 +18,9 @@ class UnreadablePreferences(OSError):
 def update_preferences(path: Path, change: Callable[[dict], None], *, keep_unreadable: bool = False) -> Path:
     """Apply ``change`` to the JSON object in ``path`` under a cross-process lock, and write it back atomically.
 
-    A missing or empty file starts as {}. One that is not a JSON object (a syntax error while someone edits
-    it) is replaced too, unless ``keep_unreadable``: then nothing is written and UnreadablePreferences says so.
+    A missing file starts as {}. One that is there but does not hold a JSON object (empty, or a syntax error
+    while someone edits it) is replaced too, unless ``keep_unreadable``: then nothing is written and
+    UnreadablePreferences says so.
     """
     path = path.expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -44,7 +45,7 @@ def update_preferences(path: Path, change: Callable[[dict], None], *, keep_unrea
             value = None
         else:
             try:
-                value = json.loads(text) if text.strip() else {}
+                value = json.loads(text) if text.strip() else (None if keep_unreadable else {})
             except ValueError:
                 value = None
         if not isinstance(value, dict):
