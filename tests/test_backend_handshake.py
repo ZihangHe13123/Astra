@@ -64,7 +64,7 @@ def test_script_handshake_precedes_blocked_optional_import(cold_backend_source, 
         f"root=Path({str(tmp_path)!r})\n"
         "class Gate:\n"
         " def find_spec(self, fullname, path=None, target=None):\n"
-        "  if fullname != 'openai': return None\n"
+        "  if fullname != 'httpx': return None\n"
         "  (root/'import-entered').write_text('blocked')\n"
         "  deadline=time.monotonic()+45\n"
         "  while not (root/'import-release').exists():\n"
