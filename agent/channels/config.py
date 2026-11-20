@@ -7,14 +7,19 @@ network port or start replying in an existing QQ group.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 
+logger = logging.getLogger(__name__)
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / ".astra" / "channels.json"
+# Problems already logged, so a file read for every message does not repeat them.
+_REPORTED: set[str] = set()
 
 
 def _bool(value: Any, default: bool = False) -> bool:
@@ -42,6 +47,32 @@ def _items(
     return default
 
 
+def _number(data: dict[str, Any], key: str, default: int, problems: list[str], prefix: str, *,
+            low: int, high: int | None = None, zero_is_unset: bool = True, invalid: int | None = None,
+            invalid_note: str = "") -> int:
+    """A whole-number setting, kept within [low, high]. Missing (or 0 where 0 means unset) takes the default.
+
+    A value that is not a whole number ("50 MB") must not stop the backend: it is recorded in ``problems``
+    and replaced by ``invalid`` (the default unless a safer value is given)."""
+    value = data.get(key)
+    if value is None or value == "" or (zero_is_unset and value == 0 and not isinstance(value, bool)):
+        number = default
+    elif isinstance(value, int) and not isinstance(value, bool):
+        number = value
+    elif isinstance(value, float) and value.is_integer():
+        number = int(value)
+    elif isinstance(value, str) and value.strip().lstrip("+-").isdecimal() and value.strip().isascii():
+        number = int(value.strip())
+        if zero_is_unset and number == 0:
+            number = default
+    else:
+        number = default if invalid is None else invalid
+        problems.append(f"{prefix}.{key} 应为整数，现在是 {json.dumps(value, ensure_ascii=False)}；"
+                        + (invalid_note or f"暂按 {number} 处理。"))
+        return number
+    return max(low, number if high is None else min(high, number))
+
+
 @dataclass(frozen=True)
 class OneBotConfig:
     enabled: bool = False
@@ -63,6 +94,8 @@ class OneBotConfig:
     file_allow_users: tuple[str, ...] = ()
     send_file_roots: tuple[str, ...] = (str(PROJECT_ROOT),)
     max_send_file_bytes: int = 50 * 1024 * 1024
+    # Settings in channels.json that could not be read, each with what is used instead.
+    problems: tuple[str, ...] = field(default=(), compare=False)
 
     @property
     def access_token(self) -> str:
@@ -70,10 +103,15 @@ class OneBotConfig:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "OneBotConfig":
+        problems: list[str] = []
+
+        def number(key: str, default: int, **limits: Any) -> int:
+            return _number(data, key, default, problems, "qq", **limits)
+
         return cls(
             enabled=_bool(data.get("enabled")),
             host=str(data.get("host") or "127.0.0.1"),
-            port=max(1, min(65_535, int(data.get("port") or 2280))),
+            port=number("port", 2280, low=1, high=65_535),
             access_token_env=str(data.get("access_token_env") or "ASTRA_QQ_ACCESS_TOKEN"),
             private_enabled=_bool(data.get("private_enabled"), True),
             group_enabled=_bool(data.get("group_enabled"), True),
@@ -86,23 +124,18 @@ class OneBotConfig:
             allow_users=_items(data.get("allow_users")),
             owner_users=_items(data.get("owner_users")),
             allow_groups=_items(data.get("allow_groups")),
-            max_input_chars=max(1, int(data.get("max_input_chars") or 8_000)),
-            max_output_chars=max(100, int(data.get("max_output_chars") or 1_800)),
-            max_images=max(1, min(8, int(data.get("max_images") or 4))),
-            max_image_bytes=max(
-                1024,
-                int(data.get("max_image_bytes") or 10 * 1024 * 1024),
-            ),
+            max_input_chars=number("max_input_chars", 8_000, low=1),
+            max_output_chars=number("max_output_chars", 1_800, low=100),
+            max_images=number("max_images", 4, low=1, high=8),
+            max_image_bytes=number("max_image_bytes", 10 * 1024 * 1024, low=1024),
             send_files_enabled=_bool(data.get("send_files_enabled")),
             file_allow_users=_items(data.get("file_allow_users")),
             send_file_roots=_items(
                 data.get("send_file_roots"),
                 (str(PROJECT_ROOT),),
             ),
-            max_send_file_bytes=max(
-                1024,
-                int(data.get("max_send_file_bytes") or 50 * 1024 * 1024),
-            ),
+            max_send_file_bytes=number("max_send_file_bytes", 50 * 1024 * 1024, low=1024),
+            problems=tuple(problems),
         )
 
 
@@ -135,29 +168,38 @@ class WeixinConfig:
     receive_files_dir: str = ""
     # 0 leaves received files on WeChat's side: the conversation gets only their names.
     max_receive_file_bytes: int = 50 * 1024 * 1024
+    # Settings in channels.json that could not be read, each with what is used instead.
+    problems: tuple[str, ...] = field(default=(), compare=False)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "WeixinConfig":
-        # 0 is a valid image limit (text only), so only a missing value takes the default.
-        images = data.get("max_images")
-        received = data.get("max_receive_file_bytes")
+        problems: list[str] = []
+
+        def number(key: str, default: int, **limits: Any) -> int:
+            return _number(data, key, default, problems, "weixin", **limits)
+
         return cls(
             enabled=_bool(data.get("enabled")),
             allow_users=_items(data.get("allow_users")),
-            max_input_chars=max(1, int(data.get("max_input_chars") or 8_000)),
-            max_output_chars=max(100, min(2_000, int(data.get("max_output_chars") or 1_800))),
-            max_images=max(0, min(8, int(4 if images is None else images))),
-            max_image_bytes=max(1024, int(data.get("max_image_bytes") or 10 * 1024 * 1024)),
+            max_input_chars=number("max_input_chars", 8_000, low=1),
+            max_output_chars=number("max_output_chars", 1_800, low=100, high=2_000),
+            # 0 is a valid image limit (text only), so only a missing value takes the default.
+            max_images=number("max_images", 4, low=0, high=8, zero_is_unset=False),
+            max_image_bytes=number("max_image_bytes", 10 * 1024 * 1024, low=1024),
             keep_awake=_bool(data.get("keep_awake"), True),
             chat_bubbles=_bool(data.get("chat_bubbles"), True),
-            max_bubbles=max(1, min(20, int(data.get("max_bubbles") or 8))),
+            max_bubbles=number("max_bubbles", 8, low=1, high=20),
             model=str(data.get("model") or "").strip(),
             send_files_enabled=_bool(data.get("send_files_enabled"), True),
             file_allow_users=_items(data.get("file_allow_users")),
             send_file_roots=_items(data.get("send_file_roots"), (str(Path.home()),)),
-            max_send_file_bytes=max(1024, int(data.get("max_send_file_bytes") or 50 * 1024 * 1024)),
+            max_send_file_bytes=number("max_send_file_bytes", 50 * 1024 * 1024, low=1024),
             receive_files_dir=str(data.get("receive_files_dir") or "").strip(),
-            max_receive_file_bytes=max(0, int(50 * 1024 * 1024 if received is None else received)),
+            # A limit that cannot be read downloads nothing rather than the default 50 MB.
+            max_receive_file_bytes=number(
+                "max_receive_file_bytes", 50 * 1024 * 1024, low=0, zero_is_unset=False, invalid=0,
+                invalid_note="收到的文件先不下载，只收文件名；写成字节数（如 52428800）后生效。"),
+            problems=tuple(problems),
         )
 
 
@@ -210,4 +252,9 @@ def load_channels_config(path: str | Path | None = None) -> ChannelsConfig:
     weixin_data = data.get("weixin") or {}
     if not isinstance(weixin_data, dict):
         weixin_data = {}
-    return ChannelsConfig(onebot=OneBotConfig.from_dict(onebot_data), weixin=WeixinConfig.from_dict(weixin_data))
+    config = ChannelsConfig(onebot=OneBotConfig.from_dict(onebot_data), weixin=WeixinConfig.from_dict(weixin_data))
+    for problem in (*config.onebot.problems, *config.weixin.problems):
+        if problem not in _REPORTED:
+            _REPORTED.add(problem)
+            logger.warning("%s: %s", source, problem)
+    return config

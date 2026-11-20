@@ -157,18 +157,24 @@ in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on`,
   and videos, sent or quoted, are downloaded, decrypted and saved in a folder
   for each day under `~/Downloads/Astra/微信` (`weixin.receive_files_dir` sets
   another folder; a relative one is under the home folder). Only a file that
-  arrived whole is saved: the key opens it and it matches the size, and for a
-  video the MD5, that WeChat gave. These checks catch a cut or garbled
-  download, not who sent it. The model is told each file's name, size and
-  saved path, beside the person's own words rather than as them: a reminder
-  set in the same message records only what they typed. A text file
+  arrived whole is saved: the key opens it, and it matches what WeChat gave
+  (a file's size, a video's encrypted size and MD5). Media marked as encrypted
+  but sent without its key, or with a size or checksum that is not one, is
+  refused. These checks catch a cut or garbled download, not who sent it. The
+  model is told each file's name, size and saved path. That, a quoted
+  message and a placeholder such as `[图片]` come beside the person's own
+  words rather than as them, each within its own limit: a reminder set in the
+  same message records only what they typed or said. A text file
   (Markdown, plain text, code, CSV, JSON and the like) of up to 64 KB comes
   along whole, exactly as written; for any other file the model uses its file
   tools, which ask for approval in WeChat when the folder is outside the
   workspace. A file larger than `max_receive_file_bytes` (50 MB) is not
   downloaded, and `0` leaves every file on WeChat's side with only its name.
   A file that cannot be downloaded or saved is reported as such, and the rest
-  of the message still arrives.
+  of the message still arrives. A number setting that is not a whole number
+  (`"50 MB"`) does not stop Astra: `/weixin status` and the log name it and
+  what is used instead, and for `max_receive_file_bytes` that is downloading
+  nothing until it is fixed.
 - **How it answers.** WeChat conversations are told to talk like a chat: short,
   casual, no Markdown, one thought per message. A reply goes out as several
   short messages the way people text (at most `max_bubbles`; `chat_bubbles:

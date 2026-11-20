@@ -84,6 +84,32 @@ def test_weixin_login_message_reply_and_logout_through_the_backend(tmp_path):
         ilink.close()
 
 
+def test_a_wechat_setting_that_is_not_a_number_is_reported_and_the_backend_keeps_working(tmp_path):
+    model = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
+    threading.Thread(target=model.serve_forever, daemon=True).start()
+    channels = tmp_path / "channels.json"
+    channels.write_text(json.dumps({"weixin": {"keep_awake": False, "max_receive_file_bytes": "50 MB"}}),
+                        encoding="utf-8")
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    proc, _, _, wait_for = _start_question_protocol_backend(
+        tmp_path, model.server_port, "weixin_settings", workdir=workdir,
+        env_overrides={"ASTRA_HOME": str(tmp_path / "home"), "ASTRA_CHANNEL_CONFIG": str(channels),
+                       "ASTRA_CONTEXT_INDEX_EMBEDDING": "off"},
+    )
+    try:
+        first = wait_for(lambda e: e.get("type") == "weixin_status", timeout=30)
+        assert first["state"] == "off"
+        assert first["error"].startswith('weixin.max_receive_file_bytes 应为整数，现在是 "50 MB"')
+        send(proc, {"type": "command", "cmd": "/weixin status"})
+        again = wait_for(lambda e: e.get("type") == "weixin_status" and e is not first, timeout=20)
+        assert again["error"] == first["error"] and proc.poll() is None
+    finally:
+        _stop_protocol_backend(proc)
+        model.shutdown()
+        model.server_close()
+
+
 class RecordingModelHandler(ModelHandler):
     models: list[str] = []
 

@@ -98,9 +98,9 @@ _TEXT_SUFFIXES = frozenset({
     ".js", ".mjs", ".ts", ".tsx", ".jsx", ".java", ".kt", ".swift", ".go", ".rs", ".rb", ".php", ".c", ".h",
     ".cc", ".cpp", ".hpp", ".cs", ".m", ".sh", ".bash", ".zsh", ".ps1", ".bat", ".sql", ".r", ".lua", ".vue",
 })
-# Windows also reserves COM and LPT with a superscript 1, 2 or 3.
-_RESERVED_FILE_NAMES = frozenset({"CON", "PRN", "AUX", "NUL", *(f"{port}{n}" for port in ("COM", "LPT")
-                                                                 for n in (*"123456789", *"¹²³"))})
+# Windows device names, also with a superscript 1, 2 or 3 after COM and LPT (os.path.isreserved's list).
+_RESERVED_FILE_NAMES = frozenset({"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+                                  *(f"{port}{n}" for port in ("COM", "LPT") for n in (*"123456789", *"¹²³"))})
 _MAX_FILE_NAME_BYTES = 180
 
 # Added to the system prompt of WeChat conversations only (see AgentChannelRouter): it is a
@@ -474,7 +474,8 @@ def _file_name(name: object, fallback: str) -> str:
         return fallback
     path = Path(text)
     stem, suffix = (path.stem, path.suffix) if len(path.suffix) <= 16 else (text, "")
-    if stem.split(".")[0].upper() in _RESERVED_FILE_NAMES:
+    # Windows reads "CON .txt" and "con.tar.gz" as the device too: the part before the first dot, spaces trimmed.
+    if stem.split(".")[0].rstrip(" ").upper() in _RESERVED_FILE_NAMES:
         stem = f"_{stem}"
     while len(f"{stem}{suffix}".encode()) > _MAX_FILE_NAME_BYTES and len(stem) > 1:
         stem = stem[:-1]
@@ -528,6 +529,16 @@ def _inline_text(name: str, data: bytes) -> str | None:
             continue
         return None if "\0" in text else text.replace("\r\n", "\n").replace("\r", "\n")
     return None
+
+
+def _declared_size(value: object) -> int | None:
+    """A size WeChat gave: None when it gave none, -1 when what it gave is not a size."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value if value >= 0 else -1
+    text = str(value).strip() if isinstance(value, str) else ""
+    return int(text) if text.isdecimal() and text.isascii() else -1
 
 
 def _size(count: int) -> str:
@@ -1001,15 +1012,17 @@ class WeixinAdapter(ChannelAdapter):
             logger.info("weixin message from a sender who is not allowed: %s", mask(sender))
             return
         await self._remember_token(sender, message)
-        text, files, images = await self._content(message.get("item_list") or [])
-        # The limit is for what the person typed; a received file is bounded by its own limits, and is
-        # passed beside their words, never as them.
+        text, context, images = await self._content(message.get("item_list") or [])
+        # The limit is for what the person typed or said. What came with it (a quote, a file) is bounded by its
+        # own limits and passed beside their words, never as them, so it never stands in for a request.
         text = text.strip()[:self.config.max_input_chars]
-        if not text and not files and not images:
+        if not text and not context and not images:
             return
-        event = ChannelMessage(channel=self.name, conversation_id=sender, sender_id=sender,
-                               text=text or ("" if files else "[图片]"), attachments=files,
-                               message_id=str(message.get("message_id") or ""), images=images, raw=message)
+        if not text and not context:
+            context = "[图片]"
+        event = ChannelMessage(channel=self.name, conversation_id=sender, sender_id=sender, text=text,
+                               attachments=context, message_id=str(message.get("message_id") or ""),
+                               images=images, raw=message)
 
         async def reply(answer: str) -> None:
             await self.send_text(sender, answer)
@@ -1033,10 +1046,12 @@ class WeixinAdapter(ChannelAdapter):
             await _finish(typing, 5.0)
 
     async def _content(self, items: list) -> tuple[str, str, tuple[ChannelImage, ...]]:
-        """What the person typed or said; what became of the files and videos they sent or quoted; their images."""
-        parts: list[str] = []
-        files: list[str] = []
+        """What the person typed or said; what came with it (quotes, placeholders, the files and videos they
+        sent or quoted); their images. Only the first is their own words."""
+        words: list[str] = []
+        context: list[str] = []
         images: list[ChannelImage] = []
+        limit = self.config.max_input_chars
 
         async def media(item: dict) -> None:
             kind = item.get("type")
@@ -1046,31 +1061,35 @@ class WeixinAdapter(ChannelAdapter):
                     if image is not None:
                         images.append(image)
                     else:
-                        parts.append("[图片：没能读取]")
+                        context.append("[图片：没能读取]")
             elif kind in (_ITEM_FILE, _ITEM_VIDEO):
-                files.append(await self._attachment(item))
+                context.append(await self._attachment(item))
 
         for item in items:
             if not isinstance(item, dict):
                 continue
             kind = item.get("type")
             if kind == _ITEM_TEXT:
-                text = str((item.get("text_item") or {}).get("text") or "")
                 quoted = (item.get("ref_msg") or {})
                 quoted_item = quoted.get("message_item") or {}
                 quoted_text = str(((quoted_item.get("text_item")) or {}).get("text") or "")
                 if quoted.get("title") or quoted_text:
-                    parts.append(f"[引用: {' | '.join(p for p in (str(quoted.get('title') or ''), quoted_text) if p)}]")
-                parts.append(text)
+                    # Earlier words, maybe not the person's; their own limit, so they never crowd out the reply.
+                    shown = " | ".join(p for p in (str(quoted.get("title") or ""), quoted_text) if p)
+                    context.append(f"[引用: {shown[:limit]}]")
+                words.append(str((item.get("text_item") or {}).get("text") or ""))
                 # A quoted image, file or video comes along, so "看看这份" about an earlier file can be answered.
                 if isinstance(quoted_item, dict):
                     await media(quoted_item)
             elif kind == _ITEM_VOICE:
                 spoken = str((item.get("voice_item") or {}).get("text") or "")
-                parts.append(f"[语音，微信转写] {spoken}" if spoken else "[语音]")
+                if spoken:
+                    words.append(f"[语音，微信转写] {spoken}")
+                else:
+                    context.append("[语音]")
             else:
                 await media(item)
-        return ("\n".join(part for part in parts if part), "\n".join(files), tuple(images))
+        return ("\n".join(part for part in words if part), "\n".join(context), tuple(images))
 
     async def _attachment(self, item: dict) -> str:
         """One file or video, saved or not; whatever goes wrong with it, the rest of the message still arrives."""
@@ -1101,6 +1120,9 @@ class WeixinAdapter(ChannelAdapter):
         key = media.get("aes_key")
         if payload.get("aeskey"):
             key = base64.b64encode(bytes.fromhex(str(payload["aeskey"]))).decode("ascii")
+        # Media marked as encrypted that comes without its key would be kept as encrypted bytes.
+        if strict and not key and str(media.get("encrypt_type", 0)).strip() not in ("", "0"):
+            raise ValueError("the media is marked as encrypted but has no key")
         data = await self._client.download(url, max_bytes)
         fetched = len(data)
         if key:
@@ -1117,13 +1139,19 @@ class WeixinAdapter(ChannelAdapter):
         limit = self.config.max_receive_file_bytes
         if limit <= 0:
             return f"[{title}]"
-        # A file's len is its plain size; a video's video_size is the encrypted size, up to one AES block more.
-        plain_size = str(payload.get("len") or "") if kind == "文件" else ""
-        sealed_size = str(payload.get("video_size") or "") if kind == "视频" else ""
-        if plain_size.isdigit() and int(plain_size) > limit:
-            return f"[{title}（{_size(int(plain_size))}），超过 {_size(limit)} 的上限，没有下载]"
-        if sealed_size.isdigit() and int(sealed_size) > limit + 16:
-            return f"[{title}（约 {_size(int(sealed_size))}），超过 {_size(limit)} 的上限，没有下载]"
+        # As Astra and Hermes send them: a file's len is its plain size, a video's video_size the size of its
+        # encrypted copy (up to one AES block more) and video_md5 the MD5 of the video itself. A value that is
+        # given but malformed is not taken as absent.
+        plain_size = _declared_size(payload.get("len")) if kind == "文件" else None
+        sealed_size = _declared_size(payload.get("video_size")) if kind == "视频" else None
+        digest = str(payload.get("video_md5") or "").strip().lower() if kind == "视频" else ""
+        if plain_size == -1 or sealed_size == -1 or (digest and not re.fullmatch(r"[0-9a-f]{32}", digest)):
+            logger.warning("weixin %s came with a malformed size or checksum", what)
+            return f"[{title}，微信给出的大小或校验值格式不对，没有下载]"
+        if plain_size is not None and plain_size > limit:
+            return f"[{title}（{_size(plain_size)}），超过 {_size(limit)} 的上限，没有下载]"
+        if sealed_size is not None and sealed_size > limit + 16:
+            return f"[{title}（约 {_size(sealed_size)}），超过 {_size(limit)} 的上限，没有下载]"
         too_large = f"[{title}，超过 {_size(limit)} 的上限，没有下载]"
         try:
             # The encrypted copy is padded by up to one AES block.
@@ -1141,12 +1169,9 @@ class WeixinAdapter(ChannelAdapter):
         data, sealed = fetched
         if len(data) > limit:
             return too_large
-        digest = str(payload.get("video_md5") or "").lower() if kind == "视频" else ""
-        # What WeChat's own apps put in these fields is not checked live, so a declared size may be the plain
-        # or the encrypted one; either way a cut download matches neither.
-        declared = plain_size or sealed_size
-        if ((declared.isdigit() and int(declared) not in (len(data), sealed))
-                or (re.fullmatch(r"[0-9a-f]{32}", digest) and hashlib.md5(data).hexdigest() != digest)):
+        if ((plain_size is not None and plain_size != len(data))
+                or (sealed_size is not None and sealed_size != sealed)
+                or (digest and hashlib.md5(data).hexdigest() != digest)):
             logger.warning("weixin %s did not match its declared size or checksum", what)
             return f"[{title}，下载的内容不完整或解不开，没有保存]"
         try:

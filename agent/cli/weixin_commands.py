@@ -82,7 +82,8 @@ class WeixinCommands:
             event["qr"] = dict(self._qr)
         if message:
             event["message"] = message
-        problem = error or str(status.get("error") or "")
+        # A setting in channels.json that could not be read is said here, with what is used instead.
+        problem = error or str(status.get("error") or "") or "；".join(config.problems)
         if problem:
             event["error"] = problem
         return event

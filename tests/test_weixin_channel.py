@@ -246,7 +246,8 @@ def test_images_are_decrypted_from_the_cdn_and_other_hosts_are_not_fetched(ilink
         finally:
             await channel.stop()
         message = seen[0]
-        assert message.text == "[图片：没能读取]\n这是什么"
+        # A placeholder is not the person's words: it comes along beside them.
+        assert (message.text, message.attachments) == ("这是什么", "[图片：没能读取]")
         assert [image.data_url for image in message.images] == [
             "data:image/png;base64," + base64.b64encode(picture).decode()]
         assert ilink.media_requests == ["img-1"]
@@ -357,9 +358,8 @@ def test_a_received_file_is_saved_for_the_person_and_a_short_text_file_is_read_i
         "[文件内容开始: _com¹.py]", "    first = 1", "    second = 2  ", "[文件内容结束: _com¹.py]"]
     assert third.attachments.startswith(f"[文件: secret_.md（5 B），已保存到 {folder / 'secret_.md'}]\n")
     assert "\n宽字符的笔记\n" in fourth.attachments
-    # The quote is part of what the person wrote, so max_input_chars (4 here) cuts it too; the file it quotes
-    # arrives whole.
-    assert (fifth.text, fifth.attachments) == ("[引用: 06_笔记.md]\n看看这份"[:4], notes_block)
+    # A quote has its own limit (max_input_chars, 4 here) and comes beside the person's words, with the file.
+    assert (fifth.text, fifth.attachments) == ("看看这份", "[引用: 06_笔]\n" + notes_block)
 
 
 def test_only_a_file_that_arrived_whole_is_saved_and_the_limit_is_kept(ilink, tmp_path):
@@ -373,6 +373,11 @@ def test_only_a_file_that_arrived_whole_is_saved_and_the_limit_is_kept(ilink, tm
     _on_cdn(ilink, "other-key", b"opened with another key", key=bytes(range(16, 32)))
     _on_cdn(ilink, "vid-1", clip)
     _on_cdn(ilink, "vid-2", clip)
+    _on_cdn(ilink, "vid-3", clip)
+    # 16 bytes encrypt to 32: a len of 32 is the encrypted size, not the file's.
+    _on_cdn(ilink, "pad-1", bytes(16))
+    _on_cdn(ilink, "vid-k", clip)
+    ilink.media["raw-1"] = b"plain"
     inbox = tmp_path / "inbox"
 
     (message,) = _received(ilink, tmp_path, [[
@@ -384,11 +389,17 @@ def test_only_a_file_that_arrived_whole_is_saved_and_the_limit_is_kept(ilink, tm
         _file("other-key", "garbled.txt"),
         _video("vid-big", video_size="9000"),
         _video("vid-2", video_md5="0" * 32),
+        _file("pad-1", "padded.txt", 32),
+        _video("vid-3", video_size=str(len(clip))),
+        _file("never-1", "odd-size.txt", "12 KB"),
+        _video("never-2", video_md5="not-an-md5"),
+        {"type": 5, "video_item": {"media": {"encrypt_query_param": "vid-k", "encrypt_type": 1}}},
+        {"type": 4, "file_item": {"media": {"encrypt_query_param": "raw-1"}, "file_name": "raw.txt", "len": "5"}},
         _video("vid-1", video_size=str(len(_sealed(clip))), video_md5=hashlib.md5(clip).hexdigest()),
     ]], receive_files_dir=str(inbox), max_receive_file_bytes=1024)
 
     lines = message.attachments.split("\n")
-    assert lines[:8] == [
+    assert lines[:13] == [
         "[文件: big.zip（4.9 KB），超过 1.0 KB 的上限，没有下载]",
         "[文件: quiet.bin，超过 1.0 KB 的上限，没有下载]",
         "[文件: gone.txt，没能下载]",
@@ -397,14 +408,48 @@ def test_only_a_file_that_arrived_whole_is_saved_and_the_limit_is_kept(ilink, tm
         "[文件: garbled.txt，下载的内容不完整或解不开，没有保存]",
         "[视频（约 8.8 KB），超过 1.0 KB 的上限，没有下载]",
         "[视频，下载的内容不完整或解不开，没有保存]",
+        "[文件: padded.txt，下载的内容不完整或解不开，没有保存]",
+        "[视频，下载的内容不完整或解不开，没有保存]",
+        "[文件: odd-size.txt，微信给出的大小或校验值格式不对，没有下载]",
+        "[视频，微信给出的大小或校验值格式不对，没有下载]",
+        # Marked as encrypted, but no key: never kept as encrypted bytes.
+        "[视频，下载的内容不完整或解不开，没有保存]",
     ]
-    video = re.fullmatch(r"\[视频: (视频-\d{6}\.mp4)（100 B），已保存到 (.+)\]", lines[8])
-    assert video is not None and len(lines) == 9 and message.text == ""
+    # Media WeChat did not encrypt is kept as it came.
+    assert lines[13:17] == [f"[文件: raw.txt（5 B），已保存到 {inbox / next(inbox.iterdir()).name / 'raw.txt'}]",
+                            "[文件内容开始: raw.txt]", "plain", "[文件内容结束: raw.txt]"]
+    video = re.fullmatch(r"\[视频: (视频-\d{6}\.mp4)（100 B），已保存到 (.+)\]", lines[17])
+    assert video is not None and len(lines) == 18 and message.text == ""
     day = next(inbox.iterdir()).name
-    assert _saved(inbox) == {f"{day}/{video.group(1)}": clip}
+    assert _saved(inbox) == {f"{day}/{video.group(1)}": clip, f"{day}/raw.txt": b"plain"}
     assert video.group(2) == str(inbox / day / video.group(1))
-    # A declared size over the limit is never fetched, and no host outside WeChat's CDN is asked.
-    assert ilink.media_requests == ["big-2", "gone-1", "short-1", "other-key", "vid-2", "vid-1"]
+    # A declared size over the limit, a malformed size or checksum, and a missing key are never fetched;
+    # no host outside WeChat's CDN is asked.
+    assert ilink.media_requests == ["big-2", "gone-1", "short-1", "other-key", "vid-2", "pad-1", "vid-3",
+                                    "raw-1", "vid-1"]
+
+
+def test_windows_device_names_are_never_used_for_a_saved_file(ilink, tmp_path):
+    for param in ("dev-1", "dev-2", "dev-3"):
+        _on_cdn(ilink, param, param.encode())
+    inbox = tmp_path / "inbox"
+    _received(ilink, tmp_path, [[_file("dev-1", "CON .txt"), _file("dev-2", "conin$.log"),
+                                 _file("dev-3", "lpt².tar.gz")]], receive_files_dir=str(inbox))
+    day = next(inbox.iterdir()).name
+    assert _saved(inbox) == {f"{day}/_CON .txt": b"dev-1", f"{day}/_conin$.log": b"dev-2",
+                             f"{day}/_lpt².tar.gz": b"dev-3"}
+
+
+def test_quotes_and_placeholders_never_crowd_out_or_stand_in_for_the_persons_words(ilink, tmp_path):
+    quote = "这是一段很长的引用标题，比允许的输入长度还要长得多"
+    (reply, picture, voice) = _received(ilink, tmp_path, [
+        [{"type": 1, "text_item": {"text": "晚点提醒我喝茶"}, "ref_msg": {"title": quote}}],
+        [{"type": 2, "image_item": {"media": {"full_url": "https://example.com/x.png"}}}],
+        [{"type": 3, "voice_item": {}}],
+    ], max_input_chars=10)
+    assert (reply.text, reply.attachments) == ("晚点提醒我喝茶", f"[引用: {quote[:10]}]")
+    assert (picture.text, picture.attachments) == ("", "[图片：没能读取]")
+    assert (voice.text, voice.attachments) == ("", "[语音]")
 
 
 def test_a_folder_that_cannot_be_used_costs_the_file_but_never_the_message(ilink, tmp_path):
@@ -446,6 +491,22 @@ def test_files_can_be_left_on_wechats_side_and_folders_are_found_from_home(ilink
     # A relative folder is under home, whichever folder the backend started in.
     assert received_files_root(WeixinConfig.from_dict({"receive_files_dir": "收件"})) == home / "收件"
     assert received_files_root(WeixinConfig(receive_files_dir=str(inbox))) == inbox
+
+
+def test_a_setting_that_is_not_a_number_is_reported_and_downloads_nothing(tmp_path):
+    from agent.channels.config import load_channels_config
+
+    path = tmp_path / "channels.json"
+    path.write_text(json.dumps({"qq": {"port": "two thousand"}, "weixin": {
+        "max_receive_file_bytes": "50 MB", "max_input_chars": "8000", "max_bubbles": 3.0, "max_images": 0}}),
+        encoding="utf-8")
+    config = load_channels_config(path)
+    assert config.weixin.max_receive_file_bytes == 0
+    assert (config.weixin.max_input_chars, config.weixin.max_bubbles, config.weixin.max_images) == (8000, 3, 0)
+    assert config.weixin.problems == ('weixin.max_receive_file_bytes 应为整数，现在是 "50 MB"；'
+                                      "收到的文件先不下载，只收文件名；写成字节数（如 52428800）后生效。",)
+    assert config.onebot.port == 2280
+    assert config.onebot.problems == ('qq.port 应为整数，现在是 "two thousand"；暂按 2280 处理。',)
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate is macOS")
