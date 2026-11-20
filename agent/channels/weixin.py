@@ -218,28 +218,37 @@ class WeixinStore:
         """Messages taken from WeChat that were not answered yet, oldest first: {"message": …, "started": …}."""
         return _pending_entries(self._read("sync.json").get("pending"))
 
-    def claim_sync(self) -> tuple[int, str, list[dict]]:
+    def claim_sync(self, owned: Callable[[], bool] = lambda: True) -> tuple[int, str, list[dict]] | None:
         """Become the poller of record: in one locked read-modify-write, raise the epoch in sync.json and read
         the cursor and the unanswered messages. From then on the saves of an earlier poller, which carry an
-        older epoch, are refused (see save_sync)."""
+        older epoch, are refused (see save_sync).
+
+        ``owned`` is asked inside that write: a claim that only gets there after its backend let the channel go
+        is refused (None), so it cannot outrank the poller that took over meanwhile."""
         claimed: dict[str, Any] = {}
 
         def change(data: dict) -> None:
+            if not owned():
+                raise _StaleSave
             epoch = _epoch(data) + 1
             data["epoch"] = epoch
             claimed.update(epoch=epoch, cursor=str(data.get("get_updates_buf") or ""),
                            pending=_pending_entries(data.get("pending")))
 
-        update_preferences(self.root / "sync.json", change)
+        try:
+            update_preferences(self.root / "sync.json", change)
+        except _StaleSave:
+            return None
         return claimed["epoch"], claimed["cursor"], claimed["pending"]
 
-    def save_sync(self, cursor: str, pending: list[dict], epoch: int) -> bool:
+    def save_sync(self, cursor: str, pending: list[dict], epoch: int, owned: Callable[[], bool] = lambda: True) -> bool:
         """The cursor and the messages before it still to answer, in one write, so a stop between taking
         messages from WeChat and answering them loses none. False, and nothing written, when another poller
-        has claimed the channel since ``epoch``: a late save must not undo what it did."""
+        has claimed the channel since ``epoch``, or when ``owned`` (asked inside the write) says this backend
+        has let the channel go: a late save must not undo what the next poller did."""
 
         def change(data: dict) -> None:
-            if _epoch(data) != epoch:
+            if _epoch(data) != epoch or not owned():
                 raise _StaleSave
             data.clear()
             data.update({"epoch": epoch, "get_updates_buf": cursor, "pending": pending})
@@ -842,6 +851,16 @@ class WeixinAdapter(ChannelAdapter):
                     self._keep_awake.stop()
         return self.config
 
+    def settings(self) -> WeixinConfig:
+        """The settings in effect now: channels.json as saved, or while it cannot be read, the ones this channel
+        last applied. Replies and /weixin status both read them here, so they never disagree."""
+        return self._refresh()
+
+    @property
+    def settings_unreadable(self) -> bool:
+        """Whether channels.json could not be read the last time this channel looked."""
+        return self._settings_unreadable
+
     def _switched_off(self) -> bool:
         """Whether channels.json now switches WeChat off (only for a channel that follows the file)."""
         return self._settings is not None and not self._refresh().enabled
@@ -959,16 +978,20 @@ class WeixinAdapter(ChannelAdapter):
                 self._state = "expired"
                 self._error = "微信登录已失效，请重新扫码登录。"
                 return
-            # Handed to the desktop's channel host, or switched off: round again to wait.
+            # Handed to the desktop's channel host, switched off, or not taken over: round again to wait.
 
     async def _poll(self, account: WeixinAccount, *, yield_to_host: bool = False) -> str:
         """Deliver messages until cancelled. Returns "expired" when WeChat reports the login expired,
-        "host" when the desktop's channel host takes over (only with ``yield_to_host``) and "off" when
-        channels.json switches the channel off. Before the last two, what was already taken from WeChat is
-        answered; the next poller continues from the saved cursor.
+        "host" when the desktop's channel host takes over (only with ``yield_to_host``), "off" when
+        channels.json switches the channel off, and "lost" when the saved messages could not be taken
+        over. Before "host" and "off", what was already taken from WeChat is answered; the next poller
+        continues from the saved cursor.
         """
         assert self._client is not None
-        await self._resume_pending(account)
+        if not await self._resume_pending(account):
+            # The saved messages could not be taken over (sync.json busy, or the channel let go meanwhile).
+            await asyncio.sleep(min(self._owner_retry, _HOST_CHECK_SECONDS))
+            return "lost"
         worker = asyncio.create_task(self._work(), name="weixin-inbox")
         timeout_ms, failures = _LONG_POLL_MS, 0
         try:
@@ -1017,11 +1040,19 @@ class WeixinAdapter(ChannelAdapter):
         finally:
             await _finish(worker, 5.0)
 
-    async def _resume_pending(self, account: WeixinAccount) -> None:
+    async def _resume_pending(self, account: WeixinAccount) -> bool:
         """Take over what the last poller (this backend or another) left: messages it had not started are
         answered now. One it was answering when it stopped is not run again, since its tools may already have
         acted; the person is told it was not finished, and if WeChat refuses that note now, when they next write."""
-        epoch, cursor, pending = await self._in_writer(self.store.claim_sync)
+        lock = self._lock
+        try:
+            claimed = await self._in_writer(lambda: self.store.claim_sync(lambda: self._lock is lock))
+        except OSError as exc:
+            logger.warning("weixin could not take over the saved messages: %s", type(exc).__name__)
+            claimed = None
+        if claimed is None:
+            return False
+        epoch, cursor, pending = claimed
         self._epoch = epoch
         self._inbox = asyncio.Queue()
         allowed = self.config.allow_users or ((account.user_id,) if account.user_id else ())
@@ -1047,6 +1078,7 @@ class WeixinAdapter(ChannelAdapter):
             logger.info("weixin resumes %d message(s) taken before the last stop", len(waiting))
         for entry in [entry for entry in self._pending if entry.get("notice")]:
             await self._tell_unfinished(entry)
+        return True
 
     async def _tell_unfinished(self, entry: dict) -> None:
         """Say that a message was cut off by a stop; the note stays owed until WeChat takes it."""
@@ -1076,7 +1108,7 @@ class WeixinAdapter(ChannelAdapter):
         cursor, snapshot, epoch = self._cursor, [dict(entry) for entry in self._pending], self._epoch
 
         def write() -> bool:
-            return self._lock is not lock or self.store.save_sync(cursor, snapshot, epoch)
+            return self._lock is not lock or self.store.save_sync(cursor, snapshot, epoch, lambda: self._lock is lock)
 
         try:
             if not await self._in_writer(write):

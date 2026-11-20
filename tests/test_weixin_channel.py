@@ -729,10 +729,10 @@ def test_a_save_still_on_its_way_at_a_handover_never_undoes_the_next_pollers(ili
 
         slow = WeixinStore(tmp_path / "weixin")
 
-        def late_save(cursor, pending, epoch):
+        def late_save(*args):
             held.set()
             go.wait(10)
-            return WeixinStore.save_sync(slow, cursor, pending, epoch)
+            return WeixinStore.save_sync(slow, *args)
 
         slow.save_sync = late_save  # type: ignore[method-assign]
         first = adapter(ilink, slow, handler)
@@ -760,6 +760,103 @@ def test_a_save_still_on_its_way_at_a_handover_never_undoes_the_next_pollers(ili
 
     asyncio.run(scenario())
     assert answered == ["第一条", "第二条"]
+
+
+def test_a_claim_still_on_its_way_at_a_handover_cannot_outrank_the_next_poller(ilink, tmp_path, monkeypatch):
+    """The backend handing over had begun to claim the saved messages; its claim lands after the next one
+    claimed them. It must not take the claim back: the next one's progress would then not be saved, and a
+    third poller would answer the same message again."""
+    import threading
+
+    from agent.channels import weixin
+
+    monkeypatch.setattr(weixin, "_SETTLE_SECONDS", 0.3)
+    held, go, ran = threading.Event(), threading.Event(), threading.Event()
+    answered: list[str] = []
+    saved = tmp_path / "weixin" / "sync.json"
+
+    def epoch() -> int:
+        return json.loads(saved.read_text(encoding="utf-8")).get("epoch", 0) if saved.exists() else 0
+
+    async def scenario():
+        store = WeixinStore(tmp_path / "weixin")
+        await logged_in(ilink, store)
+
+        async def handler(message, reply):
+            answered.append(message.text)
+            return "好"
+
+        slow = WeixinStore(tmp_path / "weixin")
+
+        def late_claim(*args):
+            held.set()
+            go.wait(10)
+            try:
+                return WeixinStore.claim_sync(slow, *args)
+            finally:
+                ran.set()
+
+        slow.claim_sync = late_claim  # type: ignore[method-assign]
+        first = adapter(ilink, slow, handler)
+        await first.start()
+        await until(held.is_set, "the first backend's claim is on its way")
+        await first.stop()
+        second = adapter(ilink, WeixinStore(tmp_path / "weixin"), handler)
+        await second.start()
+        try:
+            await until(lambda: second.running and epoch() == 1, "the second backend claimed")
+            go.set()
+            await until(ran.is_set, "the late claim got there")
+            assert epoch() == 1
+            ilink.inbound.put(ilink.text_message("第一条"))
+            await until(lambda: answered == ["第一条"] and store.pending() == [], "answered and saved")
+        finally:
+            await second.stop()
+        third = adapter(ilink, WeixinStore(tmp_path / "weixin"), handler)
+        await third.start()
+        try:
+            await until(lambda: third.running, "third online")
+            ilink.inbound.put(ilink.text_message("第二条"))
+            await until(lambda: "第二条" in answered, "a new message")
+        finally:
+            await third.stop()
+
+    asyncio.run(scenario())
+    assert answered == ["第一条", "第二条"]
+
+
+def test_status_and_replies_name_the_same_wechat_model(ilink, tmp_path, monkeypatch):
+    """Before the first reply, after a switch, and while channels.json cannot be read: /weixin status and the
+    model a reply goes to agree."""
+    from types import SimpleNamespace
+
+    from agent.channels.config import load_channels_config
+    from agent.cli.channel_models import ChannelModels
+    from agent.cli.weixin_commands import WeixinCommands
+
+    path = tmp_path / "channels.json"
+    monkeypatch.setenv("ASTRA_CHANNEL_CONFIG", str(path))
+    path.write_text(json.dumps({"weixin": {"enabled": True, "model": "test::chat-a"}}), encoding="utf-8")
+    store = WeixinStore(tmp_path / "weixin")
+    channel = WeixinAdapter(load_channels_config(path).weixin, lambda *_: None, store=store, keep_awake=FakeAwake(),
+                            settings=_following(path))
+    manager = SimpleNamespace(weixin=lambda: channel)
+    catalog = SimpleNamespace(resolve=lambda key: None, resolve_persisted=lambda key: None)
+    models = ChannelModels(lambda: catalog, channels=lambda: manager)  # type: ignore[arg-type,return-value]
+    commands = WeixinCommands(lambda: manager, lambda _event: None, models=models)  # type: ignore[arg-type,return-value]
+
+    def both() -> tuple[str, str]:
+        return commands.status_event()["model"], models.configured("weixin")
+
+    # Broken before any reply: the model the channel started with, in both.
+    path.write_text('{"weixin": {"enabled": true, "model": "test::chat-a",}}', encoding="utf-8")
+    assert both() == ("test::chat-a", "test::chat-a")
+    # Switched to B, then broken before B's first reply: B in both.
+    path.write_text(json.dumps({"weixin": {"enabled": True, "model": "test::chat-b"}}), encoding="utf-8")
+    assert both() == ("test::chat-b", "test::chat-b")
+    path.write_text("", encoding="utf-8")
+    assert both() == ("test::chat-b", "test::chat-b")
+    assert commands.status_event()["error"].startswith("channels.json 不是合法的 JSON")
 
 
 def test_a_note_wechat_refuses_is_sent_when_the_person_next_writes(ilink, tmp_path):

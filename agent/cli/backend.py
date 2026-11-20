@@ -2473,7 +2473,8 @@ async def _main(startup_started: float):
         _send({"type": "gui_ready", "workspace": str(Path(sandbox_workdir).resolve()),
                "session_id": Path(agent.context.session_path).stem})
 
-    channel_models = ChannelModels(lambda: catalog, lambda: current_model_key)
+    channel_models = ChannelModels(lambda: catalog, lambda: current_model_key,
+                                   channels=functools.partial(channel_manager_holder.get, "manager"))
     channel_router = AgentChannelRouter(agent, agent_turn_lock, sessions_dir(PROJECT_ROOT),
                                         admission=lambda: not restart.draining, model_for=channel_models.client,
                                         tasks=task_store)

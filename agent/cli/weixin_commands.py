@@ -49,13 +49,15 @@ class WeixinCommands:
     def status_event(self, *, message: str = "", error: str = "") -> dict:
         manager = self._manager()
         adapter = manager.weixin() if manager is not None else None
-        try:
-            config = load_channels_config(strict=True).weixin
-            unreadable = False
-        except (OSError, ValueError):
-            # Shown as the running channel has it, never as the defaults an unreadable file would give.
-            config = adapter.config if adapter is not None else load_channels_config().weixin
-            unreadable = True
+        if adapter is not None:
+            # The settings the channel works by, read the way its replies read them: the saved ones, or while
+            # the file cannot be read, the ones it last applied (never the defaults an unreadable file gives).
+            config, unreadable = adapter.settings(), adapter.settings_unreadable
+        else:
+            try:
+                config, unreadable = load_channels_config(strict=True).weixin, False
+            except (OSError, ValueError):
+                config, unreadable = load_channels_config().weixin, True
         enabled = config.enabled
         account = None
         if adapter is not None:
@@ -138,7 +140,7 @@ class WeixinCommands:
 
     def _model(self, key: str) -> None:
         if not key:
-            configured = load_channels_config().weixin.model
+            configured = self._models.configured("weixin") if self._models else load_channels_config().weixin.model
             default = self._label(self._models.default() if self._models else None, "")
             self.send_status(message=f"微信回复用的模型：{self._label(self._resolve(configured), configured)}" if configured
                              else f"微信回复用的模型：跟随默认{f'（{default}）' if default else ''}")
