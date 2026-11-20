@@ -7,6 +7,8 @@ import json
 import logging
 import os
 import sqlite3
+import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -14,6 +16,7 @@ import urllib.request
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 from .deepseek import DEEPSEEK_FLASH, canonical_deepseek_model, is_deepseek_model
 from .harness import default_llm_timeout
@@ -26,21 +29,115 @@ from .usage import report_usage
 from .tracing import trace_span
 from .vision_policy import VisionPreprocessPolicy
 
-try:
-    from openai import (
-        APIError,
-        APITimeoutError,
-        AsyncOpenAI,
-        BadRequestError,
-        DefaultAsyncHttpxClient,
-        RateLimitError,
-    )
-except ModuleNotFoundError:
-    class _OpenAIUnavailableError(Exception):
-        pass
+class _OpenAIUnavailableError(Exception):
+    pass
 
-    APIError = APITimeoutError = BadRequestError = RateLimitError = _OpenAIUnavailableError
-    AsyncOpenAI = DefaultAsyncHttpxClient = None
+
+class _UnloadedAPIError(_OpenAIUnavailableError):
+    pass
+
+
+class _UnloadedAPITimeoutError(_OpenAIUnavailableError):
+    pass
+
+
+class _UnloadedBadRequestError(_OpenAIUnavailableError):
+    pass
+
+
+class _UnloadedRateLimitError(_OpenAIUnavailableError):
+    pass
+
+
+_OPENAI_UNSET = object()
+_OPENAI_MODULE: Any = _OPENAI_UNSET
+_OPENAI_LOAD_LOCK = threading.RLock()
+_OPENAI_REQUIRED_ATTRS = (
+    "APIError",
+    "APITimeoutError",
+    "BadRequestError",
+    "RateLimitError",
+    "AsyncOpenAI",
+    "DefaultAsyncHttpxClient",
+)
+
+# Loaded lazily on first OpenAI-compatible SDK use so startup and native
+# providers (Gemini, Codex, Claude Code) never pay the ~2-5s openai+aiohttp
+# import cost. Tests may monkeypatch any of these attributes beforehand.
+APIError: type[Exception] = _UnloadedAPIError
+APITimeoutError: type[Exception] = _UnloadedAPITimeoutError
+BadRequestError: type[Exception] = _UnloadedBadRequestError
+RateLimitError: type[Exception] = _UnloadedRateLimitError
+AsyncOpenAI: Any = _OPENAI_UNSET
+DefaultAsyncHttpxClient: Any = _OPENAI_UNSET
+
+
+def _bind_openai_symbols(module: Any) -> None:
+    global APIError, APITimeoutError, AsyncOpenAI, BadRequestError
+    global DefaultAsyncHttpxClient, RateLimitError
+    if APIError is _UnloadedAPIError:
+        APIError = module.APIError
+    if APITimeoutError is _UnloadedAPITimeoutError:
+        APITimeoutError = module.APITimeoutError
+    if BadRequestError is _UnloadedBadRequestError:
+        BadRequestError = module.BadRequestError
+    if RateLimitError is _UnloadedRateLimitError:
+        RateLimitError = module.RateLimitError
+    if AsyncOpenAI is _OPENAI_UNSET:
+        AsyncOpenAI = module.AsyncOpenAI
+    if DefaultAsyncHttpxClient is _OPENAI_UNSET:
+        DefaultAsyncHttpxClient = module.DefaultAsyncHttpxClient
+
+
+def _ensure_openai_loaded(*, only_if_imported: bool = False) -> None:
+    """Bind OpenAI SDK symbols on demand without clobbering test monkeypatches."""
+    global AsyncOpenAI, DefaultAsyncHttpxClient, _OPENAI_MODULE
+    if (
+        APIError is not _UnloadedAPIError
+        and APITimeoutError is not _UnloadedAPITimeoutError
+        and BadRequestError is not _UnloadedBadRequestError
+        and RateLimitError is not _UnloadedRateLimitError
+        and AsyncOpenAI is not _OPENAI_UNSET
+        and DefaultAsyncHttpxClient is not _OPENAI_UNSET
+    ):
+        return
+    if only_if_imported:
+        # Never block callers waiting on a background thread mid-import of openai,
+        # and never inspect a partially-initialized sys.modules["openai"] entry.
+        if not _OPENAI_LOAD_LOCK.acquire(blocking=False):
+            return
+        try:
+            module = _OPENAI_MODULE
+            if module is _OPENAI_UNSET:
+                loaded = sys.modules.get("openai")
+                if loaded is None or not all(hasattr(loaded, attr) for attr in _OPENAI_REQUIRED_ATTRS):
+                    return
+                module = loaded
+                _OPENAI_MODULE = module
+            if module is None:
+                if AsyncOpenAI is _OPENAI_UNSET:
+                    AsyncOpenAI = None
+                if DefaultAsyncHttpxClient is _OPENAI_UNSET:
+                    DefaultAsyncHttpxClient = None
+                return
+            _bind_openai_symbols(module)
+        finally:
+            _OPENAI_LOAD_LOCK.release()
+        return
+
+    with _OPENAI_LOAD_LOCK:
+        if _OPENAI_MODULE is _OPENAI_UNSET:
+            try:
+                _OPENAI_MODULE = importlib.import_module("openai")
+            except ModuleNotFoundError:
+                _OPENAI_MODULE = None
+        if _OPENAI_MODULE is None:
+            if AsyncOpenAI is _OPENAI_UNSET:
+                AsyncOpenAI = None
+            if DefaultAsyncHttpxClient is _OPENAI_UNSET:
+                DefaultAsyncHttpxClient = None
+            return
+        _bind_openai_symbols(_OPENAI_MODULE)
 
 logger = logging.getLogger(__name__)
 
@@ -646,14 +743,38 @@ class OpenAICompatibleProvider:
             if self.config.stream_overall_timeout is None:
                 self.config.stream_overall_timeout = 0.0
         self._estimate_calibration = 1.0
-        if AsyncOpenAI is None:
-            raise RuntimeError("openai package is required to create LLMClient")
         self._proxy_url = active_proxy_for_url(config.base_url)
-        self._client = self._build_client(self._proxy_url)
-        self._route_clients = {self._proxy_url or "direct": self._client}
+        self._client_instance: Any = None
+        self._route_clients: dict[str, Any] = {}
         self._route_lock = asyncio.Lock()
 
+    @property
+    def _client(self) -> Any:
+        client = self.__dict__.get("_client_instance")
+        if (
+            client is None
+            and hasattr(self, "_route_clients")
+            and not self.config.connection_required
+        ):
+            proxy_url = active_proxy_for_url(self.config.base_url)
+            route_key = proxy_url or "direct"
+            client = self._route_clients.get(route_key)
+            if client is None:
+                client = self._build_client(proxy_url)
+                self._route_clients[route_key] = client
+            self._client_instance = client
+            self._proxy_url = proxy_url
+        return client
+
+    @_client.setter
+    def _client(self, value: Any) -> None:
+        self._client_instance = value
+
     def _build_client(self, proxy_url: str | None):
+        if AsyncOpenAI is _OPENAI_UNSET or DefaultAsyncHttpxClient is _OPENAI_UNSET:
+            _ensure_openai_loaded()
+        else:
+            _ensure_openai_loaded(only_if_imported=True)
         if AsyncOpenAI is None or DefaultAsyncHttpxClient is None:
             raise RuntimeError("openai package is required to create LLMClient")
         http_client = (
@@ -680,26 +801,39 @@ class OpenAICompatibleProvider:
         if not hasattr(self, "_proxy_url"):
             return
         proxy_url = active_proxy_for_url(self.config.base_url)
-        if proxy_url == self._proxy_url:
+        if self._client_instance is not None and proxy_url == self._proxy_url:
             return
         async with self._route_lock:
             proxy_url = active_proxy_for_url(self.config.base_url)
-            if proxy_url == self._proxy_url:
+            if self._client_instance is not None and proxy_url == self._proxy_url:
                 return
             route_key = proxy_url or "direct"
             client = self._route_clients.get(route_key)
             if client is None:
+                if AsyncOpenAI is _OPENAI_UNSET or DefaultAsyncHttpxClient is _OPENAI_UNSET:
+                    await asyncio.to_thread(_ensure_openai_loaded)
                 client = self._build_client(proxy_url)
                 self._route_clients[route_key] = client
             # Keep both route clients alive: another concurrent completion may
             # still be consuming a stream on the previous route.
-            self._client = client
+            self._client_instance = client
             self._proxy_url = proxy_url
+
+    async def _warm_client_if_needed(self) -> None:
+        """Load the OpenAI SDK before per-request network deadlines start ticking."""
+        if (
+            self.config.connection_required
+            or self.__dict__.get("_client_instance") is not None
+            or not hasattr(self, "_route_clients")
+        ):
+            return
+        await self._ensure_client_route()
 
     async def _create_completion(self, kwargs: dict):
         if self.config.connection_required:
             raise ValueError("Connect a provider with /connect and select a model before sending a request.")
         await self._ensure_client_route()
+        _ensure_openai_loaded(only_if_imported=True)
         from .deepseek_files import DeepSeekImageFiles, supports_file_reuse
         prepared = kwargs
         used_files: set[str] = set()
@@ -799,6 +933,7 @@ class OpenAICompatibleProvider:
         budget: _RequestBudget | None = None,
         per_attempt_timeout: float | None = None,
     ):
+        _ensure_openai_loaded(only_if_imported=True)
         retryable = (
             APIError,
             APITimeoutError,
@@ -992,6 +1127,7 @@ class OpenAICompatibleProvider:
         )
         kwargs.update({"stream": True, "stream_options": {"include_usage": True}})
 
+        await self._warm_client_if_needed()
         budget = _RequestBudget.from_policy(
             self.config.overall_timeout
             if self.config.stream_overall_timeout is None
@@ -1127,6 +1263,7 @@ class OpenAICompatibleProvider:
                 await chunk_events.aclose()
                 await _close_async_stream(stream)
 
+        _ensure_openai_loaded(only_if_imported=True)
         retryable = (
             APIError,
             APITimeoutError,
@@ -1252,6 +1389,7 @@ class OpenAICompatibleProvider:
         if max_tokens is not None:
             kwargs["max_tokens"] = max(64, int(max_tokens))
             self._apply_reasoning_budget(kwargs)
+        await self._warm_client_if_needed()
         budget = _RequestBudget.from_policy(
             self.config.overall_timeout,
             self.config.max_retries,
@@ -1310,7 +1448,9 @@ class OpenAICompatibleProvider:
             if request_timeout is None
             else request_timeout
         )
+        await self._warm_client_if_needed()
         budget = _RequestBudget.from_policy(logical_timeout, retry_limit)
+        _ensure_openai_loaded(only_if_imported=True)
         try:
             return await self._invoke_chat_completion(kwargs, budget)
         except BadRequestError as exc:
@@ -1361,6 +1501,8 @@ class OpenAICompatibleProvider:
         max_retries: int | None = None,
         budget: _RequestBudget | None = None,
     ) -> dict:
+        if budget is None:
+            await self._warm_client_if_needed()
         response = await self._with_retry(
             lambda: self._create_completion(kwargs),
             timeout=request_timeout,

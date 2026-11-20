@@ -22,6 +22,7 @@ import urllib.request
 from collections import OrderedDict
 from contextlib import ExitStack
 from pathlib import Path
+from typing import Any
 
 from ...sandbox.windows_job import WindowsJob
 from ..process_env import hidden_process_creationflags
@@ -31,15 +32,31 @@ try:
 except ImportError:  # pragma: no cover - exercised by monkeypatch in tests
     httpx = None
 
-try:
-    from bs4 import BeautifulSoup
-except ImportError:  # pragma: no cover - optional dependency
-    BeautifulSoup = None
+_HTML_PARSER_UNSET = object()
+BeautifulSoup: Any = _HTML_PARSER_UNSET
+markdownify_html: Any = _HTML_PARSER_UNSET
 
-try:
-    from markdownify import markdownify as markdownify_html
-except ImportError:  # pragma: no cover - optional dependency
-    markdownify_html = None
+
+def _get_beautiful_soup() -> Any:
+    global BeautifulSoup
+    if BeautifulSoup is _HTML_PARSER_UNSET:
+        try:
+            from bs4 import BeautifulSoup as _BeautifulSoup
+            BeautifulSoup = _BeautifulSoup
+        except ImportError:  # pragma: no cover - optional dependency
+            BeautifulSoup = None
+    return BeautifulSoup
+
+
+def _get_markdownify_html() -> Any:
+    global markdownify_html
+    if markdownify_html is _HTML_PARSER_UNSET:
+        try:
+            from markdownify import markdownify as _markdownify_html
+            markdownify_html = _markdownify_html
+        except ImportError:  # pragma: no cover - optional dependency
+            markdownify_html = None
+    return markdownify_html
 
 from ..network import active_proxy_for_url
 from ..tool_execution import PartialResult
@@ -834,9 +851,10 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
         return soup.find("main") or soup.body or soup
 
     def _html_to_text(body: str) -> str:
-        if BeautifulSoup is not None:
+        bs4_cls = _get_beautiful_soup()
+        if bs4_cls is not None:
             try:
-                soup = BeautifulSoup(body, "html.parser")
+                soup = bs4_cls(body, "html.parser")
                 for node in soup(["script", "style", "noscript", "nav", "footer", "header", "aside"]):
                     node.decompose()
                 main = _main_region(soup)
@@ -852,14 +870,16 @@ def register_web_tools(registry: ToolRegistry, sandbox, default_provider: str | 
 
     def _html_to_markdown(body: str) -> str:
         """Extract the main HTML region and preserve useful Markdown structure."""
-        if BeautifulSoup is None or markdownify_html is None:
+        bs4_cls = _get_beautiful_soup()
+        md_fn = _get_markdownify_html()
+        if bs4_cls is None or md_fn is None:
             return _html_to_text(body)
         try:
-            soup = BeautifulSoup(body, "html.parser")
+            soup = bs4_cls(body, "html.parser")
             for node in soup(["script", "style", "noscript", "nav", "footer", "header", "aside"]):
                 node.decompose()
             main = _main_region(soup)
-            markdown = markdownify_html(
+            markdown = md_fn(
                 str(main),
                 heading_style="ATX",
                 bullets="-",

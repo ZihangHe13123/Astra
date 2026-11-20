@@ -476,6 +476,41 @@ class FileWriteTransaction:
     running_sha256: str = hashlib.sha256(b"").hexdigest()
 
 
+def _is_unc_path(path: Path) -> bool:
+    """Return whether *path* is a Windows UNC / WSL network path."""
+    if os.name != "nt":
+        return False
+    raw = str(path)
+    return raw.startswith(("\\\\", "//"))
+
+
+def _unc_share_key(path: Path) -> tuple[str, str] | None:
+    """Return a normalized (host, share) authority key for a Windows UNC path."""
+    if not _is_unc_path(path):
+        return None
+    stripped = str(path).lstrip("\\/")
+    parts = [part for part in re.split(r"[\\/]+", stripped) if part]
+    if len(parts) < 2:
+        return None
+    host = parts[0].casefold()
+    if host == "wsl$":
+        host = "wsl.localhost"
+    return (host, parts[1].casefold())
+
+
+def _is_wsl_unc_path(path: Path) -> bool:
+    share = _unc_share_key(path)
+    return share is not None and share[0] == "wsl.localhost"
+
+
+def _normalize_configured_root_path(path: Path) -> Path:
+    """Normalize a configured root without waking stopped UNC/WSL hosts."""
+    expanded = path.expanduser()
+    if _is_unc_path(expanded):
+        return Path(os.path.normpath(str(expanded)))
+    return expanded.resolve()
+
+
 class FilesystemPolicy:
     """Resolve paths against workspace and explicitly configured host roots."""
 
@@ -489,8 +524,15 @@ class FilesystemPolicy:
             mode = item.mode.strip().lower()
             if mode not in {"ro", "rw"}:
                 raise ValueError(f"Invalid filesystem root mode '{item.mode}' for {item.path}")
-            configured.append(FilesystemRoot(item.path.expanduser().resolve(), mode, requires_approval=True))
+            configured.append(
+                FilesystemRoot(
+                    _normalize_configured_root_path(item.path),
+                    mode,
+                    requires_approval=True,
+                )
+            )
         self.configured_roots = tuple(configured)
+        self._resolved_unc_paths: dict[str, Path] = {}
         self.roots = self._with_workspace(self.configured_roots)
 
     def _with_workspace(self, configured: tuple[FilesystemRoot, ...]) -> list[FilesystemRoot]:
@@ -505,12 +547,13 @@ class FilesystemPolicy:
     def for_workspace(self, workdir: str | Path) -> "FilesystemPolicy":
         """The same configured roots around another workspace, such as a delegate's.
 
-        The roots are already resolved, so rebinding does no host IO for them (a
+        The roots are already normalized, so rebinding does no host IO for them (a
         stopped WSL distribution takes seconds to answer). Grants stay with the
         policy whose user approved them.
         """
         rebound = FilesystemPolicy(Path(workdir))
         rebound.configured_roots = self.configured_roots
+        rebound._resolved_unc_paths = dict(self._resolved_unc_paths)
         rebound.roots = rebound._with_workspace(self.configured_roots)
         return rebound
 
@@ -550,11 +593,71 @@ class FilesystemPolicy:
         except ValueError:  # Different Windows drives, or incompatible path forms.
             return False
 
-    def _matching_root(self, candidate: Path) -> FilesystemRoot | None:
+    def _resolve_unc_root(self, root_path: Path) -> Path:
+        key = os.path.normcase(str(root_path))
+        cached = self._resolved_unc_paths.get(key)
+        if cached is not None:
+            return cached
+        try:
+            resolved = root_path.resolve()
+        except OSError:
+            resolved = root_path
+        self._resolved_unc_paths[key] = resolved
+        return resolved
+
+    def _requested_candidate(self, path: str) -> Path:
+        cleaned = _clean_path(path)
+        candidate = Path(cleaned).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.workspace / candidate
+        return Path(os.path.normpath(str(candidate)))
+
+    def _matching_root(
+        self,
+        candidate: Path,
+        *,
+        requested: Path | None = None,
+    ) -> FilesystemRoot | None:
+        if not _is_unc_path(candidate):
+            for item in self.roots:
+                if self._contains(item.path, candidate):
+                    return item
+            return None
+        relevant_shares = {
+            share
+            for share in (
+                _unc_share_key(candidate),
+                _unc_share_key(requested) if requested is not None else None,
+            )
+            if share is not None
+        }
+        candidate_is_wsl = _is_wsl_unc_path(candidate)
+        best_item: FilesystemRoot | None = None
+        best_rank: tuple[int, bool, bool] = (-1, False, False)
         for item in self.roots:
-            if self._contains(item.path, candidate):
-                return item
-        return None
+            root_path = item.path
+            if _is_unc_path(root_path):
+                key = os.path.normcase(str(root_path))
+                cached = self._resolved_unc_paths.get(key)
+                if cached is not None:
+                    root_path = cached
+                elif not item.requires_approval:
+                    # Grants and workspace paths were already resolved at creation time.
+                    pass
+                elif _is_wsl_unc_path(root_path) and _unc_share_key(root_path) not in relevant_shares:
+                    # Never wake an unrelated stopped WSL distribution.
+                    continue
+                elif candidate_is_wsl and _unc_share_key(root_path) not in relevant_shares:
+                    # Accessing a WSL distro does not need to probe unrelated SMB hosts.
+                    continue
+                else:
+                    root_path = self._resolve_unc_root(root_path)
+            if self._contains(root_path, candidate):
+                rank = (len(str(root_path)), not item.requires_approval, item.mode == "rw")
+                if rank > best_rank:
+                    best_item = item
+                    best_rank = rank
+        return best_item
 
     def _candidate(self, path: str) -> Path:
         cleaned = _clean_path(path)
@@ -564,8 +667,9 @@ class FilesystemPolicy:
         return candidate.resolve()
 
     def resolve(self, path: str, *, write: bool = False) -> Path:
+        requested = self._requested_candidate(path)
         resolved = self._candidate(path)
-        item = self._matching_root(resolved)
+        item = self._matching_root(resolved, requested=requested)
         if item is not None:
             if write and item.mode != "rw":
                 raise PermissionError(f"Filesystem root is read-only: {item.path}")
@@ -575,8 +679,9 @@ class FilesystemPolicy:
 
     def permission_request(self, path: str, *, write: bool, operation: str) -> dict | None:
         """Return a frontend-safe request for every workspace-external path."""
+        requested = self._requested_candidate(path)
         target = self._candidate(path)
-        matching_root = self._matching_root(target)
+        matching_root = self._matching_root(target, requested=requested)
         outside_workspace = not self._contains(self.workspace, target)
         detail = ""
         try:
