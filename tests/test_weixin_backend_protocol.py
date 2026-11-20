@@ -236,8 +236,9 @@ def test_a_change_made_in_a_waiting_backend_reaches_the_one_that_has_wechat(tmp_
             time.sleep(0.05)
         assert ilink.replies_to(OWNER) and ilink.media_requests == [] and not inbox.exists()
 
+        # The waiting backend does not say it has stopped WeChat: the receiving one stops when it reads the change.
         send(waiting, {"type": "command", "cmd": "/weixin off"})
-        waiting_status(lambda e: e.get("message") == "微信渠道已停用。")
+        waiting_status(lambda e: e.get("message") == "微信渠道已停用；如果另一个 Astra 后台正在收微信，它会在几秒内停下。")
         receiving_status(lambda e: e.get("state") == "off")
         polls = len(ilink.polls)
         time.sleep(1.5)
@@ -245,6 +246,48 @@ def test_a_change_made_in_a_waiting_backend_reaches_the_one_that_has_wechat(tmp_
     finally:
         for proc in backends:
             _stop_protocol_backend(proc)
+        model.shutdown()
+        model.server_close()
+        ilink.close()
+
+
+def test_an_unreadable_channels_json_is_reported_and_never_written_over(tmp_path):
+    model = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
+    threading.Thread(target=model.serve_forever, daemon=True).start()
+    ilink = FakeIlink()
+    channels = tmp_path / "channels.json"
+    channels.write_text(json.dumps({"weixin": {"keep_awake": False, "max_receive_file_bytes": 0}}), encoding="utf-8")
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    proc, _, _, wait_for = _start_question_protocol_backend(
+        tmp_path, model.server_port, "weixin_unreadable", workdir=workdir,
+        env_overrides={"ASTRA_HOME": str(tmp_path / "home"), "ASTRA_CHANNEL_CONFIG": str(channels),
+                       "ASTRA_WEIXIN_BASE_URL": ilink.base, "ASTRA_WEIXIN_CDN_URL": ilink.cdn,
+                       "ASTRA_CONTEXT_INDEX_EMBEDDING": "off"},
+    )
+
+    def status(predicate, timeout: float = 20) -> dict:
+        return wait_for(lambda e: e.get("type") == "weixin_status" and predicate(e), timeout=timeout)
+
+    try:
+        status(lambda e: True, timeout=30)
+        send(proc, {"type": "command", "cmd": "/weixin login"})
+        status(lambda e: e.get("state") == "online", timeout=30)
+        good = channels.read_text(encoding="utf-8")
+        broken = good.rstrip().removesuffix("}") + ",}\n"
+        channels.write_text(broken, encoding="utf-8")
+        # Said without being asked, and shown as the running channel has it: on, not the defaults.
+        unreadable = status(lambda e: "不是合法的 JSON" in e.get("error", ""))
+        assert unreadable["error"] == "channels.json 不是合法的 JSON：改好之前，微信沿用原来的设置，这里也不能改设置。"
+        assert unreadable["enabled"] is True and unreadable["state"] == "online"
+        send(proc, {"type": "command", "cmd": "/weixin on"})
+        refused = status(lambda e: e.get("error", "").startswith("channels.json 不是合法的 JSON，设置没有改动"))
+        assert refused["state"] == "online"
+        assert channels.read_text(encoding="utf-8") == broken
+        channels.write_text(good, encoding="utf-8")
+        status(lambda e: "error" not in e and e.get("state") == "online")
+    finally:
+        _stop_protocol_backend(proc)
         model.shutdown()
         model.server_close()
         ilink.close()

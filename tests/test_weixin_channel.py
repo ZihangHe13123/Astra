@@ -6,6 +6,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 import pytest
 from weixin_fixture import BOT_TOKEN, LOGIN_LINK, OWNER, STRANGER, FakeIlink
@@ -551,6 +552,158 @@ def test_a_channel_switched_off_is_not_taken_over_by_a_backend_that_waits(ilink,
             await second.stop()
 
     asyncio.run(scenario())
+
+
+NOT_FINISHED = "「第一条」这条消息还没处理完，微信渠道就停了，没有接着处理；需要的话请再发一次。"
+
+
+def test_messages_taken_before_a_stop_are_answered_by_the_next_poller(ilink, tmp_path):
+    """/weixin off, an update or a crash while a turn runs and another message waits behind it: the waiting one
+    is answered by whoever polls next. The one cut off is not run again (its tools may have acted); the
+    person is told."""
+    seen: list[str] = []
+
+    async def scenario():
+        store = WeixinStore(tmp_path / "weixin")
+        await logged_in(ilink, store)
+        never = asyncio.Event()
+
+        async def slow(message, reply):
+            seen.append(message.text)
+            await never.wait()
+            return "好"
+
+        first = adapter(ilink, store, slow)
+        await first.start()
+        await until(lambda: first.running, "online")
+        ilink.inbound.put(ilink.text_message("第一条"))
+        ilink.inbound.put(ilink.text_message("第二条"))
+        await until(lambda: seen == ["第一条"] and len(store.pending()) == 2, "the second waits behind the first")
+        await first.stop()
+        assert [(entry["message"]["item_list"][0]["text_item"]["text"], entry["started"])
+                for entry in store.pending()] == [("第一条", True), ("第二条", False)]
+        seen.clear()
+
+        async def quick(message, reply):
+            seen.append(message.text)
+            return "好"
+
+        second = adapter(ilink, WeixinStore(tmp_path / "weixin"), quick)
+        await second.start()
+        try:
+            await until(lambda: seen == ["第二条"], "the waiting message")
+            ilink.inbound.put(ilink.text_message("第三条"))
+            await until(lambda: seen == ["第二条", "第三条"] and store.pending() == [], "new ones as well")
+        finally:
+            await second.stop()
+
+    asyncio.run(scenario())
+    assert ilink.replies_to(OWNER) == [NOT_FINISHED, "好", "好"]
+
+
+def test_switched_off_with_a_long_turn_the_waiting_messages_are_kept(ilink, tmp_path, monkeypatch):
+    from agent.channels import weixin
+
+    # Switched off in the file, the channel answers what it took for up to this long, then stops.
+    monkeypatch.setattr(weixin, "_HANDOVER_DRAIN_SECONDS", 0.3)
+    saved = tmp_path / "channels.json"
+    _save(saved, enabled=True, keep_awake=False)
+    seen: list[str] = []
+
+    async def scenario():
+        store = WeixinStore(tmp_path / "weixin")
+        await logged_in(ilink, store)
+        never = asyncio.Event()
+
+        async def handler(message, reply):
+            seen.append(message.text)
+            if message.text == "第一条":
+                await never.wait()
+            return "好"
+
+        channel = adapter(ilink, store, handler, settings=_following(saved))
+        await channel.start()
+        try:
+            await until(lambda: channel.running, "online")
+            ilink.inbound.put(ilink.text_message("第一条"))
+            ilink.inbound.put(ilink.text_message("第二条"))
+            await until(lambda: seen == ["第一条"] and len(store.pending()) == 2, "the second waits")
+            _save(saved, enabled=False)
+            await until(lambda: channel.status()["state"] == "off", "switched off")
+            _save(saved, enabled=True)
+            await until(lambda: seen == ["第一条", "第二条"] and store.pending() == [], "the waiting message")
+        finally:
+            await channel.stop()
+
+    asyncio.run(scenario())
+    assert ilink.replies_to(OWNER) == [NOT_FINISHED, "好"]
+
+
+def test_files_of_one_message_go_where_the_settings_said_when_it_arrived(ilink, tmp_path, monkeypatch):
+    from agent.channels import weixin
+
+    saved = tmp_path / "channels.json"
+    first, second = tmp_path / "first", tmp_path / "second"
+    _save(saved, enabled=True, keep_awake=False, receive_files_dir=str(first))
+    for param in ("a", "b", "c"):
+        _on_cdn(ilink, param, param.encode())
+    channel_box: list = []
+    save = weixin._save_received
+
+    def save_then_change(directory, name, data):
+        path = save(directory, name, data)
+        if name == "a.txt":
+            # The folder changes while the message is handled, and the channel reads it at once (as its poll
+            # loop does every couple of seconds).
+            _save(saved, receive_files_dir=str(second))
+            channel_box[0]._refresh()
+        return path
+
+    monkeypatch.setattr(weixin, "_save_received", save_then_change)
+
+    async def scenario():
+        store = WeixinStore(tmp_path / "weixin")
+        await logged_in(ilink, store)
+        seen: list[ChannelMessage] = []
+
+        async def handler(message, reply):
+            seen.append(message)
+            return "收到"
+
+        channel = adapter(ilink, store, handler, settings=_following(saved))
+        channel_box.append(channel)
+        await channel.start()
+        try:
+            await until(lambda: channel.running, "online")
+            ilink.inbound.put({**ilink.text_message(""), "item_list": [_file("a", "a.txt"), _file("b", "b.txt")]})
+            await until(lambda: len(seen) == 1, "two files")
+            ilink.inbound.put({**ilink.text_message(""), "item_list": [_file("c", "c.txt")]})
+            await until(lambda: len(seen) == 2, "the next message")
+        finally:
+            await channel.stop()
+
+    asyncio.run(scenario())
+    day = time.strftime("%Y-%m-%d")
+    assert _saved(first) == {f"{day}/a.txt": b"a", f"{day}/b.txt": b"b"}
+    assert _saved(second) == {f"{day}/c.txt": b"c"}
+
+
+def test_a_channel_setting_is_never_saved_over_a_file_that_is_not_json(tmp_path):
+    from agent.channels.config import set_channel_enabled
+    from agent.runtime.json_preferences import UnreadablePreferences
+
+    path = tmp_path / "channels.json"
+    broken = '{"weixin": {"enabled": false, "receive_files_dir": "~/收件",}}'
+    path.write_text(broken, encoding="utf-8")
+    with pytest.raises(UnreadablePreferences):
+        set_channel_enabled("weixin", True, path)
+    assert path.read_text(encoding="utf-8") == broken
+    # Nothing to lose: an empty file, or none, is written as usual.
+    path.write_text("\n", encoding="utf-8")
+    set_channel_enabled("weixin", True, path)
+    path.unlink()
+    set_channel_enabled("weixin", True, path)
+    assert json.loads(path.read_text(encoding="utf-8")) == {"weixin": {"enabled": True}}
 
 
 def test_quotes_and_placeholders_never_crowd_out_or_stand_in_for_the_persons_words(ilink, tmp_path):

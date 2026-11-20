@@ -197,8 +197,16 @@ class WeixinStore:
     def sync_buf(self) -> str:
         return str(self._read("sync.json").get("get_updates_buf") or "")
 
-    def save_sync_buf(self, value: str) -> None:
-        self._write("sync.json", {"get_updates_buf": value})
+    def pending(self) -> list[dict]:
+        """Messages taken from WeChat that were not answered yet, oldest first: {"message": …, "started": …}."""
+        entries = self._read("sync.json").get("pending")
+        return [entry for entry in entries if isinstance(entry, dict) and isinstance(entry.get("message"), dict)
+                ] if isinstance(entries, list) else []
+
+    def save_sync(self, cursor: str, pending: list[dict]) -> None:
+        """The cursor and the messages before it still to answer, in one write, so a stop between taking
+        messages from WeChat and answering them loses none."""
+        self._write("sync.json", {"get_updates_buf": cursor, "pending": pending})
 
     def context_tokens(self) -> dict[str, str]:
         return {str(k): str(v) for k, v in self._read("context-tokens.json").items() if v}
@@ -737,7 +745,12 @@ class WeixinAdapter(ChannelAdapter):
         self._account: WeixinAccount | None = None
         self._tokens: dict[str, str] = {}
         self._seen: OrderedDict[str, None] = OrderedDict()
+        # Messages taken from WeChat and not answered yet, kept in the store with the cursor (see save_sync).
         self._inbox: asyncio.Queue[dict] = asyncio.Queue()
+        self._pending: list[dict] = []
+        self._cursor = ""
+        self._pending_lock = asyncio.Lock()
+        self._settings_unreadable = False
         self._pause = pause
         self._tickets: dict[str, tuple[str, float]] = {}
         # Approvals waiting for the person's 同意/拒绝, by sender, and chats whose "typing…" is paused meanwhile.
@@ -755,7 +768,8 @@ class WeixinAdapter(ChannelAdapter):
 
     def state_key(self) -> tuple:
         """What a status shows that can change on its own, read without touching the disk."""
-        return (self._state, self._lock is not None, self._keep_awake.active, self._error, self.config.problems)
+        return (self._state, self._lock is not None, self._keep_awake.active, self._error, self.config.problems,
+                self._settings_unreadable)
 
     def _refresh(self) -> WeixinConfig:
         """Follow channels.json: the saved settings replace the ones in use, read before each message and,
@@ -766,8 +780,11 @@ class WeixinAdapter(ChannelAdapter):
         try:
             fresh = self._settings()
         except Exception as exc:
-            logger.warning("weixin settings could not be read, kept as they were: %s", type(exc).__name__)
+            if not self._settings_unreadable:
+                logger.warning("weixin settings could not be read, kept as they were: %s", type(exc).__name__)
+            self._settings_unreadable = True
             return self.config
+        self._settings_unreadable = False
         if fresh != self.config or fresh.problems != self.config.problems:
             self.config = fresh
             if self._lock is not None and fresh.keep_awake != self._keep_awake.active:
@@ -898,12 +915,13 @@ class WeixinAdapter(ChannelAdapter):
         answered; the next poller continues from the saved cursor.
         """
         assert self._client is not None
+        await self._resume_pending(account)
         worker = asyncio.create_task(self._work(), name="weixin-inbox")
-        cursor, timeout_ms, failures = self.store.sync_buf(), _LONG_POLL_MS, 0
+        timeout_ms, failures = _LONG_POLL_MS, 0
         try:
             while True:
                 try:
-                    response = await self._next_updates(account, cursor, timeout_ms, yield_to_host)
+                    response = await self._next_updates(account, self._cursor, timeout_ms, yield_to_host)
                     if isinstance(response, str):
                         logger.info("weixin %s", "handed over to the desktop's channel host" if response == "host"
                                     else "switched off in channels.json")
@@ -930,17 +948,73 @@ class WeixinAdapter(ChannelAdapter):
                 suggested = response.get("longpolling_timeout_ms")
                 if isinstance(suggested, int) and suggested > 0:
                     timeout_ms = suggested
-                for message in response.get("msgs") or []:
-                    # An answer to a waiting approval cannot queue behind the turn that waits for it.
-                    if isinstance(message, dict) and not await self._answered_approval(message):
-                        self._inbox.put_nowait(message)
-                # The cursor moves only after the batch is queued, so a crash re-delivers rather than drops.
+                taken = [{"message": message, "started": False} for message in response.get("msgs") or []
+                         # An answer to a waiting approval cannot queue behind the turn that waits for it.
+                         if isinstance(message, dict) and not await self._answered_approval(message)]
                 new_cursor = str(response.get("get_updates_buf") or "")
-                if new_cursor and new_cursor != cursor:
-                    cursor = new_cursor
-                    await asyncio.to_thread(self.store.save_sync_buf, cursor)
+                if taken or (new_cursor and new_cursor != self._cursor):
+                    # Saved with the cursor that passes them: WeChat does not send them again, and a stop
+                    # before they are answered leaves them for the next poller.
+                    async with self._pending_lock:
+                        self._pending.extend(taken)
+                        self._cursor = new_cursor or self._cursor
+                        await self._save_pending()
+                for entry in taken:
+                    self._inbox.put_nowait(entry)
         finally:
             await _finish(worker, 5.0)
+
+    async def _resume_pending(self, account: WeixinAccount) -> None:
+        """Take over what the last poller (this backend or another) left: messages it had not started are
+        answered now. One it was answering when it stopped is not run again, since its tools may already have
+        acted; the person is told it was not finished."""
+        cursor, pending = await asyncio.to_thread(lambda: (self.store.sync_buf(), self.store.pending()))
+        self._inbox = asyncio.Queue()
+        interrupted = [entry for entry in pending if entry.get("started")]
+        async with self._pending_lock:
+            self._cursor = cursor
+            self._pending = [entry for entry in pending if not entry.get("started")]
+            if interrupted:
+                await self._save_pending()
+        for entry in self._pending:
+            self._inbox.put_nowait(entry)
+        if self._pending:
+            logger.info("weixin resumes %d message(s) taken before the last stop", len(self._pending))
+        allowed = self.config.allow_users or ((account.user_id,) if account.user_id else ())
+        for entry in interrupted:
+            message = entry["message"]
+            sender = str(message.get("from_user_id") or "").strip()
+            if sender not in allowed or message.get("room_id") or message.get("chat_room_id"):
+                continue
+            words = next((str((item.get("text_item") or {}).get("text") or "") for item in message.get("item_list") or []
+                          if isinstance(item, dict) and item.get("type") == _ITEM_TEXT), "").strip()
+            quoted = f"「{words[:20]}{'…' if len(words) > 20 else ''}」这条消息" if words else "上一条消息"
+            try:
+                await self.send_text(sender, f"{quoted}还没处理完，微信渠道就停了，没有接着处理；需要的话请再发一次。",
+                                     bubbles=False)
+            except (httpx.HTTPError, WeixinError) as exc:
+                logger.warning("weixin could not say a message was left unfinished: %s", type(exc).__name__)
+
+    async def _save_pending(self) -> None:
+        """Write the cursor and the unanswered messages; called with _pending_lock held, and only by the backend
+        that polls (a stopped one no longer owns them). A failed write is logged: the messages are still answered."""
+        if self._lock is None:
+            return
+        snapshot = [dict(entry) for entry in self._pending]
+        try:
+            await asyncio.to_thread(self.store.save_sync, self._cursor, snapshot)
+        except OSError as exc:
+            logger.warning("weixin could not save the messages it is answering: %s", type(exc).__name__)
+
+    async def _mark_started(self, entry: dict) -> None:
+        async with self._pending_lock:
+            entry["started"] = True
+            await self._save_pending()
+
+    async def _answered(self, entry: dict) -> None:
+        async with self._pending_lock:
+            self._pending = [each for each in self._pending if each is not entry]
+            await self._save_pending()
 
     async def _next_updates(self, account: WeixinAccount, cursor: str, timeout_ms: int,
                             yield_to_host: bool) -> dict | str:
@@ -976,18 +1050,21 @@ class WeixinAdapter(ChannelAdapter):
             await asyncio.sleep(0.1)
 
     async def _work(self) -> None:
-        # One message at a time, in the order WeChat delivered them.
+        # One message at a time, in the order WeChat delivered them. Each stays saved until it is answered; one
+        # cut off by a stop stays marked as started (see _resume_pending).
         while True:
-            message = await self._inbox.get()
+            entry = await self._inbox.get()
             self._busy = True
             try:
-                await self._handle(message)
+                await self._mark_started(entry)
+                await self._handle(entry["message"])
             except asyncio.CancelledError:
+                self._busy = False
                 raise
             except Exception:
                 logger.exception("weixin message handling failed")
-            finally:
-                self._busy = False
+            self._busy = False
+            await self._answered(entry)
             if _stop_requested():
                 raise asyncio.CancelledError
 
@@ -1050,23 +1127,24 @@ class WeixinAdapter(ChannelAdapter):
         account = self._account
         if account is None:
             return
-        # The settings saved now apply to this message (who is answered, limits, where files go).
-        self._refresh()
+        # The settings saved now apply to this whole message (who is answered, limits, where files go), even
+        # if they change while it is handled.
+        config = self._refresh()
         sender = str(message.get("from_user_id") or "").strip()
         if not sender or sender == account.account_id or self._seen_before(str(message.get("message_id") or "")):
             return
         if message.get("room_id") or message.get("chat_room_id"):
             logger.info("weixin group message ignored")
             return
-        allowed = self.config.allow_users or ((account.user_id,) if account.user_id else ())
+        allowed = config.allow_users or ((account.user_id,) if account.user_id else ())
         if sender not in allowed:
             logger.info("weixin message from a sender who is not allowed: %s", mask(sender))
             return
         await self._remember_token(sender, message)
-        text, context, images = await self._content(message.get("item_list") or [])
+        text, context, images = await self._content(message.get("item_list") or [], config)
         # The limit is for what the person typed or said. What came with it (a quote, a file) is bounded by its
         # own limits and passed beside their words, never as them, so it never stands in for a request.
-        text = text.strip()[:self.config.max_input_chars]
+        text = text.strip()[:config.max_input_chars]
         if not text and not context and not images:
             return
         if not text and not context:
@@ -1096,25 +1174,25 @@ class WeixinAdapter(ChannelAdapter):
         finally:
             await _finish(typing, 5.0)
 
-    async def _content(self, items: list) -> tuple[str, str, tuple[ChannelImage, ...]]:
+    async def _content(self, items: list, config: WeixinConfig) -> tuple[str, str, tuple[ChannelImage, ...]]:
         """What the person typed or said; what came with it (quotes, placeholders, the files and videos they
         sent or quoted); their images. Only the first is their own words."""
         words: list[str] = []
         context: list[str] = []
         images: list[ChannelImage] = []
-        limit = self.config.max_input_chars
+        limit = config.max_input_chars
 
         async def media(item: dict) -> None:
             kind = item.get("type")
             if kind == _ITEM_IMAGE:
-                if len(images) < self.config.max_images:
-                    image = await self._image(item.get("image_item") or {})
+                if len(images) < config.max_images:
+                    image = await self._image(item.get("image_item") or {}, config)
                     if image is not None:
                         images.append(image)
                     else:
                         context.append("[图片：没能读取]")
             elif kind in (_ITEM_FILE, _ITEM_VIDEO):
-                context.append(await self._attachment(item))
+                context.append(await self._attachment(item, config))
 
         for item in items:
             if not isinstance(item, dict):
@@ -1142,7 +1220,7 @@ class WeixinAdapter(ChannelAdapter):
                 await media(item)
         return ("\n".join(part for part in words if part), "\n".join(context), tuple(images))
 
-    async def _attachment(self, item: dict) -> str:
+    async def _attachment(self, item: dict, config: WeixinConfig) -> str:
         """One file or video, saved or not; whatever goes wrong with it, the rest of the message still arrives."""
         if item.get("type") == _ITEM_FILE:
             payload = item.get("file_item") or {}
@@ -1151,7 +1229,7 @@ class WeixinAdapter(ChannelAdapter):
             payload = item.get("video_item") or {}
             name, kind = f"视频-{time.strftime('%H%M%S')}.mp4", "视频"
         try:
-            return await self._received(payload, name, kind)
+            return await self._received(payload, name, kind, config)
         except Exception:
             logger.exception("weixin %s could not be handled", "video" if kind == "视频" else "file")
             return f"[{kind}: {name}，没能处理]" if kind == "文件" else "[视频，没能处理]"
@@ -1180,14 +1258,14 @@ class WeixinAdapter(ChannelAdapter):
             data = await asyncio.to_thread(_decrypt, data, _aes_key(str(key)), strict=strict)
         return data, fetched
 
-    async def _received(self, payload: dict, name: str, kind: str) -> str:
+    async def _received(self, payload: dict, name: str, kind: str, config: WeixinConfig) -> str:
         """Save a file or video the person sent and say so; a small text file's text comes along.
 
         Only a file that arrived whole is saved: the key opens it, and it matches the size (and for a video
         the MD5) WeChat gave. These catch a cut or garbled download; they say nothing about who sent it."""
         title = f"{kind}: {name}" if kind == "文件" else kind
         what = "video" if kind == "视频" else "file"
-        limit = self.config.max_receive_file_bytes
+        limit = config.max_receive_file_bytes
         if limit <= 0:
             return f"[{title}]"
         # As Astra and Hermes send them: a file's len is its plain size, a video's video_size the size of its
@@ -1229,7 +1307,7 @@ class WeixinAdapter(ChannelAdapter):
             logger.warning("weixin %s did not match its declared size or checksum", what)
             return f"[{title}，下载的内容不完整或解不开，没有保存]"
         try:
-            directory = received_files_root(self.config) / time.strftime("%Y-%m-%d")
+            directory = received_files_root(config) / time.strftime("%Y-%m-%d")
             path = await asyncio.to_thread(_save_received, directory, name, data)
         except (OSError, RuntimeError) as exc:
             logger.warning("weixin %s could not be saved: %s", what, type(exc).__name__)
@@ -1242,9 +1320,9 @@ class WeixinAdapter(ChannelAdapter):
             note += f"\n[文件内容开始: {path.name}]\n{text}{ending}[文件内容结束: {path.name}]"
         return note
 
-    async def _image(self, payload: dict) -> ChannelImage | None:
+    async def _image(self, payload: dict, config: WeixinConfig) -> ChannelImage | None:
         try:
-            fetched = await self._media(payload, self.config.max_image_bytes)
+            fetched = await self._media(payload, config.max_image_bytes)
         except (httpx.HTTPError, WeixinError, ValueError, ImportError) as exc:
             logger.warning("weixin image could not be read: %s", type(exc).__name__)
             return None

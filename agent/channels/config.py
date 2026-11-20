@@ -226,14 +226,17 @@ def channels_config_path(path: str | Path | None = None) -> Path:
 
 
 def set_channel_setting(section: str, key: str, value: Any, path: str | Path | None = None) -> Path:
-    """Change one setting of one channel in the config file, keeping everything else in it."""
+    """Change one setting of one channel in the config file, keeping everything else in it.
+
+    A file that is there but is not valid JSON is never written over (it would lose every other setting):
+    UnreadablePreferences, an OSError, is raised instead."""
     from agent.runtime.json_preferences import update_preferences
 
     def change(data: dict) -> None:
         current = data.get(section)
         data[section] = {**(current if isinstance(current, dict) else {}), key: value}
 
-    return update_preferences(channels_config_path(path), change)
+    return update_preferences(channels_config_path(path), change, keep_unreadable=True)
 
 
 def set_channel_enabled(section: str, enabled: bool, path: str | Path | None = None) -> Path:

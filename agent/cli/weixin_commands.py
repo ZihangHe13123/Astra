@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from agent.channels.config import load_channels_config, set_channel_enabled, set_channel_setting
 from agent.channels.manager import ChannelManager
+from agent.runtime.json_preferences import UnreadablePreferences
 from agent.runtime.paths import state_path
 
 if TYPE_CHECKING:
@@ -23,6 +24,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 USAGE = "用法：/weixin [status|login|logout|on|off|model <模型>|model default]"
+# channels.json is there but is not valid JSON: running channels keep what they had, and nothing is written.
+UNREADABLE = "channels.json 不是合法的 JSON：改好之前，微信沿用原来的设置，这里也不能改设置。"
+NOT_SAVED = "channels.json 不是合法的 JSON，设置没有改动：先把文件改好（或删掉）再设置。"
 
 
 def is_weixin_command(command: str) -> bool:
@@ -45,7 +49,13 @@ class WeixinCommands:
     def status_event(self, *, message: str = "", error: str = "") -> dict:
         manager = self._manager()
         adapter = manager.weixin() if manager is not None else None
-        config = load_channels_config().weixin
+        try:
+            config = load_channels_config(strict=True).weixin
+            unreadable = False
+        except (OSError, ValueError):
+            # Shown as the running channel has it, never as the defaults an unreadable file would give.
+            config = adapter.config if adapter is not None else load_channels_config().weixin
+            unreadable = True
         enabled = config.enabled
         account = None
         if adapter is not None:
@@ -84,7 +94,8 @@ class WeixinCommands:
             event["message"] = message
         # A setting in channels.json that could not be read is said here, with what is used instead. A running
         # channel follows the file, so the saved settings are the ones in effect.
-        problem = error or str(status.get("error") or "") or "；".join(config.problems)
+        problem = (error or str(status.get("error") or "")
+                   or (UNREADABLE if unreadable else "；".join(config.problems)))
         if problem:
             event["error"] = problem
         return event
@@ -120,6 +131,8 @@ class WeixinCommands:
                 await self._switch(action == "on")
             else:
                 self.send_status(error=USAGE)
+        except UnreadablePreferences:
+            self.send_status(error=NOT_SAVED)
         except OSError as exc:
             self.send_status(error=f"微信设置没能保存：{exc}")
 
@@ -190,7 +203,12 @@ class WeixinCommands:
         finally:
             await client.close()
         self._qr, self._stage = None, ""
-        set_channel_enabled("weixin", True)
+        try:
+            set_channel_enabled("weixin", True)
+        except OSError as exc:
+            self.send_status(error=f"微信已登录（{mask(account.account_id)}），但渠道没能启用："
+                             + (NOT_SAVED if isinstance(exc, UnreadablePreferences) else str(exc)))
+            return
         await self._restart()
         self.send_status(message=f"微信已登录（{mask(account.account_id)}），渠道已启用。")
 
@@ -223,6 +241,13 @@ class WeixinCommands:
             if WeixinStore().account() is None:
                 self.send_status(error="还没有登录微信：先运行 /weixin login。")
                 return
+        manager = self._manager()
+        adapter = manager.weixin() if manager is not None else None
+        receiving = adapter is not None and bool(adapter.status().get("owner"))
         set_channel_enabled("weixin", on)
         await self._restart()
-        self.send_status(message="微信渠道已启用。" if on else "微信渠道已停用。")
+        if on or receiving:
+            self.send_status(message="微信渠道已启用。" if on else "微信渠道已停用。")
+        else:
+            # Another backend may be the one taking WeChat messages: it stops when it reads the change.
+            self.send_status(message="微信渠道已停用；如果另一个 Astra 后台正在收微信，它会在几秒内停下。")
