@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -47,29 +48,36 @@ def _items(
     return default
 
 
+def _whole(value: Any) -> int | None:
+    """A whole number written as a number or as plain digits ("52428800", "-5"); None for anything else."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value) if value.is_integer() else None
+    if isinstance(value, str) and re.fullmatch(r"[+-]?[0-9]+", value.strip()):
+        return int(value.strip())
+    return None
+
+
 def _number(data: dict[str, Any], key: str, default: int, problems: list[str], prefix: str, *,
             low: int, high: int | None = None, zero_is_unset: bool = True, invalid: int | None = None,
             invalid_note: str = "") -> int:
-    """A whole-number setting, kept within [low, high]. Missing (or 0 where 0 means unset) takes the default.
+    """A whole-number setting, kept within [low, high]. Only a missing one (absent or null), or 0 where 0
+    means unset, takes the default.
 
-    A value that is not a whole number ("50 MB") must not stop the backend: it is recorded in ``problems``
-    and replaced by ``invalid`` (the default unless a safer value is given)."""
+    A value that is set but is not a whole number ("50 MB", "--5", "") must not stop the backend: it is
+    recorded in ``problems`` and replaced by ``invalid`` (the default unless a safer value is given)."""
     value = data.get(key)
-    if value is None or value == "" or (zero_is_unset and value == 0 and not isinstance(value, bool)):
-        number = default
-    elif isinstance(value, int) and not isinstance(value, bool):
-        number = value
-    elif isinstance(value, float) and value.is_integer():
-        number = int(value)
-    elif isinstance(value, str) and value.strip().lstrip("+-").isdecimal() and value.strip().isascii():
-        number = int(value.strip())
-        if zero_is_unset and number == 0:
-            number = default
-    else:
+    number = default if value is None else _whole(value)
+    if number is None:
         number = default if invalid is None else invalid
         problems.append(f"{prefix}.{key} 应为整数，现在是 {json.dumps(value, ensure_ascii=False)}；"
                         + (invalid_note or f"暂按 {number} 处理。"))
         return number
+    if zero_is_unset and number == 0:
+        number = default
     return max(low, number if high is None else min(high, number))
 
 

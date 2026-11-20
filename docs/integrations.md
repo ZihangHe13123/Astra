@@ -171,8 +171,8 @@ in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on`,
   workspace. A file larger than `max_receive_file_bytes` (50 MB) is not
   downloaded, and `0` leaves every file on WeChat's side with only its name.
   A file that cannot be downloaded or saved is reported as such, and the rest
-  of the message still arrives. A number setting that is not a whole number
-  (`"50 MB"`) does not stop Astra: `/weixin status` and the log name it and
+  of the message still arrives. A number setting that is set but is not a
+  whole number (`"50 MB"`, or empty) does not stop Astra: `/weixin status` and the log name it and
   what is used instead, and for `max_receive_file_bytes` that is downloading
   nothing until it is fixed.
 - **How it answers.** WeChat conversations are told to talk like a chat: short,

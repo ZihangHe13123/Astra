@@ -477,8 +477,11 @@ def _file_name(name: object, fallback: str) -> str:
     # Windows reads "CON .txt" and "con.tar.gz" as the device too: the part before the first dot, spaces trimmed.
     if stem.split(".")[0].rstrip(" ").upper() in _RESERVED_FILE_NAMES:
         stem = f"_{stem}"
-    while len(f"{stem}{suffix}".encode()) > _MAX_FILE_NAME_BYTES and len(stem) > 1:
-        stem = stem[:-1]
+    if len(f"{stem}{suffix}".encode()) > _MAX_FILE_NAME_BYTES:
+        while len(f"{stem}{suffix}".encode()) > _MAX_FILE_NAME_BYTES and len(stem) > 1:
+            stem = stem[:-1]
+        # A cut can leave a space or a dot at the end, which Windows does not keep in a name.
+        stem = stem.rstrip(". ") or "_"
     return f"{stem}{suffix}"
 
 
@@ -1144,8 +1147,11 @@ class WeixinAdapter(ChannelAdapter):
         # given but malformed is not taken as absent.
         plain_size = _declared_size(payload.get("len")) if kind == "文件" else None
         sealed_size = _declared_size(payload.get("video_size")) if kind == "视频" else None
-        digest = str(payload.get("video_md5") or "").strip().lower() if kind == "视频" else ""
-        if plain_size == -1 or sealed_size == -1 or (digest and not re.fullmatch(r"[0-9a-f]{32}", digest)):
+        # An empty video_md5 is how a sender says it has none; anything else given (false, 0) must be one.
+        given = payload.get("video_md5") if kind == "视频" else None
+        digest = given.strip().lower() if isinstance(given, str) else ""
+        bad_digest = given not in (None, "") and not re.fullmatch(r"[0-9a-f]{32}", digest)
+        if plain_size == -1 or sealed_size == -1 or bad_digest:
             logger.warning("weixin %s came with a malformed size or checksum", what)
             return f"[{title}，微信给出的大小或校验值格式不对，没有下载]"
         if plain_size is not None and plain_size > limit:

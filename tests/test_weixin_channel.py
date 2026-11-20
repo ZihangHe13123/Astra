@@ -393,13 +393,15 @@ def test_only_a_file_that_arrived_whole_is_saved_and_the_limit_is_kept(ilink, tm
         _video("vid-3", video_size=str(len(clip))),
         _file("never-1", "odd-size.txt", "12 KB"),
         _video("never-2", video_md5="not-an-md5"),
+        _video("never-3", video_md5=False),
+        _video("never-4", video_md5=0),
         {"type": 5, "video_item": {"media": {"encrypt_query_param": "vid-k", "encrypt_type": 1}}},
         {"type": 4, "file_item": {"media": {"encrypt_query_param": "raw-1"}, "file_name": "raw.txt", "len": "5"}},
         _video("vid-1", video_size=str(len(_sealed(clip))), video_md5=hashlib.md5(clip).hexdigest()),
     ]], receive_files_dir=str(inbox), max_receive_file_bytes=1024)
 
     lines = message.attachments.split("\n")
-    assert lines[:13] == [
+    assert lines[:15] == [
         "[文件: big.zip（4.9 KB），超过 1.0 KB 的上限，没有下载]",
         "[文件: quiet.bin，超过 1.0 KB 的上限，没有下载]",
         "[文件: gone.txt，没能下载]",
@@ -412,14 +414,16 @@ def test_only_a_file_that_arrived_whole_is_saved_and_the_limit_is_kept(ilink, tm
         "[视频，下载的内容不完整或解不开，没有保存]",
         "[文件: odd-size.txt，微信给出的大小或校验值格式不对，没有下载]",
         "[视频，微信给出的大小或校验值格式不对，没有下载]",
+        "[视频，微信给出的大小或校验值格式不对，没有下载]",
+        "[视频，微信给出的大小或校验值格式不对，没有下载]",
         # Marked as encrypted, but no key: never kept as encrypted bytes.
         "[视频，下载的内容不完整或解不开，没有保存]",
     ]
     # Media WeChat did not encrypt is kept as it came.
-    assert lines[13:17] == [f"[文件: raw.txt（5 B），已保存到 {inbox / next(inbox.iterdir()).name / 'raw.txt'}]",
+    assert lines[15:19] == [f"[文件: raw.txt（5 B），已保存到 {inbox / next(inbox.iterdir()).name / 'raw.txt'}]",
                             "[文件内容开始: raw.txt]", "plain", "[文件内容结束: raw.txt]"]
-    video = re.fullmatch(r"\[视频: (视频-\d{6}\.mp4)（100 B），已保存到 (.+)\]", lines[17])
-    assert video is not None and len(lines) == 18 and message.text == ""
+    video = re.fullmatch(r"\[视频: (视频-\d{6}\.mp4)（100 B），已保存到 (.+)\]", lines[19])
+    assert video is not None and len(lines) == 20 and message.text == ""
     day = next(inbox.iterdir()).name
     assert _saved(inbox) == {f"{day}/{video.group(1)}": clip, f"{day}/raw.txt": b"plain"}
     assert video.group(2) == str(inbox / day / video.group(1))
@@ -429,15 +433,18 @@ def test_only_a_file_that_arrived_whole_is_saved_and_the_limit_is_kept(ilink, tm
                                     "raw-1", "vid-1"]
 
 
-def test_windows_device_names_are_never_used_for_a_saved_file(ilink, tmp_path):
-    for param in ("dev-1", "dev-2", "dev-3"):
+def test_a_saved_file_never_takes_a_name_windows_would_refuse(ilink, tmp_path):
+    for param in ("dev-1", "dev-2", "dev-3", "long-1", "long-2"):
         _on_cdn(ilink, param, param.encode())
     inbox = tmp_path / "inbox"
+    # Cut to the name limit, these would end in spaces.
     _received(ilink, tmp_path, [[_file("dev-1", "CON .txt"), _file("dev-2", "conin$.log"),
-                                 _file("dev-3", "lpt².tar.gz")]], receive_files_dir=str(inbox))
+                                 _file("dev-3", "lpt².tar.gz"), _file("long-1", "a" * 175 + " " * 10 + "z"),
+                                 _file("long-2", "b" * 175 + " . " * 4 + "z.txt")]], receive_files_dir=str(inbox))
     day = next(inbox.iterdir()).name
     assert _saved(inbox) == {f"{day}/_CON .txt": b"dev-1", f"{day}/_conin$.log": b"dev-2",
-                             f"{day}/_lpt².tar.gz": b"dev-3"}
+                             f"{day}/_lpt².tar.gz": b"dev-3", f"{day}/{'a' * 175}": b"long-1",
+                             f"{day}/{'b' * 175}.txt": b"long-2"}
 
 
 def test_quotes_and_placeholders_never_crowd_out_or_stand_in_for_the_persons_words(ilink, tmp_path):
@@ -497,16 +504,23 @@ def test_a_setting_that_is_not_a_number_is_reported_and_downloads_nothing(tmp_pa
     from agent.channels.config import load_channels_config
 
     path = tmp_path / "channels.json"
-    path.write_text(json.dumps({"qq": {"port": "two thousand"}, "weixin": {
-        "max_receive_file_bytes": "50 MB", "max_input_chars": "8000", "max_bubbles": 3.0, "max_images": 0}}),
-        encoding="utf-8")
-    config = load_channels_config(path)
-    assert config.weixin.max_receive_file_bytes == 0
-    assert (config.weixin.max_input_chars, config.weixin.max_bubbles, config.weixin.max_images) == (8000, 3, 0)
-    assert config.weixin.problems == ('weixin.max_receive_file_bytes 应为整数，现在是 "50 MB"；'
-                                      "收到的文件先不下载，只收文件名；写成字节数（如 52428800）后生效。",)
-    assert config.onebot.port == 2280
-    assert config.onebot.problems == ('qq.port 应为整数，现在是 "two thousand"；暂按 2280 处理。',)
+    stop = "收到的文件先不下载，只收文件名；写成字节数（如 52428800）后生效。"
+    for written in ("50 MB", "--5", "", False, 1.5, [52428800]):
+        path.write_text(json.dumps({"qq": {"port": "two thousand"}, "weixin": {
+            "max_receive_file_bytes": written, "max_input_chars": " 8000 ", "max_bubbles": 3.0, "max_images": 0,
+            "max_image_bytes": None}}), encoding="utf-8")
+        config = load_channels_config(path)
+        # Set but not a whole number, even empty: nothing is downloaded, and the setting is named.
+        assert config.weixin.max_receive_file_bytes == 0, written
+        assert config.weixin.problems == (
+            f"weixin.max_receive_file_bytes 应为整数，现在是 {json.dumps(written, ensure_ascii=False)}；{stop}",)
+        # Plain digits, a whole float, 0 where it means none, and null (not set) still read as before.
+        assert (config.weixin.max_input_chars, config.weixin.max_bubbles, config.weixin.max_images,
+                config.weixin.max_image_bytes) == (8000, 3, 0, 10 * 1024 * 1024)
+        assert config.onebot.port == 2280
+        assert config.onebot.problems == ('qq.port 应为整数，现在是 "two thousand"；暂按 2280 处理。',)
+    path.write_text(json.dumps({"weixin": {}}), encoding="utf-8")
+    assert load_channels_config(path).weixin.max_receive_file_bytes == 50 * 1024 * 1024
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate is macOS")

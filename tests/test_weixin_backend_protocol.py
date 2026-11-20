@@ -6,6 +6,8 @@ import threading
 import time
 from http.server import ThreadingHTTPServer
 
+import pytest
+
 from test_backend_task_protocol import _SlowOpenAIHandler, _start_question_protocol_backend, _stop_protocol_backend
 from test_session_lifecycle_protocol import send
 from weixin_fixture import BOT_TOKEN, OWNER, FakeIlink
@@ -84,11 +86,12 @@ def test_weixin_login_message_reply_and_logout_through_the_backend(tmp_path):
         ilink.close()
 
 
-def test_a_wechat_setting_that_is_not_a_number_is_reported_and_the_backend_keeps_working(tmp_path):
+@pytest.mark.parametrize("written", ["50 MB", "--5"])
+def test_a_wechat_setting_that_is_not_a_number_is_reported_and_the_backend_keeps_working(tmp_path, written):
     model = ThreadingHTTPServer(("127.0.0.1", 0), ModelHandler)
     threading.Thread(target=model.serve_forever, daemon=True).start()
     channels = tmp_path / "channels.json"
-    channels.write_text(json.dumps({"weixin": {"keep_awake": False, "max_receive_file_bytes": "50 MB"}}),
+    channels.write_text(json.dumps({"weixin": {"keep_awake": False, "max_receive_file_bytes": written}}),
                         encoding="utf-8")
     workdir = tmp_path / "work"
     workdir.mkdir()
@@ -100,7 +103,7 @@ def test_a_wechat_setting_that_is_not_a_number_is_reported_and_the_backend_keeps
     try:
         first = wait_for(lambda e: e.get("type") == "weixin_status", timeout=30)
         assert first["state"] == "off"
-        assert first["error"].startswith('weixin.max_receive_file_bytes 应为整数，现在是 "50 MB"')
+        assert first["error"].startswith(f'weixin.max_receive_file_bytes 应为整数，现在是 "{written}"')
         send(proc, {"type": "command", "cmd": "/weixin status"})
         again = wait_for(lambda e: e.get("type") == "weixin_status" and e is not first, timeout=20)
         assert again["error"] == first["error"] and proc.poll() is None
