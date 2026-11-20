@@ -5,8 +5,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from agent.launcher.installation import user_home
-
 _PACKAGE_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -17,6 +15,8 @@ def state_dir(root: Path | None = None) -> Path:
     source = root if root is not None else _PACKAGE_ROOT
     if source != _PACKAGE_ROOT or (source / "pyproject.toml").is_file():
         return source / ".astra"
+    from agent.launcher.installation import user_home
+
     return user_home()
 
 

@@ -52,6 +52,8 @@ class _UnloadedRateLimitError(_OpenAIUnavailableError):
 _OPENAI_UNSET = object()
 _OPENAI_MODULE: Any = _OPENAI_UNSET
 _OPENAI_LOAD_LOCK = threading.RLock()
+_OPENAI_WARMUP_LOCK = threading.Lock()
+_OPENAI_WARMUP_THREAD: threading.Thread | None = None
 _OPENAI_REQUIRED_ATTRS = (
     "APIError",
     "APITimeoutError",
@@ -138,6 +140,47 @@ def _ensure_openai_loaded(*, only_if_imported: bool = False) -> None:
                 DefaultAsyncHttpxClient = None
             return
         _bind_openai_symbols(_OPENAI_MODULE)
+
+
+def _run_openai_warmup() -> None:
+    try:
+        _ensure_openai_loaded()
+    except Exception:
+        logger.debug("background openai sdk warmup failed", exc_info=True)
+
+
+def _start_openai_warmup() -> bool:
+    """Kick off a daemon-thread OpenAI SDK import if it has not been loaded yet."""
+    global _OPENAI_WARMUP_THREAD
+    if (
+        _OPENAI_MODULE is not _OPENAI_UNSET
+        or (AsyncOpenAI is not _OPENAI_UNSET and DefaultAsyncHttpxClient is not _OPENAI_UNSET)
+    ):
+        return False
+    with _OPENAI_WARMUP_LOCK:
+        if (
+            _OPENAI_MODULE is not _OPENAI_UNSET
+            or (AsyncOpenAI is not _OPENAI_UNSET and DefaultAsyncHttpxClient is not _OPENAI_UNSET)
+        ):
+            return False
+        if _OPENAI_WARMUP_THREAD is not None and _OPENAI_WARMUP_THREAD.is_alive():
+            return False
+        if not _OPENAI_LOAD_LOCK.acquire(blocking=False):
+            return False
+        _OPENAI_LOAD_LOCK.release()
+        thread = threading.Thread(
+            target=_run_openai_warmup,
+            name="astra-openai-warmup",
+            daemon=True,
+        )
+        try:
+            thread.start()
+        except RuntimeError:
+            _OPENAI_WARMUP_THREAD = None
+            logger.debug("background openai sdk warmup thread failed to start", exc_info=True)
+            return False
+        _OPENAI_WARMUP_THREAD = thread
+        return True
 
 logger = logging.getLogger(__name__)
 
@@ -818,6 +861,12 @@ class OpenAICompatibleProvider:
             # still be consuming a stream on the previous route.
             self._client_instance = client
             self._proxy_url = proxy_url
+
+    def warmup_in_background(self) -> bool:
+        """Preload the OpenAI SDK on a daemon thread without blocking startup."""
+        if self.config.connection_required:
+            return False
+        return _start_openai_warmup()
 
     async def _warm_client_if_needed(self) -> None:
         """Load the OpenAI SDK before per-request network deadlines start ticking."""

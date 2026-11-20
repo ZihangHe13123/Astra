@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 from .approvals import ChatApprover
 from .base import ChannelAdapter, ChannelMessage, FilePolicy, MessageHandler
 from .config import ChannelsConfig, WeixinConfig
-from .onebot import OneBotAdapter
-from .weixin import WeixinAdapter
+
+if TYPE_CHECKING:
+    from .weixin import WeixinAdapter
 
 
 logger = logging.getLogger(__name__)
@@ -43,12 +45,16 @@ class ChannelManager:
     def _build_adapters(self) -> list[ChannelAdapter]:
         adapters: list[ChannelAdapter] = []
         if self.config.onebot.enabled:
+            from .onebot import OneBotAdapter
+
             adapters.append(OneBotAdapter(self.config.onebot, self.handler))
         if self.config.weixin.enabled:
             adapters.append(self.new_weixin(self.config.weixin))
         return adapters
 
     def new_weixin(self, config: WeixinConfig) -> WeixinAdapter:
+        from .weixin import WeixinAdapter
+
         return WeixinAdapter(config, self.handler, priority=self.channel_host)
 
     def adapter(self, name: str) -> ChannelAdapter | None:
@@ -125,6 +131,10 @@ class ChannelManager:
 
     def weixin(self) -> "WeixinAdapter | None":
         adapter = self.adapter("weixin")
+        if adapter is None:
+            return None
+        from .weixin import WeixinAdapter
+
         return adapter if isinstance(adapter, WeixinAdapter) else None
 
     async def send_file(

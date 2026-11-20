@@ -174,6 +174,7 @@ class VisionPreprocessor:
         cache_root: Path | str,
         *,
         max_cache_bytes: int = DEFAULT_MAX_CACHE_BYTES,
+        sweep_stale_staging: bool = True,
     ):
         if (
             isinstance(max_cache_bytes, bool)
@@ -192,11 +193,12 @@ class VisionPreprocessor:
         self._request_locks: dict[tuple[str, str], _RequestLockRecord] = {}
         self._pending_staging_paths: set[Path] = set()
         self._cleanup_unhealthy = False
-        try:
-            self._sweep_stale_staging()
-        except VisionPreprocessError:
-            self._cleanup_unhealthy = True
-            logger.warning("Stale inline image staging cleanup did not complete safely.")
+        if sweep_stale_staging:
+            try:
+                self._sweep_stale_staging()
+            except VisionPreprocessError:
+                self._cleanup_unhealthy = True
+                logger.warning("Stale inline image staging cleanup did not complete safely.")
 
     def prepare_blocks(
         self,

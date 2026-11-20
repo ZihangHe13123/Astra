@@ -2,12 +2,9 @@
 
 from __future__ import annotations
 
-import importlib.metadata
 import hashlib
 import os
-import platform
 import sys
-import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -58,6 +55,8 @@ class Installation:
         return value
 
     def describe(self) -> dict:
+        import platform
+
         commit = None
         dirty = None
         if self.kind == "source":
@@ -85,6 +84,8 @@ def discover(root: Path | None = None) -> Installation:
     version = "unknown"
     pyproject = location / "pyproject.toml"
     if pyproject.is_file():
+        import tomllib
+
         try:
             project = tomllib.loads(pyproject.read_text(encoding="utf-8")).get("project", {})
             source = project.get("name") == "agent-lab-local" and (location / "agent").is_dir()
@@ -97,6 +98,8 @@ def discover(root: Path | None = None) -> Installation:
     if desktop:
         version, owner = str(desktop["version"]), "desktop installer"
     elif not source:
+        import importlib.metadata
+
         try:
             distribution = importlib.metadata.distribution("agent-lab-local")
             version = distribution.version

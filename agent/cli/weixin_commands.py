@@ -11,21 +11,12 @@ import logging
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-import httpx
-
 from agent.channels.config import load_channels_config, set_channel_enabled, set_channel_setting
 from agent.channels.manager import ChannelManager
-from agent.channels.weixin import (
-    IlinkClient,
-    WeixinError,
-    WeixinStore,
-    mask,
-    qr_login,
-    qr_svg,
-    qr_text,
-)
+from agent.runtime.paths import state_path
 
 if TYPE_CHECKING:
+    from agent.channels.weixin import IlinkClient
     from agent.cli.channel_models import ChannelModels
     from agent.cli.model_catalog import CatalogEntry
 
@@ -40,7 +31,7 @@ def is_weixin_command(command: str) -> bool:
 
 class WeixinCommands:
     def __init__(self, manager: Callable[[], ChannelManager | None], send: Callable[[dict], None], *,
-                 client_factory: Callable[[], IlinkClient] = IlinkClient,
+                 client_factory: Callable[[], IlinkClient] | None = None,
                  models: ChannelModels | None = None) -> None:
         self._manager = manager
         self._send = send
@@ -56,15 +47,30 @@ class WeixinCommands:
         adapter = manager.weixin() if manager is not None else None
         config = load_channels_config().weixin
         enabled = config.enabled
-        store = adapter.store if adapter is not None else WeixinStore()
-        account = store.account()
+        account = None
+        if adapter is not None:
+            account = adapter.store.account()
+        else:
+            try:
+                has_account_file = (state_path("channels", "weixin") / "account.json").is_file()
+            except OSError:
+                has_account_file = False
+            if has_account_file:
+                from agent.channels.weixin import WeixinStore
+
+                account = WeixinStore().account()
+        masked_account = ""
+        if account is not None:
+            from agent.channels.weixin import mask
+
+            masked_account = mask(account.account_id)
         status = adapter.status() if adapter is not None else {
             "state": "off" if not enabled else "logged_out" if account is None else "stopped",
             "owner": False, "keep_awake": False, "error": "",
         }
         event: dict = {
             "type": "weixin_status", "enabled": enabled, "logged_in": account is not None,
-            "account": mask(account.account_id) if account is not None else "",
+            "account": masked_account,
             "state": status["state"], "owner": status["owner"], "keep_awake": status["keep_awake"],
             "login": self._stage,
             # The model WeChat answers with: a catalog key, or "" for the default model.
@@ -148,7 +154,18 @@ class WeixinCommands:
         self._login = asyncio.create_task(self._run_login(), name="weixin-login")
 
     async def _run_login(self) -> None:
-        client = self._client_factory()
+        import httpx
+        from agent.channels.weixin import (
+            IlinkClient,
+            WeixinError,
+            WeixinStore,
+            mask,
+            qr_login,
+            qr_svg,
+            qr_text,
+        )
+
+        client = self._client_factory() if self._client_factory is not None else IlinkClient()
 
         async def show(link: str) -> None:
             self._qr, self._stage = {"svg": qr_svg(link), "text": qr_text(link)}, "scan"
@@ -184,6 +201,8 @@ class WeixinCommands:
         await manager.replace("weixin", adapter, config)
 
     async def _logout(self) -> None:
+        from agent.channels.weixin import WeixinStore
+
         if self._login is not None and not self._login.done():
             self._login.cancel()
         self._qr, self._stage = None, ""
@@ -196,9 +215,12 @@ class WeixinCommands:
         self.send_status(message="已退出微信登录，渠道已停用。")
 
     async def _switch(self, on: bool) -> None:
-        if on and WeixinStore().account() is None:
-            self.send_status(error="还没有登录微信：先运行 /weixin login。")
-            return
+        if on:
+            from agent.channels.weixin import WeixinStore
+
+            if WeixinStore().account() is None:
+                self.send_status(error="还没有登录微信：先运行 /weixin login。")
+                return
         set_channel_enabled("weixin", on)
         await self._restart()
         self.send_status(message="微信渠道已启用。" if on else "微信渠道已停用。")
