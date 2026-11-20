@@ -473,6 +473,53 @@ def test_a_reply_the_model_had_to_be_asked_for_again_carries_no_error_notice(tmp
     assert "ended without an answer" in provider.requests[1]["body"]["messages"][-1]["content"]
 
 
+def test_a_file_sent_with_a_request_is_read_but_a_job_records_only_what_the_person_typed(tmp_path, provider,
+                                                                                         monkeypatch):
+    """WeChat: "remind me to drink tea in ten minutes" with an agenda attached. The model reads both; the
+    reminder's authority, kept with it and read again at every run, is only what the person typed."""
+    from agent.runtime.jobs.store import JobStore
+    from agent.runtime.llm import LLMClient, LLMConfig
+    from agent.runtime.react import ReActAgent
+    from agent.runtime.tools.jobs import register_jobs_tool
+
+    monkeypatch.setenv("AGENT_TIMEZONE", "Asia/Singapore")
+    provider.tool_rounds = 1
+    provider.tool_call = ("jobs", json.dumps({"action": "add", "name": "喝茶", "kind": "reminder",
+                                              "prompt": "该喝茶了", "after_minutes": 10}))
+    provider.reply = "好，十分钟后提醒你。"
+    config = LLMConfig(model="channel-fixture", api_key="local", base_url=f"http://127.0.0.1:{provider.server_port}/v1",
+                       context_limit=8192, max_tokens=512, max_retries=0)
+    registry = ToolRegistry()
+    approvals: list[dict] = []
+
+    async def approve(request):
+        approvals.append(request)
+        return "once"
+
+    registry.set_approval_handler(approve)
+    # The same authority the backend gives the jobs tool in a channel turn.
+    register_jobs_tool(registry, home=tmp_path / "home", workdir=lambda: tmp_path, model_key=lambda: "fixture",
+                       request=lambda: message.text if (message := active_channel_message.get()) else "")
+    agenda = "\n".join(["[文件: 议程.md（18 B），已保存到 /inbox/议程.md]", "[文件内容开始: 议程.md]",
+                        "1. 周会\n2. 喝茶", "[文件内容结束: 议程.md]"])
+
+    async def scenario():
+        agent = ReActAgent("channel", LLMClient(config), registry, system_prompt="system", max_iterations=4,
+                           progressive_tools=False, query_profile_enabled=False)
+        agent.context.set_session(str(tmp_path / "window.json"))
+        router = AgentChannelRouter(agent, asyncio.Lock(), tmp_path)
+        return await router.handle(ChannelMessage("weixin", "owner", "owner", "十分钟后提醒我喝茶", attachments=agenda))
+
+    assert asyncio.run(scenario()) == "好，十分钟后提醒你。"
+    assert len(approvals) == 1
+    [job] = JobStore(tmp_path / "home").jobs()
+    assert job["spec"]["original_request"] == "十分钟后提醒我喝茶"
+    asked = provider.requests[0]["body"]["messages"][-1]
+    assert asked["role"] == "user"
+    # The model reads the person's words and then what they sent.
+    assert asked["content"].endswith("\n十分钟后提醒我喝茶\n" + agenda)
+
+
 def test_an_error_the_turn_went_on_from_is_said_only_when_nothing_else_is(tmp_path):
     asked_again = {"type": "error", "code": "stream_closed", "recoverable": True,
                    "message": "Model connection interrupted; retrying the current response (1/2)."}

@@ -257,12 +257,16 @@ def test_images_are_decrypted_from_the_cdn_and_other_hosts_are_not_fetched(ilink
 MEDIA_KEY = bytes(range(16))
 
 
-def _on_cdn(fake: FakeIlink, param: str, data: bytes) -> None:
+def _sealed(data: bytes, key: bytes = MEDIA_KEY) -> bytes:
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
     pad = 16 - len(data) % 16
-    encryptor = Cipher(algorithms.AES(MEDIA_KEY), modes.ECB()).encryptor()
-    fake.media[param] = encryptor.update(data + bytes([pad]) * pad) + encryptor.finalize()
+    encryptor = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
+    return encryptor.update(data + bytes([pad]) * pad) + encryptor.finalize()
+
+
+def _on_cdn(fake: FakeIlink, param: str, data: bytes, key: bytes = MEDIA_KEY) -> None:
+    fake.media[param] = _sealed(data, key)
 
 
 def _media(param: str) -> dict:
@@ -275,6 +279,10 @@ def _file(param: str, name: str, size: int | None = None) -> dict:
     if size is not None:
         payload["len"] = str(size)
     return {"type": 4, "file_item": payload}
+
+
+def _video(param: str, **declared) -> dict:
+    return {"type": 5, "video_item": {"media": _media(param), **declared}}
 
 
 def _received(fake: FakeIlink, tmp_path, messages: list[list[dict]], **config) -> list[ChannelMessage]:
@@ -309,41 +317,62 @@ def test_a_received_file_is_saved_for_the_person_and_a_short_text_file_is_read_i
     notes = "# 状态机\r\n第一行\r\n第二行\n".encode()
     again = "同名的另一份".encode()
     report = b"%PDF-1.7\n" + bytes(range(256))
+    code = b"    first = 1\n    second = 2  "
+    wide = "宽字符的笔记".encode("utf-16")
     _on_cdn(ilink, "md-1", notes)
     _on_cdn(ilink, "pdf-1", report)
     _on_cdn(ilink, "md-2", again)
     _on_cdn(ilink, "odd-1", b"plain")
+    _on_cdn(ilink, "py-1", code)
+    _on_cdn(ilink, "u16-1", wide)
     inbox = tmp_path / "inbox"
 
-    first, second, third = _received(ilink, tmp_path, [
+    first, second, third, fourth, fifth = _received(ilink, tmp_path, [
         [{"type": 1, "text_item": {"text": "看看这两个"}}, _file("md-1", "06_笔记.md", len(notes)),
          _file("pdf-1", "report.pdf")],
         [_file("md-2", "06_笔记.md")],
-        [_file("odd-1", "../../.secret\n.md")],
+        [_file("odd-1", "../../.secret\n.md"), _file("py-1", "com¹.py", len(code))],
+        [_file("u16-1", "宽.txt")],
+        # The first file again, quoted: the copy already saved is the one named.
+        [{"type": 1, "text_item": {"text": "看看这份"},
+          "ref_msg": {"title": "06_笔记.md", "message_item": _file("md-1", "06_笔记.md", len(notes))}}],
     ], receive_files_dir=str(inbox), max_input_chars=4)
 
     day = next(inbox.iterdir()).name
     assert _saved(inbox) == {f"{day}/06_笔记.md": notes, f"{day}/06_笔记 (2).md": again,
-                             f"{day}/report.pdf": report, f"{day}/secret_.md": b"plain"}
+                             f"{day}/report.pdf": report, f"{day}/secret_.md": b"plain",
+                             f"{day}/_com¹.py": code, f"{day}/宽.txt": wide}
     folder = inbox / day
-    # What the person typed keeps its limit; the files they sent are told in full after it.
-    assert first.text == "\n".join([
-        "看看这两",
+    notes_block = "\n".join([
         f"[文件: 06_笔记.md（{len(notes)} B），已保存到 {folder / '06_笔记.md'}]",
-        "[文件内容开始: 06_笔记.md]", "# 状态机\n第一行\n第二行", "[文件内容结束: 06_笔记.md]",
-        f"[文件: report.pdf（{len(report)} B），已保存到 {folder / 'report.pdf'}]",
-    ])
-    assert second.text.startswith(f"[文件: 06_笔记 (2).md（{len(again)} B），已保存到 {folder / '06_笔记 (2).md'}]\n")
-    assert third.text.startswith(f"[文件: secret_.md（5 B），已保存到 {folder / 'secret_.md'}]\n")
-    assert ilink.media_requests == ["md-1", "pdf-1", "md-2", "odd-1"]
+        "[文件内容开始: 06_笔记.md]", "# 状态机", "第一行", "第二行", "[文件内容结束: 06_笔记.md]"])
+    # What the person typed keeps its limit and stays apart from what they sent.
+    assert (first.text, first.attachments) == ("看看这两", "\n".join([
+        notes_block, f"[文件: report.pdf（{len(report)} B），已保存到 {folder / 'report.pdf'}]"]))
+    assert (second.text, second.attachments.split("\n")[0]) == (
+        "", f"[文件: 06_笔记 (2).md（{len(again)} B），已保存到 {folder / '06_笔记 (2).md'}]")
+    # A code file keeps its indentation and trailing spaces; only the markers are added around it.
+    assert third.attachments.split("\n")[4:] == [
+        f"[文件: _com¹.py（{len(code)} B），已保存到 {folder / '_com¹.py'}]",
+        "[文件内容开始: _com¹.py]", "    first = 1", "    second = 2  ", "[文件内容结束: _com¹.py]"]
+    assert third.attachments.startswith(f"[文件: secret_.md（5 B），已保存到 {folder / 'secret_.md'}]\n")
+    assert "\n宽字符的笔记\n" in fourth.attachments
+    # The quote is part of what the person wrote, so max_input_chars (4 here) cuts it too; the file it quotes
+    # arrives whole.
+    assert (fifth.text, fifth.attachments) == ("[引用: 06_笔记.md]\n看看这份"[:4], notes_block)
 
 
-def test_a_file_over_the_limit_or_out_of_reach_is_named_and_only_what_arrived_is_saved(ilink, tmp_path):
+def test_only_a_file_that_arrived_whole_is_saved_and_the_limit_is_kept(ilink, tmp_path):
+    import hashlib
     import re
 
+    clip = b"\x00\x00\x00\x18ftypmp42" + bytes(88)
     _on_cdn(ilink, "big-1", bytes(5000))
     _on_cdn(ilink, "big-2", bytes(2000))
-    _on_cdn(ilink, "vid-1", b"\x00\x00\x00\x18ftypmp42" + bytes(88))
+    _on_cdn(ilink, "short-1", b"fourteen bytes")
+    _on_cdn(ilink, "other-key", b"opened with another key", key=bytes(range(16, 32)))
+    _on_cdn(ilink, "vid-1", clip)
+    _on_cdn(ilink, "vid-2", clip)
     inbox = tmp_path / "inbox"
 
     (message,) = _received(ilink, tmp_path, [[
@@ -351,41 +380,72 @@ def test_a_file_over_the_limit_or_out_of_reach_is_named_and_only_what_arrived_is
         _file("big-2", "quiet.bin"),
         _file("gone-1", "gone.txt"),
         {"type": 4, "file_item": {"file_name": "nowhere.txt", "media": {"full_url": "https://example.com/x"}}},
-        {"type": 5, "video_item": {"media": _media("vid-1")}},
+        _file("short-1", "short.txt", 123),
+        _file("other-key", "garbled.txt"),
+        _video("vid-big", video_size="9000"),
+        _video("vid-2", video_md5="0" * 32),
+        _video("vid-1", video_size=str(len(_sealed(clip))), video_md5=hashlib.md5(clip).hexdigest()),
     ]], receive_files_dir=str(inbox), max_receive_file_bytes=1024)
 
-    lines = message.text.split("\n")
-    assert lines[:4] == [
+    lines = message.attachments.split("\n")
+    assert lines[:8] == [
         "[文件: big.zip（4.9 KB），超过 1.0 KB 的上限，没有下载]",
         "[文件: quiet.bin，超过 1.0 KB 的上限，没有下载]",
         "[文件: gone.txt，没能下载]",
         "[文件: nowhere.txt，没能下载]",
+        "[文件: short.txt，下载的内容不完整或解不开，没有保存]",
+        "[文件: garbled.txt，下载的内容不完整或解不开，没有保存]",
+        "[视频（约 8.8 KB），超过 1.0 KB 的上限，没有下载]",
+        "[视频，下载的内容不完整或解不开，没有保存]",
     ]
-    video = re.fullmatch(r"\[视频: (视频-\d{6}\.mp4)（100 B），已保存到 (.+)\]", lines[4])
-    assert video is not None and len(lines) == 5
+    video = re.fullmatch(r"\[视频: (视频-\d{6}\.mp4)（100 B），已保存到 (.+)\]", lines[8])
+    assert video is not None and len(lines) == 9 and message.text == ""
     day = next(inbox.iterdir()).name
-    assert _saved(inbox) == {f"{day}/{video.group(1)}": b"\x00\x00\x00\x18ftypmp42" + bytes(88)}
+    assert _saved(inbox) == {f"{day}/{video.group(1)}": clip}
     assert video.group(2) == str(inbox / day / video.group(1))
     # A declared size over the limit is never fetched, and no host outside WeChat's CDN is asked.
-    assert ilink.media_requests == ["big-2", "gone-1", "vid-1"]
+    assert ilink.media_requests == ["big-2", "gone-1", "short-1", "other-key", "vid-2", "vid-1"]
 
 
-def test_files_can_be_left_on_wechats_side_and_the_default_folder_is_one_the_person_opens(ilink, tmp_path):
+def test_a_folder_that_cannot_be_used_costs_the_file_but_never_the_message(ilink, tmp_path):
+    _on_cdn(ilink, "md-1", b"notes")
+    blocked = tmp_path / "a-file"
+    blocked.write_text("not a folder", encoding="utf-8")
+    words = {"type": 1, "text_item": {"text": "十分钟后提醒我喝茶"}}
+    (message,) = _received(ilink, tmp_path, [[words, _file("md-1", "议程.md")]],
+                           receive_files_dir=str(blocked / "inbox"))
+    assert (message.text, message.attachments) == ("十分钟后提醒我喝茶", "[文件: 议程.md（5 B），下载了但没能保存]")
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="~user expansion fails only on POSIX")
+def test_a_home_folder_of_nobody_is_reported_with_the_file_and_the_words_still_arrive(ilink, tmp_path):
+    _on_cdn(ilink, "md-1", b"notes")
+    words = {"type": 1, "text_item": {"text": "在吗"}}
+    (message,) = _received(ilink, tmp_path, [[words, _file("md-1", "议程.md")]],
+                           receive_files_dir="~no-such-user-for-astra-tests/inbox")
+    assert (message.text, message.attachments) == ("在吗", "[文件: 议程.md（5 B），下载了但没能保存]")
+
+
+def test_files_can_be_left_on_wechats_side_and_folders_are_found_from_home(ilink, tmp_path):
     from pathlib import Path
 
     from agent.channels.weixin import received_files_root
 
     _on_cdn(ilink, "md-1", b"notes")
     inbox = tmp_path / "inbox"
-    (message,) = _received(ilink, tmp_path, [[_file("md-1", "notes.md"), {"type": 5, "video_item": {"media": _media("md-1")}}]],
+    (message,) = _received(ilink, tmp_path, [[_file("md-1", "notes.md"), _video("md-1")]],
                            receive_files_dir=str(inbox), max_receive_file_bytes=0)
-    assert message.text == "[文件: notes.md]\n[视频]"
+    assert (message.text, message.attachments) == ("", "[文件: notes.md]\n[视频]")
     assert ilink.media_requests == [] and not inbox.exists()
 
     assert WeixinConfig.from_dict({}).max_receive_file_bytes == 50 * 1024 * 1024
     assert WeixinConfig.from_dict({"max_receive_file_bytes": 0}).max_receive_file_bytes == 0
-    assert received_files_root(WeixinConfig()) == Path.home() / "Downloads" / "Astra" / "微信"
-    assert received_files_root(WeixinConfig.from_dict({"receive_files_dir": " ~/收到的 "})) == Path.home() / "收到的"
+    home = Path.home()
+    assert received_files_root(WeixinConfig()) == home / "Downloads" / "Astra" / "微信"
+    assert received_files_root(WeixinConfig.from_dict({"receive_files_dir": " ~/收到的 "})) == home / "收到的"
+    # A relative folder is under home, whichever folder the backend started in.
+    assert received_files_root(WeixinConfig.from_dict({"receive_files_dir": "收件"})) == home / "收件"
+    assert received_files_root(WeixinConfig(receive_files_dir=str(inbox))) == inbox
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate is macOS")

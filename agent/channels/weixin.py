@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import codecs
 import contextlib
 import hashlib
 import io
@@ -97,8 +98,9 @@ _TEXT_SUFFIXES = frozenset({
     ".js", ".mjs", ".ts", ".tsx", ".jsx", ".java", ".kt", ".swift", ".go", ".rs", ".rb", ".php", ".c", ".h",
     ".cc", ".cpp", ".hpp", ".cs", ".m", ".sh", ".bash", ".zsh", ".ps1", ".bat", ".sql", ".r", ".lua", ".vue",
 })
-_RESERVED_FILE_NAMES = frozenset({"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)),
-                                  *(f"LPT{n}" for n in range(1, 10))})
+# Windows also reserves COM and LPT with a superscript 1, 2 or 3.
+_RESERVED_FILE_NAMES = frozenset({"CON", "PRN", "AUX", "NUL", *(f"{port}{n}" for port in ("COM", "LPT")
+                                                                 for n in (*"123456789", *"¹²³"))})
 _MAX_FILE_NAME_BYTES = 180
 
 # Added to the system prompt of WeChat conversations only (see AgentChannelRouter): it is a
@@ -422,13 +424,21 @@ def _encrypt(data: bytes, key: bytes) -> bytes:
     return encryptor.update(data + bytes([pad]) * pad) + encryptor.finalize()
 
 
-def _decrypt(data: bytes, key: bytes) -> bytes:
+def _decrypt(data: bytes, key: bytes, *, strict: bool = False) -> bytes:
+    """AES-128-ECB with PKCS#7 padding. ``strict`` refuses a payload that is cut short or that the key
+    does not open (its padding is then wrong); otherwise such bytes come back as they are."""
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
+    if strict and (not data or len(data) % 16):
+        raise ValueError("the encrypted media is not whole AES blocks")
     decryptor = Cipher(algorithms.AES(key), modes.ECB()).decryptor()
     plain = decryptor.update(data) + decryptor.finalize()
     pad = plain[-1] if plain else 0
-    return plain[:-pad] if 1 <= pad <= 16 and plain.endswith(bytes([pad]) * pad) else plain
+    if 1 <= pad <= 16 and plain.endswith(bytes([pad]) * pad):
+        return plain[:-pad]
+    if strict:
+        raise ValueError("the media key does not open the encrypted media")
+    return plain
 
 
 def _image_type(data: bytes) -> str:
@@ -442,10 +452,15 @@ def _image_type(data: bytes) -> str:
 
 
 def received_files_root(config: WeixinConfig) -> Path:
-    """Where files and videos sent to the bot are kept: a folder the person can open too."""
-    if config.receive_files_dir:
-        return Path(config.receive_files_dir).expanduser()
-    return Path.home() / "Downloads" / "Astra" / "微信"
+    """Where files and videos sent to the bot are kept: a folder the person can open too.
+
+    A relative setting is taken from the home folder, so it names the same place whichever folder a
+    backend started in. A setting that cannot be expanded (``~nobody``) raises RuntimeError."""
+    home = Path.home()
+    if not config.receive_files_dir:
+        return home / "Downloads" / "Astra" / "微信"
+    folder = Path(config.receive_files_dir).expanduser()
+    return folder if folder.is_absolute() else home / folder
 
 
 def _file_name(name: object, fallback: str) -> str:
@@ -467,7 +482,9 @@ def _file_name(name: object, fallback: str) -> str:
 
 
 def _save_received(directory: Path, name: str, data: bytes) -> Path:
-    """Write a received file under a name not yet taken in ``directory``; nothing is overwritten."""
+    """Write a received file under a name not yet taken in ``directory``; nothing is overwritten.
+
+    The same file under the same name (sent again, or quoted) is the copy already there."""
     directory.mkdir(parents=True, exist_ok=True)
     stem, suffix = Path(name).stem, Path(name).suffix
     for number in range(1, 1000):
@@ -475,6 +492,10 @@ def _save_received(directory: Path, name: str, data: bytes) -> Path:
         try:
             handle = open(target, "xb")
         except FileExistsError:
+            with contextlib.suppress(OSError):
+                if (not target.is_symlink() and target.is_file() and target.stat().st_size == len(data)
+                        and target.read_bytes() == data):
+                    return target
             continue
         try:
             with handle:
@@ -488,14 +509,24 @@ def _save_received(directory: Path, name: str, data: bytes) -> Path:
 
 
 def _inline_text(name: str, data: bytes) -> str | None:
-    """The text of a small text file, or None when it is not one."""
-    if Path(name).suffix.lower() not in _TEXT_SUFFIXES or len(data) > _INLINE_TEXT_BYTES or b"\0" in data:
+    """The text of a small text file, exactly as written apart from line endings, or None when it is not one."""
+    if Path(name).suffix.lower() not in _TEXT_SUFFIXES or len(data) > _INLINE_TEXT_BYTES:
         return None
-    for encoding in ("utf-8-sig", "gb18030"):
+    # A byte-order mark names the encoding; without one, a NUL byte means the file is not text.
+    if data.startswith((codecs.BOM_UTF32_LE, codecs.BOM_UTF32_BE)):
+        encodings: tuple[str, ...] = ("utf-32",)
+    elif data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        encodings = ("utf-16",)
+    elif b"\0" in data:
+        return None
+    else:
+        encodings = ("utf-8-sig", "gb18030")
+    for encoding in encodings:
         try:
-            return data.decode(encoding).replace("\r\n", "\n").replace("\r", "\n")
+            text = data.decode(encoding)
         except UnicodeDecodeError:
             continue
+        return None if "\0" in text else text.replace("\r\n", "\n").replace("\r", "\n")
     return None
 
 
@@ -971,13 +1002,14 @@ class WeixinAdapter(ChannelAdapter):
             return
         await self._remember_token(sender, message)
         text, files, images = await self._content(message.get("item_list") or [])
-        # The limit is for what the person typed; a received file is bounded by its own limits.
-        text = "\n".join(part for part in (text.strip()[:self.config.max_input_chars], files) if part)
-        if not text and not images:
+        # The limit is for what the person typed; a received file is bounded by its own limits, and is
+        # passed beside their words, never as them.
+        text = text.strip()[:self.config.max_input_chars]
+        if not text and not files and not images:
             return
         event = ChannelMessage(channel=self.name, conversation_id=sender, sender_id=sender,
-                               text=text or "[图片]", message_id=str(message.get("message_id") or ""),
-                               images=images, raw=message)
+                               text=text or ("" if files else "[图片]"), attachments=files,
+                               message_id=str(message.get("message_id") or ""), images=images, raw=message)
 
         async def reply(answer: str) -> None:
             await self.send_text(sender, answer)
@@ -1001,10 +1033,23 @@ class WeixinAdapter(ChannelAdapter):
             await _finish(typing, 5.0)
 
     async def _content(self, items: list) -> tuple[str, str, tuple[ChannelImage, ...]]:
-        """What the person typed or said, what became of the files and videos they sent, and their images."""
+        """What the person typed or said; what became of the files and videos they sent or quoted; their images."""
         parts: list[str] = []
         files: list[str] = []
         images: list[ChannelImage] = []
+
+        async def media(item: dict) -> None:
+            kind = item.get("type")
+            if kind == _ITEM_IMAGE:
+                if len(images) < self.config.max_images:
+                    image = await self._image(item.get("image_item") or {})
+                    if image is not None:
+                        images.append(image)
+                    else:
+                        parts.append("[图片：没能读取]")
+            elif kind in (_ITEM_FILE, _ITEM_VIDEO):
+                files.append(await self._attachment(item))
+
         for item in items:
             if not isinstance(item, dict):
                 continue
@@ -1012,30 +1057,38 @@ class WeixinAdapter(ChannelAdapter):
             if kind == _ITEM_TEXT:
                 text = str((item.get("text_item") or {}).get("text") or "")
                 quoted = (item.get("ref_msg") or {})
-                quoted_text = str((((quoted.get("message_item") or {}).get("text_item")) or {}).get("text") or "")
+                quoted_item = quoted.get("message_item") or {}
+                quoted_text = str(((quoted_item.get("text_item")) or {}).get("text") or "")
                 if quoted.get("title") or quoted_text:
                     parts.append(f"[引用: {' | '.join(p for p in (str(quoted.get('title') or ''), quoted_text) if p)}]")
                 parts.append(text)
+                # A quoted image, file or video comes along, so "看看这份" about an earlier file can be answered.
+                if isinstance(quoted_item, dict):
+                    await media(quoted_item)
             elif kind == _ITEM_VOICE:
                 spoken = str((item.get("voice_item") or {}).get("text") or "")
                 parts.append(f"[语音，微信转写] {spoken}" if spoken else "[语音]")
-            elif kind == _ITEM_IMAGE:
-                if len(images) < self.config.max_images:
-                    image = await self._image(item.get("image_item") or {})
-                    if image is not None:
-                        images.append(image)
-                    else:
-                        parts.append("[图片：没能读取]")
-            elif kind == _ITEM_FILE:
-                payload = item.get("file_item") or {}
-                files.append(await self._received(payload, _file_name(payload.get("file_name"), "未命名文件"), "文件"))
-            elif kind == _ITEM_VIDEO:
-                name = f"视频-{time.strftime('%H%M%S')}.mp4"
-                files.append(await self._received(item.get("video_item") or {}, name, "视频"))
+            else:
+                await media(item)
         return ("\n".join(part for part in parts if part), "\n".join(files), tuple(images))
 
-    async def _media(self, payload: dict, max_bytes: int) -> bytes | None:
-        """An item's media from WeChat's CDN, decrypted; None when it names no CDN place to fetch it from."""
+    async def _attachment(self, item: dict) -> str:
+        """One file or video, saved or not; whatever goes wrong with it, the rest of the message still arrives."""
+        if item.get("type") == _ITEM_FILE:
+            payload = item.get("file_item") or {}
+            name, kind = _file_name(payload.get("file_name"), "未命名文件"), "文件"
+        else:
+            payload = item.get("video_item") or {}
+            name, kind = f"视频-{time.strftime('%H%M%S')}.mp4", "视频"
+        try:
+            return await self._received(payload, name, kind)
+        except Exception:
+            logger.exception("weixin %s could not be handled", "video" if kind == "视频" else "file")
+            return f"[{kind}: {name}，没能处理]" if kind == "文件" else "[视频，没能处理]"
+
+    async def _media(self, payload: dict, max_bytes: int, *, strict: bool = False) -> tuple[bytes, int] | None:
+        """An item's media from WeChat's CDN, decrypted, with the size that was fetched; None when it names
+        no CDN place to fetch it from. ``strict`` refuses an encrypted payload the key does not open whole."""
         assert self._client is not None
         media = payload.get("media") or {}
         param, full_url = media.get("encrypt_query_param"), media.get("full_url")
@@ -1049,53 +1102,76 @@ class WeixinAdapter(ChannelAdapter):
         if payload.get("aeskey"):
             key = base64.b64encode(bytes.fromhex(str(payload["aeskey"]))).decode("ascii")
         data = await self._client.download(url, max_bytes)
+        fetched = len(data)
         if key:
-            data = await asyncio.to_thread(_decrypt, data, _aes_key(str(key)))
-        return data
+            data = await asyncio.to_thread(_decrypt, data, _aes_key(str(key)), strict=strict)
+        return data, fetched
 
     async def _received(self, payload: dict, name: str, kind: str) -> str:
-        """Save a file or video the person sent and say so; a small text file's text comes along."""
+        """Save a file or video the person sent and say so; a small text file's text comes along.
+
+        Only a file that arrived whole is saved: the key opens it, and it matches the size (and for a video
+        the MD5) WeChat gave. These catch a cut or garbled download; they say nothing about who sent it."""
         title = f"{kind}: {name}" if kind == "文件" else kind
         what = "video" if kind == "视频" else "file"
         limit = self.config.max_receive_file_bytes
         if limit <= 0:
             return f"[{title}]"
-        declared = str(payload.get("len") or "")
-        if declared.isdigit() and int(declared) > limit:
-            return f"[{title}（{_size(int(declared))}），超过 {_size(limit)} 的上限，没有下载]"
+        # A file's len is its plain size; a video's video_size is the encrypted size, up to one AES block more.
+        plain_size = str(payload.get("len") or "") if kind == "文件" else ""
+        sealed_size = str(payload.get("video_size") or "") if kind == "视频" else ""
+        if plain_size.isdigit() and int(plain_size) > limit:
+            return f"[{title}（{_size(int(plain_size))}），超过 {_size(limit)} 的上限，没有下载]"
+        if sealed_size.isdigit() and int(sealed_size) > limit + 16:
+            return f"[{title}（约 {_size(int(sealed_size))}），超过 {_size(limit)} 的上限，没有下载]"
         too_large = f"[{title}，超过 {_size(limit)} 的上限，没有下载]"
         try:
             # The encrypted copy is padded by up to one AES block.
-            data = await self._media(payload, limit + 16)
+            fetched = await self._media(payload, limit + 16, strict=True)
         except WeixinMediaTooLarge:
             return too_large
-        except (httpx.HTTPError, WeixinError, ValueError, ImportError) as exc:
+        except (httpx.HTTPError, WeixinError, ImportError) as exc:
             logger.warning("weixin %s could not be read: %s", what, type(exc).__name__)
-            data = None
-        if data is None:
             return f"[{title}，没能下载]"
+        except ValueError as exc:
+            logger.warning("weixin %s did not decrypt: %s", what, exc)
+            return f"[{title}，下载的内容不完整或解不开，没有保存]"
+        if fetched is None:
+            return f"[{title}，没能下载]"
+        data, sealed = fetched
         if len(data) > limit:
             return too_large
-        directory = received_files_root(self.config) / time.strftime("%Y-%m-%d")
+        digest = str(payload.get("video_md5") or "").lower() if kind == "视频" else ""
+        # What WeChat's own apps put in these fields is not checked live, so a declared size may be the plain
+        # or the encrypted one; either way a cut download matches neither.
+        declared = plain_size or sealed_size
+        if ((declared.isdigit() and int(declared) not in (len(data), sealed))
+                or (re.fullmatch(r"[0-9a-f]{32}", digest) and hashlib.md5(data).hexdigest() != digest)):
+            logger.warning("weixin %s did not match its declared size or checksum", what)
+            return f"[{title}，下载的内容不完整或解不开，没有保存]"
         try:
+            directory = received_files_root(self.config) / time.strftime("%Y-%m-%d")
             path = await asyncio.to_thread(_save_received, directory, name, data)
-        except OSError as exc:
+        except (OSError, RuntimeError) as exc:
             logger.warning("weixin %s could not be saved: %s", what, type(exc).__name__)
             return f"[{title}（{_size(len(data))}），下载了但没能保存]"
         note = f"[{kind}: {path.name}（{_size(len(data))}），已保存到 {path}]"
         text = _inline_text(path.name, data) if kind == "文件" else None
         if text is not None:
-            note += f"\n[文件内容开始: {path.name}]\n{text.strip()}\n[文件内容结束: {path.name}]"
+            # The text exactly as written; the markers stand on their own lines around it.
+            ending = "" if text.endswith("\n") or not text else "\n"
+            note += f"\n[文件内容开始: {path.name}]\n{text}{ending}[文件内容结束: {path.name}]"
         return note
 
     async def _image(self, payload: dict) -> ChannelImage | None:
         try:
-            data = await self._media(payload, self.config.max_image_bytes)
+            fetched = await self._media(payload, self.config.max_image_bytes)
         except (httpx.HTTPError, WeixinError, ValueError, ImportError) as exc:
             logger.warning("weixin image could not be read: %s", type(exc).__name__)
             return None
-        if data is None:
+        if fetched is None:
             return None
+        data = fetched[0]
         kind = _image_type(data)
         return ChannelImage(data_url=f"data:{kind};base64,{base64.b64encode(data).decode('ascii')}", name="weixin-image")
 

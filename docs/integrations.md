@@ -154,13 +154,21 @@ in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on`,
   connected. Set `weixin.keep_awake` to `false` to leave sleep alone.
 - **What arrives.** Text, quoted messages, WeChat's own transcript of a voice
   message, and up to `max_images` images (decrypted from WeChat's CDN). Files
-  and videos are downloaded, decrypted and saved in a folder for each day under
-  `~/Downloads/Astra/微信` (`weixin.receive_files_dir` sets another folder), and
-  the message names each one with its size and saved path. A text file
-  (Markdown, plain text, code, CSV, JSON and the like) of up to 64 KB is added
-  to the message whole; for any other file the model uses its file tools, which
-  ask for approval in WeChat when the folder is outside the workspace. A file larger than `max_receive_file_bytes` (50 MB) is not
+  and videos, sent or quoted, are downloaded, decrypted and saved in a folder
+  for each day under `~/Downloads/Astra/微信` (`weixin.receive_files_dir` sets
+  another folder; a relative one is under the home folder). Only a file that
+  arrived whole is saved: the key opens it and it matches the size, and for a
+  video the MD5, that WeChat gave. These checks catch a cut or garbled
+  download, not who sent it. The model is told each file's name, size and
+  saved path, beside the person's own words rather than as them: a reminder
+  set in the same message records only what they typed. A text file
+  (Markdown, plain text, code, CSV, JSON and the like) of up to 64 KB comes
+  along whole, exactly as written; for any other file the model uses its file
+  tools, which ask for approval in WeChat when the folder is outside the
+  workspace. A file larger than `max_receive_file_bytes` (50 MB) is not
   downloaded, and `0` leaves every file on WeChat's side with only its name.
+  A file that cannot be downloaded or saved is reported as such, and the rest
+  of the message still arrives.
 - **How it answers.** WeChat conversations are told to talk like a chat: short,
   casual, no Markdown, one thought per message. A reply goes out as several
   short messages the way people text (at most `max_bubbles`; `chat_bubbles:

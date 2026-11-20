@@ -130,7 +130,8 @@ class WeixinConfig:
     file_allow_users: tuple[str, ...] = ()
     send_file_roots: tuple[str, ...] = (str(Path.home()),)
     max_send_file_bytes: int = 50 * 1024 * 1024
-    # Files and videos the person sends are saved here, one folder a day; empty is ~/Downloads/Astra/微信.
+    # Files and videos the person sends are saved here, one folder a day; empty is ~/Downloads/Astra/微信,
+    # and a relative folder is under the home folder.
     receive_files_dir: str = ""
     # 0 leaves received files on WeChat's side: the conversation gets only their names.
     max_receive_file_bytes: int = 50 * 1024 * 1024
