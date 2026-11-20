@@ -56,6 +56,7 @@ import urllib.error
 import urllib.request
 from contextlib import nullcontext, suppress
 from pathlib import Path
+from typing import Any
 
 from agent.runtime.process_env import hidden_process_creationflags
 from agent.runtime.provider_errors import (
@@ -123,7 +124,6 @@ from agent.runtime.tools.workspace import register_workspace_tools
 from agent.runtime.tools.image import register_image_tools, select_vision_tiles_from_holder
 from agent.runtime.conversation_opener import OPENED_JOIN_SECONDS, ConversationOpener, ConversationOpenError
 from agent.runtime.page_snapshot import PageSnapshotBroker
-from agent.runtime.tools.computer import register_local_computer_runtime
 from agent.runtime.tools.browser import register_browser_tools
 from agent.runtime.cdp_backend import CdpBrowserBackend, find_chrome
 from agent.runtime.tools.memory import register_memory_tools
@@ -187,7 +187,6 @@ from agent.cli.connections import (
     switch_to_profile,
     sync_context_budget,
 )
-from agent.cli.diagnostics import build_doctor_report, build_runtime_diagnostics
 from agent.cli.environment import enter_workspace, load_project_env
 from agent.cli.persona_preferences import save_selected_persona, startup_persona
 from agent.cli.voice_preferences import VoicePreferences, execute_voice_command
@@ -1066,14 +1065,18 @@ async def _main(startup_started: float):
         from agent.runtime.tools.canvas import register_canvas_tool
 
         register_canvas_tool(tools, workdir=os.getcwd(), render=page_snapshots.request)
-    computer_runtime = register_local_computer_runtime(
-        tools,
-        model_capabilities=lambda: (
-            agent_holder["agent"].llm.config.capabilities
-            if "agent" in agent_holder
-            else llm_config.capabilities
-        ),
-    )
+    computer_runtime: Any = None
+    if sys.platform == "darwin":
+        from agent.runtime.tools.computer import register_local_computer_runtime
+
+        computer_runtime = register_local_computer_runtime(
+            tools,
+            model_capabilities=lambda: (
+                agent_holder["agent"].llm.config.capabilities
+                if "agent" in agent_holder
+                else llm_config.capabilities
+            ),
+        )
     chrome_path = find_chrome()
     if chrome_path:
         browser_manager = register_browser_tools(tools, backend=CdpBrowserBackend(chrome_path), enable_extension=True)
@@ -2498,6 +2501,37 @@ async def _main(startup_started: float):
                          thread=thread_recorder(agent, agent_turn_lock, _send) if personal_thread else None,
                          ).start() if channel_host else None
 
+    def _schedule_openai_warmup(*, delay: float = 0.25) -> None:
+        provider = getattr(agent.llm, "provider", None)
+        warmup = getattr(provider, "warmup_in_background", None)
+        if not callable(warmup) or getattr(agent.llm.config, "connection_required", False):
+            return
+        if delay <= 0:
+            try:
+                warmup()
+            except Exception:
+                logger.debug("immediate openai warmup schedule failed", exc_info=True)
+            return
+
+        async def _delayed_warmup() -> None:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            current_provider = getattr(agent.llm, "provider", None)
+            current_warmup = getattr(current_provider, "warmup_in_background", None)
+            if callable(current_warmup) and not getattr(agent.llm.config, "connection_required", False):
+                try:
+                    current_warmup()
+                except Exception:
+                    logger.debug("delayed openai warmup schedule failed", exc_info=True)
+
+        warmup_task = asyncio.create_task(_delayed_warmup(), name="startup-openai-warmup")
+        startup_tasks.add(warmup_task)
+        warmup_task.add_done_callback(startup_tasks.discard)
+
+    _schedule_openai_warmup(delay=0.25)
+
     active_task: asyncio.Task | None = None
     active_task_id = ""
     active_request_id = ""
@@ -3755,6 +3789,7 @@ async def _main(startup_started: float):
                     current_model_key = entry.key
                     if not catalog.resolve(entry.key):
                         catalog = ModelCatalog((*catalog.entries, entry), catalog.errors, catalog.statuses)
+                    _schedule_openai_warmup(delay=0.0)
                     _send_model_result({"type": "tool_result", "name": "model",
                            "output": f"Model connection switched to: {entry.model_id}\n"
                                      f"Provider: {entry.provider_label} @ {entry.base_url}\n"
@@ -3854,6 +3889,7 @@ async def _main(startup_started: float):
                         new_entry,
                         new_api_key,
                     )
+                    _schedule_openai_warmup(delay=0.0)
                     catalog = new_catalog
                     current_model_key = new_entry.key
                     results["model"] = f"→ {new_entry.model_id}"
@@ -4538,12 +4574,16 @@ async def _main(startup_started: float):
                            "error": "", "code": ""})
                     _send({"type": "done"})
                 elif c == "/doctor" or c.startswith("/doctor "):
+                    from agent.cli.diagnostics import build_doctor_report
+
                     doctor_section = c.split(maxsplit=1)[1] if " " in c else ""
                     _send({"type": "tool_result", "name": "doctor",
                            "output": await build_doctor_report(agent, sandbox, mcp_manager, doctor_section),
                            "error": "", "code": ""})
                     _send({"type": "done"})
                 elif c == "/diagnostics" or c.startswith("/diagnostics "):
+                    from agent.cli.diagnostics import build_runtime_diagnostics
+
                     diagnostics_section = c.split(maxsplit=1)[1] if " " in c else ""
                     _send({
                         "type": "tool_result",
@@ -4656,6 +4696,7 @@ async def _main(startup_started: float):
                             agent, parts[1], parts[2], api_key_env
                         )
                         if probe.ok:
+                            _schedule_openai_warmup(delay=0.0)
                             catalog = configured_model_catalog()
                             connected_entry = next((e for e in catalog.entries if e.model_id == parts[1]
                                                     and e.base_url.rstrip("/") == parts[2].rstrip("/")), None)

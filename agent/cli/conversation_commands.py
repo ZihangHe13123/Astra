@@ -19,8 +19,6 @@ from agent.runtime.tool_execution import PartialResult
 from agent.runtime.tool_failure import ToolFailure
 from agent.runtime.tools.registry import ToolDef
 
-from .diagnostics import build_doctor_report, build_runtime_diagnostics
-
 
 def register_conversation_tools(agent: Any, *, sandbox=None, mcp_manager=None,
                                 startup_profile: dict[str, Any] | Callable[[], dict[str, Any]] | None = None,
@@ -83,6 +81,8 @@ def register_conversation_tools(agent: Any, *, sandbox=None, mcp_manager=None,
         return format_curation(record, separate_verification=True)
 
     async def diagnostics(kind: str = "runtime", section: str = "") -> str | ToolFailure:
+        from .diagnostics import build_doctor_report, build_runtime_diagnostics
+
         if kind == "doctor":
             report = await build_doctor_report(agent, sandbox, mcp_manager, section)
         elif kind != "runtime":

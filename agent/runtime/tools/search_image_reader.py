@@ -8,8 +8,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Awaitable, Callable
 from urllib.parse import urljoin
 
-from PIL import Image, UnidentifiedImageError
-
 if TYPE_CHECKING:
     import httpx
 
@@ -31,6 +29,8 @@ class SearchImageError(ValueError):
 
 
 def _save_raster(data: bytes, directory: Path) -> Path:
+    from PIL import Image, UnidentifiedImageError
+
     try:
         with Image.open(BytesIO(data)) as picture:
             if picture.format not in {"PNG", "JPEG", "WEBP", "GIF", "AVIF"}:

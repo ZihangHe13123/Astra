@@ -70,7 +70,6 @@ from .tools.disclosure import CALL_TOOL, DISPATCH_TOOLS, SEARCH_TOOL, loaded_res
 from .tools.registry import ToolRegistry
 from .tracing import TraceContext, trace_span
 from .vision_policy import VisionPreprocessPolicy
-from .vision_preprocessor import VisionPreprocessError, VisionPreprocessor, VisionTileSelectionError
 
 if TYPE_CHECKING:
     from .context_index.broker import ContextIndexBroker
@@ -82,6 +81,7 @@ if TYPE_CHECKING:
     from .skills import SkillStore
     from .task_store import TaskStore
     from .tools.delegate import DelegateMailbox
+    from .vision_preprocessor import VisionPreprocessError, VisionPreprocessor
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +102,95 @@ _REQUEST_LOCAL_IMAGE_DATA_URL_PREFIXES = (
 
 def _is_request_local_image_data_url(url: object) -> bool:
     return isinstance(url, str) and url.startswith(_REQUEST_LOCAL_IMAGE_DATA_URL_PREFIXES)
+
+
+def _vision_preprocess_error_types() -> tuple[type[BaseException], ...]:
+    """Return (VisionPreprocessError,) only when vision_preprocessor is already imported."""
+    module = sys.modules.get("agent.runtime.vision_preprocessor")
+    error_type = getattr(module, "VisionPreprocessError", None) if module is not None else None
+    return (error_type,) if isinstance(error_type, type) and issubclass(error_type, BaseException) else ()
+
+
+_VISION_STAGING_DIRECTORY_PATTERN = re.compile(r"[0-9a-f]{32}")
+
+
+def _sweep_stale_vision_staging(cache_root: str | Path, *, quiet: bool = False) -> bool:
+    """Remove confined, non-symlink staging directories from an earlier process without importing PIL."""
+    import stat
+
+    def _fail() -> bool:
+        if not quiet:
+            logger.warning("Stale inline image staging cleanup did not complete safely.")
+        return False
+
+    root_path = Path(cache_root).expanduser()
+    try:
+        root_meta = root_path.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return _fail()
+    if stat.S_ISLNK(root_meta.st_mode) or not stat.S_ISDIR(root_meta.st_mode):
+        return _fail()
+    if os.name == "posix":
+        try:
+            if stat.S_IMODE(root_meta.st_mode) != 0o700:
+                root_path.chmod(0o700, follow_symlinks=False)
+                root_meta = root_path.stat(follow_symlinks=False)
+            if (
+                not stat.S_ISDIR(root_meta.st_mode)
+                or stat.S_ISLNK(root_meta.st_mode)
+                or stat.S_IMODE(root_meta.st_mode) != 0o700
+            ):
+                return _fail()
+        except (NotImplementedError, OSError, RuntimeError):
+            return _fail()
+    try:
+        resolved_root = root_path.resolve()
+    except OSError:
+        return _fail()
+    staging_root = resolved_root / ".staging"
+    try:
+        staging_meta = staging_root.stat(follow_symlinks=False)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return _fail()
+    if stat.S_ISLNK(staging_meta.st_mode) or not stat.S_ISDIR(staging_meta.st_mode):
+        return _fail()
+    import shutil
+
+    try:
+        if not staging_root.resolve().is_relative_to(resolved_root):
+            return _fail()
+        candidates = tuple(staging_root.iterdir())
+        for candidate in candidates:
+            candidate_meta = candidate.stat(follow_symlinks=False)
+            if (
+                not _VISION_STAGING_DIRECTORY_PATTERN.fullmatch(candidate.name)
+                or stat.S_ISLNK(candidate_meta.st_mode)
+                or not stat.S_ISDIR(candidate_meta.st_mode)
+                or not candidate.resolve().is_relative_to(staging_root)
+            ):
+                return _fail()
+            pending = [candidate]
+            while pending:
+                directory = pending.pop()
+                for entry in directory.iterdir():
+                    entry_meta = entry.stat(follow_symlinks=False)
+                    if stat.S_ISLNK(entry_meta.st_mode):
+                        return _fail()
+                    if stat.S_ISDIR(entry_meta.st_mode):
+                        pending.append(entry)
+                    elif not stat.S_ISREG(entry_meta.st_mode):
+                        return _fail()
+                    if not entry.resolve().is_relative_to(staging_root):
+                        return _fail()
+            shutil.rmtree(candidate)
+        staging_root.rmdir()
+    except (OSError, RuntimeError):
+        return _fail()
+    return True
 
 
 class ToolArgumentError(ValueError):
@@ -230,9 +319,9 @@ class ReActAgent(AgentBase):
         self._stable_tool_schema_key: tuple | None = None
         self._stable_tool_schemas: list[dict] = []
         self.vision_tiles_enabled = True
-        self.vision_preprocessor = VisionPreprocessor(
-            vision_cache_root or Path.cwd() / ".astra" / "image-cache" / "tiles"
-        )
+        self._vision_cache_root = vision_cache_root or Path.cwd() / ".astra" / "image-cache" / "tiles"
+        self._vision_preprocessor: "VisionPreprocessor | None" = None
+        self._vision_staging_swept = _sweep_stale_vision_staging(self._vision_cache_root)
         self._timing_log_enabled = bool(timing_log_enabled)
         self._query_profile_enabled = query_profile_enabled
         self.context_index_broker = context_index_broker
@@ -1204,6 +1293,27 @@ class ReActAgent(AgentBase):
         self._tool_cost_revision = -1
         self.refresh_tool_token_cost()
 
+    @property
+    def vision_preprocessor(self) -> "VisionPreprocessor":
+        preprocessor = getattr(self, "_vision_preprocessor", None)
+        if preprocessor is None:
+            from .vision_preprocessor import VisionPreprocessor
+
+            cache_root = getattr(self, "_vision_cache_root", None) or (
+                Path.cwd() / ".astra" / "image-cache" / "tiles"
+            )
+            swept = bool(getattr(self, "_vision_staging_swept", False))
+            preprocessor = VisionPreprocessor(
+                cache_root,
+                sweep_stale_staging=not swept,
+            )
+            self._vision_preprocessor = preprocessor
+        return preprocessor
+
+    @vision_preprocessor.setter
+    def vision_preprocessor(self, value: "VisionPreprocessor") -> None:
+        self._vision_preprocessor = value
+
     def set_vision_tiles_enabled(self, enabled: bool) -> None:
         """Apply the tiling preference to the next vision request."""
         self.vision_tiles_enabled = bool(enabled)
@@ -1213,6 +1323,8 @@ class ReActAgent(AgentBase):
         """Resolve bounded detail tiles for the currently active request."""
         request_id = self._active_vision_request_id
         if request_id is None:
+            from .vision_preprocessor import VisionTileSelectionError
+
             raise VisionTileSelectionError(
                 "Vision tile selection is unavailable outside an active request."
             )
@@ -1630,7 +1742,17 @@ class ReActAgent(AgentBase):
                     messages = original
                 else:
                     self.context.last_prompt_tokens = projected_tokens
-        if self._vision_tile_tool_enabled():
+        if self._vision_tile_tool_enabled() and (
+            getattr(self, "_vision_preprocessor", None) is not None
+            or any(
+                isinstance(message.get("content"), list)
+                and any(
+                    isinstance(part, dict) and part.get("type") == "image_url"
+                    for part in message["content"]
+                )
+                for message in messages
+            )
+        ):
             policy = getattr(self.llm.config, "vision_preprocess", None)
             assert isinstance(policy, VisionPreprocessPolicy)
             self.vision_preprocessor.validate_provider_prompt(messages, policy)
@@ -1874,7 +1996,7 @@ class ReActAgent(AgentBase):
                     request_id=self._active_vision_request_id or "",
                     occurrence_id=f"user:{self._active_vision_request_id}:initial",
                 )
-            except VisionPreprocessError:
+            except _vision_preprocess_error_types():
                 # The provider-facing bundle is fail-closed, but the user's
                 # original attachment placeholder remains durable and retryable.
                 self.context.add_user(storage_content)
@@ -2618,7 +2740,9 @@ class ReActAgent(AgentBase):
         return chat_content, storage_content, vision_event
 
     @staticmethod
-    def _tool_image_preprocess_error(reason: str) -> VisionPreprocessError:
+    def _tool_image_preprocess_error(reason: str) -> "VisionPreprocessError":
+        from .vision_preprocessor import VisionPreprocessError
+
         return VisionPreprocessError(
             f"{reason}. Astra did not silently send a provider-downscaled substitute; "
             "disable vision tiles explicitly to restore direct sending."
@@ -4071,7 +4195,7 @@ class ReActAgent(AgentBase):
                         yield event
                 finally:
                     await active_events.aclose()
-            except VisionPreprocessError as exc:
+            except _vision_preprocess_error_types() as exc:
                 logger.warning(
                     "vision preprocessing failed session=%s request=%s",
                     session_id,
@@ -4112,7 +4236,15 @@ class ReActAgent(AgentBase):
                     await self.context.save_async()
             finally:
                 try:
-                    self.vision_preprocessor.release_request(session_id, vision_request_id)
+                    preprocessor = getattr(self, "_vision_preprocessor", None)
+                    if preprocessor is not None:
+                        preprocessor.release_request(session_id, vision_request_id)
+                    elif getattr(self, "_vision_staging_swept", True) is False:
+                        cache_root = getattr(self, "_vision_cache_root", None) or (
+                            Path.cwd() / ".astra" / "image-cache" / "tiles"
+                        )
+                        if _sweep_stale_vision_staging(cache_root, quiet=True):
+                            self._vision_staging_swept = True
                 except Exception:
                     logger.exception(
                         "vision request release failed session=%s request=%s",

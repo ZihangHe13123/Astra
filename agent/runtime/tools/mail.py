@@ -17,22 +17,20 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from agent.mail163.config import (
-    AccountProblems,
-    MAIN_ACCOUNT,
-    MailConfigurationError,
-    MailNotSetUpError,
-    check_account_problems,
-    find_account,
-    load_mail_accounts,
-    resolve_folder,
-)
-from agent.mail163.models import MailConfig
-from agent.mail163.refs import mailbox_identity, message_ref, parse_ref
-from agent.mail163.service import MailError, MailService
 from agent.runtime.tools.registry import ToolDef, ToolRegistry
+
+if TYPE_CHECKING:
+    from agent.mail163.config import AccountProblems
+    from agent.mail163.models import MailConfig
+    from agent.mail163.service import MailError
+    from agent.mail163.service import MailService as _MailService
+
+    Outcome = tuple[MailConfig, dict[str, Any] | MailError]
+
+# Loaded lazily on first tool execution; tests may monkeypatch this attribute.
+MailService: Any = None
 
 ACTIONS = ("status", "recent", "search", "read")
 # Under the registry's result limit, so the message reaches the model whole up to here.
@@ -81,6 +79,8 @@ def _named(configs: list[MailConfig], name: str, whose: str) -> MailConfig:
 
 
 def _line(item: dict[str, Any], config: MailConfig, labelled: bool) -> str:
+    from agent.mail163.refs import message_ref
+
     mark = "unread " if item.get("unread") else ""
     where = f"[{config.name}] " if labelled else ""
     ref = message_ref(config, str(item["folder"]), int(item["uidvalidity"]), int(item["uid"]))
@@ -106,20 +106,21 @@ def _newest_first(pair: tuple[MailConfig, dict[str, Any]]) -> tuple[float, int]:
     return (float(received) if isinstance(received, (int, float)) else 0.0, int(item["uid"]))
 
 
-def _opened(open_box: Callable[[MailConfig], MailService], config: MailConfig) -> MailService:
+def _opened(open_box: Callable[[MailConfig], _MailService], config: MailConfig) -> _MailService:
     """One mailbox's service: a cache that cannot be opened is that mailbox's error, not every mailbox's."""
     try:
         return open_box(config)
     except (sqlite3.Error, OSError):
+        from agent.mail163.service import MailError
+
         raise MailError("storage_error", "The local mail cache could not be opened", 5) from None
 
 
-Outcome = tuple[MailConfig, dict[str, Any] | MailError]
-
-
-def _each(configs: list[MailConfig], open_box: Callable[[MailConfig], MailService],
-          look: Callable[[MailService], dict[str, Any]]) -> list[Outcome]:
+def _each(configs: list[MailConfig], open_box: Callable[[MailConfig], _MailService],
+          look: Callable[[_MailService], dict[str, Any]]) -> list[Outcome]:
     """Open each mailbox and ``look`` in it, all at once; one that fails is reported, unless every one does."""
+    from agent.mail163.service import MailError
+
     if len(configs) == 1:
         return [(configs[0], look(_opened(open_box, configs[0])))]
 
@@ -138,6 +139,8 @@ def _each(configs: list[MailConfig], open_box: Callable[[MailConfig], MailServic
 
 
 def _notes(outcomes: list[Outcome], several: bool) -> str:
+    from agent.mail163.service import MailError
+
     notes = []
     for config, result in outcomes:
         if isinstance(result, MailError):
@@ -148,18 +151,33 @@ def _notes(outcomes: list[Outcome], several: bool) -> str:
 
 
 def register_mail_tool(registry: ToolRegistry, *, project_root: Path,
-                       service: Callable[[], MailService | Sequence[MailService]] | None = None) -> None:
-    def accounts(problems: AccountProblems) -> tuple[list[MailConfig], Callable[[MailConfig], MailService]]:
+                       service: Callable[[], _MailService | Sequence[_MailService]] | None = None) -> None:
+    def accounts(problems: AccountProblems) -> tuple[list[MailConfig], Callable[[MailConfig], _MailService]]:
         """The configured mailboxes, and how to open one; nothing is created before one is opened."""
+        from agent.mail163.config import load_mail_accounts
+        from agent.mail163.service import MailService as default_mail_service
+
+        service_factory = default_mail_service if MailService is None else MailService
         if service is None:
-            return load_mail_accounts(project_root, problems=problems), MailService
+            return load_mail_accounts(project_root, problems=problems), service_factory
         opened = service()
-        boxes = [opened] if isinstance(opened, MailService) else list(opened)
+        boxes = [opened] if isinstance(opened, default_mail_service) else list(opened)
         by_config = {id(box.config): box for box in boxes}
         return [box.config for box in boxes], lambda config: by_config[id(config)]
 
     def run(action: str, folder: str, query: str, sender: str, unread_only: bool, limit: int, uid: int, ref: str,
             account: str) -> str:
+        from agent.mail163.config import (
+            MAIN_ACCOUNT,
+            MailConfigurationError,
+            MailNotSetUpError,
+            check_account_problems,
+            find_account,
+            resolve_folder,
+        )
+        from agent.mail163.refs import parse_ref
+        from agent.mail163.service import MailError
+
         problems: AccountProblems = {}
         configs, open_box = accounts(problems)
         several = len(configs) + len(problems) > 1
@@ -178,7 +196,7 @@ def register_mail_tool(registry: ToolRegistry, *, project_root: Path,
         except MailConfigurationError as exc:
             raise ValueError(str(exc)) from None
 
-        def each(look: Callable[[MailService], dict[str, Any]]) -> list[Outcome]:
+        def each(look: Callable[[_MailService], dict[str, Any]]) -> list[Outcome]:
             try:
                 return _each(chosen, open_box, look)
             except MailError as exc:
@@ -187,7 +205,7 @@ def register_mail_tool(registry: ToolRegistry, *, project_root: Path,
                 raise
 
         if action == "status":
-            def look_status(box: MailService) -> dict[str, Any]:
+            def look_status(box: _MailService) -> dict[str, Any]:
                 return box.folders(refresh=True)
 
             lines = []
@@ -201,7 +219,7 @@ def register_mail_tool(registry: ToolRegistry, *, project_root: Path,
                 lines.append(f"{where} on {config.host}. Folders: {names or 'none listed'}.")
             return "\n".join(lines) + settings_note
         if action == "recent":
-            def look_recent(box: MailService) -> dict[str, Any]:
+            def look_recent(box: _MailService) -> dict[str, Any]:
                 name = resolve_folder(folder or "INBOX", box.config.sent_folder)
                 return box.recent(folder=name, limit=limit, unread_only=unread_only)
 
@@ -218,7 +236,7 @@ def register_mail_tool(registry: ToolRegistry, *, project_root: Path,
         if not query.strip() and not sender.strip():
             raise ValueError("search needs query or sender.")
 
-        def look_search(box: MailService) -> dict[str, Any]:
+        def look_search(box: _MailService) -> dict[str, Any]:
             return box.search(query, sender=sender, folder=folder or None, limit=limit)
 
         outcomes = each(look_search)
@@ -230,8 +248,12 @@ def register_mail_tool(registry: ToolRegistry, *, project_root: Path,
         lines = [_line(item, config, several) for config, item in found]
         return "\n".join([head, *lines]) + _notes(outcomes, several) + settings_note
 
-    def read(configs: list[MailConfig], open_box: Callable[[MailConfig], MailService], several: bool, folder: str,
+    def read(configs: list[MailConfig], open_box: Callable[[MailConfig], _MailService], several: bool, folder: str,
              uid: int, ref: str, account: str) -> str:
+        from agent.mail163.config import MAIN_ACCOUNT, MailConfigurationError, find_account
+        from agent.mail163.refs import mailbox_identity, parse_ref
+        from agent.mail163.service import MailError
+
         if ref.strip():
             # The message the ref names, in the mailbox it names, or none: never another one that has its number now.
             name, ref_folder, generation, ref_uid, binding = parse_ref(ref)
@@ -276,6 +298,9 @@ def register_mail_tool(registry: ToolRegistry, *, project_root: Path,
                    limit: int = 10, uid: int = 0, ref: str = "", account: str = "") -> str:
         if action not in ACTIONS:
             raise ValueError("Unknown action.")
+        from agent.mail163.config import MailConfigurationError, MailNotSetUpError
+        from agent.mail163.service import MailError
+
         try:
             return await asyncio.to_thread(run, action, folder, query, sender, unread_only, max(1, min(30, limit)),
                                            uid, ref, account)

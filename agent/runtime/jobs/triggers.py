@@ -18,14 +18,14 @@ import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from agent.mail163.config import MAIN_ACCOUNT, resolve_folder
-from agent.mail163.models import FolderSyncResult
-from agent.mail163.refs import mailbox_identity, message_ref
 from agent.runtime.instance_lock import InstanceAlreadyRunning, InstanceLock
 
 from .store import INACTIVE_SECONDS, JobStore, last_interaction
+
+if TYPE_CHECKING:
+    from agent.mail163.models import FolderSyncResult
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +119,8 @@ class TriggerWatcher:
                 logger.info("mail triggers could not look at mailbox %s", box.config.name, exc_info=True)
                 continue
             looks[box] = {result.folder: result for result in report.folders if result.status == "ok"}
+        from agent.mail163.config import resolve_folder
+
         queued = 0
         for job in jobs:
             try:
@@ -175,6 +177,8 @@ class TriggerWatcher:
             scan = min(waiting, key=lambda each: (_received(each.candidates[each.taken]), scans.index(each)))
             events.append(_event(scan.box, scan.candidates[scan.taken], trigger, several))
             scan.taken += 1
+        from agent.mail163.refs import mailbox_identity
+
         for scan in scans:
             if scan.taken == len(scan.candidates):
                 place = scan.reached  # Everything it looked at is passed: the first place, or all its new mail.
@@ -199,6 +203,8 @@ class _Scan:
 
 
 def _scan(box: Any, trigger: dict, seen: str | None, result: FolderSyncResult) -> _Scan:
+    from agent.mail163.refs import mailbox_identity
+
     mark, _, binding = (seen or "").partition("@")
     seen_validity, _, seen_uid = mark.partition(":")
     validity = str(result.uidvalidity)
@@ -226,6 +232,9 @@ def _received(item: dict) -> float:
 
 
 def _event(box: Any, item: dict, trigger: dict, several: bool) -> dict:
+    from agent.mail163.config import MAIN_ACCOUNT
+    from agent.mail163.refs import message_ref
+
     return {"type": "mail", "folder": item.get("folder") or trigger["folder"], "uid": int(item["uid"]),
             "ref": message_ref(box.config, item.get("folder") or trigger["folder"], int(item["uidvalidity"]),
                                int(item["uid"])),
@@ -240,6 +249,8 @@ def _watches(job: dict, config: Any) -> bool:
 
 
 def _mail_marks(cursor: str | None) -> dict[str, str]:
+    from agent.mail163.config import MAIN_ACCOUNT
+
     if cursor is None:
         return {}
     if cursor.startswith(_MAILBOXES):
@@ -248,6 +259,8 @@ def _mail_marks(cursor: str | None) -> dict[str, str]:
 
 
 def _mail_cursor(marks: dict[str, str]) -> str:
+    from agent.mail163.config import MAIN_ACCOUNT
+
     if set(marks) == {MAIN_ACCOUNT}:
         return marks[MAIN_ACCOUNT]
     return _MAILBOXES + json.dumps(marks, sort_keys=True)

@@ -19,7 +19,6 @@ from typing import Any
 from ..page_snapshot import MAX_PAGE_BYTES, PageSnapshot, PageSnapshotError, is_page_path
 from ..process_env import hidden_process_creationflags
 from ..tool_failure import ToolFailure
-from ..vision_preprocessor import VisionTileSelectionError
 from .registry import ToolDef, ToolPrivateResult, ToolRegistry
 
 SUPPORTED_IMAGE_MIME_TYPES = {"image/png", "image/jpeg", "image/webp", "image/gif"}
@@ -398,11 +397,15 @@ def select_vision_tiles_from_holder(
     agent = agent_holder.get("agent")
     selector = getattr(agent, "select_vision_tiles", None) if agent is not None else None
     if not callable(selector):
+        from ..vision_preprocessor import VisionTileSelectionError
+
         raise VisionTileSelectionError(
             "Vision tile selection is unavailable until the agent is ready."
         )
     result = selector(tile_set_id, tile_ids)
     if not isinstance(result, dict):
+        from ..vision_preprocessor import VisionTileSelectionError
+
         raise VisionTileSelectionError(
             "Vision tile selection is unavailable because the active agent returned an invalid result."
         )
@@ -511,6 +514,8 @@ def register_image_tools(
                 message="tile_ids must be unique; duplicate IDs are not allowed.",
                 retryable=True,
             )
+        from ..vision_preprocessor import VisionTileSelectionError
+
         try:
             selection = select_tiles(opaque_id, normalized_ids)
         except VisionTileSelectionError as exc:

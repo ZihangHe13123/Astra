@@ -11,7 +11,6 @@ from agent.runtime.tools.registry import ToolDef, ToolRegistry
 
 from .manager import ChannelManager
 from .router import active_channel_message, channel_turn_media
-from .weixin import spoken_text
 
 _SPEAK_MAX_CHARS = 600
 
@@ -73,6 +72,8 @@ def register_channel_tools(
 
         if message.channel != "weixin":
             raise RuntimeError("voice notes are only available in WeChat")
+        from .weixin import spoken_text
+
         text = spoken_text(words)
         if not text:
             raise ValueError("speak has nothing to say once emoji and markup are removed")

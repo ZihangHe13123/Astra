@@ -27,7 +27,6 @@ from agent.runtime.jobs.store import note_interaction
 from agent.runtime.paths import state_dir, state_path
 
 from .base import ChannelMessage, ReplySink
-from .weixin import CHAT_STYLE as WEIXIN_CHAT_STYLE
 
 
 logger = logging.getLogger(__name__)
@@ -45,8 +44,13 @@ channel_turn_media: contextvars.ContextVar[list[str] | None] = contextvars.Conte
 )
 
 
-# How to talk on a channel, added to the system prompt of its conversations only.
-CHANNEL_STYLES = {"weixin": WEIXIN_CHAT_STYLE}
+def _channel_style(channel: str) -> str:
+    """How to talk on a channel, added to the system prompt of its conversations only."""
+    if channel == "weixin":
+        from .weixin import CHAT_STYLE
+
+        return CHAT_STYLE
+    return ""
 
 
 # A message that is nothing but one of these starts a new conversation with that chat.
@@ -177,7 +181,7 @@ class AgentChannelRouter:
         context.persona_relationship_context = template.persona_relationship_context
         context.persona_affect = template.persona_affect
         suffix = getattr(template, "_stable_system_suffix", "")
-        style = CHANNEL_STYLES.get(channel, "")
+        style = _channel_style(channel)
         context.set_stable_system_suffix(f"{suffix}\n\n{style}".strip() if style else suffix)
         context.set_tools_token_cost(getattr(template, "_tools_token_cost", 0))
         context.compressor = ContextCompressor(self.agent.llm)
