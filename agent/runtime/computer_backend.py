@@ -516,15 +516,17 @@ class ComputerSessionManager:
             await self._bind_backend_directory()
             return await self._backend.status()
 
-    async def apps(self) -> list[dict[str, object]]:
+    async def apps(self, *, presentation_ref: str | None = None) -> list[dict[str, object]]:
         async with self._lock:
             self._require_open()
+            if presentation_ref is not None:
+                self._require_presentation_cleanup(presentation_ref)
             self._target_generation += 1
             # Refreshing the catalog replaces the helper's opaque target
             # registry. Consume Python-side state before dispatch so failure,
             # cancellation, and close races cannot retain stale references.
             try:
-                self._invalidate_cooperative_state()
+                self._invalidate_cooperative_state(preserve_takeover_cleanup=presentation_ref is not None)
             except ComputerSessionError:
                 if self._artifact_poisoned:
                     self._poison_artifact_session_locked(clear_target=True)
@@ -538,7 +540,13 @@ class ComputerSessionManager:
                 self._target_window_identity_ref = None
                 self._clear_suspended_continuity()
             await self._bind_backend_directory()
-            catalog = await self._backend.apps()
+            if presentation_ref is None:
+                catalog = await self._backend.apps()
+            else:
+                inspect_catalog = getattr(self._backend, "presentation_apps", None)
+                if inspect_catalog is None:
+                    raise ComputerSessionError("presentation_unsupported")
+                catalog = await inspect_catalog(presentation_ref)
             apps = [dict(app) for app in catalog.apps]
             self._last_catalog = catalog
             if self._handed_off:
@@ -597,6 +605,7 @@ class ComputerSessionManager:
         text_detail: ComputerSnapshotTextDetailMode = ComputerSnapshotTextDetailMode.OFF,
         recovery_catalog_generation: int | None = None,
         recovery_window_identity_ref: str | None = None,
+        presentation_ref: str | None = None,
     ) -> ComputerVerifiedAppState:
         """Verify and commit one exact target from the latest successful catalog."""
         async with self._lock:
@@ -609,8 +618,12 @@ class ComputerSessionManager:
             # Every valid get-state attempt consumes prior cooperative
             # authority, including attempts that later fail catalog lookup.
             # This must precede the first await and exact-ref validation.
+            if presentation_ref is not None:
+                self._require_presentation_cleanup(presentation_ref)
+                if not recovery_window_identity_ref or recovery_catalog_generation is None:
+                    raise ComputerSessionError("stale_takeover")
             try:
-                self._invalidate_cooperative_state()
+                self._invalidate_cooperative_state(preserve_takeover_cleanup=presentation_ref is not None)
             except ComputerSessionError:
                 if self._artifact_poisoned:
                     self._poison_artifact_session_locked(clear_target=True)
@@ -836,8 +849,9 @@ class ComputerSessionManager:
         self._poison_artifact_session_locked(clear_target=clear_target)
 
     def _poison_artifact_session_locked(self, *, clear_target: bool) -> None:
-        # Do not clean current artifacts here: their authority is uncertain.
-        self._clear_cooperative_references()
+        # Do not touch uncertain artifacts. The old opaque cleanup ref cannot dispatch
+        # input, and must survive so an in-flight loan can still return the foreground.
+        self._clear_cooperative_references(preserve_takeover_cleanup=True)
         self.grants.clear()
         if clear_target:
             self._target = None
@@ -1300,7 +1314,7 @@ class ComputerSessionManager:
                 if deadline_ms is None:
                     raise ComputerSessionError("approval_required", "The foreground loan is no longer current.")
                 begin_task = asyncio.create_task(begin(snapshot_id, plan_ref, continued_loan=continued_loan,
-                                                       loan_deadline_uptime_ms=deadline_ms))
+                                                       loan_deadline_continuous_ms=deadline_ms))
             elif declaration is None:
                 begin_task = asyncio.create_task(begin(snapshot_id, plan_ref))
             else:
@@ -1657,12 +1671,16 @@ class ComputerSessionManager:
 
     async def end_takeover(
         self, takeover_ref: str, *, restore_previous_focus: bool = True,
+        presentation_snapshot: ComputerSnapshot | None = None,
     ) -> Mapping[str, object]:
         if not isinstance(restore_previous_focus, bool):
             raise TypeError("restore_previous_focus must be boolean")
         cancelled = await self._acquire_lock_for_terminal_cleanup()
         try:
-            self._require_open()
+            if not self._artifact_poisoned or self._closed or self._close_task is not None:
+                self._require_open()
+            elif not restore_previous_focus:
+                restore_previous_focus = True  # never present the result of an unsafe observation
             if takeover_ref != self._takeover_cleanup_ref:
                 raise ComputerSessionError("stale_takeover")
             self._takeover_ref = None
@@ -1671,13 +1689,30 @@ class ComputerSessionManager:
             end = getattr(self._backend, "end_takeover", None)
             if end is None:
                 raise ComputerSessionError("takeover_unsupported")
-            if not restore_previous_focus and not cancelled:
+            presenting = (not restore_previous_focus and not cancelled and not self._handed_off
+                          and presentation_snapshot is not None and self._latest_snapshot is presentation_snapshot)
+            rollback = getattr(self._backend, "cancel_presentation", None)
+            if presenting and rollback is None:
+                # Never dispatch an irreversible keep-foreground request to a legacy backend.
+                presenting = False
+            if presenting:
                 end = partial(end, restore_previous_focus=False)
             cleanup_task = asyncio.create_task(self._end_takeover_owned(end, takeover_ref))
             self._terminal_cleanup_task = cleanup_task
             try:
                 result, cancelled_during_cleanup = await self._await_owned_task(cleanup_task)
                 cancelled = cancelled or cancelled_during_cleanup
+                if presenting and cancelled:
+                    # end(false) already consumed the live ref. Only the native one-shot
+                    # rollback receipt may restore; never replay end or synthesize activation.
+                    undo = asyncio.create_task(self._end_takeover_owned(rollback, takeover_ref))
+                    self._terminal_cleanup_task = undo
+                    try:
+                        await self._await_owned_task(undo)
+                    except Exception as exc:
+                        # The owned cleanup closed the uncertain transport. It must never
+                        # turn the caller's cancellation into a successful presentation.
+                        raise asyncio.CancelledError from exc
             finally:
                 self._terminal_cleanup_task = None
             if not isinstance(result, Mapping):
@@ -1687,6 +1722,11 @@ class ComputerSessionManager:
         if cancelled:
             raise asyncio.CancelledError
         return result
+
+    def _require_presentation_cleanup(self, ref: str) -> None:
+        if (not ref or ref != self._takeover_cleanup_ref or self._takeover_ref is not None
+                or self._fragment_declaration is not None or self._handed_off):
+            raise ComputerSessionError("stale_takeover")
 
     async def _end_takeover_owned(self, end: object, takeover_ref: str) -> object:
         try:

@@ -510,6 +510,71 @@ import Testing
     #expect(maximumCommit.ok)
 }
 
+@Test func focusLoanV3AndPresentationCapabilitiesInBothSnapshotScopes() {
+    let node = SerializedAXNode(index: 1, role: "AXWindow", subrole: nil, label: nil, title: nil, help: nil,
+        value: nil, enabled: true, focused: nil, actions: [], bounds: .zero,
+        elementRef: ElementReference(snapshotID: "snap", ordinal: 1), children: [], sourceElement: nil)
+    let tree = SerializedAXTree(root: node, nodeCount: 1, jsonByteCount: 0)
+    for subtree in [false, true] {
+        guard case let .object(fields) = snapshotAXTreeJSON(tree, subtree: subtree),
+              case let .array(capabilities)? = fields["observation_capabilities"] else {
+            Issue.record("missing observation capabilities"); continue
+        }
+        #expect(capabilities.contains(.string("focus_loan_v3")))
+        #expect(!capabilities.contains(.string("focus_loan_v2")))
+        #expect(capabilities.contains(.string("focus_presentation_v1")))
+    }
+}
+
+@Test func focusLoanV3RoutesOnlyExactContinuousMillisecondDeadlines() {
+    let windows = LoanDeadlineProtocolWindows()
+    let dispatcher = Dispatcher(permissions: StaticPermissions(accessibilityTrusted: true, screenRecordingAllowed: true), windows: windows)
+    func begin(_ fields: String) -> HelperResponse {
+        dispatcher.handle(
+            #"{"protocol_version":4,"request_id":"timed","operation":"takeover_begin","payload":{"snapshot_id":"snap","plan_ref":"plan",\#(fields)}}"#
+        )
+    }
+    for suffix in ["", #","continued_loan":true"#] {
+        #expect(begin(#""loan_deadline_continuous_ms":420125\#(suffix)"#).ok)
+        #expect(begin(#""loan_deadline_uptime_ms":450000\#(suffix)"#).error?.code == "protocol_mismatch")
+    }
+    #expect(begin(#""loan_deadline_continuous_ms":420125,"loan_deadline_uptime_ms":450000"#).error?.code == "protocol_mismatch")
+    for token in ["0", "-1", "null", "true", #""420125""#, "1.5", "1.0", "9007199254740992"] {
+        #expect(begin(#""loan_deadline_continuous_ms":\#(token)"#).error?.code == "protocol_mismatch")
+    }
+    #expect(windows.begins.map(\.continued) == [false, true])
+    #expect(windows.begins.map(\.deadline) == [420.125, 420.125])
+}
+
+@Test func presentationRoutesRequireOnlyTheExactBoundedTakeoverRef() {
+    let windows = CooperativeProtocolWindows()
+    let dispatcher = Dispatcher(permissions: StaticPermissions(accessibilityTrusted: true, screenRecordingAllowed: true), windows: windows)
+    let ref = String(repeating: "é", count: 256)
+    func send(_ operation: String, _ payload: String) -> HelperResponse {
+        dispatcher.handle(#"{"protocol_version":4,"request_id":"r","operation":"\#(operation)","payload":\#(payload)}"#)
+    }
+    for operation in ["presentation_apps", "cancel_presentation"] {
+        for bad in ["{}", #"{"takeover_ref":""}"#, #"{"takeover_ref":1}"#, #"{"takeover_ref":"\#(ref)x"}"#,
+                    #"{"takeover_ref":"bound","restore_previous_focus":false}"#, #"{"takeover_ref":"bound","fragment":{}}"#] {
+            #expect(send(operation, bad).error?.code == "protocol_mismatch")
+        }
+    }
+    let payload = #"{"takeover_ref":"\#(ref)"}"#
+    let catalog = send("presentation_apps", payload)
+    let cancelled = send("cancel_presentation", payload)
+    #expect(catalog.ok && catalog.result == .object(["catalog_generation": .number(7), "apps": .array([])]))
+    #expect(cancelled.ok && cancelled.result == .object(["started": .bool(true), "restoration": .string("restored")]))
+    #expect(windows.presentationAppsRefs == [ref])
+    #expect(windows.cancelPresentationRefs == [ref])
+
+    windows.presentationAppsError = TakeoverError.authorityMismatch
+    #expect(send("presentation_apps", payload).error?.code == "stale_snapshot")
+    windows.presentationAppsError = WindowObservationError.observationTimedOut
+    #expect(send("presentation_apps", payload).error?.code == "observation_timeout")
+    windows.presentationCleanupFailed = true
+    #expect(send("cancel_presentation", payload).error?.code == "helper_failed")
+}
+
 @Test func protocolV4KeepsOrdinaryForegroundVariantsAndExactFragmentVariants() {
     let windows = CooperativeProtocolWindows()
     let dispatcher = Dispatcher(
@@ -529,7 +594,7 @@ import Testing
     #expect(!continued.ok && continued.error?.code != "user_activity_paused")
     for suffix in ["", ",\"continued_loan\":true"] {
         let timed = dispatcher.handle(
-            #"{"protocol_version":4,"request_id":"timed","operation":"takeover_begin","payload":{"snapshot_id":"snapshot","plan_ref":"plan","loan_deadline_uptime_ms":420000\#(suffix)}}"#
+            #"{"protocol_version":4,"request_id":"timed","operation":"takeover_begin","payload":{"snapshot_id":"snapshot","plan_ref":"plan","loan_deadline_continuous_ms":420000\#(suffix)}}"#
         )
         // An observer without bounded loans must never substitute a plain begin.
         #expect(timed.error?.code == "user_activity_paused")
@@ -1004,10 +1069,25 @@ private final class CooperativeProtocolWindows: WindowObserving {
     var fragmentCommits: [FragmentStageCommit] = []
     var takeoverDeclarations: [ForegroundFragmentDeclaration] = []
     var ordinaryTakeoverBegins = 0
+    var presentationAppsRefs: [String] = []
+    var presentationAppsError: Error?
+    var cancelPresentationRefs: [String] = []
+    var presentationCleanupFailed = false
     var snapshotResult: JSONValue = .object([:])
     var snapshotDetails: [SnapshotTextDetailRequest] = []
 
     func apps() throws -> JSONValue { .object(["apps": .array([])]) }
+    func presentationApps(takeoverRef: String) throws -> JSONValue {
+        presentationAppsRefs.append(takeoverRef)
+        if let presentationAppsError { throw presentationAppsError }
+        return .object(["catalog_generation": .number(7), "apps": .array([])])
+    }
+
+    func cancelPresentation(takeoverRef: String) throws -> TakeoverOutcome {
+        cancelPresentationRefs.append(takeoverRef)
+        return TakeoverOutcome(started: true, restoration: .restored, cleanupFailed: presentationCleanupFailed)
+    }
+
     func snapshot(
         appRef _: String,
         windowRef _: String,
@@ -1103,6 +1183,19 @@ private final class CooperativeProtocolWindows: WindowObserving {
             takeoverRef: takeoverRef,
             actions: actions
         )
+    }
+}
+
+private final class LoanDeadlineProtocolWindows: WindowObserving {
+    var begins: [(continued: Bool, deadline: TimeInterval?)] = []
+
+    func apps() throws -> JSONValue { throw WindowObservationError.targetGone }
+    func snapshot(appRef _: String, windowRef _: String, scope _: String, artifactName _: String?,
+                  textDetail _: SnapshotTextDetailRequest) throws -> JSONValue { throw WindowObservationError.targetGone }
+
+    func takeoverBegin(snapshotID _: String, planRef _: String, continuedLoan: Bool, loanDeadline: TimeInterval?) throws -> String {
+        begins.append((continuedLoan, loanDeadline))
+        return "takeover"
     }
 }
 

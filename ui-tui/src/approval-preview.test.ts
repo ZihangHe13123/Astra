@@ -554,4 +554,7 @@ test("leaving a result in front is explicit even on the collapsed approval card"
   }, { width: 90, expanded: false });
   assert.match(view.title, /保留在前台/);
   assert.match(view.collapsedLines.join(" "), /保留在前台/);
+  assert.match(view.detailLines.join("\n"), /边界：仅此片段.*保留在前台/);
+  assert.doesNotMatch(view.detailLines.join("\n"), /归还焦点/);
+  assert.doesNotMatch(view.shortcutHint, /\[A\]/);
 });

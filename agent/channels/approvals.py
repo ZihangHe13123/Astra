@@ -91,10 +91,18 @@ def approval_prompt(request: Mapping[str, Any], timeout: float) -> str:
     raw_choices = request.get("choices")
     choices = [str(choice) for choice in raw_choices] if isinstance(raw_choices, (list, tuple)) and raw_choices \
         else ["once", "deny"]
+    session_reply = "“本会话”这个对话里都允许"
+    if request.get("kind") == "computer_foreground_takeover":
+        arguments = request.get("arguments")
+        if isinstance(arguments, Mapping) and arguments.get("present_result") is True:
+            lines.append("仅限本次操作：成功后将结果窗口保留在前台。")
+        elif "session" in choices:
+            session_reply = "“本会话”仅限本对话借用同一窗口执行普通操作，最多 2 分钟"
+            lines.append("每批操作结束时，若你未切换焦点，会尝试切回之前的应用。")
     replies = [reply for choice, reply in (
         ("once", "“发送”发出" if draft is not None else "“同意”执行一次"),
         ("task", "“本任务”这件事里都允许"),
-        ("session", "“本会话”这个对话里都允许"),
+        ("session", session_reply),
         ("always", "“以后都允许”以后不再问"),
         ("deny", "“丢弃”不发" if draft is not None else "“拒绝”取消"),
     ) if choice in choices]

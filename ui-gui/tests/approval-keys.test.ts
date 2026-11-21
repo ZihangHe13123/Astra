@@ -91,6 +91,28 @@ test("the card can take the focus and shows its keys; a later card does not clai
   assert.match(render(false), /<p class="approval-keys[^"]*">点选卡片后可按 Y \/ A \/ N<\/p>/);
 });
 
+test("the foreground loan shortcut describes the same window and time limit as its button", () => {
+  const event = { type: "tool_approval_request", request_id: "loan", tool_name: "computer_act",
+    kind: "computer_foreground_takeover", choices: all };
+  const markup = renderToStaticMarkup(React.createElement(Approval, { event, send: async () => {}, windowKeys: true }));
+  const buttonLabel = />(借用此窗口[^<]*2 分钟)<\/button>/.exec(markup)?.[1];
+  assert.ok(buttonLabel);
+  assert.ok(markup.includes(`Shift Enter ${buttonLabel}`));
+  assert.doesNotMatch(markup, /本会话允许/);
+});
+
+test("even a redacted presentation card discloses that the result will stay in front", () => {
+  const event = { type: "tool_approval_request", request_id: "show-result", tool_name: "computer_act",
+    kind: "computer_foreground_takeover", choices: ["once", "deny"] };
+  const render = (present_result: unknown) => renderToStaticMarkup(React.createElement(Approval, {
+    event: { ...event, arguments: { application: "Fixture", present_result } }, send: async () => {}, windowKeys: true,
+  }));
+  const markup = render(true);
+  assert.match(markup, /保留在前台/);
+  assert.doesNotMatch(markup, /归还焦点|Shift Enter|本会话允许/);
+  assert.doesNotMatch(render("true"), /保留在前台/);
+});
+
 test("T answers for this task inside the card, and a standing rule has no key", () => {
   const card = { in: "card", onButton: false } as const;
   const four = ["once", "task", "session", "always", "deny"];

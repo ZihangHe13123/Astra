@@ -1,6 +1,34 @@
 @preconcurrency import ApplicationServices
 import CoreGraphics
+import Darwin
 import Foundation
+
+// The wire deadline is boot-relative and includes system sleep. Do not compare it with
+// systemUptime/mach_absolute_time, or restart a relative two-minute interval here.
+enum ForegroundLoanClock {
+    static func now() -> TimeInterval {
+        Double(clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)) / 1_000_000_000
+    }
+
+    static func schedule(_ deadline: TimeInterval, _ fire: @escaping () -> Void) -> () -> Void {
+        let task = Task.detached(priority: .userInitiated) {
+            let clock = ContinuousClock()
+            while !Task.isCancelled {
+                let anchor = clock.now
+                let remaining = deadline - now()
+                if remaining <= 0 {
+                    // Cleanup can wait for an in-flight OS call; do not block a Swift executor.
+                    DispatchQueue.global(qos: .userInitiated).async { fire() }
+                    return
+                }
+                // Anchor before sampling RAW: suspend/preemption here must not extend the loan.
+                do { try await clock.sleep(until: anchor.advanced(by: .seconds(remaining)), tolerance: .zero) }
+                catch { return }
+            }
+        }
+        return { task.cancel() }
+    }
+}
 
 struct TakeoverToken: Equatable {
     let ref: String
@@ -71,6 +99,7 @@ protocol ForegroundTakeoverCoordinating: AnyObject {
 
 final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
     typealias PlanConsumer = (String) -> ForegroundTakeoverPlanAuthority?
+    typealias LoanAlarm = (_ deadline: TimeInterval, _ fire: @escaping () -> Void) -> () -> Void
 
     // Sample counts, never key values. Equality can only keep an existing loan valid.
     static func physicalInputCounts() -> [UInt32] {
@@ -92,6 +121,16 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         let counts: [UInt32]
     }
 
+    // Only compensates a cancelled acknowledgement of end(false). No plan, window content,
+    // lease, cursor or capability to deliver input survives the end of the presentation.
+    private struct PresentationReceipt {
+        let ref: String
+        let expires: TimeInterval
+        let targetPID: pid_t
+        let previousPID: pid_t?
+        let counts: [UInt32]
+    }
+
     private final class Record {
         var authority: ForegroundTakeoverPlanAuthority
         var popupPointerPoint: CGPoint?
@@ -101,8 +140,11 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         let restorePreviousFocus: Bool
         let loanDeadline: TimeInterval?
         var expiryTimer: DispatchSourceTimer?
+        var cancelLoanExpiry: (() -> Void)?
         var actConsumed = false
         var releaseCounts: [UInt32] = []
+        var releaseInterrupted = true
+        var consumedOneShot: Bool { actConsumed && loanDeadline == nil && fragmentAuthority == nil }
         var cleanupOutcome: TakeoverOutcome?
         var cleanupInProgress = false
         var terminalClaimed = false
@@ -134,6 +176,13 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
     private let frontmostPID: () -> pid_t?
     private let applicationExists: (pid_t) -> Bool
     private let inputCounts: () -> [UInt32]
+    private let loanNow: () -> TimeInterval
+    private let scheduleLoanExpiry: LoanAlarm
+    // Only input and terminal work use this gate, never post-action observations. Draining an
+    // in-flight input/held release precedes disarm and restoration, also when expiry wins.
+    private let ordinaryInputGate = NSRecursiveLock()
+    private var expiredReceipt: (ref: String, outcome: TakeoverOutcome, acknowledged: Bool)?
+    private var presentationReceipt: PresentationReceipt?
     private var lastRelease: ReleaseCheckpoint?
     private let revalidate: (WindowTarget) throws -> WindowTarget
     private let takePlan: PlanConsumer
@@ -150,6 +199,8 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         frontmostPID: @escaping () -> pid_t?,
         applicationExists: @escaping (pid_t) -> Bool,
         inputCounts: @escaping () -> [UInt32] = { [] },
+        loanNow: @escaping () -> TimeInterval = ForegroundLoanClock.now,
+        scheduleLoanExpiry: @escaping LoanAlarm = ForegroundLoanClock.schedule,
         revalidate: @escaping (WindowTarget) throws -> WindowTarget,
         takePlan: @escaping PlanConsumer,
         classifyPopupPointer: @escaping (ForegroundTakeoverPlanAuthority) -> CGPoint? = popupPointerClickPoint,
@@ -161,6 +212,8 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         self.frontmostPID = frontmostPID
         self.applicationExists = applicationExists
         self.inputCounts = inputCounts
+        self.loanNow = loanNow
+        self.scheduleLoanExpiry = scheduleLoanExpiry
         self.revalidate = revalidate
         self.takePlan = takePlan
         self.classifyPopupPointer = classifyPopupPointer
@@ -219,6 +272,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         beginReserved = true
         let prior = lastRelease
         lastRelease = nil
+        presentationReceipt = nil
         lock.unlock()
 
         var committed = false
@@ -232,7 +286,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
 
         guard let authority = takePlan(planRef) else { throw TakeoverError.stalePlan }
         if let deadline = loanDeadline {
-            let now = ProcessInfo.processInfo.systemUptime
+            let now = loanNow()
             guard deadline > now, deadline <= now + 120 else { throw TakeoverError.loanExpired }
         }
         if continuedLoan, loanDeadline == nil || prior?.loanDeadline != loanDeadline {
@@ -281,6 +335,9 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         }
 
         let reference = "takeover_\(UUID().uuidString.lowercased())"
+        // Start before the potentially blocking PID read. The new tap cannot report events
+        // from this handoff interval, including typing that leaves the same app in front.
+        let beforeArm = inputCounts()
         let oldPID = frontmostPID()
         let lease: UserActivitySessionLease
         var activationAttempted = false
@@ -297,6 +354,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         }
 
         do {
+            guard inputCounts() == beforeArm else { throw TakeoverError.userActivityPaused }
             let current = try revalidate(target)
             guard exactTarget(current, target) else { throw TakeoverError.targetChanged }
             let foregroundTarget = WindowTarget(
@@ -320,10 +378,10 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
                       frontmostPID() == prior.previousPID, inputCounts() == prior.counts
                 else { throw TakeoverError.userActivityPaused }
             }
-            let focus = FocusTransitionGuard(from: oldPID, to: current.pid, frontmostPID: frontmostPID) { [activity] in
+            let focus = FocusTransitionGuard(from: oldPID, to: current.pid, frontmostPID: frontmostPID) { [activity, loanNow] in
                 do { try activity.assertNotPaused(lease: lease) }
                 catch is UserActivityMonitoringError { throw TakeoverError.userActivityPaused }
-                if let deadline = loanDeadline, ProcessInfo.processInfo.systemUptime >= deadline { throw TakeoverError.loanExpired }
+                if let deadline = loanDeadline, loanNow() >= deadline { throw TakeoverError.loanExpired }
             }
             activationAttempted = true
             if let popupPoint = popupPointerPoint {
@@ -430,6 +488,13 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
             if records[reference] === record { record.expiryTimer = timer }
             lock.unlock()
             timer.resume()
+        } else if let loanDeadline {
+            let cancel = scheduleLoanExpiry(loanDeadline) { [weak self] in self?.expireOrdinaryLoan(reference) }
+            lock.lock()
+            let active = records[reference] === record && !record.terminalClaimed && record.cleanupOutcome == nil
+            if active { record.cancelLoanExpiry = cancel }
+            lock.unlock()
+            if !active { cancel() }
         }
         return TakeoverToken(ref: reference)
     }
@@ -689,6 +754,10 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
 
     func consume(_ takeoverRef: String, actions: [NativeAction]) throws -> DispatchPlan {
         lock.lock()
+        if expiredReceipt?.ref == takeoverRef {
+            lock.unlock()
+            throw TakeoverError.loanExpired  // Do not invalidate a newer, unrelated borrow.
+        }
         guard let record = records[takeoverRef] else {
             let active = records.values.filter { !$0.actConsumed && $0.cleanupOutcome == nil }
             active.forEach { $0.actConsumed = true }
@@ -696,9 +765,13 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
             active.forEach { _ = cleanup($0, allowRestore: false) }
             throw active.isEmpty ? TakeoverError.alreadyConsumed : TakeoverError.authorityMismatch
         }
-        guard !record.actConsumed, record.cleanupOutcome == nil else {
+        guard !record.actConsumed, !record.terminalClaimed, record.cleanupOutcome == nil else {
             lock.unlock()
             throw TakeoverError.alreadyConsumed
+        }
+        if let deadline = record.loanDeadline, loanNow() >= deadline {
+            lock.unlock()
+            throw TakeoverError.loanExpired
         }
         record.actConsumed = true
         let matches = record.authority.actions == actions &&
@@ -721,6 +794,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         lock.lock()
         guard let record = records[takeoverRef],
               record.actConsumed,
+              !record.terminalClaimed,
               record.cleanupOutcome == nil
         else {
             lock.unlock()
@@ -746,20 +820,39 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
     }
 
     func end(_ takeoverRef: String, allowRestore: Bool) throws -> TakeoverOutcome {
+        ordinaryInputGate.lock()
+        defer { ordinaryInputGate.unlock() }
         lock.lock()
+        if let receipt = expiredReceipt, receipt.ref == takeoverRef {
+            guard !receipt.acknowledged else { lock.unlock(); throw TakeoverError.alreadyConsumed }
+            expiredReceipt?.acknowledged = true
+            lock.unlock()
+            return receipt.outcome
+        }
         guard let record = records[takeoverRef], !record.terminalClaimed else {
             lock.unlock()
             throw TakeoverError.alreadyConsumed
         }
+        let presenting = !allowRestore && record.consumedOneShot && record.cleanupOutcome == nil
         record.terminalClaimed = true
         lock.unlock()
-        let outcome = cleanup(record, allowRestore: allowRestore)
+        // An overdue bounded loan cannot opt into presentation while its alarm is queued.
+        let expired = record.loanDeadline.map { loanNow() >= $0 } ?? false
+        let outcome = cleanup(record, allowRestore: expired || allowRestore)
+        var rollback: PresentationReceipt?
+        if presenting && !outcome.cleanupFailed {
+            let targetPID = record.authority.target.pid
+            let quiet = !record.releaseInterrupted && !record.releaseCounts.isEmpty && frontmostPID() == targetPID
+            rollback = PresentationReceipt(ref: takeoverRef, expires: loanNow() + 15, targetPID: targetPID,
+                previousPID: quiet ? record.oldFrontmostPID : nil, counts: record.releaseCounts)
+        }
         lock.lock()
         if outcome.cleanupFailed {
             record.terminalClaimed = false
         } else if records[takeoverRef] === record {
             records.removeValue(forKey: takeoverRef)
-            if record.actConsumed, let deadline = record.loanDeadline, outcome.restoration == .restored,
+            presentationReceipt = rollback
+            if record.actConsumed, let deadline = record.loanDeadline, loanNow() < deadline, outcome.restoration == .restored,
                let previousPID = record.oldFrontmostPID, let identity = record.authority.target.axIdentity,
                !record.releaseCounts.isEmpty {
                 let target = record.authority.target
@@ -771,9 +864,75 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         return outcome
     }
 
-    func invalidate(allowRestore: Bool, preserveIdleLoan: Bool = false) {
+    func cancelPresentation(takeoverRef: String) throws -> TakeoverOutcome {
+        ordinaryInputGate.lock()
+        defer { ordinaryInputGate.unlock() }
         lock.lock()
-        if !preserveIdleLoan || !records.isEmpty { lastRelease = nil }
+        guard !beginReserved, records.isEmpty, let receipt = presentationReceipt, receipt.ref == takeoverRef else {
+            lock.unlock()
+            throw TakeoverError.alreadyConsumed
+        }
+        presentationReceipt = nil
+        beginReserved = true  // Do not race a new borrow against external restoration effects.
+        lock.unlock()
+        defer { lock.lock(); beginReserved = false; lock.unlock() }
+        guard loanNow() < receipt.expires, let oldPID = receipt.previousPID else {
+            return TakeoverOutcome(started: true, restoration: .preservedUserFocus)
+        }
+        return TakeoverOutcome(started: true, restoration: restoreFocus(targetPID: receipt.targetPID,
+            oldPID: oldPID, counts: receipt.counts, validUntil: receipt.expires))
+    }
+
+    func discardPresentationReceipt() {
+        lock.lock()
+        presentationReceipt = nil
+        lock.unlock()
+    }
+
+    func checkPresentationObservation(_ ref: String) throws {
+        lock.lock()
+        guard let record = records[ref], record.consumedOneShot, !record.terminalClaimed, record.cleanupOutcome == nil else {
+            lock.unlock()
+            throw TakeoverError.authorityMismatch
+        }
+        let targetPID = record.authority.target.pid, lease = record.lease
+        lock.unlock()
+        guard frontmostPID() == targetPID else { throw TakeoverError.userActivityPaused }
+        do { try activity.assertNotPaused(lease: lease) }
+        catch is UserActivityMonitoringError { throw TakeoverError.userActivityPaused }
+    }
+
+    func withOrdinaryInput<T>(_ work: () throws -> T) rethrows -> T {
+        ordinaryInputGate.lock()
+        defer { ordinaryInputGate.unlock() }
+        return try work()
+    }
+
+    private func expireOrdinaryLoan(_ ref: String) {
+        ordinaryInputGate.lock()
+        defer { ordinaryInputGate.unlock() }
+        lock.lock()
+        guard let record = records[ref], let deadline = record.loanDeadline, loanNow() >= deadline,
+              !record.terminalClaimed else { lock.unlock(); return }
+        record.terminalClaimed = true
+        lock.unlock()
+        let outcome = cleanup(record, allowRestore: true)
+        lock.lock()
+        if outcome.cleanupFailed {
+            record.terminalClaimed = false  // Keep authority for an exact held-release retry.
+        } else if records[ref] === record {
+            records.removeValue(forKey: ref)
+            expiredReceipt = (ref, outcome, false)  // Outcome only, never input or renewal authority.
+        }
+        lock.unlock()
+    }
+
+    func invalidate(allowRestore: Bool, refreshingTargets: Bool = false) {
+        ordinaryInputGate.lock()
+        defer { ordinaryInputGate.unlock() }
+        lock.lock()
+        if !refreshingTargets || !records.isEmpty { lastRelease = nil }
+        presentationReceipt = nil
         let active = records.compactMap { reference, record -> (String, Record)? in
             guard !record.terminalClaimed else { return nil }
             record.terminalClaimed = true
@@ -781,7 +940,10 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         }
         lock.unlock()
         active.forEach { reference, record in
-            let outcome = cleanup(record, allowRestore: allowRestore)
+            // An unrelated catalog/selection can invalidate a borrow but cannot present its
+            // result. Return an ordinary loan conditionally; fragments retain their own policy.
+            let returnOrdinaryLoan = refreshingTargets && record.fragmentAuthority == nil
+            let outcome = cleanup(record, allowRestore: allowRestore || returnOrdinaryLoan)
             lock.lock()
             if outcome.cleanupFailed {
                 record.terminalClaimed = false
@@ -812,6 +974,8 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         record.cleanupInProgress = true
         record.expiryTimer?.cancel()
         record.expiryTimer = nil
+        let cancelLoanExpiry = record.cancelLoanExpiry
+        record.cancelLoanExpiry = nil
         record.cleanupOutcome = TakeoverOutcome(
             started: true,
             restoration: .preservedUserFocus,
@@ -819,6 +983,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         )
         lock.unlock()
 
+        cancelLoanExpiry?()
         cursor.hide()
         cursor.close()
         activity.endFragment(lease: record.lease)
@@ -843,6 +1008,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         // Take the baseline while the tap still owns this batch; do not miss typing during disarm.
         record.releaseCounts = inputCounts()
         let interrupted = (try? activity.disarm(lease: record.lease)) ?? true
+        record.releaseInterrupted = interrupted
         let outcome = TakeoverOutcome(
             started: true,
             restoration: restoreFocus(record, allowed: allowRestore && !interrupted),
@@ -857,11 +1023,14 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
 
     private func restoreFocus(_ record: Record, allowed: Bool) -> TakeoverRestoration {
         guard allowed, record.restorePreviousFocus, let oldPID = record.oldFrontmostPID else { return .preservedUserFocus }
-        let targetPID = record.authority.target.pid
+        return restoreFocus(targetPID: record.authority.target.pid, oldPID: oldPID, counts: record.releaseCounts)
+    }
+
+    private func restoreFocus(targetPID: pid_t, oldPID: pid_t, counts: [UInt32], validUntil: TimeInterval? = nil) -> TakeoverRestoration {
         // The tap was drained and removed. Keep its pre-disarm HID baseline for *every* retry
         // and for the final check, not just the decision to enter the LaunchServices controller.
-        let focus = FocusTransitionGuard(from: targetPID, to: oldPID, frontmostPID: frontmostPID) { [inputCounts, counts = record.releaseCounts] in
-            guard inputCounts() == counts else { throw TakeoverError.userActivityPaused }
+        let focus = FocusTransitionGuard(from: targetPID, to: oldPID, frontmostPID: frontmostPID) { [inputCounts, loanNow] in
+            guard inputCounts() == counts, validUntil.map({ loanNow() < $0 }) ?? true else { throw TakeoverError.userActivityPaused }
         }
         do {
             guard try focus.check() == targetPID else { return .preservedUserFocus }
@@ -895,7 +1064,7 @@ final class ForegroundPlanExecutor {
         performer: any ActionProviding,
         pidExecutor: PIDTargetedActionExecutor,
         keyboardExecutor: ForegroundKeyboardExecutor? = nil,
-        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        now: @escaping () -> TimeInterval = ForegroundLoanClock.now,
         waitSleeper: @escaping (TimeInterval) -> Void = { Thread.sleep(forTimeInterval: $0) },
         effectReader: any AXEffectReading = SystemAXEffectReader(),
         pointerOnlyPreflightState: (() throws -> ActionTargetState)? = nil

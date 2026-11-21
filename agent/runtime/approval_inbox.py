@@ -60,7 +60,7 @@ _TAKEOVER_TEXT_FIELDS = frozenset({
     "kind",
 })
 _TAKEOVER_ARGUMENT_FIELDS = frozenset({
-    "application", "window", "reason", "action_classes", "expected_effect",
+    "application", "window", "reason", "action_classes", "expected_effect", "present_result",
 })
 _TAKEOVER_ACTION_CLASSES = frozenset({"press", "text", "click", "double_click", "scroll", "drag"})
 _TEXT_LIMITS = {
@@ -122,7 +122,10 @@ def safe_approval_request(request: Mapping[str, Any]) -> dict[str, Any]:
             key = _bounded_text(raw_key, 120)
             if takeover and key not in _TAKEOVER_ARGUMENT_FIELDS:
                 continue
-            if takeover and key == "action_classes":
+            if takeover and key == "present_result":
+                if isinstance(value, bool):
+                    safe_arguments[key] = value
+            elif takeover and key == "action_classes":
                 if not isinstance(value, (list, tuple)):
                     continue
                 safe_arguments[key] = list(dict.fromkeys(

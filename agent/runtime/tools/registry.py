@@ -17,6 +17,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from ..approval_time import TimedApprovalRequest
 from ..hooks import HookRegistry, HookReject
 from ..metrics import runtime_metrics
 from ..tool_failure import ToolFailure
@@ -513,7 +514,10 @@ class ToolRegistry:
                     "duration_ms": 0,
                 })
                 return None
-            raw_decision = str(await self.approval_handler(payload)).strip().lower()
+            answer = await self.approval_handler(payload)
+            if isinstance(request, TimedApprovalRequest) and not request.record_decision_time(answer):
+                answer = "deny"
+            raw_decision = str(answer).strip().lower()
             offered = [str(choice) for choice in payload.get("choices") or ("once", "session", "deny")]
             if raw_decision in offered and raw_decision in DECISIONS:
                 decision = raw_decision

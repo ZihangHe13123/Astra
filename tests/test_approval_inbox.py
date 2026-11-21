@@ -1,3 +1,5 @@
+import pytest
+
 from agent.runtime.approval_inbox import ApprovalInbox, safe_approval_request
 
 
@@ -140,6 +142,28 @@ def test_takeover_action_classes_survive_durable_roundtrip_without_private_field
         "private-plan-ref", "private-takeover-ref", "private-digest", "unknown-private-class",
     ):
         assert private not in encoded
+
+
+@pytest.mark.parametrize("present_result", [True, False])
+def test_takeover_presentation_flag_roundtrips_as_a_boolean(tmp_path, present_result):
+    path = tmp_path / "approvals.db"
+    record = ApprovalInbox(path).create({
+        "kind": "computer_foreground_takeover", "choices": ["once", "deny"],
+        "arguments": {"present_result": present_result, "plan_ref": "private"},
+    })
+
+    replayed = ApprovalInbox(path).get(record.request_id)
+    assert replayed.request["arguments"] == {"present_result": present_result}
+    assert replayed.request["arguments"]["present_result"] is present_result
+    assert replayed.request["choices"] == ["once", "deny"]
+
+
+@pytest.mark.parametrize("value", ["true", 1, 0, None, {"text": "private"}])
+def test_takeover_drops_non_boolean_presentation_flags(value):
+    safe = safe_approval_request({
+        "kind": "computer_foreground_takeover", "arguments": {"present_result": value},
+    })
+    assert safe["arguments"] == {}
 
 
 def test_takeover_rejects_non_list_action_classes():

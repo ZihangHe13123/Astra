@@ -256,6 +256,8 @@ export function Approval({ event, send, windowKeys = false }: { event: UIEvent; 
     if (decision) { e.preventDefault(); e.stopPropagation(); decide(decision); }
   }}><span className="eyebrow">{draft ? "要发出去的内容" : "需要你的许可"}{event.channel ? `：来自${CHANNEL_NAMES[event.channel] ?? event.channel}的对话` : ""}</span><h3>{preview.title}</h3>
     {note && <p className="approval-consequence" role="note">{note}</p>}
+    {event.kind === "computer_foreground_takeover" && event.arguments?.present_result === true &&
+      <p>仅限本次操作：成功后将结果窗口保留在前台。</p>}
     {event.action_label && <p><strong>将点击：</strong>{approvalText(event.action_label)}</p>}
     {draft && <div className="approval-draft">
       {draft.to && <p><strong>发给：</strong>{approvalText(draft.to)}</p>}
@@ -270,7 +272,7 @@ export function Approval({ event, send, windowKeys = false }: { event: UIEvent; 
     <details><summary>查看后端提供的审批详情</summary><pre>{preview.details}</pre></details>
     <div className="actions" ref={actions}>{choices.map((decision: string) => <button key={decision} disabled={pending} className={decision === "once" ? "primary" : ""} onClick={() => decide(decision)}>{approvalChoiceLabel(decision, event)}</button>)}</div>
     {choices.includes("always") && <p className="small muted">「以后都允许」：你已多次批准这类操作，点了之后同类请求不再问，可以在审批设置里随时删除。</p>}
-    <p className="approval-keys small muted">{approvalKeyHint(choices, globalKeys, mac)}</p>
+    <p className="approval-keys small muted">{approvalKeyHint(choices, globalKeys, mac, event)}</p>
   </section>;
 }
 export function Question({ event, send }: { event: UIEvent; send: (c: UIEvent) => Promise<void> }) {

@@ -102,7 +102,7 @@ class TakeoverRestoration(str, Enum):
 DISPATCH_ACTION_CLASSES = frozenset({"press", "text", "click", "double_click", "scroll", "drag"})
 COMPUTER_OPERATIONS = frozenset({
     "status", "apps", "select", "snapshot", "snapshot_subtree", "get_app_state", "plan_actions",
-    "takeover_begin", "act", "fragment_stage_commit", "takeover_end",
+    "takeover_begin", "act", "fragment_stage_commit", "takeover_end", "presentation_apps", "cancel_presentation",
 })
 FRAGMENT_BACKENDS = frozenset({
     "ax_press", "ax_increment", "ax_decrement", "ax_selected_text", "wait",
@@ -1613,11 +1613,13 @@ def _validate_cooperative_request_payload(operation: str, payload: Mapping[str, 
         required = {"snapshot_id", "plan_ref"}
         if "fragment" in payload:
             required.add("fragment")
-        elif "loan_deadline_uptime_ms" in payload:
-            required.add("loan_deadline_uptime_ms")
-            deadline = payload["loan_deadline_uptime_ms"]
+        elif "loan_deadline_continuous_ms" in payload:
+            # focus_loan_v3 uses Darwin CLOCK_MONOTONIC_RAW (includes sleep).
+            # The v2 uptime field is not interchangeable, even for a first begin.
+            required.add("loan_deadline_continuous_ms")
+            deadline = payload["loan_deadline_continuous_ms"]
             if type(deadline) is not int or not 0 < deadline < 2**53:
-                raise ValueError("loan_deadline_uptime_ms must be a positive exact millisecond timestamp")
+                raise ValueError("loan_deadline_continuous_ms must be a positive exact millisecond timestamp")
             if "continued_loan" in payload:
                 required.add("continued_loan")
                 if payload["continued_loan"] is not True:
@@ -1638,6 +1640,10 @@ def _validate_cooperative_request_payload(operation: str, payload: Mapping[str, 
             operation,
         )
         FragmentStageCommit(**payload)
+        return
+    if operation in {"presentation_apps", "cancel_presentation"}:
+        _require_exact_payload(payload, {"takeover_ref"}, operation)
+        _validate_reference(payload["takeover_ref"], "takeover_ref")
         return
     if operation == "takeover_end":
         expected = {"takeover_ref"}

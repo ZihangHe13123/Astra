@@ -623,7 +623,13 @@ class MacComputerBackend:
             await configured
 
     async def apps(self) -> ComputerAppCatalog:
-        response = await self._request("apps", {})
+        return self._publish_catalog(await self._request("apps", {}))
+
+    async def presentation_apps(self, takeover_ref: str) -> ComputerAppCatalog:
+        response = await self._request("presentation_apps", {"takeover_ref": takeover_ref})
+        return self._publish_catalog(response)
+
+    def _publish_catalog(self, response: ComputerResponse) -> ComputerAppCatalog:
         result = self._required_result(response)
         generation = result.get("catalog_generation")
         apps = result.get("apps")
@@ -871,11 +877,11 @@ class MacComputerBackend:
         *,
         declaration: ForegroundFragmentDeclaration | None = None,
         continued_loan: bool = False,
-        loan_deadline_uptime_ms: int | None = None,
+        loan_deadline_continuous_ms: int | None = None,
     ) -> str:
         payload: dict[str, object] = {"snapshot_id": snapshot_id, "plan_ref": plan_ref}
-        if loan_deadline_uptime_ms is not None:
-            payload["loan_deadline_uptime_ms"] = loan_deadline_uptime_ms
+        if loan_deadline_continuous_ms is not None:
+            payload["loan_deadline_continuous_ms"] = loan_deadline_continuous_ms
         if continued_loan:
             payload["continued_loan"] = True
         if declaration is not None:
@@ -934,7 +940,13 @@ class MacComputerBackend:
         payload: dict[str, object] = {"takeover_ref": takeover_ref}
         if not restore_previous_focus:
             payload["restore_previous_focus"] = False
-        response = await self._request("takeover_end", payload)
+        return self._takeover_outcome(await self._request("takeover_end", payload))
+
+    async def cancel_presentation(self, takeover_ref: str) -> Mapping[str, object]:
+        response = await self._request("cancel_presentation", {"takeover_ref": takeover_ref})
+        return self._takeover_outcome(response)
+
+    def _takeover_outcome(self, response: ComputerResponse) -> Mapping[str, object]:
         try:
             outcome = TakeoverOutcome.from_mapping(self._required_result(response))
         except (TypeError, ValueError) as exc:

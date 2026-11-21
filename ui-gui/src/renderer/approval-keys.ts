@@ -1,3 +1,5 @@
+import { approvalChoiceLabel } from "@astra/ui-core/approval-choices";
+
 /** Keyboard answers to a pending tool approval. An approval can run a tool, so nothing typed as text may count as one. */
 export type ApprovalDecision = "once" | "task" | "session" | "deny";
 export type ApprovalKeyPress = {
@@ -32,10 +34,10 @@ export function approvalDecision(press: ApprovalKeyPress, place: ApprovalKeyPlac
 }
 
 /** The line under the buttons. Only the oldest pending approval answers the window-wide keys. */
-export function approvalKeyHint(choices: readonly string[], windowKeys: boolean, mac: boolean): string {
+export function approvalKeyHint(choices: readonly string[], windowKeys: boolean, mac: boolean, card: Record<string, unknown> = {}): string {
   const command = mac ? "⌘" : "Ctrl";
-  const combined = [["once", `${command} Enter 允许一次`], ["session", `${command} Shift Enter 本会话允许`], ["deny", `${command} ${mac ? "⌫" : "Backspace"} 拒绝`]]
-    .filter(([decision]) => choices.includes(decision)).map(([, text]) => text);
+  const combined = [["once", `${command} Enter`], ["session", `${command} Shift Enter`], ["deny", `${command} ${mac ? "⌫" : "Backspace"}`]]
+    .filter(([decision]) => choices.includes(decision)).map(([decision, keys]) => `${keys} ${approvalChoiceLabel(decision, card)}`);
   const letters = [["once", "Y"], ["task", "T"], ["session", "A"], ["deny", "N"]].filter(([decision]) => choices.includes(decision)).map(([, letter]) => letter);
   return [...(windowKeys ? combined : []), ...(letters.length ? [`点选卡片后可按 ${letters.join(" / ")}`] : [])].join(" · ");
 }

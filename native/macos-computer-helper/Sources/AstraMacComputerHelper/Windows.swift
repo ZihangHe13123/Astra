@@ -1073,6 +1073,8 @@ protocol WindowObserving {
     func fragmentStageCommit(takeoverRef: String, commit: FragmentStageCommit) throws -> FragmentStageCommitOutcome
     func takeoverEnd(takeoverRef: String) throws -> TakeoverOutcome
     func takeoverEnd(takeoverRef: String, restorePreviousFocus: Bool) throws -> TakeoverOutcome
+    func cancelPresentation(takeoverRef: String) throws -> TakeoverOutcome
+    func presentationApps(takeoverRef: String) throws -> JSONValue
     func invalidateSnapshots()
 }
 
@@ -1176,6 +1178,8 @@ extension WindowObserving {
     func takeoverEnd(takeoverRef _: String) throws -> TakeoverOutcome {
         throw TakeoverError.alreadyConsumed
     }
+    func cancelPresentation(takeoverRef _: String) throws -> TakeoverOutcome { throw TakeoverError.alreadyConsumed }
+    func presentationApps(takeoverRef _: String) throws -> JSONValue { throw TakeoverError.authorityMismatch }
     func invalidateSnapshots() {}
 }
 
@@ -1284,6 +1288,24 @@ final class SystemWindowObserver: WindowObserving {
 
     func apps() throws -> JSONValue {
         invalidateCooperativeState(.appsRefresh)
+        return try readAppsCatalog()
+    }
+
+    func presentationApps(takeoverRef: String) throws -> JSONValue {
+        actionLock.lock()
+        defer { actionLock.unlock() }
+        try takeoverCoordinator.checkPresentationObservation(takeoverRef)
+        // Refresh observation identities exactly as apps() does, without terminating this
+        // consumed one-shot or rearming any input. Ordinary catalog calls still invalidate it.
+        cooperativeStateInvalidationObserver?(.appsRefresh)
+        virtualCursor.hide()
+        invalidateObservationRefsLocked(.appsRefresh)
+        let catalog = try readAppsCatalog()
+        try takeoverCoordinator.checkPresentationObservation(takeoverRef)
+        return catalog
+    }
+
+    private func readAppsCatalog() throws -> JSONValue {
         guard permissions.screenRecordingAllowed else {
             throw WindowObservationError.permissionDenied("Screen Recording permission is required to list eligible windows")
         }
@@ -2813,13 +2835,11 @@ final class SystemWindowObserver: WindowObserving {
             )
         }
         if interactionMode == .foregroundTakeover {
-            return foregroundCooperativeAct(
-                snapshotID: snapshotID,
-                planRef: planRef,
-                takeoverRef: takeoverRef,
-                actions: actions,
-                fragmentStage: fragmentStage
-            )
+            func dispatch() -> CooperativeActionResult {
+                foregroundCooperativeAct(snapshotID: snapshotID, planRef: planRef,
+                    takeoverRef: takeoverRef, actions: actions, fragmentStage: fragmentStage)
+            }
+            return fragmentStage == nil ? takeoverCoordinator.withOrdinaryInput(dispatch) : dispatch()
         }
         guard takeoverRef == nil, fragmentStage == nil else {
             return staleAt("h takeover-ref-in-background-act")
@@ -3010,6 +3030,12 @@ final class SystemWindowObserver: WindowObserving {
         return try takeoverCoordinator.end(takeoverRef, allowRestore: restorePreviousFocus)
     }
 
+    func cancelPresentation(takeoverRef: String) throws -> TakeoverOutcome {
+        actionLock.lock()
+        defer { actionLock.unlock() }
+        return try takeoverCoordinator.cancelPresentation(takeoverRef: takeoverRef)
+    }
+
     func invalidateSnapshots() {
         // cooperativeAct owns actionLock for the whole batch. Signal its wait
         // and input gates before close waits on that lock to restore focus.
@@ -3161,12 +3187,18 @@ final class SystemWindowObserver: WindowObserving {
         if cursorShouldHide(for: reason) { virtualCursor.hide() }
         actionLock.lock()
         defer { actionLock.unlock() }
+        invalidateObservationRefsLocked(reason)
+        if reason == .newSnapshot {
+            takeoverCoordinator.discardPresentationReceipt()
+        } else {
+            takeoverCoordinator.invalidate(allowRestore: reason == .close, refreshingTargets: reason == .focus || reason == .appsRefresh)
+        }
+    }
+
+    private func invalidateObservationRefsLocked(_ reason: SnapshotInvalidationReason) {
         snapshotReferences.invalidate(reason)
         cooperativePlans.values.forEach { $0.dispatcher.invalidatePlans() }
         cooperativePlans.removeAll(keepingCapacity: false)
-        if reason != .newSnapshot {
-            takeoverCoordinator.invalidate(allowRestore: reason == .close, preserveIdleLoan: reason == .focus || reason == .appsRefresh)
-        }
     }
 
     private func foregroundCooperativeAct(
@@ -3228,7 +3260,7 @@ final class SystemWindowObserver: WindowObserving {
                 ),
                 validateFocusMutation: {
                     try self.userActivity.assertNotPaused(lease: execution.lease)
-                    if let deadline = execution.loanDeadline, ProcessInfo.processInfo.systemUptime >= deadline {
+                    if let deadline = execution.loanDeadline, ForegroundLoanClock.now() >= deadline {
                         throw ActionExecutionError.actionTimeout
                     }
                 },
@@ -3265,6 +3297,11 @@ final class SystemWindowObserver: WindowObserving {
                 )
             }
             return result
+        } catch TakeoverError.loanExpired {
+            return CooperativeActionResult(
+                batch: ActionBatchResult(outcomes: [], lastAcknowledgedAction: -1, error: nil),
+                error: .action(.actionTimeout), fragmentBinding: fragmentStage
+            )
         } catch is UserActivityMonitoringError {
             if fragmentStage != nil { takeoverCoordinator.cancelFragment(takeoverRef) }
             return CooperativeActionResult(

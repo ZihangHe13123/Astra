@@ -193,7 +193,7 @@ final class ForegroundKeyboardExecutor {
         focus: @escaping FocusLookup,
         continuingTextFocus: ContinuingTextFocusLookup? = nil,
         keyTransitionFocus: KeyTransitionFocusLookup? = nil,
-        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        now: @escaping () -> TimeInterval = ForegroundLoanClock.now,
         actionTimeout: TimeInterval = 10,
         experimentalUnicodeChunkGraphemes: Int = 8
     ) {

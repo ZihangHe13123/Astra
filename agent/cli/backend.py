@@ -84,7 +84,7 @@ from agent.cli.turn_budget import execute_budget_command
 from agent.cli.turn_changes_command import execute_changes_command
 from agent.cli.stream_events import tool_progress_event, tool_result_event
 from agent.runtime.bar_mode import BAR_SCENE_TOOL_NAMES, BarModeController
-from agent.runtime import conversation_edits
+from agent.runtime import approval_time, conversation_edits
 from agent.runtime.minimal_mode import MINIMAL_STATUS_OPEN_TEMPLATE, MinimalModeController
 from agent.runtime.local_mode import load_local_mode
 from agent.runtime.harness import RequestLifecycle, build_health_report
@@ -1148,7 +1148,9 @@ async def _main(startup_started: float):
         future = pending_tool_approvals.get(request_id)
         if future is None or future.done() or request_id in approval_resolutions:
             return False
-        normalized = decision if decision in {"once", "task", "session", "always", "deny"} else "deny"
+        normalized = str(decision) if decision in {"once", "task", "session", "always", "deny"} else "deny"
+        # Timestamp the winning answer here, not after scheduling or committing it to the inbox.
+        receipt = approval_time.TimedApprovalDecision(normalized)
 
         async def resolve() -> None:
             try:
@@ -1164,7 +1166,7 @@ async def _main(startup_started: float):
                 # settled. A recorded decision alone cannot dispatch a tool.
                 if future.done():
                     return
-                future.set_result(normalized)
+                future.set_result(receipt)
                 _send({
                     "type": "approval_resolved", "request_id": request_id,
                     "state": resolved.state if resolved is not None else (

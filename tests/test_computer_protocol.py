@@ -1,10 +1,14 @@
+import asyncio
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from agent.runtime import computer_protocol
+from agent.runtime.computer_backend import ComputerAppCatalog
+from agent.runtime.computer_forms import observation_capabilities
 from agent.runtime.computer_protocol import (
     ComputerAction,
     ComputerError,
@@ -21,6 +25,7 @@ from agent.runtime.computer_protocol import (
     decode_response,
     encode_request,
 )
+from agent.runtime.macos_computer import HelperApplicationError, HelperTransportError, MacComputerBackend
 
 
 @pytest.mark.parametrize(("key", "canonical"), [("backspace", "delete"), ("Esc", "escape"), ("ArrowLeft", "left"), ("ENTER", "return")])
@@ -40,7 +45,7 @@ def test_robustness_bad_key_has_bounded_supported_forms():
 
 @pytest.mark.parametrize("flag", [True, False, 1, "true", None])
 def test_focus_loan_wire_only_accepts_explicit_true_on_plain_begin(flag):
-    payload = {"snapshot_id": "snap-1", "plan_ref": "plan-1", "continued_loan": flag, "loan_deadline_uptime_ms": 420_000}
+    payload = {"snapshot_id": "snap-1", "plan_ref": "plan-1", "continued_loan": flag, "loan_deadline_continuous_ms": 420_000}
     if flag is True:
         encoded = encode_request(ComputerRequest(request_id="req", operation="takeover_begin", payload=payload))
         assert json.loads(encoded)["payload"]["continued_loan"] is True
@@ -50,14 +55,107 @@ def test_focus_loan_wire_only_accepts_explicit_true_on_plain_begin(flag):
 
 
 @pytest.mark.parametrize("fields", [
-    {"continued_loan": True}, {"loan_deadline_uptime_ms": True}, {"loan_deadline_uptime_ms": 0},
-    {"loan_deadline_uptime_ms": -1}, {"loan_deadline_uptime_ms": "1"}, {"loan_deadline_uptime_ms": 2**53},
-    {"loan_deadline_uptime_ms": 1.5}, {"loan_deadline_uptime_ms": None},
+    {"continued_loan": True}, {"loan_deadline_continuous_ms": True}, {"loan_deadline_continuous_ms": 0},
+    {"loan_deadline_continuous_ms": -1}, {"loan_deadline_continuous_ms": "1"}, {"loan_deadline_continuous_ms": 2**53},
+    {"loan_deadline_continuous_ms": 1.5}, {"loan_deadline_continuous_ms": 1.0}, {"loan_deadline_continuous_ms": None},
+    {"loan_deadline_uptime_ms": 420_000}, {"loan_deadline_uptime_ms": 420_000, "continued_loan": True},
+    {"loan_deadline_uptime_ms": 420_000, "loan_deadline_continuous_ms": 420_000},
 ])
 def test_focus_loan_wire_rejects_unbounded_or_invalid_loan(fields):
     with pytest.raises(ValueError):
         encode_request(ComputerRequest(request_id="req", operation="takeover_begin",
             payload={"snapshot_id": "snap-1", "plan_ref": "plan-1", **fields}))
+
+
+def test_focus_loan_capability_requires_the_continuous_clock_version():
+    assert observation_capabilities({"observation_capabilities": ["focus_loan_v2", "subtree_v1"]}) == ["subtree_v1"]
+    assert observation_capabilities({"observation_capabilities": ["focus_loan_v3"]}) == ["focus_loan_v3"]
+
+
+@pytest.mark.parametrize("continued", [False, True])
+def test_focus_loan_new_deadline_rejected_by_strict_old_v4_without_downgrade(continued):
+    frames = []
+    rejection = ComputerError(ComputerErrorCode.PROTOCOL_MISMATCH, "takeover_begin has an invalid payload")
+
+    async def strict_old_v4(req):
+        frame = json.loads(encode_request(req))
+        frames.append((frame["operation"], frame["payload"]))
+        base = {"snapshot_id", "plan_ref"}
+        if set(frame["payload"]) in (base, base | {"loan_deadline_uptime_ms"}, base | {"loan_deadline_uptime_ms", "continued_loan"}):
+            pytest.fail("continuous-clock loan reached the mock legacy takeover observer")
+        return ComputerResponse(req.request_id, ok=False, error=rejection)
+
+    backend = MacComputerBackend(SimpleNamespace(request=strict_old_v4))
+    with pytest.raises(HelperApplicationError) as failure:
+        asyncio.run(backend.begin_takeover("snap", "plan", loan_deadline_continuous_ms=420_125, continued_loan=continued))
+
+    assert failure.value.error == rejection
+    assert frames == [("takeover_begin", {
+        "snapshot_id": "snap", "plan_ref": "plan", "loan_deadline_continuous_ms": 420_125,
+        **({"continued_loan": True} if continued else {}),
+    })]
+
+
+def test_presentation_capability_is_explicit_and_independent_of_focus_loans():
+    assert observation_capabilities({"observation_capabilities": ["focus_presentation_v1"]}) == ["focus_presentation_v1"]
+    assert "focus_presentation_v1" not in observation_capabilities({"observation_capabilities": ["focus_loan_v3"]})
+
+
+@pytest.mark.parametrize("operation", ["presentation_apps", "cancel_presentation"])
+def test_presentation_wire_requires_exactly_one_bounded_takeover_ref(operation):
+    payload = {"takeover_ref": "é" * 256}
+    assert json.loads(encode_request(ComputerRequest("r", operation, payload)))["payload"] == payload
+    for invalid in ({}, {"takeover_ref": ""}, {"takeover_ref": 1}, {"takeover_ref": "é" * 257},
+                    {**payload, "restore_previous_focus": False}, {**payload, "fragment": {}}):
+        with pytest.raises(ValueError):
+            ComputerRequest("r", operation, invalid)
+
+
+def _presentation_backend(*responses):
+    frames = []
+    replies = iter(responses)
+
+    async def request(req):
+        frame = json.loads(encode_request(req))
+        frames.append((frame["operation"], frame["payload"]))
+        return ComputerResponse(req.request_id, **next(replies))
+
+    return MacComputerBackend(SimpleNamespace(request=request)), frames
+
+
+def test_presentation_apps_publishes_only_a_valid_catalog():
+    backend, frames = _presentation_backend(
+        {"ok": True, "result": {"catalog_generation": 7, "apps": [], "confirmed_absent_window_identity_refs": ["gone"]}},
+        {"ok": True, "result": {"catalog_generation": 8, "apps": [{"windows": []}]}},
+    )
+    catalog = asyncio.run(backend.presentation_apps("bound"))
+    assert catalog == ComputerAppCatalog(7, (), ("gone",))
+    with pytest.raises(HelperTransportError, match="malformed app catalog"):
+        asyncio.run(backend.presentation_apps("bound"))
+    assert backend._catalog is catalog
+    assert frames == [("presentation_apps", {"takeover_ref": "bound"})] * 2
+
+
+def test_cancel_presentation_validates_the_normal_terminal_outcome():
+    outcome = {"started": True, "restoration": "preserved_user_focus"}
+    backend, frames = _presentation_backend(
+        {"ok": True, "result": outcome},
+        {"ok": True, "result": {"started": False, "restoration": "not_started"}},
+    )
+    assert asyncio.run(backend.cancel_presentation("bound")) == outcome
+    with pytest.raises(HelperTransportError, match="malformed takeover outcome"):
+        asyncio.run(backend.cancel_presentation("bound"))
+    assert frames == [("cancel_presentation", {"takeover_ref": "bound"})] * 2
+
+
+@pytest.mark.parametrize("operation", ["presentation_apps", "cancel_presentation"])
+def test_presentation_rejection_does_not_fall_back_to_apps_or_end(operation):
+    error = ComputerError(ComputerErrorCode.PROTOCOL_MISMATCH, "operation is not supported")
+    backend, frames = _presentation_backend({"ok": False, "error": error})
+    with pytest.raises(HelperApplicationError) as failure:
+        asyncio.run(getattr(backend, operation)("bound"))
+    assert failure.value.error == error
+    assert frames == [(operation, {"takeover_ref": "bound"})]
 
 
 def test_request_has_stable_version_and_id():

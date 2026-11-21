@@ -314,7 +314,7 @@ class FakeComputerBackend:
             "ax_tree": self.snapshot_ax_tree_override or {
                 "role": self.snapshot_root_role,
                 "label": self.snapshot_root_label,
-                **({"observation_capabilities": ["focus_loan_v2"]} if self.focus_loan else {}),
+                **({"observation_capabilities": ["focus_loan_v3", "focus_presentation_v1"]} if self.focus_loan else {}),
                 "children": [
                     {
                         "role": self.focused_role,
@@ -371,8 +371,8 @@ class FakeComputerBackend:
             ),
         )
 
-    async def begin_takeover(self, snapshot_id, plan_ref, *, continued_loan=False, loan_deadline_uptime_ms=None):
-        assert not continued_loan or (self.focus_loan and loan_deadline_uptime_ms is not None)
+    async def begin_takeover(self, snapshot_id, plan_ref, *, continued_loan=False, loan_deadline_continuous_ms=None):
+        assert not continued_loan or (self.focus_loan and loan_deadline_continuous_ms is not None)
         self.calls.append(("takeover_begin", (snapshot_id, plan_ref)))
         return "takeover-1"
 
@@ -402,6 +402,14 @@ class FakeComputerBackend:
         self.calls.append(("takeover_end", takeover_ref))
         self.restoration_requests = getattr(self, "restoration_requests", []) + [restore_previous_focus]
         return self.takeover_end_result
+
+    async def presentation_apps(self, takeover_ref):
+        assert takeover_ref == "takeover-1"
+        return await self.apps()
+
+    async def cancel_presentation(self, takeover_ref):
+        self.calls.append(('cancel_presentation', takeover_ref))
+        return {'ended': True, 'restoration': 'restored'}
 
     async def close(self):
         self.calls.append(("close", None))
@@ -6961,9 +6969,14 @@ def test_post_action_target_gone_returns_fresh_catalog_without_replaying_or_gran
 
 
 @pytest.mark.parametrize("interaction_mode", ["background", "foreground_takeover"])
+@pytest.mark.parametrize("present", [False, True])
 def test_acknowledged_title_transition_returns_same_window_state_without_extra_tool_call(
-    registry, manager, backend, monkeypatch, interaction_mode,
+    registry, manager, backend, monkeypatch, interaction_mode, present,
 ):
+    if present and interaction_mode == "background":
+        # Presentation is a foreground operation; exercise its auto route instead.
+        interaction_mode = "auto"
+    backend.focus_loan = True
     register(registry, manager)
     approvals = []
 
@@ -6989,6 +7002,7 @@ def test_acknowledged_title_transition_returns_same_window_state_without_extra_t
         "snapshot_id": initial["snapshot_id"],
         "interaction_mode": interaction_mode,
         "actions": [{"type": "wait", "duration_ms": 0}],
+        "present_result": present,
     }))
 
     assert result["error"] == ""
@@ -7004,14 +7018,15 @@ def test_acknowledged_title_transition_returns_same_window_state_without_extra_t
     assert "does not prove the intended" in payload["message"]
     assert manager.target == ComputerTarget("app-1", "fresh-window-ref")
     assert not manager.grants
-    assert len(approvals) == approval_count + (interaction_mode == "foreground_takeover")
+    assert len(approvals) == approval_count + (interaction_mode == "foreground_takeover" or present)
     assert sum(name == "act" for name, _ in backend.calls) == 1
     assert sum(name == "get_app_state" for name, _ in backend.calls) == 1
     assert sum(name == "select" for name, _ in backend.calls) == 1
-    if interaction_mode == "foreground_takeover":
+    if present or interaction_mode == "foreground_takeover":
         calls = [name for name, _ in backend.calls]
         assert calls.count("takeover_end") == 1
-        assert calls.index("takeover_end") < calls.index("get_app_state")
+        assert (calls.index("takeover_end") > calls.index("get_app_state")) is present
+        assert backend.restoration_requests == [not present]
 
 
 @pytest.mark.parametrize("receipt", [
@@ -7767,6 +7782,126 @@ def test_named_keyboard_replan_preserves_recipient_and_waits_for_consent(registr
         assert [call[1] for name, call in backend.calls if name == "act"] == [[bound]]
 
 
+def test_failed_stale_foreground_plan_revokes_the_existing_loan(registry, manager, loan_backend):
+    prompts = []
+    async def decide(request):
+        prompts.append(request)
+        return "session" if len(prompts) == 1 else "deny"
+    register(registry, manager)
+    focus(registry)
+    loan_backend.plan_pid_action_classes = ()
+    registry.set_approval_handler(decide)
+    old = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    first = _borrow_focus(registry, old)
+    assert not first['error']
+    fresh = json.loads(first['fresh_output'])
+    assert _borrow_focus(registry, old).get('code') == 'stale_snapshot'
+    assert _borrow_focus(registry, fresh).get('code') == 'approval_denied'
+    assert len(prompts) == 2 and sum(n == 'act' for n, _ in loan_backend.calls) == 1
+
+
+@pytest.mark.parametrize('actual', [False, None, True])
+def test_present_checked_goal_requires_positive_final_evidence(registry, manager, backend, monkeypatch, actual):
+    node = {"role": "AXCheckBox", "element_ref": "snapshot-1:box", "label": "Enabled", "checked": False}
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["focus_presentation_v1", "checked_click_v1"], "children": [node]}
+    backend.plan_pid_action_classes = ()
+    register(registry, manager)
+    focus(registry)
+    registry.set_approval_handler(lambda _: asyncio.sleep(0, result="once"))
+    initial = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    original = backend.act
+    async def act(*args, **kwargs):
+        result = await original(*args, **kwargs)
+        backend.snapshot_ax_tree_override = {**backend.snapshot_ax_tree_override,
+            'children': [{**node, 'element_ref': 'snapshot-2:box', 'checked': actual}]}
+        return result
+    monkeypatch.setattr(backend, 'act', act)
+    result = run(registry.execute('computer_act', {'snapshot_id': initial['snapshot_id'], 'present_result': True,
+        'actions': [{'type': 'click', 'element_ref': node['element_ref'], 'checked': True}]}))
+    assert not result['error'], result
+    assert json.loads(result['fresh_output'])['choice_verification']['results'][0]['status'] == (
+        'unknown' if actual is None else 'verified' if actual else 'not_satisfied')
+    assert backend.restoration_requests == [actual is not True]
+
+
+def test_presentation_declines_older_helper_before_planning(registry, manager, backend):
+    register(registry, manager)
+    focus(registry)
+    snapshot = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    result = _borrow_focus(registry, snapshot, present_result=True)
+    assert result.get('code') == 'unsupported_operation'
+    assert not any(name in {'plan_actions', 'takeover_begin', 'act'} for name, _ in backend.calls)
+
+
+@pytest.mark.parametrize('rollback_failed', [False, True])
+def test_presentation_cancel_after_end_dispatched_runs_conditional_rollback(registry, manager, loan_backend, monkeypatch, rollback_failed):
+    register(registry, manager)
+    focus(registry)
+    loan_backend.plan_pid_action_classes = ()
+    registry.set_approval_handler(lambda _: asyncio.sleep(0, result='once'))
+    sid = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])['snapshot_id']
+    async def scenario():
+        entered, release = asyncio.Event(), asyncio.Event()
+        effects = []
+        async def end(ref, *, restore_previous_focus=True):
+            effects.append(('end', restore_previous_focus))
+            entered.set()
+            await release.wait()
+            return {'ended': True, 'restoration': 'preserved_user_focus'}
+        async def rollback(ref):
+            effects.append(('rollback', ref))
+            if rollback_failed:
+                raise OSError('rollback reply lost')
+            return {'ended': True, 'restoration': 'restored'}
+        monkeypatch.setattr(loan_backend, 'end_takeover', end)
+        monkeypatch.setattr(loan_backend, 'cancel_presentation', rollback, raising=False)
+        task = asyncio.create_task(registry.execute('computer_act', {'snapshot_id': sid, 'present_result': True,
+            'actions': [{'type': 'wait', 'duration_ms': 0}]}))
+        await asyncio.wait_for(entered.wait(), 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert effects == [('end', False), ('rollback', 'takeover-1')]
+        if rollback_failed:
+            assert ('close', None) in loan_backend.calls
+    run(scenario())
+
+
+def test_failed_presentation_observation_can_still_return_focus_when_cache_poisoned(registry, manager, loan_backend, monkeypatch):
+    register(registry, manager)
+    focus(registry)
+    loan_backend.plan_pid_action_classes = ()
+    registry.set_approval_handler(lambda _: asyncio.sleep(0, result='once'))
+    snapshot = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    async def poison(*_args, **_kwargs):
+        manager.poison_artifact_session()
+        raise ComputerSessionError('unsafe_artifact')
+    monkeypatch.setattr(manager, 'snapshot', poison)
+    result = _borrow_focus(registry, snapshot, present_result=True)
+    assert result.get('error') and manager._artifact_poisoned
+    assert loan_backend.restoration_requests == [True]
+    assert sum(n == 'act' for n, _ in loan_backend.calls) == 1
+
+
+def test_showing_old_result_does_not_commit_if_exact_snapshot_changed_while_waiting_for_end_lock(registry, manager, loan_backend, monkeypatch):
+    register(registry, manager)
+    focus(registry)
+    loan_backend.plan_pid_action_classes = ()
+    registry.set_approval_handler(lambda _: asyncio.sleep(0, result='once'))
+    snapshot = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    acquire = manager._acquire_lock_for_terminal_cleanup
+    async def intervening_capture():
+        await manager.snapshot()  # same target/binding but somebody has now published a different frame
+        return await acquire()
+    monkeypatch.setattr(manager, '_acquire_lock_for_terminal_cleanup', intervening_capture)
+    _borrow_focus(registry, snapshot, present_result=True)
+    assert loan_backend.restoration_requests == [True]
+    assert sum(n == 'act' for n, _ in loan_backend.calls) == 1
+
+
 def test_focus_loan_unavailable_does_not_activate_legacy_route(registry, manager, backend):
     register(registry, manager)
     focus(registry)
@@ -7788,7 +7923,7 @@ def test_focus_loan_unavailable_does_not_activate_legacy_route(registry, manager
 @pytest.mark.usefixtures("loan_backend")
 def test_focus_loan_cannot_be_renewed_by_observing_or_switching_targets(registry, manager, backend, monkeypatch, break_loan):
     clock = [100.0]
-    monkeypatch.setattr("agent.runtime.tools.computer.monotonic", lambda: clock[0], raising=False)
+    monkeypatch.setattr("agent.runtime.approval_time.continuous_now", lambda: clock[0])
     register(registry, manager)
     focus(registry)
     backend.plan_pid_action_classes = ()
@@ -7869,7 +8004,7 @@ def test_focus_loan_cross_batch_activity_requires_native_continuity(registry, ma
     backend_begin = backend.begin_takeover
     used_continuity_guard = []
 
-    async def begin(snapshot_id, plan_ref, *, continued_loan=False, loan_deadline_uptime_ms=None):
+    async def begin(snapshot_id, plan_ref, *, continued_loan=False, loan_deadline_continuous_ms=None):
         used_continuity_guard.append(continued_loan)
         if continued_loan:
             raise HelperApplicationError(ComputerError(ComputerErrorCode.USER_ACTIVITY_PAUSED, "changed"))
@@ -7897,7 +8032,7 @@ def test_focus_loan_cross_batch_activity_requires_native_continuity(registry, ma
 
 def test_focus_loan_expiring_while_begin_waits_never_reaches_helper(registry, manager, loan_backend, monkeypatch):
     clock = [300.0]
-    monkeypatch.setattr("agent.runtime.tools.computer.monotonic", lambda: clock[0])
+    monkeypatch.setattr("agent.runtime.approval_time.continuous_now", lambda: clock[0])
     register(registry, manager)
     focus(registry)
     loan_backend.plan_pid_action_classes = ()
@@ -7918,7 +8053,7 @@ def test_focus_loan_expiring_while_begin_waits_never_reaches_helper(registry, ma
 
 def test_focus_loan_original_deadline_reaches_native_on_every_batch(registry, manager, loan_backend, monkeypatch):
     clock = [300.0]
-    monkeypatch.setattr("agent.runtime.tools.computer.monotonic", lambda: clock[0])
+    monkeypatch.setattr("agent.runtime.approval_time.continuous_now", lambda: clock[0])
     begins = []
 
     class BeginTransport:
@@ -7937,9 +8072,27 @@ def test_focus_loan_original_deadline_reaches_native_on_every_batch(registry, ma
     assert not first["error"]
     clock[0] += 119
     assert not _borrow_focus(registry, json.loads(first["fresh_output"]))["error"]
-    assert [(p.get("loan_deadline_uptime_ms"), p.get("continued_loan")) for p in begins] == [
+    assert [(p.get("loan_deadline_continuous_ms"), p.get("continued_loan")) for p in begins] == [
         (420_000, None), (420_000, True),
     ]
+
+
+def test_focus_loan_must_not_restart_after_approval_audit_or_sleep(registry, manager, loan_backend, monkeypatch):
+    from agent.runtime import approval_time
+    clock = [600.0]
+    monkeypatch.setattr(approval_time, 'continuous_now', lambda: clock[0])
+    register(registry, manager)
+    focus(registry)
+    loan_backend.plan_pid_action_classes = ()
+    registry.set_approval_handler(lambda _: asyncio.sleep(0, result='session'))
+    async def delayed_audit(event):
+        if event['type'] == 'approval_decided':
+            clock[0] += 121  # the device slept or the persistence worker stalled
+    registry.set_approval_audit_handler(delayed_audit)
+    snapshot = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    result = _borrow_focus(registry, snapshot)
+    assert result.get('code') == 'approval_required', result
+    assert not any(n in {'takeover_begin', 'act'} for n, _ in loan_backend.calls)
 
 
 @pytest.mark.usefixtures("loan_backend")

@@ -21,7 +21,7 @@ final class CGForegroundInputPoster: PIDTargetedInputPosting {
         pointIsInTargetWindow: @escaping (CGPoint, pid_t) -> Bool = { _, _ in false },
         deliver: @escaping (CGEvent) -> Void = { $0.post(tap: .cghidEventTap) },
         validateNewInput: @escaping () throws -> Void = {},
-        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+        now: @escaping () -> TimeInterval = ForegroundLoanClock.now
     ) {
         self.frontmostPID = frontmostPID
         self.pointIsInTargetWindow = pointIsInTargetWindow

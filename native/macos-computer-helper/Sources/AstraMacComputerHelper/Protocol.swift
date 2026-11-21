@@ -554,6 +554,22 @@ final class Dispatcher {
             } catch {
                 return observationFailure(requestID: request.requestID, error: error)
             }
+        case "presentation_apps", "cancel_presentation":
+            guard let values = exactPayload(request.payload, keys: ["takeover_ref"]),
+                  let takeoverRef = boundedReference(values["takeover_ref"])
+            else { return Self.failure(requestID: request.requestID, message: "\(request.operation) requires takeover_ref") }
+            do {
+                if request.operation == "presentation_apps" {
+                    return success(requestID: request.requestID, result: try windows.presentationApps(takeoverRef: takeoverRef))
+                }
+                let outcome = try windows.cancelPresentation(takeoverRef: takeoverRef)
+                guard !outcome.cleanupFailed else { throw TakeoverError.cleanupFailed }
+                return success(requestID: request.requestID, result: takeoverOutcomeJSON(outcome))
+            } catch let error as WindowObservationError {
+                return observationFailure(requestID: request.requestID, error: error)
+            } catch {
+                return takeoverFailure(requestID: request.requestID, error: error)
+            }
         case "snapshot", "snapshot_subtree":
             var snapshotPayload = request.payload
             var subtree: (snapshotID: String, elementRef: String)?
@@ -676,9 +692,10 @@ final class Dispatcher {
                   case let .string(snapshotID)? = payload["snapshot_id"],
                   case let .string(planRef)? = payload["plan_ref"]
             else { return Self.failure(requestID: request.requestID, message: "takeover_begin has an invalid payload") }
+            let loanDeadline = continuousLoanDeadline(request)
             let declaration: ForegroundFragmentDeclaration?
             if payload["fragment"] == nil {
-                guard validateTakeoverBeginPayload(request.payload, hasFragment: false) else {
+                guard validateTakeoverBeginPayload(request.payload, hasFragment: false, loanDeadline: loanDeadline) else {
                     return Self.failure(requestID: request.requestID, message: "takeover_begin has an invalid payload")
                 }
                 declaration = nil
@@ -702,7 +719,7 @@ final class Dispatcher {
                 }
                 let reference = try windows.takeoverBegin(snapshotID: snapshotID, planRef: planRef,
                     continuedLoan: payload["continued_loan"] == .bool(true),
-                    loanDeadline: loanDeadlineUptime(payload["loan_deadline_uptime_ms"]))
+                    loanDeadline: loanDeadline)
                 return success(requestID: request.requestID, result: .object(["takeover_ref": .string(reference)]))
             } catch {
                 return takeoverFailure(requestID: request.requestID, error: error)
@@ -1101,15 +1118,20 @@ final class Dispatcher {
         return validActions(values["actions"])
     }
 
-    private func loanDeadlineUptime(_ value: JSONValue?) -> TimeInterval? {
-        guard case let .number(ms)? = value, ms > 0, ms < 9_007_199_254_740_992, ms == ms.rounded(.down) else { return nil }
-        return ms / 1000
+    private func continuousLoanDeadline(_ request: HelperRequest) -> TimeInterval? {
+        // Keep the absolute Darwin CLOCK_MONOTONIC_RAW epoch; only convert ms to seconds.
+        guard case let .object(values) = request.payload,
+              case let .number(ms)? = values["loan_deadline_continuous_ms"],
+              ms > 0, ms < 9_007_199_254_740_992,
+              let exactMS = exactPositiveInteger(strictPayloadObject(request)?["loan_deadline_continuous_ms"])
+        else { return nil }
+        return TimeInterval(exactMS) / 1000
     }
 
-    private func validateTakeoverBeginPayload(_ payload: JSONValue, hasFragment: Bool) -> Bool {
+    private func validateTakeoverBeginPayload(_ payload: JSONValue, hasFragment: Bool, loanDeadline: TimeInterval? = nil) -> Bool {
         var keys: Set<String> = ["snapshot_id", "plan_ref"]
-        if !hasFragment, case let .object(values) = payload, loanDeadlineUptime(values["loan_deadline_uptime_ms"]) != nil {
-            keys.insert("loan_deadline_uptime_ms")
+        if !hasFragment, case let .object(values) = payload, loanDeadline != nil {
+            keys.insert("loan_deadline_continuous_ms")
             if values["continued_loan"] == .bool(true) { keys.insert("continued_loan") }
         }
         if hasFragment { keys.insert("fragment") }

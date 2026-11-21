@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from agent.runtime.paths import state_path
+from .. import approval_time
 
 from ..computer_forms import form_elements, image_actions, observation_capabilities, truncated_form_region, verify_choice_goals
 from ..computer_feedback import PendingClickGuard, build_action_receipt
@@ -23,7 +24,7 @@ from contextlib import suppress
 from dataclasses import dataclass, replace
 from itertools import islice
 from pathlib import Path
-from time import monotonic
+
 from typing import Any, cast
 
 from ..computer_backend import (
@@ -476,6 +477,7 @@ class _PreparedComputerAct:
     failure: ToolFailure | None = None
     approved: bool = False
     present_result: bool = False
+    loan_at_entry: _ForegroundLoan | None = None
     reused_loan: _ForegroundLoan | None = None
     new_loan: _ForegroundLoan | None = None
     finish_presentation: Callable[[bool], Awaitable[None]] | None = None
@@ -993,9 +995,10 @@ class LocalComputerRuntime:
             return self._capability
         return self._capability
 
-    async def apps(self):
+    async def apps(self, *, presentation_ref: str | None = None):
         self._helper_started = True
-        return await (await self._ensure_manager()).apps()
+        manager = await self._ensure_manager()
+        return await manager.apps(presentation_ref=presentation_ref) if presentation_ref is not None else await manager.apps()
 
     async def select(self, app_ref: str, window_ref: str):
         self._helper_started = True
@@ -1014,6 +1017,7 @@ class LocalComputerRuntime:
         text_detail: ComputerSnapshotTextDetailMode = ComputerSnapshotTextDetailMode.OFF,
         recovery_catalog_generation: int | None = None,
         recovery_window_identity_ref: str | None = None,
+        presentation_ref: str | None = None,
     ) -> ComputerVerifiedAppState:
         self._helper_started = True
         return await (await self._ensure_manager()).get_app_state(
@@ -1023,6 +1027,7 @@ class LocalComputerRuntime:
             text_detail=text_detail,
             recovery_catalog_generation=recovery_catalog_generation,
             recovery_window_identity_ref=recovery_window_identity_ref,
+            presentation_ref=presentation_ref,
         )
 
     async def invalidate_app_state_attempt_authority(self) -> None:
@@ -1087,10 +1092,11 @@ class LocalComputerRuntime:
             takeover_ref=takeover_ref,
         )
 
-    async def end_takeover(self, takeover_ref: str, *, restore_previous_focus: bool = True):
+    async def end_takeover(self, takeover_ref: str, *, restore_previous_focus: bool = True,
+                           presentation_snapshot: ComputerSnapshot | None = None):
         self._helper_started = True
         return await (await self._ensure_manager()).end_takeover(
-            takeover_ref, restore_previous_focus=restore_previous_focus,
+            takeover_ref, restore_previous_focus=restore_previous_focus, presentation_snapshot=presentation_snapshot,
         )
 
     async def handoff(self) -> None:
@@ -2117,7 +2123,7 @@ def register_computer_tools(
     def current_loan() -> _ForegroundLoan | None:
         if foreground_loan is not None and (
             foreground_loan.grant_space != current_grant_space()
-            or foreground_loan.window != loan_window() or monotonic() >= foreground_loan.expires_at
+            or foreground_loan.window != loan_window() or approval_time.continuous_now() >= foreground_loan.expires_at
             or foreground_loan.scope not in approvals.approved_scopes
         ):
             revoke_loan()
@@ -2745,13 +2751,13 @@ def register_computer_tools(
             **(resume_recovery() if manager.handed_off else {}),
         })
 
-    async def _computer_apps():
+    async def _computer_apps(*, presentation_ref: str | None = None):
         nonlocal pending_wps_modal_target
         blocked = preflight()
         if blocked:
             return blocked
         try:
-            apps = await manager.apps()
+            apps = await manager.apps(**({"presentation_ref": presentation_ref} if presentation_ref else {}))
             clear_write_grants(preserve_foreground_session=True)
             clear_snapshot_grants()
             if (
@@ -3205,6 +3211,9 @@ def register_computer_tools(
             )
         takeover_ref: str | None = None
         recovery_catalog_attempted = False
+        presentation_binding = None
+        presentation_snapshot: ComputerSnapshot | None = None
+        presentation_generation = -1
 
         async def finish_takeover(present: bool = False) -> None:
             nonlocal takeover_ref, foreground_loan
@@ -3213,8 +3222,12 @@ def register_computer_tools(
                 takeover_ref = None
                 restoration = "restore_failed"
                 try:
-                    if present and prepared_acts.get(_permission_call_id) is prepared and not manager.handed_off:
-                        outcome = await manager.end_takeover(ending_ref, restore_previous_focus=False)
+                    if (present and act_receipt_states.get(_permission_call_id) is prepared
+                            and not manager.handed_off and presentation_binding is not None
+                            and manager.snapshot_target_binding == presentation_binding
+                            and observation_authority_generation == presentation_generation):
+                        outcome = await manager.end_takeover(ending_ref, restore_previous_focus=False,
+                                                             presentation_snapshot=presentation_snapshot)
                     else:
                         outcome = await manager.end_takeover(ending_ref)
                     raw_restoration = str(outcome.get("restoration") or "")
@@ -3239,13 +3252,25 @@ def register_computer_tools(
                 )
                 _runtime_takeover_event("foreground_takeover_end", decision)
 
+        def defer_verified_presentation(observed, snapshot: ComputerSnapshot, goals, *, complete: bool) -> None:
+            nonlocal presentation_binding, presentation_snapshot, presentation_generation
+            if (prepared.present_result and complete and observed.private.get("image_data_urls")
+                    and (goals is None or goals.get("status") == "verified")):
+                presentation_binding = manager.snapshot_target_binding
+                presentation_snapshot = snapshot
+                presentation_generation = observation_authority_generation
+                prepared.finish_presentation = finish_takeover
+
         async def recover_window_transition(deadline: float, *, action_result=None, reobserve: bool = True):
             nonlocal recovery_catalog_attempted
             if not before_identity:
                 return None
             try:
                 async with asyncio.timeout_at(deadline):
-                    await finish_takeover()
+                    keep_ref = (takeover_ref if prepared.present_result and reobserve and before_binding is not None
+                                and _fully_acknowledged_action_batch(action_result, len(normalized)) else None)
+                    if keep_ref is None:
+                        await finish_takeover()
                     async with catalog_target_operation_lock:
                         if before_authority != observation_authority_generation:
                             return None
@@ -3262,7 +3287,7 @@ def register_computer_tools(
                             if manager.handed_off:
                                 return None
                             recovery_catalog_attempted = True
-                            catalog_result = await _computer_apps()
+                            catalog_result = await _computer_apps(presentation_ref=keep_ref)
                             if not isinstance(catalog_result, str):
                                 return None
                             recovered = window_transition(
@@ -3287,20 +3312,25 @@ def register_computer_tools(
                                 arguments["app_ref"], arguments["window_ref"],
                                 recovery_catalog_generation=catalog_generation,
                                 recovery_window_identity_ref=before_identity,
+                                presentation_ref=keep_ref,
                             )
                             if authority_generation != observation_authority_generation:
                                 return None
                             remember_target(state.target.app_ref, state.target.window_ref)
                             observed = {k: v for k, v in recovered.items() if k != "next_observation"}
                             observed["observation_status"] = "observed"
-                            return await snapshot_result(
+                            goals = verify_choice_goals(before_tree, state.snapshot.payload.get("ax_tree"), normalized)
+                            observation = await snapshot_result(
                                 state.snapshot, scope="target_window", verified_state=state,
                                 action_result=action_result,
+                                choice_verification=goals,
                                 action_observation=observe_action_effect(
                                     before_tree, state.snapshot.payload.get("ax_tree"), normalized,
                                 ),
                                 observed_window_transition=observed,
                             )
+                            defer_verified_presentation(observation, state.snapshot, goals, complete=keep_ref is not None)
+                            return observation
                         except Exception as exc:  # noqa: BLE001 - recovery never replays input
                             logger.debug("same-window observation unavailable error_type=%s", type(exc).__name__)
                             if (
@@ -3410,10 +3440,10 @@ def register_computer_tools(
                     def loan_deadline() -> int | None:
                         if (prepared_acts.get(_permission_call_id) is not prepared
                                 or loan.grant_space != current_grant_space() or loan.window != loan_window()
-                                or loan.scope not in approvals.approved_scopes or monotonic() >= loan.expires_at
+                                or loan.scope not in approvals.approved_scopes or approval_time.continuous_now() >= loan.expires_at
                                 or (prepared.reused_loan is not None and current_loan() is not loan)):
                             return None
-                        # Local macOS helper shares the host monotonic uptime epoch. Never renew on transit.
+                        # Both ends use Darwin's sleep-inclusive CLOCK_MONOTONIC_RAW. Never rebase on transit.
                         return int(loan.expires_at * 1000)
 
                     takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref,
@@ -3496,17 +3526,15 @@ def register_computer_tools(
                         if form_region:
                             fresh = await manager.snapshot("target_window", expected_target_binding=before_binding,
                                 subtree_ref=form_region)
+                        goals = verify_choice_goals(before_tree, fresh.payload.get("ax_tree"), observed_actions)
                         observation = await snapshot_result(
                             fresh, scope="target_window", action_result=result.result,
                             action_observation=observe_action_effect(before_tree, fresh.payload.get("ax_tree"), observed_actions),
                             before_encoding=None if prepared.present_result else finish_takeover,
-                            choice_verification=verify_choice_goals(before_tree, fresh.payload.get("ax_tree"), observed_actions),
+                            choice_verification=goals,
                         )
-                        if (prepared.present_result and not checkpoint
-                                and _fully_acknowledged_action_batch(result.result, len(normalized))
-                                and observation.private.get("image_data_urls")):
-                            # Only the verified registry result can commit presentation. Cancellation restores.
-                            prepared.finish_presentation = finish_takeover
+                        defer_verified_presentation(observation, fresh, goals, complete=not checkpoint and
+                            _fully_acknowledged_action_batch(result.result, len(normalized)))
                         return observation
                 except Exception as exc:  # noqa: BLE001 - observation-only retry is safe after acknowledged input
                     observation_error = exc
@@ -4066,6 +4094,7 @@ def register_computer_tools(
             actions=tuple(ComputerAction.from_mapping(action) for action in raw_actions),
             raw_actions=tuple(dict(action) for action in raw_actions),
             present_result=present_result,
+            loan_at_entry=foreground_loan,
         )
         prepared_acts[call_id] = prepared
         if needs_foreground and requested_mode == "background":
@@ -4077,6 +4106,9 @@ def register_computer_tools(
         if manager.handed_off:
             return None
         snapshot_id = prepared.snapshot_id
+        if present_result and "focus_presentation_v1" not in observation_capabilities(raw_tree):
+            prepared.failure = _failure("unsupported_operation", "Showing a result requires an updated macOS helper with cancellable presentation. No input was dispatched.", retryable=False)
+            return None
         context = current_policy_context(snapshot_id)
         # decision.batch_hash 基于此刻的 context；plan_actions 之后 backend 会更新
         # trusted_snapshot，二次复核必须复用同一 context（见 _PreparedComputerAct 注释）。
@@ -4158,6 +4190,8 @@ def register_computer_tools(
             assert plan is not None
         except asyncio.CancelledError:
             prepared_acts.pop(call_id, None)
+            if prepared.loan_at_entry is foreground_loan:
+                revoke_loan()
             raise
         except Exception as exc:  # noqa: BLE001 - planning is pre-input and safely typed
             prepared.failure = _planning_failure(
@@ -4229,7 +4263,7 @@ def register_computer_tools(
             prepared.raw_actions,
             interaction_plan=plan,
         )
-        can_continue = "focus_loan_v2" in observation_capabilities(raw_tree) and bool(loan_window())
+        can_continue = "focus_loan_v3" in observation_capabilities(raw_tree) and bool(loan_window())
         if not can_continue and decision.risk is ComputerRisk.ORDINARY:
             decision = replace(decision, choices=("once", "deny"), boundary=(
                 "Only this batch. Return to the previous application unless you have changed focus."
@@ -4292,13 +4326,25 @@ def register_computer_tools(
             raise ValueError("Computer Use target changed while approval was pending")
         if prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER:
             revoke_loan()  # An unrelated freshly authorized batch is not a continuation.
+        expires_at = None
+        if (prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER and decision == "session"
+                and "session" in request["choices"]):
+            decided_at = getattr(request, "private_decided_at", None)
+            if (not isinstance(decided_at, (float, int)) or isinstance(decided_at, bool) or not math.isfinite(decided_at)
+                    or not 0 <= decided_at <= approval_time.continuous_now() or not loan_window()):
+                prepared.failure = _failure("approval_required", "Missing a valid foreground decision time. Ask again.", retryable=True)
+                return None
+            expires_at = decided_at + 120
+            if approval_time.continuous_now() >= expires_at:
+                prepared.failure = _failure("approval_required", "The foreground decision expired before dispatch. Ask again.", retryable=True)
+                return None
         cleanup = permission_grant(approvals, args, request, decision)
         if prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER:
             prepared.approved = True
             authorized_acts.add(call_id)
-            if decision == "session" and "session" in request["choices"] and loan_window():
+            if expires_at is not None:
                 prepared.new_loan = _ForegroundLoan(
-                    prepared.decision.scope, current_grant_space(), loan_window(), monotonic() + 120,
+                    prepared.decision.scope, current_grant_space(), loan_window(), expires_at,
                 )
         return cleanup
 
@@ -4340,20 +4386,25 @@ def register_computer_tools(
             if prepared.finish_presentation is not None:
                 await prepared.finish_presentation(not result.get("error") and result.get("verified") is True)
                 prepared.finish_presentation = None
-        if result.get("error") and call_id in authorized_acts:
-            clear_write_grants()
+        if result.get("error"):
+            if call_id in authorized_acts:
+                clear_write_grants()
+            elif prepared is not None and prepared.failure is not None and prepared.loan_at_entry is foreground_loan:
+                revoke_loan()
         completed_acts.add(call_id)
 
     async def finalize_act_permission(args: dict) -> None:
         call_id = str(args.get("__permission_call_id") or "")
-        prepared = act_receipt_states.pop(call_id, None)
-        prepared_acts.pop(call_id, None)
+        pending = prepared_acts.pop(call_id, None)
+        prepared = act_receipt_states.pop(call_id, None) or pending
         try:
             if prepared is not None and prepared.finish_presentation is not None:
                 await prepared.finish_presentation(False)
         finally:
             if call_id not in completed_acts and call_id in authorized_acts:
                 clear_write_grants()
+            elif call_id not in completed_acts and prepared is not None and prepared.loan_at_entry is foreground_loan:
+                revoke_loan()
             completed_acts.discard(call_id)
             authorized_acts.discard(call_id)
 

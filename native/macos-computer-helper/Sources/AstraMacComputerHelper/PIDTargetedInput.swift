@@ -370,7 +370,7 @@ final class PIDTargetedActionExecutor {
         element: @escaping ElementLookup,
         evidence: @escaping EvidenceCheck = { _, _ in false },
         delay: @escaping (useconds_t) -> Void = { usleep($0) },
-        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+        now: @escaping () -> TimeInterval = ForegroundLoanClock.now
     ) {
         self.poster = poster
         self.compatibility = compatibility

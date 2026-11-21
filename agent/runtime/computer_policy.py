@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
+from .approval_time import TimedApprovalRequest
 from .computer_protocol import DISPATCH_ACTION_CLASSES, ComputerInteractionMode
 from .tools.approval import ScopedApprovalStore
 from .tools.registry import PermissionCleanup
@@ -145,7 +146,7 @@ class ComputerPolicyDecision:
     action_classes: tuple[str, ...] = ()
 
 
-class ComputerApprovalRequest(dict[str, Any]):
+class ComputerApprovalRequest(TimedApprovalRequest):
     """Public approval copy with its exact scope kept off the wire."""
 
     private_authority_generation: int
