@@ -94,6 +94,12 @@ callbacks, disable tools and all memory/task/context providers, and preserve
 session data on failures. The host supplies command routing, cancellation,
 separate session discovery and guards against work-memory/task exports.
 
+A controller that replaces agent settings can also return the work agent's own
+values, by attribute (`yolo` included), from an optional `work_settings()`. A
+WeChat or QQ turn that borrows the agent while the mode is open then runs with
+them, as it does during Bar and Minimal; without that method it runs with the
+mode's settings.
+
 Source updates preserve ignored local modules. Controller code stays local and
 must remain compatible with this interface; changes are picked up on restart.
 Private mode-prompt keys in `persona.local.json` are retained as opaque local data.

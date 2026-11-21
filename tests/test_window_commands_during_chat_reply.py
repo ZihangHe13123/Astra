@@ -82,11 +82,14 @@ class Answer:
 class ChatReplyBackend:
     """A real backend on the persona "work" with WeChat on a local iLink and a recording model."""
 
+    # The model: RequestRecorder, or a subclass of it that answers some requests in its own way.
+    recorder: type[RequestRecorder] = RequestRecorder
+
     def __init__(self, tmp_path):
         RequestRecorder.requests, RequestRecorder.hold = [], ""
         RequestRecorder.held, RequestRecorder.release = threading.Event(), threading.Event()
         self.tmp = tmp_path
-        self.model = ThreadingHTTPServer(("127.0.0.1", 0), RequestRecorder)
+        self.model = ThreadingHTTPServer(("127.0.0.1", 0), self.recorder)
         threading.Thread(target=self.model.serve_forever, daemon=True).start()
         self.ilink = FakeIlink()
         channels = tmp_path / "channels.json"
@@ -149,15 +152,18 @@ class ChatReplyBackend:
         self.ilink.inbound.put(self.ilink.text_message(text, context_token="ctx-owner"))
         return answered
 
+    def replied(self, answered: int) -> bool:
+        """WeChat has the reply and its turn has ended: "typing…" stops after the reply is sent, once the turn
+        has given the agent back."""
+        timeline = list(self.ilink.timeline)
+        sent = [index for index, (kind, _) in enumerate(timeline) if kind == "text"]
+        return bool(len(self.ilink.replies_to(OWNER)) > answered and sent
+                    and ("typing", TYPING_STOP) in timeline[sent[-1]:])
+
     def wait_reply(self, answered: int) -> None:
-        """Until WeChat has the reply and its turn has ended: "typing…" stops after the reply is sent, once the
-        turn has given the agent back."""
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
-            timeline = list(self.ilink.timeline)
-            sent = [index for index, (kind, _) in enumerate(timeline) if kind == "text"]
-            if (len(self.ilink.replies_to(OWNER)) > answered and sent
-                    and ("typing", TYPING_STOP) in timeline[sent[-1]:]):
+            if self.replied(answered):
                 return
             time.sleep(0.05)
         raise AssertionError("WeChat was answered and its turn ended")

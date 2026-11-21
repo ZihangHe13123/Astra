@@ -469,6 +469,30 @@ class ReActAgent(AgentBase):
         self._external_sync_failures = 0
         self._external_sync_retry_at = 0.0
 
+    @property
+    def sandbox_mode(self) -> str | None:
+        """Where tools run when the sandbox can switch ("docker" or "local"); None when it cannot."""
+        sandbox = self._sandbox
+        mode = getattr(sandbox, "mode", None)
+        return str(mode) if mode and callable(getattr(sandbox, "switch", None)) else None
+
+    @sandbox_mode.setter
+    def sandbox_mode(self, mode: str | None) -> None:
+        # Set like the settings a private mode replaces, so a chat's turn can run where work tools run.
+        switch = getattr(self._sandbox, "switch", None)
+        if mode and callable(switch) and self.sandbox_mode != mode:
+            switch(mode)
+
+    @property
+    def yolo(self) -> bool:
+        """Whether eligible tool approvals are skipped: the registry's live switch, which delegates share."""
+        return bool(self.tools.yolo)
+
+    @yolo.setter
+    def yolo(self, enabled: bool) -> None:
+        # Set like the settings a private mode replaces, so a chat's turn can run with the work agent's.
+        self.tools.yolo = bool(enabled)
+
     def end_session(self, reason: str = "shutdown") -> None:
         """Dispatch session lifecycle hooks once for the current session."""
         session_id = self.context.session_scope

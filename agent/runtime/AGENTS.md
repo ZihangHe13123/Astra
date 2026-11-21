@@ -11,6 +11,7 @@ Read the repository's `AGENTS.md` first. These rules also apply when changing th
 - Main agents, delegates, worker continuation, CLI, GUI, and channels must agree on the contract being changed. Inspect sibling entry points before calling a fix complete.
 - A timed-out or disconnected write can have an unknown outcome. Observe and report it; do not replay it automatically.
 - Persistent jobs use an explicit home, a fresh occurrence-specific session and kernel ownership locks. Commit schedule advancement and the occurrence before dispatch; keep terminal outcomes immutable. Inbox delivery is a separate transaction with a durable receipt. Never turn a recovered unknown execution into an automatic retry or adopt a GUI/channel conversation as a job context.
+- Bar, Minimal and Local replace settings on the shared agent and return the work agent's own from `work_settings()` (Local: what its controller's optional `work_settings()` gives). A channel turn runs with those, YOLO included, and gives the mode its own back (`AgentChannelRouter`), so every setting a mode replaces belongs in that list. Window commands that change these settings (`/yolo`, the modes) are refused while a channel turn holds the agent.
 
 ## Checks
 

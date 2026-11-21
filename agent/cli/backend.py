@@ -919,6 +919,11 @@ async def _main(startup_started: float):
         router = channel_router_holder.get("router")
         return router.window_view() if router is not None else AgentChannelRouter.WindowView(agent.context, agent.llm)
 
+    def _window_yolo() -> bool:
+        """The window's YOLO. A chat's turn while the window is in Minimal or a local mode has the work agent's."""
+        router = channel_router_holder.get("router")
+        return bool(router.window_setting("yolo") if router is not None else agent.tools.yolo)
+
     def _chat_reply_note(command: str) -> str:
         """Why a window command that needs the agent itself, not only the window's conversation, cannot run now:
         a chat's reply is using the agent, and the command would reach that chat's conversation. "" when it can."""
@@ -2506,7 +2511,7 @@ async def _main(startup_started: float):
 
     voice.report(force=True)
     if os.getenv("ASTRA_UI_SURFACE") == "gui":
-        _send({"type": "yolo_status", "yolo": agent.tools.yolo})
+        _send({"type": "yolo_status", "yolo": _window_yolo()})
         _send({"type": "gui_ready", "workspace": str(Path(sandbox_workdir).resolve()),
                "session_id": Path(agent.context.session_path).stem})
 
@@ -2514,7 +2519,11 @@ async def _main(startup_started: float):
                                    channels=functools.partial(channel_manager_holder.get, "manager"))
     channel_router = AgentChannelRouter(agent, agent_turn_lock, sessions_dir(PROJECT_ROOT),
                                         admission=lambda: not restart.draining, model_for=channel_models.client,
-                                        tasks=task_store)
+                                        tasks=task_store,
+                                        # At most one of the private modes is open at a time.
+                                        work_settings=lambda: {**bar_mode.work_settings(),
+                                                               **minimal_mode.work_settings(),
+                                                               **local_mode.work_settings()})
     channel_router_holder["router"] = channel_router
     # Between turns: the desktop's conversation and each chat's, with how the ledger attributes them.
     idle_compactor = IdleCompactor(lambda: [(agent.context, {}), *(
@@ -3413,7 +3422,7 @@ async def _main(startup_started: float):
         _send_session_list()
         _send_working_memory()
         _send_mode_info()
-        _send({"type": "yolo_status", "yolo": agent.tools.yolo})
+        _send({"type": "yolo_status", "yolo": _window_yolo()})
         if refresh_history:
             await _send_history()
         _send_minimal_session_list()
@@ -3545,7 +3554,7 @@ async def _main(startup_started: float):
         _send_session_list()
         _send_working_memory()
         _send_mode_info()
-        _send({"type": "yolo_status", "yolo": agent.tools.yolo})
+        _send({"type": "yolo_status", "yolo": _window_yolo()})
         if refresh_history:
             await _send_history()
         _send_local_mode_info()
@@ -4366,6 +4375,10 @@ async def _main(startup_started: float):
                         error = "YOLO is available in Work and Minimal modes."
                     elif len(parts) > 2 or (len(parts) == 2 and parts[1] not in {"on", "off", "status"}):
                         error = "Usage: /yolo [on|off|status]"
+                    elif parts[1:] != ["status"] and (note := _chat_reply_note("/yolo")):
+                        # The chat's reply runs with the YOLO it started with; the switch is shared, so a change
+                        # now would reach that reply, and its approvals waiting for an answer.
+                        error = note
                     else:
                         action = parts[1] if len(parts) == 2 else "toggle"
                         if action != "status":
@@ -4373,7 +4386,7 @@ async def _main(startup_started: float):
                             if agent.tools.yolo:
                                 for request_id in tuple(pending_yolo_approvals):
                                     resolve_tool_approval(request_id, "once")
-                    _send({"type": "yolo_status", "yolo": agent.tools.yolo, "error": error})
+                    _send({"type": "yolo_status", "yolo": _window_yolo(), "error": error})
                 elif c.lower().split(maxsplit=1)[:1] == ["/voice"]:
                     # Like /yolo, a control acknowledgement: it works in every mode and
                     # during a turn, and is neither a task nor part of the conversation.
@@ -4429,7 +4442,7 @@ async def _main(startup_started: float):
                     await _send_history()
                     await _send_model_info(refresh=True)
                     _send_mode_info()
-                    _send({"type": "yolo_status", "yolo": agent.tools.yolo})
+                    _send({"type": "yolo_status", "yolo": _window_yolo()})
                     _send_minimal_session_list()
                     _send_working_memory()
                     _send({"type": "tool_result", "name": "minimal", "output": "Minimal session reset. Work context remains parked.", "error": "", "code": ""})
