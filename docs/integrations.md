@@ -136,7 +136,7 @@ shows it as an image. The QR code needs the `segno` package
 (`pip install 'segno>=1.6,<2'`, or the `weixin` extra, which also brings the
 `cryptography` used to read images). A successful login sets `weixin.enabled`
 in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on`,
-`/weixin logout` and `/weixin model` manage it afterwards.
+`/weixin logout`, `/weixin model` and `/weixin effort` manage it afterwards.
 
 - **Who is answered.** Only the WeChat user who scanned the code, unless
   `weixin.allow_users` lists others. Group messages are ignored.
@@ -211,6 +211,16 @@ in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on`,
   the current choice. The setting is `weixin.model`; it applies from the next
   message, and a model that is no longer in the catalog or has no key falls
   back to the default.
+- **How hard it thinks.** WeChat follows the reasoning effort last chosen with
+  `/mode` in any window, read for each message, so the desktop's background
+  backend that answers WeChat follows a later `/mode` too.
+  `/weixin effort <low|high|xhigh|max>` (or Settings → WeChat → reasoning
+  effort) gives WeChat an effort of its own without changing any window's;
+  `/weixin effort default` follows `/mode` again, and `/weixin effort` shows the
+  current choice. The setting is `weixin.reasoning_effort`; it applies from the
+  next message. A value that is not one of the levels is named by
+  `/weixin status` and followed as `/mode`. A model whose adapter takes no
+  effort ignores it.
 - **Approvals.** A step that needs approval (a command on this computer, a
   file outside the workspace) is sent to the chat with what it will do,
   credentials hidden, and waits for a reply: 同意 runs it once, 本任务 allows

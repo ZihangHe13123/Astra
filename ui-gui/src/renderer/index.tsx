@@ -29,6 +29,7 @@ import { MemoryReviewSettings, reviewAnswer, withProposalOptions } from "./memor
 import { PhoneNotifications, PhoneSettings } from "./phone-settings.js";
 import { managedBy } from "./chat-view.js";
 import { WeixinSettings } from "./weixin-settings.js";
+import { EFFORTS } from "./efforts.js";
 import { JobsPanel } from "./jobs-page.js";
 import { ActivityPanel } from "./activity-page.js";
 import { MemoryPanel } from "./memory-page.js";
@@ -698,8 +699,7 @@ function App() {
   </div>;
 }
 
-/** Reasoning effort as the composer offers it. The select is see-through over its label, so a phone opens its own picker. */
-const EFFORTS = [["low", "低"], ["high", "高"], ["xhigh", "超高"], ["max", "最高"]] as const;
+// The composer's effort picker (EFFORTS) is a see-through select over its label, so a phone opens its own picker.
 const NARROW = "(max-width: 700px)";
 function narrowScreen() { return typeof window !== "undefined" && !!window.matchMedia?.(NARROW).matches; }
 function useNarrow() {

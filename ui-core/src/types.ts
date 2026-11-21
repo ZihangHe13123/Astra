@@ -309,7 +309,9 @@ export type PyEvent =
   | { type: "weixin_status"; enabled: boolean; logged_in: boolean; account: string; state: "off" | "logged_out" | "stopped" | "standby" | "online" | "expired";
       owner: boolean; keep_awake: boolean; login: "" | "scan" | "confirm"; qr?: { svg: string; text: string }; message?: string; error?: string;
       /** The catalog key WeChat answers with ("" follows the default model), its model name, and the default's. */
-      model: string; model_label: string; default_model: string }
+      model: string; model_label: string; default_model: string;
+      /** How hard WeChat's model thinks ("" follows /mode), and the effort /mode saved last. */
+      reasoning_effort: string; default_reasoning_effort: string }
   | {
       type: "error";
       message: string;

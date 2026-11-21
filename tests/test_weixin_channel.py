@@ -992,6 +992,27 @@ def test_a_setting_that_is_not_a_number_is_reported_and_downloads_nothing(tmp_pa
     assert load_channels_config(path).weixin.max_receive_file_bytes == 50 * 1024 * 1024
 
 
+def test_a_wechat_reasoning_effort_that_is_not_a_level_is_reported_and_follows_mode(tmp_path):
+    from agent.channels.config import load_channels_config
+    from agent.cli.mode_preferences import REASONING_EFFORTS
+
+    path = tmp_path / "channels.json"
+    for written, read in ((" XHigh ", "xhigh"), ("", ""), (None, "")):
+        path.write_text(json.dumps({"weixin": {"reasoning_effort": written}}), encoding="utf-8")
+        assert load_channels_config(path).weixin.reasoning_effort == read
+        assert load_channels_config(path).weixin.problems == ()
+    for level in REASONING_EFFORTS:
+        path.write_text(json.dumps({"weixin": {"reasoning_effort": level}}), encoding="utf-8")
+        assert load_channels_config(path).weixin.reasoning_effort == level
+    # A level /mode does not offer, or no text at all: followed as /mode, and named.
+    for written in ("medium", "最高", 3, True, ["max"]):
+        path.write_text(json.dumps({"weixin": {"reasoning_effort": written}}), encoding="utf-8")
+        config = load_channels_config(path).weixin
+        assert config.reasoning_effort == ""
+        assert config.problems == (f"weixin.reasoning_effort 应为 {'、'.join(REASONING_EFFORTS)} 之一，现在是 "
+                                   f"{json.dumps(written, ensure_ascii=False)}；暂按跟随 /mode 处理。",)
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate is macOS")
 def test_on_a_mac_the_channel_holds_off_idle_sleep_only_while_it_polls(ilink, tmp_path):
     from agent.channels.keep_awake import KeepAwake

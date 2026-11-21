@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from agent.runtime.reasoning_efforts import REASONING_EFFORTS
+
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +81,18 @@ def _number(data: dict[str, Any], key: str, default: int, problems: list[str], p
     if zero_is_unset and number == 0:
         number = default
     return max(low, number if high is None else min(high, number))
+
+
+def _effort(data: dict[str, Any], key: str, problems: list[str], prefix: str) -> str:
+    """A reasoning effort of its own, or "" (absent, null or blank) to follow /mode. A value that is not one
+    of the levels is recorded in ``problems`` and followed as ""."""
+    value = data.get(key)
+    effort = value.strip().lower() if isinstance(value, str) else value
+    if effort is None or effort == "" or effort in REASONING_EFFORTS:
+        return effort or ""
+    problems.append(f"{prefix}.{key} 应为 {'、'.join(REASONING_EFFORTS)} 之一，现在是 "
+                    f"{json.dumps(value, ensure_ascii=False)}；暂按跟随 /mode 处理。")
+    return ""
 
 
 @dataclass(frozen=True)
@@ -167,6 +181,8 @@ class WeixinConfig:
     # channel_send_file: on, to the person who scanned the code (or file_allow_users), from these roots.
     # A catalog model key for WeChat turns ("deepseek::deepseek-flash"); empty follows the default model.
     model: str = ""
+    # The reasoning effort of WeChat turns (low, high, xhigh, max); empty follows the one /mode saved last.
+    reasoning_effort: str = ""
     send_files_enabled: bool = True
     file_allow_users: tuple[str, ...] = ()
     send_file_roots: tuple[str, ...] = (str(Path.home()),)
@@ -198,6 +214,7 @@ class WeixinConfig:
             chat_bubbles=_bool(data.get("chat_bubbles"), True),
             max_bubbles=number("max_bubbles", 8, low=1, high=20),
             model=str(data.get("model") or "").strip(),
+            reasoning_effort=_effort(data, "reasoning_effort", problems, "weixin"),
             send_files_enabled=_bool(data.get("send_files_enabled"), True),
             file_allow_users=_items(data.get("file_allow_users")),
             send_file_roots=_items(data.get("send_file_roots"), (str(Path.home()),)),

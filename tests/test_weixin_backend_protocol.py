@@ -389,6 +389,115 @@ def test_weixin_answers_with_its_own_model_and_follows_the_default_again(tmp_pat
         ilink.close()
 
 
+class EffortRecordingHandler(ModelHandler):
+    """Each conversation request's reasoning effort, with the last thing the person said in it."""
+    requests: list[tuple[str, str]] = []
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(length) or b"{}"
+        payload = json.loads(body)
+        if "messages" in payload:
+            said = [message for message in payload["messages"] if message.get("role") == "user"]
+            content = said[-1].get("content", "") if said else ""
+            text = content if isinstance(content, str) else " ".join(
+                str(part.get("text", "")) for part in content if isinstance(part, dict))
+            type(self).requests.append((text, str(payload.get("reasoning_effort", ""))))
+        self.rfile = io.BytesIO(body)
+        self.headers.replace_header("Content-Length", str(len(body)))
+        super().do_POST()
+
+
+def test_weixin_thinks_at_its_own_effort_and_follows_mode_again(tmp_path):
+    EffortRecordingHandler.requests = []
+    model = ThreadingHTTPServer(("127.0.0.1", 0), EffortRecordingHandler)
+    threading.Thread(target=model.serve_forever, daemon=True).start()
+    ilink = FakeIlink()
+    home = tmp_path / "home"
+    channels = tmp_path / "channels.json"
+    channels.write_text(json.dumps({"weixin": {"keep_awake": False}}), encoding="utf-8")
+    # A DeepSeek V4 name: its client sends the effort with every request, so each request shows it.
+    models = tmp_path / "deepseek-model.yaml"
+    models.write_text("\n".join([
+        "version: 1", "models:", "  deepseek-v4-fixture:", "    provider: openai-compatible",
+        f"    base_url: http://127.0.0.1:{model.server_port}/v1", "    api_key_env: ''", "    context_limit: 131072",
+        "    capabilities: [tools, streaming]", ""]), encoding="utf-8")
+    workdir = tmp_path / "work"
+    workdir.mkdir()
+    proc, _, seen, wait_for = _start_question_protocol_backend(
+        tmp_path, model.server_port, "weixin_effort_session", workdir=workdir,
+        settings_overrides={"selected_model": "deepseek-v4-fixture", "reasoning_effort": "low"},
+        env_overrides={"ASTRA_HOME": str(home), "ASTRA_CHANNEL_CONFIG": str(channels),
+                       "ASTRA_WEIXIN_BASE_URL": ilink.base, "ASTRA_WEIXIN_CDN_URL": ilink.cdn,
+                       "ASTRA_CONTEXT_INDEX_EMBEDDING": "off", "AGENT_MODELS_FILE": str(models)},
+    )
+
+    def status(predicate, timeout: float = 20) -> dict:
+        return wait_for(lambda e: e.get("type") == "weixin_status" and predicate(e), timeout=timeout)
+
+    def answer(command: str) -> dict:
+        send(proc, {"type": "command", "cmd": command})
+        return status(lambda e: bool(e.get("message") or e.get("error")))
+
+    def efforts(text: str) -> set[str]:
+        return {effort for said, effort in EffortRecordingHandler.requests if text in said}
+
+    def ask(text: str) -> set[str]:
+        answered = len(ilink.replies_to(OWNER))
+        ilink.inbound.put(ilink.text_message(text, context_token="ctx-owner"))
+        deadline = time.monotonic() + 30
+        while len(ilink.replies_to(OWNER)) == answered and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert len(ilink.replies_to(OWNER)) == answered + 1
+        return efforts(text)
+
+    def window(text: str) -> set[str]:
+        send(proc, {"type": "message", "text": text})
+        wait_for(lambda e: e.get("type") == "done", timeout=30)
+        return efforts(text)
+
+    def saved() -> dict:
+        return json.loads(channels.read_text(encoding="utf-8"))["weixin"]
+
+    try:
+        first = status(lambda e: True, timeout=30)
+        assert (first["reasoning_effort"], first["default_reasoning_effort"]) == ("", "low")
+        assert answer("/weixin effort")["message"] == "微信的推理强度：跟随默认（现在是 low，用 /mode 改）"
+        send(proc, {"type": "command", "cmd": "/weixin login"})
+        status(lambda e: e.get("state") == "online", timeout=30)
+        assert ask("先问一句") == {"low"}
+
+        assert "没有这个推理强度：medium" in answer("/weixin effort medium")["error"]
+        assert "reasoning_effort" not in saved()
+
+        chosen = answer("/weixin effort MAX")
+        assert (chosen["message"], chosen["reasoning_effort"]) == ("微信的推理强度改为 max，下一条消息生效。", "max")
+        assert saved()["reasoning_effort"] == "max"
+        assert ask("想深一点") == {"max"}
+        # The window keeps its own effort.
+        assert window("窗口这边") == {"low"}
+
+        followed = answer("/weixin effort default")
+        assert followed["message"] == "微信的推理强度改为跟随默认（现在是 low，用 /mode 改），下一条消息生效。"
+        assert followed["reasoning_effort"] == "" and saved()["reasoning_effort"] == ""
+        assert ask("现在呢") == {"low"}
+
+        # Another window saves /mode high. WeChat follows it from the next message, although this backend started
+        # at low (the desktop's channel host never gets a /mode of its own); this window keeps low until it switches.
+        settings = tmp_path / "settings.json"
+        settings.write_text(json.dumps({**json.loads(settings.read_text(encoding="utf-8")),
+                                        "reasoning_effort": "high"}), encoding="utf-8")
+        assert ask("默认换了") == {"high"}
+        assert window("窗口还是原来的") == {"low"}
+        send(proc, {"type": "command", "cmd": "/weixin status"})
+        assert status(lambda e: e.get("default_reasoning_effort") == "high")["reasoning_effort"] == ""
+    finally:
+        _stop_protocol_backend(proc)
+        model.shutdown()
+        model.server_close()
+        ilink.close()
+
+
 def test_a_wechat_turn_asks_for_approval_in_wechat_and_follows_the_answer(tmp_path):
     from test_backend_task_protocol import _ApprovalOpenAIHandler
 

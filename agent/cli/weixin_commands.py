@@ -13,8 +13,10 @@ from typing import TYPE_CHECKING
 
 from agent.channels.config import load_channels_config, set_channel_enabled, set_channel_setting
 from agent.channels.manager import ChannelManager
+from agent.cli.mode_preferences import applies_reasoning_effort, read_reasoning_effort
 from agent.runtime.json_preferences import UnreadablePreferences
 from agent.runtime.paths import state_path
+from agent.runtime.reasoning_efforts import REASONING_EFFORTS
 
 if TYPE_CHECKING:
     from agent.channels.weixin import IlinkClient
@@ -23,7 +25,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-USAGE = "用法：/weixin [status|login|logout|on|off|model <模型>|model default]"
+USAGE = ("用法：/weixin [status|login|logout|on|off|model <模型>|model default|"
+         f"effort <{'|'.join(REASONING_EFFORTS)}>|effort default]")
 # channels.json is there but is not valid JSON: running channels keep what they had, and nothing is written.
 UNREADABLE = "channels.json 不是合法的 JSON：改好之前，微信沿用原来的设置，这里也不能改设置。"
 NOT_SAVED = "channels.json 不是合法的 JSON，设置没有改动：先把文件改好（或删掉）再设置。"
@@ -89,6 +92,9 @@ class WeixinCommands:
             "model": config.model,
             "model_label": self._label(self._resolve(config.model), config.model) if config.model else "",
             "default_model": self._label(self._models.default() if self._models else None, ""),
+            # How hard WeChat's model thinks ("" follows /mode), and the effort /mode saved last.
+            "reasoning_effort": config.reasoning_effort,
+            "default_reasoning_effort": read_reasoning_effort(),
         }
         if self._qr is not None:
             event["qr"] = dict(self._qr)
@@ -121,6 +127,8 @@ class WeixinCommands:
         try:
             if action == "model" and len(parts) <= 3:
                 self._model(parts[2] if len(parts) > 2 else "")
+            elif action == "effort" and len(parts) <= 3:
+                self._effort(parts[2] if len(parts) > 2 else "")
             elif len(parts) > 2:
                 self.send_status(error=USAGE)
             elif action == "status":
@@ -156,6 +164,36 @@ class WeixinCommands:
         # Save the catalog's own key, so a bare model name means one model from then on.
         set_channel_setting("weixin", "model", entry.key)
         self.send_status(message=f"微信改用 {entry.model_id}，下一条消息生效。")
+
+    def _effort(self, level: str) -> None:
+        level = level.lower()
+        if level and level != "default" and level not in REASONING_EFFORTS:
+            self.send_status(error=f"没有这个推理强度：{level}。可选 {'、'.join(REASONING_EFFORTS)}，"
+                                   "或 default 跟随默认（/mode）。")
+            return
+        if level:
+            set_channel_setting("weixin", "reasoning_effort", "" if level == "default" else level)
+        # Read back the way the channel reads it, so the answer is what the next reply uses.
+        configured = (self._models.configured_effort("weixin") if self._models
+                      else load_channels_config().weixin.reasoning_effort)
+        default = f"跟随默认（现在是 {read_reasoning_effort()}，用 /mode 改）"
+        if not level:
+            text = f"微信的推理强度：{configured or default}"
+        elif configured:
+            text = f"微信的推理强度改为 {configured}，下一条消息生效。"
+        else:
+            text = f"微信的推理强度改为{default}，下一条消息生效。"
+        self.send_status(message=text + self._effort_note())
+
+    def _effort_note(self) -> str:
+        """Said when WeChat's model takes no effort at all, so a setting that changes nothing is not a mystery."""
+        if self._models is None:
+            return ""
+        configured = self._models.configured("weixin")
+        entry = self._resolve(configured) if configured else self._models.default()
+        if entry is None or applies_reasoning_effort(entry.profile.provider, entry.model_id):
+            return ""
+        return f"（{entry.model_id} 不调推理强度，这个设置在换成支持的模型后才起作用。）"
 
     def _resolve(self, key: str) -> CatalogEntry | None:
         return self._models.resolve(key) if self._models and key else None

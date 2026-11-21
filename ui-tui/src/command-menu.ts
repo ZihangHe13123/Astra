@@ -49,7 +49,7 @@ const SLASH_COMMANDS: SlashCommandSuggestion[] = [
   { command: "/connect", description: "connect a provider and choose its model", takesArgs: true, group: "MODEL" },
   { command: "/persona", description: "show or switch prompt persona", takesArgs: true, group: "MODEL" },
   { command: "/search", description: "show or switch web search provider", takesArgs: true, group: "TOOLS" },
-  { command: "/weixin", description: "WeChat channel · [status|login|on|off|logout]", takesArgs: true, group: "TOOLS" },
+  { command: "/weixin", description: "WeChat channel · [status|login|on|off|logout|model|effort]", takesArgs: true, group: "TOOLS" },
   { command: "/tool", description: "open latest or numbered tool result details", takesArgs: true, group: "TOOLS" },
   { command: "/gallery", description: "open latest or numbered image search gallery", takesArgs: true, group: "TOOLS" },
   { command: "/doc", description: "view the latest or numbered document; /doc open uses the system app", takesArgs: true, group: "TOOLS" },
@@ -130,6 +130,7 @@ const WEIXIN_OPTIONS: SlashCommandSuggestion[] = [
   { command: "off", description: "switch the channel off", completion: "/weixin off", submitValue: "/weixin off", kind: "command" },
   { command: "logout", description: "log out and forget the login", completion: "/weixin logout", submitValue: "/weixin logout", kind: "command" },
   { command: "model", description: "the model WeChat answers with: a /model key, or default", completion: "/weixin model ", submitValue: "/weixin model", kind: "command" },
+  { command: "effort", description: "how hard WeChat thinks: low, high, xhigh, max, or default to follow /mode", completion: "/weixin effort ", submitValue: "/weixin effort", kind: "command" },
 ];
 
 const MEMORY_SUBCOMMANDS: SlashCommandSuggestion[] = [
