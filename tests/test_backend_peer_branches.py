@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from agent.channels.router import AgentChannelRouter  # noqa: F401 - globals used by the executed backend closures
 from agent.cli.images import build_user_message_content  # noqa: F401 - globals used by the executed backend closures
 from agent.core.msg import Msg
 from agent.runtime.async_io import durable_io, routine_io  # noqa: F401 - globals used by the executed backend closures
@@ -48,9 +49,10 @@ def harness(tmp_path):
               question_broker=SimpleNamespace(pending_count=0, queued_request_ids=[]),
               wakeups=SimpleNamespace(status=lambda: {"state": "idle"}), process_manager=SimpleNamespace(list=lambda **kw: []),
               delegate_mailbox=SimpleNamespace(manager=SimpleNamespace(list=lambda **kw: [])), delegate_statuses={},
-              personal_thread=False)
+              personal_thread=False, channel_router_holder={})
+    # _window is the window's own conversation; with no chat turn borrowing the agent it is agent.context.
     backend_functions(ns, {"_peer", "_peer_sync_locked", "_peer_snapshot", "_peer_tick", "_response_guard",
-                           "_response_head_current"})
+                           "_response_head_current", "_window"})
     return ns, receiver, sender, context, idle, launched
 
 
