@@ -96,12 +96,21 @@ class AgentChannelRouter:
         self._template = agent.context
         # The window's own, put aside while a chat's turn borrows agent.context and agent.llm.
         self._lent: AgentChannelRouter.WindowView | None = None
+        # The channel of that turn ("weixin", "qq").
+        self._borrower = ""
 
     def window_view(self) -> AgentChannelRouter.WindowView:
         """The window's own conversation and model client. A chat's turn borrows agent.context and agent.llm
         and keeps the window's aside until it ends; a window command (/mode, /model) or what the window is told
         about its model must use these, so it never reaches a chat's client or conversation."""
         return self._lent or self.WindowView(self.agent.context, self.agent.llm)
+
+    @property
+    def borrower(self) -> str:
+        """The channel whose turn has borrowed the agent ("weixin", "qq"), or "" while the window has it. What
+        needs the agent itself, not only the window's conversation (/reset, another session, a mode, /compress,
+        /reload), has to wait until that turn ends."""
+        return self._borrower if self._lent is not None else ""
 
     def parked_contexts(self) -> list[tuple[str, AgentContext]]:
         """Each chat's conversation this process holds between its turns, by session name."""
@@ -252,6 +261,7 @@ class AgentChannelRouter:
             previous = self.agent.context
             previous_llm = self.agent.llm
             self._lent = self.WindowView(previous, previous_llm)
+            self._borrower = message.channel
             restricted = message.channel == "qq" and not message.local_tools
             context = self._chat_context(session_name) if restricted else self._context(session_name, message.channel)
             self.agent.context = context
@@ -367,3 +377,4 @@ class AgentChannelRouter:
                 self.agent.context = previous
                 self.agent.llm = previous_llm
                 self._lent = None
+                self._borrower = ""
