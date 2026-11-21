@@ -2413,7 +2413,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   };
   const foregroundId = pendingApproval?.kind === "computer_foreground_takeover" && !connectionOpen && !startupVisible
     ? pendingApproval.request_id : undefined;
-  const foregroundRelease = useForegroundApprovalInput(foregroundId, (_id, input, key, released) => {
+  const normalInputOwner = connectionOpen ? "connection" : pendingApproval ?? questionRequest ?? openToolResult ?? "composer";
+  const foregroundRelease = useForegroundApprovalInput(foregroundId, normalInputOwner, (_id, input, key, released) => {
     appshotClientRef.current?.recordInput();
     return handleInput(input, key, released);
   });

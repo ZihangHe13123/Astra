@@ -78,7 +78,10 @@ test("stream recovery separates reasoning attempts and keeps the active turn bus
     h.child.event({ type: "tool_preparing", attempt_id: "old", state: "discarded", calls: [] });
     h.child.event({ type: "error", recoverable: true, code: "stream_closed", message: "Retrying current response" });
     h.child.event({ type: "reasoning", content: "Recovered reasoning" });
-    await settle();
+    // Apple Terminal batches text for 80 ms, other terminals for 32 ms. Wait for the
+    // visible effect, not a single 60 ms sleep; the assertions still run before turn completion.
+    const deadline = performance.now() + 1500;
+    while (!h.frame().includes("Recovered reasoning") && performance.now() < deadline) await settle();
     const frame = h.frame();
     assert.match(frame, /Abandoned reasoning/);
     assert.match(frame, /STREAM CLOSED/);
@@ -661,6 +664,80 @@ test("foreground terminal keeps legacy denial and enhanced navigation, cancel an
   } finally { h.app.unmount(); }
   assert.equal(h.stdout.chunks.join("").split("\x1b[<u").length - 1, 1);
   assert.ok(h.stdout.chunks.join("").includes("\x1b[?1004l"));
+});
+
+function kittyReview(h: Awaited<ReturnType<typeof setup>>) {
+  return {
+    ask: async (id: string, foreground = true) => {
+      h.child.event({ type: "tool_approval_request", request_id: id, tool_name: foreground ? "computer_act" : "execute_shell",
+        kind: foreground ? "computer_foreground_takeover" : "host_execution", risk: "write", reason: "fixture", choices: ["once", "session", "deny"] });
+      await settle();
+    },
+    negotiate: () => h.key("\x1b[?1004;2$y\x1b[?0u\x1b[?11u"),
+    answers: () => h.child.commands.filter(c => c.type === "tool_approval_response").map(c => [c.request_id, c.decision]),
+  };
+}
+
+test("Kitty review: lock flags are not held modifiers; only a matching release grants", async () => {
+  const h = await setup(120, 36), { ask, negotiate, answers } = kittyReview(h);
+  const k = (code: number, mask: number, event: number) => `\x1b[${code};${1 + mask}:${event}u`;
+  const expected: string[][] = [];
+  try {
+    for (const [code, locks, choice] of [[121, 64, "once"], [97, 128, "session"], [13, 192, "once"]] as const) {
+      const id = `lock-${locks}`; await ask(id); await negotiate();
+      await h.key([1, 2, 4, 8, 16, 32].map(mod => k(13, locks | mod, 1) + k(13, locks | mod, 3)).join(""));
+      await h.key(k(code, locks, 1) + k(code, locks, 2) + k(code, locks, 3));
+      await h.key(k(code, locks, 1)); assert.deepEqual(answers(), expected);
+      await h.key(k(code, locks, 3)); expected.push([id, choice]); assert.deepEqual(answers(), expected);
+      await h.key("\x1b[?0u"); // pop reply for this head
+    }
+    await ask("controls"); await negotiate();
+    h.child.event({ type: "task_started", task: { id: "busy", status: "running" } }); await settle();
+    await h.key(k(99, 192 | 4, 1) + k(99, 192 | 4, 3));
+    assert.equal(h.child.commands.filter(c => c.cmd === "/cancel").length, 1);
+    await h.key(k(110, 192, 1)); assert.deepEqual(answers(), [...expected, ["controls", "deny"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("Kitty review: a blur belongs to its live reporting interval, not a future approval", async () => {
+  const h = await setup(), { ask, negotiate, answers } = kittyReview(h);
+  const down = "\x1b[121u", up = "\x1b[121;1:3u";
+  try {
+    await ask("old"); await negotiate(); await h.key(down + "\x1b[O" + up + down + up);
+    assert.deepEqual(answers(), []); // cannot approve while live reporting says unfocused
+    h.child.event({ type: "approval_resolved", request_id: "old", state: "denied", decision: "deny" }); await settle();
+    await h.key("\x1b[?0u"); // focus reporting was disabled; no focus-in notification during this gap
+    await ask("fresh"); await negotiate(); await h.key(up); assert.deepEqual(answers(), []);
+    await h.key(down); assert.deepEqual(answers(), []);
+    await h.key(up); assert.deepEqual(answers(), [["fresh", "once"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("Kitty review: unanswered foreground query cannot steal standalone Escape from an ordinary approval", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    await ask("legacy"); await h.key("n"); assert.deepEqual(answers(), [["legacy", "deny"]]);
+    await ask("ordinary", false); await h.key("\x1b");
+    assert.deepEqual(answers(), [["legacy", "deny"], ["ordinary", "deny"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("a fragmented late probe reply is not an ordinary Escape, and a deferred Escape cannot deny a different card", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  const nextRead = () => new Promise<void>(resolve => setImmediate(resolve));
+  try {
+    await ask("legacy"); await h.key("n"); await ask("normal-a", false);
+    h.stdin.write("\x1b"); await nextRead(); h.stdin.write("O"); await nextRead(); await h.key("A");
+    assert.deepEqual(answers(), [["legacy", "deny"]]); // SS3 Up is neither a rejection nor the session-choice letter
+    h.stdin.write("\x1b"); await nextRead(); h.stdin.write("[?1004;2$"); await nextRead(); await h.key("y");
+    assert.deepEqual(answers(), [["legacy", "deny"]]); // the final 'y' belongs to DECRQM
+    await h.key("n"); await ask("another-legacy"); await h.key("n");
+    await ask("normal-b", false); await ask("normal-c", false);
+    h.stdin.write("\x1b"); await nextRead(); // replace its recipient before an ambiguous Escape is delivered
+    h.child.event({ type: "approval_resolved", request_id: "normal-b", state: "denied", decision: "deny" }); await settle();
+    assert.deepEqual(answers(), [["legacy", "deny"], ["normal-a", "deny"], ["another-legacy", "deny"]]);
+    await h.key("\x1b"); assert.deepEqual(answers().at(-1), ["normal-c", "deny"]);
+  } finally { h.app.unmount(); }
 });
 
 test("a composer paste interrupted by a foreground card cannot strand normal input after remote resolution", async () => {

@@ -42,6 +42,20 @@ test("shutdown restores only modes actually changed, without asking the departin
   assert.equal(writes.at(-1), C + "?1004l" + C + "<u");
 });
 
+test("an arrow started on a foreground card cannot become a bare A on its ordinary successor", () => {
+  const { keys, negotiate } = setup(); keys.head("old"); negotiate();
+  assert.equal(keys.feed(C + "1;1"), ""); keys.head();
+  assert.equal(keys.feed("A"), "");
+  assert.equal(keys.feed("A"), "A"); // the next independent key still belongs to Ink
+});
+
+test("ordinary SS3 keys stay intact for Ink, regardless of read boundaries after a probe", () => {
+  for (const pieces of [["\x1bOA"], ["\x1b", "OA"], ["\x1b", "O", "A"], ["\x1bO", "A"]]) {
+    const { keys } = setup(); keys.head("unanswered"); keys.head();
+    assert.deepEqual(pieces.map(s => keys.feed(s)).filter(Boolean), ["\x1bOA"]);
+  }
+});
+
 test("control-string payloads, malformed CSI and modified/mismatched releases cannot manufacture consent", () => {
   for (const open of ["\x1bP", "\x1b_", "\x1b^", "\x90", "\x9f"]) {
     const { keys, grants, negotiate } = setup(); keys.head("reader"); negotiate();
@@ -49,5 +63,39 @@ test("control-string payloads, malformed CSI and modified/mismatched releases ca
     keys.feed(C + "1".repeat(80) + "u" + release + press + C + "121;2:3u");
     assert.deepEqual(grants, [], open);
     keys.feed(press + release); assert.deepEqual(grants, ["reader:once"]);
+  }
+});
+
+test("Kitty lock bits are status, not held keys, including navigation and emergency controls", () => {
+  for (const locks of [64, 128, 192]) {
+    const actions: string[] = [], keys = new ForegroundTerminalInput(() => {}, (_id, input, key, answer) => {
+      actions.push(answer?.decision ?? (key.ctrl ? `ctrl-${input}` : input || Object.keys(key)[0]!));
+    }, () => {});
+    const k = (code: number, mask = 0, event = 1) => `${C}${code};${1 + (locks | mask)}:${event}u`;
+    keys.head("req"); keys.feed(`${C}?1004;2$y${C}?0u${C}?11u`);
+    for (const mod of [1, 2, 4, 8, 16, 32, 256]) keys.feed(k(13, mod) + k(13, mod, 3));
+    keys.feed(k(121) + k(121, 1, 3) + k(121, 0, 3)); // Shift on release still cancels.
+    keys.feed(k(99, 4 | 1)); // Ctrl+Shift+C is not Ctrl+C.
+    assert.deepEqual(actions, []);
+    keys.feed(k(121) + k(121, 0, 3) + k(110) + k(118) + k(27) + k(99, 4) + k(121, 4));
+    keys.feed(`${C}1;${1 + locks}A${C}6;${1 + locks}:1~${C}6;${1 + locks}:3~`);
+    assert.deepEqual(actions, ["once", "n", "v", "escape", "ctrl-c", "ctrl-y", "upArrow", "pageDown"]);
+  }
+});
+
+test("a focus-out is binding only while focus reporting is continuous", () => {
+  for (const source of ["temporary", "already-on", "blur-before-confirm"]) {
+    const { keys, grants, negotiate } = setup();
+    keys.head("one"); negotiate(source === "already-on"); keys.feed(press + C + "O"); keys.head();
+    keys.feed(C + "?0u"); keys.head("two");
+    keys.feed(`${C}?1004;${source === "already-on" ? 1 : 2}$y${C}?0u`);
+    if (source === "blur-before-confirm") keys.feed(C + "O");
+    keys.feed(C + "?11u" + release); assert.deepEqual(grants, []);
+    keys.feed(press + release);
+    assert.deepEqual(grants, source === "temporary" ? ["two:once"] : [], source);
+    if (source !== "temporary") {
+      keys.feed(C + "I" + release); assert.deepEqual(grants, []);
+      keys.feed(press + release); assert.deepEqual(grants, ["two:once"]);
+    }
   }
 });
