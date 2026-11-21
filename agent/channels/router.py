@@ -203,9 +203,9 @@ class AgentChannelRouter:
         context.persona_active_mode = template.persona_active_mode
         context.persona_relationship_context = template.persona_relationship_context
         context.persona_affect = template.persona_affect
-        suffix = getattr(template, "_stable_system_suffix", "")
-        style = _channel_style(channel)
-        context.set_stable_system_suffix(f"{suffix}\n\n{style}".strip() if style else suffix)
+        context.set_stable_system_suffix(getattr(template, "_stable_system_suffix", ""))
+        # Not in the suffix: guidance rebuilds that at each turn from the conversation's own snapshot.
+        context.set_channel_style(_channel_style(channel))
         context.set_tools_token_cost(getattr(template, "_tools_token_cost", 0))
         context.compressor = ContextCompressor(self.agent.llm)
         context.set_session(str(self.session_root / f"{session_name}.json"))
