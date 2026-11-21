@@ -540,15 +540,15 @@ final class ForegroundKeyboardExecutor {
                 stage: stage
             )
         } catch let failure as SyntheticInputFailure {
+            let started = inputStarted || failure.inputStarted
+            let cleanupFailed = cleanupHeld(token: token, scope: scope, lease: lease, inputStarted: started)
+            if failure.userActivityPaused {
+                throw KeyboardPauseFailure(inputStarted: started, cleanupFailed: cleanupFailed, stage: stage)
+            }
             throw KeyboardPerformFailure(
                 error: failure.error,
-                inputStarted: inputStarted || failure.inputStarted,
-                cleanupFailed: cleanupHeld(
-                    token: token,
-                    scope: scope,
-                    lease: lease,
-                    inputStarted: inputStarted || failure.inputStarted
-                ),
+                inputStarted: started,
+                cleanupFailed: cleanupFailed,
                 stage: stage
             )
         } catch let error as ActionExecutionError {

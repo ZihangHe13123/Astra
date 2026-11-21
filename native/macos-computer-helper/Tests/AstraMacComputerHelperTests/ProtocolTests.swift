@@ -495,8 +495,15 @@ import Testing
     let continued = dispatcher.handle(
         #"{"protocol_version":4,"request_id":"continued","operation":"takeover_begin","payload":{"snapshot_id":"snapshot","plan_ref":"plan","continued_loan":true}}"#
     )
-    // A backend without a physical continuity checkpoint cannot substitute its ordinary begin.
-    #expect(continued.error?.code == "user_activity_paused")
+    // Refuse the obsolete, deadline-less continuation before it reaches the observer.
+    #expect(!continued.ok && continued.error?.code != "user_activity_paused")
+    for suffix in ["", ",\"continued_loan\":true"] {
+        let timed = dispatcher.handle(
+            #"{"protocol_version":4,"request_id":"timed","operation":"takeover_begin","payload":{"snapshot_id":"snapshot","plan_ref":"plan","loan_deadline_uptime_ms":420000\#(suffix)}}"#
+        )
+        // An observer without bounded loans must never substitute a plain begin.
+        #expect(timed.error?.code == "user_activity_paused")
+    }
     let ordinaryAct = dispatcher.handle(
         #"{"protocol_version":4,"request_id":"missing","operation":"act","payload":{"interaction_mode":"foreground_takeover","snapshot_id":"snapshot","plan_ref":"plan","takeover_ref":"takeover","actions":[]}}"#
     )

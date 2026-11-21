@@ -701,7 +701,8 @@ final class Dispatcher {
                     ]))
                 }
                 let reference = try windows.takeoverBegin(snapshotID: snapshotID, planRef: planRef,
-                    continuedLoan: payload["continued_loan"] == .bool(true))
+                    continuedLoan: payload["continued_loan"] == .bool(true),
+                    loanDeadline: loanDeadlineUptime(payload["loan_deadline_uptime_ms"]))
                 return success(requestID: request.requestID, result: .object(["takeover_ref": .string(reference)]))
             } catch {
                 return takeoverFailure(requestID: request.requestID, error: error)
@@ -908,6 +909,8 @@ final class Dispatcher {
             return Self.failure(requestID: requestID, message: "user activity monitor is unavailable", code: CooperativeErrorCode.userActivityPaused.rawValue)
         case TakeoverError.userActivityPaused:
             return Self.failure(requestID: requestID, message: "foreground or user input changed before activation", code: CooperativeErrorCode.userActivityPaused.rawValue)
+        case TakeoverError.loanExpired:
+            return Self.failure(requestID: requestID, message: "foreground loan is no longer current", code: ActionExecutionError.actionTimeout.rawValue)
         case TakeoverError.cleanupFailed:
             return Self.failure(requestID: requestID, message: "held input cleanup failed", code: ActionExecutionError.helperFailed.rawValue)
         case TakeoverError.stalePlan, TakeoverError.alreadyConsumed, TakeoverError.authorityMismatch:
@@ -1096,10 +1099,16 @@ final class Dispatcher {
         return validActions(values["actions"])
     }
 
+    private func loanDeadlineUptime(_ value: JSONValue?) -> TimeInterval? {
+        guard case let .number(ms)? = value, ms > 0, ms < 9_007_199_254_740_992, ms == ms.rounded(.down) else { return nil }
+        return ms / 1000
+    }
+
     private func validateTakeoverBeginPayload(_ payload: JSONValue, hasFragment: Bool) -> Bool {
         var keys: Set<String> = ["snapshot_id", "plan_ref"]
-        if !hasFragment, case let .object(values) = payload, values["continued_loan"] == .bool(true) {
-            keys.insert("continued_loan")
+        if !hasFragment, case let .object(values) = payload, loanDeadlineUptime(values["loan_deadline_uptime_ms"]) != nil {
+            keys.insert("loan_deadline_uptime_ms")
+            if values["continued_loan"] == .bool(true) { keys.insert("continued_loan") }
         }
         if hasFragment { keys.insert("fragment") }
         guard let values = exactPayload(payload, keys: keys) else { return false }

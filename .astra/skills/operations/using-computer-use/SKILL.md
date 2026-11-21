@@ -31,10 +31,10 @@ description: Use when controlling macOS interfaces with computer_* tools.
 3. Only in-memory or document-content editing without file/external effect is
    ordinary session + bundle work. Save As, Save a Copy, create or overwrite a local
    file, send, submit, export, upload, share, delete, install, System Settings, and
-   Terminal Enter need high-impact exact-batch once approval. 自动批准不等于同意借用真实键鼠；前台请求必须等人决定，不以空闲为同意。
+   Terminal Enter need high-impact exact-batch once approval. YOLO/autoapprove cannot downgrade risk or authorize foreground input. 空闲不等于同意。
 4. Target or action invalidation or authority invalidation clears snapshot,
-   element, plan, and exact approval. 能后台就后台。人可把同一窗口借出最多两分钟处理连续普通操作；换窗、中断、交接或失败即停，观察不续期。不支持跨批活动核验的旧 helper 仅按次借用。每批尝试恢复此前应用；人已切走时不拉回来。仅当人明确要求「给我看」时，最后一批可用 `present_result=true` 单次申请将结果留在前台。 Smart approval for `text_detail=on` is once-only/target-bound.
-   Bounded errors fail closed: never guess a target/ref/artifact.
+   element, plan, and exact approval. 优先后台。前台借用只限批准的聊天和窗口，最多两分钟，观察不续期。换窗、移动鼠标、打字或交接后不再续借；旧 helper 仅按次借用。到期或取消后不发新输入；每批归还此前应用，人已切走则保持原样。只有人说「给我看」才单独申请 `present_result=true`。 Smart approval: `text_detail=on` once-only/target-bound.
+   Bounded errors: never guess target/ref/artifact.
    `unsafe_artifact`: `computer_close` → fresh session →
    `computer_apps` → `computer_get_app_state`.
 5. Password, secure field, OTP, Touch ID, authentication, payment, or IME:
@@ -56,9 +56,7 @@ description: Use when controlling macOS interfaces with computer_* tools.
    are confirmed. Every action after `last_ack` has unknown semantic outcome and
    must not be automatically replayed. Handoff and ask the user to decide.
 9. `click` 的 `checked` 目标返回 `choice_verification.status=verified`，表示这批目标在最终观察中全部匹配；已满足时不会重复点击。普通 `verified` 表示数值方向或 AXPress 控件变化。 `noop` is not completion:
-   inspect a fresh snapshot and choose another explicit action.
-   `unknown_outcome` forbids replay. Return/default-button requires fresh
-   observation and an explicit new action.
+   观察新快照后另选动作。`unknown_outcome` 禁止重放；Return/default-button 须重新观察并单独执行。
 10. Use `computer_handoff`. 挂起后使用回执中的恢复参数；用户交还控制后再恢复，不要先枚举目录。After `computer_resume`, resume with a fresh snapshot
     from its response; recapture only when stale.
 11. Deadline cannot cancel an in-flight write, close an unknown session,

@@ -15,6 +15,7 @@ enum SyntheticInputEvent: Equatable {
 struct SyntheticInputFailure: Error {
     let error: ActionExecutionError
     let inputStarted: Bool
+    var userActivityPaused = false
 }
 
 protocol SyntheticInputPosting: AnyObject {

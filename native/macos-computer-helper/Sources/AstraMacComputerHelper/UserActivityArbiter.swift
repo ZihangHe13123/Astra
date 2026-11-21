@@ -134,6 +134,10 @@ protocol UserActivityMonitoring: AnyObject {
     func disarm(lease: UserActivitySessionLease) throws -> Bool
 }
 
+protocol HelperSessionActivityMonitoring: UserActivityMonitoring {
+    func requestTerminalStop()
+}
+
 final class UserActivityPauseSignal {
     private let condition = NSCondition()
     private let onOffer: (() -> Void)?
@@ -389,7 +393,7 @@ final class SystemUserActivityTapRuntime: UserActivityTapRunning {
     }
 }
 
-final class UserActivityArbiter: UserActivityMonitoring {
+final class UserActivityArbiter: HelperSessionActivityMonitoring {
     private final class StartupWaiter {
         let semaphore = DispatchSemaphore(value: 0)
         private let lock = NSLock()
@@ -475,6 +479,7 @@ final class UserActivityArbiter: UserActivityMonitoring {
     private let startupTimeout: TimeInterval
     private let afterSignalRegistration: () -> Void
     private var phase: Phase = .idle
+    private var terminalStopRequested = false
 
     init(
         heldInputs: HeldInputRegistry = .shared,
@@ -501,10 +506,22 @@ final class UserActivityArbiter: UserActivityMonitoring {
         }
     }
 
+    // Stop admitting work for this helper, but leave the tap and teardown lease
+    // intact. Only actual interference (or a failed drain) should veto restoration.
+    func requestTerminalStop() {
+        stateLock.lock()
+        terminalStopRequested = true
+        stateLock.unlock()
+    }
+
     func arm(marker: UInt64, notification: UserActivityPauseSignal) throws -> UserActivitySessionLease {
         guard marker != 0 else { throw UserActivityMonitoringError.eventTapUnavailable }
         let session = Session(generation: UUID(), marker: marker, notification: notification)
         stateLock.lock()
+        guard !terminalStopRequested else {
+            stateLock.unlock()
+            throw ActionExecutionError.helperFailed
+        }
         guard case .idle = phase else {
             stateLock.unlock()
             throw UserActivityMonitoringError.alreadyArmed
@@ -539,6 +556,7 @@ final class UserActivityArbiter: UserActivityMonitoring {
     func beginFragment(lease: UserActivitySessionLease) throws {
         stateLock.lock()
         defer { stateLock.unlock() }
+        guard !terminalStopRequested else { throw ActionExecutionError.helperFailed }
         guard case let .armed(session) = phase,
               session.lease === lease,
               !session.latch.paused,
@@ -558,6 +576,7 @@ final class UserActivityArbiter: UserActivityMonitoring {
     func assertNotPaused(lease: UserActivitySessionLease) throws {
         stateLock.lock()
         defer { stateLock.unlock() }
+        guard !terminalStopRequested else { throw ActionExecutionError.helperFailed }
         switch phase {
         case let .armed(session) where session.lease === lease:
             if session.latch.paused { throw UserActivityMonitoringError.paused }

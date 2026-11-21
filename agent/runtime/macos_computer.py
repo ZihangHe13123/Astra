@@ -849,8 +849,11 @@ class MacComputerBackend:
         *,
         declaration: ForegroundFragmentDeclaration | None = None,
         continued_loan: bool = False,
+        loan_deadline_uptime_ms: int | None = None,
     ) -> str:
         payload: dict[str, object] = {"snapshot_id": snapshot_id, "plan_ref": plan_ref}
+        if loan_deadline_uptime_ms is not None:
+            payload["loan_deadline_uptime_ms"] = loan_deadline_uptime_ms
         if continued_loan:
             payload["continued_loan"] = True
         if declaration is not None:

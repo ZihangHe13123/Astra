@@ -469,7 +469,7 @@ import Testing
 
 @Test func fragmentBeginRechecksPausePublishedBeforeRecordBecameActive() throws {
     let fixture = FragmentCoordinatorFixture(wallClockLimitMS: 1_000)
-    fixture.activity.offerPauseDuringArm = true
+    fixture.activity.offerPauseDuringFragmentBegin = true
 
     #expect(throws: TakeoverError.activityUnavailable) {
         _ = try fixture.begin()
@@ -839,18 +839,141 @@ func terminalTakeoverCleanupRetriesTheExactHeldReleaseBeforeDisarm(operation: St
     #expect(fixture.activation.restored.isEmpty)
 }
 
-@Test(arguments: ["unchanged", "key", "app", "notRestored"]) func continuingFocusLoanChecksTheGap(_ change: String) throws {
-    var counter: UInt32 = 17
-    let f = TakeoverFixture(inputCounts: { [counter] })
+@Test func physicalKeyDuringArmDoesNotActivateFragmentTarget() throws {
+    let fixture = FragmentCoordinatorFixture(wallClockLimitMS: 1_000)
+    fixture.activity.offerPauseDuringArm = true
+    #expect(throws: TakeoverError.userActivityPaused) { try fixture.begin() }
+    #expect(fixture.activation.activated.isEmpty)
+    #expect(fixture.activation.restored.isEmpty)
+    #expect(fixture.activity.disarmCount == 1)
+}
+
+@Test(arguments: ["identity", "unhide", "open", "setFocused", "exactWindow", "axRetry", "openRetry", "thirdApp"])
+func takeoverActivationYieldsAtFocusBoundaries(_ interruption: String) throws {
+    let axRetry = interruption == "axRetry" || interruption == "thirdApp"
+    let f = SettlingTakeoverFixture(exactWindowValues: axRetry ? [false, true] : [true])
+    var interrupted = false
+    var laterEffects: [String] = []
+    f.runtime.onEvent = { step in
+        if interrupted && ["open", "unhide", "setFocused", "raise"].contains(step) { laterEffects.append(step) }
+        if step == "open", interruption != "openRetry" { f.runtime.fallbackFrontmost = f.batch.target.pid }
+        if step == interruption || (step == "sleep" && (axRetry || interruption == "openRetry")) {
+            interrupted = true
+            if interruption == "thirdApp" { f.runtime.fallbackFrontmost = 99 }
+            else { f.batch.activity.isPaused = true }
+        }
+    }
+    defer { f.runtime.onEvent = { _ in } }
+
+    #expect(throws: TakeoverError.userActivityPaused) { try f.begin() }
+    #expect(interrupted)
+    #expect(laterEffects.isEmpty)
+    #expect(f.batch.cursor.presentation.virtualPointer == nil)
+    #expect(f.batch.activity.disarmCount == 1)
+}
+
+@Test(arguments: ["identity", "unhide", "thirdAppAtRetry", "typingAtRetry", "typingOnSuccess", "quietRetry", "timeout"])
+func takeoverRestorationYieldsAtFocusBoundaries(_ change: String) throws {
+    var hidCount: UInt32 = 17
+    let f = SettlingTakeoverFixture(inputCounts: { [hidCount] })
+    f.runtime.onEvent = { step in
+        if step == "open" { f.runtime.fallbackFrontmost = f.batch.target.pid }
+    }
+    defer { f.runtime.onEvent = { _ in } }
     let first = try f.begin()
+    _ = try f.coordinator.consume(first.ref, actions: f.batch.actions)
+
+    var launches = 0
+    var interrupted = false
+    var laterEffects: [String] = []
+    f.runtime.onEvent = { step in
+        if interrupted && ["open", "unhide"].contains(step) { laterEffects.append(step) }
+        if step == "open" {
+            launches += 1
+            if change == "typingOnSuccess" || (change != "timeout" && launches == 2) { f.runtime.fallbackFrontmost = 77 }
+        }
+        if !interrupted && (step == change || (step == "sleep" && ["thirdAppAtRetry", "typingAtRetry"].contains(change)) ||
+            (step == "open" && change == "typingOnSuccess")) {
+            interrupted = true
+            if change == "thirdAppAtRetry" { f.runtime.fallbackFrontmost = 99 }
+            else { hidCount += 1 }
+        }
+    }
+
+    let outcome = try f.coordinator.end(first.ref, allowRestore: true)
+    switch change {
+    case "quietRetry":
+        #expect(outcome.restoration == .restored)
+        #expect(launches == 2)
+    case "timeout":
+        #expect(outcome.restoration == .restoreFailed)
+        #expect(launches > 1)
+    default:
+        #expect(interrupted)
+        #expect(outcome.restoration == .preservedUserFocus)
+        #expect(laterEffects.isEmpty)
+    }
+    #expect(!outcome.cleanupFailed)
+    #expect(f.batch.activity.disarmCount == 1)
+}
+
+@Test(arguments: ["beforeArm", "afterOpen"])
+func terminalStopDuringActivationDoesNotForfeitQuietRestoration(_ timing: String) {
+    let f = SettlingTakeoverFixture()
+    f.batch.activity.stopRequested = timing == "beforeArm"
+    var launches = 0
+    f.runtime.onEvent = { step in
+        if step == "open" {
+            launches += 1
+            f.runtime.fallbackFrontmost = launches == 1 ? f.batch.target.pid : 77
+            f.batch.activity.stopRequested = true
+        }
+    }
+    defer { f.runtime.onEvent = { _ in } }
+    #expect(throws: ActionExecutionError.helperFailed) { try f.begin() }
+    #expect(f.runtime.fallbackFrontmost == 77)
+    #expect(launches == (timing == "beforeArm" ? 0 : 2))
+    #expect(f.runtime.raiseCount == 0)
+    #expect(f.batch.activity.disarmCount == (timing == "beforeArm" ? 0 : 1))
+}
+
+@Test func terminalStopAtFragmentAdmissionRestoresQuietPreviousApp() {
+    let f = FragmentCoordinatorFixture(wallClockLimitMS: 1_000)
+    f.activity.stopAtFragmentBegin = true
+    #expect(throws: ActionExecutionError.helperFailed) { try f.begin() }
+    #expect(f.activation.restored == [77])
+    #expect(f.activity.disarmCount == 1)
+}
+
+@Test(arguments: ["unchanged", "key", "pointerMotion", "app", "notRestored", "extended", "afterOnce"]) func continuingFocusLoanChecksTheGap(_ change: String) throws {
+    var keyCount: UInt32 = 17
+    var motionCount: UInt32 = 41
+    let f = TakeoverFixture(inputCounts: {
+        ForegroundTakeoverCoordinator.physicalInputCounts { type in
+            switch type {
+            case .keyDown: keyCount
+            case .mouseMoved: motionCount
+            default: 0
+            }
+        }
+    })
+    let deadline = ProcessInfo.processInfo.systemUptime + 60
+    let first = try f.coordinator.begin(target: f.target, snapshotID: f.guardValue.snapshotID,
+        planRef: f.plan.planRef, stageDigest: f.plan.stageDigest, continuedLoan: false,
+        loanDeadline: change == "afterOnce" ? nil : deadline)
     _ = try f.coordinator.consume(first.ref, actions: f.actions)
+    let execution = try f.coordinator.executionAuthority(for: first.ref, snapshotID: f.guardValue.snapshotID,
+        planRef: f.plan.planRef, consumedGuard: f.guardValue)
+    #expect(execution.loanDeadline == (change == "afterOnce" ? nil : deadline))
     _ = try f.coordinator.end(first.ref, allowRestore: change != "notRestored")
-    if change == "key" { counter += 1 }
+    if change == "key" { keyCount += 1 }
+    if change == "pointerMotion" { motionCount += 1 }
     if change == "app" { f.activation.currentFrontmostPID = 99 }
     let next = f.authorizeAnotherPlan()
     func continued() throws -> TakeoverToken {
         try f.coordinator.begin(target: f.target, snapshotID: f.guardValue.snapshotID,
-            planRef: next.planRef, stageDigest: next.stageDigest, continuedLoan: true)
+            planRef: next.planRef, stageDigest: next.stageDigest, continuedLoan: true,
+            loanDeadline: change == "extended" ? deadline + 1 : deadline)
     }
     if change == "unchanged" {
         let token = try continued()
@@ -2793,6 +2916,35 @@ private struct InputDispatcherTextSafetyForTakeover: BackgroundTextInputSafetyDe
 }
 
 
+// Exercise the coordinator/protocol/LaunchServices wiring, not just a stand-alone retry loop.
+// All time, focus, input, AX, process and cursor effects in this fixture are simulated.
+private struct SettlingTakeoverFixture {
+    let batch: TakeoverFixture
+    let runtime: PhasedActivationRuntime
+    let coordinator: ForegroundTakeoverCoordinator
+
+    init(exactWindowValues: [Bool] = [true], inputCounts: @escaping () -> [UInt32] = { [0] }) {
+        let batch = TakeoverFixture()
+        self.batch = batch
+        let runtime = PhasedActivationRuntime(identity: .init(bundleURL: nil, localizedName: "Fixture"),
+            expected: batch.target, fallbackFrontmost: 77, exactWindowValues: exactWindowValues)
+        self.runtime = runtime
+        let clock = ActivationTestClock()
+        let controller = LaunchServicesApplicationActivationController(runtime: runtime,
+            launcher: TimedProcessLauncher(now: clock.now) { _ in runtime.record("open") },
+            now: clock.now, sleep: { clock.sleep($0); runtime.record("sleep") }, diagnostic: { _ in },
+            timeout: 0.5, retryInterval: 0.05, activationSettleInterval: 0.15)
+        coordinator = ForegroundTakeoverCoordinator(activity: batch.activity, activation: controller,
+            cursor: batch.cursor, frontmostPID: { runtime.fallbackFrontmost }, applicationExists: { $0 == 77 },
+            inputCounts: inputCounts, revalidate: { $0 }, takePlan: batch.vault.take, classifyPopupPointer: { _ in nil })
+    }
+
+    func begin() throws -> TakeoverToken {
+        try coordinator.begin(target: batch.target, snapshotID: batch.guardValue.snapshotID,
+            planRef: batch.plan.planRef, stageDigest: batch.plan.stageDigest)
+    }
+}
+
 private final class TakeoverFixture {
     enum Failure: CaseIterable { case target, activation, sidecar, activity }
 
@@ -3260,6 +3412,9 @@ private final class TakeoverActivity: UserActivityMonitoring {
     let failArm: Bool
     var failBeginFragment = false
     var offerPauseDuringArm = false
+    var offerPauseDuringFragmentBegin = false
+    var stopRequested = false
+    var stopAtFragmentBegin = false
     private let lease = UserActivitySessionLease(marker: 123)
     private let heldInputs = HeldInputRegistry()
     private let disarmed = DispatchSemaphore(value: 0)
@@ -3269,6 +3424,7 @@ private final class TakeoverActivity: UserActivityMonitoring {
     var heldInputCount: Int { heldInputs.heldCount(scope: scope) }
     init(failArm: Bool) { self.failArm = failArm }
     func arm(marker _: UInt64, notification: UserActivityPauseSignal) throws -> UserActivitySessionLease {
+        if stopRequested { throw ActionExecutionError.helperFailed }
         if failArm { throw UserActivityMonitoringError.eventTapUnavailable }
         self.notification = notification
         if offerPauseDuringArm {
@@ -3278,11 +3434,14 @@ private final class TakeoverActivity: UserActivityMonitoring {
         return lease
     }
     func beginFragment(lease _: UserActivitySessionLease) throws {
+        if stopAtFragmentBegin { throw ActionExecutionError.helperFailed }
         if failBeginFragment { throw UserActivityMonitoringError.paused }
         fragmentsStarted += 1
+        if offerPauseDuringFragmentBegin { offerPause() }
     }
     func endFragment(lease _: UserActivitySessionLease) { fragmentsEnded += 1 }
     func assertNotPaused(lease _: UserActivitySessionLease) throws {
+        if stopRequested { throw ActionExecutionError.helperFailed }
         if isPaused { throw UserActivityMonitoringError.paused }
     }
     func heldInputScope(lease candidate: UserActivitySessionLease) throws -> HeldInputScope {
@@ -3425,6 +3584,20 @@ private final class TakeoverProtocolWindows: WindowObserving {
         lease: fixture.activity.lease, entries: entries)
     #expect(result.error == .actionTimeout)
     #expect(fixture.log.values.isEmpty)
+}
+
+@Test(arguments: [0, 200, 3000]) func foregroundLoanDoesNotRestartDeadlineAtBatchBegin(_ wait: Int) throws {
+    var clock: TimeInterval = wait == 0 ? 120 : 119
+    let fixture = MixedForegroundExecutionFixture(enabled: [], now: { clock }, waitSleeper: { clock += $0 })
+    let actions: [NativeAction] = [.wait(durationMS: wait), .click(elementRef: "press")]
+    let plan = try fixture.dispatcher.plan(actions: actions, context: DispatchContext(guardValue: fixture.guardValue))
+    let entries = try fixture.dispatcher.consumeForegroundPlan(plan, authority: ForegroundPlanConsumptionAuthority(
+        planRef: plan.planRef, snapshotID: fixture.guardValue.snapshotID, interactionMode: .foregroundTakeover,
+        actions: actions, backends: plan.backends, guardValue: fixture.guardValue))
+    let result = fixture.executor.run(expected: fixture.guardValue, application: fixture.application,
+        lease: fixture.activity.lease, entries: entries, loanDeadline: 120)
+    #expect(result.error == (wait == 200 ? nil : .actionTimeout))
+    #expect(fixture.log.values.contains("ax_press:0") == (wait == 200))
 }
 
 @Test func foregroundWaitDoesNotHoldInputEventGate() throws {

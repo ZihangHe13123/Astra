@@ -14,6 +14,7 @@ enum TakeoverError: Error, Equatable {
     case targetNotFrontmost
     case activityUnavailable
     case userActivityPaused
+    case loanExpired
     case sidecarFailed
     case cleanupFailed
 }
@@ -54,6 +55,7 @@ struct ForegroundTakeoverExecutionAuthority {
     let planAuthority: ForegroundTakeoverPlanAuthority
     let lease: UserActivitySessionLease
     let popupPointerPoint: CGPoint?
+    let loanDeadline: TimeInterval?
 }
 
 protocol ForegroundTakeoverCoordinating: AnyObject {
@@ -72,12 +74,17 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
 
     // Sample counts, never key values. Equality can only keep an existing loan valid.
     static func physicalInputCounts() -> [UInt32] {
+        physicalInputCounts { CGEventSource.counterForEventType(.hidSystemState, eventType: $0) }
+    }
+
+    static func physicalInputCounts(counter: (CGEventType) -> UInt32) -> [UInt32] {
         let types: [CGEventType] = [.keyDown, .keyUp, .leftMouseDown, .rightMouseDown, .otherMouseDown,
-                                    .scrollWheel, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
-        return types.map { CGEventSource.counterForEventType(.hidSystemState, eventType: $0) }
+                                    .scrollWheel, .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+        return types.map(counter)
     }
 
     private struct ReleaseCheckpoint {
+        let loanDeadline: TimeInterval
         let targetPID: pid_t
         let window: CGWindowID
         let axIdentity: CFHashCode
@@ -92,6 +99,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         let oldFrontmostPID: pid_t?
         let fragmentAuthority: ForegroundFragmentAuthority?
         let restorePreviousFocus: Bool
+        let loanDeadline: TimeInterval?
         var expiryTimer: DispatchSourceTimer?
         var actConsumed = false
         var releaseCounts: [UInt32] = []
@@ -107,7 +115,8 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
             popupPointerPoint: CGPoint? = nil,
             oldFrontmostPID: pid_t?,
             fragmentAuthority: ForegroundFragmentAuthority? = nil,
-            restorePreviousFocus: Bool = true
+            restorePreviousFocus: Bool = true,
+            loanDeadline: TimeInterval? = nil
         ) {
             self.authority = authority
             self.popupPointerPoint = popupPointerPoint
@@ -115,6 +124,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
             self.oldFrontmostPID = oldFrontmostPID
             self.fragmentAuthority = fragmentAuthority
             self.restorePreviousFocus = restorePreviousFocus
+            self.loanDeadline = loanDeadline
         }
     }
 
@@ -167,13 +177,13 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
     }
 
     func begin(target: WindowTarget, snapshotID: String, planRef: String, stageDigest: String,
-               continuedLoan: Bool) throws -> TakeoverToken {
+               continuedLoan: Bool, loanDeadline: TimeInterval? = nil) throws -> TakeoverToken {
         try begin(
             target: target,
             snapshotID: snapshotID,
             planRef: planRef,
             stageDigest: stageDigest,
-            declaration: nil, continuedLoan: continuedLoan
+            declaration: nil, continuedLoan: continuedLoan, loanDeadline: loanDeadline
         )
     }
 
@@ -198,7 +208,8 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         planRef: String,
         stageDigest: String?,
         declaration: ForegroundFragmentDeclaration?,
-        continuedLoan: Bool = false
+        continuedLoan: Bool = false,
+        loanDeadline: TimeInterval? = nil
     ) throws -> TakeoverToken {
         lock.lock()
         guard records.isEmpty, !beginReserved else {
@@ -220,6 +231,13 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         }
 
         guard let authority = takePlan(planRef) else { throw TakeoverError.stalePlan }
+        if let deadline = loanDeadline {
+            let now = ProcessInfo.processInfo.systemUptime
+            guard deadline > now, deadline <= now + 120 else { throw TakeoverError.loanExpired }
+        }
+        if continuedLoan, loanDeadline == nil || prior?.loanDeadline != loanDeadline {
+            throw TakeoverError.userActivityPaused
+        }
         let fragmentAuthority: ForegroundFragmentAuthority?
         if let declaration {
             do {
@@ -274,7 +292,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
                 self?.pause(reference)
             })
             lease = try activity.arm(marker: AstraEventMarker.random(), notification: notification)
-        } catch {
+        } catch is UserActivityMonitoringError {
             throw TakeoverError.activityUnavailable
         }
 
@@ -302,26 +320,32 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
                       frontmostPID() == prior.previousPID, inputCounts() == prior.counts
                 else { throw TakeoverError.userActivityPaused }
             }
-            if declaration == nil {
+            let focus = FocusTransitionGuard(from: oldPID, to: current.pid, frontmostPID: frontmostPID) { [activity] in
                 do { try activity.assertNotPaused(lease: lease) }
-                catch { throw TakeoverError.userActivityPaused }
+                catch is UserActivityMonitoringError { throw TakeoverError.userActivityPaused }
+                if let deadline = loanDeadline, ProcessInfo.processInfo.systemUptime >= deadline { throw TakeoverError.loanExpired }
             }
             activationAttempted = true
             if let popupPoint = popupPointerPoint {
+                _ = try focus.check()
                 try activation.activatePopupPointerOnly(foregroundTarget, at: popupPoint)
             } else {
-                try activation.activate(foregroundTarget)
+                try activation.activate(foregroundTarget, checkedFrontmostPID: focus.check)
             }
+            guard try focus.check() == current.pid else { throw TakeoverError.targetNotFrontmost }
             try cursor.show(at: cursorPoint)
+            _ = try focus.check()
             activeTarget = foregroundTarget
         } catch {
+            // A yield is terminal, even if the target happens to return to the front during cleanup.
+            let yielded = error as? TakeoverError == .userActivityPaused
             let cleanupRecord = Record(
                 authority: authority,
                 lease: lease,
                 popupPointerPoint: popupPointerPoint,
                 oldFrontmostPID: oldPID,
                 fragmentAuthority: fragmentAuthority,
-                restorePreviousFocus: declaration?.restorePreviousFocus ?? true
+                restorePreviousFocus: !yielded && (declaration?.restorePreviousFocus ?? true)
             )
             let cleanupOutcome = cleanup(cleanupRecord, allowRestore: activationAttempted)
             if cleanupOutcome.cleanupFailed {
@@ -336,6 +360,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
                 throw TakeoverError.targetNotFrontmost
             }
             if let typed = error as? TakeoverError { throw typed }
+            if case ActionExecutionError.helperFailed = error { throw error }
             throw TakeoverError.targetChanged
         }
 
@@ -356,23 +381,26 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         if fragmentAuthority != nil {
             do { try activity.beginFragment(lease: lease) }
             catch {
+                // A terminal helper stop does not imply that a person interrupted this loan.
+                let monitorUnavailable = error is UserActivityMonitoringError
                 let cleanupRecord = Record(
                     authority: activeAuthority,
                     lease: lease,
                     popupPointerPoint: popupPointerPoint,
                     oldFrontmostPID: oldPID,
                     fragmentAuthority: fragmentAuthority,
-                    restorePreviousFocus: declaration?.restorePreviousFocus ?? true
+                    restorePreviousFocus: !monitorUnavailable && (declaration?.restorePreviousFocus ?? true)
                 )
                 fragmentAuthority?.consume()
-                let outcome = cleanup(cleanupRecord, allowRestore: false)
+                let outcome = cleanup(cleanupRecord, allowRestore: true)
                 if outcome.cleanupFailed {
                     lock.lock()
                     records[reference] = cleanupRecord
                     lock.unlock()
                     throw TakeoverError.cleanupFailed
                 }
-                throw TakeoverError.activityUnavailable
+                if monitorUnavailable { throw TakeoverError.activityUnavailable }
+                throw error
             }
         }
         let record = Record(
@@ -381,7 +409,8 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
             popupPointerPoint: popupPointerPoint,
             oldFrontmostPID: oldPID,
             fragmentAuthority: fragmentAuthority,
-            restorePreviousFocus: declaration?.restorePreviousFocus ?? true
+            restorePreviousFocus: declaration?.restorePreviousFocus ?? true,
+            loanDeadline: loanDeadline
         )
         lock.lock()
         records[reference] = record
@@ -711,7 +740,8 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         return ForegroundTakeoverExecutionAuthority(
             planAuthority: planAuthority,
             lease: lease,
-            popupPointerPoint: popupPointerPoint
+            popupPointerPoint: popupPointerPoint,
+            loanDeadline: record.loanDeadline
         )
     }
 
@@ -729,11 +759,11 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
             record.terminalClaimed = false
         } else if records[takeoverRef] === record {
             records.removeValue(forKey: takeoverRef)
-            if record.actConsumed, record.fragmentAuthority == nil, outcome.restoration == .restored,
+            if record.actConsumed, let deadline = record.loanDeadline, outcome.restoration == .restored,
                let previousPID = record.oldFrontmostPID, let identity = record.authority.target.axIdentity,
                !record.releaseCounts.isEmpty {
                 let target = record.authority.target
-                lastRelease = ReleaseCheckpoint(targetPID: target.pid, window: target.windowID,
+                lastRelease = ReleaseCheckpoint(loanDeadline: deadline, targetPID: target.pid, window: target.windowID,
                     axIdentity: identity, previousPID: previousPID, counts: record.releaseCounts)
             }
         }
@@ -813,31 +843,9 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         // Take the baseline while the tap still owns this batch; do not miss typing during disarm.
         record.releaseCounts = inputCounts()
         let interrupted = (try? activity.disarm(lease: record.lease)) ?? true
-
-        let restoration: TakeoverRestoration
-        if !allowRestore || !record.restorePreviousFocus || interrupted || record.releaseCounts != inputCounts() {
-            restoration = .preservedUserFocus
-        } else if frontmostPID() != record.authority.target.pid {
-            restoration = .preservedUserFocus
-        } else if let oldPID = record.oldFrontmostPID {
-            if oldPID == record.authority.target.pid {
-                restoration = .restored
-            } else if applicationExists(oldPID) {
-                do {
-                    try activation.restore(pid: oldPID)
-                    restoration = .restored
-                } catch {
-                    restoration = .restoreFailed
-                }
-            } else {
-                restoration = .preservedUserFocus
-            }
-        } else {
-            restoration = .preservedUserFocus
-        }
         let outcome = TakeoverOutcome(
             started: true,
-            restoration: restoration,
+            restoration: restoreFocus(record, allowed: allowRestore && !interrupted),
             cleanupFailed: cleanupFailed
         )
         lock.lock()
@@ -845,6 +853,29 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         record.cleanupOutcome = outcome
         lock.unlock()
         return outcome
+    }
+
+    private func restoreFocus(_ record: Record, allowed: Bool) -> TakeoverRestoration {
+        guard allowed, record.restorePreviousFocus, let oldPID = record.oldFrontmostPID else { return .preservedUserFocus }
+        let targetPID = record.authority.target.pid
+        // The tap was drained and removed. Keep its pre-disarm HID baseline for *every* retry
+        // and for the final check, not just the decision to enter the LaunchServices controller.
+        let focus = FocusTransitionGuard(from: targetPID, to: oldPID, frontmostPID: frontmostPID) { [inputCounts, counts = record.releaseCounts] in
+            guard inputCounts() == counts else { throw TakeoverError.userActivityPaused }
+        }
+        do {
+            guard try focus.check() == targetPID else { return .preservedUserFocus }
+            if oldPID != targetPID {
+                guard applicationExists(oldPID) else { return .preservedUserFocus }
+                try activation.restore(pid: oldPID, checkedFrontmostPID: focus.check)
+            }
+            return try focus.check() == oldPID ? .restored : .restoreFailed
+        } catch TakeoverError.userActivityPaused {
+            return .preservedUserFocus
+        } catch {
+            // Even a failed external call may have blocked while the user resumed work.
+            return (try? focus.check()) == nil ? .preservedUserFocus : .restoreFailed
+        }
     }
 
 }
@@ -884,9 +915,12 @@ final class ForegroundPlanExecutor {
         application: PIDTargetApplication,
         lease: UserActivitySessionLease,
         entries: [PlannedDispatchEntry],
+        loanDeadline: TimeInterval? = nil,
         managesActivityFragment: Bool = true
     ) -> PIDTargetedActionResult {
-        let deadline = now() + maximumForegroundExecutionSeconds
+        // A fresh batch, preflight or wait never restarts the loan. The input backends use <= for their deadlines.
+        let deadline = min(now() + maximumForegroundExecutionSeconds, loanDeadline?.nextDown ?? .infinity)
+        guard now() <= deadline else { return stopped(error: .actionTimeout) }
         let plannedMilliseconds = entries.reduce(0) { sum, entry in
             sum + (entry.source.kind == .wait ? (entry.source.durationMS ?? 0)
                 : entry.source.kind == .drag ? (entry.source.durationMS ?? 300) : 0)
@@ -1201,12 +1235,14 @@ final class ForegroundPlanExecutor {
                             guard self.now() <= deadline else { throw ActionExecutionError.actionTimeout }
                         },
                         mutation: {
+                            func validateMutation() throws {
+                                try self.activity.assertNotPaused(lease: lease)
+                                guard self.now() <= deadline else { throw ActionExecutionError.actionTimeout }
+                            }
                             if action.source.replace == true {
-                                performance = try self.performer.performReplacement(action, validateMutation: {
-                                    try self.activity.assertNotPaused(lease: lease)
-                                })
+                                performance = try self.performer.performReplacement(action, validateMutation: validateMutation)
                             } else {
-                                performance = try self.performer.perform(action)
+                                performance = try self.performer.perform(action, validateMutation: validateMutation)
                             }
                         }
                     )

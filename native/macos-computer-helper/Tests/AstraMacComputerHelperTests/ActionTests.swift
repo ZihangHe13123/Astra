@@ -68,6 +68,24 @@ import Testing
     #expect(writer.writes.isEmpty)
 }
 
+@Test func foregroundAXLoanIsCheckedAfterBlockingStateReadBeforeNativeWrite() throws {
+    let element = AXUIElementCreateApplication(11)
+    for method in [ResolvedActionMethod.accessibilityPress, .accessibilityIncrement, .accessibilityDecrement] {
+        var expired = false
+        var writes = 0
+        let performer = SystemActionPerformer(state: {
+            expired = true
+            return ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100), axIdentity: 33)
+        }, lookup: { _, _ in nil }, performAXAction: { _, _ in writes += 1; return .success })
+        let action = ResolvedAction(source: .click(elementRef: "item"), method: method,
+                                    screenPoint: nil, endScreenPoint: nil, element: element)
+        #expect(throws: ActionExecutionError.actionTimeout) {
+            try performer.perform(action, validateMutation: { if expired { throw ActionExecutionError.actionTimeout } })
+        }
+        #expect(writes == 0)
+    }
+}
+
 // Live Finder (2026-09-23): AXPress on a search-suggestion menu item returned
 // kAXErrorAttributeUnsupported. The app refused the press before acting, so nothing happened;
 // reporting unknown_outcome forced a needless handoff. Timeouts and generic failures stay unknown.

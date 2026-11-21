@@ -35,6 +35,10 @@ final class CGPIDTargetedInputPoster: PIDTargetedInputPosting {
     }
 
     func post(_ event: SyntheticInputEvent, to targetPID: pid_t, marker: UInt64) throws {
+        deliver(try encode(event, to: targetPID, marker: marker), targetPID)
+    }
+
+    func encode(_ event: SyntheticInputEvent, to targetPID: pid_t, marker: UInt64) throws -> CGEvent {
         guard targetPID > 0, marker != 0, let source else {
             throw SyntheticInputFailure(error: .helperFailed, inputStarted: false)
         }
@@ -117,7 +121,7 @@ final class CGPIDTargetedInputPoster: PIDTargetedInputPosting {
         }
         pointerLock.unlock()
         value.setIntegerValueField(.eventSourceUserData, value: Int64(bitPattern: marker))
-        deliver(value, targetPID)
+        return value
     }
 }
 
@@ -561,12 +565,12 @@ final class PIDTargetedActionExecutor {
                 cleanupFailed: failure.cleanupFailed
             )
         } catch let failure as SyntheticInputFailure {
-            let reported = failure.inputStarted ? ActionExecutionError.unknownOutcome : failure.error
+            let reported: ActionExecutionError? = failure.inputStarted ? .unknownOutcome : (failure.userActivityPaused ? nil : failure.error)
             return PIDTargetedActionResult(
                 outcomes: [ActionOutcome(index: sourceIndex, ok: false, error: reported)],
                 lastAcknowledgedAction: -1,
                 error: reported,
-                cooperativeError: nil
+                cooperativeError: failure.userActivityPaused ? .userActivityPaused : nil
             )
         } catch let error as ActionExecutionError {
             return PIDTargetedActionResult(
@@ -884,15 +888,15 @@ final class PIDTargetedActionExecutor {
                 cleanupFailed: cleanupHeld(token: token, scope: scope, lease: lease, inputStarted: inputStarted)
             )
         } catch let failure as SyntheticInputFailure {
+            let started = inputStarted || failure.inputStarted
+            let cleanupFailed = cleanupHeld(token: token, scope: scope, lease: lease, inputStarted: started)
+            if failure.userActivityPaused {
+                throw PIDUserActivityPauseFailure(inputStarted: started, cleanupFailed: cleanupFailed)
+            }
             throw PIDActionPerformFailure(
                 error: failure.error,
-                inputStarted: inputStarted || failure.inputStarted,
-                cleanupFailed: cleanupHeld(
-                    token: token,
-                    scope: scope,
-                    lease: lease,
-                    inputStarted: inputStarted || failure.inputStarted
-                )
+                inputStarted: started,
+                cleanupFailed: cleanupFailed
             )
         } catch let error as ActionExecutionError {
             throw PIDActionPerformFailure(

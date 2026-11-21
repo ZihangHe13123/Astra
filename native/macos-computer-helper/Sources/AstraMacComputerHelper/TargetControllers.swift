@@ -31,13 +31,52 @@ protocol ApplicationActivationControlling {
     func activate(_ target: WindowTarget) throws
     func activatePopupPointerOnly(_ target: WindowTarget, at point: CGPoint) throws
     func restore(pid: pid_t) throws
+    func activate(_ target: WindowTarget, checkedFrontmostPID: () throws -> pid_t) throws
+    func restore(pid: pid_t, checkedFrontmostPID: () throws -> pid_t) throws
 }
 
 extension ApplicationActivationControlling {
+    // Single-effect injected controllers. A retrying controller must carry the check into its loop.
+    func activate(_ target: WindowTarget, checkedFrontmostPID: () throws -> pid_t) throws {
+        _ = try checkedFrontmostPID()
+        try activate(target)
+    }
+
+    func restore(pid: pid_t, checkedFrontmostPID: () throws -> pid_t) throws {
+        _ = try checkedFrontmostPID()
+        try restore(pid: pid)
+    }
+
     // Existing injected activators keep the strict path unless they explicitly
     // implement the narrower popup pointer authority.
     func activatePopupPointerOnly(_ target: WindowTarget, at _: CGPoint) throws {
         try activate(target)
+    }
+}
+
+// Local to one synchronous transition. A swallowed open can retry while the original app remains
+// frontmost; after the destination is observed, losing it is not permission to take it back.
+final class FocusTransitionGuard {
+    private var sourcePID: pid_t?
+    private let destinationPID: pid_t
+    private let frontmostPID: () -> pid_t?
+    private let checkActivity: () throws -> Void
+
+    init(from: pid_t?, to: pid_t, frontmostPID: @escaping () -> pid_t?, checkActivity: @escaping () throws -> Void = {}) {
+        sourcePID = from
+        destinationPID = to
+        self.frontmostPID = frontmostPID
+        self.checkActivity = checkActivity
+    }
+
+    func check() throws -> pid_t {
+        guard let pid = frontmostPID(), pid > 0, pid == destinationPID || pid == sourcePID else {
+            throw TakeoverError.userActivityPaused
+        }
+        // The foreground lookup itself can block on AX. Check input *after* it returns.
+        try checkActivity()
+        if pid == destinationPID { sourcePID = nil }
+        return pid
     }
 }
 
@@ -452,12 +491,24 @@ protocol ApplicationActivationRuntime {
     func unhide(pid: pid_t)
     func setFocusedWindow(_ target: WindowTarget) -> Bool
     func raiseWindow(_ target: WindowTarget) -> Bool
+    func setFocusedWindow(_ target: WindowTarget, validate: () throws -> Void) throws -> Bool
+    func raiseWindow(_ target: WindowTarget, validate: () throws -> Void) throws -> Bool
     func frontmostPID() -> pid_t?
     func focusedWindowMatches(_ target: WindowTarget) -> Bool
     func popupPointerWindowMatches(_ target: WindowTarget, at point: CGPoint) -> Bool
 }
 
 extension ApplicationActivationRuntime {
+    func setFocusedWindow(_ target: WindowTarget, validate: () throws -> Void) throws -> Bool {
+        try validate()
+        return setFocusedWindow(target)
+    }
+
+    func raiseWindow(_ target: WindowTarget, validate: () throws -> Void) throws -> Bool {
+        try validate()
+        return raiseWindow(target)
+    }
+
     func popupPointerWindowMatches(_: WindowTarget, at _: CGPoint) -> Bool { false }
 }
 
@@ -655,7 +706,12 @@ struct SystemApplicationActivationRuntime: ApplicationActivationRuntime {
     }
 
     func setFocusedWindow(_ target: WindowTarget) -> Bool {
+        (try? setFocusedWindow(target, validate: {})) ?? false
+    }
+
+    func setFocusedWindow(_ target: WindowTarget, validate: () throws -> Void) throws -> Bool {
         guard let window = exactWindow(target) else { return false }
+        try validate()
         return AXUIElementSetAttributeValue(
             AXUIElementCreateApplication(target.pid),
             kAXFocusedWindowAttribute as CFString,
@@ -664,6 +720,10 @@ struct SystemApplicationActivationRuntime: ApplicationActivationRuntime {
     }
 
     func raiseWindow(_ target: WindowTarget) -> Bool {
+        (try? raiseWindow(target, validate: {})) ?? false
+    }
+
+    func raiseWindow(_ target: WindowTarget, validate: () throws -> Void) throws -> Bool {
         guard let window = exactWindow(target) else { return false }
         if AXNodeReader.stringAttribute(window, kAXRoleAttribute).value == kAXSheetRole {
             // Activation has already brought the application forward. A sheet
@@ -672,6 +732,7 @@ struct SystemApplicationActivationRuntime: ApplicationActivationRuntime {
                 app: AXUIElementCreateApplication(target.pid), root: window
             )
         }
+        try validate()
         return AXUIElementPerformAction(window, kAXRaiseAction as CFString) == .success
     }
 
@@ -791,62 +852,73 @@ final class LaunchServicesApplicationActivationController: ApplicationActivation
     }
 
     func activate(_ target: WindowTarget) throws {
+        let focus = FocusTransitionGuard(from: runtime.frontmostPID(), to: target.pid, frontmostPID: runtime.frontmostPID)
+        try activate(target, checkedFrontmostPID: focus.check)
+    }
+
+    func activate(_ target: WindowTarget, checkedFrontmostPID: () throws -> pid_t) throws {
         guard target.interactionMode == .foregroundTakeover,
               target.axIdentity != nil,
               let identity = runtime.applicationIdentity(pid: target.pid),
               let arguments = launchArguments(identity)
         else { throw WindowObservationError.targetGone }
+        _ = try checkedFrontmostPID()
         runtime.unhide(pid: target.pid)
         let deadline = now().addingTimeInterval(timeout)
         var lastFrontmost: Bool?
-        // Which application the last check saw in front: "unknown" when it could not tell.
-        var lastFrontmostPID: pid_t??
+        var lastFrontmostPID: pid_t?
         var lastSetFocused: Bool?
         var lastRaised: Bool?
         var lastFocusedMatch: Bool?
         var attempts = 0
         var launches = 0
         var launchFailures = 0
-        func targetIsFrontmost() -> Bool {
-            let pid = runtime.frontmostPID()
-            lastFrontmostPID = .some(pid)
+        func targetIsFrontmost() throws -> Bool {
+            let pid = try checkedFrontmostPID()
+            lastFrontmostPID = pid
             return pid == target.pid
         }
+        func validateAXMutation() throws {
+            guard try targetIsFrontmost() else { throw TakeoverError.userActivityPaused }
+            guard now() < deadline else { throw WindowObservationError.targetNotFrontmost }
+        }
         while now() < deadline {
-            let frontmost = targetIsFrontmost()
+            let frontmost = try targetIsFrontmost()
             lastFrontmost = frontmost
             if !frontmost {
                 launches += 1
                 if launchOnce(arguments: arguments, deadline: deadline) {
-                    guard waitForFrontmost(deadline: deadline, frontmost: targetIsFrontmost) else { continue }
+                    guard try waitForFrontmost(deadline: deadline, frontmost: targetIsFrontmost) else { continue }
                     lastFrontmost = true
                 } else {
                     launchFailures += 1
+                    _ = try checkedFrontmostPID()
                     waitUntilNextLaunch(deadline: deadline)
                     continue
                 }
             }
             while now() < deadline {
-                let currentlyFrontmost = targetIsFrontmost()
+                let currentlyFrontmost = try targetIsFrontmost()
                 lastFrontmost = currentlyFrontmost
                 guard currentlyFrontmost else { break }
                 attempts += 1
-                let selected = runtime.setFocusedWindow(target)
+                let selected = try runtime.setFocusedWindow(target, validate: validateAXMutation)
                 lastSetFocused = selected
                 guard now() < deadline else { break }
-                let raised = runtime.raiseWindow(target)
+                let raised = try runtime.raiseWindow(target, validate: validateAXMutation)
                 lastRaised = raised
                 guard now() < deadline else { break }
                 // Preserve short-circuit verification: a failed set/raise must
                 // not produce extra AX reads merely for diagnostics.
                 var focusedMatch: Bool?
                 if selected && raised {
-                    let stillFrontmost = targetIsFrontmost()
+                    let stillFrontmost = try targetIsFrontmost()
                     lastFrontmost = stillFrontmost
                     if stillFrontmost { focusedMatch = runtime.focusedWindowMatches(target) }
                 }
                 lastFocusedMatch = focusedMatch
                 if focusedMatch == true {
+                    try validateAXMutation()
                     return
                 }
                 let retryDelay = min(retryInterval, deadline.timeIntervalSince(now()))
@@ -856,7 +928,8 @@ final class LaunchServicesApplicationActivationController: ApplicationActivation
         func value(_ flag: Bool?) -> String {
             flag.map { $0 ? "true" : "false" } ?? "not_checked"
         }
-        let seenFrontmost = lastFrontmostPID.map { $0.map(String.init) ?? "unknown" } ?? "not_checked"
+        _ = try checkedFrontmostPID()
+        let seenFrontmost = lastFrontmostPID.map(String.init) ?? "not_checked"
         diagnostic(
             "ACTIVATE-FAIL pid=\(target.pid) windowID=\(target.windowID)"
                 + " attempts=\(attempts) frontmost=\(value(lastFrontmost))"
@@ -883,19 +956,27 @@ final class LaunchServicesApplicationActivationController: ApplicationActivation
     }
 
     func restore(pid: pid_t) throws {
+        let focus = FocusTransitionGuard(from: runtime.frontmostPID(), to: pid, frontmostPID: runtime.frontmostPID)
+        try restore(pid: pid, checkedFrontmostPID: focus.check)
+    }
+
+    func restore(pid: pid_t, checkedFrontmostPID: () throws -> pid_t) throws {
         guard let identity = runtime.applicationIdentity(pid: pid),
               let arguments = launchArguments(identity)
         else { throw WindowObservationError.targetGone }
+        if try checkedFrontmostPID() == pid { return }
         runtime.unhide(pid: pid)
         let deadline = now().addingTimeInterval(timeout)
         while now() < deadline {
-            if runtime.frontmostPID() == pid { return }
+            if try checkedFrontmostPID() == pid { return }
             if launchOnce(arguments: arguments, deadline: deadline) {
-                if waitForFrontmost(deadline: deadline, frontmost: { runtime.frontmostPID() == pid }) { return }
+                if try waitForFrontmost(deadline: deadline, frontmost: { try checkedFrontmostPID() == pid }) { return }
             } else {
+                _ = try checkedFrontmostPID()
                 waitUntilNextLaunch(deadline: deadline)
             }
         }
+        _ = try checkedFrontmostPID()
         throw WindowObservationError.targetNotFrontmost
     }
 
@@ -911,13 +992,13 @@ final class LaunchServicesApplicationActivationController: ApplicationActivation
         return true
     }
 
-    private func waitForFrontmost(deadline: Date, frontmost: () -> Bool) -> Bool {
+    private func waitForFrontmost(deadline: Date, frontmost: () throws -> Bool) rethrows -> Bool {
         let settleDeadline = min(
             deadline,
             now().addingTimeInterval(activationSettleInterval)
         )
         while now() < settleDeadline {
-            if frontmost() { return true }
+            if try frontmost() { return true }
             let delay = min(retryInterval, settleDeadline.timeIntervalSince(now()))
             if delay > 0 { sleep(delay) }
         }

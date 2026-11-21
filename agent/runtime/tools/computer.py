@@ -80,6 +80,7 @@ from ..macos_computer_compatibility import (
 )
 from ..tool_failure import ToolFailure
 from .approval import ScopedApprovalStore
+from .grants import current_grant_space
 from .registry import ToolDef, ToolPrivateResult, ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -454,6 +455,7 @@ EMPTY_SCHEMA = _object_schema({})
 @dataclass(frozen=True)
 class _ForegroundLoan:
     scope: str
+    grant_space: str
     window: tuple[str, ...]
     expires_at: float
 
@@ -1060,9 +1062,12 @@ class LocalComputerRuntime:
             interaction_mode=interaction_mode,
         )
 
-    async def begin_takeover(self, snapshot_id: str, plan_ref: str, *, loan_valid: Callable[[], bool] | None = None):
+    async def begin_takeover(self, snapshot_id: str, plan_ref: str, *,
+                             loan_deadline: Callable[[], int | None] | None = None, continued_loan: bool = False):
         self._helper_started = True
-        return await (await self._ensure_manager()).begin_takeover(snapshot_id, plan_ref, loan_valid=loan_valid)
+        return await (await self._ensure_manager()).begin_takeover(
+            snapshot_id, plan_ref, loan_deadline=loan_deadline, continued_loan=continued_loan,
+        )
 
     async def act(
         self,
@@ -2111,7 +2116,8 @@ def register_computer_tools(
 
     def current_loan() -> _ForegroundLoan | None:
         if foreground_loan is not None and (
-            foreground_loan.window != loan_window() or monotonic() >= foreground_loan.expires_at
+            foreground_loan.grant_space != current_grant_space()
+            or foreground_loan.window != loan_window() or monotonic() >= foreground_loan.expires_at
             or foreground_loan.scope not in approvals.approved_scopes
         ):
             revoke_loan()
@@ -3399,10 +3405,19 @@ def register_computer_tools(
                         "This foreground action is not enabled for the exact application version.",
                         retryable=False,
                     )
-                if prepared.reused_loan is not None:
-                    takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref, loan_valid=lambda: (
-                        prepared_acts.get(_permission_call_id) is prepared and current_loan() is prepared.reused_loan
-                    ))
+                loan = prepared.reused_loan or prepared.new_loan
+                if loan is not None:
+                    def loan_deadline() -> int | None:
+                        if (prepared_acts.get(_permission_call_id) is not prepared
+                                or loan.grant_space != current_grant_space() or loan.window != loan_window()
+                                or loan.scope not in approvals.approved_scopes or monotonic() >= loan.expires_at
+                                or (prepared.reused_loan is not None and current_loan() is not loan)):
+                            return None
+                        # Local macOS helper shares the host monotonic uptime epoch. Never renew on transit.
+                        return int(loan.expires_at * 1000)
+
+                    takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref,
+                        loan_deadline=loan_deadline, continued_loan=prepared.reused_loan is not None)
                 else:
                     takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref)
                 _runtime_takeover_event("foreground_takeover_begin", decision)
@@ -4214,7 +4229,7 @@ def register_computer_tools(
             prepared.raw_actions,
             interaction_plan=plan,
         )
-        can_continue = "focus_loan_v1" in observation_capabilities(raw_tree) and bool(loan_window())
+        can_continue = "focus_loan_v2" in observation_capabilities(raw_tree) and bool(loan_window())
         if not can_continue and decision.risk is ComputerRisk.ORDINARY:
             decision = replace(decision, choices=("once", "deny"), boundary=(
                 "Only this batch. Return to the previous application unless you have changed focus."
@@ -4282,7 +4297,9 @@ def register_computer_tools(
             prepared.approved = True
             authorized_acts.add(call_id)
             if decision == "session" and "session" in request["choices"] and loan_window():
-                prepared.new_loan = _ForegroundLoan(prepared.decision.scope, loan_window(), monotonic() + 120)
+                prepared.new_loan = _ForegroundLoan(
+                    prepared.decision.scope, current_grant_space(), loan_window(), monotonic() + 120,
+                )
         return cleanup
 
     completed_observations: set[str] = set()

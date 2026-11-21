@@ -314,7 +314,7 @@ class FakeComputerBackend:
             "ax_tree": self.snapshot_ax_tree_override or {
                 "role": self.snapshot_root_role,
                 "label": self.snapshot_root_label,
-                **({"observation_capabilities": ["focus_loan_v1"]} if self.focus_loan else {}),
+                **({"observation_capabilities": ["focus_loan_v2"]} if self.focus_loan else {}),
                 "children": [
                     {
                         "role": self.focused_role,
@@ -371,8 +371,8 @@ class FakeComputerBackend:
             ),
         )
 
-    async def begin_takeover(self, snapshot_id, plan_ref, *, continued_loan=False):
-        assert not continued_loan or self.focus_loan
+    async def begin_takeover(self, snapshot_id, plan_ref, *, continued_loan=False, loan_deadline_uptime_ms=None):
+        assert not continued_loan or (self.focus_loan and loan_deadline_uptime_ms is not None)
         self.calls.append(("takeover_begin", (snapshot_id, plan_ref)))
         return "takeover-1"
 
@@ -7675,6 +7675,32 @@ def _borrow_focus(registry, snapshot, **options):
     }))
 
 
+@pytest.mark.parametrize(("owner", "other"), [("main", "channel:wechat-a"), ("channel:wechat-a", "channel:wechat-b")])
+def test_focus_loan_only_covers_approving_conversation(registry, manager, loan_backend, owner, other):
+    from agent.runtime.tools.grants import current_grant_space, grant_space
+
+    prompts = []
+
+    async def decide(_request):
+        prompts.append(current_grant_space())
+        return "session" if current_grant_space() == owner else "deny"
+
+    register(registry, manager)
+    loan_backend.plan_pid_action_classes = ()
+    registry.set_approval_handler(decide)
+    with grant_space(owner):
+        focus(registry)
+        snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+        for _ in range(2):
+            result = _borrow_focus(registry, snapshot)
+            assert not result["error"]
+            snapshot = json.loads(result["fresh_output"])
+    with grant_space(other):
+        assert _borrow_focus(registry, snapshot).get("code") == "approval_denied"
+    assert prompts == [owner, other]
+    assert sum(n == "takeover_begin" for n, _ in loan_backend.calls) == 2
+
+
 @pytest.mark.parametrize("initial_yolo", [False, True])
 def test_focus_loan_auto_fallback_waits_for_a_person(registry, manager, backend, initial_yolo):
     backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["auto_takeover_v1"],
@@ -7802,7 +7828,7 @@ def test_focus_loan_cross_batch_activity_requires_native_continuity(registry, ma
     backend_begin = backend.begin_takeover
     used_continuity_guard = []
 
-    async def begin(snapshot_id, plan_ref, *, continued_loan=False):
+    async def begin(snapshot_id, plan_ref, *, continued_loan=False, loan_deadline_uptime_ms=None):
         used_continuity_guard.append(continued_loan)
         if continued_loan:
             raise HelperApplicationError(ComputerError(ComputerErrorCode.USER_ACTIVITY_PAUSED, "changed"))
@@ -7847,6 +7873,32 @@ def test_focus_loan_expiring_while_begin_waits_never_reaches_helper(registry, ma
     monkeypatch.setattr(manager, "begin_takeover", delayed_begin)
     assert _borrow_focus(registry, json.loads(first["fresh_output"])).get("code") == "approval_required"
     assert sum(n == "takeover_begin" for n, _ in loan_backend.calls) == 1
+
+
+def test_focus_loan_original_deadline_reaches_native_on_every_batch(registry, manager, loan_backend, monkeypatch):
+    clock = [300.0]
+    monkeypatch.setattr("agent.runtime.tools.computer.monotonic", lambda: clock[0])
+    begins = []
+
+    class BeginTransport:
+        async def request(self, req):
+            assert req.operation == "takeover_begin"
+            begins.append(req.payload)
+            return ComputerResponse(req.request_id, True, result={"takeover_ref": "takeover-1"})
+
+    monkeypatch.setattr(loan_backend, "begin_takeover", MacComputerBackend(BeginTransport()).begin_takeover)
+    register(registry, manager)
+    focus(registry)
+    loan_backend.plan_pid_action_classes = ()
+    registry.set_approval_handler(lambda _: asyncio.sleep(0, result="session"))
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    first = _borrow_focus(registry, snapshot)
+    assert not first["error"]
+    clock[0] += 119
+    assert not _borrow_focus(registry, json.loads(first["fresh_output"]))["error"]
+    assert [(p.get("loan_deadline_uptime_ms"), p.get("continued_loan")) for p in begins] == [
+        (420_000, None), (420_000, True),
+    ]
 
 
 @pytest.mark.usefixtures("loan_backend")

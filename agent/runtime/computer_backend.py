@@ -1265,7 +1265,8 @@ class ComputerSessionManager:
         plan_ref: str,
         *,
         declaration: ForegroundFragmentDeclaration | None = None,
-        loan_valid: Callable[[], bool] | None = None,
+        loan_deadline: Callable[[], int | None] | None = None,
+        continued_loan: bool = False,
     ) -> str:
         async with self._lock:
             self._require_open()
@@ -1291,13 +1292,15 @@ class ComputerSessionManager:
             self._pending_plan = None
             self._takeover_ref = None
             self._takeover_cleanup_ref = None
-            if loan_valid is not None and declaration is not None:
+            if (loan_deadline is not None and declaration is not None) or (continued_loan and loan_deadline is None):
                 raise ComputerSessionError("takeover_not_allowed")
-            if loan_valid is not None:
+            if loan_deadline is not None:
                 # Authorization may have expired or been revoked while waiting for the lock.
-                if not loan_valid():
+                deadline_ms = loan_deadline()
+                if deadline_ms is None:
                     raise ComputerSessionError("approval_required", "The foreground loan is no longer current.")
-                begin_task = asyncio.create_task(begin(snapshot_id, plan_ref, continued_loan=True))
+                begin_task = asyncio.create_task(begin(snapshot_id, plan_ref, continued_loan=continued_loan,
+                                                       loan_deadline_uptime_ms=deadline_ms))
             elif declaration is None:
                 begin_task = asyncio.create_task(begin(snapshot_id, plan_ref))
             else:

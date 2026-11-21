@@ -432,15 +432,15 @@ import Testing
             localizedName: "TextEdit"
         ),
         expected: target,
-        frontmostValues: [999, 999, target.pid],
-        fallbackFrontmost: target.pid
+        fallbackFrontmost: 999
     )
     let launcher = TimedProcessLauncher(now: clock.now)
     let controller = LaunchServicesApplicationActivationController(
         runtime: runtime,
         launcher: launcher,
         now: clock.now,
-        sleep: clock.sleep,
+        // Model the delayed transition in time, not by counting frontmost safety checks.
+        sleep: { clock.sleep($0); runtime.fallbackFrontmost = target.pid },
         timeout: 1,
         retryInterval: 0.05
     )
@@ -511,7 +511,7 @@ import Testing
     #expect(runtime.raiseCount == 2)
 }
 
-@Test func losingFrontmostDuringExactWindowSettlementReturnsToLaunchServices() throws {
+@Test func losingFrontmostDuringExactWindowSettlementDoesNotReclaimFocus() throws {
     let target = activationTarget()
     let clock = ActivationTestClock()
     let runtime = PhasedActivationRuntime(
@@ -520,8 +520,7 @@ import Testing
             localizedName: "TextEdit"
         ),
         expected: target,
-        frontmostValues: [target.pid, target.pid, 999, 999],
-        fallbackFrontmost: 999,
+        fallbackFrontmost: target.pid,
         exactWindowValues: [false, true]
     )
     let launcher = TimedProcessLauncher(now: clock.now) { _ in
@@ -531,14 +530,16 @@ import Testing
         runtime: runtime,
         launcher: launcher,
         now: clock.now,
-        sleep: clock.sleep,
+        sleep: { clock.sleep($0); runtime.fallbackFrontmost = 999 },
         timeout: 1,
         retryInterval: 0.05
     )
 
-    try controller.activate(target)
-
-    #expect(launcher.invocationTimes.count == 1)
+    #expect(throws: TakeoverError.userActivityPaused) { try controller.activate(target) }
+    #expect(launcher.invocationTimes.isEmpty)
+    #expect(runtime.fallbackFrontmost == 999)
+    #expect(runtime.setFocusedCount == 1)
+    #expect(runtime.raiseCount == 1)
 }
 
 @Test func restoreRetriesOnlyAfterTheSettleWindow() throws {
@@ -744,14 +745,14 @@ private final class CompletedApplicationProcess: ApplicationManagedProcess {
     func forceTerminate() { events.append("forceTerminate") }
 }
 
-private final class ActivationTestClock {
+final class ActivationTestClock {
     private(set) var value = Date(timeIntervalSince1970: 0)
 
     func now() -> Date { value }
     func sleep(_ interval: TimeInterval) { value = value.addingTimeInterval(interval) }
 }
 
-private final class TimedProcessLauncher: ApplicationProcessLaunching {
+final class TimedProcessLauncher: ApplicationProcessLaunching {
     private let now: () -> Date
     private let afterLaunch: (Int) -> Void
     private(set) var invocationTimes: [Date] = []
@@ -772,49 +773,53 @@ private final class TimedProcessLauncher: ApplicationProcessLaunching {
     }
 }
 
-private final class PhasedActivationRuntime: ApplicationActivationRuntime {
+final class PhasedActivationRuntime: ApplicationActivationRuntime {
     private let identityValue: ApplicationLaunchIdentity?
     private let expected: WindowTarget
-    private var frontmostValues: [pid_t?]
     private var exactWindowValues: [Bool]
     var fallbackFrontmost: pid_t?
     private(set) var events: [String] = []
     private(set) var setFocusedCount = 0
     private(set) var raiseCount = 0
+    var onEvent: (String) -> Void = { _ in }
 
     init(
         identity: ApplicationLaunchIdentity?,
         expected: WindowTarget,
-        frontmostValues: [pid_t?] = [],
         fallbackFrontmost: pid_t?,
         exactWindowValues: [Bool] = [true]
     ) {
         identityValue = identity
         self.expected = expected
-        self.frontmostValues = frontmostValues
         self.fallbackFrontmost = fallbackFrontmost
         self.exactWindowValues = exactWindowValues
     }
 
-    func applicationIdentity(pid _: pid_t) -> ApplicationLaunchIdentity? { identityValue }
-    func unhide(pid _: pid_t) { events.append("unhide") }
+    func record(_ event: String) {
+        events.append(event)
+        onEvent(event)
+    }
+    func applicationIdentity(pid _: pid_t) -> ApplicationLaunchIdentity? {
+        record("identity")
+        return identityValue
+    }
+    func unhide(pid _: pid_t) { record("unhide") }
     func setFocusedWindow(_ target: WindowTarget) -> Bool {
-        events.append("setFocused")
+        record("setFocused")
         setFocusedCount += 1
         return target.axIdentity == expected.axIdentity
     }
     func raiseWindow(_ target: WindowTarget) -> Bool {
-        events.append("raise")
+        record("raise")
         raiseCount += 1
         return target.axIdentity == expected.axIdentity
     }
     func frontmostPID() -> pid_t? {
-        let value = frontmostValues.isEmpty ? fallbackFrontmost : frontmostValues.removeFirst()
-        events.append("frontmost:\(value ?? -1)")
-        return value
+        events.append("frontmost:\(fallbackFrontmost ?? -1)")
+        return fallbackFrontmost
     }
     func focusedWindowMatches(_ target: WindowTarget) -> Bool {
-        events.append("exactWindow")
+        record("exactWindow")
         let value = exactWindowValues.isEmpty ? true : exactWindowValues.removeFirst()
         return value && target.axIdentity == expected.axIdentity
     }

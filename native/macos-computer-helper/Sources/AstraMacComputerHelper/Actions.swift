@@ -812,6 +812,7 @@ protocol ActionProviding: AnyObject {
     func noteAXTextWriteUnavailable(_ element: ActionElement)
     func preflightAXTextReplacement(_ element: ActionElement) -> AXTextMutationPreflight
     func perform(_ action: ResolvedAction) throws -> ActionPerformance
+    func perform(_ action: ResolvedAction, validateMutation: () throws -> Void) throws -> ActionPerformance
     func performReplacement(_ action: ResolvedAction, validateMutation: () throws -> Void) throws -> ActionPerformance
 }
 
@@ -831,6 +832,10 @@ extension ActionProviding {
     func preflightAXTextMutation(_: ActionElement) -> AXTextMutationPreflight { .unsupported }
     func noteAXTextWriteUnavailable(_: ActionElement) {}
     func preflightAXTextReplacement(_: ActionElement) -> AXTextMutationPreflight { .unsupported }
+    func perform(_ action: ResolvedAction, validateMutation: () throws -> Void) throws -> ActionPerformance {
+        try validateMutation()
+        return try perform(action)
+    }
     func performReplacement(_: ResolvedAction, validateMutation: () throws -> Void) throws -> ActionPerformance {
         throw ActionPerformFailure(error: .invalidAction, inputStarted: false)
     }
@@ -1600,10 +1605,14 @@ final class SystemActionPerformer: ActionProviding {
     }
 
     func perform(_ action: ResolvedAction) throws -> ActionPerformance {
+        try perform(action, validateMutation: {})
+    }
+
+    func perform(_ action: ResolvedAction, validateMutation: () throws -> Void) throws -> ActionPerformance {
         guard action.source.replace != true else {
             throw ActionPerformFailure(error: .invalidAction, inputStarted: false)
         }
-        guard let checked = action.source.checked else { return try performUnverified(action) }
+        guard let checked = action.source.checked else { return try performUnverified(action, validateMutation: validateMutation) }
         guard let element = action.element,
               let role = action.verifiedElement?.roleResult.value,
               role == "AXRadioButton" || role == "AXCheckBox"
@@ -1617,19 +1626,17 @@ final class SystemActionPerformer: ActionProviding {
             case .number(1), .text("1"), .text("true"): return true
             default: return nil
             }
-        }, perform: { try self.performUnverified(action) })
+        }, perform: { try self.performUnverified(action, validateMutation: validateMutation) })
     }
 
     func performReplacement(_ action: ResolvedAction, validateMutation: () throws -> Void) throws -> ActionPerformance {
         guard action.source.replace == true, action.source.checked == nil else {
             throw ActionPerformFailure(error: .invalidAction, inputStarted: false)
         }
-        return try performUnverified(action, validateReplacementMutation: validateMutation)
+        return try performUnverified(action, validateMutation: validateMutation)
     }
 
-    private func performUnverified(_ action: ResolvedAction,
-        validateReplacementMutation: () throws -> Void = { throw ActionExecutionError.invalidAction }
-    ) throws -> ActionPerformance {
+    private func performUnverified(_ action: ResolvedAction, validateMutation: () throws -> Void) throws -> ActionPerformance {
         if action.source.replace != nil {
             guard action.source.replace == true, action.source.kind == .type,
                   action.source.elementRef != nil, action.method == .accessibilityText
@@ -1650,6 +1657,7 @@ final class SystemActionPerformer: ActionProviding {
                 logActionRejected("PERFORM element-nil method=\(action.method)")
                 throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false)
             }
+            try validateMutation()
             let error = performAXAction(element, kAXPressAction as CFString)
             guard error == .success else {
                 actionFailureDiagnostic("AXPress failed: AXError.rawValue=\(error.rawValue) role=\(action.verifiedElement?.roleResult.value ?? "?")")
@@ -1661,6 +1669,7 @@ final class SystemActionPerformer: ActionProviding {
                 logActionRejected("PERFORM element-nil method=\(action.method)")
                 throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false)
             }
+            try validateMutation()
             let error = performAXAction(element, kAXIncrementAction as CFString)
             guard error == .success else { throw axMutationFailure(error) }
             return ActionPerformance(inputStarted: true)
@@ -1669,6 +1678,7 @@ final class SystemActionPerformer: ActionProviding {
                 logActionRejected("PERFORM element-nil method=\(action.method)")
                 throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false)
             }
+            try validateMutation()
             let error = performAXAction(element, kAXDecrementAction as CFString)
             guard error == .success else { throw axMutationFailure(error) }
             return ActionPerformance(inputStarted: true)
@@ -1683,20 +1693,20 @@ final class SystemActionPerformer: ActionProviding {
                 }
                 let result = try textValueReplacer.replace(action.source.text ?? "", to: element,
                     validateBeforeMutation: {
-                        try validateReplacementMutation()
+                        try validateMutation()
                         _ = try self.state()
                         guard self.textInputSafety.map({ $0() == .safeASCIIKeyboardLayout }) ?? true else {
                             throw ActionExecutionError.inputFocusRequired
                         }
                         let current = try self.revalidateKeyboardTarget(expected,
-                            validateFocusMutation: validateReplacementMutation)
+                            validateFocusMutation: validateMutation)
                         guard current.supportsAXSelectedTextWrite, current.enabled == true,
                               current.roleResult == expected.roleResult, current.subroleResult == expected.subroleResult
                         else { throw ActionExecutionError.secureTarget }
                         try replacementTargetValidation(expected)
                         // Live target/AX reads can block while the activity latch pauses.
                         // Recheck this invocation's lease after them, without reacquiring the event gate.
-                        try validateReplacementMutation()
+                        try validateMutation()
                     })
                 return ActionPerformance(inputStarted: result.inputStarted, effectVerification: result.effectVerification,
                     observationRequired: result.observationRequired)
@@ -1704,7 +1714,7 @@ final class SystemActionPerformer: ActionProviding {
             guard textInputSafety.map({ $0() == .safeASCIIKeyboardLayout }) ?? true else {
                 throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false)
             }
-            _ = try revalidateKeyboardTarget(action.verifiedElement)
+            _ = try revalidateKeyboardTarget(action.verifiedElement, validateFocusMutation: validateMutation)
             guard axTextWriteMayLand(element) else {
                 throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false)
             }
@@ -1721,10 +1731,11 @@ final class SystemActionPerformer: ActionProviding {
                 action.source.text ?? "",
                 to: element,
                 validateBeforeMutation: {
-                    _ = try self.revalidateKeyboardTarget(action.verifiedElement)
+                    _ = try self.revalidateKeyboardTarget(action.verifiedElement, validateFocusMutation: validateMutation)
                     guard self.textInputSafety.map({ $0() == .safeASCIIKeyboardLayout }) ?? true,
                           self.axTextWriteMayLand(element)
                     else { throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false) }
+                    try validateMutation()
                 }
             )
             switch selectedTextResult {

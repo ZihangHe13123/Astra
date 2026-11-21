@@ -40,13 +40,24 @@ def test_robustness_bad_key_has_bounded_supported_forms():
 
 @pytest.mark.parametrize("flag", [True, False, 1, "true", None])
 def test_focus_loan_wire_only_accepts_explicit_true_on_plain_begin(flag):
-    payload = {"snapshot_id": "snap-1", "plan_ref": "plan-1", "continued_loan": flag}
+    payload = {"snapshot_id": "snap-1", "plan_ref": "plan-1", "continued_loan": flag, "loan_deadline_uptime_ms": 420_000}
     if flag is True:
         encoded = encode_request(ComputerRequest(request_id="req", operation="takeover_begin", payload=payload))
         assert json.loads(encoded)["payload"]["continued_loan"] is True
     else:
         with pytest.raises(ValueError):
             encode_request(ComputerRequest(request_id="req", operation="takeover_begin", payload=payload))
+
+
+@pytest.mark.parametrize("fields", [
+    {"continued_loan": True}, {"loan_deadline_uptime_ms": True}, {"loan_deadline_uptime_ms": 0},
+    {"loan_deadline_uptime_ms": -1}, {"loan_deadline_uptime_ms": "1"}, {"loan_deadline_uptime_ms": 2**53},
+    {"loan_deadline_uptime_ms": 1.5}, {"loan_deadline_uptime_ms": None},
+])
+def test_focus_loan_wire_rejects_unbounded_or_invalid_loan(fields):
+    with pytest.raises(ValueError):
+        encode_request(ComputerRequest(request_id="req", operation="takeover_begin",
+            payload={"snapshot_id": "snap-1", "plan_ref": "plan-1", **fields}))
 
 
 def test_request_has_stable_version_and_id():

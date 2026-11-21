@@ -1609,10 +1609,15 @@ def _validate_cooperative_request_payload(operation: str, payload: Mapping[str, 
         required = {"snapshot_id", "plan_ref"}
         if "fragment" in payload:
             required.add("fragment")
-        elif "continued_loan" in payload:
-            required.add("continued_loan")
-            if payload["continued_loan"] is not True:
-                raise ValueError("continued_loan must be true when present")
+        elif "loan_deadline_uptime_ms" in payload:
+            required.add("loan_deadline_uptime_ms")
+            deadline = payload["loan_deadline_uptime_ms"]
+            if type(deadline) is not int or not 0 < deadline < 2**53:
+                raise ValueError("loan_deadline_uptime_ms must be a positive exact millisecond timestamp")
+            if "continued_loan" in payload:
+                required.add("continued_loan")
+                if payload["continued_loan"] is not True:
+                    raise ValueError("continued_loan must be true when present")
         _require_exact_payload(payload, required, operation)
         _validate_reference(payload["snapshot_id"], "snapshot_id")
         _validate_reference(payload["plan_ref"], "plan_ref")

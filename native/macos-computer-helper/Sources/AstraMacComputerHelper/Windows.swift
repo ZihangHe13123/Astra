@@ -1066,7 +1066,7 @@ protocol WindowObserving {
     func planActions(snapshotID: String, interactionMode: InteractionMode, actions: [NativeAction]) -> CooperativePlanResult
     func planActions(snapshotID: String, interactionMode: InteractionMode, actions: [NativeAction], fragment: ForegroundFragmentPlanRequest?) -> CooperativePlanResult
     func takeoverBegin(snapshotID: String, planRef: String) throws -> String
-    func takeoverBegin(snapshotID: String, planRef: String, continuedLoan: Bool) throws -> String
+    func takeoverBegin(snapshotID: String, planRef: String, continuedLoan: Bool, loanDeadline: TimeInterval?) throws -> String
     func takeoverBegin(snapshotID: String, planRef: String, declaration: ForegroundFragmentDeclaration) throws -> String
     func cooperativeAct(snapshotID: String, interactionMode: InteractionMode, planRef: String, takeoverRef: String?, actions: [NativeAction]) -> CooperativeActionResult
     func cooperativeAct(snapshotID: String, interactionMode: InteractionMode, planRef: String, takeoverRef: String?, actions: [NativeAction], fragmentStage: FragmentStageAuthority?) -> CooperativeActionResult
@@ -1129,8 +1129,8 @@ extension WindowObserving {
     func takeoverBegin(snapshotID _: String, planRef _: String) throws -> String {
         throw TakeoverError.stalePlan
     }
-    func takeoverBegin(snapshotID: String, planRef: String, continuedLoan: Bool) throws -> String {
-        guard !continuedLoan else { throw TakeoverError.userActivityPaused }
+    func takeoverBegin(snapshotID: String, planRef: String, continuedLoan: Bool, loanDeadline: TimeInterval?) throws -> String {
+        guard !continuedLoan, loanDeadline == nil else { throw TakeoverError.userActivityPaused }
         return try takeoverBegin(snapshotID: snapshotID, planRef: planRef)
     }
     func takeoverBegin(
@@ -1200,7 +1200,7 @@ final class SystemWindowObserver: WindowObserving {
     private let cooperativePlanClock: () -> TimeInterval
     private var nextCooperativePlanSequence: UInt64 = 0
     private let virtualCursor: any VirtualCursorPresenting
-    private let userActivity: any UserActivityMonitoring
+    private let userActivity: any HelperSessionActivityMonitoring
     private let pidCompatibility: PIDInputCompatibilityRegistry
     private let pidPointerCapability: PIDPointerDeliveryCapability
     private let foregroundKeyboardCapability: ForegroundKeyboardDeliveryCapability
@@ -1246,7 +1246,8 @@ final class SystemWindowObserver: WindowObserving {
         permissions: any PermissionStatusProviding = SystemPermissionStatus(),
         activation: any ApplicationActivationControlling = LaunchServicesApplicationActivationController(),
         virtualCursor: any VirtualCursorPresenting = UnavailableVirtualCursorPresenter(),
-        userActivity: any UserActivityMonitoring = UserActivityArbiter(),
+        userActivity: any HelperSessionActivityMonitoring = UserActivityArbiter(),
+        takeoverCoordinator: ForegroundTakeoverCoordinator? = nil,
         pidCompatibility: PIDInputCompatibilityRegistry? = nil,
         pidPointerCapability: PIDPointerDeliveryCapability = .unavailable,
         foregroundKeyboardCapability: ForegroundKeyboardDeliveryCapability = .unavailable,
@@ -1278,6 +1279,7 @@ final class SystemWindowObserver: WindowObserving {
         self.windowServerInventory = windowServerInventory ?? (
             catalogBuilder == nil && catalogWindows == nil ? fullWindowServerInventoryForAbsence : { nil }
         )
+        if let takeoverCoordinator { self.takeoverCoordinator = takeoverCoordinator }
     }
 
     func apps() throws -> JSONValue {
@@ -2731,10 +2733,10 @@ final class SystemWindowObserver: WindowObserving {
     }
 
     func takeoverBegin(snapshotID: String, planRef: String) throws -> String {
-        try takeoverBegin(snapshotID: snapshotID, planRef: planRef, continuedLoan: false)
+        try takeoverBegin(snapshotID: snapshotID, planRef: planRef, continuedLoan: false, loanDeadline: nil)
     }
 
-    func takeoverBegin(snapshotID: String, planRef: String, continuedLoan: Bool) throws -> String {
+    func takeoverBegin(snapshotID: String, planRef: String, continuedLoan: Bool, loanDeadline: TimeInterval?) throws -> String {
         actionLock.lock()
         defer { actionLock.unlock() }
         pruneCooperativeFragmentDraftsLocked(now: cooperativePlanClock())
@@ -2750,7 +2752,7 @@ final class SystemWindowObserver: WindowObserving {
             target: target,
             snapshotID: snapshotID,
             planRef: planRef,
-            stageDigest: stored.plan.stageDigest, continuedLoan: continuedLoan
+            stageDigest: stored.plan.stageDigest, continuedLoan: continuedLoan, loanDeadline: loanDeadline
         )
         return token.ref
     }
@@ -3009,6 +3011,9 @@ final class SystemWindowObserver: WindowObserving {
     }
 
     func invalidateSnapshots() {
+        // cooperativeAct owns actionLock for the whole batch. Signal its wait
+        // and input gates before close waits on that lock to restore focus.
+        userActivity.requestTerminalStop()
         invalidateCooperativeState(.close)
     }
 
@@ -3218,6 +3223,9 @@ final class SystemWindowObserver: WindowObserving {
                 ),
                 validateFocusMutation: {
                     try self.userActivity.assertNotPaused(lease: execution.lease)
+                    if let deadline = execution.loanDeadline, ProcessInfo.processInfo.systemUptime >= deadline {
+                        throw ActionExecutionError.actionTimeout
+                    }
                 },
                 popupPointerOnlyState: popupPoint.map { point in
                     { () throws -> ActionTargetState in
@@ -3235,6 +3243,7 @@ final class SystemWindowObserver: WindowObserving {
                 snapshotID: snapshotID,
                 consumed: consumed,
                 entries: entries,
+                loanDeadline: execution.loanDeadline,
                 managesActivityFragment: fragmentStage == nil
             )
             if let fragmentStage {
@@ -3301,6 +3310,7 @@ final class SystemWindowObserver: WindowObserving {
         snapshotID: String,
         consumed: SnapshotActionContext,
         entries: [PlannedDispatchEntry],
+        loanDeadline: TimeInterval?,
         managesActivityFragment: Bool = true
     ) -> CooperativeActionResult {
         let target = authority.target
@@ -3337,10 +3347,11 @@ final class SystemWindowObserver: WindowObserving {
             validator = strictValidator
         }
         virtualCursor.hide()
+        let poster = CGForegroundInputPoster(pointIsInTargetWindow: { point, pid in
+            foregroundPointAccepted(point, pid: pid, target: target)
+        }, validateNewInput: { [userActivity] in try userActivity.assertNotPaused(lease: lease) })
         let executor = PIDTargetedActionExecutor(
-            poster: CGForegroundInputPoster(pointIsInTargetWindow: { point, pid in
-                foregroundPointAccepted(point, pid: pid, target: target)
-            }),
+            poster: poster,
             compatibility: pidCompatibility,
             genericForegroundEnabled: true,
             activity: userActivity,
@@ -3365,9 +3376,7 @@ final class SystemWindowObserver: WindowObserving {
             }
         )
         let keyboardExecutor = ForegroundKeyboardExecutor(
-            poster: CGForegroundInputPoster(pointIsInTargetWindow: { point, pid in
-                foregroundPointAccepted(point, pid: pid, target: target)
-            }),
+            poster: poster,
             compatibility: pidCompatibility,
             genericForegroundEnabled: true,
             activity: userActivity,
@@ -3441,6 +3450,7 @@ final class SystemWindowObserver: WindowObserving {
             application: authority.application,
             lease: lease,
             entries: entries,
+            loanDeadline: loanDeadline,
             managesActivityFragment: managesActivityFragment
         )
         let batch = ActionBatchResult(
