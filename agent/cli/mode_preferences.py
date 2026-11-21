@@ -10,6 +10,7 @@ from pathlib import Path
 from agent.runtime.json_preferences import update_preferences
 
 from agent.runtime.deepseek import is_deepseek_model
+from agent.runtime.gemini_wire import supports_thinking
 from agent.runtime.llm import LLMConfig
 from agent.runtime.reasoning_efforts import DEFAULT_REASONING_EFFORT, REASONING_EFFORTS
 
@@ -75,13 +76,18 @@ def set_reasoning_effort(llm, effort: str) -> None:
 
 
 def applies_reasoning_effort(provider: str, model: str) -> bool:
-    """Whether the model's adapter sends the effort with its requests; for any other it is only kept."""
-    return provider in {"openai-codex", "claude-code", "google-gemini"} or is_deepseek_model(model)
+    """Whether the model's adapter sends the effort with its requests; for any other it is only kept.
+    Google AI Studio sends a thinking setting only to the Gemini models that think (2.5 and later)."""
+    if provider == "google-gemini":
+        return supports_thinking(model)
+    return provider in {"openai-codex", "claude-code"} or is_deepseek_model(model)
 
 
 def reasoning_effort_status(config: LLMConfig) -> str:
     text = f"Reasoning effort: {config.reasoning_effort}"
-    if config.provider == "openai-codex":
+    if not applies_reasoning_effort(config.provider, config.model):
+        text += "\nSaved preference only; the current model adapter does not apply reasoning effort."
+    elif config.provider == "openai-codex":
         text += ("\nCodex returns reasoning summaries; max uses the model's highest advertised effort, "
                  "and xhigh the highest one up to xhigh.")
     elif config.provider == "claude-code":
@@ -89,8 +95,6 @@ def reasoning_effort_status(config: LLMConfig) -> str:
     elif config.provider == "google-gemini":
         text += ("\nGoogle AI Studio applies it as thinkingLevel (low, medium, high; xhigh only on "
                  "Gemini 4 Neon and Hydrogen; max uses the model's highest supported level).")
-    elif not applies_reasoning_effort(config.provider, config.model):
-        text += "\nSaved preference only; the current model adapter does not apply reasoning effort."
     elif config.reasoning_effort == "xhigh":
         text += "\nDeepSeek runs xhigh as high."
     return text

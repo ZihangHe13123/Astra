@@ -916,6 +916,33 @@ def test_while_channels_json_cannot_be_read_wechat_keeps_its_model(tmp_path, mon
     assert models.configured("weixin") == ""
 
 
+def test_a_cached_channel_client_changed_in_place_is_built_again(tmp_path, monkeypatch):
+    """Only a channel turn decides how a channel thinks: a cached client that something changed in place (as /mode
+    once did while a WeChat reply had borrowed it) is not used again as it is."""
+    from types import SimpleNamespace
+
+    from agent.cli.channel_models import ChannelModels
+    from agent.cli.model_catalog import CatalogEntry
+    from agent.cli.models import ModelProfile
+
+    profile = ModelProfile(base_url="http://127.0.0.1:9/v1", context_limit=32_000, provider="openai-compatible",
+                           api_key_env="", model_id="deepseek-v4-unit")
+    entry = CatalogEntry(key="unit::deepseek-v4-unit", model_id="deepseek-v4-unit", provider_id="unit",
+                         provider_label="Unit", base_url=profile.base_url, profile=profile)
+    path = tmp_path / "channels.json"
+    monkeypatch.setenv("ASTRA_CHANNEL_CONFIG", str(path))
+    path.write_text(json.dumps({"weixin": {"model": entry.key, "reasoning_effort": "max"}}), encoding="utf-8")
+    catalog = SimpleNamespace(resolve=lambda key: entry if key == entry.key else None, resolve_persisted=lambda key: None)
+    models = ChannelModels(lambda: catalog, lambda: "unit::window-model", current_effort=lambda: "low")  # type: ignore[arg-type,return-value]
+
+    first = models.client("weixin")
+    assert first is not None and first.config.reasoning_effort == "max"
+    assert models.client("weixin") is first
+    first.switch_model(first.config.model, reasoning_effort="high", context_limit=first.config.context_limit)
+    again = models.client("weixin")
+    assert again is not None and again is not first
+    assert (again.config.model, again.config.reasoning_effort) == ("deepseek-v4-unit", "max")
+
 def test_quotes_and_placeholders_never_crowd_out_or_stand_in_for_the_persons_words(ilink, tmp_path):
     quote = "这是一段很长的引用标题，比允许的输入长度还要长得多"
     (reply, picture, voice) = _received(ilink, tmp_path, [

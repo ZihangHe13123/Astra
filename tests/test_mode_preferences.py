@@ -138,3 +138,15 @@ def test_classic_cli_reports_and_sets_effort_without_budget_controls(monkeypatch
         asyncio.run(handle_slash(command, agent))
     assert capsys.readouterr().out.count("Unknown reasoning effort") == 3
     assert read_reasoning_effort() == "max"
+
+
+@pytest.mark.parametrize("model,applies", [("gemini-2.0-flash", False), ("gemini-2.5-flash", True), ("gemini-3-pro", True)])
+def test_gemini_takes_an_effort_only_on_the_models_that_think(model, applies):
+    from agent.cli.mode_preferences import applies_reasoning_effort
+    from agent.runtime.gemini_wire import build_thinking_config
+
+    # The same answer as the request itself gives: a thinking setting is sent exactly when the effort applies.
+    assert applies_reasoning_effort("google-gemini", model) is applies
+    assert (build_thinking_config(model, effort="max") is not None) is applies
+    status = reasoning_effort_status(LLMConfig(provider="google-gemini", model=model, reasoning_effort="max"))
+    assert ("Saved preference only" in status) is not applies

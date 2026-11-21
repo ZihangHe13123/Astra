@@ -209,8 +209,8 @@ in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on`,
   model) gives WeChat a model of its own without changing any window's;
   `/weixin model default` follows the default again, and `/weixin model` shows
   the current choice. The setting is `weixin.model`; it applies from the next
-  message, and a model that is no longer in the catalog or has no key falls
-  back to the default.
+  message, and a model that is no longer in the catalog or has no key gives way
+  to the window's model, which still thinks at WeChat's reasoning effort.
 - **How hard it thinks.** WeChat follows the reasoning effort last chosen with
   `/mode` in any window, read for each message, so the desktop's background
   backend that answers WeChat follows a later `/mode` too.

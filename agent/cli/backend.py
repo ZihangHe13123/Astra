@@ -69,12 +69,12 @@ from agent.logging_config import setup_logging
 from agent.core.msg import Msg
 from agent.core.bus import MessageBus
 from agent.runtime.llm import LLMClient, LLMConfig
-from agent.runtime.deepseek import is_deepseek_model
 from agent.runtime.react import ReActAgent
 from agent.runtime.code_mode import register_run_code_tool
 from agent.cli.mode_preferences import (
     MODE_USAGE,
     REASONING_EFFORTS,
+    applies_reasoning_effort,
     apply_reasoning_effort,
     reasoning_effort_status,
     set_reasoning_effort,
@@ -896,6 +896,14 @@ async def _main(startup_started: float):
     question_followups: set[str] = set()
     register_user_question_tools(tools, question_broker.ask)
     channel_manager_holder: dict[str, ChannelManager] = {}
+    # The channel router, once there is one (see _window).
+    channel_router_holder: dict[str, AgentChannelRouter] = {}
+
+    def _window() -> AgentChannelRouter.WindowView:
+        """The window's own conversation and model client. A chat's turn borrows agent.context and agent.llm;
+        /mode, /model, /connect and what the window is told about its model use the window's own meanwhile."""
+        router = channel_router_holder.get("router")
+        return router.window_view() if router is not None else AgentChannelRouter.WindowView(agent.context, agent.llm)
     register_channel_tools(
         tools,
         lambda: channel_manager_holder.get("manager"),
@@ -2147,7 +2155,7 @@ async def _main(startup_started: float):
     async def _refresh_model_catalog(provider_id: str | None = None, *, force: bool = False) -> ModelCatalog:
         nonlocal catalog
         refreshed = await discover_model_catalog(provider_id=provider_id, force=force)
-        _sync_current_context_budget(agent, refreshed, current_model_key)
+        _sync_current_context_budget(_window(), refreshed, current_model_key)
         if provider_id:
             entries = tuple(e for e in catalog.entries if e.provider_id != provider_id) + refreshed.entries
             errors = {k: v for k, v in catalog.errors.items() if k != provider_id}
@@ -2202,14 +2210,15 @@ async def _main(startup_started: float):
 
     def _served_model() -> str:
         """The concrete model behind an alias such as claude-code's `sonnet`, once a request has shown it."""
-        served = getattr(agent.llm, "served_model", "")
-        return served if isinstance(served, str) and served != agent.llm.config.model else ""
+        llm = _window().llm
+        served = getattr(llm, "served_model", "")
+        return served if isinstance(served, str) and served != llm.config.model else ""
 
     async def _send_model_info(*, refresh: bool = False):
         if refresh:
             await _refresh_model_catalog()
         served = _served_model()
-        ctx = agent.context
+        ctx, llm = _window()
         used = ctx.estimate_prompt_tokens()
         limit = ctx.max_prompt_tokens
         pct = (used / limit * 100) if limit > 0 else 0.0
@@ -2217,11 +2226,10 @@ async def _main(startup_started: float):
             {"name": profile.name, "description": profile.description}
             for profile in selectable_prompt_profiles().values()
         ]
-        _send({"type": "model_info", "model": agent.llm.config.model,
+        _send({"type": "model_info", "model": llm.config.model,
                "model_key": current_model_key,
-               "reasoning_effort": (agent.llm.config.reasoning_effort
-                                    if is_deepseek_model(agent.llm.config.model)
-                                    or agent.llm.config.provider in {"openai-codex", "claude-code", "google-gemini"} else None),
+               "reasoning_effort": (llm.config.reasoning_effort
+                                    if applies_reasoning_effort(llm.config.provider, llm.config.model) else None),
                "code_mode": agent.code_mode,
                "personas": personas,
                "models": [entry.to_event(current=entry.key == current_model_key)
@@ -2473,13 +2481,13 @@ async def _main(startup_started: float):
         _send({"type": "gui_ready", "workspace": str(Path(sandbox_workdir).resolve()),
                "session_id": Path(agent.context.session_path).stem})
 
-    # The router asks before a channel turn swaps agent.llm, so this is the window's own effort.
     channel_models = ChannelModels(lambda: catalog, lambda: current_model_key,
                                    channels=functools.partial(channel_manager_holder.get, "manager"),
-                                   current_effort=lambda: agent.llm.config.reasoning_effort or "")
+                                   current_effort=lambda: _window().llm.config.reasoning_effort or "")
     channel_router = AgentChannelRouter(agent, agent_turn_lock, sessions_dir(PROJECT_ROOT),
                                         admission=lambda: not restart.draining, model_for=channel_models.client,
                                         tasks=task_store)
+    channel_router_holder["router"] = channel_router
     # Between turns: the desktop's conversation and each chat's, with how the ledger attributes them.
     idle_compactor = IdleCompactor(lambda: [(agent.context, {}), *(
         (context, {"source": "channel", "session": name}) for name, context in channel_router.parked_contexts())])
@@ -3777,7 +3785,7 @@ async def _main(startup_started: float):
             if entry is not None:
                 try:
                     settings_path = switch_to_profile(
-                        agent,
+                        _window(),
                         entry.key,
                         entry.profile,
                         valid_models=set(catalog.profiles) | {entry.key},
@@ -3816,7 +3824,8 @@ async def _main(startup_started: float):
         else:
             served = _served_model()
             serving = f" (serving {served})" if served else ""
-            lines = [f"Current model: {agent.llm.config.model}{serving} @ {agent.llm.config.base_url}", "Available:"]
+            window_config = _window().llm.config
+            lines = [f"Current model: {window_config.model}{serving} @ {window_config.base_url}", "Available:"]
             for provider in dict.fromkeys(item.provider_label for item in catalog.entries):
                 lines.append(f"  [{provider}]")
                 for item in catalog.entries:
@@ -4575,7 +4584,7 @@ async def _main(startup_started: float):
                     _send({"type": "done"})
                 elif c == "/health":
                     _send({"type": "tool_result", "name": "health",
-                           "output": build_health_report(agent.llm.config, agent.tools, agent.context.max_prompt_tokens, sandbox),
+                           "output": build_health_report(_window().llm.config, agent.tools, _window().context.max_prompt_tokens, sandbox),
                            "error": "", "code": ""})
                     _send({"type": "done"})
                 elif c == "/doctor" or c.startswith("/doctor "):
@@ -4698,7 +4707,7 @@ async def _main(startup_started: float):
                     else:
                         api_key_env = parts[3] if len(parts) > 3 else "LLM_API_KEY"
                         probe, settings_path = await create_probe_and_switch(
-                            agent, parts[1], parts[2], api_key_env
+                            _window(), parts[1], parts[2], api_key_env
                         )
                         if probe.ok:
                             _schedule_openai_warmup(delay=0.0)
@@ -4719,12 +4728,14 @@ async def _main(startup_started: float):
                     await _model_command(c, cmd)
                 elif c == "/mode" or c.startswith("/mode "):
                     argument = c[len("/mode"):].strip().lower()
+                    # The window's own client, also while a chat's turn has borrowed agent.llm.
+                    window_llm = _window().llm
                     if not argument:
-                        output = f"{reasoning_effort_status(agent.llm.config)}\n{MODE_USAGE}"
+                        output = f"{reasoning_effort_status(window_llm.config)}\n{MODE_USAGE}"
                         error = ""
                     elif argument in REASONING_EFFORTS:
-                        set_reasoning_effort(agent.llm, argument)
-                        output = f"{reasoning_effort_status(agent.llm.config)}\nSaved as startup default."
+                        set_reasoning_effort(window_llm, argument)
+                        output = f"{reasoning_effort_status(window_llm.config)}\nSaved as startup default."
                         error = ""
                         await _send_model_info()
                     else:

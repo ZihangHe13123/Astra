@@ -11,7 +11,7 @@ import time
 import uuid
 from collections.abc import Callable
 from dataclasses import replace
-from typing import Any
+from typing import Any, NamedTuple
 from pathlib import Path
 
 from agent.core.msg import ContentBlock, Msg
@@ -75,6 +75,11 @@ def channel_session_name(message: ChannelMessage) -> str:
 class AgentChannelRouter:
     """Serialize use of a stateful ReActAgent and park one context per chat."""
 
+    class WindowView(NamedTuple):
+        """The window's own conversation and model client."""
+        context: Any
+        llm: Any
+
     def __init__(self, agent, turn_lock: asyncio.Lock, session_root: Path,
                  *, admission: Callable[[], bool] | None = None,
                  model_for: Callable[[str], Any] | None = None, tasks: Any = None):
@@ -89,6 +94,14 @@ class AgentChannelRouter:
         self.tasks = tasks
         self._contexts: dict[str, AgentContext] = {}
         self._template = agent.context
+        # The window's own, put aside while a chat's turn borrows agent.context and agent.llm.
+        self._lent: AgentChannelRouter.WindowView | None = None
+
+    def window_view(self) -> AgentChannelRouter.WindowView:
+        """The window's own conversation and model client. A chat's turn borrows agent.context and agent.llm
+        and keeps the window's aside until it ends; a window command (/mode, /model) or what the window is told
+        about its model must use these, so it never reaches a chat's client or conversation."""
+        return self._lent or self.WindowView(self.agent.context, self.agent.llm)
 
     def parked_contexts(self) -> list[tuple[str, AgentContext]]:
         """Each chat's conversation this process holds between its turns, by session name."""
@@ -238,6 +251,7 @@ class AgentChannelRouter:
                 return "Astra is preparing a restart. Please retry after it reconnects."
             previous = self.agent.context
             previous_llm = self.agent.llm
+            self._lent = self.WindowView(previous, previous_llm)
             restricted = message.channel == "qq" and not message.local_tools
             context = self._chat_context(session_name) if restricted else self._context(session_name, message.channel)
             self.agent.context = context
@@ -352,3 +366,4 @@ class AgentChannelRouter:
                 active_channel.reset(token)
                 self.agent.context = previous
                 self.agent.llm = previous_llm
+                self._lent = None
