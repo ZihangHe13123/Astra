@@ -34,6 +34,8 @@
     "send_files_enabled": true,
     "file_allow_users": [],
     "send_file_roots": ["~"],
-    "max_send_file_bytes": 52428800
+    "max_send_file_bytes": 52428800,
+    "receive_files_dir": "",
+    "max_receive_file_bytes": 52428800
   }
 }

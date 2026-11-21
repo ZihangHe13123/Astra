@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from .approvals import ChatApprover
@@ -34,9 +35,12 @@ class ChannelManager:
         *,
         adapters: list[ChannelAdapter] | None = None,
         channel_host: bool = False,
+        settings: Callable[[], ChannelsConfig] | None = None,
     ):
         self.config = config
         self.handler = handler
+        # The saved settings, which a running WeChat channel follows (None: it keeps the ones it started with).
+        self._settings = settings
         # The desktop's channel host: WeChat goes to it before any other backend.
         self.channel_host = channel_host
         self.adapters = adapters if adapters is not None else self._build_adapters()
@@ -55,7 +59,14 @@ class ChannelManager:
     def new_weixin(self, config: WeixinConfig) -> WeixinAdapter:
         from .weixin import WeixinAdapter
 
-        return WeixinAdapter(config, self.handler, priority=self.channel_host)
+        source = self._settings
+
+        def saved() -> WeixinConfig:
+            assert source is not None
+            return source().weixin
+
+        return WeixinAdapter(config, self.handler, priority=self.channel_host,
+                             settings=saved if source is not None else None)
 
     def adapter(self, name: str) -> ChannelAdapter | None:
         return next((item for item in self.adapters if item.name == name), None)
@@ -122,8 +133,9 @@ class ChannelManager:
             return FilePolicy(qq.send_files_enabled, qq.file_allow_users or qq.allow_users,
                               qq.send_file_roots, qq.max_send_file_bytes)
         if channel == "weixin":
-            wx = self.config.weixin
             adapter = self.weixin()
+            # A running channel's settings are the ones it follows from channels.json.
+            wx = adapter.config if adapter is not None else self.config.weixin
             owner = adapter.owner() if adapter is not None else ""
             return FilePolicy(wx.send_files_enabled, wx.file_allow_users or ((owner,) if owner else ()),
                               wx.send_file_roots, wx.max_send_file_bytes)

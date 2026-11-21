@@ -153,8 +153,41 @@ in `.astra/channels.json`. `/weixin status`, `/weixin off`, `/weixin on`,
   A closed MacBook lid still sleeps unless an external display and power are
   connected. Set `weixin.keep_awake` to `false` to leave sleep alone.
 - **What arrives.** Text, quoted messages, WeChat's own transcript of a voice
-  message, and up to `max_images` images (decrypted from WeChat's CDN). Files and
-  videos arrive as a placeholder.
+  message, and up to `max_images` images (decrypted from WeChat's CDN). Files
+  and videos, sent or quoted, are downloaded, decrypted and saved in a folder
+  for each day under `~/Downloads/Astra/微信` (`weixin.receive_files_dir` sets
+  another folder; a relative one is under the home folder). Only a file that
+  arrived whole is saved: the key opens it, and it matches what WeChat gave
+  (a file's size, a video's encrypted size and MD5). Media marked as encrypted
+  but sent without its key, or with a size or checksum that is not one, is
+  refused. These checks catch a cut or garbled download, not who sent it. The
+  model is told each file's name, size and saved path. That, a quoted
+  message and a placeholder such as `[图片]` come beside the person's own
+  words rather than as them, each within its own limit: a reminder set in the
+  same message records only what they typed or said. A text file
+  (Markdown, plain text, code, CSV, JSON and the like) of up to 64 KB comes
+  along whole, exactly as written; for any other file the model uses its file
+  tools, which ask for approval in WeChat when the folder is outside the
+  workspace. A file larger than `max_receive_file_bytes` (50 MB) is not
+  downloaded, and `0` leaves every file on WeChat's side with only its name.
+  A file that cannot be downloaded or saved is reported as such, and the rest
+  of the message still arrives. A number setting that is set but is not a
+  whole number (`"50 MB"`, or empty) does not stop Astra: `/weixin status` and the log name it and
+  what is used instead, and for `max_receive_file_bytes` that is downloading
+  nothing until it is fixed. A running channel follows `channels.json`,
+  whichever Astra backend has it: a change applies to the next message, and
+  `"enabled": false` (or `/weixin off` in any window) stops the one receiving
+  within a few seconds, after it answers what it already took. A file that is
+  there but empty or not valid JSON (a typo, or an editor midway through
+  saving) changes nothing: running channels keep their settings, the WeChat
+  model included, `/weixin status` says the file cannot be read, and Astra
+  saves no setting over it until it is fixed.
+- **Nothing taken is lost.** Messages already taken from WeChat stay saved
+  until they are answered. If the channel stops first (switched off, or Astra
+  quitting or restarting), the next backend to receive WeChat answers them.
+  The one being answered at that moment is not run again, since what it did
+  may already have happened; WeChat gets a note asking to send it again, or,
+  if WeChat does not take it then, right before the person's next answer.
 - **How it answers.** WeChat conversations are told to talk like a chat: short,
   casual, no Markdown, one thought per message. A reply goes out as several
   short messages the way people text (at most `max_bubbles`; `chat_bubbles:

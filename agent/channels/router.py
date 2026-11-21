@@ -131,7 +131,8 @@ class AgentChannelRouter:
             return ""
         try:
             run = await asyncio.to_thread(
-                self.tasks.start_run, f"channel:{message.channel}:{uuid.uuid4().hex}", message.text[:8000],
+                self.tasks.start_run, f"channel:{message.channel}:{uuid.uuid4().hex}",
+                (message.text or message.attachments.partition("\n")[0])[:8000],
                 session_id=context.session_scope, model=getattr(getattr(self.agent.llm, "config", None), "model", ""),
                 source=message.channel)
         except Exception:
@@ -226,7 +227,8 @@ class AgentChannelRouter:
     ) -> str:
         if not self.admission():
             return "Astra is preparing a restart. Please retry after it reconnects."
-        if not message.images and message.text.strip().lower() in NEW_CONVERSATION_COMMANDS:
+        if (not message.images and not message.attachments
+                and message.text.strip().lower() in NEW_CONVERSATION_COMMANDS):
             async with self.turn_lock:
                 return await self._start_new_conversation(message)
         session_name = self._session_name(message)
@@ -274,7 +276,8 @@ class AgentChannelRouter:
                 content = message.text
                 if message.is_group and message.sender_name:
                     content = f"[QQ 群成员 {message.sender_name}]\n{content}"
-                content_blocks = [ContentBlock.text(content)]
+                # The person's words and what they sent are separate blocks; a provider takes no empty one.
+                content_blocks = [ContentBlock.text(block) for block in (content, message.attachments) if block]
                 content_blocks.extend(
                     ContentBlock.image_url(image.data_url)
                     for image in message.images

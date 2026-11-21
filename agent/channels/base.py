@@ -31,6 +31,10 @@ class ChannelMessage:
     message_id: str = ""
     sender_name: str = ""
     images: tuple[ChannelImage, ...] = ()
+    # What came with the message but is not the person's own words: a quoted message, a placeholder for an
+    # image, and what became of the files they sent (where each was saved, a short text file's text). The
+    # model sees it beside ``text``; it is never taken as their words (a job's request, the task record, /new).
+    attachments: str = ""
     raw: dict[str, Any] = field(default_factory=dict, compare=False, repr=False)
     # Set only by the transport from explicit local configuration, never from message text.
     local_tools: bool = False

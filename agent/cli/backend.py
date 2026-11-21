@@ -45,6 +45,7 @@ from agent.runtime.appshot_media import AppshotMediaError
 import sqlite3
 import asyncio
 import contextvars
+import functools
 from dataclasses import replace
 import inspect
 import logging
@@ -2472,7 +2473,8 @@ async def _main(startup_started: float):
         _send({"type": "gui_ready", "workspace": str(Path(sandbox_workdir).resolve()),
                "session_id": Path(agent.context.session_path).stem})
 
-    channel_models = ChannelModels(lambda: catalog, lambda: current_model_key)
+    channel_models = ChannelModels(lambda: catalog, lambda: current_model_key,
+                                   channels=functools.partial(channel_manager_holder.get, "manager"))
     channel_router = AgentChannelRouter(agent, agent_turn_lock, sessions_dir(PROJECT_ROOT),
                                         admission=lambda: not restart.draining, model_for=channel_models.client,
                                         tasks=task_store)
@@ -2485,7 +2487,8 @@ async def _main(startup_started: float):
     if channel_host:
         # WeChat and QQ turns run here, and they send files back.
         agent.tools.add_core_tools({"channel_send_file"})
-    channel_manager = ChannelManager(load_channels_config(), channel_router.handle, channel_host=channel_host)
+    channel_manager = ChannelManager(load_channels_config(), channel_router.handle, channel_host=channel_host,
+                                     settings=functools.partial(load_channels_config, strict=True))
     channel_manager_holder["manager"] = channel_manager
     weixin_commands = WeixinCommands(lambda: channel_manager_holder.get("manager"), _send,
                                      models=channel_models)
