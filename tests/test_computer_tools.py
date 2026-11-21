@@ -315,7 +315,7 @@ class FakeComputerBackend:
             "ax_tree": self.snapshot_ax_tree_override or {
                 "role": self.snapshot_root_role,
                 "label": self.snapshot_root_label,
-                "observation_capabilities": ["focus_consent_v1", *(["focus_loan_v3", "focus_presentation_v1"] if self.focus_loan else [])],
+                "observation_capabilities": ["focus_consent_v1", *(["focus_loan_v3", "focus_presentation_v1", "focus_presentation_v2"] if self.focus_loan else [])],
                 "children": [
                     {
                         "role": self.focused_role,
@@ -400,9 +400,12 @@ class FakeComputerBackend:
         ))
         return self.act_result
 
-    async def end_takeover(self, takeover_ref, *, restore_previous_focus=True):
+    async def end_takeover(self, takeover_ref, *, restore_previous_focus=True, require_presentation_status=False):
         self.calls.append(("takeover_end", takeover_ref))
         self.restoration_requests = getattr(self, "restoration_requests", []) + [restore_previous_focus]
+        if require_presentation_status:
+            assert restore_previous_focus is False
+            return {"started": True, "restoration": "preserved_user_focus", "presented": True}
         return self.takeover_end_result
 
     async def presentation_apps(self, takeover_ref):
@@ -7868,7 +7871,7 @@ def test_failed_stale_foreground_plan_revokes_the_existing_loan(registry, manage
 @pytest.mark.parametrize('actual', [False, None, True])
 def test_present_checked_goal_requires_positive_final_evidence(registry, manager, backend, monkeypatch, actual):
     node = {"role": "AXCheckBox", "element_ref": "snapshot-1:box", "label": "Enabled", "checked": False}
-    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["focus_consent_v1", "focus_presentation_v1", "checked_click_v1"], "children": [node]}
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["focus_consent_v1", "focus_presentation_v2", "checked_click_v1"], "children": [node]}
     backend.plan_pid_action_classes = ()
     register(registry, manager)
     focus(registry)
@@ -7883,9 +7886,14 @@ def test_present_checked_goal_requires_positive_final_evidence(registry, manager
     monkeypatch.setattr(backend, 'act', act)
     result = run(registry.execute('computer_act', {'snapshot_id': initial['snapshot_id'], 'present_result': True,
         'actions': [{'type': 'click', 'element_ref': node['element_ref'], 'checked': True}]}))
-    assert not result['error'], result
-    assert json.loads(result['fresh_output'])['choice_verification']['results'][0]['status'] == (
-        'unknown' if actual is None else 'verified' if actual else 'not_satisfied')
+    if actual is True:
+        assert not result['error'] and json.loads(result['fresh_output'])['choice_verification']['status'] == 'verified'
+        assert result['computer_receipt']['presentation_status'] == 'presented'
+    else:
+        assert result['code'] == 'presentation_not_completed' and not result['verified']
+        assert result['computer_receipt']['snapshot_verified'] is True
+        assert result['computer_receipt']['presentation_status'] == 'not_presented'
+        assert result['details']['choice_status'] == ('unknown' if actual is None else 'not_satisfied')
     assert backend.restoration_requests == [actual is not True]
 
 
@@ -7898,6 +7906,75 @@ def test_presentation_declines_older_helper_before_planning(registry, manager, b
     assert not any(name in {'plan_actions', 'takeover_begin', 'act'} for name, _ in backend.calls)
 
 
+def test_v1_rollback_alone_cannot_promise_to_show_the_window(registry, manager, loan_backend):
+    loan_backend.snapshot_ax_tree_override = {
+        'role': 'AXWindow', 'observation_capabilities': ['focus_consent_v1', 'focus_presentation_v1'],
+        'children': [{'role': 'AXButton', 'label': 'Ordinary', 'element_ref': 'snapshot-1:1'}],
+    }
+    loan_backend.plan_pid_action_classes = ()
+    register(registry, manager)
+    focus(registry)
+    registry.set_approval_handler(lambda _: asyncio.sleep(0, result='once'))
+    snapshot = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    assert _borrow_focus(registry, snapshot, present_result=True).get('code') == 'unsupported_operation'
+    assert not any(name in {'plan_actions', 'takeover_begin', 'act'} for name, _ in loan_backend.calls)
+    assert not _borrow_focus(registry, snapshot)['error']  # Lack of v2 blocks showing, not ordinary guarded use.
+
+
+@pytest.mark.parametrize(('terminal', 'status'), [
+    ('shown', 'presented'), ('yielded', 'not_presented'), ('rolled_back', 'withdrawn'),
+    ('rollback_yielded', 'unconfirmed'), ('rollback_lost', 'unconfirmed'),
+    ('missing_status', 'withdrawn'), ('contradiction', 'withdrawn'), ('lost_end', 'unconfirmed'),
+])
+def test_public_presentation_receipt_distinguishes_input_from_terminal_focus(
+    registry, manager, loan_backend, monkeypatch, terminal, status,
+):
+    frames = []
+    async def transport(req):
+        frames.append((req.operation, req.payload))
+        if req.operation == 'takeover_end':
+            assert req.payload['restore_previous_focus'] is False
+            if terminal == 'lost_end':
+                raise OSError('end response lost')
+            outcome = ({'started': True, 'restoration': 'preserved_user_focus', 'presented': terminal == 'shown'}
+                       if terminal in {'shown', 'yielded'} else {'started': True})
+            if terminal == 'missing_status':
+                outcome['restoration'] = 'preserved_user_focus'
+            if terminal == 'contradiction':
+                outcome.update(restoration='restored', presented=True)
+        else:
+            assert req.operation == 'cancel_presentation'
+            if terminal == 'rollback_lost':
+                raise OSError('rollback response lost')
+            outcome = {'started': True, 'restoration': 'preserved_user_focus' if terminal == 'rollback_yielded' else 'restored'}
+        return ComputerResponse(req.request_id, True, result=outcome)
+
+    adapter = MacComputerBackend(SimpleNamespace(request=transport))
+    monkeypatch.setattr(loan_backend, 'end_takeover', adapter.end_takeover)
+    monkeypatch.setattr(loan_backend, 'cancel_presentation', adapter.cancel_presentation)
+    loan_backend.plan_pid_action_classes = ()
+    register(registry, manager)
+    focus(registry)
+    registry.set_approval_handler(lambda _: asyncio.sleep(0, result='once'))
+    snapshot = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    result = _borrow_focus(registry, snapshot, present_result=True)
+    if status != 'presented':
+        assert result.get('code') == 'presentation_not_completed' and result['verified'] is False
+        assert result['error'] and result['partial'] and result['retryable'] is False
+        assert 'fresh_output' not in result and '_private_result' not in result  # not a fresh actionable result
+    else:
+        assert not result['error'] and result['verified'] and result.get('_private_result')
+    receipt = result['computer_receipt']
+    assert receipt.get('presentation_status') == status and receipt.get('snapshot_verified') is True
+    assert receipt['dispatch_state'] == 'acknowledged' and receipt['acknowledged'] == 1 and receipt['replay'] == 'forbidden'
+    if status != 'presented':
+        assert receipt['next_step'] == 'report_presentation' and 'do not replay' in receipt_instruction(receipt).lower()
+    assert registry.persistence_safe_result(registry.get('computer_act'), result)['computer_receipt'] == receipt
+    assert sum(name == 'act' for name, _ in loan_backend.calls) == 1
+    assert [op for op, _ in frames] == ['takeover_end', *([] if terminal in {'shown', 'yielded', 'lost_end'} else ['cancel_presentation'])]
+    assert frames[0][1].get('require_presentation_status') is True
+
+
 @pytest.mark.parametrize('rollback_failed', [False, True])
 def test_presentation_cancel_after_end_dispatched_runs_conditional_rollback(registry, manager, loan_backend, monkeypatch, rollback_failed):
     register(registry, manager)
@@ -7908,11 +7985,12 @@ def test_presentation_cancel_after_end_dispatched_runs_conditional_rollback(regi
     async def scenario():
         entered, release = asyncio.Event(), asyncio.Event()
         effects = []
-        async def end(ref, *, restore_previous_focus=True):
+        async def end(ref, *, restore_previous_focus=True, require_presentation_status=False):
+            assert require_presentation_status and not restore_previous_focus
             effects.append(('end', restore_previous_focus))
             entered.set()
             await release.wait()
-            return {'ended': True, 'restoration': 'preserved_user_focus'}
+            return {'started': True, 'restoration': 'preserved_user_focus', 'presented': True}
         async def rollback(ref):
             effects.append(('rollback', ref))
             if rollback_failed:
@@ -7933,6 +8011,25 @@ def test_presentation_cancel_after_end_dispatched_runs_conditional_rollback(regi
         if rollback_failed:
             assert ('close', None) in loan_backend.calls
     run(scenario())
+
+
+def test_manager_cannot_promote_an_inconsistent_backend_presentation_receipt(registry, manager, loan_backend, monkeypatch):
+    async def malformed(_ref, *, restore_previous_focus, require_presentation_status):
+        assert not restore_previous_focus and require_presentation_status
+        return {'started': False, 'presented': True, 'restoration': 'preserved_user_focus'}
+    async def restore(ref):
+        loan_backend.calls.append(('cancel_presentation', ref))
+        return {'started': True, 'restoration': 'restored'}
+    monkeypatch.setattr(loan_backend, 'end_takeover', malformed)
+    monkeypatch.setattr(loan_backend, 'cancel_presentation', restore)
+    loan_backend.plan_pid_action_classes = ()
+    register(registry, manager)
+    focus(registry)
+    registry.set_approval_handler(lambda _: asyncio.sleep(0, result='once'))
+    snapshot = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    result = _borrow_focus(registry, snapshot, present_result=True)
+    assert result.get('code') == 'presentation_not_completed' and result['computer_receipt']['presentation_status'] == 'withdrawn'
+    assert sum(n == 'act' for n, _ in loan_backend.calls) == sum(n == 'cancel_presentation' for n, _ in loan_backend.calls) == 1
 
 
 def test_failed_presentation_observation_can_still_return_focus_when_cache_poisoned(registry, manager, loan_backend, monkeypatch):
@@ -7962,7 +8059,8 @@ def test_showing_old_result_does_not_commit_if_exact_snapshot_changed_while_wait
         await manager.snapshot()  # same target/binding but somebody has now published a different frame
         return await acquire()
     monkeypatch.setattr(manager, '_acquire_lock_for_terminal_cleanup', intervening_capture)
-    _borrow_focus(registry, snapshot, present_result=True)
+    result = _borrow_focus(registry, snapshot, present_result=True)
+    assert result['code'] == 'presentation_not_completed' and result['computer_receipt']['presentation_status'] == 'not_presented'
     assert loan_backend.restoration_requests == [True]
     assert sum(n == 'act' for n, _ in loan_backend.calls) == 1
 

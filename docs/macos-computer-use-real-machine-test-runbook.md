@@ -209,7 +209,7 @@ ScreenCaptureKit discovery 仍有独立的间歇性失败边界。若本轮在�
 
 ### 7.2 实验性 PID-pointer 五场景矩阵
 
-实验入口与 release 门禁严格分离，只有同时显式设置两个环境开关才运行：
+实验入口与 release 门禁严格分离。两个环境开关只选择实验，不代替真人同意。请在已授权的 Mac 前台终端运行：初始化 fixture 和每个需要前台的计划会分别显示本次挑战文字，输入后按提示松开 Return，再单独按下并松开右 Shift 才批准该次操作。不要用脚本或管道代答。
 
 ```bash
 set -o pipefail
@@ -225,7 +225,7 @@ printf 'fixture_experimental_exit=%s\n' "$astra_fixture_experimental_status" \
 它可能收集 `ordinary_button`、`double_click_surface`、`scroll_surface`、`drag_surface`、`custom_canvas` 五条 `ASTRA_COOPERATIVE_MATRIX_RECORD`，仅用于诊断测试注入的 PID-targeted backend。当前主机的既有新鲜结果是终止行
 `AstraMacComputerE2EHarness: NOT_SUPPORTED experimental PID pointer matrix`、exit 78；未新鲜重跑时只能把它报告为既有 `NOT_SUPPORTED (78)` 证据。
 
-若新鲜实验运行仍为 exit 78，报告 `NOT_SUPPORTED (78)`；若意外得到
+没有交互终端、未批准、超时或批准时目标改变，会以 `NOT_RUN`、exit 77 停止余下场景。这不是兼容性失败或通过，也不抹去此前已执行的场景。若新鲜实验运行仍为 exit 78，报告 `NOT_SUPPORTED (78)`；若意外得到
 `EXPERIMENTAL_PASS PID pointer matrix` 和 exit 0，只能报告
 `EXPERIMENTAL_DIAGNOSTIC_ONLY (0)` 并升级给人工复核，不能写成 release `PASS`。其他非零退出或输入后证据缺失按 `UNKNOWN_OUTCOME`/`FAIL` 原样报告。
 

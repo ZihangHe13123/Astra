@@ -39,7 +39,9 @@ export function approvalKeyHint(choices: readonly string[], windowKeys: boolean,
   const combined = [["once", `${command} Enter`], ["session", `${command} Shift Enter`], ["deny", `${command} ${mac ? "⌫" : "Backspace"}`]]
     .filter(([decision]) => choices.includes(decision)).map(([decision, keys]) => `${keys} ${approvalChoiceLabel(decision, card)}`);
   const letters = [["once", "Y"], ["task", "T"], ["session", "A"], ["deny", "N"]].filter(([decision]) => choices.includes(decision)).map(([, letter]) => letter);
-  return [...(windowKeys ? combined : []), ...(letters.length ? [`点选卡片后可按 ${letters.join(" / ")}`] : [])].join(" · ");
+  const release = card.kind === "computer_foreground_takeover" && choices.some(choice => choice !== "deny")
+    ? ["键盘允许须松开按键；若未响应，请点击按钮"] : [];
+  return [...(windowKeys ? combined : []), ...(letters.length ? [`点选卡片后可按 ${letters.join(" / ")}`] : []), ...release].join(" · ");
 }
 
 /** Whether the focus is in a field whose text the user would lose or send with the same keys. */

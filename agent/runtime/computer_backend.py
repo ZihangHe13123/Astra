@@ -44,8 +44,10 @@ from .computer_protocol import (
     FragmentStageAuthority,
     FragmentStageCommit,
     FragmentStageCommitResult,
+    TakeoverOutcome,
     decode_text_detail_envelope,
     validate_snapshot_payload,
+    validated_focus_consent,
 )
 
 
@@ -55,6 +57,13 @@ class ComputerSessionError(RuntimeError):
     def __init__(self, code: str, message: str | None = None) -> None:
         self.code = code
         super().__init__(message or code)
+
+
+class PresentationWithdrawnError(ComputerSessionError):
+    """The presentation end failed, but the exact helper acknowledged restoration on rollback."""
+
+    def __init__(self) -> None:
+        super().__init__("takeover_cleanup_failed")
 
 
 _LOCK_EX = _fcntl.LOCK_EX if os.name == "posix" and _fcntl is not None else 0
@@ -1307,17 +1316,23 @@ class ComputerSessionManager:
             self._pending_plan = None
             self._takeover_ref = None
             self._takeover_cleanup_ref = None
-            if ((declaration is not None and (loan_deadline is not None or focus_consent is not None))
+            if (type(continued_loan) is not bool or (declaration is not None and loan_deadline is not None)
                     or (continued_loan and (loan_deadline is None or focus_consent is not None))):
                 raise ComputerSessionError("takeover_not_allowed")
             begin_options: dict[str, object] = {}
-            if focus_consent is not None:
-                begin_options["focus_consent"] = focus_consent
+            if not continued_loan:
+                # Never reconstruct a missing decision witness from the current desktop.
+                try:
+                    begin_options["focus_consent"] = validated_focus_consent(focus_consent)
+                except ValueError as exc:
+                    raise ComputerSessionError("approval_required", "Fresh foreground consent is required.") from exc
             if loan_deadline is not None:
                 # Authorization may have expired or been revoked while waiting for the lock.
                 deadline_ms = loan_deadline()
                 if deadline_ms is None:
                     raise ComputerSessionError("approval_required", "The foreground loan is no longer current.")
+                if type(deadline_ms) is not int or not 0 < deadline_ms < 2**53:
+                    raise ComputerSessionError("takeover_not_allowed", "Invalid foreground loan deadline.")
                 begin_options.update(continued_loan=continued_loan, loan_deadline_continuous_ms=deadline_ms)
             if declaration is not None:
                 begin_options["declaration"] = declaration
@@ -1676,6 +1691,7 @@ class ComputerSessionManager:
     ) -> Mapping[str, object]:
         if not isinstance(restore_previous_focus, bool):
             raise TypeError("restore_previous_focus must be boolean")
+        requested_presentation = not restore_previous_focus
         cancelled = await self._acquire_lock_for_terminal_cleanup()
         try:
             if not self._artifact_poisoned or self._closed or self._close_task is not None:
@@ -1704,7 +1720,7 @@ class ComputerSessionManager:
             try:
                 result, cancelled_during_cleanup = await self._await_owned_task(cleanup_task)
                 cancelled = cancelled or cancelled_during_cleanup
-                if presenting and cancelled:
+                if presenting and cancelled and isinstance(result, Mapping) and result.get("presented") is True:
                     # end(false) already consumed the live ref. Only the native one-shot
                     # rollback receipt may restore; never replay end or synthesize activation.
                     undo = asyncio.create_task(self._end_takeover_owned(rollback, takeover_ref))
@@ -1719,6 +1735,9 @@ class ComputerSessionManager:
                 self._terminal_cleanup_task = None
             if not isinstance(result, Mapping):
                 raise ComputerSessionError("stale_takeover")
+            if requested_presentation and not presenting:
+                # An intervening observation/handoff can downgrade a planned presentation to a restore.
+                result = {**result, "presented": False}
         finally:
             self._lock.release()
         if cancelled:
@@ -1737,12 +1756,22 @@ class ComputerSessionManager:
         from .macos_computer import MalformedTakeoverOutcomeError
 
         try:
-            return await end(takeover_ref, restore_previous_focus=False)
+            result = await end(takeover_ref, restore_previous_focus=False, require_presentation_status=True)
+            # Custom backends also meet the same terminal-result contract as the native adapter.
+            try:
+                if not isinstance(result, Mapping):
+                    raise ValueError("not a presentation receipt")
+                return TakeoverOutcome.from_mapping(result, require_presentation_status=True).to_mapping()
+            except (TypeError, ValueError) as exc:
+                raise MalformedTakeoverOutcomeError("malformed presentation result") from exc
         except MalformedTakeoverOutcomeError:
             # The helper may have presented. Spend the one-shot receipt while the
             # owned end task still holds its cleanup budget, then fail closed.
             # Never issue another request on a timeout, EOF or framing error.
-            await rollback(takeover_ref)
+            result = await rollback(takeover_ref)
+            if (isinstance(result, Mapping) and set(result) == {"started", "restoration"}
+                    and result["started"] is True and result["restoration"] == "restored"):
+                raise PresentationWithdrawnError() from None
             raise
 
     async def _end_takeover_owned(self, end: object, takeover_ref: str) -> object:
@@ -1750,6 +1779,8 @@ class ComputerSessionManager:
             result = await self._run_takeover_end_task(end, takeover_ref)
         except BaseException as exc:
             await self._force_close_after_uncertain_takeover_begin()
+            if isinstance(exc, PresentationWithdrawnError):
+                raise  # Preserve the confirmed rollback, never the failed presentation as success.
             raise ComputerSessionError("takeover_cleanup_failed") from exc
         if not isinstance(result, Mapping):
             await self._force_close_after_uncertain_takeover_begin()

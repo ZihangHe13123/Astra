@@ -48,7 +48,7 @@ private final class TerminalTestDesktop: ActionProviding, ApplicationActivationC
         pointerCapability: .available, keyboardCapability: .unavailable, registry: .init(), genericForegroundEnabled: true))
     let plan = try planner.plan(actions: actions, context: .init(guardValue: expected))
     let loan = ForegroundTakeoverCoordinator(activity: activity, activation: desktop, cursor: cursor,
-        frontmostPID: { desktop.frontmost }, applicationExists: { $0 == 77 }, revalidate: { $0 },
+        frontmostPID: { desktop.frontmost }, applicationExists: { $0 == 77 }, inputCounts: { [0] }, physicalIdleSeconds: { 20 }, revalidate: { $0 },
         takePlan: { _ in .init(target: target, guardValue: expected, plan: plan, actions: actions, application: application) },
         classifyPopupPointer: { _ in nil })
     let token = try loan.begin(target: target, snapshotID: expected.snapshotID, planRef: plan.planRef, stageDigest: plan.stageDigest)

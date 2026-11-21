@@ -1069,11 +1069,13 @@ protocol WindowObserving {
     func takeoverBegin(snapshotID: String, planRef: String, continuedLoan: Bool, loanDeadline: TimeInterval?) throws -> String
     func takeoverBegin(snapshotID: String, planRef: String, focusConsent: ForegroundFocusConsent, loanDeadline: TimeInterval?) throws -> String
     func takeoverBegin(snapshotID: String, planRef: String, declaration: ForegroundFragmentDeclaration) throws -> String
+    func takeoverBegin(snapshotID: String, planRef: String, declaration: ForegroundFragmentDeclaration, focusConsent: ForegroundFocusConsent) throws -> String
     func cooperativeAct(snapshotID: String, interactionMode: InteractionMode, planRef: String, takeoverRef: String?, actions: [NativeAction]) -> CooperativeActionResult
     func cooperativeAct(snapshotID: String, interactionMode: InteractionMode, planRef: String, takeoverRef: String?, actions: [NativeAction], fragmentStage: FragmentStageAuthority?) -> CooperativeActionResult
     func fragmentStageCommit(takeoverRef: String, commit: FragmentStageCommit) throws -> FragmentStageCommitOutcome
     func takeoverEnd(takeoverRef: String) throws -> TakeoverOutcome
     func takeoverEnd(takeoverRef: String, restorePreviousFocus: Bool) throws -> TakeoverOutcome
+    func endRequiringPresentationStatus(takeoverRef: String) throws -> TakeoverOutcome
     func cancelPresentation(takeoverRef: String) throws -> TakeoverOutcome
     func presentationApps(takeoverRef: String) throws -> JSONValue
     func invalidateSnapshots()
@@ -1132,10 +1134,8 @@ extension WindowObserving {
     func takeoverBegin(snapshotID _: String, planRef _: String) throws -> String {
         throw TakeoverError.stalePlan
     }
-    func takeoverBegin(snapshotID: String, planRef: String, continuedLoan: Bool, loanDeadline: TimeInterval?) throws -> String {
-        guard !continuedLoan, loanDeadline == nil else { throw TakeoverError.userActivityPaused }
-        return try takeoverBegin(snapshotID: snapshotID, planRef: planRef)
-    }
+    func takeoverBegin(snapshotID _: String, planRef _: String, continuedLoan _: Bool, loanDeadline _: TimeInterval?) throws -> String { throw TakeoverError.userActivityPaused }
+    func takeoverBegin(snapshotID _: String, planRef _: String, declaration _: ForegroundFragmentDeclaration, focusConsent _: ForegroundFocusConsent) throws -> String { throw TakeoverError.userActivityPaused }
     func takeoverBegin(snapshotID _: String, planRef _: String, focusConsent _: ForegroundFocusConsent, loanDeadline _: TimeInterval?) throws -> String {
         throw TakeoverError.userActivityPaused  // Never downgrade a marked request.
     }
@@ -1182,6 +1182,7 @@ extension WindowObserving {
     func takeoverEnd(takeoverRef _: String) throws -> TakeoverOutcome {
         throw TakeoverError.alreadyConsumed
     }
+    func endRequiringPresentationStatus(takeoverRef _: String) throws -> TakeoverOutcome { throw TakeoverError.authorityMismatch }
     func cancelPresentation(takeoverRef _: String) throws -> TakeoverOutcome { throw TakeoverError.alreadyConsumed }
     func presentationApps(takeoverRef _: String) throws -> JSONValue { throw TakeoverError.authorityMismatch }
     func invalidateSnapshots() {}
@@ -1231,6 +1232,7 @@ final class SystemWindowObserver: WindowObserving {
         },
         inputCounts: ForegroundTakeoverCoordinator.physicalInputCounts,
         physicalIdleSeconds: ForegroundTakeoverCoordinator.secondsSincePhysicalInput,
+        presentationWindowMatches: { retainedPresentationWindowMatches($0) },
         revalidate: { [weak self] target in
             guard let self else { throw WindowObservationError.targetGone }
             _ = try self.backgroundTargetController().snapshotTargetState(target)
@@ -2803,11 +2805,12 @@ final class SystemWindowObserver: WindowObserving {
     }
 
     func takeoverBegin(snapshotID: String, planRef: String) throws -> String {
-        try takeoverBegin(snapshotID: snapshotID, planRef: planRef, continuedLoan: false, loanDeadline: nil)
+        throw TakeoverError.userActivityPaused
     }
 
     func takeoverBegin(snapshotID: String, planRef: String, continuedLoan: Bool, loanDeadline: TimeInterval?) throws -> String {
-        try beginOrdinaryTakeover(snapshotID: snapshotID, planRef: planRef, continuedLoan: continuedLoan, loanDeadline: loanDeadline, focusConsent: nil)
+        guard continuedLoan, loanDeadline != nil else { throw TakeoverError.userActivityPaused }
+        return try beginOrdinaryTakeover(snapshotID: snapshotID, planRef: planRef, continuedLoan: true, loanDeadline: loanDeadline, focusConsent: nil)
     }
 
     func takeoverBegin(snapshotID: String, planRef: String, focusConsent: ForegroundFocusConsent, loanDeadline: TimeInterval?) throws -> String {
@@ -2839,7 +2842,7 @@ final class SystemWindowObserver: WindowObserving {
     func takeoverBegin(
         snapshotID: String,
         planRef: String,
-        declaration: ForegroundFragmentDeclaration
+        declaration: ForegroundFragmentDeclaration, focusConsent: ForegroundFocusConsent
     ) throws -> String {
         actionLock.lock()
         defer { actionLock.unlock() }
@@ -2852,7 +2855,7 @@ final class SystemWindowObserver: WindowObserving {
             target: target,
             snapshotID: snapshotID,
             planRef: planRef,
-            declaration: declaration
+            declaration: declaration, focusConsent: focusConsent
         ).ref
     }
 
@@ -3085,6 +3088,11 @@ final class SystemWindowObserver: WindowObserving {
         actionLock.lock()
         defer { actionLock.unlock() }
         return try takeoverCoordinator.end(takeoverRef, allowRestore: restorePreviousFocus)
+    }
+
+    func endRequiringPresentationStatus(takeoverRef: String) throws -> TakeoverOutcome {
+        let coordinator = actionLock.withLock { takeoverCoordinator }
+        return try coordinator.end(takeoverRef, allowRestore: false, requirePresentationStatus: true)
     }
 
     func cancelPresentation(takeoverRef: String) throws -> TakeoverOutcome {
@@ -3358,6 +3366,7 @@ final class SystemWindowObserver: WindowObserving {
                     fragmentBinding: fragmentStage
                 )
             }
+            takeoverCoordinator.finishOrdinaryAct(takeoverRef, result: result)
             return result
         } catch TakeoverError.loanExpired {
             return CooperativeActionResult(

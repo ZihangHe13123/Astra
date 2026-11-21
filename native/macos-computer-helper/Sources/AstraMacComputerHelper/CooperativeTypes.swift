@@ -82,15 +82,18 @@ struct TakeoverOutcome: Codable, Equatable {
     let started: Bool
     let restoration: TakeoverRestoration
     let cleanupFailed: Bool
+    let presented: Bool
 
     init(
         started: Bool,
         restoration: TakeoverRestoration,
-        cleanupFailed: Bool = false
+        cleanupFailed: Bool = false,
+        presented: Bool = false
     ) {
         self.started = started
         self.restoration = restoration
         self.cleanupFailed = cleanupFailed
+        self.presented = presented
     }
 
     var isValid: Bool {

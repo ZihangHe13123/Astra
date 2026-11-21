@@ -446,7 +446,7 @@ import Testing
         windows: windows
     )
     let response = dispatcher.handle(
-        #"{"protocol_version":4,"request_id":"begin","operation":"takeover_begin","payload":{"snapshot_id":"snapshot-0","plan_ref":"plan-0","fragment":{"fragment_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stages":[{"stage_hash":"0000000000000000000000000000000000000000000000000000000000000000","expected_action_count":1,"requirements":[{"backend":"ax_press","action_class":"press","intent":null}]}],"max_actions":1,"wall_clock_limit_ms":1000,"restore_previous_focus":true}}}"#
+        #"{"protocol_version":4,"request_id":"begin","operation":"takeover_begin","payload":{"snapshot_id":"snapshot-0","plan_ref":"plan-0","focus_consent":{"decided_at_continuous_us":90000000,"frontmost_pid":77},"fragment":{"fragment_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stages":[{"stage_hash":"0000000000000000000000000000000000000000000000000000000000000000","expected_action_count":1,"requirements":[{"backend":"ax_press","action_class":"press","intent":null}]}],"max_actions":1,"wall_clock_limit_ms":1000,"restore_previous_focus":true}}}"#
     )
 
     #expect(response.ok)
@@ -522,7 +522,8 @@ import Testing
         }
         #expect(capabilities.contains(.string("focus_loan_v3")))
         #expect(!capabilities.contains(.string("focus_loan_v2")))
-        #expect(capabilities.contains(.string("focus_presentation_v1")))
+        #expect(capabilities.contains(.string("focus_presentation_v2")))
+        #expect(!capabilities.contains(.string("focus_presentation_v1")))
         #expect(capabilities.contains(.string("focus_consent_v1")))
     }
 }
@@ -535,7 +536,7 @@ import Testing
             #"{"protocol_version":4,"request_id":"timed","operation":"takeover_begin","payload":{"snapshot_id":"snap","plan_ref":"plan",\#(fields)}}"#
         )
     }
-    for suffix in ["", #","continued_loan":true"#] {
+    for suffix in [#","focus_consent":{"decided_at_continuous_us":300000000,"frontmost_pid":77}"#, #","continued_loan":true"#] {
         #expect(begin(#""loan_deadline_continuous_ms":420125\#(suffix)"#).ok)
         #expect(begin(#""loan_deadline_uptime_ms":450000\#(suffix)"#).error?.code == "protocol_mismatch")
     }
@@ -577,6 +578,24 @@ import Testing
     let unsupported = old.handle(#"{"protocol_version":4,"request_id":"r","operation":"takeover_begin","payload":{"snapshot_id":"s","plan_ref":"p","focus_consent":\#(valid)}}"#)
     #expect(unsupported.error?.code == "user_activity_paused")
     #expect(legacy.ordinaryTakeoverBegins == 0)
+}
+
+@Test func freshTakeoversRequireConsentBeforeCallingAnyWindowObserver() {
+    let windows = CooperativeProtocolWindows()
+    let dispatcher = Dispatcher(permissions: StaticPermissions(accessibilityTrusted: true, screenRecordingAllowed: true), windows: windows)
+    let declaration = #""fragment":{"fragment_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stages":[{"stage_hash":"0000000000000000000000000000000000000000000000000000000000000000","expected_action_count":1,"requirements":[{"backend":"ax_press","action_class":"press","intent":null}]}],"max_actions":1,"wall_clock_limit_ms":1000,"restore_previous_focus":true}"#
+    let consent = #""focus_consent":{"decided_at_continuous_us":90000000,"frontmost_pid":77}"#
+    func send(_ fields: [String]) -> HelperResponse {
+        let tail = fields.map { "," + $0 }.joined()
+        return dispatcher.handle(#"{"protocol_version":4,"request_id":"r","operation":"takeover_begin","payload":{"snapshot_id":"s","plan_ref":"p"\#(tail)}}"#)
+    }
+    for fields in [[], [#""loan_deadline_continuous_ms":100000"#], [declaration],
+                   [declaration, consent, #""loan_deadline_continuous_ms":100000"#], [declaration, consent, #""continued_loan":true"#]] {
+        #expect(send(fields).error?.code == "protocol_mismatch")
+    }
+    #expect(windows.ordinaryTakeoverBegins == 0 && windows.takeoverDeclarations.isEmpty)
+    #expect(send([declaration, consent]).ok)
+    #expect(windows.takeoverDeclarations.count == 1)
 }
 
 @Test func presentationRoutesRequireOnlyTheExactBoundedTakeoverRef() {
@@ -630,7 +649,7 @@ import Testing
             #"{"protocol_version":4,"request_id":"timed","operation":"takeover_begin","payload":{"snapshot_id":"snapshot","plan_ref":"plan","loan_deadline_continuous_ms":420000\#(suffix)}}"#
         )
         // An observer without bounded loans must never substitute a plain begin.
-        #expect(timed.error?.code == "user_activity_paused")
+        #expect(timed.error?.code == (suffix.isEmpty ? "protocol_mismatch" : "user_activity_paused"))
     }
     let ordinaryAct = dispatcher.handle(
         #"{"protocol_version":4,"request_id":"missing","operation":"act","payload":{"interaction_mode":"foreground_takeover","snapshot_id":"snapshot","plan_ref":"plan","takeover_ref":"takeover","actions":[]}}"#
@@ -640,10 +659,10 @@ import Testing
     )
 
     #expect(ordinaryPlan.ok)
-    #expect(ordinaryBegin.ok)
+    #expect(ordinaryBegin.error?.code == "protocol_mismatch")
     #expect(ordinaryAct.ok)
     #expect(background.ok)
-    #expect(windows.ordinaryTakeoverBegins == 1)
+    #expect(windows.ordinaryTakeoverBegins == 0)
 }
 
 @Test func protocolV4RoutesExactFragmentStageCommit() {
@@ -1176,7 +1195,7 @@ private final class CooperativeProtocolWindows: WindowObserving {
     func takeoverBegin(
         snapshotID _: String,
         planRef _: String,
-        declaration: ForegroundFragmentDeclaration
+        declaration: ForegroundFragmentDeclaration, focusConsent _: ForegroundFocusConsent
     ) throws -> String {
         takeoverDeclarations.append(declaration)
         return "takeover"

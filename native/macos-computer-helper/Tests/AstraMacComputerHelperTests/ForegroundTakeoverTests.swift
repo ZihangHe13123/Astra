@@ -4,6 +4,20 @@ import CoreGraphics
 import Foundation
 import Testing
 
+// Only the mock test target can manufacture the approval used by these fixtures. Production
+// must carry a decision from the wire or present a matching continuation checkpoint.
+extension ForegroundTakeoverCoordinator {
+    func simulatedConsent() -> ForegroundFocusConsent {
+        .init(decidedAtContinuousUS: Int((loanNow() - 0.001) * 1_000_000), frontmostPID: frontmostPID() ?? 77)
+    }
+
+    func begin(target: WindowTarget, snapshotID: String, planRef: String, stageDigest: String,
+               continuedLoan: Bool = false, loanDeadline: TimeInterval? = nil) throws -> TakeoverToken {
+        try begin(target: target, snapshotID: snapshotID, planRef: planRef, stageDigest: stageDigest,
+            continuedLoan: continuedLoan, loanDeadline: loanDeadline, focusConsent: continuedLoan ? nil : simulatedConsent())
+    }
+}
+
 @Test func popupPointerPlanGateAcceptsOnlyOneRawClickOnExactDialog() throws {
     let element = AXUIElementCreateApplication(11)
     let identity = CFHash(element)
@@ -139,6 +153,7 @@ import Testing
             activity: activity, activation: activation, cursor: cursor,
             frontmostPID: { activation.currentFrontmostPID },
             applicationExists: { $0 == 77 || $0 == 11 },
+            inputCounts: { [0] }, physicalIdleSeconds: { 20 },
             revalidate: { $0 },
             takePlan: vault.take,
             classifyPopupPointer: { candidate in
@@ -630,7 +645,7 @@ func postConsumeAuthorityMismatchCancelsInputAndLeavesOneCleanupTombstone(kind: 
     }
     #expect(fixture.activity.fragmentsStarted == 0)
     #expect(fixture.cursor.closeCount == 1)
-    #expect(try fixture.coordinator.end(token.ref, allowRestore: true).restoration == .preservedUserFocus)
+    #expect(try fixture.coordinator.end(token.ref, allowRestore: true).restoration == .restored)
     #expect(throws: TakeoverError.alreadyConsumed) {
         try fixture.coordinator.end(token.ref, allowRestore: true)
     }
@@ -1280,6 +1295,121 @@ private func presentationWindows(_ coordinator: ForegroundTakeoverCoordinator,
         })
 }
 
+@Test(arguments: ["unconsumed", "consumedOnly", "failed", "partial", "quiet", "finalObservation", "typed", "thirdApp", "duringLookup", "bounded"])
+func markedPresentationEndReportsOnlyCompletedQuietDispatch(_ state: String) throws {
+    let time = ManualLoanTime()
+    var counts: UInt32 = 17, completing = false
+    let f = TakeoverFixture(inputCounts: { [counts] }, beforeReadingFrontmost: {
+        if completing && state == "duringLookup" { counts += 1 }
+    }, loanTime: time)
+    let token = try f.begin(loanDeadline: state == "bounded" ? time.now + 60 : nil)
+    if state != "unconsumed" { _ = try f.coordinator.consume(token.ref, actions: f.actions) }
+    if !["unconsumed", "consumedOnly"].contains(state) {
+        let failed = state == "failed", partial = state == "partial"
+        f.coordinator.finishOrdinaryAct(token.ref, result: .init(batch: .init(
+            outcomes: partial ? [] : [.init(index: 0, ok: !failed, error: failed ? .helperFailed : nil, observationRequired: state == "finalObservation")],
+            lastAcknowledgedAction: failed || partial ? -1 : 0, error: failed ? .helperFailed : nil), error: nil))
+    }
+    if state == "typed" { f.activity.terminalInterrupted = true }
+    if state == "thirdApp" { f.activation.currentFrontmostPID = 99 }
+    completing = true
+    let windows = presentationWindows(f.coordinator)
+    let dispatcher = Dispatcher(permissions: TakeoverPermissions(), windows: windows)
+    let response = dispatcher.handle(#"{"protocol_version":4,"request_id":"p","operation":"takeover_end","payload":{"takeover_ref":"\#(token.ref)","restore_previous_focus":false,"require_presentation_status":true}}"#)
+    let restored = ["unconsumed", "consumedOnly", "failed", "partial", "bounded"].contains(state)
+    #expect(response.ok)
+    #expect(response.result == .object(["started": .bool(true), "restoration": .string(restored ? "restored" : "preserved_user_focus"), "presented": .bool(["quiet", "finalObservation"].contains(state))]))
+    #expect(f.activation.restored == (restored ? [77] : []))
+    #expect(f.activity.disarmCount == 1)
+    if restored { #expect(throws: TakeoverError.self) { try windows.cancelPresentation(takeoverRef: token.ref) } }
+}
+
+@Test func directUnconsumedEndCannotSuppressRestore() throws {
+    let f = TakeoverFixture()
+    let token = try f.begin()
+    #expect(try f.coordinator.end(token.ref, allowRestore: false).restoration == .restored)
+    #expect(f.activation.restored == [77])
+    #expect(throws: TakeoverError.self) { try f.coordinator.cancelPresentation(takeoverRef: token.ref) }
+}
+
+@Test(arguments: ["same", "newTitle", "sibling", "unreadable", "inputDuringProbe", "lateProof"])
+func markedPresentationRequiresCurrentExactWindowNotJustPID(_ state: String) throws {
+    let time = ManualLoanTime()
+    var count: UInt32 = 7, probes = 0
+    let f = TakeoverFixture(inputCounts: { [count] }, presentationWindowMatches: { target in
+        probes += 1
+        #expect(target.windowID == 22 && target.axIdentity == 33)
+        if state == "inputDuringProbe" { count += 1 }
+        if state == "lateProof" { time.now += 60 }
+        // B2 is in the same still-frontmost process. A title change alone does not change B1.
+        return state != "sibling" && state != "unreadable"
+    }, loanTime: time)
+    let token = try f.begin()
+    _ = try f.coordinator.consume(token.ref, actions: f.actions)
+    f.coordinator.finishOrdinaryAct(token.ref, result: .init(batch: .init(outcomes: [.init(index: 0, ok: true, error: nil)], lastAcknowledgedAction: 0, error: nil), error: nil))
+    let outcome = try presentationWindows(f.coordinator).endRequiringPresentationStatus(takeoverRef: token.ref)
+    #expect(probes == 1)
+    #expect(outcome.presented == ["same", "newTitle"].contains(state))
+    let restored = ["sibling", "unreadable", "lateProof"].contains(state)
+    #expect(outcome.restoration == (restored ? .restored : .preservedUserFocus))
+    #expect(f.activation.restored == (restored ? [77] : []))
+}
+
+@Test func blockedPresentationWindowProofCannotDelayCloseOrCommitAfterIt() throws {
+    let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+    let finished = DispatchSemaphore(value: 0), closed = DispatchSemaphore(value: 0)
+    let f = TakeoverFixture(presentationWindowMatches: { _ in
+        entered.signal(); _ = release.wait(timeout: .now() + 5); return true
+    })
+    let token = try f.begin()
+    _ = try f.coordinator.consume(token.ref, actions: f.actions)
+    f.coordinator.finishOrdinaryAct(token.ref, result: .init(batch: .init(outcomes: [.init(index: 0, ok: true, error: nil)], lastAcknowledgedAction: 0, error: nil), error: nil))
+    let windows = presentationWindows(f.coordinator)
+    Thread.detachNewThread {
+        #expect(throws: TakeoverError.alreadyConsumed) { try windows.endRequiringPresentationStatus(takeoverRef: token.ref) }
+        finished.signal()
+    }
+    try #require(entered.wait(timeout: .now() + 1) == .success)
+    Thread.detachNewThread { windows.invalidateSnapshots(); closed.signal() }
+    let timely = closed.wait(timeout: .now() + 1) == .success
+    #expect(timely)
+    if timely { #expect(f.activation.restored == [77]) }
+    release.signal()
+    try #require(finished.wait(timeout: .now() + 2) == .success)
+    if !timely { try #require(closed.wait(timeout: .now() + 2) == .success) }
+    #expect(f.activity.disarmCount == 1)
+    #expect(throws: TakeoverError.self) { try windows.cancelPresentation(takeoverRef: token.ref) }
+}
+
+@Test func retainedPresentationMatcherUsesAXObjectAndVisibleCGIdentityNotTitle() {
+    // Opaque test references only. Both mocked windows belong to PID 11; do not query real AX or CG.
+    let original = AXUIElementCreateApplication(411), other = AXUIElementCreateApplication(412)
+    func matches(title: String, visible: Bool = true, focused: AXUIElement?) -> Bool {
+        let target = WindowTarget(appRef: "test", windowRef: "B1", pid: 11, windowID: 22, bounds: .zero,
+            title: title, axIdentity: CFHash(original), axElement: original)
+        return retainedPresentationWindowMatches(target, onScreen: { $0.windowID == 22 && visible },
+            focusedWindow: { $0 == 11 ? focused : nil })
+    }
+    #expect(matches(title: "before", focused: original))
+    #expect(matches(title: "after navigation", focused: original))
+    #expect(!matches(title: "before", focused: other))
+    #expect(!matches(title: "before", focused: nil))
+    #expect(!matches(title: "before", visible: false, focused: original))
+}
+
+@Test func guardedFragmentRejectsResumedTypingAndCannotBeEndedWithPresentationStatus() throws {
+    let interrupted = FragmentCoordinatorFixture(wallClockLimitMS: 10_000, physicalIdleSeconds: { 0 })
+    #expect(throws: TakeoverError.userActivityPaused) { try interrupted.begin() }
+    #expect(interrupted.activation.activated.isEmpty && interrupted.activation.restored.isEmpty)
+    #expect(interrupted.activity.disarmCount == 1)
+    let f = FragmentCoordinatorFixture(wallClockLimitMS: 10_000)
+    let token = try f.begin()
+    let observer = presentationWindows(f.coordinator)
+    #expect(throws: TakeoverError.authorityMismatch) { try observer.endRequiringPresentationStatus(takeoverRef: token.ref) }
+    #expect(f.activity.disarmCount == 0)
+    #expect(try observer.takeoverEnd(takeoverRef: token.ref).restoration == .restored)
+}
+
 @Test(arguments: ["quiet", "disarmInterrupted", "postEndTyping", "thirdApp", "leftBeforeEnd", "expired"])
 func presentationCancellationConsumesOnlyAQuietCurrentReceipt(_ change: String) throws {
     var count: UInt32 = 17
@@ -1288,6 +1418,7 @@ func presentationCancellationConsumesOnlyAQuietCurrentReceipt(_ change: String) 
     let windows = presentationWindows(f.coordinator)
     let token = try f.begin()
     _ = try f.coordinator.consume(token.ref, actions: f.actions)
+    f.coordinator.finishOrdinaryAct(token.ref, result: .init(batch: .init(outcomes: [.init(index: 0, ok: true, error: nil)], lastAcknowledgedAction: 0, error: nil), error: nil))
     f.activity.retainHeldInput(cleanupFailures: 0)
     if change == "disarmInterrupted" { f.activity.terminalInterrupted = true }
     if change == "leftBeforeEnd" { f.activation.currentFrontmostPID = 99 }
@@ -1316,7 +1447,10 @@ func presentationRollbackCannotBeMintedOrCarriedByOtherAuthority(_ reason: Strin
     let token = try f.begin(loanDeadline: reason == "bounded" ? time.now + 60 : nil)
     if reason == "failedConsume" {
         #expect(throws: TakeoverError.authorityMismatch) { try f.coordinator.consume(token.ref, actions: []) }
-    } else if reason != "unconsumed" { _ = try f.coordinator.consume(token.ref, actions: f.actions) }
+    } else if reason != "unconsumed" {
+        _ = try f.coordinator.consume(token.ref, actions: f.actions)
+        f.coordinator.finishOrdinaryAct(token.ref, result: .init(batch: .init(outcomes: [.init(index: 0, ok: true, error: nil)], lastAcknowledgedAction: 0, error: nil), error: nil))
+    }
     if reason == "failedCleanup" { f.activity.retainHeldInput(cleanupFailures: .max) }
     let outcome = try windows.takeoverEnd(takeoverRef: token.ref, restorePreviousFocus: reason == "regularEnd")
     #expect(outcome.cleanupFailed == (reason == "failedCleanup"))
@@ -1332,7 +1466,7 @@ func presentationRollbackCannotBeMintedOrCarriedByOtherAuthority(_ reason: Strin
         f.activity.allowHeldInputCleanup()
         #expect(try windows.takeoverEnd(takeoverRef: token.ref).restoration == .restored)
     }
-    #expect(f.activation.restored.count == (["bounded", "regularEnd", "failedCleanup"].contains(reason) ? 1 : 0))
+    #expect(f.activation.restored.count == (["unconsumed", "bounded", "regularEnd", "failedCleanup", "failedConsume"].contains(reason) ? 1 : 0))
 }
 
 @Test func presentationCatalogRequiresConsumedOneShotAndLeavesOnlyTeardownAuthority() throws {
@@ -1530,7 +1664,7 @@ private func beginFailureConsumesPlanAndCleansUp(_ failure: TakeoverFixture.Fail
     )
 
     let response = dispatcher.handle(
-        #"{"protocol_version":4,"request_id":"begin","operation":"takeover_begin","payload":{"snapshot_id":"snapshot","plan_ref":"plan","fragment":{"fragment_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stages":[{"stage_hash":"0000000000000000000000000000000000000000000000000000000000000000","expected_action_count":1,"requirements":[{"backend":"pid_pointer","action_class":"click","intent":"pointer:click"}]}],"max_actions":1,"wall_clock_limit_ms":1000,"restore_previous_focus":true}}}"#
+        #"{"protocol_version":4,"request_id":"begin","operation":"takeover_begin","payload":{"snapshot_id":"snapshot","plan_ref":"plan","focus_consent":{"decided_at_continuous_us":90000000,"frontmost_pid":77},"fragment":{"fragment_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stages":[{"stage_hash":"0000000000000000000000000000000000000000000000000000000000000000","expected_action_count":1,"requirements":[{"backend":"pid_pointer","action_class":"click","intent":"pointer:click"}]}],"max_actions":1,"wall_clock_limit_ms":1000,"restore_previous_focus":true}}}"#
     )
 
     #expect(!response.ok)
@@ -1545,7 +1679,7 @@ private func beginFailureConsumesPlanAndCleansUp(_ failure: TakeoverFixture.Fail
         windows: windows
     )
     let begin = dispatcher.handle(
-        #"{"protocol_version":4,"request_id":"b","operation":"takeover_begin","payload":{"snapshot_id":"s","plan_ref":"p","fragment":{"fragment_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stages":[{"stage_hash":"0000000000000000000000000000000000000000000000000000000000000000","expected_action_count":1,"requirements":[{"backend":"pid_pointer","action_class":"click","intent":"pointer:click"}]}],"max_actions":1,"wall_clock_limit_ms":1000,"restore_previous_focus":true}}}"#
+        #"{"protocol_version":4,"request_id":"b","operation":"takeover_begin","payload":{"snapshot_id":"s","plan_ref":"p","focus_consent":{"decided_at_continuous_us":90000000,"frontmost_pid":77},"fragment":{"fragment_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stages":[{"stage_hash":"0000000000000000000000000000000000000000000000000000000000000000","expected_action_count":1,"requirements":[{"backend":"pid_pointer","action_class":"click","intent":"pointer:click"}]}],"max_actions":1,"wall_clock_limit_ms":1000,"restore_previous_focus":true}}}"#
     )
     #expect(begin.ok)
     #expect(windows.beginCalls == 1)
@@ -2405,6 +2539,7 @@ func productionPIDStateFactoryStopsAtDifferentKeyWindowAfterCompleteDelivery(sam
         cursor: cursor,
         frontmostPID: { activation.currentFrontmostPID },
         applicationExists: { $0 == 77 },
+        inputCounts: { [0] }, physicalIdleSeconds: { 20 },
         revalidate: { $0 },
         takePlan: vault.take
     )
@@ -3383,7 +3518,7 @@ private struct SettlingTakeoverFixture {
     let coordinator: ForegroundTakeoverCoordinator
 
     init(exactWindowValues: [Bool] = [true], inputCounts: @escaping () -> [UInt32] = { [0] },
-         physicalIdleSeconds: @escaping () -> TimeInterval? = { nil }) {
+         physicalIdleSeconds: @escaping () -> TimeInterval? = { 20 }) {
         let batch = TakeoverFixture()
         self.batch = batch
         let runtime = PhasedActivationRuntime(identity: .init(bundleURL: nil, localizedName: "Fixture"),
@@ -3402,7 +3537,8 @@ private struct SettlingTakeoverFixture {
 
     func begin(focusConsent: ForegroundFocusConsent? = nil) throws -> TakeoverToken {
         try coordinator.begin(target: batch.target, snapshotID: batch.guardValue.snapshotID,
-            planRef: batch.plan.planRef, stageDigest: batch.plan.stageDigest, continuedLoan: false, focusConsent: focusConsent)
+            planRef: batch.plan.planRef, stageDigest: batch.plan.stageDigest, continuedLoan: false,
+            focusConsent: focusConsent ?? coordinator.simulatedConsent())
     }
 }
 
@@ -3440,7 +3576,8 @@ private final class TakeoverFixture {
         snapshotGuard: ActionGuard? = nil,
         oldFrontmostPID: pid_t? = 77,
         inputCounts: @escaping () -> [UInt32] = { [0] },
-        physicalIdleSeconds: @escaping () -> TimeInterval? = { nil },
+        physicalIdleSeconds: (() -> TimeInterval?)? = nil,
+        presentationWindowMatches: @escaping (WindowTarget) -> Bool = { _ in true },
         beforeReadingFrontmost: @escaping () -> Void = {},
         loanTime: ManualLoanTime = ManualLoanTime(),
         existingPIDs: Set<pid_t> = [77],
@@ -3491,7 +3628,8 @@ private final class TakeoverFixture {
             frontmostPID: { [activation] in beforeReadingFrontmost(); return activation.currentFrontmostPID },
             applicationExists: { existingPIDs.contains($0) },
             inputCounts: inputCounts,
-            physicalIdleSeconds: physicalIdleSeconds,
+            physicalIdleSeconds: physicalIdleSeconds ?? { loanTime.now },
+            presentationWindowMatches: presentationWindowMatches,
             loanNow: { loanTime.now }, scheduleLoanExpiry: loanTime.schedule,
             revalidate: { target in
                 if failure == .target { throw WindowObservationError.targetGone }
@@ -3506,7 +3644,7 @@ private final class TakeoverFixture {
             target: target,
             snapshotID: guardValue.snapshotID,
             planRef: plan.planRef,
-            stageDigest: plan.stageDigest, continuedLoan: false, loanDeadline: loanDeadline, focusConsent: focusConsent
+            stageDigest: plan.stageDigest, continuedLoan: false, loanDeadline: loanDeadline, focusConsent: focusConsent ?? coordinator.simulatedConsent()
         )
     }
 
@@ -3559,6 +3697,7 @@ private final class FragmentCoordinatorFixture {
 
     init(
         wallClockLimitMS: Int,
+        physicalIdleSeconds: @escaping () -> TimeInterval? = { 20 },
         beforeFragmentCommit: @escaping () -> Void = {},
         classifyPopupPointer: @escaping (ForegroundTakeoverPlanAuthority) -> CGPoint? = popupPointerClickPoint
     ) {
@@ -3601,6 +3740,7 @@ private final class FragmentCoordinatorFixture {
             cursor: cursor,
             frontmostPID: { [activation] in activation.currentFrontmostPID },
             applicationExists: { $0 == 77 },
+            inputCounts: { [0] }, physicalIdleSeconds: physicalIdleSeconds,
             revalidate: { $0 },
             takePlan: vault.take,
             classifyPopupPointer: classifyPopupPointer,
@@ -3613,7 +3753,7 @@ private final class FragmentCoordinatorFixture {
             target: target,
             snapshotID: stages[0].inputSnapshotID,
             planRef: plans[0].planRef,
-            declaration: declaration
+            declaration: declaration, focusConsent: coordinator.simulatedConsent()
         )
     }
 
@@ -3847,7 +3987,7 @@ private final class TakeoverBeginFailureWindows: WindowObserving {
     func takeoverBegin(
         snapshotID _: String,
         planRef _: String,
-        declaration _: ForegroundFragmentDeclaration
+        declaration _: ForegroundFragmentDeclaration, focusConsent _: ForegroundFocusConsent
     ) throws -> String {
         _ = try fixture.begin()
         return "unexpected"
@@ -4024,7 +4164,7 @@ private final class TakeoverProtocolWindows: WindowObserving {
     func takeoverBegin(
         snapshotID _: String,
         planRef _: String,
-        declaration _: ForegroundFragmentDeclaration
+        declaration _: ForegroundFragmentDeclaration, focusConsent _: ForegroundFocusConsent
     ) throws -> String { beginCalls += 1; return "t" }
     func cooperativeAct(snapshotID _: String, interactionMode _: InteractionMode, planRef _: String, takeoverRef _: String?, actions _: [NativeAction]) -> CooperativeActionResult {
         foregroundActCalls += 1
@@ -4222,6 +4362,7 @@ func enrichedPlanningFocusStillRejectsChangedConsumedSnapshot(kind: String) thro
     let fixture = TakeoverFixture(oldFrontmostPID: 77, existingPIDs: [77])
     let token = try fixture.begin()
     _ = try fixture.coordinator.consume(token.ref, actions: fixture.actions)
+    fixture.coordinator.finishOrdinaryAct(token.ref, result: .init(batch: .init(outcomes: [.init(index: 0, ok: true, error: nil)], lastAcknowledgedAction: 0, error: nil), error: nil))
     let outcome = try fixture.coordinator.end(token.ref, allowRestore: false)
     #expect(outcome.restoration == .preservedUserFocus)
     #expect(fixture.activation.restored.isEmpty)
@@ -4231,6 +4372,14 @@ func enrichedPlanningFocusStillRejectsChangedConsumedSnapshot(kind: String) thro
 }
 
 @Test func takeoverEndRoutesExplicitFocusPolicyAndRejectsMalformedValues() {
+    for fields in [#""require_presentation_status":true"#, #""require_presentation_status":true,"restore_previous_focus":true"#,
+                   #""require_presentation_status":false,"restore_previous_focus":false"#, #""require_presentation_status":1,"restore_previous_focus":false"#,
+                   #""require_presentation_status":"true","restore_previous_focus":false"#, #""require_presentation_status":null,"restore_previous_focus":false"#] {
+        let windows = TakeoverProtocolWindows()
+        let dispatcher = Dispatcher(permissions: TakeoverPermissions(), windows: windows)
+        #expect(dispatcher.handle(#"{"protocol_version":4,"request_id":"s","operation":"takeover_end","payload":{"takeover_ref":"t",\#(fields)}}"#).error?.code == "protocol_mismatch")
+        #expect(windows.endCalls == 0)
+    }
     for restore in [true, false] {
         let windows = TakeoverProtocolWindows()
         let dispatcher = Dispatcher(permissions: TakeoverPermissions(), windows: windows)

@@ -7,7 +7,7 @@ func snapshotAXTreeJSON(_ tree: SerializedAXTree, subtree: Bool) -> JSONValue {
     guard case var .object(fields) = tree.asJSON() else { return tree.asJSON() }
     fields["observation_capabilities"] = .array([
         .string("subtree_v1"), .string("checked_click_v1"), .string("auto_takeover_v1"),
-        .string("replace_text_v1"), .string("focus_loan_v3"), .string("focus_presentation_v1"), .string("focus_consent_v1"),
+        .string("replace_text_v1"), .string("focus_loan_v3"), .string("focus_presentation_v2"), .string("focus_consent_v1"),
     ])
     fields["observation_scope"] = .string(subtree ? "native_subtree" : "window")
     return .object(fields)

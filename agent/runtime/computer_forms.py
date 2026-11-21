@@ -16,7 +16,7 @@ def observation_capabilities(tree) -> list[str]:
             for item in values
             if isinstance(item, str) and item in {
                 "subtree_v1", "checked_click_v1", "auto_takeover_v1", "replace_text_v1",
-                "focus_loan_v3", "focus_presentation_v1", "focus_consent_v1",
+                "focus_loan_v3", "focus_presentation_v1", "focus_presentation_v2", "focus_consent_v1",
             }
         ]
         if isinstance(values, list)
@@ -161,12 +161,15 @@ def safe_action_receipt(value):
         "mode": {"background", "foreground_takeover"},
         "dispatch_state": {"not_dispatched", "attempted", "acknowledged", "partial", "unknown"},
         "verification_state": {"verified", "unverified"},
-        "next_step": {"continue_from_fresh_observation", "observe_result", "follow_recovery", "refresh_snapshot", "handoff", "inspect_error"},
+        "next_step": {"continue_from_fresh_observation", "observe_result", "follow_recovery", "refresh_snapshot", "handoff", "inspect_error", "report_presentation"},
+        "presentation_status": {"presented", "not_presented", "withdrawn", "unconfirmed"},
         "replay": {"forbidden"},
     }
     for key, options in enums.items():
         if isinstance(value.get(key), str) and value[key] in options:
             result[key] = value[key]
+    if "presentation_status" in result and type(value.get("snapshot_verified")) is bool:
+        result["snapshot_verified"] = value["snapshot_verified"]
     for key in ("action_count", "acknowledged", "verified_count", "goal_count", "goal_verified_count"):
         if type(value.get(key)) is int and 0 <= value[key] <= 64:
             result[key] = value[key]

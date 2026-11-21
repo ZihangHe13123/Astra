@@ -35,6 +35,7 @@ from ..computer_backend import (
     ComputerSnapshotTargetBinding,
     ComputerTarget,
     ComputerVerifiedAppState,
+    PresentationWithdrawnError,
 )
 from ..computer_observation import observe_action_effect, window_transition
 from ..computer_policy import (
@@ -482,6 +483,7 @@ class _PreparedComputerAct:
     reused_loan: _ForegroundLoan | None = None
     new_loan: _ForegroundLoan | None = None
     finish_presentation: Callable[[bool], Awaitable[None]] | None = None
+    presentation_status: str = "not_presented"
     # decision.batch_hash 的计算输入。plan_actions 成功后 backend 会更新
     # trusted_snapshot，二次复核若重取 context 会因信任分支形状漂移而必失配
     # （2026-09-04 WPS 六连 stale 的根因）；复核必须复用同一 context。
@@ -3230,6 +3232,10 @@ def register_computer_tools(
                             and observation_authority_generation == presentation_generation):
                         outcome = await manager.end_takeover(ending_ref, restore_previous_focus=False,
                                                              presentation_snapshot=presentation_snapshot)
+                        if outcome.get("presented") is True and outcome.get("restoration") == "preserved_user_focus":
+                            prepared.presentation_status = "presented"
+                        elif outcome.get("presented") is not False or outcome.get("restoration") == "restore_failed":
+                            prepared.presentation_status = "unconfirmed"
                     else:
                         outcome = await manager.end_takeover(ending_ref)
                     raw_restoration = str(outcome.get("restoration") or "")
@@ -3242,8 +3248,13 @@ def register_computer_tools(
                             foreground_loan = prepared.new_loan
                     else:
                         revoke_loan()
-                except Exception as exc:  # noqa: BLE001 - cleanup failure remains an audit event
+                except PresentationWithdrawnError:
                     revoke_loan()
+                    restoration = "focus_restored"
+                    prepared.presentation_status = "withdrawn"
+                except Exception as exc:  # noqa: BLE001 - keep cleanup diagnostics bounded
+                    revoke_loan()
+                    prepared.presentation_status = "unconfirmed"
                     logger.warning(
                         "computer takeover cleanup failed error_type=%s",
                         type(exc).__name__,
@@ -4121,8 +4132,8 @@ def register_computer_tools(
         if manager.handed_off:
             return None
         snapshot_id = prepared.snapshot_id
-        if present_result and "focus_presentation_v1" not in observation_capabilities(raw_tree):
-            prepared.failure = _failure("unsupported_operation", "Showing a result requires an updated macOS helper with cancellable presentation. No input was dispatched.", retryable=False)
+        if present_result and "focus_presentation_v2" not in observation_capabilities(raw_tree):
+            prepared.failure = _failure("unsupported_operation", "Showing a result requires an updated macOS helper that can confirm presentation. No input was dispatched.", retryable=False)
             return None
         context = current_policy_context(snapshot_id)
         # decision.batch_hash 基于此刻的 context；plan_actions 之后 backend 会更新
@@ -4401,13 +4412,35 @@ def register_computer_tools(
                 payload = result["details"]
             if "action_result" not in payload and prepared.dispatch_result is not None:
                 payload = {**payload, "action_result": prepared.dispatch_result}
-            result["computer_receipt"] = build_action_receipt(
+            receipt = build_action_receipt(
                 payload, mode=prepared.mode.value, action_count=len(prepared.actions),
                 dispatch_attempted=prepared.dispatch_attempted, error_code=result.get("code", ""),
             )
+            result["computer_receipt"] = receipt
+            verified_image = not result.get("error") and result.get("verified") is True
             if prepared.finish_presentation is not None:
-                await prepared.finish_presentation(not result.get("error") and result.get("verified") is True)
+                await prepared.finish_presentation(verified_image)
                 prepared.finish_presentation = None
+            if prepared.present_result:
+                status = prepared.presentation_status
+                receipt.update(presentation_status=status, snapshot_verified=verified_image)
+                if not result.get("error") and status != "presented":
+                    # Don't expose a closed session's stale refs or promote a verified image to proof of presentation.
+                    result.pop("fresh_output", None)
+                    receipt["next_step"] = "report_presentation"
+                    message = {
+                        "withdrawn": "The helper confirmed that the previous application was restored; the presentation was withdrawn.",
+                        "not_presented": "The requested result was not kept in front.",
+                    }.get(status, "Could not confirm whether the requested result was left in front.")
+                    result.update(error=message, code="presentation_not_completed", error_type="presentation_not_completed",
+                                  verified=False, partial=bool(receipt.get("acknowledged")), retryable=False, recoverable=False,
+                                  recovery_hint="Report the acknowledged input separately. Do not replay input or retake the foreground.")
+                    choice = payload.get("choice_verification")
+                    if isinstance(choice, Mapping) and choice.get("status") == "not_verified":
+                        results = choice.get("results")
+                        mismatched = isinstance(results, list) and any(isinstance(g, Mapping) and
+                            g.get("status") == "not_satisfied" for g in results)
+                        result["details"] = {"choice_status": "not_satisfied" if mismatched else "unknown"}
         if result.get("error"):
             if call_id in authorized_acts:
                 clear_write_grants()

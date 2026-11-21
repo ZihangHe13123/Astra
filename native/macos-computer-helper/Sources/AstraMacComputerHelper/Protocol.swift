@@ -701,15 +701,15 @@ final class Dispatcher {
                 }
                 declaration = nil
             } else {
-                guard validateTakeoverBeginPayload(request.payload, hasFragment: true),
+                guard validateTakeoverBeginPayload(request.payload, hasFragment: true, consent: consent),
                       let decoded = fragmentDeclaration(request)
                 else { return Self.failure(requestID: request.requestID, message: "takeover_begin has an invalid fragment declaration") }
                 declaration = decoded
             }
             do {
-                if let declaration {
+                if let declaration, let consent {
                     let reference = try windows.takeoverBegin(
-                        snapshotID: snapshotID, planRef: planRef, declaration: declaration
+                        snapshotID: snapshotID, planRef: planRef, declaration: declaration, focusConsent: consent
                     )
                     return success(requestID: request.requestID, result: .object([
                         "takeover_ref": .string(reference),
@@ -788,13 +788,13 @@ final class Dispatcher {
                 if case let .bool(value)? = payload["restore_previous_focus"] {
                     restorePreviousFocus = value
                 } else { restorePreviousFocus = true }
-                let outcome = try windows.takeoverEnd(
-                    takeoverRef: takeoverRef, restorePreviousFocus: restorePreviousFocus
-                )
+                let requireStatus = payload["require_presentation_status"] == .bool(true)
+                let outcome = try requireStatus ? windows.endRequiringPresentationStatus(takeoverRef: takeoverRef)
+                    : windows.takeoverEnd(takeoverRef: takeoverRef, restorePreviousFocus: restorePreviousFocus)
                 guard !outcome.cleanupFailed else { throw TakeoverError.cleanupFailed }
                 return success(
                     requestID: request.requestID,
-                    result: takeoverOutcomeJSON(outcome)
+                    result: takeoverOutcomeJSON(outcome, includePresentation: requireStatus)
                 )
             } catch {
                 return takeoverFailure(requestID: request.requestID, error: error)
@@ -1152,7 +1152,11 @@ final class Dispatcher {
     private func validateTakeoverBeginPayload(_ payload: JSONValue, hasFragment: Bool, loanDeadline: TimeInterval? = nil,
                                              consent: ForegroundFocusConsent? = nil) -> Bool {
         var keys: Set<String> = ["snapshot_id", "plan_ref"]
-        if !hasFragment, consent != nil { keys.insert("focus_consent") }
+        if consent != nil { keys.insert("focus_consent") }
+        else {
+            guard !hasFragment, loanDeadline != nil, case let .object(values) = payload,
+                  values["continued_loan"] == .bool(true) else { return false }
+        }
         if !hasFragment, case let .object(values) = payload, loanDeadline != nil {
             keys.insert("loan_deadline_continuous_ms")
             if consent == nil, values["continued_loan"] == .bool(true) { keys.insert("continued_loan") }
@@ -1234,7 +1238,7 @@ final class Dispatcher {
 
     private func fragmentDeclaration(_ request: HelperRequest) -> ForegroundFragmentDeclaration? {
         guard let values = strictPayloadObject(request),
-              Set(values.keys) == ["snapshot_id", "plan_ref", "fragment"],
+              Set(values.keys) == ["snapshot_id", "plan_ref", "fragment", "focus_consent"],
               let raw = values["fragment"] as? [String: Any],
               Set(raw.keys) == [
                   "fragment_hash", "stages", "max_actions", "wall_clock_limit_ms",
@@ -1381,8 +1385,11 @@ final class Dispatcher {
 
     private func validateTakeoverEndPayload(_ payload: JSONValue) -> Bool {
         guard case let .object(values) = payload,
-              Set(values.keys).isSubset(of: ["takeover_ref", "restore_previous_focus"]),
+              Set(values.keys).isSubset(of: ["takeover_ref", "restore_previous_focus", "require_presentation_status"]),
               boundedReference(values["takeover_ref"]) != nil else { return false }
+        if let status = values["require_presentation_status"] {
+            return status == .bool(true) && values["restore_previous_focus"] == .bool(false)
+        }
         if let restore = values["restore_previous_focus"] {
             guard case .bool = restore else { return false }
         }
@@ -1426,11 +1433,13 @@ final class Dispatcher {
     }
 }
 
-private func takeoverOutcomeJSON(_ outcome: TakeoverOutcome) -> JSONValue {
-    .object([
+private func takeoverOutcomeJSON(_ outcome: TakeoverOutcome, includePresentation: Bool = false) -> JSONValue {
+    var fields: [String: JSONValue] = [
         "started": .bool(outcome.started),
         "restoration": .string(outcome.restoration.rawValue),
-    ])
+    ]
+    if includePresentation { fields["presented"] = .bool(outcome.presented) }
+    return .object(fields)
 }
 
 private enum RequestParseOutcome {

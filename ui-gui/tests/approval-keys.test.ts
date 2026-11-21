@@ -97,6 +97,8 @@ test("the foreground loan shortcut describes the same window and time limit as i
   const markup = renderToStaticMarkup(React.createElement(Approval, { event, send: async () => {}, windowKeys: true }));
   const buttonLabel = />(借用此窗口[^<]*2 分钟)<\/button>/.exec(markup)?.[1];
   assert.ok(buttonLabel);
+  assert.match(markup, /data-approval-choice="session"[^>]*>借用此窗口/);
+  assert.match(markup, /松开按键.*点击按钮/);
   assert.ok(markup.includes(`Shift Enter ${buttonLabel}`));
   assert.doesNotMatch(markup, /本会话允许/);
 });

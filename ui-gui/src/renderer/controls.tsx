@@ -2,7 +2,8 @@ import { connectionFlow, filterCommands, moveSelection, opensCommandInterface } 
 import { modelConnection } from "./model-connection.js";
 import { names } from "./command-help.js";
 import { approvalPreview, approvalText } from "./approval-preview.js";
-import { approvalDecision, approvalKeyHint, typingIn } from "./approval-keys.js";
+import { approvalKeyHint } from "./approval-keys.js";
+import { bindApprovalKeyboard } from "./approval-keyboard.js";
 import { approvalChoiceLabel, approvalChoices, consequenceNote } from "@astra/ui-core/approval-choices";
 import React, { useState } from "react";
 import { X, Check, ChevronRight, ExternalLink, LoaderCircle } from "lucide-react";
@@ -219,42 +220,27 @@ const CHANNEL_NAMES: Record<string, string> = { weixin: "微信", qq: "QQ", oneb
 
 export function Approval({ event, send, windowKeys = false }: { event: UIEvent; send: (c: UIEvent) => Promise<void>; windowKeys?: boolean }) {
   const [pending, setPending] = useState(false);
+  const sending = React.useRef(false);
   const choices: string[] = approvalChoices(event);
   const preview = approvalPreview(event);
   const note = consequenceNote(event);
   // A send, payment or deletion is answered on the card itself, never by a key pressed elsewhere.
   const globalKeys = windowKeys && !note;
   const decide = (decision: string) => {
-    if (pending) return;
-    setPending(true); void send({ type: "tool_approval_response", request_id: event.request_id, decision }).catch(() => setPending(false));
+    if (sending.current) return;
+    sending.current = true; setPending(true);
+    void send({ type: "tool_approval_response", request_id: event.request_id, decision }).catch(() => { sending.current = false; setPending(false); });
   };
-  const latest = React.useRef({ decide, choices }); latest.current = { decide, choices };
-  const actions = React.useRef<HTMLDivElement>(null);
-  // The Cmd/Ctrl keys answer the oldest pending approval from anywhere in the window. A key pressed
-  // inside an approval card belongs to that card alone.
-  React.useEffect(() => {
-    if (!globalKeys) return;
-    const listener = (e: KeyboardEvent) => {
-      const target = e.target instanceof Element ? e.target : null;
-      if (target?.closest(".approval")) return;
-      const typing = typingIn(target?.closest("input,textarea,[contenteditable='true']") as HTMLInputElement | null);
-      const decision = approvalDecision(e, { in: "window", typing }, latest.current.choices);
-      if (!decision) return;
-      e.preventDefault();
-      // A request scrolled out of sight is shown first; the next press answers it.
-      const row = actions.current?.getBoundingClientRect(), view = (actions.current?.closest(".messages-scroll") || document.documentElement).getBoundingClientRect();
-      if (row && (row.top < view.top || row.bottom > view.bottom)) { actions.current?.closest(".approval")?.scrollIntoView({ block: "nearest" }); return; }
-      latest.current.decide(decision);
-    };
-    window.addEventListener("keydown", listener); return () => window.removeEventListener("keydown", listener);
-  }, [globalKeys]);
+  const keyboard = { requestId: event.request_id, foreground: event.kind === "computer_foreground_takeover", windowKeys: globalKeys, pending, choices, decide };
+  const latest = React.useRef(keyboard); latest.current = keyboard;
+  const detach = React.useRef<() => void>();
+  const bind = React.useCallback((card: HTMLElement | null) => {
+    detach.current?.();
+    detach.current = card ? bindApprovalKeyboard(card, () => latest.current) : undefined;
+  }, [event.request_id, event.kind, globalKeys]);
   const mac = typeof navigator !== "undefined" && navigator.platform.includes("Mac");
   const draft = event.draft?.text ? event.draft : undefined;
-  return <section className={`approval interactive-card${note ? " consequential" : ""}`} tabIndex={0} aria-label={`需要你的许可：${preview.title}`} onKeyDown={e => {
-    const decision = approvalDecision(e.nativeEvent, { in: "card", onButton: e.target instanceof HTMLButtonElement }, choices);
-    // Stopping here keeps Escape from also closing a side panel.
-    if (decision) { e.preventDefault(); e.stopPropagation(); decide(decision); }
-  }}><span className="eyebrow">{draft ? "要发出去的内容" : "需要你的许可"}{event.channel ? `：来自${CHANNEL_NAMES[event.channel] ?? event.channel}的对话` : ""}</span><h3>{preview.title}</h3>
+  return <section ref={bind} className={`approval interactive-card${note ? " consequential" : ""}`} tabIndex={0} aria-label={`需要你的许可：${preview.title}`}><span className="eyebrow">{draft ? "要发出去的内容" : "需要你的许可"}{event.channel ? `：来自${CHANNEL_NAMES[event.channel] ?? event.channel}的对话` : ""}</span><h3>{preview.title}</h3>
     {note && <p className="approval-consequence" role="note">{note}</p>}
     {event.kind === "computer_foreground_takeover" && event.arguments?.present_result === true &&
       <p>仅限本次操作：成功后将结果窗口保留在前台。</p>}
@@ -270,7 +256,7 @@ export function Approval({ event, send, windowKeys = false }: { event: UIEvent; 
     <p className="small muted">{preview.targetLabel}</p><pre>{preview.target}</pre>
     <dl className="approval-facts">{preview.facts.map(fact => <React.Fragment key={fact.label}><dt>{fact.label}</dt><dd>{fact.value}</dd></React.Fragment>)}</dl>
     <details><summary>查看后端提供的审批详情</summary><pre>{preview.details}</pre></details>
-    <div className="actions" ref={actions}>{choices.map((decision: string) => <button key={decision} disabled={pending} className={decision === "once" ? "primary" : ""} onClick={() => decide(decision)}>{approvalChoiceLabel(decision, event)}</button>)}</div>
+    <div className="actions">{choices.map((decision: string) => <button key={decision} data-approval-choice={decision} disabled={pending} className={decision === "once" ? "primary" : ""} onClick={() => decide(decision)}>{approvalChoiceLabel(decision, event)}</button>)}</div>
     {choices.includes("always") && <p className="small muted">「以后都允许」：你已多次批准这类操作，点了之后同类请求不再问，可以在审批设置里随时删除。</p>}
     <p className="approval-keys small muted">{approvalKeyHint(choices, globalKeys, mac, event)}</p>
   </section>;

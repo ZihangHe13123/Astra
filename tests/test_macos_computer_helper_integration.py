@@ -113,7 +113,8 @@ def test_macos_backend_carries_low_level_fragment_plan_and_commit_authority():
             ),
         )
         takeover_ref = await backend.begin_takeover(
-            "snapshot-0", plan.plan_ref, declaration=declaration
+            "snapshot-0", plan.plan_ref, declaration=declaration,
+            focus_consent={"frontmost_pid": 37, "decided_at_continuous_us": 45_125_000},
         )
         await backend.act(
             ComputerTarget("app", "window"),

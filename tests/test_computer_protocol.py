@@ -72,6 +72,24 @@ def test_focus_loan_capability_requires_the_continuous_clock_version():
     assert observation_capabilities({"observation_capabilities": ["focus_loan_v3"]}) == ["focus_loan_v3"]
 
 
+_FIXTURE_FOCUS_CONSENT = {"frontmost_pid": 37, "decided_at_continuous_us": 45_125_000}
+_BEGIN_FRAGMENT = ForegroundFragmentDeclaration(
+    "a" * 64, (ForegroundFragmentStageDeclaration(
+        "b" * 64, 1, (ForegroundFragmentActionRequirement("wait", None, None),),
+    ),), 1, 1000, True,
+)
+
+
+@pytest.mark.parametrize("extra", [{}, {"loan_deadline_continuous_ms": 165_125}, {"fragment": _BEGIN_FRAGMENT}])
+def test_fresh_begin_requires_focus_consent(extra):
+    payload = {"snapshot_id": "s", "plan_ref": "p", **extra}
+    with pytest.raises(ValueError, match="focus_consent"):
+        ComputerRequest("r", "takeover_begin", payload)
+    marked = {**payload, "focus_consent": _FIXTURE_FOCUS_CONSENT}
+    expected = {**marked, "fragment": _BEGIN_FRAGMENT.to_mapping()} if "fragment" in extra else marked
+    assert json.loads(encode_request(ComputerRequest("r", "takeover_begin", marked)))["payload"] == expected
+
+
 def test_focus_consent_strict_wire_agrees_for_oneshot_and_first_bounded_begin():
     assert observation_capabilities({'observation_capabilities': ['focus_consent_v1']}) == ['focus_consent_v1']
     base = {'snapshot_id': 's', 'plan_ref': 'p'}
@@ -79,7 +97,8 @@ def test_focus_consent_strict_wire_agrees_for_oneshot_and_first_bounded_begin():
     for extra in [{}, {'loan_deadline_continuous_ms': 165_125}]:
         payload = {**base, **extra, 'focus_consent': receipt}
         assert json.loads(encode_request(ComputerRequest('r', 'takeover_begin', payload)))['payload'] == payload
-    for extra in [{'continued_loan': True, 'loan_deadline_continuous_ms': 165_125}, {'fragment': {}}]:
+    for extra in [{'continued_loan': True, 'loan_deadline_continuous_ms': 165_125}, {'fragment': {}},
+                  {'fragment': _BEGIN_FRAGMENT, 'loan_deadline_continuous_ms': 165_125}]:
         with pytest.raises(ValueError):
             ComputerRequest('r', 'takeover_begin', {**base, **extra, 'focus_consent': receipt})
     for malformed in [False, None, {}, {'frontmost_pid': 1}, {**receipt, 'other': 0},
@@ -114,12 +133,17 @@ def test_focus_loan_new_deadline_rejected_by_strict_old_v4_without_downgrade(con
 
     backend = MacComputerBackend(SimpleNamespace(request=strict_old_v4))
     with pytest.raises(HelperApplicationError) as failure:
-        asyncio.run(backend.begin_takeover("snap", "plan", loan_deadline_continuous_ms=420_125, continued_loan=continued))
+        asyncio.run(backend.begin_takeover("snap", "plan", loan_deadline_continuous_ms=420_125, continued_loan=continued,
+                                           focus_consent=None if continued else _FIXTURE_FOCUS_CONSENT))
 
-    assert failure.value.error == rejection
+    assert failure.value.error.code is ComputerErrorCode.PROTOCOL_MISMATCH
+    if continued:
+        assert failure.value.error == rejection
+    else:
+        assert "Update" in failure.value.error.message
     assert frames == [("takeover_begin", {
         "snapshot_id": "snap", "plan_ref": "plan", "loan_deadline_continuous_ms": 420_125,
-        **({"continued_loan": True} if continued else {}),
+        **({"continued_loan": True} if continued else {"focus_consent": _FIXTURE_FOCUS_CONSENT}),
     })]
 
 
@@ -175,6 +199,28 @@ def test_cancel_presentation_validates_the_normal_terminal_outcome():
     assert frames == [("cancel_presentation", {"takeover_ref": "bound"})] * 2
 
 
+def test_presentation_v2_end_marker_only_accepts_literal_true_with_explicit_keep():
+    assert observation_capabilities({'observation_capabilities': ['focus_presentation_v2']}) == ['focus_presentation_v2']
+    base = {'takeover_ref': 'bound', 'restore_previous_focus': False, 'require_presentation_status': True}
+    assert json.loads(encode_request(ComputerRequest('end', 'takeover_end', base)))['payload'] == base
+    for payload in ({'takeover_ref': 'bound', 'require_presentation_status': True}, {**base, 'restore_previous_focus': True},
+                    *({**base, 'require_presentation_status': v} for v in [None, False, 1, 'true'])):
+        with pytest.raises(ValueError):
+            ComputerRequest('end', 'takeover_end', payload)
+
+
+@pytest.mark.parametrize('presented', [True, False])
+def test_presentation_v2_replies_are_bound_to_the_requested_end_only(presented):
+    outcome = {'started': True, 'restoration': 'preserved_user_focus', 'presented': presented}
+    backend, frames = _presentation_backend(*[{'ok': True, 'result': outcome} for _ in range(3)])
+    assert asyncio.run(backend.end_takeover('bound', restore_previous_focus=False, require_presentation_status=True)) == outcome
+    assert frames[0] == ('takeover_end', {'takeover_ref': 'bound', 'restore_previous_focus': False, 'require_presentation_status': True})
+    with pytest.raises(HelperTransportError, match='malformed takeover outcome'):
+        asyncio.run(backend.end_takeover('bound', restore_previous_focus=False))
+    with pytest.raises(HelperTransportError, match='malformed takeover outcome'):
+        asyncio.run(backend.cancel_presentation('bound'))
+
+
 @pytest.mark.parametrize("operation", ["presentation_apps", "cancel_presentation"])
 def test_presentation_rejection_does_not_fall_back_to_apps_or_end(operation):
     error = ComputerError(ComputerErrorCode.PROTOCOL_MISMATCH, "operation is not supported")
@@ -183,6 +229,14 @@ def test_presentation_rejection_does_not_fall_back_to_apps_or_end(operation):
         asyncio.run(getattr(backend, operation)("bound"))
     assert failure.value.error == error
     assert frames == [(operation, {"takeover_ref": "bound"})]
+
+
+def test_terminal_receipt_with_unexpected_snapshot_is_not_result_only_and_never_proves_display():
+    outcome = {'started': True, 'restoration': 'preserved_user_focus', 'presented': True}
+    backend, frames = _presentation_backend({'ok': True, 'result': outcome, 'snapshot': ComputerSnapshot('unexpected', {})})
+    with pytest.raises(HelperTransportError, match='unexpected snapshot'):
+        asyncio.run(backend.end_takeover('bound', restore_previous_focus=False, require_presentation_status=True))
+    assert len(frames) == 1
 
 
 def test_request_has_stable_version_and_id():
@@ -333,7 +387,7 @@ def test_protocol_v4_round_trips_strict_fragment_plan_stage_and_commit_payloads(
     begin = ComputerRequest(
         "fragment-begin",
         "takeover_begin",
-        {"snapshot_id": "snapshot-0", "plan_ref": "plan-0", "fragment": declaration},
+        {"snapshot_id": "snapshot-0", "plan_ref": "plan-0", "fragment": declaration, "focus_consent": _FIXTURE_FOCUS_CONSENT},
     )
 
     assert json.loads(encode_request(initial))["payload"]["fragment_hash"] == "a" * 64
@@ -508,6 +562,13 @@ def test_decode_response_rejects_malformed_or_non_object_payload(encoded):
 def test_decode_response_rejects_missing_request_id():
     with pytest.raises(ValueError, match="request_id"):
         decode_response('{"protocol_version":1,"ok":true}')
+
+
+@pytest.mark.parametrize("result", [[], False, "status", 0])
+def test_decode_response_never_returns_success_for_non_object_result(result):
+    frame = json.dumps({"protocol_version": 4, "request_id": "matched", "ok": True, "result": result})
+    with pytest.raises(ValueError, match="result must be an object"):
+        decode_response(frame)
 
 
 def test_decode_response_rejects_duplicate_and_unknown_fields():
@@ -727,10 +788,11 @@ def test_protocol_v2_rejects_invalid_virtual_pointer_coordinates(coordinate):
             "snapshot_id": "s1",
             "actions": [{"type": "wait", "duration_ms": 0}],
         }),
-        ("takeover_begin", {"snapshot_id": "s1", "plan_ref": "p1"}),
+        ("takeover_begin", {"snapshot_id": "s1", "plan_ref": "p1", "focus_consent": _FIXTURE_FOCUS_CONSENT}),
         ("takeover_begin", {
             "snapshot_id": "s1",
             "plan_ref": "p1",
+            "focus_consent": _FIXTURE_FOCUS_CONSENT,
             "fragment": ForegroundFragmentDeclaration(
                 "a" * 64,
                 (ForegroundFragmentStageDeclaration(

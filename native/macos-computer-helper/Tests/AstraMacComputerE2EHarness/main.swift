@@ -277,6 +277,7 @@ let runExperimentalPIDPointerMatrix = ProcessInfo.processInfo.environment[
 ] == "1"
 do {
     try require(ProcessInfo.processInfo.environment["ASTRA_MACOS_COMPUTER_E2E"] == "1", "explicit E2E authorization is missing")
+    let experimentalSetupPID = runExperimentalPIDPointerMatrix ? try confirmFixtureSetup() : nil
     let package = packageRoot()
     _ = try command(["swift", "build", "--package-path", package.path, "--product", "AstraComputerFixture"])
     if runExperimentalPIDPointerMatrix {
@@ -293,6 +294,7 @@ do {
     )
     let sentinelPID = NSWorkspace.shared.frontmostApplication?.processIdentifier
     try require(sentinelPID != nil, "frontmost sentinel is unavailable")
+    if let experimentalSetupPID, sentinelPID != experimentalSetupPID || liveFrontmostPID() != experimentalSetupPID { throw FixtureConsentNotGiven() }
     try runOpen(arguments: [fixtureApp.path])
 
     var fixtureApplication: NSRunningApplication?
@@ -418,6 +420,7 @@ do {
 
     if runExperimentalPIDPointerMatrix {
         e2eStage = "forced-activation-regression"
+        defer { observer.invalidateSnapshots() }
         let failing = SystemWindowObserver(
             activation: ForcedActivationFailure(),
             pidCompatibility: registry,
@@ -426,14 +429,15 @@ do {
         guard let failingSelection = try fixtureRefs(failing.apps()) else {
             throw E2EFailure.assertion("forced activation fixture target was not discovered")
         }
-        _ = try failing.select(appRef: failingSelection.appRef, windowRef: failingSelection.windowRef)
+        let failingTarget = try failing.select(appRef: failingSelection.appRef, windowRef: failingSelection.windowRef)
         let failingSnapshot = try fresh(failing, selection: failingSelection, name: "forced-activation.png")
         let failingAction = [NativeAction.click(x: 10, y: 10)]
         guard let failingPlan = failing.planActions(
             snapshotID: failingSnapshot.0, interactionMode: .foregroundTakeover, actions: failingAction
         ).summary else { throw E2EFailure.assertion("forced activation plan failed") }
         do {
-            _ = try failing.takeoverBegin(snapshotID: failingSnapshot.0, planRef: failingPlan.planRef)
+            let consent = try approveFixtureBorrow(caseName: "forced_activation_regression", action: "Attempt activation for a single fixture click; the injected activator must refuse", target: failingTarget, planRef: failingPlan.planRef, expectedPID: sentinelPID)
+            _ = try failing.takeoverBegin(snapshotID: failingSnapshot.0, planRef: failingPlan.planRef, focusConsent: consent, loanDeadline: nil)
             throw E2EFailure.assertion("forced activation unexpectedly succeeded")
         } catch TakeoverError.targetNotFrontmost {
             try require(NSWorkspace.shared.frontmostApplication?.processIdentifier == sentinelPID, "failed activation changed the sentinel")
@@ -454,20 +458,20 @@ do {
         var matrixAccepted = true
 
         for scenario in scenarios {
-            e2eStage = "\(scenario.name)-restore-sentinel"
-            try activation.restore(pid: sentinelPID)
-            let cursorBefore = try cursorLocation()
-            let frontmostBefore = NSWorkspace.shared.frontmostApplication?.processIdentifier
-            try require(frontmostBefore == sentinelPID, "sentinel changed before approval for \(scenario.name)")
+            e2eStage = "\(scenario.name)-check-sentinel"
+            guard liveFrontmostPID() == sentinelPID else { throw FixtureConsentNotGiven() }
             let actions = [scenario.action]
             let background = observer.planActions(snapshotID: current.0, interactionMode: .background, actions: actions)
             try require(background.summary?.requiresTakeover == true, "pointer action did not require takeover")
             let foreground = observer.planActions(snapshotID: current.0, interactionMode: .foregroundTakeover, actions: actions)
             guard let plan = foreground.summary else { throw E2EFailure.assertion("foreground plan failed") }
+            let consent = try approveFixtureBorrow(caseName: scenario.name, action: scenario.actionClass.rawValue, target: target, planRef: plan.planRef, expectedPID: sentinelPID)
+            let cursorBefore = try cursorLocation()
+            let frontmostBefore = liveFrontmostPID()
             e2eStage = "\(scenario.name)-takeover-begin"
             let takeoverRef: String
             do {
-                takeoverRef = try observer.takeoverBegin(snapshotID: current.0, planRef: plan.planRef)
+                takeoverRef = try observer.takeoverBegin(snapshotID: current.0, planRef: plan.planRef, focusConsent: consent, loanDeadline: nil)
             } catch TakeoverError.targetNotFrontmost {
                 let frontmostAfter = NSWorkspace.shared.frontmostApplication?.processIdentifier
                 let frontmostDuring = frontmostAfter
@@ -543,7 +547,6 @@ do {
             try require(heldInputClean, "held input cleanup failed for \(scenario.name)")
             current = afterAction
         }
-        observer.invalidateSnapshots()
         if !matrixAccepted {
             print("AstraMacComputerE2EHarness: NOT_SUPPORTED experimental PID pointer matrix")
             throw E2EExit.notSupported
@@ -599,6 +602,9 @@ do {
         observer.invalidateSnapshots()
         print("AstraMacComputerE2EHarness: PASS AX-first/fail-closed")
     }
+} catch is FixtureConsentNotGiven {
+    print("AstraMacComputerE2EHarness: NOT_RUN remaining experimental cases (current interactive consent required)")
+    exit(77)
 } catch E2EExit.notSupported {
     exit(78)
 } catch {

@@ -40,6 +40,7 @@ from .computer_protocol import (
     FragmentStageAuthority,
     FragmentStageCommit,
     FragmentStageCommitResult,
+    NonObjectSuccessResultError,
     TakeoverOutcome,
     decode_response,
     encode_request,
@@ -328,6 +329,7 @@ class HelperTransport:
         timings = {name: 0.0 for name in ("queue", "start", "write", "read")}
         outcome = "error"
         request_finished: float | None = None
+        presenting_end_id: str | None = None
         try:
             # One absolute budget includes queueing and backpressure, not only
             # the response read. Ownership starts only after acquire succeeds.
@@ -348,6 +350,8 @@ class HelperTransport:
                     process = await self._ensure_process_locked()
                 timings[stage] = (loop.time() - stage_started) * 1000
                 stage, stage_started = "write", loop.time()
+                if request.operation == "takeover_end" and request.payload.get("restore_previous_focus") is False:
+                    presenting_end_id = request.request_id
                 await self._write_locked(process, request)
                 timings[stage] = (loop.time() - stage_started) * 1000
                 stage, stage_started = "read", loop.time()
@@ -373,10 +377,16 @@ class HelperTransport:
         except (TimeoutError, OSError, ValueError, HelperTransportError) as exc:
             outcome = "timeout" if isinstance(exc, TimeoutError) else "error"
             request_finished = loop.time()
+            if stage == "read" and isinstance(exc, NonObjectSuccessResultError) and exc.request_id == presenting_end_id:
+                # Framing is intact: the complete reply to *this* end(false) was
+                # consumed. Leave the original helper available for its one-shot undo.
+                raise MalformedTakeoverOutcomeError("helper returned malformed takeover outcome") from exc
             if owned:
                 await self._cleanup_failed_request_locked()
             if isinstance(exc, HelperTransportError):
                 raise
+            if stage == "read" and isinstance(exc, ValueError):
+                raise HelperTransportError("helper returned a malformed response") from exc
             raise HelperTransportError("helper request failed") from exc
         finally:
             timings[stage] = ((request_finished or loop.time()) - stage_started) * 1000
@@ -532,10 +542,7 @@ class HelperTransport:
             raise HelperTransportError("helper response exceeded the maximum size") from exc
         if len(raw) > MAX_RESPONSE_BYTES + 1:
             raise HelperTransportError("helper response exceeded the maximum size")
-        try:
-            return decode_response(raw[:-1])
-        except ValueError as exc:
-            raise HelperTransportError("helper returned a malformed response") from exc
+        return decode_response(raw[:-1])
 
     async def _drain_stderr(self, stream: asyncio.StreamReader) -> None:
         try:
@@ -952,23 +959,28 @@ class MacComputerBackend:
             raise HelperTransportError("helper returned malformed fragment commit") from exc
 
     async def end_takeover(
-        self, takeover_ref: str, *, restore_previous_focus: bool = True,
+        self, takeover_ref: str, *, restore_previous_focus: bool = True, require_presentation_status: bool = False,
     ) -> Mapping[str, object]:
-        if not isinstance(restore_previous_focus, bool):
-            raise TypeError("restore_previous_focus must be boolean")
+        if not isinstance(restore_previous_focus, bool) or not isinstance(require_presentation_status, bool):
+            raise TypeError("takeover end flags must be boolean")
         payload: dict[str, object] = {"takeover_ref": takeover_ref}
         if not restore_previous_focus:
             payload["restore_previous_focus"] = False
-        return self._takeover_outcome(await self._request("takeover_end", payload))
+        if require_presentation_status:
+            payload["require_presentation_status"] = True
+        return self._takeover_outcome(await self._request("takeover_end", payload),
+                                      require_presentation_status=require_presentation_status)
 
     async def cancel_presentation(self, takeover_ref: str) -> Mapping[str, object]:
         response = await self._request("cancel_presentation", {"takeover_ref": takeover_ref})
         return self._takeover_outcome(response)
 
-    def _takeover_outcome(self, response: ComputerResponse) -> Mapping[str, object]:
+    def _takeover_outcome(self, response: ComputerResponse, *, require_presentation_status: bool = False) -> Mapping[str, object]:
         self._raise_response_error(response)
+        if response.snapshot is not None:
+            raise HelperTransportError("unexpected snapshot in terminal response")
         try:
-            outcome = TakeoverOutcome.from_mapping(response.result or {})
+            outcome = TakeoverOutcome.from_mapping(response.result or {}, require_presentation_status=require_presentation_status)
         except (TypeError, ValueError) as exc:
             raise MalformedTakeoverOutcomeError("helper returned malformed takeover outcome") from exc
         if not outcome.started:

@@ -150,6 +150,16 @@ def _exact_integer(value: Any, name: str, *, minimum: int, maximum: int) -> int:
     return value
 
 
+def validated_focus_consent(value: object) -> dict[str, int]:
+    """Copy the exact decision witness; neither a default nor a later sample is valid."""
+    if not isinstance(value, Mapping) or set(value) != {"frontmost_pid", "decided_at_continuous_us"}:
+        raise ValueError("focus_consent requires the frontmost PID and continuous decision time")
+    pid, us = value["frontmost_pid"], value["decided_at_continuous_us"]
+    if type(pid) is not int or not 0 < pid < 2**31 or type(us) is not int or not 0 < us < 2**53:
+        raise ValueError("focus_consent requires bounded positive integers")
+    return {"frontmost_pid": pid, "decided_at_continuous_us": us}
+
+
 @dataclass(frozen=True)
 class ForegroundFragmentActionRequirement:
     backend: str
@@ -411,12 +421,15 @@ class FragmentStageCommitResult:
 class TakeoverOutcome:
     started: bool
     restoration: TakeoverRestoration
+    presented: bool | None = None
 
     @classmethod
-    def from_mapping(cls, value: Mapping[str, Any]) -> TakeoverOutcome:
+    def from_mapping(cls, value: Mapping[str, Any], *, require_presentation_status: bool = False) -> TakeoverOutcome:
         _require_object(value, "takeover")
-        if set(value) != {"started", "restoration"}:
-            raise ValueError("takeover requires started and restoration")
+        expected = {"started", "restoration"}
+        if require_presentation_status:
+            expected.add("presented")
+        _require_exact_payload(value, expected, "takeover outcome")
         started = value["started"]
         if not isinstance(started, bool):
             raise ValueError("takeover.started must be a boolean")  # noqa: TRY004 - wire validation
@@ -428,10 +441,15 @@ class TakeoverOutcome:
             raise ValueError("takeover not started must be not_started")
         if started and restoration is TakeoverRestoration.NOT_STARTED:
             raise ValueError("started takeover must have a terminal restoration")
-        return cls(started=started, restoration=restoration)
+        presented = value.get("presented")
+        if require_presentation_status and (type(presented) is not bool or not started
+                or (presented and restoration is not TakeoverRestoration.PRESERVED_USER_FOCUS)):
+            raise ValueError("invalid presentation outcome")
+        return cls(started=started, restoration=restoration, presented=presented)
 
     def to_mapping(self) -> dict[str, Any]:
-        return {"started": self.started, "restoration": self.restoration.value}
+        return {"started": self.started, "restoration": self.restoration.value,
+                **({"presented": self.presented} if self.presented is not None else {})}
 
 
 @dataclass(frozen=True)
@@ -992,6 +1010,18 @@ def encode_request(request: ComputerRequest) -> str:
     )
 
 
+class NonObjectSuccessResultError(ValueError):
+    """An otherwise valid, result-only success envelope; not a decoded response."""
+
+    def __init__(self, request_id: str) -> None:
+        self.request_id = request_id  # The owner of the outstanding write must still correlate it.
+        super().__init__("result must be an object")
+
+
+def _reject_non_json_constant(_: str) -> None:
+    raise ValueError("non-JSON numeric constant")
+
+
 def decode_response(encoded: str | bytes) -> ComputerResponse:
     raw = encoded.encode("utf-8") if isinstance(encoded, str) else encoded
     if not isinstance(raw, bytes):
@@ -999,8 +1029,9 @@ def decode_response(encoded: str | bytes) -> ComputerResponse:
     if len(raw) > MAX_RESPONSE_BYTES:
         raise ValueError("response exceeds 4 MiB")
     try:
-        data = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicate_object)
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicate_object,
+                          parse_constant=_reject_non_json_constant)
+    except (ValueError, RecursionError) as exc:
         raise ValueError("response must be valid JSON without duplicate fields") from exc
     _require_object(data, "response")
     _reject_unknown_fields(data, {"protocol_version", "request_id", "ok", "result", "snapshot", "error"}, "response")
@@ -1019,8 +1050,10 @@ def decode_response(encoded: str | bytes) -> ComputerResponse:
     if not isinstance(data["ok"], bool):
         raise ValueError("ok must be a boolean")  # noqa: TRY004 - protocol validation API uses ValueError
     result = data.get("result")
-    if result is not None:
-        _require_object(result, "result")
+    if result is not None and not isinstance(result, Mapping):
+        if data["ok"] and data.keys() == {"protocol_version", "request_id", "ok", "result"}:
+            raise NonObjectSuccessResultError(request_id)
+        raise ValueError("result must be an object")
     snapshot = _decode_snapshot(data.get("snapshot")) if "snapshot" in data else None
     error = _decode_error(data.get("error")) if "error" in data else None
     if not data["ok"] and error is None:
@@ -1624,13 +1657,11 @@ def _validate_cooperative_request_payload(operation: str, payload: Mapping[str, 
                 required.add("continued_loan")
                 if payload["continued_loan"] is not True:
                     raise ValueError("continued_loan must be true when present")
-        if "focus_consent" in payload and "fragment" not in payload and "continued_loan" not in payload:
+        # Only a bounded continuation uses existing authority. Every first
+        # begin, including an initial fragment, must carry decision provenance.
+        if "continued_loan" not in payload:
             required.add("focus_consent")
-            consent = payload["focus_consent"]
-            _require_object(consent, "focus_consent")
-            _require_exact_payload(consent, {"frontmost_pid", "decided_at_continuous_us"}, "focus_consent")
-            _exact_integer(consent["frontmost_pid"], "frontmost_pid", minimum=1, maximum=2**31 - 1)
-            _exact_integer(consent["decided_at_continuous_us"], "decided_at_continuous_us", minimum=1, maximum=2**53 - 1)
+            validated_focus_consent(payload.get("focus_consent"))
         _require_exact_payload(payload, required, operation)
         _validate_reference(payload["snapshot_id"], "snapshot_id")
         _validate_reference(payload["plan_ref"], "plan_ref")
@@ -1654,6 +1685,10 @@ def _validate_cooperative_request_payload(operation: str, payload: Mapping[str, 
         return
     if operation == "takeover_end":
         expected = {"takeover_ref"}
+        if "require_presentation_status" in payload:
+            if payload["require_presentation_status"] is not True or payload.get("restore_previous_focus") is not False:
+                raise ValueError("require_presentation_status must be true only for an explicit presentation end")
+            expected.add("require_presentation_status")
         if "restore_previous_focus" in payload:
             expected.add("restore_previous_focus")
             if not isinstance(payload["restore_previous_focus"], bool):

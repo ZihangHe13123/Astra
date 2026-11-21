@@ -821,6 +821,26 @@ struct SystemApplicationActivationRuntime: ApplicationActivationRuntime {
     }
 }
 
+// Read-only terminal evidence. The retained CG window must still be visible, and the focused
+// AX object must be that exact retained window, not merely its app, title, bounds or hash.
+func retainedPresentationWindowMatches(_ target: WindowTarget,
+    onScreen: (WindowTarget) -> Bool = { target in
+        guard let info = CGWindowListCopyWindowInfo([.optionIncludingWindow], target.windowID) as? [[String: Any]],
+              info.count == 1, let row = info.first else { return false }
+        return row[kCGWindowNumber as String] as? UInt32 == target.windowID
+            && row[kCGWindowOwnerPID as String] as? pid_t == target.pid && row[kCGWindowIsOnscreen as String] as? Bool == true
+    }, focusedWindow: (pid_t) -> AXUIElement? = { pid in
+        let app = AXUIElementCreateApplication(pid)
+        guard AXUIElementSetMessagingTimeout(app, 0.25) == .success else { return nil }
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &value) == .success else { return nil }
+        return decodeAXElement(value)
+    }) -> Bool {
+    guard target.pid > 0, target.windowID != 0, let retained = target.axElement, target.axIdentity == CFHash(retained),
+          onScreen(target), let focused = focusedWindow(target.pid) else { return false }
+    return CFEqual(focused, retained)
+}
+
 final class LaunchServicesApplicationActivationController: ApplicationActivationControlling {
     private let runtime: any ApplicationActivationRuntime
     private let launcher: any ApplicationProcessLaunching

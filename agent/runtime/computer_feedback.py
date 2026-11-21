@@ -7,6 +7,7 @@ from .computer_forms import safe_action_receipt
 
 
 NEXT_STEPS = {
+    "report_presentation": "Report input and presentation separately. The action receipt still applies; do not replay the input or reacquire the foreground to show it.",
     "continue_from_fresh_observation": "Requested choice states are verified. Use the returned fresh refs for remaining work, or report completion briefly. No extra read is needed for these choices; server saving is a separate result.",
     "observe_result": "Inspect the returned fresh observation first. If it proves the requested result, report it briefly. Otherwise call computer_snapshot(settle_ms=300). An acknowledgement is not a failed click: do not click the same button again because the observation looked unchanged. After two inconclusive reads, report unconfirmed.",
     "follow_recovery": "The acknowledged actions were delivered and none after them were sent, but no fresh observation was returned, so the effect is unverified. Do not replay. Follow this result's Recovery field; if that cannot be done safely, hand this step to the user.",
