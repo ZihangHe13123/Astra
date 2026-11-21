@@ -477,6 +477,7 @@ class _PreparedComputerAct:
     failure: ToolFailure | None = None
     approved: bool = False
     present_result: bool = False
+    focus_consent: Mapping[str, int] | None = None
     loan_at_entry: _ForegroundLoan | None = None
     reused_loan: _ForegroundLoan | None = None
     new_loan: _ForegroundLoan | None = None
@@ -1068,10 +1069,11 @@ class LocalComputerRuntime:
         )
 
     async def begin_takeover(self, snapshot_id: str, plan_ref: str, *,
-                             loan_deadline: Callable[[], int | None] | None = None, continued_loan: bool = False):
+                             loan_deadline: Callable[[], int | None] | None = None, continued_loan: bool = False,
+                             focus_consent: Mapping[str, int] | None = None):
         self._helper_started = True
         return await (await self._ensure_manager()).begin_takeover(
-            snapshot_id, plan_ref, loan_deadline=loan_deadline, continued_loan=continued_loan,
+            snapshot_id, plan_ref, loan_deadline=loan_deadline, continued_loan=continued_loan, focus_consent=focus_consent,
         )
 
     async def act(
@@ -3436,6 +3438,10 @@ def register_computer_tools(
                         retryable=False,
                     )
                 loan = prepared.reused_loan or prepared.new_loan
+                # New decisions, including one-shots and presentations, must cross the same native guard.
+                # Only a continued loan can substitute the exact last-release checkpoint for that receipt.
+                if prepared.reused_loan is None and prepared.focus_consent is None:
+                    return _failure("approval_required", "Missing the foreground consent receipt; no input was dispatched.", retryable=True)
                 if loan is not None:
                     def loan_deadline() -> int | None:
                         if (prepared_acts.get(_permission_call_id) is not prepared
@@ -3447,9 +3453,9 @@ def register_computer_tools(
                         return int(loan.expires_at * 1000)
 
                     takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref,
-                        loan_deadline=loan_deadline, continued_loan=prepared.reused_loan is not None)
+                        loan_deadline=loan_deadline, continued_loan=prepared.reused_loan is not None, focus_consent=prepared.focus_consent)
                 else:
-                    takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref)
+                    takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref, focus_consent=prepared.focus_consent)
                 _runtime_takeover_event("foreground_takeover_begin", decision)
             prepared.dispatch_attempted = True
             result = await manager.act(
@@ -4075,10 +4081,6 @@ def register_computer_tools(
         if not call_id:
             return None
         raw_actions = args.get("actions", [])
-        if args.get("coordinate_space", "window_logical") == "image_pixels":
-            if published_image_geometry[0] != args.get("snapshot_id"):
-                raise ValueError("Pixel coordinates require the latest published target-window snapshot")
-            raw_actions = image_actions(raw_actions, published_image_geometry[1])
         requested_mode = str(args.get("interaction_mode") or "auto")
         opens_dialog = args.get("opens_dialog", False)
         present_result = args.get("present_result") is True
@@ -4097,6 +4099,19 @@ def register_computer_tools(
             loan_at_entry=foreground_loan,
         )
         prepared_acts[call_id] = prepared
+        # Own the entry loan before pixel validation can fail, just as for native planning errors.
+        # A rejected plan gets a not-dispatched receipt; it cannot leave a reusable grant behind.
+        if args.get("coordinate_space") == "image_pixels":
+            if published_image_geometry[0] != prepared.snapshot_id:
+                prepared.failure = _failure("stale_snapshot", "Pixel coordinates require the latest published target-window snapshot.", retryable=True)
+                return None
+            try:
+                converted = image_actions(raw_actions, published_image_geometry[1])
+                prepared.actions = tuple(ComputerAction.from_mapping(action) for action in converted)
+                prepared.raw_actions = tuple(converted)
+            except ValueError as exc:
+                prepared.failure = _failure("invalid_arguments", str(exc), retryable=False)
+                return None
         if needs_foreground and requested_mode == "background":
             prepared.failure = _failure(
                 "invalid_arguments", "Opening a dialog or presenting a result requires auto or foreground_takeover; no input was dispatched.",
@@ -4263,7 +4278,11 @@ def register_computer_tools(
             prepared.raw_actions,
             interaction_plan=plan,
         )
-        can_continue = "focus_loan_v3" in observation_capabilities(raw_tree) and bool(loan_window())
+        capabilities = observation_capabilities(raw_tree)
+        if "focus_consent_v1" not in capabilities:
+            prepared.failure = _failure("unsupported_operation", "Update the macOS Computer Use helper to verify that nobody has taken over since approval. No input was dispatched.", retryable=False)
+            return None
+        can_continue = "focus_loan_v3" in capabilities and bool(loan_window())
         if not can_continue and decision.risk is ComputerRisk.ORDINARY:
             decision = replace(decision, choices=("once", "deny"), boundary=(
                 "Only this batch. Return to the previous application unless you have changed focus."
@@ -4324,20 +4343,23 @@ def register_computer_tools(
         basis = prepared.hash_basis or prepared.decision
         if basis is None or current.batch_hash != basis.batch_hash:
             raise ValueError("Computer Use target changed while approval was pending")
+        expires_at = None
         if prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER:
             revoke_loan()  # An unrelated freshly authorized batch is not a continuation.
-        expires_at = None
-        if (prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER and decision == "session"
-                and "session" in request["choices"]):
             decided_at = getattr(request, "private_decided_at", None)
-            if (not isinstance(decided_at, (float, int)) or isinstance(decided_at, bool) or not math.isfinite(decided_at)
-                    or not 0 <= decided_at <= approval_time.continuous_now() or not loan_window()):
-                prepared.failure = _failure("approval_required", "Missing a valid foreground decision time. Ask again.", retryable=True)
+            pid = getattr(request, "private_frontmost_pid", None)
+            if (type(pid) is not int or not 0 < pid < 2**31
+                    or not isinstance(decided_at, (float, int)) or isinstance(decided_at, bool)
+                    or not 1e-6 <= decided_at <= approval_time.continuous_now() or not decided_at * 1_000_000 < 2**53):
+                prepared.failure = _failure("approval_required", "Missing a valid foreground consent receipt. Ask again.", retryable=True)
                 return None
-            expires_at = decided_at + 120
-            if approval_time.continuous_now() >= expires_at:
-                prepared.failure = _failure("approval_required", "The foreground decision expired before dispatch. Ask again.", retryable=True)
-                return None
+            # Round down: uncertainty at the timestamp boundary must never mask intervening input.
+            prepared.focus_consent = {"frontmost_pid": pid, "decided_at_continuous_us": int(decided_at * 1_000_000)}
+            if decision == "session" and "session" in request["choices"]:
+                expires_at = decided_at + 120
+                if not loan_window() or approval_time.continuous_now() >= expires_at:
+                    prepared.failure = _failure("approval_required", "The foreground decision expired or its window changed. Ask again.", retryable=True)
+                    return None
         cleanup = permission_grant(approvals, args, request, decision)
         if prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER:
             prepared.approved = True

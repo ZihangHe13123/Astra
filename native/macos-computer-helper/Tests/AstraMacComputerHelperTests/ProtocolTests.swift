@@ -523,6 +523,7 @@ import Testing
         #expect(capabilities.contains(.string("focus_loan_v3")))
         #expect(!capabilities.contains(.string("focus_loan_v2")))
         #expect(capabilities.contains(.string("focus_presentation_v1")))
+        #expect(capabilities.contains(.string("focus_consent_v1")))
     }
 }
 
@@ -544,6 +545,38 @@ import Testing
     }
     #expect(windows.begins.map(\.continued) == [false, true])
     #expect(windows.begins.map(\.deadline) == [420.125, 420.125])
+}
+
+@Test func freshFocusConsentRoutesExactFieldsOnlyAndNeverDowngrades() {
+    let windows = LoanDeadlineProtocolWindows()
+    let dispatcher = Dispatcher(permissions: StaticPermissions(accessibilityTrusted: true, screenRecordingAllowed: true), windows: windows)
+    func send(_ receipt: String, _ suffix: String = "") -> HelperResponse {
+        dispatcher.handle(#"{"protocol_version":4,"request_id":"r","operation":"takeover_begin","payload":{"snapshot_id":"s","plan_ref":"p","focus_consent":\#(receipt)\#(suffix)}}"#)
+    }
+    func consent(_ time: String, _ pid: String) -> String {
+        #"{"decided_at_continuous_us":\#(time),"frontmost_pid":\#(pid)}"#
+    }
+    let valid = consent("9007199254740991", "2147483647")
+    #expect(send(valid).ok)
+    #expect(send(valid, #","loan_deadline_continuous_ms":100000"#).ok)
+    for token in ["0", "-1", "1.0", "1e0", "true", "null", #""1""#, "9007199254740992", "9223372036854775808"] {
+        #expect(send(consent(token, "7")).error?.code == "protocol_mismatch")
+        #expect(send(consent("7", token)).error?.code == "protocol_mismatch")
+    }
+    for bad in ["null", "[]", "{}", #"{"frontmost_pid":7}"#, #"{"decided_at_continuous_us":8}"#,
+                #"{"frontmost_pid":7,"decided_at_continuous_us":8,"extra":0}"#, consent("8", "2147483648")] {
+        #expect(send(bad).error?.code == "protocol_mismatch")
+    }
+    #expect(send(valid, #","loan_deadline_continuous_ms":100000,"continued_loan":true"#).error?.code == "protocol_mismatch")
+    #expect(send(valid, #","continued_loan":false"#).error?.code == "protocol_mismatch")
+    #expect(send(valid, #","fragment":{}"#).error?.code == "protocol_mismatch")
+    #expect(windows.consents == Array(repeating: .init(decidedAtContinuousUS: 9_007_199_254_740_991, frontmostPID: Int32.max), count: 2))
+    #expect(windows.begins.map(\.deadline) == [nil, 100])
+    let legacy = CooperativeProtocolWindows()
+    let old = Dispatcher(permissions: StaticPermissions(accessibilityTrusted: true, screenRecordingAllowed: true), windows: legacy)
+    let unsupported = old.handle(#"{"protocol_version":4,"request_id":"r","operation":"takeover_begin","payload":{"snapshot_id":"s","plan_ref":"p","focus_consent":\#(valid)}}"#)
+    #expect(unsupported.error?.code == "user_activity_paused")
+    #expect(legacy.ordinaryTakeoverBegins == 0)
 }
 
 @Test func presentationRoutesRequireOnlyTheExactBoundedTakeoverRef() {
@@ -1188,6 +1221,12 @@ private final class CooperativeProtocolWindows: WindowObserving {
 
 private final class LoanDeadlineProtocolWindows: WindowObserving {
     var begins: [(continued: Bool, deadline: TimeInterval?)] = []
+    var consents: [ForegroundFocusConsent] = []
+
+    func takeoverBegin(snapshotID _: String, planRef _: String, focusConsent: ForegroundFocusConsent, loanDeadline: TimeInterval?) throws -> String {
+        begins.append((false, loanDeadline)); consents.append(focusConsent)
+        return "takeover"
+    }
 
     func apps() throws -> JSONValue { throw WindowObservationError.targetGone }
     func snapshot(appRef _: String, windowRef _: String, scope _: String, artifactName _: String?,

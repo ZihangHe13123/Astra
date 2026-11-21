@@ -1067,6 +1067,7 @@ protocol WindowObserving {
     func planActions(snapshotID: String, interactionMode: InteractionMode, actions: [NativeAction], fragment: ForegroundFragmentPlanRequest?) -> CooperativePlanResult
     func takeoverBegin(snapshotID: String, planRef: String) throws -> String
     func takeoverBegin(snapshotID: String, planRef: String, continuedLoan: Bool, loanDeadline: TimeInterval?) throws -> String
+    func takeoverBegin(snapshotID: String, planRef: String, focusConsent: ForegroundFocusConsent, loanDeadline: TimeInterval?) throws -> String
     func takeoverBegin(snapshotID: String, planRef: String, declaration: ForegroundFragmentDeclaration) throws -> String
     func cooperativeAct(snapshotID: String, interactionMode: InteractionMode, planRef: String, takeoverRef: String?, actions: [NativeAction]) -> CooperativeActionResult
     func cooperativeAct(snapshotID: String, interactionMode: InteractionMode, planRef: String, takeoverRef: String?, actions: [NativeAction], fragmentStage: FragmentStageAuthority?) -> CooperativeActionResult
@@ -1135,6 +1136,9 @@ extension WindowObserving {
         guard !continuedLoan, loanDeadline == nil else { throw TakeoverError.userActivityPaused }
         return try takeoverBegin(snapshotID: snapshotID, planRef: planRef)
     }
+    func takeoverBegin(snapshotID _: String, planRef _: String, focusConsent _: ForegroundFocusConsent, loanDeadline _: TimeInterval?) throws -> String {
+        throw TakeoverError.userActivityPaused  // Never downgrade a marked request.
+    }
     func takeoverBegin(
         snapshotID _: String,
         planRef _: String,
@@ -1188,9 +1192,15 @@ final class SystemWindowObserver: WindowObserving {
     private let observationReadiness = AXObservationReadiness()
     private let activation: any ApplicationActivationControlling
     private let actionLock = NSLock()
+    // Catalog collection works on a private draft. Only the small shared registry and its
+    // invalidation epoch live under this lock; never call AX/CG or a provider while holding it.
+    private typealias WindowIdentities = [CatalogWindowIdentityKey: [CatalogWindowIdentityRecord]]
+    private let catalogLock = NSLock()
+    private var catalogEpoch = UUID()
+    private var catalogClosed = false
     private var catalogGeneration = 0
     private var targets: [String: WindowTarget] = [:]
-    private var catalogWindowIdentities: [CatalogWindowIdentityKey: [CatalogWindowIdentityRecord]] = [:]
+    private var catalogWindowIdentities: WindowIdentities = [:]
     private var catalogAbsenceTracker = CatalogWindowAbsenceTracker()
     private let recentSuggestionPopups = RecentSuggestionPopups()
     private let windowServerInventory: () -> Set<CGWindowID>?
@@ -1220,6 +1230,7 @@ final class SystemWindowObserver: WindowObserving {
             return !application.isTerminated
         },
         inputCounts: ForegroundTakeoverCoordinator.physicalInputCounts,
+        physicalIdleSeconds: ForegroundTakeoverCoordinator.secondsSincePhysicalInput,
         revalidate: { [weak self] target in
             guard let self else { throw WindowObservationError.targetGone }
             _ = try self.backgroundTargetController().snapshotTargetState(target)
@@ -1287,36 +1298,64 @@ final class SystemWindowObserver: WindowObserving {
     }
 
     func apps() throws -> JSONValue {
-        invalidateCooperativeState(.appsRefresh)
-        return try readAppsCatalog()
+        let epoch = invalidateCooperativeState(.appsRefresh)
+        return try readAppsCatalog(epoch: epoch, presentationRef: nil)
     }
 
     func presentationApps(takeoverRef: String) throws -> JSONValue {
-        actionLock.lock()
-        defer { actionLock.unlock() }
+        let epoch = try actionLock.withLock {
+            try takeoverCoordinator.checkPresentationObservation(takeoverRef, checkFrontmost: false)
+            return try catalogLock.withLock {
+                guard !catalogClosed else { throw WindowObservationError.staleTarget }
+                catalogEpoch = UUID()
+                return catalogEpoch
+            }
+        }
+        // The frontmost lookup, full catalog and final WindowServer inventory may block. They
+        // must not keep end/terminal cleanup from returning the previous application.
         try takeoverCoordinator.checkPresentationObservation(takeoverRef)
-        // Refresh observation identities exactly as apps() does, without terminating this
-        // consumed one-shot or rearming any input. Ordinary catalog calls still invalidate it.
-        cooperativeStateInvalidationObserver?(.appsRefresh)
-        virtualCursor.hide()
-        invalidateObservationRefsLocked(.appsRefresh)
-        let catalog = try readAppsCatalog()
-        try takeoverCoordinator.checkPresentationObservation(takeoverRef)
-        return catalog
+        try actionLock.withLock {
+            try takeoverCoordinator.checkPresentationObservation(takeoverRef, checkFrontmost: false)
+            try catalogLock.withLock { try requireCatalogEpochLocked(epoch) }
+            cooperativeStateInvalidationObserver?(.appsRefresh)
+            virtualCursor.hide()
+            invalidateObservationRefsLocked(.appsRefresh)
+        }
+        return try readAppsCatalog(epoch: epoch, presentationRef: takeoverRef)
     }
 
-    private func readAppsCatalog() throws -> JSONValue {
+    private func requireCatalogEpochLocked(_ epoch: UUID) throws {
+        guard !catalogClosed, catalogEpoch == epoch else { throw WindowObservationError.staleTarget }
+    }
+
+    private func readAppsCatalog(epoch: UUID, presentationRef: String?) throws -> JSONValue {
+        let previousIdentities = try catalogLock.withLock {
+            try requireCatalogEpochLocked(epoch)
+            return catalogWindowIdentities
+        }
         guard permissions.screenRecordingAllowed else {
             throw WindowObservationError.permissionDenied("Screen Recording permission is required to list eligible windows")
         }
         let observation: WindowCatalogObservation
+        let identities: WindowIdentities
         if let catalogBuilder {
             observation = try catalogBuilder()
+            identities = previousIdentities
         } else {
-            observation = try buildCatalog()
+            (observation, identities) = try buildCatalog(reusing: previousIdentities)
         }
+        let inventory = windowServerInventory()
+        if let presentationRef { try takeoverCoordinator.checkPresentationObservation(presentationRef) }
+
+        actionLock.lock()
+        defer { actionLock.unlock() }
+        if let presentationRef { try takeoverCoordinator.checkPresentationObservation(presentationRef, checkFrontmost: false) }
+        catalogLock.lock()
+        defer { catalogLock.unlock() }
+        try requireCatalogEpochLocked(epoch)
         let nextGeneration = try nextCatalogGeneration(after: catalogGeneration)
         targets = observation.targets
+        catalogWindowIdentities = identities
         catalogGeneration = nextGeneration
         // Track only exposed identities, retaining history across refreshes.
         for case let .object(app) in observation.apps {
@@ -1335,14 +1374,14 @@ final class SystemWindowObserver: WindowObserving {
             "catalog_generation": .number(Double(nextGeneration)),
             "apps": .array(observation.apps),
         ]
-        let absent = catalogAbsenceTracker.confirmedAbsent(windowIDs: windowServerInventory())
+        let absent = catalogAbsenceTracker.confirmedAbsent(windowIDs: inventory)
         if !absent.isEmpty {
             result["confirmed_absent_window_identity_refs"] = .array(absent.map(JSONValue.string))
         }
         return .object(result)
     }
 
-    private func buildCatalog() throws -> WindowCatalogObservation {
+    private func buildCatalog(reusing previousIdentities: WindowIdentities) throws -> (WindowCatalogObservation, WindowIdentities) {
         let budget = AXObservationBudget(duration: 8)
         let restoreBudget = budget.install()
         defer { restoreBudget() }
@@ -1425,7 +1464,7 @@ final class SystemWindowObserver: WindowObserving {
                     windowID: window.windowID,
                     axIdentity: catalogAXIdentityHash(axWindow)
                 )
-                let exactPrior = (catalogWindowIdentities[key] ?? []).filter {
+                let exactPrior = (previousIdentities[key] ?? []).filter {
                     CFEqual($0.element, axWindow)
                 }
                 let reusable = exactPrior.count == 1
@@ -1479,20 +1518,22 @@ final class SystemWindowObserver: WindowObserving {
             appName(lhs) < appName(rhs)
         }
         try budget.check()
-        catalogWindowIdentities = localWindowIdentities
-        return WindowCatalogObservation(
+        return (WindowCatalogObservation(
             targets: localTargets,
             apps: Array(result.prefix(maximumObservedApplications))
-        )
+        ), localWindowIdentities)
     }
 
     func select(appRef: String, windowRef: String) throws -> WindowTarget {
-        invalidateCooperativeState(.focus)
+        let epoch = invalidateCooperativeState(.focus)
         guard permissions.accessibilityTrusted else {
             throw WindowObservationError.permissionDenied("Accessibility permission is required to select a window")
         }
         let target = try backgroundTargetController().select(appRef: appRef, windowRef: windowRef)
-        targets[windowRef] = target
+        try catalogLock.withLock {
+            try requireCatalogEpochLocked(epoch)
+            targets[windowRef] = target
+        }
         return target
     }
 
@@ -1581,7 +1622,7 @@ final class SystemWindowObserver: WindowObserving {
         guard scope == "target_window" || scope == "display" else {
             throw WindowObservationError.invalidScope
         }
-        invalidateCooperativeState(.newSnapshot)
+        let epoch = invalidateCooperativeState(.newSnapshot)
         guard permissions.screenRecordingAllowed else {
             throw WindowObservationError.permissionDenied("Screen Recording permission is required to capture a window")
         }
@@ -1634,7 +1675,11 @@ final class SystemWindowObserver: WindowObserving {
                         ) else { throw WindowObservationError.captureFailed }
                         return SnapshotFinalCommit(
                             result: observation,
-                            commit: { self.targets[windowRef] = candidate }
+                            commit: {
+                                self.catalogLock.withLock {
+                                    if !self.catalogClosed && self.catalogEpoch == epoch { self.targets[windowRef] = candidate }
+                                }
+                            }
                         )
                     }
                 )
@@ -2388,10 +2433,11 @@ final class SystemWindowObserver: WindowObserving {
         windowRef: String,
         current: (WindowTarget) throws -> WindowTarget?
     ) throws -> WindowTarget {
-        guard requestedGeneration == catalogGeneration,
-              let target = targets[windowRef],
-              target.appRef == appRef
-        else { throw WindowObservationError.staleTarget }
+        let target = try catalogLock.withLock {
+            guard !catalogClosed, requestedGeneration == catalogGeneration,
+                  let target = targets[windowRef], target.appRef == appRef else { throw WindowObservationError.staleTarget }
+            return target
+        }
         guard let currentTarget = try current(target) else {
             throw WindowObservationError.targetGone
         }
@@ -2403,7 +2449,9 @@ final class SystemWindowObserver: WindowObserving {
     }
 
     private func resolve(appRef: String, windowRef: String) throws -> WindowTarget {
-        guard let target = targets[windowRef], target.appRef == appRef else { throw WindowObservationError.targetGone }
+        catalogLock.lock()
+        defer { catalogLock.unlock() }
+        guard !catalogClosed, let target = targets[windowRef], target.appRef == appRef else { throw WindowObservationError.targetGone }
         return target
     }
 
@@ -2759,6 +2807,15 @@ final class SystemWindowObserver: WindowObserving {
     }
 
     func takeoverBegin(snapshotID: String, planRef: String, continuedLoan: Bool, loanDeadline: TimeInterval?) throws -> String {
+        try beginOrdinaryTakeover(snapshotID: snapshotID, planRef: planRef, continuedLoan: continuedLoan, loanDeadline: loanDeadline, focusConsent: nil)
+    }
+
+    func takeoverBegin(snapshotID: String, planRef: String, focusConsent: ForegroundFocusConsent, loanDeadline: TimeInterval?) throws -> String {
+        try beginOrdinaryTakeover(snapshotID: snapshotID, planRef: planRef, continuedLoan: false, loanDeadline: loanDeadline, focusConsent: focusConsent)
+    }
+
+    private func beginOrdinaryTakeover(snapshotID: String, planRef: String, continuedLoan: Bool,
+                                       loanDeadline: TimeInterval?, focusConsent: ForegroundFocusConsent?) throws -> String {
         actionLock.lock()
         defer { actionLock.unlock() }
         pruneCooperativeFragmentDraftsLocked(now: cooperativePlanClock())
@@ -2774,7 +2831,7 @@ final class SystemWindowObserver: WindowObserving {
             target: target,
             snapshotID: snapshotID,
             planRef: planRef,
-            stageDigest: stored.plan.stageDigest, continuedLoan: continuedLoan, loanDeadline: loanDeadline
+            stageDigest: stored.plan.stageDigest, continuedLoan: continuedLoan, loanDeadline: loanDeadline, focusConsent: focusConsent
         )
         return token.ref
     }
@@ -3039,6 +3096,7 @@ final class SystemWindowObserver: WindowObserving {
     func invalidateSnapshots() {
         // cooperativeAct owns actionLock for the whole batch. Signal its wait
         // and input gates before close waits on that lock to restore focus.
+        catalogLock.withLock { catalogClosed = true }
         userActivity.requestTerminalStop()
         invalidateCooperativeState(.close)
     }
@@ -3182,7 +3240,10 @@ final class SystemWindowObserver: WindowObserving {
         )
     }
 
-    private func invalidateCooperativeState(_ reason: SnapshotInvalidationReason) {
+    @discardableResult
+    private func invalidateCooperativeState(_ reason: SnapshotInvalidationReason) -> UUID {
+        let epoch = UUID()
+        catalogLock.withLock { catalogEpoch = epoch }
         cooperativeStateInvalidationObserver?(reason)
         if cursorShouldHide(for: reason) { virtualCursor.hide() }
         actionLock.lock()
@@ -3193,6 +3254,7 @@ final class SystemWindowObserver: WindowObserving {
         } else {
             takeoverCoordinator.invalidate(allowRestore: reason == .close, refreshingTargets: reason == .focus || reason == .appsRefresh)
         }
+        return epoch
     }
 
     private func invalidateObservationRefsLocked(_ reason: SnapshotInvalidationReason) {

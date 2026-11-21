@@ -5981,3 +5981,174 @@ def test_mac_backend_takeover_end_carries_focus_policy(restore):
     transport.request = request
     run(MacComputerBackend(transport).end_takeover("takeover-1", restore_previous_focus=restore))
     assert payloads == [{"takeover_ref": "takeover-1", **({} if restore else {"restore_previous_focus": False})}]
+
+
+def _ndjson_reply(request, **fields):
+    return json.dumps({"protocol_version": 4, "request_id": request["request_id"], "ok": True, **fields})
+
+
+async def _start_ndjson_presentation_end(tmp_path, monkeypatch, *, present=True, timeout=1, on_rollback=None):
+    """Run the real manager/adapter/transport up to a sent but unanswered end."""
+    processes = []
+    end_sent = asyncio.Event()
+    snapshot_ids = iter(("before", "after"))
+
+    async def spawn(*_args, pass_fds, **_kwargs):
+        def reply(request):
+            operation, payload = request["operation"], request["payload"]
+            if operation == "select":
+                return _ndjson_reply(request, result={**payload, "interaction_mode": "background"})
+            if operation == "snapshot":
+                artifact = ComputerArtifact(payload["artifact_name"], pass_fds[0])
+                _write_helper_artifact(artifact, _SMART_SNAPSHOT_PNG)
+                snap = _state_snapshot(artifact.filename, snapshot_id=next(snapshot_ids))
+                return _ndjson_reply(request, snapshot={"snapshot_id": snap.snapshot_id, "payload": snap.payload})
+            if operation == "plan_actions":
+                return _ndjson_reply(request, result={
+                    "plan_ref": "plan", "interaction_mode": "foreground_takeover", "requires_takeover": True,
+                    "reason": "foreground_takeover_required", "action_classes": ["click"],
+                    "pid_action_classes": [], "last_acknowledged_action": -1,
+                })
+            if operation == "takeover_begin":
+                return _ndjson_reply(request, result={"takeover_ref": "borrow"})
+            if operation == "act":
+                return _ndjson_reply(request, result={"outcomes": [{"index": 0, "ok": True}],
+                                                     "last_acknowledged_action": 0})
+            if operation == "takeover_end":
+                end_sent.set()
+                return None  # The test controls the reply independently of the write.
+            assert operation == "cancel_presentation" and payload == {"takeover_ref": "borrow"}
+            if on_rollback is not None:
+                return on_rollback(request)
+            return _ndjson_reply(request, result={"started": True, "restoration": "restored"})
+
+        process = _TransportProcess(reply)
+        processes.append(process)
+        return process
+
+    monkeypatch.setattr("agent.runtime.macos_computer.asyncio.create_subprocess_exec", spawn)
+    transport = HelperTransport(_owned_helper(tmp_path))
+    manager = ComputerSessionManager(MacComputerBackend(transport), cache_root=tmp_path / "cache",
+                                     takeover_begin_cleanup_timeout=timeout)
+    await manager.select("app", "win")
+    before = await manager.snapshot()
+    mode = ComputerInteractionMode.FOREGROUND_TAKEOVER
+    actions = [{"type": "click", "element_ref": "ax-1"}]
+    plan = await manager.plan_actions(before.snapshot_id, actions, interaction_mode=mode)
+    ref = await manager.begin_takeover(before.snapshot_id, plan.plan_ref)
+    assert (await manager.act(before.snapshot_id, actions, interaction_mode=mode,
+                              plan_ref=plan.plan_ref, takeover_ref=ref)).ok
+    after = await manager.snapshot()
+    task = asyncio.create_task(manager.end_takeover(ref, restore_previous_focus=not present,
+                                                    presentation_snapshot=after))
+    await asyncio.wait_for(end_sent.wait(), 1)
+    request = json.loads(processes[0].stdin.writes[-1])
+    assert request["payload"] == {"takeover_ref": ref, **({"restore_previous_focus": False} if present else {})}
+    return manager, processes, request, task
+
+
+async def _assert_terminal_trace(manager, processes, *, rollback, closed):
+    assert manager.closed is closed
+    with pytest.raises(ComputerSessionError, match="session_closed" if closed else "stale_takeover"):
+        await manager.end_takeover("borrow")
+    with pytest.raises(ComputerSessionError, match="session_closed" if closed else "stale_plan"):
+        await manager.act("before", [{"type": "click", "element_ref": "ax-1"}],
+                          interaction_mode=ComputerInteractionMode.FOREGROUND_TAKEOVER,
+                          plan_ref="plan", takeover_ref="borrow")
+    await manager.close()  # Ordinary close must not undo a successful presentation.
+    assert len(processes) == 1
+    assert [json.loads(frame)["operation"] for frame in processes[0].stdin.writes] == [
+        "select", "snapshot", "plan_actions", "takeover_begin", "act", "snapshot", "takeover_end",
+        *(["cancel_presentation"] if rollback else []),
+    ]
+    assert manager._terminal_cleanup_task is manager._takeover_end_task is None
+
+
+@pytest.mark.parametrize("cancel", [False, True], ids=["uncancelled", "cancelled"])
+@pytest.mark.parametrize("result", [{"started": True}, None, {"started": True, "restoration": "preserved_user_focus"}],
+                         ids=["missing-restoration", "missing-result", "valid"])
+def test_ndjson_presentation_end_rolls_back_only_on_failure_or_cancellation(tmp_path, monkeypatch, result, cancel):
+    async def scenario():
+        manager, processes, request, task = await _start_ndjson_presentation_end(tmp_path, monkeypatch)
+        if cancel:
+            task.cancel()
+            await asyncio.sleep(0)
+            task.cancel()
+        reply = _ndjson_reply(request, **({} if result is None else {"result": result}))
+        processes[0].stdout.feed_data(reply.encode() + b"\n")
+        valid = result is not None and "restoration" in result
+        if cancel:
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        elif not valid:
+            with pytest.raises(ComputerSessionError, match="takeover_cleanup_failed"):
+                await task
+        else:
+            assert await task == result
+        await _assert_terminal_trace(manager, processes, rollback=cancel or not valid, closed=not valid)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("fault", ["hung-end", "bad-frame", "crossed-id", "eof", "exit-after-end-reply", "exit-after-valid-reply"])
+def test_ndjson_presentation_end_unusable_transport_never_reconnects(tmp_path, monkeypatch, fault):
+    async def scenario():
+        manager, processes, request, task = await _start_ndjson_presentation_end(
+            tmp_path, monkeypatch, timeout=0.05 if fault == "hung-end" else 1,
+        )
+        process = processes[0]
+        task.cancel()
+        if fault == "bad-frame":
+            process.stdout.feed_data(b"not a response\n")
+        elif fault == "crossed-id":
+            process.stdout.feed_data(_ndjson_reply(request, request_id="other", result={"started": True}).encode() + b"\n")
+        elif fault.startswith("exit-after-"):
+            result = {"started": True}
+            if fault == "exit-after-valid-reply":
+                result["restoration"] = "preserved_user_focus"
+            process.stdout.feed_data(_ndjson_reply(request, result=result).encode() + b"\n")
+        if fault == "eof" or fault.startswith("exit-after-"):
+            process.returncode = 1
+            process.stdout.feed_eof()
+        done, _ = await asyncio.wait({task}, timeout=1)
+        assert task in done, "uncertain end did not complete within its cleanup budget"
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _assert_terminal_trace(manager, processes, rollback=False, closed=True)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("fault", ["malformed", "hung"])
+def test_ndjson_presentation_end_failed_rollback_remains_owned_and_bounded(tmp_path, monkeypatch, fault):
+    async def scenario():
+        def rollback(request):
+            task.cancel()  # Another cancellation while the rollback is in flight.
+            return _ndjson_reply(request, result={"started": True}) if fault == "malformed" else None
+
+        manager, processes, request, task = await _start_ndjson_presentation_end(
+            tmp_path, monkeypatch, timeout=0.05, on_rollback=rollback,
+        )
+        task.cancel()
+        processes[0].stdout.feed_data(_ndjson_reply(request, result={"started": True}).encode() + b"\n")
+        done, _ = await asyncio.wait({task}, timeout=1)
+        assert task in done, "rollback did not complete within its cleanup budget"
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await _assert_terminal_trace(manager, processes, rollback=True, closed=True)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("present", [False, True], ids=["restoring-end", "rejected-presentation"])
+def test_ndjson_end_without_presentation_success_frame_has_no_rollback(tmp_path, monkeypatch, present):
+    async def scenario():
+        manager, processes, request, task = await _start_ndjson_presentation_end(tmp_path, monkeypatch, present=present)
+        reply = (_ndjson_reply(request, ok=False, error={"code": "helper_failed", "message": "rejected"})
+                 if present else _ndjson_reply(request, result={"started": True}))
+        processes[0].stdout.feed_data(reply.encode() + b"\n")
+        with pytest.raises(ComputerSessionError, match="takeover_cleanup_failed"):
+            await task
+        await _assert_terminal_trace(manager, processes, rollback=False, closed=True)
+
+    run(scenario())

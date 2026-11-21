@@ -33,7 +33,7 @@ description: Use when controlling macOS interfaces with computer_* tools.
    file, send, submit, export, upload, share, delete, install, System Settings, and
    Terminal Enter need high-impact exact-batch once approval. YOLO/autoapprove cannot downgrade risk or authorize foreground input. 空闲不等于同意。
 4. Target or action invalidation or authority invalidation clears snapshot,
-   element, plan, and exact approval. 优先后台。前台借用只限批准的聊天和窗口，最多两分钟，观察不续期。换窗、移动鼠标、打字或交接后不再续借；旧 helper 仅按次借用。到期或取消后不发新输入；每批归还此前应用，人已切走则保持原样。只有人说「给我看」才单独申请 `present_result=true`。 Smart approval: `text_detail=on` once-only/target-bound.
+   element, plan, and exact approval. 优先后台。同聊天同窗最多借用两分钟，观察不续期。批准后若有键鼠输入或切走，首批也让行。缺 `focus_consent_v1` 须更新，不降级；仅缺 `focus_loan_v3` 可按次批准。到期或取消即停；每批有条件归还此前应用，不打断已接手的人。只有人说「给我看」才单独申请 `present_result=true`。 Smart approval: `text_detail=on` once-only/target-bound.
    Bounded errors: never guess target/ref/artifact.
    `unsafe_artifact`: `computer_close` → fresh session →
    `computer_apps` → `computer_get_app_state`.

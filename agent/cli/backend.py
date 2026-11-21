@@ -1141,16 +1141,19 @@ async def _main(startup_started: float):
 
     pending_tool_approvals: dict[str, asyncio.Future[str]] = {}
     pending_yolo_approvals: set[str] = set()
+    pending_foreground_approvals: set[str] = set()
 
     approval_resolutions: dict[str, asyncio.Task] = {}
 
-    def resolve_tool_approval(request_id: str, decision: str) -> bool:
+    def resolve_tool_approval(request_id: str, decision: str, *, human: bool = True) -> bool:
         future = pending_tool_approvals.get(request_id)
         if future is None or future.done() or request_id in approval_resolutions:
             return False
         normalized = str(decision) if decision in {"once", "task", "session", "always", "deny"} else "deny"
-        # Timestamp the winning answer here, not after scheduling or committing it to the inbox.
-        receipt = approval_time.TimedApprovalDecision(normalized)
+        # Capture the winning answer (and front app for a human foreground grant) before scheduling any I/O.
+        receipt = approval_time.TimedApprovalDecision(
+            normalized, foreground=human and request_id in pending_foreground_approvals,
+        )
 
         async def resolve() -> None:
             try:
@@ -1223,6 +1226,8 @@ async def _main(startup_started: float):
                     if channel_name:
                         return "deny"
             pending_tool_approvals[request_id] = future
+            if request.get("kind") == "computer_foreground_takeover":
+                pending_foreground_approvals.add(request_id)
             if request.get("yolo_bypass_allowed") is True:
                 pending_yolo_approvals.add(request_id)
             _send({
@@ -1236,7 +1241,7 @@ async def _main(startup_started: float):
             })
             if tools.yolo and request.get("yolo_bypass_allowed") is True:
                 # YOLO may have been enabled while the inbox write was waiting.
-                resolve_tool_approval(request_id, "once")
+                resolve_tool_approval(request_id, "once", human=False)
             if channel_name:
                 # Asked in the chat too (WeChat), and never left waiting: no answer in time is a denial.
                 manager = channel_manager_holder.get("manager")
@@ -1254,6 +1259,7 @@ async def _main(startup_started: float):
         finally:
             pending_tool_approvals.pop(request_id, None)
             pending_yolo_approvals.discard(request_id)
+            pending_foreground_approvals.discard(request_id)
 
     tools.set_approval_handler(request_tool_approval)
     # "以后都允许" rules the person adds from a card (settings.json), and when a card may offer one.
@@ -4387,7 +4393,7 @@ async def _main(startup_started: float):
                             agent.tools.yolo = not agent.tools.yolo if action == "toggle" else action == "on"
                             if agent.tools.yolo:
                                 for request_id in tuple(pending_yolo_approvals):
-                                    resolve_tool_approval(request_id, "once")
+                                    resolve_tool_approval(request_id, "once", human=False)
                     _send({"type": "yolo_status", "yolo": _window_yolo(), "error": error})
                 elif c.lower().split(maxsplit=1)[:1] == ["/voice"]:
                     # Like /yolo, a control acknowledgement: it works in every mode and

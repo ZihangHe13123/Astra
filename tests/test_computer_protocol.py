@@ -72,6 +72,33 @@ def test_focus_loan_capability_requires_the_continuous_clock_version():
     assert observation_capabilities({"observation_capabilities": ["focus_loan_v3"]}) == ["focus_loan_v3"]
 
 
+def test_focus_consent_strict_wire_agrees_for_oneshot_and_first_bounded_begin():
+    assert observation_capabilities({'observation_capabilities': ['focus_consent_v1']}) == ['focus_consent_v1']
+    base = {'snapshot_id': 's', 'plan_ref': 'p'}
+    receipt = {'frontmost_pid': 1, 'decided_at_continuous_us': 45_125_000}
+    for extra in [{}, {'loan_deadline_continuous_ms': 165_125}]:
+        payload = {**base, **extra, 'focus_consent': receipt}
+        assert json.loads(encode_request(ComputerRequest('r', 'takeover_begin', payload)))['payload'] == payload
+    for extra in [{'continued_loan': True, 'loan_deadline_continuous_ms': 165_125}, {'fragment': {}}]:
+        with pytest.raises(ValueError):
+            ComputerRequest('r', 'takeover_begin', {**base, **extra, 'focus_consent': receipt})
+    for malformed in [False, None, {}, {'frontmost_pid': 1}, {**receipt, 'other': 0},
+                      *({**receipt, 'frontmost_pid': bad} for bad in [None, True, 1.0, 0, -1, 2**31]),
+                      *({**receipt, 'decided_at_continuous_us': bad} for bad in [None, True, 1.0, 0, -1, 2**53])]:
+        with pytest.raises(ValueError):
+            ComputerRequest('r', 'takeover_begin', {**base, 'focus_consent': malformed})
+
+
+def test_focus_consent_rejection_never_retries_without_a_receipt():
+    rejection = ComputerError(ComputerErrorCode.PROTOCOL_MISMATCH, 'takeover_begin has an invalid payload')
+    backend, frames = _presentation_backend({'ok': False, 'error': rejection})
+    receipt = {'decided_at_continuous_us': 45_125_000, 'frontmost_pid': 37}
+    with pytest.raises(HelperApplicationError) as failure:
+        asyncio.run(backend.begin_takeover('s', 'p', focus_consent=receipt))
+    assert failure.value.error.code is ComputerErrorCode.PROTOCOL_MISMATCH and 'Update' in failure.value.error.message
+    assert frames == [('takeover_begin', {'snapshot_id': 's', 'plan_ref': 'p', 'focus_consent': receipt})]
+
+
 @pytest.mark.parametrize("continued", [False, True])
 def test_focus_loan_new_deadline_rejected_by_strict_old_v4_without_downgrade(continued):
     frames = []

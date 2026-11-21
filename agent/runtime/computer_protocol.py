@@ -1624,6 +1624,13 @@ def _validate_cooperative_request_payload(operation: str, payload: Mapping[str, 
                 required.add("continued_loan")
                 if payload["continued_loan"] is not True:
                     raise ValueError("continued_loan must be true when present")
+        if "focus_consent" in payload and "fragment" not in payload and "continued_loan" not in payload:
+            required.add("focus_consent")
+            consent = payload["focus_consent"]
+            _require_object(consent, "focus_consent")
+            _require_exact_payload(consent, {"frontmost_pid", "decided_at_continuous_us"}, "focus_consent")
+            _exact_integer(consent["frontmost_pid"], "frontmost_pid", minimum=1, maximum=2**31 - 1)
+            _exact_integer(consent["decided_at_continuous_us"], "decided_at_continuous_us", minimum=1, maximum=2**53 - 1)
         _require_exact_payload(payload, required, operation)
         _validate_reference(payload["snapshot_id"], "snapshot_id")
         _validate_reference(payload["plan_ref"], "plan_ref")

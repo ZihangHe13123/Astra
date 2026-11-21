@@ -693,9 +693,10 @@ final class Dispatcher {
                   case let .string(planRef)? = payload["plan_ref"]
             else { return Self.failure(requestID: request.requestID, message: "takeover_begin has an invalid payload") }
             let loanDeadline = continuousLoanDeadline(request)
+            let consent = decodeFocusConsent(request)
             let declaration: ForegroundFragmentDeclaration?
             if payload["fragment"] == nil {
-                guard validateTakeoverBeginPayload(request.payload, hasFragment: false, loanDeadline: loanDeadline) else {
+                guard validateTakeoverBeginPayload(request.payload, hasFragment: false, loanDeadline: loanDeadline, consent: consent) else {
                     return Self.failure(requestID: request.requestID, message: "takeover_begin has an invalid payload")
                 }
                 declaration = nil
@@ -717,9 +718,13 @@ final class Dispatcher {
                         "stage_hash": .string(declaration.stages[0].stageHash),
                     ]))
                 }
-                let reference = try windows.takeoverBegin(snapshotID: snapshotID, planRef: planRef,
-                    continuedLoan: payload["continued_loan"] == .bool(true),
-                    loanDeadline: loanDeadline)
+                let reference: String
+                if let consent {
+                    reference = try windows.takeoverBegin(snapshotID: snapshotID, planRef: planRef, focusConsent: consent, loanDeadline: loanDeadline)
+                } else {
+                    reference = try windows.takeoverBegin(snapshotID: snapshotID, planRef: planRef,
+                        continuedLoan: payload["continued_loan"] == .bool(true), loanDeadline: loanDeadline)
+                }
                 return success(requestID: request.requestID, result: .object(["takeover_ref": .string(reference)]))
             } catch {
                 return takeoverFailure(requestID: request.requestID, error: error)
@@ -1128,11 +1133,29 @@ final class Dispatcher {
         return TimeInterval(exactMS) / 1000
     }
 
-    private func validateTakeoverBeginPayload(_ payload: JSONValue, hasFragment: Bool, loanDeadline: TimeInterval? = nil) -> Bool {
+    private func decodeFocusConsent(_ request: HelperRequest) -> ForegroundFocusConsent? {
+        guard case let .object(payload) = request.payload, payload["focus_consent"] != nil,
+              let raw = strictPayloadObject(request)?["focus_consent"] as? [String: Any],
+              Set(raw.keys) == ["decided_at_continuous_us", "frontmost_pid"] else { return nil }
+        func positiveInteger(_ key: String, through maximum: Int) -> Int? {
+            // Range-check before conversion, then distinguish an exact JSON integer from a
+            // boolean or a numerically equal floating/exponent token.
+            guard let value = raw[key] as? NSNumber, value.doubleValue > 0,
+                  value.doubleValue <= Double(maximum) else { return nil }
+            return exactPositiveInteger(value)
+        }
+        guard let us = positiveInteger("decided_at_continuous_us", through: 9_007_199_254_740_991),
+              let pid = positiveInteger("frontmost_pid", through: Int(Int32.max)) else { return nil }
+        return ForegroundFocusConsent(decidedAtContinuousUS: us, frontmostPID: pid_t(pid))
+    }
+
+    private func validateTakeoverBeginPayload(_ payload: JSONValue, hasFragment: Bool, loanDeadline: TimeInterval? = nil,
+                                             consent: ForegroundFocusConsent? = nil) -> Bool {
         var keys: Set<String> = ["snapshot_id", "plan_ref"]
+        if !hasFragment, consent != nil { keys.insert("focus_consent") }
         if !hasFragment, case let .object(values) = payload, loanDeadline != nil {
             keys.insert("loan_deadline_continuous_ms")
-            if values["continued_loan"] == .bool(true) { keys.insert("continued_loan") }
+            if consent == nil, values["continued_loan"] == .bool(true) { keys.insert("continued_loan") }
         }
         if hasFragment { keys.insert("fragment") }
         guard let values = exactPayload(payload, keys: keys) else { return false }

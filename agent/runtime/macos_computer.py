@@ -67,6 +67,10 @@ class HelperTransportError(RuntimeError):
     """A helper launch, framing, or process-lifetime failure."""
 
 
+class MalformedTakeoverOutcomeError(HelperTransportError):
+    """A matching success frame was received, but its terminal outcome is invalid."""
+
+
 class HelperApplicationError(HelperTransportError):
     """A well-formed, bounded native application failure."""
 
@@ -334,7 +338,14 @@ class HelperTransport:
                 if self._closed or self._request_cleanup_failed or (self._close_task is not None and not self._close_task.done()):
                     raise HelperTransportError("helper transport is closing or closed")
                 stage, stage_started = "start", loop.time()
-                process = await self._ensure_process_locked()
+                if request.operation == "cancel_presentation":
+                    # The receipt lives in the helper that ended this takeover.
+                    # Its exit between replies is not a reason to launch another.
+                    process = self._proc
+                    if process is None or process.returncode is not None:
+                        raise HelperTransportError("presentation helper is no longer running")
+                else:
+                    process = await self._ensure_process_locked()
                 timings[stage] = (loop.time() - stage_started) * 1000
                 stage, stage_started = "write", loop.time()
                 await self._write_locked(process, request)
@@ -878,8 +889,11 @@ class MacComputerBackend:
         declaration: ForegroundFragmentDeclaration | None = None,
         continued_loan: bool = False,
         loan_deadline_continuous_ms: int | None = None,
+        focus_consent: Mapping[str, int] | None = None,
     ) -> str:
         payload: dict[str, object] = {"snapshot_id": snapshot_id, "plan_ref": plan_ref}
+        if focus_consent is not None:
+            payload["focus_consent"] = dict(focus_consent)
         if loan_deadline_continuous_ms is not None:
             payload["loan_deadline_continuous_ms"] = loan_deadline_continuous_ms
         if continued_loan:
@@ -890,6 +904,11 @@ class MacComputerBackend:
             "takeover_begin",
             payload,
         )
+        if (focus_consent is not None and not response.ok and response.error is not None
+                and response.error.code is ComputerErrorCode.PROTOCOL_MISMATCH
+                and response.error.message == "takeover_begin has an invalid payload"):
+            raise HelperApplicationError(ComputerError(ComputerErrorCode.PROTOCOL_MISMATCH,
+                "Update the macOS Computer Use helper to verify foreground consent. No unguarded retry is allowed."))
         result = self._required_result(response)
         expected = {"takeover_ref"}
         if declaration is not None:
@@ -947,12 +966,13 @@ class MacComputerBackend:
         return self._takeover_outcome(response)
 
     def _takeover_outcome(self, response: ComputerResponse) -> Mapping[str, object]:
+        self._raise_response_error(response)
         try:
-            outcome = TakeoverOutcome.from_mapping(self._required_result(response))
+            outcome = TakeoverOutcome.from_mapping(response.result or {})
         except (TypeError, ValueError) as exc:
-            raise HelperTransportError("helper returned malformed takeover outcome") from exc
+            raise MalformedTakeoverOutcomeError("helper returned malformed takeover outcome") from exc
         if not outcome.started:
-            raise HelperTransportError("helper returned malformed takeover outcome")
+            raise MalformedTakeoverOutcomeError("helper returned malformed takeover outcome")
         return outcome.to_mapping()
 
     async def snapshot(

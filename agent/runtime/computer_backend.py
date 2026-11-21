@@ -19,7 +19,7 @@ import sys
 import time
 import uuid
 import zlib
-from collections.abc import Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
@@ -1281,6 +1281,7 @@ class ComputerSessionManager:
         declaration: ForegroundFragmentDeclaration | None = None,
         loan_deadline: Callable[[], int | None] | None = None,
         continued_loan: bool = False,
+        focus_consent: Mapping[str, int] | None = None,
     ) -> str:
         async with self._lock:
             self._require_open()
@@ -1306,21 +1307,21 @@ class ComputerSessionManager:
             self._pending_plan = None
             self._takeover_ref = None
             self._takeover_cleanup_ref = None
-            if (loan_deadline is not None and declaration is not None) or (continued_loan and loan_deadline is None):
+            if ((declaration is not None and (loan_deadline is not None or focus_consent is not None))
+                    or (continued_loan and (loan_deadline is None or focus_consent is not None))):
                 raise ComputerSessionError("takeover_not_allowed")
+            begin_options: dict[str, object] = {}
+            if focus_consent is not None:
+                begin_options["focus_consent"] = focus_consent
             if loan_deadline is not None:
                 # Authorization may have expired or been revoked while waiting for the lock.
                 deadline_ms = loan_deadline()
                 if deadline_ms is None:
                     raise ComputerSessionError("approval_required", "The foreground loan is no longer current.")
-                begin_task = asyncio.create_task(begin(snapshot_id, plan_ref, continued_loan=continued_loan,
-                                                       loan_deadline_continuous_ms=deadline_ms))
-            elif declaration is None:
-                begin_task = asyncio.create_task(begin(snapshot_id, plan_ref))
-            else:
-                begin_task = asyncio.create_task(
-                    begin(snapshot_id, plan_ref, declaration=declaration)
-                )
+                begin_options.update(continued_loan=continued_loan, loan_deadline_continuous_ms=deadline_ms)
+            if declaration is not None:
+                begin_options["declaration"] = declaration
+            begin_task = asyncio.create_task(begin(snapshot_id, plan_ref, **begin_options))
             try:
                 takeover_ref = await asyncio.shield(begin_task)
             except asyncio.CancelledError:
@@ -1691,12 +1692,13 @@ class ComputerSessionManager:
                 raise ComputerSessionError("takeover_unsupported")
             presenting = (not restore_previous_focus and not cancelled and not self._handed_off
                           and presentation_snapshot is not None and self._latest_snapshot is presentation_snapshot)
-            rollback = getattr(self._backend, "cancel_presentation", None)
-            if presenting and rollback is None:
-                # Never dispatch an irreversible keep-foreground request to a legacy backend.
-                presenting = False
+            rollback: Callable[[str], Awaitable[object]] | None = getattr(self._backend, "cancel_presentation", None)
             if presenting:
-                end = partial(end, restore_previous_focus=False)
+                if callable(rollback):
+                    end = partial(self._end_for_presentation, end, rollback)
+                else:
+                    # Never dispatch an irreversible keep-foreground request to a legacy backend.
+                    presenting = False
             cleanup_task = asyncio.create_task(self._end_takeover_owned(end, takeover_ref))
             self._terminal_cleanup_task = cleanup_task
             try:
@@ -1727,6 +1729,21 @@ class ComputerSessionManager:
         if (not ref or ref != self._takeover_cleanup_ref or self._takeover_ref is not None
                 or self._fragment_declaration is not None or self._handed_off):
             raise ComputerSessionError("stale_takeover")
+
+    @staticmethod
+    async def _end_for_presentation(
+        end: Callable[..., Awaitable[object]], rollback: Callable[[str], Awaitable[object]], takeover_ref: str,
+    ) -> object:
+        from .macos_computer import MalformedTakeoverOutcomeError
+
+        try:
+            return await end(takeover_ref, restore_previous_focus=False)
+        except MalformedTakeoverOutcomeError:
+            # The helper may have presented. Spend the one-shot receipt while the
+            # owned end task still holds its cleanup budget, then fail closed.
+            # Never issue another request on a timeout, EOF or framing error.
+            await rollback(takeover_ref)
+            raise
 
     async def _end_takeover_owned(self, end: object, takeover_ref: str) -> object:
         try:

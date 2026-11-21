@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from agent.core.msg import ContentBlock, Msg
+from agent.runtime import approval_time
 from agent.runtime.computer_backend import (
     ComputerActionPlan,
     ComputerActionResult,
@@ -314,7 +315,7 @@ class FakeComputerBackend:
             "ax_tree": self.snapshot_ax_tree_override or {
                 "role": self.snapshot_root_role,
                 "label": self.snapshot_root_label,
-                **({"observation_capabilities": ["focus_loan_v3", "focus_presentation_v1"]} if self.focus_loan else {}),
+                "observation_capabilities": ["focus_consent_v1", *(["focus_loan_v3", "focus_presentation_v1"] if self.focus_loan else [])],
                 "children": [
                     {
                         "role": self.focused_role,
@@ -371,8 +372,9 @@ class FakeComputerBackend:
             ),
         )
 
-    async def begin_takeover(self, snapshot_id, plan_ref, *, continued_loan=False, loan_deadline_continuous_ms=None):
+    async def begin_takeover(self, snapshot_id, plan_ref, *, continued_loan=False, loan_deadline_continuous_ms=None, focus_consent=None):
         assert not continued_loan or (self.focus_loan and loan_deadline_continuous_ms is not None)
+        assert (focus_consent is None) == continued_loan
         self.calls.append(("takeover_begin", (snapshot_id, plan_ref)))
         return "takeover-1"
 
@@ -561,7 +563,7 @@ def test_public_tool_keeps_ordinary_v3_foreground_takeover_through_native_adapte
         "plan_actions", "plan_actions", "takeover_begin", "act", "takeover_end",
     ]
     assert transport.requests[1].payload.get("fragment") is None
-    assert set(transport.requests[2].payload) == {"snapshot_id", "plan_ref"}
+    assert set(transport.requests[2].payload) == {"snapshot_id", "plan_ref", "focus_consent"}
     assert set(transport.requests[3].payload) == {
         "interaction_mode", "snapshot_id", "plan_ref", "takeover_ref", "actions",
     }
@@ -578,6 +580,7 @@ def manager(backend, tmp_path, monkeypatch):
         pytest.skip("ComputerSessionManager requires POSIX held-directory cache leases")
     # Simulate the public tool's host without changing the real OS file APIs
     # used by the session manager and its held-directory cache.
+    monkeypatch.setattr(approval_time, "frontmost_pid_now", lambda: 111, raising=False)
     monkeypatch.setattr(
         "agent.runtime.tools.computer.sys", SimpleNamespace(platform="darwin")
     )
@@ -4716,7 +4719,8 @@ def test_default_local_runtime_forwards_foreground_interface_without_fake_token(
     )
     backend.force_takeover = True
 
-    async def reject_takeover(snapshot_id, plan_ref):
+    async def reject_takeover(snapshot_id, plan_ref, *, focus_consent):
+        assert focus_consent['frontmost_pid'] == 111
         backend.calls.append(("takeover_begin", (snapshot_id, plan_ref)))
         raise HelperApplicationError(ComputerError(
             ComputerErrorCode.FOREGROUND_TAKEOVER_REQUIRED,
@@ -4736,12 +4740,8 @@ def test_default_local_runtime_forwards_foreground_interface_without_fake_token(
 
     assert required["code"] == "foreground_takeover_required"
     assert result["code"] == "foreground_takeover_required"
-    # 站点2(计划成功但 requires_takeover=true): 恢复指引要求用同一快照同一批次重试,
-    # 而 computer_begin_takeover 的必填参数是 plan_ref ⇒ details 必须带这个句柄,
-    # 否则工具在要求模型走一条它自己调不动的流程。（站点1 helper 直接拒绝时根本没有
-    # plan，不存在 plan_ref 可给，那条指引该另案改成不承诺同一快照。）
-    plan_ref = required["details"]["plan_ref"]
-    assert isinstance(plan_ref, str) and plan_ref.startswith("plan-")
+    assert required['details']['next_tool'] == 'computer_act'
+    assert required['details']['do_not_call'] == 'computer_begin_takeover'
     assert "PRIVATE-NATIVE-TAKEOVER-MESSAGE" not in json.dumps(result)
     assert ("plan_actions", ("snapshot-1", "background")) in backend.calls
     assert ("plan_actions", ("snapshot-1", "foreground_takeover")) in backend.calls
@@ -4928,7 +4928,7 @@ def test_background_takeover_plan_returns_typed_retry_without_input_or_approval(
 def test_modern_helper_auto_takeover_completes_in_one_public_action(registry, manager, backend, monkeypatch, rejection):
     monkeypatch.setattr("agent.runtime.tools.computer.enabled_pid_actions", lambda *_: frozenset({"click"}))
     registry.set_approval_handler(lambda _request: asyncio.sleep(0, result="once"))
-    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["auto_takeover_v1"],
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["auto_takeover_v1", "focus_consent_v1"],
         "children": [{"role": "AXButton", "element_ref": "snapshot-1:1", "label": "Ordinary"}]}
     register(registry, manager)
     registry.yolo = True
@@ -5020,7 +5020,7 @@ def test_refused_replacement_is_selected_and_typed_under_the_same_approval(regis
     from agent.runtime.macos_computer import HelperApplicationError
 
     backend.snapshot_ax_tree_override = {"role": "AXWindow",
-        "observation_capabilities": ["replace_text_v1", "auto_takeover_v1"],
+        "observation_capabilities": ["replace_text_v1", "auto_takeover_v1", "focus_consent_v1"],
         "children": [{"role": "AXTextField", "element_ref": "snapshot-1:field", "label": "Address",
                       "value": "old", "bounds": {"x": 10, "y": 10, "width": 50, "height": 20}}]}
     original_plan = backend.plan_actions
@@ -5062,7 +5062,7 @@ def test_dialog_intent_activates_before_an_ordinary_ax_button_with_normal_approv
     registry, manager, backend, monkeypatch, approval,
 ):
     monkeypatch.setattr("agent.runtime.tools.computer.enabled_pid_actions", lambda *_: frozenset({"click"}))
-    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["auto_takeover_v1"],
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["auto_takeover_v1", "focus_consent_v1"],
         "children": [{"role": "AXButton", "element_ref": "snapshot-1:1", "label": "Ordinary"}]}
     register(registry, manager)
     focus(registry)
@@ -7690,6 +7690,65 @@ def _borrow_focus(registry, snapshot, **options):
     }))
 
 
+@pytest.mark.parametrize('borrow', ['once', 'session', 'presentation'])
+@pytest.mark.parametrize('intervention', ['none', 'same_app_key', 'switch_app'])
+def test_fresh_takeover_carries_the_decision_not_the_state_after_audit(
+    registry, manager, loan_backend, monkeypatch, borrow, intervention,
+):
+    clock, front_pid, last_input = 45.125, 111, 45.12  # the approval gesture itself precedes the decision
+    frames = []
+    monkeypatch.setattr(approval_time, 'continuous_now', lambda: clock)
+    monkeypatch.setattr(approval_time, 'frontmost_pid_now', lambda: front_pid, raising=False)
+
+    async def begin(req):
+        frames.append(req.payload)
+        consent = req.payload.get('focus_consent')
+        if consent and (consent['frontmost_pid'] != front_pid or last_input * 1_000_000 >= consent['decided_at_continuous_us']):
+            return ComputerResponse(req.request_id, False, error=ComputerError(ComputerErrorCode.USER_ACTIVITY_PAUSED, 'intervened'))
+        return ComputerResponse(req.request_id, True, result={'takeover_ref': 'takeover-1'})
+
+    async def audit(event):
+        nonlocal clock, front_pid, last_input
+        if event['type'] == 'approval_decided':
+            clock = 46.0
+            if intervention == 'same_app_key':
+                last_input = 45.5  # key down AND up before the helper's first sample
+            elif intervention == 'switch_app':
+                front_pid = 333
+
+    monkeypatch.setattr(loan_backend, 'begin_takeover', MacComputerBackend(SimpleNamespace(request=begin)).begin_takeover)
+    register(registry, manager)
+    focus(registry)
+    loan_backend.plan_pid_action_classes = ()
+    registry.set_approval_handler(lambda card: asyncio.sleep(0, result='session' if borrow == 'session' else 'once'))
+    snapshot = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    registry.set_approval_audit_handler(audit)
+    result = _borrow_focus(registry, snapshot, present_result=borrow == 'presentation')
+    assert result.get('code') == (None if intervention == 'none' else 'user_activity_paused')
+    assert len(frames) == 1 and frames[0].get('focus_consent') == {'frontmost_pid': 111, 'decided_at_continuous_us': 45_125_000}
+    assert frames[0].get('loan_deadline_continuous_ms') == (165_125 if borrow == 'session' else None)
+    assert 'decided_at_continuous_us' not in json.dumps(result) and 'frontmost_pid' not in json.dumps(result)
+    assert sum(n == 'act' for n, _ in loan_backend.calls) == (intervention == 'none')
+
+
+@pytest.mark.parametrize('present', [False, True])
+def test_unguarded_helper_cannot_receive_a_new_takeover_even_with_permission(registry, manager, loan_backend, present):
+    loan_backend.snapshot_ax_tree_override = {'role': 'AXWindow', 'observation_capabilities': ['focus_loan_v3', 'focus_presentation_v1'],
+        'children': [{'role': 'AXButton', 'element_ref': 'snapshot-1:1', 'label': 'Ordinary'}]}
+    loan_backend.plan_pid_action_classes = ()
+    register(registry, manager)
+    focus(registry)
+    prompts = []
+    async def allow(card):
+        prompts.append(card)
+        return 'once'
+    registry.set_approval_handler(allow)
+    snapshot = json.loads(run(registry.execute('computer_snapshot', {}))['fresh_output'])
+    result = _borrow_focus(registry, snapshot, present_result=present)
+    assert result.get('code') == 'unsupported_operation' and not prompts
+    assert not any(n in {'takeover_begin', 'act'} for n, _ in loan_backend.calls)
+
+
 @pytest.mark.parametrize(("owner", "other"), [("main", "channel:wechat-a"), ("channel:wechat-a", "channel:wechat-b")])
 def test_focus_loan_only_covers_approving_conversation(registry, manager, loan_backend, owner, other):
     from agent.runtime.tools.grants import current_grant_space, grant_space
@@ -7718,7 +7777,7 @@ def test_focus_loan_only_covers_approving_conversation(registry, manager, loan_b
 
 @pytest.mark.parametrize("initial_yolo", [False, True])
 def test_focus_loan_auto_fallback_waits_for_a_person(registry, manager, backend, initial_yolo):
-    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["auto_takeover_v1"],
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["auto_takeover_v1", "focus_consent_v1"],
         "children": [{"role": "AXButton", "element_ref": "snapshot-1:1", "label": "Ordinary"}]}
     register(registry, manager)
     focus(registry)
@@ -7744,7 +7803,7 @@ def test_focus_loan_auto_fallback_waits_for_a_person(registry, manager, backend,
 @pytest.mark.parametrize("action", [{"type": "type", "text": "hello"}, {"type": "keypress", "key": "a", "modifiers": ["command"]}])
 @pytest.mark.parametrize("answer", ["once", "deny"])
 def test_named_keyboard_replan_preserves_recipient_and_waits_for_consent(registry, manager, backend, monkeypatch, action, answer):
-    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["auto_takeover_v1"],
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["auto_takeover_v1", "focus_consent_v1"],
         "children": [{"role": "AXTextField", "element_ref": f"snapshot-1:{ref}", "label": ref, "focused": ref == "A"}
                      for ref in ("A", "B")]}
     backend.plan_pid_action_classes = ()
@@ -7782,7 +7841,8 @@ def test_named_keyboard_replan_preserves_recipient_and_waits_for_consent(registr
         assert [call[1] for name, call in backend.calls if name == "act"] == [[bound]]
 
 
-def test_failed_stale_foreground_plan_revokes_the_existing_loan(registry, manager, loan_backend):
+@pytest.mark.parametrize('coordinate_space', ['window_logical', 'image_pixels'])
+def test_failed_stale_foreground_plan_revokes_the_existing_loan(registry, manager, loan_backend, coordinate_space):
     prompts = []
     async def decide(request):
         prompts.append(request)
@@ -7795,15 +7855,20 @@ def test_failed_stale_foreground_plan_revokes_the_existing_loan(registry, manage
     first = _borrow_focus(registry, old)
     assert not first['error']
     fresh = json.loads(first['fresh_output'])
-    assert _borrow_focus(registry, old).get('code') == 'stale_snapshot'
+    options = ({'coordinate_space': coordinate_space, 'actions': [{'type': 'click', 'x': 0, 'y': 0}]}
+               if coordinate_space == 'image_pixels' else {})
+    stale = _borrow_focus(registry, old, **options)
+    assert stale.get('error')
     assert _borrow_focus(registry, fresh).get('code') == 'approval_denied'
+    assert stale.get('code') == 'stale_snapshot'
+    assert stale['computer_receipt']['dispatch_state'] == 'not_dispatched'
     assert len(prompts) == 2 and sum(n == 'act' for n, _ in loan_backend.calls) == 1
 
 
 @pytest.mark.parametrize('actual', [False, None, True])
 def test_present_checked_goal_requires_positive_final_evidence(registry, manager, backend, monkeypatch, actual):
     node = {"role": "AXCheckBox", "element_ref": "snapshot-1:box", "label": "Enabled", "checked": False}
-    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["focus_presentation_v1", "checked_click_v1"], "children": [node]}
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["focus_consent_v1", "focus_presentation_v1", "checked_click_v1"], "children": [node]}
     backend.plan_pid_action_classes = ()
     register(registry, manager)
     focus(registry)
@@ -8004,11 +8069,11 @@ def test_focus_loan_cross_batch_activity_requires_native_continuity(registry, ma
     backend_begin = backend.begin_takeover
     used_continuity_guard = []
 
-    async def begin(snapshot_id, plan_ref, *, continued_loan=False, loan_deadline_continuous_ms=None):
+    async def begin(snapshot_id, plan_ref, *, continued_loan=False, loan_deadline_continuous_ms=None, focus_consent=None):
         used_continuity_guard.append(continued_loan)
         if continued_loan:
             raise HelperApplicationError(ComputerError(ComputerErrorCode.USER_ACTIVITY_PAUSED, "changed"))
-        return await backend_begin(snapshot_id, plan_ref)
+        return await backend_begin(snapshot_id, plan_ref, focus_consent=focus_consent)
 
     monkeypatch.setattr(backend, "begin_takeover", begin)
     requests = []
