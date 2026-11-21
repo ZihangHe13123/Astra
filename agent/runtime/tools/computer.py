@@ -23,6 +23,7 @@ from contextlib import suppress
 from dataclasses import dataclass, replace
 from itertools import islice
 from pathlib import Path
+from time import monotonic
 from typing import Any, cast
 
 from ..computer_backend import (
@@ -407,7 +408,11 @@ ACT_SCHEMA = _object_schema(
             "type": "string",
             "enum": ["auto", "background", "foreground_takeover"],
             "default": "auto",
-            "description": "auto plans the supported input path and handles takeover within the existing approval scope; explicit legacy modes remain available",
+            "description": "auto tries background first. Borrowing the foreground requires separate human consent, even in auto-approve mode.",
+        },
+        "present_result": {
+            "type": "boolean", "default": False,
+            "description": "Only when the user asks to see the result: request one-shot consent to leave the target in front after a successful final batch. Otherwise return focus.",
         },
         "opens_dialog": {
             "type": "boolean",
@@ -446,6 +451,13 @@ END_TAKEOVER_SCHEMA = {
 EMPTY_SCHEMA = _object_schema({})
 
 
+@dataclass(frozen=True)
+class _ForegroundLoan:
+    scope: str
+    window: tuple[str, ...]
+    expires_at: float
+
+
 @dataclass
 class _PreparedComputerAct:
     mode: ComputerInteractionMode
@@ -461,7 +473,10 @@ class _PreparedComputerAct:
     plan: ComputerActionPlan | None = None
     failure: ToolFailure | None = None
     approved: bool = False
-    restore_previous_focus: bool = True
+    present_result: bool = False
+    reused_loan: _ForegroundLoan | None = None
+    new_loan: _ForegroundLoan | None = None
+    finish_presentation: Callable[[bool], Awaitable[None]] | None = None
     # decision.batch_hash 的计算输入。plan_actions 成功后 backend 会更新
     # trusted_snapshot，二次复核若重取 context 会因信任分支形状漂移而必失配
     # （2026-09-04 WPS 六连 stale 的根因）；复核必须复用同一 context。
@@ -1045,9 +1060,9 @@ class LocalComputerRuntime:
             interaction_mode=interaction_mode,
         )
 
-    async def begin_takeover(self, snapshot_id: str, plan_ref: str):
+    async def begin_takeover(self, snapshot_id: str, plan_ref: str, *, loan_valid: Callable[[], bool] | None = None):
         self._helper_started = True
-        return await (await self._ensure_manager()).begin_takeover(snapshot_id, plan_ref)
+        return await (await self._ensure_manager()).begin_takeover(snapshot_id, plan_ref, loan_valid=loan_valid)
 
     async def act(
         self,
@@ -2075,6 +2090,32 @@ def register_computer_tools(
     pending_foreground_snapshot = ""
     catalog_target_operation_lock = asyncio.Lock()
     resume_publication_owner: str | None = None
+    foreground_loan: _ForegroundLoan | None = None
+
+    def loan_window() -> tuple[str, ...]:
+        if not trusted_target.get("metadata_trusted"):
+            return ()
+        bundle = trusted_target["bundle_id"]
+        identity = trusted_target.get("window_identity_ref")
+        if identity:
+            return manager.session_id, bundle, "identity", identity
+        # Older helpers: opaque refs are valid only in their catalog generation.
+        return (manager.session_id, bundle, str(trusted_catalog_generation),
+                trusted_target["app_ref"], trusted_target["window_ref"])
+
+    def revoke_loan() -> None:
+        nonlocal foreground_loan
+        if foreground_loan is not None:
+            approvals.approved_scopes.discard(foreground_loan.scope)
+            foreground_loan = None
+
+    def current_loan() -> _ForegroundLoan | None:
+        if foreground_loan is not None and (
+            foreground_loan.window != loan_window() or monotonic() >= foreground_loan.expires_at
+            or foreground_loan.scope not in approvals.approved_scopes
+        ):
+            revoke_loan()
+        return foreground_loan
 
     def clear_trusted_wps_destination() -> None:
         nonlocal trusted_wps_destination, trusted_wps_directory
@@ -2087,6 +2128,8 @@ def register_computer_tools(
         pending_wps_modal_target = None
 
     def clear_computer_grants() -> None:
+        nonlocal foreground_loan
+        foreground_loan = None
         nonlocal pending_foreground_digest
         nonlocal pending_foreground_snapshot
         prefixes = (
@@ -2116,6 +2159,9 @@ def register_computer_tools(
         })
 
     def clear_write_grants(*, preserve_foreground_session: bool = False) -> None:
+        nonlocal foreground_loan
+        if not preserve_foreground_session:
+            foreground_loan = None
         nonlocal pending_foreground_digest
         nonlocal pending_foreground_snapshot
         prefixes = (
@@ -2229,6 +2275,7 @@ def register_computer_tools(
                 "bundle_id": selected.get("bundle_id", ""),
                 "app_version": selected.get("app_version", ""),
                 "window_title": window.get("window_title", ""),
+                "window_identity_ref": window.get("window_identity_ref", ""),
                 "window_role": window.get("window_role", ""),
                 "known_path": window.get("known_path", ""),
             })
@@ -2261,6 +2308,7 @@ def register_computer_tools(
             })
         if previous != (app_ref, window_ref):
             clear_write_grants(preserve_foreground_session=True)
+        current_loan()  # Selecting another target ends the loan, even if we switch back.
 
     def remember_snapshot(snapshot: ComputerSnapshot) -> None:
         nonlocal effect_snapshot
@@ -3063,6 +3111,7 @@ def register_computer_tools(
         interaction_mode: str = "auto",
         coordinate_space: str = "window_logical",
         opens_dialog: bool = False,
+        present_result: bool = False,
         *,
         _permission_call_id: str = "",
     ):
@@ -3110,10 +3159,12 @@ def register_computer_tools(
                 retryable=False,
                 recovery_hint="Call computer_handoff and ask the user to complete this step.",
             )
-        if prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER and not prepared.approved:
+        if prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER and (
+            not prepared.approved or prepared.reused_loan is not None and current_loan() is not prepared.reused_loan
+        ):
             return _failure(
                 "approval_required",
-                "Foreground Computer Use requires an exact grant or an approved application scope.",
+                "Foreground Computer Use requires exact consent or a current loan of this window.",
                 retryable=True,
             )
         if prepared.mode is ComputerInteractionMode.BACKGROUND and plan.requires_takeover:
@@ -3148,16 +3199,15 @@ def register_computer_tools(
             )
         takeover_ref: str | None = None
         recovery_catalog_attempted = False
-        input_succeeded = False
 
-        async def finish_takeover() -> None:
-            nonlocal takeover_ref
+        async def finish_takeover(present: bool = False) -> None:
+            nonlocal takeover_ref, foreground_loan
             if takeover_ref is not None:
                 ending_ref = takeover_ref
                 takeover_ref = None
                 restoration = "restore_failed"
                 try:
-                    if input_succeeded and not prepared.restore_previous_focus:
+                    if present and prepared_acts.get(_permission_call_id) is prepared and not manager.handed_off:
                         outcome = await manager.end_takeover(ending_ref, restore_previous_focus=False)
                     else:
                         outcome = await manager.end_takeover(ending_ref)
@@ -3166,7 +3216,13 @@ def register_computer_tools(
                         "restored": "focus_restored",
                         "preserved_user_focus": "focus_preserved",
                     }.get(raw_restoration, "restore_failed")
+                    if restoration == "focus_restored" and not outcome.get("cleanup_failed"):
+                        if prepared.new_loan is not None and prepared_acts.get(_permission_call_id) is prepared:
+                            foreground_loan = prepared.new_loan
+                    else:
+                        revoke_loan()
                 except Exception as exc:  # noqa: BLE001 - cleanup failure remains an audit event
+                    revoke_loan()
                     logger.warning(
                         "computer takeover cleanup failed error_type=%s",
                         type(exc).__name__,
@@ -3343,7 +3399,12 @@ def register_computer_tools(
                         "This foreground action is not enabled for the exact application version.",
                         retryable=False,
                     )
-                takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref)
+                if prepared.reused_loan is not None:
+                    takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref, loan_valid=lambda: (
+                        prepared_acts.get(_permission_call_id) is prepared and current_loan() is prepared.reused_loan
+                    ))
+                else:
+                    takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref)
                 _runtime_takeover_event("foreground_takeover_begin", decision)
             prepared.dispatch_attempted = True
             result = await manager.act(
@@ -3397,7 +3458,6 @@ def register_computer_tools(
                     clear_computer_grants()
                     trusted_snapshot.clear()
                 return await report_action_failure(result.error, result.result)
-            input_succeeded = True
             observed_actions = normalized
             if checkpoint:
                 # The protocol decoder requires an acknowledged successful prefix.
@@ -3421,12 +3481,18 @@ def register_computer_tools(
                         if form_region:
                             fresh = await manager.snapshot("target_window", expected_target_binding=before_binding,
                                 subtree_ref=form_region)
-                        return await snapshot_result(
+                        observation = await snapshot_result(
                             fresh, scope="target_window", action_result=result.result,
                             action_observation=observe_action_effect(before_tree, fresh.payload.get("ax_tree"), observed_actions),
-                            before_encoding=finish_takeover,
+                            before_encoding=None if prepared.present_result else finish_takeover,
                             choice_verification=verify_choice_goals(before_tree, fresh.payload.get("ax_tree"), observed_actions),
                         )
+                        if (prepared.present_result and not checkpoint
+                                and _fully_acknowledged_action_batch(result.result, len(normalized))
+                                and observation.private.get("image_data_urls")):
+                            # Only the verified registry result can commit presentation. Cancellation restores.
+                            prepared.finish_presentation = finish_takeover
+                        return observation
                 except Exception as exc:  # noqa: BLE001 - observation-only retry is safe after acknowledged input
                     observation_error = exc
                     observation_code = (
@@ -3532,7 +3598,8 @@ def register_computer_tools(
                 },
             )
         finally:
-            await finish_takeover()
+            if prepared.finish_presentation is None:
+                await finish_takeover()
 
     async def computer_handoff():
         blocked = preflight()
@@ -3716,11 +3783,9 @@ def register_computer_tools(
         blocked = preflight()
         if blocked:
             return blocked
-        try:
-            takeover_ref = await manager.begin_takeover(snapshot_id, plan_ref)
-        except ComputerSessionError as exc:
-            return _session_failure(exc)
-        return _json({"takeover_ref": takeover_ref})
+        # A plan describes input, not a person's consent. Only a sealed act may activate an app.
+        return _failure("approval_required", "Standalone foreground activation is not permitted.",
+                        recovery_hint="Use computer_act for the full, consent-checked batch.")
 
     async def computer_end_takeover(takeover_ref: str):
         blocked = preflight()
@@ -3973,21 +4038,24 @@ def register_computer_tools(
             raw_actions = image_actions(raw_actions, published_image_geometry[1])
         requested_mode = str(args.get("interaction_mode") or "auto")
         opens_dialog = args.get("opens_dialog", False)
+        present_result = args.get("present_result") is True
+        needs_foreground = opens_dialog or present_result
         raw_tree = _LAST_PUBLISHED_AX_TREES.get(str(manager.session_id or ""))
-        automatic = requested_mode == "auto" and not opens_dialog and "auto_takeover_v1" in observation_capabilities(raw_tree)
+        automatic = requested_mode == "auto" and not needs_foreground and "auto_takeover_v1" in observation_capabilities(raw_tree)
         mode = (
-            ComputerInteractionMode.FOREGROUND_TAKEOVER if opens_dialog else ComputerInteractionMode.BACKGROUND
+            ComputerInteractionMode.FOREGROUND_TAKEOVER if needs_foreground else ComputerInteractionMode.BACKGROUND
         ) if requested_mode == "auto" else ComputerInteractionMode(requested_mode)
         prepared = _PreparedComputerAct(
             mode=mode,
             snapshot_id=str(args.get("snapshot_id") or ""),
             actions=tuple(ComputerAction.from_mapping(action) for action in raw_actions),
             raw_actions=tuple(dict(action) for action in raw_actions),
+            present_result=present_result,
         )
         prepared_acts[call_id] = prepared
-        if opens_dialog and requested_mode == "background":
+        if needs_foreground and requested_mode == "background":
             prepared.failure = _failure(
-                "invalid_arguments", "opens_dialog requires auto or foreground_takeover; no input was dispatched.",
+                "invalid_arguments", "Opening a dialog or presenting a result requires auto or foreground_takeover; no input was dispatched.",
                 retryable=False,
             )
             return None
@@ -4146,6 +4214,11 @@ def register_computer_tools(
             prepared.raw_actions,
             interaction_plan=plan,
         )
+        can_continue = "focus_loan_v1" in observation_capabilities(raw_tree) and bool(loan_window())
+        if not can_continue and decision.risk is ComputerRisk.ORDINARY:
+            decision = replace(decision, choices=("once", "deny"), boundary=(
+                "Only this batch. Return to the previous application unless you have changed focus."
+            ))
         prepared.decision = decision
         # hash 基准单独存 BG 形态：主函数与 grant 的 batch_hash 复核都以它为准
         #（2026-09-04 WPS 八连 stale 根因——interaction_mode 进 canonical hash，
@@ -4158,11 +4231,13 @@ def register_computer_tools(
                 interaction_mode=ComputerInteractionMode.BACKGROUND,
             ),
         )
-        request = permission_request(approvals, decision)
-        if request is None and decision.scope in approvals.approved_scopes:
+        loan = current_loan()
+        covered = can_continue and loan is not None and loan.scope == decision.scope and decision.risk is ComputerRisk.ORDINARY
+        request = permission_request(approvals, decision, foreground_loan=covered, present_result=present_result)
+        if request is None and covered and not present_result:
             prepared.approved = True
             authorized_acts.add(call_id)
-            prepared.restore_previous_focus = False
+            prepared.reused_loan = loan
         if isinstance(request, ComputerApprovalRequest):
             request.private_call_id = call_id
             _attach_draft(request, prepared)
@@ -4200,13 +4275,14 @@ def register_computer_tools(
         basis = prepared.hash_basis or prepared.decision
         if basis is None or current.batch_hash != basis.batch_hash:
             raise ValueError("Computer Use target changed while approval was pending")
+        if prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER:
+            revoke_loan()  # An unrelated freshly authorized batch is not a continuation.
         cleanup = permission_grant(approvals, args, request, decision)
         if prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER:
             prepared.approved = True
             authorized_acts.add(call_id)
-            prepared.restore_previous_focus = not (
-                registry.yolo or decision == "session" and "session" in request.get("choices", [])
-            )
+            if decision == "session" and "session" in request["choices"] and loan_window():
+                prepared.new_loan = _ForegroundLoan(prepared.decision.scope, loan_window(), monotonic() + 120)
         return cleanup
 
     completed_observations: set[str] = set()
@@ -4228,7 +4304,7 @@ def register_computer_tools(
             clear_write_grants()
         completed_observations.discard(call_id)
 
-    def complete_act(_args: dict, result: dict, call_id: str) -> None:
+    async def complete_act(_args: dict, result: dict, call_id: str) -> None:
         prepared = prepared_acts.get(call_id) or act_receipt_states.get(call_id)
         if prepared is not None:
             payload = {}
@@ -4244,18 +4320,25 @@ def register_computer_tools(
                 payload, mode=prepared.mode.value, action_count=len(prepared.actions),
                 dispatch_attempted=prepared.dispatch_attempted, error_code=result.get("code", ""),
             )
+            if prepared.finish_presentation is not None:
+                await prepared.finish_presentation(not result.get("error") and result.get("verified") is True)
+                prepared.finish_presentation = None
         if result.get("error") and call_id in authorized_acts:
             clear_write_grants()
         completed_acts.add(call_id)
 
-    def finalize_act_permission(args: dict) -> None:
+    async def finalize_act_permission(args: dict) -> None:
         call_id = str(args.get("__permission_call_id") or "")
+        prepared = act_receipt_states.pop(call_id, None)
         prepared_acts.pop(call_id, None)
-        act_receipt_states.pop(call_id, None)
-        if call_id not in completed_acts and call_id in authorized_acts:
-            clear_write_grants()
-        completed_acts.discard(call_id)
-        authorized_acts.discard(call_id)
+        try:
+            if prepared is not None and prepared.finish_presentation is not None:
+                await prepared.finish_presentation(False)
+        finally:
+            if call_id not in completed_acts and call_id in authorized_acts:
+                clear_write_grants()
+            completed_acts.discard(call_id)
+            authorized_acts.discard(call_id)
 
     def validate_act_arguments(args: dict[str, Any]) -> None:
         for action in args.get("actions", []):
@@ -4379,12 +4462,13 @@ def register_computer_tools(
         permission_grant=act_permission_grant, permission_finalizer=finalize_act_permission,
         completion_finalizer=complete_act,
         postcondition=verify_snapshot,
-        permission_authoritative=True, permission_yolo_auto_grant=True, owns_session_grants=True,
+        permission_authoritative=True, permission_yolo_auto_grant=lambda request: request.get("kind") == "computer_write",
+        owns_session_grants=True,
         argument_persistence="request_local", argument_validator=validate_act_arguments,
         argument_redactor=redact_act_arguments, **common,
     ))
     registry.register(ToolDef(
-        "computer_begin_takeover", "Authorize a planned foreground takeover and return its takeover reference.",
+        "computer_begin_takeover", "Legacy entry: does not activate an application. Use computer_act for a consent-checked foreground batch.",
         TAKEOVER_SCHEMA, computer_begin_takeover,
         risk="write", approval="on_risk", replay="safe", result_persistence="request_local", **common,
     ))

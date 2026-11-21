@@ -700,7 +700,8 @@ final class Dispatcher {
                         "stage_hash": .string(declaration.stages[0].stageHash),
                     ]))
                 }
-                let reference = try windows.takeoverBegin(snapshotID: snapshotID, planRef: planRef)
+                let reference = try windows.takeoverBegin(snapshotID: snapshotID, planRef: planRef,
+                    continuedLoan: payload["continued_loan"] == .bool(true))
                 return success(requestID: request.requestID, result: .object(["takeover_ref": .string(reference)]))
             } catch {
                 return takeoverFailure(requestID: request.requestID, error: error)
@@ -905,6 +906,8 @@ final class Dispatcher {
             return Self.failure(requestID: requestID, message: "target window could not be made frontmost", code: ActionExecutionError.targetNotFrontmost.rawValue)
         case TakeoverError.activityUnavailable:
             return Self.failure(requestID: requestID, message: "user activity monitor is unavailable", code: CooperativeErrorCode.userActivityPaused.rawValue)
+        case TakeoverError.userActivityPaused:
+            return Self.failure(requestID: requestID, message: "foreground or user input changed before activation", code: CooperativeErrorCode.userActivityPaused.rawValue)
         case TakeoverError.cleanupFailed:
             return Self.failure(requestID: requestID, message: "held input cleanup failed", code: ActionExecutionError.helperFailed.rawValue)
         case TakeoverError.stalePlan, TakeoverError.alreadyConsumed, TakeoverError.authorityMismatch:
@@ -1095,6 +1098,9 @@ final class Dispatcher {
 
     private func validateTakeoverBeginPayload(_ payload: JSONValue, hasFragment: Bool) -> Bool {
         var keys: Set<String> = ["snapshot_id", "plan_ref"]
+        if !hasFragment, case let .object(values) = payload, values["continued_loan"] == .bool(true) {
+            keys.insert("continued_loan")
+        }
         if hasFragment { keys.insert("fragment") }
         guard let values = exactPayload(payload, keys: keys) else { return false }
         return boundedReference(values["snapshot_id"]) != nil && boundedReference(values["plan_ref"]) != nil

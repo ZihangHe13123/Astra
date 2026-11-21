@@ -31,9 +31,9 @@ description: Use when controlling macOS interfaces with computer_* tools.
 3. Only in-memory or document-content editing without file/external effect is
    ordinary session + bundle work. Save As, Save a Copy, create or overwrite a local
    file, send, submit, export, upload, share, delete, install, System Settings, and
-   Terminal Enter need high-impact exact-batch once approval. YOLO/autoapprove 自动授予本次权限，cannot downgrade 风险或目标校验。
+   Terminal Enter need high-impact exact-batch once approval. 自动批准不等于同意借用真实键鼠；前台请求必须等人决定，不以空闲为同意。
 4. Target or action invalidation or authority invalidation clears snapshot,
-   element, plan, and exact approval. 普通前台应用授权跨观察保留，中断交接关闭或发布失败撤销。 Smart approval for `text_detail=on` is once-only/target-bound.
+   element, plan, and exact approval. 能后台就后台。人可把同一窗口借出最多两分钟处理连续普通操作；换窗、中断、交接或失败即停，观察不续期。不支持跨批活动核验的旧 helper 仅按次借用。每批尝试恢复此前应用；人已切走时不拉回来。仅当人明确要求「给我看」时，最后一批可用 `present_result=true` 单次申请将结果留在前台。 Smart approval for `text_detail=on` is once-only/target-bound.
    Bounded errors fail closed: never guess a target/ref/artifact.
    `unsafe_artifact`: `computer_close` → fresh session →
    `computer_apps` → `computer_get_app_state`.

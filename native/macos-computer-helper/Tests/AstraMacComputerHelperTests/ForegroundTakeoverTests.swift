@@ -831,6 +831,41 @@ func terminalTakeoverCleanupRetriesTheExactHeldReleaseBeforeDisarm(operation: St
     }
 }
 
+@Test func physicalKeyDuringArmDoesNotActivateOrdinaryTarget() throws {
+    let fixture = TakeoverFixture()
+    fixture.activity.offerPauseDuringArm = true
+    #expect(throws: TakeoverError.self) { try fixture.begin() }
+    #expect(fixture.activation.activated.isEmpty)
+    #expect(fixture.activation.restored.isEmpty)
+}
+
+@Test(arguments: ["unchanged", "key", "app", "notRestored"]) func continuingFocusLoanChecksTheGap(_ change: String) throws {
+    var counter: UInt32 = 17
+    let f = TakeoverFixture(inputCounts: { [counter] })
+    let first = try f.begin()
+    _ = try f.coordinator.consume(first.ref, actions: f.actions)
+    _ = try f.coordinator.end(first.ref, allowRestore: change != "notRestored")
+    if change == "key" { counter += 1 }
+    if change == "app" { f.activation.currentFrontmostPID = 99 }
+    let next = f.authorizeAnotherPlan()
+    func continued() throws -> TakeoverToken {
+        try f.coordinator.begin(target: f.target, snapshotID: f.guardValue.snapshotID,
+            planRef: next.planRef, stageDigest: next.stageDigest, continuedLoan: true)
+    }
+    if change == "unchanged" {
+        let token = try continued()
+        #expect(f.activation.activated.count == 2)
+        _ = try f.coordinator.end(token.ref, allowRestore: true)
+    } else {
+        #expect(throws: TakeoverError.userActivityPaused) { try continued() }
+        #expect(f.activation.activated.count == 1)
+        let fresh = f.authorizeAnotherPlan()  // A new human decision can still borrow.
+        let token = try f.coordinator.begin(target: f.target, snapshotID: f.guardValue.snapshotID,
+            planRef: fresh.planRef, stageDigest: fresh.stageDigest)
+        _ = try f.coordinator.end(token.ref, allowRestore: true)
+    }
+}
+
 @Test func physicalActivityPreservesUserFocusAndClosesSidecar() throws {
     let fixture = TakeoverFixture(oldFrontmostPID: 77)
     let token = try fixture.begin()
@@ -2779,6 +2814,7 @@ private final class TakeoverFixture {
         plannedFocus: KeyboardFocusAuthority? = nil,
         snapshotGuard: ActionGuard? = nil,
         oldFrontmostPID: pid_t? = 77,
+        inputCounts: @escaping () -> [UInt32] = { [0] },
         existingPIDs: Set<pid_t> = [77],
         failure: Failure? = nil,
         actions: [NativeAction] = [.click(x: 10, y: 10, within: "pointer")]
@@ -2826,6 +2862,7 @@ private final class TakeoverFixture {
             cursor: cursor,
             frontmostPID: { [activation] in activation.currentFrontmostPID },
             applicationExists: { existingPIDs.contains($0) },
+            inputCounts: inputCounts,
             revalidate: { target in
                 if failure == .target { throw WindowObservationError.targetGone }
                 return target

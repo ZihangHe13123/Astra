@@ -13,6 +13,7 @@ enum TakeoverError: Error, Equatable {
     case targetChanged
     case targetNotFrontmost
     case activityUnavailable
+    case userActivityPaused
     case sidecarFailed
     case cleanupFailed
 }
@@ -69,6 +70,21 @@ protocol ForegroundTakeoverCoordinating: AnyObject {
 final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
     typealias PlanConsumer = (String) -> ForegroundTakeoverPlanAuthority?
 
+    // Sample counts, never key values. Equality can only keep an existing loan valid.
+    static func physicalInputCounts() -> [UInt32] {
+        let types: [CGEventType] = [.keyDown, .keyUp, .leftMouseDown, .rightMouseDown, .otherMouseDown,
+                                    .scrollWheel, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+        return types.map { CGEventSource.counterForEventType(.hidSystemState, eventType: $0) }
+    }
+
+    private struct ReleaseCheckpoint {
+        let targetPID: pid_t
+        let window: CGWindowID
+        let axIdentity: CFHashCode
+        let previousPID: pid_t
+        let counts: [UInt32]
+    }
+
     private final class Record {
         var authority: ForegroundTakeoverPlanAuthority
         var popupPointerPoint: CGPoint?
@@ -78,6 +94,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         let restorePreviousFocus: Bool
         var expiryTimer: DispatchSourceTimer?
         var actConsumed = false
+        var releaseCounts: [UInt32] = []
         var cleanupOutcome: TakeoverOutcome?
         var cleanupInProgress = false
         var terminalClaimed = false
@@ -106,6 +123,8 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
     private let cursor: any VirtualCursorPresenting
     private let frontmostPID: () -> pid_t?
     private let applicationExists: (pid_t) -> Bool
+    private let inputCounts: () -> [UInt32]
+    private var lastRelease: ReleaseCheckpoint?
     private let revalidate: (WindowTarget) throws -> WindowTarget
     private let takePlan: PlanConsumer
     private let classifyPopupPointer: (ForegroundTakeoverPlanAuthority) -> CGPoint?
@@ -120,6 +139,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         cursor: any VirtualCursorPresenting,
         frontmostPID: @escaping () -> pid_t?,
         applicationExists: @escaping (pid_t) -> Bool,
+        inputCounts: @escaping () -> [UInt32] = { [] },
         revalidate: @escaping (WindowTarget) throws -> WindowTarget,
         takePlan: @escaping PlanConsumer,
         classifyPopupPointer: @escaping (ForegroundTakeoverPlanAuthority) -> CGPoint? = popupPointerClickPoint,
@@ -130,6 +150,7 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         self.cursor = cursor
         self.frontmostPID = frontmostPID
         self.applicationExists = applicationExists
+        self.inputCounts = inputCounts
         self.revalidate = revalidate
         self.takePlan = takePlan
         self.classifyPopupPointer = classifyPopupPointer
@@ -142,12 +163,17 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         planRef: String,
         stageDigest: String
     ) throws -> TakeoverToken {
+        try begin(target: target, snapshotID: snapshotID, planRef: planRef, stageDigest: stageDigest, continuedLoan: false)
+    }
+
+    func begin(target: WindowTarget, snapshotID: String, planRef: String, stageDigest: String,
+               continuedLoan: Bool) throws -> TakeoverToken {
         try begin(
             target: target,
             snapshotID: snapshotID,
             planRef: planRef,
             stageDigest: stageDigest,
-            declaration: nil
+            declaration: nil, continuedLoan: continuedLoan
         )
     }
 
@@ -171,7 +197,8 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
         snapshotID: String,
         planRef: String,
         stageDigest: String?,
-        declaration: ForegroundFragmentDeclaration?
+        declaration: ForegroundFragmentDeclaration?,
+        continuedLoan: Bool = false
     ) throws -> TakeoverToken {
         lock.lock()
         guard records.isEmpty, !beginReserved else {
@@ -179,6 +206,8 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
             throw TakeoverError.alreadyConsumed
         }
         beginReserved = true
+        let prior = lastRelease
+        lastRelease = nil
         lock.unlock()
 
         var committed = false
@@ -267,6 +296,16 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
             // Classify this sealed plan once. A later action consumes the
             // recorded point and rechecks the live popup before delivery.
             popupPointerPoint = classifyPopupPointer(authority)
+            if continuedLoan {
+                guard let prior, prior.targetPID == current.pid, prior.window == current.windowID,
+                      prior.axIdentity == current.axIdentity, oldPID == prior.previousPID,
+                      frontmostPID() == prior.previousPID, inputCounts() == prior.counts
+                else { throw TakeoverError.userActivityPaused }
+            }
+            if declaration == nil {
+                do { try activity.assertNotPaused(lease: lease) }
+                catch { throw TakeoverError.userActivityPaused }
+            }
             activationAttempted = true
             if let popupPoint = popupPointerPoint {
                 try activation.activatePopupPointerOnly(foregroundTarget, at: popupPoint)
@@ -690,13 +729,21 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
             record.terminalClaimed = false
         } else if records[takeoverRef] === record {
             records.removeValue(forKey: takeoverRef)
+            if record.actConsumed, record.fragmentAuthority == nil, outcome.restoration == .restored,
+               let previousPID = record.oldFrontmostPID, let identity = record.authority.target.axIdentity,
+               !record.releaseCounts.isEmpty {
+                let target = record.authority.target
+                lastRelease = ReleaseCheckpoint(targetPID: target.pid, window: target.windowID,
+                    axIdentity: identity, previousPID: previousPID, counts: record.releaseCounts)
+            }
         }
         lock.unlock()
         return outcome
     }
 
-    func invalidate(allowRestore: Bool) {
+    func invalidate(allowRestore: Bool, preserveIdleLoan: Bool = false) {
         lock.lock()
+        if !preserveIdleLoan || !records.isEmpty { lastRelease = nil }
         let active = records.compactMap { reference, record -> (String, Record)? in
             guard !record.terminalClaimed else { return nil }
             record.terminalClaimed = true
@@ -763,10 +810,12 @@ final class ForegroundTakeoverCoordinator: ForegroundTakeoverCoordinating {
             lock.unlock()
             return outcome
         }
+        // Take the baseline while the tap still owns this batch; do not miss typing during disarm.
+        record.releaseCounts = inputCounts()
         let interrupted = (try? activity.disarm(lease: record.lease)) ?? true
 
         let restoration: TakeoverRestoration
-        if !allowRestore || !record.restorePreviousFocus || interrupted {
+        if !allowRestore || !record.restorePreviousFocus || interrupted || record.releaseCounts != inputCounts() {
             restoration = .preservedUserFocus
         } else if frontmostPID() != record.authority.target.pid {
             restoration = .preservedUserFocus

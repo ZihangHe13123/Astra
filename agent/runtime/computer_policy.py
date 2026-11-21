@@ -774,8 +774,9 @@ def classify_computer_batch(
             reason="This batch will interact with the selected macOS application.",
             effect="The selected window may be edited or navigated.",
             boundary=(
-                "Ordinary foreground actions in this application during this Computer Use session. "
-                "High-impact actions require separate approval. The application may remain in front."
+                "Allow once, or lend this window for ordinary actions for up to 2 minutes. "
+                "High-impact actions require separate approval. Return to the previous application "
+                "after each batch unless you have changed focus."
                 if interaction_mode is ComputerInteractionMode.FOREGROUND_TAKEOVER
                 else f"Only this Computer Use session, application, and current window ({window})."
             ),
@@ -810,7 +811,7 @@ def classify_computer_batch(
     )
 
 
-def build_computer_approval(decision: ComputerPolicyDecision) -> dict[str, Any]:
+def build_computer_approval(decision: ComputerPolicyDecision, *, present_result: bool = False) -> dict[str, Any]:
     """Build bounded semantic approval copy without runtime identifiers."""
 
     foreground = decision.interaction_mode is ComputerInteractionMode.FOREGROUND_TAKEOVER
@@ -840,6 +841,12 @@ def build_computer_approval(decision: ComputerPolicyDecision) -> dict[str, Any]:
         else decision.operation
     )
     choices = list(decision.choices) or (["once", "deny"] if foreground else [])
+    if present_result:
+        title = "Show the result and leave the application in front"
+        question = f"{risk_question.rstrip('?')} and leave {application} in front to show the result?"
+        effect += " After successful input and observation, leave the target window in front."
+        boundary = "Only this exact batch and presentation. No permission for later foreground actions."
+        choices = ["once", "deny"]
     request = {
         "kind": kind,
         "operation": operation,
@@ -861,12 +868,15 @@ def build_computer_approval(decision: ComputerPolicyDecision) -> dict[str, Any]:
     }
     if window:
         request["arguments"]["window"] = window
+    if present_result:
+        request["arguments"]["present_result"] = True
     return request
 
 
 def permission_request(
     approvals: ScopedApprovalStore,
     decision: ComputerPolicyDecision,
+    *, foreground_loan: bool = False, present_result: bool = False,
 ) -> dict[str, Any] | None:
     """Build a frontend-safe request without raw text or AX payloads."""
 
@@ -875,10 +885,10 @@ def permission_request(
         decision.risk is ComputerRisk.OBSERVE and not foreground
     ):
         return None
-    if decision.scope and decision.scope in approvals.approved_scopes:
+    if (not foreground or foreground_loan and not present_result) and decision.scope in approvals.approved_scopes:
         return None
     return ComputerApprovalRequest(
-        build_computer_approval(decision),
+        build_computer_approval(decision, present_result=present_result),
         private_scope=decision.scope,
     )
 

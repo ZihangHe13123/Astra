@@ -204,14 +204,15 @@ class ToolDef:
     permission_grant: Callable[[dict, dict[str, Any], str], PermissionCleanup | None] | None = None
     # Release request-local authorization preparation on success, denial,
     # pause, unknown outcome, cancellation, and every exceptional exit.
-    permission_finalizer: Callable[[dict], None] | None = None
+    permission_finalizer: Callable[[dict], None | Awaitable[None]] | None = None
     # When true, ``permission_check`` is the sole interactive authorization
     # prompt for this call. Policy modes and YOLO may not satisfy, broaden, or
     # suppress the exact resource scope; explicit deny rules still win.
     permission_authoritative: bool = False
     # Explicit opt-in: YOLO supplies an automatic once decision, while exact
     # preflight, grant validation, cleanup, and finalization still run.
-    permission_yolo_auto_grant: bool = False
+    # A mixed-mode tool can opt in for particular backend-classified requests.
+    permission_yolo_auto_grant: bool | Callable[[dict[str, Any]], bool] = False
     # The tool's grant handler keeps its own session boundary (Computer Use: per CU session and app) and
     # receives "session" itself. Every other tool only ever receives "once"; task, session and standing
     # grants are kept by the registry's GrantLedger, per conversation.
@@ -484,7 +485,7 @@ class ToolRegistry:
             payload["grant_label"] = self._grant_label(tool, payload)
         # Set after request descriptors: only the registered permission boundary
         # can opt a pending request into live YOLO, never tool/model arguments.
-        payload["yolo_bypass_allowed"] = bypass_yolo or tool.permission_yolo_auto_grant
+        payload["yolo_bypass_allowed"] = bypass_yolo
         if agent_reason:
             payload["agent_reason"] = agent_reason
         asked_at = time.time()
@@ -1477,7 +1478,9 @@ class ToolRegistry:
                     permission_request = await permission_request
                 if permission_request is not None:
                     reason = str(permission_request.get("reason") or f"{name} requires approval")
-                    auto_grant = self.yolo and tool.permission_yolo_auto_grant
+                    opt_in = tool.permission_yolo_auto_grant
+                    yolo_eligible = opt_in(permission_request) is True if callable(opt_in) else opt_in
+                    auto_grant = self.yolo and yolo_eligible
                     # Sending, paying, deleting, publishing: decided per call, whatever was allowed before.
                     consequential = bool(permission_request.get("consequential"))
                     covered = "" if auto_grant or consequential or tool.owns_session_grants else \
@@ -1499,7 +1502,7 @@ class ToolRegistry:
                             reason=reason,
                             agent_reason=agent_reason,
                             request=permission_request,
-                            bypass_yolo=not tool.permission_authoritative,
+                            bypass_yolo=not tool.permission_authoritative or yolo_eligible,
                             choices=self._approval_choices(tool, permission_request, task_id,
                                                            consequential=consequential, rule=permission_rule),
                             grant_key=permission_rule,
@@ -1810,7 +1813,9 @@ class ToolRegistry:
                     logger.exception("permission cleanup failed name=%s", name)
             if tool.permission_finalizer is not None and permission_args is not None:
                 try:
-                    tool.permission_finalizer(permission_args)
+                    cleanup = tool.permission_finalizer(permission_args)
+                    if inspect.isawaitable(cleanup):
+                        await cleanup
                 except Exception:
                     logger.exception("permission finalizer failed name=%s", name)
 

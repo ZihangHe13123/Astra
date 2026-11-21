@@ -38,6 +38,17 @@ def test_robustness_bad_key_has_bounded_supported_forms():
     assert len(message) < 512
 
 
+@pytest.mark.parametrize("flag", [True, False, 1, "true", None])
+def test_focus_loan_wire_only_accepts_explicit_true_on_plain_begin(flag):
+    payload = {"snapshot_id": "snap-1", "plan_ref": "plan-1", "continued_loan": flag}
+    if flag is True:
+        encoded = encode_request(ComputerRequest(request_id="req", operation="takeover_begin", payload=payload))
+        assert json.loads(encoded)["payload"]["continued_loan"] is True
+    else:
+        with pytest.raises(ValueError):
+            encode_request(ComputerRequest(request_id="req", operation="takeover_begin", payload=payload))
+
+
 def test_request_has_stable_version_and_id():
     request = ComputerRequest(
         request_id="req-1",

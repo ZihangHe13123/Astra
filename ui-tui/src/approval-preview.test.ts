@@ -539,10 +539,19 @@ test("detail bounds retain one explicit omission notice when character and line 
   assert.equal(lines.filter((line) => line.includes("审批详情已省略")).length, 1);
 });
 
-test("ordinary foreground permission exposes its application session scope without expanding", () => {
+test("ordinary foreground permission exposes its bounded window loan without expanding", () => {
   const view = buildApprovalCompactView({
     ...request("application-approval"), kind: "computer_foreground_takeover",
     choices: ["once", "session", "deny"], arguments: { application: "Fixture" },
   }, { width: 100, expanded: false });
-  assert.match(view.shortcutHint, /\[A\].*CU 会话内.*此应用的普通操作/);
+  assert.match(view.shortcutHint, /\[A\].*此窗口.*2 分钟/);
+});
+
+test("leaving a result in front is explicit even on the collapsed approval card", () => {
+  const view = buildApprovalCompactView({
+    ...request("show-result"), kind: "computer_foreground_takeover", choices: ["once", "deny"],
+    arguments: { application: "Fixture", present_result: true },
+  }, { width: 90, expanded: false });
+  assert.match(view.title, /保留在前台/);
+  assert.match(view.collapsedLines.join(" "), /保留在前台/);
 });

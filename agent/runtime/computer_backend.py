@@ -19,7 +19,7 @@ import sys
 import time
 import uuid
 import zlib
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from functools import partial
@@ -1265,6 +1265,7 @@ class ComputerSessionManager:
         plan_ref: str,
         *,
         declaration: ForegroundFragmentDeclaration | None = None,
+        loan_valid: Callable[[], bool] | None = None,
     ) -> str:
         async with self._lock:
             self._require_open()
@@ -1290,7 +1291,14 @@ class ComputerSessionManager:
             self._pending_plan = None
             self._takeover_ref = None
             self._takeover_cleanup_ref = None
-            if declaration is None:
+            if loan_valid is not None and declaration is not None:
+                raise ComputerSessionError("takeover_not_allowed")
+            if loan_valid is not None:
+                # Authorization may have expired or been revoked while waiting for the lock.
+                if not loan_valid():
+                    raise ComputerSessionError("approval_required", "The foreground loan is no longer current.")
+                begin_task = asyncio.create_task(begin(snapshot_id, plan_ref, continued_loan=True))
+            elif declaration is None:
                 begin_task = asyncio.create_task(begin(snapshot_id, plan_ref))
             else:
                 begin_task = asyncio.create_task(
@@ -1660,7 +1668,7 @@ class ComputerSessionManager:
             end = getattr(self._backend, "end_takeover", None)
             if end is None:
                 raise ComputerSessionError("takeover_unsupported")
-            if not restore_previous_focus:
+            if not restore_previous_focus and not cancelled:
                 end = partial(end, restore_previous_focus=False)
             cleanup_task = asyncio.create_task(self._end_takeover_owned(end, takeover_ref))
             self._terminal_cleanup_task = cleanup_task

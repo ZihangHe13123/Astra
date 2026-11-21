@@ -1066,6 +1066,7 @@ protocol WindowObserving {
     func planActions(snapshotID: String, interactionMode: InteractionMode, actions: [NativeAction]) -> CooperativePlanResult
     func planActions(snapshotID: String, interactionMode: InteractionMode, actions: [NativeAction], fragment: ForegroundFragmentPlanRequest?) -> CooperativePlanResult
     func takeoverBegin(snapshotID: String, planRef: String) throws -> String
+    func takeoverBegin(snapshotID: String, planRef: String, continuedLoan: Bool) throws -> String
     func takeoverBegin(snapshotID: String, planRef: String, declaration: ForegroundFragmentDeclaration) throws -> String
     func cooperativeAct(snapshotID: String, interactionMode: InteractionMode, planRef: String, takeoverRef: String?, actions: [NativeAction]) -> CooperativeActionResult
     func cooperativeAct(snapshotID: String, interactionMode: InteractionMode, planRef: String, takeoverRef: String?, actions: [NativeAction], fragmentStage: FragmentStageAuthority?) -> CooperativeActionResult
@@ -1127,6 +1128,10 @@ extension WindowObserving {
     }
     func takeoverBegin(snapshotID _: String, planRef _: String) throws -> String {
         throw TakeoverError.stalePlan
+    }
+    func takeoverBegin(snapshotID: String, planRef: String, continuedLoan: Bool) throws -> String {
+        guard !continuedLoan else { throw TakeoverError.userActivityPaused }
+        return try takeoverBegin(snapshotID: snapshotID, planRef: planRef)
     }
     func takeoverBegin(
         snapshotID _: String,
@@ -1210,6 +1215,7 @@ final class SystemWindowObserver: WindowObserving {
             guard let application = NSRunningApplication(processIdentifier: pid) else { return false }
             return !application.isTerminated
         },
+        inputCounts: ForegroundTakeoverCoordinator.physicalInputCounts,
         revalidate: { [weak self] target in
             guard let self else { throw WindowObservationError.targetGone }
             _ = try self.backgroundTargetController().snapshotTargetState(target)
@@ -2725,6 +2731,10 @@ final class SystemWindowObserver: WindowObserving {
     }
 
     func takeoverBegin(snapshotID: String, planRef: String) throws -> String {
+        try takeoverBegin(snapshotID: snapshotID, planRef: planRef, continuedLoan: false)
+    }
+
+    func takeoverBegin(snapshotID: String, planRef: String, continuedLoan: Bool) throws -> String {
         actionLock.lock()
         defer { actionLock.unlock() }
         pruneCooperativeFragmentDraftsLocked(now: cooperativePlanClock())
@@ -2740,7 +2750,7 @@ final class SystemWindowObserver: WindowObserving {
             target: target,
             snapshotID: snapshotID,
             planRef: planRef,
-            stageDigest: stored.plan.stageDigest
+            stageDigest: stored.plan.stageDigest, continuedLoan: continuedLoan
         )
         return token.ref
     }
@@ -3145,7 +3155,7 @@ final class SystemWindowObserver: WindowObserving {
         cooperativePlans.values.forEach { $0.dispatcher.invalidatePlans() }
         cooperativePlans.removeAll(keepingCapacity: false)
         if reason != .newSnapshot {
-            takeoverCoordinator.invalidate(allowRestore: reason == .close)
+            takeoverCoordinator.invalidate(allowRestore: reason == .close, preserveIdleLoan: reason == .focus || reason == .appsRefresh)
         }
     }
 

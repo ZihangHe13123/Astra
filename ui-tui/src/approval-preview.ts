@@ -133,8 +133,8 @@ function takeoverFacts(request: ToolApprovalRequest): ApprovalFactItem[] {
     { label: "操作类型", value: actionClasses.join(" · ") || "application interaction" },
     { label: "预期影响", value: expectedEffect },
     { label: "边界", value: request.choices?.includes("session")
-      ? "本次 CU 会话内此应用的普通操作；高影响操作另行确认。连续操作时应用保持在前台。"
-      : "仅此片段" },
+      ? "借用此窗口，最多 2 分钟；每批归还焦点，你接手即停。高影响操作另行确认。"
+      : request.arguments?.present_result === true ? "仅此片段，完成后将结果保留在前台" : "仅此片段，完成后归还焦点" },
   ];
 }
 
@@ -272,7 +272,8 @@ function approvalFacts(request: ToolApprovalRequest): ApprovalFactItem[] {
 }
 
 export function approvalRequestTitle(request: ToolApprovalRequest): string {
-  if (isComputerTakeoverRequest(request)) return "临时接管 macOS 应用";
+  if (isComputerTakeoverRequest(request)) return request.arguments?.present_result === true
+    ? "展示结果并保留在前台" : "临时接管 macOS 应用";
   if (request.approval_title) return displayText(request.approval_title);
   if (isFilesystemRequest(request)) {
     if (request.scope_kind === "batch") return "宿主机文件系统批量修改";
@@ -305,7 +306,8 @@ export function approvalSummaryLines(
     const window = facts[1]?.value ?? "Selected window";
     const reason = facts[2]?.value ?? "";
     return wrapToolResult(
-      [`临时接管 ${application} · ${window}`, reason].filter(Boolean).join("\n"),
+      [request.arguments?.present_result === true ? `将结果保留在前台：${application} · ${window}`
+        : `临时接管 ${application} · ${window}`, reason].filter(Boolean).join("\n"),
       Math.max(20, width),
     ).slice(0, MAX_SUMMARY_LINES);
   }
@@ -487,7 +489,7 @@ export function approvalChoiceHint(
     : approvalChoices(request);
   const draft = Boolean(request.draft?.text);
   const sessionLabel = isComputerTakeoverRequest(request)
-    ? "本次 CU 会话内允许此应用的普通操作"
+    ? "借用此窗口，最多 2 分钟"
     : request.scope_kind === "directory"
     ? "会话内允许该目录"
     : request.scope_kind === "batch"

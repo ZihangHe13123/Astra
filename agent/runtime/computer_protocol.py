@@ -1609,6 +1609,10 @@ def _validate_cooperative_request_payload(operation: str, payload: Mapping[str, 
         required = {"snapshot_id", "plan_ref"}
         if "fragment" in payload:
             required.add("fragment")
+        elif "continued_loan" in payload:
+            required.add("continued_loan")
+            if payload["continued_loan"] is not True:
+                raise ValueError("continued_loan must be true when present")
         _require_exact_payload(payload, required, operation)
         _validate_reference(payload["snapshot_id"], "snapshot_id")
         _validate_reference(payload["plan_ref"], "plan_ref")

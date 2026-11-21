@@ -848,8 +848,11 @@ class MacComputerBackend:
         plan_ref: str,
         *,
         declaration: ForegroundFragmentDeclaration | None = None,
+        continued_loan: bool = False,
     ) -> str:
         payload: dict[str, object] = {"snapshot_id": snapshot_id, "plan_ref": plan_ref}
+        if continued_loan:
+            payload["continued_loan"] = True
         if declaration is not None:
             payload["fragment"] = declaration
         response = await self._request(

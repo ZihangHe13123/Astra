@@ -14,5 +14,6 @@ test("a consequential request is decided per call, and a draft reads as send or 
   assert.deepEqual(approvalChoices(send).map(choice => approvalChoiceLabel(choice, send)), ["发送", "丢弃"]);
   assert.equal(consequenceNote(send), "发送类操作：每次都会单独问你，之前给过的授权不覆盖它。");
   assert.equal(approvalChoiceLabel("task", {}), "本任务允许");
+  assert.match(approvalChoiceLabel("session", { kind: "computer_foreground_takeover" }), /此窗口.*2 分钟/);
   assert.equal(consequenceNote({}), "");
 });
