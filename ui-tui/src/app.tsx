@@ -38,7 +38,7 @@ import { runAppshotCommand } from "./appshot-commands.js";
 // and keep live items append-only, as required by Ink's Static cursor. Session
 // restoration is capped separately so reopening a large chat stays responsive.
 import React, { useState, useEffect, useLayoutEffect, useCallback, useReducer, useRef, useMemo, memo } from "react";
-import { Text, Box, Static, useInput, useStdout } from "ink";
+import { Text, Box, Static, useInput, useStdout, type Key } from "ink";
 import stringWidth from "string-width";
 import { spawn } from "child_process";
 import { createInterface } from "readline";
@@ -119,7 +119,8 @@ import {
   approvalRequestLines,
   escapeApprovalDisplayText,
 } from "./approval-preview.js";
-import { transitionApprovalInput } from "./approval-interaction.js";
+import { transitionApprovalInput, type ForegroundRelease } from "./approval-interaction.js";
+import { useForegroundApprovalInput } from "./foreground-approval-input.js";
 import { formatQuestionAnswerSummary } from "./question-interaction.js";
 import {
   MessageTimeRailCursor,
@@ -2317,9 +2318,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     ? approvalRequestLines(approvalRequests[0], Math.max(20, columns - 4)).length
     : 0;
 
-  useInput((input, key) => {
+  const handleInput = (input: string, key: Partial<Key>, released?: ForegroundRelease) => {
     if (lifecycle?.closing) return;
-    appshotClientRef.current?.recordInput();
     if (connectionOpenRef.current) return;
     if (key.ctrl && input === "y") {
       // Handle before modal navigation; backend owns state and pending approvals.
@@ -2356,6 +2356,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         input,
         key,
         { lineCount: approvalLineCount, pageSize: approvalPageSize },
+        released,
       );
       if (transition.response) {
         if (!send({
@@ -2363,11 +2364,12 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           request_id: transition.response.requestId,
           decision: transition.response.decision,
         })) return;
-        setApprovalRequests(transition.requests);
+        const answeredId = transition.response.requestId;
+        setApprovalRequests(current => current.filter(request => request.request_id !== answeredId));
       }
       setApprovalDetailOpen(transition.detailOpen);
       setApprovalDetailOffset(transition.detailOffset);
-      return;
+      return !!transition.response;
     }
     if (questionRequest?.state === "pending" && key.tab) {
       setQuestionFocused(current => !current);
@@ -2408,6 +2410,16 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     if (key.ctrl && input === "l") {
       setActivityExpanded((current) => !current);
     }
+  };
+  const foregroundId = pendingApproval?.kind === "computer_foreground_takeover" && !connectionOpen && !startupVisible
+    ? pendingApproval.request_id : undefined;
+  const foregroundRelease = useForegroundApprovalInput(foregroundId, (_id, input, key, released) => {
+    appshotClientRef.current?.recordInput();
+    return handleInput(input, key, released);
+  });
+  useInput((input, key) => {
+    appshotClientRef.current?.recordInput();
+    handleInput(input, key);
   });
 
   return (
@@ -2537,6 +2549,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           {approvalRequests[0] && (
             <ToolApprovalPanel
               request={approvalRequests[0]}
+              foregroundRelease={foregroundRelease}
               width={columns}
               queueIndex={1}
               queueTotal={approvalRequests.length}

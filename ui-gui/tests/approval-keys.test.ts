@@ -40,7 +40,7 @@ test("Cmd or Ctrl with Enter or Backspace answers from anywhere except a field t
 test("inside the card the terminal's keys decide, and Enter on a button presses that button", () => {
   assert.deepEqual(["y", "Y", "Enter", "a", "A", "n", "N", "Escape"].map(key => decide({ key }, card)),
     ["once", "once", "once", "session", "session", "deny", "deny", "deny"]);
-  assert.deepEqual(["y", "a", "n", "Escape"].map(key => decide({ key }, button)), ["once", "session", "deny", "deny"]);
+  for (const key of ["y", "t", "a", "n", "Escape"]) assert.equal(decide({ key }, button), undefined, key);
   assert.equal(decide({ key: "Enter" }, button), undefined);
   assert.equal(decide({ key: "Enter", shiftKey: true }, card), undefined);
   for (const key of ["x", "Tab", " ", "ArrowDown", "1"]) assert.equal(decide({ key }, card), undefined, key);

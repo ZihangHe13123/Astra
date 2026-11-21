@@ -137,6 +137,7 @@ final class ForegroundTakeoverCoordinator {
         let targetPID: pid_t
         let previousPID: pid_t?
         let counts: [UInt32]
+        var pendingProof: UUID? = nil
     }
 
     private final class Record {
@@ -299,6 +300,9 @@ final class ForegroundTakeoverCoordinator {
         if let deadline = loanDeadline {
             let now = loanNow()
             guard deadline > now, deadline <= now + 120 else { throw TakeoverError.loanExpired }
+            if let focusConsent, deadline > TimeInterval(focusConsent.maximumFreshLoanDeadlineMS) / 1_000 {
+                throw TakeoverError.loanExpired
+            }
         }
         if continuedLoan, loanDeadline == nil || prior?.loanDeadline != loanDeadline {
             throw TakeoverError.userActivityPaused
@@ -902,14 +906,28 @@ final class ForegroundTakeoverCoordinator {
     func end(_ takeoverRef: String, allowRestore: Bool, requirePresentationStatus: Bool = false) throws -> TakeoverOutcome {
         guard !(allowRestore && requirePresentationStatus) else { throw TakeoverError.authorityMismatch }
         let proof = requirePresentationStatus ? inspectPresentation(takeoverRef) : nil
-        ordinaryInputGate.lock()
-        defer { ordinaryInputGate.unlock() }
+        let terminal = try withOrdinaryInput {
+            try endUnderInputGate(takeoverRef, allowRestore: allowRestore, requirePresentationStatus: requirePresentationStatus, proof: proof)
+        }
+        switch terminal {
+        case let .finished(outcome): return outcome
+        case let .verify(target, pending): return try finishPresentationProof(target: target, pending: pending)
+        }
+    }
+
+    private enum TerminalDecision {
+        case finished(TakeoverOutcome)
+        case verify(WindowTarget, PresentationReceipt)
+    }
+
+    private func endUnderInputGate(_ takeoverRef: String, allowRestore: Bool, requirePresentationStatus: Bool,
+                                   proof: PresentationProof?) throws -> TerminalDecision {
         lock.lock()
         if let receipt = expiredReceipt, receipt.ref == takeoverRef {
             guard !receipt.acknowledged else { lock.unlock(); throw TakeoverError.alreadyConsumed }
             expiredReceipt?.acknowledged = true
             lock.unlock()
-            return receipt.outcome
+            return .finished(receipt.outcome)
         }
         guard let record = records[takeoverRef], !record.terminalClaimed else {
             lock.unlock()
@@ -933,20 +951,25 @@ final class ForegroundTakeoverCoordinator {
             catch { /* Internal shutdown is not human input; conditionally restore. */ }
         }
         // Merely beginning or consuming a plan does not authorize leaving it in front.
-        var outcome = cleanup(record, allowRestore: !yieldToUser && (allowRestore || (record.fragmentAuthority == nil && !presenting)),
+        let outcome = cleanup(record, allowRestore: !yieldToUser && (allowRestore || (record.fragmentAuthority == nil && !presenting)),
             observedCounts: proof?.counts)
         var rollback: PresentationReceipt?
         var presented = false
         if presenting && !outcome.cleanupFailed {
             let targetPID = record.authority.target.pid
-            presented = !record.releaseInterrupted && !record.releaseCounts.isEmpty && frontmostPID() == targetPID
-                && inputCounts() == record.releaseCounts
-            if presented, let proof, loanNow() >= proof.expires {
-                presented = false
-                outcome = TakeoverOutcome(started: true, restoration: restoreFocus(record, allowed: true))
+            let uninterrupted = !record.releaseInterrupted && !record.releaseCounts.isEmpty
+            if let proof {
+                if uninterrupted && inputCounts() == record.releaseCounts {
+                    // Publish rollback ownership, NOT a successful presentation. A new borrow,
+                    // cancel or invalidate can consume/revoke it while the final read is blocked.
+                    rollback = PresentationReceipt(ref: takeoverRef, expires: loanNow() + 15, targetPID: targetPID,
+                        previousPID: record.oldFrontmostPID, counts: record.releaseCounts, pendingProof: proof.id)
+                }
+            } else {
+                presented = uninterrupted && frontmostPID() == targetPID && inputCounts() == record.releaseCounts
+                rollback = PresentationReceipt(ref: takeoverRef, expires: loanNow() + 15, targetPID: targetPID,
+                    previousPID: presented ? record.oldFrontmostPID : nil, counts: record.releaseCounts)
             }
-            rollback = PresentationReceipt(ref: takeoverRef, expires: loanNow() + 15, targetPID: targetPID,
-                previousPID: presented ? record.oldFrontmostPID : nil, counts: record.releaseCounts)
         }
         lock.lock()
         if outcome.cleanupFailed {
@@ -963,7 +986,37 @@ final class ForegroundTakeoverCoordinator {
             }
         }
         lock.unlock()
-        return TakeoverOutcome(started: outcome.started, restoration: outcome.restoration, cleanupFailed: outcome.cleanupFailed, presented: presented)
+        if let rollback, rollback.pendingProof != nil { return .verify(record.authority.target, rollback) }
+        return .finished(TakeoverOutcome(started: outcome.started, restoration: outcome.restoration, cleanupFailed: outcome.cleanupFailed, presented: presented))
+    }
+
+    private func finishPresentationProof(target: WindowTarget, pending: PresentationReceipt) throws -> TakeoverOutcome {
+        let deadline = loanNow() + 1
+        let beganInTarget = frontmostPID() == target.pid
+        let matches = beganInTarget && presentationWindowMatches(target)
+        let stillInTarget = beganInTarget && frontmostPID() == target.pid
+        // No AX/WindowServer read above held any gate, or held the live takeover open.
+        return try withOrdinaryInput {
+            let unchanged = inputCounts() == pending.counts
+            lock.lock()
+            guard !beginReserved, records.isEmpty, var current = presentationReceipt, current.ref == pending.ref,
+                  current.pendingProof == pending.pendingProof else { lock.unlock(); throw TakeoverError.alreadyConsumed }
+            if matches && stillInTarget && unchanged && loanNow() < deadline && loanNow() < pending.expires {
+                current.pendingProof = nil
+                presentationReceipt = current
+                lock.unlock()
+                return TakeoverOutcome(started: true, restoration: .preservedUserFocus, presented: true)
+            }
+            presentationReceipt = nil
+            guard stillInTarget && unchanged, let oldPID = current.previousPID else {
+                lock.unlock(); return TakeoverOutcome(started: true, restoration: .preservedUserFocus)
+            }
+            beginReserved = true
+            lock.unlock()
+            defer { lock.withLock { beginReserved = false } }
+            return TakeoverOutcome(started: true, restoration: restoreFocus(targetPID: target.pid, oldPID: oldPID,
+                counts: current.counts, validUntil: current.expires))
+        }
     }
 
     func cancelPresentation(takeoverRef: String) throws -> TakeoverOutcome {
@@ -986,9 +1039,21 @@ final class ForegroundTakeoverCoordinator {
     }
 
     func discardPresentationReceipt() {
+        withOrdinaryInput { revokePresentation(restorePending: true) }
+    }
+
+    // Called under the input gate. A confirmed presentation stays put on close; an unfinished
+    // one still owes a conditional return. Claim it before restoring, never after an AX read.
+    private func revokePresentation(restorePending: Bool) {
         lock.lock()
+        let receipt = presentationReceipt
         presentationReceipt = nil
+        guard restorePending, let receipt, receipt.pendingProof != nil, let oldPID = receipt.previousPID,
+              !beginReserved, records.isEmpty else { lock.unlock(); return }
+        beginReserved = true
         lock.unlock()
+        defer { lock.withLock { beginReserved = false } }
+        _ = restoreFocus(targetPID: receipt.targetPID, oldPID: oldPID, counts: receipt.counts, validUntil: receipt.expires)
     }
 
     func checkPresentationObservation(_ ref: String, checkFrontmost: Bool = true) throws {
@@ -1032,9 +1097,9 @@ final class ForegroundTakeoverCoordinator {
     func invalidate(allowRestore: Bool, refreshingTargets: Bool = false) {
         ordinaryInputGate.lock()
         defer { ordinaryInputGate.unlock() }
+        revokePresentation(restorePending: allowRestore || refreshingTargets)
         lock.lock()
         if !refreshingTargets || !records.isEmpty { lastRelease = nil }
-        presentationReceipt = nil
         let active = records.compactMap { reference, record -> (String, Record)? in
             guard !record.terminalClaimed else { return nil }
             record.terminalClaimed = true

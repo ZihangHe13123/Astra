@@ -48,6 +48,7 @@ from .computer_protocol import (
     decode_text_detail_envelope,
     validate_snapshot_payload,
     validated_focus_consent,
+    validated_focus_loan_deadline,
 )
 
 
@@ -1320,19 +1321,23 @@ class ComputerSessionManager:
                     or (continued_loan and (loan_deadline is None or focus_consent is not None))):
                 raise ComputerSessionError("takeover_not_allowed")
             begin_options: dict[str, object] = {}
+            consent = None
             if not continued_loan:
                 # Never reconstruct a missing decision witness from the current desktop.
                 try:
-                    begin_options["focus_consent"] = validated_focus_consent(focus_consent)
+                    consent = validated_focus_consent(focus_consent)
                 except ValueError as exc:
                     raise ComputerSessionError("approval_required", "Fresh foreground consent is required.") from exc
+                begin_options["focus_consent"] = consent
             if loan_deadline is not None:
                 # Authorization may have expired or been revoked while waiting for the lock.
                 deadline_ms = loan_deadline()
                 if deadline_ms is None:
                     raise ComputerSessionError("approval_required", "The foreground loan is no longer current.")
-                if type(deadline_ms) is not int or not 0 < deadline_ms < 2**53:
-                    raise ComputerSessionError("takeover_not_allowed", "Invalid foreground loan deadline.")
+                try:
+                    deadline_ms = validated_focus_loan_deadline(deadline_ms, consent)
+                except ValueError as exc:
+                    raise ComputerSessionError("takeover_not_allowed", "Invalid foreground loan deadline.") from exc
                 begin_options.update(continued_loan=continued_loan, loan_deadline_continuous_ms=deadline_ms)
             if declaration is not None:
                 begin_options["declaration"] = declaration

@@ -5,15 +5,16 @@ export type ApprovalDecision = "once" | "task" | "session" | "deny";
 export type ApprovalKeyPress = {
   key: string; metaKey?: boolean; ctrlKey?: boolean; shiftKey?: boolean; altKey?: boolean; repeat?: boolean; isComposing?: boolean;
 };
-/** Inside the approval card (possibly on one of its buttons), or anywhere else in the window (possibly in a field that holds text). */
+/** The focused card root or an offered decision button, or outside all cards. Other descendants own their keys. */
 export type ApprovalKeyPlace = { in: "card"; onButton: boolean } | { in: "window"; typing: boolean };
 
 /**
  * The decision a key press gives, or undefined when it gives none.
  *
- * With Cmd or Ctrl held, Enter allows once, Shift+Enter allows for the session and Backspace denies, from
- * anywhere in the window except a field that holds text, where those keys keep sending and deleting.
- * Plain Y, T, A, N, Enter and Escape decide only inside the card, which never takes the focus by itself.
+ * With Cmd or Ctrl held, Enter allows once, Shift+Enter allows for the session and Backspace denies.
+ * Outside cards, a field holding text keeps sending and deleting. On an action button, a conflicting
+ * Enter chord must not override the button or fall through to its native click.
+ * Plain Y, T, A, N, Enter and Escape decide only on the focused card root. Enter on a button activates the button instead.
  * "以后都允许" has no key: a standing rule is added only by clicking it.
  * A held key repeats and never decides, so one press cannot answer the next request as well.
  */
@@ -24,10 +25,9 @@ export function approvalDecision(press: ApprovalKeyPress, place: ApprovalKeyPlac
     if (place.in === "window" && place.typing) return undefined;
     if (press.key === "Enter") decision = press.shiftKey ? "session" : "once";
     else if (press.key === "Backspace" && !press.shiftKey) decision = "deny";
-  } else if (place.in === "card") {
+  } else if (place.in === "card" && !place.onButton) {
     if (press.key === "Escape") decision = "deny";
-    // Enter on a focused button presses that button, whichever it is.
-    else if (press.key === "Enter") decision = place.onButton || press.shiftKey ? undefined : "once";
+    else if (press.key === "Enter") decision = press.shiftKey ? undefined : "once";
     else decision = ({ y: "once", t: "task", a: "session", n: "deny" } as Record<string, ApprovalDecision>)[press.key.toLowerCase()];
   }
   return decision && choices.includes(decision) ? decision : undefined;

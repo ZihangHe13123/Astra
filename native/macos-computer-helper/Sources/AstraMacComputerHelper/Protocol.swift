@@ -9,6 +9,12 @@ let textDetailTruncationReasonOrder = [
     "aggregate_text_limit", "wall_clock_limit", "final_byte_limit",
 ]
 
+extension ForegroundFocusConsent {
+    // Floor the original witness, not the elapsed duration. Even one extra
+    // microsecond is not authorization for the next whole wire millisecond.
+    var maximumFreshLoanDeadlineMS: Int { decidedAtContinuousUS / 1_000 + 120_000 }
+}
+
 extension DispatchPlanSummary {
     var pidActionClasses: [DispatchActionClass] {
         plannedPIDActionClasses ?? actionClasses.filter { actionClass in
@@ -692,11 +698,11 @@ final class Dispatcher {
                   case let .string(snapshotID)? = payload["snapshot_id"],
                   case let .string(planRef)? = payload["plan_ref"]
             else { return Self.failure(requestID: request.requestID, message: "takeover_begin has an invalid payload") }
-            let loanDeadline = continuousLoanDeadline(request)
+            let loanDeadlineMS = continuousLoanDeadlineMS(request)
             let consent = decodeFocusConsent(request)
             let declaration: ForegroundFragmentDeclaration?
             if payload["fragment"] == nil {
-                guard validateTakeoverBeginPayload(request.payload, hasFragment: false, loanDeadline: loanDeadline, consent: consent) else {
+                guard validateTakeoverBeginPayload(request.payload, hasFragment: false, loanDeadlineMS: loanDeadlineMS, consent: consent) else {
                     return Self.failure(requestID: request.requestID, message: "takeover_begin has an invalid payload")
                 }
                 declaration = nil
@@ -719,6 +725,7 @@ final class Dispatcher {
                     ]))
                 }
                 let reference: String
+                let loanDeadline = loanDeadlineMS.map { TimeInterval($0) / 1_000 }
                 if let consent {
                     reference = try windows.takeoverBegin(snapshotID: snapshotID, planRef: planRef, focusConsent: consent, loanDeadline: loanDeadline)
                 } else {
@@ -1123,14 +1130,14 @@ final class Dispatcher {
         return validActions(values["actions"])
     }
 
-    private func continuousLoanDeadline(_ request: HelperRequest) -> TimeInterval? {
-        // Keep the absolute Darwin CLOCK_MONOTONIC_RAW epoch; only convert ms to seconds.
+    private func continuousLoanDeadlineMS(_ request: HelperRequest) -> Int? {
+        // Validate the absolute CLOCK_MONOTONIC_RAW timestamp before converting to seconds.
         guard case let .object(values) = request.payload,
               case let .number(ms)? = values["loan_deadline_continuous_ms"],
               ms > 0, ms < 9_007_199_254_740_992,
               let exactMS = exactPositiveInteger(strictPayloadObject(request)?["loan_deadline_continuous_ms"])
         else { return nil }
-        return TimeInterval(exactMS) / 1000
+        return exactMS
     }
 
     private func decodeFocusConsent(_ request: HelperRequest) -> ForegroundFocusConsent? {
@@ -1149,15 +1156,17 @@ final class Dispatcher {
         return ForegroundFocusConsent(decidedAtContinuousUS: us, frontmostPID: pid_t(pid))
     }
 
-    private func validateTakeoverBeginPayload(_ payload: JSONValue, hasFragment: Bool, loanDeadline: TimeInterval? = nil,
+    private func validateTakeoverBeginPayload(_ payload: JSONValue, hasFragment: Bool, loanDeadlineMS: Int? = nil,
                                              consent: ForegroundFocusConsent? = nil) -> Bool {
         var keys: Set<String> = ["snapshot_id", "plan_ref"]
-        if consent != nil { keys.insert("focus_consent") }
-        else {
-            guard !hasFragment, loanDeadline != nil, case let .object(values) = payload,
+        if let consent {
+            if let loanDeadlineMS, loanDeadlineMS > consent.maximumFreshLoanDeadlineMS { return false }
+            keys.insert("focus_consent")
+        } else {
+            guard !hasFragment, loanDeadlineMS != nil, case let .object(values) = payload,
                   values["continued_loan"] == .bool(true) else { return false }
         }
-        if !hasFragment, case let .object(values) = payload, loanDeadline != nil {
+        if !hasFragment, case let .object(values) = payload, loanDeadlineMS != nil {
             keys.insert("loan_deadline_continuous_ms")
             if consent == nil, values["continued_loan"] == .bool(true) { keys.insert("continued_loan") }
         }

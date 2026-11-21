@@ -9,6 +9,7 @@ import { render } from "ink";
 import stripAnsi from "strip-ansi";
 import { StreamingMarkdownCoordinator } from "./streaming-markdown.js";
 import { TuiLifecycle } from "./tui-lifecycle.js";
+import { approvalAwareStdin } from "./foreground-approval-input.js";
 
 class FakeChild extends EventEmitter {
   exitCode: number | null = null;
@@ -41,7 +42,7 @@ const settle = () => new Promise((resolve) => setTimeout(resolve, 60));
 async function setup(columns = 90, rows = 30, appshotClientFactory?: (consumer:any) => any, appshotManifestReader?: (path:string)=>string, lifecycle?: TuiLifecycle) {
   const stdin = new Input(); const stdout = new Output();
   stdout.columns = columns; stdout.rows = rows;
-  const app = render(<App appshotClientFactory={appshotClientFactory} appshotManifestReader={appshotManifestReader} lifecycle={lifecycle} />, { stdin: stdin as any, stdout: stdout as any, stderr: stdout as any, debug: true, patchConsole: false, exitOnCtrlC: false });
+  const app = render(<App appshotClientFactory={appshotClientFactory} appshotManifestReader={appshotManifestReader} lifecycle={lifecycle} />, { stdin: approvalAwareStdin(stdin as any), stdout: stdout as any, stderr: stdout as any, debug: true, patchConsole: false, exitOnCtrlC: false });
   await settle();
   return { app, stdin, stdout, child: children.at(-1)!, frame: () => stdout.chunks.map(stripAnsi).filter((chunk) => chunk.trim()).at(-1) ?? "", async key(value: string) { stdin.write(value); await settle(); }, async submit(value: string) { stdin.write(value); await settle(); stdin.write("\r"); await settle(); } };
 }
@@ -610,6 +611,69 @@ for (const failure of ["disconnected", "EPIPE"] as const) {
     } finally { h.app.unmount(); }
   });
 }
+
+test("foreground terminal grants use negotiated raw press/release frames for one FIFO head, not text or paste", async () => {
+  const h = await setup(120, 36);
+  const ask = (id: string) => h.child.event({ type: "tool_approval_request", request_id: id, tool_name: "computer_act", risk: "write",
+    kind: "computer_foreground_takeover", reason: "fixture", choices: ["once", "session", "deny"] });
+  const decisions = () => h.child.commands.filter(c => c.type === "tool_approval_response").map(c => [c.request_id, c.decision]);
+  const down = "\x1b[121u", up = "\x1b[121;1:3u", repeat = "\x1b[121;1:2u";
+  const negotiate = async () => { await h.key("\x1b[?1004;2$y"); await h.key("\x1b[?0u"); await h.key("\x1b[?11u"); };
+  try {
+    ask("one"); ask("two"); await settle();
+    assert.ok(h.stdout.chunks.join("").includes("\x1b[?1004$p"));
+    assert.match(h.frame(), /GUI.*重新发起/);
+    await h.key("y"); await h.key("\r"); await h.key("a"); await h.key(down + up);
+    assert.deepEqual(decisions(), []);
+    await negotiate(); assert.match(h.frame(), /按下并松开/); assert.ok(h.stdout.chunks.join("").includes("\x1b[>11u"));
+    await h.key("\x1b[200~" + down); await h.key(up + "\x1b[201~");
+    await h.key(down + repeat + up); await h.key(down + "\x1b[O"); await h.key(up + "\x1b[I");
+    await h.key(down + "\x1b[97;1:3u"); await h.key(up);
+    assert.deepEqual(decisions(), []);
+    await h.key("\x1b"); await h.key("[97;1:1u"); assert.deepEqual(decisions(), []);
+    await h.key("\x1b[97;1:3u" + down + up); assert.deepEqual(decisions(), [["one", "session"]]);
+    await h.key("\x1b[?0u"); await negotiate(); await h.key(up); assert.deepEqual(decisions(), [["one", "session"]]);
+    await h.key("\x1b[13u\x1b[13;1:3u"); assert.deepEqual(decisions(), [["one", "session"], ["two", "once"]]);
+    assert.equal(h.stdout.chunks.join("").split("\x1b[<u").length - 1, 2);
+    // No pop ACK yet. Neither a lost reply nor a fragmented stale release can own the composer.
+    await h.key("real "); await h.key("\x1b[13;1:"); await h.key("3uinput"); await h.key("\r");
+    assert.ok(h.child.commands.some(c => c.type === "message" && c.text === "real input"));
+    await h.key("\x03"); assert.ok(h.child.commands.some(c => c.cmd === "/cancel"));
+    h.child.event({ type: "done" }); await settle(); await h.key("\x1b[?0uafter"); await h.key("\r");
+    assert.ok(h.child.commands.some(c => c.type === "message" && c.text === "after"));
+  } finally { h.app.unmount(); }
+});
+
+test("foreground terminal keeps legacy denial and enhanced navigation, cancel and YOLO; unmount restores modes", async () => {
+  const h = await setup(115, 36);
+  const ask = (id: string) => h.child.event({ type: "tool_approval_request", request_id: id, tool_name: "computer_act", risk: "write",
+    kind: "computer_foreground_takeover", reason: "fixture", choices: ["once", "deny"] });
+  try {
+    ask("legacy"); await settle(); await h.key("y"); await h.key("n");
+    assert.deepEqual(h.child.commands.filter(c => c.type === "tool_approval_response").map(c => c.decision), ["deny"]);
+    // First query had no answer. Its late response must not negotiate the new head.
+    ask("enhanced"); h.child.event({ type: "task_started", task: { id: "work", status: "running" } }); await settle();
+    await h.key("\x1b[?1004;2$y"); await h.key("\x1b[?1004;2$y"); await h.key("\x1b[?0u"); await h.key("\x1b[?11u");
+    await h.key("\x1b[118u\x1b[118;1:3u"); assert.match(h.frame(), /详情/);
+    await h.key("\x1b[27u"); await h.key("\x1b[121;5u\x1b[121;5:3u"); await h.key("\x1b[99;5u\x1b[99;5:3u");
+    assert.equal(h.child.commands.filter(c => c.cmd === "/yolo").length, 1);
+    assert.equal(h.child.commands.filter(c => c.cmd === "/cancel").length, 1);
+  } finally { h.app.unmount(); }
+  assert.equal(h.stdout.chunks.join("").split("\x1b[<u").length - 1, 1);
+  assert.ok(h.stdout.chunks.join("").includes("\x1b[?1004l"));
+});
+
+test("a composer paste interrupted by a foreground card cannot strand normal input after remote resolution", async () => {
+  const h = await setup(); try {
+    await h.key("\x1b[200~not a command");
+    h.child.event({ type: "tool_approval_request", request_id: "during-paste", kind: "computer_foreground_takeover",
+      tool_name: "computer_act", risk: "write", reason: "fixture", choices: ["once", "deny"] }); await settle();
+    h.child.event({ type: "approval_resolved", request_id: "during-paste", state: "denied", decision: "deny" }); await settle();
+    await h.key("y\x1b[201~"); await h.submit("fresh text");
+    assert.ok(h.child.commands.some(c => c.type === "message" && c.text === "fresh text"));
+    assert.ok(!h.child.commands.some(c => c.type === "tool_approval_response"));
+  } finally { h.app.unmount(); }
+});
 
 test("failed approval write cannot resurrect queued approvals cleared by teardown", async () => {
   const h = await setup(); try {

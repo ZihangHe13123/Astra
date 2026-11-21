@@ -10,6 +10,7 @@ import { consequenceNote } from "@astra/ui-core/approval-choices";
 
 export interface ToolApprovalPanelProps {
   request: ToolApprovalRequest;
+  foregroundRelease?: boolean;
   expanded: boolean;
   width: number;
   queueIndex: number;
@@ -59,6 +60,7 @@ function collapsedShortcutHint(shortcutHint: string): string {
 
 export function ToolApprovalPanel({
   request,
+  foregroundRelease = false,
   expanded,
   width,
   queueIndex,
@@ -97,7 +99,12 @@ export function ToolApprovalPanel({
         contentWidth,
       )
     : "";
-  const shortcuts = (expanded ? view.shortcutHint : collapsedShortcutHint(view.shortcutHint)) + "   [Ctrl+Y] YOLO";
+  let choices = expanded ? view.shortcutHint : collapsedShortcutHint(view.shortcutHint);
+  if (request.kind === "computer_foreground_takeover") {
+    choices = foregroundRelease ? `按下并松开（不按修饰键）：${choices}`
+      : "未确认终端支持松键事件。可按 N 拒绝，再到 GUI 重新发起任务。   [V] 详情";
+  }
+  const shortcuts = choices + "   [Ctrl+Y] YOLO";
   const note = consequenceNote(request);
   // What a send would put out, as is: who it goes to, then its text (a few lines; V shows all of it).
   const draftLines = request.draft?.text ? [

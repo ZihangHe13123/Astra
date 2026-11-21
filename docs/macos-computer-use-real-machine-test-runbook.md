@@ -57,6 +57,17 @@ Record the returned PNG, ordinary AX, and optional Smart detail as one transacti
 
 The Task 10 live operator must copy the [Task 10 transactional app-state matrix](macos-app-state-acceptance.md) into an ignored local evidence directory and populate that local copy. Do not commit the populated matrix or raw run metadata. It is the canonical per-cell evidence for the local run. The final report must reference this local matrix as its input, not create a competing output. Public documentation may contain only a redacted summary of the measured behavior and limitations.
 
+### 3.2 前台礼让：仅在真人同意后验收
+
+以下不是自动门禁。使用测试窗口，记录提交、客户端与终端版本；没有真人执行的行标 `NOT_RUN`。
+
+| 动作 | 应记录的结果 |
+| --- | --- |
+| GUI 用 Tab 聚焦「查看后端提供的审批详情」，按下、松开 Enter，再做一次 | 详情展开、折叠；请求仍待决定，批准数和接管数均为零。另用真正的允许按钮作正对照。 |
+| TUI 在支持松键上报的终端按住再松开 Y、Enter 或已提供的 A；再在仅上报按下的终端试一次 | 前者只在同一选择松键后批准；后者保持待决定，可以拒绝。松键后另打一键或切走应让行，不能用延时忽略这次输入。 |
+| 请求展示测试文档 A，让应用在收尾时自行聚焦同进程文档 B；另在已聚焦的测试 sheet 中完成操作 | 不能把 B 报成 A；`AXFocusedWindow` 返回父窗口时，必须用当前字段归属证明是原 sheet。不能为了验证重新激活。 |
+| 已确认勾选动作，但新截图显示未选中，归还原应用又明确失败 | 分开记录输入、截图、勾选状态和前台：`presentation_status=unconfirmed`，不重放点击。不便安全制造失败时用确定性测试，实机项不记 PASS。 |
+
 ## 4. 建立本轮证据目录
 
 从仓库根目录运行：

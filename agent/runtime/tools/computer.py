@@ -71,6 +71,7 @@ from ..computer_protocol import (
     ComputerSnapshot,
     ComputerSnapshotTextDetailMode,
     decode_text_detail_envelope,
+    focus_loan_deadline_cap_ms,
     validate_snapshot_payload,
 )
 from ..computer_routing import computer_route_advice
@@ -459,7 +460,10 @@ class _ForegroundLoan:
     scope: str
     grant_space: str
     window: tuple[str, ...]
-    expires_at: float
+    deadline_ms: int
+
+    def expired(self) -> bool:
+        return approval_time.continuous_now() >= self.deadline_ms / 1000
 
 
 @dataclass
@@ -2127,7 +2131,7 @@ def register_computer_tools(
     def current_loan() -> _ForegroundLoan | None:
         if foreground_loan is not None and (
             foreground_loan.grant_space != current_grant_space()
-            or foreground_loan.window != loan_window() or approval_time.continuous_now() >= foreground_loan.expires_at
+            or foreground_loan.window != loan_window() or foreground_loan.expired()
             or foreground_loan.scope not in approvals.approved_scopes
         ):
             revoke_loan()
@@ -3234,7 +3238,7 @@ def register_computer_tools(
                                                              presentation_snapshot=presentation_snapshot)
                         if outcome.get("presented") is True and outcome.get("restoration") == "preserved_user_focus":
                             prepared.presentation_status = "presented"
-                        elif outcome.get("presented") is not False or outcome.get("restoration") == "restore_failed":
+                        elif outcome.get("presented") is not False:
                             prepared.presentation_status = "unconfirmed"
                     else:
                         outcome = await manager.end_takeover(ending_ref)
@@ -3243,6 +3247,9 @@ def register_computer_tools(
                         "restored": "focus_restored",
                         "preserved_user_focus": "focus_preserved",
                     }.get(raw_restoration, "restore_failed")
+                    # A withheld presentation can still be in front if the ordinary return failed.
+                    if prepared.present_result and (restoration == "restore_failed" or outcome.get("cleanup_failed")):
+                        prepared.presentation_status = "unconfirmed"
                     if restoration == "focus_restored" and not outcome.get("cleanup_failed"):
                         if prepared.new_loan is not None and prepared_acts.get(_permission_call_id) is prepared:
                             foreground_loan = prepared.new_loan
@@ -3457,11 +3464,11 @@ def register_computer_tools(
                     def loan_deadline() -> int | None:
                         if (prepared_acts.get(_permission_call_id) is not prepared
                                 or loan.grant_space != current_grant_space() or loan.window != loan_window()
-                                or loan.scope not in approvals.approved_scopes or approval_time.continuous_now() >= loan.expires_at
+                                or loan.scope not in approvals.approved_scopes or loan.expired()
                                 or (prepared.reused_loan is not None and current_loan() is not loan)):
                             return None
                         # Both ends use Darwin's sleep-inclusive CLOCK_MONOTONIC_RAW. Never rebase on transit.
-                        return int(loan.expires_at * 1000)
+                        return loan.deadline_ms
 
                     takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref,
                         loan_deadline=loan_deadline, continued_loan=prepared.reused_loan is not None, focus_consent=prepared.focus_consent)
@@ -4354,7 +4361,7 @@ def register_computer_tools(
         basis = prepared.hash_basis or prepared.decision
         if basis is None or current.batch_hash != basis.batch_hash:
             raise ValueError("Computer Use target changed while approval was pending")
-        expires_at = None
+        deadline_ms = None
         if prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER:
             revoke_loan()  # An unrelated freshly authorized batch is not a continuation.
             decided_at = getattr(request, "private_decided_at", None)
@@ -4365,19 +4372,20 @@ def register_computer_tools(
                 prepared.failure = _failure("approval_required", "Missing a valid foreground consent receipt. Ask again.", retryable=True)
                 return None
             # Round down: uncertainty at the timestamp boundary must never mask intervening input.
-            prepared.focus_consent = {"frontmost_pid": pid, "decided_at_continuous_us": int(decided_at * 1_000_000)}
+            decided_us = int(decided_at * 1_000_000)
+            prepared.focus_consent = {"frontmost_pid": pid, "decided_at_continuous_us": decided_us}
             if decision == "session" and "session" in request["choices"]:
-                expires_at = decided_at + 120
-                if not loan_window() or approval_time.continuous_now() >= expires_at:
+                deadline_ms = focus_loan_deadline_cap_ms(decided_us)
+                if not loan_window() or approval_time.continuous_now() >= deadline_ms / 1000:
                     prepared.failure = _failure("approval_required", "The foreground decision expired or its window changed. Ask again.", retryable=True)
                     return None
         cleanup = permission_grant(approvals, args, request, decision)
         if prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER:
             prepared.approved = True
             authorized_acts.add(call_id)
-            if expires_at is not None:
+            if deadline_ms is not None:
                 prepared.new_loan = _ForegroundLoan(
-                    prepared.decision.scope, current_grant_space(), loan_window(), expires_at,
+                    prepared.decision.scope, current_grant_space(), loan_window(), deadline_ms,
                 )
         return cleanup
 
@@ -4430,7 +4438,7 @@ def register_computer_tools(
                     receipt["next_step"] = "report_presentation"
                     message = {
                         "withdrawn": "The helper confirmed that the previous application was restored; the presentation was withdrawn.",
-                        "not_presented": "The requested result was not kept in front.",
+                        "not_presented": "Astra did not complete the requested presentation.",
                     }.get(status, "Could not confirm whether the requested result was left in front.")
                     result.update(error=message, code="presentation_not_completed", error_type="presentation_not_completed",
                                   verified=False, partial=bool(receipt.get("acknowledged")), retryable=False, recoverable=False,

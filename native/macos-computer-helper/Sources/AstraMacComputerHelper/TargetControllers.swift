@@ -821,8 +821,8 @@ struct SystemApplicationActivationRuntime: ApplicationActivationRuntime {
     }
 }
 
-// Read-only terminal evidence. The retained CG window must still be visible, and the focused
-// AX object must be that exact retained window, not merely its app, title, bounds or hash.
+// Read-only terminal evidence. Require the retained visible CG surface and the exact AX
+// window, or focused content owned by its exact attached sheet: never metadata equality.
 func retainedPresentationWindowMatches(_ target: WindowTarget,
     onScreen: (WindowTarget) -> Bool = { target in
         guard let info = CGWindowListCopyWindowInfo([.optionIncludingWindow], target.windowID) as? [[String: Any]],
@@ -830,15 +830,59 @@ func retainedPresentationWindowMatches(_ target: WindowTarget,
         return row[kCGWindowNumber as String] as? UInt32 == target.windowID
             && row[kCGWindowOwnerPID as String] as? pid_t == target.pid && row[kCGWindowIsOnscreen as String] as? Bool == true
     }, focusedWindow: (pid_t) -> AXUIElement? = { pid in
-        let app = AXUIElementCreateApplication(pid)
-        guard AXUIElementSetMessagingTimeout(app, 0.25) == .success else { return nil }
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(app, kAXFocusedWindowAttribute as CFString, &value) == .success else { return nil }
-        return decodeAXElement(value)
-    }) -> Bool {
+        let (error, value) = observationAXAttribute(AXUIElementCreateApplication(pid), kAXFocusedWindowAttribute)
+        return error == .success ? decodeAXElement(value) : nil
+    }, role: (AXUIElement) -> String? = {
+        let result = AXNodeReader.stringAttribute($0, kAXRoleAttribute)
+        return result.status == .complete ? result.value : nil
+    },
+    focusedElement: (pid_t) -> AXUIElement? = { pid in
+        let (error, value) = observationAXAttribute(AXUIElementCreateApplication(pid), kAXFocusedUIElementAttribute)
+        return error == .success ? decodeAXElement(value) : nil
+    }, owner: (AXUIElement) -> pid_t? = observedAXPID,
+    parent: (AXUIElement) -> AXUIElement? = observedAXParent,
+    backingWindowID: (AXUIElement) -> CGWindowID? = observedAXBackingWindowID) -> Bool {
+    let limit: TimeInterval
+    if let inherited = AXObservationBudget.current {
+        guard let remaining = try? inherited.phaseTimeout(maximum: 0.5) else { return false }
+        limit = remaining
+    } else { limit = 0.5 }
+    let budget = AXObservationBudget(duration: limit, clock: ForegroundLoanClock.now)
+    let uninstall = budget.install(); defer { uninstall() }
     guard target.pid > 0, target.windowID != 0, let retained = target.axElement, target.axIdentity == CFHash(retained),
-          onScreen(target), let focused = focusedWindow(target.pid) else { return false }
-    return CFEqual(focused, retained)
+          onScreen(target), let retainedRole = role(retained), retainedRole == kAXWindowRole || retainedRole == kAXSheetRole,
+          let focused = focusedWindow(target.pid), owner(focused) == target.pid, let field = focusedElement(target.pid),
+          focusedElementBelongsToExactAXRoot(element: field, root: retained, pid: target.pid,
+            ownerPID: owner, parent: parent, permitsDescendant: { element in
+                guard let r = role(element) else { return false }
+                return r != kAXSheetRole && r != kAXWindowRole
+            }), budget.available else { return false }
+
+    // AXFocusedWindow may report the parent for a blocking sheet. The field's closest
+    // window/sheet above selects exactly one retained root, never both parent and sheet.
+    if retainedRole == kAXWindowRole {
+        guard CFEqual(focused, retained) else { return false }
+    } else {
+        var chain = [retained]
+        var host: AXUIElement?
+        while chain.count <= 8 {
+            guard budget.available, let next = parent(chain[chain.count - 1]), owner(next) == target.pid,
+                  !chain.contains(where: { CFEqual($0, next) }), let r = role(next) else { return false }
+            chain.append(next)
+            if r == kAXWindowRole { host = next; break }
+            guard r == kAXSheetRole else { return false }
+        }
+        guard let host, chain.contains(where: { CFEqual($0, focused) }),
+              let hostID = backingWindowID(host), hostID != 0 else { return false }
+    }
+
+    // The sheet can have its own CG surface or share the proven host's. In either case
+    // read the backing number from the *retained root*. If unavailable or different,
+    // a formerly matched surface still being onscreen (or title/geometry) proves nothing.
+    guard backingWindowID(retained) == target.windowID,
+          let lastWindow = focusedWindow(target.pid), CFEqual(lastWindow, focused),
+          let lastField = focusedElement(target.pid), CFEqual(lastField, field) else { return false }
+    return budget.available
 }
 
 final class LaunchServicesApplicationActivationController: ApplicationActivationControlling {

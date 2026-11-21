@@ -160,6 +160,19 @@ def validated_focus_consent(value: object) -> dict[str, int]:
     return {"frontmost_pid": pid, "decided_at_continuous_us": us}
 
 
+def focus_loan_deadline_cap_ms(decided_at_continuous_us: int) -> int:
+    """Last whole wire millisecond within 120 seconds of the original decision."""
+    return decided_at_continuous_us // 1_000 + 120_000
+
+
+def validated_focus_loan_deadline(value: object, consent: Mapping[str, int] | None) -> int:
+    if type(value) is not int or not 0 < value < 2**53:
+        raise ValueError("loan_deadline_continuous_ms must be a positive exact millisecond timestamp")
+    if consent is not None and value > focus_loan_deadline_cap_ms(consent["decided_at_continuous_us"]):
+        raise ValueError("loan_deadline_continuous_ms exceeds 120 seconds from the foreground decision")
+    return value
+
+
 @dataclass(frozen=True)
 class ForegroundFragmentActionRequirement:
     backend: str
@@ -1644,24 +1657,23 @@ def _validate_cooperative_request_payload(operation: str, payload: Mapping[str, 
         return
     if operation == "takeover_begin":
         required = {"snapshot_id", "plan_ref"}
+        # Only a bounded continuation uses existing authority. Every first
+        # begin, including an initial fragment, must carry decision provenance.
+        consent = None
+        if "continued_loan" not in payload:
+            required.add("focus_consent")
+            consent = validated_focus_consent(payload.get("focus_consent"))
         if "fragment" in payload:
             required.add("fragment")
         elif "loan_deadline_continuous_ms" in payload:
             # focus_loan_v3 uses Darwin CLOCK_MONOTONIC_RAW (includes sleep).
             # The v2 uptime field is not interchangeable, even for a first begin.
             required.add("loan_deadline_continuous_ms")
-            deadline = payload["loan_deadline_continuous_ms"]
-            if type(deadline) is not int or not 0 < deadline < 2**53:
-                raise ValueError("loan_deadline_continuous_ms must be a positive exact millisecond timestamp")
+            validated_focus_loan_deadline(payload["loan_deadline_continuous_ms"], consent)
             if "continued_loan" in payload:
                 required.add("continued_loan")
                 if payload["continued_loan"] is not True:
                     raise ValueError("continued_loan must be true when present")
-        # Only a bounded continuation uses existing authority. Every first
-        # begin, including an initial fragment, must carry decision provenance.
-        if "continued_loan" not in payload:
-            required.add("focus_consent")
-            validated_focus_consent(payload.get("focus_consent"))
         _require_exact_payload(payload, required, operation)
         _validate_reference(payload["snapshot_id"], "snapshot_id")
         _validate_reference(payload["plan_ref"], "plan_ref")

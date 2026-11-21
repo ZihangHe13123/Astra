@@ -3,6 +3,7 @@
 import React from "react";
 import { render } from "ink";
 import App from "./app.js";
+import { approvalAwareStdin } from "./foreground-approval-input.js";
 import { installTerminalOutput } from "./terminal-output.js";
 import { TuiLifecycle } from "./tui-lifecycle.js";
 import { appendFile, mkdir } from "node:fs/promises";
@@ -63,6 +64,7 @@ process.on("SIGTERM", () => { void lifecycle.requestExit("signal"); });
 process.on("SIGINT", () => { void lifecycle.requestExit("signal"); });
 
 instance = render(<App lifecycle={lifecycle} clearLiveOutput={() => instance?.clear()} />, {
+  stdin: approvalAwareStdin(process.stdin),
   stdout: outputStream as any,
   stderr: outputStream as any,
   patchConsole: false,

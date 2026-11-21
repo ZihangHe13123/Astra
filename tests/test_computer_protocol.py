@@ -1,13 +1,15 @@
 import asyncio
 import json
 import math
+import os
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from agent.runtime import computer_protocol
-from agent.runtime.computer_backend import ComputerAppCatalog
+from agent.runtime.computer_backend import ComputerActionPlan, ComputerAppCatalog, ComputerSessionError, ComputerSessionManager, ComputerTarget
 from agent.runtime.computer_forms import observation_capabilities
 from agent.runtime.computer_protocol import (
     ComputerAction,
@@ -108,6 +110,50 @@ def test_focus_consent_strict_wire_agrees_for_oneshot_and_first_bounded_begin():
             ComputerRequest('r', 'takeover_begin', {**base, 'focus_consent': malformed})
 
 
+@pytest.mark.parametrize(("decided_us", "deadline_ms", "accepted"), [
+    (100_000_000, 310_000, False),  # No new 120-second window on arrival at t=200s.
+    (100_000_000, 220_000, True), (100_000_000, 220_001, False),
+    (99_999_999, 219_999, True), (99_999_999, 220_000, False),  # 1 microsecond too long
+    (9_007_199_254_739_999, 9_007_199_374_740, False),
+])
+def test_fresh_loan_deadline_cap_on_wire(decided_us, deadline_ms, accepted):
+    payload = {
+        "snapshot_id": "s", "plan_ref": "p", "loan_deadline_continuous_ms": deadline_ms,
+        "focus_consent": {"frontmost_pid": 37, "decided_at_continuous_us": decided_us},
+    }
+    if accepted:
+        assert json.loads(encode_request(ComputerRequest("r", "takeover_begin", payload)))["payload"] == payload
+    else:
+        with pytest.raises(ValueError, match="deadline"):
+            ComputerRequest("r", "takeover_begin", payload)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="session manager requires POSIX artifact authority")
+def test_fresh_loan_deadline_cap_stops_manager_before_backend(tmp_path):
+    mode = computer_protocol.ComputerInteractionMode.FOREGROUND_TAKEOVER
+    backend = SimpleNamespace(
+        select=AsyncMock(return_value=ComputerTarget("app", "window")),
+        snapshot=AsyncMock(return_value=ComputerSnapshot("snap")),
+        plan_actions=AsyncMock(return_value=ComputerActionPlan("plan", mode, True, "foreground_takeover_required", (), ())),
+        begin_takeover=AsyncMock(return_value="must-not-begin"), close=AsyncMock(),
+    )
+
+    async def scenario():
+        manager = ComputerSessionManager(backend, cache_root=tmp_path)
+        try:
+            await manager.select("app", "window")
+            snap = await manager.snapshot()
+            plan = await manager.plan_actions(snap.snapshot_id, [{"type": "wait", "duration_ms": 0}], interaction_mode=mode)
+            with pytest.raises(ComputerSessionError):
+                await manager.begin_takeover(snap.snapshot_id, plan.plan_ref, loan_deadline=lambda: 310_000,
+                                             focus_consent={"frontmost_pid": 37, "decided_at_continuous_us": 100_000_000})
+            backend.begin_takeover.assert_not_awaited()
+        finally:
+            await manager.close()
+
+    asyncio.run(scenario())
+
+
 def test_focus_consent_rejection_never_retries_without_a_receipt():
     rejection = ComputerError(ComputerErrorCode.PROTOCOL_MISMATCH, 'takeover_begin has an invalid payload')
     backend, frames = _presentation_backend({'ok': False, 'error': rejection})
@@ -133,7 +179,7 @@ def test_focus_loan_new_deadline_rejected_by_strict_old_v4_without_downgrade(con
 
     backend = MacComputerBackend(SimpleNamespace(request=strict_old_v4))
     with pytest.raises(HelperApplicationError) as failure:
-        asyncio.run(backend.begin_takeover("snap", "plan", loan_deadline_continuous_ms=420_125, continued_loan=continued,
+        asyncio.run(backend.begin_takeover("snap", "plan", loan_deadline_continuous_ms=165_125, continued_loan=continued,
                                            focus_consent=None if continued else _FIXTURE_FOCUS_CONSENT))
 
     assert failure.value.error.code is ComputerErrorCode.PROTOCOL_MISMATCH
@@ -142,7 +188,7 @@ def test_focus_loan_new_deadline_rejected_by_strict_old_v4_without_downgrade(con
     else:
         assert "Update" in failure.value.error.message
     assert frames == [("takeover_begin", {
-        "snapshot_id": "snap", "plan_ref": "plan", "loan_deadline_continuous_ms": 420_125,
+        "snapshot_id": "snap", "plan_ref": "plan", "loan_deadline_continuous_ms": 165_125,
         **({"continued_loan": True} if continued else {"focus_consent": _FIXTURE_FOCUS_CONSENT}),
     })]
 

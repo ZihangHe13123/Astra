@@ -536,7 +536,7 @@ import Testing
             #"{"protocol_version":4,"request_id":"timed","operation":"takeover_begin","payload":{"snapshot_id":"snap","plan_ref":"plan",\#(fields)}}"#
         )
     }
-    for suffix in [#","focus_consent":{"decided_at_continuous_us":300000000,"frontmost_pid":77}"#, #","continued_loan":true"#] {
+    for suffix in [#","focus_consent":{"decided_at_continuous_us":300125000,"frontmost_pid":77}"#, #","continued_loan":true"#] {
         #expect(begin(#""loan_deadline_continuous_ms":420125\#(suffix)"#).ok)
         #expect(begin(#""loan_deadline_uptime_ms":450000\#(suffix)"#).error?.code == "protocol_mismatch")
     }
@@ -546,6 +546,21 @@ import Testing
     }
     #expect(windows.begins.map(\.continued) == [false, true])
     #expect(windows.begins.map(\.deadline) == [420.125, 420.125])
+}
+
+@Test func freshLoanDeadlineCapRejectsExtensionBeforeRouting() {
+    let windows = LoanDeadlineProtocolWindows()
+    let dispatcher = Dispatcher(permissions: StaticPermissions(accessibilityTrusted: true, screenRecordingAllowed: true), windows: windows)
+    func begin(_ decisionUS: Int, _ deadlineMS: Int) -> HelperResponse {
+        dispatcher.handle(#"{"protocol_version":4,"request_id":"capped","operation":"takeover_begin","payload":{"snapshot_id":"s","plan_ref":"p","loan_deadline_continuous_ms":\#(deadlineMS),"focus_consent":{"frontmost_pid":37,"decided_at_continuous_us":\#(decisionUS)}}}"#)
+    }
+    #expect(begin(100_000_000, 220_000).ok)
+    #expect(begin(99_999_999, 219_999).ok)
+    for (us, ms) in [(100_000_000, 310_000), (100_000_000, 220_001), (99_999_999, 220_000),
+                     (9_007_199_254_739_999, 9_007_199_374_740)] {
+        #expect(begin(us, ms).error?.code == "protocol_mismatch")
+    }
+    #expect(windows.begins.map(\.deadline) == [220, 219.999])
 }
 
 @Test func freshFocusConsentRoutesExactFieldsOnlyAndNeverDowngrades() {

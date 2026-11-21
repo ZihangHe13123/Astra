@@ -53,11 +53,13 @@ func focusBelongsToExactAXRoot(app: AXUIElement, root: AXUIElement) -> Bool {
     return focusedElementBelongsToExactAXRoot(element: focused, root: root, pid: owner)
 }
 
-func focusedElementBelongsToExactAXRoot(element focused: AXUIElement, root: AXUIElement, pid owner: pid_t) -> Bool {
-    guard observedAXPID(root) == owner, observedAXPID(focused) == owner else { return false }
+func focusedElementBelongsToExactAXRoot(element focused: AXUIElement, root: AXUIElement, pid owner: pid_t,
+    ownerPID: (AXUIElement) -> pid_t? = observedAXPID, parent: (AXUIElement) -> AXUIElement? = observedAXParent,
+    permitsDescendant: (AXUIElement) -> Bool = { _ in true }) -> Bool {
+    guard ownerPID(root) == owner, ownerPID(focused) == owner else { return false }
     return CFEqual(focused, root) || focusedAncestorBranch(root: root, focused: focused,
-        same: { CFEqual($0, $1) }, isOwned: { observedAXPID($0) == owner },
-        parent: observedAXParent) != nil
+        same: { CFEqual($0, $1) }, isOwned: { ownerPID($0) == owner && (CFEqual($0, root) || permitsDescendant($0)) },
+        parent: parent) != nil
 }
 
 // Reconstruct sheet membership on every inventory; focus loss removes the candidate.

@@ -15,8 +15,14 @@ func observedAXWindowID(_ element: AXUIElement) -> CGWindowID? {
     // A sheet may report its parent's ID. Keep the independently proven sheet
     // ownership/focus path; this bridge is only for actual AXWindow objects.
     let role = AXNodeReader.stringAttribute(element, kAXRoleAttribute)
-    guard role.status == .complete, role.value == kAXWindowRole,
-          let read = axWindowIDFunction else { return nil }
+    guard role.status == .complete, role.value == kAXWindowRole else { return nil }
+    return observedAXBackingWindowID(element)
+}
+
+// Use a sheet's raw backing surface only with independent exact AX focus/attachment proof.
+// A composited sheet can return its parent window number, not a unique sheet window number.
+func observedAXBackingWindowID(_ element: AXUIElement) -> CGWindowID? {
+    guard let read = axWindowIDFunction else { return nil }
     return observationAXCall(element: element, fallback: nil as CGWindowID?) {
         var id: CGWindowID = 0
         return read(element, &id) == .success && id != 0 ? id : nil

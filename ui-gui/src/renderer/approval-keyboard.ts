@@ -9,6 +9,7 @@ const fieldSelector = "input,textarea,[contenteditable='true']";
 /** A key inside a card belongs to that card; only the oldest eligible card listens outside. */
 export function bindApprovalKeyboard(card: HTMLElement, read: () => KeyboardCard): () => void {
   const doc = card.ownerDocument, win = doc.defaultView!;
+  const requestId = read().requestId;
   let release: AbortController | undefined;
   const cancel = () => { release?.abort(); release = undefined; };
   const interrupted = new WeakSet<KeyboardEvent>();
@@ -19,13 +20,17 @@ export function bindApprovalKeyboard(card: HTMLElement, read: () => KeyboardCard
     card.scrollIntoView({ block: "nearest" }); return true;
   }
 
+  function offeredButtonChoice(target: Element, choices: readonly string[]): string | undefined {
+    if (target.tagName !== "BUTTON" || target.parentElement !== card.querySelector(":scope > .actions")) return;
+    const button = target as HTMLButtonElement, choice = button.dataset.approvalChoice;
+    return !button.disabled && choice && choices.includes(choice) ? choice : undefined;
+  }
+
   // A foreground answer starts a physical-input check at the backend. Its own key releases must
   // precede the answer, not look like the person took over afterwards. Never infer Enter-up from
   // Meta-up: Chromium can omit that keyup, but Enter could also actually still be down.
-  function waitForRelease(down: KeyboardEvent, target: Element, outside: boolean, decision: string) {
+  function waitForRelease(down: KeyboardEvent, target: Element, outside: boolean, decision: string, buttonChoice?: string) {
     cancel();
-    const requestId = read().requestId, focus = doc.activeElement;
-    if (target !== focus || !target.isConnected || !doc.hasFocus() || doc.hidden) return;
     const held = new Set<string>(modifiers.filter(([, flag]) => down[flag]).map(([key]) => key));
     let keyUp = false;
     release = new AbortController();
@@ -38,8 +43,9 @@ export function bindApprovalKeyboard(card: HTMLElement, read: () => KeyboardCard
     win.addEventListener("keyup", e => {
       const state = read();
       const owner = target.closest(".approval");
-      const samePlace = outside ? state.windowKeys && !owner && !typingIn(target.closest<HTMLInputElement>(fieldSelector)) : owner === card;
-      if (e.isComposing || e.repeat || e.target !== target || doc.activeElement !== focus || !doc.hasFocus() || doc.hidden
+      const samePlace = outside ? state.windowKeys && !owner && !typingIn(target.closest<HTMLInputElement>(fieldSelector))
+        : owner === card && (target === card || !!buttonChoice && offeredButtonChoice(target, state.choices) === buttonChoice);
+      if (e.isComposing || e.repeat || e.target !== target || doc.activeElement !== target || !doc.hasFocus() || doc.hidden
           || !card.isConnected || !target.isConnected || state.requestId !== requestId || !state.foreground || state.pending
           || !state.choices.includes(decision) || !samePlace) { cancel(); return; }
       if (down.code ? e.code === down.code : e.key.toLowerCase() === down.key.toLowerCase()) {
@@ -58,17 +64,23 @@ export function bindApprovalKeyboard(card: HTMLElement, read: () => KeyboardCard
 
   function keydown(e: KeyboardEvent, outside: boolean) {
     const state = read(), target = e.target as Element | null;
-    const owner = target?.closest?.(".approval");
+    if (state.requestId !== requestId || !card.isConnected || !target?.isConnected || doc.activeElement !== target || !doc.hasFocus() || doc.hidden) return;
+    const owner = target.closest(".approval");
     if (outside ? owner || !state.windowKeys : owner !== card) return;
-    const button = target?.closest?.<HTMLButtonElement>("button");
+    // A descendant is not the card. In particular, Enter on <summary> must open details, not approve.
+    const buttonChoice = outside ? undefined : offeredButtonChoice(target, state.choices);
+    if (!outside && target !== card && !buttonChoice) return;
     const place = outside
-      ? { in: "window", typing: typingIn(target?.closest?.<HTMLInputElement>(fieldSelector)) } as const
-      : { in: "card", onButton: !!button } as const;
+      ? { in: "window", typing: typingIn(target.closest<HTMLInputElement>(fieldSelector)) } as const
+      : { in: "card", onButton: !!buttonChoice } as const;
     let decision: string | undefined = approvalDecision(e, place, state.choices);
-    const nativeChoice = !outside && state.foreground && (e.key === "Enter" || e.key === " ") ? button?.dataset.approvalChoice : undefined;
+    if (buttonChoice && (e.metaKey || e.ctrlKey) && e.key === "Enter" && decision !== buttonChoice) {
+      e.preventDefault(); return; // Neither the conflicting grant nor the button's default click.
+    }
+    const nativeChoice = state.foreground && (e.key === "Enter" || e.key === " ") ? buttonChoice : undefined;
     // Enter activates a focused button on keydown in Chromium. Suppress native keyboard activation
     // even for a cancelled/repeating press, but leave mouse and accessibility clicks alone.
-    const positiveButton = nativeChoice && nativeChoice !== "deny" && state.choices.includes(nativeChoice);
+    const positiveButton = nativeChoice && nativeChoice !== "deny";
     if (!decision) {
       if (!positiveButton) return;
       e.preventDefault(); // no native click; unrelated modified shortcuts still bubble
@@ -79,7 +91,7 @@ export function bindApprovalKeyboard(card: HTMLElement, read: () => KeyboardCard
     if (!decision || state.pending || state.foreground && decision !== "deny" && interrupted.has(e)) return;
     if (outside && revealIfHidden()) return;
     if (!state.foreground || decision === "deny") state.decide(decision);
-    else if (target) waitForRelease(e, target, outside, decision);
+    else waitForRelease(e, target, outside, decision, buttonChoice);
   }
   const local = (e: KeyboardEvent) => keydown(e, false), global = (e: KeyboardEvent) => keydown(e, true);
   card.addEventListener("keydown", local);

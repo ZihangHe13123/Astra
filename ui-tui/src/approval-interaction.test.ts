@@ -58,7 +58,7 @@ test("A selects the offered session decision", () => {
   assert.deepEqual(next.requests, []);
 });
 
-test("A accepts an explicitly offered foreground application session grant", () => {
+test("foreground grants require a release for the same FIFO head and an offered choice; legacy input cannot grant", () => {
   const takeover: ToolApprovalRequest = {
     ...first,
     request_id: "takeover-1",
@@ -66,19 +66,17 @@ test("A accepts an explicitly offered foreground application session grant", () 
     choices: ["once", "session", "deny"],
   };
 
-  const next = transitionApprovalInput(
-    { requests: [takeover], detailOpen: true, detailOffset: 0 },
-    "A",
-    {},
-    { lineCount: 8, pageSize: 5 },
-  );
+  const state = { requests: [takeover], detailOpen: true, detailOffset: 0 }, bounds = { lineCount: 8, pageSize: 5 };
+  for (const input of ["y", "A", "t", "l", ""]) assert.equal(transitionApprovalInput(state, input, { return: !input }, bounds).response, undefined);
+  assert.equal(transitionApprovalInput(state, "", {}, bounds, { requestId: "old", decision: "session" }).response, undefined);
+  const next = transitionApprovalInput(state, "", {}, bounds, { requestId: takeover.request_id, decision: "session" });
 
   assert.deepEqual(next.response, { requestId: "takeover-1", decision: "session" });
   assert.deepEqual(next.requests, []);
   for (const choices of [["once", "deny"] as const, undefined]) {
     const bounded = transitionApprovalInput(
       { requests: [{ ...takeover, choices: choices ? [...choices] : undefined }], detailOpen: false, detailOffset: 0 },
-      "A", {}, { lineCount: 1, pageSize: 5 },
+      "", {}, bounds, { requestId: takeover.request_id, decision: "session" },
     );
     assert.equal(bounded.response, undefined);
   }

@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import math
 import os
 import struct
 import zlib
@@ -7868,8 +7869,12 @@ def test_failed_stale_foreground_plan_revokes_the_existing_loan(registry, manage
     assert len(prompts) == 2 and sum(n == 'act' for n, _ in loan_backend.calls) == 1
 
 
-@pytest.mark.parametrize('actual', [False, None, True])
-def test_present_checked_goal_requires_positive_final_evidence(registry, manager, backend, monkeypatch, actual):
+@pytest.mark.parametrize(('actual', 'restoration', 'status'), [
+    (False, 'restored', 'not_presented'), (None, 'preserved_user_focus', 'not_presented'),
+    (False, 'restore_failed', 'unconfirmed'), (None, 'restore_failed', 'unconfirmed'),
+    (True, 'preserved_user_focus', 'presented'),
+])
+def test_present_checked_goal_requires_positive_final_evidence(registry, manager, backend, monkeypatch, actual, restoration, status):
     node = {"role": "AXCheckBox", "element_ref": "snapshot-1:box", "label": "Enabled", "checked": False}
     backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["focus_consent_v1", "focus_presentation_v2", "checked_click_v1"], "children": [node]}
     backend.plan_pid_action_classes = ()
@@ -7884,17 +7889,32 @@ def test_present_checked_goal_requires_positive_final_evidence(registry, manager
             'children': [{**node, 'element_ref': 'snapshot-2:box', 'checked': actual}]}
         return result
     monkeypatch.setattr(backend, 'act', act)
+    frames = []
+    async def terminal(req):
+        frames.append(req)
+        outcome = {'started': True, 'restoration': restoration}
+        if req.payload.get('require_presentation_status') is True:
+            outcome['presented'] = True
+        return ComputerResponse(req.request_id, True, result=outcome)
+    monkeypatch.setattr(backend, 'end_takeover', MacComputerBackend(SimpleNamespace(request=terminal)).end_takeover)
     result = run(registry.execute('computer_act', {'snapshot_id': initial['snapshot_id'], 'present_result': True,
         'actions': [{'type': 'click', 'element_ref': node['element_ref'], 'checked': True}]}))
+    receipt = result['computer_receipt']
+    assert receipt['presentation_status'] == status and receipt['snapshot_verified'] is True
+    assert receipt['acknowledged'] == 1 and receipt['replay'] == 'forbidden'
     if actual is True:
         assert not result['error'] and json.loads(result['fresh_output'])['choice_verification']['status'] == 'verified'
-        assert result['computer_receipt']['presentation_status'] == 'presented'
     else:
         assert result['code'] == 'presentation_not_completed' and not result['verified']
-        assert result['computer_receipt']['snapshot_verified'] is True
-        assert result['computer_receipt']['presentation_status'] == 'not_presented'
+        if restoration == 'restore_failed':
+            assert 'could not confirm' in result['error'].lower() and not result['retryable']
+        if restoration == 'preserved_user_focus':
+            # Yielding does not establish which window the person chose to keep in front.
+            assert 'not kept in front' not in result['error'].lower()
         assert result['details']['choice_status'] == ('unknown' if actual is None else 'not_satisfied')
-    assert backend.restoration_requests == [actual is not True]
+    assert len(frames) == 1 and frames[0].operation == 'takeover_end'
+    assert frames[0].payload.get('restore_previous_focus', True) is (actual is not True)
+    assert sum(name == 'act' for name, _ in backend.calls) == 1
 
 
 def test_presentation_declines_older_helper_before_planning(registry, manager, backend):
@@ -8214,8 +8234,9 @@ def test_focus_loan_expiring_while_begin_waits_never_reaches_helper(registry, ma
     assert sum(n == "takeover_begin" for n, _ in loan_backend.calls) == 1
 
 
-def test_focus_loan_original_deadline_reaches_native_on_every_batch(registry, manager, loan_backend, monkeypatch):
-    clock = [300.0]
+@pytest.mark.parametrize(('decision', 'deadline_ms'), [(300.0, 420_000), (math.nextafter(100.0, 0), 219_999)])
+def test_focus_loan_original_deadline_reaches_native_on_every_batch(registry, manager, loan_backend, monkeypatch, decision, deadline_ms):
+    clock = [decision]
     monkeypatch.setattr("agent.runtime.approval_time.continuous_now", lambda: clock[0])
     begins = []
 
@@ -8236,7 +8257,7 @@ def test_focus_loan_original_deadline_reaches_native_on_every_batch(registry, ma
     clock[0] += 119
     assert not _borrow_focus(registry, json.loads(first["fresh_output"]))["error"]
     assert [(p.get("loan_deadline_continuous_ms"), p.get("continued_loan")) for p in begins] == [
-        (420_000, None), (420_000, True),
+        (deadline_ms, None), (deadline_ms, True),
     ]
 
 

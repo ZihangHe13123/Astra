@@ -23,15 +23,17 @@ function fixture(foreground = true) {
     decide: (decision: string) => { sent.push(`${state.requestId}:${decision}`); } };
   let offscreen = false, reveals = 0;
   const row = { getBoundingClientRect: () => ({ top: 10, bottom: offscreen ? 101 : 90 }) };
+  const details = { open: false };
   const card = Object.assign(new Listeners(), { ownerDocument: doc, isConnected: true, querySelector: () => row,
     closest: (selector: string): unknown => selector === ".approval" ? card : null, scrollIntoView: () => { reveals++; } });
-  const element = (where: "field" | "button", choice = "") => {
-    const el = { isConnected: true, value: "", dataset: { approvalChoice: choice },
-      closest: (selector: string): unknown => selector === ".approval" ? (where === "button" ? card : null)
-        : selector.startsWith("button") ? (where === "button" ? el : null) : where === "field" ? el : null };
+  const element = (tag: string, parentElement: object | null, choice = "") => {
+    const el = { tagName: tag.toUpperCase(), parentElement, disabled: false, isConnected: true, isContentEditable: false, tabIndex: -1,
+      value: "", dataset: { approvalChoice: choice },
+      closest: (selector: string): unknown => selector === ".approval" ? (el.parentElement ? card : null)
+        : selector.startsWith("button") ? (el.tagName === "BUTTON" ? el : null) : el.isContentEditable || ["INPUT", "TEXTAREA"].includes(el.tagName) ? el : null };
     return el;
   };
-  const field = element("field"), once = element("button", "once"), session = element("button", "session"), deny = element("button", "deny");
+  const field = element("input", null), once = element("button", row, "once"), session = element("button", row, "session"), deny = element("button", row, "deny");
   const detach = bindApprovalKeyboard(card as unknown as HTMLElement, () => state);
   const input = (type: string, key: string, flags: Partial<KeyboardEvent> = {}, target: typeof field | typeof card = field) => {
     const e = { target, key, code: key.length === 1 && key !== " " ? `Key${key.toUpperCase()}` : key,
@@ -44,7 +46,7 @@ function fixture(foreground = true) {
   };
   const focus = (target: unknown) => { doc.activeElement = target as Element; };
   focus(field);
-  return { state, sent, field, card, once, session, deny, focus, input,
+  return { state, sent, field, card, once, session, deny, focus, input, details, row, element,
     down: (key: string, flags?: Partial<KeyboardEvent>, target?: typeof field | typeof card) => input("keydown", key, flags, target),
     up: (key: string, flags?: Partial<KeyboardEvent>, target?: typeof field | typeof card) => input("keyup", key, flags, target),
     unmount: detach,
@@ -68,8 +70,8 @@ test("a foreground shortcut sends once, after the approval key AND its modifiers
   }
 });
 
-test("on a foreground button native Enter cannot click early; Space and card letter shortcuts also wait", () => {
-  for (const key of ["Enter", " ", "A"]) {
+test("on a foreground decision button native Enter cannot click early and Space also waits", () => {
+  for (const key of ["Enter", " "]) {
     const f = fixture(); f.focus(f.session);
     const down = f.down(key, { shiftKey: true }, f.session);
     if (!down.defaultPrevented && key === "Enter") f.state.decide("session");
@@ -95,7 +97,7 @@ test("repeat, a different key or physical keyup, blur/focus change, click, and s
     f.up("Enter", { ctrlKey: true }); f.up("Control");
     assert.deepEqual(f.sent, [], interrupt);
   }
-  const f = fixture(); f.focus(f.once); f.down("y", {}, f.once); f.focus(f.session); f.up("y", {}, f.session);
+  const f = fixture(); f.focus(f.once); f.down("Enter", {}, f.once); f.focus(f.session); f.up("Enter", {}, f.session);
   assert.deepEqual(f.sent, []);
   f.focus(f.field); f.down("y", {}, f.card); f.up("y", {}, f.card); // not the focused card
   assert.deepEqual(f.sent, []);
@@ -128,4 +130,88 @@ test("scroll first, typing exclusions, and immediate denial / non-foreground beh
   f.field.value = ""; f.down("Backspace", { ctrlKey: true }); assert.deepEqual(f.sent, ["first:deny"]);
   const g = fixture(false); g.down("Enter", { ctrlKey: true }); assert.deepEqual(g.sent, ["first:once"]);
   g.focus(g.session); assert.equal(g.down("Enter", {}, g.session).defaultPrevented, false);
+});
+
+test("Tab to the details summary and Enter toggle disclosure without answering either kind of card", () => {
+  for (const foreground of [true, false]) {
+    const f = fixture(foreground), summary = f.element("summary", f.details);
+    f.focus(f.card); assert.equal(f.down("Tab", {}, f.card).defaultPrevented, false);
+    f.focus(summary); // native Tab traversal
+    const down = f.down("Enter", {}, summary);
+    if (!down.defaultPrevented) f.details.open = !f.details.open; // native summary activation
+    assert.equal(f.details.open, true);
+    for (const e of [down, f.down("Enter", { repeat: true }, summary), f.up("Enter", {}, summary)]) {
+      assert.equal(e.defaultPrevented || e.cancelBubble, false);
+    }
+    assert.deepEqual(f.sent, []);
+  }
+});
+
+test("a focused non-decision descendant owns its keys, even when it resembles an offered decision button", () => {
+  for (const foreground of [true, false]) {
+    const f = fixture(foreground);
+    const editable = Object.assign(f.element("div", f.details), { isContentEditable: true });
+    const tabStop = Object.assign(f.element("div", f.card), { tabIndex: 0 });
+    const children = [editable, tabStop, f.element("button", f.row, "unoffered"), f.element("span", f.row, "once"),
+      ...["summary", "pre", "a", "button", "input", "textarea", "select", "h3", "span"].map(tag => f.element(tag, f.details, "once"))];
+    for (const child of children) {
+      f.focus(child);
+      for (const key of ["Enter", " ", "Y", "T", "A", "N", "Escape"]) {
+        for (const flags of [{}, { ctrlKey: true }]) {
+          const down = f.down(key, flags, child), up = f.up(key, flags, child);
+          assert.equal(down.defaultPrevented || down.cancelBubble || up.defaultPrevented, false, `${child.tagName}: ${key}`);
+          if ("ctrlKey" in flags) f.up("Control", {}, child);
+        }
+      }
+      assert.deepEqual(f.sent, [], child.tagName);
+    }
+  }
+});
+
+test("only a focused card root owns its plain letter shortcuts, never the focused deny or another choice button", () => {
+  for (const foreground of [true, false]) {
+    const f = fixture(foreground); f.state.choices.push("task");
+    for (const button of [f.once, f.session, f.deny]) {
+      f.focus(button);
+      for (const key of ["Y", "T", "A", "N", "Escape"]) {
+        assert.equal(f.down(key, {}, button).defaultPrevented, false); f.up(key, {}, button);
+      }
+      assert.deepEqual(f.sent, []);
+    }
+    f.focus(f.card); f.down("A", {}, f.card); f.up("A", {}, f.card);
+    assert.deepEqual(f.sent, ["first:session"]);
+    f.focus(f.deny); const enter = f.down("Enter", {}, f.deny);
+    if (!enter.defaultPrevented) f.state.decide("deny"); // native deny button click
+    f.up("Enter", {}, f.deny); assert.deepEqual(f.sent, ["first:session", "first:deny"]);
+  }
+});
+
+test("a retargeted, disabled or repurposed button cannot complete an earlier foreground choice", () => {
+  for (const change of ["row", "choice", "disabled"]) {
+    const f = fixture(); f.focus(f.once); f.down("Enter", {}, f.once);
+    if (change === "row") f.once.parentElement = f.details;
+    if (change === "choice") f.once.dataset.approvalChoice = "deny";
+    if (change === "disabled") f.once.disabled = true;
+    f.up("Enter", {}, f.once); assert.deepEqual(f.sent, [], change);
+  }
+  for (const foreground of [true, false]) {
+    const f = fixture(foreground); f.focus(f.element("summary", f.details));
+    f.down("Enter", {}, f.card); f.up("Enter", {}, f.card); assert.deepEqual(f.sent, []);
+  }
+});
+
+test("explicit chords can choose the focused button but a mismatched Enter chord cannot switch its choice", () => {
+  for (const foreground of [true, false]) {
+    const f = fixture(foreground);
+    for (const [button, shiftKey] of [[f.once, false], [f.session, true], [f.deny, false], [f.once, true]] as const) {
+      f.focus(button);
+      const flags = { ctrlKey: true, shiftKey };
+      const down = f.down("Enter", flags, button);
+      if (!down.defaultPrevented) f.state.decide(button.dataset.approvalChoice); // no stray native activation, either
+      f.up("Enter", flags, button);
+      if (shiftKey) f.up("Shift", { ctrlKey: true }, button);
+      f.up("Control", {}, button);
+    }
+    assert.deepEqual(f.sent, ["first:once", "first:session"]);
+  }
 });

@@ -22,6 +22,8 @@ export interface ApprovalInteractionBounds {
   pageSize: number;
 }
 
+export type ForegroundRelease = { requestId: string; decision: "once" | "session" };
+
 export interface ApprovalInteractionTransition extends ApprovalInteractionState {
   handled: boolean;
   response?: {
@@ -35,6 +37,7 @@ export function transitionApprovalInput(
   input: string,
   key: ApprovalInputKey,
   bounds: ApprovalInteractionBounds,
+  released?: ForegroundRelease,
 ): ApprovalInteractionTransition {
   const request = state.requests[0];
   if (!request) return { ...state, handled: false };
@@ -54,16 +57,16 @@ export function transitionApprovalInput(
     response: { requestId: request.request_id, decision },
   });
 
-  if ((key.return || normalizedInput === "y") && choices.includes("once")) {
+  if (request.kind === "computer_foreground_takeover") {
+    // Ink's legacy keypress stream has no release evidence, including for an unmodified Enter.
+    if (released?.requestId === request.request_id && choices.includes(released.decision)) return resolve(released.decision);
+  } else if ((key.return || normalizedInput === "y") && choices.includes("once")) {
     return resolve("once");
-  }
-  if (normalizedInput === "t" && choices.includes("task")) {
+  } else if (normalizedInput === "t" && choices.includes("task")) {
     return resolve("task");
-  }
-  if (normalizedInput === "a" && choices.includes("session")) {
+  } else if (normalizedInput === "a" && choices.includes("session")) {
     return resolve("session");
-  }
-  if (normalizedInput === "l" && choices.includes("always")) {
+  } else if (normalizedInput === "l" && choices.includes("always")) {
     return resolve("always");
   }
   if (normalizedInput === "v") {

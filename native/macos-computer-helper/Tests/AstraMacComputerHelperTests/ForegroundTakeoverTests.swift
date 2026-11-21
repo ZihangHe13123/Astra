@@ -1086,6 +1086,22 @@ func terminalStopDuringActivationDoesNotForfeitQuietRestoration(_ timing: String
     #expect(f.activity.disarmCount == 1)
 }
 
+@Test(arguments: [220.0, 220.001, 310.0])
+func directFreshLoanCannotExtendTwoMinutesFromDecision(_ deadline: TimeInterval) throws {
+    let time = ManualLoanTime()
+    time.now = 200
+    let f = TakeoverFixture(loanTime: time)
+    let approved = ForegroundFocusConsent(decidedAtContinuousUS: 100_000_000, frontmostPID: 77)
+    if deadline == 220 {
+        let token = try f.begin(loanDeadline: deadline, focusConsent: approved)
+        #expect(time.scheduled == deadline)
+        _ = try f.coordinator.end(token.ref, allowRestore: true)
+    } else {
+        #expect(throws: TakeoverError.loanExpired) { try f.begin(loanDeadline: deadline, focusConsent: approved) }
+        #expect(f.activation.activated.isEmpty && time.scheduled == nil)
+    }
+}
+
 @Test(arguments: ["alreadyAwakeAgain", "sleptDuringArm"])
 func ordinaryLoanUsesSleepInclusiveApprovalClock(_ timing: String) throws {
     let time = ManualLoanTime()
@@ -1348,7 +1364,7 @@ func markedPresentationRequiresCurrentExactWindowNotJustPID(_ state: String) thr
     _ = try f.coordinator.consume(token.ref, actions: f.actions)
     f.coordinator.finishOrdinaryAct(token.ref, result: .init(batch: .init(outcomes: [.init(index: 0, ok: true, error: nil)], lastAcknowledgedAction: 0, error: nil), error: nil))
     let outcome = try presentationWindows(f.coordinator).endRequiringPresentationStatus(takeoverRef: token.ref)
-    #expect(probes == 1)
+    #expect(probes == (["same", "newTitle"].contains(state) ? 2 : 1))
     #expect(outcome.presented == ["same", "newTitle"].contains(state))
     let restored = ["sibling", "unreadable", "lateProof"].contains(state)
     #expect(outcome.restoration == (restored ? .restored : .preservedUserFocus))
@@ -1388,13 +1404,155 @@ func markedPresentationRequiresCurrentExactWindowNotJustPID(_ state: String) thr
         let target = WindowTarget(appRef: "test", windowRef: "B1", pid: 11, windowID: 22, bounds: .zero,
             title: title, axIdentity: CFHash(original), axElement: original)
         return retainedPresentationWindowMatches(target, onScreen: { $0.windowID == 22 && visible },
-            focusedWindow: { $0 == 11 ? focused : nil })
+            focusedWindow: { $0 == 11 ? focused : nil }, role: { _ in "AXWindow" },
+            focusedElement: { _ in focused }, owner: { _ in 11 }, parent: { _ in nil }, backingWindowID: { _ in 22 })
     }
     #expect(matches(title: "before", focused: original))
     #expect(matches(title: "after navigation", focused: original))
     #expect(!matches(title: "before", focused: other))
     #expect(!matches(title: "before", focused: nil))
     #expect(!matches(title: "before", visible: false, focused: original))
+}
+
+@Test func siblingWindowDuringCursorCloseCannotBeReportedPresented() throws {
+    var showingOriginal = true
+    let f = TakeoverFixture(presentationWindowMatches: { _ in showingOriginal })
+    let token = try completedPresentation(f)
+    f.cursor.onClose = { showingOriginal = false } // Same PID, unchanged HID and clock.
+    let outcome = try presentationWindows(f.coordinator).endRequiringPresentationStatus(takeoverRef: token.ref)
+    #expect(!outcome.presented && outcome.restoration == .restored)
+    #expect(f.activation.restored == [77] && f.activity.disarmCount == 1)
+    #expect(throws: TakeoverError.self) { try f.coordinator.cancelPresentation(takeoverRef: token.ref) }
+}
+
+private func completedPresentation(_ f: TakeoverFixture) throws -> TakeoverToken {
+    let token = try f.begin()
+    _ = try f.coordinator.consume(token.ref, actions: f.actions)
+    f.coordinator.finishOrdinaryAct(token.ref, result: .init(batch: .init(
+        outcomes: [.init(index: 0, ok: true, error: nil)], lastAcknowledgedAction: 0, error: nil), error: nil))
+    return token
+}
+
+@Test(arguments: ["close", "cancel", "newLoan", "invalidate", "typing", "thirdApp"])
+func deferredPresentationProofCannotOverrideConcurrentOwner(_ overlap: String) throws {
+    let entered = DispatchSemaphore(value: 0), release = DispatchSemaphore(value: 0)
+    let finished = DispatchSemaphore(value: 0), competing = DispatchSemaphore(value: 0)
+    var postCleanup = false, count: UInt32 = 5
+    let f = TakeoverFixture(inputCounts: { [count] }, presentationWindowMatches: { _ in
+        if postCleanup {
+            entered.signal()
+            _ = release.wait(timeout: .now() + 5)
+        }
+        return true
+    })
+    let token = try completedPresentation(f)
+    f.cursor.onClose = { postCleanup = true }
+    let windows = presentationWindows(f.coordinator)
+    Thread.detachNewThread {
+        let result = try? windows.endRequiringPresentationStatus(takeoverRef: token.ref)
+        #expect(result?.presented != true)
+        finished.signal()
+    }
+    try #require(entered.wait(timeout: .now() + 1) == .success)
+    #expect(f.activity.disarmCount == 1)
+    Thread.detachNewThread {
+        switch overlap {
+        case "close": windows.invalidateSnapshots()
+        case "cancel": #expect((try? windows.cancelPresentation(takeoverRef: token.ref))?.restoration == .restored)
+        case "invalidate": f.coordinator.invalidate(allowRestore: false)
+        case "newLoan":
+            let plan = f.authorizeAnotherPlan()
+            let newer = try? f.coordinator.begin(target: f.target, snapshotID: f.guardValue.snapshotID, planRef: plan.planRef, stageDigest: plan.stageDigest)
+            #expect(newer != nil)
+            if let newer { _ = try? f.coordinator.end(newer.ref, allowRestore: true) }
+        case "typing": count += 1
+        default: f.activation.currentFrontmostPID = 99
+        }
+        competing.signal()
+    }
+    let prompt = competing.wait(timeout: .now() + 1) == .success
+    #expect(prompt, "another owner must not wait for post-cleanup AX")
+    release.signal()
+    try #require(finished.wait(timeout: .now() + 2) == .success)
+    if !prompt { try #require(competing.wait(timeout: .now() + 2) == .success) }
+    #expect(f.activation.restored == (["close", "cancel"].contains(overlap) ? [77] : []))
+    #expect(f.activity.disarmCount == (overlap == "newLoan" ? 2 : 1))
+    #expect(throws: TakeoverError.self) { try windows.cancelPresentation(takeoverRef: token.ref) }
+}
+
+@Test(arguments: ["field", "sheetIsFocused", "sibling", "nestedOther", "detached", "foreign", "cycle", "unreadable", "hidden", "focusChangedDuringWalk", "budgetExhausted"])
+func retainedSheetPresentationRequiresExactOwnedFocusBranch(_ state: String) {
+    // Opaque IDs only; all AX, role, parent, ownership and visibility reads are fakes.
+    let win = AXUIElementCreateApplication(501), sheet = AXUIElementCreateApplication(502)
+    let other = AXUIElementCreateApplication(503), field = AXUIElementCreateApplication(504)
+    let target = WindowTarget(appRef: "app", windowRef: "sheet", pid: 11, windowID: 22, bounds: .zero,
+        title: "mutable", axIdentity: CFHash(sheet), axElement: sheet)
+    let reset = state == "budgetExhausted" ? AXObservationBudget(duration: 0).install() : nil
+    defer { reset?() }
+    var currentField = field
+    let matches = retainedPresentationWindowMatches(target, onScreen: { $0.windowID == 22 && state != "hidden" },
+        focusedWindow: { _ in state == "sheetIsFocused" ? sheet : win },
+        role: { CFEqual($0, win) ? "AXWindow" : CFEqual($0, field) ? "AXTextField" : "AXSheet" },
+        focusedElement: { _ in state == "unreadable" ? nil : currentField },
+        owner: { state == "foreign" && CFEqual($0, field) ? 99 : 11 },
+        parent: { element in
+            if CFEqual(element, field) { return ["sibling", "nestedOther"].contains(state) ? other : sheet }
+            if CFEqual(element, other) { return state == "nestedOther" ? sheet : win }
+            if CFEqual(element, sheet) {
+                if state == "focusChangedDuringWalk" { currentField = other }
+                return state == "detached" ? nil : state == "cycle" ? sheet : win
+            }
+            return nil
+        }, backingWindowID: { _ in 22 })
+    #expect(matches == ["field", "sheetIsFocused"].contains(state))
+}
+
+@Test(arguments: ["composited", "ownCG", "noSheet", "missingField", "foreignField", "missingSurface", "wrongOrdinaryID", "reattached", "ambiguousOwnCG"])
+func presentationSelectsOnlyNearestAXRootWithItsLiveCGSurface(_ state: String) {
+    // A and B stay onscreen. The visible row alone says nothing about which one backs S.
+    let a = AXUIElementCreateApplication(601), b = AXUIElementCreateApplication(602)
+    let s = AXUIElementCreateApplication(603), t = AXUIElementCreateApplication(604), field = AXUIElementCreateApplication(605)
+    let host = state == "reattached" ? b : a
+    let hasSheet = !["noSheet", "wrongOrdinaryID"].contains(state)
+    func matches(_ retained: AXUIElement, catalogID: UInt32) -> Bool {
+        let target = WindowTarget(appRef: "app", windowRef: "test", pid: 11, windowID: catalogID, bounds: .zero,
+                                  title: "unchanged", axIdentity: CFHash(retained), axElement: retained)
+        return retainedPresentationWindowMatches(target, onScreen: { _ in true }, focusedWindow: { _ in host },
+            role: { CFEqual($0, a) || CFEqual($0, b) ? "AXWindow" : CFEqual($0, field) ? "AXTextField" : "AXSheet" },
+            focusedElement: { _ in state == "missingField" ? nil : field },
+            owner: { state == "foreignField" && CFEqual($0, field) ? 88 : 11 },
+            parent: { CFEqual($0, field) ? (hasSheet ? s : host) : CFEqual($0, s) || CFEqual($0, t) ? host : nil },
+            backingWindowID: { element in
+                if CFEqual(element, a) { return state == "wrongOrdinaryID" ? 88 : 11 }
+                if CFEqual(element, b) { return 12 }
+                if CFEqual(element, s) {
+                    if state == "missingSurface" { return nil }
+                    if state == "ownCG" { return 22 }
+                    return state == "reattached" ? 12 : 11
+                }
+                return nil
+            })
+    }
+    let sheetCatalogID: UInt32 = ["ownCG", "ambiguousOwnCG"].contains(state) ? 22 : 11
+    #expect(matches(a, catalogID: 11) == (state == "noSheet"))
+    #expect(matches(s, catalogID: sheetCatalogID) == ["ownCG", "composited"].contains(state))
+    #expect(!matches(t, catalogID: sheetCatalogID))
+}
+
+@Test(arguments: [2.0, 30.0]) func deferredPresentationCannotOutliveItsRollbackReceipt(_ delay: TimeInterval) throws {
+    var postCleanup = false
+    let time = ManualLoanTime()
+    let f = TakeoverFixture(presentationWindowMatches: { _ in
+        if postCleanup { time.now += delay }
+        return true
+    }, loanTime: time)
+    let token = try completedPresentation(f)
+    f.cursor.onClose = { postCleanup = true }
+    let outcome = try presentationWindows(f.coordinator).endRequiringPresentationStatus(takeoverRef: token.ref)
+    #expect(!outcome.presented)
+    #expect(outcome.restoration == (delay == 2 ? .restored : .preservedUserFocus))
+    #expect(f.activation.restored == (delay == 2 ? [77] : []))
+    #expect(throws: TakeoverError.self) { try f.coordinator.cancelPresentation(takeoverRef: token.ref) }
 }
 
 @Test func guardedFragmentRejectsResumedTypingAndCannotBeEndedWithPresentationStatus() throws {
