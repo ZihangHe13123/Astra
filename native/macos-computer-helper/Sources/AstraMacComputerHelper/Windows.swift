@@ -2682,7 +2682,7 @@ final class SystemWindowObserver: WindowObserving {
                     ? dispatcher.plan(actions: resolvedActions, context: context)
                     : dispatcher.planFragmentDraft(actions: resolvedActions, context: context)
             } catch InputDispatchError.backgroundActionUnsupported {
-                planDiag("PLAN-REFUSED background pointer needs target_element_ref or foreground takeover")
+                planDiag("PLAN-REFUSED action cannot be prepared for background delivery")
                 return CooperativePlanResult(summary: nil, error: .cooperative(.backgroundActionUnsupported))
             } catch {
                 planDiag("PLAN-THROW dispatcher.plan: \(error)")
@@ -3114,9 +3114,10 @@ final class SystemWindowObserver: WindowObserving {
                 return AXScrollPressTarget(owner: owner, button: button)
             },
             selectedTextWriter: SystemAXSelectedTextWriter(effectProbe: .live),
-            replacementTargetValidation: { [weak self] expected in
-                guard let self, target.interactionMode == .foregroundTakeover,
-                      let element = expected.element else { throw ActionExecutionError.staleSnapshot }
+            keyboardTargetValidation: { [weak self] expected in
+                // Even a dispatcher created from a background snapshot must prove *current*
+                // foreground ownership before writing AXFocused in its approved consume phase.
+                guard let self, let element = expected.element else { throw ActionExecutionError.staleSnapshot }
                 let guardValue = snapshotContext.guardValue
                 let live = try self.currentActionState(for: target,
                     expectedFocusedRootPreference: guardValue.focusedRootPreference)
@@ -3134,6 +3135,10 @@ final class SystemWindowObserver: WindowObserving {
                     windowBounds: guardValue.bounds, requiresExactBounds: true)
                 try validateReplacementField(expected: expected, current: current,
                     belongs: { focusedElementBelongsToExactAXRoot(element: $0, root: root, pid: target.pid) })
+                guard let focused = self.trustedFocusedAXRoot(in: AXUIElementCreateApplication(target.pid), expected: root,
+                          targetBounds: guardValue.bounds, preference: guardValue.focusedRootPreference),
+                      CFHash(focused) == guardValue.focusedAXIdentity, liveFrontmostPID() == target.pid
+                else { throw ActionExecutionError.targetNotFrontmost }
             },
             // 键盘焦点获取能力在此**显式装配**（默认 nil ＝ 不获取）。有了它，`type` 才可能
             // 在目标未被点击聚焦时把焦点带过去，走纯 AX 写入而不是合成键盘事件。

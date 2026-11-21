@@ -7726,6 +7726,47 @@ def test_focus_loan_auto_fallback_waits_for_a_person(registry, manager, backend,
     assert not any(n in {"takeover_begin", "act"} for n, _ in backend.calls)
 
 
+@pytest.mark.parametrize("action", [{"type": "type", "text": "hello"}, {"type": "keypress", "key": "a", "modifiers": ["command"]}])
+@pytest.mark.parametrize("answer", ["once", "deny"])
+def test_named_keyboard_replan_preserves_recipient_and_waits_for_consent(registry, manager, backend, monkeypatch, action, answer):
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["auto_takeover_v1"],
+        "children": [{"role": "AXTextField", "element_ref": f"snapshot-1:{ref}", "label": ref, "focused": ref == "A"}
+                     for ref in ("A", "B")]}
+    backend.plan_pid_action_classes = ()
+    original_plan = backend.plan_actions
+    planned = []
+
+    async def plan(target, sid, actions, interaction_mode):
+        planned.append((interaction_mode.value, [a.to_mapping() for a in actions]))
+        if interaction_mode is ComputerInteractionMode.BACKGROUND:
+            raise HelperApplicationError(ComputerError(ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED, "needs field focus"))
+        return await original_plan(target, sid, actions, interaction_mode)
+
+    monkeypatch.setattr(backend, "plan_actions", plan)
+    register(registry, manager)
+    focus(registry)
+    sid = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])["snapshot_id"]
+    bound = {**action, "element_ref": f"{sid}:B"}
+    prompts = []
+
+    async def decide(request):
+        prompts.append(request["kind"])
+        assert planned == [("background", [bound]), ("foreground_takeover", [bound])]
+        assert not any(name in {"takeover_begin", "act"} for name, _ in backend.calls)
+        return answer
+
+    registry.yolo = True
+    registry.set_approval_handler(decide)
+    result = run(registry.execute("computer_act", {"snapshot_id": sid, "actions": [bound]}))
+    assert prompts == ["computer_foreground_takeover"]
+    if answer == "deny":
+        assert result.get("code") == "approval_denied"
+        assert not any(name in {"takeover_begin", "act"} for name, _ in backend.calls)
+    else:
+        assert not result.get("error"), result
+        assert [call[1] for name, call in backend.calls if name == "act"] == [[bound]]
+
+
 def test_focus_loan_unavailable_does_not_activate_legacy_route(registry, manager, backend):
     register(registry, manager)
     focus(registry)

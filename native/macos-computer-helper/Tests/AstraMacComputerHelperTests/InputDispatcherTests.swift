@@ -1311,6 +1311,50 @@ func statefulAXPressEffectVerifiesAnyBoundedValueChange(role: String) throws {
     }
 }
 
+@Test(arguments: ["type", "cmd-a"], ["background", "discard", "draft", "stopped", "approved"])
+func planningNamedKeyboardInputCannotMoveCaret(kind: String, path: String) throws {
+    // Two distinct, inert AX handles; every focus read/write and text write is injected.
+    func field(_ id: pid_t) -> ActionElement {
+        ActionElement(element: AXUIElementCreateApplication(id), bounds: CGRect(x: 10, y: 10, width: 30, height: 20),
+                      role: "AXTextField", subrole: nil, actions: [])
+    }
+    let a = field(11), b = field(12)
+    let context = DispatchContext(guardValue: path == "background" ? inputDispatcherBackgroundGuard() : inputDispatcherForegroundGuard())
+    var caret = a, focusWrites: [String] = []
+    let writer = InputDispatcherTextWriter()
+    let performer = SystemActionPerformer(state: { ActionTargetState(pid: 11, windowID: 22, bounds: context.guardValue.bounds, axIdentity: 33) },
+        lookup: { ref, _ in ref == "B" ? b : nil }, selectedTextWriter: writer,
+        keyboardTargetValidation: { field in #expect(field.identityToken == b.identityToken) },
+        focusedKeyboard: { _ in caret }, focusAcquisition: { _, requested in
+            focusWrites.append(requested.identityToken); caret = requested; return caret
+        })
+    let dispatcher = InputDispatcher(performer: performer, application: inputDispatcherApplication,
+        syntheticPolicy: inputDispatcherSyntheticPolicy(), backgroundTextInputSafety: InputDispatcherTextSafety(.safeASCIIKeyboardLayout))
+    let actions: [NativeAction] = [kind == "type" ? .type(text: "hello", elementRef: "B") : .keypress(key: "a", modifiers: ["command"], elementRef: "B")]
+    if path == "background" {
+        // `auto` can now request foreground approval; the background probe itself must not acquire B.
+        #expect(throws: InputDispatchError.backgroundActionUnsupported) { try dispatcher.plan(actions: actions, context: context) }
+    } else {
+        let plan = try path == "draft" ? dispatcher.planFragmentDraft(actions: actions, context: context) : dispatcher.plan(actions: actions, context: context)
+        #expect(plan.requiresTakeover && plan.cooperativeError == nil)
+        #expect(focusWrites.isEmpty && caret.identityToken == a.identityToken)
+        let authority = foregroundConsumptionAuthority(plan: plan, context: context, actions: actions)
+        if path == "approved" {
+            var leaseChecks = 0
+            let entries = try dispatcher.consumeForegroundPlan(plan, authority: authority, validateFocusMutation: { leaseChecks += 1 })
+            #expect(leaseChecks > 0 && entries.first?.targetKeyboardFocus?.identityToken == b.identityToken)
+        } else if path == "stopped" {
+            #expect(throws: ActionExecutionError.actionTimeout) { try dispatcher.consumeForegroundPlan(plan, authority: authority,
+                validateFocusMutation: { throw ActionExecutionError.actionTimeout }) }
+        } else {
+            dispatcher.invalidatePlans() // denial / abandoned fragment, no execution
+        }
+    }
+    #expect(focusWrites == (path == "approved" ? [b.identityToken] : []))
+    #expect(caret.identityToken == (path == "approved" ? b.identityToken : a.identityToken))
+    #expect(writer.writeCalls == 0)
+}
+
 @Test func backgroundAXSelectedTextRequiresExactFocusAtPlanningAndBeforeMutation() throws {
     let target = AXUIElementCreateApplication(11)
     let other = AXUIElementCreateApplication(12)
@@ -1351,7 +1395,7 @@ func statefulAXPressEffectVerifiesAnyBoundedValueChange(role: String) throws {
     )
     let context = DispatchContext(guardValue: inputDispatcherBackgroundGuard())
 
-    #expect(throws: ActionExecutionError.inputFocusRequired) {
+    #expect(throws: InputDispatchError.backgroundActionUnsupported) {
         _ = try planningDispatcher.plan(
             actions: [.type(text: "must-not-write", elementRef: "text")],
             context: context
@@ -2848,8 +2892,8 @@ func namedKeyboardPlanRetainsIdentityAcrossPreActivationFailure(kind: String) th
         "compat-approved blind type defers focus to the OS focus after activation"
     )
 
-    // 后台请求没有"激活必然先于投递"这个前提 ⇒ 不许降级，照旧当场抛出（旧行为一字不改）。
-    #expect(throws: ActionExecutionError.inputFocusRequired) {
+    // Background cannot acquire; signal a possible foreground replan, not an executable background action.
+    #expect(throws: InputDispatchError.backgroundActionUnsupported) {
         _ = try dispatcher.plan(
             actions: [.type(text: "marker", elementRef: "text")],
             context: DispatchContext(guardValue: ActionGuard(

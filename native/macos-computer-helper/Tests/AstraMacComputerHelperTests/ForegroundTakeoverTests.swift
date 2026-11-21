@@ -2281,7 +2281,7 @@ private func runReplacementForegroundCase(_ scenario: String) throws -> (
     }, lookup: { _, _ in current },
         selectedTextWriter: SystemAXSelectedTextWriter(isSettable: { _ in (.success, true) },
             setValue: { _, _ in fallbacks += 1; return .success }),
-        textValueReplacer: writer, replacementTargetValidation: validate,
+        textValueReplacer: writer, keyboardTargetValidation: validate,
         focusedKeyboard: { _ in current }, focusAcquisition: { _, _ in
             if activity.paused { focusWritesWhilePaused += 1 }
             return current

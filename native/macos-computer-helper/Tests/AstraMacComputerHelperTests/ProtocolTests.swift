@@ -409,6 +409,36 @@ import Testing
     #expect(windows.fragmentPlans.count == 2)
 }
 
+@Test func readOnlyFocusPlanAcceptsMarkedAndLegacyVariants() {
+    let windows = CooperativeProtocolWindows()
+    let dispatcher = Dispatcher(permissions: StaticPermissions(accessibilityTrusted: true, screenRecordingAllowed: true), windows: windows)
+    let hash = String(repeating: "a", count: 64)
+    let hashes = #","fragment_hash":"\#(hash)","stage_hash":"\#(hash)""#
+    let stages = ["", hashes + #","stage_index":0"#, hashes + #","stage_index":1,"takeover_ref":"takeover""#]
+    for stage in stages {
+        for marker in ["", #","require_read_only_focus":true"#] {
+            let response = dispatcher.handle(
+                #"{"protocol_version":4,"request_id":"plan","operation":"plan_actions","payload":{"interaction_mode":"foreground_takeover","snapshot_id":"snap","actions":[{"type":"keypress","element_ref":"field","key":"tab"}]\#(stage)\#(marker)}}"#
+            )
+            #expect(response.ok)
+        }
+    }
+    #expect(windows.planCalls == 6)
+}
+
+@Test func readOnlyFocusPlanRejectsInvalidMarkersBeforeWindowObserver() {
+    let windows = CooperativeProtocolWindows()
+    let dispatcher = Dispatcher(permissions: StaticPermissions(accessibilityTrusted: true, screenRecordingAllowed: true), windows: windows)
+    for token in ["false", "1", #""true""#, "null", #"true,"unexpected":true"#, #"true,"stage_index":0"#] {
+        let response = dispatcher.handle(
+            #"{"protocol_version":4,"request_id":"plan","operation":"plan_actions","payload":{"interaction_mode":"background","snapshot_id":"snap","actions":[{"type":"type","element_ref":"field","text":"text"}],"require_read_only_focus":\#(token)}}"#
+        )
+        #expect(!response.ok)
+        #expect(response.error?.code == "protocol_mismatch")
+    }
+    #expect(windows.planCalls == 0)
+}
+
 @Test func protocolV4TakeoverBeginCarriesCompleteBoundedDeclaration() {
     let windows = CooperativeProtocolWindows()
     let dispatcher = Dispatcher(

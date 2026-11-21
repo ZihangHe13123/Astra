@@ -39,6 +39,7 @@ from agent.runtime.computer_backend import (
     ComputerTarget,
 )
 from agent.runtime.computer_protocol import (
+    ComputerAction,
     ComputerError,
     ComputerErrorCode,
     ComputerInteractionMode,
@@ -53,6 +54,7 @@ from agent.runtime.computer_protocol import (
     FragmentStageCommit,
     FragmentStageCommitResult,
     TakeoverRestoration,
+    encode_request,
 )
 from agent.runtime.macos_computer import (
     ComputerRequest,
@@ -4981,6 +4983,90 @@ def test_mac_backend_uses_only_v2_select_plan_and_mode_aware_act_payloads():
     }
     assert all(request.operation != "focus" for request in transport.requests)
     assert all("app_ref" not in request.payload for request in transport.requests[1:])
+
+
+_OLD_PLAN_FRAME_ERROR = ComputerError(
+    ComputerErrorCode.PROTOCOL_MISMATCH, "plan_actions has an invalid cooperative payload",
+)
+
+
+@pytest.mark.parametrize(("actions", "mode", "stage_index"), [
+    pytest.param([{"type": "type", "text": "private", "element_ref": "field"}],
+                 "background", None, id="ordinary-type"),
+    pytest.param([{"type": "click", "element_ref": "button"},
+                  ComputerAction(type="keypress", key="tab", element_ref="field")],
+                 "foreground_takeover", None, id="mixed-keypress"),
+    pytest.param([{"type": "type", "text": "private", "replace": True, "element_ref": "field"}],
+                 "foreground_takeover", 0, id="initial-fragment"),
+    pytest.param([{"type": "keypress", "key": "return", "element_ref": "field"}],
+                 "foreground_takeover", 1, id="continuing-fragment"),
+])
+def test_read_only_focus_guard_stops_old_v4_before_window_observer(actions, mode, stage_index):
+    legacy_payload = {
+        "interaction_mode": mode, "snapshot_id": "snap",
+        "actions": [a.to_mapping() if isinstance(a, ComputerAction) else a for a in actions],
+    }
+    fragment = None
+    if stage_index is not None:
+        fragment = ForegroundFragmentPlanRequest.stage(
+            FragmentStageAuthority("a" * 64, stage_index, "b" * 64, "snap"),
+            "takeover" if stage_index else None,
+        )
+        legacy_payload.update(fragment.to_wire_fields())
+    frames = []
+
+    async def strict_v4_request(req):
+        frame = json.loads(encode_request(req))
+        frames.append(frame)
+        if frame["payload"].keys() == legacy_payload.keys():
+            pytest.fail("field-bound plan reached the mock old v4 window observer")
+        return ComputerResponse(req.request_id, ok=False, error=_OLD_PLAN_FRAME_ERROR)
+
+    backend = MacComputerBackend(SimpleNamespace(request=strict_v4_request))
+    with pytest.raises(HelperApplicationError) as failure:
+        run(backend.plan_actions(ComputerTarget("app", "win"), "snap", actions,
+                                 ComputerInteractionMode(mode), fragment=fragment))
+
+    assert [frame["operation"] for frame in frames] == ["plan_actions"]
+    assert frames[0]["protocol_version"] == 4
+    assert frames[0]["payload"] == {**legacy_payload, "require_read_only_focus": True}
+    assert frames[0]["payload"]["require_read_only_focus"] is True
+    assert failure.value.error.code is ComputerErrorCode.PROTOCOL_MISMATCH
+    message = failure.value.error.message.lower()
+    assert "update" in message and "helper" in message and "private" not in message
+
+
+@pytest.mark.parametrize(("bound", "error", "extras"), [
+    pytest.param(False, _OLD_PLAN_FRAME_ERROR, {}, id="pointer-and-unnamed-keyboard"),
+    pytest.param(True, ComputerError(ComputerErrorCode.PROTOCOL_MISMATCH,
+                                     _OLD_PLAN_FRAME_ERROR.message + ": other"), {}, id="other-message"),
+    pytest.param(True, ComputerError(ComputerErrorCode.INPUT_FOCUS_REQUIRED,
+                                     _OLD_PLAN_FRAME_ERROR.message), {}, id="other-code"),
+    pytest.param(True, _OLD_PLAN_FRAME_ERROR, {"result": {}}, id="with-result"),
+    pytest.param(True, _OLD_PLAN_FRAME_ERROR, {"snapshot": ComputerSnapshot("unexpected")}, id="with-snapshot"),
+])
+def test_read_only_focus_rejection_preserves_other_helper_errors(bound, error, extras):
+    actions = [{"type": "click", "element_ref": "button"}, {"type": "type", "text": "text"},
+               {"type": "keypress", "key": "tab"}]
+    if bound:
+        actions[-1]["element_ref"] = "field"
+    frames = []
+
+    async def request(req):
+        frames.append(json.loads(encode_request(req)))
+        return ComputerResponse(req.request_id, ok=False, error=error, **extras)
+
+    backend = MacComputerBackend(SimpleNamespace(request=request))
+    with pytest.raises(HelperApplicationError) as failure:
+        run(backend.plan_actions(ComputerTarget("app", "win"), "snap", actions, ComputerInteractionMode.BACKGROUND))
+
+    assert failure.value.error == error
+    assert failure.value.result == extras.get("result")
+    assert [frame["operation"] for frame in frames] == ["plan_actions"]
+    assert frames[0]["payload"] == {
+        "snapshot_id": "snap", "actions": actions, "interaction_mode": "background",
+        **({"require_read_only_focus": True} if bound else {}),
+    }
 
 
 def test_well_formed_helper_application_error_preserves_bounded_typed_code():

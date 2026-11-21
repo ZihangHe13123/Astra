@@ -1595,6 +1595,10 @@ def _validate_cooperative_request_payload(operation: str, payload: Mapping[str, 
     if operation == "plan_actions":
         mode = _validate_interaction_mode(payload.get("interaction_mode"))
         required = {"interaction_mode", "snapshot_id", "actions"}
+        if "require_read_only_focus" in payload:
+            if payload["require_read_only_focus"] is not True:
+                raise ValueError("require_read_only_focus must be true when present")
+            required.add("require_read_only_focus")
         fragment = payload.get("fragment")
         if fragment is not None:
             required.add("fragment")

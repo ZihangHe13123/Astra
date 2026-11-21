@@ -1088,6 +1088,8 @@ final class Dispatcher {
     ) -> Bool {
         guard case let .object(values) = payload else { return false }
         var keys: Set<String> = ["interaction_mode", "snapshot_id", "actions"]
+        // Planning is read-only even for older clients that omit this marker.
+        if values["require_read_only_focus"] == .bool(true) { keys.insert("require_read_only_focus") }
         if let request = fragment.value {
             keys.formUnion(["fragment_hash", "stage_index", "stage_hash"])
             if request.takeoverRef != nil { keys.insert("takeover_ref") }

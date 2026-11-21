@@ -30,7 +30,7 @@ import Testing
         let performer = SystemActionPerformer(state: {
             ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100), axIdentity: 33)
         }, lookup: { _, _ in target }, textValueReplacer: writer,
-        replacementTargetValidation: { current in #expect(CFEqual(current.element!, element)) },
+        keyboardTargetValidation: { current in #expect(CFEqual(current.element!, element)) },
         focusedKeyboard: { _ in target })
         let result = try performer.performReplacement(ResolvedAction(source: action, method: .accessibilityText,
             screenPoint: nil, endScreenPoint: nil, element: element, verifiedElement: target), validateMutation: {})
@@ -57,7 +57,7 @@ import Testing
     let performer = SystemActionPerformer(state: {
         ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100), axIdentity: 33)
     }, lookup: { _, _ in target }, textValueReplacer: writer,
-        replacementTargetValidation: { _ in }, focusedKeyboard: { _ in target })
+        keyboardTargetValidation: { _ in }, focusedKeyboard: { _ in target })
     do {
         _ = try performer.perform(ResolvedAction(source: source, method: .accessibilityText,
             screenPoint: nil, endScreenPoint: nil, element: ax, verifiedElement: target))
@@ -133,7 +133,7 @@ import Testing
         SystemActionPerformer(state: {
             ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100), axIdentity: 33)
         }, lookup: { _, _ in target }, textValueReplacer: ReplacementValueWriterSpy(verification: .verified),
-        replacementTargetValidation: { _ in }, focusedKeyboard: { _ in target },
+        keyboardTargetValidation: { _ in }, focusedKeyboard: { _ in target },
         keyboardOnlyTextProcess: { $0 == 11 && chromium })
     }
     #expect(performer(chromium: true).preflightAXTextReplacement(target) == .unsupported)

@@ -760,12 +760,34 @@ class MacComputerBackend:
             "snapshot_id": snapshot_id,
             "actions": serialized,
         }
+        require_read_only_focus = any(
+            action["type"] in {"type", "keypress"} and "element_ref" in action
+            for action in serialized
+        )
+        if require_read_only_focus:
+            # Older strict v4 helpers reject this key before their planner can
+            # set AXFocused. Never send these plans without the requirement.
+            payload["require_read_only_focus"] = True
         if fragment is not None:
             payload["fragment"] = fragment
         response = await self._request(
             "plan_actions",
             payload,
         )
+        if (
+            require_read_only_focus
+            and not response.ok
+            and response.result is None
+            and response.snapshot is None
+            and response.error is not None
+            and response.error.code is ComputerErrorCode.PROTOCOL_MISMATCH
+            and response.error.message == "plan_actions has an invalid cooperative payload"
+        ):
+            raise HelperApplicationError(ComputerError(
+                ComputerErrorCode.PROTOCOL_MISMATCH,
+                "The helper rejected read-only focus planning. Update the macOS Computer Use helper "
+                "before planning field-bound keyboard input.",
+            ))
         if (
             interaction_mode is ComputerInteractionMode.BACKGROUND
             and not response.ok

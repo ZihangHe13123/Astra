@@ -134,6 +134,25 @@ def test_get_app_state_bounded_native_errors_decode_as_distinct_codes(code):
     assert response.error.code.value == code
 
 
+@pytest.mark.parametrize("fields", [{}, {"require_read_only_focus": True}])
+def test_read_only_focus_plan_marker_is_optional(fields):
+    payload = {"snapshot_id": "snap", "interaction_mode": "background",
+               "actions": [{"type": "type", "text": "text", "element_ref": "field"}], **fields}
+    assert json.loads(encode_request(ComputerRequest("plan", "plan_actions", payload)))["payload"] == payload
+
+
+@pytest.mark.parametrize("fields", [
+    {"require_read_only_focus": False}, {"require_read_only_focus": 1},
+    {"require_read_only_focus": "true"}, {"require_read_only_focus": None},
+    {"require_read_only_focus": True, "unexpected": True},
+])
+def test_read_only_focus_plan_marker_does_not_relax_exact_shape(fields):
+    with pytest.raises(ValueError):
+        ComputerRequest("plan", "plan_actions", {
+            "snapshot_id": "snap", "interaction_mode": "background", "actions": [], **fields,
+        })
+
+
 def test_protocol_v4_round_trips_strict_fragment_plan_stage_and_commit_payloads():
     requirement = ForegroundFragmentActionRequirement(
         backend="pid_pointer",
