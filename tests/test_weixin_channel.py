@@ -933,7 +933,7 @@ def test_a_cached_channel_client_changed_in_place_is_built_again(tmp_path, monke
     monkeypatch.setenv("ASTRA_CHANNEL_CONFIG", str(path))
     path.write_text(json.dumps({"weixin": {"model": entry.key, "reasoning_effort": "max"}}), encoding="utf-8")
     catalog = SimpleNamespace(resolve=lambda key: entry if key == entry.key else None, resolve_persisted=lambda key: None)
-    models = ChannelModels(lambda: catalog, lambda: "unit::window-model", current_effort=lambda: "low")  # type: ignore[arg-type,return-value]
+    models = ChannelModels(lambda: catalog, lambda: "unit::window-model")  # type: ignore[arg-type,return-value]
 
     first = models.client("weixin")
     assert first is not None and first.config.reasoning_effort == "max"

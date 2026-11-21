@@ -6,6 +6,9 @@ chosen with ``/model`` and the effort last chosen with ``/mode`` in any window, 
 started earlier (the desktop's channel host) still follows a later choice. All are read for each message; a
 change applies to the next one without a restart. A model that is gone or lacks its key falls back to the
 window's model, still at the channel's effort, with a warning in the log.
+
+A channel turn answers with a client of its own, never the window's: /model and /mode change the window's
+client in place, and a turn keeps the client it started with through all its tool steps.
 """
 
 from __future__ import annotations
@@ -52,14 +55,12 @@ def client_for(entry: CatalogEntry, effort: str | None = None) -> LLMClient:
 
 class ChannelModels:
     def __init__(self, catalog: Callable[[], ModelCatalog], current: Callable[[], str] = lambda: "",
-                 channels: Callable[[], ChannelManager | None] = lambda: None,
-                 current_effort: Callable[[], str] = read_reasoning_effort) -> None:
+                 channels: Callable[[], ChannelManager | None] = lambda: None) -> None:
         self._catalog = catalog
         # The backend's channels: a running WeChat channel's own settings say which model it answers with.
         self._channels = channels
-        # The catalog key of the model this backend answers its window with, and that client's effort.
+        # The catalog key of the model this backend answers its window with.
         self._current = current
-        self._current_effort = current_effort
         self._clients: dict[tuple[str, str], tuple[CatalogEntry, LLMClient]] = {}
         # WeChat's settings last read from channels.json, kept while the file cannot be read.
         self._saved: WeixinConfig | None = None
@@ -125,12 +126,11 @@ class ChannelModels:
         return None
 
     def client(self, channel: str) -> LLMClient | None:
-        """The channel's client, or None to answer with the window's own. A model that cannot be used gives way
-        to the window's model, which still thinks at the channel's effort."""
+        """The client of the channel's next turn, its own even on the window's model and effort, so nothing the
+        window does reaches a turn under way. A model that cannot be used gives way to the window's model, which
+        still thinks at the channel's effort. None only when no model in the catalog can answer."""
         effort = self.effort(channel)
         for entry in self._candidates(channel):
-            if entry.key == self._current() and effort == self._current_effort():
-                return None
             try:
                 return self._client(entry, effort)
             except ValueError as exc:

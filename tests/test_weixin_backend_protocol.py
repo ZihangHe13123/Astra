@@ -390,10 +390,12 @@ def test_weixin_answers_with_its_own_model_and_follows_the_default_again(tmp_pat
 
 
 class EffortRecordingHandler(ModelHandler):
-    """Each conversation request's model and reasoning effort, with the last thing the person said in it. A
-    request whose words contain ``hold`` waits, once recorded, for ``release`` (``held`` says it came)."""
-    requests: list[tuple[str, str, str]] = []
+    """Each conversation request's model and reasoning effort, with the last thing the person said in it and
+    whether a tool result came before. A request whose words contain ``hold`` waits, once recorded, for
+    ``release`` (``held`` says it came); a turn whose words contain ``tool_turn`` first calls a tool."""
+    requests: list[tuple[str, str, str, bool]] = []
     hold = ""
+    tool_turn = ""
     held = threading.Event()
     release = threading.Event()
 
@@ -406,13 +408,29 @@ class EffortRecordingHandler(ModelHandler):
             content = said[-1].get("content", "") if said else ""
             text = content if isinstance(content, str) else " ".join(
                 str(part.get("text", "")) for part in content if isinstance(part, dict))
-            type(self).requests.append((text, str(payload.get("model")), str(payload.get("reasoning_effort", ""))))
+            after_tool = any(message.get("role") == "tool" for message in payload["messages"])
+            type(self).requests.append((text, str(payload.get("model")), str(payload.get("reasoning_effort", "")),
+                                        after_tool))
             if type(self).hold and type(self).hold in text:
                 type(self).held.set()
                 type(self).release.wait(30)
+            if (type(self).tool_turn and type(self).tool_turn in text and not after_tool
+                    and payload.get("stream") and payload.get("tools")):
+                self._call_a_tool()
+                return
         self.rfile = io.BytesIO(body)
         self.headers.replace_header("Content-Length", str(len(body)))
         super().do_POST()
+
+    def _call_a_tool(self) -> None:
+        call = {"index": 0, "id": "call-tool_search", "type": "function",
+                "function": {"name": "tool_search", "arguments": json.dumps({"query": "time"})}}
+        chunk = {"id": "fixture", "object": "chat.completion.chunk", "model": "fixture",
+                 "choices": [{"index": 0, "delta": {"content": "", "tool_calls": [call]}, "finish_reason": "tool_calls"}]}
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.end_headers()
+        self.wfile.write(("data: " + json.dumps(chunk) + "\n\ndata: [DONE]\n\n").encode())
 
 
 class EffortBackend:
@@ -420,7 +438,7 @@ class EffortBackend:
     each request shows it), WeChat on a local iLink, and what the tests below do with them."""
 
     def __init__(self, tmp_path, *, models: tuple[tuple[str, str], ...] = (("deepseek-v4-fixture", ""),)):
-        EffortRecordingHandler.requests, EffortRecordingHandler.hold = [], ""
+        EffortRecordingHandler.requests, EffortRecordingHandler.hold, EffortRecordingHandler.tool_turn = [], "", ""
         EffortRecordingHandler.held, EffortRecordingHandler.release = threading.Event(), threading.Event()
         self.model = ThreadingHTTPServer(("127.0.0.1", 0), EffortRecordingHandler)
         threading.Thread(target=self.model.serve_forever, daemon=True).start()
@@ -472,7 +490,11 @@ class EffortBackend:
 
     def seen(self, text: str) -> set[tuple[str, str]]:
         """The model and effort of each request made for the turn that said ``text``."""
-        return {(model, effort) for said, model, effort in EffortRecordingHandler.requests if text in said}
+        return {(model, effort) for said, model, effort, _ in EffortRecordingHandler.requests if text in said}
+
+    def steps(self, text: str) -> list[tuple[str, str, bool]]:
+        """In order, each request of the turn that said ``text``: model, effort, and whether a tool result came."""
+        return [(model, effort, after) for said, model, effort, after in EffortRecordingHandler.requests if text in said]
 
     def write_wechat(self, text: str) -> int:
         answered = len(self.ilink.replies_to(OWNER))
@@ -566,6 +588,33 @@ def test_a_window_command_during_a_wechat_reply_changes_the_window_and_not_wecha
     finally:
         backend.close()
 
+
+@pytest.mark.parametrize("pinned", [True, False], ids=["wechat-own-settings", "wechat-follows-defaults"])
+def test_a_wechat_reply_keeps_its_client_through_its_tool_steps(tmp_path, pinned):
+    """WeChat and the window start on the same model and effort. While a WeChat reply's first step (a tool call)
+    is under way, the window switches model and effort: the reply's step after the tool goes where its first one
+    went, the window's next turn where the window asked, and the next WeChat message where its settings say."""
+    backend = EffortBackend(tmp_path, models=(("deepseek-v4-fixture", ""), ("deepseek-v4-second", "")))
+    start, switched = ("deepseek-v4-fixture", "low"), ("deepseek-v4-second", "high")
+    try:
+        backend.status(lambda e: True, timeout=30)
+        backend.login()
+        if pinned:
+            backend.answer("/weixin model deepseek-v4-fixture")
+            backend.answer("/weixin effort low")
+        EffortRecordingHandler.tool_turn = EffortRecordingHandler.hold = "查一下工具"
+        answered = backend.write_wechat("查一下工具")
+        assert EffortRecordingHandler.held.wait(30), "the WeChat reply's first step is under way"
+        assert "deepseek-v4-second" in backend.result("/model deepseek-v4-second")["output"]
+        assert backend.result("/mode high")["output"].startswith("Reasoning effort: high\n")
+        EffortRecordingHandler.release.set()
+        backend.wait_reply(answered)
+
+        assert backend.steps("查一下工具") == [(*start, False), (*start, True)]
+        assert backend.window("窗口换过了") == {switched}
+        assert backend.ask("下一条") == {start if pinned else switched}
+    finally:
+        backend.close()
 
 def test_a_wechat_model_without_its_key_gives_way_to_the_window_s_at_wechat_s_effort(tmp_path):
     backend = EffortBackend(tmp_path, models=(("deepseek-v4-fixture", ""),
