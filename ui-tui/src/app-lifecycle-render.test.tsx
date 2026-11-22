@@ -1082,6 +1082,23 @@ test("an ambiguous late string offers an explicit reset, never a grant from its 
   } finally { h.app.unmount(); }
 });
 
+for (const chunks of [["]", ";", "\r"], ["];", "\r"], ["];\r"]]) {
+  test(`Composer code: delivered Escape preserves ]; and Enter in ${chunks.length} read(s) and the next card's controls`, async () => {
+    const h = await setup(), { ask, answers } = kittyReview(h);
+    try {
+      await h.key("const ids = [1"); readNow(h, "\x1b"); await new Promise(resolve => setTimeout(resolve, 65));
+      readNow(h, ...chunks); await settle();
+      assert.deepEqual(h.child.commands.filter(c => c.type === "message").map(c => c.text), ["const ids = [1];"]);
+      h.child.event({ type: "task_started", task: { id: "running", status: "running" } }); await ask("B", false);
+      assert.match(h.frame(), /Ctrl\+X/); await h.key("\x03");
+      assert.equal(h.child.commands.filter(c => c.cmd === "/cancel").length, 1);
+      await h.key("y"); assert.deepEqual(answers(), []); await h.key("n"); assert.deepEqual(answers(), [["B", "deny"]]);
+      await ask("C", false); await h.key("\x18y"); assert.equal(answers().length, 1);
+      await h.key("y"); assert.deepEqual(answers().at(-1), ["C", "once"]);
+    } finally { h.app.unmount(); }
+  });
+}
+
 test("Delivered Escape input: the first independent N or Ctrl+C on a long-visible B still works", async () => {
   for (const key of ["n", "\x03"]) {
     const h = await setup(), { ask, answers } = kittyReview(h);

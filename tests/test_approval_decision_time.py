@@ -5,6 +5,7 @@ import ctypes
 import json
 import logging
 import os
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -128,6 +129,75 @@ def test_live_decision_precedes_scheduling_database_and_audit_and_never_leaks(tm
         assert type(public_decision) is str and public_decision == choice
     encoded = json.dumps([public, audit_events, row.public()])
     assert "decided_at" not in encoded and "frontmost_pid" not in encoded and "27182818" not in encoded
+
+
+@pytest.mark.parametrize(("source", "choice", "cancel"), [
+    ("chat", "once", False), ("chat", "deny", False), ("desktop", "once", False),
+    ("timeout", "deny", False), ("chat", "once", True),
+])
+def test_channel_cutoff_closes_voting_not_the_winning_receipt(monkeypatch, source, choice, cancel):
+    clock = Mock(return_value=10.0)
+    monkeypatch.setattr(approval_time, "continuous_now", clock)
+    monkeypatch.setattr(approval_time, "frontmost_pid_now", lambda: 37)
+
+    async def scenario():
+        offered = asyncio.get_running_loop().create_future()
+        saving, publish, closed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        events, notices = [], []
+        inbox = SimpleNamespace(create=Mock(return_value=SimpleNamespace(state="pending")),
+                                resolve=Mock(return_value=None), cancel=Mock())
+
+        class Chat:
+            async def ask_approval(self, _message, _prompt, answer):
+                offered.set_result(answer)
+
+            async def end_approval(self, _owner, notice):
+                notices.append(notice)
+                closed.set()
+
+        async def durable_io(fn, *args, **kwargs):
+            if fn is inbox.resolve:
+                saving.set()
+                await publish.wait()
+            return fn(*args, **kwargs)
+
+        ns = _backend(inbox, durable_io, events.append, channel="weixin", chat=Chat())
+        ns["await_chat_approval"] = partial(await_chat_approval, timeout=0.04)
+        card = {"request_id": "race", "choices": ["once", "deny"], "kind": "computer_foreground_takeover"}
+        waiter = asyncio.create_task(ns["request_tool_approval"](card))
+        answer = await asyncio.wait_for(offered, 1)
+        receipt = ns["pending_tool_approvals"]["race"]
+        if source == "chat":
+            assert answer(choice)
+        elif source == "desktop":
+            assert ns["resolve_tool_approval"]("race", choice)
+        await asyncio.wait_for(saving.wait(), 1)
+        writer = ns["approval_resolutions"]["race"]
+        clock.return_value = 99.0
+        try:
+            # Even a stalled write must not hold the chat slot past the cutoff.
+            await asyncio.wait_for(closed.wait(), 1)
+            assert not answer("once") and not ns["resolve_tool_approval"]("race", "once")
+            assert len(notices) == 1 and bool(notices[0]) == (source == "timeout")
+            if cancel:
+                waiter.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await waiter
+                assert receipt.cancelled()
+        finally:
+            publish.set()
+            await asyncio.wait_for(writer, 1)
+
+        if not cancel:
+            result = await asyncio.wait_for(waiter, 1)
+            assert result is receipt.result() and isinstance(result, approval_time.TimedApprovalDecision)
+            assert result == choice and result.private_decided_at == 10.0
+            assert result.private_frontmost_pid == (37 if choice == "once" else None)
+        inbox.resolve.assert_called_once_with("race", choice)
+        assert [e["decision"] for e in events if e["type"] == "approval_resolved"] == ([] if cancel else [choice])
+        assert not ns["pending_tool_approvals"] and not ns["approval_resolutions"]
+
+    asyncio.run(scenario())
 
 
 def test_plain_handler_is_stamped_on_return_before_audit_not_from_public_data(monkeypatch):

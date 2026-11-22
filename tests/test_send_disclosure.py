@@ -4,6 +4,7 @@ The registry is real; no server exists and the decision sink only refuses calls.
 """
 
 import asyncio
+import json
 from types import SimpleNamespace as NS
 
 import pytest
@@ -34,7 +35,8 @@ def mail_card(tmp_path, arguments, *, name="send_email", yolo=False, risk="write
     if setup:
         setup(registry)
     registry.set_approval_handler(deny)
-    result = asyncio.run(registry.execute(f"mcp__fixture__{name}", arguments))
+    [local] = registry.tool_names  # The registered alias can be escaped or shortened; preflight uses the remote name.
+    result = asyncio.run(registry.execute(local, arguments))
     if invalid:
         assert result.get("not_executed") and not cards
         return result
@@ -124,3 +126,108 @@ def test_replay_cannot_offer_a_positive_choice_for_a_withheld_or_clipped_copy(va
 def test_a_malformed_or_absent_once_offer_does_not_widen_in_replay(offer):
     replay = safe_replay_event({"type": "tool_approval_request", "draft": {"text": "words"}, "choices": offer})
     assert replay and replay["choices"] == ["deny"]
+
+
+REPLY_ROUTE = "repos/owner/repo/pulls/pull_number/comments/comment_id/replies.post"
+
+
+@pytest.mark.parametrize("name", [REPLY_ROUTE, REPLY_ROUTE + ".v2", "repos/{owner}/{repo}/comments/{comment_id}/replies.POST",
+                                  "POST /repos/{owner}/{repo}/comments/{comment_id}/replies", "github.comments.createReply",
+                                  "create_pull_request_review_comment", "chat.postMessage"])
+def test_message_operations_disclose_text_and_exact_thread_on_the_registered_card(tmp_path, name):
+    position = {"owner": "team", "repo": "review", "pull_number": 37, "comment_id": 910}
+    card = mail_card(tmp_path, {**position, "body": "Reply line 1\nReply line 2"}, name=name)
+    assert card.get("consequential") in {"send", "publish"}
+    draft = card["draft"]
+    assert draft["text"] == "Reply line 1\nReply line 2" and draft["via"] == f"fixture/{name}"
+    assert json.loads(draft["destination"]) == position  # Keep the thread separate from To/Cc/Bcc and the tool name.
+    assert card["choices"] == ["once", "deny"] and card["yolo_bypass_allowed"] is False
+    assert safe_replay_event({**card, "type": "tool_approval_request"})["draft"] == draft
+
+
+@pytest.mark.parametrize("name", ["repos/owner/repo/comments/comment_id/replies.get", "GET /comments/{comment_id}/replies",
+                                  "comments.list", "post.get", "chat.getPost", "get_pull_request_review_comments",
+                                  "search_posts", "search.post", "POST /comments/search", "create_email_draft",
+                                  "update_message_status", "comments.reactions.create", "add_comment_reaction",
+                                  "POST /email-drafts", "messages/{id}/post-reactions.post"])
+def test_read_search_and_draft_creation_are_not_message_sends(tmp_path, name):
+    card = mail_card(tmp_path, {"query": "fixture"}, name=name)
+    assert "draft" not in card and not card.get("consequential")  # Still subject to ordinary MCP policy.
+
+
+@pytest.mark.parametrize("name,args", [
+    ("upload_file", {"file_uri": "file:///fixture/report.pdf"}),
+    ("files.upload", {"fileId": "fixture", "overwrite": False, "content_type": "application/pdf"}),
+    ("merge_pull_request", {"owner": "acme", "repo": "docs", "pull_number": 27}),
+    ("mergePullRequest", {"repository": "acme/docs", "number": 27, "merge_method": "squash"}),
+    ("upload_file", {"folder_id": "fixture", "file_uri": "file:///fixture/report", "overwrite": False}),
+    ("repos/{owner}/{repo}/pulls/{pull_number}/merge.put", {"owner": "acme", "repo": "docs", "pull_number": 27}),
+    ("repos/{owner}/{repo}/pulls/{pull_number}/merge.put", {"path": {"owner": "acme", "repo": "docs", "pull_number": 27},
+                                                          "requestBody": {"merge_method": "squash"}}),
+])
+def test_artifacts_keep_their_own_approval_regardless_of_reference_spelling(tmp_path, name, args):
+    card = mail_card(tmp_path, args, name=name)
+    assert "draft" not in card and card.get("choices") == ["once", "deny"]
+    assert card["consequential"] in {"send", "publish"} and card["target"] == f"fixture/{name}"
+    for key, value in args.items():
+        assert card["arguments"][key] == str(value)
+
+
+@pytest.mark.parametrize("name,args", [(REPLY_ROUTE, {"owner": "a", "repo": "b", "comment_id": 3}),
+    (REPLY_ROUTE, {"body": "shown", "comment_id": {"internal": "not a scalar reference"}}),
+    (REPLY_ROUTE, {"body": "shown", "bcc": {"group": "opaque"}}),
+    ("upload_file", {"file_uri": "file:///fixture/file", "envelope": {"body": "a separate message"}}),
+    ("send_file", {"file_uri": "file:///fixture/report", "to_address_id": "side-address", "body_ref": "other-body"}),
+    ("post_message", {"file_uri": "file:///fixture/file"})])
+def test_partial_or_mixed_messages_do_not_become_artifact_approvals(tmp_path, name, args):
+    card = mail_card(tmp_path, args, name=name)
+    assert card.get("choices") == ["deny"] and card["draft"]["truncated"] is True
+
+
+def test_openapi_path_and_request_body_are_projected_without_ignoring_siblings(tmp_path):
+    path = {"owner": "team", "repo": "repo", "comment_id": 8}
+    args = {"path": path, "requestBody": {"body": "text", "cc": ["copy@example.invalid"]}}
+    card = mail_card(tmp_path, args, name=REPLY_ROUTE)
+    assert card["choices"] == ["once", "deny"] and json.loads(card["draft"]["destination"]) == path
+    assert card["draft"]["cc"] == "copy@example.invalid" and card["draft"]["text"] == "text"
+    for changes in ({"comment_id": 9}, {"body": "another body"}, {"headers": {"X-Private": "fixture"}},
+                    {"requestBody": {"body": "text", "unrepresentable": {"address": "elsewhere"}}}):
+        partial = mail_card(tmp_path, {**args, **changes}, name=REPLY_ROUTE)
+        assert partial["choices"] == ["deny"] and partial["draft"]["truncated"] is True
+
+
+def test_message_route_is_not_a_replayable_read_even_if_locally_mislabelled(tmp_path):
+    card = mail_card(tmp_path, {"body": "review only"}, name=REPLY_ROUTE, risk="read", mode="locked")
+    assert card.get("risk") == "write" and card["draft"]["text"] == "review only"
+    assert card["choices"] == ["once", "deny"] and card["yolo_bypass_allowed"] is False
+
+
+def test_reply_destination_cannot_be_silently_replaced_by_a_malformed_binding():
+    from agent.cli.computer_commands import approval_choices
+    from agent.channels.approvals import approval_prompt
+
+    base = {"choices": ["once", "deny"], "draft": {"text": "hello", "destination": '{"comment_id":17}'}}
+    assert '目标位置：{"comment_id":17}' in approval_prompt(base, 30)
+    for value in ["{}", "[]", '{"comment_id":true}', '{"repo":{}}', "not json"]:
+        assert approval_choices({**base, "draft": {"text": "hello", "destination": value}}) == ["deny"]
+
+
+@pytest.mark.parametrize("name,args", [
+    ("send_sms", {"number": "12345", "message": "hello"}),
+    ("chat.postMessage", {"channel": "team", "message": "hello"}),
+    ("fixture_post_message", {"channel": "team", "message": "hello"}),
+])
+def test_existing_recipient_and_body_aliases_are_not_relabelled_as_thread_ids(tmp_path, name, args):
+    card = mail_card(tmp_path, args, name=name)
+    assert card["choices"] == ["once", "deny"]
+    assert card["draft"] == {"to": args.get("channel", args.get("number")), "text": "hello", "via": "fixture/" + name}
+
+
+@pytest.mark.parametrize("number", [37, "0037"])
+def test_explicit_path_binding_wins_over_ambiguous_mail_alias_only_in_its_own_location(tmp_path, number):
+    name = "repos/{repo}/issues/{number}/comments.post"
+    for args in ({"repo": "paper", "number": number, "body": "reply"},
+                 {"path": {"repo": "paper", "number": number}, "requestBody": {"body": "reply"}}):
+        card = mail_card(tmp_path, args, name=name)
+        assert card["choices"] == ["once", "deny"] and "to" not in card["draft"]
+        assert json.loads(card["draft"]["destination"]) == {"repo": "paper", "number": number}

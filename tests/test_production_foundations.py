@@ -786,6 +786,14 @@ _VALID_TOOL_NAME = re.compile(r"[a-zA-Z0-9_-]{1,64}")
 _LONG_REMOTE_TOOL = "repos/owner/repo/pulls/pull_number/comments/comment_id/replies.post"
 
 
+def _listing_tool(name):
+    """Namespace fixtures call the remote's declared operation: a reply gets a body, a lookup a query."""
+    tool = FakeRemoteTool(name=name)
+    if name in {_LONG_REMOTE_TOOL, _LONG_REMOTE_TOOL + ".v2", "create_pull_request_review_comment"}:
+        tool.inputSchema = {"type": "object", "properties": {"body": {"type": "string"}}, "required": ["body"]}
+    return tool
+
+
 class _ListedSession:
     """A connected server: it lists its tools and records which one each call reached."""
 
@@ -821,7 +829,8 @@ def _reached(registry, session, names=None):
     reached = {}
     for local in names if names is not None else registry.tool_names:
         before = len(session.calls)
-        result = run(registry.execute(local, {"query": "hello"}))
+        field = "body" if "body" in registry.get(local).parameters.get("properties", {}) else "query"
+        result = run(registry.execute(local, {field: "hello"}))
         assert result["error"] == "" and len(session.calls) == before + 1, result
         reached[session.calls[-1]] = local
     return reached
@@ -841,7 +850,7 @@ def _reached(registry, session, names=None):
 def test_mcp_ordinary_tool_names_stay_as_they_were(tmp_path, server, tool, name):
     # Saved conversations and user allowlists hold these names. This holds before and
     # after names became bounded: nothing about an ordinary tool changed.
-    manager, registry, session = _mcp_listing(tmp_path, server, [FakeRemoteTool(name=tool)])
+    manager, registry, session = _mcp_listing(tmp_path, server, [_listing_tool(tool)])
 
     assert registry.tool_names == [name]
     assert mcp_tool_name(server, tool) == name
@@ -852,7 +861,7 @@ def test_mcp_ordinary_tool_names_stay_as_they_were(tmp_path, server, tool, name)
 
 def test_mcp_long_tool_name_is_shortened_to_the_same_valid_name_every_time(tmp_path):
     sibling = _LONG_REMOTE_TOOL + ".v2"
-    tools = [FakeRemoteTool(name=_LONG_REMOTE_TOOL), FakeRemoteTool(name=sibling), FakeRemoteTool(name="ping")]
+    tools = [_listing_tool(name) for name in (_LONG_REMOTE_TOOL, sibling, "ping")]
 
     manager, registry, session = _mcp_listing(tmp_path / "one", "github-enterprise", tools)
     reached = _reached(registry, session)
@@ -887,11 +896,11 @@ def test_mcp_error_from_a_shortened_tool_names_the_registered_tool(tmp_path):
     manager = MCPManager(tmp_path / "mcp.json")
     failing = _OneResultSession([type("ErrorText", (), {"text": "No such thread"})()], is_error=True)
     manager._register_tools(
-        registry, "github-enterprise", failing, [FakeRemoteTool(name=_LONG_REMOTE_TOOL)], {"risk": "read"},
+        registry, "github-enterprise", failing, [_listing_tool(_LONG_REMOTE_TOOL)], {"risk": "read"},
     )
     [local] = registry.tool_names
 
-    result = run(registry.execute(local, {"query": "hello"}))
+    result = run(registry.execute(local, {"body": "synthetic reply"}))
 
     # The message names what the model can call; the details keep the server's own name.
     assert _VALID_TOOL_NAME.fullmatch(local)
@@ -1092,7 +1101,7 @@ def test_mcp_startup_and_reconnect_keep_a_server_with_flawed_tool_names(tmp_path
 
     class FakeServers(MCPManager):
         async def _enter_server_session(self, name, raw, stack):
-            sessions[name] = _ListedSession([FakeRemoteTool(name=tool) for tool in offered[name]])
+            sessions[name] = _ListedSession([_listing_tool(tool) for tool in offered[name]])
             return sessions[name]
 
     config = tmp_path / "mcp.json"

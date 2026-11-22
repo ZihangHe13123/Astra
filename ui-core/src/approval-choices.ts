@@ -14,9 +14,21 @@ const LABELS: Record<ApprovalChoice, string> = {
 };
 export const CONSEQUENCE_LABELS: Record<string, string> = { pay: "付款", send: "发送", delete: "删除", publish: "发布" };
 
-export const draftLabels = { to: "发给", cc: "抄送", bcc: "密送", subject: "主题", via: "通过" } as const;
+export const draftLabels = { to: "发给", cc: "抄送", bcc: "密送", destination: "目标位置", subject: "主题", via: "通过" } as const;
 export type ApprovalDraft = Partial<Record<keyof typeof draftLabels | "text", string>> & { truncated?: boolean };
 const draftFields = new Set(["text", ...Object.keys(draftLabels)]);
+
+function validDestination(raw: string): boolean {
+  // The source encodes a flat JSON object of named bindings. Validate its shape, but render the
+  // original string: reserializing would silently round integer identifiers beyond JS precision.
+  try {
+    const bindings: unknown = JSON.parse(raw);
+    if (!bindings || typeof bindings !== "object" || Array.isArray(bindings)) return false;
+    const entries = Object.entries(bindings);
+    return entries.length > 0 && entries.every(([key, id]) => key.trim() !== "" &&
+      (typeof id === "string" && id.trim() !== "" || Number.isInteger(id)));
+  } catch { return false; }
+}
 
 /** An unknown/redacted field or a bounded preview is never a complete send envelope. */
 export function completeApprovalDraft(value: unknown, maxUnits = Infinity): value is ApprovalDraft & { text: string } {
@@ -25,7 +37,8 @@ export function completeApprovalDraft(value: unknown, maxUnits = Infinity): valu
   if (typeof draft.text !== "string" || !draft.text.length || ("truncated" in draft && draft.truncated !== false)) return false;
   let size = 0;
   return Object.entries(draft).every(([key, v]) => key === "truncated" || draftFields.has(key) &&
-    typeof v === "string" && (size += v.length) <= maxUnits && !/[\ud800-\udfff]/u.test(v));
+    typeof v === "string" && (size += v.length) <= maxUnits && !/[\ud800-\udfff]/u.test(v) &&
+    (key !== "destination" || validDestination(v)));
 }
 type Card = { choices?: readonly string[]; consequential?: string; draft?: ApprovalDraft | null; [key: string]: unknown };
 

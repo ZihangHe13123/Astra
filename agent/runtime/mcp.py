@@ -21,7 +21,7 @@ from .tool_execution import PartialResult
 from .tool_failure import ToolFailure
 from .process_env import mark_agent_environment
 from .tools.approval import ScopedApprovalStore
-from .tools.consequence import draft_from_arguments, message_draft_required, tool_category
+from .tools.consequence import classify_mcp_operation, mcp_draft
 from .tools.registry import ToolDef, ToolRegistry
 from .project_trust import ProjectTrust
 
@@ -872,6 +872,9 @@ class MCPManager:
                 description += f"\n[Tool {_quoted(remote_name, 200)} of MCP server {_quoted(server)}]"
                 notes.append(f"{_quoted(remote_name)} is registered as {local_name}: {altered}")
             risk = str(risk_overrides.get(remote_name, default_risk)) if isinstance(risk_overrides, dict) else default_risk
+            operation = classify_mcp_operation(remote_name, server)
+            if operation.category and risk == "read":
+                risk = "write"  # A named mutation must not be scheduled or retried as an observation.
             # Server hints cannot establish replay safety for an otherwise unknown action.
             read_only = risk == "read"
             call_timeout = float(config.get("timeout", 60))
@@ -1033,8 +1036,8 @@ class MCPManager:
                     return PartialResult(attachment) if omitted or shown != text else attachment
                 return PartialResult(text) if omitted else text
 
-            category = tool_category(remote_name)
-            message_capable = category in {"send", "publish"}
+            category = operation.category
+            message_capable = operation.sends_content
             display_server = server.encode("utf-8", "backslashreplace").decode("utf-8")
             display_remote = remote_name.encode("utf-8", "backslashreplace").decode("utf-8")
             permission_scope = "mcp-side-effect:" + json.dumps([server, remote_name], ensure_ascii=True)
@@ -1045,8 +1048,9 @@ class MCPManager:
                 _remote_name=display_remote,
                 _scope=permission_scope,
                 _risk=risk,
-                _category=category,
+                _operation=operation,
             ) -> dict | None:
+                _category = _operation.category
                 if _category:
                     # A tool named for sending, paying, deleting or publishing: asked per call, whatever risk
                     # its server declares, with what it would send shown as a draft.
@@ -1059,11 +1063,9 @@ class MCPManager:
                     public = {key: value for key, value in args.items() if key not in _PERMISSION_METADATA}
                     if _risk == "secret":
                         request["arguments"] = {key: "<redacted>" for key in public}
-                    if _category in {"send", "publish"}:
-                        draft = ({"truncated": True} if _risk == "secret" else
-                                 draft_from_arguments(public, required=message_draft_required(_remote_name, public)))
-                        if draft:
-                            request["draft"] = {**draft, "via": f"{_server}/{_remote_name}"}
+                    draft = mcp_draft(_operation, public, secret=_risk == "secret")
+                    if draft:
+                        request["draft"] = {**draft, "via": f"{_server}/{_remote_name}"}
                     return request
                 # Only local configuration can classify a remote operation as read-only.
                 # A network label, a name, and server annotations are not authorization.

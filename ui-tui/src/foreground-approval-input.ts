@@ -82,12 +82,13 @@ export class ForegroundTerminalInput {
   private quarantinePaste = false;
   private pasteMatch = 0;
   private controlString?: "osc" | "st";
-  private quarantineString = false;
   private stringEscape = false;
   private oscHeader?: "empty" | "unrecognized";
   private oscEscapeOwner?: Receiver;
-  private oscLiteral?: Receiver;
-  private literalString?: { receiver: Receiver; kind: "st" | "osc" };
+  // A ']' typed after a spent/retired prefix is not a live ESC ] frame.
+  // Keep only its owner and selector syntax, never the payload or a digit buffer.
+  private oscLiteral?: { receiver: Receiver; digits: boolean };
+  private literalString?: { receiver: Receiver; kind: "st" | "osc"; drainPayload?: boolean };
   private literalEscape = false;
   private literalPasteMatch = 0;
   private literalEscapeOwner?: Receiver;
@@ -109,15 +110,16 @@ export class ForegroundTerminalInput {
     return !!this.literalEscapeOwner || !!this.oscEscapeOwner || (this.sequence === ESC && this.escape === "waiting");
   }
 
-  get needsStringBoundary(): boolean { return !!this.literalString; }
+  get needsStringBoundary(): boolean { return !!(this.literalString || this.oscLiteral); }
 
-  private keepStringBoundary(receiver: Receiver, kind: "st" | "osc") {
+  private keepStringBoundary(receiver: Receiver, kind: "st" | "osc", drainPayload = false) {
     if (!this.literalString) {
       this.literalString = { receiver, kind }; this.literalEscape = false; this.literalPasteMatch = 0;
     } else if (kind === "st") {
       // A possible DCS always needs ST, even if OSC is another interpretation.
       this.literalString.kind = "st";
     }
+    if (drainPayload) this.literalString.drainPayload = true;
   }
 
   finishEscapeWait(): string {
@@ -130,7 +132,7 @@ export class ForegroundTerminalInput {
       // Not a timely string terminator. Only the standalone *negative* Escape
       // may be delivered, to the receiver that saw it; no payload becomes a key.
       this.sequence = ESC; this.sequenceOwner = this.oscEscapeOwner; this.oscEscapeOwner = undefined;
-      this.controlString = this.oscHeader = this.oscLiteral = undefined; this.stringEscape = this.quarantineString = false;
+      this.controlString = this.oscHeader = this.oscLiteral = undefined; this.stringEscape = false;
     }
     // Never dispatch a timeout to a foreground or replacement card. Keep the origin
     // so a late Alt-letter/CSI cannot be reinterpreted as its successor's shortcut.
@@ -152,7 +154,7 @@ export class ForegroundTerminalInput {
     // not make an old key current, and changing ordinary cards never reopens terminal modes.
     this.receiver = { id, view, approval }; this.armed = undefined;
     if (this.paste) this.quarantinePaste = true;
-    if (this.controlString) this.quarantineString = true;
+
     if (previous.id === id) return;
     this.ready = this.done = this.enabledFocus = false; this.stage = "idle";
     this.reportReady();
@@ -226,7 +228,7 @@ export class ForegroundTerminalInput {
   /** Ink's readable chunks are not key boundaries. Keep only a bounded control prefix, not pasted content. */
   feed(chunk: string): string {
     const receiver = this.receiver, owner = receiver.id;
-    if (!owner && !this.sequence && !this.paste && !this.controlString && !this.literalString && !/[\x1b\x90\x98\x9d-\x9f]/.test(chunk)) return chunk;
+    if (!owner && !this.sequence && !this.paste && !this.controlString && !this.literalString && !this.oscLiteral && !/[\x1b\x90\x98\x9d-\x9f]/.test(chunk)) return chunk;
     let normal = "", remaining = chunk.length, aborted = false;
     for (const c of chunk) {
       remaining -= c.length;
@@ -240,20 +242,21 @@ export class ForegroundTerminalInput {
       // separate negative key is usable in that state. Never interpret payload
       // from a started OSC (or paste) as a shortcut, even after a view change.
       if (this.oscLiteral) {
-        // A literal ']' may already be in the old composer. Still recognize a
-        // late OSC selector; never release the resulting payload to an approval.
-        if (this.oscLiteral === receiver && !/[\d;]/.test(c)) {
-          this.controlString = this.oscHeader = undefined;
-          // A spent Escape followed by "]list" and an xterm OSC l/L title
-          // reply have the same bytes. Text belongs only to this composer.
-          if (c === "l" || c === "L") this.keepStringBoundary(receiver, "osc");
-        } else this.quarantineString = true;
-        this.oscLiteral = undefined;
+        const prefix = this.oscLiteral;
+        if (c >= "0" && c <= "9") prefix.digits = true;
+        else this.oscLiteral = undefined;
+        // Default selector, number without a separator, or title text: two
+        // interpretations. Allow typing only on this composer. An explicit
+        // numeric selector plus separator, on the other hand, has a payload
+        // to drain even on the originating composer.
+        if (prefix.digits || prefix.receiver !== receiver || /[;lL\x07\x9c\x18\x1a]/.test(c)) {
+          this.keepStringBoundary(prefix.receiver, "osc", prefix.digits && c === ";");
+        }
       }
       if (this.oscHeader && !this.stringEscape && chunk.length === 1 && receiver.approval) {
         if (c === ESC) { this.oscEscapeOwner = receiver; this.stringEscape = true; continue; }
         if (c === "\x03" || /^[nN]$/.test(c)) {
-          this.controlString = this.oscHeader = undefined; this.quarantineString = false;
+          this.controlString = this.oscHeader = undefined;
         }
       }
       if (this.literalString) {
@@ -265,7 +268,7 @@ export class ForegroundTerminalInput {
         if (cancel || (this.literalString.kind === "osc" && c === "\x07") || c === "\x9c" || (this.literalEscape && c === "\\")) {
           this.controlString = this.oscHeader = this.oscLiteral = this.literalString = undefined;
           this.sequence = ""; this.sequenceOwner = this.literalReceiver = this.oscEscapeOwner = this.armed = undefined;
-          this.literalPasteMatch = 0; this.quarantineString = this.stringEscape = this.literalEscape = false;
+          this.literalPasteMatch = 0; this.stringEscape = this.literalEscape = false;
           if (cancel) { aborted = true; this.armed = undefined; }
           continue;
         }
@@ -275,10 +278,10 @@ export class ForegroundTerminalInput {
         if ((previousEsc && "P_^X".includes(c)) || "\x90\x98\x9e\x9f".includes(c)) this.literalString.kind = "st";
         // The opener can start on the composer and finish on the next card.
         this.literalPasteMatch = c === pasteStart[this.literalPasteMatch] ? this.literalPasteMatch + 1 : c === ESC ? 1 : 0;
-        if (this.literalString.receiver !== receiver) {
+        if (this.literalString.receiver !== receiver || this.literalString.drainPayload) {
           if (this.literalPasteMatch === pasteStart.length) {
             this.paste = this.quarantinePaste = true; this.pasteMatch = this.literalPasteMatch = 0;
-          } else if (chunk.length === 1) {
+          } else if (!this.literalString.drainPayload && chunk.length === 1) {
             if (c === ESC && !previousEsc) this.literalEscapeOwner = receiver;
             if (c === "\x03" || (receiver.approval && /^[nN]$/.test(c))) { if (owner) this.legacy(c); else normal += c; }
           }
@@ -286,6 +289,11 @@ export class ForegroundTerminalInput {
         }
         // Same composer: observe boundaries in parallel, but let Ink receive
         // its real typing, cursor keys and bracketed paste through the normal path.
+        if (c === "\r" && normal && !remaining && !this.controlString && !this.sequence && !aborted) {
+          // Ink expects one key per read. Only a still-current composer can
+          // receive this Return, never the card that might open afterwards.
+          this.followingKey = { receiver, key: c }; continue;
+        }
       }
       if (this.controlString) {
         this.oscEscapeOwner = undefined;
@@ -293,16 +301,14 @@ export class ForegroundTerminalInput {
         // introduce title replies. Unknown data never provides an affirmative key.
         if (this.stringEscape || (this.oscHeader === "empty" && /[\d;lL]/.test(c))) this.oscHeader = undefined;
         else if (this.oscHeader) this.oscHeader = "unrecognized";
-        if (!owner && !this.quarantineString) normal += c;
         if (this.controlString === "osc" && c === "\x07" || c === "\x9c" || this.stringEscape && c === "\\") {
-          this.controlString = this.oscHeader = undefined; this.quarantineString = false;
+          this.controlString = this.oscHeader = undefined;
         }
         this.stringEscape = c === ESC; continue;
       }
       if ("\x90\x98\x9d\x9e\x9f".includes(c)) {
         this.controlString = c === "\x9d" ? "osc" : "st"; this.stringEscape = false;
-        this.armed = undefined; this.sequence = ""; this.quarantineString = receiver.approval;
-        if (!owner && !this.quarantineString) normal += c; continue;
+        this.armed = undefined; this.sequence = ""; continue;
       }
       if (c === ESC) {
         if (this.sequence) this.armed = undefined;
@@ -335,23 +341,15 @@ export class ForegroundTerminalInput {
           this.sequence = ""; this.armed = undefined; this.stringEscape = false;
           const string = c === "]" ? "osc" : "P_^X".includes(c) ? "st" : undefined;
           const retiredIntoComposer = !same && !receiver.approval && receiver.view === "composer";
-          if (text || (string === "st" && retiredIntoComposer)) {
-            if (string) {
-              // Keep the structural fence even when the old prefix has been
-              // consumed. Only this composer may receive literal text; head()
-              // quarantines an open string before any modal can own its payload.
-              if (string === "st") {
-                this.keepStringBoundary(receiver, "st");
-              } else {
-                this.controlString = string; this.quarantineString = false;
-                if (string === "osc") { this.oscHeader = "empty"; this.oscLiteral = receiver; }
-              }
-            }
+          if (text || (string && retiredIntoComposer)) {
+            if (string === "st") this.keepStringBoundary(receiver, string);
+            if (string === "osc") this.oscLiteral = { receiver, digits: false };
             if ((same && this.escape === "delivered") || (c >= " " && c !== "\x7f")) normal += c;
           } else if (string) {
-            this.controlString = string; this.quarantineString = receiver.approval || !same;
+            // The introducer was framed, not an independent printable suffix.
+            // Never stream a terminal/control reply into the composer or a card.
+            this.controlString = string;
             this.oscHeader = string === "osc" ? "empty" : undefined;
-            if (!this.quarantineString) normal += ESC + c;
           } else if (this.escape === "metaEscape" && (!receiver.approval || /^[nv]$/i.test(c) || c === "\x03")) {
             if (!owner) normal += c; else if (chunk.length === 1) this.legacy(c);
           } else if (same && !owner && !spent) normal += ESC + c; // preserve Alt for Ink

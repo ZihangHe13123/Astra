@@ -103,6 +103,20 @@ for (const [label, field] of Object.entries({ recipient: sample.to, cc: sample.c
   });
 }
 
+test("a reply requires the whole destination in the acknowledged Ink frame, not just the body or tool name", async () => {
+  const destination = '{"comment_id":9876543210987654321,"owner":"team","repo":"notes"}';
+  const draft = { destination, via: "fixture/reply", text: sample.text };
+  await withDraft(50, 14, draft, async h => {
+    await h.key("y"); assert.deepEqual(h.answers, []);
+    await h.resize(120, 36); assert.ok(h.frame().includes(`目标位置：${destination}`));
+    assert.ok(h.frame().includes(`通过：${draft.via}`)); assert.ok(h.frame().includes("distinct-body-line-6"));
+    await h.overwrite("9876543210987654321"); await h.key("\r"); assert.deepEqual(h.answers, []);
+    await h.restoreWithBlockedWriter(); await h.key("y"); assert.deepEqual(h.answers, []);
+    await h.ack(); assert.ok(h.frame().includes(`目标位置：${destination}`)); assert.deepEqual(h.answers, []);
+    await h.key("\r"); assert.deepEqual(h.answers, ["once"]);
+  });
+});
+
 test("resizing reveals the full draft without replaying an earlier attempted grant", async () => {
   await withDraft(50, 14, sample, async h => {
     await h.key("y"); assert.deepEqual(h.answers, []);
@@ -138,6 +152,7 @@ test("wrapped addresses, subjects and the whole multiline message survive compac
 
 for (const [name, draft] of Object.entries({
   oversized: { ...sample, text: "x".repeat(8193) }, missingBody: { to: sample.to, subject: sample.subject },
+  opaqueDestination: { text: "reply", destination: { repo: "notes" } }, nonBindingDestination: { text: "reply", destination: '[]' },
   alreadyTruncated: { ...sample, truncated: true }, missingMetadataValue: { ...sample, subject: null },
 })) test(`${name} cannot authorize an excerpt; denial still works`, async () => {
   await withDraft(120, 36, draft, async h => {

@@ -26,3 +26,14 @@ test("a draft grants only once; a withheld envelope never offers a positive choi
   }
   for (const choices of [[], ["deny"], "deny"]) assert.deepEqual(approvalChoices({choices, draft: {text: "words"}} as any), ["deny"]);
 });
+
+test("non-mail destination bindings are an optional disclosed field, not another recipient or a new grant scope", () => {
+  const card = { consequential: "send", choices: ["once", "session", "deny"] };
+  const draft = { text: "Reply", via: "fixture/reply", destination: '{"comment_id":9876543210987654321,"owner":"team","repo":"notes"}' };
+  assert.deepEqual(approvalChoices({ ...card, draft }), ["once", "deny"]);
+  for (const destination of [{ repo: "notes" }, null, "", "repo:notes", "[]", "{}", '{"comment_id":{"id":4}}']) {
+    assert.deepEqual(approvalChoices({ ...card, draft: { ...draft, destination } } as any), ["deny"]);
+  }
+  assert.deepEqual(approvalChoices({ ...card, draft: { text: "Mail", to: "person@example.invalid" } }), ["once", "deny"]);
+  assert.deepEqual(approvalChoices(card).map(c => approvalChoiceLabel(c, card)), ["允许一次", "拒绝"]);
+});

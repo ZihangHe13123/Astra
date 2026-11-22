@@ -84,6 +84,23 @@ function typedAfterEscape() {
   return keys;
 }
 
+test("spent composer Escape preserves independent code after ] and the successor's first safe controls", () => {
+  for (const text of ["];", "]; next();", "]42", "]7 + 1"]) for (const parts of [[text], [...text]]) {
+    for (const first of ["n", "\x03", "\x18y"]) {
+      const keys = typedAfterEscape();
+      assert.equal(parts.map(p => keys.feed(p)).join(""), text);
+      assert.equal(keys.feed("\r"), "\r");
+      keys.head(undefined, {}, true);
+      assert.equal(keys.feed(first), first === "\x18y" ? "" : first);
+      if (first !== "\x18y") {
+        assert.equal(keys.feed("y"), ""); assert.ok(keys.needsStringBoundary);
+        keys.feed("\x18");
+      }
+      assert.equal(keys.feed("y"), "y");
+    }
+  }
+});
+
 test("Python is composer text after a remotely retired foreground Escape, before or after its timeout", () => {
   for (const timing of ["timely", "expired-on-A", "expired-after-removal"]) for (const negative of ["N", "\x03"]) {
     const { keys } = setup(); keys.head("A"); keys.feed("\x1b");
@@ -117,6 +134,26 @@ test("a delivered composer Escape preserves bracketed words, Unicode and long li
       const keys = typedAfterEscape(); assert.equal(pieces.map(c => keys.feed(c)).join(""), word);
       assert.equal(keys.feed("\r"), "\r");
     }
+  }
+});
+
+test("an actual OSC frame is protocol data, including when fragmented on the composer", () => {
+  for (const intro of ["\x1b]", "\x9d"]) for (const parts of [[intro + "52;c;payload"], [...intro, "52", ";c;", "payload"]]) {
+    const { keys } = setup();
+    assert.equal(parts.map(p => keys.feed(p)).join(""), "");
+    keys.head(undefined, {}, true);
+    for (const key of ["y", "n", "\x03"]) assert.equal(keys.feed(key), "");
+    keys.feed("\x07"); assert.equal(keys.feed("y"), "y");
+  }
+});
+
+test("a late explicit numeric OSC selector drains its payload, unlike independent punctuation after Escape", () => {
+  for (const parts of [["]52;c;payload"], [..."]52;c;payload"]]) {
+    const keys = typedAfterEscape();
+    const text = parts.map(part => keys.feed(part)).join("");
+    assert.ok(!text.includes("payload"));
+    keys.head(undefined, {}, true); assert.equal(keys.feed("y"), ""); assert.equal(keys.feed("n"), "");
+    keys.feed("\x07"); assert.equal(keys.feed("y"), "y");
   }
 });
 

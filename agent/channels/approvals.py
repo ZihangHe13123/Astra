@@ -42,7 +42,7 @@ _HIDE = (
 )
 _TARGET_CHARS = 300
 _DRAFT_CHARS = 800
-_DRAFT_LABELS = {"to": "发给", "cc": "抄送", "bcc": "密送", "subject": "主题", "via": "通过"}
+_DRAFT_LABELS = {"to": "发给", "cc": "抄送", "bcc": "密送", "destination": "目标位置", "subject": "主题", "via": "通过"}
 _CHAT_PROMPT_BYTES = 2_000  # Conservative budget for one unsplit plain-text message.
 _DESKTOP_DRAFT = "无法在当前聊天中完整展示这份草稿。请在桌面端核对，或回复“丢弃”取消。"
 
@@ -216,22 +216,28 @@ async def await_chat_approval(
         presentation = asyncio.create_task(present())
         _chat_presentations.add(presentation)
         presentation.add_done_callback(_chat_presentations.discard)
-    try:
-        try:
-            return await asyncio.wait_for(asyncio.shield(decision), timeout)
-        except TimeoutError:
-            if owner is not None:
-                owner.closed = True
-            if resolve("deny"):
-                notice = f"{max(1, round(timeout / 60))} 分钟没等到回复，这一步没有执行。"
-            try:
-                return await asyncio.wait_for(asyncio.shield(decision), min(timeout, _CLEANUP_SECONDS))
-            except TimeoutError:
-                return "deny"
-    finally:
-        if presentation is not None and owner is not None:
+
+    def close_presentation() -> None:
+        if presentation is not None and owner is not None and not finished.is_set():
             owner.closed = True
             finished.set()
             if sending:
                 presentation.cancel()
+
+    try:
+        done, _ = await asyncio.wait({decision}, timeout=timeout)
+        if not done:
+            # Timeout competes for the same decision as chat and desktop. If a
+            # reply already won, its receipt may still be waiting on persistence.
+            if resolve("deny"):
+                notice = f"{max(1, round(timeout / 60))} 分钟没等到回复，这一步没有执行。"
+            close_presentation()
+        return await decision
+    except asyncio.CancelledError:
+        # Match the desktop wait: a cancelled caller cannot publish a late grant.
+        decision.cancel()
+        raise
+    finally:
+        close_presentation()
+        if presentation is not None:
             await asyncio.wait({presentation}, timeout=min(timeout, _CLEANUP_SECONDS))

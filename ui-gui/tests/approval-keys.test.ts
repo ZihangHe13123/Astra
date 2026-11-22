@@ -137,9 +137,20 @@ test("a draft reads as send or discard, and a consequential card ignores the win
   assert.match(markup, /<p class="approval-keys[^"]*">点选卡片后可按 Y \/ N<\/p>/);
 });
 
+test("the GUI discloses the exact reply destination separately from the tool and body", () => {
+  const destination = '{"comment_id":9876543210987654321,"owner":"team","repo":"notes"}';
+  const event = { type: "tool_approval_request", request_id: "thread", tool_name: "fixture_reply", consequential: "send",
+    choices: ["once", "deny"], draft: { destination, via: "fixture/reply", text: "thread reply" } };
+  const markup = renderToStaticMarkup(React.createElement(Approval, { event, send: async () => {} }));
+  assert.ok(markup.includes(`<strong>目标位置：</strong>${destination.replaceAll('"', '&quot;')}`));
+  assert.match(markup, /<strong>通过：<\/strong>fixture\/reply/); assert.doesNotMatch(markup, /<strong>发给：/);
+  assert.match(markup, /<pre class="draft-text">thread reply<\/pre>/); assert.match(markup, />发送<\/button>/);
+});
+
 test("an incomplete or locally clipped GUI draft offers discard but neither a send button nor its shortcut", () => {
   for (const draft of [{text: "excerpt", truncated: true}, {truncated: true}, {text: "visible", recipients: {hidden: true}},
-    {text: "x".repeat(24_001)}, {cc: 123, text: "words"}, null]) {
+    {text: "reply", destination: {repo: "notes"}}, {text: "reply", destination: '[]'},
+    {text: "reply", destination: JSON.stringify({repo: "x".repeat(24_001)})}, {text: "x".repeat(24_001)}, {cc: 123, text: "words"}, null]) {
     const event = { type: "tool_approval_request", request_id: "r", tool_name: "mail", choices: ["once", "session", "deny"], draft };
     const markup = renderToStaticMarkup(React.createElement(Approval, {event, windowKeys: true, send: async () => {}}));
     assert.match(markup, /不能发送/); assert.match(markup, /data-approval-choice="deny"/);
