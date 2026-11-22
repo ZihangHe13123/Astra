@@ -520,6 +520,11 @@ class ComputerSessionManager:
         catalog = self._last_catalog
         return catalog.generation if catalog is not None else 0
 
+    @property
+    def confirmed_absent_window_identity_refs(self) -> tuple[str, ...]:
+        catalog = self._last_catalog
+        return catalog.confirmed_absent_window_identity_refs if catalog is not None else ()
+
     async def status(self) -> dict[str, object]:
         async with self._lock:
             self._require_open()

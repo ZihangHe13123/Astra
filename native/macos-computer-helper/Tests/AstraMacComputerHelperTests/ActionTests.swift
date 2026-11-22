@@ -108,7 +108,7 @@ import Testing
             let performer = SystemActionPerformer(state: {
                 ActionTargetState(pid: 11, windowID: 22, bounds: CGRect(x: 0, y: 0, width: 100, height: 100),
                                   axIdentity: 33)
-            }, lookup: { _, _ in target }, performAXAction: { _, _ in axError })
+            }, lookup: { _, _ in target }, validateMenuPress: { _ in }, performAXAction: { _, _ in axError })
             do {
                 _ = try performer.perform(ResolvedAction(source: .click(elementRef: "item"), method: method,
                     screenPoint: nil, endScreenPoint: nil, element: element, verifiedElement: target))

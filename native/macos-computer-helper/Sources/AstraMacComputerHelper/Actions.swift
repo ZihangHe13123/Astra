@@ -52,6 +52,7 @@ struct NativeAction: Equatable {
     let checked: Bool?
     let replace: Bool?
     let textMatch: AXTextMatch?
+    let saveNewCopyTo: String?
     var supportsSelectedUnicodeEvent: Bool {
         guard textMatch != nil, let text, !text.isEmpty, text.utf16.count <= 20 else { return false }
         return !text.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains)
@@ -75,7 +76,8 @@ struct NativeAction: Equatable {
         modifiers: [String],
         checked: Bool? = nil,
         replace: Bool? = nil,
-        textMatch: AXTextMatch? = nil
+        textMatch: AXTextMatch? = nil,
+        saveNewCopyTo: String? = nil
     ) {
         self.kind = kind
         self.x = x
@@ -94,6 +96,7 @@ struct NativeAction: Equatable {
         self.checked = checked
         self.replace = replace
         self.textMatch = textMatch
+        self.saveNewCopyTo = saveNewCopyTo
     }
 
     static func click(x: CGFloat, y: CGFloat) -> Self { action(.click, x: x, y: y) }
@@ -153,7 +156,8 @@ struct NativeAction: Equatable {
             modifiers: modifiers,
             checked: checked,
             replace: replace,
-            textMatch: textMatch
+            textMatch: textMatch,
+            saveNewCopyTo: saveNewCopyTo
         )
     }
 
@@ -200,6 +204,10 @@ struct NativeAction: Equatable {
                   fields.keys.allSatisfy({ ["type", "text", "element_ref", "replace"].contains($0) })
             else { throw ActionExecutionError.invalidAction }
         }
+        if fields["save_new_copy_to"] != nil {
+            let allowed = kind == .click ? ["type","element_ref","save_new_copy_to"] : ["type","key","save_new_copy_to"]
+            guard fields.keys.allSatisfy(allowed.contains) else { throw ActionExecutionError.invalidAction }
+        }
         var textMatch: AXTextMatch?
         if fields["target_text"] != nil || fields["prefix"] != nil || fields["suffix"] != nil {
             guard fields.keys.allSatisfy({ ["type", "text", "element_ref", "target_text", "prefix", "suffix"].contains($0) }),
@@ -226,13 +234,20 @@ struct NativeAction: Equatable {
             modifiers: try modifierArray(fields["modifiers"]),
             checked: try optionalBool(fields["checked"]),
             replace: try optionalBool(fields["replace"]),
-            textMatch: textMatch
+            textMatch: textMatch,
+            saveNewCopyTo: try optionalString(fields["save_new_copy_to"], allowEmpty: false, maximumCharacters: 4096)
         )
         try action.validateShape()
         return action
     }
 
     private func validateShape() throws {
+        if let path = saveNewCopyTo {
+            guard savePanelRequestedURL(path) != nil, modifiers.isEmpty,
+                  (kind == .click && elementRef != nil && x == nil && y == nil) ||
+                  (kind == .keypress && key == "return" && elementRef == nil)
+            else { throw ActionExecutionError.invalidAction }
+        }
         if replace != nil || textMatch != nil {
             guard isReplacement, !(replace != nil && textMatch != nil), kind == .type, elementRef != nil, text != nil,
                   elementIndex == nil, targetElementRef == nil, checked == nil,
@@ -294,7 +309,7 @@ struct NativeAction: Equatable {
     }
 
     private static let allowedFields: Set<String> = [
-        "type", "x", "y", "end_x", "end_y", "text", "key", "delta_x", "delta_y", "duration_ms", "element_ref", "target_element_ref", "element_index", "modifiers", "checked", "replace", "target_text", "prefix", "suffix",
+        "type", "x", "y", "end_x", "end_y", "text", "key", "delta_x", "delta_y", "duration_ms", "element_ref", "target_element_ref", "element_index", "modifiers", "checked", "replace", "target_text", "prefix", "suffix", "save_new_copy_to",
     ]
 
     private static func optionalBool(_ value: JSONValue?) throws -> Bool? {
@@ -603,6 +618,9 @@ enum ActionExecutionError: String, Error, Equatable {
     case outOfBounds = "out_of_bounds"
     case secureTarget = "secure_target"
     case secureInputActive = "secure_input_active"
+    case saveDestinationUnverified = "save_destination_unverified"
+    case saveDestinationMismatch = "save_destination_mismatch"
+    case saveDestinationExists = "save_destination_exists"
     case textSelectionRequired = "text_selection_required"
     case textMatchNotFound = "text_match_not_found"
     case textMatchAmbiguous = "text_match_ambiguous"
@@ -828,6 +846,7 @@ struct ActionBatchResult {
 }
 
 protocol ActionProviding: AnyObject {
+    func validateSaveDestination(_ action: NativeAction) throws
     func currentTargetState() throws -> ActionTargetState
     func element(reference: String, snapshotID: String) -> ActionElement?
     func pointerElement(reference: String, snapshotID: String) -> ActionElement?
@@ -851,6 +870,9 @@ protocol ActionProviding: AnyObject {
 }
 
 extension ActionProviding {
+    func validateSaveDestination(_ action: NativeAction) throws {
+        if action.saveNewCopyTo != nil { throw ActionExecutionError.saveDestinationUnverified }
+    }
     func pointerElement(reference _: String, snapshotID _: String) -> ActionElement? { nil }
     func scrollPressTarget(
         reference _: String,
@@ -1436,8 +1458,10 @@ final class SystemActionPerformer: ActionProviding {
     private let scrollPressLookup: ((String, String, AXScrollDirection) -> AXScrollPressTarget?)?
     private let inputPoster: any SyntheticInputPosting
     private let selectedTextWriter: any AXSelectedTextWriting
+    private let savePanelGuard: ((NativeAction) throws -> Void)?
     private let textValueReplacer: any AXTextValueReplacing
     private let keyboardTargetValidation: ((ActionElement) throws -> Void)?
+    private let validateMenuPress: ((AXUIElement) throws -> Void)?
     private let performAXAction: (AXUIElement, CFString) -> AXError
     private let heldInputs: HeldInputRegistry
     private let injectedKeyboardFocus: ((ActionElement?) throws -> ActionElement)?
@@ -1464,7 +1488,9 @@ final class SystemActionPerformer: ActionProviding {
         inputPoster: any SyntheticInputPosting = UnavailableSyntheticInputPoster(),
         selectedTextWriter: any AXSelectedTextWriting = SystemAXSelectedTextWriter(),
         textValueReplacer: any AXTextValueReplacing = SystemAXTextValueReplacer(),
+        savePanelGuard: ((NativeAction) throws -> Void)? = nil,
         keyboardTargetValidation: ((ActionElement) throws -> Void)? = nil,
+        validateMenuPress: ((AXUIElement) throws -> Void)? = nil,
         performAXAction: ((AXUIElement, CFString) -> AXError)? = nil,
         heldInputs: HeldInputRegistry = .shared,
         focusedKeyboard: ((ActionElement?) throws -> ActionElement)? = nil,
@@ -1484,7 +1510,9 @@ final class SystemActionPerformer: ActionProviding {
         self.inputPoster = inputPoster
         self.selectedTextWriter = selectedTextWriter
         self.textValueReplacer = textValueReplacer
+        self.savePanelGuard = savePanelGuard
         self.keyboardTargetValidation = keyboardTargetValidation
+        self.validateMenuPress = validateMenuPress
         self.performAXAction = performAXAction ?? AXUIElementPerformAction
         self.heldInputs = heldInputs
         injectedKeyboardFocus = focusedKeyboard
@@ -1505,6 +1533,12 @@ final class SystemActionPerformer: ActionProviding {
         scrollPressLookup?(reference, snapshotID, direction)
     }
     func isVisibleOnScreen(_ point: CGPoint) -> Bool { activeDisplayBounds().contains { $0.contains(point) } }
+
+    func validateSaveDestination(_ action: NativeAction) throws {
+        guard action.saveNewCopyTo != nil else { return }
+        guard let savePanelGuard else { throw ActionExecutionError.saveDestinationUnverified }
+        try savePanelGuard(action)
+    }
 
     func preflightAXTextMutation(_ element: ActionElement) -> AXTextMutationPreflight {
         guard !element.isSecure, element.enabled == true, element.supportsAXSelectedTextWrite,
@@ -1754,6 +1788,15 @@ final class SystemActionPerformer: ActionProviding {
             guard let element = action.element else {
                 logActionRejected("PERFORM element-nil method=\(action.method)")
                 throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false)
+            }
+            if applicationMenuRole(action.verifiedElement?.roleResult.value) {
+                guard let validateMenuPress else { throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false) }
+                do { try validateMenuPress(element) }
+                catch { throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false) }
+            }
+            if action.source.saveNewCopyTo != nil {
+                do { try validateSaveDestination(action.source) }
+                catch let error as ActionExecutionError { throw ActionPerformFailure(error: error, inputStarted: false) }
             }
             try validateMutation()
             let error = performAXAction(element, kAXPressAction as CFString)

@@ -62,6 +62,21 @@ func focusedElementBelongsToExactAXRoot(element focused: AXUIElement, root: AXUI
         parent: parent) != nil
 }
 
+/// A sheet's field belongs to the sheet even when AX includes the document above it.
+func fieldBelongsToNearestAXWindow(_ field: AXUIElement, root: AXUIElement, pid: pid_t,
+    owner: (AXUIElement) -> pid_t? = observedAXPID, parent: (AXUIElement) -> AXUIElement? = observedAXParent,
+    role: (AXUIElement) -> String? = {
+        let r = AXNodeReader.stringAttribute($0, kAXRoleAttribute)
+        return r.status == .complete ? r.value : nil
+    }) -> Bool {
+    guard let rootRole = role(root), rootRole == kAXWindowRole || rootRole == kAXSheetRole else { return false }
+    return focusedElementBelongsToExactAXRoot(element: field, root: root, pid: pid, ownerPID: owner, parent: parent,
+        permitsDescendant: { element in
+            guard let r = role(element) else { return false }
+            return r != kAXSheetRole && r != kAXWindowRole
+        })
+}
+
 // Reconstruct sheet membership on every inventory; focus loss removes the candidate.
 // CG matching and stored AX identity checks remain the caller's responsibility.
 /// A read that fails when its source changes under it: an app's window list is counted, then

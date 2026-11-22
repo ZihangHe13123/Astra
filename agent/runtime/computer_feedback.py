@@ -18,6 +18,7 @@ NEXT_STEPS = {
 
 
 _PRE_INPUT_REFUSALS = frozenset({
+    "save_destination_unverified", "save_destination_mismatch", "save_destination_exists",
     "input_focus_required", "stale_snapshot", "target_not_frontmost", "target_gone", "secure_target", "out_of_bounds",
     "secure_input_active", "keyboard_focus_unverified", "control_disabled",
     "accessibility_action_refused", "text_match_not_found", "text_match_ambiguous", "text_selection_required", "text_range_unsupported", "text_input_source_unverified",

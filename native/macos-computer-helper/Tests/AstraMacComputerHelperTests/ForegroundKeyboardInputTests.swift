@@ -1412,3 +1412,25 @@ private final class KeyboardActivity: UserActivityMonitoring {
     #expect(String(decoding: delivered, as: UTF16.self) == text)
     #expect(fixture.poster.events.count < text.count)
 }
+
+@Test func textReflowToAnOwnedEdgeEditorKeepsItsLiveFocusProof() throws {
+    for owner in [true, false] {
+        let fixture = KeyboardExecutorFixture()
+        let window = fixture.guardValue.focusedAXBounds
+        let edge = CGRect(x: window.minX, y: 24, width: window.width, height: 110)
+        let entry = keyboardEntry(.type(text: "AB"), targetKeyboardFocus: fixture.expectedFocus)
+        let plan = try fixture.executor.preflight(expected: fixture.guardValue, application: fixture.application,
+            marker: fixture.lease.marker, entries: [entry])
+        fixture.poster.afterPost = { count in
+            guard count == 0 else { return }
+            fixture.focusObservation = makeKeyboardFocusObservation(expectedPID: 11, actualPID: 11,
+                identityToken: fixture.expectedFocus.identityToken, bounds: edge,
+                role: .init(value: "AXTextArea", status: .complete), subrole: .init(value: nil, status: .complete),
+                enabled: true, containerBounds: window, ownsEdgeAlignedEditor: { owner })
+        }
+        let result = fixture.executor.executePrepared(sourceIndex: 0, from: plan,
+            expected: fixture.guardValue, lease: fixture.lease)
+        #expect((result.error == nil) == owner)
+        #expect(fixture.heldInputs.heldCount == 0)
+    }
+}

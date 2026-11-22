@@ -2556,7 +2556,30 @@ private final class InputDispatcherSyntheticPosterSpy: SyntheticInputPosting {
     #expect(performer.performed.isEmpty)
 }
 
+@Test func guardedDefaultSavePlansOnlyForegroundReturnAfterPanelValidation() throws {
+    let performer = InputDispatcherPerformerSpy()
+    let dispatcher = InputDispatcher(
+        performer: performer, application: inputDispatcherApplication,
+        syntheticPolicy: SyntheticInputPlanningPolicy(pointerCapability: .available, keyboardCapability: .available,
+            registry: PIDInputCompatibilityRegistry(), genericForegroundEnabled: true))
+    let action = try NativeAction.parse(.object(["type": .string("keypress"), "key": .string("return"),
+                                                  "save_new_copy_to": .string("/test/draft.docx")]))
+    let context = DispatchContext(guardValue: inputDispatcherForegroundGuard(keyboardFocus: inputDispatcherKeyboardFocus("filename")))
+    #expect(throws: ActionExecutionError.saveDestinationUnverified) {
+        try dispatcher.plan(actions: [action], context: context)
+    }
+    performer.provenSaveDestination = "/test/draft.docx"
+    let plan = try dispatcher.plan(actions: [action], context: context)
+    #expect(plan.cooperativeError == nil && plan.requiresTakeover)
+    #expect(plan.backends == [.foregroundKeyboard])
+}
+
 private final class InputDispatcherPerformerSpy: ActionProviding {
+    var provenSaveDestination: String?
+    func validateSaveDestination(_ action: NativeAction) throws {
+        if action.saveNewCopyTo != provenSaveDestination { throw ActionExecutionError.saveDestinationUnverified }
+    }
+
     var replacementPreflight: AXTextMutationPreflight = .unsupported
     var rangePreflight: AXTextMutationPreflight = .unsupported
     func preflightAXRangeReplacement(_ element: ActionElement, matching: AXTextMatch) -> AXTextMutationPreflight { rangePreflight }

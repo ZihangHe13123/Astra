@@ -3150,6 +3150,57 @@ def test_finder_exact_path_survives_a_same_target_transient_snapshot(registry, m
     assert all("known_path" not in request["arguments"] for request in requests)
 
 
+@pytest.mark.parametrize("where", ["element_ref", "element_index", "coordinates", "default_return"])
+@pytest.mark.parametrize("verified", [False, True])
+def test_standard_wps_save_panel_approval_uses_only_its_current_destination(
+    registry, manager, backend, tmp_path, monkeypatch, verified, where,
+):
+    import agent.runtime.tools.computer as tools
+
+    observed = []
+    original = tools.classify_computer_batch
+
+    def classify(context, actions, **kwargs):
+        observed.append(context["known_path"])
+        return original(context, actions, **kwargs)
+
+    monkeypatch.setattr(tools, "classify_computer_batch", classify)
+    backend.catalog_bundle_id = "com.kingsoft.wpsoffice.mac"
+    backend.catalog_window_title = "另存为"
+    backend.snapshot_ax_tree_override = {
+        "role": "AXWindow", "subrole": "AXDialog", "title": "另存为",
+        "standard_save_panel": {"filename_status": "observed", "filename": "copy.docx",
+            "filename_element_ref": "snapshot-1:name", "directory_chooser_ref": "snapshot-1:where", "commit_element_ref": "snapshot-1:save",
+            "directory_status": "chooser_file_url" if verified else "display_name_only",
+            **({"directory": str(tmp_path)} if verified else {"directory_display_name": tmp_path.name})},
+        "children": [
+            {"role": "AXTextField", "element_ref": "snapshot-1:name", "value": "copy.docx", "focused": True},
+            {"role": "AXPopUpButton", "element_ref": "snapshot-1:where", "value": tmp_path.name},
+            {"role": "AXButton", "element_ref": "snapshot-1:save", "label": "保存", "actions": ["AXPress"],
+             "index": 3, "bounds": {"x": 5, "y": 10, "width": 50, "height": 20}},
+        ],
+    }
+    register(registry, manager)
+    registry.set_approval_handler(lambda request: asyncio.sleep(0, result="deny"))
+    focus(registry)
+    snap = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    assert snap["standard_save_panel"]["filename"] == "copy.docx"
+    assert snap["ax_tree"]["standard_save_panel"]["filename"] == "copy.docx"
+    save = {
+        "element_ref": {"type": "click", "element_ref": "snapshot-1:save"},
+        "element_index": {"type": "click", "element_index": 3},
+        "coordinates": {"type": "click", "x": 15, "y": 15},
+        "default_return": {"type": "keypress", "key": "return"},
+    }[where]
+    result = run(registry.execute("computer_act", {"snapshot_id": snap["snapshot_id"], "actions": [save]}))
+    if verified:
+        assert observed and all(path == str(tmp_path / "copy.docx") for path in observed)
+    else:
+        assert result["code"] == "save_destination_unverified"
+        assert not observed
+    assert not any(name in {"act", "takeover_begin"} for name, _ in backend.calls)
+
+
 def test_wps_confirmed_save_directory_and_filename_bind_exact_approval_path(
     registry, manager, backend, tmp_path,
 ):
@@ -5075,6 +5126,38 @@ def test_range_edit_public_preflight_refusal_preserves_reason(registry, manager,
         {"type": "type", "element_ref": "snapshot-1:field", "target_text": "pending", "text": "reviewed"}]}))
     assert failure["code"] == reason.value
     assert failure["computer_receipt"]["dispatch_state"] == "not_dispatched"
+    if reason is ComputerErrorCode.TEXT_SELECTION_REQUIRED:
+        hint = failure["recovery_hint"]
+        assert all(term in hint for term in ("double_click", "target_element_ref", "image_pixels", "Find"))
+    assert not any(name in {"act", "takeover_begin"} for name, _ in backend.calls)
+
+
+@pytest.mark.parametrize("code,window_hint", [
+    (ComputerErrorCode.INPUT_FOCUS_REQUIRED, True),
+    (ComputerErrorCode.SECURE_INPUT_ACTIVE, False),
+])
+def test_window_shortcut_reports_wrong_field_only_after_focus_refusal(
+    registry, manager, backend, monkeypatch, code, window_hint,
+):
+    from agent.runtime.macos_computer import HelperApplicationError
+
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "element_ref": "snapshot-1:doc", "children": []}
+
+    async def refuse(*args, **kwargs):
+        raise HelperApplicationError(ComputerError(code, "preflight rejected"))
+
+    monkeypatch.setattr(backend, "plan_actions", refuse)
+    register(registry, manager)
+    focus(registry)
+    state = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    result = run(registry.execute("computer_act", {
+        "snapshot_id": state["snapshot_id"], "opens_dialog": True,
+        "actions": [{"type": "keypress", "element_ref": "snapshot-1:doc", "key": "s", "modifiers": ["command", "shift"]}],
+    }))
+    assert result["code"] == code.value
+    assert result["computer_receipt"]["dispatch_state"] == "not_dispatched"
+    assert ("focus_reason" in result["details"]) == window_hint
+    assert ("subtree_ref" in result["recovery_hint"]) == window_hint
     assert not any(name in {"act", "takeover_begin"} for name, _ in backend.calls)
 
 
@@ -8825,3 +8908,151 @@ def test_unmatched_window_failure_does_not_invent_expiration_or_system_prohibiti
         assert 'window is present' in failure.message
         assert 'Stop repeating' in failure.recovery_hint
         assert 'obscured parent' in failure.recovery_hint
+
+
+def _wps_new_copy_panel(selected):
+    name, chooser, commit = "snapshot-1:name", "snapshot-1:where", "snapshot-1:save"
+    return {
+        "role": "AXWindow", "subrole": "AXDialog", "title": "另存为",
+        "observation_capabilities": ["save_panel_destination_v1"],
+        "standard_save_panel": {
+            "filename_status": "observed", "filename": "copy.docx", "filename_element_ref": name,
+            "directory_status": "selected_browser_path",
+            "directory": str(selected), "directory_chooser_ref": chooser, "commit_element_ref": commit,
+        },
+        "children": [
+            {"role": "AXTextField", "element_ref": name, "value": "copy.docx", "focused": True},
+            {"role": "AXPopUpButton", "element_ref": chooser, "label": "位置"},
+            {"role": "AXButton", "element_ref": commit, "label": "保存"},
+        ],
+    }
+
+
+@pytest.mark.skipif(os.name != "posix", reason="macOS Save As requires POSIX directories")
+@pytest.mark.parametrize("scenario,expected_error", [
+    ("match", None), ("wrong_directory", "save_destination_mismatch"),
+    ("display_only", "save_destination_unverified"), ("already_exists", "save_destination_exists"),
+    ("wrong_button", "save_destination_unverified"), ("legacy", "unsupported_operation"),
+])
+def test_guarded_wps_new_copy_checks_panel_before_approval(
+    registry, manager, backend, tmp_path, scenario, expected_error,
+):
+    selected = tmp_path / "Q4  Draft"
+    other = tmp_path / "B"
+    selected.mkdir()
+    other.mkdir()
+    destination = (other if scenario == "wrong_directory" else selected) / "copy.docx"
+    if scenario == "already_exists":
+        destination.write_text("keep original")
+    name, commit = "snapshot-1:name", "snapshot-1:save"
+    backend.catalog_bundle_id = "com.kingsoft.wpsoffice.mac"
+    backend.catalog_window_title = "另存为"
+    panel = _wps_new_copy_panel(selected)
+    if scenario == "display_only":
+        panel["standard_save_panel"]["directory_status"] = "display_name_only"
+    if scenario == "legacy":
+        panel["observation_capabilities"] = []
+    backend.snapshot_ax_tree_override = panel
+    approvals = []
+
+    async def approve(card):
+        approvals.append(card)
+        return "once"
+
+    register(registry, manager)
+    registry.set_approval_handler(approve)
+    focus(registry)
+    snap = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    approvals.clear()
+    act = {"type": "click", "element_ref": name if scenario == "wrong_button" else commit,
+           "save_new_copy_to": str(destination)}
+    result = run(registry.execute("computer_act", {"snapshot_id": snap["snapshot_id"], "actions": [act]}))
+    if expected_error:
+        assert result["code"] == expected_error
+        assert result["computer_receipt"]["dispatch_state"] == "not_dispatched"
+        assert not approvals and not any(n == "act" for n, _ in backend.calls)
+    else:
+        assert not result["error"]
+        assert approvals and approvals[0]["arguments"]["known_path"] == str(destination)
+        assert any(n == "act" and payload[1] == [act] for n, payload in backend.calls)
+        fresh = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+        second = run(registry.execute("computer_act", {"snapshot_id": fresh["snapshot_id"], "actions": [
+            {"type": "keypress", "key": "return", "save_new_copy_to": str(destination)}]}))
+        assert second["code"] == "effect_pending"
+        assert sum(n == "act" for n, _ in backend.calls) == 1
+
+@pytest.mark.skipif(os.name != "posix", reason="macOS Save As requires POSIX directories")
+@pytest.mark.parametrize("proof,settled", [
+    ("absent_then_regular_file", True), ("exact_document", True),
+    ("other_document_same_title", False), ("symlink_after_close", False),
+])
+def test_new_copy_settles_only_on_document_or_closed_panel_and_regular_file(
+    registry, manager, backend, monkeypatch, tmp_path, proof, settled,
+):
+    destination = tmp_path / "copy.docx"
+    panel = _wps_new_copy_panel(tmp_path)
+    backend.catalog_bundle_id = "com.kingsoft.wpsoffice.mac"
+    backend.catalog_window_title = "另存为"
+    backend.snapshot_ax_tree_override = panel
+    register(registry, manager)
+    registry.set_approval_handler(lambda card: asyncio.sleep(0, result="once"))
+
+    def confirm(guarded):
+        fresh = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+        action = {"type": "keypress", "key": "return"}
+        if guarded:
+            action["save_new_copy_to"] = str(destination)
+        return run(registry.execute("computer_act", {"snapshot_id": fresh["snapshot_id"], "actions": [action]}))
+
+    focus(registry)
+    assert not confirm(True)["error"]
+    destination.write_bytes(b"saved")
+    # The file appearing while the original sheet is still present cannot release the guard.
+    assert confirm(False)["code"] == "effect_pending"
+    if proof == "absent_then_regular_file":
+        destination.unlink()
+    elif proof == "symlink_after_close":
+        destination.unlink()
+        destination.symlink_to("missing.docx")
+
+    original_apps = backend.apps
+    phase = {"observing_document": True}
+
+    async def catalog():
+        result = await original_apps()
+        app = dict(result.apps[0])
+        window = dict(app["windows"][0])
+        absent = ()
+        if phase["observing_document"]:
+            window.update(title="copy.docx", window_identity_ref="document-identity")
+            if proof in {"exact_document", "other_document_same_title"}:
+                folder = tmp_path if proof == "exact_document" else tmp_path / "other"
+                folder.mkdir(exist_ok=True)
+                window["document_path"] = str(folder / "copy.docx")
+            else:
+                absent = ("identity-a",)
+        else:
+            window["window_identity_ref"] = "fresh-save-panel"
+        app["windows"] = [window]
+        return ComputerAppCatalog(result.generation, (app,), confirmed_absent_window_identity_refs=absent)
+
+    monkeypatch.setattr(backend, "apps", catalog)
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "subrole": "AXStandardWindow", "title": "copy.docx"}
+    focus(registry)
+    if proof == "absent_then_regular_file":
+        destination.write_bytes(b"saved after closing")
+    assert not run(registry.execute("computer_snapshot", {}))["error"]
+
+    phase["observing_document"] = False
+    backend.snapshot_ax_tree_override = panel
+    focus(registry)
+    if proof == "exact_document":
+        # An independently requested ordinary save may target the existing file.
+        assert not confirm(False)["error"]
+    destination.unlink()
+    later = confirm(True)
+    if settled:
+        assert not later["error"]
+    else:
+        assert later["code"] == "effect_pending"
+    assert sum(n == "act" for n, _ in backend.calls) == 1 + int(settled) + int(proof == "exact_document")

@@ -17,6 +17,7 @@ import math
 import os
 import re
 import secrets
+import stat
 import sys
 import weakref
 from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
@@ -49,6 +50,7 @@ from ..computer_policy import (
     permission_request,
     snapshot_approval_scope,
     snapshot_permission_request,
+    trusted_action_elements,
 )
 from ..computer_protocol import (
     ALLOWED_MODIFIERS,
@@ -145,8 +147,14 @@ _SAFE_ACTION_ERRORS = {
     ComputerErrorCode.STALE_SNAPSHOT: "The action snapshot is stale.",
     ComputerErrorCode.OUT_OF_BOUNDS: "The action target is outside the current window.",
     ComputerErrorCode.SECURE_TARGET: "The action targets a protected control and requires user handoff.",
-    ComputerErrorCode.SECURE_INPUT_ACTIVE: "macOS Secure Event Input is active. Leave protected input to the user.",
-    ComputerErrorCode.TEXT_SELECTION_REQUIRED: "In the app's Find UI, search for the exact text to change, use the surrounding record to choose its occurrence, then return focus to the document with that match selected. Observe it and issue the targeted edit again. The helper verifies the existing selection before one foreground Unicode input.",
+    ComputerErrorCode.SAVE_DESTINATION_UNVERIFIED: "The selected save panel did not prove its destination directory, filename and Save control.",
+    ComputerErrorCode.SAVE_DESTINATION_MISMATCH: "The save panel is pointing to a different destination.",
+    ComputerErrorCode.SAVE_DESTINATION_EXISTS: "The new-copy destination already exists.",
+    ComputerErrorCode.SECURE_INPUT_ACTIVE: (
+        "macOS reports Secure Event Input is active for this login session. Astra's input guard "
+        "stopped the operation. Another application can hold this flag while an ordinary document is focused."
+    ),
+    ComputerErrorCode.TEXT_SELECTION_REQUIRED: "The requested text range is not currently selected in the bound field.",
     ComputerErrorCode.TEXT_MATCH_NOT_FOUND: "The observed field has no literal match with that context. Inspect its current text.",
     ComputerErrorCode.TEXT_MATCH_AMBIGUOUS: "Multiple locations match. Supply more adjacent prefix or suffix from the field.",
     ComputerErrorCode.TEXT_INPUT_SOURCE_UNVERIFIED: "Direct AX text editing is unavailable with this input source. For a document edit, inspect the application’s Find and Replace command if available. The source alone does not establish active composition.",
@@ -202,6 +210,8 @@ _NUMBER = {
 _SCROLL_DELTA_X = {**_NUMBER, "description": "Content offset: positive scrolls right, negative left; pixels for pointer scrolling."}
 _SCROLL_DELTA_Y = {**_NUMBER, "description": "Content offset: positive scrolls down, negative up; pixels for pointer scrolling."}
 _ELEMENT_REF = {"type": "string", "minLength": 1, "maxLength": MAX_ELEMENT_REF_SCALARS}
+_NEW_COPY_PATH = {"type": "string", "minLength": 2, "maxLength": 4096,
+                  "description": "Absolute path requested for a new local copy. Confirm in the standard Save As panel only when its actual directory and filename match and the destination is absent."}
 _MODIFIERS = {
     "type": "array",
     "items": {"type": "string", "enum": sorted(ALLOWED_MODIFIERS)},
@@ -228,6 +238,10 @@ def _with_any_required(base: dict[str, Any], variants: tuple[tuple[str, ...], ..
 
 ACTION_SCHEMA = {
     "oneOf": [
+        _action_schema("click", {"element_ref": _ELEMENT_REF, "save_new_copy_to": _NEW_COPY_PATH},
+                       ("element_ref", "save_new_copy_to")),
+        _action_schema("keypress", {"key": {"enum": ["return", "enter"]}, "save_new_copy_to": _NEW_COPY_PATH},
+                       ("key", "save_new_copy_to")),
         _action_schema("click", {"element_ref": _ELEMENT_REF, "checked": {"type": "boolean", "description": "Optional checkbox/radio state goal: skip if satisfied, otherwise click once and verify"}}, ("element_ref",)),
         _action_schema(
             "click",
@@ -516,6 +530,82 @@ class _PreparedComputerAct:
     policy_context: dict[str, Any] | None = None
     dispatch_attempted: bool = False
     dispatch_result: dict[str, Any] | None = None
+    save_destination: str = ""
+    reserve_new_copy: bool = False
+
+
+def _observed_save_panel_destination(panel: Mapping[str, Any], elements: Mapping[str, Any]) -> tuple[str, str]:
+    """Both controls must belong to this snapshot. A popup label or source directory proves no destination."""
+    directory = panel.get("directory")
+    filename = panel.get("filename")
+    name_ref = panel.get("filename_element_ref")
+    chooser_ref = panel.get("directory_chooser_ref")
+    field = elements.get(name_ref) if isinstance(name_ref, str) else None
+    chooser = elements.get(chooser_ref) if isinstance(chooser_ref, str) else None
+    if (
+        panel.get("filename_status") != "observed" or not isinstance(field, Mapping) or field.get("role") != "AXTextField"
+        or panel.get("directory_status") not in {"chooser_file_url", "selected_browser_path"} or not isinstance(chooser, Mapping)
+        or chooser.get("role") != "AXPopUpButton" or not isinstance(directory, str) or not os.path.isabs(directory)
+        or len(directory) > 4096 or not isinstance(filename, str) or not filename or filename in {".", ".."}
+        or any(char in filename for char in "/\\:") or any(ord(char) < 32 for char in directory + filename)
+    ):
+        return "", ""
+    try:
+        if len(filename.encode("utf-8")) > 255 or not Path(directory).is_dir():
+            return "", ""
+    except (OSError, UnicodeError, ValueError):
+        return "", ""
+    return directory, filename
+
+
+def _save_panel_commit(action: ComputerAction, panel: Mapping[str, Any], context: Mapping[str, Any]) -> bool:
+    commit = panel.get("commit_element_ref")
+    if action.type in {"click", "double_click"}:
+        button = (context.get("elements") or {}).get(commit)
+        if not isinstance(button, Mapping) or button.get("role") != "AXButton":
+            return False
+        if action.element_index is not None:
+            return button.get("index") == action.element_index
+        return any(hit is button for hit in trusted_action_elements(context, action.to_mapping()))
+    if action.type != "keypress" or action.key != "return" or action.modifiers:
+        return False
+    target = action.element_ref or context.get("focused_element_ref")
+    return bool(action.save_new_copy_to or (target and target in (commit, panel.get("filename_element_ref"))))
+
+
+def _check_save_panel_action(actions: tuple[ComputerAction, ...], tree: Any, context: Mapping[str, Any]) -> ToolFailure | None:
+    expected = next((a.save_new_copy_to for a in actions if a.save_new_copy_to is not None), None)
+    panel = tree.get("standard_save_panel") if isinstance(tree, Mapping) else None
+    if expected is not None and "save_panel_destination_v1" not in observation_capabilities(tree):
+        return _failure("unsupported_operation", "This helper does not support verified new-copy destinations.")
+    if context.get("bundle_id") != "com.kingsoft.wpsoffice.mac" or not isinstance(panel, Mapping):
+        return None if expected is None else _failure("save_destination_unverified", "Bind the WPS system Save As panel and observe it.")
+    if not any(_save_panel_commit(a, panel, context) for a in actions):
+        return None if expected is None else _failure("save_destination_unverified", "Select the Save button from the current panel.")
+    directory, name = _observed_save_panel_destination(panel, context.get("elements") or {})
+    if not directory or not name:
+        return _failure("save_destination_unverified", "The panel has not confirmed its current absolute directory and filename.",
+                        recovery_hint="Use the folder chooser to select the requested directory; then observe the expanded Save As panel before submitting.")
+    if expected is None:
+        return None
+    if context.get("known_path") != str(Path(directory, name)):
+        return _failure("save_destination_unverified", "The verified destination cannot be shown on the approval.")
+    try:
+        observed = Path(directory).resolve(strict=True) / name
+        requested = Path(expected)
+        if requested.parent.resolve(strict=True) / requested.name != observed:
+            return _failure("save_destination_mismatch", "The selected destination differs from the requested new copy.",
+                            details={"observed_destination": str(observed)},
+                            recovery_hint="Select the requested folder and filename, then observe the panel again.")
+    except (OSError, RuntimeError, ValueError):
+        return _failure("save_destination_unverified", "Unable to inspect the new-copy destination.")
+    try:
+        observed.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return _failure("save_destination_unverified", "Unable to inspect the new-copy destination.")
+    return _failure("save_destination_exists", "This new copy would overwrite an existing item.")
 
 
 def _json(value: Mapping[str, Any]) -> str:
@@ -649,8 +739,29 @@ def _plan_rejection_failure(
 def _application_failure(error) -> ToolFailure:
     code = error.code
     message = _SAFE_ACTION_ERRORS.get(code, "The native Computer Use request was rejected.")
-    if code in {ComputerErrorCode.SECURE_TARGET, ComputerErrorCode.SECURE_INPUT_ACTIVE}:
+    if code in {ComputerErrorCode.SAVE_DESTINATION_UNVERIFIED, ComputerErrorCode.SAVE_DESTINATION_MISMATCH}:
+        return _failure(code.value, message, recovery_hint=(
+            "Observe the current Save As panel, select the requested directory and filename, "
+            "then verify both before confirming the new copy."
+        ))
+    if code is ComputerErrorCode.SAVE_DESTINATION_EXISTS:
+        return _failure(code.value, message, recovery_hint="Inspect the existing item and preserve it when making a new copy.")
+    if code is ComputerErrorCode.SECURE_INPUT_ACTIVE:
+        return _failure(code.value, message, recovery_hint=(
+            "Hand this input to the user. After the session's Secure Event Input state changes, "
+            "observe the document again and check whether the requested edit is still needed."
+        ))
+    if code is ComputerErrorCode.SECURE_TARGET:
         return _failure(code.value, message, recovery_hint="Hand this input to the user.")
+    if code is ComputerErrorCode.TEXT_SELECTION_REQUIRED:
+        return _failure(code.value, message, recovery_hint=(
+            "For a single word identifiable by its surrounding text in a fresh target-window screenshot, "
+            "double_click the word at its image x/y with target_element_ref set to that editor and "
+            "coordinate_space=image_pixels on computer_act. Observe the selection, then use a fresh editor ref "
+            "with the original target_text and prefix/suffix. The helper verifies the selection before writing. "
+            "If the occurrence cannot be distinguished visually or spans multiple words, use the app's Find UI, "
+            "identify the match by its surrounding text, and return focus to the document with that match selected."
+        ))
     if code is ComputerErrorCode.KEYBOARD_FOCUS_UNVERIFIED:
         return _failure(code.value, message, recovery_hint=(
             "Inspect the current window and its focused control. Use an explicitly identified "
@@ -861,6 +972,11 @@ class LocalComputerRuntime:
     def catalog_generation(self) -> int:
         manager = self._manager
         return manager.catalog_generation if manager is not None else 0
+
+    @property
+    def confirmed_absent_window_identity_refs(self) -> tuple[str, ...]:
+        manager = self._manager
+        return manager.confirmed_absent_window_identity_refs if manager is not None else ()
 
     @property
     def closed(self) -> bool:
@@ -2036,6 +2152,24 @@ def _public_snapshot_payload(
         "ax_tree": public_ax_tree,
         "message": "Inspect the attached current macOS target image before choosing the next action.",
     }
+    # A file browser's visible rows may exhaust the general AX projection budget.
+    # Keep the current native panel's bounded controls available independently.
+    panel_info = raw_ax_tree.get("standard_save_panel") if isinstance(raw_ax_tree, Mapping) else None
+    if scope == "target_window" and subtree_ref is None and role_filter is None and isinstance(panel_info, Mapping):
+        safe_panel = {
+            key: value for key, value in panel_info.items() if key in {
+                "filename_status", "filename", "filename_element_ref", "directory_status", "directory",
+                "directory_display_name", "directory_chooser_ref", "commit_element_ref",
+            } and isinstance(value, str) and len(value) <= (4096 if key == "directory" else 256)
+        }
+        private_dir = str(manager.session_dir).rstrip("/")
+        directory = safe_panel.get("directory", "")
+        if directory and (directory == private_dir or directory.startswith(private_dir + "/") or manager.session_id in directory):
+            safe_panel.pop("directory")
+            safe_panel["directory_status"] = "unverified"
+        if isinstance(public_ax_tree, dict) and "standard_save_panel" in public_ax_tree:
+            public_ax_tree["standard_save_panel"] = safe_panel
+        payload["standard_save_panel"] = safe_panel
     if capabilities:
         payload["capabilities"] = capabilities
         payload["form_controls"] = form_elements(raw_ax_tree)
@@ -2128,6 +2262,8 @@ def register_computer_tools(
     # Diagnostics survive grant invalidation, but never authorize execution.
     act_receipt_states: dict[str, _PreparedComputerAct] = {}
     pending_clicks = PendingClickGuard()
+    # The value is the original panel identity, or None once WindowServer confirms its disappearance.
+    pending_new_copies: dict[tuple[str, str], str | None] = {}
     pending_foreground_digest = ""
     pending_foreground_snapshot = ""
     catalog_target_operation_lock = asyncio.Lock()
@@ -2225,7 +2361,9 @@ def register_computer_tools(
         return value[:maximum]
 
     def _approval_safe_path(value: Any) -> str:
-        path = _trusted_text(value, 4_000)
+        if not isinstance(value, str) or len(value) > 4096:
+            return ""
+        path = value
         private_root = str(manager.session_dir).rstrip("/")
         if (
             manager.session_id in path
@@ -2235,7 +2373,29 @@ def register_computer_tools(
             return ""
         return path
 
+    def settle_saved_copies(document_path: str = "") -> None:
+        if not pending_new_copies:
+            return
+        absent = manager.confirmed_absent_window_identity_refs
+        for key, panel_identity in tuple(pending_new_copies.items()):
+            session, destination = key
+            if session != manager.session_id:
+                del pending_new_copies[key]
+                continue
+            if panel_identity in absent:
+                pending_new_copies[key] = None
+            if pending_new_copies[key] is not None and document_path != destination:
+                continue
+            # A closed panel alone can also mean Cancel. A symlink or a missing file
+            # cannot establish that this new copy reached the requested destination.
+            try:
+                if stat.S_ISREG(os.lstat(destination).st_mode):
+                    del pending_new_copies[key]
+            except OSError:
+                pass
+
     def remember_catalog(apps: list[dict[str, object]]) -> None:
+        settle_saved_copies()
         nonlocal trusted_catalog_generation, observation_authority_generation
         trusted_catalog_generation = manager.catalog_generation
         observation_authority_generation += 1
@@ -2385,6 +2545,9 @@ def register_computer_tools(
                 reference = _trusted_text(value.get("element_ref"), MAX_ELEMENT_REF_SCALARS)
                 if reference:
                     metadata: dict[str, Any] = {}
+                    index = value.get("index")
+                    if type(index) is int and index > 0:
+                        metadata["index"] = index
                     for key in ("role", "subrole", "label", "title", "help"):
                         text = _trusted_text(value.get(key), _MAX_AX_STRING)
                         if text:
@@ -2434,7 +2597,29 @@ def register_computer_tools(
                     visit(child, depth + 1)
 
         visit(raw_tree)
-        if (
+        observed_copy = ""
+        if (pending_new_copies and isinstance(raw_tree, Mapping)
+                and raw_tree.get("role") == "AXWindow" and raw_tree.get("subrole") == "AXStandardWindow"
+                and trusted_target.get("bundle_id") == "com.kingsoft.wpsoffice.mac"):
+            # Use only the selected document's own catalog path. Last directory,
+            # matching title and paths on individual controls do not identify a copy.
+            document = trusted_target.get("known_path")
+            if isinstance(document, str) and os.path.isabs(document):
+                with suppress(OSError, RuntimeError, ValueError):
+                    path = Path(document)
+                    observed_copy = str(path.parent.resolve(strict=True) / path.name)
+        settle_saved_copies(observed_copy)
+        panel = raw_tree.get("standard_save_panel") if isinstance(raw_tree, Mapping) else None
+        if isinstance(panel, Mapping) and trusted_target.get("bundle_id") == "com.kingsoft.wpsoffice.mac":
+            # A new observation replaces earlier source-directory/Go To guesses, including
+            # when the real chooser exposes only a basename or its selected folder is unreadable.
+            trusted_wps_directory, trusted_wps_filename = _observed_save_panel_destination(panel, elements)
+            known_path = (
+                _approval_safe_path(str(Path(trusted_wps_directory, trusted_wps_filename)))
+                if trusted_wps_directory and trusted_wps_filename else ""
+            )
+            trusted_wps_destination = known_path
+        elif (
             trusted_target.get("bundle_id") == "com.kingsoft.wpsoffice.mac"
             and focused_role == "AXTextField"
             and focused_value not in {"", "<redacted>"}
@@ -3506,6 +3691,13 @@ def register_computer_tools(
                 else:
                     takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref, focus_consent=prepared.focus_consent)
                 _runtime_takeover_event("foreground_takeover_begin", decision)
+            if prepared.save_destination:
+                key = (manager.session_id, prepared.save_destination)
+                if key in pending_new_copies:
+                    return _failure("effect_pending", "A save to this destination was already dispatched.",
+                                    recovery_hint="Inspect the file or resulting document. Do not submit the save again.")
+                if prepared.reserve_new_copy:
+                    pending_new_copies[key] = str((prepared.policy_context or {}).get("window_identity_ref") or "")
             prepared.dispatch_attempted = True
             result = await manager.act(
                 snapshot_id,
@@ -4177,6 +4369,25 @@ def register_computer_tools(
             prepared.failure = _failure("unsupported_operation", "Showing a result requires an updated macOS helper that can confirm presentation. No input was dispatched.", retryable=False)
             return None
         context = current_policy_context(snapshot_id)
+        save_failure = _check_save_panel_action(prepared.actions, raw_tree, context)
+        if save_failure is not None:
+            prepared.failure = save_failure
+            return None
+        panel = raw_tree.get("standard_save_panel") if isinstance(raw_tree, Mapping) else None
+        if isinstance(panel, Mapping) and any(_save_panel_commit(a, panel, context) for a in prepared.actions):
+            reported_path = context.get("known_path")
+            if reported_path:
+                destination = Path(reported_path)
+                try:
+                    prepared.save_destination = str(destination.parent.resolve(strict=True) / destination.name)
+                except (OSError, RuntimeError, ValueError):
+                    prepared.failure = _failure("save_destination_unverified", "The selected directory is no longer accessible.")
+                    return None
+            prepared.reserve_new_copy = any(a.save_new_copy_to is not None for a in prepared.actions)
+            if (manager.session_id, prepared.save_destination) in pending_new_copies:
+                prepared.failure = _failure("effect_pending", "A save to this destination was already dispatched.",
+                                            recovery_hint="Inspect the file or resulting document. Do not submit the save again.")
+                return None
         # decision.batch_hash 基于此刻的 context；plan_actions 之后 backend 会更新
         # trusted_snapshot，二次复核必须复用同一 context（见 _PreparedComputerAct 注释）。
         prepared.policy_context = context
@@ -4281,6 +4492,22 @@ def register_computer_tools(
                 exc,
                 requested_takeover=mode is ComputerInteractionMode.FOREGROUND_TAKEOVER,
             )
+            if prepared.failure.code == ComputerErrorCode.INPUT_FOCUS_REQUIRED.value and len(prepared.actions) == 1:
+                action = prepared.actions[0]
+                if (action.type == "keypress" and "command" in (action.modifiers or ())
+                        and action.element_ref and isinstance(raw_tree, Mapping)
+                        and raw_tree.get("role") == "AXWindow" and raw_tree.get("element_ref") == action.element_ref):
+                    prepared.failure = replace(
+                        prepared.failure,
+                        recovery_hint=(
+                            "No input was dispatched. This keypress named the document window as its "
+                            "focused control. Inspect the application's menu bar in this window. "
+                            "Use the menu item's subtree_ref to read its commands. A window-level "
+                            "shortcut uses the snapshot's window binding without a field element_ref; "
+                            "set opens_dialog for a command that opens a native dialog."
+                        ),
+                        details={**prepared.failure.details, "focus_reason": "window_ref_used_as_keyboard_field"},
+                    )
             if planning_refusals:
                 prepared.failure.details["planning_refusals"] = planning_refusals
             return None
@@ -4477,6 +4704,8 @@ def register_computer_tools(
                 dispatch_attempted=prepared.dispatch_attempted, error_code=result.get("code", ""),
             )
             result["computer_receipt"] = receipt
+            if prepared.dispatch_attempted and prepared.reserve_new_copy and receipt.get("dispatch_state") == "not_dispatched":
+                pending_new_copies.pop((manager.session_id, prepared.save_destination), None)
             verified_image = not result.get("error") and result.get("verified") is True
             if prepared.finish_presentation is not None:
                 await prepared.finish_presentation(verified_image)
@@ -4524,6 +4753,8 @@ def register_computer_tools(
             authorized_acts.discard(call_id)
 
     def validate_act_arguments(args: dict[str, Any]) -> None:
+        if len(args.get("actions", [])) > 1 and any("save_new_copy_to" in a for a in args["actions"]):
+            raise ValueError("A guarded Save As confirmation must be the only action in its batch")
         for action in args.get("actions", []):
             ComputerAction.from_mapping(action)
             if action.get("type") == "type" and _REDACTED_ACT_TEXT.fullmatch(action["text"]):
@@ -4639,7 +4870,7 @@ def register_computer_tools(
         postcondition=verify_snapshot, repeat_guard=False, max_calls_per_turn=32, **common,
     ))
     registry.register(ToolDef(
-        "computer_act", "Execute a guarded batch. For short forms, put independent radio/checkbox choices in one actions array using click + checked:true and fresh form_controls refs/indexes. For a word or phrase inside a document use type + target_text + exact element_ref with text as the replacement and optional adjacent prefix/suffix to choose a unique match (replace_text_range_v1). With replace_text_v1, type + replace:true + exact element_ref replaces the complete field value (empty text clears); inspect effect verification, never replace it with keyboard shortcuts after failure. Already satisfied goals skip input; inspect final choice_verification. An input acknowledgement alone does not prove the desired effect or page saving. Default auto plans takeover before input; set opens_dialog:true on the FIRST click opening a native file/save/modal panel, including ordinary or custom buttons. Coordinates default to window_logical; use image_pixels only with the latest published target image. Return fresh refs for continued work. Never replay unknown outcomes or click Submit without task authorization.", ACT_SCHEMA, computer_act,
+        "computer_act", "Execute a guarded batch. To confirm a new WPS copy, use save_new_copy_to on the observed Save button with the exact requested absolute path. If it differs from the panel, navigate to the requested folder first. For short forms, put independent radio/checkbox choices in one actions array using click + checked:true and fresh form_controls refs/indexes. For a word or phrase inside a document use type + target_text + exact element_ref with text as the replacement and optional adjacent prefix/suffix to choose a unique match (replace_text_range_v1). With replace_text_v1, type + replace:true + exact element_ref replaces the complete field value (empty text clears); inspect effect verification, never replace it with keyboard shortcuts after failure. Already satisfied goals skip input; inspect final choice_verification. An input acknowledgement alone does not prove the desired effect or page saving. Default auto plans takeover before input; set opens_dialog:true on the FIRST click opening a native file/save/modal panel, including ordinary or custom buttons. Coordinates default to window_logical; use image_pixels only with the latest published target image. Return fresh refs for continued work. Never replay unknown outcomes or click Submit without task authorization.", ACT_SCHEMA, computer_act,
         risk="write", approval="on_risk", replay="never", max_retries=0,
         result_persistence="request_local", permission_check=act_permission_check,
         permission_grant=act_permission_grant, permission_finalizer=finalize_act_permission,

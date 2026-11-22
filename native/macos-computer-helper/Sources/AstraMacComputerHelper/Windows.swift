@@ -1835,7 +1835,7 @@ final class SystemWindowObserver: WindowObserving {
             ? currentKeyboardFocusObservation(
                 in: appElement,
                 expectedPID: target.pid,
-                containerBounds: AXNodeReader.frameAttribute(focusedBefore) ?? .zero
+                containerBounds: AXNodeReader.frameAttribute(focusedBefore) ?? .zero, root: focusedBefore
             ).authority
             : nil
         let backgroundSession = target.interactionMode == .background
@@ -2220,12 +2220,15 @@ final class SystemWindowObserver: WindowObserving {
                         )
                     }
                 }
+                let savePanel = subtree == nil ? standardSavePanelObservation(
+                    tree: tree, window: serializationRoot, budget: contentBudget
+                ) : nil
                 metrics.recordContentBudget(contentBudget)
                 try budget.check()
                 if let subtree, !axSubtreeBelongsToWindow(subtree, window: expectedAfter, pid: target.pid) {
                     throw WindowObservationError.staleTarget
                 }
-                return (tree: tree, detail: detail, defaultButton: defaultButton)
+                return (tree: tree, detail: detail, defaultButton: defaultButton, savePanel: savePanel)
             } catch let error as WindowObservationError {
                 if !budget.available { throw WindowObservationError.observationTimedOut }
                 throw error
@@ -2251,7 +2254,7 @@ final class SystemWindowObserver: WindowObserving {
                     ]),
                     "backing_scale": .number(Double(backingScale)),
                     "capture_bounds": CGRectJSON.encode(captureBounds),
-                    "ax_tree": snapshotAXTreeJSON(prepared.tree, subtree: subtree != nil),
+                    "ax_tree": snapshotAXTreeJSON(prepared.tree, subtree: subtree != nil, standardSavePanel: prepared.savePanel),
                     "has_default_button": .bool(prepared.defaultButton.hasDefaultButton),
                 ]
                 if let elementRef = prepared.defaultButton.elementRef {
@@ -2379,7 +2382,7 @@ final class SystemWindowObserver: WindowObserving {
                     ? currentKeyboardFocusObservation(
                         in: appElement,
                         expectedPID: target.pid,
-                        containerBounds: focusedFinalBounds
+                        containerBounds: focusedFinalBounds, root: focusedFinal
                     ).authority
                     : nil
                 guard keyboardFocus == keyboardFocusBefore else {
@@ -2751,7 +2754,7 @@ final class SystemWindowObserver: WindowObserving {
                         return self.currentKeyboardFocusObservation(
                             in: AXUIElementCreateApplication(target.pid),
                             expectedPID: target.pid,
-                            containerBounds: sourceGuard.bounds
+                            containerBounds: sourceGuard.bounds, root: target.axElement
                         )
                     }
                 ),
@@ -3224,6 +3227,24 @@ final class SystemWindowObserver: WindowObserving {
                 return AXScrollPressTarget(owner: owner, button: button)
             },
             selectedTextWriter: SystemAXSelectedTextWriter(effectProbe: .live),
+            savePanelGuard: { [weak self] action in
+                guard let self, action.saveNewCopyTo != nil,
+                      NSRunningApplication(processIdentifier: target.pid)?.bundleIdentifier == "com.kingsoft.wpsoffice.mac",
+                      let retained = target.axElement, let window = self.catalogExactAXWindow(
+                        in: AXUIElementCreateApplication(target.pid), target: target),
+                      CFEqual(window, retained), observedAXWindowID(window) == target.windowID,
+                      CFHash(window) == snapshotContext.guardValue.axIdentity,
+                      let panel = readStandardSavePanel(window, budget: AXObservationBudget(duration: 1.0))
+                else { throw ActionExecutionError.saveDestinationUnverified }
+                // AXWindows can omit an attached Go To sheet. The application's focused window
+                // changes to that sheet while the original Save panel remains in the catalog.
+                let app = AXUIElementCreateApplication(target.pid)
+                let focusedWindow = decodeAXElement(observationAXAttribute(app, kAXFocusedWindowAttribute).1)
+                let focusedControl = decodeAXElement(observationAXAttribute(app, kAXFocusedUIElementAttribute).1)
+                let clicked = action.elementRef.flatMap { snapshotContext.references[$0]?.element }
+                try checkStandardSaveCommit(panel, action: action, clicked: clicked,
+                    exactFocusedPanel: focusedWindow.map { CFEqual($0, window) } == true, focusedControl: focusedControl)
+            },
             keyboardTargetValidation: { [weak self] expected in
                 // Even a dispatcher created from a background snapshot must prove *current*
                 // foreground ownership before writing AXFocused in its approved consume phase.
@@ -3249,6 +3270,10 @@ final class SystemWindowObserver: WindowObserving {
                           targetBounds: guardValue.bounds, preference: guardValue.focusedRootPreference),
                       CFHash(focused) == guardValue.focusedAXIdentity, liveFrontmostPID() == target.pid
                 else { throw ActionExecutionError.targetNotFrontmost }
+            },
+            validateMenuPress: { element in
+                guard let root = target.axElement, axSubtreeBelongsToWindow(element, window: root, pid: target.pid)
+                else { throw ActionExecutionError.staleSnapshot }
             },
             // 键盘焦点获取能力在此**显式装配**（默认 nil ＝ 不获取）。有了它，`type` 才可能
             // 在目标未被点击聚焦时把焦点带过去，走纯 AX 写入而不是合成键盘事件。
@@ -3517,7 +3542,7 @@ final class SystemWindowObserver: WindowObserving {
                 return self.currentKeyboardFocusObservation(
                     in: AXUIElementCreateApplication(target.pid),
                     expectedPID: target.pid,
-                    containerBounds: authority.guardValue.focusedAXBounds
+                    containerBounds: authority.guardValue.focusedAXBounds, root: target.axElement
                 )
             },
             continuingTextFocus: { [weak self] expected, wanted in
@@ -3574,7 +3599,7 @@ final class SystemWindowObserver: WindowObserving {
                     return self.currentKeyboardFocusObservation(
                         in: AXUIElementCreateApplication(target.pid),
                         expectedPID: target.pid,
-                        containerBounds: authority.guardValue.focusedAXBounds
+                        containerBounds: authority.guardValue.focusedAXBounds, root: target.axElement
                     )
                 }
             ) : authority.guardValue,
@@ -3741,7 +3766,7 @@ final class SystemWindowObserver: WindowObserving {
                 wanted: continuingTextFocus, windowBounds: focusedBounds,
                 readFocused: { self.currentFocusedAXElement(in: app) },
                 observe: { self.currentKeyboardFocusObservation(of: $0, expectedPID: target.pid,
-                    containerBounds: focusedBounds) },
+                    containerBounds: focusedBounds, root: expected) },
                 belongs: { focusedElementBelongsToExactAXRoot(element: $0, root: expected, pid: target.pid) },
                 same: { CFEqual($0, $1) },
                 reject: { logActionRejected("TEXT-CONTINUITY-REJECT pid=\(target.pid) reason=\($0)") }
@@ -3749,7 +3774,7 @@ final class SystemWindowObserver: WindowObserving {
             keyboardFocus = proof
         } else {
             keyboardFocus = currentKeyboardFocusObservation(
-                in: app, expectedPID: target.pid, containerBounds: focusedBounds
+                in: app, expectedPID: target.pid, containerBounds: focusedBounds, root: focused
             )
         }
         let state = ActionTargetState(
@@ -3804,6 +3829,10 @@ final class SystemWindowObserver: WindowObserving {
             : approximatelyEqual(localBounds, snapshotElement.bounds)
         else { return nil }
         let role = AXNodeReader.stringAttribute(element, kAXRoleAttribute)
+        if applicationMenuRole(role.value) {
+            guard let root = target.axElement, axSubtreeBelongsToWindow(element, window: root, pid: target.pid)
+            else { return nil }
+        }
         let subrole = AXNodeReader.stringAttribute(element, kAXSubroleAttribute)
         return ActionElement(
             element: element,
@@ -3998,10 +4027,10 @@ final class SystemWindowObserver: WindowObserving {
     private func currentKeyboardFocusObservation(
         in app: AXUIElement,
         expectedPID: pid_t,
-        containerBounds: CGRect
+        containerBounds: CGRect, root: AXUIElement?
     ) -> KeyboardFocusObservation {
         guard let focused = currentFocusedAXElement(in: app) else { return .secureOrIndeterminate }
-        return currentKeyboardFocusObservation(of: focused, expectedPID: expectedPID, containerBounds: containerBounds)
+        return currentKeyboardFocusObservation(of: focused, expectedPID: expectedPID, containerBounds: containerBounds, root: root)
     }
 
     private func currentFocusedAXElement(in app: AXUIElement) -> AXUIElement? {
@@ -4013,7 +4042,7 @@ final class SystemWindowObserver: WindowObserving {
     }
 
     private func currentKeyboardFocusObservation(
-        of focused: AXUIElement, expectedPID: pid_t, containerBounds: CGRect
+        of focused: AXUIElement, expectedPID: pid_t, containerBounds: CGRect, root: AXUIElement?
     ) -> KeyboardFocusObservation {
         var pid = pid_t()
         guard AXUIElementGetPid(focused, &pid) == .success else { return .secureOrIndeterminate }
@@ -4032,7 +4061,14 @@ final class SystemWindowObserver: WindowObserving {
             role: role,
             subrole: subrole,
             enabled: actionTextAreaEnabled(focused),
-            containerBounds: containerBounds
+            containerBounds: containerBounds,
+            ownsEdgeAlignedEditor: {
+                // Standard document editors can share both horizontal edges with their
+                // window. Geometry alone cannot distinguish a different overlapping window.
+                guard let root, !CFEqual(root, focused),
+                      AXNodeReader.frameAttribute(root) == containerBounds else { return false }
+                return fieldBelongsToNearestAXWindow(focused, root: root, pid: expectedPID)
+            }
         )
     }
 

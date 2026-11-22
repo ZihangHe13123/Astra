@@ -67,15 +67,13 @@ func continuingTextRejectionReason(
         return "wanted_not_text_field"
     }
     guard belongsToSelectedRoot else { return "focus_outside_selected_root" }
-    guard case let .authority(current) = observedFocus else { return "focus_not_authority" }
+    guard let current = observedFocus.authority else { return "focus_not_authority" }
     guard current.identityToken == wanted.identityToken, current.role == wanted.role,
           current.subrole == wanted.subrole, !current.isSecure
     else { return "focus_identity_changed" }
     // An autocomplete window can restyle the same field (live: Edge's omnibox shifts while its
     // suggestions open). Same identity and role inside the validated window is the proof the
     // ordinary text path already accepts for geometry transitions.
-    guard keyboardFocusIdentityAndGeometryAreTrusted(
-        identityToken: current.identityToken, bounds: current.bounds, containerBounds: windowBounds
-    ) else { return "focus_geometry_untrusted" }
+    guard observedFocus.confirmsTextGeometry(in: windowBounds) else { return "focus_geometry_untrusted" }
     return nil
 }

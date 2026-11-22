@@ -1361,7 +1361,8 @@ final class ForegroundPlanExecutor {
                         }
                         result = keyboardExecutor.executePrepared(sourceIndex: entry.sourceIndex, from: preparedKeyboard,
                             expected: expected, lease: lease, batchDeadline: deadline,
-                            batchInputStarted: priorNonWaitInputMayHaveStarted, rangeWitness: witness)
+                            batchInputStarted: priorNonWaitInputMayHaveStarted, rangeWitness: witness,
+                            validateSave: entry.source.saveNewCopyTo == nil ? nil : { try self.performer.validateSaveDestination(entry.source) })
                     } catch let error as ActionExecutionError { result = stopped(error: error) }
                     catch { result = stopped(error: .helperFailed) }
                 } else {
@@ -1459,7 +1460,8 @@ final class ForegroundPlanExecutor {
              .inputFocusRequired?: true
         case nil, .invalidAction?, .permissionDenied?, .outOfBounds?, .actionTimeout?,
              .helperFailed?, .unknownOutcome?, .accessibilityActionRefused?, .observationRequired?,
-             .textMatchNotFound?, .textMatchAmbiguous?, .textRangeUnsupported?, .textSelectionRequired?, .textInputSourceUnverified?: false
+             .textMatchNotFound?, .textMatchAmbiguous?, .textRangeUnsupported?, .textSelectionRequired?, .textInputSourceUnverified?,
+             .saveDestinationUnverified?, .saveDestinationMismatch?, .saveDestinationExists?: false
         }
     }
 

@@ -852,11 +852,9 @@ func retainedPresentationWindowMatches(_ target: WindowTarget,
     guard target.pid > 0, target.windowID != 0, let retained = target.axElement, target.axIdentity == CFHash(retained),
           onScreen(target), let retainedRole = role(retained), retainedRole == kAXWindowRole || retainedRole == kAXSheetRole,
           let focused = focusedWindow(target.pid), owner(focused) == target.pid, let field = focusedElement(target.pid),
-          focusedElementBelongsToExactAXRoot(element: field, root: retained, pid: target.pid,
-            ownerPID: owner, parent: parent, permitsDescendant: { element in
-                guard let r = role(element) else { return false }
-                return r != kAXSheetRole && r != kAXWindowRole
-            }), budget.available else { return false }
+          fieldBelongsToNearestAXWindow(field, root: retained, pid: target.pid,
+                                        owner: owner, parent: parent, role: role),
+          budget.available else { return false }
 
     // AXFocusedWindow may report the parent for a blocking sheet. The field's closest
     // window/sheet above selects exactly one retained root, never both parent and sheet.

@@ -63,6 +63,9 @@ class ComputerErrorCode(str, Enum):
     OBSERVATION_TIMEOUT = "observation_timeout"
     OUT_OF_BOUNDS = "out_of_bounds"
     SECURE_TARGET = "secure_target"
+    SAVE_DESTINATION_UNVERIFIED = "save_destination_unverified"
+    SAVE_DESTINATION_MISMATCH = "save_destination_mismatch"
+    SAVE_DESTINATION_EXISTS = "save_destination_exists"
     SECURE_INPUT_ACTIVE = "secure_input_active"
     TEXT_SELECTION_REQUIRED = "text_selection_required"
     TEXT_MATCH_NOT_FOUND = "text_match_not_found"
@@ -569,8 +572,22 @@ class ComputerAction:
     target_text: str | None = None
     prefix: str | None = None
     suffix: str | None = None
+    save_new_copy_to: str | None = None
 
     def __post_init__(self) -> None:
+        if self.save_new_copy_to is not None:
+            path = self.save_new_copy_to
+            if (not isinstance(path, str) or not _has_valid_unicode_scalars(path, 4096)
+                    or len(path.encode("utf-8")) > 4096 or not path.startswith("/")
+                    or any(part in {"", ".", ".."} for part in path.split("/")[1:])
+                    or any(ord(char) < 32 or ord(char) == 127 for char in path)):
+                raise ValueError("save_new_copy_to requires an absolute local file path with a filename")
+            click = self.type == "click" and bool(self.element_ref) and self.key is None
+            confirm = self.type == "keypress" and self.key in {"return", "enter"} and self.element_ref is None
+            if (not (click or confirm) or self.modifiers or any(getattr(self, key) is not None for key in (
+                    "x", "y", "end_x", "end_y", "text", "delta_x", "delta_y", "duration_ms",
+                    "element_index", "target_element_ref", "checked", "replace", "target_text", "prefix", "suffix"))):
+                raise ValueError("save_new_copy_to requires a standalone Save button reference or default Return")
         if self.target_text is not None or self.prefix is not None or self.suffix is not None:
             if (self.type != "type" or self.element_ref is None or self.text is None or self.replace is not None
                 or not self.target_text or self.modifiers or any(getattr(self, key) is not None for key in (
@@ -716,9 +733,11 @@ class ComputerAction:
         allowed = {
             "type", "x", "y", "end_x", "end_y", "text", "key", "delta_x",
             "delta_y", "duration_ms", "element_ref", "target_element_ref",
-            "element_index", "modifiers", "checked", "replace", "target_text", "prefix", "suffix",
+            "element_index", "modifiers", "checked", "replace", "target_text", "prefix", "suffix", "save_new_copy_to",
         }
         _reject_unknown_fields(value, allowed, "action")
+        if "save_new_copy_to" in value and not isinstance(value["save_new_copy_to"], str):
+            raise ValueError("save_new_copy_to must be a path string")
         if {"target_text", "prefix", "suffix"}.intersection(value):
             _reject_unknown_fields(value, {"type", "text", "element_ref", "target_text", "prefix", "suffix"}, "range replacement")
             if not value.get("target_text") or any(value[key] is None for key in ("prefix", "suffix") if key in value):
@@ -768,6 +787,7 @@ class KeyboardFailureDiagnostics:
             "stale_snapshot", "out_of_bounds", "secure_target", "input_focus_required",
             "secure_input_active", "keyboard_focus_unverified", "control_disabled", "text_selection_required",
             "text_range_unsupported", "text_match_not_found", "text_match_ambiguous",
+            "save_destination_unverified", "save_destination_mismatch", "save_destination_exists",
             "action_timeout", "helper_failed", "unknown_outcome", "user_activity_paused",
         }:
             raise ValueError("input diagnostics have an unknown cause")

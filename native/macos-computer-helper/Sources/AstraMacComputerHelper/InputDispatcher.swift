@@ -226,6 +226,9 @@ final class InputDispatcher: InputDispatching {
         var syntheticRequirements: [PlannedSyntheticRequirement] = []
         var requiresTakeover = context.guardValue.interactionMode == .foregroundTakeover
         var cooperativeError: CooperativeErrorCode?
+        if actions.contains(where: { $0.saveNewCopyTo != nil }), actions.count != 1 {
+            throw ActionExecutionError.invalidAction
+        }
         let requiresSafeTextInput = actions.contains { $0.kind == .type }
         let textInputSafety = requiresSafeTextInput ? backgroundTextInputSafety.detect() : nil
         for (sourceIndex, action) in actions.enumerated() {
@@ -239,6 +242,12 @@ final class InputDispatcher: InputDispatching {
                 textInputSafety: textInputSafety,
                 followsBoundSelectAll: followsBoundSelectAll
             )
+            if action.saveNewCopyTo != nil {
+                try performer.validateSaveDestination(action)
+                guard (action.kind == .click && planned.backend == .axPress) ||
+                      (action.kind == .keypress && planned.backend == .foregroundKeyboard)
+                else { throw ActionExecutionError.saveDestinationUnverified }
+            }
             if context.guardValue.interactionMode == .foregroundTakeover,
                planned.backend == .pidPointer,
                let actionClass = planned.actionClass,
@@ -869,6 +878,11 @@ final class InputDispatcher: InputDispatching {
                 logPlanDenied("keypress chordNil key=\(action.key ?? "?")")
                 return .unsupported(backend: .foregroundKeyboard, actionClass: .text)
             }
+            // Only the foreground executor can revalidate the current default Save button
+            // and its destination immediately before delivering this Return.
+            if action.saveNewCopyTo != nil {
+                return .takeover(backend: .foregroundKeyboard, actionClass: .text)
+            }
             if let element {
                 let targetFocus = try planningKeyboardFocus(for: element, expected: expected)
                 // PID/window-command delivery must not erase an explicit field
@@ -1374,6 +1388,10 @@ final class InputDispatcher: InputDispatching {
             // Preserve existing action digests when no checked goal was supplied.
             if let checked = action.checked { append("checked:\(checked)", to: &bytes) }
             if let replace = action.replace { append("replace:\(replace)", to: &bytes) }
+            if let destination = action.saveNewCopyTo {
+                append("save_new_copy_to", to: &bytes)
+                append(destination, to: &bytes)
+            }
             if let match = action.textMatch {
                 append("target_text", to: &bytes)
                 append(match.target, to: &bytes)

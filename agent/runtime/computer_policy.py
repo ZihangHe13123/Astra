@@ -121,6 +121,10 @@ _PROTOCOL_ACTION_KEYS = frozenset({
     "target_element_ref",
     "modifiers",
     "replace",
+    "target_text",
+    "save_new_copy_to",
+    "prefix",
+    "suffix",
 })
 
 
@@ -144,6 +148,7 @@ class ComputerPolicyDecision:
     requires_takeover: bool = False
     interaction_reason: str = "background_ax_only"
     action_classes: tuple[str, ...] = ()
+    new_copy_destination: str = ""
 
 
 class ComputerApprovalRequest(TimedApprovalRequest):
@@ -414,7 +419,7 @@ def _matches(patterns: tuple[re.Pattern[str], ...], text: str) -> bool:
     return any(pattern.search(text) for pattern in patterns)
 
 
-def _trusted_elements(
+def trusted_action_elements(
     context: Mapping[str, Any],
     action: Mapping[str, Any],
 ) -> tuple[Mapping[str, Any], ...]:
@@ -528,7 +533,7 @@ def _classify_action(context: Mapping[str, Any], action: Mapping[str, Any]) -> _
 
     trusted = context.get("metadata_trusted") is True
     bundle = str(context.get("bundle_id") or "").strip().casefold() if trusted else ""
-    elements = _trusted_elements(context, action)
+    elements = trusted_action_elements(context, action)
     semantics = _trusted_semantics(context, elements)
     reference_requested = isinstance(action.get("element_ref"), str) or isinstance(
         action.get("target_element_ref"), str
@@ -559,6 +564,7 @@ def _classify_action(context: Mapping[str, Any], action: Mapping[str, Any]) -> _
         risk = ComputerRisk.PROHIBITED
     elif (
         not trusted
+        or action.get("save_new_copy_to") is not None
         or not bundle
         or bundle not in _PROFILED_BUNDLES
         or element_identity_incomplete
@@ -704,7 +710,12 @@ def classify_computer_batch(
         context.get("window_title"),
         fallback="Selected window",
     )
+    guarded_save = any(action.get("save_new_copy_to") is not None for action in actions)
     known_path = _bounded(context.get("known_path"), 1_000)
+    if guarded_save:
+        # The new-copy approval shows a filesystem identity, including literal spaces.
+        path = context.get("known_path")
+        known_path = path if isinstance(path, str) and path.startswith("/") and len(path) <= 4096 else ""
     summaries = "; ".join(item.summary for item in assessments[:20])
     batch_hash = _canonical_batch_hash(
         context,
@@ -794,6 +805,7 @@ def classify_computer_batch(
     return ComputerPolicyDecision(
         risk=risk,
         scope=f"computer-write-batch:{session}:{batch_hash}",
+        new_copy_destination=known_path if guarded_save else "",
         choices=("once", "deny"),
         operation=summaries,
         target=target,
@@ -869,6 +881,9 @@ def build_computer_approval(decision: ComputerPolicyDecision, *, present_result:
     }
     if window:
         request["arguments"]["window"] = window
+    if decision.new_copy_destination:
+        request["arguments"]["known_path"] = decision.new_copy_destination
+        request["target"] += f" — {decision.new_copy_destination}"
     if present_result:
         request["arguments"]["present_result"] = True
     return request

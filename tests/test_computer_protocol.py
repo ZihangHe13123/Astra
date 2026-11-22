@@ -37,6 +37,24 @@ def test_robustness_key_aliases_are_canonical_on_wire(key, canonical):
     assert action.to_mapping()["key"] == canonical
 
 
+@pytest.mark.parametrize("path", ["", "copy.docx", "/", "/tmp/", "/tmp/../copy.docx", "/tmp//copy.docx",
+                                  "/tmp/copy\x00.docx", "/tmp/" + "汉" * 1400])
+def test_new_copy_requires_an_absolute_unambiguous_path(path):
+    with pytest.raises(ValueError, match="absolute local file path"):
+        ComputerAction.from_mapping({"type": "click", "element_ref": "save", "save_new_copy_to": path})
+
+
+@pytest.mark.parametrize("action", [
+    {"type": "click", "x": 30, "y": 24}, {"type": "click", "element_index": 2},
+    {"type": "keypress", "key": "s", "modifiers": ["command"]},
+    {"type": "keypress", "key": "return", "element_ref": "search"},
+    {"type": "double_click", "element_ref": "save"},
+])
+def test_new_copy_requires_exact_save_control_or_default_action(action):
+    with pytest.raises(ValueError, match="standalone Save button"):
+        ComputerAction.from_mapping({**action, "save_new_copy_to": "/tmp/copy.docx"})
+
+
 def test_robustness_bad_key_has_bounded_supported_forms():
     with pytest.raises(ValueError) as failure:
         ComputerAction(type="keypress", key="cmd+a")

@@ -45,6 +45,7 @@ description: Use when controlling macOS interfaces with computer_* tools.
    window, action class, effect, and boundary; does not require a filesystem destination. Exclude
    typed text, secure values, internal refs, session IDs, request-local screenshot,
    cache paths, and helper paths.
+   保存面板报告 `display_name_only` 时须核实绝对目录再保存。
 7. Real-pointer actions 须匹配精确 bundle/version/action。虚拟指针用毕归还光标与原应用，实测失败的路径保持禁用，禁止 global HID fallback。
    `docs/macos-computer-compatibility-evidence.md`.
 8. After `unknown_outcome`, timeout, cancellation, or helper loss, never retry or replay

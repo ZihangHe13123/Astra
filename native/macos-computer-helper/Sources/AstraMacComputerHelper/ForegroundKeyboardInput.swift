@@ -16,14 +16,28 @@ struct KeyboardFocusAuthority: Equatable {
 
 enum KeyboardFocusObservation: Equatable {
     case authority(KeyboardFocusAuthority)
+    case ownedEdgeEditor(KeyboardFocusAuthority, CGRect)
     case secureOrIndeterminate
     // Explicit AX secure evidence must never enter missing-focus delegation.
     case secure
     case stale
 
     var authority: KeyboardFocusAuthority? {
-        guard case let .authority(value) = self else { return nil }
-        return value
+        switch self {
+        case let .authority(value), let .ownedEdgeEditor(value, _): return value
+        default: return nil
+        }
+    }
+
+    // Ownership comes from this observation only. ActionGuard retains the field identity
+    // without carrying this proof into another observation or another root.
+    func confirmsTextGeometry(in window: CGRect) -> Bool {
+        guard let field = authority else { return false }
+        return keyboardFocusIdentityAndGeometryAreTrusted(identityToken: field.identityToken, bounds: field.bounds,
+            containerBounds: window, ownsFieldAtEdge: {
+                guard case let .ownedEdgeEditor(_, container) = self else { return false }
+                return field.role == kAXTextAreaRole as String && container == window
+            })
     }
 }
 
@@ -101,17 +115,23 @@ func makeKeyboardFocusObservation(
     role: BoundedAXStringResult,
     subrole: BoundedAXStringResult,
     enabled: Bool?,
-    containerBounds: CGRect
+    containerBounds: CGRect,
+    ownsEdgeAlignedEditor: () -> Bool = { false }
 ) -> KeyboardFocusObservation {
     if expectedPID > 0, actualPID == expectedPID,
        keyboardFocusIsExplicitlySecure(role: role.value, subrole: subrole.value) {
         return .secure
     }
+    var edgeOwner = false
     guard expectedPID > 0, actualPID == expectedPID,
           keyboardFocusIdentityAndGeometryAreTrusted(
               identityToken: identityToken,
               bounds: bounds,
-              containerBounds: containerBounds
+              containerBounds: containerBounds,
+              ownsFieldAtEdge: {
+                  edgeOwner = role.status == .complete && role.value == kAXTextAreaRole as String && ownsEdgeAlignedEditor()
+                  return edgeOwner
+              }
           )
     else { return .stale }
     guard role.status == .complete,
@@ -128,7 +148,7 @@ func makeKeyboardFocusObservation(
         role: roleValue,
         subrole: subrole.value
     )
-    return .authority(authority)
+    return edgeOwner ? .ownedEdgeEditor(authority, containerBounds) : .authority(authority)
 }
 
 protocol SecureInputDetecting {
@@ -281,11 +301,13 @@ final class ForegroundKeyboardExecutor {
         lease: UserActivitySessionLease,
         batchDeadline: TimeInterval? = nil,
         batchInputStarted: Bool = false,
-        rangeWitness: AXKeyboardRangeWitness? = nil
+        rangeWitness: AXKeyboardRangeWitness? = nil,
+        validateSave: (() throws -> Void)? = nil
     ) -> PIDTargetedActionResult {
         let deadline = min(now() + max(0, actionTimeout), batchDeadline ?? plan.deadline)
         guard let action = plan.actions[sourceIndex] else { return stopped(error: .invalidAction) }
-        guard (action.entry.source.textMatch != nil) == (rangeWitness != nil) else { return stopped(error: .invalidAction) }
+        guard (action.entry.source.saveNewCopyTo != nil) == (validateSave != nil),
+              (action.entry.source.textMatch != nil) == (rangeWitness != nil) else { return stopped(error: .invalidAction) }
         do {
             var observationRequired = false
             switch action.payload {
@@ -298,7 +320,8 @@ final class ForegroundKeyboardExecutor {
                     expected: expected,
                     deadline: deadline,
                     lease: lease,
-                    proveBoundField: batchInputStarted
+                    proveBoundField: batchInputStarted,
+                    beforeKeyDown: validateSave
                 )
             case let .text(characters):
                 var inputStarted = false
@@ -668,7 +691,7 @@ final class ForegroundKeyboardExecutor {
             switch try currentObservation() {
             case .secure:
                 throw ActionExecutionError.secureTarget
-            case let .authority(value) where value.isSecure:
+            case let .authority(value) where value.isSecure, let .ownedEdgeEditor(value, _) where value.isSecure:
                 throw ActionExecutionError.secureTarget
             default:
                 break
@@ -681,8 +704,9 @@ final class ForegroundKeyboardExecutor {
             guard !expectedFocus.isSecure else { throw ActionExecutionError.secureTarget }
             guard !secureInput.isSecureInputEnabled() else { throw ActionExecutionError.secureInputActive }
             let currentFocus: KeyboardFocusAuthority
-            switch try currentObservation() {
-            case let .authority(value):
+            let observation = try currentObservation()
+            switch observation {
+            case let .authority(value), let .ownedEdgeEditor(value, _):
                 guard !value.isSecure else { throw ActionExecutionError.secureTarget }
                 currentFocus = value
             case .secure:
@@ -706,10 +730,7 @@ final class ForegroundKeyboardExecutor {
                     guard textTransition || boundField != nil else { return false }
                     return wanted.identityToken == currentFocus.identityToken &&
                         wanted.role == currentFocus.role && wanted.subrole == currentFocus.subrole &&
-                        keyboardFocusIdentityAndGeometryAreTrusted(
-                            identityToken: currentFocus.identityToken, bounds: currentFocus.bounds,
-                            containerBounds: expected.focusedAXBounds
-                        )
+                        observation.confirmsTextGeometry(in: expected.focusedAXBounds)
                 }
                 // A delivered key may move focus: Return submits or navigates, Tab advances.
                 // That is a transition to observe, never permission for another action.
@@ -805,15 +826,17 @@ private func keyboardFiniteRect(_ rect: CGRect) -> Bool {
 func keyboardFocusIdentityAndGeometryAreTrusted(
     identityToken: String,
     bounds: CGRect,
-    containerBounds: CGRect
+    containerBounds: CGRect,
+    ownsFieldAtEdge: () -> Bool = { false }
 ) -> Bool {
     guard !identityToken.isEmpty,
           identityToken.unicodeScalars.count <= maximumAXStringCharacters,
           keyboardFiniteRect(bounds),
           keyboardFiniteRect(containerBounds)
     else { return false }
-    return bounds.minX > containerBounds.minX && bounds.maxX < containerBounds.maxX &&
-        bounds.minY > containerBounds.minY && bounds.maxY < containerBounds.maxY
+    if bounds.minX > containerBounds.minX && bounds.maxX < containerBounds.maxX &&
+        bounds.minY > containerBounds.minY && bounds.maxY < containerBounds.maxY { return true }
+    return bounds != containerBounds && containerBounds.contains(bounds) && ownsFieldAtEdge()
 }
 
 private func foregroundKeyboardFlags(_ modifiers: [String]) -> CGEventFlags {
