@@ -5,11 +5,19 @@ import { syncBuiltinESMExports } from "node:module";
 import { EventEmitter } from "node:events";
 import { PassThrough, Writable } from "node:stream";
 import React from "react";
-import { render } from "ink";
+
 import stripAnsi from "strip-ansi";
 import { StreamingMarkdownCoordinator } from "./streaming-markdown.js";
 import { TuiLifecycle } from "./tui-lifecycle.js";
-import { approvalAwareStdin } from "./foreground-approval-input.js";
+// Ink snapshots is-in-ci on import and otherwise suppresses all live, non-debug paints on CI.
+// Exercise its production renderer on this worker's synthetic TTY, then restore the environment.
+const { render } = await (async () => {
+  const ci = process.env.CI; process.env.CI = "false";
+  try { return await import("ink"); }
+  finally { if (ci === undefined) delete process.env.CI; else process.env.CI = ci; }
+})();
+const { approvalAwareStdin } = await import("./foreground-approval-input.js");
+const { approvalPaintOutput } = await import("./approval-paint.js");
 
 class FakeChild extends EventEmitter {
   exitCode: number | null = null;
@@ -39,12 +47,15 @@ class Output extends Writable {
   _write(data: Buffer, _: BufferEncoding, done: () => void) { this.chunks.push(String(data)); done(); }
 }
 const settle = () => new Promise((resolve) => setTimeout(resolve, 60));
-async function setup(columns = 90, rows = 30, appshotClientFactory?: (consumer:any) => any, appshotManifestReader?: (path:string)=>string, lifecycle?: TuiLifecycle) {
-  const stdin = new Input(); const stdout = new Output();
+// These writes negotiate terminal input, not screen content (stripAnsi alone leaves e.g. "$p").
+const screenChunk = (s: string) => s.replace(/\x1b\[(?:\?1004\$p|\?u|>11u|<u|\?1004[hl])/g, "") !== "";
+async function setup(columns = 90, rows = 30, appshotClientFactory?: (consumer:any) => any, appshotManifestReader?: (path:string)=>string, lifecycle?: TuiLifecycle,
+  display: { stdout?: Output; debug?: boolean } = {}) {
+  const stdin = new Input(); const stdout = display.stdout ?? new Output();
   stdout.columns = columns; stdout.rows = rows;
-  const app = render(<App appshotClientFactory={appshotClientFactory} appshotManifestReader={appshotManifestReader} lifecycle={lifecycle} />, { stdin: approvalAwareStdin(stdin as any), stdout: stdout as any, stderr: stdout as any, debug: true, patchConsole: false, exitOnCtrlC: false });
+  const app = render(<App appshotClientFactory={appshotClientFactory} appshotManifestReader={appshotManifestReader} lifecycle={lifecycle} />, { stdin: approvalAwareStdin(stdin as any), stdout: approvalPaintOutput(stdout as any), stderr: stdout as any, debug: display.debug ?? true, patchConsole: false, exitOnCtrlC: false });
   await settle();
-  return { app, stdin, stdout, child: children.at(-1)!, frame: () => stdout.chunks.map(stripAnsi).filter((chunk) => chunk.trim()).at(-1) ?? "", async key(value: string) { stdin.write(value); await settle(); }, async submit(value: string) { stdin.write(value); await settle(); stdin.write("\r"); await settle(); } };
+  return { app, stdin, stdout, child: children.at(-1)!, frame: () => stdout.chunks.filter(screenChunk).map(stripAnsi).filter((chunk) => chunk.trim()).at(-1) ?? "", async key(value: string) { stdin.write(value); await settle(); }, async submit(value: string) { stdin.write(value); await settle(); stdin.write("\r"); await settle(); } };
 }
 async function tool(h: Awaited<ReturnType<typeof setup>>) { h.child.event({ type: "tool_result", name: "read_file", output: "detail line\n".repeat(20), error: "" }); await settle(); await h.key("\x0f"); assert.match(h.frame(), /Tool #1/); }
 
@@ -859,6 +870,125 @@ test("Ink input send guard: reentrant ordinary key callbacks answer one FIFO hea
     });
     await h.key("n"); assert.ok(reentered); assert.deepEqual(answers(), [["A", "deny"]]);
     await h.key("a"); assert.deepEqual(answers(), [["A", "deny"], ["B", "session"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("Approval paint: an ordinary card cannot own Y before its non-debug Ink frame reaches the output sink", async () => {
+  const draft = "previous-composer-paint", marker = "visible-only-in-card-B";
+  const trace: { event: string; at: number }[] = [];
+  const note = (event: string) => trace.push({ event, at: performance.now() });
+  let hold = true, flush: (() => void) | undefined;
+  class GatedScreen extends Output {
+    override _write(data: Buffer, encoding: BufferEncoding, done: () => void) {
+      const text = stripAnsi(String(data));
+      const deliver = () => {
+        if (text.includes(marker)) note("paint B"); else if (text.includes(draft)) note("paint composer");
+        super._write(data, encoding, done);
+      };
+      if (hold && text.includes(marker)) { note("B write pending"); flush = deliver; } else deliver();
+    }
+  }
+  const stdout = new GatedScreen({ highWaterMark: 1 });
+  const h = await setup(120, 36, undefined, undefined, undefined, { stdout, debug: false });
+  const { answers } = kittyReview(h);
+  const until = async (check: () => boolean) => {
+    const deadline = performance.now() + 2000;
+    while (!check() && performance.now() < deadline) await new Promise(resolve => setImmediate(resolve));
+    assert.ok(check(), JSON.stringify(trace));
+  };
+  try {
+    h.child.stdin.on("data", data => { if (JSON.parse(String(data)).type === "tool_approval_response") note("reply"); });
+    readNow(h, draft); await until(() => trace.some(t => t.event === "paint composer"));
+    note("enqueue B"); h.child.event({ type: "tool_approval_request", request_id: "B", kind: "host_execution",
+      tool_name: "execute_shell", risk: "execute", target: marker, reason: "fixture", choices: ["once", "deny"] });
+    note("early Y"); readNow(h, "y");
+    await new Promise<void>(resolve => setImmediate(resolve));
+    if (!flush && !answers().length) { note("Y between commit and frame"); readNow(h, "y"); }
+    await until(() => !!flush || answers().length > 0);
+    assert.deepEqual(answers(), [], JSON.stringify(trace));
+    note("Y while output blocked"); readNow(h, "y"); await settle();
+    assert.ok(!stdout.chunks.some(s => s.includes(marker))); assert.deepEqual(answers(), [], JSON.stringify(trace));
+    hold = false; const deliver = flush!; flush = undefined; deliver(); await settle();
+    assert.ok(stdout.chunks.some(s => s.includes(marker)), JSON.stringify(trace));
+    note("fresh Y"); await h.key("y"); assert.deepEqual(answers(), [["B", "once"]], JSON.stringify(trace));
+  } finally { hold = false; flush?.(); h.app.unmount(); }
+});
+
+async function openFixtureOAuth(h: Awaited<ReturnType<typeof setup>>) {
+  h.child.event({ type: "model_info", model: "fixture", total_tokens: 0, context_pct: 0, connection_routes: [
+    { provider: "Fixture", id: "fixture-oauth", label: "Fixture OAuth", auth_mode: "oauth", base_url: "" },
+  ] }); await settle();
+  await h.submit("/connect"); assert.match(h.frame(), /Choose provider/);
+  await h.key("\r"); assert.match(h.frame(), /Choose API route/); assert.match(h.frame(), /Fixture OAuth/);
+}
+
+test("Approval paint: Enter on a visible approval preempts the OAuth route until the panel is restored", async () => {
+  const h = await setup(120, 36), { ask, answers } = kittyReview(h);
+  const connections = () => h.child.commands.filter(c => c.type === "connect_provider").map(c => c.route_id);
+  try {
+    await openFixtureOAuth(h);
+    await ask("B", false); assert.match(h.frame(), /审批请求/); assert.doesNotMatch(h.frame(), /Choose API route/);
+    await h.key("\r"); assert.deepEqual(connections(), []); assert.deepEqual(answers(), [["B", "once"]]);
+    assert.match(h.frame(), /Choose API route/); await h.key("\r"); assert.deepEqual(connections(), ["fixture-oauth"]);
+  } finally { h.app.unmount(); }
+});
+
+test("Approval paint: after B a restored OAuth route cannot submit before its own non-debug frame is acknowledged", async () => {
+  let hold = false, flush: (() => void) | undefined;
+  class RouteScreen extends Output {
+    override _write(data: Buffer, encoding: BufferEncoding, done: () => void) {
+      const deliver = () => super._write(data, encoding, done);
+      if (hold && stripAnsi(String(data)).includes("Choose API route")) flush = deliver;
+      else deliver();
+    }
+  }
+  const h = await setup(120, 36, undefined, undefined, undefined, { stdout: new RouteScreen({ highWaterMark: 1 }), debug: false });
+  const { ask, answers } = kittyReview(h);
+  const connections = () => h.child.commands.filter(c => c.type === "connect_provider").map(c => c.route_id);
+  try {
+    await openFixtureOAuth(h); await ask("B", false); assert.match(h.frame(), /审批请求/);
+    hold = true; await h.key("\r"); assert.deepEqual(answers(), [["B", "once"]]); assert.deepEqual(connections(), []);
+    const deadline = performance.now() + 2000;
+    while (!flush && performance.now() < deadline) await settle();
+    assert.ok(flush, "the restored route write must be pending at the sink"); assert.match(h.frame(), /审批请求/);
+    await h.key("\r"); assert.deepEqual(connections(), [], "Enter while the last painted frame still shows B");
+    hold = false; const deliver = flush; flush = undefined; deliver(); await settle();
+    assert.match(h.frame(), /Choose API route/); await h.key("\r"); assert.deepEqual(connections(), ["fixture-oauth"]);
+  } finally { hold = false; flush?.(); h.app.unmount(); }
+});
+
+test("Approval tail: 90ms-late fragmented Up and DECRQM replies cannot grant a successor", async () => {
+  for (const parts of [["[", "A"], ["[?1004;2$", "y"]]) {
+    const h = await setup(), { ask, answers } = kittyReview(h);
+    try {
+      await ask("probe"); await h.key("n"); await ask("A", false); await ask("B", false);
+      readNow(h, "\x1b"); await new Promise(resolve => setTimeout(resolve, 90)); readNow(h, ...parts); await settle();
+      const burst = answers().slice(1);
+      if (!burst.length) await h.key("n"); else assert.deepEqual(burst, [["A", "deny"]], parts.join(""));
+      await h.key("y"); assert.deepEqual(answers(), [["probe", "deny"], ["A", "deny"], ["B", "once"]]);
+    } finally { h.app.unmount(); }
+  }
+});
+
+test("Approval tail: a paste opener split across foreground removal and composer cannot answer the next card", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    await ask("F"); readNow(h, "\x1b");
+    h.child.event({ type: "approval_resolved", request_id: "F", state: "denied", decision: "deny" }); await settle();
+    readNow(h, "[200~"); await ask("B", false); await h.key("y"); assert.deepEqual(answers(), []);
+    readNow(h, "\x1b[201~"); await h.key("y"); assert.deepEqual(answers(), [["B", "once"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("Approval tail: Alt+] cannot swallow a separate Ctrl+C or N; Alt+Escape is not an ordinary denial", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    h.child.event({ type: "task_started", task: { id: "running", status: "running" } }); await ask("F");
+    await h.key("\x1b]"); assert.deepEqual(answers(), []);
+    await h.key("\x03"); assert.equal(h.child.commands.filter(c => c.cmd === "/cancel").length, 1);
+    await h.key("n"); assert.deepEqual(answers(), [["F", "deny"]]);
+    await ask("B", false); await h.key("\x1b\x1b"); assert.deepEqual(answers(), [["F", "deny"]]);
+    await h.key("\x1b"); assert.deepEqual(answers(), [["F", "deny"], ["B", "deny"]]);
   } finally { h.app.unmount(); }
 });
 

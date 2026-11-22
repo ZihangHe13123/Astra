@@ -79,6 +79,94 @@ test("normal Alt and cursor keys are framed identically at every read split, eve
   }
 });
 
+test("after a standalone Escape answers A, one late key cannot also answer B", () => {
+  for (const suffix of [["[", "A"], ["O", "A"], ["[?1004;2$", "y"], ["y"], ["a"], ["\r"]]) {
+    const { keys } = setup(); keys.head(undefined, {}, true);
+    assert.equal(keys.feed("\x1b"), ""); assert.equal(keys.finishEscapeWait(), "\x1b");
+    keys.head(undefined, {}, true);
+    assert.equal(suffix.map(s => keys.feed(s)).join(""), "", "no late suffix to the new card");
+    assert.equal(keys.feed("y"), "y", "a fresh choice is still available");
+  }
+});
+
+test("a late paste opener survives both revocation into the composer and arrival of an ordinary card", () => {
+  for (let cut = 0; cut <= "[200~".length; cut++) {
+    const { keys } = setup(); keys.head("old"); keys.feed("\x1b"); keys.head();
+    assert.equal(keys.finishEscapeWait(), "");
+    assert.equal(keys.feed("[200~".slice(0, cut)), ""); keys.head(undefined, {}, true);
+    assert.equal(keys.feed("[200~".slice(cut)), "");
+    for (const piece of ["y", "a", "\r", C + "20", "1~"]) assert.equal(keys.feed(piece), "");
+    assert.equal(keys.feed("y"), "y");
+  }
+});
+
+test("ambiguous Alt+] leaves a separate denial, standalone Escape and cancel available", () => {
+  for (const changed of [false, true]) for (const negative of ["n", "N", "\x03", "\x1b"]) {
+    const { keys } = setup(); keys.head(undefined, {}, true); keys.feed("\x1b]");
+    if (changed) keys.head(undefined, {}, true);
+    assert.equal(keys.feed(negative) + keys.finishEscapeWait(), negative);
+  }
+  const { keys } = setup(); keys.head(undefined, {}, true);
+  keys.feed("\x1b]52;c;"); // an actual OSC with payload, not just the ambiguous Alt+] prefix
+  for (const s of ["n", "y", "a", "\x07"]) assert.equal(keys.feed(s), "");
+  assert.equal(keys.feed("n"), "n");
+});
+
+test("Alt+Escape is not standalone Escape, even across reads or a FIFO turnover", () => {
+  for (const split of [false, true]) {
+    const { keys } = setup(); keys.head(undefined, {}, true);
+    if (split) { keys.feed("\x1b"); keys.head(undefined, {}, true); keys.feed("\x1b"); }
+    else keys.feed("\x1b\x1b");
+    assert.equal(keys.finishEscapeWait(), "", "no accidental denial");
+    assert.equal(keys.feed("n"), "n");
+  }
+});
+
+test("an ambiguous OSC never promotes an embedded foreground frame, and a refused chord need not strand cancellation", () => {
+  const { keys, grants, negotiate } = setup(); keys.head("F"); negotiate();
+  keys.feed("\x1b]"); keys.feed("\x1b"); keys.feed(press.slice(1) + release); keys.feed("\x07");
+  assert.deepEqual(grants, []);
+  keys.head(undefined, {}, true); keys.feed("\x1b]"); assert.equal(keys.feed("y"), "");
+  assert.equal(keys.feed("\x03"), "\x03");
+});
+
+test("a literal bracket before a separate Enter is not lost or merged into a key for the next modal", () => {
+  for (const interrupted of [false, true]) {
+    const { keys } = setup(); keys.head(undefined, {}, true); keys.feed("\x1b"); keys.finishEscapeWait(); keys.head();
+    const text = keys.feed("[") + keys.feed("\r");
+    assert.equal(text, "[");
+    if (interrupted) keys.head(undefined, {}, true);
+    assert.equal(keys.takeFollowingKey(), interrupted ? "" : "\r");
+  }
+});
+
+test("spent Escape permits independent composer submit without turning a delayed OSC into approval input", () => {
+  const { keys } = setup(); keys.feed("\x1b"); assert.equal(keys.finishEscapeWait(), "\x1b");
+  assert.equal(keys.feed("\r"), "\r");
+  keys.feed("\x1b"); keys.finishEscapeWait();
+  assert.equal(keys.feed("[\r"), "["); assert.equal(keys.takeFollowingKey(), "\r");
+});
+
+test("a possible OSC selector survives a composer hop without capturing unrelated literal ]", () => {
+  for (const before of ["]", "]52;c;"]) {
+    const { keys } = setup(); keys.head("F"); keys.feed("\x1b"); keys.head(); keys.finishEscapeWait();
+    keys.feed(before); keys.head(undefined, {}, true);
+    keys.feed("]52;c;".slice(before.length)); assert.equal(keys.feed("y"), "");
+    keys.feed("\x07"); assert.equal(keys.feed("y"), "y");
+  }
+  const { keys } = setup(); keys.head("F"); keys.feed("\x1b"); keys.head(); keys.finishEscapeWait();
+  assert.equal(keys.feed("]") + keys.feed("words"), "]words"); assert.equal(keys.feed("\r"), "\r");
+  keys.head(undefined, {}, true); assert.equal(keys.feed("y"), "y");
+});
+
+test("other string controls split across a retired card and composer also cannot deliver payload to an approval", () => {
+  for (const opener of ["P", "_", "^", "X"]) {
+    const { keys } = setup(); keys.head("F"); keys.feed("\x1b"); keys.head(); keys.finishEscapeWait();
+    keys.feed(opener + "1;"); keys.head(undefined, {}, true);
+    assert.equal(keys.feed("y"), ""); keys.feed("\x1b\\"); assert.equal(keys.feed("y"), "y");
+  }
+});
+
 test("bracketed paste and control-string payloads are not keyboard choices on an ordinary approval", () => {
   for (const [start, end] of [[C + '200~', C + '201~'], ['\x1b]', '\x07'], ['\x1bP', '\x1b\\']]) {
     const { keys } = setup(); keys.head(undefined, {}, true);

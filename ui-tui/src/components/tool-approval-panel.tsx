@@ -7,10 +7,12 @@ import { wrapToolResult } from "../tool-results.js";
 import type { ToolApprovalRequest } from "../types.js";
 import { useTheme } from "../theme-context.js";
 import { consequenceNote } from "@astra/ui-core/approval-choices";
+import { approvalPaintGlyph } from "../approval-paint.js";
 
 export interface ToolApprovalPanelProps {
   request: ToolApprovalRequest;
   foregroundRelease?: boolean;
+  paintEpoch?: string;
   expanded: boolean;
   width: number;
   queueIndex: number;
@@ -61,6 +63,7 @@ function collapsedShortcutHint(shortcutHint: string): string {
 export function ToolApprovalPanel({
   request,
   foregroundRelease = false,
+  paintEpoch,
   expanded,
   width,
   queueIndex,
@@ -123,7 +126,7 @@ export function ToolApprovalPanel({
       flexDirection="column"
     >
       <Text bold color={theme.warning} wrap="truncate-end">
-        {header}{expanded ? ` · 详情 ${safeOffset + 1}-${end}/${view.detailLines.length}` : ""}
+        {approvalPaintGlyph(paintEpoch, foregroundRelease, "h")}{header.slice(1)}{expanded ? ` · 详情 ${safeOffset + 1}-${end}/${view.detailLines.length}` : ""}
       </Text>
       <Box flexDirection="column" height={bodyHeight} overflowY="hidden">
       {note && <Text color={theme.danger} wrap="truncate-end">{truncateDisplay(note, contentWidth)}</Text>}
@@ -157,7 +160,7 @@ export function ToolApprovalPanel({
         <Text color={theme.muted} wrap="truncate-end">↑/↓ 滚动 · PgUp/PgDn 翻页 · V/Esc 折叠</Text>
       )}
       <Text color={theme.accentAlt}>
-        {shortcuts}
+        {shortcuts.slice(0, -1)}{approvalPaintGlyph(paintEpoch, foregroundRelease, "t")}
       </Text>
     </Box>
   );

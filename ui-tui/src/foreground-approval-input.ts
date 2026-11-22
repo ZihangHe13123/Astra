@@ -25,6 +25,8 @@ export function approvalAwareStdin(source: NodeJS.ReadStream): NodeJS.ReadStream
   const route: Route = { cancelEscape() { clearTimeout(wait); wait = undefined; escapeDue = false; } };
   const read = (size?: number) => {
     for (;;) {
+      const following = route.parser?.takeFollowingKey();
+      if (following) return following;
       if (escapeDue) {
         route.cancelEscape();
         const key = route.parser?.finishEscapeWait();
@@ -68,7 +70,11 @@ export class ForegroundTerminalInput {
   private flagQueries = 0;
   private sequence = "";
   private sequenceOwner?: Receiver;
-  private escapeExpired = false;
+  // Delivery to Ink and framing of bytes still in flight are independent. A spent
+  // prefix can drain a late key/paste marker, but can never mint another decision.
+  private escape: "waiting" | "expired" | "delivered" | "metaEscape" = "waiting";
+  private literalReceiver?: Receiver;
+  private followingKey?: { receiver: Receiver; key: string };
   private overflow = false;
   private paste = false;
   private quarantinePaste = false;
@@ -76,6 +82,9 @@ export class ForegroundTerminalInput {
   private controlString?: "osc" | "st";
   private quarantineString = false;
   private stringEscape = false;
+  private oscHeader?: "empty" | "unrecognized";
+  private oscEscapeOwner?: Receiver;
+  private oscLiteral?: Receiver;
 
   constructor(private write: ((s: string) => void) | undefined, private handle: Handler,
     private reportReady: (id?: string) => void) {}
@@ -91,17 +100,27 @@ export class ForegroundTerminalInput {
   close() { this.restore(false); this.receiver = { view: "closed", approval: false }; this.armed = undefined; }
 
   get awaitingEscapeTimeout(): boolean {
-    return this.sequence === ESC && !this.escapeExpired;
+    return !!this.oscEscapeOwner || (this.sequence === ESC && this.escape === "waiting");
   }
 
   finishEscapeWait(): string {
     if (!this.awaitingEscapeTimeout) return "";
+    if (this.oscEscapeOwner) {
+      // Not a timely string terminator. Only the standalone *negative* Escape
+      // may be delivered, to the receiver that saw it; no payload becomes a key.
+      this.sequence = ESC; this.sequenceOwner = this.oscEscapeOwner; this.oscEscapeOwner = undefined;
+      this.controlString = this.oscHeader = this.oscLiteral = undefined; this.stringEscape = this.quarantineString = false;
+    }
     // Never dispatch a timeout to a foreground or replacement card. Keep the origin
     // so a late Alt-letter/CSI cannot be reinterpreted as its successor's shortcut.
-    this.escapeExpired = true;
-    if (this.id || this.sequenceOwner !== this.receiver) return "";
-    this.sequence = ""; this.sequenceOwner = undefined;
+    if (this.id || this.sequenceOwner !== this.receiver) { this.escape = "expired"; return ""; }
+    this.escape = "delivered";
     return ESC;
+  }
+
+  takeFollowingKey(): string {
+    const next = this.followingKey; this.followingKey = undefined;
+    return next?.receiver === this.receiver ? next.key : "";
   }
 
   head(id?: string, view: InputOwner = "composer", approval = !!id) {
@@ -187,18 +206,40 @@ export class ForegroundTerminalInput {
   feed(chunk: string): string {
     const receiver = this.receiver, owner = receiver.id;
     if (!owner && !this.sequence && !this.paste && !this.controlString && !/[\x1b\x90\x98\x9d-\x9f]/.test(chunk)) return chunk;
-    let normal = "";
+    let normal = "", remaining = chunk.length;
     for (const c of chunk) {
+      remaining -= c.length;
       if (this.paste) {
         if (!owner && !this.quarantinePaste) normal += c;
         this.pasteMatch = c === pasteEnd[this.pasteMatch] ? this.pasteMatch + 1 : c === ESC ? 1 : 0;
         if (this.pasteMatch === pasteEnd.length) { this.paste = this.quarantinePaste = false; this.pasteMatch = 0; }
         continue;
       }
+      // ESC ] with no selector/payload is also the legacy encoding of Alt+]. A
+      // separate negative key is usable in that state. Never interpret payload
+      // from a started OSC (or paste) as a shortcut, even after a view change.
+      if (this.oscLiteral) {
+        // A literal ']' may already be in the old composer. Still recognize a
+        // late OSC selector; never release the resulting payload to an approval.
+        if (this.oscLiteral === receiver && !/[\d;lL]/.test(c)) this.controlString = this.oscHeader = undefined;
+        else this.quarantineString = true;
+        this.oscLiteral = undefined;
+      }
+      if (this.oscHeader && !this.stringEscape && chunk.length === 1 && receiver.approval) {
+        if (c === ESC) { this.oscEscapeOwner = receiver; this.stringEscape = true; continue; }
+        if (c === "\x03" || /^[nN]$/.test(c)) {
+          this.controlString = this.oscHeader = undefined; this.quarantineString = false;
+        }
+      }
       if (this.controlString) {
+        this.oscEscapeOwner = undefined;
+        // XTerm OSC functions start with a numeric/default selector; l/L also
+        // introduce title replies. Unknown data never provides an affirmative key.
+        if (this.stringEscape || (this.oscHeader === "empty" && /[\d;lL]/.test(c))) this.oscHeader = undefined;
+        else if (this.oscHeader) this.oscHeader = "unrecognized";
         if (!owner && !this.quarantineString) normal += c;
         if (this.controlString === "osc" && c === "\x07" || c === "\x9c" || this.stringEscape && c === "\\") {
-          this.controlString = undefined; this.quarantineString = false;
+          this.controlString = this.oscHeader = undefined; this.quarantineString = false;
         }
         this.stringEscape = c === ESC; continue;
       }
@@ -209,25 +250,45 @@ export class ForegroundTerminalInput {
       }
       if (c === ESC) {
         if (this.sequence) this.armed = undefined;
-        this.sequence = ESC; this.sequenceOwner = receiver; this.overflow = this.escapeExpired = false;
+        if (this.sequence === ESC && this.escape === "waiting") {
+          // Two timely ESC bytes encode Alt+Esc, not a denial. Its optional function
+          // key suffix is still non-authoritative (e.g. Alt+Up = ESC ESC [ A).
+          this.escape = "metaEscape"; continue;
+        }
+        if (this.literalReceiver === receiver && !this.overflow) normal += this.sequence.slice(1);
+        this.literalReceiver = undefined;
+        this.sequence = ESC; this.sequenceOwner = receiver; this.overflow = false; this.escape = "waiting";
         continue;
       }
       if (this.sequence === ESC) {
         const same = this.sequenceOwner === receiver;
-        if (this.escapeExpired && !same && !receiver.approval && receiver.view === "composer") {
-          // An undeliverable Escape is no longer a control prefix for fresh composer
-          // text. Do not submit an existing draft with a possibly stale Return/Ctrl key.
-          this.sequence = ""; this.sequenceOwner = undefined; this.armed = undefined;
-          if (c >= " " && c !== "\x7f") normal += c;
-        } else if (c === "[" || c === "O" || c === "N") { this.sequence = ESC + c; }
+        const spent = this.escape === "delivered" || this.escape === "metaEscape" || (this.escape === "expired" && !same);
+        const text = spent && !receiver.approval && receiver.view === "composer";
+        if (c === "[" || c === "O" || c === "N") {
+          this.sequence += c;
+          this.literalReceiver = text ? receiver : undefined;
+          if (spent) this.sequenceOwner = undefined; // parse structure, never dispatch a spent key
+        }
         else {
           this.sequence = ""; this.armed = undefined; this.stringEscape = false;
           const string = c === "]" ? "osc" : "P_^X".includes(c) ? "st" : undefined;
-          if (string) {
+          if (text) {
+            if (string) {
+              // Keep the structural fence even when the old prefix has been
+              // consumed. Only this composer may receive literal text; head()
+              // quarantines an open string before any modal can own its payload.
+              this.controlString = string; this.quarantineString = false;
+              if (string === "osc") { this.oscHeader = "empty"; this.oscLiteral = receiver; }
+            }
+            if ((same && this.escape === "delivered") || (c >= " " && c !== "\x7f")) normal += c;
+          } else if (string) {
             this.controlString = string; this.quarantineString = receiver.approval || !same;
+            this.oscHeader = string === "osc" ? "empty" : undefined;
             if (!this.quarantineString) normal += ESC + c;
-          } else if (same && !owner) normal += ESC + c; // preserve Alt for Ink; never emit a bare suffix
-          else if (same && this.escapeExpired && chunk.length === 1) this.legacy(c); // independent N/V/Ctrl; never a grant
+          } else if (this.escape === "metaEscape" && (!receiver.approval || /^[nv]$/i.test(c) || c === "\x03")) {
+            if (!owner) normal += c; else if (chunk.length === 1) this.legacy(c);
+          } else if (same && !owner && !spent) normal += ESC + c; // preserve Alt for Ink
+          else if (same && this.escape === "expired" && chunk.length === 1) this.legacy(c);
           this.sequenceOwner = undefined;
         }
         continue;
@@ -241,14 +302,20 @@ export class ForegroundTerminalInput {
           // Only the starting receiver gets the complete key, never a bare suffix or payload.
           if (!owner && this.sequenceOwner === receiver && !this.protocolFrame && !this.quarantinePaste && !this.overflow) {
             normal += prefix + body;
+          } else if (this.literalReceiver === receiver && !this.protocolFrame && !this.paste && !this.overflow) {
+            normal += prefix.slice(1) + body; // independently typed '[A', not a replayed Up arrow
           }
-          this.sequenceOwner = undefined;
+          this.sequenceOwner = this.literalReceiver = undefined;
         } else if (c < " ") {
-          this.sequence = ""; this.armed = undefined;
-          if (this.sequenceOwner === receiver && (!receiver.approval || c === "\x03")) {
+          if (this.literalReceiver === receiver && !this.overflow) {
+            normal += this.sequence.slice(1);
+            // Ink parses one read as one key. Finish the literal text first, then
+            // let a separate Return act only if its composer still owns input.
+            if (!remaining) this.followingKey = { receiver, key: c }; else normal += c;
+          } else if (this.sequenceOwner === receiver && (!receiver.approval || c === "\x03")) {
             if (!owner) normal += c; else this.legacy(c);
           }
-          this.sequenceOwner = undefined;
+          this.sequence = ""; this.armed = undefined; this.sequenceOwner = this.literalReceiver = undefined;
         } else if (!this.overflow && c <= "?" && this.sequence.length < 48) this.sequence += c;
         else { this.overflow = true; this.armed = undefined; }
         continue;
