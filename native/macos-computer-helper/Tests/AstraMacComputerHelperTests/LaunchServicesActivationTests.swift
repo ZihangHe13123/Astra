@@ -573,6 +573,101 @@ import Testing
     #expect(runtime.raiseCount == 0)
 }
 
+@Test func sharedBundleActivationAndRestorationRequestOnlyTheRetainedProcess() throws {
+    let target = activationTarget()
+    for restoring in [false, true] {
+        let clock = ActivationTestClock()
+        var requests = 0
+        weak var activeRuntime: PhasedActivationRuntime?
+        let route = runningApplicationActivationRoute(pid: target.pid, isRunning: { true },
+            matchingPIDs: { [313, target.pid] }, activateProcess: {
+                requests += 1
+                activeRuntime?.fallbackFrontmost = target.pid
+                return true
+            })
+        let identity = ApplicationLaunchIdentity(bundleURL: URL(fileURLWithPath: "/Applications/Fixture.app"),
+                                                 localizedName: "Fixture", activationRoute: route)
+        let runtime = PhasedActivationRuntime(identity: identity, expected: target, fallbackFrontmost: 999)
+        activeRuntime = runtime
+        let launcher = TimedProcessLauncher(now: clock.now)
+        let controller = LaunchServicesApplicationActivationController(runtime: runtime, launcher: launcher,
+            now: clock.now, sleep: clock.sleep)
+        if restoring { try controller.restore(pid: target.pid) } else { try controller.activate(target) }
+        #expect(requests == 1)
+        #expect(launcher.invocationTimes.isEmpty)
+        #expect(runtime.setFocusedCount == (restoring ? 0 : 1))
+        #expect(runtime.raiseCount == (restoring ? 0 : 1))
+    }
+}
+
+@Test func rejectedExactProcessActivationNeverReopensTheBundleAfterASiblingExits() {
+    let target = activationTarget()
+    let clock = ActivationTestClock()
+    var livePIDs: [pid_t] = [target.pid, 313]
+    var requests = 0
+    let route = runningApplicationActivationRoute(pid: target.pid, isRunning: { true },
+        matchingPIDs: { livePIDs }, activateProcess: {
+            requests += 1
+            livePIDs = [target.pid]
+            return false
+        })
+    let identity = ApplicationLaunchIdentity(bundleURL: URL(fileURLWithPath: "/Applications/Fixture.app"),
+                                             localizedName: "Fixture", activationRoute: route)
+    let runtime = PhasedActivationRuntime(identity: identity, expected: target, fallbackFrontmost: 999)
+    let launcher = TimedProcessLauncher(now: clock.now)
+    let controller = LaunchServicesApplicationActivationController(runtime: runtime, launcher: launcher,
+        now: clock.now, sleep: clock.sleep, timeout: 0.75)
+    expectTargetNotFrontmost { try controller.activate(target) }
+    #expect(requests > 1)
+    #expect(launcher.invocationTimes.isEmpty)
+    #expect(runtime.setFocusedCount == 0 && runtime.raiseCount == 0)
+}
+
+@Test func thirdProcessDuringExactActivationStopsBeforeAXOrFocusRestoration() {
+    let target = activationTarget()
+    for duringEnumeration in [false, true] {
+        for restoring in [false, true] {
+            let clock = ActivationTestClock()
+            weak var activeRuntime: PhasedActivationRuntime?
+            var requests = 0
+            let route = runningApplicationActivationRoute(pid: target.pid, isRunning: { true },
+                matchingPIDs: {
+                    if duringEnumeration { activeRuntime?.fallbackFrontmost = 313 }
+                    return [target.pid, 313]
+                }, activateProcess: {
+                    requests += 1
+                    activeRuntime?.fallbackFrontmost = 313
+                    return true
+                })
+            let identity = ApplicationLaunchIdentity(bundleURL: URL(fileURLWithPath: "/Applications/Fixture.app"),
+                                                     localizedName: "Fixture", activationRoute: route)
+            let runtime = PhasedActivationRuntime(identity: identity, expected: target, fallbackFrontmost: 999)
+            activeRuntime = runtime
+            let launcher = TimedProcessLauncher(now: clock.now)
+            let controller = LaunchServicesApplicationActivationController(runtime: runtime, launcher: launcher,
+                now: clock.now, sleep: clock.sleep)
+            #expect(throws: TakeoverError.userActivityPaused) {
+                if restoring { try controller.restore(pid: target.pid) } else { try controller.activate(target) }
+            }
+            #expect(requests == (duringEnumeration ? 0 : 1))
+            #expect(launcher.invocationTimes.isEmpty)
+            #expect(runtime.setFocusedCount == 0 && runtime.raiseCount == 0)
+        }
+    }
+}
+
+@Test func soleLiveInstanceUsesLaunchServicesAndGoneProcessCannotBeReopened() {
+    let target = activationTarget()
+    var alive = true
+    var requests = 0
+    let route = runningApplicationActivationRoute(pid: target.pid, isRunning: { alive },
+        matchingPIDs: { [target.pid] }, activateProcess: { requests += 1; return true })
+    guard case .launchServices = route() else { Issue.record("expected singleton route"); return }
+    alive = false
+    guard case .targetGone = route() else { Issue.record("expected dead process rejection"); return }
+    #expect(requests == 0)
+}
+
 @Test func productionSourcesDoNotCallNSRunningApplicationActivate() throws {
     let testsDirectory = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
     let packageRoot = testsDirectory.deletingLastPathComponent().deletingLastPathComponent()

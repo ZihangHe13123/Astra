@@ -427,9 +427,34 @@ struct BackgroundSnapshotSession {
     }
 }
 
+enum RunningApplicationActivationRoute {
+    case launchServices
+    case exactProcess(() -> Bool)
+    case targetGone
+}
+
 struct ApplicationLaunchIdentity {
     let bundleURL: URL?
     let localizedName: String?
+    var activationRoute: () -> RunningApplicationActivationRoute = { .launchServices }
+}
+
+/// Keep the exact running instance once a sibling is seen. A later failure or
+/// sibling exit must not turn a PID-specific request into a bundle-wide reopen.
+func runningApplicationActivationRoute(pid: pid_t, isRunning: @escaping () -> Bool,
+    matchingPIDs: @escaping () -> [pid_t], activateProcess: @escaping () -> Bool
+) -> () -> RunningApplicationActivationRoute {
+    var needsExactProcess = false
+    return {
+        guard pid > 0, isRunning() else { return .targetGone }
+        if !needsExactProcess {
+            let pids = matchingPIDs()
+            // LaunchServices is appropriate only for one confirmed, matching instance.
+            needsExactProcess = pids != [pid]
+        }
+        if needsExactProcess { return .exactProcess { isRunning() && activateProcess() } }
+        return .launchServices
+    }
 }
 
 struct ProcessLaunchInvocation: Equatable {
@@ -695,10 +720,22 @@ struct SystemApplicationActivationRuntime: ApplicationActivationRuntime {
         guard let application = NSRunningApplication(processIdentifier: pid), !application.isTerminated else {
             return nil
         }
-        return ApplicationLaunchIdentity(
-            bundleURL: application.bundleURL,
-            localizedName: application.localizedName
-        )
+        let url = application.bundleURL
+        let name = application.localizedName
+        let route = runningApplicationActivationRoute(pid: pid, isRunning: { !application.isTerminated },
+            matchingPIDs: {
+                let matches: [NSRunningApplication]
+                if let identifier = application.bundleIdentifier {
+                    matches = NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
+                } else {
+                    matches = NSWorkspace.shared.runningApplications.filter { other in
+                        if let url { return other.bundleURL == url }
+                        return name != nil && other.localizedName == name
+                    }
+                }
+                return matches.filter { !$0.isTerminated }.map(\.processIdentifier)
+            }, activateProcess: { application.activate(options: []) })
+        return ApplicationLaunchIdentity(bundleURL: url, localizedName: name, activationRoute: route)
     }
 
     func unhide(pid: pid_t) {
@@ -949,7 +986,8 @@ final class LaunchServicesApplicationActivationController: ApplicationActivation
             lastFrontmost = frontmost
             if !frontmost {
                 launches += 1
-                if launchOnce(arguments: arguments, deadline: deadline) {
+                if try requestActivation(identity, pid: target.pid, arguments: arguments, deadline: deadline,
+                                         checkedFrontmostPID: checkedFrontmostPID) {
                     guard try waitForFrontmost(deadline: deadline, frontmost: targetIsFrontmost) else { continue }
                     lastFrontmost = true
                 } else {
@@ -1031,7 +1069,8 @@ final class LaunchServicesApplicationActivationController: ApplicationActivation
         let deadline = now().addingTimeInterval(timeout)
         while now() < deadline {
             if try checkedFrontmostPID() == pid { return }
-            if launchOnce(arguments: arguments, deadline: deadline) {
+            if try requestActivation(identity, pid: pid, arguments: arguments, deadline: deadline,
+                                     checkedFrontmostPID: checkedFrontmostPID) {
                 if try waitForFrontmost(deadline: deadline, frontmost: { try checkedFrontmostPID() == pid }) { return }
             } else {
                 _ = try checkedFrontmostPID()
@@ -1042,9 +1081,21 @@ final class LaunchServicesApplicationActivationController: ApplicationActivation
         throw WindowObservationError.targetNotFrontmost
     }
 
-    private func launchOnce(arguments: [String], deadline: Date) -> Bool {
+    private func requestActivation(_ identity: ApplicationLaunchIdentity, pid: pid_t, arguments: [String],
+                                   deadline: Date, checkedFrontmostPID: () throws -> pid_t) throws -> Bool {
+        let route = identity.activationRoute()
         let remaining = deadline.timeIntervalSince(now())
         guard remaining > 0 else { return false }
+        switch route {
+        case .targetGone:
+            throw WindowObservationError.targetGone
+        case let .exactProcess(request):
+            if try checkedFrontmostPID() == pid { return true }
+            guard now() < deadline else { return false }
+            return request() && now() < deadline
+        case .launchServices:
+            break
+        }
         let result = try? launcher.run(
             executable: "/usr/bin/open",
             arguments: arguments,
