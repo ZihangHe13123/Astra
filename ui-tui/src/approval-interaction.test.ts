@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { transitionApprovalInput } from "./approval-interaction.js";
+import { ApprovalQueue, transitionApprovalInput } from "./approval-interaction.js";
 import type { ToolApprovalRequest } from "./types.js";
 
 function request(requestId: string): ToolApprovalRequest {
@@ -18,6 +18,37 @@ function request(requestId: string): ToolApprovalRequest {
 
 const first = request("approval-1");
 const second = request("approval-2");
+
+test("a response claims its displayed head before writing, never the next queued request", () => {
+  const queue = new ApprovalQueue();
+  queue.enqueue(first); queue.enqueue(second);
+  const sent: string[] = [];
+  const write = () => { sent.push(first.request_id); return true; };
+  assert.equal(queue.respond(null, write), false);
+  assert.equal(queue.respond(second, write), false);
+  assert.equal(queue.respond(first, () => {
+    assert.equal(queue.respond(first, write), false); // reentrant write callback
+    return write();
+  }), true);
+  assert.equal(queue.respond(first, write), false); // stale callback before React repaints
+  assert.deepEqual(sent, [first.request_id]);
+  assert.deepEqual(queue.requests, [second]);
+});
+
+test("a failed write retains only a still-live head; remote resolution and reconnect revoke stale callbacks", () => {
+  const queue = new ApprovalQueue();
+  queue.enqueue(first);
+  assert.equal(queue.respond(first, () => false), false);
+  assert.deepEqual(queue.requests, [first]);
+  assert.equal(queue.respond(first, () => { queue.remove(first.request_id); return false; }), false);
+  assert.deepEqual(queue.requests, []);
+  queue.enqueue(second);
+  const replacement = request(second.request_id);
+  assert.equal(queue.respond(second, () => { queue.clear(); queue.enqueue(replacement); return true; }), true);
+  assert.equal(queue.respond(second, () => assert.fail("stale response after reconnect")), false);
+  assert.equal(queue.respond(replacement, () => true), true);
+  assert.deepEqual(queue.requests, []);
+});
 
 test("Y resolves only the FIFO head and resets detail state for the next request", () => {
   const next = transitionApprovalInput(
@@ -56,6 +87,25 @@ test("A selects the offered session decision", () => {
 
   assert.deepEqual(next.response, { requestId: "approval-1", decision: "session" });
   assert.deepEqual(next.requests, []);
+});
+
+test("Ink-normalized chords are consumed without answering a pending approval", () => {
+  const head = { ...first, choices: ["once", "task", "session", "always", "deny"] } as ToolApprovalRequest;
+  const state = { requests: [head, second], detailOpen: false, detailOffset: 0 };
+  const bounds = { lineCount: 5, pageSize: 5 };
+  for (const modifier of [{ meta: true }, { ctrl: true }, { meta: true, ctrl: true }]) {
+    for (const letter of ["y", "a", "t", "l", "n"]) {
+      assert.deepEqual(transitionApprovalInput(state, letter, modifier, bounds), { ...state, handled: true });
+    }
+    assert.equal(transitionApprovalInput(state, "\r", { ...modifier, return: true }, bounds).response, undefined);
+  }
+  assert.equal(transitionApprovalInput(state, "", { return: true, shift: true }, bounds).response, undefined);
+  assert.equal(transitionApprovalInput(state, "\x1b", { escape: true, meta: true }, bounds).response, undefined); // Alt+Esc
+  assert.equal(transitionApprovalInput(state, "Y", { shift: true }, bounds).response?.decision, "once");
+  const collapsed = transitionApprovalInput({ ...state, detailOpen: true }, "", { escape: true, meta: true }, bounds);
+  assert.equal(collapsed.detailOpen, false);
+  assert.equal(collapsed.response, undefined);
+  assert.equal(transitionApprovalInput(collapsed, "", { escape: true, meta: true }, bounds).response?.decision, "deny");
 });
 
 test("foreground grants require a release for the same FIFO head and an offered choice; legacy input cannot grant", () => {

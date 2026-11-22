@@ -67,7 +67,6 @@ import type {
   LyraGlassState,
   PyEvent,
   TaskInfo,
-  ToolApprovalRequest,
   TuiCommand,
   WorkingMemory,
   StartupInfo,
@@ -119,7 +118,7 @@ import {
   approvalRequestLines,
   escapeApprovalDisplayText,
 } from "./approval-preview.js";
-import { transitionApprovalInput, type ForegroundRelease } from "./approval-interaction.js";
+import { ApprovalQueue, transitionApprovalInput, type ForegroundRelease } from "./approval-interaction.js";
 import { useForegroundApprovalInput } from "./foreground-approval-input.js";
 import { formatQuestionAnswerSummary } from "./question-interaction.js";
 import {
@@ -782,7 +781,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   const previousApprovalCountRef = useRef(0);
   const [activityExpanded, setActivityExpanded] = useState(false);
   const [commandMenuVisible, setCommandMenuVisible] = useState(false);
-  const [approvalRequests, setApprovalRequests] = useState<ToolApprovalRequest[]>([]);
+  const [approvalQueue] = useState(() => new ApprovalQueue());
+  const [approvalRequests, setApprovalRequests] = useState(approvalQueue.requests);
   const [questionProtocol, setQuestionProtocol] = useState({
     request: null as UserQuestionRequest | null,
     rejection: null as { requestId: string; reason: string } | null,
@@ -1052,12 +1052,12 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
       setCompacting(false);
       setActiveTools([]);
       setActiveProcesses([]);
-      setApprovalRequests([]);
+      setApprovalRequests(approvalQueue.clear());
       setQuestionProtocol(current => current.request?.state === "pending" ? current : { request: null, rejection: null });
       updateActiveTask(null);
       cancelRequestedRef.current = false;
     }
-  }, [completeTurn, updateActiveTask]);
+  }, [approvalQueue, completeTurn, updateActiveTask]);
 
   const clearStreamingDisplay = useCallback(() => {
     discardPendingTextRef.current();
@@ -1547,9 +1547,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         // from `pendingApproval` during render. A second activeTools update
         // here would be a second unbatched Ink repaint of the full-width
         // dock borders for the same approval event.
-        setApprovalRequests((current) => current.some((item) => item.request_id === event.request_id)
-          ? current
-          : [...current, event]);
+        setApprovalRequests(approvalQueue.enqueue(event));
         break;
       case "approval_inbox_snapshot":
         if (event.orphaned.length) {
@@ -1561,14 +1559,10 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         }
         break;
       case "approval_resolved":
-        setApprovalRequests((current) => current.filter(
-          (item) => item.request_id !== event.request_id
-        ));
+        setApprovalRequests(approvalQueue.remove(event.request_id));
         break;
       case "approval_response_rejected":
-        setApprovalRequests((current) => current.filter(
-          (item) => item.request_id !== event.request_id
-        ));
+        setApprovalRequests(approvalQueue.remove(event.request_id));
         addMessage("error", event.reason);
         break;
       case "user_question_request":
@@ -1676,7 +1670,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         }
         break;
     }
-  }, [addMessage, appendStreamChunk, clearStreamingDisplay, closeToolDetails, columns, completeTurn, finishTurn, flushStreamRole, railLayout, runtimeMode, approvalRequests.length, updateActiveTask]);
+  }, [addMessage, appendStreamChunk, approvalQueue, clearStreamingDisplay, closeToolDetails, columns, completeTurn, finishTurn, flushStreamRole, railLayout, runtimeMode, approvalRequests.length, updateActiveTask]);
 
   // ── refs to decouple backend lifecycle from React deps ──
   useLayoutEffect(() => { runtimeTimingRef.current?.commit(); });
@@ -1813,7 +1807,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           },
         },
       );
-      rl.on("line", receiveEvent);
+      rl.on("line", line => { if (!disposed && procRef.current === proc) receiveEvent(line); });
 
       const errRl = createInterface({ input: proc.stderr! });
       errRl.on("line", (line: string) => {
@@ -1835,6 +1829,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         runtimeTiming.clear();
         runtimeTimingRef.current = null;
         procRef.current = null;
+        approvalQueue.clear();
         if (disposed || lifecycle?.closing) return;
         if (questionRequestRef.current) addMessageRef.current("system", "Unanswered question expired after backend disconnect. Please ask again if needed.");
         setQuestionProtocol({ request: null, rejection: null });
@@ -1872,6 +1867,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
 
     return () => {
       disposed = true;
+      approvalQueue.clear();
       discardPendingText();
       closeHandshake();
       runtimeTimingRef.current?.clear();
@@ -2318,15 +2314,17 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     ? approvalRequestLines(approvalRequests[0], Math.max(20, columns - 4)).length
     : 0;
 
+  const approvalVisible = !!pendingApproval && !startupVisible && !connectionOpen;
   const handleInput = (input: string, key: Partial<Key>, released?: ForegroundRelease) => {
     if (lifecycle?.closing) return;
     if (connectionOpenRef.current) return;
-    if (key.ctrl && input === "y") {
+    const plainCtrl = key.ctrl && !key.meta && !key.shift;
+    if (plainCtrl && input === "y") {
       // Handle before modal navigation; backend owns state and pending approvals.
       send({ type: "command", cmd: "/yolo" });
       return;
     }
-    if (key.ctrl && input === "c") {
+    if (plainCtrl && input === "c") {
       if (busyRef.current && !cancelRequestedRef.current) {
         cancelRequestedRef.current = true;
         addMessage("system", "Cancelling active task… Press Ctrl+C again to force exit.");
@@ -2345,8 +2343,11 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         leaveViewerScreen();
         process.exit(0);
       }
+      return;
     }
-    if (approvalRequests.length > 0) {
+    if (pendingApproval !== approvalQueue.requests[0]) return; // This callback belongs to an older render.
+    if (pendingApproval) {
+      if (!approvalVisible) return;
       const transition = transitionApprovalInput(
         {
           requests: approvalRequests,
@@ -2358,14 +2359,14 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         { lineCount: approvalLineCount, pageSize: approvalPageSize },
         released,
       );
-      if (transition.response) {
-        if (!send({
+      const response = transition.response;
+      if (response) {
+        if (!approvalQueue.respond(pendingApproval, () => send({
           type: "tool_approval_response",
-          request_id: transition.response.requestId,
-          decision: transition.response.decision,
-        })) return;
-        const answeredId = transition.response.requestId;
-        setApprovalRequests(current => current.filter(request => request.request_id !== answeredId));
+          request_id: response.requestId,
+          decision: response.decision,
+        }))) return;
+        setApprovalRequests(approvalQueue.requests);
       }
       setApprovalDetailOpen(transition.detailOpen);
       setApprovalDetailOffset(transition.detailOffset);
@@ -2411,13 +2412,14 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
       setActivityExpanded((current) => !current);
     }
   };
-  const foregroundId = pendingApproval?.kind === "computer_foreground_takeover" && !connectionOpen && !startupVisible
+  const foregroundId = approvalVisible && pendingApproval.kind === "computer_foreground_takeover"
     ? pendingApproval.request_id : undefined;
-  const normalInputOwner = connectionOpen ? "connection" : pendingApproval ?? questionRequest ?? openToolResult ?? "composer";
-  const foregroundRelease = useForegroundApprovalInput(foregroundId, normalInputOwner, (_id, input, key, released) => {
+  const normalInputOwner = startupVisible ? "startup" : connectionOpen ? "connection" : pendingApproval ?? questionRequest ?? openToolResult ?? "composer";
+  const foregroundRelease = useForegroundApprovalInput(foregroundId, normalInputOwner, (id, input, key, released) => {
+    if (pendingApproval?.request_id !== id || approvalQueue.requests[0] !== pendingApproval) return false;
     appshotClientRef.current?.recordInput();
     return handleInput(input, key, released);
-  });
+  }, approvalVisible);
   useInput((input, key) => {
     appshotClientRef.current?.recordInput();
     handleInput(input, key);

@@ -286,8 +286,13 @@ test("backend-started retry enters busy even after a legacy command acknowledgem
     await h.key("\x03");
     assert.equal(exits, 0);
     assert.equal(h.child.commands.at(-1)?.cmd, "/cancel");
+    // Requesting cancellation must not discard or finalize the stream. The backend
+    // may still send a final delta before it acknowledges cancellation.
+    assert.match(h.stdout.chunks.map(stripAnsi).join(""), /Cancelling active task/);
+    h.child.event({ type: "chunk", content: " after Ctrl+C" });
     h.child.event({ type: "task_status", task: { id: "retry-task", status: "cancelled" } });
     await settle();
+    assert.match(h.stdout.chunks.map(stripAnsi).join(""), /still streaming after Ctrl\+C/);
     await h.submit("/reset");
     assert.equal(h.child.commands.at(-1)?.cmd, "/reset");
   } finally { process.exit = originalExit; h.app.unmount(); }
@@ -737,6 +742,123 @@ test("a fragmented late probe reply is not an ordinary Escape, and a deferred Es
     h.child.event({ type: "approval_resolved", request_id: "normal-b", state: "denied", decision: "deny" }); await settle();
     assert.deepEqual(answers(), [["legacy", "deny"], ["normal-a", "deny"], ["another-legacy", "deny"]]);
     await h.key("\x1b"); assert.deepEqual(answers().at(-1), ["normal-c", "deny"]);
+  } finally { h.app.unmount(); }
+});
+
+// Deliver distinct TTY reads in one turn. Ink reads the real bytes via approvalAwareStdin;
+// no assumption about a particular Escape timeout or parser callback is needed.
+function readNow(h: Awaited<ReturnType<typeof setup>>, ...chunks: string[]) {
+  for (const chunk of chunks) { h.stdin.write(chunk); h.stdin.emit("readable"); }
+}
+
+test("Ink input ownership: the Alt+Y suffix of a remotely resolved foreground card cannot answer its successor", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    await ask("F"); await ask("B", false); await h.key("\x1b");
+    h.child.event({ type: "approval_resolved", request_id: "F", state: "denied", decision: "deny" }); await settle();
+    await h.key("y"); assert.deepEqual(answers(), []);
+    await h.key("a"); assert.deepEqual(answers(), [["B", "session"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("Ink input ownership: a delivered Escape does not prefix literal composer brackets or consume the next denial", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    await ask("unanswered-probe");
+    h.child.event({ type: "approval_resolved", request_id: "unanswered-probe", state: "denied", decision: "deny" }); await settle();
+    await ask("A", false); await h.key("\x1b"); assert.deepEqual(answers(), [["A", "deny"]]);
+    await h.key("["); await h.key("A"); // independent text, not a CSI Up
+    await ask("B", false); await h.key("\x1b"); assert.deepEqual(answers(), [["A", "deny"], ["B", "deny"]]);
+    await h.key("]"); await h.key("\r"); // independent text, not an OSC opener
+    await ask("F"); await h.key("n");
+    assert.ok(h.child.commands.some(c => c.type === "message" && c.text === "[A]"));
+    assert.deepEqual(answers().at(-1), ["F", "deny"]);
+  } finally { h.app.unmount(); }
+});
+
+test("Ink input ownership: a fast split arrow after all pop replies cannot deny the next ordinary approval", async () => {
+  const h = await setup(), { ask, answers, negotiate } = kittyReview(h);
+  try {
+    await ask("F"); await negotiate(); await h.key("\x1b[110u"); await h.key("\x1b[?0u");
+    await ask("B", false); readNow(h, "\x1b", "[A"); await settle();
+    assert.deepEqual(answers(), [["F", "deny"]]);
+    await h.key("y"); assert.deepEqual(answers(), [["F", "deny"], ["B", "once"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("Ink input ownership: fast Escape+y with an orphaned query cannot double-answer A or grant B", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    await ask("F"); await h.key("n"); await ask("A", false); await ask("B", false);
+    readNow(h, "\x1b", "y"); await settle();
+    assert.deepEqual(answers(), [["F", "deny"]]); // One timely Alt+Y, not two decisions.
+    await h.key("n");
+    await h.key("a"); assert.deepEqual(answers(), [["F", "deny"], ["A", "deny"], ["B", "session"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("an old Escape on the same foreground card cannot swallow a later independent cancel or denial", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    h.child.event({ type: "task_started", task: { id: "running", status: "running" } });
+    await ask("legacy");
+    readNow(h, "\x1b", "n"); assert.deepEqual(answers(), []); // timely Alt+N is not N
+    await h.key("\x1b"); await h.key("\x03"); // no reply, then a separate human Ctrl+C
+    assert.equal(h.child.commands.filter(c => c.cmd === "/cancel").length, 1);
+    await h.key("\x1b"); await h.key("n"); assert.deepEqual(answers(), [["legacy", "deny"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("an undeliverable Escape cannot capture fresh text in the next composer", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    for (const prefix of ["]", "[", "new"]) {
+      await ask(prefix, false); readNow(h, "\x1b");
+      h.child.event({ type: "approval_resolved", request_id: prefix, state: "denied", decision: "deny" });
+      await settle(); await h.key(prefix); await h.submit("A");
+      assert.ok(h.child.commands.some(c => c.type === "message" && c.text === prefix + "A"), prefix);
+      h.child.event({ type: "done" }); await settle();
+    }
+    assert.deepEqual(answers(), []);
+  } finally { h.app.unmount(); }
+});
+
+test("Ink input send guard: a queued ordinary approval cannot answer while the startup screen hides it", async () => {
+  const streams = [process.stdin, process.stderr], before = streams.map(s => Object.getOwnPropertyDescriptor(s, "isTTY"));
+  const animation = process.env.TUI_STARTUP_ANIMATION;
+  let h: Awaited<ReturnType<typeof setup>> | undefined;
+  try {
+    for (const s of streams) Object.defineProperty(s, "isTTY", { configurable: true, value: true });
+    process.env.TUI_STARTUP_ANIMATION = "1";
+    // Only the startup condition needs TTY metadata; Ink, the backend and the optional helper are fakes.
+    h = await setup(120, 36, () => Object.assign(new EventEmitter(), {
+      start() {}, close() {}, recordInput() {}, updateDraft() {}, activityNS: 0n,
+    }));
+    const { ask, answers } = kittyReview(h); await ask("queued", false);
+    assert.doesNotMatch(h.frame(), /审批请求/); await h.key("y"); assert.deepEqual(answers(), []);
+    h.child.event({ type: "startup_banner", tools: 1, skills: 1, model: "fixture", mcp: [], learning: { mode: "review", auto: false, pending: 0 } });
+    const deadline = performance.now() + 2000;
+    while (!h.frame().includes("审批请求") && performance.now() < deadline) await settle();
+    assert.match(h.frame(), /审批请求/); await h.key("y"); assert.deepEqual(answers(), [["queued", "once"]]);
+  } finally {
+    h?.app.unmount();
+    streams.forEach((s, i) => { if (before[i]) Object.defineProperty(s, "isTTY", before[i]!); else Reflect.deleteProperty(s, "isTTY"); });
+    if (animation === undefined) delete process.env.TUI_STARTUP_ANIMATION; else process.env.TUI_STARTUP_ANIMATION = animation;
+  }
+});
+
+test("Ink input send guard: reentrant ordinary key callbacks answer one FIFO head only once", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    await ask("A", false); await ask("B", false);
+    // The fake response sink runs the second unambiguous input before the first send returns.
+    let reentered = false;
+    h.child.stdin.once("data", chunk => {
+      assert.equal(JSON.parse(String(chunk)).type, "tool_approval_response");
+      reentered = true; readNow(h, "y");
+    });
+    await h.key("n"); assert.ok(reentered); assert.deepEqual(answers(), [["A", "deny"]]);
+    await h.key("a"); assert.deepEqual(answers(), [["A", "deny"], ["B", "session"]]);
   } finally { h.app.unmount(); }
 });
 

@@ -56,6 +56,38 @@ test("ordinary SS3 keys stay intact for Ink, regardless of read boundaries after
   }
 });
 
+test("an unfinished legacy key belongs to the receiver where its Escape was read", () => {
+  const a = {}, b = {};
+  for (const first of ["foreground", undefined]) {
+    for (const key of ["y", "a", "t", "l", "n", "\r", "\x03", "[A", "OA"]) {
+      const { keys } = setup();
+      keys.head(first, a, true);
+      assert.equal(keys.feed("\x1b"), "");
+      keys.head(undefined, b, true);
+      assert.equal(keys.feed(key), "", "no suffix can answer the new receiver");
+      assert.equal(keys.feed("y"), "y", "independent input following the stale key is still usable");
+    }
+  }
+});
+
+test("normal Alt and cursor keys are framed identically at every read split, even without probe debt", () => {
+  for (const key of ["\x1by", "\x1ba", "\x1bn", "\x1b[A", "\x1bOA", "\x1b[6~"]) {
+    for (let split = 1; split < key.length; split++) {
+      const { keys } = setup();
+      assert.deepEqual([keys.feed(key.slice(0, split)), keys.feed(key.slice(split))].filter(Boolean), [key]);
+    }
+  }
+});
+
+test("bracketed paste and control-string payloads are not keyboard choices on an ordinary approval", () => {
+  for (const [start, end] of [[C + '200~', C + '201~'], ['\x1b]', '\x07'], ['\x1bP', '\x1b\\']]) {
+    const { keys } = setup(); keys.head(undefined, {}, true);
+    keys.feed(start); assert.equal(keys.feed('y'), '');
+    keys.head(undefined, {}, true); assert.equal(keys.feed('a'), ''); keys.feed(end);
+    assert.equal(keys.feed('n'), 'n');
+  }
+});
+
 test("control-string payloads, malformed CSI and modified/mismatched releases cannot manufacture consent", () => {
   for (const open of ["\x1bP", "\x1b_", "\x1b^", "\x90", "\x9f"]) {
     const { keys, grants, negotiate } = setup(); keys.head("reader"); negotiate();
