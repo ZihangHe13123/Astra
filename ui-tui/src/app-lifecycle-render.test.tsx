@@ -957,6 +957,119 @@ test("Approval paint: after B a restored OAuth route cannot submit before its ow
   } finally { hold = false; flush?.(); h.app.unmount(); }
 });
 
+// Hold the selected route's whole frame below approvalPaintOutput, on the same stream used by Ink.
+for (const change of ["refreshed ID", "local selection"] as const) test(`Connection target receipt: ${change} cannot reuse route A's frame`, async () => {
+  let hold = false, flush: (() => void) | undefined;
+  class Screen extends Output {
+    override _write(data: Buffer, encoding: BufferEncoding, done: () => void) {
+      const deliver = () => super._write(data, encoding, done);
+      if (hold && stripAnsi(String(data)).includes("Choose API route")) flush = deliver; else deliver();
+    }
+  }
+  const h = await setup(120, 36, undefined, undefined, undefined, { stdout: new Screen({ highWaterMark: 1 }), debug: false });
+  const route = (id: string) => ({ provider: "Fixture", id, label: "Same sign-in", auth_mode: "oauth", base_url: "" });
+  const routes = (...ids: string[]) => h.child.event({ type: "model_info", model: "fixture", total_tokens: 0, context_pct: 0,
+    connection_routes: ids.map(route) });
+  const connects = () => h.child.commands.filter(c => c.type === "connect_provider").map(c => c.route_id);
+  try {
+    if (change === "local selection") routes("route-A", "route-X"); else routes("route-A");
+    await settle(); await h.submit("/connect"); await h.key("\r"); assert.match(h.frame(), /› Same sign-in/);
+    hold = true;
+    if (change === "local selection") await h.key("\x1b[B"); else { routes("route-X"); await settle(); }
+    await h.key("\r"); assert.deepEqual(connects(), [], "only the old A selection has been painted");
+    assert.ok(flush, "a change of route identity must repaint even if both labels match");
+    hold = false; const deliver = flush; flush = undefined; deliver(); await settle();
+    assert.match(h.frame(), /› Same sign-in[^\n]*route-X/); await h.key("\r"); assert.deepEqual(connects(), ["route-X"]);
+  } finally { hold = false; flush?.(); h.app.unmount(); }
+});
+
+test("Connection target receipt: masked field edits may continue under backpressure but Enter cannot save an unpainted draft", async () => {
+  let hold = false, flush: (() => void) | undefined;
+  class Screen extends Output {
+    override _write(data: Buffer, encoding: BufferEncoding, done: () => void) {
+      const deliver = () => super._write(data, encoding, done);
+      if (hold && stripAnsi(String(data)).includes("API key (saved privately")) flush = deliver; else deliver();
+    }
+  }
+  const h = await setup(120, 36, undefined, undefined, undefined, { stdout: new Screen({ highWaterMark: 1 }), debug: false });
+  const saves = () => h.child.commands.filter(c => c.type === "connect_provider");
+  try {
+    h.child.event({ type: "model_info", model: "fixture", total_tokens: 0, context_pct: 0, connection_routes: [
+      { provider: "Fixture", id: "fixture-key", label: "API", auth_mode: "api-key", base_url: "https://fixture.invalid/" },
+    ] }); await settle();
+    await h.submit("/connect"); for (let i = 0; i < 3; i++) await h.key("\r"); assert.match(h.frame(), /API key \(saved privately/);
+    hold = true; await h.key("mock-one"); await h.key("-two"); await h.key("\r");
+    assert.equal(saves().length, 0); assert.ok(flush, "a masked draft frame must be pending");
+    hold = false; const deliver = flush; flush = undefined; deliver(); await settle();
+    assert.match(h.frame(), /\*{12}/); await h.key("\r"); assert.equal(saves().length, 1);
+    assert.ok(saves()[0].api_key === "mock-one-two"); assert.ok(h.stdout.chunks.every(c => !c.includes("mock-one")));
+  } finally { hold = false; flush?.(); h.app.unmount(); }
+});
+
+test("Connection target receipt: replacing the configured endpoint cannot reuse a credential draft", async () => {
+  const h = await setup(120, 36);
+  const configure = (host: string) => h.child.event({ type: "model_info", model: "fixture", total_tokens: 0, context_pct: 0, connection_routes: [
+    { provider: "Fixture", id: "same-id", label: "API", auth_mode: "api-key", base_url: `https://${host}.invalid/` },
+  ] });
+  try {
+    configure("before"); await settle(); await h.submit("/connect"); for (let i = 0; i < 3; i++) await h.key("\r");
+    await h.key("old-draft"); assert.match(h.frame(), /\*{9}/);
+    configure("after"); await settle(); await h.key("\r");
+    assert.ok(!h.child.commands.some(c => c.type === "connect_provider"), "a refreshed destination requires a new choice and draft");
+    assert.match(h.frame(), /Choose authentication/); await h.key("\r"); assert.doesNotMatch(h.frame(), /\*{9}/);
+    await h.key("new-draft"); await h.key("\r"); const saves = h.child.commands.filter(c => c.type === "connect_provider");
+    assert.equal(saves.length, 1); assert.ok(saves[0].api_key === "new-draft" && saves[0].base_url === "https://after.invalid/");
+  } finally { h.app.unmount(); }
+});
+
+test("Delivered Escape input: the composer submits literal [中文], [user] and [INFO] intact", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    const texts = ["[中文]", "[user]", "[INFO]"];
+    for (const [i, text] of texts.entries()) {
+      await ask(`A-${i}`, false); await h.key("\x1b"); assert.deepEqual(answers().at(-1), [`A-${i}`, "deny"]);
+      for (const c of text) readNow(h, c);
+      await h.key("\r"); h.child.event({ type: "done" }); await settle();
+    }
+    assert.deepEqual(h.child.commands.filter(c => c.type === "message").map(c => c.text), texts);
+  } finally { h.app.unmount(); }
+});
+
+test("Delivered Escape input: submitting Python cannot strand the next approval's Ctrl+C or N", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    await ask("A", false); await h.key("\x1b"); assert.deepEqual(answers(), [["A", "deny"]]);
+    await h.submit("Python"); assert.ok(h.child.commands.some(c => c.type === "message" && c.text === "Python"));
+    h.child.event({ type: "task_started", task: { id: "running", status: "running" } }); await ask("B", false);
+    await h.key("\x03"); assert.equal(h.child.commands.filter(c => c.cmd === "/cancel").length, 1);
+    await h.key("n"); assert.deepEqual(answers(), [["A", "deny"], ["B", "deny"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("an ambiguous late string offers an explicit reset, never a grant from its body or the reset itself", async () => {
+  const h = await setup(), { ask, answers } = kittyReview(h);
+  try {
+    await ask("A", false); await h.key("\x1b"); await h.submit("Python");
+    await ask("B", false); assert.match(h.frame(), /Ctrl\+X/);
+    await h.key("y"); assert.deepEqual(answers(), [["A", "deny"]]);
+    await h.key("\x18y"); assert.deepEqual(answers(), [["A", "deny"]]);
+    await h.key("y"); assert.deepEqual(answers(), [["A", "deny"], ["B", "once"]]);
+  } finally { h.app.unmount(); }
+});
+
+test("Delivered Escape input: the first independent N or Ctrl+C on a long-visible B still works", async () => {
+  for (const key of ["n", "\x03"]) {
+    const h = await setup(), { ask, answers } = kittyReview(h);
+    try {
+      h.child.event({ type: "task_started", task: { id: "running", status: "running" } }); await ask("A", false); await ask("B", false);
+      await h.key("\x1b"); assert.deepEqual(answers(), [["A", "deny"]]); assert.match(h.frame(), /审批请求/);
+      await new Promise(resolve => setTimeout(resolve, 550)); await h.key(key);
+      if (key === "n") assert.deepEqual(answers(), [["A", "deny"], ["B", "deny"]]);
+      else assert.equal(h.child.commands.filter(c => c.cmd === "/cancel").length, 1);
+    } finally { h.app.unmount(); }
+  }
+});
+
 test("Approval tail: 90ms-late fragmented Up and DECRQM replies cannot grant a successor", async () => {
   for (const parts of [["[", "A"], ["[?1004;2$", "y"]]) {
     const h = await setup(), { ask, answers } = kittyReview(h);

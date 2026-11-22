@@ -79,6 +79,56 @@ test("normal Alt and cursor keys are framed identically at every read split, eve
   }
 });
 
+function typedAfterEscape() {
+  const { keys } = setup(); keys.feed("\x1b"); assert.equal(keys.finishEscapeWait(), "\x1b");
+  return keys;
+}
+
+test("a delivered composer Escape preserves bracketed words, Unicode and long literal prefixes exactly once", () => {
+  for (const word of ["[中文]", "[user]", "[INFO]", "[OK]", "[u]", "[A]", "[👨‍👩‍👧‍👦é]", "[" + "1".repeat(70) + "text]"]) {
+    for (const pieces of [[word], Array.from(word)]) {
+      const keys = typedAfterEscape(); assert.equal(pieces.map(c => keys.feed(c)).join(""), word);
+      assert.equal(keys.feed("\r"), "\r");
+    }
+  }
+});
+
+test("submitting a word after a spent Escape does not strand the next card's refusal or cancel", () => {
+  for (const word of ["Python", "P2", "P.S.", "_value", "X11", "^2"]) for (const key of ["n", "\x03"]) {
+    const keys = typedAfterEscape(); assert.equal(keys.feed(word), word); assert.equal(keys.feed("\r"), "\r");
+    keys.head(undefined, {}, true); assert.equal(keys.feed(key), key);
+  }
+});
+
+test("a composer submission is not a DCS terminator: any unterminated late string keeps positive authority closed", () => {
+  // Even the private-function spelling of a DCS can be indistinguishable from
+  // a word. A newline in its payload is not ST. Refusing is always safe;
+  // positively choosing requires a real boundary, never a guess about the word.
+  for (const text of ["P$qfixture", "Pqfixture", "Python", "P2P", "_Gf=1", "X11"]) {
+    const keys = typedAfterEscape(); keys.feed(text); keys.feed("\r");
+    keys.head(undefined, {}, true); assert.equal(keys.feed("y"), "");
+    assert.equal(keys.feed("n"), "n"); keys.head(undefined, {}, true); assert.equal(keys.feed("a"), "");
+    assert.equal(keys.feed("\x18y"), "", "aborting a string must not release a coalesced answer");
+    assert.equal(keys.feed("y"), "y", "fresh decision after VT Cancel");
+  }
+});
+
+test("a possible opaque tail must not reinterpret the original composer's cursor key or let a paste abort the fence", () => {
+  const keys = typedAfterEscape(); assert.equal(keys.feed("Python"), "Python");
+  assert.equal(keys.feed(C + "A"), C + "A");
+  keys.head(undefined, {}, true); keys.feed(C + "200~");
+  assert.equal(keys.feed("\x18"), ""); assert.equal(keys.feed("y"), "");
+  keys.feed(C + "201~"); assert.equal(keys.feed("a"), ""); keys.feed("\x18"); assert.equal(keys.feed("a"), "a");
+});
+
+test("after Escape has actually rejected A the first independent refusal or cancel on B is usable", () => {
+  for (const standalone of ["n", "N", "\x03"]) {
+    const { keys } = setup(); keys.head(undefined, {}, true); keys.feed("\x1b");
+    assert.equal(keys.finishEscapeWait(), "\x1b"); keys.head(undefined, {}, true);
+    assert.equal(keys.feed(standalone), standalone);
+  }
+});
+
 test("after a standalone Escape answers A, one late key cannot also answer B", () => {
   for (const suffix of [["[", "A"], ["O", "A"], ["[?1004;2$", "y"], ["y"], ["a"], ["\r"]]) {
     const { keys } = setup(); keys.head(undefined, {}, true);

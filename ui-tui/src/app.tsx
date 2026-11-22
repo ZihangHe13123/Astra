@@ -2316,17 +2316,20 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     : 0;
 
   const approvalVisible = !!pendingApproval && !startupVisible && !openToolResult;
-  const paint = useApprovalPaint(stdout, approvalVisible ? pendingApproval : undefined, rows, terminalColumns, approvalDetailOpen);
+  const [inputFenced, setInputFenced] = useState(false);
+  const paint = useApprovalPaint(stdout, approvalVisible ? pendingApproval : undefined, rows, terminalColumns, approvalDetailOpen, inputFenced);
   const connectionVisible = connectionOpen && !startupVisible && !openToolResult && !pendingApproval && !questionRequest;
-  const connectionEpoch = useMemo(() => connectionVisible ? {} : undefined, [connectionVisible]);
-  const connectionPaint = useApprovalPaint(stdout, connectionEpoch, rows, terminalColumns, false);
+  const [connectionTarget, setConnectionTarget] = useState<object>();
+  const connectionEpoch = useMemo(() => connectionVisible && connectionTarget ? {} : undefined, [connectionVisible, connectionTarget]);
+  const connectionPaint = useApprovalPaint(stdout, connectionEpoch, rows, terminalColumns, false, inputFenced);
   const committedConnection = useRef<object>();
   useLayoutEffect(() => {
     committedConnection.current = connectionEpoch;
     return () => { committedConnection.current = undefined; };
   }, [connectionEpoch]);
-  const ownsConnectionInput = () => !!connectionEpoch && committedConnection.current === connectionEpoch &&
-    connectionPaint.current(false) && connectionOpenRef.current && !approvalQueue.requests.length && !questionRequestRef.current && !lifecycle?.closing;
+  const ownsConnectionInput = (requirePaint = true, selectedRowDigest?: string) => !!connectionEpoch && committedConnection.current === connectionEpoch &&
+    (!requirePaint || (connectionPaint.current(false) && (selectedRowDigest === undefined || connectionPaint.receipt?.draftDigest === selectedRowDigest))) &&
+    connectionOpenRef.current && !approvalQueue.requests.length && !questionRequestRef.current && !lifecycle?.closing;
   const handleInput = (input: string, key: Partial<Key>, released?: ForegroundRelease) => {
     if (lifecycle?.closing) return;
     if (connectionOpenRef.current && !pendingApproval && !questionRequest) return;
@@ -2373,6 +2376,10 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
       );
       const response = transition.response;
       if (response) {
+        if (response.decision !== "deny" && inputFenced) return;
+        // Refusal only needs the visible card. Sending needs the complete draft
+        // on this frame, not just a visible title and shortcut line.
+        if (response.decision !== "deny" && pendingApproval.draft != null && !paint.current(foregroundRelease, true)) return;
         if (!approvalQueue.respond(pendingApproval, () => send({
           type: "tool_approval_response",
           request_id: response.requestId,
@@ -2431,7 +2438,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     if (!approvalVisible || primedCard.current !== pendingApproval) primedCard.current = undefined;
     if (approvalVisible && paint.receipt) primedCard.current = pendingApproval;
   }, [pendingApproval, approvalVisible, paint.receipt]);
-  const foregroundId = approvalVisible && (paint.receipt || primedCard.current === pendingApproval) && pendingApproval.kind === "computer_foreground_takeover"
+  const foregroundId = approvalVisible && !inputFenced && (paint.receipt || primedCard.current === pendingApproval) && pendingApproval.kind === "computer_foreground_takeover"
     ? pendingApproval.request_id : undefined;
   const normalInputOwner = startupVisible ? "startup" : pendingApproval ? paint.receipt ?? paint.epoch ?? pendingApproval
     : questionRequest ?? connectionPaint.receipt ?? connectionEpoch ?? openToolResult ?? "composer";
@@ -2439,7 +2446,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     if (pendingApproval?.request_id !== id || approvalQueue.requests[0] !== pendingApproval) return false;
     appshotClientRef.current?.recordInput();
     return handleInput(input, key, released);
-  }, approvalVisible);
+  }, approvalVisible, setInputFenced);
   useInput((input, key) => {
     appshotClientRef.current?.recordInput();
     handleInput(input, key);
@@ -2553,8 +2560,10 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
           contextPct={info.ctxPct}
         />}
         auxiliary={<>
+          {inputFenced && !pendingApproval && <Text color={theme.warning}>旧终端控制串的边界未确认；按 Ctrl+X 可清除，清除本身不批准任何操作。</Text>}
           {connectionOpen && <Box flexDirection="column" display={connectionVisible ? "flex" : "none"}><ConnectionPanel routes={connectionRoutes} pending={connectionPending} error={connectionError} authorization={connectionAuth}
             active={connectionVisible} ownsInput={ownsConnectionInput} paintEpoch={connectionPaint.epoch}
+            paintTarget={connectionTarget} onPaintTarget={setConnectionTarget}
             onCancel={() => {
               if (!ownsConnectionInput()) return;
               if (connectionPending && connectionRequestRef.current) send({ type: "cancel_connection", request_id: connectionRequestRef.current });
@@ -2576,6 +2585,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
             <ToolApprovalPanel
               request={approvalRequests[0]}
               paintEpoch={paint.epoch}
+              inputFenced={inputFenced}
               foregroundRelease={foregroundRelease}
               width={columns}
               queueIndex={1}

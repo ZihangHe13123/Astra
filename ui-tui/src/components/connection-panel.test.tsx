@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
+import test from "node:test";
 import { PassThrough, Writable } from "node:stream";
 import React from "react";
-import { render } from "ink";
+import { Box, Text, render, useStdout } from "ink";
 import stripAnsi from "strip-ansi";
+import stringWidth from "string-width";
 import { ThemeProvider } from "../theme-context.js";
 import { THEMES } from "../theme.js";
-import { ConnectionPanel } from "./connection-panel.js";
+import { ConnectionPanel as Panel, type ConnectionPanelProps } from "./connection-panel.js";
+import { approvalPaintOutput, useApprovalPaint } from "../approval-paint.js";
 import type { TuiCommand } from "../types.js";
 class Input extends PassThrough { isTTY = true; setRawMode() {} ref() { return this; } unref() { return this; } }
 class Output extends Writable {
@@ -13,12 +16,19 @@ class Output extends Writable {
   _write(chunk: Buffer | string, _: BufferEncoding, cb: (e?: Error | null) => void) { this.chunks.push(String(chunk)); cb(); }
 }
 const stdin = new Input(), stdout = new Output();
+function ConnectionPanel(props: Omit<ConnectionPanelProps, "ownsInput" | "onPaintTarget">) {
+  const { stdout } = useStdout(), [target, setTarget] = React.useState<object>();
+  const paint = useApprovalPaint(stdout, target, stdout.rows, stdout.columns, false);
+  return <Box flexDirection="column" width={stdout.columns - 1}><Panel {...props} onPaintTarget={setTarget} paintTarget={target} paintEpoch={paint.epoch}
+    ownsInput={(requirePaint = true, expectedRow) => !requirePaint || paint.current(false) &&
+      (expectedRow === undefined || paint.receipt?.draftDigest === expectedRow)} /></Box>;
+}
 const saves: TuiCommand[] = [];
 let cancelled = 0;
 const instance = render(<ThemeProvider theme={THEMES.glitchcity}>
   <ConnectionPanel routes={[{ id: "provider", provider: "Provider", label: "Regular API", base_url: "https://provider.example/v1", api_key_env: "SAMPLE_KEY", key_available: false }]}
     pending={false} error="" onSave={r => saves.push(r)} onCancel={() => cancelled++} />
-</ThemeProvider>, { stdin: stdin as unknown as NodeJS.ReadStream, stdout: stdout as unknown as NodeJS.WriteStream,
+</ThemeProvider>, { stdin: stdin as unknown as NodeJS.ReadStream, stdout: approvalPaintOutput(stdout as unknown as NodeJS.WriteStream),
   stderr: stdout as unknown as NodeJS.WriteStream, debug: true, patchConsole: false, exitOnCtrlC: false });
 const press = async (text: string) => { stdin.write(text); await new Promise(r => setTimeout(r, 40)); };
 await new Promise(r => setTimeout(r, 30));
@@ -46,7 +56,7 @@ const oauthProps = {
   pending: false, error: "", onSave: (r: TuiCommand) => oauthSaves.push(r), onCancel: () => oauthCancelled++,
 };
 const oauth = render(<ThemeProvider theme={THEMES.glitchcity}><ConnectionPanel {...oauthProps} /></ThemeProvider>,
-  { stdin: oauthInput as unknown as NodeJS.ReadStream, stdout: oauthOutput as unknown as NodeJS.WriteStream,
+  { stdin: oauthInput as unknown as NodeJS.ReadStream, stdout: approvalPaintOutput(oauthOutput as unknown as NodeJS.WriteStream),
     stderr: oauthOutput as unknown as NodeJS.WriteStream, debug: true, patchConsole: false, exitOnCtrlC: false });
 const oauthPress = async (key: string) => { oauthInput.write(key); await new Promise(r => setTimeout(r, 40)); };
 await new Promise(r => setTimeout(r, 30));
@@ -75,7 +85,7 @@ const paste = async (chunks: string[]) => {
   const panel = render(<ThemeProvider theme={THEMES.glitchcity}>
     <ConnectionPanel routes={[{ id: "custom", provider: "Provider", label: "Regular API", base_url: "", api_key_env: "", key_available: false }]}
       pending={false} error="" onSave={r => saved.push(r)} onCancel={() => {}} />
-  </ThemeProvider>, { stdin: input as unknown as NodeJS.ReadStream, stdout: output as unknown as NodeJS.WriteStream,
+  </ThemeProvider>, { stdin: input as unknown as NodeJS.ReadStream, stdout: approvalPaintOutput(output as unknown as NodeJS.WriteStream),
     stderr: output as unknown as NodeJS.WriteStream, debug: true, patchConsole: false, exitOnCtrlC: false });
   await new Promise(r => setTimeout(r, 30));
   let atSubmit = ""; // the frame on screen when the last chunk, Enter, is pressed
@@ -107,4 +117,33 @@ const environment = await paste(["\r", "\r", wrap(url), "\r", "\u001b[B", "\r", 
 assert.deepEqual(environment.saved, [[url, "", "OTHER_KEY"]]);
 const filtered = await paste([wrap("prov"), "\r", "\r", wrap(url), "\r", "\r", wrap(secret), "\r"]);
 assert.equal(filtered.frames.some(frame => /Filter: prov +│/.test(frame)), true);
+
+test("an overpainted OAuth label or ID cannot authorize from the panel edges alone", async () => {
+  const input = new Input(), output = new Output(), saves: string[] = [];
+  let overlay: { x: number; y: number } | undefined;
+  const label = "Fixture subscription", id = "fixture-oauth-route";
+  const routes = [{ id, label, provider: "Fixture", base_url: "", api_key_env: "", key_available: false, auth_mode: "oauth" as const }];
+  const scene = () => <ThemeProvider theme={THEMES.glitchcity}><Box flexDirection="column">
+    <ConnectionPanel routes={routes} pending={false} error="" onSave={r => saves.push(r.route_id)} onCancel={() => {}} />
+    {overlay && <Box position="absolute" marginLeft={overlay.x} marginTop={overlay.y}><Text>×</Text></Box>}
+  </Box></ThemeProvider>;
+  const app = render(scene(), { stdin: input as any, stdout: approvalPaintOutput(output as any), stderr: output as any,
+    debug: true, patchConsole: false, exitOnCtrlC: false });
+  const settle = () => new Promise(resolve => setTimeout(resolve, 50));
+  const enter = async () => { input.write("\r"); await settle(); };
+  const frame = () => stripAnsi(output.chunks.at(-1) ?? "");
+  try {
+    await settle(); await enter();
+    for (const part of [label, id]) {
+      const lines = frame().split("\n"), y = lines.findIndex(line => line.includes(`› ${label} [${id}]`));
+      assert.notEqual(y, -1); const line = lines[y]!;
+      overlay = { x: stringWidth(line.slice(0, line.indexOf(part))) + 2, y };
+      app.rerender(scene()); await settle(); assert.ok(frame().includes("×") && !frame().includes(part));
+      assert.match(frame(), /Choose API route/); assert.match(frame(), /Enter continue/);
+      await enter(); assert.deepEqual(saves, []);
+      overlay = undefined; app.rerender(scene()); await settle(); assert.deepEqual(saves, []);
+    }
+    await enter(); assert.deepEqual(saves, [id]);
+  } finally { app.unmount(); }
+});
 assert.deepEqual(filtered.saved, [[url, secret, ""]]);

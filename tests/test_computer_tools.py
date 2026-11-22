@@ -3429,6 +3429,26 @@ def test_wps_destination_is_cleared_when_computer_session_closes(
     assert "known_path" not in requests[-1]["arguments"]
 
 
+@pytest.mark.parametrize("suffix", ["", "x"], ids=["exact-limit", "one-over"])
+def test_send_draft_producer_marks_only_clipped_joined_text(registry, manager, backend, monkeypatch, suffix):
+    async def plan_only(*args, **kwargs):
+        return ComputerActionPlan("fixture", ComputerInteractionMode.BACKGROUND, False, "background_ax_only", ("text",), ())
+
+    monkeypatch.setattr(manager, "plan_actions", plan_only)
+    register(registry, manager)
+    parts = ["x" * 1998, "…" + suffix]  # The newline between actions counts toward the 2,000 characters.
+    request = run(registry.get("computer_act").permission_check({
+        "__permission_call_id": "draft", "snapshot_id": "fixture-snapshot",
+        "actions": [{"type": "type", "text": part} for part in parts],
+    }))
+
+    assert request["consequential"] == "send"
+    draft = request["draft"]
+    assert draft["text"] == "x" * 1998 + "\n…"
+    assert draft.get("truncated", False) is bool(suffix)
+    assert not backend.calls
+
+
 def test_high_impact_action_is_once_per_exact_batch_and_session_decision_cannot_broaden(
     registry,
     manager,

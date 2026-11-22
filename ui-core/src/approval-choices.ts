@@ -14,7 +14,7 @@ const LABELS: Record<ApprovalChoice, string> = {
 };
 export const CONSEQUENCE_LABELS: Record<string, string> = { pay: "付款", send: "发送", delete: "删除", publish: "发布" };
 
-export type ApprovalDraft = { to?: string; subject?: string; text?: string; via?: string };
+export type ApprovalDraft = { to?: string; subject?: string; text?: string; via?: string; truncated?: boolean };
 type Card = { choices?: readonly string[]; consequential?: string; draft?: ApprovalDraft | null; [key: string]: unknown };
 
 /** The answers a card shows, in order; an old request without choices keeps the three it always had. */

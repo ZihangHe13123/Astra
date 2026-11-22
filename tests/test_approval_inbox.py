@@ -1,6 +1,7 @@
 import pytest
 
 from agent.runtime.approval_inbox import ApprovalInbox, safe_approval_request
+from agent.runtime.event_stream import safe_replay_event
 
 
 def test_inbox_persists_only_bounded_frontend_request(tmp_path):
@@ -47,6 +48,52 @@ def test_inbox_persists_only_bounded_frontend_request(tmp_path):
     assert len(record.request["arguments"]["secret"]) <= 4_001
     assert len(record.request["preview"]) <= 24_001
     assert ApprovalInbox(tmp_path / "approvals.db").get("approval-1") == record
+
+
+@pytest.mark.parametrize(("field", "limit"), [("to", 500), ("subject", 500), ("via", 500), ("text", 8_000)])
+def test_send_draft_inbox_marks_clipping_not_a_literal_ellipsis(field, limit):
+    for value, clipped in [("x" * (limit - 1) + "…", False), ("x" * limit + "…", True),
+                           ("x" * limit + "PRIVATE-TAIL", True)]:
+        draft = safe_approval_request({"draft": {"text": "body", field: value}})["draft"]
+        assert draft[field] == (value[:limit] + "…" if clipped else value)
+        assert draft.get("truncated", False) is clipped
+        assert safe_approval_request({"draft": draft})["draft"] == draft
+
+
+def test_send_draft_preserves_upstream_marker_through_inbox_and_replay(tmp_path):
+    draft = {"text": "producer's bounded prefix", "truncated": True}
+    path = tmp_path / "approvals.db"
+    record = ApprovalInbox(path).create({"draft": draft})
+    stored = ApprovalInbox(path).get(record.request_id)
+    assert stored.request["draft"] == draft
+    event = safe_replay_event({"type": "tool_approval_request", **stored.public()})
+    assert event["draft"] == draft
+
+
+def test_send_draft_redacted_takeover_replays_only_an_incomplete_marker(tmp_path):
+    base = {"kind": "computer_foreground_takeover", "choices": ["once", "deny"]}
+    assert "draft" not in safe_approval_request(base)
+    path = tmp_path / "approvals.db"
+    record = ApprovalInbox(path).create({**base, "draft": {
+        "to": "PRIVATE-TO", "subject": "PRIVATE-SUBJECT", "via": "PRIVATE-APP", "text": "PRIVATE-BODY",
+    }})
+    stored = ApprovalInbox(path).get(record.request_id)
+    assert stored.request == {**base, "draft": {"truncated": True}}
+    event = safe_replay_event({"type": "tool_approval_request", **stored.public()})
+    assert event["draft"] == {"truncated": True}
+    assert "PRIVATE-" not in repr(event)
+
+
+@pytest.mark.parametrize("draft", [
+    {"text": "approved words", "unsupported_recipients": "PRIVATE-EXTRA"},
+    {"text": "approved words", "subject": {"internal": "PRIVATE-SUBJECT"}},
+    ["PRIVATE-WRONG-SHAPE"],
+])
+def test_send_draft_replay_cannot_turn_unsupported_disclosure_into_a_complete_draft(draft):
+    safe = safe_approval_request({"draft": draft})
+    replay = safe_replay_event({"type": "tool_approval_request", **safe})
+    assert replay["draft"]["truncated"] is True
+    assert "PRIVATE-" not in repr(replay)
 
 
 def test_resolve_is_atomic_and_pending_only(tmp_path):

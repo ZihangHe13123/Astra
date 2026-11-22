@@ -4336,7 +4336,11 @@ def register_computer_tools(
             return
         typed = [str(action.text) for action in prepared.actions if action.type == "type" and action.text]
         if typed:
-            request["draft"] = {"text": "\n".join(typed)[:2000], "via": decision.application}
+            text = "\n".join(typed)
+            draft: dict[str, str | bool] = {"text": text[:2_000], "via": decision.application}
+            if len(text) > 2_000:
+                draft["truncated"] = True
+            request["draft"] = draft
             request["consequential"] = "send"
 
     def act_permission_grant(args: dict, request: dict[str, Any], decision: str):

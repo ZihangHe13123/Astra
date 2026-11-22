@@ -2,7 +2,7 @@ import { useLayoutEffect, useRef, useState } from "react";
 import { useStdin, useStdout, type Key } from "ink";
 import type { ForegroundRelease } from "./approval-interaction.js";
 
-const ESC = "\x1b", CSI = ESC + "[", pasteEnd = CSI + "201~";
+const ESC = "\x1b", CSI = ESC + "[", pasteStart = CSI + "200~", pasteEnd = CSI + "201~";
 const legacyEscapeWaitMS = 25;
 // Kitty keyboard protocol: disambiguate + report event types + encode even ordinary letters/Enter.
 const flags = 1 | 2 | 8;
@@ -13,7 +13,7 @@ type Handler = (id: string, input: string, key: Partial<Key>, released?: Foregro
 
 type InputOwner = object | string;
 type Receiver = { id?: string; view: InputOwner; approval: boolean };
-type Route = { parser?: ForegroundTerminalInput; cancelEscape(): void };
+type Route = { parser?: ForegroundTerminalInput; notifyBoundary?: () => void; cancelEscape(): void };
 const routes = new WeakMap<NodeJS.ReadStream, Route>();
 
 /** Ink 5 can throw while *parsing* CSI-u, even for an inactive composer. Keep its normal raw-mode
@@ -30,12 +30,14 @@ export function approvalAwareStdin(source: NodeJS.ReadStream): NodeJS.ReadStream
       if (escapeDue) {
         route.cancelEscape();
         const key = route.parser?.finishEscapeWait();
+        route.notifyBoundary?.();
         if (key) return key;
       }
       const data = source.read(size), parser = route.parser;
       if (data === null || !parser) return data;
       route.cancelEscape();
       const normal = parser.feed(String(data));
+      route.notifyBoundary?.();
       if (parser.awaitingEscapeTimeout) {
         wait = setTimeout(() => { escapeDue = true; source.emit("readable"); }, legacyEscapeWaitMS);
         wait.unref();
@@ -85,6 +87,10 @@ export class ForegroundTerminalInput {
   private oscHeader?: "empty" | "unrecognized";
   private oscEscapeOwner?: Receiver;
   private oscLiteral?: Receiver;
+  private literalST?: Receiver;
+  private literalEscape = false;
+  private literalPasteMatch = 0;
+  private stEscapeOwner?: Receiver;
 
   constructor(private write: ((s: string) => void) | undefined, private handle: Handler,
     private reportReady: (id?: string) => void) {}
@@ -100,11 +106,17 @@ export class ForegroundTerminalInput {
   close() { this.restore(false); this.receiver = { view: "closed", approval: false }; this.armed = undefined; }
 
   get awaitingEscapeTimeout(): boolean {
-    return !!this.oscEscapeOwner || (this.sequence === ESC && this.escape === "waiting");
+    return !!this.stEscapeOwner || !!this.oscEscapeOwner || (this.sequence === ESC && this.escape === "waiting");
   }
+
+  get needsStringBoundary(): boolean { return !!this.literalST; }
 
   finishEscapeWait(): string {
     if (!this.awaitingEscapeTimeout) return "";
+    if (this.stEscapeOwner) {
+      const recipient = this.stEscapeOwner; this.stEscapeOwner = undefined;
+      return recipient === this.receiver && !this.id ? ESC : ""; // never end the string on a refusal/timeout
+    }
     if (this.oscEscapeOwner) {
       // Not a timely string terminator. Only the standalone *negative* Escape
       // may be delivered, to the receiver that saw it; no payload becomes a key.
@@ -205,8 +217,8 @@ export class ForegroundTerminalInput {
   /** Ink's readable chunks are not key boundaries. Keep only a bounded control prefix, not pasted content. */
   feed(chunk: string): string {
     const receiver = this.receiver, owner = receiver.id;
-    if (!owner && !this.sequence && !this.paste && !this.controlString && !/[\x1b\x90\x98\x9d-\x9f]/.test(chunk)) return chunk;
-    let normal = "", remaining = chunk.length;
+    if (!owner && !this.sequence && !this.paste && !this.controlString && !this.literalST && !/[\x1b\x90\x98\x9d-\x9f]/.test(chunk)) return chunk;
+    let normal = "", remaining = chunk.length, aborted = false;
     for (const c of chunk) {
       remaining -= c.length;
       if (this.paste) {
@@ -230,6 +242,33 @@ export class ForegroundTerminalInput {
         if (c === "\x03" || /^[nN]$/.test(c)) {
           this.controlString = this.oscHeader = undefined; this.quarantineString = false;
         }
+      }
+      if (this.literalST) {
+        // The same bytes can be the word “Python” following Escape, or DCS with
+        // a private function and opaque data. Preserve the composer's input, but
+        // CR/LF can occur in that data: submitting text never grants a new card.
+        this.stEscapeOwner = undefined;
+        const cancel = c === "\x18" || c === "\x1a"; // VT CAN/SUB; paste has priority above
+        if (cancel || c === "\x9c" || (this.literalEscape && c === "\\")) {
+          this.controlString = this.oscHeader = this.oscLiteral = this.literalST = undefined;
+          this.sequence = ""; this.sequenceOwner = this.literalReceiver = this.oscEscapeOwner = this.armed = undefined;
+          this.literalPasteMatch = 0; this.quarantineString = this.stringEscape = this.literalEscape = false;
+          if (cancel) { aborted = true; this.armed = undefined; }
+          continue;
+        }
+        const previousEsc = this.literalEscape; this.literalEscape = c === ESC;
+        if (this.literalST !== receiver) {
+          this.literalPasteMatch = c === pasteStart[this.literalPasteMatch] ? this.literalPasteMatch + 1 : c === ESC ? 1 : 0;
+          if (this.literalPasteMatch === pasteStart.length) {
+            this.paste = this.quarantinePaste = true; this.pasteMatch = this.literalPasteMatch = 0;
+          } else if (chunk.length === 1) {
+            if (c === ESC && !previousEsc) this.stEscapeOwner = receiver;
+            if (c === "\x03" || (receiver.approval && /^[nN]$/.test(c))) { if (owner) this.legacy(c); else normal += c; }
+          }
+          continue;
+        }
+        // Same composer: observe boundaries in parallel, but let Ink receive
+        // its real typing, cursor keys and bracketed paste through the normal path.
       }
       if (this.controlString) {
         this.oscEscapeOwner = undefined;
@@ -257,14 +296,20 @@ export class ForegroundTerminalInput {
         }
         if (this.literalReceiver === receiver && !this.overflow) normal += this.sequence.slice(1);
         this.literalReceiver = undefined;
-        this.sequence = ESC; this.sequenceOwner = receiver; this.overflow = false; this.escape = "waiting";
+        this.sequence = ESC; this.sequenceOwner = aborted ? undefined : receiver; this.overflow = false; this.escape = "waiting";
         continue;
       }
       if (this.sequence === ESC) {
         const same = this.sequenceOwner === receiver;
         const spent = this.escape === "delivered" || this.escape === "metaEscape" || (this.escape === "expired" && !same);
         const text = spent && !receiver.approval && receiver.view === "composer";
-        if (c === "[" || c === "O" || c === "N") {
+        if (this.escape === "delivered" && receiver.approval && chunk.length === 1 && (c === "\x03" || /^[nN]$/.test(c))) {
+          // No actual CSI/paste/string has begun. The new card can refuse or
+          // cancel immediately. Never take this path for an affirmative key.
+          this.sequence = c === "N" ? ESC + "N" : ""; // also drain a possible late SS2 suffix
+          this.sequenceOwner = this.armed = undefined;
+          if (owner) this.legacy(c); else normal += c;
+        } else if (c === "[" || c === "O" || c === "N") {
           this.sequence += c;
           this.literalReceiver = text ? receiver : undefined;
           if (spent) this.sequenceOwner = undefined; // parse structure, never dispatch a spent key
@@ -277,8 +322,12 @@ export class ForegroundTerminalInput {
               // Keep the structural fence even when the old prefix has been
               // consumed. Only this composer may receive literal text; head()
               // quarantines an open string before any modal can own its payload.
-              this.controlString = string; this.quarantineString = false;
-              if (string === "osc") { this.oscHeader = "empty"; this.oscLiteral = receiver; }
+              if (string === "st" && this.escape === "delivered") {
+                this.literalST = receiver; this.literalEscape = false; this.literalPasteMatch = 0;
+              } else {
+                this.controlString = string; this.quarantineString = false;
+                if (string === "osc") { this.oscHeader = "empty"; this.oscLiteral = receiver; }
+              }
             }
             if ((same && this.escape === "delivered") || (c >= " " && c !== "\x7f")) normal += c;
           } else if (string) {
@@ -294,29 +343,42 @@ export class ForegroundTerminalInput {
         continue;
       }
       if (this.sequence) {
+        const literal = this.literalReceiver === receiver;
         if (c >= "@" && c <= "~") {
           const prefix = this.sequence.slice(0, 2), body = this.sequence.slice(2) + c; this.sequence = "";
           this.protocolFrame = false;
-          if (!this.overflow && prefix === CSI) this.frame(body, this.sequenceOwner);
+          // The composer did not type an ESC here. Only positively recognized
+          // paste framing or a reply we actually requested may consume its text.
+          const knownLateFrame = body === "200~" || (this.focusQueries > 0 && /^\?1004;[0-4]\$y$/.test(body)) ||
+            (this.flagQueries > 0 && /^\?\d{1,3}u$/.test(body));
+          if (!this.overflow && prefix === CSI && (!literal || knownLateFrame)) this.frame(body, this.sequenceOwner);
           else this.armed = undefined;
           // Only the starting receiver gets the complete key, never a bare suffix or payload.
           if (!owner && this.sequenceOwner === receiver && !this.protocolFrame && !this.quarantinePaste && !this.overflow) {
             normal += prefix + body;
-          } else if (this.literalReceiver === receiver && !this.protocolFrame && !this.paste && !this.overflow) {
-            normal += prefix.slice(1) + body; // independently typed '[A', not a replayed Up arrow
+          } else if (literal && !this.protocolFrame && !this.paste) {
+            normal += this.overflow ? c : prefix.slice(1) + body;
           }
           this.sequenceOwner = this.literalReceiver = undefined;
-        } else if (c < " ") {
-          if (this.literalReceiver === receiver && !this.overflow) {
-            normal += this.sequence.slice(1);
+        } else if (c < " " || c === "\x7f") {
+          if (literal) {
+            if (!this.overflow) normal += this.sequence.slice(1);
             // Ink parses one read as one key. Finish the literal text first, then
             // let a separate Return act only if its composer still owns input.
-            if (!remaining) this.followingKey = { receiver, key: c }; else normal += c;
+            if (normal && !remaining) this.followingKey = { receiver, key: c }; else normal += c;
           } else if (this.sequenceOwner === receiver && (!receiver.approval || c === "\x03")) {
             if (!owner) normal += c; else this.legacy(c);
           }
           this.sequence = ""; this.armed = undefined; this.sequenceOwner = this.literalReceiver = undefined;
+        } else if (literal && c > "~") {
+          // Unicode is never a CSI parameter. Preserve it (and the bracket)
+          // instead of dropping the rest of a word waiting for an ASCII final.
+          normal += (this.overflow ? "" : this.sequence.slice(1)) + c;
+          this.sequence = ""; this.sequenceOwner = this.literalReceiver = this.armed = undefined;
         } else if (!this.overflow && c <= "?" && this.sequence.length < 48) this.sequence += c;
+        else if (literal) {
+          normal += (this.overflow ? "" : this.sequence.slice(1)) + c; this.overflow = true;
+        }
         else { this.overflow = true; this.armed = undefined; }
         continue;
       }
@@ -324,7 +386,7 @@ export class ForegroundTerminalInput {
       if (!owner) normal += c;
       else if (chunk.length === 1 && receiver === this.receiver) this.legacy(c);
     }
-    return receiver === this.receiver ? normal : "";
+    return !aborted && receiver === this.receiver ? normal : "";
   }
 
   private legacy(c: string) {
@@ -333,7 +395,8 @@ export class ForegroundTerminalInput {
   }
 }
 
-export function useForegroundApprovalInput(id: string | undefined, normalOwner: InputOwner, handle: Handler, approval = !!id): boolean {
+export function useForegroundApprovalInput(id: string | undefined, normalOwner: InputOwner, handle: Handler, approval = !!id,
+  onBoundary?: (blocked: boolean) => void): boolean {
   const { stdin, isRawModeSupported } = useStdin(), { stdout } = useStdout();
   const [readyId, setReadyId] = useState<string>();
   const latest = useRef({ id, handle }); latest.current = { id, handle };
@@ -346,11 +409,16 @@ export function useForegroundApprovalInput(id: string | undefined, normalOwner: 
       (head, ...args) => head === latest.current.id && latest.current.handle(head, ...args), head => { if (live) setReadyId(head); });
     controller.current = input;
     route.parser = input;
+    let blocked = false;
+    route.notifyBoundary = () => {
+      if (blocked !== input.needsStringBoundary) { blocked = input.needsStringBoundary; onBoundary?.(blocked); }
+    };
     return () => {
-      live = false; route.cancelEscape(); input.close();
+      live = false; route.cancelEscape(); input.close(); route.notifyBoundary = undefined;
+      if (blocked) onBoundary?.(false);
       route.parser = undefined; controller.current = undefined;
     };
-  }, [stdin, isRawModeSupported, stdout]);
+  }, [stdin, isRawModeSupported, stdout, onBoundary]);
   useLayoutEffect(() => { controller.current?.head(id, normalOwner, approval); }, [id, normalOwner, approval, stdin, isRawModeSupported, stdout]);
   return !!id && readyId === id;
 }

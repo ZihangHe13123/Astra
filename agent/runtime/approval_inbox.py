@@ -151,9 +151,26 @@ def safe_approval_request(request: Mapping[str, Any]) -> dict[str, Any]:
         ]
 
     draft = request.get("draft")
-    if not takeover and isinstance(draft, Mapping):
-        result["draft"] = {key: _bounded_text(draft[key], 8_000 if key == "text" else 500)
-                           for key in ("to", "subject", "text", "via") if draft.get(key)}
+    if draft is not None and (takeover or not isinstance(draft, Mapping)):
+        # Preserve the need to review a withheld/unsupported draft, not its contents.
+        result["draft"] = {"truncated": True}
+    elif isinstance(draft, Mapping):
+        safe_draft: dict[str, str | bool] = {}
+        fields = ("to", "subject", "text", "via")
+        truncated = draft.get("truncated", False) is not False or any(key not in (*fields, "truncated") for key in draft)
+        for key in fields:
+            if key not in draft:
+                continue
+            value = draft[key]
+            if not isinstance(value, str):
+                truncated = True
+                continue
+            limit = 8_000 if key == "text" else 500
+            truncated = truncated or len(value) > limit
+            safe_draft[key] = _bounded_text(value, limit)
+        if truncated:
+            safe_draft["truncated"] = True
+        result["draft"] = safe_draft
 
     change_summary = request.get("change_summary")
     if not takeover and isinstance(change_summary, Mapping):
