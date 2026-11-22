@@ -7,7 +7,7 @@ import os
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .context import AgentContext
 from .persona_overrides import local_mode_prompt
@@ -226,6 +226,28 @@ class BarModeController:
     @property
     def output_mode(self) -> str:
         return self._output_mode
+
+    def work_settings(self) -> dict[str, Any]:
+        """The work agent's own value of each agent attribute the bar has replaced; empty while it is closed.
+
+        leave() puts these back. A WeChat or QQ turn that borrows the agent meanwhile runs with them
+        (channels/router.py), so the bar's scene state, forced tool and sampling never reach a chat.
+        """
+        if not self.active:
+            return {}
+        return {
+            "memory_store": self._work_memory_store,
+            "external_memory_provider": self._work_external_memory_provider,
+            "skill_store": self._work_skill_store,
+            "task_store": self._work_task_store,
+            "tools_enabled": self._work_tools_enabled,
+            "tool_allowlist": self._work_tool_allowlist,
+            "runtime_context_provider": self._work_runtime_context_provider,
+            "runtime_turn_context_provider": self._work_runtime_turn_context_provider,
+            "generation_overrides_provider": self._work_generation_overrides_provider,
+            "finalize_after_tools_provider": self._work_finalize_after_tools_provider,
+            "forced_tool_name": self._work_forced_tool_name,
+        }
 
     def _apply_output_contract(self) -> None:
         if not self.active:

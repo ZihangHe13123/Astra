@@ -270,7 +270,7 @@
   },
   {
     "command": "/weixin",
-    "description": "WeChat channel · [status|login|on|off|logout|model]",
+    "description": "WeChat channel · [status|login|on|off|logout|model|effort]",
     "group": "TOOLS",
     "id": "F57",
     "takes_args": true,
@@ -310,6 +310,12 @@
         "description": "the model WeChat answers with: a /model key, or default",
         "completion": "/weixin model ",
         "submitValue": "/weixin model"
+      },
+      {
+        "command": "effort",
+        "description": "how hard WeChat thinks: low, high, xhigh, max, or default to follow /mode",
+        "completion": "/weixin effort ",
+        "submitValue": "/weixin effort"
       }
     ]
   },

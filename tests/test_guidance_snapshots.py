@@ -127,6 +127,30 @@ def test_disk_changes_are_pending_until_explicit_application(tmp_path, monkeypat
     assert any(item["function"]["name"] == "new_tool" for item in third_tools)
 
 
+def test_a_channel_style_follows_the_guidance_through_its_application_refresh_and_reset(tmp_path, monkeypatch):
+    style = "[Chat style] Short messages, like texting."
+    root = project(tmp_path)
+    context = AgentContext(system_prompt="Shared identity")
+    context.set_channel_style(style)
+    agent, llm, _store = agent_for(root, monkeypatch, context=context)
+
+    def system(index: int) -> str:
+        return llm.requests[index][0][0]["content"]
+
+    reply(agent, "first")
+    assert "Root contract v1" in system(0) and "<available-skills>" in system(0)
+    assert system(0).endswith("</available-skills>\n\n" + style)
+    (root / "AGENTS.md").write_text("Root contract v2", encoding="utf-8")
+    reply(agent, "second")
+    assert system(1) == system(0)
+    agent.refresh_session_guidance()
+    reply(agent, "third")
+    assert "Root contract v2" in system(2) and system(2).endswith("</available-skills>\n\n" + style)
+    agent.reset_conversation()
+    reply(agent, "fourth")
+    assert system(3) == system(2)
+
+
 def test_guidance_survives_cold_restore_and_workspace_a_b_a(tmp_path, monkeypatch):
     a, b = project(tmp_path, "a"), project(tmp_path, "b")
     (b / "AGENTS.md").write_text("Project B only", encoding="utf-8")

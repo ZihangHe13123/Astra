@@ -7,10 +7,11 @@ Read the repository's `AGENTS.md` first. These rules also apply when changing th
 - `SessionLease` protects writable sessions. A preview or copied context must not release the live owner's lease. Use the existing ownership mechanism.
 - Root and discovered project instructions share `ProjectInstructions`, its trust boundary, and its byte budget. Cached instructions never grant tool permissions. Minimal and Local modes retain their zero-injection behavior.
 - A conversation's tool list is fixed once applied. With deferred disclosure, other tools reach the model only as `tool_search` results and run through `call_tool` under their own names; never add a schema to the list to load one.
-- Static guidance and skill catalogs are applied per conversation. Ordinary disk edits are pending until a new conversation or explicit application. Append new regional guidance through the existing projection/tool-result boundary; preserve already-sent history.
+- Static guidance and skill catalogs are applied per conversation. Ordinary disk edits are pending until a new conversation or explicit application. Append new regional guidance through the existing projection/tool-result boundary; preserve already-sent history. A channel's chat style is a separate part of its contexts (`AgentContext.set_channel_style`, after the guidance suffix); guidance rebuilds only its own suffix.
 - Main agents, delegates, worker continuation, CLI, GUI, and channels must agree on the contract being changed. Inspect sibling entry points before calling a fix complete.
 - A timed-out or disconnected write can have an unknown outcome. Observe and report it; do not replay it automatically.
 - Persistent jobs use an explicit home, a fresh occurrence-specific session and kernel ownership locks. Commit schedule advancement and the occurrence before dispatch; keep terminal outcomes immutable. Inbox delivery is a separate transaction with a durable receipt. Never turn a recovered unknown execution into an automatic retry or adopt a GUI/channel conversation as a job context.
+- Bar, Minimal and Local replace settings on the shared agent and return the work agent's own from `work_settings()` (Local: what its controller's optional `work_settings()` gives). A channel turn runs with those, YOLO included, and gives the mode its own back (`AgentChannelRouter`), so every setting a mode replaces belongs in that list. Window commands that change these settings (`/yolo`, the modes) are refused while a channel turn holds the agent.
 
 ## Checks
 

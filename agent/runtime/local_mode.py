@@ -7,8 +7,9 @@ import os
 import re
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from .paths import state_path
 from .session_store import SessionStore
@@ -88,6 +89,18 @@ class LocalMode:
     @property
     def session_name(self) -> str:
         return self.controller.session_name if self.controller is not None else ""
+
+    def work_settings(self) -> dict[str, Any]:
+        """The work agent's own value of each agent attribute the open mode has replaced; empty while it is closed.
+
+        A controller that replaces settings on the shared agent (memory, tools, runtime providers, YOLO) names
+        them, with the values its leave() puts back, in an optional ``work_settings()`` of its own. A WeChat or
+        QQ turn that borrows the agent meanwhile runs with them (channels/router.py). A controller without that
+        method lends nothing.
+        """
+        own = getattr(self.controller, "work_settings", None) if self.active else None
+        lent = own() if callable(own) else None
+        return {str(name): value for name, value in lent.items()} if isinstance(lent, Mapping) else {}
 
     @property
     def tool_name(self) -> str:

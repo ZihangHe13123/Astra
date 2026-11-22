@@ -916,6 +916,33 @@ def test_while_channels_json_cannot_be_read_wechat_keeps_its_model(tmp_path, mon
     assert models.configured("weixin") == ""
 
 
+def test_a_cached_channel_client_changed_in_place_is_built_again(tmp_path, monkeypatch):
+    """Only a channel turn decides how a channel thinks: a cached client that something changed in place (as /mode
+    once did while a WeChat reply had borrowed it) is not used again as it is."""
+    from types import SimpleNamespace
+
+    from agent.cli.channel_models import ChannelModels
+    from agent.cli.model_catalog import CatalogEntry
+    from agent.cli.models import ModelProfile
+
+    profile = ModelProfile(base_url="http://127.0.0.1:9/v1", context_limit=32_000, provider="openai-compatible",
+                           api_key_env="", model_id="deepseek-v4-unit")
+    entry = CatalogEntry(key="unit::deepseek-v4-unit", model_id="deepseek-v4-unit", provider_id="unit",
+                         provider_label="Unit", base_url=profile.base_url, profile=profile)
+    path = tmp_path / "channels.json"
+    monkeypatch.setenv("ASTRA_CHANNEL_CONFIG", str(path))
+    path.write_text(json.dumps({"weixin": {"model": entry.key, "reasoning_effort": "max"}}), encoding="utf-8")
+    catalog = SimpleNamespace(resolve=lambda key: entry if key == entry.key else None, resolve_persisted=lambda key: None)
+    models = ChannelModels(lambda: catalog, lambda: "unit::window-model")  # type: ignore[arg-type,return-value]
+
+    first = models.client("weixin")
+    assert first is not None and first.config.reasoning_effort == "max"
+    assert models.client("weixin") is first
+    first.switch_model(first.config.model, reasoning_effort="high", context_limit=first.config.context_limit)
+    again = models.client("weixin")
+    assert again is not None and again is not first
+    assert (again.config.model, again.config.reasoning_effort) == ("deepseek-v4-unit", "max")
+
 def test_quotes_and_placeholders_never_crowd_out_or_stand_in_for_the_persons_words(ilink, tmp_path):
     quote = "这是一段很长的引用标题，比允许的输入长度还要长得多"
     (reply, picture, voice) = _received(ilink, tmp_path, [
@@ -990,6 +1017,27 @@ def test_a_setting_that_is_not_a_number_is_reported_and_downloads_nothing(tmp_pa
         assert config.onebot.problems == ('qq.port 应为整数，现在是 "two thousand"；暂按 2280 处理。',)
     path.write_text(json.dumps({"weixin": {}}), encoding="utf-8")
     assert load_channels_config(path).weixin.max_receive_file_bytes == 50 * 1024 * 1024
+
+
+def test_a_wechat_reasoning_effort_that_is_not_a_level_is_reported_and_follows_mode(tmp_path):
+    from agent.channels.config import load_channels_config
+    from agent.cli.mode_preferences import REASONING_EFFORTS
+
+    path = tmp_path / "channels.json"
+    for written, read in ((" XHigh ", "xhigh"), ("", ""), (None, "")):
+        path.write_text(json.dumps({"weixin": {"reasoning_effort": written}}), encoding="utf-8")
+        assert load_channels_config(path).weixin.reasoning_effort == read
+        assert load_channels_config(path).weixin.problems == ()
+    for level in REASONING_EFFORTS:
+        path.write_text(json.dumps({"weixin": {"reasoning_effort": level}}), encoding="utf-8")
+        assert load_channels_config(path).weixin.reasoning_effort == level
+    # A level /mode does not offer, or no text at all: followed as /mode, and named.
+    for written in ("medium", "最高", 3, True, ["max"]):
+        path.write_text(json.dumps({"weixin": {"reasoning_effort": written}}), encoding="utf-8")
+        config = load_channels_config(path).weixin
+        assert config.reasoning_effort == ""
+        assert config.problems == (f"weixin.reasoning_effort 应为 {'、'.join(REASONING_EFFORTS)} 之一，现在是 "
+                                   f"{json.dumps(written, ensure_ascii=False)}；暂按跟随 /mode 处理。",)
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="caffeinate is macOS")

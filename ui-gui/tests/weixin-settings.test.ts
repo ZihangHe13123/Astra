@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import React from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { initialSession, projectEvent } from "@astra/ui-core/session-state";
-import { WeixinSettings, weixinModelOptions, weixinView } from "../src/renderer/weixin-settings.js";
+import { WeixinSettings, weixinEffortOptions, weixinModelOptions, weixinSettingCommand, weixinView } from "../src/renderer/weixin-settings.js";
+import { EFFORTS } from "../src/renderer/efforts.js";
 
 const status = (fields: Record<string, unknown> = {}) => ({ type: "weixin_status", enabled: false, logged_in: false, account: "", state: "off",
   owner: false, keep_awake: false, login: "", ...fields });
@@ -58,4 +59,20 @@ test("the model WeChat answers with is chosen from the catalog, following the de
   assert.match(html, /<option value="local::qwen" selected="">qwen · Local<\/option>/);
   assert.match(renderToStaticMarkup(React.createElement(WeixinSettings, { status: status(), ready: false, models, run: () => {} })),
     /<select disabled="">/);
+});
+
+test("WeChat's reasoning effort follows the default until a level is picked, and each choice is a /weixin command", () => {
+  const view = (fields: Record<string, unknown>) => weixinView(status(fields) as never);
+  const levels = EFFORTS.map(([value, label]) => ({ value, label }));
+  assert.deepEqual(weixinEffortOptions(view({ reasoning_effort: "", default_reasoning_effort: "low" })),
+    [{ value: "", label: "跟随默认（低）" }, ...levels]);
+  assert.deepEqual(weixinEffortOptions(view({}))[0], { value: "", label: "跟随默认" }, "a backend that does not say the default");
+
+  const html = renderToStaticMarkup(React.createElement(WeixinSettings,
+    { status: status({ reasoning_effort: "max", default_reasoning_effort: "low" }), ready: true, run: () => {} }));
+  assert.match(html, /推理强度<select>/);
+  assert.match(html, /<option value="max" selected="">最高<\/option>/);
+  assert.equal(weixinSettingCommand("effort", "xhigh"), "/weixin effort xhigh");
+  assert.equal(weixinSettingCommand("effort", ""), "/weixin effort default");
+  assert.equal(weixinSettingCommand("model", ""), "/weixin model default");
 });

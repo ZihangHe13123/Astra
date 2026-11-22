@@ -26,7 +26,7 @@ in, and leaving restores every parked field untouched.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .context import AgentContext
 from .session_store import SessionStore
@@ -90,6 +90,33 @@ class MinimalModeController:
     def session_name(self) -> str:
         path = self.agent.context.session_path if self.active else ""
         return Path(path).stem if path else ""
+
+    def work_settings(self) -> dict[str, Any]:
+        """The work agent's own value of each agent attribute Minimal has replaced; empty while it is closed.
+
+        leave() puts these back. A WeChat or QQ turn that borrows the agent meanwhile runs with them
+        (channels/router.py): the work tools, memory and guidance, its tools run where the work agent's do,
+        not in Minimal's Docker sandbox, and it has the work agent's YOLO, whatever /yolo set for this mode.
+        """
+        if not self.active:
+            return {}
+        return {
+            "memory_store": self._work_memory_store,
+            "external_memory_provider": self._work_external_memory_provider,
+            "skill_store": self._work_skill_store,
+            "task_store": self._work_task_store,
+            "tools_enabled": self._work_tools_enabled,
+            "tool_allowlist": self._work_tool_allowlist,
+            "runtime_context_provider": self._work_runtime_context_provider,
+            "runtime_turn_context_provider": self._work_runtime_turn_context_provider,
+            "generation_overrides_provider": self._work_generation_overrides_provider,
+            "finalize_after_tools_provider": self._work_finalize_after_tools_provider,
+            "forced_tool_name": self._work_forced_tool_name,
+            "code_mode": self._work_code_mode,
+            "minimal_mode": self._work_minimal_mode,
+            "sandbox_mode": self._work_sandbox_mode,
+            "yolo": self._work_yolo,
+        }
 
     @staticmethod
     def _close_persistent_bash(agent: "ReActAgent") -> None:

@@ -1,5 +1,6 @@
 import React from "react";
 import type { UIEvent } from "@astra/ui-core/session-state";
+import { EFFORTS } from "./efforts.js";
 
 const STATES: Record<string, string> = {
   off: "未启用", logged_out: "未登录", stopped: "已停止", standby: "待命：另一个 Astra 会话正在接收",
@@ -16,6 +17,7 @@ export function weixinView(status: UIEvent | undefined) {
     waiting: status?.login === "scan" || status?.login === "confirm", confirming: status?.login === "confirm", qr,
     message: typeof status?.message === "string" ? status.message : "", error: typeof status?.error === "string" ? status.error : "",
     model: String(status?.model ?? ""), modelLabel: String(status?.model_label ?? ""), defaultModel: String(status?.default_model ?? ""),
+    effort: String(status?.reasoning_effort ?? ""), defaultEffort: String(status?.default_reasoning_effort ?? ""),
   };
 }
 
@@ -25,6 +27,18 @@ export function weixinModelOptions(view: ReturnType<typeof weixinView>, models: 
     ...models.filter(model => typeof model?.key === "string" && model.key).map(model => ({ value: String(model.key), label: `${model.name} · ${model.provider}` }))];
   if (view.model && !options.some(option => option.value === view.model)) options.push({ value: view.model, label: `${view.modelLabel || view.model}（不在模型列表里）` });
   return options;
+}
+
+/** How hard WeChat's model thinks: following the default (the composer's, /mode), or a level of its own. */
+export function weixinEffortOptions(view: ReturnType<typeof weixinView>) {
+  const name = (value: string) => EFFORTS.find(([level]) => level === value)?.[1] ?? value;
+  return [{ value: "", label: view.defaultEffort ? `跟随默认（${name(view.defaultEffort)}）` : "跟随默认" },
+    ...EFFORTS.map(([value, label]) => ({ value: value as string, label: label as string }))];
+}
+
+/** The command a settings select runs: a value of its own, or default to follow the default again. */
+export function weixinSettingCommand(setting: "model" | "effort", value: string) {
+  return `/weixin ${setting} ${value || "default"}`;
 }
 
 /** The channel belongs to the installation; any open session's backend logs in, switches and reports it. */
@@ -38,8 +52,13 @@ export function WeixinSettings({ status, ready, run, models }: {
     {view.known && <p className="small" role="status">状态：{view.label}{view.account && `（${view.account}）`}{view.state === "online" && (view.keepAwake ? " · 已阻止电脑空闲睡眠" : " · 未阻止睡眠")}</p>}
     {view.waiting && view.qr && <div className="weixin-qr"><img src={view.qr} alt="微信登录二维码" width={192} height={192}/><p className="muted small">{view.confirming ? "已扫码，请在手机微信里确认。" : "用手机微信扫一扫登录。"}</p></div>}
     {view.known && <label className="weixin-model small">回复用的模型
-      <select disabled={!ready} value={view.model} onChange={event => run(event.target.value ? `/weixin model ${event.target.value}` : "/weixin model default")}>
+      <select disabled={!ready} value={view.model} onChange={event => run(weixinSettingCommand("model", event.target.value))}>
         {weixinModelOptions(view, models).map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
+      </select>
+    </label>}
+    {view.known && <label className="weixin-effort small">推理强度
+      <select disabled={!ready} value={view.effort} onChange={event => run(weixinSettingCommand("effort", event.target.value))}>
+        {weixinEffortOptions(view).map(option => <option key={option.value} value={option.value}>{option.label}</option>)}
       </select>
     </label>}
     {view.message && !view.error && <p className="muted small">{view.message}</p>}

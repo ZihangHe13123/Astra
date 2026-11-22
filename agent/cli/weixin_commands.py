@@ -9,12 +9,21 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from pathlib import Path
 from typing import TYPE_CHECKING
 
-from agent.channels.config import load_channels_config, set_channel_enabled, set_channel_setting
+from agent.channels.config import (
+    channels_config_path,
+    load_channels_config,
+    set_channel_enabled,
+    set_channel_setting,
+)
 from agent.channels.manager import ChannelManager
+from agent.cli.mode_preferences import applies_reasoning_effort, read_reasoning_effort
+from agent.cli.model_preferences import model_settings_path
 from agent.runtime.json_preferences import UnreadablePreferences
 from agent.runtime.paths import state_path
+from agent.runtime.reasoning_efforts import REASONING_EFFORTS
 
 if TYPE_CHECKING:
     from agent.channels.weixin import IlinkClient
@@ -23,7 +32,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-USAGE = "用法：/weixin [status|login|logout|on|off|model <模型>|model default]"
+USAGE = ("用法：/weixin [status|login|logout|on|off|model <模型>|model default|"
+         f"effort <{'|'.join(REASONING_EFFORTS)}>|effort default]")
 # channels.json is there but is not valid JSON: running channels keep what they had, and nothing is written.
 UNREADABLE = "channels.json 不是合法的 JSON：改好之前，微信沿用原来的设置，这里也不能改设置。"
 NOT_SAVED = "channels.json 不是合法的 JSON，设置没有改动：先把文件改好（或删掉）再设置。"
@@ -31,6 +41,20 @@ NOT_SAVED = "channels.json 不是合法的 JSON，设置没有改动：先把文
 
 def is_weixin_command(command: str) -> bool:
     return command.lower().split(maxsplit=1)[:1] == ["/weixin"]
+
+
+def _signature(path: Path) -> tuple[int, int] | None:
+    """When a file was last written and how long it is, read without opening it."""
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return stat.st_mtime_ns, stat.st_size
+
+
+def _shown(event: dict) -> dict:
+    """What a status shows apart from the answer to one command."""
+    return {key: value for key, value in event.items() if key != "message"}
 
 
 class WeixinCommands:
@@ -45,6 +69,7 @@ class WeixinCommands:
         self._qr: dict[str, str] | None = None
         self._stage = ""
         self._last_key: tuple | None = None
+        self._last_shown: dict | None = None
 
     def status_event(self, *, message: str = "", error: str = "") -> dict:
         manager = self._manager()
@@ -89,6 +114,9 @@ class WeixinCommands:
             "model": config.model,
             "model_label": self._label(self._resolve(config.model), config.model) if config.model else "",
             "default_model": self._label(self._models.default() if self._models else None, ""),
+            # How hard WeChat's model thinks ("" follows /mode), and the effort /mode saved last.
+            "reasoning_effort": config.reasoning_effort,
+            "default_reasoning_effort": read_reasoning_effort(),
         }
         if self._qr is not None:
             event["qr"] = dict(self._qr)
@@ -102,18 +130,31 @@ class WeixinCommands:
             event["error"] = problem
         return event
 
-    def send_status(self, **reply: str) -> None:
+    def _change_key(self) -> tuple:
+        """What says a status may differ without a command here: the channel's own state, and the two files its
+        settings and defaults come from, by their size and time (they are read only when one changed)."""
         manager = self._manager()
         adapter = manager.weixin() if manager is not None else None
-        self._last_key = adapter.state_key() if adapter is not None else None
-        self._send(self.status_event(**reply))
+        return (adapter.state_key() if adapter is not None else None,
+                _signature(channels_config_path()), _signature(model_settings_path()))
+
+    def send_status(self, **reply: str) -> None:
+        event = self.status_event(**reply)
+        self._last_key, self._last_shown = self._change_key(), _shown(event)
+        self._send(event)
 
     def tick(self) -> None:
-        """Report a change the channel made on its own: it came online, went to standby or expired."""
-        manager = self._manager()
-        adapter = manager.weixin() if manager is not None else None
-        if adapter is not None and adapter.state_key() != self._last_key:
-            self.send_status()
+        """Report a change made without a command here: the channel came online, went to standby or expired, or
+        a setting a status shows changed elsewhere (/mode or /model in another window, /weixin in another
+        terminal, an edit of channels.json), so the desktop's settings never show an old value."""
+        key = self._change_key()
+        if key == self._last_key:
+            return
+        self._last_key = key
+        event = self.status_event()
+        if _shown(event) != self._last_shown:
+            self._last_shown = _shown(event)
+            self._send(event)
 
     async def handle(self, command: str) -> None:
         parts = command.split()
@@ -121,6 +162,8 @@ class WeixinCommands:
         try:
             if action == "model" and len(parts) <= 3:
                 self._model(parts[2] if len(parts) > 2 else "")
+            elif action == "effort" and len(parts) <= 3:
+                self._effort(parts[2] if len(parts) > 2 else "")
             elif len(parts) > 2:
                 self.send_status(error=USAGE)
             elif action == "status":
@@ -155,7 +198,38 @@ class WeixinCommands:
             return
         # Save the catalog's own key, so a bare model name means one model from then on.
         set_channel_setting("weixin", "model", entry.key)
-        self.send_status(message=f"微信改用 {entry.model_id}，下一条消息生效。")
+        answering = self._models.answering("weixin") if self._models else entry
+        detour = (f"（{entry.model_id} 缺少密钥，先用 {answering.model_id} 回复。）"
+                  if answering is not None and answering.key != entry.key else "")
+        self.send_status(message=f"微信改用 {entry.model_id}，下一条消息生效。{detour}")
+
+    def _effort(self, level: str) -> None:
+        level = level.lower()
+        if level and level != "default" and level not in REASONING_EFFORTS:
+            self.send_status(error=f"没有这个推理强度：{level}。可选 {'、'.join(REASONING_EFFORTS)}，"
+                                   "或 default 跟随默认（/mode）。")
+            return
+        if level:
+            set_channel_setting("weixin", "reasoning_effort", "" if level == "default" else level)
+        # Read back the way the channel reads it, so the answer is what the next reply uses.
+        configured = (self._models.configured_effort("weixin") if self._models
+                      else load_channels_config().weixin.reasoning_effort)
+        default = f"跟随默认（现在是 {read_reasoning_effort()}，用 /mode 改）"
+        if not level:
+            text = f"微信的推理强度：{configured or default}"
+        elif configured:
+            text = f"微信的推理强度改为 {configured}，下一条消息生效。"
+        else:
+            text = f"微信的推理强度改为{default}，下一条消息生效。"
+        self.send_status(message=text + self._effort_note())
+
+    def _effort_note(self) -> str:
+        """Said when the model WeChat's next reply goes to takes no effort, so a setting that changes nothing is
+        not a mystery."""
+        entry = self._models.answering("weixin") if self._models is not None else None
+        if entry is None or applies_reasoning_effort(entry.profile.provider, entry.model_id):
+            return ""
+        return f"（{entry.model_id} 不调推理强度，这个设置在换成支持的模型后才起作用。）"
 
     def _resolve(self, key: str) -> CatalogEntry | None:
         return self._models.resolve(key) if self._models and key else None

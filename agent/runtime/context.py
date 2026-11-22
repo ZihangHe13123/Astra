@@ -346,6 +346,9 @@ class AgentContext:
     _system_token_cost: int = field(default=0, init=False, repr=False)
     _tools_token_cost: int = 0
     _stable_system_suffix: str = field(default="", init=False, repr=False)
+    # How to talk on the channel this conversation belongs to (WeChat's chat style), sent after the guidance
+    # suffix. Its owner, the channel router, sets it on each chat context it builds; it is never saved.
+    _channel_style: str = field(default="", init=False, repr=False)
     _system_prompt_migration: dict = field(default_factory=dict, init=False, repr=False)
     guidance_snapshot: dict = field(default_factory=dict, init=False, repr=False)
     system_projection: SystemPromptProjection = field(default_factory=SystemPromptProjection, init=False, repr=False)
@@ -423,9 +426,20 @@ class AgentContext:
 
     @property
     def effective_system_prompt(self) -> str:
-        if not self._stable_system_suffix:
-            return self.system_prompt
-        return f"{self.system_prompt}\n\n{self._stable_system_suffix}".strip()
+        prompt = self.system_prompt
+        if self._stable_system_suffix:
+            prompt = f"{prompt}\n\n{self._stable_system_suffix}".strip()
+        if self._channel_style:
+            prompt = f"{prompt}\n\n{self._channel_style}".strip()
+        return prompt
+
+    def set_channel_style(self, style: str):
+        """Set how to talk on this conversation's channel, sent after the guidance suffix.
+
+        Guidance rebuilds only its own suffix, so applying, refreshing or resetting it keeps the style.
+        """
+        self._channel_style = str(style or "").strip()
+        self._system_token_cost = _estimate_value_tokens(self.effective_system_prompt)
 
     def set_stable_system_suffix(self, suffix: str):
         """Set deterministic capability guidance kept outside session state.

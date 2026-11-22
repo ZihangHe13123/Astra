@@ -69,12 +69,12 @@ from agent.logging_config import setup_logging
 from agent.core.msg import Msg
 from agent.core.bus import MessageBus
 from agent.runtime.llm import LLMClient, LLMConfig
-from agent.runtime.deepseek import is_deepseek_model
 from agent.runtime.react import ReActAgent
 from agent.runtime.code_mode import register_run_code_tool
 from agent.cli.mode_preferences import (
     MODE_USAGE,
     REASONING_EFFORTS,
+    applies_reasoning_effort,
     apply_reasoning_effort,
     reasoning_effort_status,
     set_reasoning_effort,
@@ -465,6 +465,15 @@ def _is_setting_command(command: str) -> bool:
     return _is_consolidation_command(command) or is_weixin_command(command)
 
 
+# Window commands that act through the agent itself, not only on the window's conversation: they end, clear,
+# switch, compact or reload the conversation the agent holds, open or leave a mode around it, or apply guidance
+# to it. While a chat's reply has borrowed the agent, that conversation is the chat's, so they wait for the reply.
+# (Switching with /session <name> waits as well; see _session_command. So does the command of an installed
+# local mode, which only that installation names.)
+AGENT_COMMANDS = frozenset({"/reset", "/bar", "/minimal", "/sip", "/compress", "/reload",
+                            "/guidance", "/skills"})
+
+
 def _isolated_mode_blocks_command(
     command: str,
     *,
@@ -722,21 +731,24 @@ def _run_memory_consolidation(memory_store: MemoryStore) -> dict[str, int]:
         return {"expired": 0, "merged_observations": 0, "extracted_observations": 0}
 
 
-def _save_handoff(agent: ReActAgent, task_store: TaskStore | None, *, notes: str = "") -> Path | None:
-    """Persist a redacted handoff for the active work session."""
+def _save_handoff(agent: ReActAgent, task_store: TaskStore | None, *, notes: str = "",
+                  window: AgentChannelRouter.WindowView | None = None) -> Path | None:
+    """Persist a redacted handoff for the active work session: ``window``'s conversation when given (the
+    window's own while a chat's reply has borrowed the agent), else the agent's."""
     if getattr(agent, "local_mode", False):
         return None
+    context, llm = window or (agent.context, agent.llm)
     try:
-        session_id = agent.context.session_scope
+        session_id = context.session_scope
         text = generate_handoff(
             session_id=session_id,
             task_store=task_store,
             messages=[
                 item if isinstance(item, dict) else {"role": item.role, "content": item.get_text()}
-                for item in agent.context.messages
+                for item in context.messages
             ],
-            model=agent.llm.config.model,
-            persona_id=agent.context.persona_id or "",
+            model=llm.config.model,
+            persona_id=context.persona_id or "",
             extra_notes=notes,
         )
         return save_handoff(text, session_id=session_id)
@@ -883,8 +895,9 @@ async def _main(startup_started: float):
     tools = ToolRegistry()
     def _question_identity() -> dict[str, str]:
         from agent.runtime.session_identity import session_key
-        path = Path(agent.context.session_path).resolve()
-        return {"session_id": path.stem, "session_scope": session_key(path) + (":" + agent.context.branch_id if agent.context.branch_id != "main" else ""),
+        context = _window().context
+        path = Path(context.session_path).resolve()
+        return {"session_id": path.stem, "session_scope": session_key(path) + (":" + context.branch_id if context.branch_id != "main" else ""),
                 "task_id": str(agent_holder.get("question_task_id", ""))}
 
     question_broker = UserQuestionBroker(
@@ -896,6 +909,30 @@ async def _main(startup_started: float):
     question_followups: set[str] = set()
     register_user_question_tools(tools, question_broker.ask)
     channel_manager_holder: dict[str, ChannelManager] = {}
+    # The channel router, once there is one (see _window).
+    channel_router_holder: dict[str, AgentChannelRouter] = {}
+
+    def _window() -> AgentChannelRouter.WindowView:
+        """The window's own conversation and model client. A chat's turn borrows agent.context and agent.llm;
+        window commands, what the window is shown and a window turn that waits for the agent use the window's
+        own meanwhile."""
+        router = channel_router_holder.get("router")
+        return router.window_view() if router is not None else AgentChannelRouter.WindowView(agent.context, agent.llm)
+
+    def _window_yolo() -> bool:
+        """The window's YOLO. A chat's turn while the window is in Minimal or a local mode has the work agent's."""
+        router = channel_router_holder.get("router")
+        return bool(router.window_setting("yolo") if router is not None else agent.tools.yolo)
+
+    def _chat_reply_note(command: str) -> str:
+        """Why a window command that needs the agent itself, not only the window's conversation, cannot run now:
+        a chat's reply is using the agent, and the command would reach that chat's conversation. "" when it can."""
+        router = channel_router_holder.get("router")
+        channel = router.borrower if router is not None else ""
+        if not channel:
+            return ""
+        chat = {"weixin": "WeChat", "qq": "QQ"}.get(channel, channel)
+        return f"Astra is answering a {chat} message right now. Run {command} again once that reply has been sent."
     register_channel_tools(
         tools,
         lambda: channel_manager_holder.get("manager"),
@@ -1319,7 +1356,7 @@ async def _main(startup_started: float):
     startup_profiler.mark("agent_and_session_setup")
 
     def _current_memory_session() -> str:
-        return agent.context.session_scope
+        return _window().context.session_scope
 
     def _send_working_memory() -> None:
         if bar_mode.active or minimal_mode.active or local_mode.active:
@@ -1371,7 +1408,7 @@ async def _main(startup_started: float):
         _require_local_work_session()
         if wakeup_context.get() is not None or restart.draining:
             raise ValueError("A wakeup cannot create further schedules or run while restart is pending.")
-        status = wakeups.schedule(session=Path(agent.context.session_path).stem, prompt=prompt,
+        status = wakeups.schedule(session=Path(_window().context.session_path).stem, prompt=prompt,
                                   original_request=latest_user_request,
                                   delay_seconds=delay_seconds, interval_seconds=interval_seconds,
                                   lifetime_seconds=lifetime_seconds)
@@ -1456,7 +1493,8 @@ async def _main(startup_started: float):
     def _window_name() -> str:
         if peer_link is not None and peer_link.name:
             return peer_link.name
-        return Path(agent.context.session_path).stem if agent.context.session_path else ""
+        path = _window().context.session_path
+        return Path(path).stem if path else ""
 
     # Other Astra windows name this one when it holds the browser channel.
     set_owner_label_provider(_window_name)
@@ -1464,7 +1502,7 @@ async def _main(startup_started: float):
 
     def _peer() -> PeerLink:
         if (peer_link is None or not peer_link.peer_id
-                or peer_link.peer_id != f"{peer_link.site}:{agent.context.session_scope}"):
+                or peer_link.peer_id != f"{peer_link.site}:{_window().context.session_scope}"):
             raise ValueError("Messaging other Astra sessions is available after the current conversation branch joins the local mailbox.")
         return peer_link
 
@@ -2147,7 +2185,7 @@ async def _main(startup_started: float):
     async def _refresh_model_catalog(provider_id: str | None = None, *, force: bool = False) -> ModelCatalog:
         nonlocal catalog
         refreshed = await discover_model_catalog(provider_id=provider_id, force=force)
-        _sync_current_context_budget(agent, refreshed, current_model_key)
+        _sync_current_context_budget(_window(), refreshed, current_model_key)
         if provider_id:
             entries = tuple(e for e in catalog.entries if e.provider_id != provider_id) + refreshed.entries
             errors = {k: v for k, v in catalog.errors.items() if k != provider_id}
@@ -2202,14 +2240,15 @@ async def _main(startup_started: float):
 
     def _served_model() -> str:
         """The concrete model behind an alias such as claude-code's `sonnet`, once a request has shown it."""
-        served = getattr(agent.llm, "served_model", "")
-        return served if isinstance(served, str) and served != agent.llm.config.model else ""
+        llm = _window().llm
+        served = getattr(llm, "served_model", "")
+        return served if isinstance(served, str) and served != llm.config.model else ""
 
     async def _send_model_info(*, refresh: bool = False):
         if refresh:
             await _refresh_model_catalog()
         served = _served_model()
-        ctx = agent.context
+        ctx, llm = _window()
         used = ctx.estimate_prompt_tokens()
         limit = ctx.max_prompt_tokens
         pct = (used / limit * 100) if limit > 0 else 0.0
@@ -2217,11 +2256,10 @@ async def _main(startup_started: float):
             {"name": profile.name, "description": profile.description}
             for profile in selectable_prompt_profiles().values()
         ]
-        _send({"type": "model_info", "model": agent.llm.config.model,
+        _send({"type": "model_info", "model": llm.config.model,
                "model_key": current_model_key,
-               "reasoning_effort": (agent.llm.config.reasoning_effort
-                                    if is_deepseek_model(agent.llm.config.model)
-                                    or agent.llm.config.provider in {"openai-codex", "claude-code", "google-gemini"} else None),
+               "reasoning_effort": (llm.config.reasoning_effort
+                                    if applies_reasoning_effort(llm.config.provider, llm.config.model) else None),
                "code_mode": agent.code_mode,
                "personas": personas,
                "models": [entry.to_event(current=entry.key == current_model_key)
@@ -2258,10 +2296,12 @@ async def _main(startup_started: float):
         from agent.ui.reasoning import legacy_reasoning_text, reasoning_display_fields
         hist = []
         gui_history = os.getenv("ASTRA_UI_SURFACE") == "gui"
-        source_positions = {id(message): index for index, message in enumerate(agent.context.messages)}
+        # The window's conversation, also while a chat's reply has borrowed agent.context.
+        context = _window().context
+        source_positions = {id(message): index for index, message in enumerate(context.messages)}
         history_mode = "bar" if bar_mode.active else "minimal" if minimal_mode.active else "local" if local_mode.active else "work"
-        history_session = Path(agent.context.session_path).stem if agent.context.session_path else ""
-        for position, message in enumerate(visible_wakeup_history(agent.context.messages)):
+        history_session = Path(context.session_path).stem if context.session_path else ""
+        for position, message in enumerate(visible_wakeup_history(context.messages)):
             if message.get("role") not in ("user", "assistant"):
                 continue
             legacy_reasoning = legacy_reasoning_text(message) if gui_history else None
@@ -2285,26 +2325,26 @@ async def _main(startup_started: float):
                 item["timestamp"] = timestamp
             hist.append(item)
         saved_results = []
-        if _task_tracking_enabled() and task_store is not None and agent.context.session_path:
+        if _task_tracking_enabled() and task_store is not None and context.session_path:
             try:
-                saved_results = await durable_io(task_store.recent_tool_results, agent.context.session_scope)
+                saved_results = await durable_io(task_store.recent_tool_results, context.session_scope)
             except Exception:
                 logger.exception("could not restore saved tool details")
-        results = history_tool_results(agent.context.messages, saved_results)
+        results = history_tool_results(context.messages, saved_results)
         if bar_mode.active:
             results = [result for result in results if result["name"] not in BAR_SCENE_TOOL_NAMES or result["error"]]
         delegates = {}
-        session_id = Path(agent.context.session_path).stem if agent.context.session_path else ""
-        if agent.context.session_path:
+        session_id = Path(context.session_path).stem if context.session_path else ""
+        if context.session_path:
             from agent.ui.delegates import delegate_history
-            restored_delegates = await durable_io(delegate_history, SessionStore(agent.context.session_path))
+            restored_delegates = await durable_io(delegate_history, SessionStore(context.session_path))
             delegates = {item["process_id"]: item for item in restored_delegates}
-            delegates.update({pid: item for pid, item in delegate_statuses.items() if item.get("session_id") == agent.context.session_scope})
+            delegates.update({pid: item for pid, item in delegate_statuses.items() if item.get("session_id") == context.session_scope})
         _send({"type": "history", "session_id": session_id, "messages": hist,
-               "branch_id": agent.context.branch_id,
+               "branch_id": context.branch_id,
                "tool_results": results, "delegates": list(delegates.values())})
         if os.getenv("ASTRA_UI_SURFACE") == "gui":
-            _send({"type": "response_versions", **ConversationBranches(agent.context.session_path).state(branch_id=agent.context.branch_id)})
+            _send({"type": "response_versions", **ConversationBranches(context.session_path).state(branch_id=context.branch_id)})
         identity = _question_identity()
         question_broker.expire_other_sessions(identity["session_id"], identity["session_scope"])
         question_broker.recover_expired(identity["session_id"], identity["session_scope"])
@@ -2312,8 +2352,9 @@ async def _main(startup_started: float):
     def _send_session_info():
         if bar_mode.active or minimal_mode.active or local_mode.active:
             return
-        current = Path(agent.context.session_path).stem if agent.context.session_path else ""
-        _send({"type": "session_info", "name": current, "messages": len(agent.context.messages)})
+        context = _window().context
+        current = Path(context.session_path).stem if context.session_path else ""
+        _send({"type": "session_info", "name": current, "messages": len(context.messages)})
 
     def _send_mode_info() -> None:
         _send({
@@ -2378,9 +2419,10 @@ async def _main(startup_started: float):
         if bar_mode.active or minimal_mode.active or local_mode.active:
             return session_list_revision
         session_list_revision += 1
+        context = _window().context
         _send(_build_session_list_event(
-            agent.context.session_path,
-            len(agent.context.messages),
+            context.session_path,
+            len(context.messages),
             include_counts=include_counts,
         ))
         return session_list_revision
@@ -2469,7 +2511,7 @@ async def _main(startup_started: float):
 
     voice.report(force=True)
     if os.getenv("ASTRA_UI_SURFACE") == "gui":
-        _send({"type": "yolo_status", "yolo": agent.tools.yolo})
+        _send({"type": "yolo_status", "yolo": _window_yolo()})
         _send({"type": "gui_ready", "workspace": str(Path(sandbox_workdir).resolve()),
                "session_id": Path(agent.context.session_path).stem})
 
@@ -2477,7 +2519,12 @@ async def _main(startup_started: float):
                                    channels=functools.partial(channel_manager_holder.get, "manager"))
     channel_router = AgentChannelRouter(agent, agent_turn_lock, sessions_dir(PROJECT_ROOT),
                                         admission=lambda: not restart.draining, model_for=channel_models.client,
-                                        tasks=task_store)
+                                        tasks=task_store,
+                                        # At most one of the private modes is open at a time.
+                                        work_settings=lambda: {**bar_mode.work_settings(),
+                                                               **minimal_mode.work_settings(),
+                                                               **local_mode.work_settings()})
+    channel_router_holder["router"] = channel_router
     # Between turns: the desktop's conversation and each chat's, with how the ledger attributes them.
     idle_compactor = IdleCompactor(lambda: [(agent.context, {}), *(
         (context, {"source": "channel", "session": name}) for name, context in channel_router.parked_contexts())])
@@ -2594,8 +2641,9 @@ async def _main(startup_started: float):
         if os.getenv("ASTRA_UI_SURFACE") != "gui":
             return True
         try:
-            selected, _ = ConversationBranches(agent.context.session_path).resolve()
-            if selected == agent.context.branch_id:
+            context = _window().context
+            selected, _ = ConversationBranches(context.session_path).resolve()
+            if selected == context.branch_id:
                 return True
         except Exception:
             logger.exception("could not verify the selected conversation branch")
@@ -2660,7 +2708,7 @@ async def _main(startup_started: float):
         if (resume_task is None and _task_tracking_enabled() and task_store is not None
                 and all(block.type == "text" for block in msg.content)):
             from agent.runtime.task_resume import budget_resume_candidate, resume_prompt
-            session_id = agent.context.session_scope
+            session_id = _window().context.session_scope
             candidate = await durable_io(budget_resume_candidate, task_store, session_id, input_text)
             if candidate is not None:
                 resume_task = await durable_io(task_store.prepare_resume, candidate["id"])
@@ -2678,7 +2726,7 @@ async def _main(startup_started: float):
         if _response_regenerating or not _response_head_current():
             return False
         active_wakeup = msg.metadata.get("source") == "session_wakeup"
-        if agent.llm.config.connection_required:
+        if _window().llm.config.connection_required:
             _send({"type": "error", "message": "Use /connect and select a model before sending a message."})
             _send({"type": "done"})
             return False
@@ -2707,7 +2755,9 @@ async def _main(startup_started: float):
         async def start_and_stream() -> None:
             nonlocal active_task_id, _reply_done, entered, stopped
             entered = True
-            context_path = agent.context.session_path
+            # This runs before the turn waits for the agent, which a chat's reply may hold meanwhile.
+            window_context, window_llm = _window()
+            context_path = window_context.session_path
             with profile_request(str(request_id)), usage_context(
                     source="chat", session=Path(context_path).stem if context_path else ""):
                 run = resume_task
@@ -2718,8 +2768,8 @@ async def _main(startup_started: float):
                     assert task_store is not None
                     run = task_store.start_run(
                         str(request_id), input_text,
-                        session_id=agent.context.session_scope,
-                        model=agent.llm.config.model,
+                        session_id=window_context.session_scope,
+                        model=window_llm.config.model,
                         source="desktop" if os.getenv("ASTRA_UI_SURFACE") == "gui" else "terminal",
                     )
 
@@ -2734,7 +2784,7 @@ async def _main(startup_started: float):
                     if not bar_mode.active and not local_mode.active:
                         msg.metadata["task_id"] = active_task_id
                     if not (bar_mode.active or local_mode.active or minimal_mode.active):
-                        work_turn.update(task_id=active_task_id, session=agent.context.session_scope)
+                        work_turn.update(task_id=active_task_id, session=window_context.session_scope)
                     if not bar_mode.active:
                         msg.metadata["runtime_task_id"] = active_task_id
                         _send({"type": "task_started", "task": run})
@@ -3166,7 +3216,7 @@ async def _main(startup_started: float):
     def _consolidation_command(c: str) -> None:
         try:
             output, error = execute_memory_command(
-                memory_store, shlex.split(c)[1:], session_id=agent.context.session_scope,
+                memory_store, shlex.split(c)[1:], session_id=_current_memory_session(),
                 consolidation=consolidation,
             )
         except ValueError as exc:
@@ -3372,7 +3422,7 @@ async def _main(startup_started: float):
         _send_session_list()
         _send_working_memory()
         _send_mode_info()
-        _send({"type": "yolo_status", "yolo": agent.tools.yolo})
+        _send({"type": "yolo_status", "yolo": _window_yolo()})
         if refresh_history:
             await _send_history()
         _send_minimal_session_list()
@@ -3504,7 +3554,7 @@ async def _main(startup_started: float):
         _send_session_list()
         _send_working_memory()
         _send_mode_info()
-        _send({"type": "yolo_status", "yolo": agent.tools.yolo})
+        _send({"type": "yolo_status", "yolo": _window_yolo()})
         if refresh_history:
             await _send_history()
         _send_local_mode_info()
@@ -3532,8 +3582,10 @@ async def _main(startup_started: float):
             return
         resend_text = ""
         refresh_history = False
+        # The window's conversation: a chat's reply may have borrowed agent.context meanwhile.
+        context = _window().context
         if command_name == "retry":
-            ok, message, retry_text = conversation_edits.take_last_request(agent.context)
+            ok, message, retry_text = conversation_edits.take_last_request(context)
             if ok:
                 refresh_history = True
                 snippet = retry_text if len(retry_text) <= 40 else f"{retry_text[:40]}…"
@@ -3542,7 +3594,7 @@ async def _main(startup_started: float):
             else:
                 output, error = "", message
         elif c == "/undo":
-            ok, message = conversation_edits.undo_last_reply(agent.context)
+            ok, message = conversation_edits.undo_last_reply(context)
             if ok:
                 refresh_history = True
                 output, error = message, ""
@@ -3555,7 +3607,7 @@ async def _main(startup_started: float):
             except ValueError:
                 count = 0
             if 1 <= count <= 50:
-                ok, message = conversation_edits.undo_last_exchanges(agent.context, count)
+                ok, message = conversation_edits.undo_last_exchanges(context, count)
                 if ok:
                     refresh_history = True
                     output, error = message, ""
@@ -3692,7 +3744,7 @@ async def _main(startup_started: float):
         else:
             task_id = parts[1].strip()
             task = await durable_io(task_store.get_task, task_id)
-            current_session = agent.context.session_scope
+            current_session = _window().context.session_scope
             if task is None:
                 _send({"type": "tool_result", "name": "resume", "output": "", "error": f"Unknown task: {task_id}", "code": ""})
                 _send({"type": "done"})
@@ -3775,7 +3827,7 @@ async def _main(startup_started: float):
             if entry is not None:
                 try:
                     settings_path = switch_to_profile(
-                        agent,
+                        _window(),
                         entry.key,
                         entry.profile,
                         valid_models=set(catalog.profiles) | {entry.key},
@@ -3814,7 +3866,8 @@ async def _main(startup_started: float):
         else:
             served = _served_model()
             serving = f" (serving {served})" if served else ""
-            lines = [f"Current model: {agent.llm.config.model}{serving} @ {agent.llm.config.base_url}", "Available:"]
+            window_config = _window().llm.config
+            lines = [f"Current model: {window_config.model}{serving} @ {window_config.base_url}", "Available:"]
             for provider in dict.fromkeys(item.provider_label for item in catalog.entries):
                 lines.append(f"  [{provider}]")
                 for item in catalog.entries:
@@ -3915,7 +3968,9 @@ async def _main(startup_started: float):
     async def _session_command(c: str) -> None:
         """/session: list, export, rename, delete or switch saved sessions."""
         sessions = list_sessions()
-        current = agent.context.session_path
+        # The window's conversation, also while a chat's reply has borrowed agent.context.
+        window_context = _window().context
+        current = window_context.session_path
         if c == "/session":
             lines = [f"Sessions ({len(sessions)}):"]
             for s in sessions:
@@ -3942,8 +3997,8 @@ async def _main(startup_started: float):
                     try:
                         rename_session(old_name, new_name)
                         memory_store.rename_working(old_name, new_name)
-                        if Path(agent.context.session_path).resolve() == old_path.resolve():
-                            agent.context.set_session(str(new_path))
+                        if Path(window_context.session_path).resolve() == old_path.resolve():
+                            window_context.set_session(str(new_path))
                     finally:
                         del rename_lease
                     _send_session_info()
@@ -3953,7 +4008,7 @@ async def _main(startup_started: float):
                            "output": f"Renamed session '{old_name}' to '{new_name}'", "error": "", "code": ""})
                 elif len(parts) >= 3 and parts[1] == "delete":
                     name = parts[2]
-                    if Path(agent.context.session_path).resolve() == session_path(name).resolve():
+                    if Path(window_context.session_path).resolve() == session_path(name).resolve():
                         raise SessionNameError("Switch to another session before deleting the active session.")
                     delete_session(name)
                     memory_store.clear_working(name)
@@ -3961,6 +4016,9 @@ async def _main(startup_started: float):
                     _send_working_memory()
                     _send({"type": "tool_result", "name": "session",
                            "output": f"Deleted session '{name}'", "error": "", "code": ""})
+                elif note := _chat_reply_note("/session"):
+                    # Switching ends the agent's conversation and starts another in it: now that would be the chat's.
+                    _send({"type": "tool_result", "name": "session", "output": "", "error": note, "code": "busy"})
                 else:
                     name = parts[1]
                     target = session_path(name)
@@ -4295,6 +4353,13 @@ async def _main(startup_started: float):
                            "request_id": restart.request_id,
                            "message": "Restart is pending; use /restart cancel before changing the session."})
                     continue
+                head = c.split(maxsplit=1)[0].lower() if c else ""
+                if (head in AGENT_COMMANDS or local_mode.matches(head)) and (note := _chat_reply_note(head)):
+                    if head == "/reset":
+                        await _send_history()  # the terminal clears its transcript as it sends /reset
+                    _send({"type": "tool_result", "name": head[1:], "output": "", "error": note, "code": "busy"})
+                    _send({"type": "done"})
+                    continue
                 if (c.lower().split(maxsplit=1)[:1] not in (["/learn"], ["/yolo"], ["/cancel"], ["/voice"])
                         and not _is_setting_command(c)):
                     await _cancel_manual_reviews()
@@ -4310,6 +4375,10 @@ async def _main(startup_started: float):
                         error = "YOLO is available in Work and Minimal modes."
                     elif len(parts) > 2 or (len(parts) == 2 and parts[1] not in {"on", "off", "status"}):
                         error = "Usage: /yolo [on|off|status]"
+                    elif parts[1:] != ["status"] and (note := _chat_reply_note("/yolo")):
+                        # The chat's reply runs with the YOLO it started with; the switch is shared, so a change
+                        # now would reach that reply, and its approvals waiting for an answer.
+                        error = note
                     else:
                         action = parts[1] if len(parts) == 2 else "toggle"
                         if action != "status":
@@ -4317,7 +4386,7 @@ async def _main(startup_started: float):
                             if agent.tools.yolo:
                                 for request_id in tuple(pending_yolo_approvals):
                                     resolve_tool_approval(request_id, "once")
-                    _send({"type": "yolo_status", "yolo": agent.tools.yolo, "error": error})
+                    _send({"type": "yolo_status", "yolo": _window_yolo(), "error": error})
                 elif c.lower().split(maxsplit=1)[:1] == ["/voice"]:
                     # Like /yolo, a control acknowledgement: it works in every mode and
                     # during a turn, and is neither a task nor part of the conversation.
@@ -4373,7 +4442,7 @@ async def _main(startup_started: float):
                     await _send_history()
                     await _send_model_info(refresh=True)
                     _send_mode_info()
-                    _send({"type": "yolo_status", "yolo": agent.tools.yolo})
+                    _send({"type": "yolo_status", "yolo": _window_yolo()})
                     _send_minimal_session_list()
                     _send_working_memory()
                     _send({"type": "tool_result", "name": "minimal", "output": "Minimal session reset. Work context remains parked.", "error": "", "code": ""})
@@ -4463,7 +4532,7 @@ async def _main(startup_started: float):
                     _send({"type": "done"})
                 elif c == "/handoff" or c.startswith("/handoff "):
                     notes = c[len("/handoff"):].strip()
-                    path = _save_handoff(agent, task_store, notes=notes)
+                    path = _save_handoff(agent, task_store, notes=notes, window=_window())
                     _send({
                         "type": "tool_result",
                         "name": "handoff",
@@ -4474,18 +4543,19 @@ async def _main(startup_started: float):
                     _send({"type": "done"})
                 elif c == "/think" or c.startswith("/think "):
                     parts = c.split(maxsplit=1)
+                    window_context = _window().context
                     if len(parts) == 1:
-                        agent.context.show_reasoning = not agent.context.show_reasoning
+                        window_context.show_reasoning = not window_context.show_reasoning
                     else:
                         value = parts[1].strip().lower()
                         if value not in {"on", "off"}:
                             _send({"type": "tool_result", "name": "think", "output": "", "error": "Usage: /think [on|off]", "code": ""})
                             _send({"type": "done"})
                             continue
-                        agent.context.show_reasoning = value == "on"
-                    await agent.context.save_async()
+                        window_context.show_reasoning = value == "on"
+                    await window_context.save_async()
                     await _send_model_info()
-                    _send({"type": "tool_result", "name": "think", "output": f"Thinking display: {'ON' if agent.context.show_reasoning else 'OFF'}", "error": "", "code": ""})
+                    _send({"type": "tool_result", "name": "think", "output": f"Thinking display: {'ON' if window_context.show_reasoning else 'OFF'}", "error": "", "code": ""})
                     _send({"type": "done"})
                 elif c == "/tools":
                     details = sorted(agent.tools.describe(), key=lambda item: item["name"])
@@ -4502,7 +4572,7 @@ async def _main(startup_started: float):
                         output, error = execute_memory_command(
                             memory_store,
                             memory_parts,
-                            session_id=agent.context.session_scope,
+                            session_id=_current_memory_session(),
                             retainer=agent.memory_retainer,
                             consolidation=consolidation,
                         )
@@ -4573,7 +4643,7 @@ async def _main(startup_started: float):
                     _send({"type": "done"})
                 elif c == "/health":
                     _send({"type": "tool_result", "name": "health",
-                           "output": build_health_report(agent.llm.config, agent.tools, agent.context.max_prompt_tokens, sandbox),
+                           "output": build_health_report(_window().llm.config, agent.tools, _window().context.max_prompt_tokens, sandbox),
                            "error": "", "code": ""})
                     _send({"type": "done"})
                 elif c == "/doctor" or c.startswith("/doctor "):
@@ -4652,7 +4722,7 @@ async def _main(startup_started: float):
                     })
                     _send({"type": "done"})
                 elif c == "/usage" or c.startswith("/usage "):
-                    context_path = agent.context.session_path
+                    context_path = _window().context.session_path
                     output, error = execute_usage_command(c[len("/usage"):].strip(),
                                                           session=Path(context_path).stem if context_path else "")
                     _send({"type": "tool_result", "name": "usage", "output": output, "error": error, "code": ""})
@@ -4696,7 +4766,7 @@ async def _main(startup_started: float):
                     else:
                         api_key_env = parts[3] if len(parts) > 3 else "LLM_API_KEY"
                         probe, settings_path = await create_probe_and_switch(
-                            agent, parts[1], parts[2], api_key_env
+                            _window(), parts[1], parts[2], api_key_env
                         )
                         if probe.ok:
                             _schedule_openai_warmup(delay=0.0)
@@ -4717,12 +4787,14 @@ async def _main(startup_started: float):
                     await _model_command(c, cmd)
                 elif c == "/mode" or c.startswith("/mode "):
                     argument = c[len("/mode"):].strip().lower()
+                    # The window's own client, also while a chat's turn has borrowed agent.llm.
+                    window_llm = _window().llm
                     if not argument:
-                        output = f"{reasoning_effort_status(agent.llm.config)}\n{MODE_USAGE}"
+                        output = f"{reasoning_effort_status(window_llm.config)}\n{MODE_USAGE}"
                         error = ""
                     elif argument in REASONING_EFFORTS:
-                        set_reasoning_effort(agent.llm, argument)
-                        output = f"{reasoning_effort_status(agent.llm.config)}\nSaved as startup default."
+                        set_reasoning_effort(window_llm, argument)
+                        output = f"{reasoning_effort_status(window_llm.config)}\nSaved as startup default."
                         error = ""
                         await _send_model_info()
                     else:
@@ -4761,7 +4833,8 @@ async def _main(startup_started: float):
                         if arg in profiles:
                             profile = get_prompt_profile(arg)
                             state = profile.default_state()
-                            agent.set_persona(state, profile.system_prompt(state))
+                            # The window's conversation, also while a chat's reply has borrowed agent.context.
+                            _window().context.set_persona(state, profile.system_prompt(state))
                             settings_path = save_selected_persona(arg)
                             _send({"type": "tool_result", "name": "persona",
                                    "output": f"Persona switched to: {arg}\n"
@@ -4776,7 +4849,7 @@ async def _main(startup_started: float):
                     else:
                         lines = ["Available personas:"]
                         for name, profile in profiles.items():
-                            marker = " *" if name == agent.context.persona_id else "  "
+                            marker = " *" if name == _window().context.persona_id else "  "
                             lines.append(f"  {marker} {name} — {profile.description}")
                         _send({"type": "tool_result", "name": "persona",
                                "output": "\n".join(lines), "error": "", "code": ""})

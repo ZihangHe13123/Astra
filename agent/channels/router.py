@@ -9,9 +9,9 @@ import json
 import logging
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import replace
-from typing import Any
+from typing import Any, NamedTuple
 from pathlib import Path
 
 from agent.core.msg import ContentBlock, Msg
@@ -75,20 +75,55 @@ def channel_session_name(message: ChannelMessage) -> str:
 class AgentChannelRouter:
     """Serialize use of a stateful ReActAgent and park one context per chat."""
 
+    class WindowView(NamedTuple):
+        """The window's own conversation and model client."""
+        context: Any
+        llm: Any
+
     def __init__(self, agent, turn_lock: asyncio.Lock, session_root: Path,
                  *, admission: Callable[[], bool] | None = None,
-                 model_for: Callable[[str], Any] | None = None, tasks: Any = None):
+                 model_for: Callable[[str], Any] | None = None, tasks: Any = None,
+                 work_settings: Callable[[], Mapping[str, Any]] | None = None):
         self.agent = agent
         self.turn_lock = turn_lock
         self.session_root = Path(session_root)
         self.admission = admission or (lambda: True)
         # A channel's own model client, or None to answer with the agent's.
         self.model_for = model_for or (lambda channel: None)
+        # The work agent's own settings that a private mode of the window (/bar, /minimal, a local mode) has
+        # replaced on the agent, by attribute; empty in work mode. A chat's turn runs with them.
+        self.work_settings = work_settings or (lambda: {})
         # The task store, when there is one: each chat turn is recorded there as a run with
         # its steps, like a desktop turn, so the activity page shows what Astra did in chats.
         self.tasks = tasks
         self._contexts: dict[str, AgentContext] = {}
         self._template = agent.context
+        # The window's own, put aside while a chat's turn borrows agent.context and agent.llm.
+        self._lent: AgentChannelRouter.WindowView | None = None
+        # The channel of that turn ("weixin", "qq").
+        self._borrower = ""
+        # The window's own values of the agent settings that turn runs with in their place.
+        self._window_settings: dict[str, Any] = {}
+
+    def window_setting(self, attribute: str) -> Any:
+        """The window's own value of an agent setting (``yolo``): while a chat's turn runs with the work agent's
+        value in its place, the one the turn put aside; otherwise the agent's."""
+        if attribute in self._window_settings:
+            return self._window_settings[attribute]
+        return getattr(self.agent, attribute)
+
+    def window_view(self) -> AgentChannelRouter.WindowView:
+        """The window's own conversation and model client. A chat's turn borrows agent.context and agent.llm
+        and keeps the window's aside until it ends; a window command (/mode, /model) or what the window is told
+        about its model must use these, so it never reaches a chat's client or conversation."""
+        return self._lent or self.WindowView(self.agent.context, self.agent.llm)
+
+    @property
+    def borrower(self) -> str:
+        """The channel whose turn has borrowed the agent ("weixin", "qq"), or "" while the window has it. What
+        needs the agent itself, not only the window's conversation (/reset, another session, a mode, /compress,
+        /reload), has to wait until that turn ends."""
+        return self._borrower if self._lent is not None else ""
 
     def parked_contexts(self) -> list[tuple[str, AgentContext]]:
         """Each chat's conversation this process holds between its turns, by session name."""
@@ -181,9 +216,9 @@ class AgentChannelRouter:
         context.persona_active_mode = template.persona_active_mode
         context.persona_relationship_context = template.persona_relationship_context
         context.persona_affect = template.persona_affect
-        suffix = getattr(template, "_stable_system_suffix", "")
-        style = _channel_style(channel)
-        context.set_stable_system_suffix(f"{suffix}\n\n{style}".strip() if style else suffix)
+        context.set_stable_system_suffix(getattr(template, "_stable_system_suffix", ""))
+        # Not in the suffix: guidance rebuilds that at each turn from the conversation's own snapshot.
+        context.set_channel_style(_channel_style(channel))
         context.set_tools_token_cost(getattr(template, "_tools_token_cost", 0))
         context.compressor = ContextCompressor(self.agent.llm)
         context.set_session(str(self.session_root / f"{session_name}.json"))
@@ -220,6 +255,31 @@ class AgentChannelRouter:
             self._contexts[session_name] = context
         return self._contexts[session_name]
 
+    def _use_turn_settings(self, saved: dict[str, Any], restricted: bool) -> None:
+        """Set on the agent what a chat's turn runs with, keeping in ``saved`` what each setting replaced.
+
+        A private mode of the window (/bar, /minimal, a local mode) puts its own memory, tools and runtime providers
+        on the agent itself. A chat's turn runs with the work agent's own instead, the same whatever the
+        window's mode; the mode gets its own back when the turn ends. A contact's QQ turn then gets no owner
+        context and only the chat tools.
+        """
+        def use(attribute: str, value: Any) -> None:
+            saved.setdefault(attribute, getattr(self.agent, attribute, None))
+            setattr(self.agent, attribute, value)
+
+        for attribute, value in self.work_settings().items():
+            use(attribute, value)
+        if restricted:
+            work_tools = getattr(self.agent, "tool_allowlist", None)
+            for attribute in ("memory_store", "memory_router", "memory_retainer", "external_memory_provider",
+                              "context_index_broker", "runtime_context_provider", "runtime_turn_context_provider",
+                              "_turn_context_key", "_turn_context_block", "_standing_memory_block"):
+                if hasattr(self.agent, attribute):
+                    use(attribute, "" if attribute.startswith("_") else None)
+            use("tool_allowlist", set(CHAT_TOOLS if work_tools is None else CHAT_TOOLS & work_tools))
+            # Reuse the runtime's zero-injection contract: no project/skill guidance from the owner.
+            use("minimal_mode", True)
+
     async def handle(
         self,
         message: ChannelMessage,
@@ -238,6 +298,8 @@ class AgentChannelRouter:
                 return "Astra is preparing a restart. Please retry after it reconnects."
             previous = self.agent.context
             previous_llm = self.agent.llm
+            self._lent = self.WindowView(previous, previous_llm)
+            self._borrower = message.channel
             restricted = message.channel == "qq" and not message.local_tools
             context = self._chat_context(session_name) if restricted else self._context(session_name, message.channel)
             self.agent.context = context
@@ -254,25 +316,15 @@ class AgentChannelRouter:
             message_token = active_channel_message.set(message)
             media: list[str] = []
             media_token = channel_turn_media.set(media)
-            saved = {}
-            if restricted:
-                for attribute in ("memory_store", "memory_router", "memory_retainer", "external_memory_provider",
-                                  "context_index_broker", "runtime_context_provider", "runtime_turn_context_provider", "tool_allowlist",
-                                  "minimal_mode",
-                                  "_turn_context_key", "_turn_context_block", "_standing_memory_block"):
-                    if hasattr(self.agent, attribute):
-                        saved[attribute] = getattr(self.agent, attribute)
-                for attribute in saved:
-                    setattr(self.agent, attribute, "" if attribute.startswith("_") else None)
-                previous_tools = saved.get("tool_allowlist")
-                self.agent.tool_allowlist = set(CHAT_TOOLS if previous_tools is None else CHAT_TOOLS & previous_tools)
-                # Reuse the runtime's zero-injection contract: no project/skill guidance from the owner.
-                self.agent.minimal_mode = True
+            # What the turn's settings replaced on the agent, given back when it ends.
+            saved: dict[str, Any] = {}
+            self._window_settings = saved
             ceiling = tool_access_scope.get()
             allowed = (CHAT_TOOLS if ceiling is None else ceiling & CHAT_TOOLS) if restricted else ceiling
             access_token = tool_access_scope.set(allowed)
             task_id, outcome = "", "failed"
             try:
+                self._use_turn_settings(saved, restricted)
                 content = message.text
                 if message.is_group and message.sender_name:
                     content = f"[QQ 群成员 {message.sender_name}]\n{content}"
@@ -343,6 +395,7 @@ class AgentChannelRouter:
                 tool_access_scope.reset(access_token)
                 for attribute, value in saved.items():
                     setattr(self.agent, attribute, value)
+                self._window_settings = {}
                 if task_id:
                     await self._finish_task(task_id, outcome)
                 channel_turn_media.reset(media_token)
@@ -352,3 +405,5 @@ class AgentChannelRouter:
                 active_channel.reset(token)
                 self.agent.context = previous
                 self.agent.llm = previous_llm
+                self._lent = None
+                self._borrower = ""
