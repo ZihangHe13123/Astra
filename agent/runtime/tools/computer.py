@@ -1893,6 +1893,20 @@ def _fully_acknowledged_action_batch(value: Mapping[str, object] | None, count: 
     )
 
 
+def _next_transition_observation(details: Mapping[str, Any]) -> Mapping[str, str] | None:
+    transition = details.get("window_transition")
+    if not isinstance(transition, Mapping):
+        return None
+    recipe = transition.get("next_observation")
+    if not isinstance(recipe, Mapping) or recipe.get("tool") != "computer_get_app_state":
+        return None
+    args = recipe.get("arguments")
+    if (not isinstance(args, Mapping) or set(args) != {"app_ref", "window_ref"}
+            or not all(isinstance(ref, str) and 0 < len(ref) <= 256 for ref in args.values())):
+        return None
+    return args
+
+
 _POST_OBSERVATION_ERROR_CODES = frozenset({
     "helper_failed", "snapshot_failed", "observation_timeout", "target_gone",
     "stale_target", "stale_snapshot", "overlay_blocked", "window_content_unavailable",
@@ -4703,6 +4717,15 @@ def register_computer_tools(
                 payload, mode=prepared.mode.value, action_count=len(prepared.actions),
                 dispatch_attempted=prepared.dispatch_attempted, error_code=result.get("code", ""),
             )
+            # Only native dispatch evidence plus a concrete read grants this progress
+            # marker. The action remains an error with an unverified effect.
+            if (prepared.dispatch_attempted and not manager.handed_off
+                    and result.get("code") == "post_action_observation_pending"
+                    and receipt.get("dispatch_state") == "acknowledged"
+                    and payload.get("observation_error_code") in {"overlay_blocked", "target_gone", "stale_target", "stale_snapshot", "target_not_frontmost"}
+                    and _fully_acknowledged_action_batch(prepared.dispatch_result, len(prepared.actions))
+                    and _next_transition_observation(payload) is not None):
+                receipt["next_step"] = "observe_window_transition"
             result["computer_receipt"] = receipt
             if prepared.dispatch_attempted and prepared.reserve_new_copy and receipt.get("dispatch_state") == "not_dispatched":
                 pending_new_copies.pop((manager.session_id, prepared.save_destination), None)

@@ -7138,7 +7138,7 @@ def test_post_action_target_gone_returns_fresh_catalog_without_replaying_or_gran
     assert "Other Fixture" not in json.dumps(recovery)
     assert manager.target is None
     assert not manager.grants
-    assert result["computer_receipt"]["next_step"] == "follow_recovery"
+    assert result["computer_receipt"]["next_step"] == "observe_window_transition"
     assert "computer_get_app_state" in result["recovery_hint"]
     assert "computer_snapshot" not in receipt_instruction(result["computer_receipt"])
     assert sum(name == "act" for name, _ in backend.calls) == 1
@@ -7829,6 +7829,89 @@ def test_post_action_missing_delivery_proof_remains_unknown(
     assert result["computer_receipt"]["dispatch_state"] == "unknown"
     assert result["computer_receipt"]["replay"] == "forbidden"
     assert sum(name == "act" for name, _value in backend.calls) == 1
+
+
+@pytest.mark.parametrize("scenario", ["six-transitions", "exact-replay", "invalid-snapshots"])
+def test_react_continues_acknowledged_native_window_changes_without_replaying_input(
+    registry, manager, backend, monkeypatch, scenario,
+):
+    register(registry, manager)
+    registry.set_approval_handler(lambda _request: asyncio.sleep(0, result="once"))
+    original_act, original_snapshot, original_apps = backend.act, backend.snapshot, backend.apps
+    changes = 0
+
+    async def act(*args, **kwargs):
+        nonlocal changes
+        result = await original_act(*args, **kwargs)
+        changes += 1
+        backend.catalog_window_ref = f"panel-{changes}"
+        backend.catalog_window_identity_ref = f"panel-identity-{changes}"
+        return result
+
+    async def snapshot(target, *args, **kwargs):
+        if target.window_ref != backend.catalog_window_ref:
+            raise ComputerSessionError("target_gone")
+        return await original_snapshot(target, *args, **kwargs)
+
+    async def catalog():
+        result = await original_apps()
+        return ComputerAppCatalog(result.generation, ({**result.apps[0], "windows": result.apps[0]["windows"][:1]},))
+
+    monkeypatch.setattr(backend, "act", act)
+    monkeypatch.setattr(backend, "snapshot", snapshot)
+    monkeypatch.setattr(backend, "apps", catalog)
+    focus(registry)
+    start = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    first = {"snapshot_id": start["snapshot_id"], "actions": [{"type": "wait", "duration_ms": 1}]}
+
+    class Model:
+        class Config:
+            capabilities = frozenset({"tools", "vision"})
+
+        config = Config()
+        requests = 0
+
+        async def chat_stream(self, messages, tools):
+            self.requests += 1
+            if not tools or self.requests > 12:
+                yield {"type": "done", "content": "Completed the window observations.", "usage": None}
+                return
+            if scenario == "invalid-snapshots":
+                name, args = "computer_act", {**first, "snapshot_id": f"expired-{self.requests}"}
+            elif self.requests == 1 or scenario == "exact-replay":
+                name, args = "computer_act", first
+            elif self.requests % 2 == 0:
+                previous = next(m["content"] for m in reversed(messages) if m["role"] == "tool")
+                assert "observe_window_transition" in previous
+                details = json.loads(previous.split("Details: ", 1)[1].splitlines()[0])
+                recipe = details["window_transition"]["next_observation"]
+                name, args = recipe["tool"], recipe["arguments"]
+            else:
+                name = "computer_act"
+                args = {"snapshot_id": f"snapshot-{changes + 1}", "actions": [{"type": "wait", "duration_ms": 1}]}
+            yield {"type": "tool_calls", "calls": [{"id": f"transition-{self.requests}", "name": name,
+                   "arguments": json.dumps(args)}], "content": "", "usage": None}
+
+    async def collect():
+        agent = ReActAgent("fixture", Model(), registry, max_iterations=14, failure_threshold=2)
+        agent.tool_allowlist = {"computer_act", "computer_get_app_state"}
+        return [e async for e in agent.reply_stream(Msg(content=[ContentBlock.text("Inspect the next windows.")]))]
+
+    events = run(collect())
+    if scenario == "invalid-snapshots":
+        assert any(e.get("code") == "tool_circuit" for e in events)
+        assert changes == 0
+    elif scenario == "exact-replay":
+        assert changes == 1
+        assert any(e.get("code") == "repeated_tool_call" for e in events)
+    else:
+        assert changes == 6
+        assert sum(name == "get_app_state" for name, _ in backend.calls) == 6
+        assert not any(e.get("code") in {"tool_circuit", "repeated_tool_call"} for e in events)
+        assert not any(e.get("_failure_streak") for e in events)
+    pending = [e for e in events if e.get("code") == "post_action_observation_pending"]
+    assert len(pending) == changes
+    assert all(e["error"] and e["computer_receipt"]["verification_state"] == "unverified" for e in pending)
 
 
 def test_post_action_unrecognized_observation_code_is_not_disclosed(

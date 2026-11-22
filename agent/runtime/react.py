@@ -3700,6 +3700,14 @@ class ReActAgent(AgentBase):
                 # new action rather than a repeat.
                 tool_signature_counts.pop(call_signatures.get(call_id, ""), None)
 
+    @staticmethod
+    def _awaits_native_window_observation(event: dict) -> bool:
+        receipt = event.get("computer_receipt")
+        return (event.get("name") == "computer_act" and event.get("code") == "post_action_observation_pending"
+                and isinstance(receipt, dict) and receipt.get("channel") == "native"
+                and receipt.get("next_step") == "observe_window_transition"
+                and receipt.get("dispatch_state") == "acknowledged" and receipt.get("replay") == "forbidden")
+
     def _note_failure_streak(self, tc: dict, event: dict, refusals: dict | None) -> None:
         """Count one tool's failures in a row this turn; the third is flagged to the model."""
         name = str(tc.get("name") or "")
@@ -3707,7 +3715,7 @@ class ReActAgent(AgentBase):
                 or event.get("dispatch_refused")):
             return
         streaks = self._failure_streaks
-        if not event.get("error"):
+        if not event.get("error") or self._awaits_native_window_observation(event):
             streaks.pop(name, None)
             return
         streaks[name] = streaks.get(name, 0) + 1
@@ -5134,6 +5142,12 @@ class ReActAgent(AgentBase):
                         # The call never ran, and the model may be told to send it again.
                         continue
                     signature = call_signatures.get(str(event.get("id") or ""))
+                    if self._awaits_native_window_observation(event):
+                        # The next step is a read. An identical input call must still be refused.
+                        if signature:
+                            failed_tool_signatures.add(signature)
+                        failure_state.pop(name, None)
+                        continue
                     if signature and self._is_deterministic_tool_error(error, event):
                         failed_tool_signatures.add(signature)
                     fingerprint = self._error_fingerprint(error)

@@ -162,7 +162,7 @@ def safe_action_receipt(value):
         "mode": {"background", "foreground_takeover"},
         "dispatch_state": {"not_dispatched", "attempted", "acknowledged", "partial", "unknown"},
         "verification_state": {"verified", "unverified"},
-        "next_step": {"continue_from_fresh_observation", "observe_result", "follow_recovery", "refresh_snapshot", "handoff", "inspect_error", "report_presentation"},
+        "next_step": {"continue_from_fresh_observation", "observe_result", "observe_window_transition", "follow_recovery", "refresh_snapshot", "handoff", "inspect_error", "report_presentation"},
         "presentation_status": {"presented", "not_presented", "withdrawn", "unconfirmed"},
         "replay": {"forbidden"},
     }
