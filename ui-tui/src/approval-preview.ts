@@ -487,7 +487,7 @@ export function approvalChoiceHint(
   const choices: readonly ApprovalChoice[] = !request.choices?.length && isComputerTakeoverRequest(request)
     ? ["once", "deny"]
     : approvalChoices(request);
-  const draft = Boolean(request.draft?.text);
+  const draft = "draft" in request;
   const sessionLabel = isComputerTakeoverRequest(request)
     ? "借用此窗口，最多 2 分钟"
     : request.scope_kind === "directory"

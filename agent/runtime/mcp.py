@@ -21,7 +21,7 @@ from .tool_execution import PartialResult
 from .tool_failure import ToolFailure
 from .process_env import mark_agent_environment
 from .tools.approval import ScopedApprovalStore
-from .tools.consequence import draft_from_arguments, tool_category
+from .tools.consequence import draft_from_arguments, message_draft_required, tool_category
 from .tools.registry import ToolDef, ToolRegistry
 from .project_trust import ProjectTrust
 
@@ -74,6 +74,17 @@ _NAME_HASH_CHARS = 8
 _ALTERED_SERVER_CHARS = 16
 # /mcp shows this many renamed or skipped tools of one server and counts the rest.
 _MAX_REPORTED_TOOL_NOTES = 20
+
+# Only these registry-owned keys are added to the copy passed to permission_check; none is a
+# remote argument. Refuse actual arguments colliding with them (or invoke's bound transport).
+_PERMISSION_METADATA = frozenset({"__permission_call_id", "__approval_justification", "__execution_origin"})
+_MCP_RESERVED_ARGUMENTS = _PERMISSION_METADATA | {"_remote_name", "_local_name", "_server", "_artifact_dir",
+                                                  "_session", "_read_only", "_timeout"}
+
+
+def _validate_mcp_arguments(arguments: dict) -> None:
+    if not _MCP_RESERVED_ARGUMENTS.isdisjoint(arguments):
+        raise ValueError("MCP argument name collides with private adapter metadata")
 
 
 def _expand_env(value: Any) -> Any:
@@ -1023,6 +1034,7 @@ class MCPManager:
                 return PartialResult(text) if omitted else text
 
             category = tool_category(remote_name)
+            message_capable = category in {"send", "publish"}
             display_server = server.encode("utf-8", "backslashreplace").decode("utf-8")
             display_remote = remote_name.encode("utf-8", "backslashreplace").decode("utf-8")
             permission_scope = "mcp-side-effect:" + json.dumps([server, remote_name], ensure_ascii=True)
@@ -1038,18 +1050,18 @@ class MCPManager:
                 if _category:
                     # A tool named for sending, paying, deleting or publishing: asked per call, whatever risk
                     # its server declares, with what it would send shown as a draft.
-                    request = side_effect_approvals.request(
-                        scope=_scope,
-                        kind="mcp_side_effect",
-                        operation=f"Call MCP tool {_remote_name}",
-                        target=f"{_server}/{_remote_name}",
-                        reason=f"{_remote_name} may {_category} on your behalf",
-                        detail="Asked for every call: no earlier approval covers it.",
-                        arguments={str(key): "<redacted>" for key in args} if _risk == "secret" else None,
-                    )
-                    if request is not None:
-                        request["consequential"] = _category
-                        draft = {} if _risk == "secret" else draft_from_arguments(args)
+                    # In particular, an in-flight once grant on the same tool is *not* this call's
+                    # disclosure. This card and its grant do not use the shared temporary scope set.
+                    request: dict[str, Any] = dict(scope=_scope, kind="mcp_side_effect",
+                        operation=f"Call MCP tool {_remote_name}", target=f"{_server}/{_remote_name}",
+                        reason=f"{_remote_name} may {_category} on your behalf", consequential=_category,
+                        detail="Asked for every call: no earlier approval covers it.")
+                    public = {key: value for key, value in args.items() if key not in _PERMISSION_METADATA}
+                    if _risk == "secret":
+                        request["arguments"] = {key: "<redacted>" for key in public}
+                    if _category in {"send", "publish"}:
+                        draft = ({"truncated": True} if _risk == "secret" else
+                                 draft_from_arguments(public, required=message_draft_required(_remote_name, public)))
                         if draft:
                             request["draft"] = {**draft, "via": f"{_server}/{_remote_name}"}
                     return request
@@ -1087,7 +1099,10 @@ class MCPManager:
                 approval="on_risk",
                 group=f"mcp:{_SAFE_NAME.sub('_', server).strip('_') or 'server'}",
                 permission_check=permission_check,
-                permission_grant=side_effect_approvals.grant,
+                permission_grant=(lambda *_: None) if category else side_effect_approvals.grant,
+                permission_authoritative=message_capable,
+                permission_yolo_auto_grant=message_capable,  # registry always vetoes draft-bearing requests
+                argument_validator=_validate_mcp_arguments,
             ))
         registry.replace_owned_tools(f"mcp:{server}", definitions)
         self._tool_names[server] = frozenset(definition.name for definition in definitions)

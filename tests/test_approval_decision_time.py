@@ -48,7 +48,7 @@ def _registry(request, handler, audit, grants):
 
 def _backend(inbox, durable_io, send, *, channel="", chat=None):
     ns = dict(approval_time=approval_time, asyncio=asyncio, logger=logging.getLogger(__name__), os=os,
-              pending_tool_approvals={}, pending_yolo_approvals=set(), pending_foreground_approvals=set(),
+              pending_tool_approvals={}, pending_yolo_approvals=set(), pending_foreground_approvals=set(), pending_draft_choices={},
               approval_resolutions={}, approval_inbox=inbox, durable_io=durable_io, _send=send,
               tools=SimpleNamespace(yolo=False), agent_holder={}, active_channel=SimpleNamespace(get=lambda: channel),
               active_task_id="fixture", approval_choices=lambda card: card["choices"], await_chat_approval=await_chat_approval,
@@ -228,6 +228,30 @@ def test_missing_or_invalid_live_pid_cannot_be_replaced_by_a_later_sample(monkey
     result = asyncio.run(_registry(request, answer, None, []).execute("timing_fixture", {}))
     assert result.get("error_type") == "approval_denied"
     assert read_front.call_count == 1
+
+
+@pytest.mark.parametrize(("choices", "reply", "expected"), [
+    (["deny"], "once", "deny"), (["once", "deny"], "session", "deny"), (["once", "deny"], "once", "once"),
+])
+def test_pending_draft_resolves_only_an_offered_human_answer(choices, reply, expected):
+    events = []
+    ns = _backend(None, None, events.append)
+
+    async def scenario():
+        ns["tools"].yolo = True
+        card = {"request_id": "fixture", "choices": choices, "kind": "computer_write", "yolo_bypass_allowed": True,
+                "draft": {"truncated": True} if choices == ["deny"] else {"text": "fixture"}}
+        pending = asyncio.create_task(ns["request_tool_approval"](card))
+        await asyncio.sleep(0)
+        assert events[0]["choices"] == choices
+        assert not ns["pending_yolo_approvals"]
+        assert not ns["resolve_tool_approval"]("fixture", "once", human=False)
+        assert ns["resolve_tool_approval"]("fixture", reply)
+        assert await asyncio.wait_for(pending, 1) == expected
+        assert events[-1]["decision"] == expected
+        assert not ns["pending_draft_choices"]
+
+    asyncio.run(scenario())
 
 
 def test_automatic_answer_cannot_supply_or_refresh_a_foreground_witness(monkeypatch):

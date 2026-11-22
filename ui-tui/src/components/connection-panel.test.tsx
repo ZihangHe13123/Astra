@@ -19,7 +19,7 @@ const stdin = new Input(), stdout = new Output();
 function ConnectionPanel(props: Omit<ConnectionPanelProps, "ownsInput" | "onPaintTarget">) {
   const { stdout } = useStdout(), [target, setTarget] = React.useState<object>();
   const paint = useApprovalPaint(stdout, target, stdout.rows, stdout.columns, false);
-  return <Box flexDirection="column" width={stdout.columns - 1}><Panel {...props} onPaintTarget={setTarget} paintTarget={target} paintEpoch={paint.epoch}
+  return <Box flexDirection="column" width={stdout.columns - 1}><Panel {...props} width={stdout.columns - 1} onPaintTarget={setTarget} paintTarget={target} paintEpoch={paint.epoch}
     ownsInput={(requirePaint = true, expectedRow) => !requirePaint || paint.current(false) &&
       (expectedRow === undefined || paint.receipt?.draftDigest === expectedRow)} /></Box>;
 }
@@ -147,3 +147,66 @@ test("an overpainted OAuth label or ID cannot authorize from the panel edges alo
   } finally { app.unmount(); }
 });
 assert.deepEqual(filtered.saved, [[url, secret, ""]]);
+
+const claudeRoute = { id: "claude-code", provider: "Claude / Claude Code", label: "Subscription · your signed-in claude CLI",
+  base_url: "", api_key_env: "", key_available: false, auth_mode: "oauth" as const };
+const claudeChoice = `› ${claudeRoute.label} [${claudeRoute.id}]`;
+const cells = (text: string) => text.replace(/[\s│▏▕↳]/gu, "");
+
+async function withClaude(columns: number, exercise: (h: { frame(): string; rows(): string[]; saves: string[];
+  enter(): Promise<void>; cover(wholeRow: boolean): Promise<void>; restore(): Promise<void>;
+  resizeWithBlockedWriter(columns: number): Promise<void>; ack(): Promise<void> }) => Promise<void>) {
+  const input = new Input(), saves: string[] = [], settle = () => new Promise(resolve => setTimeout(resolve, 50));
+  let hold = false, flush: (() => void) | undefined;
+  const output = Object.assign(new Writable({ write(chunk, _, done) {
+    const deliver = () => { output.chunks.push(String(chunk)); done(); };
+    if (hold) flush = deliver; else deliver();
+  } }), { columns, rows: 34, isTTY: true, chunks: [] as string[] });
+  let overlay: { x: number; y: number; text: string } | undefined;
+  const scene = () => <ThemeProvider theme={THEMES.glitchcity}><Box flexDirection="column">
+    <ConnectionPanel routes={[claudeRoute]} pending={false} error="" onSave={r => saves.push(r.route_id)} onCancel={() => {}} />
+    {overlay && <Box position="absolute" marginLeft={overlay.x} marginTop={overlay.y}><Text>{overlay.text}</Text></Box>}
+  </Box></ThemeProvider>;
+  const app = render(scene(), { stdin: input as any, stdout: approvalPaintOutput(output as any), stderr: output as any,
+    debug: true, patchConsole: false, exitOnCtrlC: false });
+  const frame = () => stripAnsi(output.chunks.at(-1) ?? "");
+  const rows = () => { const lines = frame().split("\n"); return lines.slice(lines.findIndex(s => s.includes("Choose API route")) + 1,
+    lines.findIndex(s => s.includes("Enter continue"))); };
+  const enter = async () => { input.write("\r"); await settle(); };
+  try {
+    await settle(); await enter();
+    await exercise({ frame, rows, saves, enter, cover: async whole => {
+      const lines = frame().split("\n"), y = lines.indexOf(rows()[1]!);
+      assert.notEqual(y, -1); const x = whole ? 2 : 3; // blank the row, or obscure its first content cell
+      overlay = { x, y, text: whole ? " ".repeat(columns - 7) + "×" : "×" };
+      app.rerender(scene()); await settle();
+    }, restore: async () => { overlay = undefined; app.rerender(scene()); await settle(); },
+    resizeWithBlockedWriter: async next => {
+      hold = true; overlay = undefined; output.columns = next; output.emit("resize"); app.rerender(scene()); await settle(); assert.ok(flush);
+    }, ack: async () => { hold = false; flush!(); flush = undefined; await settle(); } });
+  } finally { hold = false; flush?.(); app.unmount(); }
+}
+
+for (const columns of [60, 65]) test(`fully visible Claude route submits at ${columns}×34`, async () => {
+  await withClaude(columns, async h => {
+    assert.equal(h.rows().length, columns === 60 ? 2 : 1);
+    assert.equal(cells(h.rows().join("")), cells(claudeChoice));
+    if (columns === 60) assert.match(h.rows()[1]!, /↳.+▕/);
+    await h.enter(); assert.deepEqual(h.saves, [claudeRoute.id]);
+  });
+});
+
+test("a wrapped OAuth option requires every continuation and a fresh key after the resized frame is acknowledged", async () => {
+  await withClaude(60, async h => {
+    for (const whole of [false, true]) {
+      assert.equal(h.rows().length, 2); assert.equal(cells(h.rows().join("")), cells(claudeChoice));
+      await h.cover(whole); assert.match(h.frame(), /Choose API route/); assert.match(h.frame(), /Enter continue/);
+      assert.match(h.rows()[1]!, /×/); if (whole) assert.doesNotMatch(h.rows()[1]!, /↳|▕/);
+      await h.enter(); assert.deepEqual(h.saves, []);
+      if (!whole) await h.restore();
+    }
+    await h.resizeWithBlockedWriter(65); await h.enter(); assert.deepEqual(h.saves, []);
+    await h.ack(); assert.equal(h.rows().length, 1); assert.equal(cells(h.rows()[0]!), cells(claudeChoice));
+    assert.deepEqual(h.saves, []); await h.enter(); assert.deepEqual(h.saves, [claudeRoute.id]);
+  });
+});

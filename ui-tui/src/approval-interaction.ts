@@ -78,7 +78,7 @@ export function transitionApprovalInput(
   if (key.ctrl || (key.meta && !escape) || (key.shift && !/^[A-Z]$/.test(input))) {
     return { ...state, handled: true };
   }
-  const choices: readonly ApprovalChoice[] = !request.choices?.length && request.kind === "computer_foreground_takeover"
+  const choices: readonly ApprovalChoice[] = !("draft" in request) && !request.choices?.length && request.kind === "computer_foreground_takeover"
     ? ["once", "deny"]
     : approvalChoices(request);
   const normalizedInput = input.toLowerCase();

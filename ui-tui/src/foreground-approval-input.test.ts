@@ -84,6 +84,33 @@ function typedAfterEscape() {
   return keys;
 }
 
+test("Python is composer text after a remotely retired foreground Escape, before or after its timeout", () => {
+  for (const timing of ["timely", "expired-on-A", "expired-after-removal"]) for (const negative of ["N", "\x03"]) {
+    const { keys } = setup(); keys.head("A"); keys.feed("\x1b");
+    if (timing === "expired-on-A") assert.equal(keys.finishEscapeWait(), "");
+    keys.head();
+    if (timing === "expired-after-removal") assert.equal(keys.finishEscapeWait(), "");
+    assert.equal(keys.feed("P") + keys.feed("ython"), "Python", timing);
+    assert.equal(keys.feed("\r"), "\r");
+    keys.head(undefined, {}, true);
+    assert.equal(keys.feed(negative), negative); assert.equal(keys.feed("y"), "");
+    assert.equal(keys.needsStringBoundary, true);
+    keys.feed("\x07"); assert.equal(keys.feed("a"), "", "BEL is not DCS ST");
+    assert.equal(keys.feed("\x18y"), ""); assert.equal(keys.feed("y"), "y");
+  }
+});
+
+test("after a delivered composer Escape, ]list is literal there but a possible OSC title never grants the next card", () => {
+  for (const text of ["]list", "]List"]) for (const parts of [[text], [...text]]) for (const boundary of ["\x07", "\x1b\\", "\x18"]) {
+    const keys = typedAfterEscape();
+    assert.equal(parts.map(part => keys.feed(part)).join(""), text);
+    assert.equal(keys.feed("\r"), "\r");
+    keys.head(undefined, {}, true); assert.equal(keys.needsStringBoundary, true);
+    assert.equal(keys.feed("n"), "n"); assert.equal(keys.feed("y"), ""); assert.equal(keys.feed("\x03"), "\x03");
+    keys.feed(boundary); assert.equal(keys.feed("a"), "a");
+  }
+});
+
 test("a delivered composer Escape preserves bracketed words, Unicode and long literal prefixes exactly once", () => {
   for (const word of ["[中文]", "[user]", "[INFO]", "[OK]", "[u]", "[A]", "[👨‍👩‍👧‍👦é]", "[" + "1".repeat(70) + "text]"]) {
     for (const pieces of [[word], Array.from(word)]) {
@@ -119,6 +146,26 @@ test("a possible opaque tail must not reinterpret the original composer's cursor
   keys.head(undefined, {}, true); keys.feed(C + "200~");
   assert.equal(keys.feed("\x18"), ""); assert.equal(keys.feed("y"), "");
   keys.feed(C + "201~"); assert.equal(keys.feed("a"), ""); keys.feed("\x18"); assert.equal(keys.feed("a"), "a");
+});
+
+test("a paste opener split across literal-string ownership protects every pasted reset or shortcut", () => {
+  const start = C + "200~";
+  for (const word of ["Python", "]list"]) for (let cut = 0; cut <= start.length; cut++) {
+    const keys = typedAfterEscape(); keys.feed(word); keys.feed(start.slice(0, cut));
+    keys.head(undefined, {}, true); keys.feed(start.slice(cut));
+    for (const c of ["n", "\x03", "\x18", "\x07", "\x1b\\", "y"]) assert.equal(keys.feed(c), "");
+    keys.feed(C + "201~"); assert.equal(keys.feed("a"), ""); keys.feed("\x18"); assert.equal(keys.feed("a"), "a");
+  }
+});
+
+test("an ambiguous title does not shorten a subsequent ST-only string or promote an embedded Kitty gesture", () => {
+  for (const open of ["\x1bP", "\x9f"]) {
+    const { keys, grants, negotiate } = setup(); keys.feed("\x1b"); keys.finishEscapeWait(); keys.feed("]list");
+    keys.feed(open); keys.head("B"); keys.feed("\x07");
+    negotiate(); keys.feed(press + release); assert.deepEqual(grants, []);
+    keys.feed("\x1b\\"); negotiate(); keys.feed(release); assert.deepEqual(grants, []);
+    keys.feed(press + release); assert.deepEqual(grants, ["B:once"]);
+  }
 });
 
 test("after Escape has actually rejected A the first independent refusal or cancel on B is usable", () => {

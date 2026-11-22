@@ -54,7 +54,7 @@ function visibleCard(frame: string, rows: number, columns: number): Receipt | un
   if (!head || !tail || extra || head[3] !== "h" || tail[3] !== "t" ||
       head[1] !== tail[1] || head[2] !== tail[2]) return;
   const cell = (mark: RegExpMatchArray) => frame.slice(mark.index! + mark[0].length).match(/^(?:\x1b\[[\d;]*m)*([^\x1b])/u)?.[1];
-  if (cell(head) !== "◆" || !["O", "e", "n"].includes(cell(tail) ?? "")) return;
+  if (cell(head) !== "◆" || !["O", "·", "e", "n"].includes(cell(tail) ?? "")) return;
 
   // A full clear (and debug mode) can replay Static history. From the marked
   // header to the final newline, require visible rows, no wrapping, and only

@@ -1142,6 +1142,7 @@ async def _main(startup_started: float):
     pending_tool_approvals: dict[str, asyncio.Future[str]] = {}
     pending_yolo_approvals: set[str] = set()
     pending_foreground_approvals: set[str] = set()
+    pending_draft_choices: dict[str, tuple[str, ...]] = {}
 
     approval_resolutions: dict[str, asyncio.Task] = {}
 
@@ -1150,6 +1151,11 @@ async def _main(startup_started: float):
         if future is None or future.done() or request_id in approval_resolutions:
             return False
         normalized = str(decision) if decision in {"once", "task", "session", "always", "deny"} else "deny"
+        if request_id in pending_draft_choices:
+            if not human:
+                return False
+            if normalized not in pending_draft_choices[request_id]:
+                normalized = "deny"  # Never persist or publish an approval the draft did not offer.
         # Capture the winning answer (and front app for a human foreground grant) before scheduling any I/O.
         receipt = approval_time.TimedApprovalDecision(
             normalized, foreground=human and request_id in pending_foreground_approvals,
@@ -1228,7 +1234,10 @@ async def _main(startup_started: float):
             pending_tool_approvals[request_id] = future
             if request.get("kind") == "computer_foreground_takeover":
                 pending_foreground_approvals.add(request_id)
-            if request.get("yolo_bypass_allowed") is True:
+            choices = approval_choices(request)
+            if "draft" in request:
+                pending_draft_choices[request_id] = tuple(choices)
+            elif request.get("yolo_bypass_allowed") is True:
                 pending_yolo_approvals.add(request_id)
             _send({
                 "type": "tool_approval_request",
@@ -1237,9 +1246,9 @@ async def _main(startup_started: float):
                 "surface": surface,
                 "channel": channel_name,
                 "state": persisted.state if persisted is not None else "pending",
-                "choices": approval_choices(request),
+                "choices": choices,
             })
-            if tools.yolo and request.get("yolo_bypass_allowed") is True:
+            if tools.yolo and request_id in pending_yolo_approvals:
                 # YOLO may have been enabled while the inbox write was waiting.
                 resolve_tool_approval(request_id, "once", human=False)
             if channel_name:
@@ -1260,6 +1269,7 @@ async def _main(startup_started: float):
             pending_tool_approvals.pop(request_id, None)
             pending_yolo_approvals.discard(request_id)
             pending_foreground_approvals.discard(request_id)
+            pending_draft_choices.pop(request_id, None)
 
     tools.set_approval_handler(request_tool_approval)
     # "以后都允许" rules the person adds from a card (settings.json), and when a card may offer one.

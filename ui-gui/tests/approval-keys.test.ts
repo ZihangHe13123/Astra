@@ -125,12 +125,24 @@ test("T answers for this task inside the card, and a standing rule has no key", 
 
 test("a draft reads as send or discard, and a consequential card ignores the window's keys", () => {
   const event = { type: "tool_approval_request", request_id: "r2", tool_name: "mcp__mail__send_email", reason: "发邮件",
-    choices: ["once", "deny"], consequential: "send", draft: { to: "tan@example.edu", subject: "Meeting", text: "明天见" } };
+    choices: ["once", "deny"], consequential: "send", draft: { to: "tan@example.edu", cc: "copy@example.invalid", bcc: "blind@example.invalid", subject: "Meeting", text: "明天见" } };
   const markup = renderToStaticMarkup(React.createElement(Approval, { event, send: async () => {}, windowKeys: true }));
   assert.match(markup, /要发出去的内容/);
   assert.match(markup, /发送类操作：每次都会单独问你/);
   assert.match(markup, /<strong>发给：<\/strong>tan@example.edu/);
+  assert.match(markup, /<strong>抄送：<\/strong>copy@example.invalid/);
+  assert.match(markup, /<strong>密送：<\/strong>blind@example.invalid/);
   assert.match(markup, /<pre class="draft-text">明天见<\/pre>/);
   assert.match(markup, />发送<\/button><button[^>]*>丢弃<\/button>/);
   assert.match(markup, /<p class="approval-keys[^"]*">点选卡片后可按 Y \/ N<\/p>/);
+});
+
+test("an incomplete or locally clipped GUI draft offers discard but neither a send button nor its shortcut", () => {
+  for (const draft of [{text: "excerpt", truncated: true}, {truncated: true}, {text: "visible", recipients: {hidden: true}},
+    {text: "x".repeat(24_001)}, {cc: 123, text: "words"}, null]) {
+    const event = { type: "tool_approval_request", request_id: "r", tool_name: "mail", choices: ["once", "session", "deny"], draft };
+    const markup = renderToStaticMarkup(React.createElement(Approval, {event, windowKeys: true, send: async () => {}}));
+    assert.match(markup, /不能发送/); assert.match(markup, /data-approval-choice="deny"/);
+    assert.doesNotMatch(markup, /data-approval-choice="(?:once|session)"|可按 Y/);
+  }
 });

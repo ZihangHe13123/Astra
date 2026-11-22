@@ -1,7 +1,7 @@
 import { escapeApprovalDisplayText } from "@astra/ui-core/approval-display";
 import type { UIEvent } from "@astra/ui-core/session-state";
 
-const MAX_PREVIEW = 24_000;
+export const MAX_PREVIEW = 24_000;
 /** Preserve code layout; make ANSI, bidi and other hidden controls visible like the TUI. */
 export function approvalText(value: unknown): string {
   const raw = typeof value === "string" ? value : value == null ? "" : JSON.stringify(value, null, 2);

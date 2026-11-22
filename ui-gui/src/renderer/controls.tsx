@@ -1,10 +1,11 @@
 import { connectionFlow, filterCommands, moveSelection, opensCommandInterface } from "./control-state.js";
 import { modelConnection } from "./model-connection.js";
 import { names } from "./command-help.js";
-import { approvalPreview, approvalText } from "./approval-preview.js";
+import { approvalPreview, approvalText, MAX_PREVIEW } from "./approval-preview.js";
 import { approvalKeyHint } from "./approval-keys.js";
 import { bindApprovalKeyboard } from "./approval-keyboard.js";
-import { approvalChoiceLabel, approvalChoices, consequenceNote } from "@astra/ui-core/approval-choices";
+import { approvalChoiceLabel, approvalChoices, completeApprovalDraft, consequenceNote, draftLabels } from "@astra/ui-core/approval-choices";
+import { escapeApprovalDisplayText } from "@astra/ui-core/approval-display";
 import React, { useState } from "react";
 import { X, Check, ChevronRight, ExternalLink, LoaderCircle } from "lucide-react";
 import type { CommandDescription } from "../bridge.js";
@@ -221,13 +222,15 @@ const CHANNEL_NAMES: Record<string, string> = { weixin: "微信", qq: "QQ", oneb
 export function Approval({ event, send, windowKeys = false }: { event: UIEvent; send: (c: UIEvent) => Promise<void>; windowKeys?: boolean }) {
   const [pending, setPending] = useState(false);
   const sending = React.useRef(false);
-  const choices: string[] = approvalChoices(event);
+  const hasDraft = "draft" in event;
+  const draft = event.risk !== "secret" && completeApprovalDraft(event.draft, MAX_PREVIEW) ? event.draft : undefined;
+  const choices: string[] = hasDraft && !draft ? ["deny"] : approvalChoices(event);
   const preview = approvalPreview(event);
   const note = consequenceNote(event);
   // A send, payment or deletion is answered on the card itself, never by a key pressed elsewhere.
-  const globalKeys = windowKeys && !note;
+  const globalKeys = windowKeys && !note && !hasDraft;
   const decide = (decision: string) => {
-    if (sending.current) return;
+    if (sending.current || !choices.includes(decision)) return;
     sending.current = true; setPending(true);
     void send({ type: "tool_approval_response", request_id: event.request_id, decision }).catch(() => { sending.current = false; setPending(false); });
   };
@@ -239,17 +242,18 @@ export function Approval({ event, send, windowKeys = false }: { event: UIEvent; 
     detach.current = card ? bindApprovalKeyboard(card, () => latest.current) : undefined;
   }, [event.request_id, event.kind, globalKeys]);
   const mac = typeof navigator !== "undefined" && navigator.platform.includes("Mac");
-  const draft = event.draft?.text ? event.draft : undefined;
-  return <section ref={bind} className={`approval interactive-card${note ? " consequential" : ""}`} tabIndex={0} aria-label={`需要你的许可：${preview.title}`}><span className="eyebrow">{draft ? "要发出去的内容" : "需要你的许可"}{event.channel ? `：来自${CHANNEL_NAMES[event.channel] ?? event.channel}的对话` : ""}</span><h3>{preview.title}</h3>
+  // Escape controls *and* literal backslashes distinctly; preserve body line breaks and whitespace.
+  const fieldText = (s: string) => escapeApprovalDisplayText(s.replaceAll("\\", "\\\\")).replaceAll("\u2028", "\\u{2028}").replaceAll("\u2029", "\\u{2029}");
+  return <section ref={bind} className={`approval interactive-card${note ? " consequential" : ""}`} tabIndex={0} aria-label={`需要你的许可：${preview.title}`}><span className="eyebrow">{hasDraft ? "要发出去的内容" : "需要你的许可"}{event.channel ? `：来自${CHANNEL_NAMES[event.channel] ?? event.channel}的对话` : ""}</span><h3>{preview.title}</h3>
     {note && <p className="approval-consequence" role="note">{note}</p>}
     {event.kind === "computer_foreground_takeover" && event.arguments?.present_result === true &&
       <p>仅限本次操作：成功后将结果窗口保留在前台。</p>}
     {event.action_label && <p><strong>将点击：</strong>{approvalText(event.action_label)}</p>}
+    {hasDraft && !draft && <p role="note">草稿不完整或过长，不能发送。请丢弃后重新核对完整内容。</p>}
     {draft && <div className="approval-draft">
-      {draft.to && <p><strong>发给：</strong>{approvalText(draft.to)}</p>}
-      {draft.subject && <p><strong>主题：</strong>{approvalText(draft.subject)}</p>}
-      <pre className="draft-text">{approvalText(draft.text)}</pre>
-      {draft.via && <p className="small muted">通过 {approvalText(draft.via)}</p>}
+      {(Object.keys(draftLabels) as (keyof typeof draftLabels)[]).map(k => draft[k] !== undefined &&
+        <p key={k}><strong>{draftLabels[k]}：</strong>{fieldText(draft[k])}</p>)}
+      <pre className="draft-text">{draft.text.split("\n").map(fieldText).join("\n")}</pre>
     </div>}
     <p>{preview.explanationLabel}：{preview.explanation}</p>
     {preview.summary && <p>{preview.summary}</p>}

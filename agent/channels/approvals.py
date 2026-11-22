@@ -14,14 +14,17 @@ import asyncio
 import logging
 import re
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any, Protocol
 
-from agent.runtime.tools.consequence import LABELS
+from agent.runtime.tools.consequence import DRAFT_TEXT_FIELDS, LABELS, complete_approval_draft
 from agent.channels.base import ChannelMessage
 
 logger = logging.getLogger(__name__)
 
 APPROVAL_SECONDS = 300.0
+_CLEANUP_SECONDS = 5.0
+_chat_presentations: set[asyncio.Task[None]] = set()
 _APPROVE = frozenset({"同意", "批准", "允许", "执行", "可以", "好", "好的", "行", "发送", "发", "yes", "y", "ok", "approve",
                       "/approve", "send"})
 _TASK = frozenset({"本任务", "这次任务", "本次任务", "这件事都行", "任务内都行", "task"})
@@ -39,6 +42,9 @@ _HIDE = (
 )
 _TARGET_CHARS = 300
 _DRAFT_CHARS = 800
+_DRAFT_LABELS = {"to": "发给", "cc": "抄送", "bcc": "密送", "subject": "主题", "via": "通过"}
+_CHAT_PROMPT_BYTES = 2_000  # Conservative budget for one unsplit plain-text message.
+_DESKTOP_DRAFT = "无法在当前聊天中完整展示这份草稿。请在桌面端核对，或回复“丢弃”取消。"
 
 
 def hide_credentials(text: str) -> str:
@@ -47,10 +53,29 @@ def hide_credentials(text: str) -> str:
     return text
 
 
-class ChatApprover(Protocol):
-    async def ask_approval(self, message: ChannelMessage, prompt: str, answer: Callable[[str], object]) -> None: ...
+@dataclass(eq=False)
+class ChatApproval:
+    """Identity of one registration, even if two calls came from the same message."""
 
-    async def end_approval(self, message: ChannelMessage, notice: str = "") -> None: ...
+    message: ChannelMessage
+    resolve: Callable[[str], object]
+    delivered: bool = False
+    closed: bool = False
+    ending: bool = False
+
+    def __call__(self, choice: str) -> object:
+        if self.closed:
+            return False
+        accepted = self.resolve(choice)
+        if accepted is not False:
+            self.closed = True
+        return accepted
+
+
+class ChatApprover(Protocol):
+    async def ask_approval(self, message: ChannelMessage, prompt: str, answer: ChatApproval) -> bool | None: ...
+
+    async def end_approval(self, owner: ChatApproval, notice: str = "") -> None: ...
 
 
 def approval_reply(text: str) -> str | None:
@@ -65,22 +90,36 @@ def approval_reply(text: str) -> str | None:
 
 def approval_prompt(request: Mapping[str, Any], timeout: float) -> str:
     """What the person reads: the action, its target with credentials hidden, and how to answer."""
+    return _chat_offer(request, timeout, private=True, limit=_CHAT_PROMPT_BYTES)[0]
+
+
+def _chat_offer(request: Mapping[str, Any], timeout: float, *, private: bool, limit: int) -> tuple[str, bool]:
+    draft = request.get("draft")
+    if "draft" in request:
+        if (not private or request.get("risk") == "secret" or not isinstance(draft, Mapping)
+                or not complete_approval_draft(draft)):
+            return _DESKTOP_DRAFT, False
+        for key in DRAFT_TEXT_FIELDS:
+            if key not in draft:
+                continue
+            text = draft[key]
+            if (len(text) > (_DRAFT_CHARS if key == "text" else 500) or hide_credentials(text) != text
+                    or any(not c.isprintable() and not (c == "\n" and key == "text") for c in text)):
+                return _DESKTOP_DRAFT, False
     title = str(request.get("approval_title") or request.get("operation") or f"使用工具 {request.get('tool_name') or ''}")
     target = hide_credentials(str(request.get("target") or "")).strip()
     if len(target) > _TARGET_CHARS:
         target = target[:_TARGET_CHARS] + "…"
     reason = str(request.get("agent_reason") or request.get("reason") or "").strip()
-    raw_draft = request.get("draft")
-    draft = raw_draft if isinstance(raw_draft, Mapping) and raw_draft.get("text") else None
     lines = [f"需要你批准：{title.strip()}"]
     category = str(request.get("consequential") or "")
     if category:
         lines.append(f"{LABELS.get(category, '高影响')}类操作：每次都会单独问你，之前给过的授权不覆盖它。")
     if draft is not None:
-        lines.append("要发出去的内容：")
-        lines.extend(f"{label}：{draft[key]}" for key, label in (("to", "发给"), ("subject", "主题")) if draft.get(key))
-        text = str(draft["text"])
-        lines.append(text if len(text) <= _DRAFT_CHARS else text[:_DRAFT_CHARS] + "…")
+        fields = [f"{label}：{draft[key]}" for key, label in _DRAFT_LABELS.items() if key in draft]
+        lines.append(f"要发出去的内容（{len(fields)} 项发送信息，随后是正文）：")
+        lines.extend(fields)
+        lines.append(draft["text"])
     if request.get("action_label"):
         lines.append(f"将点击：{request['action_label']}")
     if target:
@@ -91,6 +130,10 @@ def approval_prompt(request: Mapping[str, Any], timeout: float) -> str:
     raw_choices = request.get("choices")
     choices = [str(choice) for choice in raw_choices] if isinstance(raw_choices, (list, tuple)) and raw_choices \
         else ["once", "deny"]
+    if draft is not None:
+        if "once" not in choices:
+            return _DESKTOP_DRAFT, False
+        choices = ["once", "deny"]
     session_reply = "“本会话”这个对话里都允许"
     if request.get("kind") == "computer_foreground_takeover":
         arguments = request.get("arguments")
@@ -107,7 +150,16 @@ def approval_prompt(request: Mapping[str, Any], timeout: float) -> str:
         ("deny", "“丢弃”不发" if draft is not None else "“拒绝”取消"),
     ) if choice in choices]
     lines.append(f"回复{'，'.join(replies)}；{minutes} 分钟内没回复就不执行。")
-    return "\n".join(lines)
+    prompt = "\n".join(lines)
+    if draft is not None:
+        if len(prompt) > limit or len(prompt) > _CHAT_PROMPT_BYTES:
+            return _DESKTOP_DRAFT, False
+        try:
+            if len(prompt.encode("utf-8")) > _CHAT_PROMPT_BYTES:
+                return _DESKTOP_DRAFT, False
+        except UnicodeEncodeError:
+            return _DESKTOP_DRAFT, False
+    return prompt, True
 
 
 async def await_chat_approval(
@@ -120,25 +172,66 @@ async def await_chat_approval(
     timeout: float = APPROVAL_SECONDS,
 ) -> str:
     """Wait for the decision, asking in the chat when it can; no answer in time is a denial."""
-    # Closed afterwards even when asking failed part way: the chat may already be waiting for an answer.
-    asked = approver is not None and message is not None
-    if approver is not None and message is not None:
-        try:
-            await approver.ask_approval(message, approval_prompt(request, timeout), resolve)
-        except Exception:
-            # The desktop may still answer; the time limit below still applies.
-            logger.exception("could not ask for approval in the %s chat", message.channel)
     notice = ""
+    finished = asyncio.Event()
+    sending = True
+    presentation = None
+    owner = None
+    if approver is not None and message is not None and not decision.done():
+        has_draft = "draft" in request
+        can_send = False
+
+        def answer(choice: str) -> object:
+            if decision.done() or (has_draft and choice != "deny"
+                                   and not (choice == "once" and registration.delivered and can_send)):
+                return False
+            return resolve(choice)
+
+        registration = owner = ChatApproval(message, answer)
+
+        async def present() -> None:
+            nonlocal sending, can_send
+            try:
+                try:
+                    if has_draft:
+                        private = not message.is_group and bool(message.sender_id) and message.sender_id == message.conversation_id
+                        prompt, can_send = _chat_offer(request, timeout, private=private,
+                            limit=getattr(approver, "approval_prompt_limit", _CHAT_PROMPT_BYTES))
+                    else:
+                        prompt = approval_prompt(request, timeout)
+                    registration.delivered = await approver.ask_approval(message, prompt, registration) is not False
+                except Exception:
+                    logger.exception("could not ask for approval in the %s chat", message.channel)
+                sending = False
+                await finished.wait()
+            finally:
+                # If a cancelled send is still unwinding, *it* keeps its slot. A later
+                # request must not receive a reply to that late prompt or clear its listener.
+                try:
+                    async with asyncio.timeout(_CLEANUP_SECONDS):
+                        await approver.end_approval(registration, notice)
+                except Exception:
+                    logger.exception("could not close the approval in the %s chat", message.channel)
+
+        presentation = asyncio.create_task(present())
+        _chat_presentations.add(presentation)
+        presentation.add_done_callback(_chat_presentations.discard)
     try:
         try:
             return await asyncio.wait_for(asyncio.shield(decision), timeout)
         except TimeoutError:
+            if owner is not None:
+                owner.closed = True
             if resolve("deny"):
                 notice = f"{max(1, round(timeout / 60))} 分钟没等到回复，这一步没有执行。"
-            return await decision
-    finally:
-        if asked and approver is not None and message is not None:
             try:
-                await approver.end_approval(message, notice)
-            except Exception:
-                logger.exception("could not close the approval in the %s chat", message.channel)
+                return await asyncio.wait_for(asyncio.shield(decision), min(timeout, _CLEANUP_SECONDS))
+            except TimeoutError:
+                return "deny"
+    finally:
+        if presentation is not None and owner is not None:
+            owner.closed = True
+            finished.set()
+            if sending:
+                presentation.cancel()
+            await asyncio.wait({presentation}, timeout=min(timeout, _CLEANUP_SECONDS))

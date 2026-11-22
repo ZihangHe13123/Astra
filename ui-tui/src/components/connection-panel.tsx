@@ -1,15 +1,17 @@
 import { randomUUID } from "node:crypto";
 import React, { useLayoutEffect, useMemo, useRef, useState } from "react";
-import { Box, Text, useInput } from "ink";
+import { Box, Text, useInput, useStdout } from "ink";
 import type { ConnectionRoute, TuiCommand } from "../types.js";
 import { singleLineFieldText } from "../paste-command.js";
 import { graphemeBoundary } from "../grapheme-editing.js";
 import { useTheme } from "../theme-context.js";
 import { escapeApprovalDisplayText } from "@astra/ui-core/approval-display";
 import { approvalDraftRow, approvalPaintGlyph } from "../approval-paint.js";
-import { draftFingerprint } from "../approval-draft.js";
+import { draftFingerprint, MAX_DRAFT_ROWS } from "../approval-draft.js";
+import { wrapToolResult } from "../tool-results.js";
 
 export interface ConnectionPanelProps {
+  width?: number;
   active?: boolean;
   ownsInput: (requirePaint?: boolean, selectedRowDigest?: string) => boolean;
   paintTarget?: object;
@@ -66,7 +68,7 @@ function sameDestination(selected: ConnectionRoute, current?: ConnectionRoute) {
     current.auth_mode === selected.auth_mode && current.base_url === selected.base_url && current.api_key_env === selected.api_key_env;
 }
 
-export function ConnectionPanel({ routes, pending, error, authorization, active = true, ownsInput, paintTarget, onPaintTarget, paintEpoch, onSave, onCancel }: ConnectionPanelProps) {
+export function ConnectionPanel({ routes, pending, error, authorization, width, active = true, ownsInput, paintTarget, onPaintTarget, paintEpoch, onSave, onCancel }: ConnectionPanelProps) {
   const theme = useTheme();
   const [stage, setStage] = useState<"provider" | "route" | "url" | "auth" | "key" | "env">("provider");
   const [provider, setProvider] = useState("");
@@ -91,7 +93,16 @@ export function ConnectionPanel({ routes, pending, error, authorization, active 
   const selection = Math.min(index, Math.max(0, filtered.length - 1));
   const chosen = filtered[selection];
   const selectedRow = stage === "route" && chosen ? `› ${chosen.label}` : undefined;
-  const selectedDigest = useMemo(() => selectedRow && draftFingerprint([selectedRow]), [selectedRow]);
+  const { stdout } = useStdout();
+  // Two borders, two padding cells and two proof rails. Wrap before Ink lays out the cells so
+  // each physical row has its own index and the verifier rejoins exactly the original option.
+  const rowWidth = (width ?? stdout.columns - 1) - 6;
+  const selectedRows = useMemo(() => {
+    if (!selectedRow || selectedRow.length > 8192 || !Number.isSafeInteger(rowWidth) || rowWidth < 1) return;
+    const parts = wrapToolResult(selectedRow, rowWidth);
+    return parts.length <= MAX_DRAFT_ROWS ? parts : undefined;
+  }, [selectedRow, rowWidth]);
+  const selectedDigest = useMemo(() => selectedRows && selectedRow ? draftFingerprint([selectedRow]) : undefined, [selectedRows, selectedRow]);
   const textEntry = stage === "url" || stage === "key" || stage === "env";
   // Only opaque identity leaves the form. A draft edit changes its revision, never a marker's text.
   const [revision, revise] = useState(0);
@@ -123,7 +134,7 @@ export function ConnectionPanel({ routes, pending, error, authorization, active 
     resetField(previous => previous + 1);
   };
   const choose = () => {
-    if (!chosen || !canCommit(selectedDigest)) return;
+    if (!chosen || (selectedRow && !selectedRows) || !canCommit(selectedDigest)) return;
     if (stage === "provider") { setProvider(chosen.key); moveTo("route"); }
     else if (stage === "route") {
       const next = chosen.route!;
@@ -176,7 +187,10 @@ export function ConnectionPanel({ routes, pending, error, authorization, active 
       : <>
         {query && <Text color={theme.muted}>Filter: {query}</Text>}
         {filtered.slice(Math.max(0, selection - 4), Math.max(0, selection - 4) + 7).map(item =>
-          item === chosen && selectedRow ? <Text key={item.key}>{approvalDraftRow(marked, 0, { text: selectedRow, newLine: true })}</Text>
+          item === chosen && selectedRow ? <Box key={item.key} flexDirection="column" flexShrink={0}>
+            {selectedRows ? selectedRows.map((text, i) => <Text key={i} wrap="truncate-end">
+              {approvalDraftRow(marked, i, { text, newLine: i === 0 })}</Text>) : <Text>Selected route cannot be displayed in full.</Text>}
+          </Box>
           : <Text key={item.key} inverse={item === chosen}>{item === chosen ? "› " : "  "}{item.label}</Text>)}
       </>}
     <Text color={theme.muted}>↑/↓ choose · Enter continue · Esc {pending ? "cancel connectio" : "clos"}{approvalPaintGlyph(marked, false, "t", pending ? "n" : "e")}</Text>

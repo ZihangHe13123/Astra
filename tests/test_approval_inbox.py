@@ -78,7 +78,7 @@ def test_send_draft_redacted_takeover_replays_only_an_incomplete_marker(tmp_path
         "to": "PRIVATE-TO", "subject": "PRIVATE-SUBJECT", "via": "PRIVATE-APP", "text": "PRIVATE-BODY",
     }})
     stored = ApprovalInbox(path).get(record.request_id)
-    assert stored.request == {**base, "draft": {"truncated": True}}
+    assert stored.request == {**base, "choices": ["deny"], "draft": {"truncated": True}}
     event = safe_replay_event({"type": "tool_approval_request", **stored.public()})
     assert event["draft"] == {"truncated": True}
     assert "PRIVATE-" not in repr(event)

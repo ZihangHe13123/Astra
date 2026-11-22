@@ -2335,7 +2335,10 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     if (connectionOpenRef.current && !pendingApproval && !questionRequest) return;
     const plainCtrl = key.ctrl && !key.meta && !key.shift;
     if (plainCtrl && input === "y") {
-      // Handle before modal navigation; backend owns state and pending approvals.
+      // A send card has no mode-switch shortcut, even while its first paint is pending.
+      // The backend independently excludes drafts from both automatic and pending grants.
+      if (inputFenced || (approvalQueue.requests[0] && "draft" in approvalQueue.requests[0]) ||
+          (pendingApproval && "draft" in pendingApproval)) return;
       send({ type: "command", cmd: "/yolo" });
       return;
     }
@@ -2379,7 +2382,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         if (response.decision !== "deny" && inputFenced) return;
         // Refusal only needs the visible card. Sending needs the complete draft
         // on this frame, not just a visible title and shortcut line.
-        if (response.decision !== "deny" && pendingApproval.draft != null && !paint.current(foregroundRelease, true)) return;
+        if (response.decision !== "deny" && "draft" in pendingApproval && !paint.current(foregroundRelease, true)) return;
         if (!approvalQueue.respond(pendingApproval, () => send({
           type: "tool_approval_response",
           request_id: response.requestId,
@@ -2562,7 +2565,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         auxiliary={<>
           {inputFenced && !pendingApproval && <Text color={theme.warning}>旧终端控制串的边界未确认；按 Ctrl+X 可清除，清除本身不批准任何操作。</Text>}
           {connectionOpen && <Box flexDirection="column" display={connectionVisible ? "flex" : "none"}><ConnectionPanel routes={connectionRoutes} pending={connectionPending} error={connectionError} authorization={connectionAuth}
-            active={connectionVisible} ownsInput={ownsConnectionInput} paintEpoch={connectionPaint.epoch}
+            width={columns} active={connectionVisible} ownsInput={ownsConnectionInput} paintEpoch={connectionPaint.epoch}
             paintTarget={connectionTarget} onPaintTarget={setConnectionTarget}
             onCancel={() => {
               if (!ownsConnectionInput()) return;

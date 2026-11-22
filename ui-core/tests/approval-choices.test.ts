@@ -17,3 +17,12 @@ test("a consequential request is decided per call, and a draft reads as send or 
   assert.match(approvalChoiceLabel("session", { kind: "computer_foreground_takeover" }), /此窗口.*2 分钟/);
   assert.equal(consequenceNote({}), "");
 });
+
+test("a draft grants only once; a withheld envelope never offers a positive choice, even on replay", () => {
+  const stale = { choices: ["once", "session", "always", "deny"] };
+  assert.deepEqual(approvalChoices({...stale, draft: {text: "message", cc: "copy", bcc: "blind"}}), ["once", "deny"]);
+  for (const draft of [{text: "prefix", truncated: true}, {}, {text: "message", cc: null}, {text: "message", unshown: "field"}, null]) {
+    assert.deepEqual(approvalChoices({...stale, draft} as any), ["deny"]);
+  }
+  for (const choices of [[], ["deny"], "deny"]) assert.deepEqual(approvalChoices({choices, draft: {text: "words"}} as any), ["deny"]);
+});

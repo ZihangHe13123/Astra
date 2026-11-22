@@ -23,6 +23,7 @@ from ..metrics import runtime_metrics
 from ..tool_failure import ToolFailure
 from ..tool_execution import ExecutionFailure, ExecutionResult, PartialResult, StateChanged
 from ..tracing import trace_span
+from .consequence import draft_approval_choices
 from .disclosure import CORE_TOOLS, DISPATCH_TOOLS, SEARCH_TOOL, DisclosureResult, catalog, disclosure_mode
 from .grants import DECISIONS, GrantLedger, granted_keys, request_keys, rule_key
 from .policy import VALID_RISKS, ToolPolicy, policy_call_scope
@@ -484,6 +485,9 @@ class ToolRegistry:
         if grant_key:
             payload["grant_key"] = grant_key
             payload["grant_label"] = self._grant_label(tool, payload)
+        # Validate the answer against the offer we sent, not mutable client state.
+        offered = tuple(str(choice) for choice in payload.get("choices") or ("once", "session", "deny"))
+        has_draft = "draft" in payload
         # Set after request descriptors: only the registered permission boundary
         # can opt a pending request into live YOLO, never tool/model arguments.
         payload["yolo_bypass_allowed"] = bypass_yolo
@@ -518,10 +522,9 @@ class ToolRegistry:
             if isinstance(request, TimedApprovalRequest) and not request.record_decision_time(answer):
                 answer = "deny"
             raw_decision = str(answer).strip().lower()
-            offered = [str(choice) for choice in payload.get("choices") or ("once", "session", "deny")]
             if raw_decision in offered and raw_decision in DECISIONS:
                 decision = raw_decision
-            elif raw_decision in {"task", "session", "always"} and "once" in offered:
+            elif not has_draft and raw_decision in {"task", "session", "always"} and "once" in offered:
                 # A frontend may not broaden what the card offered: the exact call at most.
                 decision = "once"
             else:
@@ -558,6 +561,8 @@ class ToolRegistry:
                           consequential: bool, rule: str, hook_ask: bool = False) -> list[str]:
         """What the card offers. A consequential request, or one a hook insists on, is decided per call."""
         declared = request.get("choices") if isinstance(request, dict) else None
+        if request is not None and "draft" in request:
+            return draft_approval_choices({**request, "risk": tool.risk})
         if tool.owns_session_grants:
             known = [choice for choice in (declared or ("once", "session", "deny"))
                      if choice in {"once", "session", "deny"}]
@@ -1483,17 +1488,22 @@ class ToolRegistry:
                 if permission_request is not None:
                     reason = str(permission_request.get("reason") or f"{name} requires approval")
                     opt_in = tool.permission_yolo_auto_grant
-                    yolo_eligible = opt_in(permission_request) is True if callable(opt_in) else opt_in
-                    auto_grant = self.yolo and yolo_eligible
+                    # A disclosed draft needs its own answer, even on an otherwise
+                    # YOLO-eligible background write. The same bit controls live toggles.
+                    has_draft = "draft" in permission_request
+                    yolo_eligible = not has_draft and (not tool.permission_authoritative or (
+                        opt_in(permission_request) is True if callable(opt_in) else opt_in
+                    ))
+                    auto_grant = self.yolo and tool.permission_authoritative and yolo_eligible
                     # Sending, paying, deleting, publishing: decided per call, whatever was allowed before.
-                    consequential = bool(permission_request.get("consequential"))
+                    consequential = has_draft or bool(permission_request.get("consequential"))
                     covered = "" if auto_grant or consequential or tool.owns_session_grants else \
                         self.grants.covering(request_keys(name, permission_request), task_id)
                     if not auto_grant and not covered:
                         report("awaiting_approval", message=reason)
                     if auto_grant or covered:
                         decision = "once"
-                    elif interactive_decision and not tool.permission_authoritative:
+                    elif interactive_decision and not tool.permission_authoritative and not has_draft:
                         decision = "once" if consequential and interactive_decision != "deny" else interactive_decision
                     else:
                         approval_started = time.perf_counter()
@@ -1506,7 +1516,7 @@ class ToolRegistry:
                             reason=reason,
                             agent_reason=agent_reason,
                             request=permission_request,
-                            bypass_yolo=not tool.permission_authoritative or yolo_eligible,
+                            bypass_yolo=yolo_eligible,
                             choices=self._approval_choices(tool, permission_request, task_id,
                                                            consequential=consequential, rule=permission_rule),
                             grant_key=permission_rule,

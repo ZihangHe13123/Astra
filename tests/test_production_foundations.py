@@ -1032,22 +1032,24 @@ def test_mcp_tools_that_send_or_delete_are_asked_every_call_and_show_their_draft
     registry = _approved_mcp_registry()
     manager = MCPManager(tmp_path / "mcp.json")
     session = _ListedSession()
-    manager._register_tools(registry, "mail", session, [FakeRemoteTool(name="send_email"),
+    email = FakeRemoteTool(name="send_email")
+    email.inputSchema = {"type": "object", "properties": {k: {"type": "string"} for k in ("to", "subject", "text")}}
+    manager._register_tools(registry, "mail", session, [email,
                                                          FakeRemoteTool(name="delete_thread"),
                                                          FakeRemoteTool(name="list_threads")], {"tool_risks": {"list_threads": "read"}})
     requests = []
 
     async def decide(request):
         requests.append(request)
-        return "session"
+        return "once" if "draft" in request else "session"
 
     registry.set_approval_handler(decide)
-    letter = {"query": "x", "to": "tan@example.edu", "subject": "Meeting", "text": "明天下午三点见。"}
+    letter = {"to": "tan@example.edu", "subject": "Meeting", "text": "明天下午三点见。"}
     for _ in range(2):
         assert run(registry.execute("mcp__mail__send_email", letter))["error"] == ""
     assert run(registry.execute("mcp__mail__delete_thread", {"query": "x"}))["error"] == ""
     assert run(registry.execute("mcp__mail__list_threads", {"query": "x"}))["error"] == ""
-    # Every send and delete is asked, only once or deny is offered, and "session" counts as once.
+    # Every send and delete is asked; only an explicit once can send a draft.
     assert [request["target"] for request in requests] == ["mail/send_email", "mail/send_email", "mail/delete_thread"]
     assert all(request["choices"] == ["once", "deny"] for request in requests)
     assert [request["consequential"] for request in requests] == ["send", "send", "delete"]

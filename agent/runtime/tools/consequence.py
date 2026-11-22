@@ -56,10 +56,14 @@ def label_category(text: str) -> str:
     return ""
 
 
+def _name_words(name: str) -> list[str]:
+    return [word.lower() for word in re.findall(r"[A-Z]?[a-z]+|[0-9]+", name or "")]
+
+
 def tool_category(name: str) -> str:
     """The category a tool name's leading verb says it has, or ""."""
-    words = re.findall(r"[A-Z]?[a-z]+|[0-9]+", re.sub(r"[^A-Za-z0-9]+", " ", name or ""))
-    verb = words[0].lower() if words else ""
+    words = _name_words(name)
+    verb = words[0] if words else ""
     for category, verbs in _VERBS.items():
         if verb in verbs:
             return category
@@ -107,22 +111,78 @@ def command_category(parts: list[str]) -> str:
 
 _DRAFT_FIELDS = {
     "to": ("to", "recipient", "recipients", "email", "address", "channel", "chat", "chat_id", "user", "username",
-           "phone", "number"),
+           "phone", "number", "to_recipients", "to_addresses"),
+    "cc": ("cc", "cc_recipients", "cc_addresses", "carbon_copy"),
+    "bcc": ("bcc", "bcc_recipients", "bcc_addresses", "blind_carbon_copy"),
     "subject": ("subject", "title"),
     "text": ("text", "body", "message", "content", "markdown", "html", "caption", "status"),
 }
 
 
-def draft_from_arguments(args: Mapping[str, Any]) -> dict[str, str]:
-    """What a send or publish call would put out, read from its arguments, for the card to show as is."""
-    draft: dict[str, str] = {}
-    lowered = {str(key).lower(): value for key, value in args.items() if not str(key).startswith("_")}
-    for field, names in _DRAFT_FIELDS.items():
-        for name in names:
-            value = lowered.get(name)
-            if isinstance(value, (list, tuple)):
-                value = ", ".join(str(item) for item in value)
-            if isinstance(value, (str, int, float)) and str(value).strip():
-                draft[field] = str(value)
-                break
-    return draft if draft.get("text") else {}
+_DRAFT_ALIASES = {alias: field for field, names in _DRAFT_FIELDS.items() for name in names
+                  for alias in (name, name.replace("_", ""))}
+DRAFT_TEXT_FIELDS = ("to", "cc", "bcc", "subject", "text", "via")
+
+
+def message_draft_required(name: str, args: Mapping[str, Any]) -> bool:
+    """Do not confuse an opaque message with the absence of a message.
+
+    A named artifact operation on simple references still has its ordinary consequential card.
+    A post, or an unknown/nested payload, cannot claim that exception merely by omitting `text`.
+    """
+    words = set(_name_words(name))
+    artifact = words & {"upload", "release", "deploy", "merge", "push"}
+    references = {"file", "files", "path", "paths", "file_path", "tag", "version", "ref", "branch", "base", "head",
+                  "repo", "repository", "owner", "remote", "environment", "target"}
+    return not (artifact and not words & {"message", "mail", "email", "post", "tweet"} and all(
+        key in references and (isinstance(value, str) or key in {"files", "paths"} and isinstance(value, list)
+                               and all(isinstance(item, str) for item in value)) for key, value in args.items()))
+
+
+def complete_approval_draft(value: object) -> bool:
+    """Source completeness, independent of what fits on a particular approval surface."""
+    return (isinstance(value, Mapping) and isinstance(value.get("text"), str) and bool(value["text"])
+            and value.get("truncated", False) is False and all(
+                key == "truncated" or key in DRAFT_TEXT_FIELDS and isinstance(item, str)
+                for key, item in value.items()))
+
+
+def draft_approval_choices(request: Mapping[str, object]) -> list[str]:
+    """One exact human answer, or only refusal when this copy can't disclose the send."""
+    offered = request.get("choices")
+    if (request.get("risk") != "secret" and complete_approval_draft(request.get("draft"))
+            and (offered is None or isinstance(offered, (list, tuple)) and "once" in offered)):
+        return ["once", "deny"]
+    return ["deny"]
+
+
+def draft_from_arguments(args: Mapping[str, Any], *, required: bool = False) -> dict[str, str | bool]:
+    """Project actual arguments, never an apparently complete subset of a message.
+
+    Do not expose arbitrary fields/structures in the card or guess which of two aliases a server uses.
+    Non-message operations with no message fields have no draft. A required but opaque message is deny-only.
+    """
+    draft: dict[str, str | bool] = {}
+    seen: set[str] = set()
+    omitted = False
+    for key, item in args.items():
+        field = _DRAFT_ALIASES.get(key.lower())
+        if field is None or field in seen:
+            omitted = True
+            continue
+        seen.add(field)
+        if field in {"to", "cc", "bcc"} and isinstance(item, (list, tuple)):
+            # Simple address lists keep their familiar display. Never stringify a nested mailbox or
+            # invent list boundaries for an entry which itself contains separators.
+            if all(isinstance(address, str) and address.strip() and not any(c in address for c in ",;\r\n")
+                   for address in item):
+                item = ", ".join(item)
+        if isinstance(item, str):
+            draft[field] = item
+        else:
+            omitted = True
+    if not required and not seen:
+        return {}
+    if omitted or not draft.get("text"):
+        draft["truncated"] = True
+    return draft

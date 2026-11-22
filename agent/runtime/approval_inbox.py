@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from agent.runtime.paths import state_path
 from agent.runtime.sqlite_wal import enable_wal
+from agent.runtime.tools.consequence import DRAFT_TEXT_FIELDS, draft_approval_choices
 
 import json
 import os
@@ -151,12 +152,12 @@ def safe_approval_request(request: Mapping[str, Any]) -> dict[str, Any]:
         ]
 
     draft = request.get("draft")
-    if draft is not None and (takeover or not isinstance(draft, Mapping)):
+    if "draft" in request and (takeover or request.get("risk") == "secret" or not isinstance(draft, Mapping)):
         # Preserve the need to review a withheld/unsupported draft, not its contents.
         result["draft"] = {"truncated": True}
     elif isinstance(draft, Mapping):
         safe_draft: dict[str, str | bool] = {}
-        fields = ("to", "subject", "text", "via")
+        fields = DRAFT_TEXT_FIELDS
         truncated = draft.get("truncated", False) is not False or any(key not in (*fields, "truncated") for key in draft)
         for key in fields:
             if key not in draft:
@@ -171,6 +172,10 @@ def safe_approval_request(request: Mapping[str, Any]) -> dict[str, Any]:
         if truncated:
             safe_draft["truncated"] = True
         result["draft"] = safe_draft
+
+    if "draft" in result:
+        # Sanitizing a malformed offer must not turn it into a legacy card with no offer.
+        result["choices"] = draft_approval_choices({**result, "choices": request.get("choices")})
 
     change_summary = request.get("change_summary")
     if not takeover and isinstance(change_summary, Mapping):

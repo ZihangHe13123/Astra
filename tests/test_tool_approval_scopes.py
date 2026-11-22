@@ -1141,6 +1141,102 @@ def test_pending_yolo_eligibility_comes_from_the_tool_boundary(authoritative, au
     assert requests[0]["yolo_bypass_allowed"] is expected
 
 
+@pytest.mark.parametrize("initial_yolo", [True, False], ids=["already-on", "live-toggle"])
+def test_draft_approval_is_never_yolo_eligible(initial_yolo):
+    registry = ToolRegistry()
+    registry.yolo = initial_yolo
+    seen, calls = [], []
+
+    async def decide(request):
+        # Model the broker's live switch while a request is pending. It can
+        # only release IDs for which the registry set yolo_bypass_allowed.
+        registry.yolo = True
+        seen.append((request["choices"], request["yolo_bypass_allowed"]))
+        return "once" if request["yolo_bypass_allowed"] else "deny"
+
+    registry.set_approval_handler(decide)
+    registry.register(ToolDef(
+        name="approval_probe", description="in-memory fixture", parameters={"type": "object"},
+        fn=lambda: calls.append("body"), risk="read", permission_authoritative=True,
+        owns_session_grants=True, permission_yolo_auto_grant=lambda req: req["kind"] == "computer_write",
+        permission_check=lambda _: {"kind": "computer_write", "draft": {"text": "fixture"},
+                                    "choices": ["once", "session", "deny"], "yolo_bypass_allowed": True},
+        permission_grant=lambda *_: calls.append("grant"),
+    ))
+    result = run(registry.execute("approval_probe", {}))
+    assert seen == [(["once", "deny"], False)]
+    assert result.get("code") == "approval_denied" and calls == []
+
+
+@pytest.mark.parametrize("draft", [None, {}, {"truncated": True}, {"text": "prefix", "truncated": True},
+                                   {"text": "body", "unexpected": "hidden"}])
+def test_incomplete_draft_offers_only_deny_and_rejects_positive_reply(draft):
+    registry = ToolRegistry()
+    seen, calls = [], []
+
+    async def stale_client(request):
+        seen.append((list(request["choices"]), request["yolo_bypass_allowed"]))
+        return "once"
+
+    registry.set_approval_handler(stale_client)
+    registry.register(ToolDef(
+        name="draft_probe", description="in-memory fixture", parameters={"type": "object"},
+        fn=lambda: calls.append("body"), risk="read", permission_authoritative=True, permission_yolo_auto_grant=True,
+        permission_check=lambda _: {"draft": draft, "consequential": "send", "choices": ["once", "deny"]},
+        permission_grant=lambda *_: calls.append("grant"),
+    ))
+    result = run(registry.execute("draft_probe", {}))
+    assert seen == [(["deny"], False)]
+    assert result.get("code") == "approval_denied" and calls == []
+
+
+def test_generic_policy_decision_cannot_stand_in_for_draft_disclosure():
+    policy = ToolPolicy(mode="permissive")
+    policy.add_rule(PolicyRule(tool_pattern="draft_probe", action="ask"))
+    registry = ToolRegistry(policy=policy)
+    prompts, calls = [], []
+
+    async def decide(request):
+        prompts.append(request)
+        return "deny" if "draft" in request else "once"
+
+    registry.set_approval_handler(decide)
+    registry.register(ToolDef(
+        name="draft_probe", description="in-memory fixture", parameters={"type": "object"},
+        fn=lambda: calls.append("body"), risk="read", permission_check=lambda _: {"draft": {"text": "body"}},
+        permission_grant=lambda *_: calls.append("grant"),
+    ))
+    result = run(registry.execute("draft_probe", {}))
+    assert ["draft" in prompt for prompt in prompts] == [False, True]
+    assert prompts[-1]["yolo_bypass_allowed"] is False
+    assert result.get("code") == "approval_denied" and calls == []
+
+
+@pytest.mark.parametrize(("declared", "reply", "expected", "allowed"), [
+    (["once", "session", "deny"], "once", ["once", "deny"], True),
+    (["once", "session", "deny"], "session", ["once", "deny"], False),
+    (["deny"], "once", ["deny"], False),
+])
+def test_complete_draft_keeps_only_explicit_offered_once(declared, reply, expected, allowed):
+    registry = ToolRegistry()
+    seen, decisions = [], []
+
+    async def client(request):
+        seen.append(list(request["choices"]))
+        return reply
+
+    registry.set_approval_handler(client)
+    registry.register(ToolDef(
+        name="choice_probe", description="in-memory fixture", parameters={"type": "object"}, fn=lambda: "fixture",
+        permission_authoritative=True, permission_check=lambda _: {"draft": {"text": "body"}, "choices": declared},
+        permission_grant=lambda _args, _card, decision: decisions.append(decision),
+    ))
+    result = run(registry.execute("choice_probe", {}))
+    assert seen == [expected]
+    assert decisions == (["once"] if allowed else [])
+    assert (result["error"] == "") is allowed
+
+
 def test_yolo_bypass_does_not_persist_after_yolo_is_disabled():
     calls = []
     policy = ToolPolicy(mode="permissive")
@@ -1407,7 +1503,7 @@ def test_mcp_declared_side_effect_requires_exact_tool_approval():
         [FakeRemoteTool()],
         {"risk": "network", "tool_risks": {"send_message": "write"}},
     )
-    decisions = iter(["deny", "once"])
+    decisions = iter(["deny", "once", "once"])
     requests = []
 
     async def decide(request):
@@ -1427,15 +1523,17 @@ def test_mcp_declared_side_effect_requires_exact_tool_approval():
     assert denied["error_type"] == "approval_denied"
     assert session.calls == []
 
-    allowed = run(registry.execute(
+    opaque = run(registry.execute(
         "mcp__messaging__send_message",
         {"body": "hello", "justification": "业务协议需要把这段说明原样传给远端工具。"},
     ))
+    # This is a remote argument, not Astra approval metadata. Its meaning isn't part of the
+    # draft schema: don't drop it or silently send an undisclosed argument.
+    assert opaque["error_type"] == "approval_denied" and requests[-1]["choices"] == ["deny"]
+    assert session.calls == []
+    allowed = run(registry.execute("mcp__messaging__send_message", {"body": "hello"}))
     assert allowed["error"] == ""
-    assert session.calls == [(
-        "send_message",
-        {"body": "hello", "justification": "业务协议需要把这段说明原样传给远端工具。"},
-    )]
+    assert session.calls == [("send_message", {"body": "hello"})]
     assert requests[0]["kind"] == "mcp_side_effect"
     assert requests[0]["target"] == "messaging/send_message"
 

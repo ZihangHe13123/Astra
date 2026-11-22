@@ -112,15 +112,16 @@ export function ToolApprovalPanel({
       : "未确认终端支持松键事件。可按 N 拒绝，再到 GUI 重新发起任务。   [V] 详情";
   }
   const note = consequenceNote(request);
-  const hasDraft = request.draft != null;
-  const draftRows = useMemo(() => wrapDraft(request.draft, contentWidth), [request.draft, contentWidth]);
+  const hasDraft = "draft" in request;
+  const draftRows = useMemo(() => request.risk === "secret" ? undefined : wrapDraft(request.draft, contentWidth), [request.draft, request.risk, contentWidth]);
   const heightLimit = maxHeight ?? (hasDraft ? Math.max(1, stdout.rows - 2) : undefined);
-  const fullShortcuts = inputFenced ? "输入边界未确认：N 拒绝，Ctrl+C 取消；先按 Ctrl+X，再单独选择。此时不启用 YOLO" : choices + "   [Ctrl+Y] YOLO";
+  const fullShortcuts = inputFenced ? "输入边界未确认：N 拒绝，Ctrl+C 取消；先按 Ctrl+X，再单独选择。此时不启用 YOLO"
+    : hasDraft ? choices + " ·" : choices + "   [Ctrl+Y] YOLO";
   const bodyBudget = (footerRows: number) => heightLimit === undefined ? undefined :
     Math.max(1, heightLimit - 3 - footerRows - (expanded ? 1 : 0));
   const draftBudget = bodyBudget(wrapToolResult(fullShortcuts, contentWidth).length) ?? 0;
   const fitsDraft = !!draftRows && draftRows.length + Number(!!note) + Number(!!request.action_label) + 1 <= draftBudget;
-  const shortcuts = hasDraft && !fitsDraft ? `${expanded ? "[N]" : "[N/Esc]"} 丢弃   [Ctrl+Y] YOLO` : fullShortcuts;
+  const shortcuts = hasDraft && !fitsDraft ? `${expanded ? "[N]" : "[N/Esc]"} 丢弃 ·` : fullShortcuts;
   const shortcutRows = wrapToolResult(shortcuts, contentWidth).length;
   const bodyHeight = bodyBudget(shortcutRows);
   return (
@@ -174,7 +175,7 @@ export function ToolApprovalPanel({
         <Text color={theme.muted} wrap="truncate-end">↑/↓ 滚动 · PgUp/PgDn 翻页 · V/Esc 折叠</Text>
       )}
       <Text color={theme.accentAlt}>
-        {shortcuts.slice(0, -1)}{approvalPaintGlyph(paintEpoch, foregroundRelease, "t")}
+        {shortcuts.slice(0, -1)}{approvalPaintGlyph(paintEpoch, foregroundRelease, "t", shortcuts.slice(-1))}
       </Text>
     </Box>
   );

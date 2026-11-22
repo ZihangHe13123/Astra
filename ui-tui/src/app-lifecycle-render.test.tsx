@@ -1046,6 +1046,31 @@ test("Delivered Escape input: submitting Python cannot strand the next approval'
   } finally { h.app.unmount(); }
 });
 
+for (const flow of ["retired foreground prefix", "expired retired prefix", "timed out composer prefix"]) {
+  test(`Composer strings: ${flow} preserves submission and leaves B a refusal and reset`, async () => {
+    const h = await setup(), { ask, answers } = kittyReview(h);
+    try {
+      const retired = flow !== "timed out composer prefix";
+      if (retired) {
+        await ask("A"); readNow(h, "\x1b");
+        h.child.event({ type: "approval_resolved", request_id: "A", state: "denied", decision: "deny" });
+      } else readNow(h, "\x1b");
+      if (flow === "retired foreground prefix") await new Promise(resolve => setImmediate(resolve));
+      else await new Promise(resolve => setTimeout(resolve, 65));
+      const text = retired ? "Python" : "]list";
+      await h.submit(text);
+      assert.deepEqual(h.child.commands.filter(c => c.type === "message").map(c => c.text), [text]);
+      h.child.event({ type: "task_started", task: { id: "running", status: "running" } }); await ask("B", false);
+      assert.match(h.frame(), /Ctrl\+X/);
+      await h.key("\x03"); assert.equal(h.child.commands.filter(c => c.cmd === "/cancel").length, 1);
+      await h.key("y"); assert.deepEqual(answers(), []);
+      await h.key("n"); assert.deepEqual(answers(), [["B", "deny"]]);
+      await ask("C", false); await h.key("\x18y"); assert.equal(answers().length, 1);
+      await h.key("y"); assert.deepEqual(answers().at(-1), ["C", "once"]);
+    } finally { h.app.unmount(); }
+  });
+}
+
 test("an ambiguous late string offers an explicit reset, never a grant from its body or the reset itself", async () => {
   const h = await setup(), { ask, answers } = kittyReview(h);
   try {

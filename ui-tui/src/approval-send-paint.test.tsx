@@ -11,11 +11,12 @@ import stripAnsi from "strip-ansi";
 import { approvalPaintOutput } from "./approval-paint.js";
 import { approvalAwareStdin } from "./foreground-approval-input.js";
 
-const sample = { to: "recipient@example.invalid", subject: "Review this message", via: "inert mail fixture",
+const sample = { to: "recipient@example.invalid", cc: "copy@example.invalid", bcc: "blind@example.invalid",
+  subject: "Review this message", via: "inert mail fixture",
   text: Array.from({ length: 6 }, (_, i) => `distinct-body-line-${i + 1}`).join("\n") };
 
 async function withDraft(columns: number, rows: number, draft: Record<string, unknown>, exercise: (h: {
-  frame(): string; key(bytes: string): Promise<void>; answers: string[];
+  frame(): string; key(bytes: string): Promise<void>; answers: string[]; commands: string[];
   overwrite(text: string): Promise<void>; resize(columns: number, rows: number): Promise<void>;
   restoreWithBlockedWriter(): Promise<void>; ack(): Promise<void>;
 }) => Promise<void>) {
@@ -26,8 +27,9 @@ async function withDraft(columns: number, rows: number, draft: Record<string, un
   syncBuiltinESMExports();
   let screen = "";
   let hold = false, flush: (() => void) | undefined;
-  const answers: string[] = [], stdin = new Input();
-  child.stdin.on("data", data => { const cmd = JSON.parse(String(data)); if (cmd.type === "tool_approval_response") answers.push(cmd.decision); });
+  const answers: string[] = [], commands: string[] = [], stdin = new Input();
+  child.stdin.on("data", data => { const cmd = JSON.parse(String(data));
+    if (cmd.type === "tool_approval_response") answers.push(cmd.decision); else if (cmd.type === "command") commands.push(cmd.cmd); });
   const output = Object.assign(new Writable({ write(chunk, _, done) {
     const deliver = () => { if (String(chunk).includes("\n")) screen = stripAnsi(String(chunk)); done(); };
     if (hold) flush = deliver; else deliver();
@@ -48,7 +50,7 @@ async function withDraft(columns: number, rows: number, draft: Record<string, un
     child.stdout.write(JSON.stringify({ type: "tool_approval_request", request_id: "message", tool_name: "send_fixture",
       consequential: "send", kind: "tool_execution", risk: "write", reason: "fixture", choices: ["once", "deny"], draft }) + "\n");
     await settle(); assert.match(screen, /审批请求/);
-    await exercise({ answers, frame: () => screen, key: async bytes => { stdin.write(bytes); stdin.emit("readable"); await settle(); },
+    await exercise({ answers, commands, frame: () => screen, key: async bytes => { stdin.write(bytes); stdin.emit("readable"); await settle(); },
       resize: async (columns, rows) => { Object.assign(output, { columns, rows }); output.emit("resize"); await settle(); },
       restoreWithBlockedWriter: async () => { hold = true; overlay = undefined; app!.rerender(scene()); await settle(); assert.ok(flush); },
       ack: async () => { hold = false; flush!(); flush = undefined; await settle(); },
@@ -72,17 +74,29 @@ test("a 50x14 send card must not grant from its painted header and footer alone"
 
 test("the same draft fully visible at 120x36 can grant", async () => {
   await withDraft(120, 36, sample, async h => {
-    for (const text of [sample.to, sample.subject, sample.via, ...sample.text.split("\n")]) assert.ok(h.frame().includes(text), text);
+    for (const text of [sample.to, `抄送：${sample.cc}`, `密送：${sample.bcc}`, sample.subject, sample.via,
+      ...sample.text.split("\n")]) assert.ok(h.frame().includes(text), text);
     await h.key("\r"); assert.deepEqual(h.answers, ["once"]);
   });
 });
 
-for (const [label, field] of Object.entries({ recipient: sample.to, subject: sample.subject, route: sample.via, body: "distinct-body-line-3" })) {
+for (const [label, width, height, draft] of [
+  ["short", 50, 14, sample], ["truncated", 120, 36, { ...sample, truncated: true }], ["complete", 120, 36, sample],
+] as const) test(`Ctrl+Y is not a mode switch on a ${label} send card`, async () => {
+  await withDraft(width, height, draft, async h => {
+    await h.key("\x19"); assert.ok(!h.commands.includes("/yolo")); assert.deepEqual(h.answers, []);
+    assert.doesNotMatch(h.frame(), /\[Ctrl\+Y\]/);
+    await h.key("n"); assert.deepEqual(h.answers, ["deny"]);
+  });
+});
+
+for (const [label, field] of Object.entries({ recipient: sample.to, cc: sample.cc, bcc: sample.bcc,
+  subject: sample.subject, route: sample.via, body: "distinct-body-line-3" })) {
   test(`overpainting an interior ${label} cell revokes the full-draft receipt`, async () => {
     await withDraft(120, 36, sample, async h => {
       const height = h.frame().split("\n").length;
       await h.overwrite(field); assert.equal(h.frame().split("\n").length, height);
-      assert.match(h.frame(), /审批请求/); assert.match(h.frame(), /YOLO/);
+      assert.match(h.frame(), /审批请求/); assert.match(h.frame(), /丢弃/);
       await h.key("y"); assert.deepEqual(h.answers, []);
       await h.key("n"); assert.deepEqual(h.answers, ["deny"]);
     });

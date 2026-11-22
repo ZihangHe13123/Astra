@@ -3449,6 +3449,30 @@ def test_send_draft_producer_marks_only_clipped_joined_text(registry, manager, b
     assert not backend.calls
 
 
+@pytest.mark.parametrize("initial_yolo", [True, False], ids=["already-on", "enabled-while-pending"])
+@pytest.mark.parametrize("size", [2000, 2001], ids=["whole", "clipped"])
+def test_registered_background_draft_stays_pending_for_human_review(registry, manager, backend, monkeypatch, initial_yolo, size):
+    async def plan_only(*args, **kwargs):
+        return ComputerActionPlan("fixture", ComputerInteractionMode.BACKGROUND, False, "background_ax_only", ("text",), ())
+
+    seen = []
+
+    async def refuse(card):
+        registry.yolo = True  # A settings change is not this card's answer.
+        seen.append(card)
+        return "deny"
+
+    monkeypatch.setattr(manager, "plan_actions", plan_only)
+    register(registry, manager)
+    registry.set_approval_handler(refuse)
+    registry.yolo = initial_yolo
+    result = run(registry.execute("computer_act", {"snapshot_id": "fixture-snapshot",
+                 "actions": [{"type": "type", "text": "x" * size}]}))
+    assert result.get("code") == "approval_denied" and not backend.calls
+    assert len(seen) == 1 and seen[0]["kind"] == "computer_write" and seen[0]["yolo_bypass_allowed"] is False
+    assert seen[0]["choices"] == (["once", "deny"] if size == 2000 else ["deny"])
+
+
 def test_high_impact_action_is_once_per_exact_batch_and_session_decision_cannot_broaden(
     registry,
     manager,
