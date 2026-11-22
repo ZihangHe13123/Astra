@@ -5034,9 +5034,51 @@ def test_capable_helper_receives_exact_replacement_semantics(registry, manager, 
     assert sent == [[action]]
 
 
-def test_refused_replacement_recommends_select_all_and_typing(registry, manager, backend, monkeypatch):
-    """Live Edge 2026-09-23: browser fields refuse native replacement before any input.
-    The refusal must name the keyboard route that works instead of a user handoff."""
+@pytest.mark.parametrize("supported", [True, False])
+def test_range_replacement_requires_capability_and_reaches_native_wire(registry, manager, backend, supported):
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["replace_text_range_v1"] if supported else [],
+        "children": [{"role": "AXTextArea", "element_ref": "snapshot-1:field", "label": "Body",
+                      "value": "DR-731 pending", "bounds": {"x": 10, "y": 10, "width": 50, "height": 20}}]}
+    register(registry, manager)
+    registry.set_approval_handler(lambda request: asyncio.sleep(0, result="once"))
+    focus(registry)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    action = {"type": "type", "element_ref": "snapshot-1:field", "target_text": "pending", "prefix": "DR-731 ", "text": "reviewed"}
+    result = run(registry.execute("computer_act", {"snapshot_id": snapshot["snapshot_id"], "actions": [action]}))
+    sent = [payload[1] for name, payload in backend.calls if name == "act"]
+    if supported:
+        assert sent == [[action]]
+    else:
+        assert result["code"] == "unsupported_operation"
+        assert not any(name in {"plan_actions", "act"} for name, _ in backend.calls)
+
+
+@pytest.mark.parametrize("reason", [
+    ComputerErrorCode.TEXT_MATCH_NOT_FOUND, ComputerErrorCode.TEXT_MATCH_AMBIGUOUS,
+    ComputerErrorCode.TEXT_RANGE_UNSUPPORTED, ComputerErrorCode.TEXT_INPUT_SOURCE_UNVERIFIED, ComputerErrorCode.TEXT_SELECTION_REQUIRED,
+])
+def test_range_edit_public_preflight_refusal_preserves_reason(registry, manager, backend, monkeypatch, reason):
+    from agent.runtime.macos_computer import HelperApplicationError
+
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "observation_capabilities": ["replace_text_range_v1"],
+        "children": [{"role": "AXTextArea", "element_ref": "snapshot-1:field", "label": "Body",
+                      "value": "pending", "bounds": {"x": 10, "y": 10, "width": 50, "height": 20}}]}
+
+    async def refuse(*args, **kwargs):
+        raise HelperApplicationError(ComputerError(reason, "native preflight refused"))
+
+    monkeypatch.setattr(backend, "plan_actions", refuse)
+    register(registry, manager)
+    focus(registry)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    failure = run(registry.execute("computer_act", {"snapshot_id": snapshot["snapshot_id"], "actions": [
+        {"type": "type", "element_ref": "snapshot-1:field", "target_text": "pending", "text": "reviewed"}]}))
+    assert failure["code"] == reason.value
+    assert failure["computer_receipt"]["dispatch_state"] == "not_dispatched"
+    assert not any(name in {"act", "takeover_begin"} for name, _ in backend.calls)
+
+
+def test_refused_replacement_exposes_final_keyboard_plan_error(registry, manager, backend, monkeypatch):
     from agent.runtime.macos_computer import HelperApplicationError
 
     backend.snapshot_ax_tree_override = {"role": "AXWindow",
@@ -5044,7 +5086,9 @@ def test_refused_replacement_recommends_select_all_and_typing(registry, manager,
         "children": [{"role": "AXTextField", "element_ref": "snapshot-1:field", "label": "Address",
                       "value": "old", "bounds": {"x": 10, "y": 10, "width": 50, "height": 20}}]}
 
-    async def refuse(*_args, **_kwargs):
+    async def refuse(target, snapshot_id, actions, interaction_mode):
+        if actions[0].type == "keypress":
+            raise HelperApplicationError(ComputerError(ComputerErrorCode.KEYBOARD_FOCUS_UNVERIFIED, "incomplete identity"))
         raise HelperApplicationError(ComputerError(
             ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED, "the action batch is unsafe"))
 
@@ -5054,11 +5098,13 @@ def test_refused_replacement_recommends_select_all_and_typing(registry, manager,
     snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
     result = run(registry.execute("computer_act", {"snapshot_id": snapshot["snapshot_id"],
         "actions": [{"type": "type", "text": "example.com", "element_ref": "snapshot-1:field", "replace": True}]}))
-    assert result["code"] == "background_action_unsupported"
-    hint = result["recovery_hint"]
-    assert "No input was dispatched" in hint
-    assert "command+a" in hint and "without replace" in hint
-    assert "hand this step to the user" not in hint
+    assert result["code"] == "keyboard_focus_unverified"
+    assert result["details"]["planning_refusals"] == [
+        {"mode": "background", "route": "requested", "code": "background_action_unsupported"},
+        {"mode": "foreground_takeover", "route": "requested", "code": "background_action_unsupported"},
+        {"mode": "foreground_takeover", "route": "select_all_and_type", "code": "keyboard_focus_unverified"},
+    ]
+    assert result["computer_receipt"]["dispatch_state"] == "not_dispatched"
     assert not any(name in {"takeover_begin", "act"} for name, _ in backend.calls)
 
 
@@ -7584,8 +7630,45 @@ def test_post_action_overlay_keeps_cause_without_repeating_input_or_observation(
     assert sum(name == "act" for name, _value in backend.calls) == 1
 
 
+def test_post_action_does_not_offer_a_sheet_known_to_belong_to_another_document(registry, manager, backend, monkeypatch):
+    register(registry, manager)
+    registry.set_approval_handler(lambda _request: asyncio.sleep(0, result="once"))
+    original_apps = backend.apps
+    appeared = False
+
+    async def apps():
+        catalog = await original_apps()
+        windows = catalog.apps[0]["windows"]
+        windows.append({**windows[0], "window_ref": "doc-b", "window_identity_ref": "identity-b"})
+        if appeared:
+            windows.append({**windows[0], "window_ref": "sheet-b", "window_identity_ref": "sheet-identity",
+                            "parent_window_identity_ref": "identity-b"})
+        return catalog
+
+    monkeypatch.setattr(backend, "apps", apps)
+    focus(registry)
+    initial = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+
+    async def covered(*_args, **_kwargs):
+        nonlocal appeared
+        appeared = True
+        raise ComputerSessionError("overlay_blocked", "covered")
+
+    monkeypatch.setattr(backend, "snapshot", covered)
+    result = run(registry.execute("computer_act", {
+        "snapshot_id": initial["snapshot_id"], "actions": [{"type": "wait", "duration_ms": 0}],
+    }))
+    transition = result["details"]["window_transition"]
+    assert "next_observation" not in transition
+    assert transition["observation_reason"] == "sheet_belongs_to_other_window"
+    assert "different window" in result["recovery_hint"]
+    assert result["computer_receipt"]["replay"] == "forbidden"
+    assert sum(name == "act" for name, _ in backend.calls) == 1
+
+
+@pytest.mark.parametrize("attached", [False, True])
 def test_post_action_overlay_hands_over_to_the_popup_the_action_opened(
-    registry, manager, backend, monkeypatch,
+    registry, manager, backend, monkeypatch, attached,
 ):
     """Live WeChat 4.1: clicking its search box opened a list window over the main window."""
     register(registry, manager)
@@ -7606,6 +7689,12 @@ def test_post_action_overlay_hands_over_to_the_popup_the_action_opened(
             "window_identity_ref": "popup-identity",
             "bounds": {"x": 49, "y": 37, "width": 368, "height": 96},
         })
+        if attached:
+            catalog.apps[0]["windows"][-1]["parent_window_identity_ref"] = backend.catalog_window_identity_ref
+            catalog.apps[0]["windows"].append({
+                "window_ref": "other-document-ref", "title": "Unrelated", "bindable": True,
+                "window_identity_ref": "other-document-identity",
+            })
         return catalog
 
     monkeypatch.setattr(backend, "snapshot", blocked)
@@ -7617,6 +7706,8 @@ def test_post_action_overlay_hands_over_to_the_popup_the_action_opened(
     transition = result["details"]["window_transition"]
     assert result["code"] == "post_action_observation_pending"
     assert result["details"]["observation_error_code"] == "overlay_blocked"
+    if attached:
+        assert transition["observation_reason"] == "attached_sheet"
     assert transition["status"] == "new_window_observed"
     assert transition["next_observation"] == {
         "tool": "computer_get_app_state",

@@ -1396,6 +1396,7 @@ final class SystemWindowObserver: WindowObserving {
         }
         var localTargets: [String: WindowTarget] = [:]
         var localWindowIdentities: [CatalogWindowIdentityKey: [CatalogWindowIdentityRecord]] = [:]
+        var sheetParents: [String: (CatalogWindowIdentityKey, AXUIElement)] = [:]
         var usedWindowIdentityReferences: Set<String> = []
         var grouped: [pid_t: (
             appRef: String,
@@ -1439,6 +1440,7 @@ final class SystemWindowObserver: WindowObserving {
             let accessibilityTrusted = permissions.accessibilityTrusted
             try budget.check()
             let axWindow: AXUIElement?
+            var bindingReason: String?
             if accessibilityTrusted {
                 if let catalogAXWindowMatcher {
                     axWindow = catalogAXWindowMatcher(AXUIElementCreateApplication(window.pid), target)
@@ -1446,7 +1448,7 @@ final class SystemWindowObserver: WindowObserving {
                     let inventory = inventories.value(for: window.pid) {
                         catalogAXWindows?(window.pid) ?? catalogAXWindowRecords(pid: window.pid)
                     }
-                    axWindow = matchingCatalogAXWindow(target: target, records: inventory)
+                    axWindow = matchingCatalogAXWindow(target: target, records: inventory) { bindingReason = $0 }
                 }
             } else { axWindow = nil }
             let documentPath: String?
@@ -1479,10 +1481,17 @@ final class SystemWindowObserver: WindowObserving {
                     CatalogWindowIdentityRecord(element: axWindow, reference: token)
                 )
                 windowIdentityRef = token
+                if AXNodeReader.stringAttribute(axWindow, kAXRoleAttribute).value == kAXSheetRole,
+                   attachedSheetRoot(axWindow, pid: window.pid) != nil,
+                   let parent = observedAXParent(axWindow), let parentID = observedAXWindowID(parent) {
+                    let key = CatalogWindowIdentityKey(pid: window.pid, windowID: parentID,
+                                                       axIdentity: catalogAXIdentityHash(parent))
+                    sheetParents[windowRef] = (key, parent)
+                }
             } else {
                 windowIdentityRef = nil
             }
-            let windowValues = catalogWindowJSON(
+            var windowValues = catalogWindowJSON(
                 windowRef: windowRef,
                 title: window.title,
                 bounds: window.bounds,
@@ -1491,6 +1500,7 @@ final class SystemWindowObserver: WindowObserving {
                 exactAXWindowFound: axWindow != nil,
                 windowIdentityRef: windowIdentityRef
             )
+            if let bindingReason { windowValues["binding_reason"] = .string(bindingReason) }
             var catalogTarget = target
             if let axWindow {
                 catalogTarget = WindowTarget(
@@ -1509,12 +1519,20 @@ final class SystemWindowObserver: WindowObserving {
             grouped[window.pid] = values
         }
         let result = grouped.values.map { value in
-            JSONValue.object([
+            // Resolve after enumerating every window: SCK often lists a sheet ahead of its parent.
+            let relatedWindows = value.windows.map { window -> JSONValue in
+                guard case var .object(fields) = window, case let .string(ref)? = fields["window_ref"],
+                      let (key, parent) = sheetParents[ref] else { return window }
+                let matches = (localWindowIdentities[key] ?? []).filter { CFEqual($0.element, parent) }
+                if matches.count == 1 { fields["parent_window_identity_ref"] = .string(matches[0].reference) }
+                return .object(fields)
+            }
+            return JSONValue.object([
                 "app_ref": .string(value.appRef),
                 "name": .string(bounded(value.name)),
                 "bundle_id": value.bundleID.map { .string(bounded($0)) } ?? .null,
                 "app_version": value.appVersion.map { .string(bounded($0)) } ?? .null,
-                "windows": .array(value.windows),
+                "windows": .array(relatedWindows),
             ])
         }.sorted { lhs, rhs in
             appName(lhs) < appName(rhs)
@@ -3793,7 +3811,7 @@ final class SystemWindowObserver: WindowObserving {
             bounds: localBounds,
             roleResult: role,
             subroleResult: subrole,
-            enabled: AXNodeReader.boolAttribute(element, kAXEnabledAttribute),
+            enabled: actionTextAreaEnabled(element),
             actionNames: AXNodeReader.actionNameResults(element)
         )
     }
@@ -4013,7 +4031,7 @@ final class SystemWindowObserver: WindowObserving {
             bounds: bounds,
             role: role,
             subrole: subrole,
-            enabled: AXNodeReader.boolAttribute(focused, kAXEnabledAttribute),
+            enabled: actionTextAreaEnabled(focused),
             containerBounds: containerBounds
         )
     }

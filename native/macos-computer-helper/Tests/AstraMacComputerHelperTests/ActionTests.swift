@@ -648,4 +648,8 @@ private final class RecordingActionProvider: ActionProviding {
     #expect(focused("AXGroup").acceptsFocusedKeyboardInput)
     #expect(!focused(nil).isSecure)
     #expect(!focused("AXSecureTextField").acceptsFocusedKeyboardInput)
+    #expect(focused("AXSecureTextField").keyboardTargetRejection == .secureTarget)
+    #expect(focused("AXTextArea", substatus: .truncated).keyboardTargetRejection == .keyboardFocusUnverified)
+    let disabled = ActionElement(element: nil, bounds: .zero, role: "AXTextField", subrole: nil, enabled: false, actions: [])
+    #expect(disabled.keyboardTargetRejection == .controlDisabled)
 }

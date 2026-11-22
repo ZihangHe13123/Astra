@@ -63,6 +63,14 @@ class ComputerErrorCode(str, Enum):
     OBSERVATION_TIMEOUT = "observation_timeout"
     OUT_OF_BOUNDS = "out_of_bounds"
     SECURE_TARGET = "secure_target"
+    SECURE_INPUT_ACTIVE = "secure_input_active"
+    TEXT_SELECTION_REQUIRED = "text_selection_required"
+    TEXT_MATCH_NOT_FOUND = "text_match_not_found"
+    TEXT_MATCH_AMBIGUOUS = "text_match_ambiguous"
+    TEXT_INPUT_SOURCE_UNVERIFIED = "text_input_source_unverified"
+    TEXT_RANGE_UNSUPPORTED = "text_range_unsupported"
+    KEYBOARD_FOCUS_UNVERIFIED = "keyboard_focus_unverified"
+    CONTROL_DISABLED = "control_disabled"
     INPUT_FOCUS_REQUIRED = "input_focus_required"
     ACTION_TIMEOUT = "action_timeout"
     HELPER_FAILED = "helper_failed"
@@ -558,8 +566,21 @@ class ComputerAction:
     modifiers: tuple[str, ...] = ()
     checked: bool | None = None
     replace: bool | None = None
+    target_text: str | None = None
+    prefix: str | None = None
+    suffix: str | None = None
 
     def __post_init__(self) -> None:
+        if self.target_text is not None or self.prefix is not None or self.suffix is not None:
+            if (self.type != "type" or self.element_ref is None or self.text is None or self.replace is not None
+                or not self.target_text or self.modifiers or any(getattr(self, key) is not None for key in (
+                    "x", "y", "end_x", "end_y", "key", "delta_x", "delta_y", "duration_ms",
+                    "element_index", "target_element_ref", "checked",
+                ))):
+                raise ValueError("target_text requires a type action on an exact element_ref")
+            for value in (self.target_text, self.prefix, self.suffix):
+                if value is not None and (not isinstance(value, str) or not _has_valid_unicode_scalars(value, MAX_TEXT_CHARACTERS)):
+                    raise ValueError("range text and context must contain valid bounded Unicode strings")
         if self.replace is not None and (
             self.replace is not True or self.type != "type" or self.element_ref is None
             or self.modifiers or any(getattr(self, key) is not None for key in (
@@ -695,9 +716,13 @@ class ComputerAction:
         allowed = {
             "type", "x", "y", "end_x", "end_y", "text", "key", "delta_x",
             "delta_y", "duration_ms", "element_ref", "target_element_ref",
-            "element_index", "modifiers", "checked", "replace",
+            "element_index", "modifiers", "checked", "replace", "target_text", "prefix", "suffix",
         }
         _reject_unknown_fields(value, allowed, "action")
+        if {"target_text", "prefix", "suffix"}.intersection(value):
+            _reject_unknown_fields(value, {"type", "text", "element_ref", "target_text", "prefix", "suffix"}, "range replacement")
+            if not value.get("target_text") or any(value[key] is None for key in ("prefix", "suffix") if key in value):
+                raise ValueError("target_text must be non-empty and context must be a string")
         if "replace" in value:
             if value["replace"] is not True:
                 raise ValueError("replace must be true when specified")
@@ -741,6 +766,8 @@ class KeyboardFailureDiagnostics:
         if not isinstance(value["cause"], str) or value["cause"] not in {
             "protocol_mismatch", "permission_denied", "target_gone", "target_not_frontmost",
             "stale_snapshot", "out_of_bounds", "secure_target", "input_focus_required",
+            "secure_input_active", "keyboard_focus_unverified", "control_disabled", "text_selection_required",
+            "text_range_unsupported", "text_match_not_found", "text_match_ambiguous",
             "action_timeout", "helper_failed", "unknown_outcome", "user_activity_paused",
         }:
             raise ValueError("input diagnostics have an unknown cause")
@@ -1692,7 +1719,10 @@ def _validate_cooperative_request_payload(operation: str, payload: Mapping[str, 
         FragmentStageCommit(**payload)
         return
     if operation in {"presentation_apps", "cancel_presentation"}:
-        _require_exact_payload(payload, {"takeover_ref"}, operation)
+        keys = {"takeover_ref"}
+        if operation == "presentation_apps" and payload.get("window_catalog_relations") is True:
+            keys.add("window_catalog_relations")
+        _require_exact_payload(payload, keys, operation)
         _validate_reference(payload["takeover_ref"], "takeover_ref")
         return
     if operation == "takeover_end":

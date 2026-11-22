@@ -145,6 +145,14 @@ _SAFE_ACTION_ERRORS = {
     ComputerErrorCode.STALE_SNAPSHOT: "The action snapshot is stale.",
     ComputerErrorCode.OUT_OF_BOUNDS: "The action target is outside the current window.",
     ComputerErrorCode.SECURE_TARGET: "The action targets a protected control and requires user handoff.",
+    ComputerErrorCode.SECURE_INPUT_ACTIVE: "macOS Secure Event Input is active. Leave protected input to the user.",
+    ComputerErrorCode.TEXT_SELECTION_REQUIRED: "In the app's Find UI, search for the exact text to change, use the surrounding record to choose its occurrence, then return focus to the document with that match selected. Observe it and issue the targeted edit again. The helper verifies the existing selection before one foreground Unicode input.",
+    ComputerErrorCode.TEXT_MATCH_NOT_FOUND: "The observed field has no literal match with that context. Inspect its current text.",
+    ComputerErrorCode.TEXT_MATCH_AMBIGUOUS: "Multiple locations match. Supply more adjacent prefix or suffix from the field.",
+    ComputerErrorCode.TEXT_INPUT_SOURCE_UNVERIFIED: "Direct AX text editing is unavailable with this input source. For a document edit, inspect the application’s Find and Replace command if available. The source alone does not establish active composition.",
+    ComputerErrorCode.TEXT_RANGE_UNSUPPORTED: "The exact field text or selection cannot be reliably read or edited through Accessibility.",
+    ComputerErrorCode.KEYBOARD_FOCUS_UNVERIFIED: "The helper could not verify the focused control's accessibility metadata or identity.",
+    ComputerErrorCode.CONTROL_DISABLED: "The target control is disabled.",
     ComputerErrorCode.INPUT_FOCUS_REQUIRED: "The intended text input element is not focused.",
     ComputerErrorCode.ACCESSIBILITY_ACTION_REFUSED: (
         "The application refused this accessibility action before acting on it."
@@ -267,6 +275,20 @@ ACTION_SCHEMA = {
                             "description": "Replace the complete field value; empty text clears. Requires replace_text_v1 and exact readback."},
             },
             ("text", "element_ref", "replace"),
+        ),
+        _action_schema(
+            "type",
+            {
+                "text": {"type": "string", "maxLength": MAX_TEXT_CHARACTERS},
+                "element_ref": _ELEMENT_REF,
+                "target_text": {"type": "string", "minLength": 1, "maxLength": MAX_TEXT_CHARACTERS,
+                                "description": "Replace this exact substring once in the observed native field."},
+                "prefix": {"type": "string", "maxLength": MAX_TEXT_CHARACTERS,
+                           "description": "Text immediately before the intended match, to disambiguate duplicates."},
+                "suffix": {"type": "string", "maxLength": MAX_TEXT_CHARACTERS,
+                           "description": "Text immediately after the intended match."},
+            },
+            ("text", "element_ref", "target_text"),
         ),
         _action_schema(
             "keypress",
@@ -583,7 +605,6 @@ def _plan_rejection_failure(
     exc: BaseException,
     *,
     requested_takeover: bool,
-    replace_requested: bool = False,
 ) -> ToolFailure | None:
     """把 helper 的"后台直投不可行"翻译成**当下真能执行**的指引。
 
@@ -598,21 +619,14 @@ def _plan_rejection_failure(
     if exc.error.code is not ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED:
         return None
     if requested_takeover:
-        # Browser fields and active input methods refuse native replacement before input;
-        # selecting the field and typing reaches the same value through the keyboard path.
-        recovery_hint = (
-            "No input was dispatched. Native replacement is unavailable for this field. "
-            "Send keypress command+a on the same element_ref, then type the new text without "
-            "replace in the same batch."
-            if replace_requested else
-            "Foreground takeover was already requested, so switching modes cannot fix this. "
-            "The unmet precondition is in details.helper_message; satisfy it or hand this step to the user."
-        )
         return _failure(
             ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED.value,
-            _SAFE_ACTION_ERRORS[ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED],
+            "The helper could not plan this foreground action.",
             retryable=False,
-            recovery_hint=recovery_hint,
+            recovery_hint=(
+                "No input was dispatched. Inspect the unmet precondition in details.helper_message "
+                "and choose an available action, or hand this step to the user."
+            ),
             details={
                 "requested_interaction_mode": ComputerInteractionMode.FOREGROUND_TAKEOVER.value,
                 "helper_message": exc.error.message,
@@ -635,6 +649,15 @@ def _plan_rejection_failure(
 def _application_failure(error) -> ToolFailure:
     code = error.code
     message = _SAFE_ACTION_ERRORS.get(code, "The native Computer Use request was rejected.")
+    if code in {ComputerErrorCode.SECURE_TARGET, ComputerErrorCode.SECURE_INPUT_ACTIVE}:
+        return _failure(code.value, message, recovery_hint="Hand this input to the user.")
+    if code is ComputerErrorCode.KEYBOARD_FOCUS_UNVERIFIED:
+        return _failure(code.value, message, recovery_hint=(
+            "Inspect the current window and its focused control. Use an explicitly identified "
+            "editable control or application menu command if the new observation supports it."
+        ))
+    if code is ComputerErrorCode.CONTROL_DISABLED:
+        return _failure(code.value, message, recovery_hint="Inspect the window for the prerequisite that enables the control.")
     if code is ComputerErrorCode.PROTOCOL_MISMATCH and error.message:
         # 安全文案不能吃掉 helper 的原文：未知码的名字若在这一步被替换掉，协议层的
         # 保留就白做了 —— 调用方依旧只看到一句 protocol_mismatch。
@@ -2238,6 +2261,7 @@ def register_computer_tools(
                         continue
                     windows[window_ref] = {
                         "window_identity_ref": _trusted_text(raw_window.get("window_identity_ref"), 256),
+                        "parent_window_identity_ref": _trusted_text(raw_window.get("parent_window_identity_ref"), 256),
                         "window_title": _trusted_text(raw_window.get("title"), 1_000),
                         "window_role": _trusted_text(raw_window.get("role"), 256),
                         "known_path": _approval_safe_path(
@@ -2296,6 +2320,7 @@ def register_computer_tools(
                 "app_version": selected.get("app_version", ""),
                 "window_title": window.get("window_title", ""),
                 "window_identity_ref": window.get("window_identity_ref", ""),
+                "parent_window_identity_ref": window.get("parent_window_identity_ref", ""),
                 "window_role": window.get("window_role", ""),
                 "known_path": window.get("known_path", ""),
             })
@@ -3098,13 +3123,13 @@ def register_computer_tools(
         })
 
     def _planning_failure(
-        exc: BaseException, *, requested_takeover: bool = False, replace_requested: bool = False,
+        exc: BaseException, *, requested_takeover: bool = False,
     ) -> ToolFailure:
         # manifest 只管 background 直投许可；background 不可行 ≠ 必须用户手点，而是可升级为
         # 显式授权的 foreground takeover（独立授权路径，不该被 manifest 卡住）。但已经请求接管
         # 时不许再建议切模式 —— 见 _plan_rejection_failure。
         rejection = _plan_rejection_failure(
-            exc, requested_takeover=requested_takeover, replace_requested=replace_requested,
+            exc, requested_takeover=requested_takeover,
         )
         if rejection is not None:
             return rejection
@@ -3313,6 +3338,7 @@ def register_computer_tools(
                             recovered = window_transition(
                                 json.loads(catalog_result).get("apps", []),
                                 before_target.get("bundle_id"), before_identity, before_identities,
+                                parent_identity=before_target.get("parent_window_identity_ref"),
                             )
                             # A closing modal can outlive its AX object briefly.
                             # Wait once for catalog matching, never repeat input.
@@ -3379,7 +3405,12 @@ def register_computer_tools(
                     "Wait for the panel state to change or hand this step to the user; "
                     "then obtain fresh bindable refs through normal observation approval."
                 )
-            if recovery is not None:
+            if recovery is not None and recovery.get("observation_reason") == "sheet_belongs_to_other_window":
+                return (
+                    "Do not repeat this action batch. The new sheet belongs to a different window. "
+                    "Wait for the original target to become observable or hand this step to the user."
+                )
+            if recovery is not None and recovery.get("next_observation"):
                 return (
                     "Do not repeat this action batch. Use the fresh window_transition refs "
                     "with computer_get_app_state through normal observation approval."
@@ -3630,11 +3661,14 @@ def register_computer_tools(
                     {"window_transition": {k: v for k, v in covering.items() if k != "next_observation"}}
                     if isinstance(covering, Mapping) else {}
                 )
+                hint = "Do not repeat this action batch. " + (unavailable.recovery_hint or "")
+                if isinstance(covering, Mapping) and covering.get("observation_reason") == "sheet_belongs_to_other_window":
+                    hint = recovery_hint(covering)
                 return _failure(
                     failure_code,
                     ("Input dispatch is acknowledged. " if acknowledged else "") + unavailable.message,
                     retryable=False,
-                    recovery_hint="Do not repeat this action batch. " + (unavailable.recovery_hint or ""),
+                    recovery_hint=hint,
                     details={
                         "observation_status": "post_action_observation_pending",
                         **cause,
@@ -4153,6 +4187,13 @@ def register_computer_tools(
                 recovery_hint="Call computer_snapshot(settle_ms=300) and inspect the result. Ref churn or an unchanged dialog does not authorize another click. After two inconclusive reads, report unconfirmed and hand off.",
             )
             return None
+        if any(action.target_text is not None for action in prepared.actions):
+            if "replace_text_range_v1" not in observation_capabilities(raw_tree):
+                prepared.failure = _failure(
+                    "unsupported_operation", "This helper does not support targeted text replacement. No input was dispatched.",
+                    retryable=False,
+                )
+                return None
         if any(action.replace is True for action in prepared.actions):
             if "replace_text_v1" not in observation_capabilities(raw_tree):
                 prepared.failure = _failure(
@@ -4178,29 +4219,33 @@ def register_computer_tools(
             # 新语义(2026-09-02, requires_active): foreground takeover 是独立显式
             # 授权路径, 不再要求先以 background 提交同一批动作; pending digest
             # 仅作可选的批次一致性校验(为空即跳过)。
+        planning_refusals: list[dict[str, str]] = []
+
+        async def plan_route(
+            actions: tuple[ComputerAction, ...], interaction_mode: ComputerInteractionMode, route: str,
+        ) -> ComputerActionPlan:
+            try:
+                return await manager.plan_actions(snapshot_id, list(actions), interaction_mode=interaction_mode)
+            except HelperApplicationError as exc:
+                planning_refusals.append({"mode": interaction_mode.value, "route": route, "code": exc.error.code.value})
+                raise
+
         async def plan_in(interaction_mode: ComputerInteractionMode) -> ComputerActionPlan:
             try:
-                return await manager.plan_actions(
-                    snapshot_id, list(prepared.actions), interaction_mode=interaction_mode,
-                )
+                return await plan_route(prepared.actions, interaction_mode, "requested")
             except HelperApplicationError as exc:
                 # A field that refuses native replacement is selected and typed into instead,
                 # before approval, so the grant and every batch_hash check cover this batch.
                 rewritten = (
                     _select_all_replacements(prepared.raw_actions)
                     if interaction_mode is ComputerInteractionMode.FOREGROUND_TAKEOVER
-                    and exc.error.code is ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED
+                    and exc.error.code in {ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED, ComputerErrorCode.TEXT_INPUT_SOURCE_UNVERIFIED}
                     else None
                 )
                 if rewritten is None:
                     raise
-                try:
-                    actions = tuple(ComputerAction.from_mapping(action) for action in rewritten)
-                    replanned = await manager.plan_actions(
-                        snapshot_id, list(actions), interaction_mode=interaction_mode,
-                    )
-                except Exception:  # noqa: BLE001 - report the original, documented refusal
-                    raise exc from None
+                actions = tuple(ComputerAction.from_mapping(action) for action in rewritten)
+                replanned = await plan_route(actions, interaction_mode, "select_all_and_type")
                 prepared.raw_actions, prepared.actions = rewritten, actions
                 return replanned
 
@@ -4210,10 +4255,15 @@ def register_computer_tools(
             except HelperApplicationError as exc:
                 # Only a typed, pre-input rejection can preserve this exact
                 # snapshot for one foreground plan. Transport loss never does.
-                if not automatic or exc.error.code not in {
+                whole_field_source_fallback = (
+                    exc.error.code is ComputerErrorCode.TEXT_INPUT_SOURCE_UNVERIFIED
+                    and any(action.replace is True for action in prepared.actions)
+                    and all(action.target_text is None for action in prepared.actions)
+                )
+                if not automatic or (not whole_field_source_fallback and exc.error.code not in {
                     ComputerErrorCode.FOREGROUND_TAKEOVER_REQUIRED,
                     ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED,
-                }:
+                }):
                     raise
                 plan = None
             if automatic and (plan is None or plan.requires_takeover):
@@ -4230,11 +4280,9 @@ def register_computer_tools(
             prepared.failure = _planning_failure(
                 exc,
                 requested_takeover=mode is ComputerInteractionMode.FOREGROUND_TAKEOVER,
-                replace_requested=any(
-                    action.get("type") == "type" and action.get("replace") is True
-                    for action in prepared.raw_actions
-                ),
             )
+            if planning_refusals:
+                prepared.failure.details["planning_refusals"] = planning_refusals
             return None
         background = classify_computer_batch(
             context,
@@ -4591,7 +4639,7 @@ def register_computer_tools(
         postcondition=verify_snapshot, repeat_guard=False, max_calls_per_turn=32, **common,
     ))
     registry.register(ToolDef(
-        "computer_act", "Execute a guarded batch. For short forms, put independent radio/checkbox choices in one actions array using click + checked:true and fresh form_controls refs/indexes. With replace_text_v1, type + replace:true + exact element_ref replaces the complete field value (empty text clears); inspect effect verification, never replace it with keyboard shortcuts after failure. Already satisfied goals skip input; inspect final choice_verification. An input acknowledgement alone does not prove the desired effect or page saving. Default auto plans takeover before input; set opens_dialog:true on the FIRST click opening a native file/save/modal panel, including ordinary or custom buttons. Coordinates default to window_logical; use image_pixels only with the latest published target image. Return fresh refs for continued work. Never replay unknown outcomes or click Submit without task authorization.", ACT_SCHEMA, computer_act,
+        "computer_act", "Execute a guarded batch. For short forms, put independent radio/checkbox choices in one actions array using click + checked:true and fresh form_controls refs/indexes. For a word or phrase inside a document use type + target_text + exact element_ref with text as the replacement and optional adjacent prefix/suffix to choose a unique match (replace_text_range_v1). With replace_text_v1, type + replace:true + exact element_ref replaces the complete field value (empty text clears); inspect effect verification, never replace it with keyboard shortcuts after failure. Already satisfied goals skip input; inspect final choice_verification. An input acknowledgement alone does not prove the desired effect or page saving. Default auto plans takeover before input; set opens_dialog:true on the FIRST click opening a native file/save/modal panel, including ordinary or custom buttons. Coordinates default to window_logical; use image_pixels only with the latest published target image. Return fresh refs for continued work. Never replay unknown outcomes or click Submit without task authorization.", ACT_SCHEMA, computer_act,
         risk="write", approval="on_risk", replay="never", max_retries=0,
         result_persistence="request_local", permission_check=act_permission_check,
         permission_grant=act_permission_grant, permission_finalizer=finalize_act_permission,

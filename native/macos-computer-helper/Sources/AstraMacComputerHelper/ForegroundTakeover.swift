@@ -1351,14 +1351,19 @@ final class ForegroundPlanExecutor {
                 result = executeResolved(entry, expected: expected, lease: lease, deadline: deadline)
             case .foregroundKeyboard:
                 if let keyboardExecutor, let preparedKeyboard {
-                    result = keyboardExecutor.executePrepared(
-                        sourceIndex: entry.sourceIndex,
-                        from: preparedKeyboard,
-                        expected: expected,
-                        lease: lease,
-                        batchDeadline: deadline,
-                        batchInputStarted: priorNonWaitInputMayHaveStarted
-                    )
+                    do {
+                        var witness: AXKeyboardRangeWitness?
+                        if entry.source.textMatch != nil {
+                            guard let ref = entry.source.elementRef,
+                                  let element = performer.element(reference: ref, snapshotID: expected.snapshotID)
+                            else { throw ActionExecutionError.staleSnapshot }
+                            witness = try performer.selectedUnicodeWitness(for: entry.source, element: element)
+                        }
+                        result = keyboardExecutor.executePrepared(sourceIndex: entry.sourceIndex, from: preparedKeyboard,
+                            expected: expected, lease: lease, batchDeadline: deadline,
+                            batchInputStarted: priorNonWaitInputMayHaveStarted, rangeWitness: witness)
+                    } catch let error as ActionExecutionError { result = stopped(error: error) }
+                    catch { result = stopped(error: .helperFailed) }
                 } else {
                     result = stopped(cooperativeError: .backgroundActionUnsupported)
                 }
@@ -1414,7 +1419,7 @@ final class ForegroundPlanExecutor {
                 // exact validation of its own first event already passes: Cmd+L restyles the
                 // address bar it then types into. Anything else waits for a fresh observation.
                 let nextIndex = entry.sourceIndex + 1
-                guard nextIndex < entries.count,
+                guard entry.source.textMatch == nil, nextIndex < entries.count,
                       entries[nextIndex].backend == .foregroundKeyboard || entries[nextIndex].backend == .pidKeyboard,
                       let keyboardExecutor, let preparedKeyboard,
                       keyboardExecutor.boundTextFieldEntryMayStart(
@@ -1450,9 +1455,11 @@ final class ForegroundPlanExecutor {
         if result.cooperativeError == .userActivityPaused { return true }
         return switch result.error {
         case .targetGone?, .targetNotFrontmost?, .staleSnapshot?, .secureTarget?,
+             .secureInputActive?, .keyboardFocusUnverified?, .controlDisabled?,
              .inputFocusRequired?: true
         case nil, .invalidAction?, .permissionDenied?, .outOfBounds?, .actionTimeout?,
-             .helperFailed?, .unknownOutcome?, .accessibilityActionRefused?: false
+             .helperFailed?, .unknownOutcome?, .accessibilityActionRefused?, .observationRequired?,
+             .textMatchNotFound?, .textMatchAmbiguous?, .textRangeUnsupported?, .textSelectionRequired?, .textInputSourceUnverified?: false
         }
     }
 
@@ -1575,7 +1582,7 @@ final class ForegroundPlanExecutor {
                                 try self.activity.assertNotPaused(lease: lease)
                                 guard self.now() <= deadline else { throw ActionExecutionError.actionTimeout }
                             }
-                            if action.source.replace == true {
+                            if action.source.isReplacement {
                                 performance = try self.performer.performReplacement(action, validateMutation: validateMutation)
                             } else {
                                 performance = try self.performer.perform(action, validateMutation: validateMutation)
@@ -1614,7 +1621,7 @@ final class ForegroundPlanExecutor {
         } catch is UserActivityMonitoringError {
             return stopped(cooperativeError: .userActivityPaused)
         } catch let failure as ActionPerformFailure {
-            if entry.source.replace == true {
+            if entry.source.isReplacement {
                 do { try activity.assertNotPaused(lease: lease) }
                 catch {
                     let error: ActionExecutionError? = failure.inputStarted ? .unknownOutcome : nil
@@ -1745,7 +1752,7 @@ private func popupPointerPlanClickPoint(_ authority: ForegroundTakeoverPlanAutho
           action.elementIndex == nil, action.modifiers.isEmpty,
           action.endX == nil, action.endY == nil, action.text == nil, action.key == nil,
           action.deltaX == nil, action.deltaY == nil, action.durationMS == nil,
-          action.checked == nil, action.replace == nil,
+          action.checked == nil, !action.isReplacement,
           guardMatchesExactTarget(guardValue, target),
           sameSnapshotIdentity(authority.snapshotGuard, guardValue),
           guardValue.focusedRootPreference == .selectedWindow,
@@ -1797,7 +1804,7 @@ func popupPointerClickEntriesMatch(
           action.elementIndex == nil, action.modifiers.isEmpty,
           action.endX == nil, action.endY == nil, action.text == nil, action.key == nil,
           action.deltaX == nil, action.deltaY == nil, action.durationMS == nil,
-          action.checked == nil, action.replace == nil,
+          action.checked == nil, !action.isReplacement,
           let x = action.x, let y = action.y, x.isFinite, y.isFinite,
           x > 0, y > 0, x < expected.bounds.width, y < expected.bounds.height,
           entries.count == 1, let entry = entries.first,

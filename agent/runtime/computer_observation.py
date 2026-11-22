@@ -220,7 +220,7 @@ def _catalog_windows_may_overlap(first, second):
     )
 
 
-def window_transition(apps, bundle_id, old_identity, prior_identities):
+def window_transition(apps, bundle_id, old_identity, prior_identities, *, parent_identity=None):
     """Return catalog evidence and an observation suggestion, never a selected target."""
     matches = [a for a in apps[:100] if isinstance(a, Mapping) and bundle_id and a.get("bundle_id") == bundle_id]
     if len(matches) != 1:
@@ -243,8 +243,31 @@ def window_transition(apps, bundle_id, old_identity, prior_identities):
     }
     if old_identity and present and new:
         result["status"] = "new_window_observed"
-    candidate = new[0] if len(new) == 1 else None
-    if old_identity and not present and not new:
+    # A new unlabelled popup remains a possible observation on older helpers.
+    # Explicit attachment to a different document rules that suggestion out.
+    candidate = new[0] if len(new) == 1 and not new[0].get("parent_window_identity_ref") else None
+    if new and all(w.get("parent_window_identity_ref") and w["parent_window_identity_ref"] != old_identity for w in new):
+        result["observation_reason"] = "sheet_belongs_to_other_window"
+    if present:
+        attached = [w for w in new if w.get("parent_window_identity_ref") == old_identity]
+        if len(attached) == 1:
+            candidate = attached[0]
+            result["observation_reason"] = "attached_sheet"
+        elif len(attached) > 1:
+            result["observation_reason"] = "ambiguous_attached_sheets"
+            return result
+    if not present and parent_identity:
+        parents = [w for w in windows if w.get("bindable") is True and w.get("window_identity_ref") == parent_identity]
+        if len(parents) != 1:
+            result["observation_reason"] = "sheet_parent_unavailable"
+            return result
+        visible_sheets = [w for w in windows if w.get("parent_window_identity_ref") == parent_identity]
+        if visible_sheets:
+            result["observation_reason"] = "sheet_parent_still_covered"
+            return result
+        candidate = parents[0]
+        result["observation_reason"] = "sheet_parent"
+    if old_identity and not present and not new and not parent_identity:
         remaining = [w for w in windows if w.get("bindable") is True and w.get("window_identity_ref")]
         if len(remaining) == 1:
             candidate = remaining[0]

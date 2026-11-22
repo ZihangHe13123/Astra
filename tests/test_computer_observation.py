@@ -291,6 +291,48 @@ def test_closed_modal_does_not_guess_among_old_windows_or_without_old_identity()
         assert "next_observation" not in window_transition(apps, "test", old, {"parent", "other", "modal"})
 
 
+def test_attached_sheet_transition_uses_parent_identity_among_simultaneous_windows():
+    apps = catalog(identities=("parent", "sheet", "sibling"))
+    windows = apps[0]["windows"]
+    windows[1]["parent_window_identity_ref"] = "parent"
+    transition = window_transition(apps, "test", "parent", {"parent"})
+    assert transition["observation_reason"] == "attached_sheet"
+    assert transition["next_observation"]["arguments"]["window_ref"] == "ref-sheet"
+    windows[2]["parent_window_identity_ref"] = "parent"
+    ambiguous = window_transition(apps, "test", "parent", {"parent"})
+    assert ambiguous["observation_reason"] == "ambiguous_attached_sheets"
+    assert "next_observation" not in ambiguous
+
+
+def test_new_sheet_of_another_document_does_not_become_the_pending_action_target():
+    apps = catalog(identities=("parent", "other", "unrelated-sheet"))
+    for window in apps[0]["windows"]:
+        window["title"] = "Review"
+    apps[0]["windows"][-1]["parent_window_identity_ref"] = "other"
+    transition = window_transition(apps, "test", "parent", {"parent", "other"})
+    assert transition["observation_reason"] == "sheet_belongs_to_other_window"
+    assert "next_observation" not in transition
+    # A disappearing sheet still leads back to its own bound parent.
+    closed = window_transition(apps, "test", "closed", {"parent", "other", "closed"}, parent_identity="parent")
+    assert closed["next_observation"]["arguments"]["window_ref"] == "ref-parent"
+    # Legacy catalogs lack the contradicting relation and retain their suggestion.
+    del apps[0]["windows"][-1]["parent_window_identity_ref"]
+    legacy = window_transition(apps, "test", "parent", {"parent", "other"})
+    assert legacy["next_observation"]["arguments"]["window_ref"] == "ref-unrelated-sheet"
+
+
+def test_closed_sheet_recovers_its_actual_parent_among_other_documents():
+    apps = catalog(identities=("parent", "sibling"))
+    def closed():
+        return window_transition(apps, "test", "sheet", {"parent", "sibling", "sheet"}, parent_identity="parent")
+    assert closed()["next_observation"]["arguments"]["window_ref"] == "ref-parent"
+    assert closed()["observation_reason"] == "sheet_parent"
+    apps[0]["windows"][1]["parent_window_identity_ref"] = "parent"
+    assert "next_observation" not in closed()
+    apps[0]["windows"].pop(0)
+    assert "next_observation" not in closed()
+
+
 def test_transition_can_reobserve_exact_surviving_target_with_fresh_refs():
     result = window_transition(catalog(identities=("old", "other")), "test", "old", {"old", "other"})
     assert result["status"] == "target_still_present"

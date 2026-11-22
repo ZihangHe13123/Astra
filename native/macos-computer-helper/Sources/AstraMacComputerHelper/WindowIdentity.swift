@@ -12,11 +12,16 @@ private let axWindowIDFunction: AXWindowIDFunction? = {
 }()
 
 func observedAXWindowID(_ element: AXUIElement) -> CGWindowID? {
-    // A sheet may report its parent's ID. Keep the independently proven sheet
-    // ownership/focus path; this bridge is only for actual AXWindow objects.
     let role = AXNodeReader.stringAttribute(element, kAXRoleAttribute)
-    guard role.status == .complete, role.value == kAXWindowRole else { return nil }
-    return observedAXBackingWindowID(element)
+    guard role.status == .complete else { return nil }
+    if role.value == kAXWindowRole { return observedAXBackingWindowID(element) }
+    // AppKit sometimes assigns a sheet its own CG surface while leaving AXTitle empty.
+    // A composited sheet can instead return an ancestor's number.
+    guard role.value == kAXSheetRole, let pid = observedAXPID(element),
+          let id = observedAXBackingWindowID(element),
+          attachedSheetRoot(element, pid: pid, excludingBackingID: id) != nil
+    else { return nil }
+    return id
 }
 
 // Use a sheet's raw backing surface only with independent exact AX focus/attachment proof.

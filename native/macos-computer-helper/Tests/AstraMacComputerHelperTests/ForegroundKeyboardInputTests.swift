@@ -58,7 +58,7 @@ import Testing
 
     fixture.focus = fixture.expectedFocus
     fixture.secureInput.enabled = true
-    #expect(throws: ActionExecutionError.secureTarget) {
+    #expect(throws: ActionExecutionError.secureInputActive) {
         _ = try fixture.executor.preflight(
             expected: fixture.guardValue,
             application: fixture.application,
@@ -530,7 +530,7 @@ func foregroundNamedInputWithoutTargetAuthorityCannotBecomeWindowInput(kind: Str
             lease: fixture.lease
         )
 
-        #expect(result.error == .secureTarget)
+        #expect(result.error == (transition == .secureOrIndeterminate ? .keyboardFocusUnverified : .secureTarget))
         #expect(result.lastAcknowledgedAction == -1)
         #expect(fixture.poster.events.isEmpty)
     }
@@ -598,6 +598,75 @@ func foregroundNamedInputWithoutTargetAuthorityCannotBecomeWindowInput(kind: Str
         .virtualKeyUp(36, []),
     ])
     #expect(fixture.heldInputs.heldCount == 0)
+}
+
+@Test func selectedRangeUnicodeUsesOnePairWithFreshProofAndVerifiesTheResult() throws {
+    let action = try NativeAction.parse(.object(["type": .string("type"), "element_ref": .string("field"),
+        "target_text": .string("pending"), "text": .string("已审🙂")]))
+    for scenario in ["missing", "moved", "changed", "verified"] {
+        let fixture = KeyboardExecutorFixture()
+        let entry = keyboardEntry(action, targetKeyboardFocus: fixture.expectedFocus)
+        let plan = try fixture.executor.preflight(expected: fixture.guardValue, application: fixture.application,
+            marker: fixture.lease.marker, entries: [entry])
+        var validations = 0
+        var observations = 0
+        let witness = AXKeyboardRangeWitness(beforeInput: {
+            validations += 1
+            if scenario == "moved" { throw ActionExecutionError.textSelectionRequired }
+        }, afterInput: {
+            observations += 1
+            return scenario == "verified"
+        })
+        let result = fixture.executor.executePrepared(sourceIndex: 0, from: plan, expected: fixture.guardValue,
+            lease: fixture.lease, rangeWitness: scenario == "missing" ? nil : witness)
+        if scenario == "moved" || scenario == "missing" {
+            #expect(result.error == (scenario == "missing" ? .invalidAction : .textSelectionRequired))
+            #expect(fixture.poster.events.isEmpty && observations == 0)
+        } else {
+            #expect(validations == 1 && observations == 1)
+            #expect(fixture.poster.events.map(\.event) == [.unicodeKeyDown(Array("已审🙂".utf16)), .unicodeKeyUp(Array("已审🙂".utf16))])
+            #expect(result.outcomes.first?.effectVerification == (scenario == "verified" ? .verified : .unverified))
+            #expect(result.outcomes.first?.observationRequired == (scenario == "changed"))
+        }
+    }
+}
+
+@Test func selectedRangeUnicodeRevalidatesDeliveryAfterReadingTheSelection() throws {
+    let action = try NativeAction.parse(.object(["type": .string("type"), "element_ref": .string("field"),
+        "target_text": .string("pending"), "text": .string("reviewed")]))
+    for secureInputChanged in [false, true] {
+        let fixture = KeyboardExecutorFixture()
+        let entry = keyboardEntry(action, targetKeyboardFocus: fixture.expectedFocus)
+        let plan = try fixture.executor.preflight(expected: fixture.guardValue, application: fixture.application,
+            marker: fixture.lease.marker, entries: [entry])
+        let witness = AXKeyboardRangeWitness(beforeInput: {
+            if secureInputChanged { fixture.secureInput.enabled = true }
+            else {
+                fixture.focus = KeyboardFocusAuthority(identityToken: "different-field", bounds: fixture.focus.bounds,
+                    role: fixture.focus.role, subrole: fixture.focus.subrole)
+            }
+        }, afterInput: { true })
+        let result = fixture.executor.executePrepared(sourceIndex: 0, from: plan, expected: fixture.guardValue,
+            lease: fixture.lease, rangeWitness: witness)
+        #expect(result.outcomes.first?.inputDiagnostics?.inputMayHaveStarted == false)
+        #expect(fixture.poster.events.isEmpty)
+    }
+}
+
+@Test func selectedRangeUnicodeReportsHandoffDuringEffectVerification() throws {
+    let activity = KeyboardActivity()
+    let fixture = KeyboardExecutorFixture(activity: activity)
+    let action = try NativeAction.parse(.object(["type": .string("type"), "element_ref": .string("field"),
+        "target_text": .string("old"), "text": .string("new")]))
+    let plan = try fixture.executor.preflight(expected: fixture.guardValue, application: fixture.application,
+        marker: fixture.lease.marker, entries: [keyboardEntry(action, targetKeyboardFocus: fixture.expectedFocus)])
+    let witness = AXKeyboardRangeWitness(beforeInput: {}, afterInput: { activity.paused = true; return true })
+    let result = fixture.executor.executePrepared(sourceIndex: 0, from: plan, expected: fixture.guardValue,
+        lease: fixture.lease, rangeWitness: witness)
+    #expect(fixture.poster.events.count == 2)
+    #expect(result.error == .unknownOutcome && result.cooperativeError == .userActivityPaused)
+    #expect(result.outcomes.first?.effectVerification != .verified)
+    #expect(result.outcomes.first?.inputDiagnostics?.inputMayHaveStarted == true)
 }
 
 @Test func foregroundKeyboardTextUsesBalancedUnicodePairsAndPausesBetweenCharacters() throws {
@@ -788,7 +857,7 @@ func foregroundNamedInputWithoutTargetAuthorityCannotBecomeWindowInput(kind: Str
     fixture.secureInput.enabled = true
     let blindGuard = fixture.guardValue.replacingKeyboardFocus(nil)
     let entry = keyboardEntry(.type(text: "hi"))
-    #expect(throws: ActionExecutionError.secureTarget) {
+    #expect(throws: ActionExecutionError.secureInputActive) {
         _ = try fixture.executor.preflight(
             expected: blindGuard,
             application: fixture.application,
@@ -1307,7 +1376,7 @@ private final class KeyboardActivity: UserActivityMonitoring {
     fixture.secureInput.enabled = true
     let result = fixture.executor.executePrepared(sourceIndex: 0, from: plan,
         expected: fixture.guardValue, lease: fixture.lease)
-    #expect(result.error == .secureTarget)
+    #expect(result.error == .secureInputActive)
     #expect(fixture.poster.events.isEmpty)
 }
 

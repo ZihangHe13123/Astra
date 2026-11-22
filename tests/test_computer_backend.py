@@ -4617,6 +4617,27 @@ def _native_catalog_result():
     }
 
 
+def test_native_catalog_preserves_verified_sheet_parent_and_match_diagnostics():
+    result = _native_catalog_result()
+    windows = result["apps"][0]["windows"]
+    parent = windows[0]["window_identity_ref"]
+    windows.append({**windows[0], "window_ref": "sheet-ref", "window_identity_ref": "sheet-id",
+                    "parent_window_identity_ref": parent, "title": ""})
+    windows[2]["binding_reason"] = "window_bounds_mismatch"
+    transport = StaticTransport(ComputerResponse("unused", ok=True))
+
+    async def request(request):
+        return ComputerResponse(request.request_id, ok=True, result=result)
+
+    transport.request = request
+    catalog = run(MacComputerBackend(transport).apps())
+    assert catalog.apps[0]["windows"][-1]["parent_window_identity_ref"] == parent
+    assert catalog.apps[0]["windows"][2]["binding_reason"] == "window_bounds_mismatch"
+    windows[-1]["parent_window_identity_ref"] = "other-app-window"
+    with pytest.raises(HelperTransportError, match="malformed app catalog"):
+        run(MacComputerBackend(transport).apps())
+
+
 def _malformed_nested_catalog_results():
     results = []
 

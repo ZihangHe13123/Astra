@@ -2522,8 +2522,44 @@ private final class InputDispatcherSyntheticPosterSpy: SyntheticInputPosting {
     #expect(performer.performed.isEmpty)
 }
 
+@Test func wholeFieldReplacePreservesLegacyIMEFallbackSignal() throws {
+    let performer = InputDispatcherPerformerSpy()
+    let dispatcher = InputDispatcher(performer: performer,
+        backgroundTextInputSafety: InputDispatcherTextSafety(.imeOrCandidate))
+    let action = try NativeAction.parse(.object(["type": .string("type"), "text": .string("更新"),
+        "replace": .bool(true), "element_ref": .string("text")]))
+    let background = try dispatcher.plan(actions: [action], context: DispatchContext(guardValue: inputDispatcherBackgroundGuard()))
+    #expect(background.cooperativeError == .backgroundActionUnsupported)
+    #expect(performer.performed.isEmpty)
+}
+
+@Test func localRangePlanBindsArgumentsAndOnlyBorrowsFocusWhenRequired() throws {
+    let performer = InputDispatcherPerformerSpy()
+    let dispatcher = InputDispatcher(performer: performer,
+        backgroundTextInputSafety: InputDispatcherTextSafety(.safeASCIIKeyboardLayout))
+    let action = try NativeAction.parse(.object(["type": .string("type"), "text": .string("new"),
+        "target_text": .string("old"), "prefix": .string("DR-731 "), "element_ref": .string("text")]))
+    let context = DispatchContext(guardValue: inputDispatcherBackgroundGuard())
+    #expect(throws: ActionExecutionError.textRangeUnsupported) { try dispatcher.plan(actions: [action], context: context) }
+    let protected = try NativeAction.parse(.object(["type": .string("type"), "text": .string("new"),
+        "target_text": .string("old"), "element_ref": .string("secure")]))
+    #expect(throws: ActionExecutionError.secureTarget) { try dispatcher.plan(actions: [protected], context: context) }
+    performer.rangePreflight = .settable
+    let plan = try dispatcher.plan(actions: [action], context: context)
+    #expect(!plan.requiresTakeover && plan.backends == [.axSelectedText])
+    #expect(!plan.matches(actions: [.type(text: "new", elementRef: "text")]))
+    performer.focusedKeyboardElementError = .inputFocusRequired
+    let takeover = try dispatcher.plan(actions: [action], context: context)
+    #expect(takeover.requiresTakeover)
+    let ime = InputDispatcher(performer: performer, backgroundTextInputSafety: InputDispatcherTextSafety(.imeOrCandidate))
+    #expect(throws: ActionExecutionError.textInputSourceUnverified) { try ime.plan(actions: [action], context: context) }
+    #expect(performer.performed.isEmpty)
+}
+
 private final class InputDispatcherPerformerSpy: ActionProviding {
     var replacementPreflight: AXTextMutationPreflight = .unsupported
+    var rangePreflight: AXTextMutationPreflight = .unsupported
+    func preflightAXRangeReplacement(_ element: ActionElement, matching: AXTextMatch) -> AXTextMutationPreflight { rangePreflight }
     func preflightAXTextReplacement(_ element: ActionElement) -> AXTextMutationPreflight { replacementPreflight }
     var performed: [ResolvedAction] = []
     var state = ActionTargetState(

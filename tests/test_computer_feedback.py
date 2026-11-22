@@ -61,6 +61,7 @@ def refused(code, outcome_code=None):
 
 @pytest.mark.parametrize("code", [
     "input_focus_required", "stale_snapshot", "target_not_frontmost", "target_gone", "secure_target", "out_of_bounds",
+    "secure_input_active", "keyboard_focus_unverified", "control_disabled",
     # Live Finder 2026-09-23: the app refused AXPress on a suggestion item before acting.
     "accessibility_action_refused",
 ])

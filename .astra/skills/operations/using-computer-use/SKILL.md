@@ -45,9 +45,7 @@ description: Use when controlling macOS interfaces with computer_* tools.
    window, action class, effect, and boundary; does not require a filesystem destination. Exclude
    typed text, secure values, internal refs, session IDs, request-local screenshot,
    cache paths, and helper paths.
-7. Real-pointer actions need an exact bundle/version/action cell; evidence never
-   transfers. Virtual-cursor plans restore cursor/prior app. Failed evidence stays
-   disabled; never use global HID fallback.
+7. Real-pointer actions 须匹配精确 bundle/version/action。虚拟指针用毕归还光标与原应用，实测失败的路径保持禁用，禁止 global HID fallback。
    `docs/macos-computer-compatibility-evidence.md`.
 8. After `unknown_outcome`, timeout, cancellation, or helper loss, never retry or replay
    an unacknowledged semantic action—even if a fresh snapshot looks unchanged.
@@ -91,7 +89,7 @@ Finder 翻页/关标签、WPS 保存/目录/输入法任务，再读取 [文件�
 
 - 语义按钮回执成功却没有效果，不连续重复 AXPress，也不默认改用未获支持的快捷键。正常授权下选择菜单等已观察到的新动作；未知结果仍遵守 no-replay。
 - 坐标默认是窗口相对逻辑坐标；若依据本次返回图片选点，明确传 coordinate_space="image_pixels"，工具按 published_image_size 转换。不可使用旧 Appshot 的屏幕坐标。优先用 `target_element_ref` 绑定具体目标控件。前台视觉坐标可省略引用，由最新快照限定窗口；引用失效必须重新观察。没有效果时不凭标题栏高度猜偏移、读取旧 AX 缓存再点，或改用全局 Tab/Return 重试。`action_observation` 仅提供匹配控件的值变化或目标标签仍在的证据；`unchanged` 不授权重放，`unknown` 不等于未执行，树里没有标签也不是关闭证明。
-- `post_action_observation_pending`／`next_step=follow_recovery`：动作已确认但没有返回新观察，后续界面未确认，不等于输入失败或保存成功。按本结果 Recovery 走（弹窗切换时即 `window_transition.next_observation`），不按 observe_result 截图；建议本身不授予权限，不重放原动作。
+- `post_action_observation_pending`／`next_step=follow_recovery`：动作已确认但没有返回新观察，后续界面未确认，不等于输入失败或保存成功。按本结果 Recovery 走（附属弹窗及返回父窗时取 `window_transition.next_observation`），不按 observe_result 截图；建议本身不授予权限，不重放原动作。
 
 ## Common Mistakes
 
@@ -111,6 +109,7 @@ Finder 翻页/关标签、WPS 保存/目录/输入法任务，再读取 [文件�
 - 首次切换到 CU 后尽早完成一个实际字段并读回，确认输入通道可用，再扩展到其余字段。
 - 优先点击题号导航或已观察到的定位控件；图片数字首次读清后记录为结构化数据，只对仍不清楚的部分重新观察。不要反复宣称已确认又从头滚动。
 - 快照失效不等于时间超期；按回执重新观察，不猜测原因。
+- 精确改词用 `type` 的 `target_text` 与 `text`，重复词加紧邻的 `prefix` 或 `suffix`，核对读回。
 - 长文本一次提交，由工具分块；不要先写剪贴板再尝试粘贴。未知结果时观察并交接，不自动补打未确认的部分。
 
 `overlay_blocked`：遮挡未变停止重试。`no_suspended_target`：无目标可恢复。绑定同因失败两次即停止。`verified=false` 不得称逐字通过且空白等价与旧题图均须单列证据边界。

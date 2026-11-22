@@ -39,3 +39,20 @@ def test_replacement_capability_is_explicit_and_not_inferred():
     assert observation_capabilities({"observation_capabilities": ["replace_text_v1"]}) == ["replace_text_v1"]
     assert "replace_text_v1" not in observation_capabilities({})
     assert "replace_text_v1" not in observation_capabilities({"observation_capabilities": "replace_text_v1"})
+
+
+@pytest.mark.parametrize("replacement", ["", "已审 ✅"])
+def test_range_replacement_round_trip(replacement):
+    payload = {"type": "type", "text": replacement, "element_ref": "fresh:body", "target_text": "待审",
+               "prefix": "DR-731：", "suffix": "。"}
+    assert not ToolRegistry._schema_errors(ACTION_SCHEMA, payload, strict=True)
+    assert ComputerAction.from_mapping(payload).to_mapping() == payload
+
+
+@pytest.mark.parametrize("changes", [
+    {"target_text": ""}, {"target_text": None}, {"element_ref": None}, {"replace": True}, {"prefix": False},
+    {"suffix": None}, {"x": 1}, {"element_index": 1}, {"modifiers": []}, {"type": "click"}, {"target_text": "\ud800"},
+])
+def test_range_replacement_rejects_unbound_or_ambiguous_shapes(changes):
+    with pytest.raises(ValueError):
+        ComputerAction.from_mapping({"type": "type", "text": "new", "element_ref": "body", "target_text": "old", **changes})

@@ -213,17 +213,49 @@ func catalogAXWindowRecords(pid: pid_t) -> [CatalogAXWindowRecord] {
     }
 }
 
-func matchingCatalogAXWindow(target: WindowTarget, records: [CatalogAXWindowRecord]) -> AXUIElement? {
-    guard target.windowID != 0 else { return nil }
+func matchingCatalogAXWindow(target: WindowTarget, records: [CatalogAXWindowRecord],
+                             onMismatch: (String) -> Void = { _ in }) -> AXUIElement? {
+    func missing(_ reason: String) -> AXUIElement? { onMismatch(reason); return nil }
+    guard target.windowID != 0 else { return missing("window_id_missing") }
     let exact = records.filter { $0.windowID == target.windowID }
-    guard exact.count <= 1 else { return nil }
+    guard exact.count <= 1 else { return missing("multiple_ax_matches") }
     let candidates = exact.isEmpty ? records.filter { $0.windowID == nil } : exact
-    let matches = candidates.filter {
-        screenCaptureBoundsMatchAXBounds(screenCapture: target.bounds, accessibility: $0.bounds) &&
+    guard !candidates.isEmpty else { return missing("no_ax_candidate") }
+    let sameBounds = candidates.filter {
+        screenCaptureBoundsMatchAXBounds(screenCapture: target.bounds, accessibility: $0.bounds)
+    }
+    guard !sameBounds.isEmpty else { return missing("window_bounds_mismatch") }
+    let matches = sameBounds.filter {
         ($0.windowID != nil || ($0.title.status == .complete &&
         windowTitlesMatch(screenCaptureTitle: target.title, accessibilityTitle: $0.title.value ?? ""))) &&
         (target.axIdentity == nil || target.axIdentity == CFHash($0.element)) &&
         (target.axElement == nil || CFEqual(target.axElement!, $0.element))
     }
-    return matches.count == 1 ? matches[0].element : nil
+    guard matches.count == 1 else {
+        return missing(matches.isEmpty ? "ax_identity_metadata_mismatch" : "multiple_ax_matches")
+    }
+    return matches[0].element
+}
+
+
+func requestsCatalogRelations(_ payload: JSONValue) -> Bool {
+    guard case let .object(options) = payload, case .bool(true)? = options["window_catalog_relations"] else { return false }
+    return true
+}
+
+/// Protocol v4 clients validate every window key, so extensions are sent only on request.
+func catalogForClient(_ catalog: JSONValue, payload: JSONValue) -> JSONValue {
+    if requestsCatalogRelations(payload) { return catalog }
+    guard case var .object(result) = catalog, case let .array(apps)? = result["apps"] else { return catalog }
+    result["apps"] = .array(apps.map { app in
+        guard case var .object(fields) = app, case let .array(windows)? = fields["windows"] else { return app }
+        fields["windows"] = .array(windows.map { window in
+            guard case var .object(values) = window else { return window }
+            values.removeValue(forKey: "parent_window_identity_ref")
+            values.removeValue(forKey: "binding_reason")
+            return .object(values)
+        })
+        return .object(fields)
+    })
+    return .object(result)
 }

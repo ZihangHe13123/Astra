@@ -545,6 +545,7 @@ final class Dispatcher {
                 result: .object([
                     "supported": .bool(true),
                     "build_identity": bundledHelperBuildIdentity(),
+                    "window_catalog_relations": .bool(true),
                     "permissions": .object([
                         "accessibility": .bool(permissions.accessibilityTrusted),
                         "screen_recording": .bool(permissions.screenRecordingAllowed),
@@ -556,17 +557,21 @@ final class Dispatcher {
             return success(requestID: request.requestID, result: .object(["closed": .bool(true)]))
         case "apps":
             do {
-                return success(requestID: request.requestID, result: try windows.apps())
+                let result = try windows.apps()
+                return success(requestID: request.requestID, result: catalogForClient(result, payload: request.payload))
             } catch {
                 return observationFailure(requestID: request.requestID, error: error)
             }
         case "presentation_apps", "cancel_presentation":
-            guard let values = exactPayload(request.payload, keys: ["takeover_ref"]),
+            let extended = request.operation == "presentation_apps" && requestsCatalogRelations(request.payload)
+            let keys: Set<String> = extended ? ["takeover_ref", "window_catalog_relations"] : ["takeover_ref"]
+            guard let values = exactPayload(request.payload, keys: keys),
                   let takeoverRef = boundedReference(values["takeover_ref"])
             else { return Self.failure(requestID: request.requestID, message: "\(request.operation) requires takeover_ref") }
             do {
                 if request.operation == "presentation_apps" {
-                    return success(requestID: request.requestID, result: try windows.presentationApps(takeoverRef: takeoverRef))
+                    let result = try windows.presentationApps(takeoverRef: takeoverRef)
+                    return success(requestID: request.requestID, result: catalogForClient(result, payload: request.payload))
                 }
                 let outcome = try windows.cancelPresentation(takeoverRef: takeoverRef)
                 guard !outcome.cleanupFailed else { throw TakeoverError.cleanupFailed }
@@ -916,6 +921,15 @@ final class Dispatcher {
         case .staleSnapshot: return "snapshot or element reference is stale"
         case .outOfBounds: return "action coordinates are outside the target window"
         case .secureTarget: return "automatic interaction with a secure target is prohibited"
+        case .secureInputActive: return "macOS Secure Event Input is active"
+        case .textSelectionRequired: return "use the application's Find interface to select the exact requested text in the editor"
+        case .textMatchNotFound: return "no exact occurrence matches the target and adjacent text"
+        case .textMatchAmbiguous: return "multiple occurrences match; use more adjacent context"
+        case .textInputSourceUnverified: return "the current input source does not establish that direct accessibility text edits are safe"
+        case .textRangeUnsupported: return "the field cannot be read or edited as a verified text range"
+        case .observationRequired: return "inspect the application before continuing this action batch"
+        case .keyboardFocusUnverified: return "the keyboard target's identity or accessibility metadata could not be verified"
+        case .controlDisabled: return "the target control is disabled"
         case .inputFocusRequired: return "the intended input element is not focused"
         case .actionTimeout: return "action did not complete within its bound"
         case .helperFailed: return "native action failed"

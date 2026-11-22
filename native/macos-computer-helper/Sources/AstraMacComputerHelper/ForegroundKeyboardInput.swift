@@ -280,10 +280,12 @@ final class ForegroundKeyboardExecutor {
         expected: ActionGuard,
         lease: UserActivitySessionLease,
         batchDeadline: TimeInterval? = nil,
-        batchInputStarted: Bool = false
+        batchInputStarted: Bool = false,
+        rangeWitness: AXKeyboardRangeWitness? = nil
     ) -> PIDTargetedActionResult {
         let deadline = min(now() + max(0, actionTimeout), batchDeadline ?? plan.deadline)
         guard let action = plan.actions[sourceIndex] else { return stopped(error: .invalidAction) }
+        guard (action.entry.source.textMatch != nil) == (rangeWitness != nil) else { return stopped(error: .invalidAction) }
         do {
             var observationRequired = false
             switch action.payload {
@@ -315,7 +317,8 @@ final class ForegroundKeyboardExecutor {
                             deadline: deadline,
                             lease: lease,
                             textInputStarted: inputStarted,
-                            proveBoundField: batchInputStarted
+                            proveBoundField: batchInputStarted,
+                            beforeKeyDown: rangeWitness?.beforeInput
                         )
                         observationRequired = observationRequired || needsObservation
                         inputStarted = true
@@ -335,9 +338,25 @@ final class ForegroundKeyboardExecutor {
                     }
                 }
             }
+            var effect: ActionEffectVerification?
+            if let rangeWitness {
+                // Input was already posted. An unreadable or unexpected result requires a new
+                // observation and must never cause the text event to be replayed.
+                let verified: Bool
+                do {
+                    try activity.assertNotPaused(lease: lease)
+                    let matches = (try? rangeWitness.afterInput()) == true
+                    try activity.assertNotPaused(lease: lease)
+                    verified = matches && now() <= deadline
+                } catch {
+                    throw KeyboardPauseFailure(inputStarted: true, cleanupFailed: false, stage: .afterKeyUp)
+                }
+                effect = verified ? .verified : .unverified
+                observationRequired = observationRequired || !verified
+            }
             return PIDTargetedActionResult(
                 outcomes: [ActionOutcome(index: sourceIndex, ok: true, error: nil,
-                    observationRequired: observationRequired)],
+                    effectVerification: effect, observationRequired: observationRequired)],
                 lastAcknowledgedAction: sourceIndex,
                 error: nil,
                 cooperativeError: nil
@@ -414,6 +433,7 @@ final class ForegroundKeyboardExecutor {
             )
         case .type:
             guard let text = entry.source.text,
+                  entry.source.textMatch == nil || entry.source.supportsSelectedUnicodeEvent,
                   text.unicodeScalars.count <= maximumNativeTextCharacters,
                   (genericForegroundEnabled || compatibility.allows(application: application, backend: .foregroundKeyboard, action: .text)),
                   (genericForegroundEnabled || compatibility.allowsTextEntry(application: application))
@@ -421,7 +441,7 @@ final class ForegroundKeyboardExecutor {
             return PreparedAction(
                 entry: entry,
                 intent: .textEntry,
-                payload: .text(unicodeChunks(text)),
+                payload: .text(entry.source.textMatch == nil ? unicodeChunks(text) : [Array(text.utf16)]),
                 targetKeyboardFocus: entry.targetKeyboardFocus
             )
         case .click, .rightClick, .doubleClick, .scroll, .drag, .wait:
@@ -473,7 +493,8 @@ final class ForegroundKeyboardExecutor {
         deadline: TimeInterval,
         lease: UserActivitySessionLease,
         textInputStarted: Bool = false,
-        proveBoundField: Bool = false
+        proveBoundField: Bool = false,
+        beforeKeyDown: (() throws -> Void)? = nil
     ) throws -> Bool {
         let token = UUID()
         let scope: HeldInputScope
@@ -489,6 +510,10 @@ final class ForegroundKeyboardExecutor {
             try activity.performPIDEvent(
                 lease: lease,
                 validate: {
+                    // A range witness checks the exact field before reading its document and
+                    // selection. Those AX reads may block. Revalidate the current delivery
+                    // target and Secure Event Input after the witness, just before posting.
+                    try beforeKeyDown?()
                     focusChanged = try self.validateEvent(
                         action: action,
                         application: application,
@@ -497,6 +522,7 @@ final class ForegroundKeyboardExecutor {
                         allowTextGeometryTransition: textInputStarted,
                         proveBoundField: proveBoundField
                     )
+                    guard self.now() <= deadline else { throw ActionExecutionError.actionTimeout }
                 },
                 mutation: {
                     stage = .keyDown
@@ -637,7 +663,7 @@ final class ForegroundKeyboardExecutor {
         // 每次投递前复核，避免 preflight 后焦点进入安全字段；不要求焦点 identity 匹配。
         if expected.keyboardFocus == nil, expected.interactionMode == .foregroundTakeover {
             guard !secureInput.isSecureInputEnabled() else {
-                throw ActionExecutionError.secureTarget
+                throw ActionExecutionError.secureInputActive
             }
             switch try currentObservation() {
             case .secure:
@@ -652,16 +678,17 @@ final class ForegroundKeyboardExecutor {
             }
         } else {
             guard let expectedFocus = expected.keyboardFocus else { throw ActionExecutionError.staleSnapshot }
-            guard !expectedFocus.isSecure, !secureInput.isSecureInputEnabled() else {
-                throw ActionExecutionError.secureTarget
-            }
+            guard !expectedFocus.isSecure else { throw ActionExecutionError.secureTarget }
+            guard !secureInput.isSecureInputEnabled() else { throw ActionExecutionError.secureInputActive }
             let currentFocus: KeyboardFocusAuthority
             switch try currentObservation() {
             case let .authority(value):
                 guard !value.isSecure else { throw ActionExecutionError.secureTarget }
                 currentFocus = value
-            case .secure, .secureOrIndeterminate:
+            case .secure:
                 throw ActionExecutionError.secureTarget
+            case .secureOrIndeterminate:
+                throw ActionExecutionError.keyboardFocusUnverified
             case .stale:
                 logActionRejected("KEY-VALIDATE focus observation stale")
                 throw ActionExecutionError.staleSnapshot
@@ -691,7 +718,7 @@ final class ForegroundKeyboardExecutor {
                     guard !currentFocus.role.isEmpty,
                           currentFocus.role.lowercased() != "axunknown",
                           currentFocus.subrole?.lowercased() != "axunknown"
-                    else { throw ActionExecutionError.secureTarget }
+                    else { throw ActionExecutionError.keyboardFocusUnverified }
                     focusChanged = true
                     return true
                 }

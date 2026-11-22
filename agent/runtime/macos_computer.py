@@ -137,7 +137,7 @@ def _decode_catalog_apps(value: object) -> tuple[dict[str, object], ...]:
     window_count = 0
     required_app_keys = {"app_ref", "name", "bundle_id", "app_version", "windows"}
     required_window_keys = {"window_ref", "title", "bounds", "bindable", "binding_status"}
-    optional_window_keys = {"document_path", "window_identity_ref"}
+    optional_window_keys = {"document_path", "window_identity_ref", "parent_window_identity_ref", "binding_reason"}
 
     for application in value:
         if not isinstance(application, Mapping) or set(application) != required_app_keys:
@@ -222,7 +222,27 @@ def _decode_catalog_apps(value: object) -> tuple[dict[str, object], ...]:
                 decoded_window["document_path"] = document_path
             if identity_ref is not None:
                 decoded_window["window_identity_ref"] = identity_ref
+            if "parent_window_identity_ref" in window:
+                parent = window["parent_window_identity_ref"]
+                if not bindable or parent == identity_ref or not _valid_catalog_string(
+                    parent, _MAX_CATALOG_REFERENCE_SCALARS, nonempty=True,
+                ):
+                    raise ValueError("malformed sheet parent identity")
+                decoded_window["parent_window_identity_ref"] = parent
+            if "binding_reason" in window:
+                reason = window["binding_reason"]
+                if binding_status != "ax_window_unmatched" or reason not in {
+                    "window_id_missing", "multiple_ax_matches", "no_ax_candidate",
+                    "window_bounds_mismatch", "ax_identity_metadata_mismatch",
+                }:
+                    raise ValueError("malformed window binding reason")
+                decoded_window["binding_reason"] = reason
             decoded_windows.append(decoded_window)
+
+        app_identities = {entry["window_identity_ref"] for entry in decoded_windows if "window_identity_ref" in entry}
+        if any(entry["parent_window_identity_ref"] not in app_identities for entry in decoded_windows
+               if "parent_window_identity_ref" in entry):
+            raise ValueError("sheet parent not in same application catalog")
 
         decoded_apps.append({
             "app_ref": app_ref,
@@ -619,10 +639,13 @@ class MacComputerBackend:
     def __init__(self, transport: _RequestTransport) -> None:
         self._transport = transport
         self._catalog: ComputerAppCatalog | None = None
+        self._window_catalog_relations = False
 
     async def status(self) -> dict[str, object]:
         response = await self._request("status", {})
-        return self._required_result(response)
+        result = self._required_result(response)
+        self._window_catalog_relations = result.get("window_catalog_relations") is True
+        return result
 
     async def bind_artifact_directory(self, directory_fd: int) -> None:
         configure = getattr(self._transport, "configure_artifact_directory", None)
@@ -641,10 +664,13 @@ class MacComputerBackend:
             await configured
 
     async def apps(self) -> ComputerAppCatalog:
-        return self._publish_catalog(await self._request("apps", {}))
+        return self._publish_catalog(await self._request("apps", {"window_catalog_relations": True}))
 
     async def presentation_apps(self, takeover_ref: str) -> ComputerAppCatalog:
-        response = await self._request("presentation_apps", {"takeover_ref": takeover_ref})
+        payload: dict[str, object] = {"takeover_ref": takeover_ref}
+        if self._window_catalog_relations:
+            payload["window_catalog_relations"] = True
+        response = await self._request("presentation_apps", payload)
         return self._publish_catalog(response)
 
     def _publish_catalog(self, response: ComputerResponse) -> ComputerAppCatalog:

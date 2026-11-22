@@ -491,8 +491,12 @@ final class InputDispatcher: InputDispatching {
                     index: entry.sourceIndex,
                     ok: true,
                     error: nil,
-                    effectVerification: performance.effectVerification ?? verifyEffect(effectProbe)
+                    effectVerification: performance.effectVerification ?? verifyEffect(effectProbe),
+                    observationRequired: performance.observationRequired
                 ))
+                if performance.observationRequired && acknowledged != record.entries.last?.sourceIndex {
+                    return ActionBatchResult(outcomes: outcomes, lastAcknowledgedAction: acknowledged, error: .observationRequired)
+                }
             } catch {
                 let typed = inputDispatchActionError(error)
                 logActionRejected("EXECUTE-OTHER snapshotID=\(record.guardValue.snapshotID) error=\(typed) raw=\(error)")
@@ -647,6 +651,25 @@ final class InputDispatcher: InputDispatching {
         }
         let element = action.elementRef.flatMap { performer.element(reference: $0, snapshotID: expected.snapshotID) }
         if action.elementRef != nil, element == nil { throw ActionExecutionError.staleSnapshot }
+        if action.isReplacement {
+            guard let element else { throw ActionExecutionError.invalidAction }
+            if let refusal = element.keyboardTargetRejection { throw refusal }
+            guard element.enabled != nil else { throw ActionExecutionError.keyboardFocusUnverified }
+            // The source type cannot distinguish an idle IME from an active composition.
+            if textInputSafety != .safeASCIIKeyboardLayout {
+                // Legacy clients use this refusal to replan a whole-field replacement
+                // as a target-bound foreground keyboard command before approval.
+                if action.replace == true { return .unsupported(backend: .axSelectedText, actionClass: .text) }
+                guard textInputSafety == .imeOrCandidate, action.supportsSelectedUnicodeEvent else {
+                    throw ActionExecutionError.textInputSourceUnverified
+                }
+                // Reading this proof cannot change an IME composition or move the selection.
+                _ = try performer.selectedUnicodeWitness(for: action, element: element)
+                guard let authority = inputDispatchKeyboardFocusAuthority(element, localToWindowBounds: expected.bounds)
+                else { throw ActionExecutionError.keyboardFocusUnverified }
+                return .takeover(backend: .foregroundKeyboard, actionClass: .text, targetKeyboardFocus: authority)
+            }
+        }
         // IME 一刀切闸窄化（实测驱动，see docs/macos-computer-use.md#input-delivery-contracts）：
         // 原写法只要布局不安全就把整发 type 判死。实测证明这既不必要也不正确 —— 拼音激活下
         // virtualKey 0 + unicode 串的 postToPid 事件能把「测试」「abc」都送进 Safari 网页输入框
@@ -770,13 +793,16 @@ final class InputDispatcher: InputDispatching {
             logPlanDenied(
                 "TYPE-PREFLIGHT role=\(element.roleResult) enabled=\(String(describing: element.enabled)) secure=\(element.isSecure)"
             )
-            if action.replace != nil {
-                guard action.replace == true, action.elementRef != nil,
-                      element.supportsAXSelectedTextWrite, !element.isSecure, element.enabled == true,
-                      textInputSafety == .safeASCIIKeyboardLayout
-                else { return .unsupported(backend: .axSelectedText, actionClass: .text) }
-                switch performer.preflightAXTextReplacement(element) {
-                case .unsupported: return .unsupported(backend: .axSelectedText, actionClass: .text)
+            if action.isReplacement {
+                guard element.supportsAXSelectedTextWrite else {
+                    if action.textMatch != nil { throw ActionExecutionError.textRangeUnsupported }
+                    return .unsupported(backend: .axSelectedText, actionClass: .text)
+                }
+                let preflight = action.textMatch.map { performer.preflightAXRangeReplacement(element, matching: $0) } ?? performer.preflightAXTextReplacement(element)
+                switch preflight {
+                case .unsupported:
+                    if action.textMatch != nil { throw ActionExecutionError.textRangeUnsupported }
+                    return .unsupported(backend: .axSelectedText, actionClass: .text)
                 case let .failed(error): throw error
                 case .settable: break
                 }
@@ -788,7 +814,8 @@ final class InputDispatcher: InputDispatching {
                 return PlannedAction(resolved: ResolvedAction(source: action, method: .accessibilityText,
                     screenPoint: nil, endScreenPoint: nil, element: axElement, verifiedElement: element),
                     backend: .axSelectedText, actionClass: .text,
-                    targetKeyboardFocus: authority, requiresTakeover: true)
+                    targetKeyboardFocus: authority,
+                    requiresTakeover: action.textMatch == nil || (try? performer.focusedKeyboardElement(matching: element)) == nil)
             }
             guard !element.isSecure else { return .unsupported(backend: .axSelectedText, actionClass: .text) }
             if followsBoundSelectAll {
@@ -1021,7 +1048,9 @@ final class InputDispatcher: InputDispatching {
     private func planningKeyboardFocus(for element: ActionElement, expected: ActionGuard) throws -> KeyboardFocusAuthority {
         do {
             let observed = try performer.focusedKeyboardElement(matching: element)
-            guard let focus = inputDispatchKeyboardFocusAuthority(observed) else { throw ActionExecutionError.secureTarget }
+            guard let focus = inputDispatchKeyboardFocusAuthority(observed) else {
+                throw observed.keyboardTargetRejection ?? ActionExecutionError.keyboardFocusUnverified
+            }
             return focus
         } catch let error as ActionExecutionError where error == .inputFocusRequired || error == .targetNotFrontmost {
             guard let named = inputDispatchKeyboardFocusAuthority(element, localToWindowBounds: expected.bounds) else { throw error }
@@ -1078,7 +1107,7 @@ final class InputDispatcher: InputDispatching {
             guard entry.source.replace == nil else { throw InputDispatchError.backgroundActionUnsupported }
             guard !current.isSecure else { throw ActionExecutionError.secureTarget }
             _ = try performer.focusedKeyboardElement(matching: current)
-            switch performer.preflightAXTextMutation(current) {
+            switch entry.source.textMatch.map({ performer.preflightAXRangeReplacement(current, matching: $0) }) ?? performer.preflightAXTextMutation(current) {
             case .settable: return current
             case .unsupported:
                 performer.noteAXTextWriteUnavailable(current)
@@ -1144,15 +1173,18 @@ final class InputDispatcher: InputDispatching {
             guard !current.isSecure else { throw ActionExecutionError.secureTarget }
             // Replacement consume is read-only. Focus acquisition belongs to
             // performReplacement, where this invocation's activity lease guards it.
-            if entry.source.replace != true {
+            if !entry.source.isReplacement {
                 _ = try performer.acquireOrVerifyKeyboardFocus(matching: current,
                     validateFocusMutation: validateFocusMutation)
             }
-            switch entry.source.replace == true
-                ? performer.preflightAXTextReplacement(current) : performer.preflightAXTextMutation(current) {
+            let preflight: AXTextMutationPreflight
+            if let match = entry.source.textMatch { preflight = performer.preflightAXRangeReplacement(current, matching: match) }
+            else if entry.source.replace == true { preflight = performer.preflightAXTextReplacement(current) }
+            else { preflight = performer.preflightAXTextMutation(current) }
+            switch preflight {
             case .settable: break
             case .unsupported:
-                if entry.source.replace == true {
+                if entry.source.isReplacement {
                     throw InputDispatchError.backgroundActionUnsupported
                 }
                 performer.noteAXTextWriteUnavailable(current)
@@ -1342,6 +1374,12 @@ final class InputDispatcher: InputDispatching {
             // Preserve existing action digests when no checked goal was supplied.
             if let checked = action.checked { append("checked:\(checked)", to: &bytes) }
             if let replace = action.replace { append("replace:\(replace)", to: &bytes) }
+            if let match = action.textMatch {
+                append("target_text", to: &bytes)
+                append(match.target, to: &bytes)
+                append(match.prefix, to: &bytes)
+                append(match.suffix, to: &bytes)
+            }
         }
         return SHA256.hash(data: Data(bytes)).map { String(format: "%02x", $0) }.joined()
     }

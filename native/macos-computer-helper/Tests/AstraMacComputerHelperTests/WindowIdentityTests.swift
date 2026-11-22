@@ -24,7 +24,14 @@ private func complete(_ value: String) -> BoundedAXStringResult {
     let record = CatalogAXWindowRecord(element: element, bounds: bounds, title: name)
     let matched = matchingCatalogAXWindow(target: target, records: [record])
     #expect(matched.map { CFEqual($0, element) } == true)
-    #expect(matchingCatalogAXWindow(target: target, records: [record, record]) == nil)
+    var mismatch: String?
+    #expect(matchingCatalogAXWindow(target: target, records: [record, record], onMismatch: { mismatch = $0 }) == nil)
+    #expect(mismatch == "multiple_ax_matches")
+    let unnamedRecord = CatalogAXWindowRecord(element: element, bounds: bounds, title: complete(""))
+    #expect(matchingCatalogAXWindow(target: target, records: [unnamedRecord], onMismatch: { mismatch = $0 }) == nil)
+    #expect(mismatch == "ax_identity_metadata_mismatch")
+    let independent = CatalogAXWindowRecord(element: element, bounds: bounds, title: complete(""), windowID: 99)
+    #expect(matchingCatalogAXWindow(target: target, records: [independent]).map { CFEqual($0, element) } == true)
     let factory = ForegroundPIDActionStateFactory(
         focusedAXWindow: { PIDAXFocusedWindowObservation(pid: 42, bounds: bounds,
             axIdentity: CFHash(element), title: name.value) },
@@ -132,4 +139,22 @@ private func complete(_ value: String) -> BoundedAXStringResult {
     } catch WindowObservationError.targetGone {
         // A missing catalog target remains a separate condition.
     }
+}
+
+@Test func catalogRelationsAreReturnedOnlyToClientsThatRequestThem() throws {
+    let catalog = JSONValue.object(["apps": .array([.object(["windows": .array([
+        .object(["window_ref": .string("sheet"), "parent_window_identity_ref": .string("parent")]),
+        .object(["window_ref": .string("unbound"), "binding_reason": .string("no_ax_candidate")])
+    ])])])])
+    func records(_ payload: JSONValue) throws -> [[String: String]] {
+        let data = try JSONEncoder().encode(catalogForClient(catalog, payload: payload))
+        let object = try #require(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let apps = try #require(object["apps"] as? [[String: Any]])
+        return try #require(apps.first?["windows"] as? [[String: String]])
+    }
+    let legacy = try records(.object([:]))
+    #expect(legacy == [["window_ref": "sheet"], ["window_ref": "unbound"]])
+    let current = try records(.object(["window_catalog_relations": .bool(true)]))
+    #expect(current[0]["parent_window_identity_ref"] == "parent")
+    #expect(current[1]["binding_reason"] == "no_ax_candidate")
 }
