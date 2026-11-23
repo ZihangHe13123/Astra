@@ -154,8 +154,11 @@ def test_real_worker_fresh_context_read_only_tools_result_and_receipt(tmp_path, 
     assert not names.intersection({"search_web", "fetch_url"})
     inbox = command(env, "inbox")
     assert inbox[0]["output"] == "fixture-check-result" and inbox[0]["delivery_state"] == "delivered"
-    saved = SessionStore(home / "jobs" / "runs" / run["id"] / "session.json").load(readonly=True)
+    run_dir = home / "jobs" / "runs" / run["id"]
+    saved = SessionStore(run_dir / "session.json").load(readonly=True)
     assert saved["messages"][-1]["content"] == "fixture-check-result"
+    header = json.loads((run_dir / "session.header.json").read_text(encoding="utf-8"))
+    assert header["workspace"] == os.path.realpath(work)
     (work / "AGENTS.md").write_text("JOBS_GUIDANCE_VERSION_TWO", encoding="utf-8")
     before = len(provider.requests)
     command(env, "run", job["id"])

@@ -59,6 +59,7 @@ from agent.runtime.context import AgentContext
 from agent.runtime.context_compressor import ContextCompressor
 from agent.runtime.context_index import create_context_index_broker
 from agent.runtime.context_index.workspace import resolve_workspace
+from agent.runtime.conversation_folder import rebind_system_context
 from agent.runtime.tools.context_index import register_context_index_tools
 
 if TYPE_CHECKING:
@@ -533,6 +534,7 @@ def _context_for_session(session_id: str | None) -> AgentContext:
     if session_id is not None:
         context.set_session(str(api_session_path(session_id)))
         context.load()
+        rebind_system_context(context, "api")
         _sessions[session_id] = context
     return context
 
