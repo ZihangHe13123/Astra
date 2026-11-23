@@ -165,7 +165,7 @@ def test_save_as_intent_scope_boundaries(workflow, backend, scenario):
 @pytest.mark.parametrize("scenario,code", [
     ("relative", "invalid_arguments"), ("no_extension", "invalid_arguments"),
     ("no_opener", "invalid_arguments"), ("missing_directory", "save_destination_unverified"),
-    ("not_directory", "save_destination_unverified"), ("unknown_source", "save_destination_unverified"),
+    ("not_directory", "save_destination_unverified"),
     ("format_mismatch", "save_destination_unverified"), ("exists", "save_destination_exists"),
 ])
 def test_invalid_save_as_intent_stops_before_approval(workflow, backend, registry, scenario, code):
@@ -177,18 +177,62 @@ def test_invalid_save_as_intent_stops_before_approval(workflow, backend, registr
     }.get(scenario, target)
     if scenario == "exists":
         target.touch()
-    if scenario == "unknown_source":
-        backend.snapshot_ax_tree_override.pop("document_path")
-        state = snapshot(cu.run(registry.execute("computer_snapshot", {})))
-        result = cu.run(registry.execute("computer_act", {
-            "snapshot_id": state, "opens_dialog": True, "save_as_intent": str(path),
-            "actions": [{"type": "click", "element_ref": "snapshot-1:open"}],
-        }))
-    else:
-        result = open_panel(path, opens_dialog=scenario != "no_opener")
+    result = open_panel(path, opens_dialog=scenario != "no_opener")
     assert result["code"] == code
     assert not cards
     assert not any(name in {"act", "takeover_begin", "plan_actions"} for name, _ in backend.calls)
+
+
+@pytest.mark.parametrize("scenario", [
+    "document", "file_menu", "no_extension", "different_extension", "other_app", "other_version",
+    "no_stable_identity", "not_a_document",
+])
+def test_save_as_source_can_be_the_bound_wps_document_title(workflow, backend, registry, scenario):
+    from agent.runtime.approval_inbox import safe_approval_request
+
+    source, target, _, cards, act, _, bind_panel = workflow
+    document = backend.snapshot_ax_tree_override
+    document.pop("document_path")
+    if scenario == "no_extension":
+        backend.catalog_window_title = document["title"] = source.stem
+    if scenario == "different_extension":
+        target = target.with_suffix(".pdf")
+    if scenario == "other_app":
+        backend.catalog_bundle_id = "com.apple.TextEdit"
+    if scenario == "other_version":
+        backend.catalog_app_version = "12.1.26027"
+    if scenario == "no_stable_identity":
+        backend.catalog_window_identity_ref = ""
+    if scenario == "not_a_document":
+        document["subrole"] = "AXDialog"
+    cu.focus(registry)
+    state = snapshot(cu.run(registry.execute("computer_snapshot", {})))
+    if scenario == "file_menu":
+        backend.snapshot_ax_tree_override = {
+            "role": "AXMenuBarItem", "title": "文件",
+            "observation_capabilities": document["observation_capabilities"],
+            "children": document["children"],
+        }
+        state = snapshot(cu.run(registry.execute("computer_snapshot", {})))
+    result = act(state, {"type": "click", "element_ref": "snapshot-1:open"}, opens_dialog=True, save_as_intent=str(target))
+    if scenario not in {"document", "file_menu"}:
+        assert result["code"] == "save_destination_unverified"
+        assert not cards and not any(name == "act" for name, _ in backend.calls)
+        return
+
+    assert not result["error"], result
+    assert len(cards) == 1 and cards[0]["choices"] == ["once", "deny"]
+    disclosure = {
+        "source": source.name + "（窗口标题，无文件路径）",
+        "directory": str(target.parent), "filename": target.name,
+    }
+    assert cards[0]["arguments"]["save_as_intent"] == disclosure
+    assert safe_approval_request(cards[0])["arguments"]["save_as_intent"] == disclosure
+    state = bind_panel()
+    edited = act(state, {"type": "type", "element_ref": "snapshot-1:name", "text": target.name})
+    saved = act(snapshot(edited), {"type": "click", "element_ref": "snapshot-1:save", "save_new_copy_to": str(target)})
+    assert not saved["error"], saved
+    assert len(cards) == 1
 
 
 def test_save_as_card_persistence_keeps_only_complete_visible_paths(workflow):

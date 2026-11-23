@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from agent.runtime.computer_save_as_intent import valid_save_as_source_disclosure
 from agent.runtime.paths import state_path
 from agent.runtime.sqlite_wal import enable_wal
 from agent.runtime.tools.consequence import DRAFT_TEXT_FIELDS, draft_approval_choices
@@ -125,7 +126,7 @@ def safe_approval_request(request: Mapping[str, Any]) -> dict[str, Any]:
                 fields = {"source", "directory", "filename"}
                 if (isinstance(value, Mapping) and set(value) == fields and all(
                         isinstance(item, str) and 0 < len(item) <= 4096 and item.isprintable()
-                        for item in value.values()) and value["source"].startswith("/")
+                        for item in value.values()) and valid_save_as_source_disclosure(value["source"])
                         and value["directory"].startswith("/") and "/" not in value["filename"]):
                     safe_arguments[key] = dict(value)
                     if "approval_boundary" in request:

@@ -18,12 +18,39 @@ SAVE_AS_BOUNDARY = (
 SAVE_AS_COVERED_REASONS = frozenset({"keyword_window_title", "unreferenced_enter", "save_new_copy_to"})
 
 
+_WINDOW_TITLE_NOTE = "（窗口标题，无文件路径）"
+
+
+@dataclass(frozen=True)
+class _SaveAsSource:
+    name: str
+    from_window_title: bool = False
+
+    @property
+    def extension(self) -> str:
+        path = Path(self.name)
+        if not self.name.isprintable() or not (self.from_window_title or path.is_absolute()):
+            return ""
+        return path.suffix.casefold()
+
+    @property
+    def disclosure(self) -> str:
+        return self.name + _WINDOW_TITLE_NOTE if self.from_window_title else self.name
+
+
+def valid_save_as_source_disclosure(source: str) -> bool:
+    return source.startswith("/") or (
+        source.endswith(_WINDOW_TITLE_NOTE)
+        and bool(_SaveAsSource(source.removesuffix(_WINDOW_TITLE_NOTE), from_window_title=True).extension)
+    )
+
+
 @dataclass(eq=False)
 class _SaveAsIntent:
     session: str
     grant_space: str
     source_window: str
-    source: str
+    source: _SaveAsSource
     destination: Path
     deadline_ms: int
     existing_windows: frozenset[str]
@@ -45,7 +72,7 @@ def _local_directory(directory: Path) -> bool:
     return status == 0 and result[0] == ctypes.sizeof(result) and bool(result[1] & 0x00001000)  # MNT_LOCAL
 
 
-def resolve_save_as_destination(path: str, source: str) -> tuple[Path | None, str]:
+def resolve_save_as_destination(path: str, source: _SaveAsSource | None) -> tuple[Path | None, str]:
     requested = Path(path)
     if (
         not requested.is_absolute() or not requested.suffix or path.startswith("//") or path.endswith("/")
@@ -54,9 +81,7 @@ def resolve_save_as_destination(path: str, source: str) -> tuple[Path | None, st
         or any(char in requested.name for char in (":", "\\"))
     ):
         return None, "invalid_arguments"
-    if not source or not Path(source).is_absolute() or not all(char.isprintable() for char in source):
-        return None, "save_destination_unverified"
-    if Path(source).suffix.casefold() != requested.suffix.casefold():
+    if source is None or source.extension != requested.suffix.casefold():
         return None, "save_destination_unverified"
     try:
         directory = requested.parent.resolve(strict=True)

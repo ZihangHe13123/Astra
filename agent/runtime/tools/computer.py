@@ -79,7 +79,13 @@ from ..computer_protocol import (
     validate_snapshot_payload,
 )
 from ..computer_routing import computer_route_advice
-from ..computer_save_as_intent import SAVE_AS_BOUNDARY, SAVE_AS_COVERED_REASONS, _SaveAsIntent, resolve_save_as_destination
+from ..computer_save_as_intent import (
+    SAVE_AS_BOUNDARY,
+    SAVE_AS_COVERED_REASONS,
+    _SaveAsIntent,
+    _SaveAsSource,
+    resolve_save_as_destination,
+)
 from ..computer_saved_document import ApprovedCopy, ReplacementProof, is_document_save, paragraph_changes
 from ..computer_wps_panel import addresses_single_replace, find_fields, has_wps_panel_capability, wps_panel_action_kind
 from ..computer_text import contains_credentials
@@ -585,7 +591,7 @@ class _PreparedComputerAct:
     reserve_new_copy: bool = False
     save_panel: str = ""
     save_reservation: _SavePanelReservation | None = None
-    save_as_opening: tuple[str, Path] | None = None
+    save_as_opening: tuple[_SaveAsSource, Path] | None = None
     proposed_save_as_intent: _SaveAsIntent | None = None
     covered_save_as_intent: _SaveAsIntent | None = None
     proposed_readback: ApprovedCopy | None = None
@@ -2552,6 +2558,29 @@ def register_computer_tools(
             revoke_save_as_intent()
             return None
         return intent
+
+    def observed_save_as_source(context: Mapping[str, Any], tree: Any) -> _SaveAsSource | None:
+        is_document = (isinstance(tree, Mapping) and tree.get("role") == "AXWindow"
+                       and tree.get("subrole") == "AXStandardWindow")
+        native_path = trusted_target.get("known_path") or (tree.get("document_path") if is_document else "")
+        if native_path:
+            return _SaveAsSource(_approval_safe_path(native_path))
+        if (context.get("known_path") or context.get("metadata_trusted") is not True
+                or context.get("bundle_id") != "com.kingsoft.wpsoffice.mac"
+                or context.get("app_version") != "12.1.26026"):
+            return None
+        identity = str(context.get("window_identity_ref") or "")
+        title = str(trusted_target.get("window_title") or "")
+        if not (identity and title):
+            return None
+        # A File-menu subtree omits the document role. Its selected native
+        # identity and title must match a full AXStandardWindow observation.
+        if is_document and (tree.get("title") or tree.get("label")) == title:
+            return _SaveAsSource(title, from_window_title=True)
+        if (isinstance(tree, Mapping) and tree.get("role") in {"AXMenuBarItem", "AXMenu"}
+                and last_wps_document == (identity, title)):
+            return _SaveAsSource(title, from_window_title=True)
+        return None
 
     def is_save_as_opener(actions: tuple[ComputerAction, ...], context: Mapping[str, Any]) -> bool:
         if len(actions) != 1:
@@ -4852,11 +4881,7 @@ def register_computer_tools(
         opening_path = args.get("save_as_intent")
         if opening_path is not None:
             revoke_save_as_intent()
-            native_path = trusted_target.get("known_path") or (
-                raw_tree.get("document_path") if isinstance(raw_tree, Mapping)
-                and raw_tree.get("subrole") == "AXStandardWindow" else ""
-            )
-            source = _approval_safe_path(native_path)
+            source = observed_save_as_source(context, raw_tree)
             destination, path_failure = resolve_save_as_destination(str(opening_path), source)
             if (not opens_dialog or mode is not ComputerInteractionMode.FOREGROUND_TAKEOVER or present_result
                     or any(action.save_new_copy_to is not None for action in prepared.actions)):
@@ -4868,7 +4893,7 @@ def register_computer_tools(
                 or trusted_snapshot.get("snapshot_id") != prepared.snapshot_id
             ):
                 path_failure = "save_destination_unverified"
-            if path_failure or destination is None:
+            if path_failure or destination is None or source is None:
                 prepared.failure = _failure(
                     path_failure or "save_destination_unverified",
                     "Save As needs a verified source and a new local absolute destination of the same format.",
@@ -5218,7 +5243,7 @@ def register_computer_tools(
         if prepared.save_as_opening is not None:
             source, destination = prepared.save_as_opening
             request["arguments"]["save_as_intent"] = {
-                "source": source, "directory": str(destination.parent), "filename": destination.name,
+                "source": source.disclosure, "directory": str(destination.parent), "filename": destination.name,
             }
             if (prepared.policy_context or {}).get("bundle_id") == "com.kingsoft.wpsoffice.mac" and destination.suffix.casefold() == ".docx":
                 detail = " The short local copy may be read back to verify its saved body and any separately approved precise replacement."
@@ -5319,9 +5344,13 @@ def register_computer_tools(
             prepared.focus_consent = {"frontmost_pid": pid, "decided_at_continuous_us": decided_us}
             if prepared.save_as_opening is not None:
                 source, destination = prepared.save_as_opening
-                shown = {"source": source, "directory": str(destination.parent), "filename": destination.name}
+                shown = {"source": source.disclosure, "directory": str(destination.parent), "filename": destination.name}
                 if decision != "once" or request.get("arguments", {}).get("save_as_intent") != shown:
                     raise ValueError("Save As needs the exact one-shot approval for the displayed path")
+                if source.from_window_title and observed_save_as_source(
+                    current_policy_context(prepared.snapshot_id), effect_snapshot[1]
+                ) != source:
+                    raise ValueError("The Save As document window changed while approval was pending")
                 verified, problem = resolve_save_as_destination(str(destination), source)
                 if verified != destination:
                     prepared.failure = _failure(problem, "The new-copy destination changed while approval was pending.")
