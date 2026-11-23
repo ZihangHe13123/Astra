@@ -4553,8 +4553,16 @@ def register_computer_tools(
                 )
                 if rewritten is None:
                     raise
-                actions = tuple(ComputerAction.from_mapping(action) for action in rewritten)
-                replanned = await plan_route(actions, interaction_mode, "select_all_and_type")
+                try:
+                    actions = tuple(ComputerAction.from_mapping(action) for action in rewritten)
+                    replanned = await plan_route(actions, interaction_mode, "select_all_and_type")
+                except Exception as fallback:  # Planning never dispatches input. Cancellation still propagates.
+                    if not isinstance(fallback, HelperApplicationError):  # plan_route already recorded native errors
+                        code = ("invalid_arguments" if isinstance(fallback, ValueError)
+                                else _planning_failure(fallback, requested_takeover=True).code)
+                        planning_refusals.append({"mode": interaction_mode.value, "route": "select_all_and_type",
+                                                  "code": code[:64]})
+                    raise exc from fallback
                 prepared.raw_actions, prepared.actions = rewritten, actions
                 return replanned
 
@@ -4608,6 +4616,15 @@ def register_computer_tools(
                     )
             if planning_refusals:
                 prepared.failure.details["planning_refusals"] = planning_refusals
+                if planning_refusals[-1]["route"] == "select_all_and_type":
+                    cause = exc.__cause__
+                    followup = (_application_failure(cause.error).recovery_hint
+                                if isinstance(cause, HelperApplicationError) else "")
+                    prepared.failure = replace(prepared.failure, retryable=False, recovery_hint=(
+                        "Direct field replacement was refused. Its fallback selects the same field with command+a "
+                        "and types the requested text. That plan also failed before any input. "
+                        + (followup or "Inspect the field and the fallback refusal before choosing another action.")
+                    ))
             return None
         background = classify_computer_batch(
             context,

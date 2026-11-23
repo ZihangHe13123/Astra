@@ -5161,7 +5161,15 @@ def test_window_shortcut_reports_wrong_field_only_after_focus_refusal(
     assert not any(name in {"act", "takeover_begin"} for name, _ in backend.calls)
 
 
-def test_refused_replacement_exposes_final_keyboard_plan_error(registry, manager, backend, monkeypatch):
+@pytest.mark.parametrize("original,fallback", [
+    (ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED, "keyboard_focus_unverified"),
+    (ComputerErrorCode.TEXT_INPUT_SOURCE_UNVERIFIED, "keyboard_focus_unverified"),
+    (ComputerErrorCode.TEXT_INPUT_SOURCE_UNVERIFIED, "invalid_arguments"),
+])
+def test_refused_replacement_retains_original_diagnosis_and_alternate_plan_trace(
+    registry, manager, backend, monkeypatch, original, fallback,
+):
+    from agent.runtime.computer_protocol import ComputerAction
     from agent.runtime.macos_computer import HelperApplicationError
 
     backend.snapshot_ax_tree_override = {"role": "AXWindow",
@@ -5172,20 +5180,29 @@ def test_refused_replacement_exposes_final_keyboard_plan_error(registry, manager
     async def refuse(target, snapshot_id, actions, interaction_mode):
         if actions[0].type == "keypress":
             raise HelperApplicationError(ComputerError(ComputerErrorCode.KEYBOARD_FOCUS_UNVERIFIED, "incomplete identity"))
-        raise HelperApplicationError(ComputerError(
-            ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED, "the action batch is unsafe"))
+        raise HelperApplicationError(ComputerError(original, "the original requested operation was refused"))
 
+    if fallback == "invalid_arguments":
+        parse = ComputerAction.from_mapping
+        def refuse_conversion(cls, value):
+            if value.get("type") == "keypress":
+                raise ValueError("private user-supplied text")
+            return parse(value)
+        monkeypatch.setattr(ComputerAction, "from_mapping", classmethod(refuse_conversion))
     monkeypatch.setattr(backend, "plan_actions", refuse)
     register(registry, manager)
     focus(registry)
     snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
     result = run(registry.execute("computer_act", {"snapshot_id": snapshot["snapshot_id"],
         "actions": [{"type": "type", "text": "example.com", "element_ref": "snapshot-1:field", "replace": True}]}))
-    assert result["code"] == "keyboard_focus_unverified"
+    assert result["code"] == original.value
+    assert "command+a" in result["recovery_hint"]
+    assert "private user-supplied text" not in str(result)
+    assert not result["retryable"]
     assert result["details"]["planning_refusals"] == [
-        {"mode": "background", "route": "requested", "code": "background_action_unsupported"},
-        {"mode": "foreground_takeover", "route": "requested", "code": "background_action_unsupported"},
-        {"mode": "foreground_takeover", "route": "select_all_and_type", "code": "keyboard_focus_unverified"},
+        {"mode": "background", "route": "requested", "code": original.value},
+        {"mode": "foreground_takeover", "route": "requested", "code": original.value},
+        {"mode": "foreground_takeover", "route": "select_all_and_type", "code": fallback},
     ]
     assert result["computer_receipt"]["dispatch_state"] == "not_dispatched"
     assert not any(name in {"takeover_begin", "act"} for name, _ in backend.calls)
