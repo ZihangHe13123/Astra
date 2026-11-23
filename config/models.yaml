@@ -201,7 +201,8 @@ models:
       max_tokens: 32768
 
   # Anthropic Claude API (native Messages API, a Console API key billed per token).
-  # 1M context; Astra compacts at 150k for cost. Thinking is adaptive (summaries shown as
+  # 1M context; Astra compacts at half the window (500k) like other API models; an entry's
+  # auto_compact_token_limit sets an earlier line. Thinking is adaptive (summaries shown as
   # reasoning); /mode sets output_config.effort. Sampling parameters are not sent.
   claude-opus-5-5:
     provider: anthropic-api

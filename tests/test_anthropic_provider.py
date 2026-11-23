@@ -441,7 +441,9 @@ def test_connect_discovery_and_env_only_setup(monkeypatch):
 
 def test_compaction_line_cache_lifetime_mode_status_and_delegate_guard():
     assert prompt_cache_seconds(PROVIDER_NAME) == 3600
-    assert prompt_token_budget(1_000_000, 64_000, model="claude-opus-5-5", provider=PROVIDER_NAME) == 150_000
+    # The hour-long cache is shared with Claude Code; its 150k line is not: that line answers the
+    # CLI's replay of every earlier turn, which the Messages API does not do.
+    assert prompt_token_budget(1_000_000, 64_000, model="claude-opus-5-5", provider=PROVIDER_NAME) == 500_000
     status = mode_preferences.reasoning_effort_status(config(reasoning_effort="xhigh"))
     assert "output_config.effort" in status
     assert mode_preferences.applies_reasoning_effort(PROVIDER_NAME, "claude-opus-5-5")

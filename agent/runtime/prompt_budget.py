@@ -22,8 +22,12 @@ CLAUDE_CODE_COMPACT_TOKENS = 150_000
 # uncached to do it.
 CLAUDE_CODE_CACHE_SECONDS = 3600
 # The Claude API route (a Console key, billed per token) writes its cache breakpoints for an hour too,
-# and is held to the same compaction line for cost: every request reads the whole history again, so
-# a 500k-token conversation costs about three times what a 150k one does at every step.
+# so it shares that lifetime, but not the 150k line, which answers the CLI's replay of every earlier
+# turn: the Messages API does not do that, so the route compacts at half its window like other models
+# (decided 2026-11-24). Each request still reads the whole history from the cache, on Opus 5.5 at
+# $0.20 per million tokens (about $0.10 a step at 500k, $0.03 at 150k; Claude 4.6 and later models
+# but Haiku 5.5 bill the whole 1M window at the standard rate). A model's auto_compact_token_limit
+# sets an earlier line.
 CLAUDE_CACHE_PROVIDERS = frozenset({"claude-code", "anthropic-api"})
 # How far past its compaction line a request inside a turn may go, within the model's window, before
 # the history is rewritten (AgentContext.compaction_threshold), when a compaction would take off less
@@ -50,8 +54,9 @@ def prompt_token_budget(context_limit: int, max_tokens: int, *, model: str = "",
 
     GPT models and the Codex provider use the model window minus the output
     reserve, without the additional 50% proactive threshold used by other
-    models. Claude Code and Claude API models stop at CLAUDE_CODE_COMPACT_TOKENS
-    when half their window is more. A model's own auto_compact_token_limit replaces all three rules.
+    models. Claude Code models stop at CLAUDE_CODE_COMPACT_TOKENS when half their
+    window is more; Claude API models keep the half. A model's own
+    auto_compact_token_limit replaces all three rules.
     Preserve the configured completion allowance (with an 8K minimum),
     scaling the reserve down only when it would consume the entire window.
     """
@@ -63,7 +68,7 @@ def prompt_token_budget(context_limit: int, max_tokens: int, *, model: str = "",
     if provider == "openai-codex" or model_id.startswith(("gpt-", "chatgpt-")):
         return completion_safe
     compression_threshold = max(1, limit // 2)
-    if provider in CLAUDE_CACHE_PROVIDERS:
+    if provider == "claude-code":
         compression_threshold = min(compression_threshold, CLAUDE_CODE_COMPACT_TOKENS)
     return min(completion_safe, compression_threshold)
 
