@@ -41,6 +41,11 @@ func standardSavePanelFields(_ fields: [StandardSavePanelField], complete: Bool)
     var result: [String: JSONValue] = ["filename_status": .string("unverified"),
                                        "directory_status": .string("unverified")]
     guard complete else { return .object(result) }
+    let hide = fields.filter { $0.role == kAXCheckBoxRole as String && $0.identifier == "hideExtension" }
+    if hide.count == 1, let value = hide[0].value {
+        result["filename_extension_visibility"] = .string(value)
+        if !hide[0].reference.isEmpty { result["hide_extension_element_ref"] = .string(hide[0].reference) }
+    }
     let commits = fields.filter { $0.identifier == "OKButton" && $0.role == kAXButtonRole as String }
     if commits.count == 1 && !commits[0].reference.isEmpty { result["commit_element_ref"] = .string(commits[0].reference) }
     let names = fields.filter { $0.identifier == "saveAsNameTextField" && $0.role == kAXTextFieldRole as String }
@@ -198,6 +203,16 @@ func readStandardSavePanel(_ root: AXUIElement, budget: AXObservationBudget,
             if let children = panelElements(element, kAXChildrenAttribute, limit: 128) { next += children }
             else { return nil }
         } else if role == kAXBrowserRole as String { browsers.append(element) }
+        else if role == kAXCheckBoxRole as String {
+            let id = AXNodeReader.stringAttribute(element, kAXIdentifierAttribute).value?.lowercased() ?? ""
+            let title = AXNodeReader.stringAttribute(element, kAXTitleAttribute).value?.lowercased() ?? ""
+            guard ["hideextension", "hideextensionbutton", "hide extension"].contains(id)
+                    || ["hide extension", "隐藏扩展名", "隱藏副檔名", "隱藏延伸檔名"].contains(title),
+                  let checked = AXNodeReader.boolAttribute(element, kAXValueAttribute)
+            else { continue }
+            fields.append(StandardSavePanelField(identifier: "hideExtension", role: role,
+                reference: reference(element) ?? "", value: checked ? "hidden" : "shown", directoryPath: nil))
+        }
         else if ["AXTextField", "AXPopUpButton", "AXButton"].contains(role) {
             let id = AXNodeReader.stringAttribute(element, kAXIdentifierAttribute)
             guard id.status == .complete, let identifier = id.value,
@@ -258,11 +273,20 @@ func savePanelRequestedURL(_ path: String) -> URL? {
     return file
 }
 
+/// A requested suffix is not proof of the format the app will append.
+private func verifySavePanelExtension(_ file: URL, visibleName: String, visibility: String?) throws {
+    if visibility == "hidden" || (visibility != "shown" && !file.pathExtension.isEmpty &&
+        visibleName.utf8.elementsEqual(file.deletingPathExtension().lastPathComponent.utf8)) {
+        throw ActionExecutionError.saveExtensionUnverified
+    }
+}
+
 /// A guard, never a filesystem writer. Open and inspect only the actual selected
 /// directory. AT_SYMLINK_NOFOLLOW also treats a dangling symlink as an existing destination.
-func proveNewSavePanelDestination(requested: String, filename: String?, directory: String?) throws {
+func proveNewSavePanelDestination(requested: String, filename: String?, directory: String?, extensionVisibility: String? = nil) throws {
     guard let file = savePanelRequestedURL(requested), let name = savePanelLeafName(filename),
           let directory, !file.pathExtension.isEmpty else { throw ActionExecutionError.saveDestinationUnverified }
+    try verifySavePanelExtension(file, visibleName: name, visibility: extensionVisibility)
     let actualParent = URL(fileURLWithPath: directory, isDirectory: true).standardizedFileURL.resolvingSymlinksInPath()
     let wantedParent = file.deletingLastPathComponent().standardizedFileURL.resolvingSymlinksInPath()
     guard name.utf8.elementsEqual(file.lastPathComponent.utf8), actualParent.path.utf8.elementsEqual(wantedParent.path.utf8)
@@ -274,6 +298,20 @@ func proveNewSavePanelDestination(requested: String, filename: String?, director
     var info = stat()
     if fstatat(descriptor, name, &info, AT_SYMLINK_NOFOLLOW) == 0 { throw ActionExecutionError.saveDestinationExists }
     guard errno == ENOENT else { throw ActionExecutionError.saveDestinationUnverified }
+}
+
+/// Some AppKit sheets keep the document as AXFocusedWindow. The focused control
+/// must then belong to this exact sheet, not to the document or a further child sheet.
+func standardSavePanelHasFocus(_ panel: AXUIElement, focusedWindow: AXUIElement?,
+                               focusedControl: AXUIElement?, pid: pid_t,
+                               sheetRoot: (AXUIElement, pid_t) -> AXUIElement? = { attachedSheetRoot($0, pid: $1) },
+                               nearestWindowMatches: (AXUIElement, AXUIElement, pid_t) -> Bool = {
+                                   fieldBelongsToNearestAXWindow($0, root: $1, pid: $2)
+                               }) -> Bool {
+    guard let focusedWindow else { return false }
+    if CFEqual(focusedWindow, panel) { return true }
+    guard let owner = sheetRoot(panel, pid), CFEqual(owner, focusedWindow), let focusedControl else { return false }
+    return nearestWindowMatches(focusedControl, panel, pid)
 }
 
 func checkStandardSaveCommit(_ panel: LiveSavePanel, action: NativeAction, clicked: AXUIElement?,
@@ -296,9 +334,14 @@ func checkStandardSaveCommit(_ panel: LiveSavePanel, action: NativeAction, click
     }
     guard case let .object(facts) = panel.evidence, case let .string(name)? = facts["filename"],
           case let .string(directory)? = facts["directory"] else { throw ActionExecutionError.saveDestinationUnverified }
-    try proveNewSavePanelDestination(requested: requested, filename: name, directory: directory)
+    var visibility: String?
+    if case let .string(state)? = facts["filename_extension_visibility"] { visibility = state }
+    try proveNewSavePanelDestination(requested: requested, filename: name, directory: directory, extensionVisibility: visibility)
     // Directory discovery may perform several AX reads. Re-read the actual name
     // control after them, before the delivery backend does its final activity check.
     guard let field = panel.filenameField, let live = readFilename(field) else { throw ActionExecutionError.saveDestinationUnverified }
-    guard live.utf8.elementsEqual(name.utf8) else { throw ActionExecutionError.saveDestinationMismatch }
+    if !live.utf8.elementsEqual(name.utf8) {
+        if let file = savePanelRequestedURL(requested) { try verifySavePanelExtension(file, visibleName: live, visibility: nil) }
+        throw ActionExecutionError.saveDestinationMismatch
+    }
 }

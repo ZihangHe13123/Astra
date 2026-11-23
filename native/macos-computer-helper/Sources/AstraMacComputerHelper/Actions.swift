@@ -620,6 +620,7 @@ enum ActionExecutionError: String, Error, Equatable {
     case secureInputActive = "secure_input_active"
     case saveDestinationUnverified = "save_destination_unverified"
     case saveDestinationMismatch = "save_destination_mismatch"
+    case saveExtensionUnverified = "save_extension_unverified"
     case saveDestinationExists = "save_destination_exists"
     case textSelectionRequired = "text_selection_required"
     case textMatchNotFound = "text_match_not_found"

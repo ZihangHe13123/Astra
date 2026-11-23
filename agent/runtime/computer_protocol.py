@@ -64,6 +64,7 @@ class ComputerErrorCode(str, Enum):
     OUT_OF_BOUNDS = "out_of_bounds"
     SECURE_TARGET = "secure_target"
     SAVE_DESTINATION_UNVERIFIED = "save_destination_unverified"
+    SAVE_EXTENSION_UNVERIFIED = "save_extension_unverified"
     SAVE_DESTINATION_MISMATCH = "save_destination_mismatch"
     SAVE_DESTINATION_EXISTS = "save_destination_exists"
     SECURE_INPUT_ACTIVE = "secure_input_active"
@@ -787,7 +788,7 @@ class KeyboardFailureDiagnostics:
             "stale_snapshot", "out_of_bounds", "secure_target", "input_focus_required",
             "secure_input_active", "keyboard_focus_unverified", "control_disabled", "text_selection_required",
             "text_range_unsupported", "text_match_not_found", "text_match_ambiguous",
-            "save_destination_unverified", "save_destination_mismatch", "save_destination_exists",
+            "save_destination_unverified", "save_destination_mismatch", "save_destination_exists", "save_extension_unverified",
             "action_timeout", "helper_failed", "unknown_outcome", "user_activity_paused",
         }:
             raise ValueError("input diagnostics have an unknown cause")

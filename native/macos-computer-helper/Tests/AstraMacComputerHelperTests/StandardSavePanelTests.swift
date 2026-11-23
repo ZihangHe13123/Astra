@@ -151,3 +151,50 @@ import Testing
     }
     #expect(checks == 2 && presses == 0)
 }
+
+@Test func hiddenSaveExtensionRequiresVisibleFullNameAndNeverGuessesFormat() throws {
+    let parent = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: parent) }
+    let path = parent.appendingPathComponent("draft.v2.docx").path
+    for shown in ["draft.v2", "draft.v2.docx"] {
+        #expect(throws: ActionExecutionError.saveExtensionUnverified) {
+            try proveNewSavePanelDestination(requested: path, filename: shown, directory: parent.path, extensionVisibility: "hidden")
+        }
+    }
+    #expect(throws: ActionExecutionError.saveExtensionUnverified) {
+        try proveNewSavePanelDestination(requested: path, filename: "draft.v2", directory: parent.path)
+    }
+    try proveNewSavePanelDestination(requested: path, filename: "draft.v2.docx", directory: parent.path, extensionVisibility: "shown")
+    let option = StandardSavePanelField(identifier: "hideExtension", role: "AXCheckBox", reference: "toggle",
+                                        value: "hidden", directoryPath: nil)
+    guard case let .object(panel) = standardSavePanelFields([option], complete: true) else {
+        Issue.record("missing standard-panel evidence"); return
+    }
+    #expect(panel["filename_extension_visibility"] == .string("hidden"))
+    #expect(panel["hide_extension_element_ref"] == .string("toggle"))
+}
+
+@Test func guardedSaveEnterIsCanonicalBeforeNativeShapeAndDigestChecks() throws {
+    func key(_ name: String) throws -> NativeAction {
+        try NativeAction.parse(.object(["type": .string("keypress"), "key": .string(name),
+                                       "save_new_copy_to": .string("/tmp/Copy.docx")]))
+    }
+    let enter = try key("enter"), canonical = try key("return")
+    #expect(enter.key == "return")
+    #expect(InputDispatcher.digest([enter]) == InputDispatcher.digest([canonical]))
+}
+
+@Test func attachedSavePanelAcceptsOnlyItsOwnFocusedControl() {
+    let panel = AXUIElementCreateApplication(10), document = AXUIElementCreateApplication(11)
+    let filename = AXUIElementCreateApplication(12), other = AXUIElementCreateApplication(13)
+    func focused(_ window: AXUIElement, _ field: AXUIElement?) -> Bool {
+        standardSavePanelHasFocus(panel, focusedWindow: window, focusedControl: field, pid: 10,
+            sheetRoot: { _,_ in document }, nearestWindowMatches: { f, p, _ in CFEqual(f, filename) && CFEqual(p, panel) })
+    }
+    #expect(focused(panel, filename))
+    #expect(focused(document, filename))
+    #expect(!focused(document, nil))
+    #expect(!focused(document, other))
+    #expect(!focused(other, filename))
+}

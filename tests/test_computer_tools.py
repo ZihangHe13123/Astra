@@ -3193,11 +3193,8 @@ def test_standard_wps_save_panel_approval_uses_only_its_current_destination(
         "default_return": {"type": "keypress", "key": "return"},
     }[where]
     result = run(registry.execute("computer_act", {"snapshot_id": snap["snapshot_id"], "actions": [save]}))
-    if verified:
-        assert observed and all(path == str(tmp_path / "copy.docx") for path in observed)
-    else:
-        assert result["code"] == "save_destination_unverified"
-        assert not observed
+    assert result["code"] == "approval_denied"
+    assert observed and all(path == (str(tmp_path / "copy.docx") if verified else "") for path in observed)
     assert not any(name in {"act", "takeover_begin"} for name, _ in backend.calls)
 
 
@@ -9107,6 +9104,54 @@ def _wps_new_copy_panel(selected):
     }
 
 
+@pytest.mark.skipif(os.name != "posix", reason="standard macOS Save As panel")
+@pytest.mark.parametrize("bundle,key", [("com.apple.TextEdit", "enter"), ("com.apple.Preview", "return")])
+def test_guarded_save_on_standard_panel_accepts_exact_destination_and_keyboard_alias(
+    registry, manager, backend, tmp_path, bundle, key,
+):
+    backend.catalog_bundle_id = bundle
+    backend.catalog_window_title = "Save As"
+    backend.snapshot_ax_tree_override = _wps_new_copy_panel(tmp_path)
+    register(registry, manager)
+    cards = []
+
+    async def approve(card):
+        cards.append(card)
+        return "once"
+
+    registry.set_approval_handler(approve)
+    focus(registry)
+    state = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    args = {"type": "keypress", "key": key, "save_new_copy_to": str(tmp_path / "copy.docx")}
+    result = run(registry.execute("computer_act", {"snapshot_id": state["snapshot_id"], "actions": [args]}))
+    assert not result["error"]
+    assert any(name == "act" and payload[1] == [{**args, "key": "return"}] for name, payload in backend.calls)
+    assert any(card["arguments"].get("known_path") == str(tmp_path / "copy.docx") for card in cards)
+    assert not any(card["arguments"].get("saved_copy_readback") for card in cards)
+
+
+@pytest.mark.parametrize("visibility,name", [("hidden", "copy"), ("hidden", "copy.docx"), (None, "copy")])
+def test_hidden_extension_explains_how_to_reveal_name_without_dispatch(
+    registry, manager, backend, tmp_path, visibility, name,
+):
+    backend.catalog_bundle_id = "com.apple.TextEdit"
+    backend.catalog_window_title = "Save As"
+    root = _wps_new_copy_panel(tmp_path)
+    root["standard_save_panel"]["filename"] = name
+    root["children"][0]["value"] = name
+    if visibility:
+        root["standard_save_panel"]["filename_extension_visibility"] = visibility
+    backend.snapshot_ax_tree_override = root
+    register(registry, manager)
+    focus(registry)
+    snap = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    result = run(registry.execute("computer_act", {"snapshot_id": snap["snapshot_id"], "actions": [
+        {"type": "click", "element_ref": "snapshot-1:save", "save_new_copy_to": "/tmp/copy.docx"}]}))
+    assert result["code"] == "save_extension_unverified"
+    assert "Hide extension" in result["recovery_hint"]
+    assert not any(n in {"act","takeover_begin"} for n, _ in backend.calls)
+
+
 @pytest.mark.skipif(os.name != "posix", reason="macOS Save As requires POSIX directories")
 @pytest.mark.parametrize("scenario,expected_error", [
     ("match", None), ("wrong_directory", "save_destination_mismatch"),
@@ -9163,9 +9208,9 @@ def test_guarded_wps_new_copy_checks_panel_before_approval(
 @pytest.mark.skipif(os.name != "posix", reason="macOS Save As requires POSIX directories")
 @pytest.mark.parametrize("proof,settled", [
     ("absent_then_regular_file", True), ("exact_document", True),
-    ("other_document_same_title", False), ("symlink_after_close", False),
+    ("other_document_same_title", False), ("symlink_after_close", True),
 ])
-def test_new_copy_settles_only_on_document_or_closed_panel_and_regular_file(
+def test_new_copy_releases_after_confirmed_closure_or_exact_document(
     registry, manager, backend, monkeypatch, tmp_path, proof, settled,
 ):
     destination = tmp_path / "copy.docx"

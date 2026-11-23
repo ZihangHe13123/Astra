@@ -149,6 +149,7 @@ class ComputerPolicyDecision:
     interaction_reason: str = "background_ax_only"
     action_classes: tuple[str, ...] = ()
     new_copy_destination: str = ""
+    saved_copy_readback: bool = False
 
 
 class ComputerApprovalRequest(TimedApprovalRequest):
@@ -806,6 +807,7 @@ def classify_computer_batch(
         risk=risk,
         scope=f"computer-write-batch:{session}:{batch_hash}",
         new_copy_destination=known_path if guarded_save else "",
+        saved_copy_readback=guarded_save and bundle == "com.kingsoft.wpsoffice.mac" and known_path.lower().endswith(".docx"),
         choices=("once", "deny"),
         operation=summaries,
         target=target,
@@ -883,7 +885,7 @@ def build_computer_approval(decision: ComputerPolicyDecision, *, present_result:
         request["arguments"]["window"] = window
     if decision.new_copy_destination:
         request["arguments"]["known_path"] = decision.new_copy_destination
-        if decision.new_copy_destination.lower().endswith(".docx"):
+        if decision.saved_copy_readback:
             disclosure = (" In this Computer Use session, saving this new copy may also read back "
                           "its short main-body text from this exact local file to the model for verification.")
             request["arguments"]["saved_copy_readback"] = True

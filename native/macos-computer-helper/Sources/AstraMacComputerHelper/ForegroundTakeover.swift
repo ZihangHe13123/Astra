@@ -1461,7 +1461,7 @@ final class ForegroundPlanExecutor {
         case nil, .invalidAction?, .permissionDenied?, .outOfBounds?, .actionTimeout?,
              .helperFailed?, .unknownOutcome?, .accessibilityActionRefused?, .observationRequired?,
              .textMatchNotFound?, .textMatchAmbiguous?, .textRangeUnsupported?, .textSelectionRequired?, .textInputSourceUnverified?,
-             .saveDestinationUnverified?, .saveDestinationMismatch?, .saveDestinationExists?: false
+             .saveDestinationUnverified?, .saveDestinationMismatch?, .saveExtensionUnverified?, .saveDestinationExists?: false
         }
     }
 

@@ -3269,7 +3269,6 @@ final class SystemWindowObserver: WindowObserving {
             selectedTextWriter: SystemAXSelectedTextWriter(effectProbe: .live),
             savePanelGuard: { [weak self] action in
                 guard let self, action.saveNewCopyTo != nil,
-                      NSRunningApplication(processIdentifier: target.pid)?.bundleIdentifier == "com.kingsoft.wpsoffice.mac",
                       let retained = target.axElement, let window = self.catalogExactAXWindow(
                         in: AXUIElementCreateApplication(target.pid), target: target),
                       CFEqual(window, retained), observedAXWindowID(window) == target.windowID,
@@ -3283,7 +3282,8 @@ final class SystemWindowObserver: WindowObserving {
                 let focusedControl = decodeAXElement(observationAXAttribute(app, kAXFocusedUIElementAttribute).1)
                 let clicked = action.elementRef.flatMap { snapshotContext.references[$0]?.element }
                 try checkStandardSaveCommit(panel, action: action, clicked: clicked,
-                    exactFocusedPanel: focusedWindow.map { CFEqual($0, window) } == true, focusedControl: focusedControl)
+                    exactFocusedPanel: standardSavePanelHasFocus(window, focusedWindow: focusedWindow,
+                        focusedControl: focusedControl, pid: target.pid), focusedControl: focusedControl)
             },
             keyboardTargetValidation: { [weak self] expected in
                 // Even a dispatcher created from a background snapshot must prove *current*
