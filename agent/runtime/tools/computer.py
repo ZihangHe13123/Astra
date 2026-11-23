@@ -3457,6 +3457,9 @@ def register_computer_tools(
         if rejection is not None:
             return rejection
         if isinstance(exc, HelperApplicationError):
+            if exc.error.code is ComputerErrorCode.OBSERVATION_REQUIRED:
+                return _failure(exc.error.code.value, "No input was dispatched. The control could not be verified during planning.",
+                                recovery_hint="Inspect a fresh snapshot before choosing a control or splitting a dependent batch.")
             return _application_failure(exc.error)
         if isinstance(exc, ComputerSessionError):
             return _session_failure(exc)

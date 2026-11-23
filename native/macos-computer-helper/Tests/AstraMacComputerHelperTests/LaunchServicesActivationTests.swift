@@ -684,6 +684,94 @@ import Testing
     #expect(!normalized.contains(".activate(from:"))
 }
 
+@Test func visibleFocusedModalPreventsActivationOrRaisingItsDocument() {
+    let target = activationTarget()
+    let runtime = ActivationRuntimeSpy(identity: ApplicationLaunchIdentity(
+        bundleURL: URL(fileURLWithPath: "/Applications/Test.app"), localizedName: "Test"), expected: target)
+    runtime.modalState = { .blockedByKeyModal }
+    let launcher = ProcessLauncherSpy(status: 0)
+    let controller = LaunchServicesApplicationActivationController(runtime: runtime, launcher: launcher)
+    #expect(throws: TakeoverError.coveredByFocusedModal) { try controller.activate(target) }
+    #expect(launcher.invocations.isEmpty)
+    #expect(runtime.unhideCount == 0 && runtime.setFocusedWindowCount == 0 && runtime.raiseCount == 0)
+}
+
+@Test func modalAppearingDuringAWindowCheckPreventsTheNextAXMutation() {
+    let target = activationTarget()
+    let runtime = ActivationRuntimeSpy(identity: ApplicationLaunchIdentity(
+        bundleURL: URL(fileURLWithPath: "/Applications/Test.app"), localizedName: "Test"), expected: target)
+    runtime.markVerified()
+    var probes = 0
+    runtime.modalState = { probes += 1; return probes >= 3 ? .blockedByKeyModal : .ordinary }
+    let launcher = ProcessLauncherSpy(status: 0)
+    let controller = LaunchServicesApplicationActivationController(runtime: runtime, launcher: launcher)
+    #expect(throws: TakeoverError.coveredByFocusedModal) { try controller.activate(target) }
+    #expect(launcher.invocations.isEmpty)
+    #expect(runtime.setFocusedWindowCount == 0 && runtime.raiseCount == 0)
+}
+
+@Test func anAlreadyKeyRetainedModalDoesNotRaiseItselfOrItsDocument() throws {
+    let target = activationTarget()
+    let runtime = ActivationRuntimeSpy(identity: ApplicationLaunchIdentity(
+        bundleURL: URL(fileURLWithPath: "/Applications/Test.app"), localizedName: "Test"), expected: target)
+    runtime.modalState = { .retainedModalIsKey }
+    runtime.markVerified()
+    let launcher = ProcessLauncherSpy(status: 0)
+    try LaunchServicesApplicationActivationController(runtime: runtime, launcher: launcher).activate(target)
+    #expect(launcher.invocations.isEmpty)
+    #expect(runtime.focusedWindowMatchCount == 1 && runtime.setFocusedWindowCount == 0 && runtime.raiseCount == 0)
+}
+
+@Test func onlyTheExactVisibleKeyModalCanUseTheRetainedAuthority() {
+    let retained = AXUIElementCreateApplication(42), other = AXUIElementCreateApplication(43)
+    let target = WindowTarget(appRef: "a", windowRef: "w", pid: 77, windowID: 50, bounds: .zero,
+                              title: "", axIdentity: CFHash(retained), axElement: retained, interactionMode: .foregroundTakeover)
+    func classify(_ key: AXUIElement, owner: pid_t = 77, modal: Bool = true, visible: Bool) -> FocusedModalActivation {
+        activationForFocusedModal(target, focusedWindow: { key }, owner: { _ in owner },
+                                  isModal: { _ in modal }, attachedSheet: { _, _ in nil }, visibleRetainedSurfaceMatches: { _ in visible })
+    }
+    #expect(classify(other, visible: true) == .blockedByKeyModal)
+    #expect(classify(other, visible: false) == .blockedByKeyModal)
+    #expect(classify(retained, visible: false) == .blockedByKeyModal)
+    #expect(classify(retained, visible: true) == .retainedModalIsKey)
+    #expect(classify(other, modal: false, visible: true) == .ordinary)
+    #expect(classify(other, owner: 88, visible: true) == .ordinary)
+}
+
+@Test func attachedSheetOwningTheFocusedFieldTakesPriorityOverItsAXFocusedWindow() {
+    let document = AXUIElementCreateApplication(42), sheet = AXUIElementCreateApplication(43)
+    func classify(_ retained: AXUIElement, sheetHasField: Bool, visible: Bool) -> FocusedModalActivation {
+        let target = WindowTarget(appRef: "a", windowRef: "w", pid: 77, windowID: 50, bounds: .zero,
+                                  title: "", axIdentity: CFHash(retained), axElement: retained, interactionMode: .foregroundTakeover)
+        return activationForFocusedModal(target, focusedWindow: { document }, owner: { _ in 77 },
+            isModal: { _ in false }, attachedSheet: { reported, pid in
+                sheetHasField && CFEqual(reported, document) && pid == 77 ? sheet : nil
+            }, visibleRetainedSurfaceMatches: { _ in visible })
+    }
+    #expect(classify(document, sheetHasField:true, visible:true) == .blockedByKeyModal)
+    #expect(classify(sheet, sheetHasField:true, visible:true) == .retainedModalIsKey)
+    #expect(classify(sheet, sheetHasField:true, visible:false) == .blockedByKeyModal)
+    #expect(classify(document, sheetHasField:false, visible:true) == .ordinary)
+}
+
+@Test func windowVisibilityLogIsBoundedToTheOwnedProcessAndIncludesNonkeySurfaces() {
+    func row(_ id: UInt32, pid: Int32, layer: Int, on: Bool) -> [String: Any] {
+        [kCGWindowNumber as String: id, kCGWindowOwnerPID as String: pid, kCGWindowLayer as String: layer,
+         kCGWindowIsOnscreen as String: on, kCGWindowName as String: "PRIVATE"]
+    }
+    let windows = [row(8500,pid:7,layer:0,on:true),row(8541,pid:7,layer:0,on:true),
+                   row(10424,pid:7,layer:3,on:false),row(99,pid:8,layer:20,on:true)]
+    let inventory = foregroundWindowInventory(windows, pid:7, selected:8500, key:8541)
+    #expect(inventory.contains("selected_state=onscreen key_state=onscreen window_count=3 truncated=false"))
+    #expect(inventory.contains("10424/3/offscreen"))
+    #expect(!inventory.contains("PRIVATE") && !inventory.contains("99/20"))
+    let many = (1...26).map { row(UInt32($0),pid:7,layer:0,on:$0 != 26) }
+    let truncated = foregroundWindowInventory(many, pid:7, selected:1, key:26)
+    #expect(truncated.contains("key_state=offscreen window_count=26 truncated=true"))
+    #expect(!truncated.contains("26/0"))
+    #expect(foregroundWindowInventory(nil, pid:7, selected:1, key:nil).contains("inventory=unavailable"))
+}
+
 private func activationTarget() -> WindowTarget {
     WindowTarget(
         appRef: "app",
@@ -720,6 +808,8 @@ private final class ProcessLauncherSpy: ApplicationProcessLaunching {
 }
 
 private final class ActivationRuntimeSpy: ApplicationActivationRuntime {
+    var modalState: () -> FocusedModalActivation = { .ordinary }
+    func focusedModalActivation(_: WindowTarget) -> FocusedModalActivation { modalState() }
     private let identityValue: ApplicationLaunchIdentity?
     private let expected: WindowTarget
     private let exactFocusedWindowMatchesValue: Bool

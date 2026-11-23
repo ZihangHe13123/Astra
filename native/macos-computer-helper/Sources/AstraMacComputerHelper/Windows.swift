@@ -241,6 +241,29 @@ func catalogTargetsMatch(_ expected: WindowTarget, _ current: WindowTarget) -> B
     }
 }
 
+/// Describes only WindowServer surfaces owned by the approved process. The
+/// keyed windows can fall past the bounded sample and still get a truthful state.
+func foregroundWindowInventory(_ rows: [[String: Any]]?, pid: pid_t, selected: CGWindowID, key: CGWindowID?) -> String {
+    guard let rows else { return "selected_state=unknown key_state=unknown inventory=unavailable" }
+    let limit = 24
+    var entries: [String] = [], total = 0
+    var selectedState = "absent", keyState = key == nil ? "unknown" : "absent"
+    for row in rows {
+        guard row[kCGWindowOwnerPID as String] as? pid_t == pid,
+              let id = row[kCGWindowNumber as String] as? CGWindowID else { continue }
+        let state = row[kCGWindowIsOnscreen as String] as? Bool == true ? "onscreen" : "offscreen"
+        if id == selected { selectedState = state }
+        if id == key { keyState = state }
+        total += 1
+        if entries.count < limit {
+            let layer = (row[kCGWindowLayer as String] as? Int).map(String.init) ?? "unknown"
+            entries.append("\(id)/\(layer)/\(state)")
+        }
+    }
+    return "selected_state=\(selectedState) key_state=\(keyState) window_count=\(total) "
+        + "truncated=\(total > limit) windows=[\(entries.joined(separator: ","))]"
+}
+
 enum WindowObservationError: Error {
     case permissionDenied(String)
     case staleTarget
@@ -1250,6 +1273,7 @@ final class SystemWindowObserver: WindowObserving {
         inputCounts: ForegroundTakeoverCoordinator.physicalInputCounts,
         physicalIdleSeconds: ForegroundTakeoverCoordinator.secondsSincePhysicalInput,
         presentationWindowMatches: { retainedPresentationWindowMatches($0) },
+        traceWindowPhase: { [weak self] target, phase in self?.logForegroundWindowState(target, phase: phase) },
         revalidate: { [weak self] target in
             guard let self else { throw WindowObservationError.targetGone }
             _ = try self.backgroundTargetController().snapshotTargetState(target)
@@ -3400,6 +3424,33 @@ final class SystemWindowObserver: WindowObserving {
         cooperativePlans.removeAll(keepingCapacity: false)
     }
 
+    /// Bound-process identifiers and visibility only. The sampled key window can
+    /// change while an event is in flight; this log does not acknowledge delivery.
+    private func logForegroundWindowState(_ target: WindowTarget, phase: String) {
+        let budget = AXObservationBudget(duration: 0.08, clock: ForegroundLoanClock.now)
+        let restore = budget.install()
+        defer { restore() }
+        let (error, value) = observationAXAttribute(AXUIElementCreateApplication(target.pid), kAXFocusedWindowAttribute)
+        let axWindow = error == .success ? decodeAXElement(value).flatMap {
+            observedAXPID($0) == target.pid ? $0 : nil
+        } : nil
+        let key = axWindow.map { focusedAttachedSheet(in: $0, pid: target.pid) ?? $0 }
+        let keyID = key.flatMap(observedAXBackingWindowID)
+        let modal: Bool? = key.flatMap {
+            let role = AXNodeReader.stringAttribute($0, kAXRoleAttribute)
+            guard role.status == .complete else { return nil }
+            return role.value == kAXSheetRole ? true : AXNodeReader.boolAttribute($0, kAXModalAttribute)
+        }
+        let bound = key.flatMap { actual in target.axElement.map { CFEqual($0, actual) } }
+        let appFront = NSRunningApplication(processIdentifier: target.pid)?.isActive
+        let inventory = foregroundWindowInventory(CGWindowListCopyWindowInfo(.optionAll, kCGNullWindowID) as? [[String: Any]],
+                                                   pid: target.pid, selected: target.windowID, key: keyID)
+        logActionRejected("FG-WINDOW phase=\(phase) pid=\(target.pid) selected=\(target.windowID) "
+            + "ax_focus_window=\(axWindow.flatMap(observedAXBackingWindowID).map(String.init) ?? "unknown") "
+            + "key=\(keyID.map(String.init) ?? "unknown") key_modal=\(modal.map(String.init) ?? "unknown") "
+            + "key_bound=\(bound.map(String.init) ?? "unknown") app_front=\(appFront.map(String.init) ?? "unknown") \(inventory)")
+    }
+
     private func foregroundCooperativeAct(
         snapshotID: String,
         planRef: String,
@@ -3472,6 +3523,8 @@ final class SystemWindowObserver: WindowObserving {
                     }
                 }
             )
+            let sample = actions.contains { $0.kind == .keypress || $0.kind == .click }
+            if sample { logForegroundWindowState(authority.target, phase: "before_input") }
             let result = executeForegroundActions(
                 authority: authority,
                 plannedPopupPoint: popupPoint,
@@ -3482,6 +3535,7 @@ final class SystemWindowObserver: WindowObserving {
                 loanDeadline: execution.loanDeadline,
                 managesActivityFragment: fragmentStage == nil
             )
+            if sample { logForegroundWindowState(authority.target, phase: "after_input") }
             if let fragmentStage {
                 takeoverCoordinator.finishFragmentStage(
                     takeoverRef,

@@ -3880,6 +3880,23 @@ private final class ManualLoanTime {
     }
 }
 
+@Test func foregroundPhasesObserveTheSameBindingEvenWhenActivationFailsOrNoActRuns() throws {
+    for fail in [false, true] {
+        var phases: [String] = []
+        let fixture = TakeoverFixture(traceWindowPhase: { target, phase in
+            #expect(target.pid == 11 && target.windowID == 22)
+            phases.append(phase)
+        }, failure: fail ? .activation : nil)
+        if fail {
+            #expect(throws: TakeoverError.targetNotFrontmost) { _ = try fixture.begin() }
+        } else {
+            let token = try fixture.begin()
+            _ = try fixture.coordinator.end(token.ref, allowRestore: true)
+        }
+        #expect(phases == ["before_begin", "after_begin", "before_end", "after_end"])
+    }
+}
+
 private final class TakeoverFixture {
     enum Failure: CaseIterable { case target, activation, sidecar, activity }
 
@@ -3904,6 +3921,7 @@ private final class TakeoverFixture {
         inputCounts: @escaping () -> [UInt32] = { [0] },
         physicalIdleSeconds: (() -> TimeInterval?)? = nil,
         presentationWindowMatches: @escaping (WindowTarget) -> Bool = { _ in true },
+        traceWindowPhase: @escaping (WindowTarget, String) -> Void = { _, _ in },
         beforeReadingFrontmost: @escaping () -> Void = {},
         loanTime: ManualLoanTime = ManualLoanTime(),
         existingPIDs: Set<pid_t> = [77],
@@ -3956,6 +3974,7 @@ private final class TakeoverFixture {
             inputCounts: inputCounts,
             physicalIdleSeconds: physicalIdleSeconds ?? { loanTime.now },
             presentationWindowMatches: presentationWindowMatches,
+            traceWindowPhase: traceWindowPhase,
             loanNow: { loanTime.now }, scheduleLoanExpiry: loanTime.schedule,
             revalidate: { target in
                 if failure == .target { throw WindowObservationError.targetGone }

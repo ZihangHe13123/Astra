@@ -511,6 +511,40 @@ private final class FoundationApplicationManagedProcess: ApplicationManagedProce
     }
 }
 
+enum FocusedModalActivation {
+    case ordinary
+    case retainedModalIsKey
+    case blockedByKeyModal
+}
+
+/// AXModal/AXSheet describes the *key* window of this same process. A proven
+/// different key modal vetoes a raise even when the compositor cannot map it.
+/// Nothing here selects that modal or transfers the document's input authority.
+func activationForFocusedModal(
+    _ target: WindowTarget, focusedWindow: () -> AXUIElement?,
+    owner: (AXUIElement) -> pid_t? = observedAXPID,
+    isModal: (AXUIElement) -> Bool = { element in
+        let role = AXNodeReader.stringAttribute(element, kAXRoleAttribute)
+        return role.status == .complete && (role.value == kAXSheetRole ||
+            (role.value == kAXWindowRole && AXNodeReader.boolAttribute(element, kAXModalAttribute) == true))
+    },
+    attachedSheet: (AXUIElement, pid_t) -> AXUIElement? = { focusedAttachedSheet(in: $0, pid: $1) },
+    visibleRetainedSurfaceMatches: (WindowTarget) -> Bool = { retainedPresentationWindowMatches($0) }
+) -> FocusedModalActivation {
+    func keyModal() -> AXUIElement? {
+        guard let window = focusedWindow(), owner(window) == target.pid else { return nil }
+        let confirmedModal = isModal(window)
+        if let sheet = attachedSheet(window, target.pid) { return sheet }
+        return confirmedModal ? window : nil
+    }
+    guard let retained = target.axElement, target.axIdentity == CFHash(retained), let modal = keyModal()
+    else { return .ordinary }
+    guard CFEqual(modal, retained), visibleRetainedSurfaceMatches(target),
+          let stillKey = keyModal(), CFEqual(stillKey, modal)
+    else { return .blockedByKeyModal }
+    return .retainedModalIsKey
+}
+
 protocol ApplicationActivationRuntime {
     func applicationIdentity(pid: pid_t) -> ApplicationLaunchIdentity?
     func unhide(pid: pid_t)
@@ -520,10 +554,13 @@ protocol ApplicationActivationRuntime {
     func raiseWindow(_ target: WindowTarget, validate: () throws -> Void) throws -> Bool
     func frontmostPID() -> pid_t?
     func focusedWindowMatches(_ target: WindowTarget) -> Bool
+    func focusedModalActivation(_ target: WindowTarget) -> FocusedModalActivation
     func popupPointerWindowMatches(_ target: WindowTarget, at point: CGPoint) -> Bool
 }
 
 extension ApplicationActivationRuntime {
+    func focusedModalActivation(_: WindowTarget) -> FocusedModalActivation { .ordinary }
+
     func setFocusedWindow(_ target: WindowTarget, validate: () throws -> Void) throws -> Bool {
         try validate()
         return setFocusedWindow(target)
@@ -794,6 +831,18 @@ struct SystemApplicationActivationRuntime: ApplicationActivationRuntime {
         return CFEqual(focused, expected)
     }
 
+    func focusedModalActivation(_ target: WindowTarget) -> FocusedModalActivation {
+        let maximum = 0.2
+        let limit = AXObservationBudget.current.map { (try? $0.phaseTimeout(maximum: maximum)) ?? 0 } ?? maximum
+        let budget = AXObservationBudget(duration: limit, clock: ForegroundLoanClock.now)
+        let restore = budget.install()
+        defer { restore() }
+        return activationForFocusedModal(target) {
+            let (error, value) = observationAXAttribute(AXUIElementCreateApplication(target.pid), kAXFocusedWindowAttribute)
+            return error == .success ? decodeAXElement(value) : nil
+        }
+    }
+
     func popupPointerWindowMatches(_ target: WindowTarget, at point: CGPoint) -> Bool {
         func reject(_ stage: PopupPointerProofFailureStage, numbers: String? = nil) -> Bool {
             diagnostic("POPUP-POINTER-PROOF-FAIL stage=\(stage.rawValue) pid=\(target.pid) windowID=\(target.windowID)"
@@ -962,6 +1011,10 @@ final class LaunchServicesApplicationActivationController: ApplicationActivation
               let arguments = launchArguments(identity)
         else { throw WindowObservationError.targetGone }
         _ = try checkedFrontmostPID()
+        if runtime.focusedModalActivation(target) == .blockedByKeyModal {
+            throw TakeoverError.coveredByFocusedModal
+        }
+        _ = try checkedFrontmostPID()
         runtime.unhide(pid: target.pid)
         let deadline = now().addingTimeInterval(timeout)
         var lastFrontmost: Bool?
@@ -978,6 +1031,11 @@ final class LaunchServicesApplicationActivationController: ApplicationActivation
             return pid == target.pid
         }
         func validateAXMutation() throws {
+            if runtime.focusedModalActivation(target) == .blockedByKeyModal {
+                throw TakeoverError.coveredByFocusedModal
+            }
+            // The AX inspection above may block. Recheck the foreground, input
+            // lease and deadline immediately before the caller mutates AX focus.
             guard try targetIsFrontmost() else { throw TakeoverError.userActivityPaused }
             guard now() < deadline else { throw WindowObservationError.targetNotFrontmost }
         }
@@ -1001,6 +1059,17 @@ final class LaunchServicesApplicationActivationController: ApplicationActivation
                 let currentlyFrontmost = try targetIsFrontmost()
                 lastFrontmost = currentlyFrontmost
                 guard currentlyFrontmost else { break }
+                switch runtime.focusedModalActivation(target) {
+                case .blockedByKeyModal:
+                    throw TakeoverError.coveredByFocusedModal
+                case .retainedModalIsKey:
+                    // Already selected on its visible, retained surface. Recheck
+                    // the lease and exact key window without raising its parent.
+                    guard try targetIsFrontmost(), now() < deadline, runtime.focusedWindowMatches(target),
+                          try targetIsFrontmost(), now() < deadline else { throw WindowObservationError.targetNotFrontmost }
+                    return
+                case .ordinary: break
+                }
                 attempts += 1
                 let selected = try runtime.setFocusedWindow(target, validate: validateAXMutation)
                 lastSetFocused = selected

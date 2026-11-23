@@ -53,6 +53,7 @@ enum TakeoverError: Error, Equatable {
     case authorityMismatch
     case targetChanged
     case targetNotFrontmost
+    case coveredByFocusedModal
     case activityUnavailable
     case userActivityPaused
     case loanExpired
@@ -203,6 +204,7 @@ final class ForegroundTakeoverCoordinator {
     private let inputCounts: () -> [UInt32]
     private let physicalIdleSeconds: () -> TimeInterval?
     private let presentationWindowMatches: (WindowTarget) -> Bool
+    private let traceWindowPhase: (WindowTarget, String) -> Void
     let loanNow: () -> TimeInterval
     private let scheduleLoanExpiry: LoanAlarm
     // Only input and terminal work use this gate, never post-action observations. Draining an
@@ -228,6 +230,7 @@ final class ForegroundTakeoverCoordinator {
         inputCounts: @escaping () -> [UInt32] = { [] },
         physicalIdleSeconds: @escaping () -> TimeInterval? = { nil },
         presentationWindowMatches: @escaping (WindowTarget) -> Bool = { _ in false },
+        traceWindowPhase: @escaping (WindowTarget, String) -> Void = { _, _ in },
         loanNow: @escaping () -> TimeInterval = ForegroundLoanClock.now,
         scheduleLoanExpiry: @escaping LoanAlarm = ForegroundLoanClock.schedule,
         revalidate: @escaping (WindowTarget) throws -> WindowTarget,
@@ -243,6 +246,7 @@ final class ForegroundTakeoverCoordinator {
         self.inputCounts = inputCounts
         self.physicalIdleSeconds = physicalIdleSeconds
         self.presentationWindowMatches = presentationWindowMatches
+        self.traceWindowPhase = traceWindowPhase
         self.loanNow = loanNow
         self.scheduleLoanExpiry = scheduleLoanExpiry
         self.revalidate = revalidate
@@ -368,6 +372,14 @@ final class ForegroundTakeoverCoordinator {
         // from this handoff interval, including typing that leaves the same app in front.
         let beforeArm = inputCounts()
         let oldPID = frontmostPID()
+        traceWindowPhase(target, "before_begin")
+        var sampledBegin = false
+        func sampleAfterBegin() {
+            guard !sampledBegin else { return }
+            sampledBegin = true
+            traceWindowPhase(target, "after_begin")
+        }
+        defer { sampleAfterBegin() }
         let lease: UserActivitySessionLease
         var activationAttempted = false
         var activeTarget: WindowTarget?
@@ -463,7 +475,9 @@ final class ForegroundTakeoverCoordinator {
             try cursor.show(at: cursorPoint)
             _ = try checkedFrontmostPID()
             activeTarget = foregroundTarget
+            sampleAfterBegin()
         } catch {
+            sampleAfterBegin()
             // A yield is terminal, even if the target happens to return to the front during cleanup.
             let yielded = error as? TakeoverError == .userActivityPaused
             let cleanupRecord = Record(
@@ -1174,6 +1188,8 @@ final class ForegroundTakeoverCoordinator {
         )
         lock.unlock()
 
+        traceWindowPhase(record.authority.target, "before_end")
+        defer { traceWindowPhase(record.authority.target, "after_end") }
         cancelLoanExpiry?()
         cursor.hide()
         cursor.close()

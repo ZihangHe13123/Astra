@@ -106,8 +106,20 @@ func completeObservedAXWindows(_ app: AXUIElement) -> [AXUIElement]? {
         let role = AXNodeReader.stringAttribute($0, kAXRoleAttribute)
         return role.status == .complete && role.value == kAXWindowRole
     }
-    let sheets = focusedSheetChain(windows: parents, focused: focused,
-        maximumSheets: maximumObservedWindows - windows.count,
+    let sheets = observedFocusedSheetChain(parents: parents, focused: focused, owner: owner,
+                                          maximumSheets: maximumObservedWindows - windows.count)
+    for sheet in sheets {
+        if !result.contains(where: { CFEqual($0, sheet) }) { result.append(sheet) }
+    }
+    return result
+}
+
+/// Use the same exact AX ancestor and containment checks for both inventory
+/// and activation when AXFocusedWindow still names a sheet's document.
+func observedFocusedSheetChain(parents: [AXUIElement], focused: AXUIElement, owner: pid_t,
+                               maximumSheets: Int = 8) -> [AXUIElement] {
+    focusedSheetChain(windows: parents, focused: focused,
+        maximumSheets: maximumSheets,
         same: { CFEqual($0, $1) }, isOwned: { observedAXPID($0) == owner },
         parent: observedAXParent,
         isSheet: {
@@ -120,8 +132,10 @@ func completeObservedAXWindows(_ app: AXUIElement) -> [AXUIElement]? {
             return trustedFocusedWindow(expectedIdentity: 1, targetBounds: outer,
                 focusedIdentity: 2, focusedBounds: inner)
         })
-    for sheet in sheets {
-        if !result.contains(where: { CFEqual($0, sheet) }) { result.append(sheet) }
-    }
-    return result
+}
+
+func focusedAttachedSheet(in window: AXUIElement, pid: pid_t) -> AXUIElement? {
+    let (error, value) = observationAXAttribute(AXUIElementCreateApplication(pid), kAXFocusedUIElementAttribute)
+    guard error == .success, let field = decodeAXElement(value) else { return nil }
+    return observedFocusedSheetChain(parents: [window], focused: field, owner: pid).last
 }

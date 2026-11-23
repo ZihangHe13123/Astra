@@ -236,12 +236,17 @@ final class InputDispatcher: InputDispatching {
             let followsBoundSelectAll = action.kind == .type && action.replace == nil
                 && action.elementRef != nil && action.elementRef == preceding?.elementRef
                 && preceding.flatMap { ApprovedKeyChord(action: $0) }?.rawValue == "command+a"
-            var planned = try resolveBackground(
-                action,
-                expected: context.guardValue,
-                textInputSafety: textInputSafety,
-                followsBoundSelectAll: followsBoundSelectAll
-            )
+            var planned: PlannedAction
+            do {
+                planned = try resolveBackground(
+                    action, expected: context.guardValue, textInputSafety: textInputSafety,
+                    followsBoundSelectAll: followsBoundSelectAll
+                )
+            } catch {
+                let code = (error as? ActionExecutionError)?.rawValue ?? "planning_error"
+                logActionRejected("PLAN-ENTRY index=\(sourceIndex) kind=\(action.kind.rawValue) code=\(code)")
+                throw error
+            }
             if action.saveNewCopyTo != nil {
                 try performer.validateSaveDestination(action)
                 guard (action.kind == .click && planned.backend == .axPress) ||
@@ -714,7 +719,7 @@ final class InputDispatcher: InputDispatching {
             if action.elementRef != nil, element == nil { throw ActionExecutionError.staleSnapshot }
             guard let element else { return .takeover(backend: .pidPointer, actionClass: .click) }
             guard !element.isSecure else { return .unsupported(backend: .axPress, actionClass: .press) }
-            guard element.enabled != false else { throw ActionExecutionError.helperFailed }
+            guard element.enabled != false else { throw ActionExecutionError.controlDisabled }
             let pointerElement = action.elementRef.flatMap {
                 performer.pointerElement(reference: $0, snapshotID: expected.snapshotID)
             }
@@ -740,10 +745,16 @@ final class InputDispatcher: InputDispatching {
             }
             guard let element else { return .takeover(backend: .pidPointer, actionClass: .click) }
             guard !element.isSecure else { return .unsupported(backend: .axPress, actionClass: .press) }
-            guard element.enabled != false else { throw ActionExecutionError.helperFailed }
+            guard element.enabled != false else { throw ActionExecutionError.controlDisabled }
             guard let actionNames = element.actionNames.completeNames else {
-                if let error = element.actionNames.error { throw mapAXActionError(error) }
-                throw ActionExecutionError.helperFailed
+                if let error = element.actionNames.error {
+                    let classified = mapAXActionError(error)
+                    logActionRejected("PLAN-AX action_list error=\(error.rawValue)")
+                    if classified != .helperFailed { throw classified }
+                }
+                // Do not infer support for AXPress or fall back to a coordinate
+                // when the provider did not return its complete action list.
+                throw ActionExecutionError.observationRequired
             }
             guard actionNames.contains(kAXPressAction as String) else {
                 let pointerElement = action.elementRef.flatMap {

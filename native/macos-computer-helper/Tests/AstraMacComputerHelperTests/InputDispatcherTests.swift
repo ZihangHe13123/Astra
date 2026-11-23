@@ -2032,11 +2032,25 @@ func planningNamedKeyboardInputCannotMoveCaret(kind: String, path: String) throw
         syntheticPolicy: inputDispatcherSyntheticPolicy(),
         backgroundTextInputSafety: InputDispatcherTextSafety(.safeASCIIKeyboardLayout)
     )
-    #expect(throws: ActionExecutionError.helperFailed) {
+    #expect(throws: ActionExecutionError.controlDisabled) {
         _ = try disabledDispatcher.plan(
             actions: [.click(elementRef: "fallback")],
             context: DispatchContext(guardValue: inputDispatcherBackgroundGuard())
         )
+    }
+}
+
+@Test func clickRequiresFreshObservationForAnIncompleteActionList() throws {
+    let performer = InputDispatcherPerformerSpy()
+    let dispatcher = InputDispatcher(performer: performer)
+    let context = DispatchContext(guardValue: inputDispatcherBackgroundGuard())
+    for error: AXError? in [nil, .noValue, .cannotComplete, .invalidUIElement] {
+        performer.scrollActionNames = ActionNameResults(values: [], status: .failed, error: error)
+        let expected: ActionExecutionError = error == .cannotComplete ? .actionTimeout
+            : error == .invalidUIElement ? .staleSnapshot : .observationRequired
+        #expect(throws: expected) {
+            _ = try dispatcher.plan(actions: [.click(elementRef: "scroll")], context: context)
+        }
     }
 }
 

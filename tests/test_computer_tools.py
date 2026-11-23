@@ -5205,6 +5205,24 @@ def test_refused_replacement_retains_original_diagnosis_and_alternate_plan_trace
     assert not any(name in {"takeover_begin", "act"} for name, _ in backend.calls)
 
 
+def test_unobservable_click_in_planning_reports_zero_dispatch(registry, manager, backend, monkeypatch):
+    from agent.runtime.macos_computer import HelperApplicationError
+
+    async def refuse(*args, **kwargs):
+        raise HelperApplicationError(ComputerError(ComputerErrorCode.OBSERVATION_REQUIRED, "unreadable AX action list"))
+
+    monkeypatch.setattr(backend, "plan_actions", refuse)
+    register(registry, manager)
+    focus(registry)
+    snap = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    result = run(registry.execute("computer_act", {"snapshot_id": snap["snapshot_id"],
+        "actions": [{"type": "click", "element_ref": "snapshot-1:button"}]}))
+    assert result["code"] == "observation_required"
+    assert "No input was dispatched" in result["error"]
+    assert result["computer_receipt"]["dispatch_state"] == "not_dispatched"
+    assert not any(name in {"takeover_begin", "act"} for name, _ in backend.calls)
+
+
 def test_refused_replacement_is_selected_and_typed_under_the_same_approval(registry, manager, backend, monkeypatch):
     """Live Edge 2026-09-26: an address bar refused native replacement three times, costing a round
     trip each. The tool now selects the bound field and types, the route its refusal documents."""

@@ -963,6 +963,8 @@ final class Dispatcher {
             return Self.failure(requestID: requestID, message: "target changed before takeover", code: ActionExecutionError.staleSnapshot.rawValue)
         case TakeoverError.targetNotFrontmost:
             return Self.failure(requestID: requestID, message: "target window could not be made frontmost", code: ActionExecutionError.targetNotFrontmost.rawValue)
+        case TakeoverError.coveredByFocusedModal:
+            return Self.failure(requestID: requestID, message: "an active modal window prevents exact activation of this target; inspect the current window list before acting", code: "overlay_blocked")
         case TakeoverError.activityUnavailable:
             return Self.failure(requestID: requestID, message: "user activity monitor is unavailable", code: CooperativeErrorCode.userActivityPaused.rawValue)
         case TakeoverError.userActivityPaused:
