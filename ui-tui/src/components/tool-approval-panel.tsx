@@ -7,7 +7,7 @@ import { wrapToolResult } from "../tool-results.js";
 import type { ToolApprovalRequest } from "../types.js";
 import { useTheme } from "../theme-context.js";
 import { consequenceNote } from "@astra/ui-core/approval-choices";
-import { approvalDraftRow, approvalPaintGlyph } from "../approval-paint.js";
+import { approvalDraftRow, approvalPaintGlyph, markLoanShortcut } from "../approval-paint.js";
 import { wrapDraft } from "../approval-draft.js";
 
 export interface ToolApprovalPanelProps {
@@ -179,7 +179,9 @@ export function ToolApprovalPanel({
         <Text color={theme.muted} wrap="truncate-end">↑/↓ 滚动 · PgUp/PgDn 翻页 · V/Esc 折叠</Text>
       )}
       <Text color={theme.accentAlt}>
-        {shortcuts.slice(0, -1)}{approvalPaintGlyph(paintEpoch, foregroundRelease, "t", shortcuts.slice(-1))}
+        {request.kind === "computer_foreground_takeover"
+          ? markLoanShortcut(shortcuts.slice(0, -1), paintEpoch, loanSelected)
+          : shortcuts.slice(0, -1)}{approvalPaintGlyph(paintEpoch, foregroundRelease, "t", shortcuts.slice(-1))}
       </Text>
     </Box>
   );

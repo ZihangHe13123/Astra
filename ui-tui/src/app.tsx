@@ -2390,6 +2390,8 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
       const response = transition.response;
       if (response) {
         if (response.decision !== "deny" && inputFenced) return;
+        if (response.decision === "session" && pendingApproval.kind === "computer_foreground_takeover" &&
+            paint.receipt?.loan !== (loanSelected ? "confirm" : "select")) return;
         // Refusal only needs the visible card. Sending needs the complete draft
         // on this frame, not just a visible title and shortcut line.
         if (response.decision !== "deny" && "draft" in pendingApproval && !paint.current(foregroundRelease, true)) return;

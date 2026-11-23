@@ -474,6 +474,12 @@ export function compactApprovalLines(lines: string[], maxLines: number): string[
   ];
 }
 
+const windowLoan = "借用此窗口，最多 2 分钟";
+export const loanShortcut = {
+  select: `[Tab] 选择${windowLoan}`,
+  confirm: `[回车] 确认${windowLoan}`,
+} as const;
+
 /**
  * The keyboard-choice row: collapsed shows only allow-once and deny; the
  * session grant appears once the detail view is expanded.
@@ -494,7 +500,7 @@ export function approvalChoiceHint(
     : isComputerTakeoverRequest(request) ? (loanSelected ? "[英文 Y] 允许一次" : "[回车] 允许一次（英文 Y 也可）")
     : "[Y/回车] 仅本次允许";
   const sessionLabel = isComputerTakeoverRequest(request)
-    ? "借用此窗口，最多 2 分钟"
+    ? windowLoan
     : request.scope_kind === "directory"
     ? "会话内允许该目录"
     : request.scope_kind === "batch"
@@ -505,7 +511,7 @@ export function approvalChoiceHint(
         ? `会话内允许 ${displayText(request.session_scope_label)}`
       : "会话内允许";
   const sessionHint = isComputerTakeoverRequest(request)
-    ? (loanSelected ? `[回车] 确认${sessionLabel}   [Tab] 切回允许一次` : `[Tab] 选择${sessionLabel}（英文 A 可直接借用）`)
+    ? (loanSelected ? `${loanShortcut.confirm}   [Tab] 切回允许一次` : `${loanShortcut.select}（英文 A 可直接借用）`)
     : `[A] ${sessionLabel}`;
   return [
     choices.includes("once") ? onceHint : "",

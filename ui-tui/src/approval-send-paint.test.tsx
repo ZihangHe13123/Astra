@@ -15,7 +15,7 @@ const sample = { to: "recipient@example.invalid", cc: "copy@example.invalid", bc
   subject: "Review this message", via: "inert mail fixture",
   text: Array.from({ length: 6 }, (_, i) => `distinct-body-line-${i + 1}`).join("\n") };
 
-async function withDraft(columns: number, rows: number, draft: Record<string, unknown>, exercise: (h: {
+async function withApproval(columns: number, rows: number, request: Record<string, unknown>, exercise: (h: {
   frame(): string; key(bytes: string): Promise<void>; answers: string[]; commands: string[];
   overwrite(text: string): Promise<void>; resize(columns: number, rows: number): Promise<void>;
   restoreWithBlockedWriter(): Promise<void>; ack(): Promise<void>;
@@ -47,8 +47,7 @@ async function withDraft(columns: number, rows: number, draft: Record<string, un
     app = render(scene(), { stdin: approvalAwareStdin(stdin as any), stdout: approvalPaintOutput(output as any), stderr: output as any,
       debug: true, patchConsole: false, exitOnCtrlC: false });
     await settle();
-    child.stdout.write(JSON.stringify({ type: "tool_approval_request", request_id: "message", tool_name: "send_fixture",
-      consequential: "send", kind: "tool_execution", risk: "write", reason: "fixture", choices: ["once", "deny"], draft }) + "\n");
+    child.stdout.write(JSON.stringify({ type: "tool_approval_request", request_id: "fixture", risk: "write", reason: "fixture", ...request }) + "\n");
     await settle(); assert.match(screen, /审批请求/);
     await exercise({ answers, commands, frame: () => screen, key: async bytes => { stdin.write(bytes); stdin.emit("readable"); await settle(); },
       resize: async (columns, rows) => { Object.assign(output, { columns, rows }); output.emit("resize"); await settle(); },
@@ -63,6 +62,42 @@ async function withDraft(columns: number, rows: number, draft: Record<string, un
     hold = false; flush?.(); app?.unmount(); childProcess.spawn = spawn; syncBuiltinESMExports();
   }
 }
+
+function withDraft(columns: number, rows: number, draft: Record<string, unknown>, exercise: Parameters<typeof withApproval>[3]) {
+  return withApproval(columns, rows, { tool_name: "send_fixture", consequential: "send",
+    kind: "tool_execution", choices: ["once", "deny"], draft }, exercise);
+}
+
+test("Tab loan confirmation requires every disclosed scope cell even if both card edges survive", async () => {
+  await withApproval(120, 36, { kind: "computer_foreground_takeover", tool_name: "computer_act",
+    choices: ["once", "session", "deny"] }, async h => {
+    await h.overwrite("最多 2 分钟");
+    await h.key("A"); assert.deepEqual(h.answers, [], "direct borrowing needs the same scope disclosure");
+    await h.restoreWithBlockedWriter(); await h.ack();
+    await h.key("\t");
+    assert.match(h.frame(), /确认借用此窗口，最多 2 分钟/);
+    await h.overwrite("最多 2 分钟"); // an Ink overlay inside the trusted hint
+    assert.match(h.frame(), /审批请求/);
+    assert.match(h.frame(), /YOLO/);
+    await h.key("\r");
+    assert.deepEqual(h.answers, []);
+    await h.restoreWithBlockedWriter(); await h.key("\r"); assert.deepEqual(h.answers, []);
+    await h.ack(); assert.match(h.frame(), /确认借用此窗口，最多 2 分钟/);
+    await h.key("\r"); assert.deepEqual(h.answers, ["session"]);
+  });
+});
+
+test("a clipped loan cannot be confirmed until its wrapped hint is visible in the viewport", async () => {
+  await withApproval(120, 36, { kind: "computer_foreground_takeover", tool_name: "computer_act",
+    choices: ["once", "session", "deny"] }, async h => {
+    await h.key("\t");
+    await h.resize(24, 5); await h.key("\r"); assert.deepEqual(h.answers, []);
+    await h.resize(41, 24);
+    const cells = h.frame().replaceAll("│", "").replace(/\s/g, "");
+    assert.ok(cells.includes("[回车]确认借用此窗口，最多2分钟"), h.frame());
+    await h.key("\r"); assert.deepEqual(h.answers, ["session"]);
+  });
+});
 
 test("a 50x14 send card must not grant from its painted header and footer alone", async () => {
   await withDraft(50, 14, sample, async h => {

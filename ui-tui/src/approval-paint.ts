@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { useLayoutEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import stringWidth from "string-width";
+import { loanShortcut } from "./approval-preview.js";
 import { draftFingerprint, draftLogicalLines, MAX_DRAFT_ROWS, type DraftRow } from "./approval-draft.js";
 
 // Ink preserves OSC 8 styles on cells surviving Yoga layout, wrapping and clipping.
@@ -12,6 +13,7 @@ export function approvalPaintGlyph(epoch: string | undefined, ready: boolean, ed
   return epoch ? `${start}${epoch}-${ready ? "r" : "b"}-${edge}\x07${glyph}${end}` : glyph;
 }
 
+const safeStyles = /\x1b\[(?:0|3[0-79]|9[0-7]|38;5;\d{1,3}|38;2;\d{1,3};\d{1,3};\d{1,3})m/g;
 const draftMarks = /\x1b\]8;;astra-paint-([0-9a-f]{32})-d(\d{1,3})([lc])\x07/g;
 export function approvalDraftRow(epoch: string | undefined, i: number, row: DraftRow) {
   const cells = `${row.newLine ? "▏" : "↳"}${row.text}▕`;
@@ -29,7 +31,6 @@ function paintedDraft(frameBetweenEdges: string, epoch: string): string | undefi
     if (extra || finished || index >= MAX_DRAFT_ROWS || mark[1] !== epoch || mark[2] !== String(index++)) return;
     // Our draft rows only use foreground color. In particular, don't hash through
     // concealment, cursor movement, or a foreign OSC as though the text were visible.
-    const safeStyles = /\x1b\[(?:0|3[0-79]|9[0-7]|38;5;\d{1,3}|38;2;\d{1,3};\d{1,3};\d{1,3})m/g;
     if (/[\x00-\x1f\x7f-\x9f]/.test(line.replace(draftMarks, "").replaceAll(end, "").replace(safeStyles, ""))) return;
     const from = mark.index! + mark[0].length, to = line.indexOf(end, from);
     if (to < 0) return;
@@ -42,7 +43,37 @@ function paintedDraft(frameBetweenEdges: string, epoch: string): string | undefi
   return logical.length ? draftFingerprint(logical) : undefined;
 }
 
-type Receipt = { epoch: string; ready: boolean; draftDigest?: string };
+const loanMarks = /\x1b\]8;;astra-paint-([0-9a-f]{32})-loan\x07/g;
+
+export function markLoanShortcut(text: string, epoch: string | undefined, selected: boolean): string {
+  if (!epoch) return text;
+  const label = selected ? loanShortcut.confirm : loanShortcut.select;
+  return text.replace(label, `${start}${epoch}-loan\x07${label}${end}`);
+}
+
+function paintedLoan(frame: string, epoch: string): "select" | "confirm" | undefined {
+  if (!frame.includes(`astra-paint-${epoch}-loan`)) return;
+  let label = "", finished = false;
+  for (const line of frame.split("\n")) {
+    const [mark, extra] = line.matchAll(loanMarks);
+    if (!mark) { if (label) finished = true; continue; }
+    if (extra || finished || mark[1] !== epoch) return;
+    const from = mark.index! + mark[0].length, to = line.indexOf(end, from);
+    if (to < 0) return;
+    // Ink may wrap the trusted hyperlink into adjacent physical rows. Keep the
+    // cells surviving layout; concealed cells and foreign controls cannot match.
+    if (/[\x00-\x1f\x7f-\x9f]/.test(line.replace(loanMarks, "").replace(marks, "").replaceAll(end, "").replace(safeStyles, ""))) return;
+    label += line.slice(from, to).replace(safeStyles, "");
+  }
+  const words = label.replaceAll(" ", "");
+  if (words === loanShortcut.select.replaceAll(" ", "")) return "select";
+  if (words === loanShortcut.confirm.replaceAll(" ", "")) return "confirm";
+}
+
+type Receipt = { epoch: string; ready: boolean; draftDigest?: string; loan?: "select" | "confirm" };
+function sameReceipt(a?: Receipt, b?: Receipt): boolean {
+  return a?.epoch === b?.epoch && a?.ready === b?.ready && a?.draftDigest === b?.draftDigest && a?.loan === b?.loan;
+}
 type Observer = { read(): Receipt | undefined; subscribe(cb: () => void): () => void };
 const observers = new WeakMap<NodeJS.WriteStream, Observer>();
 const absent = () => undefined;
@@ -60,10 +91,11 @@ function visibleCard(frame: string, rows: number, columns: number): Receipt | un
   // header to the final newline, require visible rows, no wrapping, and only
   // cell styling, not cursor motion that could erase or move these glyphs.
   const from = frame.lastIndexOf("\n", head.index!) + 1;
-  const lines = frame.slice(from).replace(marks, "").replace(draftMarks, "").replaceAll(end, "").replace(/\x1b\[[\d;]*m/g, "").split("\n");
+  const lines = frame.slice(from).replace(marks, "").replace(draftMarks, "").replace(loanMarks, "").replaceAll(end, "").replace(/\x1b\[[\d;]*m/g, "").split("\n");
   if (Number.isSafeInteger(rows) && rows > 0 && Number.isSafeInteger(columns) && columns > 0 && lines.length <= rows && lines.every(line =>
     !/[\x00-\x1f\x7f-\x9f]/.test(line) && stringWidth(line) < columns)) {
-    return { epoch: head[1]!, ready: head[2] === "r", draftDigest: paintedDraft(frame.slice(head.index, tail.index), head[1]!) };
+    const body = frame.slice(head.index, tail.index), epoch = head[1]!;
+    return { epoch, ready: head[2] === "r", draftDigest: paintedDraft(body, epoch), loan: paintedLoan(body, epoch) };
   }
 }
 
@@ -72,7 +104,7 @@ export function approvalPaintOutput(target: NodeJS.WriteStream): NodeJS.WriteStr
   let receipt: Receipt | undefined, revision = 0;
   const listeners = new Set<() => void>();
   const publish = (next?: Receipt) => {
-    if (receipt?.epoch === next?.epoch && receipt?.ready === next?.ready && receipt?.draftDigest === next?.draftDigest) return;
+    if (sameReceipt(receipt, next)) return;
     receipt = next;
     // A synchronous sink must not reenter Ink while it is committing its tree.
     queueMicrotask(() => listeners.forEach(notify => notify()));
@@ -90,11 +122,11 @@ export function approvalPaintOutput(target: NodeJS.WriteStream): NodeJS.WriteStr
       // and their terminators, without altering actual hyperlinks in the frame.
       let privateLink = false;
       chunk = chunk.replace(/\x1b\]8;;([^\x07\x1b\n]*)\x07/g, (code: string, url: string) => {
-        if (url) privateLink = /^astra-paint-[0-9a-f]{32}-(?:[br]-[ht]|d\d{1,3}[lc])$/.test(url);
+        if (url) privateLink = /^astra-paint-[0-9a-f]{32}-(?:[br]-[ht]|d\d{1,3}[lc]|loan)$/.test(url);
         return privateLink ? "" : code;
       });
     }
-    if (receipt?.epoch !== candidate?.epoch || receipt?.ready !== candidate?.ready || receipt?.draftDigest !== candidate?.draftDigest) publish();
+    if (!sameReceipt(receipt, candidate)) publish();
     let settled = false;
     try {
       return target.write(chunk, enc, error => {
