@@ -1484,7 +1484,7 @@ final class ForegroundPlanExecutor {
              .inputFocusRequired?: true
         case nil, .invalidAction?, .permissionDenied?, .outOfBounds?, .actionTimeout?,
              .helperFailed?, .unknownOutcome?, .accessibilityActionRefused?, .observationRequired?,
-             .textMatchNotFound?, .textMatchAmbiguous?, .textRangeUnsupported?, .textSelectionRequired?, .textInputSourceUnverified?,
+             .textMatchNotFound?, .textMatchAmbiguous?, .textRangeUnsupported?, .textSelectionRequired?, .textInputSourceUnverified?, .textCompositionActive?,
              .saveDestinationUnverified?, .saveDestinationMismatch?, .saveExtensionUnverified?, .saveDestinationExists?: false
         }
     }

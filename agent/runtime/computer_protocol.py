@@ -71,6 +71,7 @@ class ComputerErrorCode(str, Enum):
     TEXT_SELECTION_REQUIRED = "text_selection_required"
     TEXT_MATCH_NOT_FOUND = "text_match_not_found"
     TEXT_MATCH_AMBIGUOUS = "text_match_ambiguous"
+    TEXT_COMPOSITION_ACTIVE = "text_composition_active"
     TEXT_INPUT_SOURCE_UNVERIFIED = "text_input_source_unverified"
     TEXT_RANGE_UNSUPPORTED = "text_range_unsupported"
     KEYBOARD_FOCUS_UNVERIFIED = "keyboard_focus_unverified"

@@ -939,6 +939,7 @@ final class Dispatcher {
         case .textSelectionRequired: return "use the application's Find interface to select the exact requested text in the editor"
         case .textMatchNotFound: return "no exact occurrence matches the target and adjacent text"
         case .textMatchAmbiguous: return "multiple occurrences match; use more adjacent context"
+        case .textCompositionActive: return "the target editor has active marked text; commit or cancel the composition before editing"
         case .textInputSourceUnverified: return "the current input source does not establish that direct accessibility text edits are safe"
         case .textRangeUnsupported: return "the field cannot be read or edited as a verified text range"
         case .observationRequired: return "inspect the application before continuing this action batch"

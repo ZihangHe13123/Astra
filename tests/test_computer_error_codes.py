@@ -201,3 +201,12 @@ def test_unavailable_pixels_after_ack_keep_specific_recovery() -> None:
     assert failure.retryable is False
     assert "capture/privacy state" in failure.recovery_hint
     assert "Do not repeat" in failure.recovery_hint
+
+
+def test_active_composition_is_distinct_from_an_unverified_input_source():
+    from agent.runtime.tools.computer import _application_failure
+
+    marked = _application_failure(_failed("text_composition_active"))
+    unknown = _application_failure(_failed("text_input_source_unverified"))
+    assert marked.code == "text_composition_active" and "commit or cancel" in marked.message
+    assert unknown.code == "text_input_source_unverified" and "does not establish active composition" in unknown.message

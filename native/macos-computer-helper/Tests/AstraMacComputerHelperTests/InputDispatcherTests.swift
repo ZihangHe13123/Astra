@@ -1656,7 +1656,7 @@ func planningNamedKeyboardInputCannotMoveCaret(kind: String, path: String) throw
     )
 
     safety.value = .imeOrCandidate
-    #expect(throws: InputDispatchError.backgroundActionUnsupported) {
+    #expect(throws: ActionExecutionError.textInputSourceUnverified) {
         _ = try dispatcher.execute(plan, context: context)
     }
     #expect(throws: ActionExecutionError.staleSnapshot) {
@@ -2522,6 +2522,70 @@ private final class InputDispatcherSyntheticPosterSpy: SyntheticInputPosting {
     #expect(performer.performed.isEmpty)
 }
 
+@Test func unnamedTypingRetainsASCIIForegroundKeyboardRouteFromTheSameBackgroundSnapshot() throws {
+    let performer = InputDispatcherPerformerSpy()
+    let source = MutableInputDispatcherTextSafety(.safeASCIIKeyboardLayout)
+    let dispatcher = InputDispatcher(performer: performer, application: inputDispatcherApplication,
+        syntheticPolicy: inputDispatcherSyntheticPolicy(), backgroundTextInputSafety: source)
+    let guardValue = inputDispatcherBackgroundGuard().replacingKeyboardFocus(inputDispatcherKeyboardFocus("focused-editor"))
+    let context = DispatchContext(guardValue: guardValue)
+    let actions = [NativeAction.type(text: "marker")]
+    let ascii = try dispatcher.plan(actions: actions, context: context)
+    #expect(ascii.requiresTakeover && ascii.cooperativeError == nil && ascii.backends == [.foregroundKeyboard])
+    source.value = .imeOrCandidate
+    let ime = try dispatcher.plan(actions: actions, context: context)
+    #expect(ime.cooperativeError == .backgroundActionUnsupported)
+    #expect(performer.performed.isEmpty)
+}
+
+@Test func foregroundAXTextPlanReportsChangeOfInputSourceBeforeInput() throws {
+    let performer = InputDispatcherPerformerSpy(textPreflight: .settable)
+    let safety = MutableInputDispatcherTextSafety(.safeASCIIKeyboardLayout)
+    let dispatcher = InputDispatcher(performer: performer, backgroundTextInputSafety: safety)
+    let context = DispatchContext(guardValue: inputDispatcherForegroundGuard())
+    let actions = [NativeAction.type(text: "已核对", elementRef: "text")]
+    let plan = try dispatcher.plan(actions: actions, context: context)
+    #expect(plan.backends == [.axSelectedText])
+    safety.value = .imeOrCandidate
+    let authority = foregroundConsumptionAuthority(plan: plan, context: context, actions: actions)
+    #expect(throws: ActionExecutionError.textInputSourceUnverified) {
+        _ = try dispatcher.consumeForegroundPlan(plan, authority: authority)
+    }
+    #expect(throws: ActionExecutionError.staleSnapshot) {
+        _ = try dispatcher.consumeForegroundPlan(plan, authority: authority)
+    }
+    #expect(performer.performed.isEmpty)
+}
+
+@Test func focusedTextEditWithIdleIMEAndRetainedSelectionCanPlanAndConsumeAX() throws {
+    let performer = InputDispatcherPerformerSpy()
+    performer.composition = .unmarked
+    performer.rangePreflight = .settable
+    let safety = MutableInputDispatcherTextSafety(.safeASCIIKeyboardLayout)
+    let dispatcher = InputDispatcher(performer: performer, backgroundTextInputSafety: safety)
+    let action = try NativeAction.parse(.object(["type": .string("type"), "target_text": .string("待签"),
+        "text": .string("已签"), "element_ref": .string("text")]))
+    let context = DispatchContext(guardValue: inputDispatcherForegroundGuard())
+    for observed in [AXTextComposition.unmarked, .marked, .unavailable] {
+        safety.value = .safeASCIIKeyboardLayout
+        performer.composition = .unmarked
+        let plan = try dispatcher.plan(actions: [action], context: context)
+        #expect(plan.backends == [.axSelectedText])
+        safety.value = .imeOrCandidate
+        performer.composition = observed
+        let authority = foregroundConsumptionAuthority(plan: plan, context: context, actions: [action])
+        if observed == .unmarked {
+            let entries = try dispatcher.consumeForegroundPlan(plan, authority: authority)
+            #expect(entries.map(\.backend) == [.axSelectedText])
+        } else {
+            let error = observed == .marked ? ActionExecutionError.textCompositionActive : .textInputSourceUnverified
+            #expect(throws: error) { _ = try dispatcher.consumeForegroundPlan(plan, authority: authority) }
+            #expect(throws: error) { _ = try dispatcher.plan(actions: [action], context: context) }
+        }
+        #expect(performer.performed.isEmpty)
+    }
+}
+
 @Test func wholeFieldReplacePreservesLegacyIMEFallbackSignal() throws {
     let performer = InputDispatcherPerformerSpy()
     let dispatcher = InputDispatcher(performer: performer,
@@ -2548,6 +2612,13 @@ private final class InputDispatcherSyntheticPosterSpy: SyntheticInputPosting {
     let plan = try dispatcher.plan(actions: [action], context: context)
     #expect(!plan.requiresTakeover && plan.backends == [.axSelectedText])
     #expect(!plan.matches(actions: [.type(text: "new", elementRef: "text")]))
+    // TextEdit can still report its editor as focused while Terminal is frontmost.
+    performer.backgroundReplacementTargetError = .targetNotFrontmost
+    let behindTerminal = try dispatcher.plan(actions: [action], context: context)
+    #expect(behindTerminal.requiresTakeover && performer.performed.isEmpty)
+    performer.backgroundReplacementTargetError = .staleSnapshot
+    #expect(throws: ActionExecutionError.staleSnapshot) { try dispatcher.plan(actions: [action], context: context) }
+    performer.backgroundReplacementTargetError = nil
     performer.focusedKeyboardElementError = .inputFocusRequired
     let takeover = try dispatcher.plan(actions: [action], context: context)
     #expect(takeover.requiresTakeover)
@@ -2581,6 +2652,13 @@ private final class InputDispatcherPerformerSpy: ActionProviding {
     }
 
     var replacementPreflight: AXTextMutationPreflight = .unsupported
+    var composition: AXTextComposition = .unsupported
+    func textComposition(of _: ActionElement) -> AXTextComposition { composition }
+    var backgroundReplacementTargetError: ActionExecutionError?
+    func validateBackgroundReplacementTarget(_ element: ActionElement) throws {
+        if let backgroundReplacementTargetError { throw backgroundReplacementTargetError }
+        _ = try focusedKeyboardElement(matching: element)
+    }
     var rangePreflight: AXTextMutationPreflight = .unsupported
     func preflightAXRangeReplacement(_ element: ActionElement, matching: AXTextMatch) -> AXTextMutationPreflight { rangePreflight }
     func preflightAXTextReplacement(_ element: ActionElement) -> AXTextMutationPreflight { replacementPreflight }

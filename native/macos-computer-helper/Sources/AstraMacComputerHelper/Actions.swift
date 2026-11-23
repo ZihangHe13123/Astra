@@ -626,6 +626,7 @@ enum ActionExecutionError: String, Error, Equatable {
     case textMatchNotFound = "text_match_not_found"
     case textMatchAmbiguous = "text_match_ambiguous"
     case textInputSourceUnverified = "text_input_source_unverified"
+    case textCompositionActive = "text_composition_active"
     case textRangeUnsupported = "text_range_unsupported"
     case observationRequired = "observation_required"
     case keyboardFocusUnverified = "keyboard_focus_unverified"
@@ -864,6 +865,8 @@ protocol ActionProviding: AnyObject {
     func noteAXTextWriteUnavailable(_ element: ActionElement)
     func preflightAXTextReplacement(_ element: ActionElement) -> AXTextMutationPreflight
     func preflightAXRangeReplacement(_ element: ActionElement, matching match: AXTextMatch) -> AXTextMutationPreflight
+    func textComposition(of element: ActionElement) -> AXTextComposition
+    func validateBackgroundReplacementTarget(_ element: ActionElement) throws
     func selectedUnicodeWitness(for action: NativeAction, element: ActionElement) throws -> AXKeyboardRangeWitness
     func perform(_ action: ResolvedAction) throws -> ActionPerformance
     func perform(_ action: ResolvedAction, validateMutation: () throws -> Void) throws -> ActionPerformance
@@ -890,6 +893,20 @@ extension ActionProviding {
     func noteAXTextWriteUnavailable(_: ActionElement) {}
     func preflightAXTextReplacement(_: ActionElement) -> AXTextMutationPreflight { .unsupported }
     func preflightAXRangeReplacement(_: ActionElement, matching _: AXTextMatch) -> AXTextMutationPreflight { .unsupported }
+    func textComposition(of _: ActionElement) -> AXTextComposition { .unsupported }
+
+    func allowsAXText(_ element: ActionElement, source: BackgroundTextInputSafety?) throws -> Bool {
+        switch textComposition(of: element) {
+        case .marked: throw ActionExecutionError.textCompositionActive
+        case .unmarked: return source == .safeASCIIKeyboardLayout || source == .imeOrCandidate
+        case .unavailable: throw ActionExecutionError.textInputSourceUnverified
+        case .unsupported: return source == .safeASCIIKeyboardLayout
+        }
+    }
+
+    func validateBackgroundReplacementTarget(_ element: ActionElement) throws {
+        _ = try focusedKeyboardElement(matching: element)
+    }
     func selectedUnicodeWitness(for _: NativeAction, element _: ActionElement) throws -> AXKeyboardRangeWitness {
         throw ActionExecutionError.textInputSourceUnverified
     }
@@ -1469,11 +1486,9 @@ final class SystemActionPerformer: ActionProviding {
     /// 键盘焦点获取能力。**默认 nil ＝ 永不获取**：能力必须在装配处显式开启，
     /// 既让单测不必碰真实 AX，也保证这不是一个隐式全局行为。
     private let focusAcquisition: ((ActionTargetState, ActionElement) -> ActionElement?)?
-    /// 键盘布局安全检测。**默认 nil = 不加额外限制**（既有单测与未注入路径行为不变）；生产在
-    /// `makeActionPerformer` 显式注入实时检测器。守的是：输入法激活时**绝不尝试 AX 文本写**，
-    /// 改投对输入法免疫的 unicode 事件（实测：SCIM 激活下 unicode 串能进 WebKit 输入框并更新
-    /// React 状态，而真实按键码会被候选窗截走）。see docs/macos-computer-use.md#input-delivery-contracts
+    /// Production reads the live keyboard source and the exact editor's composition at every AX mutation.
     private let textInputSafety: (() -> BackgroundTextInputSafety)?
+    private let textCompositionProbe: (ActionElement) -> AXTextComposition
     /// Web content detection, ignored-write memory and the Chromium-family process probe.
     /// Default nil = no extra routing (legacy unit paths unchanged); production injects all
     /// three in `makeActionPerformer`.
@@ -1497,6 +1512,7 @@ final class SystemActionPerformer: ActionProviding {
         focusedKeyboard: ((ActionElement?) throws -> ActionElement)? = nil,
         focusAcquisition: ((ActionTargetState, ActionElement) -> ActionElement?)? = nil
         ,textInputSafety: (() -> BackgroundTextInputSafety)? = nil,
+        textCompositionProbe: @escaping (ActionElement) -> AXTextComposition = AXTextComposition.observe,
         webContentProbe: ((AXUIElement) -> Bool)? = nil,
         axTextWriteMemory: AXTextWriteEffectMemory? = nil,
         keyboardOnlyTextProcess: ((pid_t) -> Bool)? = nil
@@ -1519,6 +1535,7 @@ final class SystemActionPerformer: ActionProviding {
         injectedKeyboardFocus = focusedKeyboard
         self.focusAcquisition = focusAcquisition
         self.textInputSafety = textInputSafety
+        self.textCompositionProbe = textCompositionProbe
     }
 
     func currentTargetState() throws -> ActionTargetState { try state() }
@@ -1602,6 +1619,27 @@ final class SystemActionPerformer: ActionProviding {
               element.enabled == true, element.supportsAXSelectedTextWrite, axTextWriteMayLand(ax)
         else { return .unsupported }
         return textValueReplacer.preflightRange(to: ax, matching: match)
+    }
+
+    func textComposition(of element: ActionElement) -> AXTextComposition { textCompositionProbe(element) }
+
+    private func validateAXTextInput(_ target: ActionElement) throws {
+        do {
+            guard try allowsAXText(target, source: textInputSafety?() ?? .safeASCIIKeyboardLayout) else {
+                throw ActionExecutionError.textInputSourceUnverified
+            }
+        } catch let error as ActionExecutionError {
+            throw ActionPerformFailure(error: error, inputStarted: false)
+        }
+    }
+
+
+    func validateBackgroundReplacementTarget(_ element: ActionElement) throws {
+        guard let keyboardTargetValidation else { throw ActionExecutionError.keyboardFocusUnverified }
+        // The application can retain its focused editor behind Terminal. Verify the same
+        // exact frontmost document and field required at mutation, without acquiring focus.
+        try keyboardTargetValidation(element)
+        _ = try focusedKeyboardElement(matching: element)
     }
 
     func selectedUnicodeWitness(for action: NativeAction, element: ActionElement) throws -> AXKeyboardRangeWitness {
@@ -1757,9 +1795,9 @@ final class SystemActionPerformer: ActionProviding {
     private func performUnverified(_ action: ResolvedAction, validateMutation: () throws -> Void,
         keyboardFocus: (ActionElement?) throws -> ActionElement
     ) throws -> ActionPerformance {
-        func revalidateKeyboardTarget(_ expected: ActionElement?) throws -> ActionElement {
+        func revalidateKeyboardTarget(_ expected: ActionElement?, observeOnly: Bool = false) throws -> ActionElement {
             do {
-                let current = try keyboardFocus(expected)
+                let current = try observeOnly ? self.focusedKeyboardElement(matching: expected) : keyboardFocus(expected)
                 if let rejection = current.keyboardTargetRejection { throw rejection }
                 return current
             } catch let error as ActionExecutionError {
@@ -1769,6 +1807,18 @@ final class SystemActionPerformer: ActionProviding {
             } catch {
                 throw ActionPerformFailure(error: .helperFailed, inputStarted: false)
             }
+        }
+        func validateTextSetter(_ field: ActionElement) throws {
+            guard field.enabled == true, let expected = action.verifiedElement,
+                  field.roleResult == expected.roleResult, field.subroleResult == expected.subroleResult
+            else { throw ActionPerformFailure(error: .keyboardFocusUnverified, inputStarted: false) }
+            try validateMutation()
+            // The marked-range read is the last AX query. A later focus query could itself
+            // start composition. After this point the production guards only check HID
+            // activity, the loan deadline and secure input before the caller invokes the setter.
+            try self.validateAXTextInput(field)
+            if IsSecureEventInputEnabled() { throw ActionPerformFailure(error: .secureInputActive, inputStarted: false) }
+            try validateMutation()
         }
         if action.source.isReplacement {
             guard action.source.kind == .type,
@@ -1837,23 +1887,12 @@ final class SystemActionPerformer: ActionProviding {
                 func validateTextMutation() throws {
                     try validateMutation()
                     _ = try self.state()
-                    guard self.textInputSafety.map({ $0() == .safeASCIIKeyboardLayout }) ?? true else {
-                        throw ActionExecutionError.textInputSourceUnverified
-                    }
-                    let current: ActionElement
-                    if action.source.textMatch != nil && validatedFocus {
-                        current = try self.focusedKeyboardElement(matching: expected)
-                    } else {
-                        current = try revalidateKeyboardTarget(expected)
-                    }
+                    let current = try revalidateKeyboardTarget(expected, observeOnly: validatedFocus)
                     guard current.supportsAXSelectedTextWrite, current.enabled == true,
                           current.roleResult == expected.roleResult, current.subroleResult == expected.subroleResult
                     else { throw ActionExecutionError.keyboardFocusUnverified }
                     try keyboardTargetValidation(expected)
-                    if action.source.textMatch != nil && IsSecureEventInputEnabled() {
-                        throw ActionExecutionError.secureInputActive
-                    }
-                    try validateMutation()
+                    try validateTextSetter(current)
                     validatedFocus = true
                 }
                 let replacement = action.source.text ?? ""
@@ -1867,10 +1906,8 @@ final class SystemActionPerformer: ActionProviding {
                 return ActionPerformance(inputStarted: result.inputStarted, effectVerification: result.effectVerification,
                     observationRequired: result.observationRequired)
             }
-            guard textInputSafety.map({ $0() == .safeASCIIKeyboardLayout }) ?? true else {
-                throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false)
-            }
-            _ = try revalidateKeyboardTarget(action.verifiedElement)
+            let exactTarget = try revalidateKeyboardTarget(action.verifiedElement)
+            try validateAXTextInput(exactTarget)
             guard axTextWriteMayLand(element) else {
                 throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false)
             }
@@ -1887,11 +1924,10 @@ final class SystemActionPerformer: ActionProviding {
                 action.source.text ?? "",
                 to: element,
                 validateBeforeMutation: {
-                    _ = try revalidateKeyboardTarget(action.verifiedElement)
-                    guard self.textInputSafety.map({ $0() == .safeASCIIKeyboardLayout }) ?? true,
-                          self.axTextWriteMayLand(element)
+                    guard self.axTextWriteMayLand(element)
                     else { throw ActionPerformFailure(error: .staleSnapshot, inputStarted: false) }
-                    try validateMutation()
+                    let exactTarget = try revalidateKeyboardTarget(action.verifiedElement, observeOnly: true)
+                    try validateTextSetter(exactTarget)
                 }
             )
             switch selectedTextResult {

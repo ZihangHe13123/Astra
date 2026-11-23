@@ -454,15 +454,7 @@ final class InputDispatcher: InputDispatching {
             logActionRejected("EXECUTE-MODE-OR-BACKENDS planRef=\(plan.planRef)")
             throw ActionExecutionError.staleSnapshot
         }
-        if record.requiresSafeTextInput {
-            let observedSafety = backgroundTextInputSafety.detect()
-            guard observedSafety == .safeASCIIKeyboardLayout else {
-                logActionRejected(
-                    "EXECUTE-TEXT-SAFETY observed=\(observedSafety) diagnosticSource=\(currentKeyboardInputSourceIDForDiagnostics())"
-                )
-                throw InputDispatchError.backgroundActionUnsupported
-            }
-        }
+        try validatePlannedAXText(record)
         guard record.cooperativeError == nil else { throw ActionExecutionError.invalidAction }
         guard !record.requiresTakeover, record.interactionMode == .background else {
             throw ActionExecutionError.targetNotFrontmost
@@ -562,20 +554,7 @@ final class InputDispatcher: InputDispatching {
             consumeDiag("consumeForegroundPlan: mode/backends mismatch planRef=\(plan.planRef)")
             throw ActionExecutionError.staleSnapshot
         }
-        // 复核必须用 consume 时刻**真实可见**的判据：`resolved`/`verifiedElement` 只挂在
-        // .accessibilityText 路由上（键盘路由不带元素），所以按 role 判"会不会投真实按键码"在这里
-        // 不可求值 —— 实机前一次尝试因此仍然被拒（用例红在同一个 backgroundActionUnsupported）。
-        // 而这条不变量真正保护的是 **AX 文本 mutation**（`productionTextPreflightRejectsIME…`）：
-        // 输入法激活时不许去写 AXSelectedText。unicode 投递免疫输入法（探针实测），故只拦会走
-        // AX 写的那条批。残留缺口（如实记）：若计划时布局安全、投递前才切到拼音，而目标是非白名单
-        // role（perform 会投真实按键码），本处无法识别 ⇒ 后果是文字被候选窗截走（正确性问题，
-        // 非安全边界），要收口得把逐条目的形态决策随 plan 记录一起存下来。
-        if record.requiresSafeTextInput,
-           backgroundTextInputSafety.detect() != .safeASCIIKeyboardLayout,
-           record.entries.contains(where: { $0.backend == .axSelectedText }) {
-            consumeDiag("consumeForegroundPlan: unsafe layout must not perform an AX text write")
-            throw InputDispatchError.backgroundActionUnsupported
-        }
+        try validatePlannedAXText(record)
 
         for (index, entry) in record.entries.enumerated() {
             guard entry.sourceIndex == index,
@@ -649,6 +628,17 @@ final class InputDispatcher: InputDispatching {
         fragmentDrafts = fragmentDrafts.filter { $0.value.expiresAt >= now }
     }
 
+    private func validatePlannedAXText(_ record: PlanRecord) throws {
+        guard record.requiresSafeTextInput else { return }
+        let source = backgroundTextInputSafety.detect()
+        for entry in record.entries where entry.backend == .axSelectedText {
+            guard let target = entry.resolved?.verifiedElement else { throw ActionExecutionError.staleSnapshot }
+            guard try performer.allowsAXText(target, source: source) else {
+                throw ActionExecutionError.textInputSourceUnverified
+            }
+        }
+    }
+
     private func resolveBackground(
         _ action: NativeAction,
         expected: ActionGuard,
@@ -660,12 +650,13 @@ final class InputDispatcher: InputDispatching {
         }
         let element = action.elementRef.flatMap { performer.element(reference: $0, snapshotID: expected.snapshotID) }
         if action.elementRef != nil, element == nil { throw ActionExecutionError.staleSnapshot }
+        let textMayUseAX = try action.kind == .type && element.map { try performer.allowsAXText($0, source: textInputSafety) } == true
         if action.isReplacement {
             guard let element else { throw ActionExecutionError.invalidAction }
             if let refusal = element.keyboardTargetRejection { throw refusal }
             guard element.enabled != nil else { throw ActionExecutionError.keyboardFocusUnverified }
             // The source type cannot distinguish an idle IME from an active composition.
-            if textInputSafety != .safeASCIIKeyboardLayout {
+            if !textMayUseAX {
                 // Legacy clients use this refusal to replan a whole-field replacement
                 // as a target-bound foreground keyboard command before approval.
                 if action.replace == true { return .unsupported(backend: .axSelectedText, actionClass: .text) }
@@ -679,15 +670,9 @@ final class InputDispatcher: InputDispatching {
                 return .takeover(backend: .foregroundKeyboard, actionClass: .text, targetKeyboardFocus: authority)
             }
         }
-        // IME 一刀切闸窄化（实测驱动，see docs/macos-computer-use.md#input-delivery-contracts）：
-        // 原写法只要布局不安全就把整发 type 判死。实测证明这既不必要也不正确 —— 拼音激活下
-        // virtualKey 0 + unicode 串的 postToPid 事件能把「测试」「abc」都送进 Safari 网页输入框
-        // （AX value 可见、发送按钮由灰变黑）。会被输入法截走候选的是**真实按键码**。
-        // 所以本闸只管一件事：这一发最终会不会投真实按键码 —— role 不在 AX 写白名单 ⇒ perform
-        // 会选物理键 ⇒ 照旧拒；元素没点名 ⇒ 形态不可知 ⇒ 保守拒。AX 写路径由下面的 preflight
-        // 跳过与 perform 侧守卫两处拦住，那条不变量不松。
-        if action.kind == .type,
-           textInputSafety != .safeASCIIKeyboardLayout,
+        // Without a target-specific AX witness, keep the existing Unicode-versus-physical-key policy.
+        if action.kind == .type, textInputSafety != .safeASCIIKeyboardLayout,
+           !textMayUseAX,
            expected.interactionMode == .background
             || (!(element?.supportsAXSelectedTextWrite ?? false)
                 && !(expected.interactionMode == .foregroundTakeover
@@ -820,11 +805,20 @@ final class InputDispatcher: InputDispatching {
                 else { throw ActionExecutionError.inputFocusRequired }
                 // No focus acquisition while planning; the existing foreground
                 // authorization and activity lease must guard the mutation.
+                var requiresTakeover = true
+                if action.textMatch != nil && expected.interactionMode == .background {
+                    do {
+                        try performer.validateBackgroundReplacementTarget(element)
+                        requiresTakeover = false
+                    } catch ActionExecutionError.inputFocusRequired, ActionExecutionError.targetNotFrontmost {
+                        // The normal takeover plan must acquire authorization before it can activate the document.
+                    }
+                }
                 return PlannedAction(resolved: ResolvedAction(source: action, method: .accessibilityText,
                     screenPoint: nil, endScreenPoint: nil, element: axElement, verifiedElement: element),
                     backend: .axSelectedText, actionClass: .text,
                     targetKeyboardFocus: authority,
-                    requiresTakeover: action.textMatch == nil || (try? performer.focusedKeyboardElement(matching: element)) == nil)
+                    requiresTakeover: requiresTakeover)
             }
             guard !element.isSecure else { return .unsupported(backend: .axSelectedText, actionClass: .text) }
             if followsBoundSelectAll {
@@ -837,10 +831,9 @@ final class InputDispatcher: InputDispatching {
                 return .takeover(backend: .foregroundKeyboard, actionClass: .text, targetKeyboardFocus: focus)
             }
             let targetKeyboardFocus = try planningKeyboardFocus(for: element, expected: expected)
-            // 输入法不安全 ⇒ 连 AX 文本写的 preflight 都不做，本发强制走键盘 unicode 通道
-            // （不变量：不安全布局下绝不做文本 mutation；perform 侧另有同向守卫）。
+            // Preflight AX only when both the current input source and the target-specific evidence permit it.
             let mutationPreflight: AXTextMutationPreflight =
-                textInputSafety == .safeASCIIKeyboardLayout
+                textMayUseAX
                     ? performer.preflightAXTextMutation(element)
                     : .unsupported
             logActionRejected("TYPE-ROUTE safety=\(String(describing: textInputSafety)) preflight=\(mutationPreflight)")

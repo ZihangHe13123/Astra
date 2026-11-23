@@ -159,6 +159,7 @@ _SAFE_ACTION_ERRORS = {
     ComputerErrorCode.TEXT_SELECTION_REQUIRED: "The requested text range is not currently selected in the bound field.",
     ComputerErrorCode.TEXT_MATCH_NOT_FOUND: "The observed field has no literal match with that context. Inspect its current text.",
     ComputerErrorCode.TEXT_MATCH_AMBIGUOUS: "Multiple locations match. Supply more adjacent prefix or suffix from the field.",
+    ComputerErrorCode.TEXT_COMPOSITION_ACTIVE: "The target editor reports an active input-method composition. Let the user commit or cancel it before issuing a fresh edit.",
     ComputerErrorCode.TEXT_INPUT_SOURCE_UNVERIFIED: "Direct AX text editing is unavailable with this input source. For a document edit, inspect the application’s Find and Replace command if available. The source alone does not establish active composition.",
     ComputerErrorCode.TEXT_RANGE_UNSUPPORTED: "The exact field text or selection cannot be reliably read or edited through Accessibility.",
     ComputerErrorCode.KEYBOARD_FOCUS_UNVERIFIED: "The helper could not verify the focused control's accessibility metadata or identity.",

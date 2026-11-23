@@ -84,7 +84,7 @@ func backgroundWriterNeverTakesKeyboardFocus(drift: Bool) throws {
         state: makeState,
         lookup: { _, _ in target },
         selectedTextWriter: writer, keyboardTargetValidation: { _ in },
-        focusedKeyboard: { _ in other },
+        focusedKeyboard: { _ in acquireCalls == 0 ? other : target },
         focusAcquisition: { _, expected in
             acquireCalls += 1
             return expected
@@ -96,7 +96,7 @@ func backgroundWriterNeverTakesKeyboardFocus(drift: Bool) throws {
         _ = try performer.perform(typeAction(target: targetAX, verified: target), validateMutation: { leaseChecks += 1 })
     }
     #expect(leaseChecks >= acquireCalls)
-    #expect(acquireCalls >= 1)
+    #expect(acquireCalls == 1)
     #expect(setCalls == 1)
 }
 
@@ -243,7 +243,10 @@ func foregroundFocusWriteRequiresCurrentWindowAndField(probe: String) throws {
         state: makeState,
         lookup: { _, _ in target },
         selectedTextWriter: writer, keyboardTargetValidation: { _ in },
-        focusedKeyboard: { _ in throw ActionExecutionError.inputFocusRequired },
+        focusedKeyboard: { _ in
+            guard acquireCalls > 0 else { throw ActionExecutionError.inputFocusRequired }
+            return target
+        },
         focusAcquisition: { _, expected in
             acquireCalls += 1
             return expected
@@ -253,7 +256,7 @@ func foregroundFocusWriteRequiresCurrentWindowAndField(probe: String) throws {
     #expect(throws: Never.self) {
         _ = try performer.perform(typeAction(target: targetAX, verified: target), validateMutation: {})
     }
-    #expect(acquireCalls >= 1)
+    #expect(acquireCalls == 1)
     #expect(setCalls == 1)
 }
 

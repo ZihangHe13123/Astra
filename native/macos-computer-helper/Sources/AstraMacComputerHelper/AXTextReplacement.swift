@@ -180,6 +180,9 @@ final class SystemAXTextValueReplacer: AXTextValueReplacing {
                 effectVerification: verified ? .verified : .unverified, observationRequired: !verified)
         } catch let failure as ActionPerformFailure {
             throw ActionPerformFailure(error: failure.error, inputStarted: inputStarted || failure.inputStarted)
+        } catch let pause as UserActivityMonitoringError {
+            if inputStarted { throw ActionPerformFailure(error: .unknownOutcome, inputStarted: true) }
+            throw pause
         } catch {
             throw ActionPerformFailure(error: (error as? ActionExecutionError) ?? .helperFailed, inputStarted: inputStarted)
         }
@@ -358,6 +361,9 @@ extension SystemAXTextValueReplacer {
                                          observationRequired: !verified)
         } catch let failure as ActionPerformFailure {
             throw ActionPerformFailure(error: failure.error, inputStarted: inputStarted || failure.inputStarted)
+        } catch let pause as UserActivityMonitoringError {
+            if inputStarted { throw ActionPerformFailure(error: .unknownOutcome, inputStarted: true) }
+            throw pause
         } catch {
             throw ActionPerformFailure(error: (error as? ActionExecutionError) ?? .helperFailed, inputStarted: inputStarted)
         }
