@@ -84,11 +84,16 @@ private func panelElements(_ e: AXUIElement, _ key: String, limit: Int) -> [AXUI
     return result.count == values.count ? result : nil
 }
 
+struct SaveBrowserItem: Hashable {
+    let original: URL
+    let resolved: URL
+}
+
 enum SaveBrowserSelection: Equatable {
     case empty
     case selectedVirtualItem
-    case directory(URL)
-    case file(URL)
+    case directory(SaveBrowserItem)
+    case file(SaveBrowserItem)
 }
 
 func provenSaveBrowserDirectory(_ columns: [SaveBrowserSelection], popupLabel: String?,
@@ -96,13 +101,13 @@ func provenSaveBrowserDirectory(_ columns: [SaveBrowserSelection], popupLabel: S
     guard let popupLabel, !popupLabel.isEmpty, columns.count >= 2 else { return nil }
     // The trailing column is the current location's contents. A selected file can
     // corroborate its parent, but cannot establish a location on its own.
-    // The column URLs are already canonical. Foundation standardization can fold
-    // /private/tmp back to /tmp and break literal parent comparisons.
+    // A symlink can change the directory's ancestry. Compare the paths shown
+    // by AX in this browser; only the resulting destination uses realpath.
     let branch = Array(columns.dropLast())
     guard case let .directory(folder)? = branch.last else { return nil }
     switch columns.last {
     case .empty?: break
-    case let .file(file)? where file.deletingLastPathComponent().path == folder.path: break
+    case let .file(file)? where file.original.deletingLastPathComponent().path == folder.original.path: break
     default: return nil
     }
     // Finder can show a virtual volume or alias in earlier columns. Anchor
@@ -111,11 +116,11 @@ func provenSaveBrowserDirectory(_ columns: [SaveBrowserSelection], popupLabel: S
     guard !branch.contains(.empty) else { return nil }
     if branch.count >= 2 {
         guard case let .directory(parent) = branch[branch.count - 2],
-              parent.path != folder.path, folder.deletingLastPathComponent().path == parent.path
+              parent.original.path != folder.original.path, folder.original.deletingLastPathComponent().path == parent.original.path
         else { return nil }
-    } else if folder.path != "/" { return nil }
-    guard popupLabel == folder.lastPathComponent || popupLabel == displayName(folder) else { return nil }
-    return folder.path
+    } else if folder.original.path != "/" { return nil }
+    guard popupLabel == folder.original.lastPathComponent || popupLabel == displayName(folder.original) else { return nil }
+    return folder.resolved.path
 }
 
 private func panelRole(_ e: AXUIElement) -> String? {
@@ -123,13 +128,15 @@ private func panelRole(_ e: AXUIElement) -> String? {
     return read.status == .complete ? read.value : nil
 }
 
-private func localItemURL(_ e: AXUIElement) -> URL? {
+private func localItemURL(_ e: AXUIElement) -> SaveBrowserItem? {
     let (status, raw) = observationAXAttribute(e, kAXURLAttribute)
     guard status == .success, let url = raw as? URL, url.isFileURL,
           url.host == nil || url.host == "" || url.host == "localhost",
-          url.path.hasPrefix("/"), url.path.utf8.count <= 4096, url.query == nil, url.fragment == nil
+          url.path.hasPrefix("/"), url.path.utf8.count <= 4096, url.query == nil, url.fragment == nil,
+          !url.path.unicodeScalars.contains(where: CharacterSet.controlCharacters.contains),
+          let resolved = canonicalSaveItem(url)
     else { return nil }
-    return canonicalSaveItem(url)
+    return SaveBrowserItem(original: URL(fileURLWithPath: url.path), resolved: resolved)
 }
 
 private func columnSelection(_ column: AXUIElement) -> SaveBrowserSelection? {
@@ -151,12 +158,12 @@ private func columnSelection(_ column: AXUIElement) -> SaveBrowserSelection? {
         guard let children = panelElements(selected[0], kAXChildrenAttribute, limit: 12) else { return nil }
         candidates += children.filter { panelRole($0) == kAXTextFieldRole as String }
     }
-    let urls = Set(candidates.compactMap(localItemURL))
-    if urls.isEmpty { return .selectedVirtualItem }
-    guard urls.count == 1, let url = urls.first else { return nil }
-    guard let props = try? url.resourceValues(forKeys: [.isDirectoryKey, .volumeIsLocalKey]),
+    let items = Set(candidates.compactMap(localItemURL))
+    if items.isEmpty { return .selectedVirtualItem }
+    guard items.count == 1, let item = items.first else { return nil }
+    guard let props = try? item.resolved.resourceValues(forKeys: [.isDirectoryKey, .volumeIsLocalKey]),
           props.volumeIsLocal == true, let directory = props.isDirectory else { return .selectedVirtualItem }
-    return directory ? .directory(url) : .file(url)
+    return directory ? .directory(item) : .file(item)
 }
 
 private func folderFromBrowser(_ browser: AXUIElement, popupLabel: String?, budget: AXObservationBudget) -> String? {

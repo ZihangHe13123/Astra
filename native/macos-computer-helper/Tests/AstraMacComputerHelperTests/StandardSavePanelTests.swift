@@ -3,6 +3,10 @@ import Foundation
 import ApplicationServices
 import Testing
 
+private func directSaveBrowserItem(_ url: URL) -> SaveBrowserItem {
+    SaveBrowserItem(original: url, resolved: url)
+}
+
 @Test func standardSavePanelNamesExactFieldsAndTreatsFolderLabelsAsUnverified() {
     let fname = StandardSavePanelField(identifier: "saveAsNameTextField", role: "AXTextField", reference: "filename",
         value: "local-note.docx", directoryPath: nil)
@@ -53,13 +57,40 @@ import Testing
 
 @Test func savePanelBrowserSelectionUsesTheActualSelectedFolderAndItsContentsColumn() {
     let base = URL(fileURLWithPath: "/fixture"), parent = base.appendingPathComponent("A"), folder = parent.appendingPathComponent("reports")
-    let selected = [SaveBrowserSelection.selectedVirtualItem, .directory(parent), .directory(folder)]
+    let selected = [SaveBrowserSelection.selectedVirtualItem, .directory(directSaveBrowserItem(parent)), .directory(directSaveBrowserItem(folder))]
     #expect(provenSaveBrowserDirectory(selected + [.empty], popupLabel: "reports") == folder.path)
-    #expect(provenSaveBrowserDirectory(selected + [.file(folder.appendingPathComponent("existing.docx"))], popupLabel: "reports") == folder.path)
-    #expect(provenSaveBrowserDirectory([.directory(base.appendingPathComponent("B")),.directory(folder),.empty], popupLabel: "reports") == nil)
+    #expect(provenSaveBrowserDirectory(selected + [.file(directSaveBrowserItem(folder.appendingPathComponent("existing.docx")))], popupLabel: "reports") == folder.path)
+    #expect(provenSaveBrowserDirectory([.directory(directSaveBrowserItem(base.appendingPathComponent("B"))),.directory(directSaveBrowserItem(folder)),.empty], popupLabel: "reports") == nil)
     #expect(provenSaveBrowserDirectory(selected + [.empty], popupLabel: "other") == nil)
-    #expect(provenSaveBrowserDirectory([.file(folder.appendingPathComponent("existing.docx")),.empty], popupLabel: "reports") == nil)
+    #expect(provenSaveBrowserDirectory([.file(directSaveBrowserItem(folder.appendingPathComponent("existing.docx"))),.empty], popupLabel: "reports") == nil)
     #expect(provenSaveBrowserDirectory(selected + [.selectedVirtualItem], popupLabel: "reports") == nil)
+}
+
+@Test(arguments: ["alias", "canonical", "disconnected", "alias_label_and_selected_file"])
+func saveBrowserProvesTheObservedPathBeforeReturningTheResolvedDirectory(scenario: String) {
+    let root = URL(fileURLWithPath: "/")
+    let temporary = URL(fileURLWithPath: "/private/tmp")
+    let child = URL(fileURLWithPath: "/private/tmp/x")
+    let alias = SaveBrowserItem(original: URL(fileURLWithPath: "/tmp"), resolved: temporary)
+    switch scenario {
+    case "alias":
+        #expect(provenSaveBrowserDirectory([.directory(directSaveBrowserItem(root)), .directory(alias), .empty],
+                                           popupLabel: "tmp") == "/private/tmp")
+    case "canonical":
+        #expect(provenSaveBrowserDirectory([.directory(directSaveBrowserItem(temporary)),
+                                           .directory(directSaveBrowserItem(child)), .empty],
+                                           popupLabel: "x") == "/private/tmp/x")
+    case "disconnected":
+        let disconnected = SaveBrowserItem(original: URL(fileURLWithPath: "/elsewhere/x"), resolved: child)
+        #expect(provenSaveBrowserDirectory([.directory(directSaveBrowserItem(temporary)),
+                                           .directory(disconnected), .empty], popupLabel: "x") == nil)
+    default:
+        let chosen = SaveBrowserItem(original: URL(fileURLWithPath: "/chosen"), resolved: temporary)
+        let file = SaveBrowserItem(original: URL(fileURLWithPath: "/chosen/copy.docx"),
+                                   resolved: URL(fileURLWithPath: "/private/tmp/copy.docx"))
+        #expect(provenSaveBrowserDirectory([.directory(directSaveBrowserItem(root)), .directory(chosen), .file(file)],
+                                           popupLabel: "chosen") == "/private/tmp")
+    }
 }
 
 @Test func newSavePanelCopyChecksTheRealDirectoryNameAndFilesystemImmediatelyBeforeSave() throws {
@@ -88,9 +119,9 @@ import Testing
     try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: false)
     defer { try? FileManager.default.removeItem(at: folderURL) }
     let parent = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
-    let columns: [SaveBrowserSelection] = [.directory(parent), .directory(folderURL)]
+    let columns: [SaveBrowserSelection] = [.directory(directSaveBrowserItem(parent)), .directory(directSaveBrowserItem(folderURL))]
     #expect(provenSaveBrowserDirectory(columns + [.empty], popupLabel: folderURL.lastPathComponent) == folder)
-    #expect(provenSaveBrowserDirectory(columns + [.file(folderURL.appendingPathComponent("existing.docx"))],
+    #expect(provenSaveBrowserDirectory(columns + [.file(directSaveBrowserItem(folderURL.appendingPathComponent("existing.docx")))],
                                       popupLabel: folderURL.lastPathComponent) == folder)
     let name = "copy.docx"
     #expect(savePanelLocalDirectory(URL(fileURLWithPath: alias) as NSURL) == folder)
