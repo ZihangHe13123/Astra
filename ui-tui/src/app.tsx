@@ -118,7 +118,7 @@ import {
   approvalRequestLines,
   escapeApprovalDisplayText,
 } from "./approval-preview.js";
-import { ApprovalQueue, transitionApprovalInput, type ForegroundRelease } from "./approval-interaction.js";
+import { ApprovalQueue, transitionApprovalInput, type ForegroundChoice } from "./approval-interaction.js";
 import { useForegroundApprovalInput } from "./foreground-approval-input.js";
 import { useApprovalPaint } from "./approval-paint.js";
 import { formatQuestionAnswerSummary } from "./question-interaction.js";
@@ -2330,7 +2330,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   const ownsConnectionInput = (requirePaint = true, selectedRowDigest?: string) => !!connectionEpoch && committedConnection.current === connectionEpoch &&
     (!requirePaint || (connectionPaint.current(false) && (selectedRowDigest === undefined || connectionPaint.receipt?.draftDigest === selectedRowDigest))) &&
     connectionOpenRef.current && !approvalQueue.requests.length && !questionRequestRef.current && !lifecycle?.closing;
-  const handleInput = (input: string, key: Partial<Key>, released?: ForegroundRelease) => {
+  const handleInput = (input: string, key: Partial<Key>, chosen?: ForegroundChoice) => {
     if (lifecycle?.closing) return;
     if (connectionOpenRef.current && !pendingApproval && !questionRequest) return;
     const plainCtrl = key.ctrl && !key.meta && !key.shift;
@@ -2375,7 +2375,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
         input,
         key,
         { lineCount: approvalLineCount, pageSize: approvalPageSize },
-        released,
+        chosen,
       );
       const response = transition.response;
       if (response) {
@@ -2445,10 +2445,10 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
     ? pendingApproval.request_id : undefined;
   const normalInputOwner = startupVisible ? "startup" : pendingApproval ? paint.receipt ?? paint.epoch ?? pendingApproval
     : questionRequest ?? connectionPaint.receipt ?? connectionEpoch ?? openToolResult ?? "composer";
-  const foregroundRelease = useForegroundApprovalInput(foregroundId, normalInputOwner, (id, input, key, released) => {
+  const foregroundRelease = useForegroundApprovalInput(foregroundId, normalInputOwner, (id, input, key, chosen) => {
     if (pendingApproval?.request_id !== id || approvalQueue.requests[0] !== pendingApproval) return false;
     appshotClientRef.current?.recordInput();
-    return handleInput(input, key, released);
+    return handleInput(input, key, chosen);
   }, approvalVisible, setInputFenced);
   useInput((input, key) => {
     appshotClientRef.current?.recordInput();

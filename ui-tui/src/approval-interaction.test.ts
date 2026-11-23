@@ -108,7 +108,7 @@ test("Ink-normalized chords are consumed without answering a pending approval", 
   assert.equal(transitionApprovalInput(collapsed, "", { escape: true, meta: true }, bounds).response?.decision, "deny");
 });
 
-test("foreground grants require a release for the same FIFO head and an offered choice; legacy input cannot grant", () => {
+test("foreground grants come only from the raw parser's choice for the same FIFO head and an offered choice, never Ink keys", () => {
   const takeover: ToolApprovalRequest = {
     ...first,
     request_id: "takeover-1",

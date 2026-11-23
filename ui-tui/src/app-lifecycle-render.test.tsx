@@ -641,8 +641,9 @@ test("foreground terminal grants use negotiated raw press/release frames for one
   try {
     ask("one"); ask("two"); await settle();
     assert.ok(h.stdout.chunks.join("").includes("\x1b[?1004$p"));
-    assert.match(h.frame(), /GUI.*重新发起/);
-    await h.key("y"); await h.key("\r"); await h.key("a"); await h.key(down + up);
+    assert.match(h.frame(), /\[Y\/回车\] 允许一次/); assert.doesNotMatch(h.frame(), /按下并松开/);
+    // Before Kitty reporting is live: Alt letters, a paste and unconfirmed Kitty frames do not answer.
+    await h.key("\x1by"); await h.key("\x1b[200~y\ra\x1b[201~"); await h.key(down + up);
     assert.deepEqual(decisions(), []);
     await negotiate(); assert.match(h.frame(), /按下并松开/); assert.ok(h.stdout.chunks.join("").includes("\x1b[>11u"));
     await h.key("\x1b[200~" + down); await h.key(up + "\x1b[201~");
@@ -668,7 +669,7 @@ test("foreground terminal keeps legacy denial and enhanced navigation, cancel an
   const ask = (id: string) => h.child.event({ type: "tool_approval_request", request_id: id, tool_name: "computer_act", risk: "write",
     kind: "computer_foreground_takeover", reason: "fixture", choices: ["once", "deny"] });
   try {
-    ask("legacy"); await settle(); await h.key("y"); await h.key("n");
+    ask("legacy"); await settle(); await h.key("\x1by"); await h.key("n");
     assert.deepEqual(h.child.commands.filter(c => c.type === "tool_approval_response").map(c => c.decision), ["deny"]);
     // First query had no answer. Its late response must not negotiate the new head.
     ask("enhanced"); h.child.event({ type: "task_started", task: { id: "work", status: "running" } }); await settle();
@@ -680,6 +681,46 @@ test("foreground terminal keeps legacy denial and enhanced navigation, cancel an
   } finally { h.app.unmount(); }
   assert.equal(h.stdout.chunks.join("").split("\x1b[<u").length - 1, 1);
   assert.ok(h.stdout.chunks.join("").includes("\x1b[?1004l"));
+});
+
+test("a terminal without key-event reporting answers each painted foreground head with one independent key", async () => {
+  const h = await setup(120, 36);
+  const ask = async (id: string, choices = ["once", "session", "deny"]) => {
+    h.child.event({ type: "tool_approval_request", request_id: id, tool_name: "computer_act", risk: "write",
+      kind: "computer_foreground_takeover", reason: "fixture", choices });
+    await settle();
+  };
+  const decisions = () => h.child.commands.filter(c => c.type === "tool_approval_response").map(c => [c.request_id, c.decision]);
+  const expected: string[][] = [];
+  try {
+    await ask("one"); await ask("two");
+    assert.match(h.frame(), /\[Y\/回车\] 允许一次.*\[A\] 借用此窗口.*\[N\] 拒绝/);
+    assert.doesNotMatch(h.frame(), /按下并松开|N\/Esc|GUI/);
+    await h.key("y"); expected.push(["one", "once"]); assert.deepEqual(decisions(), expected); // only the head
+    await h.key("A"); expected.push(["two", "session"]); assert.deepEqual(decisions(), expected);
+    await ask("enter"); await h.key("\r"); expected.push(["enter", "once"]); assert.deepEqual(decisions(), expected);
+
+    await ask("guarded", ["once", "deny"]);
+    await h.key("a"); // not offered
+    await h.key("yy"); await h.key("y\r"); // coalesced bytes are not one key
+    await h.key("\x1by"); await h.key("\x1b"); await h.key("y"); // Alt+y, then a suffix after an Escape wait
+    await h.key("\x1b[200~y\x1b[201~"); // paste
+    await h.key("\x1b]2;"); await h.key("y"); await h.key("\x07"); // string payload until its terminator
+    assert.deepEqual(decisions(), expected);
+    await h.key("Y"); expected.push(["guarded", "once"]); assert.deepEqual(decisions(), expected);
+  } finally { h.app.unmount(); }
+});
+
+test("once Kitty reporting is live, a plain byte cannot answer the foreground card; its release frame can", async () => {
+  const h = await setup(120, 36);
+  const decisions = () => h.child.commands.filter(c => c.type === "tool_approval_response").map(c => [c.request_id, c.decision]);
+  try {
+    h.child.event({ type: "tool_approval_request", request_id: "kitty", tool_name: "computer_act", risk: "write",
+      kind: "computer_foreground_takeover", reason: "fixture", choices: ["once", "session", "deny"] });
+    await settle(); await h.key("\x1b[?1004;2$y\x1b[?0u\x1b[?11u"); assert.match(h.frame(), /按下并松开/);
+    await h.key("y"); await h.key("\r"); await h.key("a"); assert.deepEqual(decisions(), []);
+    await h.key("\x1b[121u\x1b[121;1:3u"); assert.deepEqual(decisions(), [["kitty", "once"]]);
+  } finally { h.app.unmount(); }
 });
 
 function kittyReview(h: Awaited<ReturnType<typeof setup>>) {

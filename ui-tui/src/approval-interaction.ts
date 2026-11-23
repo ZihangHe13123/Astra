@@ -25,7 +25,8 @@ export interface ApprovalInteractionBounds {
   pageSize: number;
 }
 
-export type ForegroundRelease = { requestId: string; decision: "once" | "session" };
+/** A foreground answer from the raw terminal parser, bound to the head that was on screen. */
+export type ForegroundChoice = { requestId: string; decision: "once" | "session" };
 
 /** Live FIFO; React renders its snapshots, but input and backend events need not wait for a repaint. */
 export class ApprovalQueue {
@@ -67,7 +68,7 @@ export function transitionApprovalInput(
   input: string,
   key: ApprovalInputKey,
   bounds: ApprovalInteractionBounds,
-  released?: ForegroundRelease,
+  chosen?: ForegroundChoice,
 ): ApprovalInteractionTransition {
   const request = state.requests[0];
   if (!request) return { ...state, handled: false };
@@ -94,8 +95,9 @@ export function transitionApprovalInput(
   });
 
   if (request.kind === "computer_foreground_takeover") {
-    // Ink's legacy keypress stream has no release evidence, including for an unmodified Enter.
-    if (released?.requestId === request.request_id && choices.includes(released.decision)) return resolve(released.decision);
+    // Only the raw parser answers: it binds the key to this head and refuses Escape suffixes, string
+    // payloads and pastes. Ink's keypress stream cannot tell those from a typed Y or Enter.
+    if (chosen?.requestId === request.request_id && choices.includes(chosen.decision)) return resolve(chosen.decision);
   } else if (((key.return && (input === "" || input === "\r")) || normalizedInput === "y") && choices.includes("once")) {
     return resolve("once");
   } else if (normalizedInput === "t" && choices.includes("task")) {

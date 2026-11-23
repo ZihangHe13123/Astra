@@ -108,8 +108,9 @@ export function ToolApprovalPanel({
     : "";
   let choices = expanded ? view.shortcutHint : collapsedShortcutHint(view.shortcutHint);
   if (request.kind === "computer_foreground_takeover") {
-    choices = foregroundRelease ? `按下并松开（不按修饰键）：${choices}`
-      : "未确认终端支持松键事件。可按 N 拒绝，再到 GUI 重新发起任务。   [V] 详情";
+    // Kitty reporting answers on the matching release. Elsewhere one key answers on press, and a
+    // legacy Escape never reaches a foreground card, so only N refuses there.
+    choices = foregroundRelease ? `按下并松开（不按修饰键）：${choices}` : choices.replace("[N/Esc]", "[N]");
   }
   const note = consequenceNote(request);
   const hasDraft = "draft" in request;

@@ -1,6 +1,6 @@
 import { useLayoutEffect, useRef, useState } from "react";
 import { useStdin, useStdout, type Key } from "ink";
-import type { ForegroundRelease } from "./approval-interaction.js";
+import type { ForegroundChoice } from "./approval-interaction.js";
 
 const ESC = "\x1b", CSI = ESC + "[", pasteStart = CSI + "200~", pasteEnd = CSI + "201~";
 const legacyEscapeWaitMS = 25;
@@ -9,7 +9,7 @@ const flags = 1 | 2 | 8;
 // Kitty encodes 1 + a bitmask. Ignore only the Caps/Num Lock indicators; an unknown
 // bit or a physically held modifier must not turn a chord into a plain approval key.
 function heldModifiers(wire?: string): number { return (Number(wire || 1) - 1) & ~(64 | 128); }
-type Handler = (id: string, input: string, key: Partial<Key>, released?: ForegroundRelease) => boolean | void;
+type Handler = (id: string, input: string, key: Partial<Key>, chosen?: ForegroundChoice) => boolean | void;
 
 type InputOwner = object | string;
 type Receiver = { id?: string; view: InputOwner; approval: boolean };
@@ -54,7 +54,7 @@ export function approvalAwareStdin(source: NodeJS.ReadStream): NodeJS.ReadStream
   return input;
 }
 
-/** Only the raw, acknowledged terminal protocol can produce a foreground release. Never log stdin. */
+/** Only this raw parser can produce a foreground choice. Never log stdin. */
 export class ForegroundTerminalInput {
   private receiver: Receiver = { view: "composer", approval: false };
   private get id() { return this.receiver.id; }
@@ -164,7 +164,7 @@ export class ForegroundTerminalInput {
     }
   }
 
-  private send(input: string, key: Partial<Key>, decision?: ForegroundRelease["decision"]) {
+  private send(input: string, key: Partial<Key>, decision?: ForegroundChoice["decision"]) {
     const id = this.id;
     if (!id || this.done) return;
     if (this.handle(id, input, key, decision ? { requestId: id, decision } : undefined) && this.id === id) this.done = true;
@@ -400,14 +400,22 @@ export class ForegroundTerminalInput {
       }
       this.armed = undefined;
       if (!owner) normal += c;
-      else if (chunk.length === 1 && receiver === this.receiver) this.legacy(c);
+      else if (chunk.length === 1 && receiver === this.receiver) this.legacy(c, true);
     }
     return !aborted && receiver === this.receiver ? normal : "";
   }
 
-  private legacy(c: string) {
+  /** `independent`: a lone byte read with no Escape prefix, control string or paste pending. */
+  private legacy(c: string, independent = false) {
     if (c === "\x03" || c === "\x19") this.send(c === "\x03" ? "c" : "y", { ctrl: true });
     if (/^[nv]$/i.test(c)) this.send(c.toLowerCase(), {});
+    // Without key-event reporting the terminal sends a key once, on press. Only an independent byte
+    // chooses, never an Escape suffix, a timeout, string payload or paste. Its release is not
+    // takeover evidence for the helper. Once Kitty reporting is live, only its release frames choose.
+    if (independent && !this.ready && this.receiver.approval) {
+      if (/^[y\r]$/i.test(c)) this.send("", {}, "once");
+      else if (/^a$/i.test(c)) this.send("", {}, "session");
+    }
   }
 }
 

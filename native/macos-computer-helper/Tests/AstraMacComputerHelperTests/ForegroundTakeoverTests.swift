@@ -884,7 +884,7 @@ func markedDecisionDoesNotChargeLaterPIDLookupToHIDSample(_ situation: String) t
     let time = ManualLoanTime()
     time.now = 100
     // A local approval gesture 5 ms before consent is legitimate. An event 5 ms after is not.
-    let lastEvent = situation == "postDecisionKey" ? 100.005 : 99.995
+    var lastEvent = situation == "postDecisionKey" ? 100.005 : 99.995
     var samples = 0, count: UInt32 = 17
     var duringFinalPIDRead: () -> Void = {}
     let f = TakeoverFixture(inputCounts: { [count] }, physicalIdleSeconds: {
@@ -895,7 +895,7 @@ func markedDecisionDoesNotChargeLaterPIDLookupToHIDSample(_ situation: String) t
         if samples == 2 { duringFinalPIDRead() }
     }, loanTime: time)
     duringFinalPIDRead = {
-        if situation == "counterDuringAX" { count += 1 }
+        if situation == "counterDuringAX" { count += 1; lastEvent = time.now }  // a press during the AX read
         if situation == "pauseDuringAX" { f.activity.isPaused = true }
     }
     defer { duringFinalPIDRead = {} }
@@ -909,13 +909,14 @@ func markedDecisionDoesNotChargeLaterPIDLookupToHIDSample(_ situation: String) t
     } else {
         let expected: TakeoverError = situation == "expiredDuringAX" ? .loanExpired : .userActivityPaused
         #expect(throws: expected) { try begin() }
-        #expect(samples == (situation == "postDecisionKey" ? 1 : 2))
+        // A changed count is dated by one more idle sample.
+        #expect(samples == ["postDecisionKey": 1, "counterDuringAX": 3][situation, default: 2])
         #expect(f.activation.activated.isEmpty && f.activation.restored.isEmpty)
     }
     #expect(f.activity.disarmCount == 1)
 }
 
-@Test(arguments: ["thirdApp", "destination", "flags", "keypress"])
+@Test(arguments: ["thirdApp", "destination", "countedPress", "keypress"])
 func markedBorrowRechecksTheFinalHIDAndPIDBeforeUnhide(_ change: String) throws {
     var count: UInt32 = 17
     var idle = 20.0
@@ -927,7 +928,7 @@ func markedBorrowRechecksTheFinalHIDAndPIDBeforeUnhide(_ change: String) throws 
                 switch change {
                 case "thirdApp": f.runtime.fallbackFrontmost = 99
                 case "destination": f.runtime.fallbackFrontmost = f.batch.target.pid
-                case "flags": count += 1
+                case "countedPress": count += 1; idle = 0.1
                 default: idle = 0.1
                 }
             }
@@ -942,29 +943,94 @@ func markedBorrowRechecksTheFinalHIDAndPIDBeforeUnhide(_ change: String) throws 
     #expect(f.batch.activity.disarmCount == 1)
 }
 
-@Test(arguments: [CGEventType.flagsChanged, .leftMouseUp, .rightMouseUp, .otherMouseUp])
-func markedFirstBorrowCountsChangesDuringTapStartup(_ event: CGEventType) throws {
+@Test(arguments: [CGEventType.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown, .scrollWheel, .mouseMoved,
+                  .leftMouseDragged, .rightMouseDragged, .otherMouseDragged])
+func markedFirstBorrowCountsPressesDuringTapStartup(_ event: CGEventType) throws {
+    for pressedAfterDecision in [true, false] {
+        let time = ManualLoanTime()
+        time.now = 100
+        let hid = BatchedPresses(time)
+        let f = TakeoverFixture(inputCounts: hid.counts, physicalIdleSeconds: hid.idle, loanTime: time)
+        // Published while the monitor starts: a new press, or the approving press from an earlier batch.
+        f.activity.onArm = { hid.publish(event, pressedAt: pressedAfterDecision ? 99.5 : 89.5) }
+        let consent = ForegroundFocusConsent(decidedAtContinuousUS: 90_000_000, frontmostPID: 77)
+        if pressedAfterDecision {
+            #expect(throws: TakeoverError.userActivityPaused) { try f.begin(focusConsent: consent) }
+            #expect(f.activation.activated.isEmpty && f.activation.restored.isEmpty)
+        } else {
+            let token = try f.begin(focusConsent: consent)
+            #expect(try f.coordinator.end(token.ref, allowRestore: true).restoration == .restored)
+        }
+        #expect(f.activity.disarmCount == 1)
+    }
+}
+
+// The window server publishes HID counts and times in batches dated to each batch's start (every
+// 0.5 s on the macOS 27 test Mac). The press that approved can surface mid-activation.
+@Test func markedBorrowContinuesWhenItsApprovingPressIsPublishedDuringActivation() throws {
+    var count: UInt32 = 17
+    let f = SettlingTakeoverFixture(inputCounts: { [count] }, physicalIdleSeconds: { 20 })
+    f.runtime.onEvent = { step in
+        if step == "identity" { count += 1 }  // newly counted, still dated before the decision at 90 s
+        if step == "open" { f.runtime.fallbackFrontmost = f.batch.target.pid }
+    }
+    defer { f.runtime.onEvent = { _ in } }
+    _ = try f.begin(focusConsent: .init(decidedAtContinuousUS: 90_000_000, frontmostPID: 77))
+    #expect(f.runtime.events.contains("open"))
+    #expect(f.runtime.fallbackFrontmost == f.batch.target.pid)
+}
+
+// A terminal without key-event reporting sends the approval key on press, so its release follows the
+// decision. A release ends a gesture that began before; only a new press is the person taking over.
+@Test(arguments: [CGEventType.keyUp, .flagsChanged, .leftMouseUp, .rightMouseUp, .otherMouseUp])
+func markedFirstBorrowIgnoresReleasesAfterTheDecision(_ event: CGEventType) throws {
     let time = ManualLoanTime()
     time.now = 100
-    var count: UInt32 = 0
-    let f = TakeoverFixture(inputCounts: {
-        ForegroundTakeoverCoordinator.physicalInputCounts { $0 == event ? count : 0 }
-    }, physicalIdleSeconds: { 20 }, loanTime: time)
-    f.activity.onArm = { count += 1 }
+    var counts: [CGEventType: UInt32] = [.keyDown: 7, event: 3]
+    var last: [CGEventType: TimeInterval] = [.keyDown: 89.99, event: 89.99]  // the approval press
+    func countsNow() -> [UInt32] { ForegroundTakeoverCoordinator.physicalInputCounts { counts[$0] ?? 0 } }
+    let f = TakeoverFixture(inputCounts: countsNow, physicalIdleSeconds: {
+        ForegroundTakeoverCoordinator.secondsSincePhysicalInput { time.now - (last[$0] ?? 0) }
+    }, loanTime: time)
+    last[event] = 90.08  // released after the decision at 90 s
+    f.activity.onArm = { counts[event, default: 0] += 1 }  // and counted while the monitor starts
+    let token = try f.begin(focusConsent: .init(decidedAtContinuousUS: 90_000_000, frontmostPID: 77))
+    #expect(f.activation.activated.map(\.pid) == [f.target.pid])
+    #expect(try f.coordinator.end(token.ref, allowRestore: true).restoration == .restored)
+
+    let pressed = TakeoverFixture(inputCounts: countsNow, physicalIdleSeconds: {
+        ForegroundTakeoverCoordinator.secondsSincePhysicalInput { time.now - (last[$0] ?? 0) }
+    }, loanTime: time)
+    last[.keyDown] = 90.2  // a new press after the decision is the person taking over
     #expect(throws: TakeoverError.userActivityPaused) {
-        try f.begin(focusConsent: .init(decidedAtContinuousUS: 90_000_000, frontmostPID: 77))
+        try pressed.begin(focusConsent: .init(decidedAtContinuousUS: 90_000_000, frontmostPID: 77))
     }
-    #expect(f.activation.activated.isEmpty && f.activation.restored.isEmpty)
-    #expect(f.activity.disarmCount == 1)
+    #expect(pressed.activation.activated.isEmpty && pressed.activation.restored.isEmpty)
+}
+
+@Test func physicalIdleIsTheNewestPressAndUnknownWhenAnySampleIsUnusable() {
+    let ago: [CGEventType: TimeInterval] = [.keyDown: 4, .keyUp: 0.5, .flagsChanged: 0.25, .leftMouseUp: 0.1,
+                                            .rightMouseUp: 0.1, .otherMouseUp: 0.1, .mouseMoved: 3]
+    func newest(_ override: [CGEventType: TimeInterval] = [:]) -> TimeInterval? {
+        ForegroundTakeoverCoordinator.secondsSincePhysicalInput { override[$0] ?? ago[$0] ?? 600 }
+    }
+    #expect(newest() == 3)
+    #expect(newest([.otherMouseDragged: 2.5]) == 2.5)
+    for unusable in [TimeInterval.nan, .infinity, -1] {
+        #expect(newest([.scrollWheel: unusable]) == nil)
+    }
+    #expect(ForegroundTakeoverCoordinator.physicalInputCounts { $0 == .keyUp || $0 == .flagsChanged ? 1 : 0 }
+        .allSatisfy { $0 == 0 })
 }
 
 @Test(arguments: ["previousPID", "tapStartup"])
 func firstBorrowRejectsPhysicalInputBeforeTapPublication(_ when: String) {
-    var count: UInt32 = 0
-    let f = TakeoverFixture(inputCounts: { [count] }, beforeReadingFrontmost: {
-        if when == "previousPID" { count += 1 }
-    })
-    f.activity.onArm = { if when == "tapStartup" { count += 1 } }
+    let time = ManualLoanTime()
+    let hid = BatchedPresses(time)
+    let f = TakeoverFixture(inputCounts: hid.counts, physicalIdleSeconds: hid.idle, beforeReadingFrontmost: {
+        if when == "previousPID" { hid.publish(.keyDown, pressedAt: time.now) }
+    }, loanTime: time)
+    f.activity.onArm = { if when == "tapStartup" { hid.publish(.keyDown, pressedAt: time.now) } }
     // The event never reached the tap and the same app stayed in front.
     #expect(throws: TakeoverError.userActivityPaused) { try f.begin() }
     #expect(f.activation.activated.isEmpty)
@@ -3786,6 +3852,20 @@ private struct SettlingTakeoverFixture {
             planRef: batch.plan.planRef, stageDigest: batch.plan.stageDigest, continuedLoan: false,
             focusConsent: focusConsent ?? coordinator.simulatedConsent())
     }
+}
+
+/// What the window server has published: per-class press counts and the time of the newest press.
+private final class BatchedPresses {
+    private var count: [CGEventType: UInt32] = [:]
+    private var newest: [CGEventType: TimeInterval] = [:]
+    private let time: ManualLoanTime
+    init(_ time: ManualLoanTime) { self.time = time }
+    func publish(_ type: CGEventType, pressedAt instant: TimeInterval) {
+        count[type, default: 0] += 1
+        newest[type] = max(newest[type] ?? 0, instant)
+    }
+    func counts() -> [UInt32] { ForegroundTakeoverCoordinator.physicalInputCounts { self.count[$0] ?? 0 } }
+    func idle() -> TimeInterval? { ForegroundTakeoverCoordinator.secondsSincePhysicalInput { self.time.now - (self.newest[$0] ?? 0) } }
 }
 
 private final class ManualLoanTime {

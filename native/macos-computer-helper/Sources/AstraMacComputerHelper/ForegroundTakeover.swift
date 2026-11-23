@@ -103,21 +103,35 @@ final class ForegroundTakeoverCoordinator {
     typealias PlanConsumer = (String) -> ForegroundTakeoverPlanAuthority?
     typealias LoanAlarm = (_ deadline: TimeInterval, _ fire: @escaping () -> Void) -> () -> Void
 
+    // Takeover evidence is something the person starts: a key or button press, the wheel, motion or a
+    // drag. A key, button or modifier release only ends a gesture that began earlier, such as the key that
+    // answered a terminal approval on press. The activity monitor ignores the same releases.
+    static let physicalPressEventTypes: [CGEventType] = [.keyDown, .leftMouseDown, .rightMouseDown, .otherMouseDown,
+                                                         .scrollWheel, .mouseMoved, .leftMouseDragged,
+                                                         .rightMouseDragged, .otherMouseDragged]
+
     // Sample counts, never key values. Equality can only keep an existing loan valid.
     static func physicalInputCounts() -> [UInt32] {
         physicalInputCounts { CGEventSource.counterForEventType(.hidSystemState, eventType: $0) }
     }
 
     static func physicalInputCounts(counter: (CGEventType) -> UInt32) -> [UInt32] {
-        let types: [CGEventType] = [.keyDown, .keyUp, .flagsChanged, .leftMouseDown, .leftMouseUp,
-                                    .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp,
-                                    .scrollWheel, .mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
-        return types.map(counter)
+        physicalPressEventTypes.map(counter)
     }
 
     static func secondsSincePhysicalInput() -> TimeInterval? {
-        guard let anyInput = CGEventType(rawValue: UInt32.max) else { return nil }  // kCGAnyInputEventType
-        return CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: anyInput)
+        secondsSincePhysicalInput { CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: $0) }
+    }
+
+    /// The most recent press of any class above. One unusable sample makes the answer unknown.
+    static func secondsSincePhysicalInput(since: (CGEventType) -> TimeInterval) -> TimeInterval? {
+        var newest: TimeInterval?
+        for type in physicalPressEventTypes {
+            let seconds = since(type)
+            guard seconds.isFinite, seconds >= 0 else { return nil }
+            newest = min(newest ?? seconds, seconds)
+        }
+        return newest
     }
 
     private struct ReleaseCheckpoint {
@@ -374,8 +388,14 @@ final class ForegroundTakeoverCoordinator {
             // Sample immediately after the HID query, conservatively including that query's latency.
             guard consent.remainedQuiet(idle: idle, checkedAt: loanNow()) else { throw TakeoverError.userActivityPaused }
         }
-        func checkConsentCounts() throws {
-            guard !beforeArm.isEmpty, inputCounts() == beforeArm else { throw TakeoverError.userActivityPaused }
+        // The window server publishes these counters in batches, each dated to the batch's start (every
+        // 0.5 s on the macOS 27 test Mac). The press that made the decision can therefore show up after
+        // `beforeArm`. A changed count is takeover evidence unless an idle sample taken after it dates
+        // every press to before the decision. A press later in the decision's own batch cannot be told
+        // apart from the approving one; the activity monitor covers input once it is armed.
+        func checkConsentCounts(_ consent: ForegroundFocusConsent) throws {
+            guard !beforeArm.isEmpty else { throw TakeoverError.userActivityPaused }
+            if inputCounts() != beforeArm { try checkIdleAtSample(consent) }
         }
         func checkActivityAndDeadline() throws {
             do { try activity.assertNotPaused(lease: lease) }
@@ -383,14 +403,16 @@ final class ForegroundTakeoverCoordinator {
             if let deadline = loanDeadline, loanNow() >= deadline { throw TakeoverError.loanExpired }
         }
         do {
-            guard inputCounts() == beforeArm else { throw TakeoverError.userActivityPaused }
             if let focusConsent {
+                try checkConsentCounts(focusConsent)
                 try checkIdleAtSample(focusConsent)
                 guard oldPID == focusConsent.frontmostPID, frontmostPID() == focusConsent.frontmostPID else {
                     throw TakeoverError.userActivityPaused
                 }
-                try checkConsentCounts()
+                try checkConsentCounts(focusConsent)
                 try checkActivityAndDeadline()
+            } else if inputCounts() != beforeArm {
+                throw TakeoverError.userActivityPaused
             }
             let current = try revalidate(target)
             guard exactTarget(current, target) else { throw TakeoverError.targetChanged }
@@ -424,7 +446,7 @@ final class ForegroundTakeoverCoordinator {
                 let pid = try focus.check()
                 if let focusConsent {
                     guard !awaitingFirstEffect || pid == focusConsent.frontmostPID else { throw TakeoverError.userActivityPaused }
-                    try checkConsentCounts()
+                    try checkConsentCounts(focusConsent)
                 }
                 try checkActivityAndDeadline()
                 awaitingFirstEffect = false

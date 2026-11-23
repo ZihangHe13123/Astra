@@ -353,3 +353,36 @@ test("a focus-out is binding only while focus reporting is continuous", () => {
     }
   }
 });
+
+test("without Kitty reporting, one independent key answers its foreground head on press, once", () => {
+  for (const [key, decision] of [["y", "once"], ["Y", "once"], ["\r", "once"], ["a", "session"], ["A", "session"]]) {
+    const { keys, grants } = setup(); keys.head("F"); // probe written, never answered
+    keys.feed(key); keys.feed(key); assert.deepEqual(grants, [`F:${decision}`], JSON.stringify(key));
+  }
+});
+
+test("a plain-byte answer is never an Escape suffix, a coalesced read, a paste or string payload", () => {
+  const cases: [string, (keys: ForegroundTerminalInput) => void][] = [
+    ["Alt+y", keys => keys.feed("\x1by")],
+    ["Alt+y split inside the Escape wait", keys => { keys.feed("\x1b"); keys.feed("y"); }],
+    ["suffix after an expired Escape", keys => { keys.feed("\x1b"); assert.equal(keys.finishEscapeWait(), ""); keys.feed("y"); }],
+    ["two bytes", keys => keys.feed("yy")],
+    ["y with Return", keys => keys.feed("y\r")],
+    ["bracketed paste", keys => keys.feed(C + "200~y" + C + "201~")],
+    ["OSC payload", keys => { keys.feed("\x1b]2;"); keys.feed("y"); keys.feed("\x07"); }],
+    ["DCS payload", keys => { keys.feed("\x1bP"); keys.feed("y"); keys.feed("\x1b\\"); }],
+    ["CSI final byte", keys => { keys.feed(C + "?1004;2$"); keys.feed("y"); }],
+  ];
+  for (const [name, feed] of cases) {
+    const { keys, grants } = setup(); keys.head("F");
+    feed(keys); assert.deepEqual(grants, [], name);
+    keys.feed("y"); assert.deepEqual(grants, ["F:once"], `${name}: a fresh key still answers`);
+  }
+});
+
+test("once Kitty reporting is live, plain bytes cannot answer; only a matching release frame can", () => {
+  const { keys, grants, negotiate } = setup(); keys.head("K"); negotiate();
+  for (const key of ["y", "Y", "\r", "a"]) keys.feed(key);
+  assert.deepEqual(grants, []);
+  keys.feed(press + release); assert.deepEqual(grants, ["K:once"]);
+});
