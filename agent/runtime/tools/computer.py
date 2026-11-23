@@ -589,6 +589,7 @@ class _PreparedComputerAct:
     policy_context: dict[str, Any] | None = None
     dispatch_attempted: bool = False
     dispatch_result: dict[str, Any] | None = None
+    acknowledged_sheet_dismissal: bool = False
     save_destination: str = ""
     reserve_new_copy: bool = False
     save_panel: str = ""
@@ -3992,11 +3993,15 @@ def register_computer_tools(
                             unmatched = any(w.get("bindable") is False for w in recovered.get("windows", []))
                             waiting_for_popup = (covering and user_action_delivered
                                                  and recovered.get("observation_reason") == "exact_previous_target")
-                            if attempt == 1 or not (unmatched or waiting_for_popup):
+                            closing_sheet = (prepared.acknowledged_sheet_dismissal
+                                             and recovered.get("status") == "target_still_present")
+                            if attempt == 1 or not (unmatched or waiting_for_popup or closing_sheet):
                                 break
                             await asyncio.sleep(0.1)
                         if recovered is None:
                             return None
+                        if prepared.acknowledged_sheet_dismissal and recovered.get("observation_reason") != "sheet_parent":
+                            return {k: v for k, v in recovered.items() if k != "next_observation"}
                         arguments = _next_transition_observation({"window_transition": recovered})
                         if not may_reobserve or arguments is None:
                             return recovered
@@ -4276,10 +4281,24 @@ def register_computer_tools(
                 acknowledged = result.result["last_acknowledged_action"]
                 assert isinstance(acknowledged, int) and not isinstance(acknowledged, bool)
                 observed_actions = normalized[:acknowledged + 1]
+            action = prepared.actions[0]
+            prepared.acknowledged_sheet_dismissal = (
+                result.ok and prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER
+                and len(prepared.actions) == 1 and action.type == "keypress"
+                and action.key in {"return", "escape"} and not action.modifiers
+                and before_target.get("window_role") == "AXSheet"
+                and bool(before_target.get("parent_window_identity_ref"))
+                and _fully_acknowledged_action_batch(result.result, 1)
+                and (prepared.dispatch_result or {}).get("outcomes") == [{
+                    "index": 0, "ok": True, "effect_verification": "unverified", "observation_required": True,
+                }]
+            )
             observation_error: Exception | None = None
             pending_clicks.remember(before_binding, before_tree, normalized, result.result)
             observation_deadline = asyncio.get_running_loop().time() + _POST_ACTION_OBSERVATION_TIMEOUT_SECONDS
-            for attempt in range(3):
+            # The helper proved the attached sheet disappeared; observe its catalogued
+            # parent without probing the old target or sending the key again.
+            for attempt in range(0 if prepared.acknowledged_sheet_dismissal else 3):
                 if asyncio.get_running_loop().time() >= observation_deadline:
                     observation_error = TimeoutError()
                     break
@@ -4313,12 +4332,15 @@ def register_computer_tools(
                     if attempt < 2:
                         remaining = observation_deadline - asyncio.get_running_loop().time()
                         await asyncio.sleep(min(0.05, max(0, remaining)))
-            assert observation_error is not None
-            logger.warning(
-                "post-action computer snapshot failed error_type=%s",
-                type(observation_error).__name__,
-            )
-            observation_code = _post_observation_error_code(observation_error)
+            if prepared.acknowledged_sheet_dismissal:
+                observation_code = ComputerErrorCode.TARGET_GONE.value
+            else:
+                assert observation_error is not None
+                logger.warning(
+                    "post-action computer snapshot failed error_type=%s",
+                    type(observation_error).__name__,
+                )
+                observation_code = _post_observation_error_code(observation_error)
             # A checkpoint's validated prefix is the complete observed batch,
             # not proof that its unexecuted suffix was delivered. Missing or
             # malformed receipts must remain genuinely unknown.
@@ -5512,6 +5534,7 @@ def register_computer_tools(
         nonlocal save_as_intent
         nonlocal readback_copy, pending_replacement
         prepared = prepared_acts.get(call_id) or act_receipt_states.get(call_id)
+        returning_to_save_panel = False
         if prepared is not None:
             payload = {}
             with suppress(ValueError, TypeError):
@@ -5536,6 +5559,14 @@ def register_computer_tools(
                     and _next_transition_observation(payload) is not None):
                 receipt["next_step"] = "observe_window_transition"
                 result["committed_no_replay"] = True
+                transition = payload.get("window_transition")
+                returning_to_save_panel = (
+                    prepared.acknowledged_sheet_dismissal
+                    and prepared.covered_save_as_intent is not None
+                    and save_as_intent is prepared.covered_save_as_intent
+                    and isinstance(transition, Mapping)
+                    and transition.get("observation_reason") == "sheet_parent"
+                )
             full_ack = (not manager.handed_off and prepared.dispatch_attempted
                         and _fully_acknowledged_action_batch(prepared.dispatch_result, len(prepared.actions)))
             if prepared.proposed_save_as_intent is not None and full_ack and (
@@ -5584,7 +5615,7 @@ def register_computer_tools(
                             g.get("status") == "not_satisfied" for g in results)
                         result["details"] = {"choice_status": "not_satisfied" if mismatched else "unknown"}
         if result.get("error"):
-            if prepared is not None and (
+            if not returning_to_save_panel and prepared is not None and (
                 (prepared.covered_save_as_intent is not None and save_as_intent is prepared.covered_save_as_intent)
                 or (prepared.failure is not None and save_as_intent is not None
                     and trusted_target.get("window_identity_ref") in {save_as_intent.panel, save_as_intent.sheet})
@@ -5593,7 +5624,7 @@ def register_computer_tools(
             if prepared is None or write_lease is prepared.write_lease_at_entry or write_lease is prepared.covered_write_lease:
                 revoke_write_lease()
             if call_id in authorized_acts:
-                clear_write_grants()
+                clear_write_grants(preserve_foreground_session=returning_to_save_panel)
             elif prepared is not None and prepared.failure is not None and prepared.loan_at_entry is foreground_loan:
                 revoke_loan()
         completed_acts.add(call_id)

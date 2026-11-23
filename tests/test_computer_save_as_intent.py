@@ -4,6 +4,7 @@ import json
 import sys
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from zipfile import ZipFile
 
 import pytest
 
@@ -234,11 +235,16 @@ def test_save_as_sheet_refusals_return_to_ordinary_approval(workflow, bind_direc
     assert len(cards) == 3
 
 
-@pytest.mark.parametrize("path_syntax", ["absolute", "home_alias", "tmp_alias"])
+@pytest.mark.parametrize(("path_syntax", "deferred"), [
+    ("absolute", False), ("home_alias", False), ("tmp_alias", False), ("absolute", True),
+])
 def test_save_as_panel_loan_keeps_two_cards_across_its_attached_sheet(
-    workflow, bind_directory_sheet, registry, backend, monkeypatch, path_syntax,
+    workflow, bind_directory_sheet, registry, backend, monkeypatch, path_syntax, deferred,
 ):
-    _, _, clock, cards, act, open_panel, bind_panel = workflow
+    source, _, clock, cards, act, open_panel, bind_panel = workflow
+    expected_body = ["Shift handover", "Outbound clearance is pending."]
+    body(source, expected_body)
+    original = source.read_bytes()
     root = Path.home() if path_syntax == "home_alias" else Path("/private/tmp")
     begins = []
     native_begin = backend.begin_takeover
@@ -269,6 +275,39 @@ def test_save_as_panel_loan_keeps_two_cards_across_its_attached_sheet(
                       interaction_mode="foreground_takeover")
         assert not opening["error"], opening
         assert len(cards) == 2 and cards[1]["choices"] == ["once", "session", "deny"]
+        panel_catalog = backend.apps
+        panel_tree = backend.snapshot_ax_tree_override
+        native_act = backend.act
+        native_snapshot = backend.snapshot
+        sheet_closed = False
+        defer_parent_read = deferred
+
+        async def simulate_sheet_and_save(target, snapshot_id, actions, **kwargs):
+            nonlocal sheet_closed
+            receipt = await native_act(target, snapshot_id, actions, **kwargs)
+            if target.window_ref == "sheet-ref" and actions[0].key == "return":
+                sheet_closed = True
+                backend.snapshot_ax_tree_override = panel_tree
+                monkeypatch.setattr(backend, "apps", panel_catalog)
+                return cu.ComputerActionResult(result={"last_acknowledged_action": 0, "outcomes": [{
+                    "index": 0, "ok": True, "effect_verification": "unverified", "observation_required": True,
+                }]})
+            if actions[0].save_new_copy_to:
+                assert target.window_ref == "window-1" and sheet_closed
+                body(destination, expected_body)
+            return receipt
+
+        async def capture(target, *args, **kwargs):
+            nonlocal defer_parent_read
+            if sheet_closed and target.window_ref == "sheet-ref":
+                raise cu.ComputerSessionError("target_not_frontmost")
+            if sheet_closed and target.window_ref == "window-1" and defer_parent_read:
+                defer_parent_read = False
+                raise cu.ComputerSessionError("snapshot_failed")
+            return await native_snapshot(target, *args, **kwargs)
+
+        monkeypatch.setattr(backend, "act", simulate_sheet_and_save)
+        monkeypatch.setattr(backend, "snapshot", capture)
         clock[0] += 1
         filled = act(bind_directory_sheet(), {"type": "type", "text": typed, "replace": True, "element_ref": "directory"},
                      interaction_mode="foreground_takeover")
@@ -276,10 +315,27 @@ def test_save_as_panel_loan_keeps_two_cards_across_its_attached_sheet(
         assert len(cards) == 2
         clock[0] += 1
         accepted = act(snapshot(filled), {"type": "keypress", "key": "return"}, interaction_mode="foreground_takeover")
-        assert not accepted["error"], accepted
-        edited = act(bind_panel(directory=directory), {"type": "type", "element_ref": "snapshot-1:name", "text": destination.name})
+        assert accepted["computer_receipt"]["dispatch_state"] == "acknowledged"
+        if deferred:
+            assert accepted["code"] == "post_action_observation_pending", accepted
+            assert accepted["committed_no_replay"] is True
+            transition = accepted["details"]["window_transition"]
+            observe = transition["next_observation"]
+            panel_state = snapshot(cu.run(registry.execute(observe["tool"], observe["arguments"])))
+        else:
+            assert not accepted["error"], accepted
+            transition = json.loads(accepted["fresh_output"])["window_transition"]
+            panel_state = snapshot(accepted)
+        assert transition["observation_reason"] == "sheet_parent"
+        edited = act(panel_state, {"type": "type", "element_ref": "snapshot-1:name", "text": destination.name})
+        assert not edited["error"], edited
         saved = act(snapshot(edited), {"type": "click", "element_ref": "snapshot-1:save", "save_new_copy_to": str(destination)})
         assert not saved["error"], saved
+        with ZipFile(destination) as saved_docx:
+            assert saved_docx.testzip() is None
+            with ZipFile(source) as source_docx:
+                assert saved_docx.read("word/document.xml") == source_docx.read("word/document.xml")
+        assert source.read_bytes() == original
         assert len(cards) == 2
         assert len(begins) == 4
         assert [b.get("continued_loan") for b in begins] == [None, False, True, True]

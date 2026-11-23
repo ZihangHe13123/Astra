@@ -198,6 +198,7 @@ final class ForegroundKeyboardExecutor {
     private let focus: FocusLookup
     private let continuingTextFocus: ContinuingTextFocusLookup?
     private let keyTransitionFocus: KeyTransitionFocusLookup?
+    private let captureSheetDismissal: (() -> (() -> Bool)?)?
     private let now: () -> TimeInterval
     private let actionTimeout: TimeInterval
     private let experimentalUnicodeChunkGraphemes: Int
@@ -213,6 +214,7 @@ final class ForegroundKeyboardExecutor {
         focus: @escaping FocusLookup,
         continuingTextFocus: ContinuingTextFocusLookup? = nil,
         keyTransitionFocus: KeyTransitionFocusLookup? = nil,
+        captureSheetDismissal: (() -> (() -> Bool)?)? = nil,
         now: @escaping () -> TimeInterval = ForegroundLoanClock.now,
         actionTimeout: TimeInterval = 10,
         experimentalUnicodeChunkGraphemes: Int = 8
@@ -227,6 +229,7 @@ final class ForegroundKeyboardExecutor {
         self.focus = focus
         self.continuingTextFocus = continuingTextFocus
         self.keyTransitionFocus = keyTransitionFocus
+        self.captureSheetDismissal = captureSheetDismissal
         self.now = now
         self.actionTimeout = actionTimeout
         self.experimentalUnicodeChunkGraphemes = min(8, max(1, experimentalUnicodeChunkGraphemes))
@@ -311,9 +314,13 @@ final class ForegroundKeyboardExecutor {
               (action.entry.source.textMatch != nil) == (rangeWitness != nil) else { return stopped(error: .invalidAction) }
         do {
             var observationRequired = false
+            var effect: ActionEffectVerification?
             switch action.payload {
             case let .key(down, up):
-                observationRequired = try postBalanced(
+                let plainDismissalKey = expected.interactionMode == .foregroundTakeover
+                    && action.entry.source.modifiers.isEmpty
+                    && (action.entry.source.key == "return" || action.entry.source.key == "escape")
+                let performance = try postBalanced(
                     down: down,
                     up: up,
                     action: action,
@@ -322,8 +329,11 @@ final class ForegroundKeyboardExecutor {
                     deadline: deadline,
                     lease: lease,
                     proveBoundField: batchInputStarted,
-                    beforeKeyDown: validateSave
+                    beforeKeyDown: validateSave,
+                    captureSheetDismissal: plainDismissalKey ? captureSheetDismissal : nil
                 )
+                observationRequired = performance.observationRequired
+                effect = performance.effectVerification
             case let .text(characters):
                 var inputStarted = false
                 for units in characters {
@@ -332,7 +342,7 @@ final class ForegroundKeyboardExecutor {
                         // Shift-Return inserts a line break without selecting
                         // the ordinary Return/default-button action.
                         let lineBreak = units == [10] || units == [13] || units == [13, 10]
-                        let needsObservation = try postBalanced(
+                        let performance = try postBalanced(
                             down: lineBreak ? .virtualKeyDown(36, .maskShift) : .unicodeKeyDown(units),
                             up: lineBreak ? .virtualKeyUp(36, .maskShift) : .unicodeKeyUp(units),
                             action: action,
@@ -345,7 +355,7 @@ final class ForegroundKeyboardExecutor {
                             beforeKeyDown: rangeWitness?.beforeInput,
                             validateComposition: validateComposition
                         )
-                        observationRequired = observationRequired || needsObservation
+                        observationRequired = observationRequired || performance.observationRequired
                         inputStarted = true
                     } catch let failure as KeyboardPerformFailure {
                         throw KeyboardPerformFailure(
@@ -363,7 +373,6 @@ final class ForegroundKeyboardExecutor {
                     }
                 }
             }
-            var effect: ActionEffectVerification?
             if let rangeWitness {
                 // Input was already posted. An unreadable or unexpected result requires a new
                 // observation and must never cause the text event to be replayed.
@@ -520,8 +529,9 @@ final class ForegroundKeyboardExecutor {
         textInputStarted: Bool = false,
         proveBoundField: Bool = false,
         beforeKeyDown: (() throws -> Void)? = nil,
-        validateComposition: (() throws -> Void)? = nil
-    ) throws -> Bool {
+        validateComposition: (() throws -> Void)? = nil,
+        captureSheetDismissal: (() -> (() -> Bool)?)? = nil
+    ) throws -> ActionPerformance {
         let token = UUID()
         let scope: HeldInputScope
         do {
@@ -531,6 +541,8 @@ final class ForegroundKeyboardExecutor {
         }
         var inputStarted = false
         var focusChanged = false
+        var sheetDismissed = false
+        var confirmsSheetDismissal: (() -> Bool)?
         var stage: KeyboardFailureStage = .beforeKeyDown
         do {
             try activity.performPIDEvent(
@@ -540,6 +552,7 @@ final class ForegroundKeyboardExecutor {
                     // selection. Those AX reads may block. Revalidate the current delivery
                     // target and Secure Event Input after the witness, just before posting.
                     try beforeKeyDown?()
+                    confirmsSheetDismissal = captureSheetDismissal?()
                     focusChanged = try self.validateEvent(
                         action: action,
                         application: application,
@@ -578,17 +591,26 @@ final class ForegroundKeyboardExecutor {
                 lease: lease,
                 validate: {
                     guard self.now() <= deadline else { throw ActionExecutionError.actionTimeout }
-                    let afterReleaseChanged = try self.validateEnvironment(
-                        expected: expected, application: application, actions: [action],
-                        allowOrdinaryKeyFocusTransition: true,
-                        allowTextGeometryTransition: true
-                    )
-                    focusChanged = focusChanged || afterReleaseChanged
+                    do {
+                        let afterReleaseChanged = try self.validateEnvironment(
+                            expected: expected, application: application, actions: [action],
+                            allowOrdinaryKeyFocusTransition: true,
+                            allowTextGeometryTransition: true
+                        )
+                        focusChanged = focusChanged || afterReleaseChanged
+                    } catch let error as ActionExecutionError
+                        where error == .targetNotFrontmost || error == .targetGone || error == .staleSnapshot {
+                        guard confirmsSheetDismissal?() == true else { throw error }
+                        guard !self.secureInput.isSecureInputEnabled() else { throw ActionExecutionError.secureInputActive }
+                        sheetDismissed = true
+                        focusChanged = true
+                    }
                     guard self.now() <= deadline else { throw ActionExecutionError.actionTimeout }
                 },
                 mutation: {}
             )
-            return focusChanged
+            return ActionPerformance(inputStarted: true, effectVerification: sheetDismissed ? .unverified : nil,
+                observationRequired: focusChanged)
         } catch is UserActivityMonitoringError {
             throw KeyboardPauseFailure(
                 inputStarted: inputStarted,

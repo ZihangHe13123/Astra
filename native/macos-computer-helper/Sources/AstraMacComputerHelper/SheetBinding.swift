@@ -46,6 +46,47 @@ func observedAXParent(_ element: AXUIElement) -> AXUIElement? {
     return error == .success ? decodeAXElement(value) : nil
 }
 
+/// Capture the direct parent before delivery so a successor with a reused CG
+/// number cannot stand in for the sheet's original parent.
+func sheetDismissalWitness<Element>(
+    sheet: Element, pid: pid_t, attachedParent: () -> Element?,
+    same: @escaping (Element, Element) -> Bool,
+    windowID: @escaping (Element) -> CGWindowID?,
+    frontmostPID: @escaping () -> pid_t?,
+    sheetIsInvalid: @escaping () -> Bool,
+    currentSheets: @escaping (Element) -> [Element]?,
+    focusedWindow: @escaping () -> Element?
+) -> (() -> Bool)? {
+    guard let parent = attachedParent(), let parentID = windowID(parent) else { return nil }
+    return {
+        guard frontmostPID() == pid,
+              sheetIsInvalid() || currentSheets(parent).map({ sheets in
+                  !sheets.contains(where: { same($0, sheet) })
+              }) == true,
+              let focused = focusedWindow(), same(focused, parent),
+              windowID(focused) == parentID
+        else { return false }
+        return frontmostPID() == pid
+    }
+}
+
+func sheetDismissalWitness(for sheet: AXUIElement, pid: pid_t) -> (() -> Bool)? {
+    sheetDismissalWitness(sheet: sheet, pid: pid, attachedParent: {
+        guard attachedSheetRoot(sheet, pid: pid) != nil,
+              let parent = observedAXParent(sheet), observedAXPID(parent) == pid
+        else { return nil }
+        return parent
+    }, same: { CFEqual($0, $1) }, windowID: observedAXWindowID, frontmostPID: liveFrontmostPID,
+        sheetIsInvalid: { observationAXAttribute(sheet, kAXRoleAttribute).0 == .invalidUIElement },
+        currentSheets: { completeAXElementArray($0, attribute: "AXSheets", maximum: maximumObservedWindows) },
+        focusedWindow: {
+            let (error, value) = observationAXAttribute(AXUIElementCreateApplication(pid), kAXFocusedWindowAttribute)
+            guard error == .success, let focused = decodeAXElement(value), observedAXPID(focused) == pid
+            else { return nil }
+            return focusedAttachedSheet(in: focused, pid: pid) ?? focused
+        })
+}
+
 func focusBelongsToExactAXRoot(app: AXUIElement, root: AXUIElement) -> Bool {
     guard let owner = observedAXPID(app) else { return false }
     let (error, value) = observationAXAttribute(app, kAXFocusedUIElementAttribute)

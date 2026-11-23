@@ -3872,7 +3872,10 @@ final class SystemWindowObserver: WindowObserving {
                     .revalidateAndObserveFocus(expected: expected, point: nil)
                 return KeyboardTextContinuationObservation(focus: focus ?? .stale,
                     observationRequired: observation.observationRequired)
-            }
+            },
+            captureSheetDismissal: entries.count == 1 ? {
+                target.axElement.flatMap { sheetDismissalWitness(for: $0, pid: target.pid) }
+            } : nil
         )
         let result = ForegroundPlanExecutor(
             activity: userActivity,

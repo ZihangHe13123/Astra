@@ -1136,6 +1136,58 @@ func foregroundNamedInputWithoutTargetAuthorityCannotBecomeWindowInput(kind: Str
     #expect(fixture.poster.events.count == 2)
 }
 
+@Test(arguments: ["return", "enter", "escape", "otherWindow", "changedWindowID", "otherApplication",
+                  "plainWindow", "modified", "liveSheet", "unreadableSheets", "secureInput", "userActivity"])
+func attachedSheetKeyReleaseRequiresTheRecordedParent(scenario: String) throws {
+    let key = ["enter", "escape"].contains(scenario) ? scenario : "return"
+    let modifiers = scenario == "modified" ? ["command"] : []
+    var frontmostPID: pid_t = 11
+    var focused = "sheet"
+    var parentID: CGWindowID = 55
+    var sheetStillAttached = true
+    let witness = {
+        sheetDismissalWitness(sheet: "sheet", pid: 11,
+            attachedParent: { scenario == "plainWindow" ? nil : "parent" },
+            same: ==, windowID: { _ in parentID }, frontmostPID: { frontmostPID },
+            sheetIsInvalid: { scenario == "escape" && !sheetStillAttached },
+            currentSheets: { _ in
+                if scenario == "unreadableSheets" || scenario == "escape" { return nil }
+                return sheetStillAttached ? ["sheet"] : []
+            }, focusedWindow: { focused })
+    }
+    let fixture = KeyboardExecutorFixture(
+        keyChords: Set(["return", "escape", "command+return"].compactMap(ApprovedKeyChord.init(rawValue:))),
+        keyTransitionFocus: { _ in throw ActionExecutionError.targetNotFrontmost },
+        captureSheetDismissal: witness
+    )
+    fixture.poster.afterPost = { call in
+        guard call == 1 else { return }
+        sheetStillAttached = scenario == "liveSheet"
+        focused = scenario == "otherWindow" ? "sibling" : "parent"
+        if scenario == "changedWindowID" { parentID += 1 }
+        if scenario == "otherApplication" { frontmostPID = 12 }
+        if scenario == "secureInput" { fixture.secureInput.enabled = true }
+        if scenario == "userActivity" { fixture.activity.paused = true }
+    }
+    let plan = try fixture.executor.preflight(expected: fixture.guardValue, application: fixture.application,
+        marker: fixture.lease.marker, entries: [keyboardEntry(.keypress(key: key, modifiers: modifiers))])
+    let result = fixture.executor.executePrepared(sourceIndex: 0, from: plan,
+        expected: fixture.guardValue, lease: fixture.lease)
+    #expect(fixture.poster.events.count == 2)
+    if ["return", "enter", "escape"].contains(scenario) {
+        #expect(result.error == nil)
+        #expect(result.lastAcknowledgedAction == 0)
+        #expect(result.outcomes.first?.ok == true)
+        #expect(result.outcomes.first?.effectVerification == .unverified)
+        #expect(result.outcomes.first?.observationRequired == true)
+    } else {
+        #expect(result.error == .unknownOutcome)
+        #expect(result.lastAcknowledgedAction == -1)
+        #expect(result.outcomes.first?.observationRequired == false)
+        #expect(result.cooperativeError == (scenario == "userActivity" ? .userActivityPaused : nil))
+    }
+}
+
 private final class KeyboardExecutorFixture {
     let application = PIDTargetApplication(bundleIdentifier: "com.example.Editor", version: "1.2.3")
     let expectedFocus: KeyboardFocusAuthority
@@ -1169,6 +1221,7 @@ private final class KeyboardExecutorFixture {
         clockStep: TimeInterval = 0,
         continuingTextFocus: ForegroundKeyboardExecutor.ContinuingTextFocusLookup? = nil,
         keyTransitionFocus: ForegroundKeyboardExecutor.KeyTransitionFocusLookup? = nil,
+        captureSheetDismissal: (() -> (() -> Bool)?)? = nil,
         experimentalUnicodeChunkGraphemes: Int = 1
     ) {
         self.activity = activity
@@ -1214,6 +1267,7 @@ private final class KeyboardExecutorFixture {
             focus: { focusState.observation },
             continuingTextFocus: continuingTextFocus,
             keyTransitionFocus: keyTransitionFocus,
+            captureSheetDismissal: captureSheetDismissal,
             now: {
                 if !clock.isEmpty { last = clock.removeFirst() }
                 defer { last += clockStep }
