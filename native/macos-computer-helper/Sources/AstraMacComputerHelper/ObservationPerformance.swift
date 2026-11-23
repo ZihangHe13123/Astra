@@ -243,16 +243,25 @@ func requestsCatalogRelations(_ payload: JSONValue) -> Bool {
     return true
 }
 
+func requestsFocusedDialogRelations(_ payload: JSONValue) -> Bool {
+    guard requestsCatalogRelations(payload), case let .object(options) = payload else { return false }
+    return options["focused_dialog_relations"] == .bool(true)
+}
+
 /// Protocol v4 clients validate every window key, so extensions are sent only on request.
 func catalogForClient(_ catalog: JSONValue, payload: JSONValue) -> JSONValue {
-    if requestsCatalogRelations(payload) { return catalog }
+    if requestsFocusedDialogRelations(payload) { return catalog }
+    let includeSheetRelations = requestsCatalogRelations(payload)
     guard case var .object(result) = catalog, case let .array(apps)? = result["apps"] else { return catalog }
     result["apps"] = .array(apps.map { app in
         guard case var .object(fields) = app, case let .array(windows)? = fields["windows"] else { return app }
         fields["windows"] = .array(windows.map { window in
             guard case var .object(values) = window else { return window }
-            values.removeValue(forKey: "parent_window_identity_ref")
-            values.removeValue(forKey: "binding_reason")
+            values.removeValue(forKey: "focused_dialog_document_identity_ref")
+            if !includeSheetRelations {
+                values.removeValue(forKey: "parent_window_identity_ref")
+                values.removeValue(forKey: "binding_reason")
+            }
             return .object(values)
         })
         return .object(fields)

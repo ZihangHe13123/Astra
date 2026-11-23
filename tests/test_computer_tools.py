@@ -7804,6 +7804,83 @@ def test_post_action_overlay_hands_over_to_the_popup_the_action_opened(
     assert sum(name == "act" for name, _value in backend.calls) == 1
 
 
+@pytest.mark.parametrize("relation", [
+    "parent_window_identity_ref", "focused_dialog_document_identity_ref", None,
+])
+def test_acknowledged_dialog_transition_returns_live_pixels_refs_and_document_on_close(
+    registry, manager, backend, monkeypatch, relation,
+):
+    register(registry, manager)
+    registry.set_approval_handler(lambda _request: asyncio.sleep(0, result="once"))
+    focus(registry)
+    initial = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    original_apps, original_snapshot, original_state = backend.apps, backend.snapshot, backend.get_app_state
+    dialog_open = True
+    captured = []
+    checks = []
+    document_id = backend.catalog_window_identity_ref
+
+    async def catalog():
+        c = await original_apps()
+        windows = c.apps[0]["windows"]
+        if dialog_open:
+            windows.append({**windows[0], "window_ref": "dialog-ref", "window_identity_ref": "dialog-id",
+                            **({relation: document_id} if relation else {})})
+        return ComputerAppCatalog(c.generation, c.apps,
+                                  confirmed_absent_window_identity_refs=() if dialog_open else ("dialog-id",))
+
+    async def snapshot(target, *args, **kwargs):
+        captured.append(target.window_ref)
+        if target.window_ref == "window-1" and dialog_open:
+            raise ComputerSessionError("overlay_blocked")
+        if target.window_ref == "dialog-ref" and not dialog_open:
+            raise ComputerSessionError("target_gone")
+        return await original_snapshot(target, *args, **kwargs)
+
+    async def get_state(target, *args, expected_focused_dialog_document_identity_ref=None, **kwargs):
+        checks.append((target.window_ref, expected_focused_dialog_document_identity_ref, kwargs["text_detail"].value))
+        return await original_state(target, *args, **kwargs)
+
+    monkeypatch.setattr(backend, "apps", catalog)
+    monkeypatch.setattr(backend, "snapshot", snapshot)
+    monkeypatch.setattr(backend, "get_app_state", get_state)
+
+    def click(snap):
+        return run(registry.execute("computer_act", {"snapshot_id": snap["snapshot_id"],
+                                                     "actions": [{"type": "click", "x": 1, "y": 2}]}))
+
+    opened = click(initial)
+    if relation is None:
+        # Old helpers report the new candidate without silently choosing it.
+        recipe = opened["details"]["window_transition"]["next_observation"]
+        assert manager.target is None and not checks
+        opened = run(registry.execute(recipe["tool"], recipe["arguments"]))
+    assert opened.get("error") == ""
+    payload = json.loads(opened["fresh_output"])
+    if relation:
+        assert payload["window_transition"]["observation_status"] == "observed"
+        assert "next_observation" not in payload["window_transition"]
+        assert opened["computer_receipt"]["acknowledged"] == 1
+    assert opened["_private_result"]["image_data_urls"]
+    assert payload["window_id"] == "dialog-ref"
+    assert manager.target == ComputerTarget("app-1", "dialog-ref")
+    assert checks == [("dialog-ref", document_id if relation == "focused_dialog_document_identity_ref" else None, "off")]
+
+    dialog_open = False
+    closed = click(payload)
+    assert closed.get("error") == ""
+    fresh = json.loads(closed["fresh_output"])
+    assert fresh["window_transition"]["observation_reason"] == {
+        "parent_window_identity_ref": "sheet_parent",
+        "focused_dialog_document_identity_ref": "dialog_document", None: "observed_origin",
+    }[relation]
+    assert fresh["window_id"] == "window-1"
+    assert closed["_private_result"]["image_data_urls"] and closed["computer_receipt"]["acknowledged"] == 1
+    assert checks[-1] == ("window-1", None, "off")
+    assert captured == ["window-1", "dialog-ref", "dialog-ref", "window-1"]
+    assert sum(name == "act" for name, _ in backend.calls) == 2
+
+
 @pytest.mark.parametrize("native_result", [
     None, {}, {"outcomes": [], "last_acknowledged_action": -1},
     {"outcomes": [{"index": 7, "ok": True}], "last_acknowledged_action": 0},

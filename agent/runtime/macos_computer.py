@@ -126,7 +126,7 @@ def _decode_catalog_bounds(value: object) -> dict[str, int | float]:
     return decoded
 
 
-def _decode_catalog_apps(value: object) -> tuple[dict[str, object], ...]:
+def _decode_catalog_apps(value: object, *, focused_dialog_relations: bool = False) -> tuple[dict[str, object], ...]:
     if not isinstance(value, list) or len(value) > _MAX_CATALOG_APPLICATIONS:
         raise ValueError("malformed catalog applications")
 
@@ -138,6 +138,8 @@ def _decode_catalog_apps(value: object) -> tuple[dict[str, object], ...]:
     required_app_keys = {"app_ref", "name", "bundle_id", "app_version", "windows"}
     required_window_keys = {"window_ref", "title", "bounds", "bindable", "binding_status"}
     optional_window_keys = {"document_path", "window_identity_ref", "parent_window_identity_ref", "binding_reason"}
+    if focused_dialog_relations:
+        optional_window_keys.add("focused_dialog_document_identity_ref")
 
     for application in value:
         if not isinstance(application, Mapping) or set(application) != required_app_keys:
@@ -222,13 +224,17 @@ def _decode_catalog_apps(value: object) -> tuple[dict[str, object], ...]:
                 decoded_window["document_path"] = document_path
             if identity_ref is not None:
                 decoded_window["window_identity_ref"] = identity_ref
-            if "parent_window_identity_ref" in window:
-                parent = window["parent_window_identity_ref"]
+            if "parent_window_identity_ref" in window and "focused_dialog_document_identity_ref" in window:
+                raise ValueError("conflicting native window relations")
+            for relation in ("parent_window_identity_ref", "focused_dialog_document_identity_ref"):
+                if relation not in window:
+                    continue
+                parent = window[relation]
                 if not bindable or parent == identity_ref or not _valid_catalog_string(
                     parent, _MAX_CATALOG_REFERENCE_SCALARS, nonempty=True,
                 ):
-                    raise ValueError("malformed sheet parent identity")
-                decoded_window["parent_window_identity_ref"] = parent
+                    raise ValueError("malformed window relation identity")
+                decoded_window[relation] = parent
             if "binding_reason" in window:
                 reason = window["binding_reason"]
                 if binding_status != "ax_window_unmatched" or reason not in {
@@ -240,9 +246,9 @@ def _decode_catalog_apps(value: object) -> tuple[dict[str, object], ...]:
             decoded_windows.append(decoded_window)
 
         app_identities = {entry["window_identity_ref"] for entry in decoded_windows if "window_identity_ref" in entry}
-        if any(entry["parent_window_identity_ref"] not in app_identities for entry in decoded_windows
-               if "parent_window_identity_ref" in entry):
-            raise ValueError("sheet parent not in same application catalog")
+        for relation in ("parent_window_identity_ref", "focused_dialog_document_identity_ref"):
+            if any(entry[relation] not in app_identities for entry in decoded_windows if relation in entry):
+                raise ValueError("window relation not in same application catalog")
 
         decoded_apps.append({
             "app_ref": app_ref,
@@ -640,11 +646,13 @@ class MacComputerBackend:
         self._transport = transport
         self._catalog: ComputerAppCatalog | None = None
         self._window_catalog_relations = False
+        self._focused_dialog_relations = False
 
     async def status(self) -> dict[str, object]:
         response = await self._request("status", {})
         result = self._required_result(response)
         self._window_catalog_relations = result.get("window_catalog_relations") is True
+        self._focused_dialog_relations = self._window_catalog_relations and result.get("focused_dialog_relations") is True
         return result
 
     async def bind_artifact_directory(self, directory_fd: int) -> None:
@@ -664,12 +672,17 @@ class MacComputerBackend:
             await configured
 
     async def apps(self) -> ComputerAppCatalog:
-        return self._publish_catalog(await self._request("apps", {"window_catalog_relations": True}))
+        payload = {"window_catalog_relations": True}
+        if self._focused_dialog_relations:
+            payload["focused_dialog_relations"] = True
+        return self._publish_catalog(await self._request("apps", payload))
 
     async def presentation_apps(self, takeover_ref: str) -> ComputerAppCatalog:
         payload: dict[str, object] = {"takeover_ref": takeover_ref}
         if self._window_catalog_relations:
             payload["window_catalog_relations"] = True
+        if self._focused_dialog_relations:
+            payload["focused_dialog_relations"] = True
         response = await self._request("presentation_apps", payload)
         return self._publish_catalog(response)
 
@@ -692,7 +705,7 @@ class MacComputerBackend:
             if not isinstance(absence, list):
                 raise ValueError("malformed exact-window absence evidence")
             catalog = ComputerAppCatalog(
-                generation, _decode_catalog_apps(apps), tuple(absence),
+                generation, _decode_catalog_apps(apps, focused_dialog_relations=self._focused_dialog_relations), tuple(absence),
             )
         except (TypeError, ValueError) as exc:
             raise HelperTransportError("helper returned malformed app catalog") from exc
@@ -707,6 +720,7 @@ class MacComputerBackend:
         *,
         text_detail: ComputerSnapshotTextDetailMode = ComputerSnapshotTextDetailMode.OFF,
         text_detail_artifact: ComputerArtifact | None = None,
+        expected_focused_dialog_document_identity_ref: str | None = None,
     ) -> ComputerBackendAppState:
         catalog = self._catalog
         if catalog is None:
@@ -724,6 +738,10 @@ class MacComputerBackend:
             "scope": scope,
             "artifact_name": artifact.filename,
         }
+        if expected_focused_dialog_document_identity_ref is not None:
+            if not self._focused_dialog_relations:
+                raise HelperTransportError("helper cannot verify focused dialog ownership")
+            payload["expected_focused_dialog_document_identity_ref"] = expected_focused_dialog_document_identity_ref
         if text_detail is ComputerSnapshotTextDetailMode.ON:
             if text_detail_artifact is None:
                 raise ValueError("text detail on requires an artifact filename")

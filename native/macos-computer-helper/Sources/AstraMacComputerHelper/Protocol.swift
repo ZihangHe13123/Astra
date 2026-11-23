@@ -85,15 +85,27 @@ struct GetAppStateRequest: Equatable {
     let scope: String
     let artifactName: String
     let textDetail: SnapshotTextDetailRequest
+    var expectedFocusedDialogDocumentIdentityRef: String? = nil
 }
 
 func getAppStateRequest(_ request: HelperRequest) -> GetAppStateRequest? {
     guard let values = try? JSONSerialization.jsonObject(with: request.payloadData) as? [String: Any] else {
         return nil
     }
-    let base: Set<String> = [
+    var base: Set<String> = [
         "app_ref", "window_ref", "catalog_generation", "scope", "artifact_name",
     ]
+    let relationKey = "expected_focused_dialog_document_identity_ref"
+    let expectedDocument: String?
+    if let raw = values[relationKey] {
+        guard let reference = raw as? String, boundedGetAppStateReference(reference),
+              values["scope"] as? String == "target_window", values["text_detail"] == nil,
+              values["text_detail_artifact_name"] == nil else { return nil }
+        expectedDocument = reference
+        base.insert(relationKey)
+    } else {
+        expectedDocument = nil
+    }
     let hasTextDetail = values["text_detail"] != nil || values["text_detail_artifact_name"] != nil
     guard Set(values.keys) == (hasTextDetail ? base.union(["text_detail", "text_detail_artifact_name"]) : base),
           let appRef = values["app_ref"] as? String,
@@ -124,7 +136,8 @@ func getAppStateRequest(_ request: HelperRequest) -> GetAppStateRequest? {
         catalogGeneration: catalogGeneration,
         scope: scope,
         artifactName: artifactName,
-        textDetail: textDetail
+        textDetail: textDetail,
+        expectedFocusedDialogDocumentIdentityRef: expectedDocument
     )
 }
 
@@ -546,6 +559,7 @@ final class Dispatcher {
                     "supported": .bool(true),
                     "build_identity": bundledHelperBuildIdentity(),
                     "window_catalog_relations": .bool(true),
+                    "focused_dialog_relations": .bool(true),
                     "permissions": .object([
                         "accessibility": .bool(permissions.accessibilityTrusted),
                         "screen_recording": .bool(permissions.screenRecordingAllowed),
@@ -564,7 +578,8 @@ final class Dispatcher {
             }
         case "presentation_apps", "cancel_presentation":
             let extended = request.operation == "presentation_apps" && requestsCatalogRelations(request.payload)
-            let keys: Set<String> = extended ? ["takeover_ref", "window_catalog_relations"] : ["takeover_ref"]
+            var keys: Set<String> = extended ? ["takeover_ref", "window_catalog_relations"] : ["takeover_ref"]
+            if extended && requestsFocusedDialogRelations(request.payload) { keys.insert("focused_dialog_relations") }
             guard let values = exactPayload(request.payload, keys: keys),
                   let takeoverRef = boundedReference(values["takeover_ref"])
             else { return Self.failure(requestID: request.requestID, message: "\(request.operation) requires takeover_ref") }
@@ -640,14 +655,7 @@ final class Dispatcher {
                 )
             }
             do {
-                let observation = try windows.getAppState(
-                    appRef: routed.appRef,
-                    windowRef: routed.windowRef,
-                    catalogGeneration: routed.catalogGeneration,
-                    scope: routed.scope,
-                    artifactName: routed.artifactName,
-                    textDetail: routed.textDetail
-                )
+                let observation = try windows.getAppState(routed)
                 let result = observation.helperResultJSON
                 return HelperResponse(
                     protocolVersion: protocolVersion,

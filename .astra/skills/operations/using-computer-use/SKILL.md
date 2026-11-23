@@ -79,7 +79,7 @@ description: Use when controlling macOS interfaces with computer_* tools.
 
 1. 正常短流程：apps → get_app_state → act。十题等短时选择任务，先把题目与答案匹配好，再把独立选项放进同一个 actions（每项 click + checked:true）；工具逐项执行一次并核验，批末返回新快照。不要逐题调用 focus/snapshot/plan/begin_takeover，不把后台 plan_ref 传给 begin_takeover。需要继续时使用 act 返回的新 snapshot_id/ref。每一步先检查结果和目标效果，同一窗口串行，不提前排队后续输入。
 2. 只有最新返回观察之后又发生页面/窗口/弹窗变化、用户操作、引用失效、需要更晚效果或缺少新观察时，才追加 `computer_snapshot`。切换应用或 helper 重启：重新 apps → get_app_state，不使用旧 ref。
-3. 不为等待动画反复点击。computer_receipt 的 dispatch_state=acknowledged 表示动作已确认，verification_state=unverified 只表示业务结果未确认。next_step=observe_result 时调用 computer_snapshot(settle_ms=300) 后读结果；最多两次无新增证据的观察，然后报告未确认。effect_pending 表示工具阻止了同一待确认按钮的补点，也按此观察，不换 ref 重试。
+3. 不为等待动画反复点击。computer_receipt 的 dispatch_state=acknowledged 表示动作已确认，verification_state=unverified 只表示业务结果未确认。先读 act 的新窗口和回执。缺少效果证据时才调用 computer_snapshot(settle_ms=300)，最多两次无新增证据的观察。effect_pending 表示工具阻止了同一待确认按钮的补点，也按此观察，不换 ref 重试。
 4. 空 AX 树：先看当前目标截图。登录/权限界面交给用户；普通界面检查覆盖限制，最多做一次针对性刷新或已有 subtree 投影。依然没有可验证目标时报告缺少能力，不猜 element_ref，不自动走全局 HID/剪贴板/临时脚本兜底。
 5. `stale_snapshot` 不一定代表未派发。只有返回证据明确该批次输入前被拒绝，才允许刷新后重新规划一次；`last_ack=-1` 单独不足以证明零输入。`unknown_outcome`、部分执行或效果不明遵守上方 no-replay 规则。
 6. 截图、快照和 ref 都是 request-local。失效后的旧图片/锚点不再作为当前状态；截图能证明视觉变化，不能代替原生 `effect_verification` 或文件保存后的核验。
@@ -90,7 +90,7 @@ Finder 翻页/关标签、WPS 保存/目录/输入法任务，再读取 [文件�
 
 - 语义按钮回执成功却没有效果，不连续重复 AXPress，也不默认改用未获支持的快捷键。正常授权下选择菜单等已观察到的新动作；未知结果仍遵守 no-replay。
 - 坐标默认是窗口相对逻辑坐标；若依据本次返回图片选点，明确传 coordinate_space="image_pixels"，工具按 published_image_size 转换。不可使用旧 Appshot 的屏幕坐标。优先用 `target_element_ref` 绑定具体目标控件。前台视觉坐标可省略引用，由最新快照限定窗口；引用失效必须重新观察。没有效果时不凭标题栏高度猜偏移、读取旧 AX 缓存再点，或改用全局 Tab/Return 重试。`action_observation` 仅提供匹配控件的值变化或目标标签仍在的证据；`unchanged` 不授权重放，`unknown` 不等于未执行，树里没有标签也不是关闭证明。
-- `post_action_observation_pending`／`next_step=follow_recovery`：动作已确认但没有返回新观察，后续界面未确认，不等于输入失败或保存成功。按本结果 Recovery 走（附属弹窗及返回父窗时取 `window_transition.next_observation`），不按 observe_result 截图；建议本身不授予权限，不重放原动作。
+- `post_action_observation_pending`／`next_step=follow_recovery`：动作已确认但没有返回新观察，后续界面未确认，不等于输入失败或保存成功。按 Recovery 中的 `window_transition.next_observation` 继续。若 act 已附新窗口快照，直接用其中的 refs。
 
 ## Common Mistakes
 

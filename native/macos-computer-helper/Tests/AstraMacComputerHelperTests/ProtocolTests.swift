@@ -335,6 +335,23 @@ import Testing
     ))
 }
 
+@Test func focusedDialogRecoveryOnlyAcceptsAWindowReadWithoutDetailedText() throws {
+    func parse(_ extra: [String: Any]) throws -> GetAppStateRequest? {
+        var base: [String: Any] = ["app_ref": "app", "window_ref": "panel", "catalog_generation": 2,
+                                   "scope": "target_window", "artifact_name": "image.png",
+                                   "expected_focused_dialog_document_identity_ref": "document-identity"]
+        base.merge(extra) { _, value in value }
+        return getAppStateRequest(HelperRequest(protocolVersion: 4, requestID: "read", operation: "get_app_state",
+            payload: .object([:]), payloadData: try JSONSerialization.data(withJSONObject: base)))
+    }
+    let current = try #require(try parse([:]))
+    #expect(current.expectedFocusedDialogDocumentIdentityRef == "document-identity")
+    #expect(try parse(["scope": "display"]) == nil)
+    #expect(try parse(["text_detail": "on", "text_detail_artifact_name": "image.ax.json"]) == nil)
+    #expect(try parse(["expected_focused_dialog_document_identity_ref": ""]) == nil)
+    #expect(try parse(["expected_focused_dialog_document_identity_ref": 7]) == nil)
+}
+
 @Test func getAppStateRejectsInvalidCatalogGenerationAndPayloadShapes() {
     let invalidPayloads = [
         #"{"window_ref":"win_a","catalog_generation":7,"scope":"target_window","artifact_name":"snapshot-token.png"}"#,

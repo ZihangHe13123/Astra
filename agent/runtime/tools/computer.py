@@ -1163,6 +1163,7 @@ class LocalComputerRuntime:
         text_detail: ComputerSnapshotTextDetailMode = ComputerSnapshotTextDetailMode.OFF,
         recovery_catalog_generation: int | None = None,
         recovery_window_identity_ref: str | None = None,
+        expected_focused_dialog_document_identity_ref: str | None = None,
         presentation_ref: str | None = None,
     ) -> ComputerVerifiedAppState:
         self._helper_started = True
@@ -1173,6 +1174,7 @@ class LocalComputerRuntime:
             text_detail=text_detail,
             recovery_catalog_generation=recovery_catalog_generation,
             recovery_window_identity_ref=recovery_window_identity_ref,
+            expected_focused_dialog_document_identity_ref=expected_focused_dialog_document_identity_ref,
             presentation_ref=presentation_ref,
         )
 
@@ -2271,6 +2273,10 @@ def register_computer_tools(
     trusted_wps_filename = ""
     trusted_wps_document_title = ""
     pending_wps_modal_target: tuple[str, str, str] | None = None
+    # A suggested window is not a grant. Follow its return path only after a
+    # real selection and positive disappearance of the selected window.
+    observed_route: list[str] = []
+    offered_transition: tuple[str, str] | None = None
     approval_scope_secret = secrets.token_bytes(32)
     prepared_acts: dict[str, _PreparedComputerAct] = {}
     # Diagnostics survive grant invalidation, but never authorize execution.
@@ -2321,7 +2327,9 @@ def register_computer_tools(
         pending_wps_modal_target = None
 
     def clear_computer_grants() -> None:
-        nonlocal foreground_loan
+        nonlocal foreground_loan, offered_transition
+        observed_route.clear()
+        offered_transition = None
         foreground_loan = None
         nonlocal pending_foreground_digest
         nonlocal pending_foreground_snapshot
@@ -2436,6 +2444,7 @@ def register_computer_tools(
                     windows[window_ref] = {
                         "window_identity_ref": _trusted_text(raw_window.get("window_identity_ref"), 256),
                         "parent_window_identity_ref": _trusted_text(raw_window.get("parent_window_identity_ref"), 256),
+                        "focused_dialog_document_identity_ref": _trusted_text(raw_window.get("focused_dialog_document_identity_ref"), 256),
                         "window_title": _trusted_text(raw_window.get("title"), 1_000),
                         "window_role": _trusted_text(raw_window.get("role"), 256),
                         "known_path": _approval_safe_path(
@@ -2452,7 +2461,7 @@ def register_computer_tools(
             }
 
     def remember_target(app_ref: str, window_ref: str) -> None:
-        nonlocal observation_authority_generation
+        nonlocal observation_authority_generation, offered_transition
         nonlocal trusted_wps_destination, trusted_wps_directory
         nonlocal trusted_wps_filename, trusted_wps_document_title
         nonlocal pending_wps_modal_target
@@ -2461,6 +2470,17 @@ def register_computer_tools(
         previous = (trusted_target.get("app_ref"), trusted_target.get("window_ref"))
         selected = trusted_catalog.get(app_ref)
         window = selected.get("windows", {}).get(window_ref) if selected is not None else None
+        identity = window.get("window_identity_ref") if isinstance(window, Mapping) else None
+        if not identity:
+            observed_route.clear()
+        elif identity in observed_route:
+            del observed_route[observed_route.index(identity) + 1:]
+        elif observed_route and offered_transition == (observed_route[-1], identity):
+            observed_route.append(identity)
+            del observed_route[:-16]
+        else:
+            observed_route[:] = [identity]
+        offered_transition = None
         catalog_title = (
             str(window.get("window_title") or "").strip().casefold()
             if isinstance(window, Mapping)
@@ -2495,6 +2515,7 @@ def register_computer_tools(
                 "window_title": window.get("window_title", ""),
                 "window_identity_ref": window.get("window_identity_ref", ""),
                 "parent_window_identity_ref": window.get("parent_window_identity_ref", ""),
+                "focused_dialog_document_identity_ref": window.get("focused_dialog_document_identity_ref", ""),
                 "window_role": window.get("window_role", ""),
                 "known_path": window.get("known_path", ""),
             })
@@ -3505,13 +3526,13 @@ def register_computer_tools(
                 presentation_generation = observation_authority_generation
                 prepared.finish_presentation = finish_takeover
 
-        async def recover_window_transition(deadline: float, *, action_result=None, reobserve: bool = True):
-            nonlocal recovery_catalog_attempted
+        async def recover_window_transition(deadline: float, *, action_result=None, covering: bool = False):
+            nonlocal recovery_catalog_attempted, offered_transition
             if not before_identity:
                 return None
             try:
                 async with asyncio.timeout_at(deadline):
-                    keep_ref = (takeover_ref if prepared.present_result and reobserve and before_binding is not None
+                    keep_ref = (takeover_ref if prepared.present_result and not covering and before_binding is not None
                                 and _fully_acknowledged_action_batch(action_result, len(normalized)) else None)
                     if keep_ref is None:
                         await finish_takeover()
@@ -3519,14 +3540,15 @@ def register_computer_tools(
                         if before_authority != observation_authority_generation:
                             return None
                         may_reobserve = (
-                            reobserve
-                            and before_binding is not None
+                            before_binding is not None
                             and manager.snapshot_target_binding == before_binding
                             and _fully_acknowledged_action_batch(action_result, len(normalized))
                         )
                         # Catalog refresh consumes old authority. Suggested refs do
                         # not grant observation or replay an uncertain input.
+                        user_action_delivered = may_reobserve and any(a.type != "wait" for a in prepared.actions)
                         recovered = None
+                        closed_identity_confirmed = False
                         for attempt in range(2):
                             if manager.handed_off:
                                 return None
@@ -3534,29 +3556,58 @@ def register_computer_tools(
                             catalog_result = await _computer_apps(presentation_ref=keep_ref)
                             if not isinstance(catalog_result, str):
                                 return None
+                            closed_identity_confirmed |= before_identity in manager.confirmed_absent_window_identity_refs
                             recovered = window_transition(
                                 json.loads(catalog_result).get("apps", []),
                                 before_target.get("bundle_id"), before_identity, before_identities,
                                 parent_identity=before_target.get("parent_window_identity_ref"),
+                                dialog_document=before_target.get("focused_dialog_document_identity_ref"),
+                                observed_origin=(
+                                    observed_route[-2] if len(observed_route) >= 2 and observed_route[-1] == before_identity
+                                    and closed_identity_confirmed else None
+                                ),
                             )
-                            # A closing modal can outlive its AX object briefly.
-                            # Wait once for catalog matching, never repeat input.
+                            # AX can announce an overlay before it publishes a new window, or
+                            # briefly retain an unmatched closing window. Retry only the read.
                             unmatched = any(w.get("bindable") is False for w in recovered.get("windows", []))
-                            if not unmatched or attempt == 1:
+                            waiting_for_popup = (covering and user_action_delivered
+                                                 and recovered.get("observation_reason") == "exact_previous_target")
+                            if attempt == 1 or not (unmatched or waiting_for_popup):
                                 break
                             await asyncio.sleep(0.1)
                         if recovered is None:
                             return None
-                        if not may_reobserve or recovered.get("observation_reason") != "exact_previous_target":
+                        arguments = _next_transition_observation({"window_transition": recovered})
+                        if not may_reobserve or arguments is None:
                             return recovered
-                        arguments = recovered["next_observation"]["arguments"]
+                        next_context = app_state_policy_context(arguments["app_ref"], arguments["window_ref"])
+                        next_identity = next_context.get("window_identity_ref")
+                        if not isinstance(next_identity, str) or not next_identity:
+                            return recovered
+                        reason = recovered.get("observation_reason")
+                        if user_action_delivered and before_tree is not None and recovered.get("status") == "new_window_observed":
+                            offered_transition = (before_identity, next_identity)
+                        same_window = reason == "exact_previous_target" and next_identity == before_identity and not covering
+                        related = reason in {"attached_sheet", "focused_document_dialog", "sheet_parent",
+                                             "dialog_document", "observed_origin"}
+                        if not same_window and (not related or keep_ref is not None or not user_action_delivered):
+                            return recovered
+                        # Only the default target-window observation can be folded into this
+                        # receipt. A future policy that requires consent gets the normal recipe.
+                        if app_state_approval_scope(next_context, catalog_generation=manager.catalog_generation,
+                                app_ref=arguments["app_ref"], window_ref=arguments["window_ref"],
+                                capture_scope="target_window", text_detail_mode="off"):
+                            return recovered
                         catalog_generation = manager.catalog_generation
                         authority_generation = observation_authority_generation
                         try:
                             state = await manager.get_app_state(
                                 arguments["app_ref"], arguments["window_ref"],
                                 recovery_catalog_generation=catalog_generation,
-                                recovery_window_identity_ref=before_identity,
+                                recovery_window_identity_ref=next_identity,
+                                expected_focused_dialog_document_identity_ref=(
+                                    before_identity if reason == "focused_document_dialog" else None
+                                ),
                                 presentation_ref=keep_ref,
                             )
                             if authority_generation != observation_authority_generation:
@@ -3564,20 +3615,21 @@ def register_computer_tools(
                             remember_target(state.target.app_ref, state.target.window_ref)
                             observed = {k: v for k, v in recovered.items() if k != "next_observation"}
                             observed["observation_status"] = "observed"
-                            goals = verify_choice_goals(before_tree, state.snapshot.payload.get("ax_tree"), normalized)
+                            goals = (verify_choice_goals(before_tree, state.snapshot.payload.get("ax_tree"), normalized)
+                                     if same_window else None)
                             observation = await snapshot_result(
                                 state.snapshot, scope="target_window", verified_state=state,
                                 action_result=action_result,
                                 choice_verification=goals,
                                 action_observation=observe_action_effect(
                                     before_tree, state.snapshot.payload.get("ax_tree"), normalized,
-                                ),
+                                ) if same_window else None,
                                 observed_window_transition=observed,
                             )
                             defer_verified_presentation(observation, state.snapshot, goals, complete=keep_ref is not None)
                             return observation
                         except Exception as exc:  # noqa: BLE001 - recovery never replays input
-                            logger.debug("same-window observation unavailable error_type=%s", type(exc).__name__)
+                            logger.debug("transition observation unavailable error_type=%s", type(exc).__name__)
                             if (
                                 manager.catalog_generation != catalog_generation
                                 or observation_authority_generation != authority_generation
@@ -3830,8 +3882,10 @@ def register_computer_tools(
                 # stopping at the parent it covers. Neither the input nor the covered target's
                 # observation is repeated.
                 covering = await recover_window_transition(
-                    observation_deadline, action_result=result.result, reobserve=False,
+                    observation_deadline, action_result=result.result, covering=True,
                 )
+                if isinstance(covering, ToolPrivateResult):
+                    return covering
                 if (
                     isinstance(covering, Mapping)
                     and covering.get("status") == "new_window_observed"

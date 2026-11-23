@@ -220,9 +220,17 @@ def _catalog_windows_may_overlap(first, second):
     )
 
 
-def window_transition(apps, bundle_id, old_identity, prior_identities, *, parent_identity=None):
+def window_transition(apps, bundle_id, old_identity, prior_identities, *, parent_identity=None,
+                      dialog_document=None, observed_origin=None):
     """Return catalog evidence and an observation suggestion, never a selected target."""
     matches = [a for a in apps[:100] if isinstance(a, Mapping) and bundle_id and a.get("bundle_id") == bundle_id]
+    if len(matches) > 1:
+        # Stable helper identities include the process instance. A second running
+        # copy of the app has the same bundle, but cannot own any of these windows.
+        anchored = [a for a in matches if any(isinstance(w, Mapping) and w.get("window_identity_ref") in prior_identities
+                    for w in (a.get("windows") or []))]
+        if len(anchored) == 1:
+            matches = anchored
     if len(matches) != 1:
         return {"status": "application_not_observed" if not matches else "ambiguous_application", "windows": []}
     app = matches[0]
@@ -245,29 +253,41 @@ def window_transition(apps, bundle_id, old_identity, prior_identities, *, parent
         result["status"] = "new_window_observed"
     # A new unlabelled popup remains a possible observation on older helpers.
     # Explicit attachment to a different document rules that suggestion out.
-    candidate = new[0] if len(new) == 1 and not new[0].get("parent_window_identity_ref") else None
-    if new and all(w.get("parent_window_identity_ref") and w["parent_window_identity_ref"] != old_identity for w in new):
+    def owner(window):
+        return window.get("parent_window_identity_ref") or window.get("focused_dialog_document_identity_ref")
+
+    candidate = new[0] if len(new) == 1 and not owner(new[0]) else None
+    if new and all(owner(w) and owner(w) != old_identity for w in new):
         result["observation_reason"] = "sheet_belongs_to_other_window"
     if present:
-        attached = [w for w in new if w.get("parent_window_identity_ref") == old_identity]
+        attached = [w for w in new if owner(w) == old_identity]
         if len(attached) == 1:
             candidate = attached[0]
-            result["observation_reason"] = "attached_sheet"
+            result["observation_reason"] = (
+                "attached_sheet" if candidate.get("parent_window_identity_ref") else "focused_document_dialog"
+            )
         elif len(attached) > 1:
             result["observation_reason"] = "ambiguous_attached_sheets"
             return result
-    if not present and parent_identity:
-        parents = [w for w in windows if w.get("bindable") is True and w.get("window_identity_ref") == parent_identity]
+    origin = parent_identity or dialog_document or observed_origin
+    if not present and origin:
+        parents = [w for w in windows if w.get("bindable") is True and w.get("window_identity_ref") == origin]
         if len(parents) != 1:
             result["observation_reason"] = "sheet_parent_unavailable"
             return result
-        visible_sheets = [w for w in windows if w.get("parent_window_identity_ref") == parent_identity]
-        if visible_sheets:
+        if any(owner(w) == origin for w in windows):
             result["observation_reason"] = "sheet_parent_still_covered"
             return result
+        if any(not owner(w) for w in new):
+            # A closing panel can open a separate confirmation, even if that
+            # new window has no declared parent. Do not bind through it.
+            result["observation_reason"] = "new_window_during_return"
+            return result
         candidate = parents[0]
-        result["observation_reason"] = "sheet_parent"
-    if old_identity and not present and not new and not parent_identity:
+        result["observation_reason"] = (
+            "sheet_parent" if parent_identity else "dialog_document" if dialog_document else "observed_origin"
+        )
+    if old_identity and not present and not new and not origin:
         remaining = [w for w in windows if w.get("bindable") is True and w.get("window_identity_ref")]
         if len(remaining) == 1:
             candidate = remaining[0]

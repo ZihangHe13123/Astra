@@ -1870,3 +1870,13 @@ def test_native_subtree_request_preserves_exact_snapshot_anchor():
     for bad in ({**payload,'subtree_ref':''},{**payload,'scope':'display'},{**payload,'unexpected':True}):
         with pytest.raises(ValueError):
             encode_request(ComputerRequest('subtree','snapshot_subtree',bad))
+
+
+@pytest.mark.parametrize("scope,extra", [
+    ("display", {}),
+    ("target_window", {"text_detail": "on", "text_detail_artifact_name": "state.ax.json"}),
+])
+def test_automatic_dialog_read_cannot_escalate_capture(scope, extra):
+    with pytest.raises(ValueError, match="default target-window"):
+        ComputerRequest("r1", "get_app_state", {"app_ref": "app", "window_ref": "dialog", "catalog_generation": 1,
+                        "scope": scope, "artifact_name": "state.png", "expected_focused_dialog_document_identity_ref": "doc", **extra})

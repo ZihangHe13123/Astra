@@ -1624,6 +1624,11 @@ def _validate_reference(value: Any, name: str) -> None:
 def _validate_cooperative_request_payload(operation: str, payload: Mapping[str, Any]) -> None:
     if operation == "get_app_state":
         base = {"app_ref", "window_ref", "catalog_generation", "scope", "artifact_name"}
+        if "expected_focused_dialog_document_identity_ref" in payload:
+            if payload.get("scope") != "target_window" or "text_detail" in payload:
+                raise ValueError("focused dialog recovery permits only default target-window observation")
+            _validate_reference(payload["expected_focused_dialog_document_identity_ref"], "dialog document identity")
+            base.add("expected_focused_dialog_document_identity_ref")
         if "text_detail" not in payload and "text_detail_artifact_name" not in payload:
             _require_exact_payload(payload, base, operation)
         else:
@@ -1742,6 +1747,8 @@ def _validate_cooperative_request_payload(operation: str, payload: Mapping[str, 
         keys = {"takeover_ref"}
         if operation == "presentation_apps" and payload.get("window_catalog_relations") is True:
             keys.add("window_catalog_relations")
+            if payload.get("focused_dialog_relations") is True:
+                keys.add("focused_dialog_relations")
         _require_exact_payload(payload, keys, operation)
         _validate_reference(payload["takeover_ref"], "takeover_ref")
         return

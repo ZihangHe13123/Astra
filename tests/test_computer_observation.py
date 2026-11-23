@@ -338,3 +338,24 @@ def test_transition_can_reobserve_exact_surviving_target_with_fresh_refs():
     assert result["status"] == "target_still_present"
     assert result["next_observation"]["arguments"]["window_ref"] == "ref-old"
     assert result["observation_reason"] == "exact_previous_target"
+
+
+def test_focused_dialog_is_bound_to_its_document_and_running_instance():
+    apps = catalog(identities=("doc", "dialog"))
+    apps[0]["windows"][1]["focused_dialog_document_identity_ref"] = "doc"
+    other_instance = catalog(identities=("another-doc", "unrelated"))[0]
+    other_instance["app_ref"] = "other-instance"
+    apps.append(other_instance)
+    transition = window_transition(apps, "test", "doc", {"doc"})
+    assert transition["observation_reason"] == "focused_document_dialog"
+    assert transition["next_observation"]["arguments"]["window_ref"] == "ref-dialog"
+    assert "next_observation" not in window_transition(apps, "test", "missing", {"missing"})
+    apps[0]["windows"][1]["focused_dialog_document_identity_ref"] = "something-else"
+    assert "next_observation" not in window_transition(apps, "test", "doc", {"doc"})
+
+
+def test_new_unowned_confirmation_prevents_automatic_return_through_it():
+    apps = catalog(identities=("doc", "new-confirm"))
+    transition = window_transition(apps, "test", "dialog", {"doc", "dialog"}, dialog_document="doc")
+    assert "next_observation" not in transition
+    assert transition["observation_reason"] == "new_window_during_return"

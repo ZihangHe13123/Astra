@@ -4638,6 +4638,49 @@ def test_native_catalog_preserves_verified_sheet_parent_and_match_diagnostics():
         run(MacComputerBackend(transport).apps())
 
 
+@pytest.mark.parametrize("modern", [False, True])
+def test_focused_dialog_observation_is_wire_negotiated_and_bound_to_same_app(modern):
+    transport = StaticTransport(ComputerResponse("unused", ok=True))
+    raw = _native_catalog_result()
+    windows = raw["apps"][0]["windows"]
+    dialog = {**windows[0], "window_ref": "dialog-ref", "window_identity_ref": "dialog-id",
+              "focused_dialog_document_identity_ref": "identity-1"}
+    if modern:
+        windows.append(dialog)
+
+    async def request(req):
+        transport.requests.append(req)
+        if req.operation == "status":
+            return ComputerResponse(req.request_id, ok=True, result={"window_catalog_relations": True,
+                                           **({"focused_dialog_relations": True} if modern else {})})
+        if req.operation in ("apps", "presentation_apps"):
+            return ComputerResponse(req.request_id, ok=True, result=raw)
+        return ComputerResponse(req.request_id, ok=True, result=_app_state_result(window_ref="dialog-ref"),
+                                snapshot=_state_snapshot("state.png"))
+
+    transport.request = request
+    backend = MacComputerBackend(transport)
+    run(backend.status())
+    c = run(backend.apps())
+    run(backend.presentation_apps("takeover-ref"))
+    for r in transport.requests[-2:]:
+        assert r.payload["window_catalog_relations"] is True
+        assert r.payload.get("focused_dialog_relations") == (True if modern else None)
+    capture = backend.get_app_state(ComputerTarget("app-1", "dialog-ref"), "target_window", ComputerArtifact("state.png", 10),
+                                    expected_focused_dialog_document_identity_ref="identity-1")
+    if not modern:
+        with pytest.raises(HelperTransportError, match="cannot verify focused dialog"):
+            run(capture)
+        assert transport.requests[-1].operation == "presentation_apps"
+        return
+    assert c.apps[0]["windows"][-1]["focused_dialog_document_identity_ref"] == "identity-1"
+    run(capture)
+    assert transport.requests[-1].payload["expected_focused_dialog_document_identity_ref"] == "identity-1"
+    dialog["focused_dialog_document_identity_ref"] = "foreign-id"
+    with pytest.raises(HelperTransportError, match="malformed app catalog"):
+        run(backend.apps())
+
+
 def _malformed_nested_catalog_results():
     results = []
 

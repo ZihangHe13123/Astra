@@ -341,6 +341,7 @@ class ComputerBackend(Protocol):
         *,
         text_detail: ComputerSnapshotTextDetailMode = ComputerSnapshotTextDetailMode.OFF,
         text_detail_artifact: ComputerArtifact | None = None,
+        expected_focused_dialog_document_identity_ref: str | None = None,
     ) -> ComputerBackendAppState: ...
     async def select(self, app_ref: str, window_ref: str) -> ComputerTarget: ...
     async def snapshot(
@@ -620,6 +621,7 @@ class ComputerSessionManager:
         text_detail: ComputerSnapshotTextDetailMode = ComputerSnapshotTextDetailMode.OFF,
         recovery_catalog_generation: int | None = None,
         recovery_window_identity_ref: str | None = None,
+        expected_focused_dialog_document_identity_ref: str | None = None,
         presentation_ref: str | None = None,
     ) -> ComputerVerifiedAppState:
         """Verify and commit one exact target from the latest successful catalog."""
@@ -679,6 +681,12 @@ class ComputerSessionManager:
                     "session_state_changed: same-window observation continuity was lost",
                 )
 
+            if expected_focused_dialog_document_identity_ref is not None and (
+                not recovery_window_identity_ref or scope != "target_window"
+                or text_detail is not ComputerSnapshotTextDetailMode.OFF
+            ):
+                raise ComputerSessionError("session_state_changed", "unbound focused dialog observation")
+
             await self._bind_backend_directory()
 
             token = uuid.uuid4().hex
@@ -713,6 +721,8 @@ class ComputerSessionManager:
                     artifact,
                     text_detail=text_detail,
                     text_detail_artifact=detail_artifact,
+                    **({"expected_focused_dialog_document_identity_ref": expected_focused_dialog_document_identity_ref}
+                       if expected_focused_dialog_document_identity_ref is not None else {}),
                 )
                 if (
                     state.target != requested_target

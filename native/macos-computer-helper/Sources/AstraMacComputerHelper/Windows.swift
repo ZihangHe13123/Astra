@@ -1044,6 +1044,7 @@ struct AppStateObservation {
 }
 
 protocol WindowObserving {
+    func getAppState(_ request: GetAppStateRequest) throws -> AppStateObservation
     func apps() throws -> JSONValue
     func select(appRef: String, windowRef: String) throws -> WindowTarget
     func getAppState(
@@ -1082,6 +1083,12 @@ protocol WindowObserving {
 }
 
 extension WindowObserving {
+    func getAppState(_ request: GetAppStateRequest) throws -> AppStateObservation {
+        guard request.expectedFocusedDialogDocumentIdentityRef == nil else { throw WindowObservationError.staleTarget }
+        return try getAppState(appRef: request.appRef, windowRef: request.windowRef,
+            catalogGeneration: request.catalogGeneration, scope: request.scope,
+            artifactName: request.artifactName, textDetail: request.textDetail)
+    }
     func snapshotSubtree(appRef: String, windowRef: String, snapshotID: String, elementRef: String,
                          scope: String, artifactName: String?, textDetail: SnapshotTextDetailRequest) throws -> JSONValue {
         throw WindowObservationError.staleTarget
@@ -1383,6 +1390,13 @@ final class SystemWindowObserver: WindowObserving {
         return .object(result)
     }
 
+    private func stableWindowIdentity(_ element: AXUIElement, pid: pid_t, in identities: WindowIdentities) -> String? {
+        guard observedAXPID(element) == pid, let id = observedAXWindowID(element) else { return nil }
+        let key = CatalogWindowIdentityKey(pid: pid, windowID: id, axIdentity: catalogAXIdentityHash(element))
+        let matches = (identities[key] ?? []).filter { CFEqual($0.element, element) }
+        return matches.count == 1 ? matches[0].reference : nil
+    }
+
     private func buildCatalog(reusing previousIdentities: WindowIdentities) throws -> (WindowCatalogObservation, WindowIdentities) {
         let budget = AXObservationBudget(duration: 8)
         let restoreBudget = budget.install()
@@ -1518,13 +1532,24 @@ final class SystemWindowObserver: WindowObserving {
             values.windows.append(.object(windowValues))
             grouped[window.pid] = values
         }
-        let result = grouped.values.map { value in
+        func exactIdentity(_ key: CatalogWindowIdentityKey, _ element: AXUIElement) -> String? {
+            let matches = (localWindowIdentities[key] ?? []).filter { CFEqual($0.element, element) }
+            return matches.count == 1 ? matches[0].reference : nil
+        }
+        let result = grouped.map { pid, value in
+            // Only two live, independently bound surfaces can carry a focused-dialog relation.
+            let relation = value.windows.count > 1 && permissions.accessibilityTrusted
+                ? focusedDialogDocumentRelation(pid: pid, catalogIdentity: { element in
+                    self.stableWindowIdentity(element, pid: pid, in: localWindowIdentities)
+                }) : nil
             // Resolve after enumerating every window: SCK often lists a sheet ahead of its parent.
             let relatedWindows = value.windows.map { window -> JSONValue in
-                guard case var .object(fields) = window, case let .string(ref)? = fields["window_ref"],
-                      let (key, parent) = sheetParents[ref] else { return window }
-                let matches = (localWindowIdentities[key] ?? []).filter { CFEqual($0.element, parent) }
-                if matches.count == 1 { fields["parent_window_identity_ref"] = .string(matches[0].reference) }
+                guard case var .object(fields) = window, case let .string(ref)? = fields["window_ref"] else { return window }
+                if let (key, parent) = sheetParents[ref], let parentRef = exactIdentity(key, parent) {
+                    fields["parent_window_identity_ref"] = .string(parentRef)
+                } else if let relation, fields["window_identity_ref"] == .string(relation.dialog) {
+                    fields["focused_dialog_document_identity_ref"] = .string(relation.document)
+                }
                 return .object(fields)
             }
             return JSONValue.object([
@@ -1631,6 +1656,13 @@ final class SystemWindowObserver: WindowObserving {
         artifactName: String,
         textDetail: SnapshotTextDetailRequest
     ) throws -> AppStateObservation {
+        try getAppState(GetAppStateRequest(appRef: appRef, windowRef: windowRef, catalogGeneration: requestedGeneration,
+            scope: scope, artifactName: artifactName, textDetail: textDetail))
+    }
+
+    func getAppState(_ request: GetAppStateRequest) throws -> AppStateObservation {
+        let appRef = request.appRef, windowRef = request.windowRef, requestedGeneration = request.catalogGeneration
+        let scope = request.scope, artifactName = request.artifactName, textDetail = request.textDetail
         let operationBudget = AXObservationBudget(duration: 12)
         let restoreBudget = operationBudget.install()
         defer { restoreBudget() }
@@ -1666,23 +1698,31 @@ final class SystemWindowObserver: WindowObserving {
         guard candidate.interactionMode == .background else {
             throw WindowObservationError.staleTarget
         }
-        let request = GetAppStateRequest(
-            appRef: appRef,
-            windowRef: windowRef,
-            catalogGeneration: requestedGeneration,
-            scope: scope,
-            artifactName: artifactName,
-            textDetail: textDetail
-        )
+        func validateDialogRelation() throws {
+            guard let expected = request.expectedFocusedDialogDocumentIdentityRef else { return }
+            let identities = try catalogLock.withLock {
+                try requireCatalogEpochLocked(epoch)
+                guard catalogGeneration == requestedGeneration else { throw WindowObservationError.staleTarget }
+                return catalogWindowIdentities
+            }
+            guard let targetElement = candidate.axElement,
+                  let dialog = stableWindowIdentity(targetElement, pid: candidate.pid, in: identities),
+                  let live = focusedDialogDocumentRelation(pid: candidate.pid, catalogIdentity: {
+                      self.stableWindowIdentity($0, pid: candidate.pid, in: identities)
+                  }), live.dialog == dialog, live.document == expected
+            else { throw WindowObservationError.staleTarget }
+        }
         let captured: SnapshotCaptureTransactionResult<AppStateObservation>
         do {
             captured = try retryingBackgroundFocusChange(candidate) {
-                try captureSnapshot(
+                try validateDialogRelation()
+                return try captureSnapshot(
                     target: candidate,
                     scope: scope,
                     artifactName: artifactName,
                     textDetail: textDetail,
                     prepareCommit: { snapshot in
+                        try validateDialogRelation()
                         let observation = AppStateObservation(
                             target: candidate,
                             catalogGeneration: requestedGeneration,

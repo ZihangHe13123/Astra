@@ -34,6 +34,37 @@ func observedAXBackingWindowID(_ element: AXUIElement) -> CGWindowID? {
     }
 }
 
+/// A relation between two current observations, distinct from an AX parent or a read grant.
+/// Both native objects must resolve to exact stable identities from the same live catalog.
+func focusedDialogDocumentRelation(
+    pid: pid_t,
+    catalogIdentity: (AXUIElement) -> String?,
+    appWindow: (AXUIElement, String) -> AXUIElement? = { app, key in
+        var value: CFTypeRef?
+        guard observationAXCall(element: app, fallback: AXError.cannotComplete, {
+            AXUIElementCopyAttributeValue(app, key as CFString, &value)
+        }) == .success else { return nil }
+        return decodeAXElement(value)
+    },
+    windowSubrole: (AXUIElement) -> String? = { element in
+        let role = AXNodeReader.stringAttribute(element, kAXRoleAttribute)
+        guard role.status == .complete, role.value == kAXWindowRole as String else { return nil }
+        let subrole = AXNodeReader.stringAttribute(element, kAXSubroleAttribute)
+        return subrole.status == .complete ? subrole.value : nil
+    }
+) -> (dialog: String, document: String)? {
+    let app = AXUIElementCreateApplication(pid)
+    guard let dialog = appWindow(app, kAXFocusedWindowAttribute),
+          windowSubrole(dialog) == kAXDialogSubrole as String,
+          let main = appWindow(app, kAXMainWindowAttribute), !CFEqual(dialog, main),
+          windowSubrole(main) == kAXStandardWindowSubrole as String,
+          let dialogRef = catalogIdentity(dialog), let mainRef = catalogIdentity(main), dialogRef != mainRef,
+          let stillMain = appWindow(app, kAXMainWindowAttribute), CFEqual(main, stillMain),
+          let stillFocused = appWindow(app, kAXFocusedWindowAttribute), CFEqual(dialog, stillFocused)
+    else { return nil }
+    return (dialogRef, mainRef)
+}
+
 func matchingScreenWindow(
     pid: pid_t, bounds: CGRect, title: BoundedAXStringResult,
     windowID: CGWindowID?, windows: [PIDScreenCaptureWindowObservation]
