@@ -9503,3 +9503,71 @@ def test_final_wps_save_reads_only_approved_copy_on_bound_document(registry, man
         assert "reply now" in observed["message"]
         assert "saved_document" not in json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
     assert sum(name == "act" for name, _ in backend.calls) == actions
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native document readback uses POSIX access")
+@pytest.mark.parametrize("case", ["exact", "empty", "missing_path", "denied", "unchanged", "link", "binary"])
+def test_textedit_save_reads_the_disclosed_document_bytes(registry, manager, backend, tmp_path, monkeypatch, case):
+    destination = tmp_path / "巡检记录.txt"
+    original = "北区巡检记录\nA-12 | 状态: 待处理\nA-21 | 状态: 待处理\n南区巡检记录\nB-07 | 状态: 待处理\n".encode()
+    updated = b"\n" + original.replace("A-21 | 状态: 待处理".encode(), "A-21 | 状态: 已完成".encode())
+    destination.write_bytes(original)
+    if case == "link":
+        destination.rename(tmp_path / "other")
+        destination.symlink_to(tmp_path / "other")
+    backend.catalog_bundle_id = "com.apple.TextEdit"
+    backend.catalog_window_title = destination.name
+    backend.snapshot_ax_tree_override = {"role": "AXWindow", "subrole": "AXStandardWindow",
+                                         "title": destination.name, "children": []}
+    catalog = backend.apps
+    async def windows():
+        result = await catalog()
+        if case != "missing_path":
+            result.apps[0]["windows"][0]["document_path"] = str(destination)
+        return result
+    monkeypatch.setattr(backend, "apps", windows)
+    cards = []
+    async def approve(card):
+        if card.get("kind") in {"computer_foreground_takeover", "computer_write"}:
+            cards.append(card)
+            if case == "denied":
+                return "deny"
+        return "once"
+    act = backend.act
+    async def save(*args, **kwargs):
+        result = await act(*args, **kwargs)
+        if case == "empty":
+            destination.write_bytes(b"")
+        elif case == "binary":
+            destination.write_bytes(b"\x00data\xff")
+        elif case not in {"unchanged", "link"}:
+            destination.write_bytes(updated)
+        return result
+    monkeypatch.setattr(backend, "act", save)
+    register(registry, manager)
+    registry.set_approval_handler(approve)
+    focus(registry)
+    observed = run(registry.execute("computer_snapshot", {}))
+    snapshot = json.loads(observed["fresh_output"])["snapshot_id"]
+    result = run(registry.execute("computer_act", {"snapshot_id": snapshot, "actions": [
+        {"type": "keypress", "key": "s", "modifiers": ["command"]},
+    ]}))
+    assert cards, result
+    if case == "denied":
+        assert result["error"] and destination.read_bytes() == original
+        assert "saved_document" not in result.get("fresh_output", "")
+        return
+    assert not result["error"], result
+    payload = json.loads(result["fresh_output"])
+    if case == "missing_path":
+        assert "saved_document" not in payload and "saved_plain_text_readback" not in cards[-1]["arguments"]
+        return
+    assert str(destination) in cards[-1]["approval_effect"] and cards[-1]["arguments"]["saved_plain_text_readback"]
+    proof = payload["saved_document"]
+    if case in {"unchanged", "link", "binary"}:
+        assert proof["status"] == "unverified" and "text" not in proof
+        return
+    raw = b"" if case == "empty" else updated
+    assert proof["evidence"] == "saved_plain_text" and proof["text"] == raw.decode()
+    assert proof["byte_count"] == len(raw) and proof["line_count"] == (0 if case == "empty" else 6)
+    assert "saved_document" not in result["output"]

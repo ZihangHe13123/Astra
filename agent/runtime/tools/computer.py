@@ -559,6 +559,7 @@ class _PreparedComputerAct:
     save_reservation: _SavePanelReservation | None = None
     proposed_readback: ApprovedCopy | None = None
     readback_epoch: int = -1
+    text_readback_offer: ApprovedCopy | None = None
     final_copy: ApprovedCopy | None = None
     saved_document_check: _SavedDocumentCheck | None = None
 
@@ -3869,7 +3870,9 @@ def register_computer_tools(
                 _runtime_takeover_event("foreground_takeover_begin", decision)
             # A later input must never inherit the proof of an earlier Save.
             latest_save_check = None
-            if prepared.final_copy is not None and prepared.final_copy is readback_copy:
+            if prepared.final_copy is not None and (
+                prepared.final_copy is readback_copy or prepared.final_copy is prepared.text_readback_offer
+            ):
                 latest_save_check = _SavedDocumentCheck(
                     prepared.final_copy, str((prepared.policy_context or {}).get("window_identity_ref") or ""),
                     prepared.final_copy.version(),
@@ -4557,6 +4560,17 @@ def register_computer_tools(
                 and readback_copy.matches(document_identity, document_title, str(trusted_target.get("known_path") or ""))
                 and is_document_save(prepared.actions, context, raw_tree)):
             prepared.final_copy = readback_copy
+        elif (context.get("bundle_id") == "com.apple.TextEdit" and document_identity
+              and isinstance(raw_tree, Mapping) and raw_tree.get("subrole") == "AXStandardWindow"
+              and document_title == (raw_tree.get("title") or raw_tree.get("label"))
+              and is_document_save(prepared.actions, context, raw_tree)):
+            # Only the native window's own AXDocument is a file identity. Values on
+            # children (including title/filename fields) cannot select a disk path.
+            path = str(trusted_target.get("known_path") or "")
+            if path and document_title == Path(path).name and all(c.isprintable() for c in path):
+                prepared.text_readback_offer = ApprovedCopy.bind(
+                    path, manager.session_id, current_grant_space(), (document_identity, document_title), plain_text=True,
+                )
         save_failure = _check_save_panel_action(prepared, raw_tree, context) or check_save_intent(prepared)
         if save_failure is not None:
             prepared.failure = save_failure
@@ -4724,7 +4738,7 @@ def register_computer_tools(
             request = permission_request(approvals, background)
             if isinstance(request, ComputerApprovalRequest):
                 request.private_call_id = call_id
-                _attach_draft(request, prepared)
+                _attach_action_disclosures(request, prepared)
             return request
         if (
             not plan.requires_takeover
@@ -4791,11 +4805,20 @@ def register_computer_tools(
             prepared.reused_loan = loan
         if isinstance(request, ComputerApprovalRequest):
             request.private_call_id = call_id
-            _attach_draft(request, prepared)
+            _attach_action_disclosures(request, prepared)
         return request
 
-    def _attach_draft(request: ComputerApprovalRequest, prepared) -> None:
-        """A high-impact batch that types text shows that text as the draft it would send."""
+    def _attach_action_disclosures(request: ComputerApprovalRequest, prepared: _PreparedComputerAct) -> None:
+        offer = prepared.text_readback_offer
+        if offer is not None and request.get("choices") == ["once", "deny"] and not prepared.present_result:
+            path = str(offer.path)
+            disclosure = f" Read back the complete short UTF-8 text, byte count, and line count from {path} after Save."
+            request["target"] += f" — {path}"
+            request["arguments"]["known_path"] = path
+            request["arguments"]["saved_plain_text_readback"] = True
+            request["approval_effect"] += disclosure
+            request["arguments"]["expected_effect"] += disclosure
+            request["approval_question"] = request["approval_question"].rstrip("?") + " and verify this local file's text?"
         decision = prepared.decision
         if decision is None or decision.risk is not ComputerRisk.HIGH_IMPACT:
             return
@@ -4849,6 +4872,12 @@ def register_computer_tools(
                     prepared.failure = _failure("approval_required", "The foreground decision expired or its window changed. Ask again.", retryable=True)
                     return None
         cleanup = permission_grant(approvals, args, request, decision)
+        offer = prepared.text_readback_offer
+        if (decision == "once" and offer is not None and request.get("arguments", {}).get("saved_plain_text_readback") is True
+                and request["arguments"].get("known_path") == str(offer.path)
+                and trusted_target.get("known_path") == str(offer.path)
+                and trusted_target.get("window_identity_ref") == offer.origin_window):
+            prepared.final_copy = offer
         if (prepared.reserve_new_copy and prepared.decision.saved_copy_readback
                 and request.get("arguments", {}).get("saved_copy_readback") is True
                 and request["arguments"].get("known_path") == prepared.decision.new_copy_destination):
@@ -4891,11 +4920,13 @@ def register_computer_tools(
         authority = observation_authority_generation
 
         def authorized() -> bool:
-            return (check is latest_save_check and copy is readback_copy and not manager.handed_off
+            text_document = copy.path.suffix.lower() == ".txt"
+            bundle = "com.apple.TextEdit" if text_document else "com.kingsoft.wpsoffice.mac"
+            return (check is latest_save_check and (text_document or copy is readback_copy) and not manager.handed_off
                     and binding is not None and binding == manager.snapshot_target_binding
                     and authority == observation_authority_generation and copy.session == manager.session_id
                     and copy.grant_space == current_grant_space() and payload.get("snapshot_id") == trusted_snapshot.get("snapshot_id")
-                    and trusted_target.get("bundle_id") == "com.kingsoft.wpsoffice.mac"
+                    and trusted_target.get("bundle_id") == bundle
                     and trusted_target.get("window_identity_ref") == check.window)
 
         if not authorized() or not copy.matches(check.window, str(tree.get("title") or tree.get("label") or ""),

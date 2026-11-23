@@ -1,4 +1,4 @@
-"""Read back the short main body of one explicitly approved WPS copy after Save."""
+"""Read back an explicitly approved short native document after Save."""
 
 from __future__ import annotations
 
@@ -106,9 +106,10 @@ class ApprovedCopy:
     origin_title: str
 
     @classmethod
-    def bind(cls, path: str, session: str, grant_space: str, origin: tuple[str, str]) -> ApprovedCopy | None:
+    def bind(cls, path: str, session: str, grant_space: str, origin: tuple[str, str], *,
+             plain_text: bool = False) -> ApprovedCopy | None:
         destination = Path(path)
-        if (os.name != "posix" or not destination.is_absolute() or destination.suffix.lower() != ".docx"):
+        if (os.name != "posix" or not destination.is_absolute() or destination.suffix.lower() != (".txt" if plain_text else ".docx")):
             return None
         try:
             parent = destination.parent
@@ -130,6 +131,8 @@ class ApprovedCopy:
                 return native.is_absolute() and native.parent.resolve(strict=True) / native.name == self.path
             except (OSError, ValueError, RuntimeError):
                 return False
+        if self.path.suffix.lower() == ".txt":
+            return False
         # Some WPS releases omit AXDocument. The same native AX + WindowServer
         # identity must have changed from a different document name to this copy.
         return window == self.origin_window and bool(self.origin_title) and self.origin_title != title
@@ -160,9 +163,12 @@ class ApprovedCopy:
             fd = os.open(self.path.name, flags, dir_fd=directory)
             source = stack.enter_context(os.fdopen(fd, "rb"))
             before = os.fstat(source.fileno())
-            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or not 0 < before.st_size <= _MAX_PACKAGE:
+            plain_text = self.path.suffix.lower() == ".txt"
+            limit = 4 * _MAX_TEXT if plain_text else _MAX_PACKAGE
+            if (not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+                    or before.st_size > limit or (not plain_text and not before.st_size)):
                 raise ValueError("unsupported document file")
-            data = source.read(_MAX_PACKAGE + 1)
+            data = source.read(limit + 1)
             named = os.stat(self.path.name, dir_fd=directory, follow_symlinks=False)
             if (len(data) != before.st_size or _version(named) != _version(before)
                     or _version(os.fstat(source.fileno())) != _version(before)):
@@ -197,6 +203,18 @@ class ApprovedCopy:
             current, data = self._read()
             if current == before:
                 return self._waiting_for_update()
+            if self.path.suffix.lower() == ".txt":
+                proof["missing"] = "complete_short_plain_text"
+                # Decode bytes directly to preserve the BOM and the exact CR/LF sequences.
+                text = data.decode("utf-8")
+                if (len(text) > _MAX_TEXT or contains_credentials(text)
+                        or any(ord(char) < 32 and char not in "\r\n\t" for char in text)):
+                    return proof
+                return {"path": str(self.path), "status": "read_back", "evidence": "saved_plain_text",
+                        "version_changed_since_save_started": True, "sha256": hashlib.sha256(data).hexdigest(),
+                        "encoding": "utf-8", "byte_count": len(data), "line_count": len(text.splitlines()),
+                        "text": text, "next_step": "Compare these exact on-disk bytes and line breaks with the requested edit. "
+                        "This read proves the file at this point only. If you interact with it again, verify it again before reporting."}
             proof["missing"] = "complete_short_main_body"
             paragraphs = _body_paragraphs(data)
         except (BadZipFile, EOFError, ET.ParseError, zlib.error):
