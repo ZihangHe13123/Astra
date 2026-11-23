@@ -80,7 +80,7 @@ from ..computer_protocol import (
 )
 from ..computer_routing import computer_route_advice
 from ..computer_save_as_intent import SAVE_AS_BOUNDARY, SAVE_AS_COVERED_REASONS, _SaveAsIntent, resolve_save_as_destination
-from ..computer_saved_document import ApprovedCopy, ReplacementProof, is_document_save
+from ..computer_saved_document import ApprovedCopy, ReplacementProof, is_document_save, paragraph_changes
 from ..computer_wps_panel import addresses_single_replace, find_fields, has_wps_panel_capability, wps_panel_action_kind
 from ..computer_text import contains_credentials
 from ..macos_computer import HelperApplicationError, HelperTransportError
@@ -535,6 +535,12 @@ class _SavePanelReservation:
     confirmation_windows: frozenset[str] = frozenset()
 
 
+@dataclass(frozen=True)
+class _WpsReplacement:
+    copy: ApprovedCopy
+    proof: ReplacementProof | None
+
+
 @dataclass
 class _SavedDocumentCheck:
     copy: ApprovedCopy
@@ -542,7 +548,7 @@ class _SavedDocumentCheck:
     before: tuple[int, int, int, int, int] | None
     awaiting_observation: bool = False
     saw_incomplete_package: bool = False
-    replacement: ReplacementProof | None = None
+    replacement: _WpsReplacement | None = None
 
 
 @dataclass
@@ -587,7 +593,7 @@ class _PreparedComputerAct:
     text_readback_offer: ApprovedCopy | None = None
     final_copy: ApprovedCopy | None = None
     saved_document_check: _SavedDocumentCheck | None = None
-    replacement: ReplacementProof | None = None
+    replacement: _WpsReplacement | None = None
 
 
 def _observed_save_panel_destination(panel: Mapping[str, Any], elements: Mapping[str, Any]) -> tuple[str, str]:
@@ -2383,7 +2389,8 @@ def register_computer_tools(
     readback_epoch = 0
     readback_copy: ApprovedCopy | None = None
     latest_save_check: _SavedDocumentCheck | None = None
-    pending_replacement: ReplacementProof | None = None
+    readback_baseline: tuple[str, ...] | None = None
+    pending_replacement: _WpsReplacement | None = None
     pending_foreground_digest = ""
     pending_foreground_snapshot = ""
     catalog_target_operation_lock = asyncio.Lock()
@@ -2577,7 +2584,7 @@ def register_computer_tools(
 
     def document_for_wps_dialog() -> ApprovedCopy | None:
         copy = readback_copy
-        if copy is None or not copy.allow_replace_readback or copy.session != manager.session_id or copy.grant_space != current_grant_space():
+        if copy is None or copy.session != manager.session_id or copy.grant_space != current_grant_space():
             return None
         # A live reference from the native window catalog ties this dialog to the document.
         # The source document can also host a contained dialog in the same selected window.
@@ -2606,7 +2613,8 @@ def register_computer_tools(
     def clear_computer_grants() -> None:
         revoke_save_as_intent()
         revoke_write_lease()
-        nonlocal readback_copy, last_wps_document, readback_epoch, latest_save_check, pending_replacement
+        nonlocal readback_copy, last_wps_document, readback_epoch, latest_save_check, pending_replacement, readback_baseline
+        readback_baseline = None
         pending_replacement = None
         latest_save_check = None
         readback_copy = None
@@ -4121,22 +4129,26 @@ def register_computer_tools(
                     takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref, focus_consent=prepared.focus_consent)
                 _runtime_takeover_event("foreground_takeover_begin", decision)
             if prepared.replacement is not None:
-                proof = prepared.replacement
-                if (proof.copy is not document_for_wps_dialog() or proof.copy.version() != proof.before
-                        or pending_replacement is not None
+                replacement = prepared.replacement
+                proof = replacement.proof
+                if pending_replacement is not None and pending_replacement.copy is replacement.copy:
+                    return _failure("effect_pending", "A replacement on this copy is awaiting its saved readback. Do not repeat it.")
+                if (replacement.copy is not document_for_wps_dialog()
+                        or proof is not None and replacement.copy.version() != proof.before
                         or trusted_snapshot.get("snapshot_id") != prepared.snapshot_id):
                     return _failure("replacement_unverified",
-                        "The document, snapshot or pending edit changed since planning; Replace was not dispatched.", retryable=False)
-                pending_replacement = proof
+                        "The document or snapshot changed since planning; Replace was not dispatched.", retryable=False)
+                pending_replacement = replacement
             # A later input must never inherit the proof of an earlier Save.
             latest_save_check = None
             if prepared.final_copy is not None and (
                 prepared.final_copy is readback_copy or prepared.final_copy is prepared.text_readback_offer
             ):
                 replacement = pending_replacement if pending_replacement and pending_replacement.copy is prepared.final_copy else None
+                proof = replacement.proof if replacement is not None else None
                 latest_save_check = _SavedDocumentCheck(
                     prepared.final_copy, str((prepared.policy_context or {}).get("window_identity_ref") or ""),
-                    replacement.before if replacement else prepared.final_copy.version(), replacement=replacement,
+                    proof.before if proof is not None else prepared.final_copy.version(), replacement=replacement,
                 )
                 prepared.saved_document_check = latest_save_check
             lease_for_dispatch = prepared.covered_write_lease
@@ -4911,31 +4923,27 @@ def register_computer_tools(
                     "Submit one bound Replace button alone so the current fields can be verified.", retryable=False)
                 return None
             copy = document_for_wps_dialog()
-            fields = find_fields(raw_tree)
-            if copy is None or fields is None or fields.replacement is None:
-                prepared.failure = _failure("replacement_unverified",
-                    "The current find/replace fields or their relationship to an approved local copy could not be verified.",
-                    retryable=False, recovery_hint="Observe the approved document and its native dialog. If still ambiguous, hand off.")
-                return None
-            if pending_replacement is not None and pending_replacement.copy is copy:
-                prepared.failure = _failure("effect_pending", "A replacement on this copy is awaiting its saved readback. Do not repeat it.")
-                return None
-            find, replacement = fields.find.get("value"), fields.replacement.get("value")
-            if not isinstance(find, str) or not isinstance(replacement, str):
-                prepared.failure = _failure("replacement_unverified", "Both field values must be observed in full before Replace.", retryable=False)
-                return None
-            proof, problem = await asyncio.to_thread(copy.read_for_replacement, find, replacement)
-            if proof is None:
-                hints = {
-                    "multiple_matches": "Multiple potential matches. Use Replace All only if the user asked to change all of them; otherwise hand off.",
-                    "pattern_or_escape_unsupported": "Only literal single-line text can be verified against the saved file. Hand off this pattern search.",
-                    "short_plain_body_unavailable": "The copy does not expose a complete short plain document for this check. Hand off.",
-                }
-                hint = hints.get(problem, "Check the saved copy and fields before deciding how to proceed.")
-                prepared.failure = _failure("replacement_unverified", "The saved main body does not establish one exact match.",
-                                            retryable=False, details={"reason": problem}, recovery_hint=hint)
-                return None
-            prepared.replacement = proof
+            if copy is not None:
+                if pending_replacement is not None and pending_replacement.copy is copy:
+                    prepared.failure = _failure("effect_pending", "A replacement on this copy is awaiting its saved readback. Do not repeat it.")
+                    return None
+                proof = None
+                if copy.allow_replace_readback:
+                    fields = find_fields(raw_tree)
+                    field = fields.replacement if fields is not None else None
+                    find = fields.find.get("value") if fields is not None else None
+                    replacement = field.get("value") if field is not None else None
+                    if not isinstance(find, str) or not isinstance(replacement, str):
+                        prepared.failure = _failure("replacement_unverified",
+                            "Both field values must be observed in full before Replace.", retryable=False)
+                        return None
+                    proof, problem = await asyncio.to_thread(copy.read_for_replacement, find, replacement)
+                    if proof is None and problem not in {"multiple_matches", "pattern_or_escape_unsupported"}:
+                        prepared.failure = _failure("replacement_unverified", "The saved main body could not be checked for Replace.",
+                            retryable=False, details={"reason": problem},
+                            recovery_hint="Check the saved copy and the field values before continuing.")
+                        return None
+                prepared.replacement = _WpsReplacement(copy, proof)
         save_failure = _check_save_panel_action(prepared, raw_tree, context) or check_save_intent(prepared)
         if save_failure is not None:
             if intent is not None:
@@ -5246,8 +5254,9 @@ def register_computer_tools(
             request["consequential"] = "send"
 
     def record_copy_readback(prepared: _PreparedComputerAct, allow_replace: bool) -> None:
-        nonlocal readback_copy, readback_epoch
+        nonlocal readback_copy, readback_epoch, readback_baseline
         readback_copy = None
+        readback_baseline = None
         readback_epoch += 1
         prepared.readback_epoch = readback_epoch
         origin = ("", "")
@@ -5375,7 +5384,7 @@ def register_computer_tools(
     authorized_acts: set[str] = set()
 
     async def publish_saved_document(check: _SavedDocumentCheck, result: dict, payload: dict, *, wait: bool) -> str | None:
-        nonlocal pending_replacement
+        nonlocal pending_replacement, readback_baseline
         if result.get("error") or result.get("verified") is not True or not result.get("fresh_output"):
             return None
         tree = payload.get("ax_tree")
@@ -5399,10 +5408,11 @@ def register_computer_tools(
         if not authorized() or not copy.matches(check.window, str(tree.get("title") or tree.get("label") or ""),
                                                 str(trusted_target.get("known_path") or "")):
             return None
-        if check.replacement:
-            evidence = await asyncio.to_thread(copy.after_save, check.before, wait=wait, single_story=True)
-        else:
+        proof = check.replacement.proof if check.replacement is not None else None
+        if proof is None:
             evidence = await asyncio.to_thread(copy.after_save, check.before, wait=wait)
+        else:
+            evidence = await asyncio.to_thread(copy.after_save, check.before, wait=wait, single_story=True)
         if not authorized():
             return None
         if evidence.get("reason") == "incomplete_package":
@@ -5410,10 +5420,12 @@ def register_computer_tools(
                 evidence["missing"] = "complete_short_main_body"
                 evidence["next_step"] = "The updated document is still unreadable. Report Save as unverified without repeating it."
             check.saw_incomplete_package = True
-        replacement_status = ""
-        if check.replacement is not None:
-            replacement_status = check.replacement.compare(evidence)
-            if replacement_status in {"verified", "mismatch"} and pending_replacement is check.replacement:
+        replacement_status = proof.compare(evidence) if proof is not None else ""
+        if copy is readback_copy and evidence["status"] == "read_back":
+            paragraphs = tuple(evidence["paragraphs"])
+            evidence["paragraph_changes"] = paragraph_changes(readback_baseline, paragraphs)
+            readback_baseline = paragraphs
+            if pending_replacement is check.replacement:
                 pending_replacement = None
         payload["saved_document"] = evidence
         payload["message"] = evidence["next_step"]

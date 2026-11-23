@@ -78,10 +78,13 @@ def find_dialog(find, replacement, *, conflicting=False):
         "case_alias",
         "width_alias",
         "pattern",
+        "pattern_extra_note_story",
         "extra_note_story",
         "no_replace_readback_grant",
         "overlap",
         "unrelated_doc",
+        "not_approved_copy",
+        "diff_limit",
         "ambiguous_fields",
         "mixed_batch",
         "double_click",
@@ -90,7 +93,7 @@ def find_dialog(find, replacement, *, conflicting=False):
         "absent_target",
     ],
 )
-def test_wps_replace_needs_one_exact_saved_match_and_checks_all_paragraphs(
+def test_wps_replace_approval_and_saved_paragraph_changes(
     registry, manager, backend, tmp_path, monkeypatch, case
 ):
     destination = tmp_path / "copy.docx"
@@ -98,11 +101,13 @@ def test_wps_replace_needs_one_exact_saved_match_and_checks_all_paragraphs(
     needle = "seed"
     if case == "duplicate":
         before[-1] = "another seed"
+    if case == "diff_limit":
+        before = ["旧" * 220] + [f"before {i}" for i in range(1, 22)]
     if case == "case_alias":
         before[-1] = "another SEEd"
     if case == "width_alias":
         before[-1] = "another Ｓｅｅｄ"
-    if case == "pattern":
+    if case in {"pattern", "pattern_extra_note_story"}:
         before[1], needle = "unique s??d", "s??d"
     if case == "overlap":
         before[1], needle = "aaa", "aa"
@@ -158,24 +163,56 @@ def test_wps_replace_needs_one_exact_saved_match_and_checks_all_paragraphs(
         assert not result["error"], result
         return json.loads(result["fresh_output"])["snapshot_id"]
 
-    observe("source.docx", "doc-id", doc("source.docx"))
-    panel = cu._wps_new_copy_panel(tmp_path)
-    if case != "no_replace_readback_grant":
-        panel["observation_capabilities"].append(CAP)
-    snapshot = observe("另存为", "panel-id", panel)
-    copy = {"type": "click", "element_ref": "snapshot-1:save", "save_new_copy_to": str(destination)}
-    # A genuine one-time consent to the exact new copy activates saved-document readback.
-    result = cu.run(registry.execute("computer_act", {"snapshot_id": snapshot, "actions": [copy]}))
-    assert not result["error"], result
-    assert asked[-1]["arguments"]["saved_copy_readback"] is True
-    assert bool(asked[-1]["arguments"].get("wps_single_replace_readback")) == (case != "no_replace_readback_grant")
+    if case != "not_approved_copy":
+        observe("source.docx", "doc-id", doc("source.docx"))
+        panel = cu._wps_new_copy_panel(tmp_path)
+        if case != "no_replace_readback_grant":
+            panel["observation_capabilities"].append(CAP)
+        snapshot = observe("另存为", "panel-id", panel)
+        copy = {"type": "click", "element_ref": "snapshot-1:save", "save_new_copy_to": str(destination)}
+        result = cu.run(registry.execute("computer_act", {"snapshot_id": snapshot, "actions": [copy]}))
+        assert not result["error"], result
+        assert asked[-1]["arguments"]["saved_copy_readback"] is True
+        assert bool(asked[-1]["arguments"].get("wps_single_replace_readback")) == (case != "no_replace_readback_grant")
     body(destination, before)
-    if case == "extra_note_story":
+    if case in {"extra_note_story", "pattern_extra_note_story"}:
         with ZipFile(destination, "a") as package:
             package.writestr(
                 "word/endnotes.xml",
                 '<w:endnotes xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:endnote w:id="2"><w:p><w:r><w:t>another seed</w:t></w:r></w:p></w:endnote></w:endnotes>',
             )
+    def save_document(paragraphs):
+        snap = observe("copy.docx", "doc-id", doc("copy.docx"))
+        save_act = backend.act
+
+        async def save(*args, **kwargs):
+            reply = await save_act(*args, **kwargs)
+            body(destination, paragraphs)
+            return reply
+
+        with monkeypatch.context() as save_fixture:
+            save_fixture.setattr(backend, "act", save)
+            result = cu.run(registry.execute("computer_act", {"snapshot_id": snap, "actions": [
+                {"type": "keypress", "key": "s", "modifiers": ["command"]},
+            ]}))
+        assert not result["error"], result
+        return result, json.loads(result["fresh_output"])["saved_document"]
+
+    if case in {"duplicate", "diff_limit"}:
+        first_save, first_evidence = save_document(before)
+        if case == "diff_limit":
+            after = ["新" * 230] + [f"after {i}" for i in range(1, 22)]
+            _, evidence = save_document(after)
+            changes = evidence["paragraph_changes"]
+            assert changes["truncated"] is True and len(changes["changes"]) == 20
+            assert changes["changes"][0] == {"paragraph": 1, "before": "旧" * 200, "after": "新" * 200}
+            assert changes["changes"][-1]["paragraph"] == 20
+            _, repeated = save_document(after)
+            assert repeated["paragraph_changes"] == {"status": "compared", "changes": [], "truncated": False}
+            assert first_evidence["paragraph_changes"] == {"status": "no_baseline"}
+            return
+        assert first_save["computer_receipt"]["next_step"] == "review_saved_document"
+
     observe("copy.docx", "doc-id", doc("copy.docx"))
     snap = observe("查找和替换", "dialog-id", dialog)
     actions = [{"type": "click", "element_ref": "replace-once"}]
@@ -186,39 +223,50 @@ def test_wps_replace_needs_one_exact_saved_match_and_checks_all_paragraphs(
     if case == "mixed_batch":
         actions.append({"type": "wait", "duration_ms": 1})
     acted = sum(name == "act" for name, _ in backend.calls)
+    approvals = len(asked)
     result = cu.run(registry.execute("computer_act", {"snapshot_id": snap, "actions": actions}))
-    if case not in {"verified", "other_paragraph_changed"}:
+    if case in {"ambiguous_fields", "changed_during_approval", "extra_note_story", "absent_target",
+                "mixed_batch", "double_click", "pointer_hit"}:
         assert result["code"] in {"replacement_unverified", "replacement_requires_single_action"}, result
-        if case in {"duplicate", "case_alias", "width_alias", "overlap", "absent_target"}:
-            assert result["details"]["reason"] == ("no_match" if case == "absent_target" else "multiple_matches")
         assert sum(name == "act" for name, _ in backend.calls) == acted
         return
     assert not result["error"], result
+    assert len(asked) == approvals + 1 and asked[-1]["kind"] == "computer_write"
+    assert sum(name == "act" for name, _ in backend.calls) == acted + 1
+    if case in {"unrelated_doc", "not_approved_copy"}:
+        assert asked[-1]["choices"] == ["once", "session", "deny"]
+        return
+
     snap = observe("查找和替换", "dialog-id", dialog)
     assert (
         cu.run(registry.execute("computer_act", {"snapshot_id": snap, "actions": actions}))["code"] == "effect_pending"
     )
-    snap = observe("copy.docx", "doc-id", doc("copy.docx"))
-    save_act = backend.act
-
-    async def save(*args, **kwargs):
-        reply = await save_act(*args, **kwargs)
-        body(destination, ["first", "unique changed", "last" if case == "verified" else "extra"])
-        return reply
-
-    monkeypatch.setattr(backend, "act", save)
-    result = cu.run(
-        registry.execute(
-            "computer_act",
-            {"snapshot_id": snap, "actions": [{"type": "keypress", "key": "s", "modifiers": ["command"]}]},
+    updated = list(before)
+    updated[1] = "unique changed"
+    if case == "other_paragraph_changed":
+        updated[-1] = "extra"
+    result, evidence = save_document(updated)
+    if case in {"verified", "other_paragraph_changed"}:
+        assert evidence["replacement_verification"]["status"] == ("verified" if case == "verified" else "mismatch")
+        assert result["computer_receipt"]["next_step"] == (
+            "review_saved_document" if case == "verified" else "report_replacement_mismatch"
         )
-    )
+    else:
+        assert "replacement_verification" not in evidence
+    if case == "duplicate":
+        assert evidence["paragraph_changes"] == {
+            "status": "compared", "changes": [{"paragraph": 2, "before": "unique seed", "after": "unique changed"}],
+            "truncated": False,
+        }
+        assert first_evidence["paragraph_changes"] == {"status": "no_baseline"}
+    else:
+        assert evidence["paragraph_changes"] == {"status": "no_baseline"}
+    # A valid Save readback releases the one-replacement-at-a-time guard.
+    if case == "pattern_extra_note_story":
+        return  # A new literal Replace still needs the original single-story proof.
+    snap = observe("查找和替换", "dialog-id", find_dialog("changed", "again"))
+    result = cu.run(registry.execute("computer_act", {"snapshot_id": snap, "actions": actions}))
     assert not result["error"], result
-    evidence = json.loads(result["fresh_output"])["saved_document"]
-    assert evidence["replacement_verification"]["status"] == ("verified" if case == "verified" else "mismatch")
-    assert result["computer_receipt"]["next_step"] == (
-        "review_saved_document" if case == "verified" else "report_replacement_mismatch"
-    )
 
 
 @pytest.mark.parametrize(

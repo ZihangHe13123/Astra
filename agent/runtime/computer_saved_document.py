@@ -15,6 +15,7 @@ import xml.etree.ElementTree as ET
 import zlib
 from collections.abc import Mapping
 from dataclasses import dataclass
+from itertools import zip_longest
 from pathlib import Path
 from zipfile import BadZipFile, ZIP_DEFLATED, ZIP_STORED, ZipFile
 
@@ -211,18 +212,20 @@ class ApprovedCopy:
 
     def read_for_replacement(self, needle: str, replacement: str) -> tuple[ReplacementProof | None, str]:
         """Read one stable, consented copy and derive the only acceptable final paragraph sequence."""
-        if not self.allow_replace_readback or self.path.suffix.lower() != ".docx" or not needle or needle == replacement:
+        if not self.allow_replace_readback or self.path.suffix.lower() != ".docx" or not needle:
+            return None, "invalid_replacement"
+        # WPS supports pattern characters and caret escapes. Detect them before
+        # reading, since a saved plain body cannot verify these operations.
+        if (any(ch in r"^\*?[](){}<>@!" or ord(ch) < 32 for ch in needle)
+                or any(ch in r"^\&" or ord(ch) < 32 for ch in replacement)):
+            return None, "pattern_or_escape_unsupported"
+        if needle == replacement:
             return None, "invalid_replacement"
         try:
             version, data = self._read()
             paragraphs = _body_paragraphs(data, single_story=True)
         except (OSError, ValueError, RuntimeError, BadZipFile, EOFError, ET.ParseError, zlib.error):
             return None, "short_plain_body_unavailable"
-        # Literal fields only. WPS has Word-compatible pattern characters and
-        # caret escapes, as well as case and width insensitive search modes.
-        if (any(ch in r"^\*?[](){}<>@!" or ord(ch) < 32 for ch in needle)
-                or any(ch in r"^\&" or ord(ch) < 32 for ch in replacement)):
-            return None, "pattern_or_escape_unsupported"
         folded_needle = unicodedata.normalize("NFKC", needle).casefold()
         locations = []
         for i, paragraph in enumerate(paragraphs):
@@ -290,6 +293,23 @@ class ApprovedCopy:
                 "next_step": "Save was acknowledged. A newer file version has not appeared. "
                              "Observe this document with computer_snapshot(settle_ms=300) to check again. "
                              "If it is still unchanged, report the pending save. Do not repeat the edit or Save."}
+
+
+def paragraph_changes(before: tuple[str, ...] | None, after: tuple[str, ...]) -> dict[str, object]:
+    if before is None:
+        return {"status": "no_baseline"}
+    changes = []
+    truncated = False
+    for number, (old, new) in enumerate(zip_longest(before, after), start=1):
+        if old == new:
+            continue
+        if len(changes) == 20:
+            truncated = True
+            break
+        truncated |= any(len(text) > 200 for text in (old, new) if text is not None)
+        changes.append({"paragraph": number, "before": old[:200] if old is not None else None,
+                        "after": new[:200] if new is not None else None})
+    return {"status": "compared", "changes": changes, "truncated": truncated}
 
 
 @dataclass(frozen=True)
