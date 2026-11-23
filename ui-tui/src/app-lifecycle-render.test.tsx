@@ -641,7 +641,7 @@ test("foreground terminal grants use negotiated raw press/release frames for one
   try {
     ask("one"); ask("two"); await settle();
     assert.ok(h.stdout.chunks.join("").includes("\x1b[?1004$p"));
-    assert.match(h.frame(), /\[Y\/回车\] 允许一次/); assert.doesNotMatch(h.frame(), /按下并松开/);
+    assert.match(h.frame(), /\[回车\] 允许一次（英文 Y 也可）/); assert.doesNotMatch(h.frame(), /按下并松开/);
     // Before Kitty reporting is live: Alt letters, a paste and unconfirmed Kitty frames do not answer.
     await h.key("\x1by"); await h.key("\x1b[200~y\ra\x1b[201~"); await h.key(down + up);
     assert.deepEqual(decisions(), []);
@@ -694,7 +694,7 @@ test("a terminal without key-event reporting answers each painted foreground hea
   const expected: string[][] = [];
   try {
     await ask("one"); await ask("two");
-    assert.match(h.frame(), /\[Y\/回车\] 允许一次.*\[A\] 借用此窗口.*\[N\] 拒绝/);
+    assert.match(h.frame(), /\[回车\] 允许一次（英文 Y 也可）.*\[A\] 借用此窗口.*\[N\] 拒绝/);
     assert.doesNotMatch(h.frame(), /按下并松开|N\/Esc|GUI/);
     await h.key("y"); expected.push(["one", "once"]); assert.deepEqual(decisions(), expected); // only the head
     await h.key("A"); expected.push(["two", "session"]); assert.deepEqual(decisions(), expected);

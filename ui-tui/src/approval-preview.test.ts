@@ -94,7 +94,7 @@ test("foreground takeover card shows only the sanitized bounded fragment", () =>
   assert.match(rendered, /操作类型：scroll · click/);
   assert.match(rendered, /预期影响：滚动并选择\\u\{2066\}一段内容/);
   assert.match(rendered, /边界：仅此片段/);
-  assert.equal(view.shortcutHint, "[Y/回车] 仅本次允许   [N] 拒绝");
+  assert.equal(view.shortcutHint, "[回车] 允许一次（英文 Y 也可）   [N] 拒绝");
   assert.doesNotMatch(
     `${view.title}\n${view.targetPreview.raw}\n${view.collapsedLines.join("\n")}\n${rendered}\n${view.shortcutHint}`,
     /opaque-|session|会话内|plan_ref|takeover_ref|private-command-ref/,

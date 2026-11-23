@@ -488,6 +488,9 @@ export function approvalChoiceHint(
     ? ["once", "deny"]
     : approvalChoices(request);
   const draft = "draft" in request;
+  const onceHint = draft ? "[Y/回车] 发送"
+    : isComputerTakeoverRequest(request) ? "[回车] 允许一次（英文 Y 也可）"
+    : "[Y/回车] 仅本次允许";
   const sessionLabel = isComputerTakeoverRequest(request)
     ? "借用此窗口，最多 2 分钟"
     : request.scope_kind === "directory"
@@ -500,7 +503,7 @@ export function approvalChoiceHint(
         ? `会话内允许 ${displayText(request.session_scope_label)}`
       : "会话内允许";
   return [
-    choices.includes("once") ? (draft ? "[Y/回车] 发送" : "[Y/回车] 仅本次允许") : "",
+    choices.includes("once") ? onceHint : "",
     expanded && choices.includes("task") ? "[T] 本任务允许" : "",
     (expanded || isComputerTakeoverRequest(request)) && choices.includes("session") ? `[A] ${sessionLabel}` : "",
     expanded && choices.includes("always") ? "[L] 以后都允许" : "",
