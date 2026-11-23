@@ -630,6 +630,21 @@ import Testing
     #expect(windows.takeoverDeclarations.count == 1)
 }
 
+@Test func ordinaryAndPresentationCatalogsPassOnlyNegotiatedFocusedDialogRequestsToTheObserver() {
+    let windows = CooperativeProtocolWindows()
+    let dispatcher = Dispatcher(permissions: StaticPermissions(accessibilityTrusted: true, screenRecordingAllowed: true), windows: windows)
+    for operation in ["apps", "presentation_apps"] {
+        let base = operation == "presentation_apps" ? [#""takeover_ref":"bound""#] : []
+        for flags in [[], [#""window_catalog_relations":true"#],
+                      [#""window_catalog_relations":true"#, #""focused_dialog_relations":true"#]] {
+            let fields = (base + flags).joined(separator: ",")
+            #expect(dispatcher.handle(#"{"protocol_version":4,"request_id":"r","operation":"\#(operation)","payload":{\#(fields)}}"#).ok)
+        }
+    }
+    #expect(windows.focusedCatalogRequests == [false, false, true, false, false, true])
+    #expect(windows.presentationAppsRefs == ["bound", "bound", "bound"])
+}
+
 @Test func presentationRoutesRequireOnlyTheExactBoundedTakeoverRef() {
     let windows = CooperativeProtocolWindows()
     let dispatcher = Dispatcher(permissions: StaticPermissions(accessibilityTrusted: true, screenRecordingAllowed: true), windows: windows)
@@ -1154,6 +1169,13 @@ private final class CooperativeProtocolWindows: WindowObserving {
     var takeoverDeclarations: [ForegroundFragmentDeclaration] = []
     var ordinaryTakeoverBegins = 0
     var presentationAppsRefs: [String] = []
+    var focusedCatalogRequests: [Bool] = []
+    func apps(includingFocusedDialogRelation: Bool, presentationRef: String?) throws -> JSONValue {
+        focusedCatalogRequests.append(includingFocusedDialogRelation)
+        if let presentationRef { return try presentationApps(takeoverRef: presentationRef) }
+        return try apps()
+    }
+
     var presentationAppsError: Error?
     var cancelPresentationRefs: [String] = []
     var presentationCleanupFailed = false

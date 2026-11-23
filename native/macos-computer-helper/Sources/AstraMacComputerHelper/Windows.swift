@@ -1046,6 +1046,7 @@ struct AppStateObservation {
 protocol WindowObserving {
     func getAppState(_ request: GetAppStateRequest) throws -> AppStateObservation
     func apps() throws -> JSONValue
+    func apps(includingFocusedDialogRelation: Bool, presentationRef: String?) throws -> JSONValue
     func select(appRef: String, windowRef: String) throws -> WindowTarget
     func getAppState(
         appRef: String,
@@ -1083,6 +1084,11 @@ protocol WindowObserving {
 }
 
 extension WindowObserving {
+    func apps(includingFocusedDialogRelation _: Bool, presentationRef: String?) throws -> JSONValue {
+        if let presentationRef { return try presentationApps(takeoverRef: presentationRef) }
+        return try apps()
+    }
+
     func getAppState(_ request: GetAppStateRequest) throws -> AppStateObservation {
         guard request.expectedFocusedDialogDocumentIdentityRef == nil else { throw WindowObservationError.staleTarget }
         return try getAppState(appRef: request.appRef, windowRef: request.windowRef,
@@ -1206,6 +1212,8 @@ final class SystemWindowObserver: WindowObserving {
     private let catalogLock = NSLock()
     private var catalogEpoch = UUID()
     private var catalogClosed = false
+    // The pid is observation scope only. Rotating catalog refs and input authority remain independent.
+    private var lastBoundCatalogPID: pid_t?
     private var catalogGeneration = 0
     private var targets: [String: WindowTarget] = [:]
     private var catalogWindowIdentities: WindowIdentities = [:]
@@ -1217,6 +1225,8 @@ final class SystemWindowObserver: WindowObserving {
     private let catalogAXWindowMatcher: ((AXUIElement, WindowTarget) -> AXUIElement?)?
     private let catalogAXWindows: ((pid_t) -> [CatalogAXWindowRecord])?
     private let catalogAXIdentityHash: (AXUIElement) -> CFHashCode
+    private let targetRecordProvider: ((WindowTarget) throws -> TargetCatalogRecord?)?
+    private let catalogDialogRelation: (pid_t, (AXUIElement) -> String?) -> (dialog: String, document: String)?
     private let snapshotReferences = SnapshotReferenceRegistry()
     private var cooperativePlans: [String: StoredCooperativePlan] = [:]
     private let cooperativePlanClock: () -> TimeInterval
@@ -1283,6 +1293,10 @@ final class SystemWindowObserver: WindowObserving {
         catalogAXWindowMatcher: ((AXUIElement, WindowTarget) -> AXUIElement?)? = nil,
         catalogAXIdentityHash: @escaping (AXUIElement) -> CFHashCode = { CFHash($0) },
         catalogAXWindows: ((pid_t) -> [CatalogAXWindowRecord])? = nil,
+        targetRecordProvider: ((WindowTarget) throws -> TargetCatalogRecord?)? = nil,
+        catalogDialogRelation: @escaping (pid_t, (AXUIElement) -> String?) -> (dialog: String, document: String)? = {
+            focusedDialogDocumentRelation(pid: $0, catalogIdentity: $1)
+        },
         windowServerInventory: (() -> Set<CGWindowID>?)? = nil
     ) {
         self.permissions = permissions
@@ -1299,6 +1313,8 @@ final class SystemWindowObserver: WindowObserving {
         self.catalogWindows = catalogWindows
         self.catalogAXWindowMatcher = catalogAXWindowMatcher
         self.catalogAXIdentityHash = catalogAXIdentityHash
+        self.targetRecordProvider = targetRecordProvider
+        self.catalogDialogRelation = catalogDialogRelation
         self.catalogAXWindows = catalogAXWindows
         self.windowServerInventory = windowServerInventory ?? (
             catalogBuilder == nil && catalogWindows == nil ? fullWindowServerInventoryForAbsence : { nil }
@@ -1307,11 +1323,19 @@ final class SystemWindowObserver: WindowObserving {
     }
 
     func apps() throws -> JSONValue {
-        let epoch = invalidateCooperativeState(.appsRefresh)
-        return try readAppsCatalog(epoch: epoch, presentationRef: nil)
+        try apps(includingFocusedDialogRelation: false, presentationRef: nil)
     }
 
     func presentationApps(takeoverRef: String) throws -> JSONValue {
+        try apps(includingFocusedDialogRelation: false, presentationRef: takeoverRef)
+    }
+
+    func apps(includingFocusedDialogRelation: Bool, presentationRef: String?) throws -> JSONValue {
+        guard let takeoverRef = presentationRef else {
+            let epoch = invalidateCooperativeState(.appsRefresh)
+            let pid = includingFocusedDialogRelation ? catalogLock.withLock { lastBoundCatalogPID } : nil
+            return try readAppsCatalog(epoch: epoch, presentationRef: nil, relationPID: pid)
+        }
         let epoch = try actionLock.withLock {
             try takeoverCoordinator.checkPresentationObservation(takeoverRef, checkFrontmost: false)
             return try catalogLock.withLock {
@@ -1322,7 +1346,7 @@ final class SystemWindowObserver: WindowObserving {
         }
         // The frontmost lookup, full catalog and final WindowServer inventory may block. They
         // must not keep end/terminal cleanup from returning the previous application.
-        try takeoverCoordinator.checkPresentationObservation(takeoverRef)
+        let presentationPID = try takeoverCoordinator.checkPresentationObservation(takeoverRef)
         try actionLock.withLock {
             try takeoverCoordinator.checkPresentationObservation(takeoverRef, checkFrontmost: false)
             try catalogLock.withLock { try requireCatalogEpochLocked(epoch) }
@@ -1330,14 +1354,22 @@ final class SystemWindowObserver: WindowObserving {
             virtualCursor.hide()
             invalidateObservationRefsLocked(.appsRefresh)
         }
-        return try readAppsCatalog(epoch: epoch, presentationRef: takeoverRef)
+        return try readAppsCatalog(epoch: epoch, presentationRef: takeoverRef,
+                                   relationPID: includingFocusedDialogRelation ? presentationPID : nil)
     }
 
     private func requireCatalogEpochLocked(_ epoch: UUID) throws {
         guard !catalogClosed, catalogEpoch == epoch else { throw WindowObservationError.staleTarget }
     }
 
-    private func readAppsCatalog(epoch: UUID, presentationRef: String?) throws -> JSONValue {
+    // A reused PID alone cannot carry scope to a new process after its last known window disappears.
+    private func retainsWindow(in pid: pid_t, from previous: WindowIdentities, to current: WindowIdentities) -> Bool {
+        current.contains { key, live in
+            key.pid == pid && previous[key]?.contains { prior in live.contains { $0.reference == prior.reference } } == true
+        }
+    }
+
+    private func readAppsCatalog(epoch: UUID, presentationRef: String?, relationPID: pid_t?) throws -> JSONValue {
         let previousIdentities = try catalogLock.withLock {
             try requireCatalogEpochLocked(epoch)
             return catalogWindowIdentities
@@ -1351,7 +1383,8 @@ final class SystemWindowObserver: WindowObserving {
             observation = try catalogBuilder()
             identities = previousIdentities
         } else {
-            (observation, identities) = try buildCatalog(reusing: previousIdentities)
+            (observation, identities) = try buildCatalog(reusing: previousIdentities, relationPID: relationPID,
+                                                         hasPresentation: presentationRef != nil)
         }
         let inventory = windowServerInventory()
         if let presentationRef { try takeoverCoordinator.checkPresentationObservation(presentationRef) }
@@ -1364,6 +1397,9 @@ final class SystemWindowObserver: WindowObserving {
         try requireCatalogEpochLocked(epoch)
         let nextGeneration = try nextCatalogGeneration(after: catalogGeneration)
         targets = observation.targets
+        if let pid = lastBoundCatalogPID, !retainsWindow(in: pid, from: previousIdentities, to: identities) {
+            lastBoundCatalogPID = nil
+        }
         catalogWindowIdentities = identities
         catalogGeneration = nextGeneration
         // Track only exposed identities, retaining history across refreshes.
@@ -1397,7 +1433,8 @@ final class SystemWindowObserver: WindowObserving {
         return matches.count == 1 ? matches[0].reference : nil
     }
 
-    private func buildCatalog(reusing previousIdentities: WindowIdentities) throws -> (WindowCatalogObservation, WindowIdentities) {
+    private func buildCatalog(reusing previousIdentities: WindowIdentities, relationPID: pid_t?,
+                              hasPresentation: Bool) throws -> (WindowCatalogObservation, WindowIdentities) {
         let budget = AXObservationBudget(duration: 8)
         let restoreBudget = budget.install()
         defer { restoreBudget() }
@@ -1536,18 +1573,19 @@ final class SystemWindowObserver: WindowObserving {
             let matches = (localWindowIdentities[key] ?? []).filter { CFEqual($0.element, element) }
             return matches.count == 1 ? matches[0].reference : nil
         }
+        let relation = relationPID.flatMap { pid -> (dialog: String, document: String)? in
+            guard hasPresentation || retainsWindow(in: pid, from: previousIdentities, to: localWindowIdentities),
+                  localTargets.values.lazy.filter({ $0.pid == pid && $0.axElement != nil }).prefix(2).count == 2,
+                  permissions.accessibilityTrusted else { return nil }
+            return catalogDialogRelation(pid) { self.stableWindowIdentity($0, pid: pid, in: localWindowIdentities) }
+        }
         let result = grouped.map { pid, value in
-            // Only two live, independently bound surfaces can carry a focused-dialog relation.
-            let relation = value.windows.count > 1 && permissions.accessibilityTrusted
-                ? focusedDialogDocumentRelation(pid: pid, catalogIdentity: { element in
-                    self.stableWindowIdentity(element, pid: pid, in: localWindowIdentities)
-                }) : nil
             // Resolve after enumerating every window: SCK often lists a sheet ahead of its parent.
             let relatedWindows = value.windows.map { window -> JSONValue in
                 guard case var .object(fields) = window, case let .string(ref)? = fields["window_ref"] else { return window }
                 if let (key, parent) = sheetParents[ref], let parentRef = exactIdentity(key, parent) {
                     fields["parent_window_identity_ref"] = .string(parentRef)
-                } else if let relation, fields["window_identity_ref"] == .string(relation.dialog) {
+                } else if pid == relationPID, let relation, fields["window_identity_ref"] == .string(relation.dialog) {
                     fields["focused_dialog_document_identity_ref"] = .string(relation.document)
                 }
                 return .object(fields)
@@ -1578,6 +1616,7 @@ final class SystemWindowObserver: WindowObserving {
         try catalogLock.withLock {
             try requireCatalogEpochLocked(epoch)
             targets[windowRef] = target
+            lastBoundCatalogPID = target.pid
         }
         return target
     }
@@ -1737,7 +1776,10 @@ final class SystemWindowObserver: WindowObserving {
                             result: observation,
                             commit: {
                                 self.catalogLock.withLock {
-                                    if !self.catalogClosed && self.catalogEpoch == epoch { self.targets[windowRef] = candidate }
+                                    if !self.catalogClosed && self.catalogEpoch == epoch {
+                                        self.targets[windowRef] = candidate
+                                        self.lastBoundCatalogPID = candidate.pid
+                                    }
                                 }
                             }
                         )
@@ -2541,6 +2583,7 @@ final class SystemWindowObserver: WindowObserving {
     }
 
     private func currentCatalogRecord(for target: WindowTarget) throws -> TargetCatalogRecord? {
+        if let targetRecordProvider { return try targetRecordProvider(target) }
         let content = try waitForShareableContent()
         guard let current = matchingCurrentWindow(for: target, in: content.windows) else {
             return nil
@@ -3165,7 +3208,10 @@ final class SystemWindowObserver: WindowObserving {
     func invalidateSnapshots() {
         // cooperativeAct owns actionLock for the whole batch. Signal its wait
         // and input gates before close waits on that lock to restore focus.
-        catalogLock.withLock { catalogClosed = true }
+        catalogLock.withLock {
+            catalogClosed = true
+            lastBoundCatalogPID = nil
+        }
         userActivity.requestTerminalStop()
         invalidateCooperativeState(.close)
     }

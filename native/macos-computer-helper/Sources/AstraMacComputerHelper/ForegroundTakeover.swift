@@ -1056,7 +1056,8 @@ final class ForegroundTakeoverCoordinator {
         _ = restoreFocus(targetPID: receipt.targetPID, oldPID: oldPID, counts: receipt.counts, validUntil: receipt.expires)
     }
 
-    func checkPresentationObservation(_ ref: String, checkFrontmost: Bool = true) throws {
+    @discardableResult
+    func checkPresentationObservation(_ ref: String, checkFrontmost: Bool = true) throws -> pid_t {
         lock.lock()
         guard let record = records[ref], record.consumedOneShot, !record.terminalClaimed, record.cleanupOutcome == nil else {
             lock.unlock()
@@ -1067,6 +1068,7 @@ final class ForegroundTakeoverCoordinator {
         if checkFrontmost, frontmostPID() != targetPID { throw TakeoverError.userActivityPaused }
         do { try activity.assertNotPaused(lease: lease) }
         catch is UserActivityMonitoringError { throw TakeoverError.userActivityPaused }
+        return targetPID
     }
 
     func withOrdinaryInput<T>(_ work: () throws -> T) rethrows -> T {

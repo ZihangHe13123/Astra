@@ -571,7 +571,8 @@ final class Dispatcher {
             return success(requestID: request.requestID, result: .object(["closed": .bool(true)]))
         case "apps":
             do {
-                let result = try windows.apps()
+                let result = try windows.apps(includingFocusedDialogRelation: requestsFocusedDialogRelations(request.payload),
+                                              presentationRef: nil)
                 return success(requestID: request.requestID, result: catalogForClient(result, payload: request.payload))
             } catch {
                 return observationFailure(requestID: request.requestID, error: error)
@@ -585,7 +586,8 @@ final class Dispatcher {
             else { return Self.failure(requestID: request.requestID, message: "\(request.operation) requires takeover_ref") }
             do {
                 if request.operation == "presentation_apps" {
-                    let result = try windows.presentationApps(takeoverRef: takeoverRef)
+                    let result = try windows.apps(includingFocusedDialogRelation: requestsFocusedDialogRelations(request.payload),
+                                                  presentationRef: takeoverRef)
                     return success(requestID: request.requestID, result: catalogForClient(result, payload: request.payload))
                 }
                 let outcome = try windows.cancelPresentation(takeoverRef: takeoverRef)

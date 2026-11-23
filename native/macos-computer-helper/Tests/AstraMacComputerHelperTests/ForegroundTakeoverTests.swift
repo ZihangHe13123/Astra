@@ -1627,6 +1627,94 @@ func presentationRollbackCannotBeMintedOrCarriedByOtherAuthority(_ reason: Strin
     #expect(f.activation.restored.count == (["unconsumed", "bounded", "regularEnd", "failedCleanup", "failedConsume"].contains(reason) ? 1 : 0))
 }
 
+@Test func catalogProbesOnlyTheLastBoundProcessOrTheAuthorizedPresentationProcess() throws {
+    let fixture = TakeoverFixture()
+    let presentationPID = fixture.target.pid
+    let otherPID = presentationPID + 1
+    let frame = CGRect(x: 1, y: 2, width: 300, height: 200)
+    var elements = (1...4).map { AXUIElementCreateApplication(pid_t(9000 + $0)) }
+    var visibleWindows = (1...4).map { id in
+        CatalogSCWindow(pid: id <= 2 ? presentationPID : otherPID, windowID: CGWindowID(id),
+            bounds: frame, isOnScreen: true, title: "Window-\(id)", applicationName: "Same App",
+            bundleID: "test.same-app", appVersion: nil, isTerminated: false, isRegularApplication: true)
+    }
+    var probes: [pid_t] = []
+    func makeObserver() -> SystemWindowObserver {
+        SystemWindowObserver(permissions: TakeoverPermissions(), takeoverCoordinator: fixture.coordinator,
+            catalogWindows: { visibleWindows },
+            catalogAXWindowMatcher: { _, target in elements[Int(target.windowID) - 1] },
+            targetRecordProvider: { target in
+                guard let axWindow = target.axElement else { return nil }
+                let window = TargetAXWindowRecord(windowID: target.windowID, bounds: frame,
+                    identity: CFHash(axWindow), element: axWindow)
+                return TargetCatalogRecord(appRef: target.appRef, windowRef: target.windowRef, pid: target.pid,
+                    windowID: target.windowID, bounds: frame, title: target.title, axWindows: [window])
+            }, catalogDialogRelation: { pid, _ in probes.append(pid); return nil })
+    }
+    let observer = makeObserver()
+    func catalog(_ enabled: Bool = true, presentation: String? = nil) throws -> JSONValue {
+        try observer.apps(includingFocusedDialogRelation: enabled, presentationRef: presentation)
+    }
+    func refs(_ raw: JSONValue, title: String) throws -> (String, String) {
+        guard case let .object(root) = raw, case let .array(apps)? = root["apps"] else { throw WindowObservationError.captureFailed }
+        for case let .object(app) in apps {
+            guard case let .string(appRef)? = app["app_ref"], case let .array(wins)? = app["windows"] else { continue }
+            for case let .object(win) in wins where win["title"] == .string(title) {
+                if case let .string(winRef)? = win["window_ref"] { return (appRef, winRef) }
+            }
+        }
+        throw WindowObservationError.targetGone
+    }
+    let initial = try catalog()
+    #expect(probes.isEmpty)
+    let first = try refs(initial, title: "Window-1")
+    _ = try observer.select(appRef: first.0, windowRef: first.1)
+    _ = try catalog(false)
+    #expect(probes.isEmpty)
+    let refreshed = try catalog()
+    let freshFirst = try refs(refreshed, title: "Window-1")
+    #expect(freshFirst.0 != first.0 && freshFirst.1 != first.1)
+    _ = try catalog()
+    #expect(probes == [presentationPID, presentationPID])
+
+    let second = try refs(try catalog(false), title: "Window-3")
+    _ = try observer.select(appRef: second.0, windowRef: second.1)
+    _ = try catalog()
+    #expect(probes.last == otherPID)
+    probes.removeAll()
+    let token = try fixture.begin()
+    _ = try fixture.coordinator.consume(token.ref, actions: fixture.actions)
+    _ = try catalog(false, presentation: token.ref)
+    #expect(probes.isEmpty)
+    _ = try catalog(presentation: token.ref)
+    #expect(probes == [presentationPID])
+    _ = try observer.takeoverEnd(takeoverRef: token.ref, restorePreviousFocus: true)
+    #expect(throws: TakeoverError.self) { try catalog(presentation: token.ref) }
+    #expect(probes == [presentationPID])
+
+    probes.removeAll()
+    _ = try makeObserver().apps(includingFocusedDialogRelation: true, presentationRef: nil)
+    #expect(probes.isEmpty)
+    let originalWindows = visibleWindows
+    visibleWindows.removeAll { $0.pid == otherPID }
+    _ = try catalog()
+    visibleWindows = originalWindows
+    let returned = try catalog()
+    #expect(probes.isEmpty)
+
+    // A new set of native windows under the same numeric PID must not inherit the old binding.
+    let rebound = try refs(returned, title: "Window-3")
+    _ = try observer.select(appRef: rebound.0, windowRef: rebound.1)
+    elements[2] = AXUIElementCreateApplication(9903)
+    elements[3] = AXUIElementCreateApplication(9904)
+    _ = try catalog()
+    _ = try catalog()
+    #expect(probes.isEmpty)
+    observer.invalidateSnapshots()
+    #expect(throws: WindowObservationError.self) { try catalog() }
+    #expect(probes.isEmpty)
+}
+
 @Test func presentationCatalogRequiresConsumedOneShotAndLeavesOnlyTeardownAuthority() throws {
     let f = TakeoverFixture()
     let token = try f.begin()
