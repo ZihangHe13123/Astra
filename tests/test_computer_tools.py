@@ -7989,6 +7989,8 @@ def test_react_continues_acknowledged_native_window_changes_without_replaying_in
     pending = [e for e in events if e.get("code") == "post_action_observation_pending"]
     assert len(pending) == changes
     assert all(e["error"] and e["computer_receipt"]["verification_state"] == "unverified" for e in pending)
+    assert all(e.get("committed_no_replay") is True for e in pending)
+    assert not any(e.get("committed_no_replay") for e in events if e.get("code") == "stale_snapshot")
 
 
 def test_post_action_unrecognized_observation_code_is_not_disclosed(

@@ -4826,6 +4826,7 @@ def register_computer_tools(
                     and _fully_acknowledged_action_batch(prepared.dispatch_result, len(prepared.actions))
                     and _next_transition_observation(payload) is not None):
                 receipt["next_step"] = "observe_window_transition"
+                result["committed_no_replay"] = True
             full_ack = (not manager.handed_off and prepared.dispatch_attempted
                         and _fully_acknowledged_action_batch(prepared.dispatch_result, len(prepared.actions)))
             if (full_ack and prepared.proposed_readback is not None and prepared.readback_epoch == readback_epoch

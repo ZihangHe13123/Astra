@@ -1244,6 +1244,9 @@ class ToolRegistry:
         timed_attempt_started: float | None = None
 
         async def finalize(result: dict) -> dict:
+            # Only the tool's registered completion finalizer can attest that this
+            # invocation committed work whose identical signature must not be replayed.
+            result.pop("committed_no_replay", None)
             if result.get("error") and not handler_started:
                 result["not_executed"] = True
             if tool.completion_finalizer is not None:
@@ -1254,7 +1257,10 @@ class ToolRegistry:
                     if inspect.isawaitable(completion):
                         await completion
                 except Exception:
+                    result.pop("committed_no_replay", None)
                     logger.exception("tool completion finalizer failed name=%s", name)
+                if not handler_started or result.get("committed_no_replay") is not True:
+                    result.pop("committed_no_replay", None)
             self.hooks.dispatch_tool_result(
                 name,
                 self.persistence_safe_args(tool, args),
