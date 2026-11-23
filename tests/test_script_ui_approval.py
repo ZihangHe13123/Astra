@@ -69,6 +69,36 @@ def test_registered_host_ui_action_needs_each_human_once_even_in_yolo(tmp_path, 
     assert registry.approved_permission_scopes == before
 
 
+@pytest.mark.parametrize(("tool", "transport"), [("execute_shell", "shell"), ("bash", "bash")])
+def test_compound_ui_script_discloses_other_shell_consequences(tmp_path, tool, transport):
+    host = RecordingHost(tmp_path)
+    registry = ToolRegistry()
+    register_code_tools(registry, host)
+    registry.yolo = True
+    command = """rm "fixture.txt"; osascript -e 'tell application "Fixture" to activate'"""
+    cards = []
+    decisions = iter(["deny", "once"])
+
+    async def answer(request):
+        cards.append(request)
+        return next(decisions)
+
+    registry.set_approval_handler(answer)
+    assert asyncio.run(registry.execute(tool, {"command": command}))["error_type"] == "approval_denied"
+    assert host.dispatched == []
+    assert not asyncio.run(registry.execute(tool, {"command": command}))["error"]
+    assert host.dispatched == [(transport, command)]
+    assert len(cards) == 2
+    for card in cards:
+        assert card["kind"] == "script_ui_control" and card["human_only"] is True
+        assert card["choices"] == ["once", "deny"] and card["yolo_bypass_allowed"] is False
+        assert "将应用调到前台" in card["approval_summary"]
+        assert "删除" in card["operation"]
+        assert card["consequential"] == "delete"
+        assert "焦点" in card["approval_effect"] and "主机状态" in card["approval_effect"]
+        assert command == card["arguments"]["command"]
+
+
 @pytest.mark.parametrize("command", ["open -a Fixture sample.txt", "pytest -q tests", "cmake --build build",
                                     """osascript -e 'tell application "System Events" to get name of every process'""",
                                     "printf '%s' 'cliclick c:fixture'"])
