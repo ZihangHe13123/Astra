@@ -671,18 +671,19 @@ class MacComputerBackend:
         if inspect.isawaitable(configured):
             await configured
 
-    async def apps(self) -> ComputerAppCatalog:
-        payload = {"window_catalog_relations": True}
+    def _catalog_options(self) -> dict[str, object]:
+        options: dict[str, object] = {}
+        if self._window_catalog_relations:
+            options["window_catalog_relations"] = True
         if self._focused_dialog_relations:
-            payload["focused_dialog_relations"] = True
-        return self._publish_catalog(await self._request("apps", payload))
+            options["focused_dialog_relations"] = True
+        return options
+
+    async def apps(self) -> ComputerAppCatalog:
+        return self._publish_catalog(await self._request("apps", self._catalog_options()))
 
     async def presentation_apps(self, takeover_ref: str) -> ComputerAppCatalog:
-        payload: dict[str, object] = {"takeover_ref": takeover_ref}
-        if self._window_catalog_relations:
-            payload["window_catalog_relations"] = True
-        if self._focused_dialog_relations:
-            payload["focused_dialog_relations"] = True
+        payload = {"takeover_ref": takeover_ref, **self._catalog_options()}
         response = await self._request("presentation_apps", payload)
         return self._publish_catalog(response)
 

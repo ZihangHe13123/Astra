@@ -4638,6 +4638,25 @@ def test_native_catalog_preserves_verified_sheet_parent_and_match_diagnostics():
         run(MacComputerBackend(transport).apps())
 
 
+@pytest.mark.parametrize("status", [None, {}, {"window_catalog_relations": False},
+                                   {"focused_dialog_relations": True}])
+def test_catalog_requests_without_advertised_relation_support_use_legacy_payloads(status):
+    transport = StaticTransport(ComputerResponse("unused", ok=True))
+
+    async def request(req):
+        transport.requests.append(req)
+        result = status if req.operation == "status" else {"catalog_generation": 7, "apps": []}
+        return ComputerResponse(req.request_id, ok=True, result=result)
+
+    transport.request = request
+    backend = MacComputerBackend(transport)
+    if status is not None:
+        run(backend.status())
+    run(backend.apps())
+    run(backend.presentation_apps("takeover-ref"))
+    assert [req.payload for req in transport.requests[-2:]] == [{}, {"takeover_ref": "takeover-ref"}]
+
+
 @pytest.mark.parametrize("modern", [False, True])
 def test_focused_dialog_observation_is_wire_negotiated_and_bound_to_same_app(modern):
     transport = StaticTransport(ComputerResponse("unused", ok=True))
