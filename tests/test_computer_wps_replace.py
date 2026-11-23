@@ -7,6 +7,7 @@ from xml.sax.saxutils import escape
 
 import pytest
 
+from agent.runtime.computer_saved_document import ApprovedCopy
 from tests import test_computer_tools as cu
 
 backend, manager, registry = cu.backend, cu.manager, cu.registry
@@ -94,6 +95,8 @@ def find_dialog(find, replacement, *, conflicting=False):
         "double_click",
         "pointer_hit",
         "changed_during_approval",
+        "snapshot_changed_before_dispatch",
+        "copy_binding_changed_before_dispatch",
         "absent_target",
     ],
 )
@@ -249,7 +252,35 @@ def test_wps_replace_approval_and_saved_paragraph_changes(
         actions.append({"type": "wait", "duration_ms": 1})
     acted = sum(name == "act" for name, _ in backend.calls)
     approvals = len(asked)
+    if case in {"snapshot_changed_before_dispatch", "copy_binding_changed_before_dispatch"}:
+        original_act = manager.act
+        original_matches = ApprovedCopy.matches
+        other_path = destination.parent / "other" / destination.name
+        other_path.parent.mkdir()
+        body(other_path, before)
+
+        async def change_after_approval(*args, **kwargs):
+            assert len(asked) == approvals + 1
+            if case == "snapshot_changed_before_dispatch":
+                observed = await registry.execute("computer_snapshot", {})
+                assert not observed["error"], observed
+                assert json.loads(observed["fresh_output"])["snapshot_id"] != snap
+            else:
+                def matches_current_document(copy, window, title, catalog_path):
+                    # The dialog now points at a different file with the same title.
+                    return original_matches(copy, window, title, str(other_path) if copy.path == destination else catalog_path)
+
+                monkeypatch.setattr(ApprovedCopy, "matches", matches_current_document)
+            return await original_act(*args, **kwargs)
+
+        monkeypatch.setattr(manager, "act", change_after_approval)
     result = cu.run(registry.execute("computer_act", {"snapshot_id": snap, "actions": actions}))
+    if case in {"snapshot_changed_before_dispatch", "copy_binding_changed_before_dispatch"}:
+        assert result["code"] == "stale_snapshot", result
+        assert result["retryable"] is True
+        assert result["computer_receipt"]["dispatch_state"] == "not_dispatched"
+        assert sum(name == "act" for name, _ in backend.calls) == acted
+        return
     if case in {"mixed_batch", "double_click", "pointer_hit"}:
         assert result["code"] == "replacement_requires_single_action", result
         assert sum(name == "act" for name, _ in backend.calls) == acted
@@ -265,6 +296,7 @@ def test_wps_replace_approval_and_saved_paragraph_changes(
     assert (
         cu.run(registry.execute("computer_act", {"snapshot_id": snap, "actions": actions}))["code"] == "effect_pending"
     )
+    assert sum(name == "act" for name, _ in backend.calls) == acted + 1
     updated = list(before)
     updated[1] = "unique changed"
     if case == "other_paragraph_changed":

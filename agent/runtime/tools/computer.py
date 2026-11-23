@@ -24,7 +24,6 @@ from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from itertools import islice
-from functools import partial
 from pathlib import Path
 
 from typing import Any, cast
@@ -4126,7 +4125,19 @@ def register_computer_tools(
         intent_for_dispatch = prepared.covered_save_as_intent
         if intent_for_dispatch is not None and current_save_as_intent() is not intent_for_dispatch:
             return _failure("approval_required", "The Save As approval expired or its target changed. No input was dispatched.")
+        replacement_to_dispatch = prepared.replacement
+        replacement_ready = False
+
+        def require_replacement_binding() -> None:
+            if replacement_to_dispatch is not None and (
+                replacement_to_dispatch.copy is not document_for_wps_dialog()
+                or trusted_snapshot.get("snapshot_id") != prepared.snapshot_id
+            ):
+                raise ComputerSessionError("stale_snapshot",
+                    "The replacement dialog's snapshot or approved copy changed. No input was dispatched.")
+
         try:
+            require_replacement_binding()
             conflict = check_save_intent(prepared, reserve=True)
             if conflict:
                 return conflict
@@ -4193,17 +4204,6 @@ def register_computer_tools(
                 else:
                     takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref, focus_consent=prepared.focus_consent)
                 _runtime_takeover_event("foreground_takeover_begin", decision)
-            replacement = prepared.replacement
-            if (replacement is not None and replacement.copy is document_for_wps_dialog()
-                    and trusted_snapshot.get("snapshot_id") == prepared.snapshot_id):
-                proof = replacement.proof
-                if pending_replacement is not None and pending_replacement.copy is replacement.copy:
-                    return _failure("effect_pending", "A replacement on this copy is awaiting its saved readback. Do not repeat it.")
-                if proof is not None and replacement.copy.version() != proof.before:
-                    # The input is still bound to the approved dialog. Only
-                    # the optional exact replacement evidence has gone stale.
-                    replacement = prepared.replacement = replace(replacement, proof=None)
-                pending_replacement = replacement
             # A later input must never inherit the proof of an earlier Save.
             latest_save_check = None
             if prepared.final_copy is not None and (
@@ -4217,18 +4217,38 @@ def register_computer_tools(
                 )
                 prepared.saved_document_check = latest_save_check
             lease_for_dispatch = prepared.covered_write_lease
-            dispatch = manager.act
-            if lease_for_dispatch is not None:
-                dispatch = partial(manager.act, write_permitted=lambda: current_write_lease() is lease_for_dispatch)
-            if intent_for_dispatch is not None:
-                dispatch = partial(manager.act, write_permitted=lambda: save_as_scope_for(prepared, decision) is intent_for_dispatch)
+
+            def permit_dispatch() -> bool:
+                nonlocal pending_replacement, replacement_ready
+                if intent_for_dispatch is not None and save_as_scope_for(prepared, decision) is not intent_for_dispatch:
+                    return False
+                if lease_for_dispatch is not None and current_write_lease() is not lease_for_dispatch:
+                    return False
+                if replacement_to_dispatch is not None:
+                    # The session manager holds its action lock here, immediately
+                    # before consuming the plan and handing it to the helper.
+                    require_replacement_binding()
+                    copy, proof = replacement_to_dispatch.copy, replacement_to_dispatch.proof
+                    if pending_replacement is not None and pending_replacement.copy is copy:
+                        raise ComputerSessionError("effect_pending",
+                            "A replacement on this copy is awaiting its saved readback. Do not repeat it.")
+                    if proof is not None and copy.version() != proof.before:
+                        # Disk changes revoke only the optional exact replacement proof.
+                        prepared.replacement = replace(replacement_to_dispatch, proof=None)
+                    pending_replacement = prepared.replacement
+                    replacement_ready = True
+                return True
+
             prepared.dispatch_attempted = True
-            result = await dispatch(
+            result = await manager.act(
                 snapshot_id,
                 normalized,
                 interaction_mode=prepared.mode,
                 plan_ref=plan.plan_ref,
                 takeover_ref=takeover_ref,
+                write_permitted=permit_dispatch if (
+                    replacement_to_dispatch is not None or lease_for_dispatch is not None or intent_for_dispatch is not None
+                ) else None,
             )
             prepared.dispatch_result = _safe_action_metadata(result.result)
         except HelperApplicationError as exc:
@@ -4251,6 +4271,15 @@ def register_computer_tools(
                 retryable=True,
             )
         except ComputerSessionError as exc:
+            if replacement_to_dispatch is not None and not replacement_ready:
+                prepared.dispatch_attempted = False
+                if exc.code == "stale_plan":
+                    # A fresh observation may already have consumed the old
+                    # plan before the manager reaches the dispatch check.
+                    try:
+                        require_replacement_binding()
+                    except ComputerSessionError as stale:
+                        return _session_failure(stale)
             return _session_failure(exc)
         except Exception as exc:  # noqa: BLE001 - dispatch started, so outcome is conservatively unknown
             logger.warning("computer action helper failed error_type=%s", type(exc).__name__)
