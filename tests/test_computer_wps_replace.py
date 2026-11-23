@@ -80,6 +80,10 @@ def find_dialog(find, replacement, *, conflicting=False):
         "pattern",
         "pattern_extra_note_story",
         "extra_note_story",
+        "header",
+        "case_only",
+        "missing_field_value",
+        "invalid_same_text",
         "no_replace_readback_grant",
         "overlap",
         "unrelated_doc",
@@ -107,13 +111,17 @@ def test_wps_replace_approval_and_saved_paragraph_changes(
         before[-1] = "another SEEd"
     if case == "width_alias":
         before[-1] = "another Ｓｅｅｄ"
+    if case == "case_only":
+        before[1] = "unique SEED"
     if case in {"pattern", "pattern_extra_note_story"}:
         before[1], needle = "unique s??d", "s??d"
     if case == "overlap":
         before[1], needle = "aaa", "aa"
     if case == "absent_target":
         needle = "absent"
-    dialog = find_dialog(needle, "changed", conflicting=case == "ambiguous_fields")
+    dialog = find_dialog(needle, needle if case == "invalid_same_text" else "changed", conflicting=case == "ambiguous_fields")
+    if case == "missing_field_value":
+        dialog["children"][0]["children"][3]["children"][0].pop("value")
     backend.catalog_app_version = "12.1.26026"
     backend.catalog_bundle_id = "com.kingsoft.wpsoffice.mac"
     current_catalog = backend.apps
@@ -174,7 +182,23 @@ def test_wps_replace_approval_and_saved_paragraph_changes(
         assert not result["error"], result
         assert asked[-1]["arguments"]["saved_copy_readback"] is True
         assert bool(asked[-1]["arguments"].get("wps_single_replace_readback")) == (case != "no_replace_readback_grant")
-    body(destination, before)
+    def write_document(paragraphs):
+        body(destination, paragraphs)
+        if case == "header":
+            with ZipFile(destination, "a") as package:
+                package.writestr(
+                    "word/_rels/document.xml.rels",
+                    '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                    '<Relationship Id="header" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/header" '
+                    'Target="header1.xml"/></Relationships>',
+                )
+                package.writestr(
+                    "word/header1.xml",
+                    '<w:hdr xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                    '<w:p><w:r><w:t>seed in header</w:t></w:r></w:p></w:hdr>',
+                )
+
+    write_document(before)
     if case in {"extra_note_story", "pattern_extra_note_story"}:
         with ZipFile(destination, "a") as package:
             package.writestr(
@@ -187,7 +211,7 @@ def test_wps_replace_approval_and_saved_paragraph_changes(
 
         async def save(*args, **kwargs):
             reply = await save_act(*args, **kwargs)
-            body(destination, paragraphs)
+            write_document(paragraphs)
             return reply
 
         with monkeypatch.context() as save_fixture:
@@ -198,7 +222,8 @@ def test_wps_replace_approval_and_saved_paragraph_changes(
         assert not result["error"], result
         return result, json.loads(result["fresh_output"])["saved_document"]
 
-    if case in {"duplicate", "diff_limit"}:
+    has_baseline = case in {"duplicate", "diff_limit", "header", "case_only", "missing_field_value"}
+    if has_baseline:
         first_save, first_evidence = save_document(before)
         if case == "diff_limit":
             after = ["新" * 230] + [f"after {i}" for i in range(1, 22)]
@@ -225,16 +250,15 @@ def test_wps_replace_approval_and_saved_paragraph_changes(
     acted = sum(name == "act" for name, _ in backend.calls)
     approvals = len(asked)
     result = cu.run(registry.execute("computer_act", {"snapshot_id": snap, "actions": actions}))
-    if case in {"ambiguous_fields", "changed_during_approval", "extra_note_story", "absent_target",
-                "mixed_batch", "double_click", "pointer_hit"}:
-        assert result["code"] in {"replacement_unverified", "replacement_requires_single_action"}, result
+    if case in {"mixed_batch", "double_click", "pointer_hit"}:
+        assert result["code"] == "replacement_requires_single_action", result
         assert sum(name == "act" for name, _ in backend.calls) == acted
         return
     assert not result["error"], result
     assert len(asked) == approvals + 1 and asked[-1]["kind"] == "computer_write"
+    assert asked[-1]["choices"] == ["once", "session", "deny"]
     assert sum(name == "act" for name, _ in backend.calls) == acted + 1
     if case in {"unrelated_doc", "not_approved_copy"}:
-        assert asked[-1]["choices"] == ["once", "session", "deny"]
         return
 
     snap = observe("查找和替换", "dialog-id", dialog)
@@ -253,17 +277,15 @@ def test_wps_replace_approval_and_saved_paragraph_changes(
         )
     else:
         assert "replacement_verification" not in evidence
-    if case == "duplicate":
+    if has_baseline:
         assert evidence["paragraph_changes"] == {
-            "status": "compared", "changes": [{"paragraph": 2, "before": "unique seed", "after": "unique changed"}],
+            "status": "compared", "changes": [{"paragraph": 2, "before": before[1], "after": "unique changed"}],
             "truncated": False,
         }
         assert first_evidence["paragraph_changes"] == {"status": "no_baseline"}
     else:
         assert evidence["paragraph_changes"] == {"status": "no_baseline"}
     # A valid Save readback releases the one-replacement-at-a-time guard.
-    if case == "pattern_extra_note_story":
-        return  # A new literal Replace still needs the original single-story proof.
     snap = observe("查找和替换", "dialog-id", find_dialog("changed", "again"))
     result = cu.run(registry.execute("computer_act", {"snapshot_id": snap, "actions": actions}))
     assert not result["error"], result

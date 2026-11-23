@@ -4157,16 +4157,16 @@ def register_computer_tools(
                 else:
                     takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref, focus_consent=prepared.focus_consent)
                 _runtime_takeover_event("foreground_takeover_begin", decision)
-            if prepared.replacement is not None:
-                replacement = prepared.replacement
+            replacement = prepared.replacement
+            if (replacement is not None and replacement.copy is document_for_wps_dialog()
+                    and trusted_snapshot.get("snapshot_id") == prepared.snapshot_id):
                 proof = replacement.proof
                 if pending_replacement is not None and pending_replacement.copy is replacement.copy:
                     return _failure("effect_pending", "A replacement on this copy is awaiting its saved readback. Do not repeat it.")
-                if (replacement.copy is not document_for_wps_dialog()
-                        or proof is not None and replacement.copy.version() != proof.before
-                        or trusted_snapshot.get("snapshot_id") != prepared.snapshot_id):
-                    return _failure("replacement_unverified",
-                        "The document or snapshot changed since planning; Replace was not dispatched.", retryable=False)
+                if proof is not None and replacement.copy.version() != proof.before:
+                    # The input is still bound to the approved dialog. Only
+                    # the optional exact replacement evidence has gone stale.
+                    replacement = prepared.replacement = replace(replacement, proof=None)
                 pending_replacement = replacement
             # A later input must never inherit the proof of an earlier Save.
             latest_save_check = None
@@ -4958,16 +4958,8 @@ def register_computer_tools(
                     field = fields.replacement if fields is not None else None
                     find = fields.find.get("value") if fields is not None else None
                     replacement = field.get("value") if field is not None else None
-                    if not isinstance(find, str) or not isinstance(replacement, str):
-                        prepared.failure = _failure("replacement_unverified",
-                            "Both field values must be observed in full before Replace.", retryable=False)
-                        return None
-                    proof, problem = await asyncio.to_thread(copy.read_for_replacement, find, replacement)
-                    if proof is None and problem not in {"multiple_matches", "pattern_or_escape_unsupported"}:
-                        prepared.failure = _failure("replacement_unverified", "The saved main body could not be checked for Replace.",
-                            retryable=False, details={"reason": problem},
-                            recovery_hint="Check the saved copy and the field values before continuing.")
-                        return None
+                    if isinstance(find, str) and isinstance(replacement, str):
+                        proof, _ = await asyncio.to_thread(copy.read_for_replacement, find, replacement)
                 prepared.replacement = _WpsReplacement(copy, proof)
         save_failure = _check_save_panel_action(prepared, raw_tree, context) or check_save_intent(prepared)
         if save_failure is not None:
