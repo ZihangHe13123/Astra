@@ -5,6 +5,8 @@ import math
 from collections.abc import Mapping
 from typing import Any
 
+from .computer_feedback import safe_action_receipt as safe_action_receipt
+
 
 def observation_capabilities(tree) -> list[str]:
     if not isinstance(tree, Mapping):
@@ -150,28 +152,3 @@ def verify_choice_goals(before, after, actions):
         "status": "verified" if all(r["status"] == "verified" for r in results) else "not_verified",
         "results": results,
     }
-
-
-def safe_action_receipt(value):
-    """Fixed diagnostics only; never persist page content, input, paths or refs."""
-    if not isinstance(value, Mapping):
-        return {}
-    result = {}
-    enums = {
-        "channel": {"native"},
-        "mode": {"background", "foreground_takeover"},
-        "dispatch_state": {"not_dispatched", "attempted", "acknowledged", "partial", "unknown"},
-        "verification_state": {"verified", "unverified"},
-        "next_step": {"continue_from_fresh_observation", "observe_result", "observe_window_transition", "review_saved_document", "follow_recovery", "refresh_snapshot", "handoff", "inspect_error", "report_presentation"},
-        "presentation_status": {"presented", "not_presented", "withdrawn", "unconfirmed"},
-        "replay": {"forbidden"},
-    }
-    for key, options in enums.items():
-        if isinstance(value.get(key), str) and value[key] in options:
-            result[key] = value[key]
-    if "presentation_status" in result and type(value.get("snapshot_verified")) is bool:
-        result["snapshot_verified"] = value["snapshot_verified"]
-    for key in ("action_count", "acknowledged", "verified_count", "goal_count", "goal_verified_count"):
-        if type(value.get(key)) is int and 0 <= value[key] <= 64:
-            result[key] = value[key]
-    return result

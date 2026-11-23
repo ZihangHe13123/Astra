@@ -3,13 +3,13 @@
 import re
 from collections.abc import Mapping
 
-from .computer_forms import safe_action_receipt
-
 
 NEXT_STEPS = {
     "report_presentation": "Report input and presentation separately. The action receipt still applies; do not replay the input or reacquire the foreground to show it.",
     "continue_from_fresh_observation": "Requested choice states are verified. Use the returned fresh refs for remaining work, or report completion briefly. No extra read is needed for these choices; server saving is a separate result.",
     "observe_result": "Inspect the returned fresh observation first. If it proves the requested result, report it briefly. Otherwise call computer_snapshot(settle_ms=300). An acknowledgement is not a failed click: do not click the same button again because the observation looked unchanged. After two inconclusive reads, report unconfirmed.",
+    "observe_saved_document": "Save was acknowledged. Check the same approved document with computer_snapshot(settle_ms=300). If the file update is still unverified, report it as pending. Do not repeat the edit or Save.",
+    "report_unverified_save": "Report that Save was acknowledged and the on-disk changes could not be verified. Do not repeat the edit or Save.",
     "review_saved_document": "Check the saved_document evidence in this result. If its on-disk path and body match the requested changes and all tasks are done, give the final answer now. Otherwise address only the missing requirement.",
     "observe_window_transition": "All input in this batch was delivered. Observe the returned window with computer_get_app_state through normal observation approval. Do not replay the batch. Its effect remains unverified.",
     "follow_recovery": "The acknowledged actions were delivered and none after them were sent, but no fresh observation was returned, so the effect is unverified. Do not replay. Follow this result's Recovery field; if that cannot be done safely, hand this step to the user.",
@@ -17,6 +17,31 @@ NEXT_STEPS = {
     "handoff": "Input outcome is uncertain. Observe if possible, then report what remains unconfirmed. Do not replay the action.",
     "inspect_error": "This call did not dispatch input. Follow its error code and recovery hint; do not guess another API or target.",
 }
+
+
+def safe_action_receipt(value):
+    """Fixed diagnostics only; never persist page content, input, paths or refs."""
+    if not isinstance(value, Mapping):
+        return {}
+    result = {}
+    enums = {
+        "channel": {"native"},
+        "mode": {"background", "foreground_takeover"},
+        "dispatch_state": {"not_dispatched", "attempted", "acknowledged", "partial", "unknown"},
+        "verification_state": {"verified", "unverified"},
+        "next_step": NEXT_STEPS.keys(),
+        "presentation_status": {"presented", "not_presented", "withdrawn", "unconfirmed"},
+        "replay": {"forbidden"},
+    }
+    for key, options in enums.items():
+        if isinstance(value.get(key), str) and value[key] in options:
+            result[key] = value[key]
+    if "presentation_status" in result and type(value.get("snapshot_verified")) is bool:
+        result["snapshot_verified"] = value["snapshot_verified"]
+    for key in ("action_count", "acknowledged", "verified_count", "goal_count", "goal_verified_count"):
+        if type(value.get(key)) is int and 0 <= value[key] <= 64:
+            result[key] = value[key]
+    return result
 
 
 _PRE_INPUT_REFUSALS = frozenset({
@@ -81,8 +106,11 @@ def build_action_receipt(payload, *, mode, action_count, dispatch_attempted, err
     })
 
 
-def receipt_instruction(receipt):
-    return NEXT_STEPS.get(safe_action_receipt(receipt).get("next_step", ""), "")
+def receipt_instruction(receipt, *, fresh_result=True):
+    step = safe_action_receipt(receipt).get("next_step", "")
+    if step == "review_saved_document" and not fresh_result:
+        return "The saved-document details were request-local. This receipt alone cannot establish a path or body. If verification is still needed, use an authorized read-only check."
+    return NEXT_STEPS.get(step, "")
 
 
 def _field(action, name):

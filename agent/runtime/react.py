@@ -3519,7 +3519,7 @@ class ReActAgent(AgentBase):
             if key in result:
                 event[key] = result[key]
         if name == "computer_act" and "computer_receipt" in result:
-            from .computer_forms import safe_action_receipt
+            from .computer_feedback import safe_action_receipt
             event["computer_receipt"] = safe_action_receipt(result["computer_receipt"])
         if result.get("fresh_output") is not None:
             event["_fresh_output"] = result["fresh_output"]
@@ -4102,11 +4102,10 @@ class ReActAgent(AgentBase):
                 )
         lines = [f"[Tool result: {name} | status: {status}]"]
         if name == "computer_act" and isinstance(event.get("computer_receipt"), dict):
-            from .computer_feedback import receipt_instruction
-            from .computer_forms import safe_action_receipt
+            from .computer_feedback import receipt_instruction, safe_action_receipt
             receipt = safe_action_receipt(event["computer_receipt"])
             lines.append("Computer receipt: " + json.dumps(receipt, ensure_ascii=False, separators=(",", ":")))
-            instruction = receipt_instruction(receipt)
+            instruction = receipt_instruction(receipt, fresh_result=not event.get("request_local_placeholder"))
             if instruction:
                 lines.append("Next step: " + instruction)
         lines.append(output)

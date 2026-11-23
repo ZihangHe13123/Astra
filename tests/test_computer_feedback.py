@@ -1,3 +1,4 @@
+import asyncio
 import json
 from types import SimpleNamespace
 
@@ -174,3 +175,86 @@ def test_saved_context_keeps_fixed_receipt_without_private_payload():
     assert "secret" not in output
     assert "not click the same button" in output
     assert json.loads(output.split("Computer receipt: ")[1].splitlines()[0])["replay"] == "forbidden"
+
+
+@pytest.mark.parametrize(("step", "guidance"), [
+    ("observe_saved_document", "computer_snapshot(settle_ms=300)"),
+    ("report_unverified_save", "on-disk changes could not be verified"),
+    ("review_saved_document", "all tasks are done"),
+])
+@pytest.mark.parametrize("include_fresh", [True, False])
+def test_save_receipt_survives_ui_and_model_projection_without_retaining_body(tmp_path, step, guidance, include_fresh):
+    from agent.core.msg import ContentBlock, Msg
+    from agent.runtime.computer_forms import safe_action_receipt
+    from agent.runtime.tools.registry import ToolDef, ToolRegistry
+
+    private_body = "PRIVATE-NEW-SAVED-BODY"
+    old_body = "STALE-PREVIOUS-BODY"
+    copy_path = "/private/task/copy.docx"
+    value = {"next_step": step, "dispatch_state": "acknowledged", "paragraphs": [old_body], "path": copy_path}
+    assert safe_action_receipt(value) == {"next_step": step, "dispatch_state": "acknowledged"}
+    proof = {"status": "read_back", "path": copy_path, "paragraphs": [private_body]} if step == "review_saved_document" else {
+        "status": "unverified", "path": copy_path,
+        "missing": "saved_file_update" if step == "observe_saved_document" else "complete_short_main_body",
+    }
+
+    async def save():
+        return json.dumps({"saved_document": proof})
+
+    def finish(_args, result, _call_id):
+        result["computer_receipt"] = value
+        if not include_fresh:
+            result.pop("fresh_output", None)
+
+    async def status():
+        return "ready"
+
+    registry = ToolRegistry(artifact_dir=tmp_path / "artifacts")
+    schema = {"type": "object", "properties": {}}
+    registry.register(ToolDef("computer_act", "Test Save", schema, save,
+                              result_persistence="request_local", completion_finalizer=finish))
+    registry.register(ToolDef("computer_status", "Test status", schema, status))
+    persistent = registry.persistence_safe_result(registry.get("computer_act"), {
+        "computer_receipt": value, "fresh_output": json.dumps(proof),
+    })
+    assert persistent["computer_receipt"] == safe_action_receipt(value)
+    assert "fresh_output" not in persistent and copy_path not in json.dumps(persistent)
+
+    class RecordingModel:
+        def __init__(self):
+            self.prompts = []
+
+        async def chat_stream(self, messages, tools):
+            self.prompts.append(messages)
+            if len(self.prompts) <= 2:
+                name = "computer_act" if len(self.prompts) == 1 else "computer_status"
+                yield {"type": "tool_calls", "calls": [{"id": name, "name": name, "arguments": "{}"}],
+                       "content": "", "usage": None}
+            else:
+                yield {"type": "done", "content": "finished", "usage": None}
+
+    async def scenario():
+        model = RecordingModel()
+        agent = ReActAgent("fixture", model, registry, max_iterations=3)
+        agent.context.set_session(str(tmp_path / "session.json"))
+        events = [e async for e in agent.reply_stream(Msg(content=[ContentBlock.text("Verify the save.")]))]
+        return model.prompts, agent.context.messages, events
+
+    prompts, history, events = asyncio.run(scenario())
+    immediate, later = (next(m["content"] for m in prompt if m.get("tool_call_id") == "computer_act")
+                        for prompt in prompts[1:])
+    save_event = next(e for e in events if e.get("computer_receipt"))
+    assert save_event["computer_receipt"] == safe_action_receipt(value)
+    for content in (immediate, later):
+        assert f'"next_step":"{step}"' in content
+    assert old_body not in json.dumps([prompts, history, events])
+    assert (copy_path in immediate) == include_fresh
+    assert (private_body in immediate) == (include_fresh and step == "review_saved_document")
+    for retained in (later, json.dumps(history), json.dumps(events)):
+        assert private_body not in retained and copy_path not in retained
+    if step == "review_saved_document":
+        expected = guidance if include_fresh else "receipt alone cannot establish"
+        assert expected in immediate and "receipt alone cannot establish" in later
+    else:
+        assert guidance in immediate and guidance in later
+        assert "Do not repeat the edit or Save" in immediate

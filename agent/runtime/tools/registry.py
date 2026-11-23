@@ -889,7 +889,7 @@ class ToolRegistry:
             if key in safe_keys
         }
         if tool.name == "computer_act" and "computer_receipt" in result:
-            from ..computer_forms import safe_action_receipt
+            from ..computer_feedback import safe_action_receipt
             safe["computer_receipt"] = safe_action_receipt(result["computer_receipt"])
         return safe
 
