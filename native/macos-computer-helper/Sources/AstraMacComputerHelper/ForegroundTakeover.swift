@@ -204,7 +204,7 @@ final class ForegroundTakeoverCoordinator {
     private let inputCounts: () -> [UInt32]
     private let physicalIdleSeconds: () -> TimeInterval?
     private let presentationWindowMatches: (WindowTarget) -> Bool
-    private let traceWindowPhase: (WindowTarget, String) -> Void
+    private let traceWindowPhase: ((WindowTarget, String) -> Void)?
     let loanNow: () -> TimeInterval
     private let scheduleLoanExpiry: LoanAlarm
     // Only input and terminal work use this gate, never post-action observations. Draining an
@@ -230,7 +230,7 @@ final class ForegroundTakeoverCoordinator {
         inputCounts: @escaping () -> [UInt32] = { [] },
         physicalIdleSeconds: @escaping () -> TimeInterval? = { nil },
         presentationWindowMatches: @escaping (WindowTarget) -> Bool = { _ in false },
-        traceWindowPhase: @escaping (WindowTarget, String) -> Void = { _, _ in },
+        traceWindowPhase: ((WindowTarget, String) -> Void)? = nil,
         loanNow: @escaping () -> TimeInterval = ForegroundLoanClock.now,
         scheduleLoanExpiry: @escaping LoanAlarm = ForegroundLoanClock.schedule,
         revalidate: @escaping (WindowTarget) throws -> WindowTarget,
@@ -372,12 +372,12 @@ final class ForegroundTakeoverCoordinator {
         // from this handoff interval, including typing that leaves the same app in front.
         let beforeArm = inputCounts()
         let oldPID = frontmostPID()
-        traceWindowPhase(target, "before_begin")
+        traceWindowPhase?(target, "before_begin")
         var sampledBegin = false
         func sampleAfterBegin() {
             guard !sampledBegin else { return }
             sampledBegin = true
-            traceWindowPhase(target, "after_begin")
+            traceWindowPhase?(target, "after_begin")
         }
         defer { sampleAfterBegin() }
         let lease: UserActivitySessionLease
@@ -1188,8 +1188,8 @@ final class ForegroundTakeoverCoordinator {
         )
         lock.unlock()
 
-        traceWindowPhase(record.authority.target, "before_end")
-        defer { traceWindowPhase(record.authority.target, "after_end") }
+        traceWindowPhase?(record.authority.target, "before_end")
+        defer { traceWindowPhase?(record.authority.target, "after_end") }
         cancelLoanExpiry?()
         cursor.hide()
         cursor.close()

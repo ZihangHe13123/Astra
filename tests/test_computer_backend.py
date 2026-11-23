@@ -5976,7 +5976,11 @@ def _owned_helper(tmp_path: Path) -> Path:
     return helper
 
 
-def test_helper_transport_uses_safe_environment_and_matching_ndjson(monkeypatch, tmp_path):
+@pytest.mark.parametrize("trace", [None, "0", "true", "1"])
+def test_helper_transport_uses_safe_environment_and_matching_ndjson(monkeypatch, tmp_path, trace):
+    monkeypatch.delenv("ASTRA_CU_TRACE_WINDOW_VISIBILITY", raising=False)
+    if trace is not None:
+        monkeypatch.setenv("ASTRA_CU_TRACE_WINDOW_VISIBILITY", trace)
     calls = []
 
     def response_factory(request):
@@ -6001,7 +6005,10 @@ def test_helper_transport_uses_safe_environment_and_matching_ndjson(monkeypatch,
     response = run(scenario())
     assert response.result == {"ready": True}
     assert calls[0][0] == (str(_owned_helper(tmp_path)),)
-    assert calls[0][1]["env"] == {"PATH": os.defpath, "LANG": "en_US.UTF-8"}
+    expected_env = {"PATH": os.defpath, "LANG": "en_US.UTF-8"}
+    if trace == "1":
+        expected_env["ASTRA_CU_TRACE_WINDOW_VISIBILITY"] = "1"
+    assert calls[0][1]["env"] == expected_env
     assert calls[0][1]["start_new_session"] is True
     process = process_holder[0]
     assert process.stdin.writes == [b'{"protocol_version":4,"request_id":"req-1","operation":"status","payload":{}}\n']

@@ -4741,3 +4741,11 @@ func enrichedPlanningFocusStillRejectsChangedConsumedSnapshot(kind: String) thro
         #expect(windows.endCalls == 0)
     }
 }
+
+
+@Test func foregroundWindowSamplingRequiresExplicitOptIn() {
+    for setting in [nil, "", "0", "true"] as [String?] {
+        #expect(SystemWindowObserver.windowPhaseTrace(setting: setting) == nil)
+    }
+    #expect(SystemWindowObserver.windowPhaseTrace(setting: "1") != nil)
+}

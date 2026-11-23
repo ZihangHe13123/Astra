@@ -1261,6 +1261,9 @@ final class SystemWindowObserver: WindowObserving {
     private let foregroundKeyboardCapability: ForegroundKeyboardDeliveryCapability
     private let cooperativeStateInvalidationObserver: ((SnapshotInvalidationReason) -> Void)?
     private let artifactSession: SnapshotArtifactSession
+    private let traceWindowPhase = SystemWindowObserver.windowPhaseTrace(
+        setting: ProcessInfo.processInfo.environment["ASTRA_CU_TRACE_WINDOW_VISIBILITY"]
+    )
     private lazy var takeoverCoordinator = ForegroundTakeoverCoordinator(
         activity: userActivity,
         activation: activation,
@@ -1273,7 +1276,7 @@ final class SystemWindowObserver: WindowObserving {
         inputCounts: ForegroundTakeoverCoordinator.physicalInputCounts,
         physicalIdleSeconds: ForegroundTakeoverCoordinator.secondsSincePhysicalInput,
         presentationWindowMatches: { retainedPresentationWindowMatches($0) },
-        traceWindowPhase: { [weak self] target, phase in self?.logForegroundWindowState(target, phase: phase) },
+        traceWindowPhase: traceWindowPhase,
         revalidate: { [weak self] target in
             guard let self else { throw WindowObservationError.targetGone }
             _ = try self.backgroundTargetController().snapshotTargetState(target)
@@ -3424,9 +3427,13 @@ final class SystemWindowObserver: WindowObserving {
         cooperativePlans.removeAll(keepingCapacity: false)
     }
 
+    static func windowPhaseTrace(setting: String?) -> ((WindowTarget, String) -> Void)? {
+        setting == "1" ? logForegroundWindowState : nil
+    }
+
     /// Bound-process identifiers and visibility only. The sampled key window can
     /// change while an event is in flight; this log does not acknowledge delivery.
-    private func logForegroundWindowState(_ target: WindowTarget, phase: String) {
+    private static func logForegroundWindowState(_ target: WindowTarget, phase: String) {
         let budget = AXObservationBudget(duration: 0.08, clock: ForegroundLoanClock.now)
         let restore = budget.install()
         defer { restore() }
@@ -3523,8 +3530,8 @@ final class SystemWindowObserver: WindowObserving {
                     }
                 }
             )
-            let sample = actions.contains { $0.kind == .keypress || $0.kind == .click }
-            if sample { logForegroundWindowState(authority.target, phase: "before_input") }
+            let sample = traceWindowPhase != nil && actions.contains { $0.kind == .keypress || $0.kind == .click }
+            if sample { traceWindowPhase?(authority.target, "before_input") }
             let result = executeForegroundActions(
                 authority: authority,
                 plannedPopupPoint: popupPoint,
@@ -3535,7 +3542,7 @@ final class SystemWindowObserver: WindowObserving {
                 loanDeadline: execution.loanDeadline,
                 managesActivityFragment: fragmentStage == nil
             )
-            if sample { logForegroundWindowState(authority.target, phase: "after_input") }
+            if sample { traceWindowPhase?(authority.target, "after_input") }
             if let fragmentStage {
                 takeoverCoordinator.finishFragmentStage(
                     takeoverRef,

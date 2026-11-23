@@ -524,6 +524,8 @@ class HelperTransport:
         if process is not None:
             await self._stop_process_locked()
         environment = {"PATH": os.defpath, "LANG": "en_US.UTF-8"}
+        if os.environ.get("ASTRA_CU_TRACE_WINDOW_VISIBILITY") == "1":
+            environment["ASTRA_CU_TRACE_WINDOW_VISIBILITY"] = "1"
         pass_fds: tuple[int, ...] = ()
         if self._artifact_directory_fd is not None:
             environment["ASTRA_COMPUTER_ARTIFACT_DIR_FD"] = str(self._artifact_directory_fd)
