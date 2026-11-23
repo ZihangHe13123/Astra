@@ -11,6 +11,7 @@ import stat
 import sys
 import time
 import xml.etree.ElementTree as ET
+import zlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -198,7 +199,12 @@ class ApprovedCopy:
                 return self._waiting_for_update()
             proof["missing"] = "complete_short_main_body"
             paragraphs = _body_paragraphs(data)
-        except (OSError, ValueError, RuntimeError, EOFError, BadZipFile, ET.ParseError, NotImplementedError):
+        except (BadZipFile, EOFError, ET.ParseError, zlib.error):
+            # The file can have a new stat version before an in-place ZIP/XML write is complete.
+            return {**proof, "missing": "saved_file_update", "reason": "incomplete_package",
+                    "next_step": "The updated document is not readable yet. Observe it again with "
+                                 "computer_snapshot(settle_ms=300). Do not repeat the edit or Save."}
+        except (OSError, ValueError, RuntimeError, NotImplementedError):
             return proof
         return {"path": str(self.path), "status": "read_back", "evidence": "saved_docx_main_body",
                 "version_changed_since_save_started": True,

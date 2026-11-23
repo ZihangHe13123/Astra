@@ -522,6 +522,7 @@ class _SavedDocumentCheck:
     window: str
     before: tuple[int, int, int, int, int] | None
     awaiting_observation: bool = False
+    saw_incomplete_package: bool = False
 
 
 @dataclass
@@ -4903,6 +4904,11 @@ def register_computer_tools(
         evidence = await asyncio.to_thread(copy.after_save, check.before, wait=wait)
         if not authorized():
             return None
+        if evidence.get("reason") == "incomplete_package":
+            if check.saw_incomplete_package:
+                evidence["missing"] = "complete_short_main_body"
+                evidence["next_step"] = "The updated document is still unreadable. Report Save as unverified without repeating it."
+            check.saw_incomplete_package = True
         payload["saved_document"] = evidence
         payload["message"] = evidence["next_step"]
         result["fresh_output"] = _json(payload)

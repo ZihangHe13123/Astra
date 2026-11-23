@@ -9304,7 +9304,7 @@ def test_new_copy_releases_after_confirmed_closure_or_exact_document(
 @pytest.mark.parametrize("route", ["menu_save", "command_s", "unrelated_same_title", "handoff", "exact_path",
                                   "late_snapshot", "late_app_state", "late_observation_denied", "late_after_handoff",
                                   "late_other_window", "late_other_grant_space", "late_handoff_during_read",
-                                  "late_intervening_input"])
+                                  "late_intervening_input", "late_partial_zip", "late_persistent_partial_zip"])
 def test_final_wps_save_reads_only_approved_copy_on_bound_document(registry, manager, backend, tmp_path, monkeypatch, route):
     from zipfile import ZipFile
 
@@ -9379,7 +9379,9 @@ def test_final_wps_save_reads_only_approved_copy_on_bound_document(registry, man
     original_act = backend.act
     async def save_copy(*args, **kwargs):
         result = await original_act(*args, **kwargs)
-        if not route.startswith("late_"):
+        if route == "late_persistent_partial_zip":
+            destination.write_bytes(b"PK\x03\x04")
+        elif not route.startswith("late_"):
             write_body("after")
         backend.snapshot_ax_tree_override = document("copy.docx")
         return result
@@ -9402,8 +9404,23 @@ def test_final_wps_save_reads_only_approved_copy_on_bound_document(registry, man
     assert "paragraphs" not in proof and "sha256" not in proof
     assert saved["computer_receipt"]["next_step"] == "observe_saved_document"
     actions = sum(name == "act" for name, _ in backend.calls)
+    if route == "late_partial_zip":
+        # A writer truncates and rewrites this inode after the initial Save response.
+        destination.write_bytes(b"PK\x03\x04")
     next_read = run(registry.execute("computer_snapshot", {}))
-    assert json.loads(next_read["fresh_output"])["saved_document"] == proof
+    next_proof = json.loads(next_read["fresh_output"])["saved_document"]
+    if route == "late_partial_zip":
+        assert next_proof["missing"] == "saved_file_update" and next_proof["reason"] == "incomplete_package"
+        assert not {"paragraphs", "sha256"} & next_proof.keys()
+    elif route == "late_persistent_partial_zip":
+        assert next_proof["missing"] == "complete_short_main_body" and next_proof["status"] == "unverified"
+        assert not {"paragraphs", "sha256"} & next_proof.keys()
+        another = run(registry.execute("computer_snapshot", {}))
+        assert "saved_document" not in json.loads(another["fresh_output"])
+        assert sum(name == "act" for name, _ in backend.calls) == actions
+        return
+    else:
+        assert next_proof == proof
     write_body("after")
 
     if route == "late_handoff_during_read":
