@@ -321,6 +321,30 @@ try {
   await expect(historyDiagram.locator('img[alt="Mermaid 图表"]')).toBeVisible();
   await waitForImage(historyDiagram);
   await assertMeasuredRows();
+  // Scrolled up through rows not measured yet, the rows on screen move only with the scroll. A row mounting above
+  // them used to keep its estimated room for a frame or two before the anchor was put back, so the conversation
+  // jumped up and back while scrolling (2026-11-24).
+  const historyBox = await page.locator('.messages-scroll').boundingBox();
+  await page.mouse.move(historyBox.x + historyBox.width / 2, historyBox.y + historyBox.height / 2);
+  const tracked = page.evaluate(() => new Promise(done => {
+    const el = document.querySelector('.messages-scroll'), start = performance.now(), frames = [];
+    const sample = () => {
+      const view = el.getBoundingClientRect();
+      frames.push([...el.querySelectorAll('.measured-message')].map(row => ({ id: row.dataset.rowId, top: row.getBoundingClientRect().top }))
+        .filter(row => row.top >= view.top && row.top < view.bottom));
+      if (performance.now() - start < 2500) requestAnimationFrame(sample); else done(frames);
+    };
+    requestAnimationFrame(sample);
+  }));
+  for (let step = 0; step < 12; step++) { await page.mouse.wheel(0, -150); await page.waitForTimeout(60); }
+  const frames = await tracked;
+  let movedBack = 0, compared = 0;
+  for (let i = 1; i < frames.length; i++) for (const row of frames[i]) {
+    const before = frames[i - 1].find(old => old.id === row.id);
+    if (before) { compared++; movedBack = Math.max(movedBack, before.top - row.top); }
+  }
+  assert.ok(compared > 0 && frames.at(-1).every(row => !frames[0].some(old => old.id === row.id)), 'the wheel scrolls past the rows first on screen');
+  assert.ok(movedBack <= 1, `scrolling up, rows on screen must never move back up (${movedBack}px)`);
   // One scroll to the top, right after rows were measured, stays there. Made in an animation frame, like a user's
   // scroll and like scrollToTop's polling, it used to meet the row measurement queued for that frame: following was
   // still on, so the list was pinned back to the bottom (6 runs in 10 locally; a macOS runner failed on it

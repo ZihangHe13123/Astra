@@ -144,6 +144,17 @@ export const MessageList = memo(function MessageList({ messages: sourceMessages,
   }, [scroller]);
   useLayoutEffect(() => {
     if (!list.current) return;
+    // A row mounting for the first time is measured before the frame is drawn: the update below renders again at
+    // once, so its estimated room is replaced and the anchor put back in this frame. Left to the observer, the rows
+    // under it were drawn shifted for a frame or two, and the conversation jumped while scrolling up.
+    let mounted = false;
+    for (const row of list.current.querySelectorAll<HTMLElement>("[data-row-id]")) {
+      const id = row.dataset.rowId!;
+      if (sizes.current.has(id)) continue;
+      const height = row.getBoundingClientRect().height;
+      if (height > 0) { sizes.current.set(id, height); mounted = true; }
+    }
+    if (mounted) resize(n => n + 1);
     let frame = 0;
     const observer = new ResizeObserver(entries => {
       let changed = false;
