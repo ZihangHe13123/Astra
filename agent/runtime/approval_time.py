@@ -13,7 +13,7 @@ def continuous_now() -> float:
     """Monotonic seconds, including suspend on macOS (the helper's clock) and Linux."""
     if sys.platform == "darwin":
         return time.clock_gettime(time.CLOCK_MONOTONIC_RAW)
-    if sys.platform.startswith("linux") and hasattr(time, "CLOCK_BOOTTIME"):
+    if sys.platform == "linux" and hasattr(time, "CLOCK_BOOTTIME"):
         return time.clock_gettime(time.CLOCK_BOOTTIME)
     return time.monotonic()
 
