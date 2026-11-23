@@ -119,10 +119,10 @@ export function approvalPaintOutput(target: NodeJS.WriteStream): NodeJS.WriteStr
 }
 
 export function useApprovalPaint(stdout: NodeJS.WriteStream, head: object | undefined, rows: number, columns: number,
-  expanded: boolean, inputFenced = false) {
+  expanded: boolean, inputFenced = false, loanSelected = false) {
   const observer = observers.get(stdout);
   const epoch = useMemo(() => head && observer ? randomBytes(16).toString("hex") : undefined,
-    [head, observer, rows, columns, expanded, inputFenced]);
+    [head, observer, rows, columns, expanded, inputFenced, loanSelected]);
   const expectedDraft = useMemo(() => {
     const lines = head && "draft" in head ? draftLogicalLines(head.draft) : undefined;
     return lines && draftFingerprint(lines);

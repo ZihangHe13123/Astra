@@ -694,20 +694,65 @@ test("a terminal without key-event reporting answers each painted foreground hea
   const expected: string[][] = [];
   try {
     await ask("one"); await ask("two");
-    assert.match(h.frame(), /\[回车\] 允许一次（英文 Y 也可）.*\[A\] 借用此窗口.*\[N\] 拒绝/);
+    assert.match(h.frame(), /\[回车\] 允许一次（英文 Y 也可）.*\[Tab\] 选择借用此窗口.*\[N\] 拒绝/);
     assert.doesNotMatch(h.frame(), /按下并松开|N\/Esc|GUI/);
     await h.key("y"); expected.push(["one", "once"]); assert.deepEqual(decisions(), expected); // only the head
     await h.key("A"); expected.push(["two", "session"]); assert.deepEqual(decisions(), expected);
     await ask("enter"); await h.key("\r"); expected.push(["enter", "once"]); assert.deepEqual(decisions(), expected);
 
     await ask("guarded", ["once", "deny"]);
-    await h.key("a"); // not offered
+    await h.key("\t"); await h.key("a"); // session is not offered
+    assert.doesNotMatch(h.frame(), /选择借用|确认借用/);
     await h.key("yy"); await h.key("y\r"); // coalesced bytes are not one key
     await h.key("\x1by"); await h.key("\x1b"); await h.key("y"); // Alt+y, then a suffix after an Escape wait
     await h.key("\x1b[200~y\x1b[201~"); // paste
     await h.key("\x1b]2;"); await h.key("y"); await h.key("\x07"); // string payload until its terminator
     assert.deepEqual(decisions(), expected);
     await h.key("Y"); expected.push(["guarded", "once"]); assert.deepEqual(decisions(), expected);
+  } finally { h.app.unmount(); }
+});
+
+test("Tab chooses a foreground loan and a separate Return confirms only the painted choice", async () => {
+  let hold = false, flush: (() => void) | undefined;
+  class SelectionScreen extends Output {
+    override _write(data: Buffer, encoding: BufferEncoding, done: () => void) {
+      const deliver = () => super._write(data, encoding, done);
+      if (hold && stripAnsi(String(data)).includes("确认借用此窗口")) flush = deliver;
+      else deliver();
+    }
+  }
+  const h = await setup(120, 36, undefined, undefined, undefined, { stdout: new SelectionScreen(), debug: false });
+  const { ask, answers } = kittyReview(h);
+  try {
+    await ask("first"); await ask("second");
+    await h.key("\t\r"); await h.key("\x1b[200~\t\r\x1b[201~"); await h.key("\x1b\t");
+    assert.deepEqual(answers(), []); assert.doesNotMatch(h.frame(), /确认借用/);
+    hold = true;
+    await h.key("\t");
+    assert.ok(flush, "the selection redraw must have reached the gated sink");
+    await h.key("\r");
+    assert.deepEqual(answers(), [], "Return cannot use the old once frame or the queued loan frame");
+    hold = false; const deliver = flush; flush = undefined; deliver(); await settle();
+    assert.match(h.frame(), /\[回车\] 确认借用此窗口，最多 2 分钟/);
+    await h.key("\r"); assert.deepEqual(answers(), [["first", "session"]]);
+    await h.key("\r"); assert.deepEqual(answers(), [["first", "session"], ["second", "once"]]);
+    await ask("toggle"); await h.key("\t"); await h.key("\t"); await h.key("\r");
+    assert.deepEqual(answers().at(-1), ["toggle", "once"]);
+    await ask("withdraw"); await h.key("\t");
+    h.child.event({ type: "approval_resolved", request_id: "withdraw", state: "denied", decision: "deny" });
+    await ask("replacement"); await h.key("\r");
+    assert.deepEqual(answers().at(-1), ["replacement", "once"]);
+  } finally { hold = false; flush?.(); h.app.unmount(); }
+});
+
+test("Kitty Tab and Return select and confirm the offered loan on independent releases", async () => {
+  const h = await setup(120, 36), { ask, negotiate, answers } = kittyReview(h);
+  try {
+    await ask("enhanced"); await negotiate();
+    await h.key("\t"); await h.key("\x1b[9u"); assert.doesNotMatch(h.frame(), /确认借用/);
+    await h.key("\x1b[9;1:3u"); assert.match(h.frame(), /确认借用此窗口/);
+    await h.key("\r"); await h.key("\x1b[13u"); assert.deepEqual(answers(), []);
+    await h.key("\x1b[13;1:3u"); assert.deepEqual(answers(), [["enhanced", "session"]]);
   } finally { h.app.unmount(); }
 });
 

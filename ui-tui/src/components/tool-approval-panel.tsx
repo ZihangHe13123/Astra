@@ -13,6 +13,7 @@ import { wrapDraft } from "../approval-draft.js";
 export interface ToolApprovalPanelProps {
   request: ToolApprovalRequest;
   foregroundRelease?: boolean;
+  loanSelected?: boolean;
   inputFenced?: boolean;
   paintEpoch?: string;
   expanded: boolean;
@@ -65,6 +66,7 @@ function collapsedShortcutHint(shortcutHint: string): string {
 export function ToolApprovalPanel({
   request,
   foregroundRelease = false,
+  loanSelected = false,
   inputFenced = false,
   paintEpoch,
   expanded,
@@ -83,6 +85,7 @@ export function ToolApprovalPanel({
     width: contentWidth,
     position: queueIndex,
     total: queueTotal,
+    loanSelected,
     expanded,
   });
   const safeOffset = clampToolDetailOffset(offset, view.detailLines.length, pageSize);

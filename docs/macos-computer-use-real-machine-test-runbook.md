@@ -65,6 +65,7 @@ The Task 10 live operator must copy the [Task 10 transactional app-state matrix]
 | --- | --- |
 | GUI 用 Tab 聚焦「查看后端提供的审批详情」，按下、松开 Enter，再做一次 | 详情展开、折叠；请求仍待决定，批准数和接管数均为零。另用真正的允许按钮作正对照。 |
 | TUI 在支持松键上报的终端（如 kitty）按下再松开 Y、Enter 或已提供的 A；再在只送字符的终端（如 Terminal.app）按一次 Y | 前者在同一选择松键后批准，后者按下即批准；都只回答已经画出的这张卡，Alt+Y、粘贴和转义序列的尾字节不算。批准后目标应用来到前台，松开批准键本身不算接手；借用期间另打一键、点按或用 ⌘Tab 切走，借用让行且不再夺回；正常结束后焦点回到原应用。不能用延时忽略批准后的新按键。 |
+| Terminal.app 使用系统拼音，普通前台卡提供两分钟借用。在候选栏收起时按 Tab，看到“确认借用此窗口，最多 2 分钟”后按回车 | 单按 Tab 没有审批回执。确认后同一请求只收到一条 session，下一张卡默认允许一次。仅提供单次批准的卡不显示此切换选项。 |
 | 用非 debug 的 TUI 和只记录答复、不执行工具的测试后端；在输入框连续打字时送入普通审批，再让一张普通审批暂时盖住 `/connect` | 卡片和选项写出前，原本输入的 Y 不得产生批准。卡片可见后 Enter 只回答该卡；连接面板重新显示后独立按 Enter 才能选路。不要实际连接账号。 |
 | 用同一张假发送卡（主收件人、抄送、密送、主题、六行不同正文），对照 50×14 与 120×36，再调整窗口大小 | 核对卡片和输入：内容不全时 Y 不发送，N 可丢弃；Ctrl+Y 不是草稿快捷键，预开或另处开启 YOLO 也不能结算本卡。所有字段完整写出后须重新按 Y 或 Enter。只记录决定，不发邮件。 |
 | 用标记为 `truncated:true` 的测试草稿重放给 GUI，分别试有正文节选和无正文的卡 | 都不提供发送按钮或肯定快捷键，可以丢弃。完整草稿须列出实际提供的主收件人、抄送、密送。 |
@@ -414,6 +415,14 @@ output/computer-use/<YYYY-MM-DD-HHMM>-real-machine-report.md
 
 | Gate | Bundle ID | Exact version | Result | Input started | Cursor unchanged | Sentinel frontmost | Fresh effect | No plan/approval/sidecar | Evidence |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+
+## 可选的前台窗口诊断
+
+复现模态窗口离屏时，给本次 Astra 后端进程设置 `ASTRA_CU_TRACE_WINDOW_VISIBILITY=1`，
+并启动新的 helper 会话。采样写入本机 `/tmp/astra-sipp-diagnostics.log` 的
+`FG-WINDOW` 行，包括借用开始和结束前后，以及按键或点击派发前后。
+记录只包含所绑定进程的窗口编号、层次、可见性、焦点归属和截断状态。
+默认关闭这些额外的 AX 和 WindowServer 查询。常规错误原因仍走原诊断路径。
 
 ## Experimental PID-pointer diagnostic
 

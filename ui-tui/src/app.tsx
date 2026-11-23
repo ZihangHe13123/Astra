@@ -2317,7 +2317,17 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
 
   const approvalVisible = !!pendingApproval && !startupVisible && !openToolResult;
   const [inputFenced, setInputFenced] = useState(false);
-  const paint = useApprovalPaint(stdout, approvalVisible ? pendingApproval : undefined, rows, terminalColumns, approvalDetailOpen, inputFenced);
+  const [selectedLoanCard, setSelectedLoanCard] = useState<typeof pendingApproval>();
+  // A second read can arrive before React renders the selection or Ink writes its new hint.
+  const requestedLoanCard = useRef<typeof pendingApproval>();
+  const loanSelected = !!pendingApproval && pendingApproval === selectedLoanCard;
+  useLayoutEffect(() => {
+    if (!approvalVisible || inputFenced || requestedLoanCard.current !== pendingApproval) {
+      requestedLoanCard.current = undefined;
+      setSelectedLoanCard(undefined);
+    }
+  }, [pendingApproval, approvalVisible, inputFenced]);
+  const paint = useApprovalPaint(stdout, approvalVisible ? pendingApproval : undefined, rows, terminalColumns, approvalDetailOpen, inputFenced, loanSelected);
   const connectionVisible = connectionOpen && !startupVisible && !openToolResult && !pendingApproval && !questionRequest;
   const [connectionTarget, setConnectionTarget] = useState<object>();
   const connectionEpoch = useMemo(() => connectionVisible && connectionTarget ? {} : undefined, [connectionVisible, connectionTarget]);
@@ -2448,6 +2458,17 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
   const foregroundRelease = useForegroundApprovalInput(foregroundId, normalInputOwner, (id, input, key, chosen) => {
     if (pendingApproval?.request_id !== id || approvalQueue.requests[0] !== pendingApproval) return false;
     appshotClientRef.current?.recordInput();
+    if (key.tab || (key.return && chosen)) {
+      if (!paint.current(foregroundRelease) || loanSelected !== (requestedLoanCard.current === pendingApproval)) return false;
+      if (key.tab) {
+        if (pendingApproval.choices?.includes("session")) {
+          requestedLoanCard.current = loanSelected ? undefined : pendingApproval;
+          setSelectedLoanCard(requestedLoanCard.current);
+        }
+        return false;
+      }
+      if (loanSelected && chosen) return handleInput(input, key, { ...chosen, decision: "session" });
+    }
     return handleInput(input, key, chosen);
   }, approvalVisible, setInputFenced);
   useInput((input, key) => {
@@ -2590,6 +2611,7 @@ export default function App({ appshotClientFactory, appshotManifestReader, lifec
               paintEpoch={paint.epoch}
               inputFenced={inputFenced}
               foregroundRelease={foregroundRelease}
+              loanSelected={loanSelected}
               width={columns}
               queueIndex={1}
               queueTotal={approvalRequests.length}

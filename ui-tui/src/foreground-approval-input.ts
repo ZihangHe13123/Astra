@@ -206,9 +206,12 @@ export class ForegroundTerminalInput {
     if (!this.id || origin !== this.receiver || this.done) { this.armed = undefined; return; }
     const code = Number(key?.[1]), mod = heldModifiers(key?.[2]), event = Number(key?.[3] || 1);
     const previous = this.armed; this.armed = undefined;
-    if (key && this.ready && !this.blurred && mod === 0 && (code === 121 || code === 13 || code === 97)) {
+    if (key && this.ready && !this.blurred && mod === 0 && (code === 121 || code === 13 || code === 97 || code === 9)) {
       if (event === 1 && previous === undefined) this.armed = code;
-      if (event === 3 && previous === code) this.send("", {}, code === 97 ? "session" : "once");
+      if (event === 3 && previous === code) {
+        if (code === 9) this.send("", { tab: true });
+        else this.send("", { return: code === 13 }, code === 97 ? "session" : "once");
+      }
       return;
     }
     if (key && event === 1) {
@@ -413,7 +416,8 @@ export class ForegroundTerminalInput {
     // chooses, never an Escape suffix, a timeout, string payload or paste. Its release is not
     // takeover evidence for the helper. Once Kitty reporting is live, only its release frames choose.
     if (independent && !this.ready && this.receiver.approval) {
-      if (/^[y\r]$/i.test(c)) this.send("", {}, "once");
+      if (c === "\t") this.send("", { tab: true });
+      else if (/^[y\r]$/i.test(c)) this.send("", { return: c === "\r" }, "once");
       else if (/^a$/i.test(c)) this.send("", {}, "session");
     }
   }

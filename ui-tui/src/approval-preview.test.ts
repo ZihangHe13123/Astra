@@ -544,7 +544,7 @@ test("ordinary foreground permission exposes its bounded window loan without exp
     ...request("application-approval"), kind: "computer_foreground_takeover",
     choices: ["once", "session", "deny"], arguments: { application: "Fixture" },
   }, { width: 100, expanded: false });
-  assert.match(view.shortcutHint, /\[A\].*此窗口.*2 分钟/);
+  assert.match(view.shortcutHint, /\[Tab\] 选择借用此窗口，最多 2 分钟（英文 A 可直接借用）/);
 });
 
 test("leaving a result in front is explicit even on the collapsed approval card", () => {

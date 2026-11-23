@@ -69,6 +69,7 @@ export interface ApprovalCompactViewOptions {
   position?: number;
   total?: number;
   expanded?: boolean;
+  loanSelected?: boolean;
 }
 
 import { escapeApprovalDisplayText, isUnsafeDisplayCodePoint } from "@astra/ui-core/approval-display";
@@ -370,7 +371,7 @@ export function buildApprovalCompactView(
     targetPreview,
     collapsedLines: approvalSummaryLines(request, width),
     detailLines: approvalRequestLines(request, width),
-    shortcutHint: approvalChoiceHint(request, options.expanded ?? false),
+    shortcutHint: approvalChoiceHint(request, options.expanded ?? false, options.loanSelected),
     queuePosition: `${position}/${total}`,
   };
 }
@@ -483,13 +484,14 @@ export function compactApprovalLines(lines: string[], maxLines: number): string[
 export function approvalChoiceHint(
   request: ToolApprovalRequest,
   expanded: boolean,
+  loanSelected = false,
 ): string {
   const choices: readonly ApprovalChoice[] = !request.choices?.length && isComputerTakeoverRequest(request)
     ? ["once", "deny"]
     : approvalChoices(request);
   const draft = "draft" in request;
   const onceHint = draft ? "[Y/回车] 发送"
-    : isComputerTakeoverRequest(request) ? "[回车] 允许一次（英文 Y 也可）"
+    : isComputerTakeoverRequest(request) ? (loanSelected ? "[英文 Y] 允许一次" : "[回车] 允许一次（英文 Y 也可）")
     : "[Y/回车] 仅本次允许";
   const sessionLabel = isComputerTakeoverRequest(request)
     ? "借用此窗口，最多 2 分钟"
@@ -502,10 +504,13 @@ export function approvalChoiceHint(
       : request.session_scope_label
         ? `会话内允许 ${displayText(request.session_scope_label)}`
       : "会话内允许";
+  const sessionHint = isComputerTakeoverRequest(request)
+    ? (loanSelected ? `[回车] 确认${sessionLabel}   [Tab] 切回允许一次` : `[Tab] 选择${sessionLabel}（英文 A 可直接借用）`)
+    : `[A] ${sessionLabel}`;
   return [
     choices.includes("once") ? onceHint : "",
     expanded && choices.includes("task") ? "[T] 本任务允许" : "",
-    (expanded || isComputerTakeoverRequest(request)) && choices.includes("session") ? `[A] ${sessionLabel}` : "",
+    (expanded || isComputerTakeoverRequest(request)) && choices.includes("session") ? sessionHint : "",
     expanded && choices.includes("always") ? "[L] 以后都允许" : "",
     choices.includes("deny") ? (draft ? (expanded ? "[N] 丢弃" : "[N/Esc] 丢弃") : expanded ? "[N] 拒绝" : "[N/Esc] 拒绝") : "",
   ].filter(Boolean).join("   ");
