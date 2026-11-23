@@ -213,6 +213,7 @@ enum UserActivityTapSignal: Equatable {
     case event(UserActivityEvent)
     case disabledByTimeout
     case disabledByUserInput
+    case monitoringIncomplete
 }
 
 protocol UserActivityWorkSubmitting: AnyObject {
@@ -237,7 +238,7 @@ protocol UserActivityTapRunning: AnyObject {
 final class SystemUserActivityTapRuntime: UserActivityTapRunning {
     private final class Control {
         var stopRequested = false
-        var tap: CFMachPort?
+        var stopBlockRan = false  // Only accessed on this generation's tap thread.
         var runLoop: CFRunLoop?
     }
 
@@ -248,6 +249,11 @@ final class SystemUserActivityTapRuntime: UserActivityTapRunning {
 
     private let lock = NSLock()
     private var controls: [UUID: Control] = [:]
+    private let eventsOfInterest: CGEventMask
+
+    init(eventsOfInterest: CGEventMask = SystemUserActivityTapRuntime.eventMask) {
+        self.eventsOfInterest = eventsOfInterest
+    }
 
     func start(
         generation: UUID,
@@ -270,7 +276,7 @@ final class SystemUserActivityTapRuntime: UserActivityTapRunning {
                 tap: .cgSessionEventTap,
                 place: .headInsertEventTap,
                 options: .listenOnly,
-                eventsOfInterest: Self.eventMask,
+                eventsOfInterest: self.eventsOfInterest,
                 callback: Self.tapCallback,
                 userInfo: Unmanaged.passUnretained(context).toOpaque()
             ) else {
@@ -279,12 +285,12 @@ final class SystemUserActivityTapRuntime: UserActivityTapRunning {
                 exited()
                 return
             }
+            let loop = CFRunLoopGetCurrent()!
             let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
             self.lock.lock()
             let mayPublish = self.controls[generation] === control && !control.stopRequested
             if mayPublish {
-                control.tap = tap
-                control.runLoop = CFRunLoopGetCurrent()
+                control.runLoop = loop
             }
             self.lock.unlock()
             guard mayPublish else {
@@ -292,21 +298,20 @@ final class SystemUserActivityTapRuntime: UserActivityTapRunning {
                 exited()
                 return
             }
-            CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .commonModes)
+            CFRunLoopAddSource(loop, source, .commonModes)
             CGEvent.tapEnable(tap: tap, enable: true)
-            guard publish(true) else {
-                CGEvent.tapEnable(tap: tap, enable: false)
-                CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
-                self.remove(generation)
-                exited()
-                return
+            if publish(true) {
+                // A stop posted before this call also runs on this generation's loop.
+                CFRunLoopRun()
+                if !control.stopBlockRan || !Self.drainPendingEvents()
+                    || !CFMachPortIsValid(tap) || !CGEvent.tapIsEnabled(tap: tap) {
+                    signal(.monitoringIncomplete)
+                }
             }
-            self.lock.lock()
-            let shouldRun = self.controls[generation] === control && !control.stopRequested
-            self.lock.unlock()
-            if shouldRun { CFRunLoopRun() }
-            CGEvent.tapEnable(tap: tap, enable: false)
-            CFRunLoopRemoveSource(CFRunLoopGetCurrent(), source, .commonModes)
+            // Disabling a live tap can emit tapDisabledByUserInput. Detach the
+            // source on its owning thread before closing the port.
+            CFRunLoopRemoveSource(loop, source, .commonModes)
+            CFMachPortInvalidate(tap)
             self.remove(generation)
             exited()
             withExtendedLifetime(context) {}
@@ -317,13 +322,38 @@ final class SystemUserActivityTapRuntime: UserActivityTapRunning {
 
     func stop(generation: UUID) {
         lock.lock()
-        let control = controls[generation]
-        control?.stopRequested = true
-        let tap = control?.tap
-        let runLoop = control?.runLoop
+        guard let control = controls[generation], !control.stopRequested else {
+            lock.unlock()
+            return
+        }
+        control.stopRequested = true
+        let runLoop = control.runLoop
         lock.unlock()
-        if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
-        if let runLoop { CFRunLoopStop(runLoop) }
+        if let runLoop {
+            CFRunLoopPerformBlock(runLoop, CFRunLoopMode.defaultMode.rawValue) { [weak control] in
+                guard let control else { return }
+                control.stopBlockRan = true
+                CFRunLoopStop(CFRunLoopGetCurrent())
+            }
+            CFRunLoopWakeUp(runLoop)
+        }
+    }
+
+    /// Service events already queued when the stop block ran, without admitting another
+    /// indefinite wait. A busy or stopped loop cannot attest an uninterrupted handoff.
+    static func drainPendingEvents(
+        next: () -> CFRunLoopRunResult = { CFRunLoopRunInMode(.defaultMode, 0, true) },
+        now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+    ) -> Bool {
+        let deadline = now() + 0.05
+        while now() < deadline {
+            switch next() {
+            case .timedOut: return now() < deadline
+            case .handledSource: continue
+            default: return false
+            }
+        }
+        return false
     }
 
     private func remove(_ generation: UUID) {
@@ -749,7 +779,7 @@ final class UserActivityArbiter: HelperSessionActivityMonitoring {
         case let .event(event):
             if case let .pause(value) = session.classifier.consume(event) { reason = value } else { reason = nil }
             disableTap = false
-        case .disabledByTimeout, .disabledByUserInput:
+        case .disabledByTimeout, .disabledByUserInput, .monitoringIncomplete:
             reason = .monitorDisabled
             disableTap = true
         }
