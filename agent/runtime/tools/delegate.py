@@ -1210,7 +1210,7 @@ def _worker_llm(
     resolved = _resolve_model(model)
     if (
         isinstance(active, LLMClient)
-        and active.config.provider in {"openai-codex", "claude-code", "google-gemini"}
+        and active.config.provider in {"openai-codex", "claude-code", "google-gemini", "anthropic-api"}
         and not _is_local_endpoint(active.config.base_url)
         and resolved.lower().startswith("deepseek-")
     ):

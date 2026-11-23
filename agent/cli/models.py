@@ -77,7 +77,7 @@ class ModelProfile:
         settings["vision_preprocess"] = self.vision_preprocess
         if self.auto_compact_token_limit is not None:
             settings["auto_compact_token_limit"] = self.auto_compact_token_limit
-        if self.provider in {"openai-codex", "google-gemini"} or self.reasoning_levels:
+        if self.provider in {"openai-codex", "google-gemini", "anthropic-api"} or self.reasoning_levels:
             settings["reasoning_levels"] = self.reasoning_levels
         return settings
 

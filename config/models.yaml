@@ -199,3 +199,54 @@ models:
     reasoning_levels: [low, medium, high]
     generation:
       max_tokens: 32768
+
+  # Anthropic Claude API (native Messages API, a Console API key billed per token).
+  # 1M context; Astra compacts at 150k for cost. Thinking is adaptive (summaries shown as
+  # reasoning); /mode sets output_config.effort. Sampling parameters are not sent.
+  claude-opus-5-5:
+    provider: anthropic-api
+    base_url: https://api.anthropic.com/v1
+    api_key_env: CLAUDE_API_KEY
+    catalog_provider: claude-api
+    provider_label: Claude API
+    context_limit: 1000000
+    capabilities: [tools, reasoning, vision, streaming]
+    reasoning_levels: [low, medium, high, xhigh, max]
+    generation:
+      max_tokens: 64000
+
+  claude-sonnet-5-5:
+    provider: anthropic-api
+    base_url: https://api.anthropic.com/v1
+    api_key_env: CLAUDE_API_KEY
+    catalog_provider: claude-api
+    provider_label: Claude API
+    context_limit: 1000000
+    capabilities: [tools, reasoning, vision, streaming]
+    reasoning_levels: [low, medium, high, xhigh, max]
+    generation:
+      max_tokens: 64000
+
+  claude-haiku-5-5:
+    provider: anthropic-api
+    base_url: https://api.anthropic.com/v1
+    api_key_env: CLAUDE_API_KEY
+    catalog_provider: claude-api
+    provider_label: Claude API
+    context_limit: 1000000
+    capabilities: [tools, reasoning, vision, streaming]
+    reasoning_levels: [low, medium, high, xhigh, max]
+    generation:
+      max_tokens: 64000
+
+  claude-fable-5-2:
+    provider: anthropic-api
+    base_url: https://api.anthropic.com/v1
+    api_key_env: CLAUDE_API_KEY
+    catalog_provider: claude-api
+    provider_label: Claude API
+    context_limit: 1000000
+    capabilities: [tools, reasoning, vision, streaming]
+    reasoning_levels: [low, medium, high, xhigh, max]
+    generation:
+      max_tokens: 64000
