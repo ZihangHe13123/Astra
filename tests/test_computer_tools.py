@@ -9283,7 +9283,10 @@ def test_new_copy_releases_after_confirmed_closure_or_exact_document(
 
 
 @pytest.mark.skipif(os.name != "posix", reason="native WPS uses local POSIX paths")
-@pytest.mark.parametrize("route", ["menu_save", "command_s", "unrelated_same_title", "handoff", "unchanged", "exact_path"])
+@pytest.mark.parametrize("route", ["menu_save", "command_s", "unrelated_same_title", "handoff", "exact_path",
+                                  "late_snapshot", "late_app_state", "late_observation_denied", "late_after_handoff",
+                                  "late_other_window", "late_other_grant_space", "late_handoff_during_read",
+                                  "late_intervening_input"])
 def test_final_wps_save_reads_only_approved_copy_on_bound_document(registry, manager, backend, tmp_path, monkeypatch, route):
     from zipfile import ZipFile
 
@@ -9358,7 +9361,7 @@ def test_final_wps_save_reads_only_approved_copy_on_bound_document(registry, man
     original_act = backend.act
     async def save_copy(*args, **kwargs):
         result = await original_act(*args, **kwargs)
-        if route != "unchanged":
+        if not route.startswith("late_"):
             write_body("after")
         backend.snapshot_ax_tree_override = document("copy.docx")
         return result
@@ -9368,10 +9371,100 @@ def test_final_wps_save_reads_only_approved_copy_on_bound_document(registry, man
     payload = json.loads(saved["fresh_output"])
     if route in {"unrelated_same_title", "handoff"}:
         assert "saved_document" not in payload
-    else:
-        proof = payload["saved_document"]
+        return
+    assert "saved_document" not in saved["output"]
+    proof = payload["saved_document"]
+    if not route.startswith("late_"):
         assert proof["status"] == "read_back" and proof["path"] == str(destination)
-        assert proof["paragraphs"] == (["before"] if route == "unchanged" else ["after"])
-        assert proof["version_changed_since_save_started"] == (route != "unchanged")
+        assert proof["paragraphs"] == ["after"] and proof["version_changed_since_save_started"]
         assert saved["computer_receipt"]["next_step"] == "review_saved_document"
-        assert "saved_document" not in saved["output"]
+        return
+
+    assert proof["status"] == "unverified" and proof["missing"] == "saved_file_update"
+    assert "paragraphs" not in proof and "sha256" not in proof
+    assert saved["computer_receipt"]["next_step"] == "observe_saved_document"
+    actions = sum(name == "act" for name, _ in backend.calls)
+    next_read = run(registry.execute("computer_snapshot", {}))
+    assert json.loads(next_read["fresh_output"])["saved_document"] == proof
+    write_body("after")
+
+    if route == "late_handoff_during_read":
+        import threading
+        from agent.runtime.computer_saved_document import ApprovedCopy
+
+        async def handoff_during_read():
+            entered = asyncio.Event()
+            release = threading.Event()
+            loop = asyncio.get_running_loop()
+            after_save = ApprovedCopy.after_save
+
+            def held_read(self, before, *, wait):
+                proof = after_save(self, before, wait=wait)
+                assert proof["status"] == "read_back"
+                loop.call_soon_threadsafe(entered.set)
+                assert release.wait(timeout=5)
+                return proof
+
+            monkeypatch.setattr(ApprovedCopy, "after_save", held_read)
+            observing = asyncio.create_task(registry.execute("computer_snapshot", {}))
+            try:
+                await asyncio.wait_for(entered.wait(), timeout=3)
+                handoff = await asyncio.wait_for(registry.execute("computer_handoff", {}), timeout=3)
+                assert not handoff["error"]
+            finally:
+                release.set()
+            return await observing
+
+        interrupted = run(handoff_during_read())
+        assert "saved_document" not in interrupted.get("fresh_output", "")
+        assert sum(name == "act" for name, _ in backend.calls) == actions
+        return
+    if route == "late_intervening_input":
+        input_result = run(registry.execute("computer_act", {
+            "snapshot_id": json.loads(next_read["fresh_output"])["snapshot_id"],
+            "actions": [{"type": "keypress", "key": "right"}],
+        }))
+        assert not input_result["error"], input_result
+        observed = run(registry.execute("computer_snapshot", {}))
+        assert "saved_document" not in json.loads(observed["fresh_output"])
+        assert sum(name == "act" for name, _ in backend.calls) == actions + 1
+        return
+    if route == "late_observation_denied":
+        async def deny(_card):
+            return "deny"
+        registry.set_approval_handler(deny)
+        refused = run(registry.execute("computer_snapshot", {"text_detail": "on"}))
+        assert refused["code"] == "approval_denied" and "fresh_output" not in refused
+    elif route == "late_after_handoff":
+        assert not run(registry.execute("computer_handoff", {}))["error"]
+        run(registry.execute("computer_apps", {}))
+        assert not run(registry.execute("computer_resume", {"app_ref": "app-1", "window_ref": "window-1"}))["error"]
+        focus(registry)
+    elif route == "late_other_window":
+        backend.catalog_window_identity_ref = "unrelated-window"
+        focus(registry)
+        other = run(registry.execute("computer_snapshot", {}))
+        assert "saved_document" not in json.loads(other["fresh_output"])
+        backend.catalog_window_identity_ref = "identity-a"
+        focus(registry)
+    elif route == "late_other_grant_space":
+        from agent.runtime.tools.grants import grant_space
+        with grant_space("another-task"):
+            other = run(registry.execute("computer_snapshot", {}))
+            assert "saved_document" not in json.loads(other["fresh_output"])
+
+    if route == "late_app_state":
+        complete = run(registry.execute("computer_get_app_state", {"app_ref": "app-1", "window_ref": "window-1"}))
+    else:
+        complete = run(registry.execute("computer_snapshot", {}))
+    observed = json.loads(complete["fresh_output"])
+    assert "saved_document" not in complete["output"]
+    if route == "late_after_handoff":
+        assert "saved_document" not in observed
+    else:
+        assert observed["saved_document"]["paragraphs"] == ["after"]
+        assert observed["saved_document"]["path"] == str(destination)
+        assert observed["saved_document"]["version_changed_since_save_started"] is True
+        assert "reply now" in observed["message"]
+        assert "saved_document" not in json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    assert sum(name == "act" for name, _ in backend.calls) == actions

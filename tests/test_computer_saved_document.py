@@ -45,6 +45,29 @@ def test_readback_preserves_paragraphs_breaks_and_whitespace(tmp_path):
     assert proof["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def test_unchanged_file_is_not_read_or_published(tmp_path, monkeypatch):
+    path = tmp_path / "copy.docx"
+    copy = bound(path)
+    package(path, body("old text"))
+    before = copy.version()
+    monkeypatch.setattr(ApprovedCopy, "_read", lambda self: pytest.fail("opened stale document"))
+    proof = copy.after_save(before, wait=False)
+    assert proof["status"] == "unverified" and proof["missing"] == "saved_file_update"
+    assert not {"paragraphs", "sha256"} & proof.keys()
+
+
+def test_recheck_rejects_old_version_even_if_stat_saw_an_update(tmp_path, monkeypatch):
+    path = tmp_path / "copy.docx"
+    copy = bound(path)
+    package(path, body("old text"))
+    before = copy.version()
+    # The leaf can be replaced twice between the preliminary stat and the verified open.
+    monkeypatch.setattr(ApprovedCopy, "version", lambda self: (1, 2, 3, 4, 5))
+    proof = copy.after_save(before, wait=False)
+    assert proof["status"] == "unverified" and proof["missing"] == "saved_file_update"
+    assert not {"paragraphs", "sha256"} & proof.keys()
+
+
 @pytest.mark.parametrize("issue", ["symlink", "hardlink", "directory_replaced", "redirected_main", "large",
                                    "unknown_structure", "hidden", "credential", "invalid_package"])
 def test_incomplete_or_redirected_readback_never_returns_body(tmp_path, issue):

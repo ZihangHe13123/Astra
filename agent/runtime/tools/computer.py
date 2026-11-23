@@ -516,6 +516,14 @@ class _SavePanelReservation:
 
 
 @dataclass
+class _SavedDocumentCheck:
+    copy: ApprovedCopy
+    window: str
+    before: tuple[int, int, int, int, int] | None
+    awaiting_observation: bool = False
+
+
+@dataclass
 class _PreparedComputerAct:
     mode: ComputerInteractionMode
     snapshot_id: str
@@ -550,7 +558,7 @@ class _PreparedComputerAct:
     proposed_readback: ApprovedCopy | None = None
     readback_epoch: int = -1
     final_copy: ApprovedCopy | None = None
-    version_before_save: tuple[int, int, int, int, int] | None = None
+    saved_document_check: _SavedDocumentCheck | None = None
 
 
 def _observed_save_panel_destination(panel: Mapping[str, Any], elements: Mapping[str, Any]) -> tuple[str, str]:
@@ -2326,6 +2334,7 @@ def register_computer_tools(
     last_wps_document = ("", "")
     readback_epoch = 0
     readback_copy: ApprovedCopy | None = None
+    latest_save_check: _SavedDocumentCheck | None = None
     pending_foreground_digest = ""
     pending_foreground_snapshot = ""
     catalog_target_operation_lock = asyncio.Lock()
@@ -2369,7 +2378,8 @@ def register_computer_tools(
         pending_wps_modal_target = None
 
     def clear_computer_grants() -> None:
-        nonlocal readback_copy, last_wps_document, readback_epoch
+        nonlocal readback_copy, last_wps_document, readback_epoch, latest_save_check
+        latest_save_check = None
         readback_copy = None
         last_wps_document = ("", "")
         readback_epoch += 1
@@ -3472,7 +3482,7 @@ def register_computer_tools(
         *,
         _permission_call_id: str = "",
     ):
-        nonlocal pending_foreground_digest, pending_foreground_snapshot
+        nonlocal pending_foreground_digest, pending_foreground_snapshot, latest_save_check
         blocked = preflight()
         if blocked:
             return blocked
@@ -3852,8 +3862,14 @@ def register_computer_tools(
                 else:
                     takeover_ref = await manager.begin_takeover(snapshot_id, plan.plan_ref, focus_consent=prepared.focus_consent)
                 _runtime_takeover_event("foreground_takeover_begin", decision)
+            # A later input must never inherit the proof of an earlier Save.
+            latest_save_check = None
             if prepared.final_copy is not None and prepared.final_copy is readback_copy:
-                prepared.version_before_save = prepared.final_copy.version()
+                latest_save_check = _SavedDocumentCheck(
+                    prepared.final_copy, str((prepared.policy_context or {}).get("window_identity_ref") or ""),
+                    prepared.final_copy.version(),
+                )
+                prepared.saved_document_check = latest_save_check
             prepared.dispatch_attempted = True
             result = await manager.act(
                 snapshot_id,
@@ -4858,11 +4874,47 @@ def register_computer_tools(
     # Lifecycle bookkeeping must survive catalog refresh clearing prepared plans.
     authorized_acts: set[str] = set()
 
-    def complete_observation(_args: dict, result: dict, call_id: str) -> None:
+    async def publish_saved_document(check: _SavedDocumentCheck, result: dict, payload: dict, *, wait: bool) -> str | None:
+        if result.get("error") or result.get("verified") is not True or not result.get("fresh_output"):
+            return None
+        tree = payload.get("ax_tree")
+        if (not isinstance(tree, Mapping) or tree.get("role") != "AXWindow"
+                or tree.get("subrole") != "AXStandardWindow" or payload.get("scope") != "target_window"):
+            return None
+        copy = check.copy
+        binding = manager.snapshot_target_binding
+        authority = observation_authority_generation
+
+        def authorized() -> bool:
+            return (check is latest_save_check and copy is readback_copy and not manager.handed_off
+                    and binding is not None and binding == manager.snapshot_target_binding
+                    and authority == observation_authority_generation and copy.session == manager.session_id
+                    and copy.grant_space == current_grant_space() and payload.get("snapshot_id") == trusted_snapshot.get("snapshot_id")
+                    and trusted_target.get("bundle_id") == "com.kingsoft.wpsoffice.mac"
+                    and trusted_target.get("window_identity_ref") == check.window)
+
+        if not authorized() or not copy.matches(check.window, str(tree.get("title") or tree.get("label") or ""),
+                                                str(trusted_target.get("known_path") or "")):
+            return None
+        evidence = await asyncio.to_thread(copy.after_save, check.before, wait=wait)
+        if not authorized():
+            return None
+        payload["saved_document"] = evidence
+        payload["message"] = evidence["next_step"]
+        result["fresh_output"] = _json(payload)
+        check.awaiting_observation = check.before is not None and evidence.get("missing") in {"stable_saved_file", "saved_file_update"}
+        if check.awaiting_observation:
+            return "observe_saved_document"
+        return "review_saved_document" if evidence["status"] == "read_back" else "report_unverified_save"
+
+    async def complete_observation(_args: dict, result: dict, call_id: str) -> None:
         if result.get("error"):
             clear_write_grants()
         else:
             completed_observations.add(call_id)
+            check = latest_save_check
+            if check is not None and check.awaiting_observation and result.get("verified") and result.get("fresh_output"):
+                await publish_saved_document(check, result, json.loads(result["fresh_output"]), wait=False)
 
     def finalize_observation(args: dict) -> None:
         call_id = str(args.get("__permission_call_id") or "")
@@ -4905,25 +4957,10 @@ def register_computer_tools(
                     and prepared.proposed_readback.session == manager.session_id
                     and prepared.proposed_readback.grant_space == current_grant_space()):
                 readback_copy = prepared.proposed_readback
-            copy = prepared.final_copy
-            if (copy is not None and copy is readback_copy and full_ack and result.get("verified") is True
-                    and not result.get("error") and not prepared.present_result and "fresh_output" in result):
-                tree = payload.get("ax_tree")
-                identity = str((prepared.policy_context or {}).get("window_identity_ref") or "")
-                session_binding = manager.snapshot_target_binding
-                authority_generation = observation_authority_generation
-                if (isinstance(tree, Mapping) and tree.get("role") == "AXWindow" and tree.get("subrole") == "AXStandardWindow"
-                        and str(trusted_target.get("window_identity_ref") or "") == identity
-                        and copy.matches(identity, str(tree.get("title") or tree.get("label") or ""),
-                                         str(trusted_target.get("known_path") or ""))):
-                    evidence = await asyncio.to_thread(copy.after_save, prepared.version_before_save)
-                    if (copy is readback_copy and session_binding == manager.snapshot_target_binding
-                            and authority_generation == observation_authority_generation and not manager.handed_off
-                            and copy.session == manager.session_id and copy.grant_space == current_grant_space()):
-                        payload["saved_document"] = evidence
-                        payload["message"] = evidence["next_step"]
-                        result["fresh_output"] = _json(payload)
-                        receipt["next_step"] = "review_saved_document"
+            if full_ack and prepared.saved_document_check is not None and not prepared.present_result:
+                next_step = await publish_saved_document(prepared.saved_document_check, result, payload, wait=True)
+                if next_step:
+                    receipt["next_step"] = next_step
             result["computer_receipt"] = receipt
             finish_save_intent(prepared, not_dispatched=receipt.get("dispatch_state") == "not_dispatched")
             verified_image = not result.get("error") and result.get("verified") is True

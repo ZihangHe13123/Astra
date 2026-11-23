@@ -8,6 +8,7 @@ import io
 import os
 import re
 import stat
+import sys
 import time
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping
@@ -134,6 +135,8 @@ class ApprovedCopy:
 
     @contextlib.contextmanager
     def _directory(self):
+        if sys.platform == "win32":
+            raise NotImplementedError("native saved-document readback requires POSIX directory descriptors")
         parent = self.path.parent
         fd = os.open(parent, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
         try:
@@ -147,6 +150,8 @@ class ApprovedCopy:
             os.close(fd)
 
     def _read(self) -> tuple[tuple[int, int, int, int, int], bytes]:
+        if sys.platform == "win32":
+            raise NotImplementedError("native saved-document readback requires POSIX file flags")
         # Anchor all leaf lookups in the directory approved before creation.
         with contextlib.ExitStack() as stack:
             directory = stack.enter_context(self._directory())
@@ -173,7 +178,7 @@ class ApprovedCopy:
             pass
         return None
 
-    def after_save(self, before: tuple[int, int, int, int, int] | None) -> dict:
+    def after_save(self, before: tuple[int, int, int, int, int] | None, *, wait: bool = True) -> dict:
         # Save can return before Word finishes its atomic replacement. Poll only
         # the authorized file, never the app or a directory listing.
         proof = {"path": str(self.path), "status": "unverified", "missing": "stable_saved_file",
@@ -181,20 +186,32 @@ class ApprovedCopy:
         if before is None:
             return proof
         try:
-            deadline = time.monotonic() + 0.6
-            while self.version() == before and time.monotonic() < deadline:
+            deadline = time.monotonic() + (0.6 if wait else 0)
+            current = self.version()
+            while current == before and time.monotonic() < deadline:
                 time.sleep(0.05)
+                current = self.version()
+            if current == before:
+                return self._waiting_for_update()
             current, data = self._read()
+            if current == before:
+                return self._waiting_for_update()
             proof["missing"] = "complete_short_main_body"
             paragraphs = _body_paragraphs(data)
         except (OSError, ValueError, RuntimeError, EOFError, BadZipFile, ET.ParseError, NotImplementedError):
             return proof
         return {"path": str(self.path), "status": "read_back", "evidence": "saved_docx_main_body",
-                "version_changed_since_save_started": current != before,
+                "version_changed_since_save_started": True,
                 "sha256": hashlib.sha256(data).hexdigest(), "paragraphs": paragraphs,
                 "next_step": "Compare these on-disk paragraphs and path with the user's request. "
                              "If they satisfy the requested edit and no other work remains, reply now. "
                              "If they differ, report or correct only that difference."}
+
+    def _waiting_for_update(self) -> dict:
+        return {"path": str(self.path), "status": "unverified", "missing": "saved_file_update",
+                "next_step": "Save was acknowledged. A newer file version has not appeared. "
+                             "Observe this document with computer_snapshot(settle_ms=300) to check again. "
+                             "If it is still unchanged, report the pending save. Do not repeat the edit or Save."}
 
 
 def is_document_save(actions, context, tree) -> bool:
