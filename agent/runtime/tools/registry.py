@@ -211,6 +211,9 @@ class ToolDef:
     # prompt for this call. Policy modes and YOLO may not satisfy, broaden, or
     # suppress the exact resource scope; explicit deny rules still win.
     permission_authoritative: bool = False
+    # A backend classifier may require a fresh human answer for this exact call.
+    # A None result preserves the tool's ordinary policy and resource checks.
+    manual_approval_check: Callable[[dict], dict[str, Any] | None] | None = None
     # Explicit opt-in: YOLO supplies an automatic once decision, while exact
     # preflight, grant validation, cleanup, and finalization still run.
     # A mixed-mode tool can opt in for particular backend-classified requests.
@@ -524,7 +527,7 @@ class ToolRegistry:
             raw_decision = str(answer).strip().lower()
             if raw_decision in offered and raw_decision in DECISIONS:
                 decision = raw_decision
-            elif not has_draft and raw_decision in {"task", "session", "always"} and "once" in offered:
+            elif not has_draft and not payload.get("human_only") and raw_decision in {"task", "session", "always"} and "once" in offered:
                 # A frontend may not broaden what the card offered: the exact call at most.
                 decision = "once"
             else:
@@ -556,6 +559,27 @@ class ToolRegistry:
         title = str(payload.get("approval_title") or payload.get("operation") or tool.name)
         target = str(payload.get("session_scope_label") or payload.get("target") or "")
         return f"{title}：{target}"[:300] if target else title[:300]
+
+    @staticmethod
+    async def _exact_approval(tool: ToolDef, args: dict) -> tuple[bool, dict[str, Any] | None]:
+        if tool.manual_approval_check is not None:
+            request = tool.manual_approval_check(args)
+            if request is not None:
+                # The registry, not a model argument or frontend, selects this boundary.
+                return True, {**request, "human_only": True, "choices": ["once", "deny"]}
+        if tool.permission_authoritative and tool.permission_check is not None:
+            result = tool.permission_check(args)
+            return True, await result if inspect.isawaitable(result) else result
+        return False, None
+
+    @staticmethod
+    def _yolo_eligible(tool: ToolDef, request: dict, authoritative: bool) -> bool:
+        if "draft" in request or request.get("human_only") is True:
+            return False
+        if not authoritative:
+            return True
+        opt_in = tool.permission_yolo_auto_grant
+        return opt_in(request) is True if callable(opt_in) else opt_in
 
     def _approval_choices(self, tool: ToolDef, request: dict[str, Any] | None, task_id: str, *,
                           consequential: bool, rule: str, hook_ask: bool = False) -> list[str]:
@@ -830,7 +854,7 @@ class ToolRegistry:
             )
         if tool.permission_yolo_auto_grant and not tool.permission_authoritative:
             raise ValueError("YOLO exact auto-grants require authoritative permission handlers")
-        if tool.permission_authoritative and (
+        if (tool.permission_authoritative or tool.manual_approval_check is not None) and (
             tool.permission_check is None or tool.permission_grant is None
         ):
             raise ValueError(
@@ -1385,12 +1409,7 @@ class ToolRegistry:
                 permission_args["__execution_origin"] = execution_origin
             if agent_reason:
                 permission_args["__approval_justification"] = agent_reason
-            exact_permission_request = None
-            if tool.permission_authoritative and tool.permission_check is not None:
-                checked = tool.permission_check(permission_args)
-                exact_permission_request = (
-                    await checked if inspect.isawaitable(checked) else checked
-                )
+            authoritative, exact_permission_request = await self._exact_approval(tool, permission_args)
 
             # Authorization happens only after transform hooks and structural argument
             # validation, so malformed/incomplete actions can never trigger an
@@ -1423,8 +1442,8 @@ class ToolRegistry:
                 hook_ask = hook_decision.kind == "ask"
                 call_scope = policy_call_scope(name, args)
                 policy_keys = request_keys(name, None, call_scope)
-                covered = "" if hook_ask or tool.permission_authoritative else self.grants.covering(policy_keys, task_id)
-                if tool.permission_authoritative:
+                covered = "" if hook_ask or authoritative else self.grants.covering(policy_keys, task_id)
+                if authoritative:
                     policy_reason = f"{policy_reason}; exact permission is authoritative"
                 elif covered:
                     # Allowed earlier for this task, this conversation or always; still one call at a time.
@@ -1482,34 +1501,29 @@ class ToolRegistry:
                     report("approved", message=policy_reason)
 
             if tool.permission_check is not None and (
-                tool.permission_authoritative or not self.yolo
+                authoritative or not self.yolo
             ):
                 permission_request = (
                     exact_permission_request
-                    if tool.permission_authoritative
+                    if authoritative
                     else tool.permission_check(permission_args)
                 )
                 if inspect.isawaitable(permission_request):
                     permission_request = await permission_request
                 if permission_request is not None:
                     reason = str(permission_request.get("reason") or f"{name} requires approval")
-                    opt_in = tool.permission_yolo_auto_grant
-                    # A disclosed draft needs its own answer, even on an otherwise
-                    # YOLO-eligible background write. The same bit controls live toggles.
                     has_draft = "draft" in permission_request
-                    yolo_eligible = not has_draft and (not tool.permission_authoritative or (
-                        opt_in(permission_request) is True if callable(opt_in) else opt_in
-                    ))
-                    auto_grant = self.yolo and tool.permission_authoritative and yolo_eligible
+                    yolo_eligible = self._yolo_eligible(tool, permission_request, authoritative)
+                    auto_grant = self.yolo and authoritative and yolo_eligible
                     # Sending, paying, deleting, publishing: decided per call, whatever was allowed before.
-                    consequential = has_draft or bool(permission_request.get("consequential"))
+                    consequential = has_draft or bool(permission_request.get("human_only") or permission_request.get("consequential"))
                     covered = "" if auto_grant or consequential or tool.owns_session_grants else \
                         self.grants.covering(request_keys(name, permission_request), task_id)
                     if not auto_grant and not covered:
                         report("awaiting_approval", message=reason)
                     if auto_grant or covered:
                         decision = "once"
-                    elif interactive_decision and not tool.permission_authoritative and not has_draft:
+                    elif interactive_decision and not authoritative and not has_draft:
                         decision = "once" if consequential and interactive_decision != "deny" else interactive_decision
                     else:
                         approval_started = time.perf_counter()

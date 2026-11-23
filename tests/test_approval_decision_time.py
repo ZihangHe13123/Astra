@@ -49,7 +49,7 @@ def _registry(request, handler, audit, grants):
 
 def _backend(inbox, durable_io, send, *, channel="", chat=None):
     ns = dict(approval_time=approval_time, asyncio=asyncio, logger=logging.getLogger(__name__), os=os,
-              pending_tool_approvals={}, pending_yolo_approvals=set(), pending_foreground_approvals=set(), pending_draft_choices={},
+              pending_tool_approvals={}, pending_yolo_approvals=set(), pending_foreground_approvals=set(), pending_human_choices={},
               approval_resolutions={}, approval_inbox=inbox, durable_io=durable_io, _send=send,
               tools=SimpleNamespace(yolo=False), agent_holder={}, active_channel=SimpleNamespace(get=lambda: channel),
               active_task_id="fixture", approval_choices=lambda card: card["choices"], await_chat_approval=await_chat_approval,
@@ -353,7 +353,30 @@ def test_pending_draft_resolves_only_an_offered_human_answer(choices, reply, exp
         assert ns["resolve_tool_approval"]("fixture", reply)
         assert await asyncio.wait_for(pending, 1) == expected
         assert events[-1]["decision"] == expected
-        assert not ns["pending_draft_choices"]
+        assert not ns["pending_human_choices"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("initial_yolo", [True, False])
+def test_script_ui_card_waits_for_a_current_human_decision(initial_yolo):
+    events = []
+    ns = _backend(None, None, events.append)
+
+    async def scenario():
+        ns["tools"].yolo = initial_yolo
+        card = {"request_id": "script-fixture", "choices": ["once", "deny"], "kind": "script_ui_control",
+                "human_only": True, "yolo_bypass_allowed": False}
+        pending = asyncio.create_task(ns["request_tool_approval"](card))
+        await asyncio.sleep(0)
+        assert events[0]["kind"] == "script_ui_control"
+        ns["tools"].yolo = True
+        assert "script-fixture" not in ns["pending_yolo_approvals"]
+        assert not ns["resolve_tool_approval"]("script-fixture", "once", human=False)
+        assert not pending.done()
+        assert ns["resolve_tool_approval"]("script-fixture", "once", human=True)
+        assert await asyncio.wait_for(pending, 1) == "once"
+        assert events[-1]["decision"] == "once"
 
     asyncio.run(scenario())
 

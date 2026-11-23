@@ -19,6 +19,7 @@ from .approval import ScopedApprovalStore
 from .consequence import command_category
 from .processes import ProcessManager
 from .registry import ToolRegistry, ToolDef, approval_justification_schema
+from .script_ui import inline_python_action, inline_shell_action
 
 
 def _bounded_text_preview(text: str, *, label: str, limit: int) -> str:
@@ -217,6 +218,25 @@ def register_code_tools(
                 "image": active.image,
             }
         return None
+
+    def _ui_script_request(args: dict, *, python: bool = False, force_host: bool = False):
+        if not force_host and not _uses_host_sandbox():
+            return None
+        field = "code" if python else "command"
+        source = str(args.get(field) or "")
+        action = inline_python_action(source) if python else inline_shell_action(source)
+        if not action:
+            return None
+        effect = "脚本将直接操作界面，绕过 CU 的焦点保护。你有输入时脚本可能继续操作，结束后焦点也可能留在目标应用。"
+        preview = _bounded_text_preview(source, label="脚本", limit=1500)
+        return {
+            "kind": "script_ui_control",
+            "operation": action, "target": action, "reason": effect,
+            "approval_title": "脚本直接操作界面", "approval_summary": action,
+            "approval_effect": effect, "approval_question": "允许本次脚本直接操作界面？",
+            "approval_boundary": "仅限这一次调用。每次执行均需重新确认。",
+            "arguments": {field: preview}, "detail": preview,
+        }
 
     def _python_permission_check(args: dict):
         if not _uses_host_sandbox():
@@ -417,6 +437,8 @@ def register_code_tools(
         return request
 
     def _host_permission_grant(args: dict, request: dict, decision: str):
+        if request.get("kind") == "script_ui_control":
+            return None  # The fresh answer covers this invocation only; no host scope is minted.
         grant_request = dict(request)
         if decision == "session" and request.get("session_scope"):
             grant_request["scopes"] = [
@@ -786,6 +808,7 @@ def register_code_tools(
         # The selected sandbox already owns timeout/cancellation. A second
         # registry-level 30s deadline used to cut off a configured 60s run.
         timeout=None,
+        manual_approval_check=lambda args: _ui_script_request(args, python=True),
         permission_check=_python_permission_check,
         permission_grant=_host_permission_grant,
         approval_formatter=_python_approval_formatter,
@@ -855,6 +878,7 @@ def register_code_tools(
         }, "required": ["command"]},
         fn=_execute_shell, sandboxed=True, risk="execute", approval="on_risk", group="code",
         timeout=None,
+        manual_approval_check=_ui_script_request,
         permission_check=_shell_permission_check,
         permission_grant=_host_permission_grant,
         approval_formatter=_shell_approval_formatter,
@@ -882,6 +906,7 @@ def register_code_tools(
         approval="on_risk",
         group="minimal",
         timeout=None,
+        manual_approval_check=lambda args: _ui_script_request(args, force_host=True),
         permission_check=_persistent_bash_permission_check,
         permission_grant=_host_permission_grant,
         approval_formatter=_persistent_bash_approval_formatter,
