@@ -189,8 +189,8 @@ def decide(
     if system:
         return FolderDecision("open", folder, True, "", system=True)
     if here or (move_from and same_folder(move_from, folder)):
-        notice = (f"Moved session '{name}' from {folder} to {current}. Project instructions for {current} "
-                  "apply from the next turn, added after the earlier ones.")
+        notice = (f"Moved session '{name}' from {folder} to {current}. "
+                  f"Project instructions for {current} apply from the next turn.")
         return FolderDecision("open", folder, True, notice)
     if state == "other":
         notice = f"Session '{name}' belongs to {folder}. Open it there, or use /session {name} --here to move it to {current}."

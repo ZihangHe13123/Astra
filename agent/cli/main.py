@@ -79,9 +79,11 @@ from .skill_commands import execute_skill_command
 from .guidance_commands import execute_guidance_command
 from .learning_commands import execute_learning_command
 from .conversation_commands import register_conversation_tools
+from ..runtime import conversation_folder
 from ..runtime.command_workflows import workflow_message, raw_command as normalize_direct_command
 from ..runtime.tools.conclave import register_conclave_tools
 from ..runtime.prompts import get_prompt_profile, selectable_prompt_profiles
+from ..runtime.session_store import SessionStore
 from .render import render_text, render_tool_block, StreamRenderer, ReasoningRenderer, render_status_bar
 from .search_preferences import SEARCH_PROVIDERS, resolve_startup_search_provider, save_selected_search_provider
 
@@ -467,16 +469,50 @@ async def handle_slash(cmd: str, agent: ReActAgent) -> Msg | None:
                 out = export_session_markdown(target)
                 print(f"  \033[90mSession '{target}' exported to {out}\033[0m\n")
 
+            elif not arg or parts[1:] == ["--all"]:
+                show_all = bool(arg)
+                workdir = conversation_folder.current_folder()
+                current_path = Path(agent.context.session_path).resolve()
+                sessions = list_sessions()
+                lines = []
+                for name in sessions:
+                    is_current = False
+                    try:
+                        path = session_path(name)
+                        is_current = path.resolve() == current_path
+                        folder, _ = conversation_folder.listing_folder(SessionStore(path))
+                    except (OSError, ValueError):
+                        folder = ""
+                    if show_all or is_current or conversation_folder.same_folder(folder, workdir):
+                        marker = " \033[1m*\033[0m" if is_current else "  "
+                        suffix = f" — {conversation_folder.folder_label(folder)}" if show_all else ""
+                        lines.append(f"    {marker} \033[36m{name}\033[0m ({session_msg_count(name)} msgs){suffix}")
+                count = len(lines)
+                hidden = len(sessions) - count
+                title = f"All sessions ({count}):" if show_all else f"Sessions in {conversation_folder.folder_label(workdir)} ({count}):"
+                print(f"  \033[90m{title}\033[0m")
+                for line in lines:
+                    print(line)
+                if hidden:
+                    print(f"  \033[90m{hidden} more in other folders: /session --all\033[0m")
+                print()
+
             elif arg:
                 target = arg
                 target_path = session_path(target)
                 exists = session_exists(target)
+                here = "--here" in parts[2:]
+                decision = conversation_folder.decide(target_path, conversation_folder.current_folder(), here=here)
+                if decision.status == "refuse":
+                    print(f"  \033[33m{decision.notice}\033[0m\n")
+                    return
 
                 agent.context.save()
                 candidate = agent.context.stage_session(str(target_path))
                 agent.end_session("session_switch")
                 agent.reset_conversation()
                 agent.context.adopt_session(candidate)
+                notice = conversation_folder.apply_decision(agent.context, decision)
                 agent.begin_session()
 
                 if exists:
@@ -486,17 +522,8 @@ async def handle_slash(cmd: str, agent: ReActAgent) -> Msg | None:
                     agent.context.save()
                     msg = f"Switched to new session '{target}'."
                 print(f"  \033[90m{msg}\033[0m\n")
-
-            else:
-                current_path = Path(agent.context.session_path).resolve()
-                sessions = list_sessions()
-                print(f"  \033[90mSessions ({len(sessions)}):\033[0m")
-                for s in sessions:
-                    sp = session_path(s).resolve()
-                    marker = " \033[1m*\033[0m" if sp == current_path else "  "
-                    count = session_msg_count(s)
-                    print(f"    {marker} \033[36m{s}\033[0m ({count} msgs)")
-                print()
+                if notice:
+                    print(f"  \033[90m{notice}\033[0m\n")
         except (SessionNameError, OSError, AppshotMediaError) as e:
             print(f"  \033[33m{e}\033[0m\n")
 
@@ -990,10 +1017,19 @@ async def _async_init(llm_config: LLMConfig, sandbox_timeout: int, workdir: str)
         auto_compact_token_limit=llm_config.auto_compact_token_limit,
     )
     agent.llm.config.context_limit = limit
-    agent.context.set_session(str(startup_session_path()))
+    initial_session_path = startup_session_path()
+    folder_decision = conversation_folder.decide(
+        initial_session_path, conversation_folder.current_folder(), move_from="", system=False)
+    if folder_decision.status == "refuse":
+        print(folder_decision.notice, file=sys.stderr)
+        raise SystemExit(1)
+    agent.context.set_session(str(initial_session_path))
     bus.register(agent)
 
     restored = agent.context.load()
+    notice = conversation_folder.apply_decision(agent.context, folder_decision)
+    if notice:
+        print(f"  \033[90m{notice}\033[0m\n")
     if restored:
         count = len(agent.context.messages) // 2
         print(f"  \033[90m[Restored session with {count} previous exchanges]\033[0m\n")
