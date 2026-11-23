@@ -1519,6 +1519,7 @@ class ComputerSessionManager:
         interaction_mode: ComputerInteractionMode,
         plan_ref: str,
         takeover_ref: str | None = None,
+        write_permitted: Callable[[], bool] | None = None,
         fragment_stage: FragmentStageAuthority | None = None,
     ) -> ComputerActionResult:
         async with self._lock:
@@ -1547,6 +1548,8 @@ class ComputerSessionManager:
                 or takeover_ref != self._takeover_ref
             ):
                 raise ComputerSessionError("stale_takeover")
+            if write_permitted is not None and not write_permitted():
+                raise ComputerSessionError("approval_required", "The background write lease is no longer current. No input was dispatched.")
             # Consume before dispatch: cancellation, crash, and malformed
             # replies can never leave either authority replayable.
             self._pending_plan = None

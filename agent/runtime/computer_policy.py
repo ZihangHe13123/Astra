@@ -791,7 +791,8 @@ def classify_computer_batch(
                 "High-impact actions require separate approval. Return to the previous application "
                 "after each batch unless you have changed focus."
                 if interaction_mode is ComputerInteractionMode.FOREGROUND_TAKEOVER
-                else f"Only this Computer Use session, application, and current window ({window})."
+                else "Allow once, or allow ordinary background edits in this window for up to 2 minutes. "
+                     "Ends when the window changes, someone takes over, a high-impact action is requested, or an action fails."
             ),
             question=f"Allow these ordinary actions in {application}?",
             application=application,
@@ -943,7 +944,7 @@ def permission_grant(
     scope = getattr(request, "private_scope", "")
     if not scope:
         raise ValueError("approval request is missing its private Computer Use scope")
-    if request.get("kind") == "computer_foreground_takeover" and effective == "once":
+    if effective == "once" and (request.get("kind") == "computer_foreground_takeover" or scope.startswith("computer-write:")):
         # The sealed prepared call owns this authorization. Never publish a
         # temporary app scope that a concurrent call could reuse as a session.
         return None

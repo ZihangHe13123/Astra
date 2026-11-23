@@ -1,5 +1,5 @@
 import stringWidth from "string-width";
-import { approvalChoices, type ApprovalChoice } from "@astra/ui-core/approval-choices";
+import { approvalChoiceLabel, approvalChoices, type ApprovalChoice } from "@astra/ui-core/approval-choices";
 import type { ToolApprovalRequest } from "./types.js";
 import { summarizeToolResult, wrapToolResult } from "./tool-results.js";
 
@@ -501,6 +501,7 @@ export function approvalChoiceHint(
     : "[Y/回车] 仅本次允许";
   const sessionLabel = isComputerTakeoverRequest(request)
     ? windowLoan
+    : request.kind === "computer_write" ? approvalChoiceLabel("session", request)
     : request.scope_kind === "directory"
     ? "会话内允许该目录"
     : request.scope_kind === "batch"

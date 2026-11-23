@@ -51,3 +51,8 @@ test("a request from a chat's own conversation says which chat asks", () => {
   assert.match(render({ channel: "weixin" }), /需要你的许可：来自微信的对话/);
   assert.doesNotMatch(render({}), /来自/);
 });
+
+test('the desktop background write button shows the bounded window grant', () => {
+  const html = render({ kind: 'computer_write', tool_name: 'computer_act', choices: ['once', 'session', 'deny'] });
+  assert.match(html, /data-approval-choice="session"[^>]*>允许此窗口，最多 2 分钟<\/button>/);
+});

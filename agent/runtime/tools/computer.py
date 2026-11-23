@@ -24,6 +24,7 @@ from collections.abc import Awaitable, Callable, Collection, Mapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
 from itertools import islice
+from functools import partial
 from pathlib import Path
 
 from typing import Any, cast
@@ -507,6 +508,17 @@ class _ForegroundLoan:
         return approval_time.continuous_now() >= self.deadline_ms / 1000
 
 
+@dataclass(frozen=True)
+class _BackgroundWriteLease:
+    scope: str
+    grant_space: str
+    window: tuple[str, ...]
+    deadline_ms: int
+
+    def expired(self) -> bool:
+        return approval_time.continuous_now() >= self.deadline_ms / 1_000
+
+
 @dataclass(eq=False)
 class _SavePanelReservation:
     session_id: str
@@ -546,6 +558,8 @@ class _PreparedComputerAct:
     present_result: bool = False
     focus_consent: Mapping[str, int] | None = None
     loan_at_entry: _ForegroundLoan | None = None
+    write_lease_at_entry: _BackgroundWriteLease | None = None
+    covered_write_lease: _BackgroundWriteLease | None = None
     reused_loan: _ForegroundLoan | None = None
     new_loan: _ForegroundLoan | None = None
     finish_presentation: Callable[[bool], Awaitable[None]] | None = None
@@ -1301,6 +1315,7 @@ class LocalComputerRuntime:
         interaction_mode: ComputerInteractionMode,
         plan_ref: str,
         takeover_ref: str | None = None,
+        write_permitted: Callable[[], bool] | None = None,
     ):
         self._helper_started = True
         return await (await self._ensure_manager()).act(
@@ -1309,6 +1324,7 @@ class LocalComputerRuntime:
             interaction_mode=interaction_mode,
             plan_ref=plan_ref,
             takeover_ref=takeover_ref,
+            write_permitted=write_permitted,
         )
 
     async def end_takeover(self, takeover_ref: str, *, restore_previous_focus: bool = True,
@@ -2364,6 +2380,7 @@ def register_computer_tools(
     catalog_target_operation_lock = asyncio.Lock()
     resume_publication_owner: str | None = None
     foreground_loan: _ForegroundLoan | None = None
+    write_lease: _BackgroundWriteLease | None = None
 
     def loan_window() -> tuple[str, ...]:
         if not trusted_target.get("metadata_trusted"):
@@ -2375,6 +2392,31 @@ def register_computer_tools(
         # Older helpers: opaque refs are valid only in their catalog generation.
         return (manager.session_id, bundle, str(trusted_catalog_generation),
                 trusted_target["app_ref"], trusted_target["window_ref"])
+
+    def write_window() -> tuple[str, ...]:
+        return loan_window() if trusted_target.get("window_identity_ref") else ()
+
+    def discard_unleased_write_scopes() -> None:
+        prefix = f"computer-write:{manager.session_id}:"
+        keep = write_lease.scope if write_lease is not None else ""
+        approvals.approved_scopes.difference_update({
+            scope for scope in approvals.approved_scopes if scope.startswith(prefix) and scope != keep
+        })
+
+    def revoke_write_lease() -> None:
+        nonlocal write_lease
+        write_lease = None
+        discard_unleased_write_scopes()
+
+    def current_write_lease() -> _BackgroundWriteLease | None:
+        if write_lease is not None and (
+            write_lease.window != write_window() or write_lease.expired()
+            or write_lease.grant_space != current_grant_space() or write_lease.scope not in approvals.approved_scopes
+        ):
+            revoke_write_lease()
+        else:
+            discard_unleased_write_scopes()
+        return write_lease
 
     def revoke_loan() -> None:
         nonlocal foreground_loan
@@ -2420,6 +2462,7 @@ def register_computer_tools(
         pending_wps_modal_target = None
 
     def clear_computer_grants() -> None:
+        revoke_write_lease()
         nonlocal readback_copy, last_wps_document, readback_epoch, latest_save_check, pending_replacement
         pending_replacement = None
         latest_save_check = None
@@ -2458,16 +2501,17 @@ def register_computer_tools(
             ))
         })
 
-    def clear_write_grants(*, preserve_foreground_session: bool = False) -> None:
+    def clear_write_grants(*, preserve_foreground_session: bool = False, preserve_write_lease: bool = False) -> None:
+        if not preserve_write_lease or (write_lease is not None and write_lease.expired()):
+            revoke_write_lease()
+        else:
+            discard_unleased_write_scopes()
         nonlocal foreground_loan
         if not preserve_foreground_session:
             foreground_loan = None
         nonlocal pending_foreground_digest
         nonlocal pending_foreground_snapshot
-        prefixes = (
-            f"computer-write:{manager.session_id}:",
-            f"computer-write-batch:{manager.session_id}:",
-        ) + (() if preserve_foreground_session else (f"computer-foreground:{manager.session_id}:",))
+        prefixes = (f"computer-write-batch:{manager.session_id}:",) + (() if preserve_foreground_session else (f"computer-foreground:{manager.session_id}:",))
         approvals.approved_scopes.difference_update({
             scope for scope in approvals.approved_scopes
             if scope.startswith(prefixes)
@@ -2687,7 +2731,12 @@ def register_computer_tools(
                 "window_ref": window_ref,
             })
         if previous != (app_ref, window_ref):
-            clear_write_grants(preserve_foreground_session=True)
+            # Catalog refresh discards opaque refs; reselecting the same stable
+            # window is an observation, selecting a different identity revokes.
+            clear_write_grants(preserve_foreground_session=True, preserve_write_lease=(
+                write_lease is not None and write_lease.window == write_window()
+            ))
+        current_write_lease()
         current_loan()  # Selecting another target ends the loan, even if we switch back.
 
     def remember_snapshot(snapshot: ComputerSnapshot) -> None:
@@ -3156,7 +3205,7 @@ def register_computer_tools(
             return blocked
         try:
             apps = await manager.apps(**({"presentation_ref": presentation_ref} if presentation_ref else {}))
-            clear_write_grants(preserve_foreground_session=True)
+            clear_write_grants(preserve_foreground_session=True, preserve_write_lease=True)
             clear_snapshot_grants()
             if (
                 trusted_target.get("bundle_id") == "com.kingsoft.wpsoffice.mac"
@@ -3249,7 +3298,7 @@ def register_computer_tools(
                     "its fresh catalog before calling computer_get_app_state."
                 ),
             )
-        clear_write_grants(preserve_foreground_session=True)
+        clear_write_grants(preserve_foreground_session=True, preserve_write_lease=True)
         approvals.approved_scopes.difference_update({
             approved
             for approved in approvals.approved_scopes
@@ -3934,8 +3983,12 @@ def register_computer_tools(
                     replacement.before if replacement else prepared.final_copy.version(), replacement=replacement,
                 )
                 prepared.saved_document_check = latest_save_check
+            lease_for_dispatch = prepared.covered_write_lease
+            dispatch = manager.act
+            if lease_for_dispatch is not None:
+                dispatch = partial(manager.act, write_permitted=lambda: current_write_lease() is lease_for_dispatch)
             prepared.dispatch_attempted = True
-            result = await manager.act(
+            result = await dispatch(
                 snapshot_id,
                 normalized,
                 interaction_mode=prepared.mode,
@@ -4489,7 +4542,7 @@ def register_computer_tools(
         return permission_grant(approvals, args, request, decision)
 
     async def app_state_permission_check(args: dict) -> ComputerApprovalRequest | None:
-        clear_write_grants(preserve_foreground_session=True)
+        clear_write_grants(preserve_foreground_session=True, preserve_write_lease=True)
         clear_snapshot_grants()
         trusted_snapshot.clear()
         verified_artifacts.clear()
@@ -4597,7 +4650,7 @@ def register_computer_tools(
             actions=actions,
             raw_actions=tuple(dict(action) for action in raw_actions),
             present_result=present_result,
-            loan_at_entry=foreground_loan,
+            loan_at_entry=foreground_loan, write_lease_at_entry=write_lease,
         )
         prepared_acts[call_id] = prepared
         # Own the entry loan before pixel validation can fail, just as for native planning errors.
@@ -4846,6 +4899,8 @@ def register_computer_tools(
             ),
         )
         prepared.plan = plan
+        if background.risk in {ComputerRisk.PROHIBITED, ComputerRisk.HIGH_IMPACT}:
+            revoke_write_lease()
         if background.handoff_required:
             prepared.decision = background
             return None
@@ -4854,10 +4909,16 @@ def register_computer_tools(
         # （2026-09-04 WPS 六连 stale 的另一半根因）。
         prepared.decision = background
         if mode is ComputerInteractionMode.BACKGROUND:
-            prepared.decision = background
             if plan.requires_takeover:
                 return None
+            lease = current_write_lease()
+            if background.risk is ComputerRisk.ORDINARY and not write_window():
+                background = replace(background, choices=("once", "deny"),
+                                     boundary="Only this exact background action batch in the current window.")
+                prepared.decision = background
             request = permission_request(approvals, background)
+            if request is None and lease is not None and background.risk is ComputerRisk.ORDINARY and lease.scope == background.scope:
+                prepared.covered_write_lease = lease
             if isinstance(request, ComputerApprovalRequest):
                 request.private_call_id = call_id
                 _attach_action_disclosures(request, prepared)
@@ -4961,6 +5022,7 @@ def register_computer_tools(
             request["consequential"] = "send"
 
     def act_permission_grant(args: dict, request: dict[str, Any], decision: str):
+        nonlocal write_lease
         if manager.handed_off:
             raise ValueError("Computer Use target changed while approval was pending")
         call_id = str(getattr(request, "private_call_id", ""))
@@ -5000,7 +5062,25 @@ def register_computer_tools(
                 if not loan_window() or approval_time.continuous_now() >= deadline_ms / 1000:
                     prepared.failure = _failure("approval_required", "The foreground decision expired or its window changed. Ask again.", retryable=True)
                     return None
+        background_session = (prepared.mode is ComputerInteractionMode.BACKGROUND and prepared.decision.risk is ComputerRisk.ORDINARY
+                              and decision == "session" and "session" in request["choices"])
+        write_deadline = None
+        if background_session:
+            decided_at = getattr(request, "private_decided_at", None)
+            now = approval_time.continuous_now()
+            if (not isinstance(decided_at, (float, int)) or isinstance(decided_at, bool)
+                    or not 1e-6 <= decided_at <= now or not decided_at * 1_000_000 < 2**53 or not write_window()):
+                prepared.failure = _failure("approval_required", "The ordinary background write decision could not be bound to this window.")
+                return None
+            write_deadline = focus_loan_deadline_cap_ms(int(decided_at * 1_000_000))
+            if now >= write_deadline / 1000:
+                prepared.failure = _failure("approval_required", "The background write decision has expired. Ask for a fresh decision.")
+                return None
+            revoke_write_lease()
         cleanup = permission_grant(approvals, args, request, decision)
+        if write_deadline is not None:
+            write_lease = _BackgroundWriteLease(prepared.decision.scope, current_grant_space(), write_window(), write_deadline)
+            prepared.covered_write_lease = write_lease
         offer = prepared.text_readback_offer
         if (decision == "once" and offer is not None and request.get("arguments", {}).get("saved_plain_text_readback") is True
                 and request["arguments"].get("known_path") == str(offer.path)
@@ -5177,6 +5257,8 @@ def register_computer_tools(
                             g.get("status") == "not_satisfied" for g in results)
                         result["details"] = {"choice_status": "not_satisfied" if mismatched else "unknown"}
         if result.get("error"):
+            if prepared is None or write_lease is prepared.write_lease_at_entry or write_lease is prepared.covered_write_lease:
+                revoke_write_lease()
             if call_id in authorized_acts:
                 clear_write_grants()
             elif prepared is not None and prepared.failure is not None and prepared.loan_at_entry is foreground_loan:
@@ -5192,6 +5274,8 @@ def register_computer_tools(
                 await prepared.finish_presentation(False)
         finally:
             if call_id not in completed_acts and prepared is not None:
+                if write_lease is prepared.write_lease_at_entry or write_lease is prepared.covered_write_lease:
+                    revoke_write_lease()
                 finish_save_intent(prepared)
             if call_id not in completed_acts and call_id in authorized_acts:
                 clear_write_grants()

@@ -54,6 +54,7 @@ export function approvalChoices(card: Card): ApprovalChoice[] {
 }
 
 export function approvalChoiceLabel(choice: string, card: Card): string {
+  if (choice === "session" && card.kind === "computer_write") return "允许此窗口，最多 2 分钟";
   if (choice === "session" && card.kind === "computer_foreground_takeover") return "借用此窗口，最多 2 分钟";
   if ("draft" in card) {
     if (choice === "once") return "发送";

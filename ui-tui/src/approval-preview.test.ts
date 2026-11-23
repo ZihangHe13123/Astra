@@ -558,3 +558,10 @@ test("leaving a result in front is explicit even on the collapsed approval card"
   assert.doesNotMatch(view.detailLines.join("\n"), /归还焦点/);
   assert.doesNotMatch(view.shortcutHint, /\[A\]/);
 });
+
+test("the expanded background computer-write shortcut names its bounded window grant", () => {
+  const view = buildApprovalCompactView({
+    ...request("write"), kind: "computer_write", choices: ["once", "session", "deny"],
+  }, { width: 100, expanded: true });
+  assert.match(view.shortcutHint, /\[A\] 允许此窗口，最多 2 分钟/);
+});

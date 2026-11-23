@@ -37,3 +37,8 @@ test("non-mail destination bindings are an optional disclosed field, not another
   assert.deepEqual(approvalChoices({ ...card, draft: { text: "Mail", to: "person@example.invalid" } }), ["once", "deny"]);
   assert.deepEqual(approvalChoices(card).map(c => approvalChoiceLabel(c, card)), ["允许一次", "拒绝"]);
 });
+
+test("a background computer-write session is limited to this window and two minutes", () => {
+  assert.equal(approvalChoiceLabel("session", { kind: "computer_write" }), "允许此窗口，最多 2 分钟");
+  assert.equal(approvalChoiceLabel("session", { kind: "host_execution" }), "本会话允许");
+});
