@@ -2534,10 +2534,10 @@ class ReActAgent(AgentBase):
         *,
         occurrence_id: str,
     ) -> tuple[object, object, dict | None] | None:
-        if event.get("error"):
-            return None
         payload = event.get("_request_local_image_attachment")
         request_local_attachment = isinstance(payload, dict)
+        if event.get("error") and not request_local_attachment:
+            return None
         if not request_local_attachment:
             payload = event.get("_vision_tile_attachment")
         if not isinstance(payload, dict):
@@ -4028,7 +4028,7 @@ class ReActAgent(AgentBase):
     @staticmethod
     def _separate_request_local_image_attachment(event: dict) -> dict:
         """Keep verified request-local image bytes out of public tool events."""
-        if event.get("error") or not event.get("request_local_placeholder"):
+        if not event.get("request_local_placeholder"):
             return event
         private = event.get("_private_result")
         data_urls = private.get("image_data_urls") if isinstance(private, dict) else None

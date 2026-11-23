@@ -39,6 +39,7 @@ from ..computer_backend import (
     PresentationWithdrawnError,
 )
 from ..computer_observation import observe_action_effect, window_transition
+from ..computer_overlay import blocker_observation
 from ..computer_policy import (
     ComputerApprovalRequest,
     ComputerPolicyDecision,
@@ -667,7 +668,24 @@ def _failure(code: str, message: str, *, retryable: bool = False, recovery_hint:
     )
 
 
+def _blocked_observation(error: HelperApplicationError, app_ref: str, window_ref: str, *, failure: ToolFailure | None = None):
+    blocked = failure or _application_failure(error.error)
+    evidence = blocker_observation(error.result, app_ref, window_ref)
+    if evidence is None:
+        return blocked
+    metadata, image_url = evidence
+    payload: dict[str, Any] = {"blocking_overlay": metadata}
+    if image_url:
+        payload.update(type="image_attachment", detail="original", image_labels=[
+            "Blocking window for user handoff. Do not click this image."
+        ])
+    return ToolPrivateResult(output=_json(payload), private={"image_data_urls": [image_url]} if image_url else {},
+                             failure=blocked)
+
+
 def _session_failure(exc: ComputerSessionError) -> ToolFailure:
+    if exc.code in {"overlay_blocked", "ax_window_unmatched"}:
+        return _application_failure(ComputerError(ComputerErrorCode(exc.code), ""))
     retryable = exc.code in {"stale_snapshot", "target_required", "handoff_active"}
     recovery_hint = ""
     if exc.code == "stale_target" and "subtree_ref" in str(exc):
@@ -827,24 +845,22 @@ def _application_failure(error) -> ToolFailure:
         return _failure(
             code.value, message, retryable=False,
             recovery_hint=(
-                "Stop repeating catalog/bind calls while the overlay is unchanged. "
-                "Observe the visible popup as its own catalog target and use an observed dismissal "
-                "control if authorized by the task; otherwise ask the user to dismiss it. Do not guess keys, use "
-                "resume without a suspended target, or treat this as a reference TTL failure. "
-                "After the overlay changes, refresh computer_apps and observe the intended window."
+                "Hand this step to the user to handle the blocking window. Stop input and do not retry the "
+                "same action or switch to shell, Python, AppleScript, or coordinate clicks. After the user "
+                "confirms the overlay changed, refresh computer_apps and observe the intended window."
             ),
-            details={"retry_requires": "overlay_state_changed"},
+            details={"retry_requires": "overlay_state_changed", "next_step": "ask_user_to_handle_overlay"},
         )
     if code is ComputerErrorCode.AX_WINDOW_UNMATCHED:
         return _failure(
             code.value, message, retryable=False,
             recovery_hint=(
                 "Stop repeating catalog/bind calls while the window is unchanged. "
-                "Do not target its obscured parent or bypass identity checks with guessed input. "
-                "After the panel changes, refresh computer_apps and choose only bindable=true windows; "
+                "Do not target its obscured parent or use shell, Python, AppleScript, or coordinates to drive it. "
+                "Hand the blocked step to the user. After the user handles it, refresh computer_apps and choose only bindable=true windows; "
                 "if it remains unmatched, report a compatibility failure and hand this step to the user."
             ),
-            details={"retry_requires": "window_identity_or_state_changed"},
+            details={"retry_requires": "window_identity_or_state_changed", "next_step": "ask_user_to_handle_overlay"},
         )
     if code is ComputerErrorCode.WINDOW_CONTENT_UNAVAILABLE:
         return _failure(
@@ -913,10 +929,11 @@ def _action_failure(error, result: Mapping[str, object] | None) -> ToolFailure:
         retryable=base.retryable and not do_not_repeat,
         recovery_hint=(
             "Do not repeat this action batch. Capture a fresh snapshot and inspect the current state."
-            if do_not_repeat and error.code is not ComputerErrorCode.WINDOW_CONTENT_UNAVAILABLE
+            if do_not_repeat and error.code not in {ComputerErrorCode.WINDOW_CONTENT_UNAVAILABLE, ComputerErrorCode.OVERLAY_BLOCKED,
+                                                    ComputerErrorCode.AX_WINDOW_UNMATCHED}
             else base.recovery_hint
         ),
-        details=details,
+        details={**base.details, **details},
     )
 
 
@@ -3281,6 +3298,10 @@ def register_computer_tools(
                 verified_state=state,
             )
         except HelperApplicationError as exc:
+            if (exc.error.code is ComputerErrorCode.OVERLAY_BLOCKED and scope == "target_window"
+                    and request_catalog_generation == trusted_catalog_generation
+                    and request_authority_generation == observation_authority_generation and not manager.handed_off):
+                return _blocked_observation(exc, app_ref, window_ref)
             return _app_state_identity_failure(exc.error, target_bound=manager.target is not None)
         except HelperTransportError as exc:
             logger.warning("computer app state helper failed error_type=%s", type(exc).__name__)
@@ -3427,6 +3448,9 @@ def register_computer_tools(
                 role_filter=role_filter or None,
             )
         except HelperApplicationError as exc:
+            if (exc.error.code is ComputerErrorCode.OVERLAY_BLOCKED and scope == "target_window" and not subtree_ref
+                    and request_target_binding is not None and manager.snapshot_target_binding == request_target_binding and not manager.handed_off):
+                return _blocked_observation(exc, request_target_binding.app_ref, request_target_binding.window_ref)
             return _application_failure(exc.error)
         except HelperTransportError as exc:
             logger.warning("computer snapshot helper failed error_type=%s", type(exc).__name__)
@@ -4038,18 +4062,24 @@ def register_computer_tools(
                 hint = "Do not repeat this action batch. " + (unavailable.recovery_hint or "")
                 if isinstance(covering, Mapping) and covering.get("observation_reason") == "sheet_belongs_to_other_window":
                     hint = recovery_hint(covering)
-                return _failure(
+                failure = _failure(
                     failure_code,
                     ("Input dispatch is acknowledged. " if acknowledged else "") + unavailable.message,
                     retryable=False,
                     recovery_hint=hint,
                     details={
                         "observation_status": "post_action_observation_pending",
+                        **unavailable.details,
                         **cause,
                         "action_result": _model_action_metadata(result.result),
                         **windows,
                     },
                 )
+                if (observation_code == "overlay_blocked" and isinstance(observation_error, HelperApplicationError)
+                        and manager.target is not None and not manager.handed_off):
+                    return _blocked_observation(observation_error, str(before_target.get("app_ref") or ""),
+                                                str(before_target.get("window_ref") or ""), failure=failure)
+                return failure
             recovery = (
                 await recover_window_transition(observation_deadline, action_result=result.result)
                 if observation_code in {"target_gone", "stale_target"} else None

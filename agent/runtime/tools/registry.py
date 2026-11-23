@@ -261,6 +261,7 @@ class ToolPrivateResult:
 
     output: str
     private: dict[str, Any]
+    failure: ToolFailure | None = None
 
 
 @dataclass
@@ -1627,6 +1628,12 @@ class ToolRegistry:
                             slot = _PRIVATE_RESULT_SLOT.get()
                             if slot is None:
                                 raise RuntimeError("Private tool result side channel is unavailable")
+                            if raw_result.failure is not None:
+                                if tool.result_persistence != "request_local":
+                                    raise ValueError("Private diagnostic evidence requires request-local results")
+                                slot.capture({**raw_result.private, "failure_output": raw_result.output,
+                                              "failure_code": raw_result.failure.code})
+                                return raw_result.failure
                             slot.capture(raw_result.private)
                             return raw_result.output
 
@@ -1663,6 +1670,11 @@ class ToolRegistry:
                             }
                             if result.artifact_ref:
                                 failure_result["artifact_ref"] = result.artifact_ref
+                            if private_result and private_result.get("failure_code") == result.code:
+                                failure_result["fresh_output"] = private_result.pop("failure_output")
+                                private_result.pop("failure_code")
+                                failure_result["request_local_placeholder"] = True
+                                failure_result["_private_result"] = private_result
                             failure_result.update(self._shape_error(name, result.message, tool))
                             report("failed", status="failed", message=result.message)
                             self.hooks.dispatch_tool_error(

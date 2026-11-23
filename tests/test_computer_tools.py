@@ -7775,7 +7775,7 @@ def test_post_action_overlay_keeps_cause_without_repeating_input_or_observation(
     assert result["computer_receipt"]["replay"] == "forbidden"
     assert result["retryable"] is False
     assert "overlay" in result["recovery_hint"].lower()
-    assert "Observe the visible popup as its own catalog target" in result["recovery_hint"]
+    assert "Hand this step to the user" in result["recovery_hint"]
     assert "stop automatic input" not in receipt_instruction(result["computer_receipt"]).lower()
     assert "Do not repeat" in result["recovery_hint"]
     assert "PRIVATE-OVERLAY-DETAIL" not in json.dumps(result)
@@ -9122,9 +9122,9 @@ def test_overlay_failure_is_not_reported_as_expired_refs():
         failure = convert(error)
         assert failure.code == 'overlay_blocked'
         assert failure.retryable is False
-        assert failure.details == {'retry_requires': 'overlay_state_changed'}
+        assert failure.details == {'retry_requires': 'overlay_state_changed', 'next_step': 'ask_user_to_handle_overlay'}
         assert 'private native details' not in failure.message
-        assert 'Stop repeating' in failure.recovery_hint
+        assert 'Hand this step to the user' in failure.recovery_hint
 
 
 def test_unmatched_window_failure_does_not_invent_expiration_or_system_prohibition():
@@ -9135,7 +9135,7 @@ def test_unmatched_window_failure_does_not_invent_expiration_or_system_prohibiti
         failure = convert(error)
         assert failure.code == 'ax_window_unmatched'
         assert failure.retryable is False
-        assert failure.details == {'retry_requires': 'window_identity_or_state_changed'}
+        assert failure.details == {'retry_requires': 'window_identity_or_state_changed', 'next_step': 'ask_user_to_handle_overlay'}
         assert 'private native title' not in failure.message
         assert 'window is present' in failure.message
         assert 'Stop repeating' in failure.recovery_hint
@@ -9609,3 +9609,53 @@ def test_textedit_save_reads_the_disclosed_document_bytes(registry, manager, bac
     assert proof["evidence"] == "saved_plain_text" and proof["text"] == raw.decode()
     assert proof["byte_count"] == len(raw) and proof["line_count"] == (0 if case == "empty" else 6)
     assert "saved_document" not in result["output"]
+
+
+@pytest.mark.parametrize("tool", ["computer_get_app_state", "computer_snapshot"])
+@pytest.mark.parametrize("case", ["visual", "ax_only", "both", "crossed", "corrupt"])
+def test_blocker_handoff_keeps_native_metadata_and_pixels_request_local(registry, manager, backend, monkeypatch, case, tool):
+    from agent.runtime.react import ReActAgent
+    from agent.runtime.macos_computer import HelperApplicationError
+
+    register(registry, manager)
+    registry.set_approval_handler(lambda card: asyncio.sleep(0, result="once"))
+    focus(registry)
+    source = {"visual": "window_server", "ax_only": "accessibility"}.get(case, "window_server_and_ax")
+    pixels = base64.b64encode(_screenshot_png_bytes(width=48, height=32)).decode("ascii")
+    data = {"blocking_overlay": {
+        "app_ref": "app-1", "window_ref": "unrelated" if case == "crossed" else "window-1",
+        "app_name": "Test App", "visible_count": 0 if case == "ax_only" else 1,
+        "ax_scan": "clear" if case == "visual" else "overlay",
+        "windows": [{"window_id": 719, "title": "Unpublished fixture title", "width_pt": 48,
+                     "height_pt": 32, "layer": 8, "modal": True, "source": source}],
+        "image_status": {"visual": "window_binding_unverified", "ax_only": "no_visible_blocker"}.get(case, "captured_exact_window"),
+    }, "overlay_png": "bad-png" if case == "corrupt" else pixels}
+    calls = []
+    async def blocked(*_args, **_kwargs):
+        calls.append(True)
+        raise HelperApplicationError(ComputerError(ComputerErrorCode.OVERLAY_BLOCKED, "private raw helper error"), result=data)
+    monkeypatch.setattr(backend, "get_app_state" if tool == "computer_get_app_state" else "snapshot", blocked)
+    args = {"app_ref": "app-1", "window_ref": "window-1"} if tool == "computer_get_app_state" else {}
+    result = run(registry.execute(tool, args))
+    assert calls == [True] and result["code"] == "overlay_blocked", result
+    assert not result["retryable"] and result["details"]["next_step"] == "ask_user_to_handle_overlay"
+    public = {k: v for k, v in result.items() if k not in {"_private_result", "fresh_output"}}
+    assert "Unpublished fixture title" not in json.dumps(public)
+    assert pixels not in json.dumps(public)
+    assert "private raw helper error" not in json.dumps(result)
+    if case == "crossed":
+        assert "fresh_output" not in result
+        return
+    evidence = json.loads(result["fresh_output"])["blocking_overlay"]
+    assert evidence["application"] == "Test App"
+    assert evidence["windows"] == [{"title": "Unpublished fixture title", "width_pt": 48, "height_pt": 32, "layer": 8,
+                                    "source": source, "modal": True}]
+    event = {**result, "_fresh_output": result["fresh_output"]}
+    separated = ReActAgent._separate_request_local_image_attachment(event)
+    if case == "both":
+        assert separated["_request_local_image_attachment"]["image_data_urls"] == ["data:image/png;base64," + pixels]
+        assert "_private_result" not in separated
+    else:
+        assert "_request_local_image_attachment" not in separated
+    if case == "corrupt":
+        assert evidence["image_status"] == "invalid_image"

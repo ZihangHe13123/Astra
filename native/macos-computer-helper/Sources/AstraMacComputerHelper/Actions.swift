@@ -614,6 +614,7 @@ enum ActionExecutionError: String, Error, Equatable {
     case permissionDenied = "permission_denied"
     case targetGone = "target_gone"
     case targetNotFrontmost = "target_not_frontmost"
+    case overlayBlocked = "overlay_blocked"
     case staleSnapshot = "stale_snapshot"
     case outOfBounds = "out_of_bounds"
     case secureTarget = "secure_target"

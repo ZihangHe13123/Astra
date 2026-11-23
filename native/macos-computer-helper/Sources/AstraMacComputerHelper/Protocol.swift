@@ -856,7 +856,13 @@ final class Dispatcher {
         )
     }
 
+    private func blockingOverlayFailure(requestID: String, evidence: BlockingOverlay) -> HelperResponse {
+        HelperResponse(protocolVersion: protocolVersion, requestID: requestID, ok: false, result: evidence.result,
+            error: HelperError(code: "overlay_blocked", message: "a blocking window prevents exact target binding"))
+    }
+
     private func observationFailure(requestID: String, error: Error) -> HelperResponse {
+        if let evidence = error as? BlockingOverlay { return blockingOverlayFailure(requestID: requestID, evidence: evidence) }
         let pair: (String, String)
         switch error {
         case WindowObservationError.permissionDenied:
@@ -897,6 +903,7 @@ final class Dispatcher {
     }
 
     private func appStateFailure(requestID: String, error: Error) -> HelperResponse {
+        if let evidence = error as? BlockingOverlay { return blockingOverlayFailure(requestID: requestID, evidence: evidence) }
         let pair: (String, String)
         switch error {
         case WindowObservationError.observationTimedOut:
@@ -930,6 +937,7 @@ final class Dispatcher {
         case .targetNotFrontmost: return "target window is no longer frontmost"
         case .staleSnapshot: return "snapshot or element reference is stale"
         case .outOfBounds: return "action coordinates are outside the target window"
+        case .overlayBlocked: return "a blocking window prevents exact target binding"
         case .secureTarget: return "automatic interaction with a secure target is prohibited"
         case .secureInputActive: return "macOS Secure Event Input is active"
         case .saveDestinationUnverified: return "the exact standard save panel, commit control, current directory or filename could not be verified"

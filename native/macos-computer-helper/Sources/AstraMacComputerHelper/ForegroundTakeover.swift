@@ -1503,7 +1503,7 @@ final class ForegroundPlanExecutor {
     private func observationFailed(_ result: PIDTargetedActionResult) -> Bool {
         if result.cooperativeError == .userActivityPaused { return true }
         return switch result.error {
-        case .targetGone?, .targetNotFrontmost?, .staleSnapshot?, .secureTarget?,
+        case .targetGone?, .targetNotFrontmost?, .staleSnapshot?, .overlayBlocked?, .secureTarget?,
              .secureInputActive?, .keyboardFocusUnverified?, .controlDisabled?,
              .inputFocusRequired?: true
         case nil, .invalidAction?, .permissionDenied?, .outOfBounds?, .actionTimeout?,

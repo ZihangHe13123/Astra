@@ -1708,6 +1708,8 @@ final class SystemWindowObserver: WindowObserving {
         }
         snapshotSucceeded = true
         return captured.snapshot
+        } catch let overlay as BlockingOverlay where scope == "target_window" && subtree == nil {
+            throw capturedBlockingOverlay(overlay, currentTarget: { try self.resolve(appRef: appRef, windowRef: windowRef) })
         } catch {
             if !operationBudget.available { throw WindowObservationError.observationTimedOut }
             throw error
@@ -1825,6 +1827,10 @@ final class SystemWindowObserver: WindowObserving {
         }
         snapshotSucceeded = true
         return captured.result
+        } catch let overlay as BlockingOverlay where scope == "target_window" && request.expectedFocusedDialogDocumentIdentityRef == nil {
+            throw capturedBlockingOverlay(overlay, currentTarget: {
+                try self.resolveCatalogTarget(catalogGeneration: requestedGeneration, appRef: appRef, windowRef: windowRef, current: { $0 })
+            })
         } catch {
             if !operationBudget.available { throw WindowObservationError.observationTimedOut }
             throw error
@@ -2609,6 +2615,77 @@ final class SystemWindowObserver: WindowObserving {
         )
     }
 
+    /// Capture one exact attached window, never a desktop crop or a same-app sibling selected by geometry.
+    /// A failure leaves the useful AX/WindowServer metadata intact and grants no new target or refs.
+    private func capturedBlockingOverlay(_ original: BlockingOverlay, currentTarget: () throws -> WindowTarget) -> BlockingOverlay {
+        var evidence = original
+        guard let child = original.contained, let id = child.window.windowID, id != original.parentID,
+              let bounds = child.window.bounds, original.visibleCount == 1,
+              original.windows.count == 1, original.windows[0].windowID == id,
+              original.windows[0].source == "window_server_and_ax",
+              let launched = NSRunningApplication(processIdentifier: original.pid)?.launchDate,
+              let width = Int(exactly: bounds.width.rounded()), let height = Int(exactly: bounds.height.rounded()),
+              (1...2048).contains(width), (1...2048).contains(height) else { return evidence }
+        func checkedWindow() throws -> SCWindow {
+            try AXObservationBudget.current?.check()
+            let parent = try currentTarget()
+            guard permissions.screenRecordingAllowed, permissions.accessibilityTrusted,
+                  parent.pid == original.pid, parent.windowID == original.parentID, parent.bounds.contains(bounds),
+                  parent.appRef == original.appRef, parent.windowRef == original.windowRef,
+                  NSRunningApplication(processIdentifier: parent.pid)?.launchDate == launched,
+                  !SystemSecureInputDetector().isSecureInputEnabled(),
+                  let fresh = try currentCatalogRecord(for: parent)?.blockingOverlay,
+                  fresh.visibleCount == 1, fresh.windows.count == 1, fresh.windows[0].windowID == id,
+                  fresh.windows[0].source == "window_server_and_ax", let current = fresh.contained,
+                  current.window.bounds == bounds, CFEqual(current.element, child.element),
+                  overlayTreeIsNonsecure(current.element, pid: parent.pid)
+            else { throw WindowObservationError.staleTarget }
+            let matches = try waitForShareableContent().windows.filter { $0.owningApplication?.processID == parent.pid &&
+                $0.windowID == id && $0.isOnScreen && $0.frame == bounds }
+            guard matches.count == 1 else { throw WindowObservationError.staleTarget }
+            return matches[0]
+        }
+        do {
+            let window = try checkedWindow()
+            let filter = SCContentFilter(desktopIndependentWindow: window)
+            guard primaryWindowContentHasExactSize(contentRect: filter.contentRect, expectedBounds: bounds)
+            else { return evidence }
+            let config = SCStreamConfiguration()
+            config.width = width
+            config.height = height
+            config.showsCursor = false
+            config.ignoreShadowsSingleWindow = true
+            let image = try waitForAsync(timeout: AXObservationBudget.current?.phaseTimeout(maximum: 1) ?? 1) {
+                try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+            }
+            guard image.width == width, image.height == height else { return evidence }
+            let bytes = try AppshotCaptureImage.png(image)
+            guard bytes.count <= 512 * 1024 else { evidence.imageStatus = "image_size_limit"; return evidence }
+            _ = try checkedWindow()
+            evidence.png = bytes
+            evidence.imageStatus = "captured_exact_window"
+        } catch {
+            evidence.imageStatus = "capture_or_privacy_check_failed"
+        }
+        return evidence
+    }
+
+    /// Missing AX metadata, mixed process ownership and secure fields all suppress a diagnostic image.
+    private func overlayTreeIsNonsecure(_ root: AXUIElement, pid: pid_t) -> Bool {
+        var remaining = [root], visited: [AXUIElement] = []
+        while let node = remaining.popLast() {
+            if visited.contains(where: { CFEqual($0, node) }) { continue }
+            guard visited.count < 128, observedAXPID(node) == pid,
+                  !secureActionIdentity(role: AXNodeReader.stringAttribute(node, kAXRoleAttribute),
+                                        subrole: AXNodeReader.stringAttribute(node, kAXSubroleAttribute)),
+                  let children = completeAXChildren(node, maximum: 128)
+            else { return false }
+            visited.append(node)
+            remaining.append(contentsOf: children)
+        }
+        return true
+    }
+
     private func currentCatalogRecord(for target: WindowTarget) throws -> TargetCatalogRecord? {
         if let targetRecordProvider { return try targetRecordProvider(target) }
         let content = try waitForShareableContent()
@@ -2671,8 +2748,17 @@ final class SystemWindowObserver: WindowObserving {
                 accessibility: $0.bounds
             )
         }
+        var containedBlocker: ContainedBlockingElement?
         let axOverlay: ContainedAXOverlayScan = selectedAXWindows.count == 1
-            ? selectedAXWindows[0].element.map { containedAXOverlay(in: $0, targetBounds: current.frame) } ?? .uncertain
+            ? selectedAXWindows[0].element.map { root in
+                containedAXOverlay(in: root, targetBounds: current.frame) { element, bounds in
+                    guard observedAXPID(element) == target.pid else { return }
+                    let description = BlockingOverlayWindow(windowID: observedAXWindowID(element), bounds: bounds,
+                        layer: nil, title: accessibilityWindowName(element).value,
+                        isModal: AXNodeReader.boolAttribute(element, kAXModalAttribute), source: "accessibility")
+                    containedBlocker = ContainedBlockingElement(element: element, window: description)
+                }
+            } ?? .uncertain
             : .clear
         let containsAXOverlay = axOverlay != .clear
         let indicatorIDs = Set(axWindows.compactMap { candidate in
@@ -2720,6 +2806,17 @@ final class SystemWindowObserver: WindowObserving {
             ? backgroundVisibleWindowAmbiguities(targetPID: target.pid, targetWindowID: current.windowID,
                 targetBounds: current.frame, records: overlayCandidates)
             : []
+        if containedBlocker == nil, visibleOffenders.count == 1,
+           selectedAXWindows.count == 1, let root = selectedAXWindows[0].element {
+            let offender = visibleOffenders[0]
+            let matches = axWindows.filter { $0.windowID == offender.windowID && $0.bounds == offender.bounds }
+            if matches.count == 1, let child = matches[0].element, let parent = observedAXParent(child),
+               CFEqual(parent, root), observedAXPID(child) == target.pid {
+                containedBlocker = ContainedBlockingElement(element: child, window: BlockingOverlayWindow(
+                    windowID: offender.windowID, bounds: offender.bounds, layer: nil, title: accessibilityWindowName(child).value,
+                    isModal: matches[0].isModal, source: "accessibility"))
+            }
+        }
         let overlayMayBeTransient = overlaysMayBeTransient(visibleOffenders, axOverlay: axOverlay) {
             self.recentSuggestionPopups.contains($0, at: observedAt)
         }
@@ -2754,6 +2851,10 @@ final class SystemWindowObserver: WindowObserving {
             title: current.title ?? target.title,
             axWindows: axWindows,
             containsUnselectedOverlay: containsAXOverlay || containsVisibleOverlay,
+            blockingOverlay: containsAXOverlay || containsVisibleOverlay ? blockingOverlayEvidence(
+                for: target, application: current.owningApplication?.applicationName, ax: axOverlay,
+                contained: containedBlocker, offenders: visibleOffenders, screens: screenWindows, axWindows: axWindows
+            ) : nil,
             overlayMayBeTransient: overlayMayBeTransient,
             siblingOrdering: siblingOrdering,
             suggestionPopupWindowIDs: Set(suggestionPopups.map(\.windowID)),
@@ -3277,6 +3378,8 @@ final class SystemWindowObserver: WindowObserving {
                 // 再被下面洗成 stale_snapshot，使整条 takeover 坐标点击路径不可用。
                 if target.interactionMode == .background {
                     do { return try self.backgroundTargetController().snapshotTargetState(target) }
+                    catch is BlockingOverlay { throw ActionExecutionError.overlayBlocked }
+                    catch WindowObservationError.overlayBlocked { throw ActionExecutionError.overlayBlocked }
                     catch let error as WindowObservationError {
                         logActionRejected("TARGET-STATE-OBS snapshotID=\(snapshotContext.guardValue.snapshotID) obsError=\(error)")
                         throw ActionExecutionError.staleSnapshot
@@ -4137,7 +4240,8 @@ final class SystemWindowObserver: WindowObserving {
         return matches.count == 1 ? matches[0] : nil
     }
 
-    private func containedAXOverlay(in root: AXUIElement, targetBounds: CGRect) -> ContainedAXOverlayScan {
+    private func containedAXOverlay(in root: AXUIElement, targetBounds: CGRect,
+        found: (AXUIElement, CGRect?) -> Void = { _, _ in }) -> ContainedAXOverlayScan {
         containedAXOverlayScan(
             root: root,
             targetBounds: targetBounds,
@@ -4148,7 +4252,7 @@ final class SystemWindowObserver: WindowObserving {
                     subrole: AXNodeReader.stringAttribute(candidate, kAXSubroleAttribute),
                     bounds: AXNodeReader.frameAttribute(candidate)
                 )
-            }
+            }, found: found
         )
     }
 
@@ -4374,7 +4478,9 @@ private struct StoredCooperativePlan {
 }
 
 private func windowActionError(_ error: Error) -> ActionExecutionError {
-    error as? ActionExecutionError ?? .helperFailed
+    if error is BlockingOverlay { return .overlayBlocked }
+    if case WindowObservationError.overlayBlocked = error { return .overlayBlocked }
+    return error as? ActionExecutionError ?? .helperFailed
 }
 
 func windowTitlesMatch(screenCaptureTitle: String, accessibilityTitle: String) -> Bool {
@@ -4658,7 +4764,8 @@ func containedAXOverlayScan(
     root: AXUIElement,
     targetBounds: CGRect,
     children: (AXUIElement, Int) -> [AXUIElement]?,
-    attributes: (AXUIElement) -> AXOverlayAttributes?
+    attributes: (AXUIElement) -> AXOverlayAttributes?,
+    found: (AXUIElement, CGRect?) -> Void = { _, _ in }
 ) -> ContainedAXOverlayScan {
     var queue: [(element: AXUIElement, depth: Int)] = [(root, 0)]
     var visited: [AXUIElement] = []
@@ -4713,6 +4820,7 @@ func containedAXOverlayScan(
             if isOverlay {
                 guard let bounds = values.bounds else {
                     overlayDiagnostic("overlay role \(values.role.value ?? "?") has unreadable bounds")
+                    found(candidate, nil)
                     return .overlay
                 }
                 if trustedFocusedWindow(
@@ -4721,6 +4829,7 @@ func containedAXOverlayScan(
                     focusedIdentity: 2,
                     focusedBounds: bounds
                 ) || approximatelyEqual(bounds, targetBounds) {
+                    found(candidate, bounds)
                     return .overlay
                 }
             }

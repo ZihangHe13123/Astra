@@ -129,6 +129,7 @@ struct TargetCatalogRecord {
     let title: String
     let axWindows: [TargetAXWindowRecord]
     let containsUnselectedOverlay: Bool
+    let blockingOverlay: BlockingOverlay?
     /// Every overlay is a small floating window of the target app, the shape of a caret
     /// indicator or tooltip, or a suggestion list proven moments ago, so it may vanish on its
     /// own. It still blocks until it does.
@@ -148,6 +149,7 @@ struct TargetCatalogRecord {
         title: String,
         axWindows: [TargetAXWindowRecord],
         containsUnselectedOverlay: Bool = false,
+        blockingOverlay: BlockingOverlay? = nil,
         overlayMayBeTransient: Bool = false,
         siblingOrdering: BackgroundSiblingOrderingProof? = nil,
         suggestionPopupWindowIDs: Set<CGWindowID> = [],
@@ -164,6 +166,7 @@ struct TargetCatalogRecord {
         self.title = title
         self.axWindows = axWindows
         self.containsUnselectedOverlay = containsUnselectedOverlay
+        self.blockingOverlay = blockingOverlay
         self.siblingOrdering = siblingOrdering
     }
 }
@@ -295,6 +298,7 @@ final class BackgroundTargetController: TargetSelecting {
 
         guard !record.containsUnselectedOverlay else {
             logActionRejected("observation_validation=overlay_blocked")
+            if let evidence = record.blockingOverlay { throw evidence }
             throw WindowObservationError.overlayBlocked
         }
 
