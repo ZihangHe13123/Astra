@@ -647,7 +647,7 @@ class MacComputerBackend:
     def __init__(self, transport: _RequestTransport) -> None:
         self._transport = transport
         self._catalog: ComputerAppCatalog | None = None
-        self._window_catalog_relations = False
+        self._window_catalog_relations: bool | None = None
         self._focused_dialog_relations = False
 
     async def status(self) -> dict[str, object]:
@@ -682,6 +682,11 @@ class MacComputerBackend:
         return options
 
     async def apps(self) -> ComputerAppCatalog:
+        # WPS dialog ownership needs native catalog evidence. Discover it once
+        # on an ordinary read before the caller needs to follow its first dialog.
+        if (self._window_catalog_relations is None and self._catalog is not None
+                and any(app.get("bundle_id") == "com.kingsoft.wpsoffice.mac" for app in self._catalog.apps)):
+            await self.status()
         return self._publish_catalog(await self._request("apps", self._catalog_options()))
 
     async def presentation_apps(self, takeover_ref: str) -> ComputerAppCatalog:
