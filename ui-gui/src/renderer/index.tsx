@@ -89,7 +89,13 @@ function App() {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [initialModelKey, setInitialModelKey] = useState<string>();
   const [olderLoading, setOlderLoading] = useState(false);
-  const [follow, setFollow] = useState(true);
+  const [follow, setFollowState] = useState(true);
+  // Following as it is now. A scroll's handler changes it before React renders again, so a pin queued for an
+  // earlier update reads this rather than the value that update rendered with.
+  const followRef = useRef(true);
+  const setFollow = useCallback((value: boolean) => { followRef.current = value; setFollowState(value); }, []);
+  // Where the conversation was at its last scroll event.
+  const scrolledTop = useRef(0);
   const scroller = useRef<HTMLDivElement>(null);
   const input = useRef<HTMLTextAreaElement>(null);
   const loaded = useRef(false);
@@ -202,7 +208,17 @@ function App() {
   }, [active, modal, workspace, state?.isDraft, preview, panel, docTarget, detailsWide]);
   useEffect(() => { if (panel !== "files") setDetailsWide(false); }, [panel, active]);
   useEffect(() => { setFollow(!preview?.locatedFromLog); setOlderLoading(false); }, [active, preview?.session_id, preview?.mode]);
-  useEffect(() => { if (follow && scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight; }, [state?.revision, active, preview, follow]);
+  useEffect(() => { if (followRef.current && scroller.current) scroller.current.scrollTop = scroller.current.scrollHeight; }, [state?.revision, active, preview, follow]);
+  // Any scroll up leaves the newest message at once; a scroll that ends near the bottom follows it again. Following
+  // pins the list to the bottom on every update, so a scroll up that had to reach 120 px first was pulled back while
+  // a reply was arriving.
+  const followScroll = (e: React.UIEvent<HTMLDivElement>) => {
+    const t = e.currentTarget; if (!t.clientHeight) return;
+    const fromBottom = t.scrollHeight - t.scrollTop - t.clientHeight;
+    const up = t.scrollTop < scrolledTop.current - 1 && fromBottom > 1;
+    scrolledTop.current = t.scrollTop;
+    setFollow(!up && fromBottom < 120);
+  };
   useEffect(() => {
     const event = state?.info.restart_ready;
     if (!event || event.replayed || document.hidden) return;
@@ -606,7 +622,7 @@ function App() {
     </aside>
     <main className={`main${chat ? " chat-view" : ""}`}><header className="topbar"><div>{!side && <button className="icon" aria-label="显示侧栏" onClick={() => setSide(true)}><PanelLeft size={18}/></button>}{chat ? <span className="chat-avatar" aria-hidden="true"><Sparkles size={15}/></span> : <Folder size={17}/>}<span className="title" title={currentTitle}>{currentTitle}</span>{chat && model?.model && model.model !== "none" && <span className="chat-model muted small">{modelDisplayName(model.model, model.served_model)}</span>}{theme.console && theme.wording.tag && <span className="topbar-tag">{theme.wording.tag}</span>}<span className="mode-badge">{preview ? "只读历史" : state?.mode && state.mode !== "work" ? state.mode : ""}</span></div>
       <div>{logSession && <button className="icon" aria-label="查看会话记录" onClick={() => openLog()}><FileText size={17}/></button>}<span className="workspace" title={state?.workspace || workspace}>{(state?.workspace || workspace).split(/[\\/]/).pop()}</span>{historyLoading || state?.status === "connecting" || state?.status === "loading" ? <LoaderCircle size={16} className="spin"/> : null}<button className="icon" aria-label="执行详情" onClick={() => { if (panel) leaveDoc(); setPanel(panel ? undefined : "tools"); }}><PanelRight size={18}/></button></div></header>
-      <div className={`body ${(panel === "logs" && logSession || panel && panel !== "logs" && state && !preview) ? "with-details" : ""}${detailsWide && panel === "files" && state && !preview ? " details-wide" : ""}`}><div className="conversation"><div className="messages-scroll" aria-busy={historyLoading} data-history-request={preview?.request || 0} ref={scroller} onScroll={e => { const t = e.currentTarget; if (!t.clientHeight) return; setFollow(t.scrollHeight - t.scrollTop - t.clientHeight < 120); }}>
+      <div className={`body ${(panel === "logs" && logSession || panel && panel !== "logs" && state && !preview) ? "with-details" : ""}${detailsWide && panel === "files" && state && !preview ? " details-wide" : ""}`}><div className="conversation"><div className="messages-scroll" aria-busy={historyLoading} data-history-request={preview?.request || 0} ref={scroller} onScroll={followScroll}>
         <div className="messages">
           {!messages.length && (chat ? <div className="chat-welcome"><span className="chat-avatar" aria-hidden="true"><Sparkles size={18}/></span><p>这是你的个人对话：随时聊，定时任务的结果也会发到这里。项目里的活还在各自的会话里做。</p></div>
             : <Welcome info={preview ? undefined : state?.info.startup_banner} openModels={() => { void openModels(); }} showCommands={showCommands} run={value => { void command(value).catch(fail); }}/>)}

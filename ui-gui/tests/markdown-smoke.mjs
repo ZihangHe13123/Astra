@@ -39,6 +39,9 @@ archive[260] = { role: 'assistant', content: 'HISTORICAL_RICH_MARKDOWN\n\n' + so
 writeFileSync(join(sessionDir, oldSession + '.json'), JSON.stringify({ messages: archive }));
 let releaseStream;
 const streamGate = new Promise(resolve => { releaseStream = resolve; });
+// A reply that keeps arriving, one paragraph at a time, until the test lets it finish.
+let releaseFollow;
+const followGate = new Promise(resolve => { releaseFollow = resolve; });
 const requests = [];
 const server = createServer(async (req, res) => {
   if (req.method === 'GET') { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({ data: [{ id: 'markdown-test' }] })); return; }
@@ -52,6 +55,11 @@ const server = createServer(async (req, res) => {
     chunk({ role: 'assistant', content: partial });
     await streamGate;
     chunk({ content: '\n```\n\n' + source });
+  } else if (text.includes('FOLLOW_STREAM')) {
+    chunk({ role: 'assistant', content: 'FOLLOW_STREAM_START\n\n' });
+    let open = true; void followGate.then(() => { open = false; });
+    for (let line = 1; open && line <= 3000; line++) { chunk({ content: `持续输出第 ${line} 段。\n\n` }); await new Promise(resolve => setTimeout(resolve, 40)); }
+    chunk({ content: 'FOLLOW_STREAM_END' });
   } else if (text.includes('SECRET_MASK')) chunk({ role: 'assistant', content: 'SECRET_MASK_REPLY' });
   else chunk({ role: 'assistant', content: invalid });
   chunk({}, 'stop'); res.end('data: [DONE]\n\n');
@@ -233,6 +241,46 @@ try {
   await expect.poll(clipboardText).toBe(secretMessage);
   passed('a credential in a sent message is drawn masked, shown one value at a time, and sent and copied as written');
 
+  // While a reply is still arriving, a small scroll up stays where the user made it: following stops at once and
+  // the newest text keeps arriving below. It used to be pulled back to the bottom by the next update until the scroll
+  // was 120 px away, so a slow trackpad scroll could not leave the bottom during output (2026-11-24).
+  await submit('FOLLOW_STREAM');
+  const following = page.locator('.message.assistant').filter({ hasText: 'FOLLOW_STREAM_START' });
+  await following.waitFor();
+  const scroller = page.locator('.messages-scroll');
+  const fromBottom = () => scroller.evaluate(el => el.scrollHeight - el.scrollTop - el.clientHeight);
+  await expect.poll(() => following.evaluate(el => el.getBoundingClientRect().height)).toBeGreaterThan(400);
+  await expect.poll(fromBottom).toBeLessThan(2);
+  const box = await scroller.boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  const sampleScroll = ms => page.evaluate(ms => new Promise(done => {
+    const el = document.querySelector('.messages-scroll'), reply = [...document.querySelectorAll('.message.assistant')].at(-1);
+    const start = performance.now(), samples = [];
+    const sample = () => {
+      samples.push({ at: performance.now(), fromBottom: el.scrollHeight - el.scrollTop - el.clientHeight, text: reply.textContent.length });
+      if (performance.now() - start < ms) requestAnimationFrame(sample); else done(samples);
+    };
+    requestAnimationFrame(sample);
+  }), ms);
+  const sampled = sampleScroll(1500);
+  for (let step = 0; step < 3; step++) { await page.mouse.wheel(0, -30); await page.waitForTimeout(50); }
+  const samples = await sampled;
+  assert.ok(samples.at(-1).text > samples[0].text, 'the reply keeps arriving while the scroll is checked');
+  assert.ok(samples.some(sample => sample.fromBottom >= 20), 'the wheel moves the conversation');
+  // Every frame of the last half second: a pin to the bottom shows up as one frame near 0 between two updates.
+  const settled = Math.min(...samples.filter(sample => sample.at >= samples.at(-1).at - 500).map(sample => sample.fromBottom));
+  assert.ok(settled >= 20, `a small scroll up during output must hold, not return to the bottom (${settled}px from it)`);
+  await expect(page.locator('.jump-latest')).toBeVisible();
+  // Scrolled back down to the bottom, the list follows the reply again.
+  await page.mouse.wheel(0, 100000);
+  await expect.poll(fromBottom).toBeLessThan(2);
+  await expect(page.locator('.jump-latest')).toHaveCount(0);
+  releaseFollow();
+  await following.getByText('FOLLOW_STREAM_END').waitFor();
+  await waitIdle();
+  await expect.poll(fromBottom).toBeLessThan(2);
+  passed('a small scroll up during output stays put, and scrolling back to the bottom follows the reply again');
+
   // Select a fixture through the normal file chooser IPC. The renderer never
   // receives an injected preview or arbitrary file-read capability.
   await app.evaluate(({ dialog, shell }, path) => {
@@ -332,6 +380,7 @@ try {
   })(), 'Failure diagnostics', 3000).catch(error => console.error(error));
 } finally {
   releaseStream();
+  releaseFollow();
   if (app) {
     if (failure) await bounded(app.evaluate(({ dialog }) => {
       const original = dialog.showMessageBox.bind(dialog);
