@@ -200,6 +200,8 @@ class ApprovalRecord:
     created_at: str
     updated_at: str
     resolved_at: str | None
+    # Choices on the live backend card. Replay uses only the redacted request.
+    offered_choices: tuple[str, ...] | None = None
 
     def public(self) -> dict[str, Any]:
         return {
@@ -265,6 +267,8 @@ class ApprovalInbox:
 
     @staticmethod
     def _record(row: sqlite3.Row) -> ApprovalRecord:
+        request = json.loads(row["request_json"])
+        offered_choices = request.pop("offered_choices", None)
         return ApprovalRecord(
             request_id=str(row["request_id"]),
             session_id=str(row["session_id"]),
@@ -273,10 +277,11 @@ class ApprovalInbox:
             channel=str(row["channel"]),
             state=str(row["state"]),
             decision=str(row["decision"]),
-            request=json.loads(row["request_json"]),
+            request=request,
             created_at=str(row["created_at"]),
             updated_at=str(row["updated_at"]),
             resolved_at=str(row["resolved_at"]) if row["resolved_at"] else None,
+            offered_choices=tuple(offered_choices) if offered_choices is not None else None,
         )
 
     def create(
@@ -288,9 +293,15 @@ class ApprovalInbox:
         task_id: str = "",
         surface: str = "tui",
         channel: str = "",
+        offered_choices: list[str] | None = None,
     ) -> ApprovalRecord:
         resolved_id = str(request_id or request.get("request_id") or uuid.uuid4().hex)
-        payload = json.dumps(safe_approval_request(request), ensure_ascii=False, separators=(",", ":"))
+        stored = safe_approval_request(request)
+        if offered_choices is not None:
+            stored["offered_choices"] = list(dict.fromkeys(
+                choice for choice in offered_choices if choice in APPROVAL_DECISIONS
+            ))
+        payload = json.dumps(stored, ensure_ascii=False, separators=(",", ":"))
         now = _now()
         with self._lock, self._connection() as db:
             db.execute(

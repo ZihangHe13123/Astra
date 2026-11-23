@@ -59,6 +59,40 @@ def _backend(inbox, durable_io, send, *, channel="", chat=None):
     return ns
 
 
+@pytest.mark.parametrize(("draft", "offered", "decision"), [
+    ({"text": "private fixture"}, ["once", "deny"], "once"),
+    ({"truncated": True}, ["deny"], "deny"),
+])
+def test_backend_audits_live_offer_independently_of_redacted_replay(tmp_path, monkeypatch, draft, offered, decision):
+    from agent.cli.computer_commands import approval_choices
+    from agent.runtime.event_stream import safe_replay_event
+
+    inbox = ApprovalInbox(tmp_path / "approvals.db")
+    monkeypatch.setattr(approval_time, "frontmost_pid_now", lambda: 42)
+    async def durable_io(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    def send(event):
+        if event["type"] == "tool_approval_request":
+            assert event["choices"] == offered
+            ns["resolve_tool_approval"](event["request_id"], "once")
+
+    ns = _backend(inbox, durable_io, send)
+    ns["approval_choices"] = approval_choices
+    request = {"kind": "computer_foreground_takeover", "request_id": "fixture",
+               "draft": draft, "choices": ["once", "session", "deny"], "offered_choices": ["always"]}
+    assert asyncio.run(ns["request_tool_approval"](request)) == decision
+    record = ApprovalInbox(inbox.path).get("fixture")
+    assert record.decision == decision
+    assert record.offered_choices == tuple(offered)
+    public = record.public()
+    assert public["choices"] == ["deny"]
+    assert public["draft"] == {"truncated": True}
+    assert "offered_choices" not in public
+    assert "private fixture" not in str(public)
+    assert safe_replay_event({"type": "tool_approval_request", **public})["choices"] == ["deny"]
+
+
 @pytest.mark.parametrize(("channel", "choice"), [("", "session"), ("", "once"), ("weixin", "session")],
                          ids=["local-gui", "present-once", "remote-chat"])
 def test_live_decision_precedes_scheduling_database_and_audit_and_never_leaks(tmp_path, monkeypatch, channel, choice):

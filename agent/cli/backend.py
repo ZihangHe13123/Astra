@@ -1217,6 +1217,7 @@ async def _main(startup_started: float):
         )
         try:
             persisted = None
+            choices = approval_choices(request)
             if approval_inbox is not None:
                 try:
                     persisted = await durable_io(approval_inbox.create,
@@ -1226,6 +1227,7 @@ async def _main(startup_started: float):
                         task_id="" if channel_name else active_task_id,
                         surface=surface,
                         channel=channel_name,
+                        offered_choices=choices,
                     )
                 except Exception:
                     logger.exception("approval inbox write failed request_id=%s", request_id)
@@ -1234,7 +1236,6 @@ async def _main(startup_started: float):
             pending_tool_approvals[request_id] = future
             if request.get("kind") == "computer_foreground_takeover":
                 pending_foreground_approvals.add(request_id)
-            choices = approval_choices(request)
             if "draft" in request:
                 pending_draft_choices[request_id] = tuple(choices)
             elif request.get("yolo_bypass_allowed") is True:
