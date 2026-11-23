@@ -883,6 +883,13 @@ def build_computer_approval(decision: ComputerPolicyDecision, *, present_result:
         request["arguments"]["window"] = window
     if decision.new_copy_destination:
         request["arguments"]["known_path"] = decision.new_copy_destination
+        if decision.new_copy_destination.lower().endswith(".docx"):
+            disclosure = (" In this Computer Use session, saving this new copy may also read back "
+                          "its short main-body text from this exact local file to the model for verification.")
+            request["arguments"]["saved_copy_readback"] = True
+            request["approval_effect"] += disclosure
+            request["arguments"]["expected_effect"] += disclosure
+            request["approval_question"] = question.rstrip("?") + " and allow later verification of this copy's body text?"
         request["target"] += f" — {decision.new_copy_destination}"
     if present_result:
         request["arguments"]["present_result"] = True

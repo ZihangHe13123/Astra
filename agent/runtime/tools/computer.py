@@ -77,6 +77,7 @@ from ..computer_protocol import (
     validate_snapshot_payload,
 )
 from ..computer_routing import computer_route_advice
+from ..computer_saved_document import ApprovedCopy, is_document_save
 from ..computer_text import contains_credentials
 from ..macos_computer import HelperApplicationError, HelperTransportError
 from ..macos_computer_compatibility import (
@@ -532,6 +533,10 @@ class _PreparedComputerAct:
     dispatch_result: dict[str, Any] | None = None
     save_destination: str = ""
     reserve_new_copy: bool = False
+    proposed_readback: ApprovedCopy | None = None
+    readback_epoch: int = -1
+    final_copy: ApprovedCopy | None = None
+    version_before_save: tuple[int, int, int, int, int] | None = None
 
 
 def _observed_save_panel_destination(panel: Mapping[str, Any], elements: Mapping[str, Any]) -> tuple[str, str]:
@@ -2284,6 +2289,9 @@ def register_computer_tools(
     pending_clicks = PendingClickGuard()
     # The value is the original panel identity, or None once WindowServer confirms its disappearance.
     pending_new_copies: dict[tuple[str, str], str | None] = {}
+    last_wps_document = ("", "")
+    readback_epoch = 0
+    readback_copy: ApprovedCopy | None = None
     pending_foreground_digest = ""
     pending_foreground_snapshot = ""
     catalog_target_operation_lock = asyncio.Lock()
@@ -2327,6 +2335,10 @@ def register_computer_tools(
         pending_wps_modal_target = None
 
     def clear_computer_grants() -> None:
+        nonlocal readback_copy, last_wps_document, readback_epoch
+        readback_copy = None
+        last_wps_document = ("", "")
+        readback_epoch += 1
         nonlocal foreground_loan, offered_transition
         observed_route.clear()
         offered_transition = None
@@ -2551,7 +2563,7 @@ def register_computer_tools(
         current_loan()  # Selecting another target ends the loan, even if we switch back.
 
     def remember_snapshot(snapshot: ComputerSnapshot) -> None:
-        nonlocal effect_snapshot
+        nonlocal effect_snapshot, last_wps_document, readback_copy
         effect_snapshot = (snapshot.snapshot_id, snapshot.payload.get("ax_tree"))
         nonlocal trusted_wps_destination, trusted_wps_directory, trusted_wps_filename
         elements: dict[str, dict[str, Any]] = {}
@@ -2632,6 +2644,13 @@ def register_computer_tools(
                     visit(child, depth + 1)
 
         visit(raw_tree)
+        if (isinstance(raw_tree, Mapping) and raw_tree.get("role") == "AXWindow"
+                and raw_tree.get("subrole") == "AXStandardWindow"
+                and trusted_target.get("bundle_id") == "com.kingsoft.wpsoffice.mac"):
+            identity = str(trusted_target.get("window_identity_ref") or "")
+            title = str(raw_tree.get("title") or raw_tree.get("label") or "")
+            if identity and title and trusted_target.get("window_title") == title:
+                last_wps_document = (identity, title)
         observed_copy = ""
         if (pending_new_copies and isinstance(raw_tree, Mapping)
                 and raw_tree.get("role") == "AXWindow" and raw_tree.get("subrole") == "AXStandardWindow"
@@ -3764,6 +3783,8 @@ def register_computer_tools(
                                     recovery_hint="Inspect the file or resulting document. Do not submit the save again.")
                 if prepared.reserve_new_copy:
                     pending_new_copies[key] = str((prepared.policy_context or {}).get("window_identity_ref") or "")
+            if prepared.final_copy is not None and prepared.final_copy is readback_copy:
+                prepared.version_before_save = prepared.final_copy.version()
             prepared.dispatch_attempted = True
             result = await manager.act(
                 snapshot_id,
@@ -4437,6 +4458,15 @@ def register_computer_tools(
             prepared.failure = _failure("unsupported_operation", "Showing a result requires an updated macOS helper that can confirm presentation. No input was dispatched.", retryable=False)
             return None
         context = current_policy_context(snapshot_id)
+        document_identity = str(context.get("window_identity_ref") or "")
+        document_title = str(trusted_target.get("window_title") or "")
+        if (readback_copy is not None and readback_copy.session == manager.session_id
+                and readback_copy.grant_space == current_grant_space()
+                and context.get("bundle_id") == "com.kingsoft.wpsoffice.mac"
+                and last_wps_document == (document_identity, document_title)
+                and readback_copy.matches(document_identity, document_title, str(trusted_target.get("known_path") or ""))
+                and is_document_save(prepared.actions, context, raw_tree)):
+            prepared.final_copy = readback_copy
         save_failure = _check_save_panel_action(prepared.actions, raw_tree, context)
         if save_failure is not None:
             prepared.failure = save_failure
@@ -4727,6 +4757,21 @@ def register_computer_tools(
                     prepared.failure = _failure("approval_required", "The foreground decision expired or its window changed. Ask again.", retryable=True)
                     return None
         cleanup = permission_grant(approvals, args, request, decision)
+        if (prepared.reserve_new_copy and request.get("arguments", {}).get("saved_copy_readback") is True
+                and request["arguments"].get("known_path") == prepared.decision.new_copy_destination):
+            nonlocal readback_copy, readback_epoch
+            readback_copy = None
+            readback_epoch += 1
+            prepared.readback_epoch = readback_epoch
+            origin = ("", "")
+            # Catalog app_refs are generation-local. Correlate source and panel in this
+            # one generation, using only the live source's stable native window identity.
+            windows = trusted_catalog.get(trusted_target.get("app_ref", ""), {}).get("windows", {})
+            if last_wps_document[0] and any(
+                    w.get("window_identity_ref") == last_wps_document[0] and w.get("window_title") == last_wps_document[1]
+                    for w in windows.values()):
+                origin = last_wps_document
+            prepared.proposed_readback = ApprovedCopy.bind(prepared.save_destination, manager.session_id, current_grant_space(), origin)
         if prepared.mode is ComputerInteractionMode.FOREGROUND_TAKEOVER:
             prepared.approved = True
             authorized_acts.add(call_id)
@@ -4756,6 +4801,7 @@ def register_computer_tools(
         completed_observations.discard(call_id)
 
     async def complete_act(_args: dict, result: dict, call_id: str) -> None:
+        nonlocal readback_copy
         prepared = prepared_acts.get(call_id) or act_receipt_states.get(call_id)
         if prepared is not None:
             payload = {}
@@ -4780,6 +4826,31 @@ def register_computer_tools(
                     and _fully_acknowledged_action_batch(prepared.dispatch_result, len(prepared.actions))
                     and _next_transition_observation(payload) is not None):
                 receipt["next_step"] = "observe_window_transition"
+            full_ack = (not manager.handed_off and prepared.dispatch_attempted
+                        and _fully_acknowledged_action_batch(prepared.dispatch_result, len(prepared.actions)))
+            if (full_ack and prepared.proposed_readback is not None and prepared.readback_epoch == readback_epoch
+                    and prepared.proposed_readback.session == manager.session_id
+                    and prepared.proposed_readback.grant_space == current_grant_space()):
+                readback_copy = prepared.proposed_readback
+            copy = prepared.final_copy
+            if (copy is not None and copy is readback_copy and full_ack and result.get("verified") is True
+                    and not result.get("error") and not prepared.present_result and "fresh_output" in result):
+                tree = payload.get("ax_tree")
+                identity = str((prepared.policy_context or {}).get("window_identity_ref") or "")
+                session_binding = manager.snapshot_target_binding
+                authority_generation = observation_authority_generation
+                if (isinstance(tree, Mapping) and tree.get("role") == "AXWindow" and tree.get("subrole") == "AXStandardWindow"
+                        and str(trusted_target.get("window_identity_ref") or "") == identity
+                        and copy.matches(identity, str(tree.get("title") or tree.get("label") or ""),
+                                         str(trusted_target.get("known_path") or ""))):
+                    evidence = await asyncio.to_thread(copy.after_save, prepared.version_before_save)
+                    if (copy is readback_copy and session_binding == manager.snapshot_target_binding
+                            and authority_generation == observation_authority_generation and not manager.handed_off
+                            and copy.session == manager.session_id and copy.grant_space == current_grant_space()):
+                        payload["saved_document"] = evidence
+                        payload["message"] = evidence["next_step"]
+                        result["fresh_output"] = _json(payload)
+                        receipt["next_step"] = "review_saved_document"
             result["computer_receipt"] = receipt
             if prepared.dispatch_attempted and prepared.reserve_new_copy and receipt.get("dispatch_state") == "not_dispatched":
                 pending_new_copies.pop((manager.session_id, prepared.save_destination), None)

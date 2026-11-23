@@ -9216,3 +9216,98 @@ def test_new_copy_settles_only_on_document_or_closed_panel_and_regular_file(
     else:
         assert later["code"] == "effect_pending"
     assert sum(n == "act" for n, _ in backend.calls) == 1 + int(settled) + int(proof == "exact_document")
+
+
+@pytest.mark.skipif(os.name != "posix", reason="native WPS uses local POSIX paths")
+@pytest.mark.parametrize("route", ["menu_save", "command_s", "unrelated_same_title", "handoff", "unchanged", "exact_path"])
+def test_final_wps_save_reads_only_approved_copy_on_bound_document(registry, manager, backend, tmp_path, monkeypatch, route):
+    from zipfile import ZipFile
+
+    destination = tmp_path / "copy.docx"
+    def write_body(text):
+        with ZipFile(destination, "w") as package:
+            package.writestr("_rels/.rels", '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+                             '<Relationship Id="r" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+                             'Target="word/document.xml"/></Relationships>')
+            package.writestr("word/document.xml", '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                             f'<w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>')
+
+    def document(title):
+        return {"role": "AXWindow", "subrole": "AXStandardWindow", "title": title,
+                "children": [{"role": "AXButton", "title": "Save", "element_ref": "save-button"}]}
+
+    async def approve(card):
+        cards.append(card)
+        return "once"
+
+    def snap():
+        result = run(registry.execute("computer_snapshot", {}))
+        assert not result["error"], result
+        return json.loads(result["fresh_output"])["snapshot_id"]
+
+    cards = []
+    backend.catalog_bundle_id = "com.kingsoft.wpsoffice.mac"
+    backend.catalog_window_title = "origin.docx"
+    backend.snapshot_ax_tree_override = document("origin.docx")
+    register(registry, manager)
+    registry.set_approval_handler(approve)
+    focus(registry)
+    snap()
+    catalog = backend.apps
+    async def windows():
+        result = await catalog()
+        window = result.apps[0]["windows"][0]
+        if backend.catalog_window_title == "另存为":
+            result.apps[0]["windows"].append({**window, "window_ref": "underlying-document",
+                                              "window_identity_ref": "identity-a", "title": "origin.docx"})
+        elif backend.catalog_window_title == "copy.docx" and route == "exact_path":
+            window["document_path"] = str(destination)
+        return result
+    monkeypatch.setattr(backend, "apps", windows)
+    backend.catalog_window_identity_ref = "panel"
+    backend.catalog_window_title = "另存为"
+    backend.snapshot_ax_tree_override = _wps_new_copy_panel(tmp_path)
+    focus(registry)
+    commit = {"type": "click", "element_ref": "snapshot-1:save", "save_new_copy_to": str(destination)}
+    created = run(registry.execute("computer_act", {"snapshot_id": snap(), "actions": [commit]}))
+    assert not created["error"], created
+    assert cards[-1]["arguments"]["saved_copy_readback"] is True
+    assert "main-body text" in cards[-1]["approval_effect"]
+    write_body("before")
+    backend.catalog_window_identity_ref = "identity-b" if route in {"unrelated_same_title", "exact_path"} else "identity-a"
+    backend.catalog_window_title = "copy.docx"
+    backend.snapshot_ax_tree_override = document("copy.docx")
+    focus(registry)
+    snap()
+    if route == "handoff":
+        assert not run(registry.execute("computer_handoff", {}))["error"]
+        run(registry.execute("computer_apps", {}))
+        assert not run(registry.execute("computer_resume", {"app_ref": "app-1", "window_ref": "window-1"}))["error"]
+        focus(registry)
+    if route == "menu_save":
+        backend.snapshot_ax_tree_override = {"role": "AXMenuBarItem", "title": "File",
+                                            "children": [{"role": "AXMenuItem", "title": "Save", "element_ref": "save"}]}
+        save = {"type": "click", "element_ref": "save"}
+    else:
+        save = {"type": "keypress", "key": "s", "modifiers": ["command"]}
+    snapshot = snap()
+    original_act = backend.act
+    async def save_copy(*args, **kwargs):
+        result = await original_act(*args, **kwargs)
+        if route != "unchanged":
+            write_body("after")
+        backend.snapshot_ax_tree_override = document("copy.docx")
+        return result
+    monkeypatch.setattr(backend, "act", save_copy)
+    saved = run(registry.execute("computer_act", {"snapshot_id": snapshot, "actions": [save]}))
+    assert not saved["error"], saved
+    payload = json.loads(saved["fresh_output"])
+    if route in {"unrelated_same_title", "handoff"}:
+        assert "saved_document" not in payload
+    else:
+        proof = payload["saved_document"]
+        assert proof["status"] == "read_back" and proof["path"] == str(destination)
+        assert proof["paragraphs"] == (["before"] if route == "unchanged" else ["after"])
+        assert proof["version_changed_since_save_started"] == (route != "unchanged")
+        assert saved["computer_receipt"]["next_step"] == "review_saved_document"
+        assert "saved_document" not in saved["output"]

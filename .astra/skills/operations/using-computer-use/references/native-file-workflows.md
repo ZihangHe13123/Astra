@@ -4,7 +4,7 @@
 
 - Finder 关闭标签可优先考虑已观察到的 `AXMenuItem`「关闭标签页 / Close Tab」。先确认目标标签当前已选中；多个标签时菜单作用于当前标签，不能用「关闭窗口」「关闭其他标签页」替代。必要时先选择目标标签并核验，再用新快照的菜单 ref。菜单被截断时可用 `computer_snapshot(role_filter="AXMenuItem")`；这不是恢复 helper 未采集的节点。
 
-- 保存需核验实际目标文件及内容，不能只看保存按钮回执。另存为弹窗出现后绑定它的新 refs；已请求的文件目标、覆盖规则和 once 审批保持有效边界，不能为了测试保存到个人文稿目录。新 ref 仍反复 stale 时停止输入并报告，不反复试同一批次。
+- WPS 保存时，若回执包含 `saved_document` 的实际路径和磁盘段落，逐项与任务核对；已满足且无其他待办就答复用户。缺少路径或正文证据时只核验缺项。另存为使用已观察的目标窗口、目录和文件名，遵守原有覆盖规则和一次性审批。新 ref 仍反复 stale 时停止输入并报告，不反复试同一批次。
 
 - Finder 滚动优先检查目标内容区域的 `AXScrollBar` 子节点：已观察到且支持 `AXPress` 的 `AXIncrementPage`（下一页）/ `AXDecrementPage`（上一页）可用 `click(element_ref=...)` 做语义翻页。必须核对父滚动条属于目标列表，不能误点侧边栏；用新快照逐页操作并核验滚动值/可见行。子按钮缺失时，可先用 `role_filter="AXScrollBar"` 定位目标滚动条，再以最新返回的滚动条 ref 作 `subtree_ref` 观察子按钮；role_filter 本身不会保留不同角色的子节点。`action_observation` 的 `matching_scrollbar_value_changed` 仅说明该滚动条数值变化，不保证目标内容已到达。
 
