@@ -96,11 +96,13 @@ func provenSaveBrowserDirectory(_ columns: [SaveBrowserSelection], popupLabel: S
     guard let popupLabel, !popupLabel.isEmpty, columns.count >= 2 else { return nil }
     // The trailing column is the current location's contents. A selected file can
     // corroborate its parent, but cannot establish a location on its own.
+    // The column URLs are already canonical. Foundation standardization can fold
+    // /private/tmp back to /tmp and break literal parent comparisons.
     let branch = Array(columns.dropLast())
     guard case let .directory(folder)? = branch.last else { return nil }
     switch columns.last {
     case .empty?: break
-    case let .file(file)? where file.deletingLastPathComponent().standardizedFileURL.path == folder.path: break
+    case let .file(file)? where file.deletingLastPathComponent().path == folder.path: break
     default: return nil
     }
     // Finder can show a virtual volume or alias in earlier columns. Anchor
@@ -109,7 +111,7 @@ func provenSaveBrowserDirectory(_ columns: [SaveBrowserSelection], popupLabel: S
     guard !branch.contains(.empty) else { return nil }
     if branch.count >= 2 {
         guard case let .directory(parent) = branch[branch.count - 2],
-              parent.path != folder.path, folder.deletingLastPathComponent().standardizedFileURL.path == parent.path
+              parent.path != folder.path, folder.deletingLastPathComponent().path == parent.path
         else { return nil }
     } else if folder.path != "/" { return nil }
     guard popupLabel == folder.lastPathComponent || popupLabel == displayName(folder) else { return nil }

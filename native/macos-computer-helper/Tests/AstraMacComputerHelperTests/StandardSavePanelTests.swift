@@ -87,6 +87,11 @@ import Testing
     let folderURL = URL(fileURLWithPath: folder, isDirectory: true)
     try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: false)
     defer { try? FileManager.default.removeItem(at: folderURL) }
+    let parent = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
+    let columns: [SaveBrowserSelection] = [.directory(parent), .directory(folderURL)]
+    #expect(provenSaveBrowserDirectory(columns + [.empty], popupLabel: folderURL.lastPathComponent) == folder)
+    #expect(provenSaveBrowserDirectory(columns + [.file(folderURL.appendingPathComponent("existing.docx"))],
+                                      popupLabel: folderURL.lastPathComponent) == folder)
     let name = "copy.docx"
     #expect(savePanelLocalDirectory(URL(fileURLWithPath: alias) as NSURL) == folder)
     try proveNewSavePanelDestination(requested: alias + "/" + name, filename: name, directory: folder)
