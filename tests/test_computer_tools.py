@@ -5266,6 +5266,44 @@ def test_refused_replacement_is_selected_and_typed_under_the_same_approval(regis
     assert len(requests) == 1  # one approval, for the batch that runs
 
 
+def test_keyboard_replacement_across_two_fields_requires_separate_observations(registry, manager, backend, monkeypatch):
+    from agent.runtime.macos_computer import HelperApplicationError
+
+    fields = ["snapshot-1:find", "snapshot-1:replace"]
+    backend.snapshot_ax_tree_override = {"role": "AXWindow",
+        "observation_capabilities": ["replace_text_v1", "auto_takeover_v1", "focus_consent_v1"],
+        "children": [{"role": "AXTextField", "label": name, "element_ref": ref}
+                     for name, ref in zip(("Find", "Replace"), fields)]}
+    planned = []
+
+    async def refuse_native(target, snapshot_id, actions, interaction_mode):
+        planned.append(tuple(action.type for action in actions))
+        raise HelperApplicationError(ComputerError(ComputerErrorCode.BACKGROUND_ACTION_UNSUPPORTED, "AX refused"))
+
+    monkeypatch.setattr(backend, "plan_actions", refuse_native)
+    requests = []
+
+    async def approve(request):
+        requests.append(request)
+        return "once"
+
+    registry.set_approval_handler(approve)
+    register(registry, manager)
+    focus(registry)
+    snapshot = json.loads(run(registry.execute("computer_snapshot", {}))["fresh_output"])
+    result = run(registry.execute("computer_act", {"snapshot_id": snapshot["snapshot_id"],
+        "actions": [{"type": "type", "text": value, "element_ref": ref, "replace": True}
+                    for value, ref in zip(("old", "new"), fields)]}))
+
+    assert result["code"] == "background_action_unsupported"
+    assert "one focused field at a time" in result["recovery_hint"]
+    assert result["computer_receipt"]["dispatch_state"] == "not_dispatched"
+    assert result["details"]["planning_refusals"][-1]["code"] == "multiple_keyboard_fields"
+    assert planned == [("type", "type"), ("type", "type")]
+    assert not requests
+    assert not any(name in {"takeover_begin", "act"} for name, _ in backend.calls)
+
+
 @pytest.mark.parametrize("approval", ["once", "deny"])
 def test_dialog_intent_activates_before_an_ordinary_ax_button_with_normal_approval(
     registry, manager, backend, monkeypatch, approval,

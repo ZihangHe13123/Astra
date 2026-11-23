@@ -4642,6 +4642,14 @@ def register_computer_tools(
                 )
                 if rewritten is None:
                     raise
+                # The keyboard path checks every bound target before dispatching its first key.
+                # It cannot establish a single keyboard focus for two separate editors.
+                fields = {action.element_ref for action in prepared.actions
+                          if action.type == "type" and action.element_ref}
+                if len(fields) > 1:
+                    planning_refusals.append({"mode": interaction_mode.value, "route": "select_all_and_type",
+                                              "code": "multiple_keyboard_fields"})
+                    raise
                 try:
                     actions = tuple(ComputerAction.from_mapping(action) for action in rewritten)
                     replanned = await plan_route(actions, interaction_mode, "select_all_and_type")
@@ -4705,7 +4713,13 @@ def register_computer_tools(
                     )
             if planning_refusals:
                 prepared.failure.details["planning_refusals"] = planning_refusals
-                if planning_refusals[-1]["route"] == "select_all_and_type":
+                if planning_refusals[-1]["code"] == "multiple_keyboard_fields":
+                    prepared.failure = replace(prepared.failure, retryable=False, recovery_hint=(
+                        "The native replacement was refused. Keyboard replacement needs one focused field at a time. "
+                        "No input was dispatched. Observe this dialog, act on the first field alone, then use "
+                        "a fresh observation to locate the next field."
+                    ))
+                elif planning_refusals[-1]["route"] == "select_all_and_type":
                     cause = exc.__cause__
                     followup = (_application_failure(cause.error).recovery_hint
                                 if isinstance(cause, HelperApplicationError) else "")
