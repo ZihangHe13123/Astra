@@ -9,6 +9,7 @@ from functools import lru_cache
 from pathlib import Path
 
 from agent.cli import sessions
+from agent.runtime.conversation_folder import listing_folder
 from agent.runtime.session_store import SessionStore
 from agent.ui.history_index import check_query_branch, history_page
 from agent.ui.delegates import delegate_history
@@ -45,7 +46,12 @@ def list_sessions() -> list[dict]:
             files = [p for p in (store.jsonl_path, store.legacy_path, store.snapshot_path) if p.exists()]
             mtimes["default"] = max((p.stat().st_mtime for p in files), default=0.0)
         for name, modified in mtimes.items():
-            result.append({"name": name, "mode": mode, "modified": modified})
+            try:
+                folder, source = listing_folder(SessionStore(path_resolver(name)))
+            except (OSError, ValueError):
+                folder, source = "", ""
+            result.append({"name": name, "mode": mode, "modified": modified,
+                           "workspace": folder or None, "workspace_source": source})
     return sorted(result, key=lambda s: s["modified"], reverse=True)
 
 

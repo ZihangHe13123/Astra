@@ -42,8 +42,11 @@ class ResponseVersions:
     def _adopt(self, candidate) -> None:
         # A branch shares the physical world, but no ephemeral prompt/steering,
         # context-index state or working-memory cache from its former sibling.
+        folder = self.agent.context.workspace
         self.agent.reset_conversation()
         self.agent.context.adopt_session(candidate)
+        if folder:
+            self.agent.context.workspace = folder
 
     async def select(self, command: dict) -> None:
         identity = self._identity(command)

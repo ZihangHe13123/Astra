@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -78,6 +79,30 @@ def test_alternative_uses_completed_observations_without_replaying_and_keeps_fol
     assert context.messages == original
     assert len(model.requests) == 1
     assert context.branch_id == "main"
+
+
+def test_selecting_the_original_reply_keeps_the_conversations_moved_folder(tmp_path, monkeypatch):
+    original_folder = tmp_path / "A"
+    moved_folder = tmp_path / "B"
+    original_folder.mkdir()
+    moved_folder.mkdir()
+    monkeypatch.setenv("SANDBOX_WORKDIR", str(original_folder))
+    context, _, controller, command, _, _ = fixture(tmp_path)
+    asyncio.run(controller.regenerate(command))
+    context.workspace = str(moved_folder)
+    context.save()
+
+    state = controller.state()
+    group = state["groups"][0]
+    asyncio.run(controller.select({"type": "response_select", "request_id": "select-original",
+        "branch_id": state["branch_id"], "revision": state["revision"],
+        "group_id": group["id"], "version_id": group["versions"][0]["id"]}))
+
+    assert context.branch_id == "main"
+    assert context.workspace == str(moved_folder)
+    context.save()
+    header = SessionStore(context.session_path, branch_id="main").header_path
+    assert json.loads(header.read_text(encoding="utf-8"))["workspace"] == str(moved_folder)
 
 
 @pytest.mark.parametrize("events,error", [
